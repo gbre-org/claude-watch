@@ -88,16 +88,19 @@ test-trust-workspace:
 # Run the claude-tmux env / mount passthrough tests (corporate CA bundle
 # forwarding, proxy passthrough, host hooks-dir bind-mount, set-but-missing
 # path warnings). Exercises the wrapper's --print-docker-args debug hook so
-# no docker daemon is needed. 17 cases, ~1s.
+# no docker daemon is needed. 23 cases, ~1s.
 test-claude-tmux-env:
 	container/bin/tests/claude-tmux-env.test
 
 # Run the exec-hook shim tests (settings.json hook safe-exec wrapper for
 # cross-arch hooks — ELF passthrough, Mach-O / unknown / missing no-op,
-# dedup flag file). Runs directly on Linux against synthetic magic-byte
-# stubs; no container needed. 9 cases, ~1s.
+# dedup flag file) AND the generate-hooks-shim-settings rewrite tests
+# (container-local settings.json with every hook command wrapped in
+# /usr/local/bin/exec-hook). Both run directly on Linux against
+# synthetic inputs; no container needed. 22 cases total, ~1s.
 test-hooks-shim:
 	container/hooks-shim/tests/exec-hook.test
+	container/hooks-shim/tests/generate-hooks-shim-settings.test
 
 # Release build
 build:

@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Generate a container-local settings JSON that wraps each hook command in
+/usr/local/bin/exec-hook, so cross-arch host binaries no-op silently
+instead of spamming "Exec format error" on every hook event.
+
+WHY THIS EXISTS
+
+Operators bind-mount ~/.claude into the container, including
+~/.claude/settings.json with its `hooks.<event>.[*].hooks[*].command`
+entries. When the host is macOS (or any non-Linux platform), those
+commands often point at host-native binaries — devbar's
+telemetry-hook, etc. — that Linux's exec() bounces with "Exec format
+error". Claude Code logs the failure on every hook event; the noise
+buries real diagnostics.
+
+PR #135 shipped /usr/local/bin/exec-hook, a magic-byte sniffer that
+exec's ELF / shebang transparently and silently no-ops on Mach-O /
+unknown. The shim is opt-in: the operator has to MANUALLY edit each
+hook command in their settings.json to wrap it as
+  "command": "exec-hook /Users/me/.devbar/bin/telemetry-hook"
+On a Mac host where settings.json is bind-mounted in, that edit is
+load-bearing on the HOST and surprises the host install.
+
+This helper produces a container-local copy of settings.json with
+every hook command wrapped, so the operator doesn't have to mutate
+the host file. It is invoked by container/entrypoint.sh when
+CLAUDE_CONTAINER_REWRITE_HOOKS=1 is set. The generated file lives at
+$OUTPUT_PATH (default /tmp/claude-shim/settings.json, uid 1000
+writable). The entrypoint then launches claude with
+`--settings $OUTPUT_PATH` so Claude Code merges the rewritten hooks
+on top of its normal user/project/local cascade.
+
+NON-GOALS
+
+- We do NOT inspect the target binary's magic bytes here. The shim
+  itself does that at hook-fire time, per-target. This helper just
+  wraps EVERY hook command unconditionally. That's safe: the shim
+  is transparent for ELF and shebang targets (exec passthrough); the
+  only behaviour change for native-Linux hooks is one extra exec()
+  hop per fire, which is negligible.
+- We do NOT mutate the host's settings.json. The output is a
+  container-local file at a deterministic path under /tmp.
+
+INPUT FORMAT
+
+~/.claude/settings.json schema (per Claude Code docs):
+  {
+    "hooks": {
+      "<event>": [
+        {
+          "matcher": "...",
+          "hooks": [
+            { "type": "command", "command": "/path/to/hook [args]" },
+            ...
+          ]
+        },
+        ...
+      ],
+      ...
+    },
+    "<other-top-level-keys>": ...
+  }
+
+This script ONLY rewrites `hooks.<event>.[*].hooks[*].command`. All
+other top-level keys are passed through unchanged (Claude Code's
+merge semantics will combine them with the user/project/local
+cascade).
+
+OUTPUT FORMAT
+
+Same schema with each command rewritten:
+  "command": "/usr/local/bin/exec-hook <original-command-verbatim>"
+
+The original command may already start with "exec-hook " (the
+operator pre-wrapped on the host). In that case we don't double-wrap.
+
+EXIT CODES
+
+  0  output written successfully, or input lacks any hooks (graceful no-op)
+  1  unexpected error parsing input / writing output
+
+The script is fail-safe: on parse error / missing input, it logs to
+stderr and exits 0 so the entrypoint can keep going. Bad-input cases
+shouldn't break the container.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+EXEC_HOOK_PATH = "/usr/local/bin/exec-hook"
+
+
+def wrap_command(cmd: str) -> str:
+    """Prefix `cmd` with `exec-hook ` unless already wrapped.
+
+    `cmd` is the raw "command" string from settings.json — typically a
+    shell-ready string like "/path/to/hook arg1 arg2". We DON'T tokenise
+    + re-quote it because hook commands frequently rely on shell features
+    (pipes, env-var expansion, redirection); naive shlex would break
+    those. Instead we just prefix the literal exec-hook path.
+
+    Edge cases handled:
+      - command already starts with "exec-hook " or "/usr/local/bin/exec-hook ":
+        return verbatim (no double-wrap).
+      - command starts with whitespace: stripped before prefix check, but
+        original whitespace preserved in the output (so funky operator
+        whitespace round-trips).
+      - command is empty: returned as-is (Claude Code will reject it
+        on its own; not our problem to validate).
+    """
+    if not cmd:
+        return cmd
+    stripped = cmd.lstrip()
+    # Already wrapped — don't double-prefix.
+    if stripped.startswith("exec-hook ") or stripped.startswith(f"{EXEC_HOOK_PATH} "):
+        return cmd
+    # Bare "exec-hook" or bare exec-hook path with no args is a usage
+    # error in settings.json but pass it through unchanged rather than
+    # rewriting; the shim will print its usage banner on stderr at
+    # fire time and exit 2, which is the operator-visible signal we want.
+    if stripped == "exec-hook" or stripped == EXEC_HOOK_PATH:
+        return cmd
+    return f"{EXEC_HOOK_PATH} {cmd}"
+
+
+def rewrite_hooks(settings: dict) -> dict:
+    """Walk settings["hooks"] and wrap every nested command. Returns a
+    new dict; the input is not mutated.
+
+    Tolerates missing / malformed shapes by leaving them alone — Claude
+    Code's own validator will complain about the original shape and we
+    don't want to silently "fix" something we don't understand."""
+    out = dict(settings)  # shallow copy is fine, we deep-copy the hooks tree
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return out
+    new_hooks: dict = {}
+    for event, entries in hooks.items():
+        if not isinstance(entries, list):
+            new_hooks[event] = entries
+            continue
+        new_entries = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                new_entries.append(entry)
+                continue
+            new_entry = dict(entry)
+            inner = entry.get("hooks")
+            if isinstance(inner, list):
+                new_inner = []
+                for hook in inner:
+                    if not isinstance(hook, dict):
+                        new_inner.append(hook)
+                        continue
+                    new_hook = dict(hook)
+                    cmd = hook.get("command")
+                    if isinstance(cmd, str):
+                        new_hook["command"] = wrap_command(cmd)
+                    new_inner.append(new_hook)
+                new_entry["hooks"] = new_inner
+            new_entries.append(new_entry)
+        new_hooks[event] = new_entries
+    out["hooks"] = new_hooks
+    return out
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        description="Generate a container-local settings JSON with every "
+                    "hook command wrapped in /usr/local/bin/exec-hook.",
+    )
+    p.add_argument(
+        "--input", "-i",
+        default=os.environ.get("CLAUDE_SHIM_INPUT", "/home/hndrewaall/.claude/settings.json"),
+        help="Path to the source settings.json (default: ~/.claude/settings.json).",
+    )
+    p.add_argument(
+        "--output", "-o",
+        default=os.environ.get("CLAUDE_SHIM_OUTPUT", "/tmp/claude-shim/settings.json"),
+        help="Path to write the rewritten settings.json to. Created with "
+             "0600 perms; parent dir created if missing.",
+    )
+    p.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress stderr 'wrote N hooks' summary on success.",
+    )
+    args = p.parse_args(argv)
+
+    in_path = Path(args.input)
+    out_path = Path(args.output)
+
+    if not in_path.exists():
+        if not args.quiet:
+            print(
+                f"generate-hooks-shim-settings: input {in_path} does not exist; nothing to rewrite.",
+                file=sys.stderr,
+            )
+        return 0
+
+    try:
+        with in_path.open("r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except Exception as e:
+        print(
+            f"generate-hooks-shim-settings: failed to parse {in_path}: {e}",
+            file=sys.stderr,
+        )
+        return 0  # fail-safe: don't break the container
+
+    if not isinstance(settings, dict):
+        print(
+            f"generate-hooks-shim-settings: {in_path} root is not a JSON object; skipping.",
+            file=sys.stderr,
+        )
+        return 0
+
+    rewritten = rewrite_hooks(settings)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write to a temp file then atomic-rename so a concurrent claude
+    # launch never sees a half-written file.
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(rewritten, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, out_path)
+
+    if not args.quiet:
+        # Count hooks we touched for the operator's awareness.
+        n = 0
+        hooks = rewritten.get("hooks") or {}
+        for entries in hooks.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                inner = (entry or {}).get("hooks") or []
+                for hook in inner:
+                    if isinstance((hook or {}).get("command"), str):
+                        n += 1
+        print(
+            f"generate-hooks-shim-settings: wrote {n} hook(s) -> {out_path}",
+            file=sys.stderr,
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

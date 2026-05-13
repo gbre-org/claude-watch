@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Tests for container/hooks-shim/generate-hooks-shim-settings.
+
+Coverage:
+  - Empty / missing hooks key: passthrough, no rewrite.
+  - Single hook command: wrapped with /usr/local/bin/exec-hook prefix.
+  - Already-wrapped (exec-hook ... or /usr/local/bin/exec-hook ...):
+    no double-wrap.
+  - Mixed-shape settings.json: only hooks.<event>.[*].hooks[*].command
+    is touched, every other top-level key passes through unchanged.
+  - Multiple hooks across multiple events: every command wrapped.
+  - Malformed hook tree (non-dict entries, non-list inner hooks):
+    passed through unchanged, no exception.
+  - Missing input file: exit 0, no output written.
+  - Unparseable input: exit 0, no output written, stderr explains why.
+  - Output path: created with 0600 perms, parent dir auto-created.
+  - Atomic write: a temp file is used + rename (we don't catch a
+    half-written file in a race, but we DO verify the temp suffix
+    leaves no leftover after success).
+
+Run:  ./generate-hooks-shim-settings.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "generate-hooks-shim-settings"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate helper at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+EXEC_HOOK = "/usr/local/bin/exec-hook"
+
+
+def run_helper(input_path: str, output_path: str, expect_rc: int = 0) -> tuple[str, str]:
+    result = subprocess.run(
+        [str(SCRIPT), "--input", input_path, "--output", output_path, "--quiet"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != expect_rc:
+        raise AssertionError(
+            f"helper exited {result.returncode} (expected {expect_rc})\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout, result.stderr
+
+
+def write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f)
+
+
+def load_output(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_no_hooks_key_passthrough() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"someOtherKey": {"x": 1}, "permissions": {"deny": []}})
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(result == {"someOtherKey": {"x": 1}, "permissions": {"deny": []}},
+               f"no-hooks: expected passthrough, got {result}")
+
+
+def test_empty_hooks_dict_passthrough() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {}})
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(result == {"hooks": {}},
+               f"empty-hooks: expected unchanged, got {result}")
+
+
+def test_single_command_wrapped() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup|resume",
+                        "hooks": [
+                            {"type": "command", "command": "/Users/me/.devbar/bin/telemetry-hook"},
+                        ],
+                    },
+                ],
+            },
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        cmd = result["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        expect(cmd == f"{EXEC_HOOK} /Users/me/.devbar/bin/telemetry-hook",
+               f"single-cmd: wrapper missing, got {cmd!r}")
+
+
+def test_already_wrapped_not_double_wrapped() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        # Two forms of pre-wrap: bare `exec-hook ...` (PATH-resolved) and
+        # the absolute path form. Both should pass through unchanged.
+        write_json(inp, {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": "exec-hook /Users/me/hook"},
+                            {"type": "command", "command": f"{EXEC_HOOK} /Users/me/hook2"},
+                        ],
+                    },
+                ],
+            },
+        })
+        run_helper(str(inp), str(out))
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        expect(cmds[0] == "exec-hook /Users/me/hook",
+               f"already-wrapped: bare exec-hook should pass through, got {cmds[0]!r}")
+        expect(cmds[1] == f"{EXEC_HOOK} /Users/me/hook2",
+               f"already-wrapped: absolute exec-hook should pass through, got {cmds[1]!r}")
+
+
+def test_multi_event_multi_hook_all_wrapped() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "/p/a"}]},
+                    {"hooks": [{"type": "command", "command": "/p/b"}]},
+                ],
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {"type": "command", "command": "/p/c"},
+                            {"type": "command", "command": "/p/d"},
+                        ],
+                    },
+                ],
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "/p/e"}]},
+                ],
+            },
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        cmds = []
+        for entries in result["hooks"].values():
+            for entry in entries:
+                for h in entry["hooks"]:
+                    cmds.append(h["command"])
+        for cmd in cmds:
+            expect(cmd.startswith(f"{EXEC_HOOK} "),
+                   f"multi-hook: every command should be wrapped, got {cmd!r}")
+        expect(len(cmds) == 5, f"multi-hook: expected 5 commands, got {len(cmds)}")
+
+
+def test_other_top_level_keys_preserved() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "permissions": {"deny": ["Bash(rm -rf /)"]},
+            "env": {"FOO": "bar"},
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "/p/x"}]}],
+            },
+            "unknownTopLevelKey": [1, 2, 3],
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(result["permissions"] == {"deny": ["Bash(rm -rf /)"]},
+               "other-keys: permissions should pass through")
+        expect(result["env"] == {"FOO": "bar"},
+               "other-keys: env should pass through")
+        expect(result["unknownTopLevelKey"] == [1, 2, 3],
+               "other-keys: unknown keys should pass through")
+
+
+def test_malformed_hooks_tree_no_exception() -> None:
+    """Non-dict entries / non-list inner hooks pass through unchanged."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {
+                "SessionStart": "not-a-list",  # malformed event value
+                "Stop": [
+                    "not-a-dict-entry",  # malformed entry
+                    {"hooks": "not-a-list"},  # malformed inner hooks
+                    {"hooks": [
+                        "not-a-dict-hook",  # malformed hook
+                        {"type": "command", "command": "/p/valid"},  # valid one
+                    ]},
+                ],
+            },
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        # Malformed paths pass through unchanged.
+        expect(result["hooks"]["SessionStart"] == "not-a-list",
+               "malformed: non-list event value should pass through")
+        # The one valid command in the mess still gets wrapped.
+        valid_cmd = result["hooks"]["Stop"][2]["hooks"][1]["command"]
+        expect(valid_cmd == f"{EXEC_HOOK} /p/valid",
+               f"malformed: valid command in messy tree should still be wrapped, got {valid_cmd!r}")
+
+
+def test_missing_input_no_output() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "out.json"
+        run_helper("/this/input/does/not/exist.json", str(out))
+        expect(not out.exists(),
+               "missing-input: helper should not write output for missing input")
+
+
+def test_unparseable_input_no_output() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        inp.write_text("this is not json")
+        _, stderr = run_helper(str(inp), str(out))
+        expect(not out.exists(),
+               "unparseable: helper should not write output for unparseable input")
+        expect("failed to parse" in stderr,
+               f"unparseable: stderr should explain the failure, got: {stderr!r}")
+
+
+def test_output_perms_0600() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/p/x"}]}]}})
+        run_helper(str(inp), str(out))
+        mode = stat.S_IMODE(out.stat().st_mode)
+        expect(mode == 0o600,
+               f"perms: output should be 0600, got {oct(mode)}")
+
+
+def test_output_parent_dir_auto_created() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        # Nested non-existent output dir — helper must mkdir -p.
+        out = Path(td) / "nested" / "deep" / "out.json"
+        write_json(inp, {"hooks": {}})
+        run_helper(str(inp), str(out))
+        expect(out.exists(),
+               "parent-dir: helper should create missing output parent dirs")
+
+
+def test_no_tmp_leftover() -> None:
+    """The atomic-rename pattern should leave no .tmp leftover after success."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/p/x"}]}]}})
+        run_helper(str(inp), str(out))
+        leftovers = list(Path(td).glob("*.tmp"))
+        expect(not leftovers,
+               f"atomic-rename: no .tmp leftover expected, got {leftovers}")
+
+
+def test_realistic_corp_settings() -> None:
+    """End-to-end with a realistic corp settings.json shape (multi-event, matchers, args)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup|resume",
+                        "hooks": [
+                            {"type": "command", "command": "/Users/hallandrew/.devbar/bin/telemetry-hook session-start"},
+                        ],
+                    },
+                ],
+                "UserPromptSubmit": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": "/Users/hallandrew/.devbar/bin/telemetry-hook prompt-submit"},
+                        ],
+                    },
+                ],
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {"type": "command", "command": "check-no-bg-ampersand"},
+                            {"type": "command", "command": "/Users/hallandrew/.devbar/bin/telemetry-hook pre-tool"},
+                        ],
+                    },
+                ],
+            },
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        # Every command, regardless of whether it points at a Mach-O or a
+        # bare name on PATH (check-no-bg-ampersand), gets wrapped. The
+        # shim is transparent on ELF + shebang, so this is safe.
+        expect(
+            result["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            == f"{EXEC_HOOK} /Users/hallandrew/.devbar/bin/telemetry-hook session-start",
+            "corp: SessionStart command should be wrapped with args preserved",
+        )
+        expect(
+            result["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            == f"{EXEC_HOOK} check-no-bg-ampersand",
+            "corp: bare PATH command should also be wrapped",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_no_hooks_key_passthrough,
+    test_empty_hooks_dict_passthrough,
+    test_single_command_wrapped,
+    test_already_wrapped_not_double_wrapped,
+    test_multi_event_multi_hook_all_wrapped,
+    test_other_top_level_keys_preserved,
+    test_malformed_hooks_tree_no_exception,
+    test_missing_input_no_output,
+    test_unparseable_input_no_output,
+    test_output_perms_0600,
+    test_output_parent_dir_auto_created,
+    test_no_tmp_leftover,
+    test_realistic_corp_settings,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")

@@ -248,6 +248,86 @@ def test_claude_host_hooks_dir_missing() -> None:
            "hooks-dir: missing dir should NOT be bind-mounted")
 
 
+def find_workdir(argv: list[str]) -> str | None:
+    """Last `-w <path>` wins (matches docker run semantics)."""
+    last = None
+    for i, tok in enumerate(argv):
+        if tok == "-w" and i + 1 < len(argv):
+            last = argv[i + 1]
+    return last
+
+
+def test_claude_host_project_dir_existing() -> None:
+    """CLAUDE_HOST_PROJECT_DIR existing dir => bind-mount + WORKDIR override."""
+    with tempfile.TemporaryDirectory(prefix="host-project-") as d:
+        argv = run_script({"CLAUDE_HOST_PROJECT_DIR": d})
+        # Bind-mount at the SAME absolute path inside the container.
+        mounts = find_volume_mounts(argv)
+        expected_mount = f"{d}:{d}"
+        expect(expected_mount in mounts,
+               f"project-dir: expected bind-mount {expected_mount} in {mounts}")
+        # WORKDIR overridden to the host path so Claude's cwd-derived
+        # project key matches the host.
+        wd = find_workdir(argv)
+        expect(wd == d,
+               f"project-dir: -w should be {d}, got {wd}")
+        # The env var itself is forwarded so the entrypoint can see it
+        # for trust-workspace pre-seeding.
+        expect(find_env_arg(argv, "CLAUDE_HOST_PROJECT_DIR") == d,
+               "project-dir: CLAUDE_HOST_PROJECT_DIR env var should be forwarded")
+
+
+def test_claude_host_project_dir_missing_fallback() -> None:
+    """CLAUDE_HOST_PROJECT_DIR pointing at a missing dir => fall back to /workspace."""
+    bogus = "/this/host/project/dir/does/not/exist"
+    argv = run_script({"CLAUDE_HOST_PROJECT_DIR": bogus})
+    expect(not any(bogus in m for m in find_volume_mounts(argv)),
+           "project-dir: missing dir should NOT be bind-mounted")
+    wd = find_workdir(argv)
+    expect(wd == "/workspace",
+           f"project-dir: missing dir should fall back to /workspace, got {wd}")
+
+
+def test_claude_host_project_dir_unset_default_workspace() -> None:
+    """No CLAUDE_HOST_PROJECT_DIR => WORKDIR = /workspace (regression check)."""
+    argv = run_script({})
+    wd = find_workdir(argv)
+    expect(wd == "/workspace",
+           f"unset: -w should be /workspace, got {wd}")
+    expect(find_env_arg(argv, "CLAUDE_HOST_PROJECT_DIR") is None,
+           "unset: CLAUDE_HOST_PROJECT_DIR should NOT be forwarded")
+
+
+def test_warning_fires_for_missing_project_dir() -> None:
+    """CLAUDE_HOST_PROJECT_DIR set to a missing dir => stderr WARNING."""
+    bogus = "/this/host/project/dir/does/not/exist"
+    _, stderr = run_script(
+        {"CLAUDE_HOST_PROJECT_DIR": bogus},
+        suppress_warnings=False,
+        return_stderr=True,
+    )
+    expect("WARNING" in stderr,
+           f"missing-project-dir: expected WARNING in stderr:\n{stderr}")
+    expect("CLAUDE_HOST_PROJECT_DIR" in stderr,
+           f"missing-project-dir: stderr should name the var:\n{stderr}")
+    expect(bogus in stderr,
+           f"missing-project-dir: stderr should include the bad path:\n{stderr}")
+
+
+def test_rewrite_hooks_flag_forwarded() -> None:
+    """CLAUDE_CONTAINER_REWRITE_HOOKS=1 => forwarded as env to the container."""
+    argv = run_script({"CLAUDE_CONTAINER_REWRITE_HOOKS": "1"})
+    expect(find_env_arg(argv, "CLAUDE_CONTAINER_REWRITE_HOOKS") == "1",
+           "rewrite-hooks: CLAUDE_CONTAINER_REWRITE_HOOKS=1 should be forwarded")
+
+
+def test_rewrite_hooks_flag_unset_not_forwarded() -> None:
+    """CLAUDE_CONTAINER_REWRITE_HOOKS unset => not in env args."""
+    argv = run_script({})
+    expect(find_env_arg(argv, "CLAUDE_CONTAINER_REWRITE_HOOKS") is None,
+           "rewrite-hooks: unset var should NOT be forwarded")
+
+
 def test_claude_wildcard_still_forwarded() -> None:
     """Regression: existing CLAUDE_* / ANTHROPIC_* passthrough still works."""
     argv = run_script({
@@ -397,6 +477,12 @@ TESTS = [
     test_warning_fires_for_missing_hooks_dir,
     test_no_warning_for_valid_paths,
     test_suppress_warnings_silences_stderr,
+    test_claude_host_project_dir_existing,
+    test_claude_host_project_dir_missing_fallback,
+    test_claude_host_project_dir_unset_default_workspace,
+    test_warning_fires_for_missing_project_dir,
+    test_rewrite_hooks_flag_forwarded,
+    test_rewrite_hooks_flag_unset_not_forwarded,
 ]
 
 for t in TESTS:

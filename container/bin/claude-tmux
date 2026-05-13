@@ -15,6 +15,25 @@
 #
 # Env var overrides:
 #   CLAUDE_CONTAINER_IMAGE      # image tag (default: claude-container:dev)
+#   CLAUDE_HOST_PROJECT_DIR     # ABSOLUTE host path that should also be the
+#                               # in-container cwd. Bind-mounted at the SAME
+#                               # path inside the container so Claude Code's
+#                               # cwd-derived project key (~/.claude/projects/
+#                               # <urlencoded-cwd>/) resolves to the same key
+#                               # the host would use. Without this, the
+#                               # in-container claude lands at /workspace and
+#                               # never finds the host-side project memory
+#                               # tree even though ~/.claude is bind-mounted.
+#                               # Missing dir = silently skipped (falls back
+#                               # to the /workspace default).
+#   CLAUDE_CONTAINER_REWRITE_HOOKS  # When "1" (default off), the entrypoint
+#                               # generates a container-local settings.json
+#                               # that wraps every hook command in
+#                               # /usr/local/bin/exec-hook so cross-arch
+#                               # Mach-O / unknown binaries no-op silently
+#                               # instead of spamming "Exec format error".
+#                               # Off by default to preserve existing
+#                               # behaviour; opt-in for Mac-host operators.
 #
 # Env vars passed through to the container (only if set on the host):
 #   CLAUDE_CODE_SSE_PORT        # load-bearing for VSCode IDE integration
@@ -93,6 +112,21 @@ Environment overrides:
                            references a host-only path (e.g. corp telemetry
                            hook at /Users/<you>/.devbar/bin/telemetry-hook).
                            Missing dir = silently skipped.
+  CLAUDE_HOST_PROJECT_DIR  Absolute host path to make the in-container cwd.
+                           Bind-mounted at the SAME path inside the container
+                           and set as the container WORKDIR so Claude Code's
+                           cwd-derived project key matches the host. Without
+                           this the in-container cwd is /workspace and project
+                           memory under ~/.claude/projects/-<host-path-key>/
+                           is invisible. Missing dir = silently skipped (the
+                           wrapper falls back to the default /workspace).
+  CLAUDE_CONTAINER_REWRITE_HOOKS  When "1", the entrypoint generates a
+                           container-local settings.json that wraps every
+                           hook command in /usr/local/bin/exec-hook so
+                           cross-arch Mach-O / unknown binaries no-op
+                           silently instead of spamming "Exec format error"
+                           on every hook event. Default off to preserve
+                           existing behaviour.
 
 Environment passthrough (only if set on the host):
   CLAUDE_CODE_SSE_PORT     VSCode IDE integration port (load-bearing).
@@ -332,6 +366,36 @@ if [ -n "${CLAUDE_HOST_HOOKS_DIR:-}" ] && [ -d "$CLAUDE_HOST_HOOKS_DIR" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# Host-project-dir bind mount + cwd override.
+#
+# Claude Code derives its project-memory tree key from the cwd at launch:
+#   ~/.claude/projects/<urlencoded-cwd>/memory/MEMORY.md
+# On the host, cwd is the operator's actual project dir, e.g.
+#   /Users/<you>/repos/eichi -> project key "-Users-<you>-repos-eichi".
+# In the container, the default cwd is /workspace -> project key "-workspace",
+# which does not exist on the host, so the in-container claude reports "No
+# previous memories found" even though ~/.claude is bind-mounted with the
+# real tree.
+#
+# CLAUDE_HOST_PROJECT_DIR is the escape hatch: bind-mount the host path at
+# the SAME absolute path inside the container AND override the container's
+# WORKDIR so Claude lands there. The project key then matches the host key
+# exactly and project memory loads. Read-write because operators expect to
+# edit code from inside Claude.
+#
+# Missing-dir handling matches CLAUDE_HOST_HOOKS_DIR: silently skipped with
+# a stderr WARNING via the fail-loud guard below.
+# -----------------------------------------------------------------------------
+
+project_dir_mount_args=()
+project_dir_workdir=""
+if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_HOST_PROJECT_DIR" ]; then
+    project_abs="$(cd "$CLAUDE_HOST_PROJECT_DIR" && pwd)"
+    project_dir_mount_args+=(-v "$project_abs:$project_abs")
+    project_dir_workdir="$project_abs"
+fi
+
+# -----------------------------------------------------------------------------
 # Fail-loud guard: set-but-missing paths.
 #
 # The forwarding logic above is forgiving by design — a CA env var that
@@ -369,6 +433,11 @@ done
 if [ -n "${CLAUDE_HOST_HOOKS_DIR:-}" ] && [ ! -d "$CLAUDE_HOST_HOOKS_DIR" ]; then
     warn "\$CLAUDE_HOST_HOOKS_DIR is set to '$CLAUDE_HOST_HOOKS_DIR' on the host but no such directory exists."
     warn "settings.json hook references pointing at that path will fail inside the container. To fix: either unset \$CLAUDE_HOST_HOOKS_DIR or correct the path."
+fi
+
+if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] && [ ! -d "$CLAUDE_HOST_PROJECT_DIR" ]; then
+    warn "\$CLAUDE_HOST_PROJECT_DIR is set to '$CLAUDE_HOST_PROJECT_DIR' on the host but no such directory exists."
+    warn "The container will fall back to /workspace as its cwd. Project memory under ~/.claude/projects/-<host-path-key>/ will not load. To fix: either unset \$CLAUDE_HOST_PROJECT_DIR or correct the path."
 fi
 
 # -----------------------------------------------------------------------------
@@ -519,6 +588,27 @@ if [ -t 0 ] && [ -t 1 ]; then
     tty_flag=(-t)
 fi
 
+# Forward CLAUDE_HOST_PROJECT_DIR + CLAUDE_CONTAINER_REWRITE_HOOKS into the
+# container env so the entrypoint can see them.  Both are read-only signals
+# downstream of the mount + WORKDIR setup above; forwarding the value lets
+# the entrypoint emit clearer diagnostics ("project dir not bind-mounted" /
+# "rewrite hooks enabled") instead of guessing.
+if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ]; then
+    env_args+=(-e "CLAUDE_HOST_PROJECT_DIR=$CLAUDE_HOST_PROJECT_DIR")
+fi
+if [ -n "${CLAUDE_CONTAINER_REWRITE_HOOKS:-}" ]; then
+    env_args+=(-e "CLAUDE_CONTAINER_REWRITE_HOOKS=$CLAUDE_CONTAINER_REWRITE_HOOKS")
+fi
+
+# WORKDIR — default /workspace; override to the host-project path when
+# CLAUDE_HOST_PROJECT_DIR is set (and resolved above to project_dir_workdir).
+# Project-dir wins because it's the cwd the operator actually wants Claude
+# Code to launch in (matches host project-memory key).
+workdir="/workspace"
+if [ -n "$project_dir_workdir" ]; then
+    workdir="$project_dir_workdir"
+fi
+
 # Assemble the docker invocation as a single argv array so we can either
 # print it (for tests) or exec it (for real invocations) without
 # duplicating the argument list.
@@ -532,7 +622,8 @@ docker_argv=(
     --mount type=volume,src=claude-container-versions,dst=/home/hndrewaall/.local/share/claude
     "${ssl_mount_args[@]}"
     "${hooks_mount_args[@]}"
-    -w /workspace
+    "${project_dir_mount_args[@]}"
+    -w "$workdir"
     "${env_args[@]}"
     "$IMAGE"
     "$@"

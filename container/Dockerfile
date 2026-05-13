@@ -177,6 +177,19 @@ COPY hooks-shim/exec-hook /usr/local/lib/claude-hooks-shim/exec-hook
 RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
     && ln -s /usr/local/lib/claude-hooks-shim/exec-hook /usr/local/bin/exec-hook
 
+# generate-hooks-shim-settings — entrypoint-side companion to exec-hook.
+# When CLAUDE_CONTAINER_REWRITE_HOOKS=1 is set in the container env, the
+# entrypoint runs this helper to generate a container-local copy of
+# ~/.claude/settings.json with every hook command wrapped in
+# /usr/local/bin/exec-hook, then launches claude with `--settings
+# /tmp/claude-shim/settings.json`. The output file overrides the host
+# settings.json's hooks for the in-container session without mutating the
+# host file. See container/hooks-shim/generate-hooks-shim-settings for the
+# rewrite logic and the embedded test suite at
+# container/hooks-shim/tests/generate-hooks-shim-settings.test.
+COPY hooks-shim/generate-hooks-shim-settings /usr/local/bin/generate-hooks-shim-settings
+RUN chmod +x /usr/local/bin/generate-hooks-shim-settings
+
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
 # "Quick safety check" trust dialog. Invoked by entrypoint.sh before tmux

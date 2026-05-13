@@ -82,6 +82,16 @@ services:
       https_proxy: ${https_proxy:-}
       http_proxy: ${http_proxy:-}
       no_proxy: ${no_proxy:-}
+      # Cross-arch hook auto-rewrite. When "1", the entrypoint generates
+      # a container-local copy of settings.json wrapping every hook
+      # command in /usr/local/bin/exec-hook, so non-Linux host binaries
+      # silently no-op instead of spamming "Exec format error" on every
+      # hook event. Off by default; Mac-host operators enable it via .env.
+      CLAUDE_CONTAINER_REWRITE_HOOKS: ${CLAUDE_CONTAINER_REWRITE_HOOKS:-}
+      # Host-project-dir signal — read by the entrypoint's
+      # trust-workspace pre-seed so the workspace at the bind-mounted
+      # host project path is pre-trusted (skips the first-launch dialog).
+      CLAUDE_HOST_PROJECT_DIR: ${CLAUDE_HOST_PROJECT_DIR:-}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in
@@ -187,6 +197,15 @@ services:
       # settings.json reference Just Works. Defaults to /dev/null
       # (graceful no-op) for operators without host-resident hooks.
       - "${CLAUDE_HOST_HOOKS_DIR:-/dev/null}:${CLAUDE_HOST_HOOKS_DIR:-/dev/null}:ro"
+      # Host project dir — rw. When CLAUDE_HOST_PROJECT_DIR is set, the
+      # host path is bind-mounted at the SAME absolute path inside the
+      # container so Claude Code's cwd-derived project-memory key
+      # (~/.claude/projects/<urlencoded-cwd>/) matches the host path
+      # rather than /workspace. Pair with `working_dir:
+      # ${CLAUDE_HOST_PROJECT_DIR}` below for the cwd flip. Defaults to
+      # /dev/null (graceful no-op) so unconfigured deployments keep the
+      # /workspace default.
+      - "${CLAUDE_HOST_PROJECT_DIR:-/dev/null}:${CLAUDE_HOST_PROJECT_DIR:-/dev/null}:rw"
       # Persists the in-container claude binary's auto-updates across
       # `--rm` restarts so you don't reset to the image-baked version
       # every time the container exits.
@@ -198,6 +217,14 @@ services:
       # 1000, which lives at /tmp/tmux-1000/default inside the
       # container.
       - "claude-tmux-socket:/tmp/tmux-1000"
+    # working_dir flip: when CLAUDE_HOST_PROJECT_DIR is set, override the
+    # image WORKDIR (/workspace) with the host path so the in-container
+    # claude lands at the project-memory-matching cwd. Empty / unset
+    # falls back to the image default. Compose interpolation requires a
+    # default value for the conditional, so we leave the var verbatim
+    # and let docker resolve "" -> empty working-dir flag (which Docker
+    # treats as the image default).
+    working_dir: ${CLAUDE_HOST_PROJECT_DIR:-/workspace}
     stdin_open: true
     tty: true
 

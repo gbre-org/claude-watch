@@ -79,6 +79,42 @@ case ":${PATH}:" in
     *) export PATH="/usr/local/lib/claude-hooks-shim:${PATH}" ;;
 esac
 
+# CLAUDE_CONTAINER_REWRITE_HOOKS — opt-in entrypoint-side hook wrapper.
+#
+# When the host is non-Linux (typical: a Mac laptop bind-mounting
+# ~/.claude/settings.json into a Linux container) AND that settings.json
+# references host-native hook binaries by absolute path, Linux's exec()
+# bounces them with "Exec format error" on every hook event. PR #135 ships
+# /usr/local/bin/exec-hook (the magic-byte sniffer) but its wiring is
+# opt-in per hook: the operator has to hand-edit each command in
+# settings.json to wrap it. On a Mac host that edit would mutate the
+# host's live settings.json, which is hostile.
+#
+# Instead: when CLAUDE_CONTAINER_REWRITE_HOOKS=1, generate a CONTAINER-LOCAL
+# copy of settings.json with every hook command wrapped in
+# /usr/local/bin/exec-hook, and tell the in-container claude to merge it
+# via `--settings <path>` (additive on top of the user/project/local
+# cascade). The host file is never touched.
+#
+# Default OFF so existing operators see no behaviour change. Mac-host
+# operators flip the flag in their .env / docker-compose.override.yml.
+CLAUDE_SHIM_SETTINGS_PATH=""
+if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
+    CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
+    # Best-effort generation; the helper is fail-safe (returns 0 even
+    # on parse errors and logs to stderr).
+    /usr/local/bin/generate-hooks-shim-settings \
+        --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
+        --output "$CLAUDE_SHIM_SETTINGS_PATH" || true
+    # If the helper didn't produce an output file (input missing,
+    # unparseable), clear the var so we don't pass a broken --settings
+    # path to claude.
+    if [ ! -f "$CLAUDE_SHIM_SETTINGS_PATH" ]; then
+        CLAUDE_SHIM_SETTINGS_PATH=""
+    fi
+fi
+export CLAUDE_SHIM_SETTINGS_PATH
+
 # Pre-trust the in-container workspace so Claude Code skips its first-launch
 # "Quick safety check: Is this a project you created or one you trust?"
 # prompt. The trust state lives at projects[<path>].hasTrustDialogAccepted
@@ -98,6 +134,14 @@ esac
 # on recoverable errors, because `set -euo pipefail` is in effect.
 if [ -x /usr/local/bin/trust-workspace ]; then
     /usr/local/bin/trust-workspace "${WORKSPACE:-/workspace}" || true
+    # Also pre-trust the host-project-dir cwd when CLAUDE_HOST_PROJECT_DIR
+    # is the active WORKDIR (claude-tmux bind-mounted that path at the
+    # same absolute path inside the container). Without this, the in-
+    # container claude would still see the trust prompt on first launch
+    # at the project path even though /workspace is already trusted.
+    if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_HOST_PROJECT_DIR" ]; then
+        /usr/local/bin/trust-workspace "$CLAUDE_HOST_PROJECT_DIR" || true
+    fi
 fi
 
 cleanup() {
@@ -133,8 +177,17 @@ fi
 # claude exits (no "press Enter to close pane" UX). Acceptable for Phase 1.5;
 # Phase 2+ can revisit if users need post-exit inspection. See Phase 1f §8
 # "Bug #2" in the project doc.
+# Build the claude invocation. When the rewritten settings file exists
+# (CLAUDE_CONTAINER_REWRITE_HOOKS=1 path above), pass it via --settings so
+# Claude Code merges the wrapped hook commands on top of the user/project
+# cascade. Otherwise launch claude bare to preserve the existing default.
+CLAUDE_CMD="exec claude"
+if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
+    CLAUDE_CMD="exec claude --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+fi
+
 tmux new-session -d -s "$SESSION" -x 200 -y 50 \
-    "exec claude"
+    "$CLAUDE_CMD"
 
 # Optional sidebar: when CLAUDE_CONTAINER_SIDEBAR=1, split off a 25%-wide
 # right pane running the in-container claude-watch daemon. Bare
