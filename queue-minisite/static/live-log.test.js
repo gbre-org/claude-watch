@@ -374,6 +374,89 @@ console.log('\nfmtWorkloadLine — terminal-style (flat, no <details>)');
   }
 }
 
+console.log('\nfmtWorkloadLine — transient-replace (\\r progress frames)');
+{
+  // The CR/LF-aware tail emits each \r-terminated rsync-style progress
+  // segment as a workload_line with `transient: true`. The renderer
+  // must REPLACE the previous workload row in place rather than stack
+  // a new one. \n-terminated segments graduate to permanent.
+  //
+  // State machine under test:
+  //   transient -> transient -> transient  (one replacing row)
+  //   transient -> permanent               (final replace + graduate)
+  //   permanent -> transient                (start a new tracked row)
+  //   permanent -> permanent                (regression — current behavior)
+  stream.innerHTML = '';
+
+  // Three back-to-back transient frames — should leave ONE row whose
+  // text is the final transient value.
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: '20%', transient: true });
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: '40%', transient: true });
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: '60%', transient: true });
+  assert('three transient frames → one row in stream',
+    stream.children.length === 1,
+    'got rows=' + stream.children.length);
+  assert('only row shows the latest transient value (60%)',
+    stream.firstElementChild && stream.firstElementChild.textContent.includes('60%'),
+    'got: ' + (stream.firstElementChild && stream.firstElementChild.textContent));
+  assert('only row no longer shows the earlier transient value (20%)',
+    !(stream.firstElementChild && stream.firstElementChild.textContent.includes('20%')),
+    'got: ' + (stream.firstElementChild && stream.firstElementChild.textContent));
+
+  // Final \n-terminated frame — REPLACE the prior row and graduate it
+  // so the NEXT segment (if any) appends fresh.
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: '100%', transient: false });
+  assert('finalize (\\n) still keeps a single row in place',
+    stream.children.length === 1,
+    'got rows=' + stream.children.length);
+  assert('finalized row text is the permanent 100% value',
+    stream.firstElementChild && stream.firstElementChild.textContent.includes('100%'));
+
+  // A subsequent permanent line should APPEND, not replace — the prior
+  // row has graduated, transient-tracking is cleared.
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: 'done', transient: false });
+  assert('post-finalize permanent line APPENDS (now 2 rows)',
+    stream.children.length === 2,
+    'got rows=' + stream.children.length);
+
+  // permanent → transient: the new transient line opens a fresh tracked
+  // row instead of overwriting the prior permanent row.
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: '10s elapsed', transient: true });
+  assert('permanent → transient APPENDS (3 rows now)',
+    stream.children.length === 3,
+    'got rows=' + stream.children.length);
+  assert('last row reflects the new transient text',
+    stream.lastElementChild && stream.lastElementChild.textContent.includes('10s elapsed'));
+
+  // Another transient — REPLACE the just-added transient row.
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: '20s elapsed', transient: true });
+  assert('back-to-back transient still 3 rows (replaced)',
+    stream.children.length === 3);
+  assert('last row updated to 20s elapsed',
+    stream.lastElementChild && stream.lastElementChild.textContent.includes('20s elapsed'));
+}
+
+console.log('\nfmtWorkloadLine — meta frame breaks the transient chain');
+{
+  // A meta frame (or error, or raw) MUST clear the transient-tracking
+  // anchor so a subsequent transient workload line opens a fresh row
+  // rather than overwriting the meta line.
+  stream.innerHTML = '';
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: '20%', transient: true });
+  // Inject a meta frame (workload-end / backfill-end / etc all flow
+  // through the same appendLine path).
+  renderEvent({ type: 'meta', kind: 'backfill-end' });
+  // Transient again — should NOT replace the meta row; should append.
+  renderEvent({ type: 'event', kind: 'workload_line', rec: {}, text: '50%', transient: true });
+  assert('after meta, transient frame appends (3 rows: 20%, meta, 50%)',
+    stream.children.length === 3,
+    'got rows=' + stream.children.length);
+  assert('meta row is intact between the two transient frames',
+    stream.children[1].textContent.includes('[meta]'));
+  assert('last row is the new transient value (50%)',
+    stream.lastElementChild.textContent.includes('50%'));
+}
+
 console.log('\nfmtAttachment');
 {
   const payload = {

@@ -148,6 +148,18 @@
     statusEl.className = 'log-status log-status-' + (kind || 'pending');
   }
 
+  // Tracks the last appended row when the source segment was \r-
+  // terminated (a "transient" progress frame). The next workload line
+  // — transient or permanent — replaces the row in place rather than
+  // stacking. Reset by close() / open() / mode change.
+  //
+  // We anchor on the DOM node (not an index) so MAX_LINES head-trim or
+  // any unrelated appendLine call between two workload frames doesn't
+  // shift the target. The presence of a ref means "the prior workload
+  // segment was \r-terminated" — i.e. the next one is allowed to
+  // replace it.
+  let lastTransientRow = null;
+
   function appendLine(html, classes) {
     const el = document.createElement('div');
     el.className = 'log-line ' + (classes || '');
@@ -162,6 +174,21 @@
         streamEl.removeChild(streamEl.firstChild);
       }
     }
+    if (autoscroll) {
+      streamEl.scrollTop = streamEl.scrollHeight;
+    }
+    return el;
+  }
+
+  // Replace the rendered content of an existing row in place, used by
+  // the workload-line transient-replace path so \r-terminated progress
+  // frames update one DOM row instead of stacking thousands. Honors
+  // autoscroll so a long progress run still keeps the bottom-pinned
+  // view tracking the latest frame.
+  function replaceLineContent(row, html, classes) {
+    if (!row) return;
+    row.className = 'log-line ' + (classes || '');
+    row.innerHTML = html;
     if (autoscroll) {
       streamEl.scrollTop = streamEl.scrollHeight;
     }
@@ -1060,6 +1087,9 @@
         msg = k;
       }
       appendLine('<span class="log-meta">[meta] ' + msg + '</span>', 'log-meta-line');
+      // A meta frame breaks the transient-replace chain so subsequent
+      // workload frames don't accidentally overwrite an unrelated row.
+      lastTransientRow = null;
       // Workload mode: server closes after the workload-end meta. Close
       // the source proactively so the browser doesn't reconnect.
       if (mode === 'workload' && k === 'workload-end' && evtSource) {
@@ -1077,10 +1107,12 @@
         'log-error-line'
       );
       setStatus('error', 'err');
+      lastTransientRow = null;
       return;
     }
     if (payload.type === 'raw') {
       appendLine('<span class="log-raw">[raw] ' + esc(payload.line || '') + '</span>', 'log-raw-line');
+      lastTransientRow = null;
       return;
     }
     if (payload.type !== 'event') return;
@@ -1126,7 +1158,42 @@
         '<div class="log-event-body">' + out.body + '</div>' +
         '</details>';
     }
-    appendLine(html, out.cls);
+    // Transient-replace path: workload lines whose source segment was
+    // \r-terminated (rsync-style progress frames) update the previous
+    // workload row in place rather than appending a new one. The flag
+    // arrives on the payload as `transient: true`; we only honor it for
+    // workload_line kinds (anything else gets the normal append path).
+    //
+    // State machine:
+    //   prev=transient, new=transient  → REPLACE prior row, keep ref.
+    //   prev=transient, new=permanent  → REPLACE prior row, drop ref
+    //                                     (the row "graduates").
+    //   prev=permanent / unset, new=transient → append + start tracking.
+    //   prev=permanent / unset, new=permanent → append (current behavior).
+    //
+    // Any non-workload event (meta, error, raw, agent JSONL kinds) breaks
+    // the chain — clears lastTransientRow so a subsequent transient
+    // segment starts a fresh row instead of overwriting a wholly
+    // unrelated line.
+    const isWorkload = kind === 'workload_line';
+    const isTransient = isWorkload && payload.transient === true;
+    // Defensive: a tracked row can be evicted under us by the MAX_LINES
+    // head-trim or by a wholesale streamEl.innerHTML='' reset on modal
+    // re-open / mode change. Either case detaches the node from the
+    // stream, at which point we MUST fall through to the append path
+    // so the new segment shows up. `parentNode === streamEl` is cheap
+    // and robust; `isConnected` would also work but reads less well.
+    if (isWorkload && lastTransientRow && lastTransientRow.parentNode === streamEl) {
+      replaceLineContent(lastTransientRow, html, out.cls);
+      lastTransientRow = isTransient ? lastTransientRow : null;
+      return;
+    }
+    const appended = appendLine(html, out.cls);
+    if (isTransient) {
+      lastTransientRow = appended;
+    } else {
+      lastTransientRow = null;
+    }
   }
 
   function open(row) {
@@ -1153,6 +1220,8 @@
     }
     summaryEl.textContent = summary;
     streamEl.innerHTML = '';
+    // Fresh modal — no prior workload row to replace.
+    lastTransientRow = null;
     setStatus('connecting…', 'pending');
     // In live + workload modes auto-scroll defaults on (we want to see
     // new events as they arrive). In archive mode the file is finite —
@@ -1265,6 +1334,7 @@
     }
     modal.hidden = true;
     document.body.classList.remove('modal-open');
+    lastTransientRow = null;
     if (triggerEl && typeof triggerEl.focus === 'function') {
       triggerEl.focus();
     }

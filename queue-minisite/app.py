@@ -1400,6 +1400,78 @@ def _format_sse_comment(text: str) -> bytes:
     return f": {text}\n\n".encode("utf-8")
 
 
+def _split_cr_lf_segments(
+    buf: str, *, flush_remainder: bool = False
+) -> tuple[list[tuple[str, bool]], str]:
+    """Split a text buffer on BOTH ``\\r`` and ``\\n`` terminators.
+
+    Used by the workload tail/replay paths so single-line in-place
+    progress updates (``rsync --info=progress2``, ``curl``, bare
+    ``printf "\\r"`` loops) surface to the client as transient segments
+    that the front-end can render as one updating row rather than
+    thousands of stacked rows.
+
+    Returns ``(segments, remainder)`` where each segment is
+    ``(text, transient)``:
+      * ``transient=True``  — segment ended with a ``\\r`` (progress
+        update; the next segment should REPLACE this one in the UI).
+      * ``transient=False`` — segment ended with a ``\\n`` (or
+        ``\\r\\n`` — collapsed to a single ``\\n`` terminator); the
+        segment "graduates" to permanent.
+
+    ``remainder`` is the unterminated tail; the caller is expected to
+    prepend it to the next chunk so terminators that straddle a chunk
+    boundary (notably ``\\r\\n`` arriving across two reads) collapse
+    correctly.
+
+    ``flush_remainder=True`` emits any unterminated tail as a final
+    ``transient=False`` segment — used at workload exit / archive EOF
+    so the last line of a producer that didn't end with a newline is
+    still surfaced. (We treat it as permanent because there will be no
+    further segments to replace it.) ``remainder`` is empty in that case.
+    """
+    segments: list[tuple[str, bool]] = []
+    i = 0
+    start = 0
+    n = len(buf)
+    while i < n:
+        ch = buf[i]
+        if ch == "\n":
+            segments.append((buf[start:i], False))
+            i += 1
+            start = i
+        elif ch == "\r":
+            # Lookahead for \r\n. If the buffer ends in a bare \r AND
+            # we're not flushing, defer — the next chunk might start
+            # with \n, in which case it would be a single \r\n terminator.
+            if i + 1 < n:
+                if buf[i + 1] == "\n":
+                    segments.append((buf[start:i], False))
+                    i += 2
+                    start = i
+                else:
+                    segments.append((buf[start:i], True))
+                    i += 1
+                    start = i
+            else:
+                # Bare \r at end-of-buffer.
+                if flush_remainder:
+                    segments.append((buf[start:i], True))
+                    i += 1
+                    start = i
+                else:
+                    # Stop here; carry \r + everything after as remainder
+                    # so the next read can fuse a possible \n.
+                    break
+        else:
+            i += 1
+    remainder = buf[start:]
+    if flush_remainder and remainder:
+        segments.append((remainder, False))
+        remainder = ""
+    return segments, remainder
+
+
 def _tail_jsonl(path: Path) -> Iterator[bytes]:
     """Generator yielding SSE events for a tailed agent JSONL.
 
@@ -1524,7 +1596,12 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
     })
 
     try:
-        f = open(out_path, "r", encoding="utf-8", errors="replace")
+        # newline="" disables Python's universal-newlines translation so
+        # bare \r bytes survive into the buffer for _split_cr_lf_segments
+        # to see. Without this, the default newline=None mode rewrites
+        # both \r\n AND lone \r to \n during read(), erasing the very
+        # signal we need to detect rsync-style progress frames.
+        f = open(out_path, "r", encoding="utf-8", errors="replace", newline="")
     except OSError as exc:
         yield _format_sse({"type": "error", "kind": "open-failed", "error": str(exc)})
         return
@@ -1551,26 +1628,45 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
             "exit_code": exit_code,
         })
 
+    # Read buffer carried across iterations so CR/LF terminators that
+    # straddle a chunk boundary fuse correctly (notably \r\n split across
+    # two reads). _split_cr_lf_segments returns (segments, remainder).
+    pending = ""
+    # Chunk size for the byte-level read loop. The producer writes line
+    # at a time so anything in the 4–64 KB range is fine; 8 KB matches
+    # typical pipe buffer sizes.
+    READ_CHUNK = 8192
+
     try:
-        # Backfill: read the whole file, take tail N lines.
+        # Backfill: read the whole file, split on \r AND \n, take tail N
+        # segments. For an archived rsync-style log this means the user
+        # sees the FINAL progress line + the trailing "done" rather than
+        # 1000s of stacked progress rows.
         try:
-            backfill = f.readlines()[-SSE_TAIL_BACKFILL_LINES:]
+            initial = f.read()
         except OSError as exc:
             yield _format_sse({"type": "error", "kind": "read-failed", "error": str(exc)})
             return
+        # For backfill we flush any unterminated tail as a permanent
+        # segment — the file at this point is whatever the producer has
+        # written so far; if it's mid-line we'd rather surface it than
+        # hide it. The tail loop below starts fresh from the live EOF.
+        backfill_segments, _ = _split_cr_lf_segments(initial, flush_remainder=True)
+        if len(backfill_segments) > SSE_TAIL_BACKFILL_LINES:
+            backfill_segments = backfill_segments[-SSE_TAIL_BACKFILL_LINES:]
 
-        if backfill:
+        if backfill_segments:
             yield _format_sse({
                 "type": "meta",
                 "kind": "backfill-begin",
-                "lines": len(backfill),
+                "lines": len(backfill_segments),
             })
-            for line in backfill:
-                line = line.rstrip("\n")
+            for text, transient in backfill_segments:
                 yield _format_sse({
                     "type": "event",
                     "kind": "workload_line",
-                    "text": line,
+                    "text": text,
+                    "transient": transient,
                 })
                 last_data_at = time.monotonic()
             yield _format_sse({"type": "meta", "kind": "backfill-end"})
@@ -1578,29 +1674,36 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
         # Tail loop. Terminate as soon as we observe the .exit file AND
         # have drained the output file at EOF — that ordering avoids
         # cutting off the last line of a workload that exits between
-        # readline iterations.
+        # reads.
         while True:
-            line = f.readline()
-            if line:
-                line = line.rstrip("\n")
-                yield _format_sse({
-                    "type": "event",
-                    "kind": "workload_line",
-                    "text": line,
-                })
-                last_data_at = time.monotonic()
-                continue
-            # EOF — check if the workload has exited.
-            if exit_path.exists():
-                # One more readline pass in case lines were appended
-                # between the last read and the exit check.
-                trailing = f.readline()
-                if trailing:
-                    trailing = trailing.rstrip("\n")
+            chunk = f.read(READ_CHUNK)
+            if chunk:
+                pending += chunk
+                segments, pending = _split_cr_lf_segments(pending)
+                for text, transient in segments:
                     yield _format_sse({
                         "type": "event",
                         "kind": "workload_line",
-                        "text": trailing,
+                        "text": text,
+                        "transient": transient,
+                    })
+                    last_data_at = time.monotonic()
+                continue
+            # EOF — check if the workload has exited.
+            if exit_path.exists():
+                # One more read in case bytes were appended between the
+                # last poll and the exit check.
+                trailing = f.read()
+                if trailing:
+                    pending += trailing
+                segments, _ = _split_cr_lf_segments(pending, flush_remainder=True)
+                pending = ""
+                for text, transient in segments:
+                    yield _format_sse({
+                        "type": "event",
+                        "kind": "workload_line",
+                        "text": text,
+                        "transient": transient,
                     })
                 yield from _emit_end("exit")
                 return
@@ -1889,15 +1992,24 @@ def _replay_workload_output(path: Path) -> Iterator[bytes]:
 
     line_count = 0
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for raw in f:
-                raw = raw.rstrip("\n")
-                yield _format_sse({
-                    "type": "event",
-                    "kind": "workload_line",
-                    "text": raw,
-                })
-                line_count += 1
+        # newline="" disables universal-newlines translation so \r bytes
+        # survive into the buffer for _split_cr_lf_segments. See the
+        # matching note in _tail_workload_output.
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            data = f.read()
+        # Replay an entire archive in one pass — splitting on \r AND \n
+        # so producers that wrote in-place progress updates (rsync,
+        # curl) surface their final state instead of replaying every
+        # \r-terminated frame as a stacked permanent row.
+        segments, _ = _split_cr_lf_segments(data, flush_remainder=True)
+        for text, transient in segments:
+            yield _format_sse({
+                "type": "event",
+                "kind": "workload_line",
+                "text": text,
+                "transient": transient,
+            })
+            line_count += 1
     except OSError as exc:
         yield _format_sse({
             "type": "error",
