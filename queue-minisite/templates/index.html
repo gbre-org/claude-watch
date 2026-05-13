@@ -98,14 +98,20 @@
         {% set owner = it.owner %}
         {% set is_starting = it.is_starting %}
         {% set is_workload = it.workload_label|length > 0 %}
-        {# Workload-bound items are clickable even when no agent record
-           exists — the live-log endpoint dispatches to the workload tail
-           branch instead of looking up an agent. #}
-        {% set is_clickable = (not is_starting) or is_workload %}
-        {% set log_mode = 'workload' if is_workload else 'live' %}
+        {# All running rows (including starting) are clickable. Workload-bound
+           items dispatch to the workload tail branch; agent items hit the
+           agent JSONL tail; starting items open the same modal in a "polling"
+           state and retry the SSE connection until the agent's first event
+           lands (live-log.js handles the transition). #}
+        {% set is_clickable = True %}
+        {% if is_workload %}
+          {% set log_mode = 'workload' %}
+        {% else %}
+          {% set log_mode = 'live' %}
+        {% endif %}
         <article
           id="queue-{{ it.id }}"
-          class="item {% if is_starting and not is_workload %}state-starting{% else %}state-running{% endif %} drop-zone {% if is_clickable %}log-clickable{% endif %} {% if owner.alive == False and not is_starting and not is_workload %}orphan{% endif %}"
+          class="item {% if is_starting and not is_workload %}state-starting{% else %}state-running{% endif %} drop-zone log-clickable {% if owner.alive == False and not is_starting and not is_workload %}orphan{% endif %}"
           data-queue-id="{{ it.id }}"
           data-queue-status="running"
           data-queue-starting="{{ '1' if (is_starting and not is_workload) else '0' }}"
@@ -113,7 +119,11 @@
           data-queue-description="{{ it.description }}"
           data-agent-id="{{ owner.agent_id }}"
           {% if is_workload %}data-workload-label="{{ it.workload_label }}"{% endif %}
-          {% if is_clickable %}data-log-mode="{{ log_mode }}" tabindex="0" role="button" aria-label="View {% if is_workload %}workload{% else %}live{% endif %} log for {{ it.id }}" title="Click to view {% if is_workload %}workload output{% else %}live log{% endif %}. Drop a pending item here to set this as its dependency."{% else %}aria-label="Starting: agent spawning for {{ it.id }}" title="Agent spawning — live log unavailable until first event."{% endif %}>
+          data-log-mode="{{ log_mode }}"
+          tabindex="0"
+          role="button"
+          aria-label="View {% if is_workload %}workload{% elif is_starting %}live (polling — waiting for first event){% else %}live{% endif %} log for {{ it.id }}"
+          title="{% if is_starting and not is_workload %}Click to open log viewer — polls for the agent's first event, then tails live. Drop a pending item here to set this as its dependency.{% else %}Click to view {% if is_workload %}workload output{% else %}live log{% endif %}. Drop a pending item here to set this as its dependency.{% endif %}">
           <header class="item-head">
             {% if is_starting and not is_workload %}
               <span class="badge state-starting" title="registered, waiting for agent to emit first event">starting</span>

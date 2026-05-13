@@ -601,6 +601,110 @@ console.log('\nmodal vim shortcuts — keydown dispatch (j/k/g/G/Esc)');
   probe.remove();
 }
 
+// Starting-state polling — clicking on a row whose queue item is
+// "starting" (registered but no agent JSONL yet) opens the modal in a
+// polling state. The /stream endpoint emits a one-shot error event
+// (kind=no-agent or kind=no-jsonl) and closes; the frontend swallows
+// the error, schedules a retry, and only transitions to live-tail
+// when a real `meta:stream-start` lands.
+console.log('\nstarting-state polling — no-agent / no-jsonl retry');
+{
+  const hooks = window.__liveLog;
+  const statusEl = window.document.getElementById('log-modal-status');
+
+  // Helper: reset polling state between assertions.
+  function resetPolling(qid) {
+    hooks.clearPollTimer();
+    hooks.setPollingQid(qid);
+    if (statusEl) statusEl.textContent = '';
+  }
+
+  // 1. no-agent error while polling → no error line, schedules a retry.
+  resetPolling('q-test-starting');
+  stream.innerHTML = '';
+  renderEvent({
+    type: 'error',
+    kind: 'no-agent',
+    queue_id: 'q-test-starting',
+    error: 'No active agent record found for this queue id.',
+  });
+  assert('no-agent while polling: pollingQid retained',
+    hooks.getPollingQid() === 'q-test-starting',
+    'got: ' + hooks.getPollingQid());
+  assert('no-agent while polling: retry timer scheduled',
+    hooks.getPollTimer() !== null);
+  assert('no-agent while polling: status = waiting for agent…',
+    statusEl.textContent === 'waiting for agent…',
+    'got: ' + statusEl.textContent);
+  assert('no-agent while polling: no error line rendered in stream',
+    stream.querySelector('.log-error-line') === null);
+
+  // 2. no-jsonl error while polling → same retry behavior.
+  resetPolling('q-test-starting');
+  stream.innerHTML = '';
+  renderEvent({
+    type: 'error',
+    kind: 'no-jsonl',
+    queue_id: 'q-test-starting',
+    error: 'Agent transcript not found.',
+  });
+  assert('no-jsonl while polling: retry timer scheduled',
+    hooks.getPollTimer() !== null);
+  assert('no-jsonl while polling: no error line rendered in stream',
+    stream.querySelector('.log-error-line') === null);
+
+  // 3. stream-start arrives while polling → polling cleared, transition.
+  resetPolling('q-test-starting');
+  stream.innerHTML = '';
+  renderEvent({
+    type: 'meta',
+    kind: 'stream-start',
+    path: '/agents-jsonl/agent-abc.jsonl',
+  });
+  assert('stream-start while polling: pollingQid cleared',
+    hooks.getPollingQid() === null,
+    'got: ' + hooks.getPollingQid());
+  assert('stream-start while polling: status = streaming',
+    statusEl.textContent === 'streaming',
+    'got: ' + statusEl.textContent);
+
+  // 4. Other error kinds while polling → still rendered as a real
+  // error (e.g. server crash, malformed payload).
+  resetPolling('q-test-starting');
+  stream.innerHTML = '';
+  renderEvent({
+    type: 'error',
+    kind: 'jsonl-read-failed',
+    queue_id: 'q-test-starting',
+    error: 'EIO',
+  });
+  assert('non-poll error while polling: error line rendered',
+    stream.querySelector('.log-error-line') !== null);
+  assert('non-poll error while polling: status = error',
+    statusEl.textContent === 'error',
+    'got: ' + statusEl.textContent);
+
+  // 5. no-agent error when NOT polling (regular running row) →
+  // surfaced as a real error.
+  resetPolling(null);
+  stream.innerHTML = '';
+  renderEvent({
+    type: 'error',
+    kind: 'no-agent',
+    queue_id: 'q-test-running',
+    error: 'No active agent record found for this queue id.',
+  });
+  assert('no-agent without polling: error line rendered',
+    stream.querySelector('.log-error-line') !== null);
+  assert('no-agent without polling: status = error',
+    statusEl.textContent === 'error',
+    'got: ' + statusEl.textContent);
+
+  // Clean up.
+  hooks.clearPollTimer();
+  hooks.setPollingQid(null);
+}
+
 console.log('\n--------------------------------------------------------------');
 if (failures) {
   console.error(failures + ' assertion(s) failed.');
