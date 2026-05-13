@@ -260,8 +260,15 @@ assert('T5a: q-bbbb has state-starting class',
 const startingBadge = bbbb && bbbb.querySelector('.badge.state-starting');
 assert('T5b: q-bbbb has starting badge',
   !!startingBadge && startingBadge.textContent.trim() === 'starting');
-assert('T5c: q-bbbb is NOT log-clickable while starting',
-  bbbb && !bbbb.classList.contains('log-clickable'));
+// PR #131 + refresh.js sibling: starting rows ARE clickable (polling
+// modal). The test originally asserted the pre-PR-131 invariant
+// (starting → non-clickable); now we assert the new invariant so any
+// future regression that reverts refresh.js to the gated logic gets
+// caught by `node refresh.test.js`.
+assert('T5c: q-bbbb IS log-clickable while starting (PR #131 polling-modal)',
+  bbbb && bbbb.classList.contains('log-clickable'));
+assert('T5d: q-bbbb starting row has role=button + data-log-mode=live',
+  bbbb && bbbb.getAttribute('role') === 'button' && bbbb.getAttribute('data-log-mode') === 'live');
 
 // === TEST 6: identical state → no-op merge (idempotent) ===
 const aaaaBefore = $('article[data-queue-id="q-aaaa"]');

@@ -85,20 +85,33 @@
     const ownerAlive = owner.alive;
     const orphan = ownerAlive === false && !isStarting && !isWorkload;
     const stateCls = (isStarting && !isWorkload) ? 'state-starting' : 'state-running';
-    const isClickable = !isStarting || isWorkload;
+    // PR #131: starting rows are clickable too — clicking opens the
+    // log modal in a polling state, retrying SSE until the agent's
+    // first event lands. Must match the server-side template
+    // (templates/index.html) so the SPA refresh tick doesn't overwrite
+    // the server's clickable markup with a non-clickable replacement
+    // every REFRESH_MS.
+    const isClickable = true;
     const cardClasses = [
       'item',
       stateCls,
       'drop-zone',
-      isClickable ? 'log-clickable' : '',
+      'log-clickable',
       orphan ? 'orphan' : '',
     ].filter(Boolean).join(' ');
     const startingFlag = (isStarting && !isWorkload) ? '1' : '0';
     const logMode = isWorkload ? 'workload' : 'live';
-    const logKindLabel = isWorkload ? 'workload' : 'live';
-    const logModeAttr = isClickable
-      ? `data-log-mode="${logMode}" tabindex="0" role="button" aria-label="View ${logKindLabel} log for ${attr(it.id)}" title="Click to view ${isWorkload ? 'workload output' : 'live log'}. Drop a pending item here to set this as its dependency."`
-      : `aria-label="Starting: agent spawning for ${attr(it.id)}" title="Agent spawning — live log unavailable until first event."`;
+    // aria-label / title vary by state so screen readers + tooltips
+    // describe the polling behaviour for starting rows. Mirrors the
+    // template's logic.
+    let logKindLabel;
+    if (isWorkload) logKindLabel = 'workload';
+    else if (isStarting) logKindLabel = 'live (polling — waiting for first event)';
+    else logKindLabel = 'live';
+    const titleText = (isStarting && !isWorkload)
+      ? 'Click to open log viewer — polls for the agent\'s first event, then tails live. Drop a pending item here to set this as its dependency.'
+      : `Click to view ${isWorkload ? 'workload output' : 'live log'}. Drop a pending item here to set this as its dependency.`;
+    const logModeAttr = `data-log-mode="${logMode}" tabindex="0" role="button" aria-label="View ${logKindLabel} log for ${attr(it.id)}" title="${attr(titleText)}"`;
     const workloadAttr = isWorkload ? ` data-workload-label="${attr(workloadLabel)}"` : '';
 
     let head = '';
