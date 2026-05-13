@@ -137,6 +137,20 @@
   // but the server tails /tmp/claude-workloads/<label>.output instead of
   // an agent JSONL — same wire format, simpler line-oriented payload.
   let mode = 'live';
+  // Starting-state polling: when a queue row carries
+  // data-queue-starting="1" the modal opens but no agent record / JSONL
+  // exists yet. The backend's /stream endpoint emits a one-shot error
+  // event (kind=no-agent or kind=no-jsonl) and closes the connection.
+  // We treat that as "still warming up", close the EventSource, wait
+  // POLL_INTERVAL_MS, and retry. As soon as a real `meta:stream-start`
+  // event arrives we clear the polling state and transition into the
+  // normal live-tail UI. `pollingQid` is the queue id we're polling
+  // for; non-null means we're in polling mode. `pollTimer` is the
+  // pending setTimeout handle (cleared on close + on successful
+  // transition).
+  let pollingQid = null;
+  let pollTimer = null;
+  const POLL_INTERVAL_MS = 2000;
   // Cap the number of rendered lines — long-running agents can ship
   // thousands of events; keeping them all in the DOM is pointless and
   // eats memory. We trim from the top once we exceed this.
@@ -1058,6 +1072,20 @@
       const k = payload.kind || 'meta';
       let msg;
       if (k === 'stream-start') {
+        // First real event from the agent — if we were polling for a
+        // starting item, drop out of polling state and let the rest of
+        // the modal flow take over.
+        if (pollingQid) {
+          pollingQid = null;
+          if (pollTimer) {
+            clearTimeout(pollTimer);
+            pollTimer = null;
+          }
+          appendLine(
+            '<span class="log-meta">[meta] agent started — switching to live tail</span>',
+            'log-meta-line',
+          );
+        }
         msg = 'connected: ' + esc(payload.path || '');
         if (mode === 'archive') {
           setStatus('replaying…', 'ok');
@@ -1098,9 +1126,25 @@
       return;
     }
     if (payload.type === 'error') {
+      // Polling mode: a `no-agent` / `no-jsonl` error from /stream means
+      // the agent hasn't emitted its first event yet. Don't surface as
+      // a hard error — close the SSE source (server already closed it
+      // after the one-shot event, but be explicit) and schedule a
+      // retry. Other error kinds (or non-polling rows) fall through to
+      // the normal error-render path.
+      const k = payload.kind || 'error';
+      if (pollingQid && (k === 'no-agent' || k === 'no-jsonl')) {
+        if (evtSource) {
+          try { evtSource.close(); } catch (_) {}
+          evtSource = null;
+        }
+        setStatus('waiting for agent…', 'pending');
+        schedulePollRetry();
+        return;
+      }
       appendLine(
         '<span class="log-error">[error] ' +
-          esc(payload.kind || 'error') +
+          esc(k) +
           ': ' +
           esc(payload.error || '') +
           '</span>',
@@ -1222,7 +1266,30 @@
     streamEl.innerHTML = '';
     // Fresh modal — no prior workload row to replace.
     lastTransientRow = null;
-    setStatus('connecting…', 'pending');
+    // Cancel any prior polling state (modal can be re-opened on a
+    // different row without an intervening close — be defensive).
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    pollingQid = null;
+    // Detect starting-state rows. The template stamps
+    // data-queue-starting="1" on rows where the queue item is
+    // registered but the owning agent hasn't emitted its first JSONL
+    // event yet (and the row isn't workload-bound). For those we open
+    // the modal in a polling state — the SSE /stream endpoint will
+    // emit a one-shot no-agent/no-jsonl error, we'll retry every
+    // POLL_INTERVAL_MS until a real stream-start lands.
+    const startingFlag = (row.getAttribute('data-queue-starting') || '0') === '1';
+    if (startingFlag && mode === 'live') {
+      pollingQid = id;
+      appendLine(
+        '<span class="log-meta">[meta] <span class="spinner" aria-hidden="true"></span>waiting for agent — polling for first event every ' +
+          (POLL_INTERVAL_MS / 1000) + 's…</span>',
+        'log-meta-line',
+      );
+    }
+    setStatus(pollingQid ? 'waiting for agent…' : 'connecting…', 'pending');
     // In live + workload modes auto-scroll defaults on (we want to see
     // new events as they arrive). In archive mode the file is finite —
     // start at the top and let the reader scroll naturally; auto-scroll
@@ -1262,6 +1329,20 @@
     modal.hidden = false;
     document.body.classList.add('modal-open');
 
+    connectEventSource(id);
+
+    setTimeout(() => closeBtn && closeBtn.focus(), 0);
+  }
+
+  // Open (or re-open) the EventSource against the SSE endpoint chosen by
+  // `mode`. Factored out of `open()` so the polling-retry path can
+  // re-connect without re-running the modal-setup chrome (DOM reset,
+  // meta fetch, focus). Idempotent: closes any existing source first.
+  function connectEventSource(id) {
+    if (evtSource) {
+      try { evtSource.close(); } catch (_) {}
+      evtSource = null;
+    }
     // 'archive' hits the dedicated replay endpoint; 'live' AND 'workload'
     // both hit /stream — the server dispatches on the queue item's scope
     // (workload-bound items tail the workload output file; everything
@@ -1301,6 +1382,14 @@
 
     evtSource.onerror = () => {
       if (!evtSource) return;
+      // Polling mode: the server closes the SSE after emitting the
+      // one-shot no-agent/no-jsonl error event. The renderEvent path
+      // already scheduled a retry — onerror just swallows the close
+      // without changing status (the polling status was set by the
+      // error branch).
+      if (pollingQid && evtSource.readyState === EventSource.CLOSED) {
+        return;
+      }
       if (mode === 'archive') {
         // Archive mode: the connection close on EOF is expected. Only
         // surface if we never got a stream-start (real error).
@@ -1322,8 +1411,22 @@
         setStatus('reconnecting…', 'warn');
       }
     };
+  }
 
-    setTimeout(() => closeBtn && closeBtn.focus(), 0);
+  // Schedule the next polling retry. Called from renderEvent() when a
+  // no-agent / no-jsonl event lands while we're polling. Single pending
+  // timer at a time; close() clears it.
+  function schedulePollRetry() {
+    if (!pollingQid) return;
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+    }
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      if (!pollingQid) return;
+      if (modal.hidden) return;
+      connectEventSource(pollingQid);
+    }, POLL_INTERVAL_MS);
   }
 
   function close() {
@@ -1332,6 +1435,13 @@
       try { evtSource.close(); } catch (_) {}
       evtSource = null;
     }
+    // Cancel any pending polling retry — modal close is the universal
+    // teardown.
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    pollingQid = null;
     modal.hidden = true;
     document.body.classList.remove('modal-open');
     lastTransientRow = null;
@@ -1529,5 +1639,16 @@
     jumpToBottom,
     scrollStream,
     SCROLL_STEP_PX,
+    // Starting-state polling hooks. Tests drive the polling flow by
+    // setting pollingQid via setPollingQid(), then firing a synthetic
+    // error event through renderEvent() and asserting the timer state
+    // / status. POLL_INTERVAL_MS is exposed read-only.
+    POLL_INTERVAL_MS,
+    getPollingQid: () => pollingQid,
+    setPollingQid: (q) => { pollingQid = q; },
+    getPollTimer: () => pollTimer,
+    clearPollTimer: () => {
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    },
   };
 })();
