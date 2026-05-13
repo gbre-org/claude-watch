@@ -414,7 +414,7 @@ fn get_descendants(pid: &str) -> Vec<String> {
 ///     timestamp prefix — the SSE wrapper in queue-minisite stamps each
 ///     wire frame anyway, and disk timestamps were blocking carriage-
 ///     return progress; see next bullet).
-///   * Runs the user's command under `script -q -f -c '...' /dev/null`
+///   * Runs the user's command under `script -q -f -e -c '...' /dev/null`
 ///     so it sees a PTY on stdout. WITHOUT this, progress-emitting tools
 ///     like `rsync --progress`, `curl`, `wget --progress`, `pv` either
 ///     suppress progress entirely (they detect non-tty) OR emit only
@@ -571,19 +571,24 @@ fn build_wrapper_script(
          # for the common case (Python, shell, C tools).\n\
          # WORKLOAD_LINE_BUFFER=0 opts out of both.\n\
          #\n\
-         # PTY wrap: run the user command inside `script -q -f -c '...'\n\
+         # PTY wrap: run the user command inside `script -q -f -e -c '...'\n\
          # /dev/null` so it sees a real PTY on stdout. This is the only\n\
          # way to get `\\r`-separated progress frames (rsync --progress,\n\
          # curl, wget --progress, pv) into the .output file in real\n\
          # time — without a PTY, rsync silently suppresses progress and\n\
          # curl/pv switch to `\\n`-terminated summary output. `-q` quiets\n\
          # script's own start/done banner; `-f` flushes the PTY output\n\
-         # after every write so bytes hit fd1 immediately. The typescript\n\
+         # after every write so bytes hit fd1 immediately; `-e`/`--return`\n\
+         # makes `script` exit with the child's exit code so the\n\
+         # wrapper's `EC=$?` captures the user command's real rc instead\n\
+         # of always seeing 0 (without `-e`, script's own success masks\n\
+         # `false`/`exit 7`/etc., which then mis-routes the queue\n\
+         # transition to `done` rather than `abandoned`). The typescript\n\
          # argument is /dev/null — we don't want script's typescript\n\
          # file, we just want its PTY-to-stdout passthrough.\n\
          # WORKLOAD_PTY=0 opts out (e.g. for tests that want a non-tty\n\
          # stdout, or commands that misbehave under a PTY).\n\
-         # Build the inner command string. `script -q -f -c <STR>` takes\n\
+         # Build the inner command string. `script -q -f -e -c <STR>` takes\n\
          # ONE string argument that gets passed to /bin/sh -c, so we need\n\
          # to assemble the line-buffer prefix + the user command into a\n\
          # single bash-parseable string. Rust assembles `INNER_CMD_LB`\n\
@@ -595,7 +600,7 @@ fn build_wrapper_script(
              INNER_CMD={inner_cmd_raw_q}\n\
          fi\n\
          if [ \"${{WORKLOAD_PTY:-1}}\" != \"0\" ] && command -v script >/dev/null 2>&1; then\n\
-             setsid --wait script -q -f -c \"$INNER_CMD\" /dev/null\n\
+             setsid --wait script -q -f -e -c \"$INNER_CMD\" /dev/null\n\
          else\n\
              setsid --wait bash -c \"$INNER_CMD\"\n\
          fi\n\
@@ -2083,12 +2088,13 @@ mod tests {
 
     #[test]
     fn wrapper_script_wraps_user_command_in_pty() {
-        // The user command runs under `script -q -f -c <STR> /dev/null`
+        // The user command runs under `script -q -f -e -c <STR> /dev/null`
         // so progress-emitting tools (rsync --progress, curl,
         // wget --progress, pv) see a TTY and emit `\r`-separated
         // progress frames continuously instead of suppressing them
         // entirely. `-q` quiets script's banner; `-f` flushes after
-        // every write so bytes hit fd1 immediately.
+        // every write so bytes hit fd1 immediately; `-e` propagates
+        // the child's exit code so the wrapper sees the real rc.
         let script = build_wrapper_script(
             "pty",
             "rsync --progress src dst",
@@ -2099,8 +2105,9 @@ mod tests {
             None,
         );
         assert!(
-            script.contains("setsid --wait script -q -f -c"),
-            "wrapper must wrap user command in `script -q -f -c` for PTY allocation:\n{script}"
+            script.contains("setsid --wait script -q -f -e -c"),
+            "wrapper must wrap user command in `script -q -f -e -c` for PTY allocation \
+             with exit-code propagation:\n{script}"
         );
         assert!(
             script.contains("WORKLOAD_PTY"),
@@ -2321,6 +2328,245 @@ mod tests {
             body.contains("=== DONE (exit 0)"),
             "expected DONE line in output:\n{body}"
         );
+    }
+
+    /// End-to-end verification of the PTY exit-code-propagation fix:
+    /// when the inner command fails (`false`, `exit 7`, etc.), the
+    /// wrapper's `EC=$?` must capture the real rc — NOT 0 from
+    /// `script`'s own success. Without `script -e`, `script` swallows
+    /// the child rc and the wrapper writes `=== DONE (exit 0) ===`
+    /// even for a genuinely failed inner command, which then mis-
+    /// routes the queue-bound workload to `done` instead of `abandon`
+    /// (PR #138 contract).
+    ///
+    /// Three cases per failure mode:
+    ///   * `false`          → `exit 1`
+    ///   * `exit 7`         → `exit 7`
+    ///   * `bash -c "exit 7"` → `exit 7` (extra layer; same rc)
+    ///
+    /// Plus the clean-exit baseline (`true` → `exit 0`) as a
+    /// regression cover.
+    #[test]
+    fn wrapper_script_runtime_propagates_inner_exit_code() {
+        // Requires `script` (util-linux) on PATH; the PTY branch is
+        // where the bug lives. Without `script` the wrapper falls back
+        // to bare `setsid --wait bash -c` which already propagates rc.
+        if Command::new("sh")
+            .args(["-c", "command -v script >/dev/null"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("script(1) not on PATH; skipping exit-code propagation test");
+            return;
+        }
+
+        // (label, inner command, expected exit code)
+        let cases: &[(&str, &str, i32)] = &[
+            ("ecok", "true", 0),
+            ("ecfalse", "false", 1),
+            ("ecexit7", "exit 7", 7),
+            ("ecbashexit7", "bash -c \"exit 7\"", 7),
+        ];
+
+        for (label, inner, expected_rc) in cases {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let out_path = tmp.path().join(format!("{label}.output"));
+            let exit_path = tmp.path().join(format!("{label}.exit"));
+            let hb_path = tmp.path().join(format!("{label}.heartbeat"));
+            let script_path = tmp.path().join(format!("{label}.sh"));
+
+            let script_full = build_wrapper_script(
+                label,
+                inner,
+                &out_path,
+                &exit_path,
+                &hb_path,
+                "/bin/true",
+                None,
+            );
+            let script = script_full.replace("sleep 30\n", "sleep 0\n");
+
+            std::fs::write(&script_path, &script).expect("write script");
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+
+            let status = Command::new("bash")
+                .arg(&script_path)
+                .env("WORKLOAD_HEARTBEAT", "0")
+                .status()
+                .expect("run wrapper");
+            assert!(
+                status.success(),
+                "wrapper itself must exit 0 (bug isn't about the wrapper's own rc): \
+                 case={label} inner={inner:?} status={status:?}"
+            );
+
+            // settle the .exit write
+            std::thread::sleep(Duration::from_millis(200));
+
+            let exit_body = std::fs::read_to_string(&exit_path)
+                .unwrap_or_else(|e| panic!("read .exit for {label}: {e}"));
+            let recorded_rc: i32 = exit_body
+                .trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("parse rc for {label}: {e} (body={exit_body:?})"));
+            assert_eq!(
+                recorded_rc, *expected_rc,
+                "case={label} inner={inner:?}: .exit recorded {recorded_rc}, expected {expected_rc} \
+                 (script(1) is masking the child rc — needs `-e/--return`)"
+            );
+
+            // The DONE line in the .output must also carry the real rc.
+            let out_body = std::fs::read_to_string(&out_path).unwrap_or_default();
+            let expected_done = format!("=== DONE (exit {expected_rc})");
+            assert!(
+                out_body.contains(&expected_done),
+                "case={label} inner={inner:?}: expected {expected_done:?} in .output:\n{out_body}"
+            );
+        }
+    }
+
+    /// End-to-end verification that the rc propagated through the PTY
+    /// flows into `cmd_emit_done`'s queue transition: a failed inner
+    /// command must drive `queue abandon`, a clean exit must drive
+    /// `queue done`. Stubs `session-task` and asserts the stub was
+    /// invoked with the right subcommand.
+    ///
+    /// We can't drive the wrapper's `emit-done` shellout to invoke
+    /// `cmd_emit_done` directly (the wrapper calls the claude-watch
+    /// binary, which we don't have on PATH inside the test). Instead
+    /// we read `EC` from the wrapper's `.exit` file and feed it into
+    /// `cmd_emit_done` ourselves — which mirrors exactly what the
+    /// real wrapper does (`{exe_q} workload emit-done --exit-code "$EC"
+    /// ...`). The contract under test is: rc captured in `.exit`
+    /// → matched queue transition.
+    #[test]
+    fn wrapper_script_runtime_drives_queue_abandon_on_failure() {
+        if Command::new("sh")
+            .args(["-c", "command -v script >/dev/null"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("script(1) not on PATH; skipping rc→queue transition test");
+            return;
+        }
+
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        // Stub session-task: record args, exit 0.
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" >> {rec}\nprintf -- '---\\n' >> {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
+        }
+
+        let cases: &[(&str, &str, i32, &str, &str)] = &[
+            // (label, inner, expected_rc, qid, expected_subcommand)
+            ("rqfalse", "false", 1, "q-rqfalse-test", "abandon"),
+            ("rqexit7", "bash -c \"exit 7\"", 7, "q-rqexit7-test", "abandon"),
+            ("rqok", "true", 0, "q-rqok-test", "done"),
+        ];
+
+        for (label, inner, expected_rc, qid, _expected_sub) in cases {
+            let out_path = tmp.path().join(format!("{label}.output"));
+            let exit_path = tmp.path().join(format!("{label}.exit"));
+            let hb_path = tmp.path().join(format!("{label}.heartbeat"));
+            let script_path = tmp.path().join(format!("{label}.sh"));
+
+            let script_full = build_wrapper_script(
+                label,
+                inner,
+                &out_path,
+                &exit_path,
+                &hb_path,
+                "/bin/true",
+                None,
+            );
+            let script = script_full.replace("sleep 30\n", "sleep 0\n");
+            std::fs::write(&script_path, &script).expect("write script");
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+
+            let status = Command::new("bash")
+                .arg(&script_path)
+                .env("WORKLOAD_HEARTBEAT", "0")
+                .status()
+                .expect("run wrapper");
+            assert!(status.success(), "wrapper rc != 0 for case {label}: {status:?}");
+
+            std::thread::sleep(Duration::from_millis(150));
+
+            // Read rc from .exit (this is the wrapper's source of truth)
+            // and feed it into cmd_emit_done with the test qid — mirrors
+            // the real emit-done invocation in the wrapper template.
+            let exit_body = std::fs::read_to_string(&exit_path)
+                .unwrap_or_else(|e| panic!("read .exit for {label}: {e}"));
+            let captured_rc: i32 = exit_body
+                .trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("parse rc for {label}: {e}"));
+            assert_eq!(
+                captured_rc, *expected_rc,
+                "wrapper .exit rc mismatch for {label}: got {captured_rc}, expected {expected_rc}"
+            );
+
+            let _ = cmd_emit_done(
+                label,
+                captured_rc,
+                &out_path.to_string_lossy(),
+                false,
+                Some(qid),
+            );
+        }
+
+        unsafe {
+            match prev_q {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        let recorded = std::fs::read_to_string(&recording).expect("read recording");
+
+        // Each case's queue transition is recorded in the stub. Split
+        // on the `---\n` separator we wrote between invocations.
+        for (_label, _inner, _expected_rc, qid, expected_sub) in cases {
+            let needle_sub = format!("\n{expected_sub}\n{qid}\n");
+            // Also accept the case where the subcommand is the first arg:
+            // `queue\nabandon\n<qid>\n` — printf "%s\n" expands each arg
+            // on its own line.
+            let alt_needle = format!("queue\n{expected_sub}\n{qid}\n");
+            assert!(
+                recorded.contains(&needle_sub) || recorded.contains(&alt_needle),
+                "expected `queue {expected_sub} {qid}` in stub recording:\n{recorded}"
+            );
+        }
     }
 
     /// End-to-end verification of the central bug fix: `\r`-separated
