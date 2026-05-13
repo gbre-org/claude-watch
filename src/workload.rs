@@ -410,15 +410,28 @@ fn get_descendants(pid: &str) -> Vec<String> {
 ///
 ///   * Traps INT/TERM (fatfinger-proof against accidental Ctrl-C in the
 ///     pane).
-///   * Pipes all stdout+stderr through a per-line ISO8601-with-timezone
-///     timestamp prefixer (e.g. `2026-05-05T14:33:21-04:00 line text`)
-///     before tee'ing into `<label>.output`. Prefer `ts` from moreutils
-///     when available; fall back to a pure-bash `while read` loop.
-///     Per-line timestamps make 4+ hour workloads (gpt-image-2 iter
-///     batches, large rsync runs) post-mortem-debuggable straight from
-///     the .output file without correlating against journalctl.
+///   * Writes header / footer lines straight to `<label>.output` (no
+///     timestamp prefix — the SSE wrapper in queue-minisite stamps each
+///     wire frame anyway, and disk timestamps were blocking carriage-
+///     return progress; see next bullet).
+///   * Runs the user's command under `script -q -f -c '...' /dev/null`
+///     so it sees a PTY on stdout. WITHOUT this, progress-emitting tools
+///     like `rsync --progress`, `curl`, `wget --progress`, `pv` either
+///     suppress progress entirely (they detect non-tty) OR emit only
+///     `\r`-separated frames that the old `ts | tee` chain buffered
+///     until a final `\n` — so all the in-flight progress for one file
+///     accumulated and only flushed when the file finished. Users saw
+///     "rows updating between files, not during them" in queue.gbre.org.
+///     With a PTY, rsync emits `\r`-separated frames continuously AND
+///     `script -f` flushes after every write; the bytes flow straight
+///     through `tee` (no `\n`-buffered `ts` in front of it) into the
+///     .output file, where queue-minisite's `_split_cr_lf_segments`
+///     splitter (PR #133) picks them up as transient SSE frames in
+///     real time. Opt out with `WORKLOAD_PTY=0` for the rare consumer
+///     that genuinely needs a non-tty stdout (CI scripts that test
+///     tty-aware branches).
 ///   * Echoes a header (`=== workload: <label> ===` etc.), runs the
-///     command via `setsid --wait bash -c ...`, captures the exit code,
+///     command via `setsid --wait script ...`, captures the exit code,
 ///     writes `<label>.exit`, and emits the `workload-done` claude-event
 ///     via the embedded `claude-watch workload emit-done` subcommand.
 fn build_wrapper_script(
@@ -436,6 +449,18 @@ fn build_wrapper_script(
     let cmd_q = shell_quote(command);
     let label_q = shell_quote(label);
     let exe_q = shell_quote(exe_path);
+    // Inner command strings passed as a single argument to `script -q
+    // -f -c <STR>` (or to `bash -c <STR>` in the no-PTY fallback). The
+    // inner string is what the PTY-wrapped shell will parse, so it
+    // must itself be a valid bash command line. We compose it as
+    // `bash -c '<user-cmd>'` so the original user command runs in its
+    // own bash with no re-quoting needed; then we shell-quote the
+    // whole thing ONCE more so the wrapper's `INNER_CMD=<...>`
+    // assignment lands a clean literal.
+    let inner_cmd_lb = format!("PYTHONUNBUFFERED=1 stdbuf -oL -eL bash -c {cmd_q}");
+    let inner_cmd_raw = format!("bash -c {cmd_q}");
+    let inner_cmd_lb_q = shell_quote(&inner_cmd_lb);
+    let inner_cmd_raw_q = shell_quote(&inner_cmd_raw);
     // When the workload is bound to a queue item (auto-created in
     // `cmd_run` OR explicitly supplied via --queue-id), append the qid
     // to the emit-done call so the wrapper-side emit carries the qid
@@ -466,13 +491,19 @@ fn build_wrapper_script(
          # bring-up — without this, the EXIT-trap kill of the heartbeat\n\
          # sidecar fires but the sidecar lives on with PPID=1.\n\
          trap : INT TERM\n\
-         # Per-line ISO8601 timestamp prefix for {out_q}.\n\
-         # Prefer `ts` (moreutils); fall back to pure-bash `date -Is`.\n\
-         if command -v ts >/dev/null 2>&1; then\n\
-             exec > >(ts '%Y-%m-%dT%H:%M:%S%z ' | tee -a {out_q}) 2>&1\n\
-         else\n\
-             exec > >(while IFS= read -r line; do printf '%s %s\\n' \"$(date -Is)\" \"$line\"; done | tee -a {out_q}) 2>&1\n\
-         fi\n\
+         # Send all wrapper-side output (headers, heartbeat-related noise,\n\
+         # footer) straight to {out_q}. NOTE: we deliberately do NOT pipe\n\
+         # through `ts | tee` here — `ts` reads line-by-line and would\n\
+         # buffer the user command's `\\r`-separated progress frames\n\
+         # (rsync --progress, curl, pv, wget --progress) until a `\\n`\n\
+         # arrived, defeating the live-tail SSE path. The user command\n\
+         # itself runs under `script -q -f` further down, which both\n\
+         # gives it a PTY (so rsync etc. emit progress at all) and\n\
+         # flushes after every write. Header / footer lines don't need\n\
+         # timestamps — queue-minisite stamps each SSE wire frame\n\
+         # server-side, and no downstream consumer parses .output\n\
+         # timestamps.\n\
+         exec >> {out_q} 2>&1\n\
          echo '=== workload: {label} ==='\n\
          echo 'Started: '$(date -Iseconds)\n\
          echo 'Command: {command_escaped}'\n\
@@ -539,10 +570,34 @@ fn build_wrapper_script(
          # that explicitly call setvbuf() — but it's the right default\n\
          # for the common case (Python, shell, C tools).\n\
          # WORKLOAD_LINE_BUFFER=0 opts out of both.\n\
+         #\n\
+         # PTY wrap: run the user command inside `script -q -f -c '...'\n\
+         # /dev/null` so it sees a real PTY on stdout. This is the only\n\
+         # way to get `\\r`-separated progress frames (rsync --progress,\n\
+         # curl, wget --progress, pv) into the .output file in real\n\
+         # time — without a PTY, rsync silently suppresses progress and\n\
+         # curl/pv switch to `\\n`-terminated summary output. `-q` quiets\n\
+         # script's own start/done banner; `-f` flushes the PTY output\n\
+         # after every write so bytes hit fd1 immediately. The typescript\n\
+         # argument is /dev/null — we don't want script's typescript\n\
+         # file, we just want its PTY-to-stdout passthrough.\n\
+         # WORKLOAD_PTY=0 opts out (e.g. for tests that want a non-tty\n\
+         # stdout, or commands that misbehave under a PTY).\n\
+         # Build the inner command string. `script -q -f -c <STR>` takes\n\
+         # ONE string argument that gets passed to /bin/sh -c, so we need\n\
+         # to assemble the line-buffer prefix + the user command into a\n\
+         # single bash-parseable string. Rust assembles `INNER_CMD_LB`\n\
+         # (with stdbuf wrap) and `INNER_CMD_RAW` (without) at template-\n\
+         # render time; the wrapper picks one at runtime.\n\
          if [ \"${{WORKLOAD_LINE_BUFFER:-1}}\" != \"0\" ] && command -v stdbuf >/dev/null 2>&1; then\n\
-             PYTHONUNBUFFERED=1 setsid --wait stdbuf -oL -eL bash -c {cmd_q}\n\
+             INNER_CMD={inner_cmd_lb_q}\n\
          else\n\
-             setsid --wait bash -c {cmd_q}\n\
+             INNER_CMD={inner_cmd_raw_q}\n\
+         fi\n\
+         if [ \"${{WORKLOAD_PTY:-1}}\" != \"0\" ] && command -v script >/dev/null 2>&1; then\n\
+             setsid --wait script -q -f -c \"$INNER_CMD\" /dev/null\n\
+         else\n\
+             setsid --wait bash -c \"$INNER_CMD\"\n\
          fi\n\
          EC=$?\n\
          echo ''\n\
@@ -558,6 +613,8 @@ fn build_wrapper_script(
         // The "Command: " line gets the unquoted version for readability;
         // escape single quotes for the heredoc context.
         command_escaped = command.replace('\'', "'\\''"),
+        inner_cmd_lb_q = inner_cmd_lb_q,
+        inner_cmd_raw_q = inner_cmd_raw_q,
     )
 }
 
@@ -1982,13 +2039,17 @@ mod tests {
         );
     }
 
-    // ----- build_wrapper_script: timestamp-prefix tests ---------------------
+    // ----- build_wrapper_script: PTY-wrap + raw-output tests ----------------
 
     #[test]
-    fn wrapper_script_contains_timestamp_prefix_paths() {
-        // Both the `ts` (moreutils) path and the pure-bash fallback
-        // must be present in the generated script — the wrapper
-        // chooses at runtime via `command -v ts`.
+    fn wrapper_script_writes_output_without_ts_prefix() {
+        // The new wrapper redirects all wrapper-side output straight to
+        // .output (`exec >> OUT 2>&1`) without piping through `ts | tee`.
+        // The `ts | tee` chain block-buffered on `\n`, swallowing
+        // `\r`-separated progress frames from rsync/curl/pv until a
+        // final newline arrived — the bug behind q-2026-05-13-e6ab.
+        // Hard guards: both the `ts` prefixer AND the pure-bash
+        // `date -Is` per-line fallback must be GONE.
         let script = build_wrapper_script(
             "demo",
             "echo hi",
@@ -1999,32 +2060,60 @@ mod tests {
             None,
         );
         assert!(
-            script.contains("if command -v ts"),
-            "wrapper must runtime-detect `ts`:\n{script}"
+            !script.contains("ts '%Y-%m-%dT%H:%M:%S%z '"),
+            "wrapper must NOT pipe through `ts` (it `\\n`-buffers, killing \\r progress):\n{script}"
         );
         assert!(
-            script.contains("ts '%Y-%m-%dT%H:%M:%S%z '"),
-            "wrapper must invoke `ts` with ISO8601+tz format:\n{script}"
+            !script.contains("while IFS= read -r line"),
+            "wrapper must NOT use the per-line bash fallback (same `\\n`-buffer problem):\n{script}"
         );
         assert!(
-            script.contains("while IFS= read -r line"),
-            "wrapper must include pure-bash fallback loop:\n{script}"
+            script.contains("exec >> '/tmp/claude-workloads/demo.output' 2>&1"),
+            "wrapper must redirect headers/footers straight into the .output path:\n{script}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_wraps_user_command_in_pty() {
+        // The user command runs under `script -q -f -c <STR> /dev/null`
+        // so progress-emitting tools (rsync --progress, curl,
+        // wget --progress, pv) see a TTY and emit `\r`-separated
+        // progress frames continuously instead of suppressing them
+        // entirely. `-q` quiets script's banner; `-f` flushes after
+        // every write so bytes hit fd1 immediately.
+        let script = build_wrapper_script(
+            "pty",
+            "rsync --progress src dst",
+            Path::new("/tmp/pty.output"),
+            Path::new("/tmp/pty.exit"),
+            Path::new("/tmp/pty.heartbeat"),
+            "/usr/bin/claude-watch",
+            None,
         );
         assert!(
-            script.contains("$(date -Is)"),
-            "fallback must call `date -Is` per line:\n{script}"
+            script.contains("setsid --wait script -q -f -c"),
+            "wrapper must wrap user command in `script -q -f -c` for PTY allocation:\n{script}"
         );
         assert!(
-            script.contains("tee -a '/tmp/claude-workloads/demo.output'"),
-            "wrapper must still tee into the .output path:\n{script}"
+            script.contains("WORKLOAD_PTY"),
+            "wrapper must honor WORKLOAD_PTY=0 opt-out:\n{script}"
+        );
+        // The no-PTY fallback path (when `script` is missing, or
+        // WORKLOAD_PTY=0) still runs the user command via setsid bash.
+        assert!(
+            script.contains("setsid --wait bash -c "),
+            "wrapper must retain a non-PTY `setsid --wait bash -c` fallback:\n{script}"
         );
     }
 
     #[test]
     fn wrapper_script_no_unprefixed_tee_exec() {
         // Regression guard: the old wrapper had `exec > >(tee -a OUT) 2>&1`
-        // with no timestamp filter. Make sure that exact substring is
-        // gone — every `tee -a` must follow a prefixer pipe.
+        // (or `exec > >(ts | tee -a OUT) 2>&1`). The new wrapper writes
+        // straight to the file via `exec >> OUT 2>&1` — no `tee`, no
+        // `>( ... )` process substitution that would re-introduce
+        // pipe-side buffering on the path between the user command
+        // and the disk file.
         let script = build_wrapper_script(
             "guard",
             "true",
@@ -2040,13 +2129,17 @@ mod tests {
         );
         assert!(
             !script.contains(">(tee -a"),
-            "found `>(tee -a` (unprefixed) — every tee must follow a `|` from a prefixer:\n{script}"
+            "found `>(tee -a` — every wrapper-side write must go straight to the file (no process-sub pipe):\n{script}"
+        );
+        assert!(
+            !script.contains("| tee -a"),
+            "found a `| tee -a` chain — re-introduces pipe buffering between user cmd and .output:\n{script}"
         );
     }
 
     #[test]
     fn wrapper_script_preserves_headers_and_emit_done() {
-        // The timestamp change must NOT break the existing wrapper
+        // The PTY change must NOT break the existing wrapper
         // structure: header lines, setsid invocation, exit-file write,
         // and the emit-done CLI call all stay.
         let script = build_wrapper_script(
@@ -2059,7 +2152,7 @@ mod tests {
             Some("q-2026-05-05-test"),
         );
         assert!(script.contains("=== workload: wp ==="));
-        assert!(script.contains("setsid --wait bash -c"));
+        assert!(script.contains("setsid --wait"));
         assert!(script.contains("echo $EC > '/tmp/wp.exit'"));
         assert!(script.contains("workload emit-done --label 'wp'"));
         assert!(
@@ -2125,17 +2218,19 @@ mod tests {
     }
 
     /// End-to-end verification: actually execute the wrapper script and
-    /// check that the .output file ends up with ISO8601 timestamp
-    /// prefixes on every line. This catches shell-syntax regressions
-    /// the `script.contains(...)` unit tests can't — a typo in the
-    /// heredoc would still pass those but blow up at runtime.
+    /// check that the .output file contains the user command's stdout
+    /// AND the wrapper headers/footer. The old version of this test
+    /// asserted ISO8601 prefixes on every line; the new wrapper writes
+    /// raw output (no `ts` prefix) so we instead check that the body
+    /// is non-empty, headers are present, and the user's echo output
+    /// made it through.
     ///
     /// We run the wrapper directly (not through tmux). The wrapper
     /// includes a trailing `sleep 30` (so tmux pane stays alive a bit
     /// after exit) — we patch it to `sleep 0` before executing so the
     /// test runs in <1s.
     #[test]
-    fn wrapper_script_runtime_emits_iso8601_prefixes() {
+    fn wrapper_script_runtime_emits_body_and_headers() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("rt.output");
         let exit_path = tmp.path().join("rt.exit");
@@ -2176,9 +2271,9 @@ mod tests {
             "wrapper exited non-zero: {status:?}\nscript:\n{script}"
         );
 
-        // Bash reaps `>(...)` process substitutions on parent exit,
-        // but the tee inside may need a brief moment to flush. 200ms
-        // is generous; in practice it's instant.
+        // The user command runs under `script -q -f`, which flushes
+        // after every write — no buffering settle-time needed in
+        // practice, but a small slack covers PTY teardown.
         std::thread::sleep(Duration::from_millis(200));
 
         let body = std::fs::read_to_string(&out_path)
@@ -2188,30 +2283,23 @@ mod tests {
             "output file is empty; script:\n{script}"
         );
 
-        // Every non-empty line must start with an ISO8601-with-tz
-        // timestamp. `date -Is` produces `YYYY-MM-DDTHH:MM:SS±HH:MM`
-        // (with colon); `ts '%Y-%m-%dT%H:%M:%S%z '` produces
-        // `±HHMM` (no colon). Accept either shape.
-        let ts_re = regex_lite::Regex::new(
+        // No more ISO8601 prefix — verify the OPPOSITE: lines must NOT
+        // be prefixed with a `YYYY-MM-DDTHH:MM:SS±HHMM ` timestamp.
+        // (One header line `Started: <iso>` contains an ISO8601 but
+        // not as a leading prefix — it's preceded by `Started: `.)
+        let leading_ts_re = regex_lite::Regex::new(
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:?\d{2} ",
         )
         .expect("compile regex");
-        let mut checked = 0;
         for (i, line) in body.lines().enumerate() {
             if line.is_empty() {
                 continue;
             }
             assert!(
-                ts_re.is_match(line),
-                "line {i} missing ISO8601 prefix: {line:?}\nfull body:\n{body}"
+                !leading_ts_re.is_match(line),
+                "line {i} unexpectedly carries leading ISO8601 prefix: {line:?}\nfull body:\n{body}"
             );
-            checked += 1;
         }
-        // Header (3 echoes + ---) + 2 echo lines + blank + DONE = ≥5 prefixed lines.
-        assert!(
-            checked >= 5,
-            "expected at least 5 prefixed lines, got {checked}\nbody:\n{body}"
-        );
 
         assert!(
             body.contains("first") && body.contains("second"),
@@ -2224,6 +2312,95 @@ mod tests {
         assert!(
             body.contains("=== DONE (exit 0)"),
             "expected DONE line in output:\n{body}"
+        );
+    }
+
+    /// End-to-end verification of the central bug fix: `\r`-separated
+    /// progress frames must reach the .output file in real time, NOT
+    /// be buffered until a `\n` arrives. The old `ts | tee` chain
+    /// failed this; the new PTY-wrapped `script -q -f` path passes it.
+    ///
+    /// Producer: a bash loop that emits 5 `\rprog:N%` frames over ~1s
+    /// with NO `\n` until the final `done\n`. We sample the .output
+    /// file size midway through; with the bug, the file would still
+    /// be empty (or contain only the wrapper header) because the user
+    /// command's progress bytes are buffered behind ts/tee. With the
+    /// fix, all 5 frames are already on disk when we sample.
+    #[test]
+    fn wrapper_script_runtime_streams_carriage_return_progress() {
+        // Skip if `script` (util-linux) is unavailable — required for
+        // the PTY wrap. Without it the wrapper falls back to non-PTY
+        // mode and the test would race on platform default buffering.
+        if Command::new("sh")
+            .args(["-c", "command -v script >/dev/null"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("script(1) not on PATH; skipping \\r-progress runtime test");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("cr.output");
+        let exit_path = tmp.path().join("cr.exit");
+        let hb_path = tmp.path().join("cr.heartbeat");
+        let script_path = tmp.path().join("cr.sh");
+
+        // 5 frames, 200ms apart — total ~1s. Each frame is `\rprog:N%`
+        // with NO `\n`. Final newline + done line graduates the row.
+        let inner = "for i in 1 2 3 4 5; do printf '\\rprog: %d%%' $((i*20)); sleep 0.2; done; printf '\\ndone\\n'";
+
+        let script_full = build_wrapper_script(
+            "cr",
+            inner,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            "/bin/true",
+            None,
+        );
+        let script = script_full.replace("sleep 30\n", "sleep 0\n");
+
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        let mut child = Command::new("bash")
+            .arg(&script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn wrapper");
+
+        // Sample at ~600ms in. By now the producer has emitted 3
+        // of 5 frames (200ms, 400ms, 600ms). The .output file must
+        // already contain at least the first 2 `\rprog:` frames if
+        // the PTY+raw-tee chain is unbuffered. With the old bug
+        // (ts | tee), it would contain ZERO progress bytes here —
+        // they'd all flush at the final `\n` ~1s later.
+        std::thread::sleep(Duration::from_millis(600));
+        let mid_body = std::fs::read_to_string(&out_path).unwrap_or_default();
+
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        let final_body = std::fs::read_to_string(&out_path).unwrap_or_default();
+
+        // Sanity: the run produced the expected final output.
+        assert!(
+            final_body.contains("done"),
+            "expected final 'done' marker in .output:\n{final_body}"
+        );
+
+        // Count `\r` bytes in the mid-sample. The producer emits
+        // exactly one `\r` per frame. With unbuffered streaming we
+        // expect ≥2 `\r` by 600ms in.
+        let mid_cr_count = mid_body.matches('\r').count();
+        assert!(
+            mid_cr_count >= 2,
+            "mid-run .output contained {mid_cr_count} `\\r` bytes — expected ≥2 \
+             (PTY+raw-tee streaming broken; old `ts | tee` chain would show 0). \
+             full mid_body bytes (with `\\r` rendered):\n{mid_body:?}\n\
+             final_body:\n{final_body:?}"
         );
     }
 
