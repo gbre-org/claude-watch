@@ -705,6 +705,190 @@ console.log('\nstarting-state polling — no-agent / no-jsonl retry');
   hooks.setPollingQid(null);
 }
 
+// Runtime ticker — applyMetaSummary() with a running-item payload
+// should:
+//   1. render the initial runtime string,
+//   2. stamp data-started-at on the runtime row + value,
+//   3. mark the runtime ticker as active,
+//   4. re-render the runtime string when the simulated clock advances,
+//   5. stop ticking once a non-running status comes in,
+//   6. stop ticking on resetMetaSummary() (modal close / re-open).
+//
+// We drive the clock by stubbing Date.now() — the production code
+// calls Date.now() directly inside renderRuntimeFromAnchor(), so a
+// targeted stub is enough without faking setInterval too.
+console.log('\nruntime ticker — running item RUNTIME field updates live');
+{
+  const hooks = window.__liveLog;
+  const runtimeRow = window.document.getElementById('log-meta-row-runtime');
+  const runtimeVal = window.document.getElementById('log-meta-runtime');
+
+  // live-log.js runs inside the jsdom window context, so it calls
+  // window.Date.now() — NOT Node's Date.now (which is a different
+  // intrinsic on a different global). Stub both to keep the test
+  // deterministic regardless of where the production code resolves
+  // Date from.
+  const realNodeDateNow = Date.now;
+  const realWinDateNow = window.Date.now;
+  function withClock(nowMs, fn) {
+    Date.now = () => nowMs;
+    window.Date.now = () => nowMs;
+    try { fn(); } finally {
+      Date.now = realNodeDateNow;
+      window.Date.now = realWinDateNow;
+    }
+  }
+
+  // Anchor "now" at a fixed instant so the test is deterministic.
+  // started_at is 30s before now → initial render is "30s".
+  const NOW_MS = 1778598000000;            // arbitrary fixed timestamp
+  const STARTED_MS = NOW_MS - 30 * 1000;   // 30s ago
+  const startedIso = new Date(STARTED_MS).toISOString();
+
+  // Reset modal state first — applyMetaSummary() assumes a fresh
+  // open (resetMetaSummary clears prior rows + stops any ticker).
+  hooks.resetMetaSummary();
+
+  withClock(NOW_MS, () => {
+    hooks.applyMetaSummary({
+      ok: true,
+      status: 'running',
+      started_at: startedIso,
+      runtime_seconds: 30,
+    });
+  });
+
+  assert('running: runtime row visible',
+    runtimeRow && runtimeRow.hidden === false,
+    'hidden=' + (runtimeRow && runtimeRow.hidden));
+  assert('running: data-started-at stamped on row',
+    runtimeRow && runtimeRow.getAttribute('data-started-at') === startedIso,
+    'got: ' + (runtimeRow && runtimeRow.getAttribute('data-started-at')));
+  assert('running: data-started-at stamped on value el',
+    runtimeVal && runtimeVal.getAttribute('data-started-at') === startedIso,
+    'got: ' + (runtimeVal && runtimeVal.getAttribute('data-started-at')));
+  assert('running: initial runtime text = "30s"',
+    runtimeVal && runtimeVal.textContent === '30s',
+    'got: ' + (runtimeVal && runtimeVal.textContent));
+  assert('running: runtime ticker is active',
+    hooks.getRuntimeTickerActive() === true);
+  assert('running: getRuntimeStartedMs matches anchor',
+    hooks.getRuntimeStartedMs() === STARTED_MS,
+    'got: ' + hooks.getRuntimeStartedMs());
+
+  // Simulate +5s elapsed and call the tick path manually. We can't
+  // easily fast-forward jsdom's setInterval, but we expose the same
+  // logic through Date.now() — re-invoking applyMetaSummary() would
+  // restart the ticker; instead we test the per-frame render by
+  // calling fmtRuntime via the anchor. The cleanest assertion: stub
+  // Date.now, kick the interval callback manually by calling
+  // applyMetaSummary() again with the same anchor (production code
+  // path is identical — startRuntimeTicker() renders once
+  // immediately before the interval).
+  withClock(NOW_MS + 5000, () => {
+    hooks.applyMetaSummary({
+      ok: true,
+      status: 'running',
+      started_at: startedIso,
+      runtime_seconds: 35,
+    });
+  });
+  assert('running +5s: runtime text = "35s"',
+    runtimeVal && runtimeVal.textContent === '35s',
+    'got: ' + (runtimeVal && runtimeVal.textContent));
+
+  // Simulate +10s elapsed.
+  withClock(NOW_MS + 10000, () => {
+    hooks.applyMetaSummary({
+      ok: true,
+      status: 'running',
+      started_at: startedIso,
+      runtime_seconds: 40,
+    });
+  });
+  assert('running +10s: runtime text = "40s"',
+    runtimeVal && runtimeVal.textContent === '40s',
+    'got: ' + (runtimeVal && runtimeVal.textContent));
+
+  // Status flips to done → ticker should stop, data-started-at removed.
+  hooks.applyMetaSummary({
+    ok: true,
+    status: 'done',
+    started_at: startedIso,
+    runtime_seconds: 42,
+  });
+  assert('done: runtime ticker stopped',
+    hooks.getRuntimeTickerActive() === false);
+  assert('done: data-started-at removed from row',
+    runtimeRow && !runtimeRow.hasAttribute('data-started-at'));
+  assert('done: data-started-at removed from value el',
+    runtimeVal && !runtimeVal.hasAttribute('data-started-at'));
+  assert('done: runtime text = server value "42s"',
+    runtimeVal && runtimeVal.textContent === '42s',
+    'got: ' + (runtimeVal && runtimeVal.textContent));
+
+  // Re-arm: running again → ticker restarts cleanly.
+  withClock(NOW_MS + 60000, () => {
+    hooks.applyMetaSummary({
+      ok: true,
+      status: 'running',
+      started_at: startedIso,
+      runtime_seconds: 90,
+    });
+  });
+  assert('re-arm: ticker active again',
+    hooks.getRuntimeTickerActive() === true);
+  assert('re-arm: runtime text = "1m 30s"',
+    runtimeVal && runtimeVal.textContent === '1m 30s',
+    'got: ' + (runtimeVal && runtimeVal.textContent));
+
+  // resetMetaSummary() (modal close / re-open) → ticker stops.
+  hooks.resetMetaSummary();
+  assert('reset: runtime ticker stopped',
+    hooks.getRuntimeTickerActive() === false);
+  assert('reset: data-started-at cleared',
+    runtimeRow && !runtimeRow.hasAttribute('data-started-at'));
+
+  // Non-running statuses with no started_at (e.g. pending) → no
+  // ticker, no data-started-at stamp, no runtime row.
+  hooks.applyMetaSummary({
+    ok: true,
+    status: 'pending',
+    started_at: null,
+    runtime_seconds: null,
+  });
+  assert('pending: ticker stays stopped',
+    hooks.getRuntimeTickerActive() === false);
+  assert('pending: no data-started-at',
+    runtimeRow && !runtimeRow.hasAttribute('data-started-at'));
+
+  // Cleanup belt + braces.
+  hooks.stopRuntimeTicker();
+  hooks.resetMetaSummary();
+}
+
+// Template attribute presence — sanity-check that the inline
+// templates/index.html scaffolding still wires up the meta rows the
+// runtime ticker depends on. We don't load Flask here, just grep the
+// raw file for the element IDs and confirm they exist alongside the
+// data-started-at consumer in live-log.js. Cheap, catches the case
+// where someone renames the row IDs out from under the ticker.
+console.log('\nruntime ticker — template element IDs present');
+{
+  const templatePath = path.resolve(STATIC_DIR, '..', 'templates', 'index.html');
+  const tmpl = fs.readFileSync(templatePath, 'utf8');
+  assert('template has #log-meta-row-runtime',
+    tmpl.includes('id="log-meta-row-runtime"'));
+  assert('template has #log-meta-runtime',
+    tmpl.includes('id="log-meta-runtime"'));
+  assert('live-log.js sets data-started-at on runtime row',
+    liveLogSrc.includes("setAttribute('data-started-at'"));
+  assert('live-log.js starts runtime ticker for running items',
+    liveLogSrc.includes('startRuntimeTicker'));
+  assert('live-log.js exposes RUNTIME_TICK_MS',
+    liveLogSrc.includes('RUNTIME_TICK_MS'));
+}
+
 console.log('\n--------------------------------------------------------------');
 if (failures) {
   console.error(failures + ' assertion(s) failed.');

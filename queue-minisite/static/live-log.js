@@ -156,6 +156,56 @@
   // eats memory. We trim from the top once we exceed this.
   const MAX_LINES = 2000;
 
+  // Runtime ticker — re-renders the RUNTIME meta row every
+  // RUNTIME_TICK_MS while the open modal's item is running. Without
+  // this the runtime string is whatever the server computed at modal
+  // open and stays frozen for the entire viewing session (Andrew
+  // screenshotted a "19m 26s" frozen value, 2026-05-13).
+  //
+  // State:
+  //   runtimeTickerTimer  — setInterval handle; null when not ticking.
+  //   runtimeStartedMs    — Date.parse(started_at_iso); the anchor we
+  //                         subtract from Date.now() each tick.
+  //
+  // Lifecycle:
+  //   start  — applyMetaSummary() with status === 'running' AND a
+  //            parseable started_at calls startRuntimeTicker().
+  //   stop   — resetMetaSummary() (modal re-open / status change) +
+  //            close() (modal close) call stopRuntimeTicker(). Belt
+  //            + braces: if applyMetaSummary() lands a non-running
+  //            status on a subsequent meta refresh, the ticker also
+  //            stops.
+  const RUNTIME_TICK_MS = 1000;
+  let runtimeTickerTimer = null;
+  let runtimeStartedMs = null;
+
+  function stopRuntimeTicker() {
+    if (runtimeTickerTimer) {
+      clearInterval(runtimeTickerTimer);
+      runtimeTickerTimer = null;
+    }
+    runtimeStartedMs = null;
+  }
+
+  function renderRuntimeFromAnchor() {
+    if (runtimeStartedMs === null || isNaN(runtimeStartedMs)) return;
+    const secs = Math.max(0, (Date.now() - runtimeStartedMs) / 1000);
+    setMetaRow('runtime', fmtRuntime(secs), false);
+  }
+
+  function startRuntimeTicker(startedIso) {
+    stopRuntimeTicker();
+    if (!startedIso) return;
+    const parsed = Date.parse(startedIso);
+    if (isNaN(parsed)) return;
+    runtimeStartedMs = parsed;
+    // Render once immediately so the displayed value matches the
+    // ticking source (avoids a 1-second visual lag between the
+    // server-computed string and the first ticker frame).
+    renderRuntimeFromAnchor();
+    runtimeTickerTimer = setInterval(renderRuntimeFromAnchor, RUNTIME_TICK_MS);
+  }
+
   function setStatus(label, kind) {
     if (!statusEl) return;
     statusEl.textContent = label;
@@ -303,6 +353,14 @@
     }
     if (returnBodyEl) returnBodyEl.textContent = '';
     setMetaToggleInitialState();
+    // Tear down any prior runtime ticker — a stale interval from the
+    // previous modal-open would otherwise keep updating #log-meta-runtime
+    // with the previous item's start anchor.
+    stopRuntimeTicker();
+    const runtimeRow = metaRowEls.runtime;
+    const runtimeVal = metaValEls.runtime;
+    if (runtimeRow) runtimeRow.removeAttribute('data-started-at');
+    if (runtimeVal) runtimeVal.removeAttribute('data-started-at');
   }
 
   // Apply a parsed /api/queue/<id>/meta payload to the summary block.
@@ -316,11 +374,39 @@
     // status pill (always visible when meta loaded)
     setMetaRow('status', statusPillHtml(meta.status), true);
 
-    // runtime — "5m 23s (started 16:57:03, completed 17:02:03)" style
+    // runtime — "5m 23s (started 16:57:03, completed 17:02:03)" style.
+    //
+    // For running items we ALSO start a 1Hz ticker that recomputes
+    // (now - started_at) locally each second so the displayed value
+    // updates live (otherwise it stays frozen at the modal-open
+    // value — Andrew flagged a "19m 26s" frozen value 2026-05-13).
+    // The ticker reads `started_at` from this same meta payload, so
+    // it's accurate even when the server's runtime_seconds is
+    // already a few hundred ms stale by the time the JSON lands.
+    //
+    // Non-running items (done / abandoned / pending / starting)
+    // intentionally render only the static server-computed value
+    // and keep the ticker stopped — their runtime no longer advances.
     if (meta.runtime_seconds !== null && meta.runtime_seconds !== undefined) {
       setMetaRow('runtime', fmtRuntime(meta.runtime_seconds), false);
     } else {
       setMetaRow('runtime', '');
+    }
+    if (meta.status === 'running' && meta.started_at) {
+      // Stamp data-started-at on the row element so an external test
+      // (or future feature) can find the live runtime anchor without
+      // needing to call into __liveLog hooks.
+      const runtimeRow = metaRowEls.runtime;
+      const runtimeVal = metaValEls.runtime;
+      if (runtimeRow) runtimeRow.setAttribute('data-started-at', meta.started_at);
+      if (runtimeVal) runtimeVal.setAttribute('data-started-at', meta.started_at);
+      startRuntimeTicker(meta.started_at);
+    } else {
+      stopRuntimeTicker();
+      const runtimeRow = metaRowEls.runtime;
+      const runtimeVal = metaValEls.runtime;
+      if (runtimeRow) runtimeRow.removeAttribute('data-started-at');
+      if (runtimeVal) runtimeVal.removeAttribute('data-started-at');
     }
 
     // timestamps — created / started / completed / abandoned (whichever exist)
@@ -1442,6 +1528,10 @@
       pollTimer = null;
     }
     pollingQid = null;
+    // Stop the 1Hz runtime ticker (running-item RUNTIME field). Leaves
+    // the row's data-started-at attribute removed so the next open
+    // starts from a clean slate.
+    stopRuntimeTicker();
     modal.hidden = true;
     document.body.classList.remove('modal-open');
     lastTransientRow = null;
@@ -1650,5 +1740,15 @@
     clearPollTimer: () => {
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     },
+    // Runtime ticker hooks — exposed so a jsdom test can drive
+    // applyMetaSummary() with a running-item payload, advance the
+    // jsdom clock, and assert the rendered runtime string updates.
+    applyMetaSummary,
+    resetMetaSummary,
+    fmtRuntime,
+    RUNTIME_TICK_MS,
+    getRuntimeTickerActive: () => runtimeTickerTimer !== null,
+    getRuntimeStartedMs: () => runtimeStartedMs,
+    stopRuntimeTicker,
   };
 })();
