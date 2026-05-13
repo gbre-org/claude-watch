@@ -105,7 +105,7 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         the unhealthy-watchers report verbatim, so an inform-mode obligation
         using this predicate gives the main loop a concise "X is DOWN"
         banner after every tool call.
-  - no_pending_watcher_outputs: {} (no params)
+  - no_pending_watcher_outputs: {exempt_command_patterns?}
         satisfied iff there are no captured-but-unread watcher outputs.
         Reads sidecars from /tmp/claude-watcher-output-pending/ -- each one
         describes a `watcher-ctl run <name>` background task and the path of
@@ -115,6 +115,16 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         Read, Bash:^watcher-ctl, Bash:^(pgrep|pkill|ps), Bash:^cat, and
         Bash:^obligations from the gate to avoid self-deadlock; everything
         else must Read the captured output before proceeding.
+
+        ``exempt_command_patterns`` (optional): list of tool_pattern
+        strings (same syntax as ``_tool_pattern_matches``) evaluated
+        against each sidecar's recorded ``command`` field with
+        ``tool_name="Bash"``. Sidecars whose command matches ANY pattern
+        are skipped during the unread-count pass. Use to exclude noisy /
+        trivial captured outputs (e.g. ``Bash:^watcher-ctl\\b`` skips
+        ``watcher-ctl run <name>`` "Started watcher X" blurbs that
+        accumulate hundreds-per-session and gate everything until each is
+        Read). Absent / empty list => no filtering (current behavior).
   - agent_inbox_empty: {path, agent_id?}
         satisfied iff the JSON inbox at ``path`` is missing OR contains
         no UNREAD messages. Accepts both schema v2 (a dict envelope
@@ -944,6 +954,18 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
                 if _tool_pattern_matches(exempt_pat, tool_name, command_string):
                     return (True, f"exempt: {exempt_pat} ({why})")
 
+            # Optional per-sidecar filter: skip sidecars whose recorded
+            # `command` matches any pattern in ``exempt_command_patterns``.
+            # Pattern syntax mirrors ``_tool_pattern_matches``, evaluated with
+            # tool_name="Bash" against the sidecar's command string. Empty /
+            # missing list => no filtering. Invalid types => no filtering
+            # (default-open at the param layer).
+            raw_ecp = params.get("exempt_command_patterns", [])
+            exempt_cmd_patterns = [
+                p for p in (raw_ecp if isinstance(raw_ecp, list) else [])
+                if isinstance(p, str) and p
+            ]
+
             # Walk the sidecar dir. Each file is a JSON describing one
             # captured-but-possibly-unread watcher output.
             sidecar_dir = _watcher_pending_dir()
@@ -977,6 +999,18 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
                     except OSError:
                         pass
                     continue
+                # Per-sidecar command exemption: skip if the registered
+                # command matches any exempt_command_patterns entry. The
+                # sidecar's `command` is the original Bash invocation
+                # (preserved verbatim by the post-tool hook) -- we treat it
+                # as a Bash command_string for pattern matching.
+                if exempt_cmd_patterns:
+                    sc_cmd = sc.get("command", "") or ""
+                    if isinstance(sc_cmd, str) and any(
+                        _tool_pattern_matches(p, "Bash", sc_cmd)
+                        for p in exempt_cmd_patterns
+                    ):
+                        continue
                 # Predicate fails iff the output file has been written since
                 # the watcher was registered (size > 0 AND mtime > registered_at).
                 if st.st_size > 0 and st.st_mtime > float(registered_at):

@@ -33,6 +33,10 @@ Test cases (PreToolUse):
  28. Exempt: Bash:^pgrep bypasses gate even with unread sidecar
  29. Exempt: Read tool bypasses gate even with unread sidecar
  30. Sidecar-write on Bash + run_in_background + watcher-ctl run -> sidecar appears
+ 30a. exempt_command_patterns absent -> watcher-ctl sidecar still gates (baseline)
+ 30b. exempt_command_patterns matches watcher-ctl -> sidecar skipped, predicate allows
+ 30c. exempt_command_patterns doesn't skip non-matching sidecars (regression guard)
+ 30d. exempt_command_patterns empty list -> no filtering (deny)
  31. is_main_loop predicate alone: main-loop (no agent_id) -> allow
  32. is_main_loop predicate alone: subagent (agent_id present) -> deny
  32b. is_main_loop predicate: empty-string agent_id -> allow (treated as main loop)
@@ -934,6 +938,153 @@ def main() -> int:
             fake_session_dir.parent.rmdir()
         except OSError:
             pass
+
+        # ===== exempt_command_patterns predicate-param tests =====
+        # The no_pending_watcher_outputs predicate accepts an optional
+        # `exempt_command_patterns` list. Each sidecar's recorded `command`
+        # field is matched (tool_name="Bash") against the patterns; any
+        # match skips the sidecar in the unread count. Use case: silence
+        # the `watcher-ctl run X` "Started watcher X" blurbs that accumulate
+        # hundreds-per-session and gate everything until each is Read.
+        #
+        # We isolate the sidecar dir to a fresh subdir of tmpdir so the
+        # tests don't see stragglers from earlier scenarios.
+        sidecar_dir3 = tmpdir / "watcher-output-pending-ecp"
+        env_ecp = env.copy()
+        env_ecp["WATCHER_PENDING_DIR"] = str(sidecar_dir3)
+
+        def _write_sidecar_cmd(task_id: str, output_path: Path,
+                               command: str,
+                               registered_at: float | None = None) -> Path:
+            sidecar_dir3.mkdir(parents=True, exist_ok=True)
+            sc = {
+                "task_id": task_id,
+                "command": command,
+                "watcher_name": "explicit-test",
+                "output_file_path": str(output_path),
+                "registered_at": (registered_at if registered_at is not None
+                                  else time.time()),
+            }
+            sp = sidecar_dir3 / f"{task_id}.json"
+            sp.write_text(json.dumps(sc))
+            return sp
+
+        # --- Test 30a: baseline -- exempt_command_patterns absent ->
+        # watcher-ctl sidecar still gates (regression guard for the
+        # default-no-filter behavior). ---
+        out_file_ecp1 = tmpdir / "captured-ecp1.output"
+        out_file_ecp1.write_text("watcher fired\n")
+        os.utime(out_file_ecp1, (time.time(), time.time()))
+        sc_ecp1 = _write_sidecar_cmd(
+            "ecp1", out_file_ecp1,
+            command="watcher-ctl run sample-ecp1",
+            registered_at=time.time() - 10,
+        )
+        ob_ecp_baseline = _add_ob(
+            env_ecp,
+            tool_pattern="*",
+            predicate="no_pending_watcher_outputs",
+            params={},  # exempt_command_patterns absent
+            ttl=0,
+            deny_msg="Read the captured watcher output before proceeding",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_ecp,
+        )
+        results.append(_check(
+            "30a. exempt_command_patterns absent -> watcher-ctl sidecar gates",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_ecp_baseline], env_ecp)
+
+        # --- Test 30b: exempt_command_patterns matches the watcher-ctl
+        # sidecar's command -> sidecar is skipped -> predicate allows. ---
+        ob_ecp_match = _add_ob(
+            env_ecp,
+            tool_pattern="*",
+            predicate="no_pending_watcher_outputs",
+            params={
+                "exempt_command_patterns": ["Bash:^watcher-ctl\\b"],
+            },
+            ttl=0,
+            deny_msg="Read the captured watcher output before proceeding",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_ecp,
+        )
+        results.append(_check(
+            "30b. exempt_command_patterns matches watcher-ctl -> sidecar skipped",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_ecp_match], env_ecp)
+
+        # --- Test 30c: non-watcher-ctl sidecar with the same exempt list
+        # is NOT skipped (regression guard against over-broad filtering). ---
+        out_file_ecp2 = tmpdir / "captured-ecp2.output"
+        out_file_ecp2.write_text("arbitrary bg output\n")
+        os.utime(out_file_ecp2, (time.time(), time.time()))
+        sc_ecp2 = _write_sidecar_cmd(
+            "ecp2", out_file_ecp2,
+            command="sleep 30 && echo done",
+            registered_at=time.time() - 10,
+        )
+        ob_ecp_non = _add_ob(
+            env_ecp,
+            tool_pattern="*",
+            predicate="no_pending_watcher_outputs",
+            params={
+                "exempt_command_patterns": ["Bash:^watcher-ctl\\b"],
+            },
+            ttl=0,
+            deny_msg="Read the captured watcher output before proceeding",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_ecp,
+        )
+        # Banner should mention the non-exempt sidecar path (not the
+        # watcher-ctl one). Both unread sidecars exist, but only the
+        # sleep-30 one should be counted in `unread`.
+        banner = (out.get("systemMessage", "") or "")
+        names_ok = (
+            str(out_file_ecp2) in banner
+            and str(out_file_ecp1) not in banner
+        )
+        results.append(_check(
+            "30c. exempt_command_patterns doesn't skip non-matching sidecars",
+            rc == 0 and _is_deny(out) and names_ok,
+            f"rc={rc} out={out} names_ok={names_ok}",
+        ))
+        _run([str(CLI), "satisfy", ob_ecp_non], env_ecp)
+
+        # --- Test 30d: empty exempt_command_patterns list -> no filtering
+        # (same effect as absent). ---
+        ob_ecp_empty = _add_ob(
+            env_ecp,
+            tool_pattern="*",
+            predicate="no_pending_watcher_outputs",
+            params={"exempt_command_patterns": []},
+            ttl=0,
+            deny_msg="Read the captured watcher output before proceeding",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_ecp,
+        )
+        results.append(_check(
+            "30d. exempt_command_patterns empty list -> no filtering (deny)",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_ecp_empty], env_ecp)
+
+        # Cleanup ECP sidecars.
+        for sc_path in (sc_ecp1, sc_ecp2):
+            try:
+                if sc_path.exists():
+                    sc_path.unlink()
+            except OSError:
+                pass
 
         # ===== is_main_loop + all_of (predicate composition) tests =====
         # Replaces the old row-level `main_loop_only` flag tests. The
