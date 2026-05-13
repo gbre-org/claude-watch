@@ -151,6 +151,21 @@ RUN chmod 0644 /etc/profile.d/claude-tools.sh \
     && chown root:root /etc/profile.d/claude-tools.sh \
     && printf '\n# Pull in claude-watch bind-mounted CLI dirs for non-login shells.\nif [ -r /etc/profile.d/claude-tools.sh ]; then\n    . /etc/profile.d/claude-tools.sh\nfi\n' >> /etc/bash.bashrc
 
+# trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
+# in ~/.claude.json so the in-container claude binary skips the first-launch
+# "Quick safety check" trust dialog. Invoked by entrypoint.sh before tmux
+# launches claude; safe to invoke ad-hoc later (e.g. via
+# `docker compose exec claude-container trust-workspace /custom/path`) if a
+# downstream image runs in a different cwd. The script is a graceful no-op
+# when the config file is missing or the bind-mount is read-only, so a
+# stripped-down `docker run` without ~/.claude.json mounted still works
+# (operator sees the trust prompt once and dismisses it manually). See
+# container/bin/trust-workspace.py for the full safety contract and the
+# embedded `--test` mode (11 unit tests, including the Linux file-bind-mount
+# EBUSY fallback path).
+COPY bin/trust-workspace.py /usr/local/bin/trust-workspace
+RUN chmod +x /usr/local/bin/trust-workspace
+
 # Entrypoint script — tmux session bootstrap + env passthrough + signal handling.
 # Phase 1e (q-2026-05-11-8a96): pane 1 now runs the real claude-watch daemon
 # instead of the Phase 0 placeholder bash banner. Pane 1 keeps itself open with

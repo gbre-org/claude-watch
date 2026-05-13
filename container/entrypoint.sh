@@ -65,6 +65,27 @@ if [ -r /etc/profile.d/claude-tools.sh ]; then
     . /etc/profile.d/claude-tools.sh
 fi
 
+# Pre-trust the in-container workspace so Claude Code skips its first-launch
+# "Quick safety check: Is this a project you created or one you trust?"
+# prompt. The trust state lives at projects[<path>].hasTrustDialogAccepted
+# in ~/.claude.json (which is bind-mounted rw from the host operator's
+# ${HOME}/.claude.json in the example compose stack). The merge preserves
+# every other project entry already in the file; see container/bin/
+# trust-workspace.py for the full safety / idempotency contract.
+#
+# WORKSPACE defaults to /workspace (matches the Dockerfile WORKDIR and the
+# example compose claude-tmux working_dir). Override with $WORKSPACE if a
+# downstream image lands claude in a different cwd.
+#
+# Graceful no-op when ~/.claude.json is missing, unparseable, or the
+# bind-mount is read-only — the trust prompt would just resurface on first
+# launch in that case, which is the same UX as a fresh upstream image. We
+# wrap in `|| true` defensively even though the script never exits non-zero
+# on recoverable errors, because `set -euo pipefail` is in effect.
+if [ -x /usr/local/bin/trust-workspace ]; then
+    /usr/local/bin/trust-workspace "${WORKSPACE:-/workspace}" || true
+fi
+
 cleanup() {
     # Killing the tmux session terminates both panes' child processes
     # (pane 0's claude, pane 1's claude-watch daemon) via SIGHUP from the

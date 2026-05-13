@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -77,6 +77,13 @@ test-watchers: test-self-clear
 # against fixtures). 33 cases, ~1s.
 test-dashboard:
 	tools/dashboard/tests/dashboard-parser.test
+
+# Run the trust-workspace embedded test suite (claude-container's
+# pre-seed for ~/.claude.json's projects[<workspace>].hasTrustDialogAccepted
+# entry; suppresses the in-container first-launch trust prompt). 11 cases,
+# <0.1s, all in-process against tmpdir HOMEs.
+test-trust-workspace:
+	python3 container/bin/trust-workspace.py --test
 
 # Release build
 build:

@@ -163,6 +163,14 @@ claude
 
 Or use the standalone `claude-tmux` wrapper at [`container/bin/claude-tmux`](../../container/bin/claude-tmux) — it's a more ergonomic entrypoint than `docker compose exec` for interactive use. See [`container/README.md`](../../container/README.md) for details.
 
+### First-launch trust prompt
+
+Claude Code normally shows a "Quick safety check: Is this a project you created or one you trust?" prompt the first time it runs in a new cwd. The `claude-container` entrypoint pre-seeds the trust state for `/workspace` (the Dockerfile `WORKDIR` and the in-container tmux pane's cwd) before launching tmux, so the prompt is skipped on every boot — you land directly at the Claude Code idle prompt.
+
+The pre-seed writes `projects["/workspace"].hasTrustDialogAccepted = true` into the bind-mounted `~/.claude.json`, preserves every other project entry already in the file, and is idempotent (re-running on every container boot is a no-op after the first). When the bind-mount is missing or read-only the entrypoint logs a warning and falls back to showing the prompt — same UX as a stock upstream image.
+
+To pre-trust a different cwd in a downstream image, set `WORKSPACE=/custom/path` in the container env; the entrypoint passes it through to `trust-workspace`. To pre-trust additional paths inside an already-running container, run `docker compose exec claude-container trust-workspace /another/path`.
+
 ## ttyd web console
 
 After `docker compose up -d`, a browser-attachable terminal is available at
