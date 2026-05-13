@@ -10,7 +10,13 @@
 #   dashboard --no-attach  — build/refit but don't attach (headless / test)
 #   dashboard --attach     — RW multi-client attach (SSH / phone)
 #   dashboard --attach --cc — RW attach (iTerm2 -CC mode / laptop)
+#   dashboard --attach --shared [--cc] — RW attach to the canonical session
+#                          itself (no grouped child). All clients on the
+#                          canonical session share window/pane selection so
+#                          each can drive the others' view (no independent
+#                          windows). Combine with --cc for iTerm2 -CC mode.
 #   dashboard --read-only  — RO attach (safe monitoring)
+#   dashboard --read-only --shared — RO shared attach (no grouped child)
 #
 # Env overrides (mostly for tests):
 #   DASHBOARD_SESSION    — tmux session name (default: dashboard)
@@ -88,8 +94,10 @@ if [ "$1" = "--detach" ]; then
     exit 0
 fi
 
-# --attach: RW multi-client attach (grouped session for independent window selection)
-# --read-only: RO attach (safe for monitoring)
+# --attach: RW multi-client attach (default = grouped session for independent
+#           window selection; pass --shared to attach to the canonical session
+#           directly so multiple clients drive the same view).
+# --read-only: RO attach (safe for monitoring; also honours --shared).
 if [ "$1" = "--attach" ] || [ "$1" = "--read-only" ]; then
     if ! tmux has-session -t "$SESSION" 2>/dev/null; then
         echo "No dashboard session running." >&2
@@ -99,13 +107,35 @@ if [ "$1" = "--attach" ] || [ "$1" = "--read-only" ]; then
     if [ "$1" = "--read-only" ]; then
         RO_FLAG="-r"
     fi
+    # Scan remaining args for --shared and --cc (order-independent).
+    SHARED=0
+    CC=0
+    shift
+    for arg in "$@"; do
+        case "$arg" in
+            --shared) SHARED=1 ;;
+            --cc) CC=1 ;;
+        esac
+    done
     # Reset window-size to prevent iTerm2 -CC from locking to manual mode
     tmux set-option -t "$SESSION" window-size latest 2>/dev/null
     # Kill orphaned grouped sessions from previous attaches to prevent leaks
     for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${SESSION}-"); do
         tmux kill-session -t "$s" 2>/dev/null
     done
-    if [ "$2" = "--cc" ]; then
+    if [ "$SHARED" = 1 ]; then
+        # Shared: attach directly to the canonical session. All clients on it
+        # share window/pane selection — switching windows in one client
+        # switches them in all. Required so the local gomorrah client, the
+        # ttyd browser client, and the iTerm2 -CC laptop client all drive
+        # the SAME view of the dashboard pane.
+        if [ "$CC" = 1 ]; then
+            exec tmux -CC attach-session -t "$SESSION" $RO_FLAG
+        else
+            exec tmux attach-session -t "$SESSION" $RO_FLAG
+        fi
+    fi
+    if [ "$CC" = 1 ]; then
         # iTerm2 -CC: grouped session (independent window selection)
         exec tmux -CC new-session -t "$SESSION" $RO_FLAG
     else
