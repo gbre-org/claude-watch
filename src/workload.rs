@@ -16,6 +16,7 @@
 
 use crate::event_bus::{emit_workload_done, WorkloadDoneEvent};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -52,6 +53,221 @@ fn script_file(label: &str) -> PathBuf {
 /// but real stalls page Andrew.
 fn heartbeat_file(label: &str) -> PathBuf {
     PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat"))
+}
+
+/// Per-workload captured-script sidecar. Written by `cmd_run` at
+/// workload start time when the command parses as `<interpreter>
+/// <path>` for a known scripting interpreter (bash/sh/python/ruby/
+/// node/perl/etc.). The file holds JSON serialised from
+/// `ScriptCapture` and is read by queue-minisite's
+/// `/api/queue/<id>/meta` endpoint to surface the script's contents in
+/// the modal "Script contents" disclosure.
+///
+/// Capture-at-run-time is robust against `/tmp` cleanup, script
+/// edits, or deletes that happen after the workload has started —
+/// the modal would otherwise show stale or empty content (a real
+/// failure mode observed 2026-05-13 when
+/// `/tmp/promote-sweep-batch2.sh` was modified mid-session and the
+/// modal had no way to show what had actually run).
+fn script_capture_file(label: &str) -> PathBuf {
+    PathBuf::from(WORKLOAD_DIR).join(format!("{label}.script.json"))
+}
+
+/// Maximum bytes of script content to embed in the capture. Anything
+/// larger is truncated; `ScriptCapture::truncated` flips to `true`.
+/// 1 MiB is well above any plausible shell/python script size while
+/// still bounding the size of the per-workload sidecar.
+const SCRIPT_CAPTURE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Number of bytes from the head of the file to inspect for a NUL
+/// byte when detecting binary content. Matches what `file(1)` /
+/// `git diff` use for text-vs-binary heuristics.
+const SCRIPT_CAPTURE_BINARY_PROBE_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScriptCapture {
+    /// Resolved absolute (or PATH-resolved) path of the script.
+    pub path: String,
+    /// Bare interpreter name (`bash`, `python3`, `node`, ...) as the
+    /// front-end sees it. Tracks the FIRST positional arg, not its
+    /// resolved absolute path, since that's what the user typed.
+    pub interpreter: String,
+    /// Total file size in bytes (before truncation).
+    pub size_bytes: u64,
+    /// True when `content` was clipped to `SCRIPT_CAPTURE_MAX_BYTES`.
+    pub truncated: bool,
+    /// True when the file was detected as binary (NUL byte in the
+    /// first `SCRIPT_CAPTURE_BINARY_PROBE_BYTES`). When true,
+    /// `content` is `None`.
+    pub binary: bool,
+    /// UTF-8 decoded body. `None` when the file is binary. Lossy
+    /// decode (invalid bytes → U+FFFD) so we can still surface
+    /// near-text content without crashing the renderer.
+    pub content: Option<String>,
+    /// SHA-256 of the FULL file content (not the truncated body),
+    /// so a viewer can confirm the script identity even on a
+    /// truncated/binary capture.
+    pub sha256: String,
+}
+
+/// Recognise interpreter argv0s where the second positional arg is a
+/// script path we want to capture.
+///
+/// Matching is on the bare basename so `/usr/bin/python3.11` and
+/// `python3.11` both match. We intentionally keep this list short —
+/// each entry is something Andrew or one of his tools actually feeds
+/// to `workload run`. Adding more interpreters is a one-line change.
+fn interpreter_basename(arg0: &str) -> Option<&'static str> {
+    let base = Path::new(arg0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(arg0);
+    match base {
+        "bash" => Some("bash"),
+        "sh" => Some("sh"),
+        "zsh" => Some("zsh"),
+        "dash" => Some("dash"),
+        "python" | "python3" => Some("python3"),
+        // Versioned pythons: python3.11, python3.12, ... Match by prefix.
+        b if b.starts_with("python3.") => Some("python3"),
+        b if b.starts_with("python2.") => Some("python2"),
+        "ruby" => Some("ruby"),
+        "node" | "nodejs" => Some("node"),
+        "perl" => Some("perl"),
+        _ => None,
+    }
+}
+
+/// Resolve a relative script path against PATH so a command like
+/// `bash myscript.sh` (where myscript.sh isn't in cwd but is on
+/// PATH) still captures. Absolute paths and `./...` / `../...`
+/// short-circuit to the literal value. Returns `None` if the file
+/// can't be found anywhere.
+fn resolve_script_path(raw: &str) -> Option<PathBuf> {
+    let pb = PathBuf::from(raw);
+    // Absolute or explicit relative-from-cwd: use as-is.
+    if pb.is_absolute() || raw.starts_with("./") || raw.starts_with("../") {
+        return if pb.is_file() { Some(pb) } else { None };
+    }
+    // Try cwd first (common case: `workload run foo -- bash script.sh`
+    // launched from the dir containing script.sh).
+    if pb.is_file() {
+        return Some(pb);
+    }
+    // Fall back to PATH walk.
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(&pb);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Probe an open file body for a NUL byte in the first
+/// `SCRIPT_CAPTURE_BINARY_PROBE_BYTES`. Matches `git`'s binary
+/// detection (good-enough for refusing to embed a megabyte of
+/// non-text in the modal).
+fn looks_binary(bytes: &[u8]) -> bool {
+    let probe_len = bytes.len().min(SCRIPT_CAPTURE_BINARY_PROBE_BYTES);
+    bytes[..probe_len].contains(&0u8)
+}
+
+/// Inspect `cmd_args` and, if it looks like a script invocation
+/// (`<interpreter> <single-file-path>`), read the file and return a
+/// `ScriptCapture`. Returns `None` when:
+///
+///   * cmd_args doesn't match the `<interpreter> <path>` shape
+///   * the interpreter isn't in the recognised list
+///   * the resolved path is a symlink (refused for safety — don't
+///     follow `/etc/shadow` etc.)
+///   * the resolved path isn't a regular file
+///   * any I/O error reading the file
+///
+/// The function is fail-soft: any error path returns None so the
+/// workload itself still runs. Capture is a nice-to-have, not a
+/// hard requirement.
+///
+/// Safety rails:
+///   * Symlinks are refused via `symlink_metadata` + `is_symlink()`
+///     check. We do NOT use `O_NOFOLLOW` at the syscall level because
+///     `fs::read` follows symlinks by default — instead we stat first
+///     with `symlink_metadata` and bail before reading.
+///   * Files larger than `SCRIPT_CAPTURE_MAX_BYTES` are truncated.
+///   * Binary content (NUL in first 512 bytes) skips the body but
+///     keeps the metadata (size + sha256) so the user knows the
+///     workload ran a binary.
+pub fn try_capture_script(cmd_args: &[String]) -> Option<ScriptCapture> {
+    if cmd_args.len() != 2 {
+        return None;
+    }
+    let arg0 = cmd_args[0].as_str();
+    let arg1 = cmd_args[1].as_str();
+    let interpreter = interpreter_basename(arg0)?;
+
+    // The second arg has to look like a path — refuse `-c`-style
+    // inline-script invocations (`bash -c 'echo hi'`), and refuse
+    // bare option flags.
+    if arg1.starts_with('-') {
+        return None;
+    }
+
+    let resolved = resolve_script_path(arg1)?;
+
+    // Symlink refuse — use symlink_metadata so we don't traverse.
+    let lmeta = fs::symlink_metadata(&resolved).ok()?;
+    if lmeta.file_type().is_symlink() {
+        return None;
+    }
+    if !lmeta.is_file() {
+        return None;
+    }
+
+    let size_bytes = lmeta.len();
+    let path_str = resolved.to_string_lossy().to_string();
+
+    // Read with a size cap. Read full file to compute sha256, but
+    // truncate the embedded body if oversize.
+    let full = fs::read(&resolved).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&full);
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    let binary = looks_binary(&full);
+    let truncated = (full.len() as u64) > SCRIPT_CAPTURE_MAX_BYTES;
+
+    let content = if binary {
+        None
+    } else {
+        let body: &[u8] = if truncated {
+            &full[..SCRIPT_CAPTURE_MAX_BYTES as usize]
+        } else {
+            &full
+        };
+        Some(String::from_utf8_lossy(body).into_owned())
+    };
+
+    Some(ScriptCapture {
+        path: path_str,
+        interpreter: interpreter.to_string(),
+        size_bytes,
+        truncated,
+        binary,
+        content,
+        sha256,
+    })
+}
+
+/// Persist a capture to the per-label sidecar so queue-minisite can
+/// surface it later. Fail-soft: errors are silently swallowed (any
+/// failure here means the modal omits the section, which is the
+/// existing fall-through behaviour).
+fn write_script_capture(label: &str, cap: &ScriptCapture) {
+    let path = script_capture_file(label);
+    if let Ok(json) = serde_json::to_string(cap) {
+        let _ = fs::write(&path, json);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -708,14 +924,27 @@ pub fn cmd_run(
     let exit_path = exit_file(label);
     let heartbeat_path = heartbeat_file(label);
     let script_path = script_file(label);
+    let script_capture_path = script_capture_file(label);
 
     // Clean up previous run's exit marker + output + heartbeat. The
     // heartbeat MUST be removed up-front so the stale-watchdog detector
     // can't get a false-positive on a stale leftover from a prior run
     // that pet the watchdog and then crashed.
+    // Also remove any prior script-capture sidecar so a re-run that no
+    // longer matches the interpreter pattern doesn't surface a stale
+    // capture from the previous invocation.
     let _ = fs::remove_file(&exit_path);
     let _ = fs::remove_file(&out_path);
     let _ = fs::remove_file(&heartbeat_path);
+    let _ = fs::remove_file(&script_capture_path);
+
+    // Try to capture the script content NOW (before the workload
+    // starts) so a later modify/delete of the script doesn't affect
+    // what the modal shows. Fail-soft: no capture means the modal
+    // omits the "Script contents" section.
+    if let Some(cap) = try_capture_script(cmd_args) {
+        write_script_capture(label, &cap);
+    }
     // Also clear the cron-workload-stale-check single-emit sentinel so
     // a freshly-started workload that legitimately stalls again will
     // re-fire workload-stale instead of being silently swallowed.
@@ -2937,5 +3166,239 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // (c) Exit file must also exist with the user-command rc.
         let ec = std::fs::read_to_string(&exit_path).expect("read exit");
         assert_eq!(ec.trim(), "0", "expected exit 0; got {ec:?}");
+    }
+
+    // ----- script-capture tests -----
+
+    #[test]
+    fn capture_bash_script_happy_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("hello.sh");
+        std::fs::write(&script, "#!/bin/bash\necho hi\necho there\n").expect("write");
+
+        let args = vec!["bash".to_string(), script.to_string_lossy().to_string()];
+        let cap = try_capture_script(&args).expect("capture");
+        assert_eq!(cap.interpreter, "bash");
+        assert_eq!(cap.path, script.to_string_lossy());
+        assert!(!cap.truncated);
+        assert!(!cap.binary);
+        assert_eq!(
+            cap.content.as_deref(),
+            Some("#!/bin/bash\necho hi\necho there\n")
+        );
+        assert_eq!(cap.size_bytes, 31);
+        // sha256 of the file content
+        let expected = {
+            let mut h = Sha256::new();
+            h.update(b"#!/bin/bash\necho hi\necho there\n");
+            format!("{:x}", h.finalize())
+        };
+        assert_eq!(cap.sha256, expected);
+    }
+
+    #[test]
+    fn capture_python_versioned_interpreter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("script.py");
+        std::fs::write(&script, "print('hi')\n").expect("write");
+
+        let args = vec![
+            "python3.11".to_string(),
+            script.to_string_lossy().to_string(),
+        ];
+        let cap = try_capture_script(&args).expect("capture");
+        assert_eq!(cap.interpreter, "python3");
+        assert_eq!(cap.content.as_deref(), Some("print('hi')\n"));
+    }
+
+    #[test]
+    fn capture_absolute_interpreter_path_basename_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("foo.sh");
+        std::fs::write(&script, "exit 0\n").expect("write");
+
+        let args = vec![
+            "/usr/bin/bash".to_string(),
+            script.to_string_lossy().to_string(),
+        ];
+        let cap = try_capture_script(&args).expect("capture");
+        assert_eq!(cap.interpreter, "bash");
+    }
+
+    #[test]
+    fn capture_refuses_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real.sh");
+        std::fs::write(&target, "echo hi\n").expect("write target");
+        let symlink = dir.path().join("link.sh");
+        std::os::unix::fs::symlink(&target, &symlink).expect("symlink");
+
+        let args = vec!["bash".to_string(), symlink.to_string_lossy().to_string()];
+        let cap = try_capture_script(&args);
+        assert!(
+            cap.is_none(),
+            "symlink must be refused (don't follow into /etc/shadow etc.)"
+        );
+    }
+
+    #[test]
+    fn capture_refuses_nonexistent_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.sh");
+        let args = vec!["bash".to_string(), missing.to_string_lossy().to_string()];
+        assert!(try_capture_script(&args).is_none());
+    }
+
+    #[test]
+    fn capture_refuses_dash_c_inline_script() {
+        // `bash -c 'echo hi'` is NOT a script invocation — refuse.
+        let args = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "echo hi".to_string(),
+        ];
+        assert!(try_capture_script(&args).is_none());
+    }
+
+    #[test]
+    fn capture_refuses_unknown_interpreter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("thing");
+        std::fs::write(&script, "hello\n").expect("write");
+        let args = vec!["ls".to_string(), script.to_string_lossy().to_string()];
+        assert!(try_capture_script(&args).is_none());
+    }
+
+    #[test]
+    fn capture_refuses_too_many_args() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("foo.sh");
+        std::fs::write(&script, "echo $1\n").expect("write");
+        // `bash foo.sh arg1` — three positional args, not a single-file
+        // invocation we're confident about. Could enable later but for
+        // now the explicit test guards the "exactly 2 args" rule.
+        let args = vec![
+            "bash".to_string(),
+            script.to_string_lossy().to_string(),
+            "arg1".to_string(),
+        ];
+        assert!(try_capture_script(&args).is_none());
+    }
+
+    #[test]
+    fn capture_truncates_oversized_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("big.sh");
+        // Build a file just over the cap.
+        let body = "a".repeat(SCRIPT_CAPTURE_MAX_BYTES as usize + 100);
+        std::fs::write(&script, &body).expect("write");
+
+        let args = vec!["bash".to_string(), script.to_string_lossy().to_string()];
+        let cap = try_capture_script(&args).expect("capture");
+        assert!(cap.truncated);
+        assert_eq!(cap.size_bytes, body.len() as u64);
+        let content = cap.content.as_deref().expect("content");
+        assert_eq!(content.len(), SCRIPT_CAPTURE_MAX_BYTES as usize);
+        // sha256 is over the FULL body, not the truncated slice.
+        let expected = {
+            let mut h = Sha256::new();
+            h.update(body.as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        assert_eq!(cap.sha256, expected);
+    }
+
+    #[test]
+    fn capture_detects_binary_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("blob");
+        // NUL byte inside the first 512 bytes → binary.
+        let mut body: Vec<u8> = b"#!/bin/bash\n".to_vec();
+        body.push(0);
+        body.extend_from_slice(b"echo hi\n");
+        std::fs::write(&script, &body).expect("write");
+
+        let args = vec!["bash".to_string(), script.to_string_lossy().to_string()];
+        let cap = try_capture_script(&args).expect("capture");
+        assert!(cap.binary, "NUL byte in head should flag binary");
+        assert!(
+            cap.content.is_none(),
+            "binary content must omit body, keep metadata"
+        );
+        assert_eq!(cap.size_bytes, body.len() as u64);
+        assert!(!cap.sha256.is_empty());
+    }
+
+    #[test]
+    fn capture_does_not_crash_on_missing_dir() {
+        // Resolving a relative-with-cwd path that isn't on PATH must
+        // simply return None, not panic.
+        let args = vec![
+            "bash".to_string(),
+            "definitely-not-on-path-xyz.sh".to_string(),
+        ];
+        assert!(try_capture_script(&args).is_none());
+    }
+
+    #[test]
+    fn capture_resolves_path_lookup() {
+        // Place a script in a tmpdir, prepend to PATH, invoke with bare
+        // basename. We want resolve_script_path to find it via PATH.
+        let _guard = WORKLOAD_TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("only-on-path.sh");
+        std::fs::write(&script, "echo hi\n").expect("write");
+
+        // Save and override PATH so the test is hermetic.
+        let prev_path = std::env::var_os("PATH");
+        let new_path = match &prev_path {
+            Some(p) => {
+                let mut v = std::ffi::OsString::new();
+                v.push(dir.path());
+                v.push(":");
+                v.push(p);
+                v
+            }
+            None => dir.path().as_os_str().to_os_string(),
+        };
+        // SAFETY: WORKLOAD_TEST_ENV_LOCK held across the read/write.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+
+        let args = vec![
+            "bash".to_string(),
+            "only-on-path.sh".to_string(),
+        ];
+        let cap = try_capture_script(&args);
+
+        // Restore PATH before any assert (so a failing assert doesn't
+        // leave the test process with a polluted PATH).
+        unsafe {
+            match prev_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let cap = cap.expect("PATH lookup should resolve");
+        assert_eq!(cap.interpreter, "bash");
+        assert_eq!(cap.content.as_deref(), Some("echo hi\n"));
+    }
+
+    #[test]
+    fn capture_serde_roundtrip() {
+        let cap = ScriptCapture {
+            path: "/tmp/foo.sh".to_string(),
+            interpreter: "bash".to_string(),
+            size_bytes: 42,
+            truncated: false,
+            binary: false,
+            content: Some("echo hi\n".to_string()),
+            sha256: "abc123".to_string(),
+        };
+        let j = serde_json::to_string(&cap).expect("serialize");
+        let back: ScriptCapture = serde_json::from_str(&j).expect("deserialize");
+        assert_eq!(cap, back);
     }
 }

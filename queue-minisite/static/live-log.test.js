@@ -81,6 +81,11 @@ const initialHTML = `<!doctype html>
       <summary><span id="log-modal-return-label"></span></summary>
       <pre id="log-modal-return-body"></pre>
     </details>
+    <details id="log-modal-script-capture" hidden>
+      <summary><span id="log-modal-script-capture-label"></span></summary>
+      <div id="log-modal-script-capture-header"></div>
+      <pre id="log-modal-script-capture-body"></pre>
+    </details>
   </div>
 </body></html>`;
 
@@ -887,6 +892,112 @@ console.log('\nruntime ticker — template element IDs present');
     liveLogSrc.includes('startRuntimeTicker'));
   assert('live-log.js exposes RUNTIME_TICK_MS',
     liveLogSrc.includes('RUNTIME_TICK_MS'));
+}
+
+// Script-capture rendering — exercises applyScriptCapture() directly
+// via the __liveLog hook so we cover the three cases (hidden when
+// null, body+header on text capture, "binary content" placeholder
+// when binary). The corresponding template + sidecar wiring is
+// covered server-side in test_meta.py.
+console.log('\napplyScriptCapture — text capture');
+{
+  const { applyScriptCapture } = window.__liveLog;
+  const details = window.document.getElementById('log-modal-script-capture');
+  const header = window.document.getElementById('log-modal-script-capture-header');
+  const body = window.document.getElementById('log-modal-script-capture-body');
+
+  // Reset
+  details.hidden = true;
+  header.textContent = '';
+  body.textContent = '';
+
+  applyScriptCapture({
+    path: '/tmp/foo.sh',
+    interpreter: 'bash',
+    size_bytes: 42,
+    truncated: false,
+    binary: false,
+    content: '#!/bin/bash\necho hi\n',
+    sha256: 'abc123def4567890',
+  });
+
+  assert('text capture: section unhidden', details.hidden === false);
+  assert('text capture: header has interpreter + path',
+    header.textContent.includes('bash') && header.textContent.includes('/tmp/foo.sh'),
+    'got: ' + header.textContent);
+  assert('text capture: header has sha256 prefix',
+    header.textContent.includes('sha256 abc123def456'),
+    'got: ' + header.textContent);
+  assert('text capture: body has script content',
+    body.textContent === '#!/bin/bash\necho hi\n',
+    'got: ' + body.textContent);
+  assert('text capture: default-collapsed',
+    details.open === false);
+}
+
+console.log('\napplyScriptCapture — null payload hides section');
+{
+  const { applyScriptCapture } = window.__liveLog;
+  const details = window.document.getElementById('log-modal-script-capture');
+  const header = window.document.getElementById('log-modal-script-capture-header');
+  const body = window.document.getElementById('log-modal-script-capture-body');
+
+  // Pre-populate to simulate a stale prior render — applyScriptCapture
+  // must clear it.
+  details.hidden = false;
+  header.textContent = 'stale';
+  body.textContent = 'stale';
+
+  applyScriptCapture(null);
+
+  assert('null capture: section hidden', details.hidden === true);
+  assert('null capture: header cleared', header.textContent === '');
+  assert('null capture: body cleared', body.textContent === '');
+}
+
+console.log('\napplyScriptCapture — binary content shows placeholder');
+{
+  const { applyScriptCapture } = window.__liveLog;
+  const details = window.document.getElementById('log-modal-script-capture');
+  const body = window.document.getElementById('log-modal-script-capture-body');
+
+  details.hidden = true;
+  body.textContent = '';
+
+  applyScriptCapture({
+    path: '/tmp/blob',
+    interpreter: 'bash',
+    size_bytes: 1024,
+    truncated: false,
+    binary: true,
+    content: null,
+    sha256: 'deadbeefcafe1234',
+  });
+
+  assert('binary capture: section unhidden', details.hidden === false);
+  assert('binary capture: body is placeholder',
+    body.textContent.includes('binary content'),
+    'got: ' + body.textContent);
+}
+
+console.log('\napplyScriptCapture — truncated annotation');
+{
+  const { applyScriptCapture } = window.__liveLog;
+  const header = window.document.getElementById('log-modal-script-capture-header');
+
+  applyScriptCapture({
+    path: '/tmp/big.sh',
+    interpreter: 'bash',
+    size_bytes: 2 * 1024 * 1024,
+    truncated: true,
+    binary: false,
+    content: 'a'.repeat(100),
+    sha256: '0123456789abcdef',
+  });
+
+  assert('truncated capture: header notes truncation',
+    header.innerHTML.includes('truncated to 1 MiB'),
+    'got: ' + header.innerHTML);
 }
 
 console.log('\n--------------------------------------------------------------');

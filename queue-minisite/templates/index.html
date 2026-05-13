@@ -597,6 +597,21 @@
           <summary class="prompt-summary"><span id="log-modal-return-label">Agent return value</span></summary>
           <pre class="prompt-body" id="log-modal-return-body"></pre>
         </details>
+        {# Captured script contents — populated for workload-bound items
+           whose command was `<interpreter> <path>` (bash/python/node/
+           ruby/perl/...). Capture happens at workload START so a later
+           edit/delete of the script doesn't strand the modal viewer.
+           Defaults to COLLAPSED — most users only need this when
+           debugging a misbehaving workload. The small header line
+           above the body shows the captured path + SHA256 + size so
+           the viewer can verify identity. Hidden when no capture is
+           stored (older workloads, non-script commands, capture refused
+           for safety). #}
+        <details class="prompt-toggle log-modal-script-capture" id="log-modal-script-capture" hidden>
+          <summary class="prompt-summary"><span id="log-modal-script-capture-label">Script contents</span></summary>
+          <div class="prompt-body" id="log-modal-script-capture-header"></div>
+          <pre class="prompt-body" id="log-modal-script-capture-body"></pre>
+        </details>
       </section>
       {# Collapsible Prompt section — populated by live-log.js from the
          row's data-queue-description attribute. Click summary to

@@ -72,6 +72,16 @@
   const returnDetailsEl = document.getElementById('log-modal-return');
   const returnLabelEl = document.getElementById('log-modal-return-label');
   const returnBodyEl = document.getElementById('log-modal-return-body');
+  // Captured-script disclosure block. Populated from
+  // /api/queue/<id>/meta when the workload-bound queue item carries a
+  // script_capture sidecar on disk. Default-collapsed (most users only
+  // expand it when debugging) and hidden entirely when no capture is
+  // present. Header line shows path / size / sha256; body is the
+  // script content (truncated to 1 MiB on the server side).
+  const scriptCaptureDetailsEl = document.getElementById('log-modal-script-capture');
+  const scriptCaptureLabelEl = document.getElementById('log-modal-script-capture-label');
+  const scriptCaptureHeaderEl = document.getElementById('log-modal-script-capture-header');
+  const scriptCaptureBodyEl = document.getElementById('log-modal-script-capture-body');
   // Collapse/expand wrapper around the 10 metadata rows. Default state
   // is viewer-controlled (persisted in localStorage); first-visit
   // fallback is collapsed on mobile, expanded otherwise. See
@@ -352,6 +362,18 @@
       returnDetailsEl.open = true;
     }
     if (returnBodyEl) returnBodyEl.textContent = '';
+    // Tear down the captured-script block so a slow meta fetch on the
+    // next open doesn't show stale content from the previous modal.
+    if (scriptCaptureDetailsEl) {
+      scriptCaptureDetailsEl.hidden = true;
+      scriptCaptureDetailsEl.open = false;
+    }
+    if (scriptCaptureHeaderEl) {
+      scriptCaptureHeaderEl.textContent = '';
+      scriptCaptureHeaderEl.innerHTML = '';
+    }
+    if (scriptCaptureBodyEl) scriptCaptureBodyEl.textContent = '';
+    if (scriptCaptureLabelEl) scriptCaptureLabelEl.textContent = 'Script contents';
     setMetaToggleInitialState();
     // Tear down any prior runtime ticker — a stale interval from the
     // previous modal-open would otherwise keep updating #log-meta-runtime
@@ -496,7 +518,78 @@
     // abandon reason (only set when the item was abandoned).
     setMetaRow('abandon', meta.abandon_reason || '');
 
+    // Captured script contents — only present for workload-bound
+    // items whose command parsed as `<interpreter> <path>`. The
+    // backend serves a `null` payload (or omits the key for older
+    // server versions) when nothing was captured; we treat both as
+    // "hide the section". Body is rendered as plain text (esc()'d)
+    // into a <pre> so script content with HTML-looking tokens
+    // doesn't get interpreted.
+    applyScriptCapture(meta.script_capture);
+
     metaSummaryEl.hidden = false;
+  }
+
+  // Render the captured-script disclosure block from the meta payload.
+  // The capture object shape (from /api/queue/<id>/meta):
+  //
+  //   {
+  //     path: "/tmp/foo.sh",
+  //     interpreter: "bash",
+  //     size_bytes: 42,
+  //     truncated: false,
+  //     binary: false,
+  //     content: "#!/bin/bash\necho hi\n" | null,
+  //     sha256: "abc123...",
+  //   }
+  //
+  // When `binary` is true the server omits `content`; we keep the
+  // disclosure visible (so users can see WHAT ran) but render a
+  // "(binary content, body omitted)" placeholder in the body.
+  function applyScriptCapture(cap) {
+    if (!scriptCaptureDetailsEl || !scriptCaptureHeaderEl || !scriptCaptureBodyEl) return;
+    if (!cap || typeof cap !== 'object') {
+      scriptCaptureDetailsEl.hidden = true;
+      scriptCaptureHeaderEl.textContent = '';
+      scriptCaptureBodyEl.textContent = '';
+      return;
+    }
+    // Small header line: "<interpreter> <path> · <size> bytes · sha256
+    // <12-char prefix>". Keeps the body uncluttered while still giving
+    // the viewer enough to verify identity / compare against an
+    // on-disk copy.
+    const headerParts = [];
+    const interp = typeof cap.interpreter === 'string' ? cap.interpreter : '';
+    const p = typeof cap.path === 'string' ? cap.path : '';
+    if (interp || p) headerParts.push(esc(interp + ' ' + p).trim());
+    if (typeof cap.size_bytes === 'number') {
+      headerParts.push(cap.size_bytes.toLocaleString() + ' bytes');
+    }
+    if (typeof cap.sha256 === 'string' && cap.sha256.length >= 12) {
+      headerParts.push('sha256 ' + esc(cap.sha256.slice(0, 12)) + '…');
+    }
+    if (cap.truncated) {
+      headerParts.push('<strong>(truncated to 1 MiB)</strong>');
+    }
+    if (cap.binary) {
+      headerParts.push('<strong>(binary)</strong>');
+    }
+    scriptCaptureHeaderEl.innerHTML = headerParts.join(' · ');
+
+    if (cap.binary || cap.content === null || cap.content === undefined) {
+      scriptCaptureBodyEl.textContent =
+        '(binary content — body omitted; ' +
+        (typeof cap.size_bytes === 'number' ? cap.size_bytes : '?') +
+        ' bytes total)';
+    } else {
+      // Plain text — esc by way of textContent (avoids any HTML
+      // interpretation, no need to call esc() manually here).
+      scriptCaptureBodyEl.textContent = String(cap.content);
+    }
+    scriptCaptureDetailsEl.hidden = false;
+    // Stay collapsed by default — most viewers don't need to see the
+    // script body unless they're debugging.
+    scriptCaptureDetailsEl.open = false;
   }
 
   // Fire the meta fetch in the background — we don't block the
@@ -1750,5 +1843,9 @@
     getRuntimeTickerActive: () => runtimeTickerTimer !== null,
     getRuntimeStartedMs: () => runtimeStartedMs,
     stopRuntimeTicker,
+    // Script-capture render hook — exposed so a jsdom test can drive
+    // applyScriptCapture() with a capture payload and assert the
+    // <details> section toggles + body renders correctly.
+    applyScriptCapture,
   };
 })();

@@ -143,7 +143,9 @@ class MetaEndpointTest(unittest.TestCase):
         os.environ["AGENT_STATE_JSON"] = str(Path(cls.tmp) / "no-agents.json")
         os.environ["AGENTS_JSONL_ROOT"] = str(cls.jsonl_root)
         os.environ["QUEUE_LOG_ARCHIVE_DIR"] = str(cls.archive_dir)
-        os.environ["WORKLOAD_LOG_DIR"] = str(Path(cls.tmp) / "no-workloads")
+        cls.workload_dir = Path(cls.tmp) / "workloads"
+        cls.workload_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["WORKLOAD_LOG_DIR"] = str(cls.workload_dir)
         os.environ["SESSION_TASK_BIN"] = str(SESSION_TASK)
 
         sys.path.insert(0, str(HERE))
@@ -167,6 +169,10 @@ class MetaEndpointTest(unittest.TestCase):
                     p.unlink()
         if self.jsonl_root.exists():
             for p in self.jsonl_root.iterdir():
+                if p.is_file():
+                    p.unlink()
+        if self.workload_dir.exists():
+            for p in self.workload_dir.iterdir():
                 if p.is_file():
                     p.unlink()
         self.appmod._cache.fetched_at = 0.0
@@ -290,6 +296,91 @@ class MetaEndpointTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         p = r.get_json()
         self.assertIn(b["id"], p["dependents"])
+
+    # ---------- script_capture surfaced from workload sidecar ----------
+
+    def test_script_capture_surfaced_for_workload_item(self):
+        # Workload-bound queue items carry a `workload:<label>` scope.
+        # When the workload-run CLI captures a script at start time it
+        # writes /tmp/claude-workloads/<label>.script.json; the meta
+        # endpoint loads that file and includes it as `script_capture`.
+        item = _add(
+            self.env,
+            self.queue_actual,
+            "wl fixture",
+            ["workload:test-wl-1"],
+        )
+        qid = item["id"]
+
+        capture = {
+            "path": "/tmp/foo.sh",
+            "interpreter": "bash",
+            "size_bytes": 42,
+            "truncated": False,
+            "binary": False,
+            "content": "#!/bin/bash\necho hi\n",
+            "sha256": "abc123def",
+        }
+        (self.workload_dir / "test-wl-1.script.json").write_text(json.dumps(capture))
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertEqual(p["workload_label"], "test-wl-1")
+        self.assertIsNotNone(p["script_capture"])
+        self.assertEqual(p["script_capture"]["interpreter"], "bash")
+        self.assertEqual(p["script_capture"]["path"], "/tmp/foo.sh")
+        self.assertEqual(p["script_capture"]["content"], "#!/bin/bash\necho hi\n")
+
+    def test_script_capture_null_when_sidecar_missing(self):
+        # Workload item with no .script.json on disk (older workloads,
+        # non-script invocations, capture refused for safety). The
+        # meta payload still has the key, set to None.
+        item = _add(
+            self.env,
+            self.queue_actual,
+            "wl no-capture",
+            ["workload:test-wl-2"],
+        )
+        qid = item["id"]
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertEqual(p["workload_label"], "test-wl-2")
+        self.assertIsNone(p["script_capture"])
+
+    def test_script_capture_null_for_non_workload_item(self):
+        # No `workload:` scope token → the loader is never invoked.
+        item = _add(self.env, self.queue_actual, "plain item", ["repo:test"])
+        qid = item["id"]
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertEqual(p["workload_label"], "")
+        self.assertIsNone(p["script_capture"])
+
+    def test_script_capture_rejects_malformed_sidecar(self):
+        # A garbage file at the sidecar path should fail-soft to None,
+        # not crash the endpoint.
+        item = _add(
+            self.env,
+            self.queue_actual,
+            "wl malformed",
+            ["workload:test-wl-3"],
+        )
+        qid = item["id"]
+        (self.workload_dir / "test-wl-3.script.json").write_text("{not valid json")
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertIsNone(p["script_capture"])
 
 
 if __name__ == "__main__":

@@ -644,6 +644,52 @@ def _extract_workload_label(scope: list[Any]) -> str:
     return ""
 
 
+def _load_workload_script_capture(label: str) -> dict[str, Any] | None:
+    """Return the workload's captured script content, or ``None``.
+
+    The ``workload run`` CLI writes
+    ``/tmp/claude-workloads/<label>.script.json`` at workload-START time
+    when the command parses as ``<interpreter> <path>`` for a known
+    scripting interpreter (bash/sh/python/ruby/node/perl/...). Capture-
+    at-start is robust against later edits / deletes of the underlying
+    script — the modal would otherwise show stale or empty content.
+
+    Returns the parsed JSON dict, or ``None`` when:
+
+      * the label fails the label-regex (path-traversal guard)
+      * the sidecar file doesn't exist (older workloads, non-script
+        commands, capture was refused for safety)
+      * the file can't be parsed as JSON
+      * the parsed shape isn't the expected dict
+
+    Fail-soft — any error path returns ``None`` so the modal falls back
+    to its existing behaviour (no "Script contents" row).
+    """
+    if not _WORKLOAD_LABEL_RE.match(label):
+        return None
+    path = Path(WORKLOAD_LOG_DIR) / f"{label}.script.json"
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # Defensive shape check — we don't want a malformed sidecar to
+    # crash the meta endpoint or the frontend. Only require the
+    # always-present fields; optional/nullable fields are passed
+    # through as-is.
+    if not isinstance(data.get("path"), str):
+        return None
+    if not isinstance(data.get("interpreter"), str):
+        return None
+    if not isinstance(data.get("sha256"), str):
+        return None
+    return data
+
+
 def _render_payload() -> dict[str, Any]:
     data, err = _cached_queue()
     items = data.get("items", []) if isinstance(data, dict) else []
@@ -2514,6 +2560,17 @@ def api_queue_meta(qid: str) -> Any:
                 if completion is not None:
                     agent_info.update(completion)
 
+    # Captured script content for workload-bound items, when the
+    # workload command parsed as `<interpreter> <path>` and the
+    # `workload run` CLI was able to snapshot the script at start
+    # time. Items without a workload label, items whose command
+    # didn't match the interpreter pattern, and pre-feature workloads
+    # all yield None — the front-end omits the section entirely in
+    # that case.
+    script_capture: dict[str, Any] | None = None
+    if shaped["workload_label"]:
+        script_capture = _load_workload_script_capture(shaped["workload_label"])
+
     payload: dict[str, Any] = {
         "ok": True,
         "id": shaped["id"],
@@ -2541,6 +2598,7 @@ def api_queue_meta(qid: str) -> Any:
         "age_label": shaped["age_label"],
         "runtime_seconds": runtime_seconds,
         "agent": agent_info,
+        "script_capture": script_capture,
     }
     if shaped.get("owner") is not None:
         payload["owner"] = shaped["owner"]

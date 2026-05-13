@@ -17,6 +17,7 @@ regex-lite = "0.1"
 clap = { version = "4", features = ["derive"] }
 notify = "7"
 libc = "0.2"
+sha2 = "0.10"
 
 [dev-dependencies]
 filetime = "0.2"
