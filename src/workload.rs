@@ -962,15 +962,23 @@ pub fn cmd_kill(label: &str) -> i32 {
         if !already_exited {
             // Synthesise the exit marker so subsequent `workload wait`
             // calls return cleanly with the kill code, and emit the
-            // claude-event before tearing down the pane.
+            // claude-event before tearing down the pane. We route this
+            // through `cmd_emit_done` — NOT a bare `emit_workload_done` —
+            // so a queue-bound workload also gets its queue item
+            // transitioned to `abandoned` here. The wrapper would
+            // normally do that itself on natural exit, but `cmd_kill`
+            // SIGKILLs the wrapper before its `emit-done` step runs, so
+            // without this the queue item gets stranded in `running`
+            // forever (Andrew DM 2026-05-13: rc=-15 event arrived but
+            // the queue UI still showed `running`).
             let _ = fs::write(&exit_path, "-15\n");
-            emit_workload_done(&WorkloadDoneEvent {
+            cmd_emit_done(
                 label,
-                exit_code: -15,
-                killed: true,
-                log_path: &info.output,
-                queue_id: info.queue_id.as_deref(),
-            });
+                -15,
+                &info.output,
+                true,
+                info.queue_id.as_deref(),
+            );
         }
         kill_pane_tree(&info.pane_id);
         let _ = Command::new("tmux")

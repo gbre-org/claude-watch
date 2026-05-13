@@ -2737,6 +2737,18 @@ def cmd_queue_abandon(args):
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             sys.exit(1)
+        # Idempotent on already-terminal items. Mirrors `cmd_queue_done`'s
+        # `already done` early-return so callers that race (e.g. workload
+        # kill -> cmd_emit_done both fire abandon for the same qid because
+        # the wrapper raced to .exit) don't get a duplicate
+        # `queue-abandoned` claude-event, duplicate pingme, or a clobbered
+        # `abandoned_at` timestamp + `abandon_reason`. Same exit code as
+        # `cmd_queue_done` (0) so the caller treats it as success.
+        if target["status"] in ("done", "abandoned"):
+            print(f"already {target['status']}: {args.id}")
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            return
         started_at = target.get("started_at")
         target["status"] = "abandoned"
         target["abandoned_at"] = _fmt_ts()

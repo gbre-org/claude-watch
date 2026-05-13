@@ -361,6 +361,120 @@ def test_env_var_suppresses_claude_event():
 
 
 # ---------------------------------------------------------------------------
+# 7. Idempotent terminal transitions
+#
+# A workload that was killed via `workload kill` triggers an abandon
+# transition from claude-watch even if the wrapper script also raced
+# ahead and ran its own `emit-done` transition. The second abandon must
+# be a no-op: same stored `abandoned_at`, same `abandon_reason`, no
+# duplicate `queue-abandoned` claude-event, no duplicate pingme. Same
+# guarantee applies to `queue done`. Andrew DM 2026-05-13.
+# ---------------------------------------------------------------------------
+
+
+def test_abandon_is_idempotent_on_already_abandoned():
+    """Second `queue abandon` on an already-abandoned item is a no-op.
+
+    Without this, a workload-kill race that fires two abandon calls
+    would (a) clobber `abandoned_at` and `abandon_reason` with the
+    later call's values, and (b) emit a duplicate `queue-abandoned`
+    claude-event that the main loop would handle twice.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_dir = Path(tmp) / "bin"
+        ev_log = Path(tmp) / "claude-event.log"
+        _install_fake_claude_event(bin_dir, ev_log)
+        _install_fake_pingme(bin_dir)
+        env = _env_for_tmp(tmp, bin_dir=bin_dir)
+
+        r1 = _add(env, "abandon-idem", ["repo:ce-aidem"], "--summary",
+                  "abandon idempotency")
+        d1 = json.loads(r1.stdout)
+        _run(env, "queue", "register", d1["id"], "--json", check=True)
+
+        _run(env, "queue", "abandon", d1["id"], "--reason", "first reason",
+             check=True)
+
+        # Snapshot persisted state after first abandon so we can verify
+        # the second call doesn't mutate it.
+        r_show1 = _run(env, "queue", "show", d1["id"], check=True)
+        item_after_first = json.loads(r_show1.stdout)
+        first_at = item_after_first["abandoned_at"]
+        first_reason = item_after_first.get("abandon_reason")
+        assert item_after_first["status"] == "abandoned"
+        assert first_reason == "first reason"
+
+        # Second abandon — different reason, must NOT clobber state.
+        r2 = _run(env, "queue", "abandon", d1["id"], "--reason",
+                  "second reason (should be ignored)")
+        assert r2.returncode == 0, (
+            f"second abandon should exit 0; got rc={r2.returncode}\n"
+            f"stdout={r2.stdout}\nstderr={r2.stderr}"
+        )
+        assert "already abandoned" in r2.stdout, r2.stdout
+
+        r_show2 = _run(env, "queue", "show", d1["id"], check=True)
+        item_after_second = json.loads(r_show2.stdout)
+        assert item_after_second["abandoned_at"] == first_at, (
+            "abandoned_at must NOT be overwritten by repeat abandon"
+        )
+        assert item_after_second.get("abandon_reason") == first_reason, (
+            "abandon_reason must NOT be overwritten by repeat abandon"
+        )
+
+        # claude-event log: register + first abandon only. The repeat
+        # abandon must not emit a duplicate `queue-abandoned`.
+        calls = _read_shim_log(ev_log)
+        tags = [
+            _parse_claude_event_argv(c).get("tag") for c in calls
+        ]
+        assert tags == ["queue-running", "queue-abandoned"], (
+            f"expected exactly one queue-abandoned emit, got tags={tags}"
+        )
+
+
+def test_abandon_is_idempotent_after_done():
+    """`queue abandon` on a done item must not flip status or re-emit.
+
+    Asymmetric race: the wrapper completes naturally (transitions to
+    `done`), then `workload kill` arrives anyway (slow tmux teardown)
+    and tries to `abandon`. The done status must be preserved and no
+    duplicate event fires.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_dir = Path(tmp) / "bin"
+        ev_log = Path(tmp) / "claude-event.log"
+        _install_fake_claude_event(bin_dir, ev_log)
+        _install_fake_pingme(bin_dir)
+        env = _env_for_tmp(tmp, bin_dir=bin_dir)
+
+        r1 = _add(env, "done-then-abandon", ["repo:ce-dta"], "--summary",
+                  "done then abandon")
+        d1 = json.loads(r1.stdout)
+        _run(env, "queue", "register", d1["id"], "--json", check=True)
+        _run(env, "queue", "done", d1["id"], check=True)
+
+        # Now try to abandon — should be a no-op.
+        r2 = _run(env, "queue", "abandon", d1["id"], "--reason", "late kill")
+        assert r2.returncode == 0
+        assert "already done" in r2.stdout, r2.stdout
+
+        r_show = _run(env, "queue", "show", d1["id"], check=True)
+        item = json.loads(r_show.stdout)
+        assert item["status"] == "done", item
+        assert item.get("abandon_reason") is None, item
+        assert item.get("abandoned_at") is None, item
+
+        calls = _read_shim_log(ev_log)
+        tags = [
+            _parse_claude_event_argv(c).get("tag") for c in calls
+        ]
+        assert tags == ["queue-running", "queue-done"], (
+            f"abandon-on-done should not emit; tags={tags}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Entry point for direct invocation
 # ---------------------------------------------------------------------------
 
@@ -373,6 +487,8 @@ def _all_tests():
         test_abandon_emits_queue_abandoned_event,
         test_failing_claude_event_does_not_block_queue_op,
         test_env_var_suppresses_claude_event,
+        test_abandon_is_idempotent_on_already_abandoned,
+        test_abandon_is_idempotent_after_done,
     ]
 
 
