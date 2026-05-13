@@ -43,12 +43,22 @@ if not SCRIPT.exists():
     sys.exit(2)
 
 
-def run_script(env: dict, args: list[str] | None = None) -> list[str]:
+def run_script(
+    env: dict,
+    args: list[str] | None = None,
+    suppress_warnings: bool = True,
+    return_stderr: bool = False,
+) -> list[str] | tuple[list[str], str]:
     """Run claude-tmux --print-docker-args with the given env.
 
     Returns the printed argv as a list of strings (one element per
     line of stdout). The script always prints to stdout under
     --print-docker-args.
+
+    By default, `--suppress-warnings` is passed so the fail-loud
+    set-but-missing path warnings don't leak into the captured stderr
+    of unrelated tests. Tests that EXERCISE the warning path pass
+    `suppress_warnings=False` and `return_stderr=True`.
     """
     if args is None:
         args = []
@@ -65,8 +75,16 @@ def run_script(env: dict, args: list[str] | None = None) -> list[str]:
         "PWD": env.pop("PWD", "/tmp/fake-workspace"),
     }
     base_env.update(env)
+    # Arg order matters: --suppress-warnings has to come BEFORE
+    # --print-docker-args so the script's left-to-right shift sequence
+    # consumes it correctly (see top-of-script flag handlers).
+    cli_args: list[str] = []
+    if suppress_warnings:
+        cli_args.append("--suppress-warnings")
+    cli_args.append("--print-docker-args")
+    cli_args.extend(args)
     result = subprocess.run(
-        [str(SCRIPT), "--print-docker-args", *args],
+        [str(SCRIPT), *cli_args],
         env=base_env,
         capture_output=True,
         text=True,
@@ -78,7 +96,10 @@ def run_script(env: dict, args: list[str] | None = None) -> list[str]:
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
         )
-    return result.stdout.splitlines()
+    stdout_lines = result.stdout.splitlines()
+    if return_stderr:
+        return stdout_lines, result.stderr
+    return stdout_lines
 
 
 def find_env_arg(argv: list[str], name: str) -> str | None:
@@ -268,6 +289,93 @@ def test_combined_corp_setup() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fail-loud warning tests (set-but-missing path → stderr WARNING).
+# ---------------------------------------------------------------------------
+
+
+def test_warning_fires_for_missing_node_extra_ca_certs() -> None:
+    """NODE_EXTRA_CA_CERTS set to a missing file => stderr WARNING."""
+    bogus = "/this/path/does/not/exist.pem"
+    _, stderr = run_script(
+        {"NODE_EXTRA_CA_CERTS": bogus},
+        suppress_warnings=False,
+        return_stderr=True,
+    )
+    expect("WARNING" in stderr,
+           f"missing-CA: expected WARNING in stderr, got:\n{stderr}")
+    expect("NODE_EXTRA_CA_CERTS" in stderr,
+           f"missing-CA: stderr should name the offending var:\n{stderr}")
+    expect(bogus in stderr,
+           f"missing-CA: stderr should include the bad path:\n{stderr}")
+    expect("system CA" in stderr,
+           f"missing-CA: stderr should explain the silent-fallback failure mode:\n{stderr}")
+
+
+def test_warning_fires_for_each_missing_ca_var() -> None:
+    """Each of the four CA env vars triggers its own WARNING when missing."""
+    bogus = "/this/path/does/not/exist.pem"
+    for var in (
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+    ):
+        _, stderr = run_script(
+            {var: bogus},
+            suppress_warnings=False,
+            return_stderr=True,
+        )
+        expect(var in stderr,
+               f"missing-CA per-var: stderr should name ${var}:\n{stderr}")
+        expect("WARNING" in stderr,
+               f"missing-CA per-var: WARNING missing for ${var}:\n{stderr}")
+
+
+def test_warning_fires_for_missing_hooks_dir() -> None:
+    """CLAUDE_HOST_HOOKS_DIR set to a missing dir => stderr WARNING."""
+    bogus = "/this/host/hooks/dir/does/not/exist"
+    _, stderr = run_script(
+        {"CLAUDE_HOST_HOOKS_DIR": bogus},
+        suppress_warnings=False,
+        return_stderr=True,
+    )
+    expect("WARNING" in stderr,
+           f"missing-hooks-dir: expected WARNING in stderr:\n{stderr}")
+    expect("CLAUDE_HOST_HOOKS_DIR" in stderr,
+           f"missing-hooks-dir: stderr should name the var:\n{stderr}")
+    expect(bogus in stderr,
+           f"missing-hooks-dir: stderr should include the bad path:\n{stderr}")
+
+
+def test_no_warning_for_valid_paths() -> None:
+    """Valid CA file + valid hooks dir => NO warnings."""
+    with tempfile.NamedTemporaryFile(prefix="ca-", suffix=".pem") as f, \
+         tempfile.TemporaryDirectory(prefix="devbar-bin-") as hooks:
+        _, stderr = run_script(
+            {
+                "NODE_EXTRA_CA_CERTS": f.name,
+                "CLAUDE_HOST_HOOKS_DIR": hooks,
+            },
+            suppress_warnings=False,
+            return_stderr=True,
+        )
+        expect("WARNING" not in stderr,
+               f"valid-paths: stderr should be clean, got:\n{stderr}")
+
+
+def test_suppress_warnings_silences_stderr() -> None:
+    """--suppress-warnings hides the set-but-missing warning."""
+    bogus = "/this/path/does/not/exist.pem"
+    _, stderr = run_script(
+        {"NODE_EXTRA_CA_CERTS": bogus},
+        suppress_warnings=True,
+        return_stderr=True,
+    )
+    expect("WARNING" not in stderr,
+           f"--suppress-warnings: stderr should be empty, got:\n{stderr}")
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -284,6 +392,11 @@ TESTS = [
     test_claude_host_hooks_dir_missing,
     test_claude_wildcard_still_forwarded,
     test_combined_corp_setup,
+    test_warning_fires_for_missing_node_extra_ca_certs,
+    test_warning_fires_for_each_missing_ca_var,
+    test_warning_fires_for_missing_hooks_dir,
+    test_no_warning_for_valid_paths,
+    test_suppress_warnings_silences_stderr,
 ]
 
 for t in TESTS:

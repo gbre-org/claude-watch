@@ -151,6 +151,32 @@ RUN chmod 0644 /etc/profile.d/claude-tools.sh \
     && chown root:root /etc/profile.d/claude-tools.sh \
     && printf '\n# Pull in claude-watch bind-mounted CLI dirs for non-login shells.\nif [ -r /etc/profile.d/claude-tools.sh ]; then\n    . /etc/profile.d/claude-tools.sh\nfi\n' >> /etc/bash.bashrc
 
+# exec-hook — settings.json hook safe-exec wrapper.
+#
+# When a user runs Claude Code inside this container with a host
+# ~/.claude/settings.json that references hook binaries built for a
+# different architecture (e.g. a Mac telemetry hook bind-mounted into a
+# Linux container), Linux's exec() bounces them with "Exec format error"
+# and Claude Code logs the failure on EVERY hook event. This shim
+# inspects the target binary's magic bytes; ELF binaries are exec'd
+# transparently, Mach-O / unknown formats no-op silently with a single
+# stderr heads-up per target per container lifetime.
+#
+# Wiring: installed at /usr/local/lib/claude-hooks-shim/exec-hook AND
+# /usr/local/bin/exec-hook (symlink) so settings.json hook entries can
+# reference it as a bare command. The entrypoint also prepends the lib
+# dir to PATH for completeness. PATH manipulation is the wiring choice
+# here (over a build-time settings.json patch) because settings.json
+# travels with the operator's host config — mutating it from inside the
+# container would surprise the host. The shim is opt-in: the operator
+# decides per hook whether to wrap their command in `exec-hook ...`.
+#
+# See container/hooks-shim/exec-hook for the full magic-byte table,
+# dedup mechanism, and the future-scope IPC-forwarder TODO.
+COPY hooks-shim/exec-hook /usr/local/lib/claude-hooks-shim/exec-hook
+RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
+    && ln -s /usr/local/lib/claude-hooks-shim/exec-hook /usr/local/bin/exec-hook
+
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
 # "Quick safety check" trust dialog. Invoked by entrypoint.sh before tmux

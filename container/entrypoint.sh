@@ -65,6 +65,20 @@ if [ -r /etc/profile.d/claude-tools.sh ]; then
     . /etc/profile.d/claude-tools.sh
 fi
 
+# Prepend the hooks-shim dir to PATH so bare `exec-hook ...` resolves to
+# the safe-exec wrapper without depending on /usr/local/bin's relative
+# position. Operators reference the shim from ~/.claude/settings.json
+# hook entries (see /usr/local/lib/claude-hooks-shim/exec-hook header
+# for the why + usage). PATH manipulation here (rather than mutating
+# settings.json at build time) keeps the host-side config untouched —
+# settings.json travels with the operator's host install. The shim is a
+# strict wrapper: ELF targets pass through transparently, only non-ELF
+# formats no-op.
+case ":${PATH}:" in
+    *":/usr/local/lib/claude-hooks-shim:"*) ;;
+    *) export PATH="/usr/local/lib/claude-hooks-shim:${PATH}" ;;
+esac
+
 # Pre-trust the in-container workspace so Claude Code skips its first-launch
 # "Quick safety check: Is this a project you created or one you trust?"
 # prompt. The trust state lives at projects[<path>].hasTrustDialogAccepted

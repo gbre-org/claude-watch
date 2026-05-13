@@ -7,6 +7,10 @@
 # Usage:
 #   claude-tmux                 # launch the tmux session via image ENTRYPOINT
 #   claude-tmux bash            # debug shell inside the container
+#   claude-tmux verify          # post-up sanity check: forwarded env vars
+#                               # / mounts visible AND resolvable inside the
+#                               # running container. Pairs with `up -d` for
+#                               # operators to catch silent CA / hook misconfig.
 #   claude-tmux --help          # show usage and exit (no docker invoked)
 #
 # Env var overrides:
@@ -130,15 +134,50 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     exit 0
 fi
 
-# --print-docker-args (testing hook): build the docker invocation but emit
-# the argv (one-per-line, no docker actually run) instead of executing.
-# Used by container/bin/tests/claude-tmux-env.test to verify env / mount
-# forwarding without spinning up a container or requiring docker.
+# Flag parsing — order-independent: each flag is checked in a loop so the
+# caller can pass --print-docker-args / --suppress-warnings / verify in any
+# order. Each match consumes one argv element via `shift`.
 PRINT_DOCKER_ARGS=0
-if [ "${1:-}" = "--print-docker-args" ]; then
-    PRINT_DOCKER_ARGS=1
-    shift
-fi
+SUPPRESS_WARNINGS=0
+VERIFY_MODE=0
+while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+        --print-docker-args)
+            # Testing hook: build the docker invocation but emit the argv
+            # (one-per-line, no docker actually run) instead of executing.
+            # Used by container/bin/tests/claude-tmux-env.test to verify
+            # env / mount forwarding without spinning up a container or
+            # requiring docker.
+            PRINT_DOCKER_ARGS=1
+            shift
+            ;;
+        --suppress-warnings)
+            # Testing hook + escape valve: silence the set-but-missing CA
+            # / hooks-dir stderr warnings emitted later. Tests that pass
+            # /nonexistent/path values to exercise the *forwarding* logic
+            # (e.g. test_ssl_ca_missing_file_no_mount) set this so their
+            # stderr capture stays clean. Operators can also pass it on
+            # the command line if they prefer to ignore warnings they've
+            # already acknowledged.
+            SUPPRESS_WARNINGS=1
+            shift
+            ;;
+        verify)
+            # `verify` subcommand: post-up sanity check. Re-uses the same
+            # env-passthrough detection logic the wrapper uses for `docker
+            # run`, but instead of starting a fresh container it
+            # `docker exec`s into a running one to confirm every forwarded
+            # env var is visible AND every mount path resolves inside the
+            # container. Handled BELOW after we've parsed all env state.
+            VERIFY_MODE=1
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 
 # -----------------------------------------------------------------------------
 # Pick a docker invocation that works: bare first, sudo fallback.
@@ -293,6 +332,46 @@ if [ -n "${CLAUDE_HOST_HOOKS_DIR:-}" ] && [ -d "$CLAUDE_HOST_HOOKS_DIR" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# Fail-loud guard: set-but-missing paths.
+#
+# The forwarding logic above is forgiving by design — a CA env var that
+# points at a non-existent file is forwarded to the container anyway (the
+# value may be meaningful even without a host bind-mount, e.g. inside a
+# downstream image that bakes its own bundle at that path). But "forgiving"
+# is also a silent-bypass failure mode: if the operator's host env points
+# at a stale path, the container falls back to its baked system CA and
+# corporate TLS endpoints quietly fail validation. That's the exact bug
+# class motivating this warning.
+#
+# Policy: when one of the CA env vars OR CLAUDE_HOST_HOOKS_DIR is set but
+# the referenced path doesn't exist (file for CA vars, directory for the
+# hooks dir), emit a single explicit WARNING line per variable to stderr
+# before invoking docker. Suppressed under --suppress-warnings (tests +
+# explicit operator opt-out). Does NOT exit non-zero — silent fallback is
+# still possible if the operator chooses to ignore the warning, but at
+# least they've SEEN it.
+# -----------------------------------------------------------------------------
+
+warn() {
+    if [ "$SUPPRESS_WARNINGS" = "0" ]; then
+        printf 'claude-tmux: WARNING: %s\n' "$1" >&2
+    fi
+}
+
+for v in NODE_EXTRA_CA_CERTS SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE; do
+    val="${!v-}"
+    if [ -n "$val" ] && [ ! -f "$val" ]; then
+        warn "\$$v is set to '$val' on the host but the file does not exist."
+        warn "The container will silently use the system CA. To fix: either unset \$$v or correct the path."
+    fi
+done
+
+if [ -n "${CLAUDE_HOST_HOOKS_DIR:-}" ] && [ ! -d "$CLAUDE_HOST_HOOKS_DIR" ]; then
+    warn "\$CLAUDE_HOST_HOOKS_DIR is set to '$CLAUDE_HOST_HOOKS_DIR' on the host but no such directory exists."
+    warn "settings.json hook references pointing at that path will fail inside the container. To fix: either unset \$CLAUDE_HOST_HOOKS_DIR or correct the path."
+fi
+
+# -----------------------------------------------------------------------------
 # Signal handling — forward SIGTERM/SIGINT to the container so it can exit
 # cleanly. The trap fires the kill in the background; the main `docker run`
 # call then returns naturally with the container's exit code.
@@ -322,6 +401,118 @@ trap 'forward_signal INT' INT
 # on macOS/Windows; --add-host is harmless there and required on Linux.
 # -w /workspace: matches Dockerfile WORKDIR; explicit here for safety.
 # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# `claude-tmux verify` — post-up sanity check.
+#
+# Runs `docker compose exec` (or `docker exec`) against a running container
+# matching the image tag and asserts each forwarded env var is visible AND,
+# for the CA path / hooks-dir vars, that the referenced path resolves inside
+# the container. Exits non-zero if any check fails.
+#
+# Detection: scans `docker ps` for a container running CLAUDE_CONTAINER_IMAGE.
+# If multiple match, the operator can set CLAUDE_TMUX_CONTAINER to disambiguate.
+# -----------------------------------------------------------------------------
+
+if [ "$VERIFY_MODE" = "1" ]; then
+    # Pick the target container. Operator override wins; otherwise first
+    # match by image tag.
+    target="${CLAUDE_TMUX_CONTAINER:-}"
+    if [ -z "$target" ]; then
+        target="$("${DOCKER_CMD[@]}" ps --filter "ancestor=$IMAGE" --format '{{.ID}}' | head -n1)"
+    fi
+    if [ -z "$target" ]; then
+        cat >&2 <<EOF
+claude-tmux verify: no running container found for image '$IMAGE'.
+
+Start one with:
+  docker compose up -d
+
+Or specify a container id/name explicitly:
+  CLAUDE_TMUX_CONTAINER=<id-or-name> claude-tmux verify
+EOF
+        exit 1
+    fi
+
+    verify_failures=0
+    verify_checked=0
+
+    # Check that a single env var is set inside the container (printenv).
+    check_env_in_container() {
+        local name="$1"
+        local expected="$2"
+        verify_checked=$((verify_checked + 1))
+        local actual
+        actual="$("${DOCKER_CMD[@]}" exec "$target" printenv "$name" 2>/dev/null || true)"
+        if [ "$actual" != "$expected" ]; then
+            printf 'claude-tmux verify: FAIL  $%s inside container = "%s" (expected "%s")\n' \
+                "$name" "$actual" "$expected" >&2
+            verify_failures=$((verify_failures + 1))
+        else
+            printf 'claude-tmux verify: PASS  $%s = "%s"\n' "$name" "$actual"
+        fi
+    }
+
+    # Check that a path resolves inside the container.
+    check_path_in_container() {
+        local name="$1"
+        local path="$2"
+        local kind="$3"  # "file" or "dir"
+        verify_checked=$((verify_checked + 1))
+        local test_flag
+        case "$kind" in
+            file) test_flag="-f" ;;
+            dir)  test_flag="-d" ;;
+            *)    test_flag="-e" ;;
+        esac
+        if "${DOCKER_CMD[@]}" exec "$target" test "$test_flag" "$path" 2>/dev/null; then
+            printf 'claude-tmux verify: PASS  $%s path resolves inside container (%s)\n' \
+                "$name" "$path"
+        else
+            printf 'claude-tmux verify: FAIL  $%s path does NOT resolve inside container (%s)\n' \
+                "$name" "$path" >&2
+            verify_failures=$((verify_failures + 1))
+        fi
+    }
+
+    # Forwarded CA / proxy env vars: every var SET on the host should be
+    # visible inside the container with the same value. For path-valued
+    # ones, the path should also resolve inside.
+    for v in NODE_EXTRA_CA_CERTS SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE; do
+        val="${!v-}"
+        if [ -n "$val" ]; then
+            check_env_in_container "$v" "$val"
+            if [ -f "$val" ]; then
+                check_path_in_container "$v" "$val" file
+            fi
+        fi
+    done
+
+    for v in HTTPS_PROXY HTTP_PROXY NO_PROXY https_proxy http_proxy no_proxy; do
+        val="${!v-}"
+        if [ -n "$val" ]; then
+            check_env_in_container "$v" "$val"
+        fi
+    done
+
+    if [ -n "${CLAUDE_HOST_HOOKS_DIR:-}" ] && [ -d "$CLAUDE_HOST_HOOKS_DIR" ]; then
+        hooks_abs="$(cd "$CLAUDE_HOST_HOOKS_DIR" && pwd)"
+        check_path_in_container "CLAUDE_HOST_HOOKS_DIR" "$hooks_abs" dir
+    fi
+
+    if [ "$verify_checked" = "0" ]; then
+        echo "claude-tmux verify: no forwarded env / mount vars set on host — nothing to check." >&2
+        echo "  (Set NODE_EXTRA_CA_CERTS, HTTPS_PROXY, CLAUDE_HOST_HOOKS_DIR, etc. and re-run.)" >&2
+        exit 0
+    fi
+
+    if [ "$verify_failures" = "0" ]; then
+        printf '\nclaude-tmux verify: all %d check(s) passed.\n' "$verify_checked"
+        exit 0
+    fi
+    printf '\nclaude-tmux verify: %d of %d check(s) FAILED.\n' "$verify_failures" "$verify_checked" >&2
+    exit 1
+fi
 
 tty_flag=()
 if [ -t 0 ] && [ -t 1 ]; then

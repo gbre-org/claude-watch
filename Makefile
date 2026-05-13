@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -86,11 +86,18 @@ test-trust-workspace:
 	python3 container/bin/trust-workspace.py --test
 
 # Run the claude-tmux env / mount passthrough tests (corporate CA bundle
-# forwarding, proxy passthrough, host hooks-dir bind-mount). Exercises
-# the wrapper's --print-docker-args debug hook so no docker daemon is
-# needed. 12 cases, ~1s.
+# forwarding, proxy passthrough, host hooks-dir bind-mount, set-but-missing
+# path warnings). Exercises the wrapper's --print-docker-args debug hook so
+# no docker daemon is needed. 17 cases, ~1s.
 test-claude-tmux-env:
 	container/bin/tests/claude-tmux-env.test
+
+# Run the exec-hook shim tests (settings.json hook safe-exec wrapper for
+# cross-arch hooks — ELF passthrough, Mach-O / unknown / missing no-op,
+# dedup flag file). Runs directly on Linux against synthetic magic-byte
+# stubs; no container needed. 9 cases, ~1s.
+test-hooks-shim:
+	container/hooks-shim/tests/exec-hook.test
 
 # Release build
 build:

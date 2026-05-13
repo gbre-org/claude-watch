@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Tests for container/hooks-shim/exec-hook.
+
+Covers the magic-byte-based dispatch and the dedup flag-file behaviour.
+Runs directly on Linux (no container needed). Each case uses a tmpdir
+TMPDIR so the dedup state never leaks between cases.
+
+Coverage:
+  - ELF binary => exec'd transparently (stdout/exit forwarded).
+  - Mach-O binary => silent no-op, exit 0, ONE stderr line written.
+  - Shebang script => exec'd transparently.
+  - Missing target => silent no-op + heads-up, exit 0.
+  - Unknown format => silent no-op + heads-up, exit 0.
+  - Dedup: same target twice in same TMPDIR => only ONE stderr line.
+  - Empty argv => exits 2 with usage text.
+
+Run:  ./exec-hook.test
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "exec-hook"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate exec-hook at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+        print(f"  -> FAIL: {msg}")
+
+
+def run_shim(
+    target: str | None,
+    *args: str,
+    tmpdir: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run exec-hook against `target` with the given args.
+
+    Pass target=None to invoke with no argv (exercises the usage path).
+    """
+    env = os.environ.copy()
+    if tmpdir is not None:
+        env["TMPDIR"] = tmpdir
+    argv: list[str] = [str(SCRIPT)]
+    if target is not None:
+        argv.append(target)
+    argv.extend(args)
+    return subprocess.run(
+        argv,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def write_mach_o_stub(path: Path) -> None:
+    """Write a 16-byte Mach-O 64-bit magic stub. Just the magic bytes are
+    enough — the shim only inspects the first 4."""
+    # 0xFEEDFACF = Mach-O 64 little-endian magic, written as big-endian
+    # bytes (the on-disk order). The shim reads bytes left-to-right.
+    path.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 12)
+
+
+def write_elf_stub(path: Path) -> None:
+    """Write a 16-byte ELF magic stub. Same logic as the Mach-O stub —
+    only the leading 4 bytes are inspected."""
+    path.write_bytes(b"\x7fELF" + b"\x00" * 12)
+    path.chmod(0o755)
+
+
+def write_shebang(path: Path, body: str) -> None:
+    path.write_text(f"#!/usr/bin/env bash\n{body}\n")
+    path.chmod(0o755)
+
+
+def write_unknown(path: Path) -> None:
+    path.write_bytes(b"AAAA\x00\x00\x00\x00")
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+def test_elf_execs_transparently() -> None:
+    """ELF target -> shim exec's it; exit code + stdout match real exec."""
+    # We can't actually run a synthetic 16-byte ELF — it'd SIGSEGV. So
+    # use a real ELF binary that exists on every Linux host: /bin/true.
+    # (Verified ELF by `od -An -tx1 -N4 /bin/true`.)
+    with tempfile.TemporaryDirectory() as td:
+        r = run_shim("/bin/true", tmpdir=td)
+        expect(r.returncode == 0,
+               f"ELF /bin/true: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        expect(r.stderr == "",
+               f"ELF /bin/true: stderr should be empty, got:\n{r.stderr}")
+
+
+def test_elf_forwards_args_and_exit() -> None:
+    """ELF target receives forwarded args; non-zero exit propagates."""
+    with tempfile.TemporaryDirectory() as td:
+        # /bin/false ignores args and returns 1.
+        r = run_shim("/bin/false", "ignored-arg", tmpdir=td)
+        expect(r.returncode == 1,
+               f"/bin/false: expected exit 1, got {r.returncode}")
+
+
+def test_mach_o_silent_noop() -> None:
+    """Mach-O target -> exit 0, one stderr line, no exec."""
+    with tempfile.TemporaryDirectory() as td:
+        mach = Path(td) / "telemetry-hook"
+        write_mach_o_stub(mach)
+        r = run_shim(str(mach), tmpdir=td)
+        expect(r.returncode == 0,
+               f"Mach-O: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        expect("[hook-shim]" in r.stderr,
+               f"Mach-O: expected [hook-shim] heads-up, got:\n{r.stderr}")
+        expect("Mach-O" in r.stderr,
+               f"Mach-O: heads-up should label the format, got:\n{r.stderr}")
+        expect(str(mach) in r.stderr,
+               f"Mach-O: heads-up should name the target, got:\n{r.stderr}")
+
+
+def test_mach_o_dedup() -> None:
+    """Same Mach-O target hit twice in same TMPDIR -> ONE stderr line."""
+    with tempfile.TemporaryDirectory() as td:
+        mach = Path(td) / "telemetry-hook"
+        write_mach_o_stub(mach)
+        r1 = run_shim(str(mach), tmpdir=td)
+        r2 = run_shim(str(mach), tmpdir=td)
+        expect(r1.returncode == 0 and r2.returncode == 0,
+               f"dedup: both calls should exit 0; r1={r1.returncode} r2={r2.returncode}")
+        expect("[hook-shim]" in r1.stderr,
+               f"dedup: first call should emit heads-up, got:\n{r1.stderr}")
+        expect("[hook-shim]" not in r2.stderr,
+               f"dedup: second call should be silent, got:\n{r2.stderr}")
+
+
+def test_mach_o_dedup_per_target() -> None:
+    """Different Mach-O targets in same TMPDIR -> ONE heads-up EACH."""
+    with tempfile.TemporaryDirectory() as td:
+        m1 = Path(td) / "hook-one"
+        m2 = Path(td) / "hook-two"
+        write_mach_o_stub(m1)
+        write_mach_o_stub(m2)
+        run_shim(str(m1), tmpdir=td)  # primes dedup for m1
+        r = run_shim(str(m2), tmpdir=td)
+        expect("[hook-shim]" in r.stderr,
+               f"dedup-per-target: m2's first call should emit heads-up, got:\n{r.stderr}")
+        expect(str(m2) in r.stderr,
+               f"dedup-per-target: stderr should name m2, got:\n{r.stderr}")
+
+
+def test_shebang_script_exec() -> None:
+    """Shebang script -> exec'd transparently (no heads-up)."""
+    with tempfile.TemporaryDirectory() as td:
+        s = Path(td) / "hookscript"
+        write_shebang(s, 'echo "hook ran with $1"; exit 42')
+        r = run_shim(str(s), "arg1", tmpdir=td)
+        expect(r.returncode == 42,
+               f"shebang: expected exit 42, got {r.returncode}; stderr:\n{r.stderr}")
+        expect("hook ran with arg1" in r.stdout,
+               f"shebang: expected stdout 'hook ran with arg1', got:\n{r.stdout}")
+        expect("[hook-shim]" not in r.stderr,
+               f"shebang: no heads-up expected, got:\n{r.stderr}")
+
+
+def test_missing_target() -> None:
+    """Missing target -> exit 0, ONE heads-up labelled (missing)."""
+    with tempfile.TemporaryDirectory() as td:
+        r = run_shim("/this/file/does/not/exist", tmpdir=td)
+        expect(r.returncode == 0,
+               f"missing: expected exit 0, got {r.returncode}")
+        expect("missing" in r.stderr,
+               f"missing: stderr should label it (missing), got:\n{r.stderr}")
+
+
+def test_unknown_format_noop() -> None:
+    """Unknown magic bytes -> silent no-op, exit 0, ONE heads-up."""
+    with tempfile.TemporaryDirectory() as td:
+        u = Path(td) / "garbled"
+        write_unknown(u)
+        r = run_shim(str(u), tmpdir=td)
+        expect(r.returncode == 0,
+               f"unknown: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        expect("unknown format" in r.stderr,
+               f"unknown: heads-up should label it, got:\n{r.stderr}")
+
+
+def test_empty_argv_usage() -> None:
+    """No target -> exit 2 + usage text."""
+    r = run_shim(None)
+    expect(r.returncode == 2,
+           f"usage: expected exit 2, got {r.returncode}")
+    expect("Usage" in r.stderr,
+           f"usage: stderr should contain 'Usage', got:\n{r.stderr}")
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_elf_execs_transparently,
+    test_elf_forwards_args_and_exit,
+    test_mach_o_silent_noop,
+    test_mach_o_dedup,
+    test_mach_o_dedup_per_target,
+    test_shebang_script_exec,
+    test_missing_target,
+    test_unknown_format_noop,
+    test_empty_argv_usage,
+]
+
+for t in TESTS:
+    print(f"--- {t.__name__}")
+    try:
+        t()
+        if not failures:
+            print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")
