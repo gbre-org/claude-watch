@@ -83,11 +83,60 @@ behavior or claude-watch monitoring.
 | `~/bin` | `CLAUDE_HOST_BIN_DIR` | `/home/hndrewaall/bin` | `ro` | Launcher / shim scripts (mostly symlinks into `~/repos/*/bin`). Resolves correctly because `~/repos` is also mounted. |
 | `~/claude-events` | `CLAUDE_HOST_EVENTS_DIR` | `/home/hndrewaall/claude-events` | `rw` | claude-event JSONL spool. Host producers write, in-container `claude-event-watch` consumes. |
 | `~/.config/session` | _(not overridable; shared with queue-minisite)_ | `/home/hndrewaall/.config/session` | `rw` | session-task queue.json (same path the queue-minisite mounts). |
+| `/dev/null` _(default; corp-CA bundle on VPN)_ | `CLAUDE_HOST_CORP_CA_BUNDLE` | _(same path as source)_ | `ro` | Corporate-CA bundle for operators behind a TLS MITM proxy. The forwarded `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` env vars carry an ABSOLUTE host path; this mount makes that path resolve INSIDE the container. Set to the same value as `NODE_EXTRA_CA_CERTS`. Default `/dev/null` is a no-op for non-corp setups. |
+| `/dev/null` _(default; host hook-script dir)_ | `CLAUDE_HOST_HOOKS_DIR` | _(same path as source)_ | `ro` | Host directory of settings.json hook scripts referenced by ABSOLUTE host path (e.g. corp telemetry hooks at `~/.devbar/bin/`). Without this, Claude Code logs `SessionStart:startup hook error — /bin/sh: 1: <path>: not found`. Default `/dev/null` is a no-op for hosts without external hooks. |
 
 Host-specific integration mounts (shell-history databases, messaging
 attachment dirs, etc.) are intentionally out of scope for this example.
 Add them in a local `docker-compose.override.yml` if your operator setup
 needs them.
+
+### Corporate VPN / SSL passthrough
+
+Operators VPN'd into a corporate network whose TLS MITM proxy injects a
+custom root CA need two things to flow into the container so the
+in-container `claude` binary can reach the API:
+
+1. **Env-var forwarding** — set `NODE_EXTRA_CA_CERTS` (Node honors this
+   for the `claude` binary), `SSL_CERT_FILE` (OpenSSL / curl),
+   `REQUESTS_CA_BUNDLE` (Python requests), and any of
+   `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (and lowercase variants)
+   in your `.env` (compose substitutes them via the `environment:`
+   block).
+2. **Bind-mount the CA bundle path inside the container** — set
+   `CLAUDE_HOST_CORP_CA_BUNDLE` to the SAME absolute path you used for
+   `NODE_EXTRA_CA_CERTS` (e.g. `/Users/<you>/.config/corp/corp-ca.pem`
+   on macOS). The compose file bind-mounts that file read-only at the
+   identical path inside the container so the env-var reference
+   resolves.
+
+Without step 2, you'll see the forwarded env vars inside the container
+but `claude` will fail with `Unable to connect to API: SSL certificate
+verification failed. Check your proxy or corporate SSL certificates.`
+because the path the env var points at doesn't exist in the bookworm
+filesystem.
+
+### Host hook-script dir
+
+When `~/.claude/settings.json` (which IS bind-mounted into the
+container) references hook scripts by absolute host path —
+common with corp telemetry tooling like devbar, which auto-installs a
+hook into `~/.devbar/bin/telemetry-hook` and registers it in
+settings.json — the path doesn't exist inside the bookworm-slim
+container. Claude Code logs
+
+```
+SessionStart:startup hook error — /bin/sh: 1: /Users/<you>/.devbar/bin/telemetry-hook: not found
+UserPromptSubmit hook error — /bin/sh: 1: /Users/<you>/.devbar/bin/telemetry-hook: not found
+```
+
+at every session start / prompt submit. The hook silently fails (Claude
+Code keeps running), but every prompt logs the error.
+
+Fix: set `CLAUDE_HOST_HOOKS_DIR` in `.env` to the host directory holding
+the hook script (e.g. `/Users/<you>/.devbar/bin`). The compose file
+bind-mounts that dir read-only at the SAME path inside the container so
+the settings.json reference resolves.
 
 ### Host paths on non-default layouts (env-var overrides)
 

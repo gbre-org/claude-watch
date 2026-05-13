@@ -17,6 +17,20 @@
 #   CLAUDE_CODE_IDE_HOST_OVERRIDE  # host the claude binary connects to for SSE
 #   ANTHROPIC_API_KEY           # API key, if not using Pro auth via ~/.claude
 #   CLAUDE_* / ANTHROPIC_*      # any other matching env vars
+#   NODE_EXTRA_CA_CERTS         # extra CA bundle for Node (Claude Code is Node);
+#                               # if it points at an existing file, that file is
+#                               # auto bind-mounted at the same path inside the
+#                               # container (read-only) so the path resolves.
+#   SSL_CERT_FILE               # OpenSSL CA bundle (curl, Python requests, etc.)
+#                               # auto bind-mounted same as NODE_EXTRA_CA_CERTS.
+#   REQUESTS_CA_BUNDLE          # Python requests/urllib3 CA bundle, auto bind-mounted.
+#   CURL_CA_BUNDLE              # curl CA bundle override, auto bind-mounted.
+#   HTTPS_PROXY / HTTP_PROXY / NO_PROXY / https_proxy / http_proxy / no_proxy
+#                               # Corporate proxy settings (VPN'd into SF / similar).
+#                               # Forwarded verbatim; the proxy host needs to be
+#                               # reachable from inside the container's netns
+#                               # (bridge networking + host-gateway alias usually
+#                               # handles a host-loopback proxy).
 #
 # Bind mounts (rw):
 #   ~/.claude  -> /home/hndrewaall/.claude    (session state, credentials)
@@ -69,11 +83,26 @@ Usage:
 
 Environment overrides:
   CLAUDE_CONTAINER_IMAGE   Image tag (default: claude-container:dev).
+  CLAUDE_HOST_HOOKS_DIR    Host directory of settings.json hook scripts to
+                           bind-mount at the SAME path inside the container,
+                           read-only. Required when ~/.claude/settings.json
+                           references a host-only path (e.g. corp telemetry
+                           hook at /Users/<you>/.devbar/bin/telemetry-hook).
+                           Missing dir = silently skipped.
 
 Environment passthrough (only if set on the host):
   CLAUDE_CODE_SSE_PORT     VSCode IDE integration port (load-bearing).
   ANTHROPIC_API_KEY        API key if not using ~/.claude credentials.
   CLAUDE_* / ANTHROPIC_*   Any other matching env vars.
+  NODE_EXTRA_CA_CERTS      Node CA bundle. If the var points at an existing
+                           file, that file is auto bind-mounted (read-only)
+                           at the same path inside the container so corporate
+                           SSL chains resolve.
+  SSL_CERT_FILE            OpenSSL CA bundle, same auto-mount treatment.
+  REQUESTS_CA_BUNDLE       Python requests/urllib3 CA bundle, same.
+  CURL_CA_BUNDLE           curl CA bundle override, same.
+  HTTPS_PROXY / HTTP_PROXY / NO_PROXY (and lowercase variants)
+                           Corporate proxy settings, forwarded verbatim.
 
 Bind mounts (read-write):
   ~/.claude   -> /home/hndrewaall/.claude    Session state, credentials.
@@ -101,12 +130,27 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     exit 0
 fi
 
+# --print-docker-args (testing hook): build the docker invocation but emit
+# the argv (one-per-line, no docker actually run) instead of executing.
+# Used by container/bin/tests/claude-tmux-env.test to verify env / mount
+# forwarding without spinning up a container or requiring docker.
+PRINT_DOCKER_ARGS=0
+if [ "${1:-}" = "--print-docker-args" ]; then
+    PRINT_DOCKER_ARGS=1
+    shift
+fi
+
 # -----------------------------------------------------------------------------
 # Pick a docker invocation that works: bare first, sudo fallback.
 # -----------------------------------------------------------------------------
 
 DOCKER_CMD=()
-if docker ps >/dev/null 2>&1; then
+if [ "$PRINT_DOCKER_ARGS" = "1" ]; then
+    # Skip the docker probe entirely under the testing hook — the test runs
+    # in CI / on dev machines without docker access. Use a placeholder so
+    # the rest of the script behaves identically.
+    DOCKER_CMD=(docker)
+elif docker ps >/dev/null 2>&1; then
     DOCKER_CMD=(docker)
 elif sudo -n docker ps >/dev/null 2>&1; then
     DOCKER_CMD=(sudo docker)
@@ -154,6 +198,101 @@ while IFS= read -r name; do
 done < <(env | grep -E '^(CLAUDE|ANTHROPIC)_' | cut -d= -f1 | sort -u || true)
 
 # -----------------------------------------------------------------------------
+# Corporate-network passthrough: SSL CA bundles + proxy settings.
+#
+# Why: operators on enterprise VPNs (Salesforce, etc.) inject a corp CA into
+# their host's NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / etc. so HTTPS to corp
+# endpoints validates. Without forwarding, the in-container claude binary
+# trips on "Unable to connect to API: SSL certificate verification failed.
+# Check your proxy or corporate SSL certificates" against any TLS endpoint
+# behind the corp MITM proxy.
+#
+# Two things have to happen:
+#   1. Forward the env var into the container so Node / OpenSSL / requests
+#      / curl pick up the override.
+#   2. Bind-mount the CA file at the SAME path inside the container so the
+#      env var's path resolves. The bookworm-slim runtime image has its
+#      own /etc/ssl/certs/ tree but doesn't know about your corp root.
+#
+# Proxy vars (HTTPS_PROXY / HTTP_PROXY / NO_PROXY + lowercase) are just
+# forwarded — the proxy hostname needs to be reachable from the container's
+# netns. host.docker.internal is wired via --add-host below, so a
+# host-loopback corp proxy works without extra config.
+# -----------------------------------------------------------------------------
+
+ssl_mount_args=()
+# Newline-separated dedup list of absolute paths already mounted (so two
+# env vars pointing at the same bundle don't generate two -v args).
+# Newline-delimited because absolute paths can contain spaces but not
+# newlines on every supported OS. Using a plain string instead of a
+# bash-4 associative array keeps the script portable to bash 3.2.
+ssl_mounted_paths=""
+
+ssl_passthrough_var() {
+    # Forward $1 into the container; if its value names an existing file,
+    # also bind-mount that file read-only at the same path. Dedup by
+    # absolute path so two env vars pointing at the same bundle only
+    # mount once.
+    local name="$1"
+    local val="${!name-}"
+    if [ -z "$val" ]; then
+        return 0
+    fi
+    env_args+=(-e "$name=$val")
+    # Only attempt the bind mount when the value looks like a real file
+    # path on the host (skip URLs, "1"/"true"/etc, missing paths).
+    if [ -f "$val" ]; then
+        local abs
+        abs="$(cd "$(dirname "$val")" && pwd)/$(basename "$val")"
+        # Dedup: only mount if we haven't already mounted this absolute path.
+        case $'\n'"$ssl_mounted_paths"$'\n' in
+            *$'\n'"$abs"$'\n'*) ;;
+            *)
+                ssl_mounted_paths="${ssl_mounted_paths}${abs}"$'\n'
+                # Read-only so the container can't mutate the host's CA bundle.
+                ssl_mount_args+=(-v "$abs:$abs:ro")
+                ;;
+        esac
+    fi
+}
+
+for v in NODE_EXTRA_CA_CERTS SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE; do
+    ssl_passthrough_var "$v"
+done
+
+# Proxy env vars: forward verbatim. Both uppercase and lowercase variants —
+# Node honors uppercase; many Linux CLIs (curl, python requests) check
+# lowercase first.
+for v in HTTPS_PROXY HTTP_PROXY NO_PROXY https_proxy http_proxy no_proxy; do
+    if [ -n "${!v-}" ]; then
+        env_args+=(-e "$v=${!v}")
+    fi
+done
+
+# -----------------------------------------------------------------------------
+# Host hook-script bind mount.
+#
+# When ~/.claude/settings.json (which IS bind-mounted into the container)
+# references hook scripts by absolute host path — e.g. a corporate
+# telemetry hook at /Users/<you>/.devbar/bin/telemetry-hook — the path
+# doesn't exist inside the container and Claude Code surfaces
+# "SessionStart:startup hook error — /bin/sh: 1: <path>: not found".
+#
+# Setting CLAUDE_HOST_HOOKS_DIR on the host tells the wrapper to bind-mount
+# that directory at the SAME path inside the container so the hook resolves.
+# The mount is read-only — hooks shouldn't mutate themselves.
+#
+# Missing / empty / non-directory = silently skipped (graceful no-op for
+# operators without hooks).
+# -----------------------------------------------------------------------------
+
+hooks_mount_args=()
+if [ -n "${CLAUDE_HOST_HOOKS_DIR:-}" ] && [ -d "$CLAUDE_HOST_HOOKS_DIR" ]; then
+    hooks_abs="$(cd "$CLAUDE_HOST_HOOKS_DIR" && pwd)"
+    hooks_mount_args+=(-v "$hooks_abs:$hooks_abs:ro")
+fi
+
+# -----------------------------------------------------------------------------
 # Signal handling — forward SIGTERM/SIGINT to the container so it can exit
 # cleanly. The trap fires the kill in the background; the main `docker run`
 # call then returns naturally with the container's exit code.
@@ -189,14 +328,29 @@ if [ -t 0 ] && [ -t 1 ]; then
     tty_flag=(-t)
 fi
 
-"${DOCKER_CMD[@]}" run --rm -i "${tty_flag[@]}" \
-    --name "$CONTAINER_NAME" \
-    --add-host=host.docker.internal:host-gateway \
-    -v "${HOME}/.claude:/home/hndrewaall/.claude" \
-    -v "${HOME}/repos:/home/hndrewaall/repos" \
-    -v "${PWD}:/workspace" \
-    --mount type=volume,src=claude-container-versions,dst=/home/hndrewaall/.local/share/claude \
-    -w /workspace \
-    "${env_args[@]}" \
-    "$IMAGE" \
+# Assemble the docker invocation as a single argv array so we can either
+# print it (for tests) or exec it (for real invocations) without
+# duplicating the argument list.
+docker_argv=(
+    "${DOCKER_CMD[@]}" run --rm -i "${tty_flag[@]}"
+    --name "$CONTAINER_NAME"
+    --add-host=host.docker.internal:host-gateway
+    -v "${HOME}/.claude:/home/hndrewaall/.claude"
+    -v "${HOME}/repos:/home/hndrewaall/repos"
+    -v "${PWD}:/workspace"
+    --mount type=volume,src=claude-container-versions,dst=/home/hndrewaall/.local/share/claude
+    "${ssl_mount_args[@]}"
+    "${hooks_mount_args[@]}"
+    -w /workspace
+    "${env_args[@]}"
+    "$IMAGE"
     "$@"
+)
+
+if [ "$PRINT_DOCKER_ARGS" = "1" ]; then
+    # One argv element per line; the test parses with `while read`.
+    printf '%s\n' "${docker_argv[@]}"
+    exit 0
+fi
+
+exec "${docker_argv[@]}"

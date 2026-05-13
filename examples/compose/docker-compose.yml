@@ -62,6 +62,26 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       # Forwarded if set on the host (VSCode IDE port).
       CLAUDE_CODE_SSE_PORT: ${CLAUDE_CODE_SSE_PORT:-}
+      # Corporate-network passthrough: SSL CA bundles + proxy settings for
+      # operators on enterprise VPNs (Salesforce, etc.) where the host
+      # injects a corp CA into NODE_EXTRA_CA_CERTS / SSL_CERT_FILE etc.
+      # Without this, the in-container claude binary fails with
+      # "Unable to connect to API: SSL certificate verification failed.
+      # Check your proxy or corporate SSL certificates" against any
+      # TLS endpoint behind the corp MITM proxy. Note: forwarding the
+      # env var alone isn't enough — the CA file path also has to resolve
+      # inside the container. See the CLAUDE_HOST_CORP_CA_BUNDLE mount
+      # below for the bind-mount side of the fix.
+      NODE_EXTRA_CA_CERTS: ${NODE_EXTRA_CA_CERTS:-}
+      SSL_CERT_FILE: ${SSL_CERT_FILE:-}
+      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
+      CURL_CA_BUNDLE: ${CURL_CA_BUNDLE:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+      https_proxy: ${https_proxy:-}
+      http_proxy: ${http_proxy:-}
+      no_proxy: ${no_proxy:-}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in
@@ -147,6 +167,26 @@ services:
       # session-task writes go to /home/hndrewaall/.config/session inside
       # the container's own filesystem, which is invisible to the minisite.
       - "${HOME}/.config/session:/home/hndrewaall/.config/session:rw"
+      # Corporate SSL CA bundle — ro. Forwarded NODE_EXTRA_CA_CERTS /
+      # SSL_CERT_FILE / etc. env vars carry an ABSOLUTE host path that
+      # has to resolve inside the container; we bind-mount the host file
+      # at the SAME path to make the chain validate. The default
+      # `/dev/null` source is a graceful no-op when the operator isn't on
+      # a corp VPN — it bind-mounts a real (but empty) device which
+      # OpenSSL / Node treat as "no extra CA", no errors. macOS operators
+      # on enterprise VPNs typically set this to whatever
+      # NODE_EXTRA_CA_CERTS already points at on their laptop (e.g.
+      # /Users/<you>/.config/corp/corp-ca.pem).
+      - "${CLAUDE_HOST_CORP_CA_BUNDLE:-/dev/null}:${CLAUDE_HOST_CORP_CA_BUNDLE:-/dev/null}:ro"
+      # Host hook-script dir — ro. When ~/.claude/settings.json references
+      # a hook script by ABSOLUTE host path (corp telemetry hooks,
+      # auto-installed via tools like devbar), the path has to resolve
+      # inside the container or Claude Code logs "SessionStart:startup
+      # hook error — /bin/sh: 1: <path>: not found" and refuses to fire
+      # the hook. Bind-mount the host dir at the SAME path so the
+      # settings.json reference Just Works. Defaults to /dev/null
+      # (graceful no-op) for operators without host-resident hooks.
+      - "${CLAUDE_HOST_HOOKS_DIR:-/dev/null}:${CLAUDE_HOST_HOOKS_DIR:-/dev/null}:ro"
       # Persists the in-container claude binary's auto-updates across
       # `--rm` restarts so you don't reset to the image-baked version
       # every time the container exits.

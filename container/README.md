@@ -174,6 +174,9 @@ The `claude-tmux` wrapper passes EXACTLY the following surface into the containe
 - `CLAUDE_CODE_IDE_HOST_OVERRIDE` — host the claude binary dials for SSE; defaults to `host.docker.internal` if unset (the wrapper supplies the default)
 - `ANTHROPIC_API_KEY` — only if set on the host
 - `CLAUDE_*` / `ANTHROPIC_*` — any other vars matching these prefixes are forwarded automatically
+- `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` — corporate-CA bundles. The wrapper forwards the env var AND auto bind-mounts the CA file (read-only) at the SAME path inside the container so the env-var reference resolves. Needed when the host is VPNed into a corp network with TLS MITM (Salesforce et al.); without this the in-container `claude` binary fails with "Unable to connect to API: SSL certificate verification failed."
+- `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (and lowercase variants) — forwarded verbatim. The proxy hostname needs to be reachable from the container's netns; `host.docker.internal` is wired via `--add-host`, so a host-loopback corp proxy works without extra config.
+- `CLAUDE_HOST_HOOKS_DIR` — host directory containing settings.json hook scripts. When `~/.claude/settings.json` (bind-mounted in) references a hook by ABSOLUTE host path (e.g. corp telemetry hooks installed under `~/.devbar/bin/`), set this to the host dir; the wrapper bind-mounts it read-only at the SAME path inside the container so the hook resolves. Without this, Claude Code prints `SessionStart:startup hook error — /bin/sh: 1: <path>: not found` and the hook silently fails.
 
 **Network policy**: default **bridge networking** with an explicit
 host-loopback alias. The wrapper invokes

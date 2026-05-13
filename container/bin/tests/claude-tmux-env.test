@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""Tests for claude-tmux env / mount passthrough.
+
+Exercises the env-forwarding and bind-mount construction in
+container/bin/claude-tmux WITHOUT actually invoking docker. Uses the
+script's `--print-docker-args` debug hook, which builds the same argv
+the real path would `exec` but prints it (one-per-line) and exits 0.
+
+Coverage:
+  - CLAUDE_* / ANTHROPIC_* wildcard pass-through (regression check
+    against the prior surface — the new SSL / proxy code shouldn't
+    break this).
+  - NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / REQUESTS_CA_BUNDLE /
+    CURL_CA_BUNDLE: env var forwarded AND bind-mount of the file at
+    the same path inside the container, read-only.
+  - HTTPS_PROXY / HTTP_PROXY / NO_PROXY (and lowercase): env var
+    forwarded, no spurious mounts.
+  - CLAUDE_HOST_HOOKS_DIR pointing at an existing dir: bind-mount of
+    the dir at the same path inside the container, read-only.
+  - CLAUDE_HOST_HOOKS_DIR pointing at a missing dir: no mount,
+    no error.
+  - SSL CA env var pointing at a missing file: env forwarded, no
+    mount (we don't bind-mount a non-existent source).
+  - Two SSL vars pointing at the SAME bundle: only ONE bind-mount
+    (dedup test).
+
+Run:  ./claude-tmux-env.test
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "claude-tmux"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate claude-tmux at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+def run_script(env: dict, args: list[str] | None = None) -> list[str]:
+    """Run claude-tmux --print-docker-args with the given env.
+
+    Returns the printed argv as a list of strings (one element per
+    line of stdout). The script always prints to stdout under
+    --print-docker-args.
+    """
+    if args is None:
+        args = []
+    # Start from a clean env so test cases don't inherit the caller's
+    # CLAUDE_* / NODE_EXTRA_CA_CERTS / etc. We DO need PATH so /usr/bin
+    # tools (mktemp etc. invoked inside the script's subshell) resolve.
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        # claude-tmux uses $HOME for the .claude / repos bind mount
+        # sources. Tests want a deterministic value.
+        "HOME": env.pop("HOME", "/tmp/fake-home"),
+        # The script reads $PWD for the workspace mount. Compose tests
+        # set this explicitly.
+        "PWD": env.pop("PWD", "/tmp/fake-workspace"),
+    }
+    base_env.update(env)
+    result = subprocess.run(
+        [str(SCRIPT), "--print-docker-args", *args],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"claude-tmux exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result.stdout.splitlines()
+
+
+def find_env_arg(argv: list[str], name: str) -> str | None:
+    """Find the value of `-e NAME=...` in the printed docker argv."""
+    for i, tok in enumerate(argv):
+        if tok == "-e" and i + 1 < len(argv) and argv[i + 1].startswith(f"{name}="):
+            return argv[i + 1][len(name) + 1 :]
+    return None
+
+
+def find_volume_mounts(argv: list[str]) -> list[str]:
+    """All `-v SRC:DST[:OPTS]` mount strings in the argv."""
+    out = []
+    for i, tok in enumerate(argv):
+        if tok == "-v" and i + 1 < len(argv):
+            out.append(argv[i + 1])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_baseline_no_corp_env() -> None:
+    """No SSL / proxy vars set => no spurious -e or -v args."""
+    argv = run_script({})
+    expect(find_env_arg(argv, "NODE_EXTRA_CA_CERTS") is None,
+           "baseline: NODE_EXTRA_CA_CERTS should not appear when unset")
+    expect(find_env_arg(argv, "HTTPS_PROXY") is None,
+           "baseline: HTTPS_PROXY should not appear when unset")
+    mounts = find_volume_mounts(argv)
+    # We expect exactly the three baked-in mounts: .claude, repos, $PWD.
+    # Anything beyond that is a regression. (Named volumes come via
+    # --mount, not -v, so they don't show up in this list.)
+    expect(len(mounts) == 3,
+           f"baseline: expected 3 -v mounts, got {len(mounts)}: {mounts}")
+
+
+def test_node_extra_ca_certs_existing_file() -> None:
+    """NODE_EXTRA_CA_CERTS pointing at an existing file => env + mount."""
+    with tempfile.NamedTemporaryFile(prefix="corp-ca-", suffix=".pem") as f:
+        path = f.name
+        argv = run_script({"NODE_EXTRA_CA_CERTS": path})
+        expect(find_env_arg(argv, "NODE_EXTRA_CA_CERTS") == path,
+               f"NODE_EXTRA_CA_CERTS env should be forwarded as {path}")
+        expected_mount = f"{path}:{path}:ro"
+        expect(expected_mount in find_volume_mounts(argv),
+               f"expected mount {expected_mount} in {find_volume_mounts(argv)}")
+
+
+def test_ssl_cert_file_existing_file() -> None:
+    with tempfile.NamedTemporaryFile(prefix="ca-", suffix=".pem") as f:
+        path = f.name
+        argv = run_script({"SSL_CERT_FILE": path})
+        expect(find_env_arg(argv, "SSL_CERT_FILE") == path,
+               "SSL_CERT_FILE env should be forwarded")
+        expect(f"{path}:{path}:ro" in find_volume_mounts(argv),
+               "SSL_CERT_FILE source should be bind-mounted ro")
+
+
+def test_requests_ca_bundle_existing_file() -> None:
+    with tempfile.NamedTemporaryFile(prefix="ca-", suffix=".pem") as f:
+        path = f.name
+        argv = run_script({"REQUESTS_CA_BUNDLE": path})
+        expect(find_env_arg(argv, "REQUESTS_CA_BUNDLE") == path,
+               "REQUESTS_CA_BUNDLE env should be forwarded")
+        expect(f"{path}:{path}:ro" in find_volume_mounts(argv),
+               "REQUESTS_CA_BUNDLE source should be bind-mounted ro")
+
+
+def test_curl_ca_bundle_existing_file() -> None:
+    with tempfile.NamedTemporaryFile(prefix="ca-", suffix=".pem") as f:
+        path = f.name
+        argv = run_script({"CURL_CA_BUNDLE": path})
+        expect(find_env_arg(argv, "CURL_CA_BUNDLE") == path,
+               "CURL_CA_BUNDLE env should be forwarded")
+        expect(f"{path}:{path}:ro" in find_volume_mounts(argv),
+               "CURL_CA_BUNDLE source should be bind-mounted ro")
+
+
+def test_ssl_ca_missing_file_no_mount() -> None:
+    """Env var set but file doesn't exist => forward env, NO mount."""
+    bogus = "/this/path/does/not/exist.pem"
+    argv = run_script({"NODE_EXTRA_CA_CERTS": bogus})
+    expect(find_env_arg(argv, "NODE_EXTRA_CA_CERTS") == bogus,
+           "missing-file: env should still be forwarded")
+    expect(not any(m.startswith(f"{bogus}:") for m in find_volume_mounts(argv)),
+           "missing-file: source should NOT be bind-mounted")
+
+
+def test_ssl_ca_dedup() -> None:
+    """Two SSL vars pointing at the same file => ONE bind-mount."""
+    with tempfile.NamedTemporaryFile(prefix="ca-", suffix=".pem") as f:
+        path = f.name
+        argv = run_script({
+            "NODE_EXTRA_CA_CERTS": path,
+            "SSL_CERT_FILE": path,
+            "REQUESTS_CA_BUNDLE": path,
+        })
+        mounts = [m for m in find_volume_mounts(argv) if path in m]
+        expect(len(mounts) == 1,
+               f"dedup: expected exactly 1 mount for {path}, got {len(mounts)}: {mounts}")
+
+
+def test_proxy_vars_forwarded_no_mount() -> None:
+    """Proxy env vars: forward, no mount (they're URLs, not files)."""
+    argv = run_script({
+        "HTTPS_PROXY": "http://corp.example.com:8080",
+        "HTTP_PROXY": "http://corp.example.com:8080",
+        "NO_PROXY": "localhost,127.0.0.1,host.docker.internal",
+        "https_proxy": "http://corp.example.com:8080",
+        "http_proxy": "http://corp.example.com:8080",
+        "no_proxy": "localhost,127.0.0.1",
+    })
+    for name in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+                 "https_proxy", "http_proxy", "no_proxy"):
+        expect(find_env_arg(argv, name) is not None,
+               f"proxy: {name} should be forwarded")
+    # No -v should reference these (they're URLs / hostnames).
+    expect(all("corp.example.com" not in m for m in find_volume_mounts(argv)),
+           "proxy: URLs should NOT appear in bind mounts")
+
+
+def test_claude_host_hooks_dir_existing() -> None:
+    """CLAUDE_HOST_HOOKS_DIR pointing at a real dir => bind-mount ro."""
+    with tempfile.TemporaryDirectory(prefix="devbar-bin-") as d:
+        argv = run_script({"CLAUDE_HOST_HOOKS_DIR": d})
+        expected = f"{d}:{d}:ro"
+        expect(expected in find_volume_mounts(argv),
+               f"hooks-dir: expected mount {expected} in {find_volume_mounts(argv)}")
+
+
+def test_claude_host_hooks_dir_missing() -> None:
+    """CLAUDE_HOST_HOOKS_DIR pointing at a missing dir => silently skipped."""
+    bogus = "/this/host/hooks/dir/does/not/exist"
+    argv = run_script({"CLAUDE_HOST_HOOKS_DIR": bogus})
+    expect(not any(bogus in m for m in find_volume_mounts(argv)),
+           "hooks-dir: missing dir should NOT be bind-mounted")
+
+
+def test_claude_wildcard_still_forwarded() -> None:
+    """Regression: existing CLAUDE_* / ANTHROPIC_* passthrough still works."""
+    argv = run_script({
+        "CLAUDE_FOO": "bar",
+        "ANTHROPIC_API_KEY": "sk-test",
+        "ANTHROPIC_BETA": "beta1",
+    })
+    expect(find_env_arg(argv, "CLAUDE_FOO") == "bar",
+           "wildcard: CLAUDE_FOO should be forwarded")
+    expect(find_env_arg(argv, "ANTHROPIC_API_KEY") == "sk-test",
+           "wildcard: ANTHROPIC_API_KEY should be forwarded")
+    expect(find_env_arg(argv, "ANTHROPIC_BETA") == "beta1",
+           "wildcard: ANTHROPIC_BETA should be forwarded")
+
+
+def test_combined_corp_setup() -> None:
+    """End-to-end: corp VPN scenario (CA bundle + proxy + hooks dir)."""
+    with tempfile.NamedTemporaryFile(prefix="corp-ca-", suffix=".pem") as f, \
+         tempfile.TemporaryDirectory(prefix="devbar-bin-") as hooks:
+        ca = f.name
+        argv = run_script({
+            "NODE_EXTRA_CA_CERTS": ca,
+            "SSL_CERT_FILE": ca,
+            "HTTPS_PROXY": "http://corp:8080",
+            "NO_PROXY": "localhost",
+            "CLAUDE_HOST_HOOKS_DIR": hooks,
+        })
+        # Env vars
+        for name in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
+                     "HTTPS_PROXY", "NO_PROXY"):
+            expect(find_env_arg(argv, name) is not None,
+                   f"combined: {name} should be forwarded")
+        # Mounts
+        mounts = find_volume_mounts(argv)
+        expect(f"{ca}:{ca}:ro" in mounts,
+               f"combined: CA mount missing: {mounts}")
+        expect(f"{hooks}:{hooks}:ro" in mounts,
+               f"combined: hooks-dir mount missing: {mounts}")
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_baseline_no_corp_env,
+    test_node_extra_ca_certs_existing_file,
+    test_ssl_cert_file_existing_file,
+    test_requests_ca_bundle_existing_file,
+    test_curl_ca_bundle_existing_file,
+    test_ssl_ca_missing_file_no_mount,
+    test_ssl_ca_dedup,
+    test_proxy_vars_forwarded_no_mount,
+    test_claude_host_hooks_dir_existing,
+    test_claude_host_hooks_dir_missing,
+    test_claude_wildcard_still_forwarded,
+    test_combined_corp_setup,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")
