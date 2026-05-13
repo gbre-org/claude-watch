@@ -1288,20 +1288,90 @@
     open(row);
   });
 
+  // Vim-style keyboard nav inside the open modal.
+  //
+  //   Esc      — close modal (restores focus to the row that opened it).
+  //   j / k    — scroll the log stream down / up by one "line"
+  //              (SCROLL_STEP_PX, roughly one rendered log row).
+  //   g  | gg  — jump to top of log. We accept single-g for the historical
+  //              shortcut (q-f806 wired this before the chord) AND the
+  //              true-vim two-key `gg` chord. Either is fine; both land at
+  //              top. The chord is detected by stashing a pending-g
+  //              timestamp and treating the second g within
+  //              CHORD_WINDOW_MS as the trigger.
+  //   G        — jump to bottom of log + re-arm auto-scroll.
+  //   /        — placeholder. No log-search surface today; reserved so a
+  //              future filter input can wire up without further keybind
+  //              plumbing. See task notes 2026-05-13.
+  //
+  // Typing-target guard: any keydown originating inside an <input>,
+  // <textarea>, <select>, or contenteditable element is left to bubble
+  // normally — so the user can type the literal characters into the
+  // action-modal reason box, the metadata search field, etc. The lone
+  // exception is Esc, which always closes the topmost modal (parity with
+  // the action.js modal handler — Esc out of an input is "get me out").
+  //
+  // Why this handler doesn't fight keyboard.js: keyboard.js's main-list
+  // shortcuts (j/k row nav, /, Enter to open) early-return when
+  // isAnyModalOpen() is true, so when the log modal is showing only the
+  // handler below is active for j/k/g/G.
+  const SCROLL_STEP_PX = 40;           // ~one log row in the rendered stream
+  const CHORD_WINDOW_MS = 700;         // gg chord acceptance window
+  let pendingGAt = 0;                  // monotonic ms of the last solo `g`
+
+  function scrollStream(delta) {
+    streamEl.scrollTop = streamEl.scrollTop + delta;
+  }
+
+  function isModalTypingTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (el.isContentEditable) return true;
+    return false;
+  }
+
   // Keyboard activation on focused row (Enter / Space).
   document.addEventListener('keydown', (ev) => {
     // First handle modal-open state.
     if (!modal.hidden) {
+      // Esc always closes the modal — even from inside an input — so the
+      // user can bail without first tabbing out of a focused field.
       if (ev.key === 'Escape') {
         ev.preventDefault();
         close();
-      } else if (ev.key === 'g' && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
-        // vim-style: lowercase g → top, uppercase G → bottom.
+        return;
+      }
+      // Don't hijack literal-character keys when the user is typing into
+      // a real input field inside the modal (e.g. action-modal reason
+      // textarea — that modal sits at the same level so it can capture
+      // the same keydown). The action-modal's own focus-trap + Enter
+      // handler still wins.
+      if (isModalTypingTarget(document.activeElement)) return;
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+
+      if (ev.key === 'j') {
+        ev.preventDefault();
+        scrollStream(SCROLL_STEP_PX);
+      } else if (ev.key === 'k') {
+        ev.preventDefault();
+        scrollStream(-SCROLL_STEP_PX);
+      } else if (ev.key === 'g') {
+        // Both single-g (historical) and gg-chord (true vim) jump to top.
+        // Single-g jumps immediately; a second g inside the chord window
+        // is a harmless re-jump (already at top). Either way the chord
+        // state resets.
         ev.preventDefault();
         jumpToTop();
-      } else if (ev.key === 'G' && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        pendingGAt = Date.now();
+      } else if (ev.key === 'G') {
         ev.preventDefault();
         jumpToBottom();
+        pendingGAt = 0;
+      } else if (ev.key === '/') {
+        // Reserved for in-modal log search. No search surface today —
+        // preventDefault would only swallow Firefox's quick-find without
+        // offering a replacement, so we let it through.
       }
       return;
     }
@@ -1382,5 +1452,12 @@
     setMetaToggleInitialState,
     readMetaToggleStored,
     writeMetaToggleStored,
+    // Modal keybind hooks — exposed so a jsdom test can drive the
+    // scroll/jump primitives without dispatching synthetic keydowns
+    // through the global listener.
+    jumpToTop,
+    jumpToBottom,
+    scrollStream,
+    SCROLL_STEP_PX,
   };
 })();

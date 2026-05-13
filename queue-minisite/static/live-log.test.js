@@ -394,6 +394,130 @@ console.log('\nfmtAttachment');
   }
 }
 
+console.log('\nmodal vim shortcuts — jumpToTop / jumpToBottom / scrollStream');
+{
+  // The modal keybind helpers manipulate streamEl.scrollTop directly.
+  // jsdom doesn't lay elements out, so scrollHeight defaults to 0 — we
+  // can stub a non-zero scrollHeight on the actual <pre> the IIFE
+  // looked up to drive the bottom-jump path. Bind the same element the
+  // IIFE captured (window.document.getElementById('log-modal-stream')).
+  const streamEl = window.document.getElementById('log-modal-stream');
+  // jsdom's HTMLElement.scrollHeight is read-only; defineProperty lets
+  // us shim it without touching layout. scrollTop is read/write so we
+  // can just assign + read it back.
+  Object.defineProperty(streamEl, 'scrollHeight', {
+    configurable: true,
+    get: () => 1000,
+  });
+  const { jumpToTop, jumpToBottom, scrollStream, SCROLL_STEP_PX } = window.__liveLog;
+
+  assert('SCROLL_STEP_PX is positive', typeof SCROLL_STEP_PX === 'number' && SCROLL_STEP_PX > 0);
+
+  streamEl.scrollTop = 500;
+  jumpToTop();
+  assert('jumpToTop sets scrollTop to 0', streamEl.scrollTop === 0);
+
+  streamEl.scrollTop = 0;
+  jumpToBottom();
+  assert('jumpToBottom sets scrollTop to scrollHeight', streamEl.scrollTop === 1000);
+
+  streamEl.scrollTop = 100;
+  scrollStream(SCROLL_STEP_PX);
+  assert('scrollStream(+step) increases scrollTop by step',
+    streamEl.scrollTop === 100 + SCROLL_STEP_PX,
+    'got: ' + streamEl.scrollTop);
+  scrollStream(-SCROLL_STEP_PX);
+  assert('scrollStream(-step) decreases scrollTop by step',
+    streamEl.scrollTop === 100,
+    'got: ' + streamEl.scrollTop);
+}
+
+console.log('\nmodal vim shortcuts — keydown dispatch (j/k/g/G/Esc)');
+{
+  // Verify that the global keydown listener actually wires the modal
+  // helpers when modal.hidden = false. We toggle the modal visible,
+  // dispatch synthetic KeyboardEvents at the document, and assert the
+  // observable side-effect on streamEl.scrollTop. A modal-hidden
+  // baseline confirms the handler stays a no-op when the modal is closed
+  // (so the main-list keyboard.js shortcuts continue to own j/k).
+  const doc = window.document;
+  const modal = doc.getElementById('log-modal');
+  const streamEl = doc.getElementById('log-modal-stream');
+
+  function fire(key) {
+    const ev = new window.KeyboardEvent('keydown', {
+      key, bubbles: true, cancelable: true,
+    });
+    doc.dispatchEvent(ev);
+    return ev;
+  }
+
+  // Baseline: modal hidden → j/k must NOT scroll the stream (keyboard.js
+  // owns those keys when the modal is closed).
+  modal.hidden = true;
+  streamEl.scrollTop = 200;
+  fire('j');
+  assert('modal hidden: j is not consumed by live-log handler',
+    streamEl.scrollTop === 200, 'got: ' + streamEl.scrollTop);
+
+  // Modal open: j scrolls down by step.
+  modal.hidden = false;
+  streamEl.scrollTop = 200;
+  fire('j');
+  assert('modal open: j scrolls down by SCROLL_STEP_PX',
+    streamEl.scrollTop === 200 + window.__liveLog.SCROLL_STEP_PX,
+    'got: ' + streamEl.scrollTop);
+
+  // Modal open: k scrolls up by step.
+  streamEl.scrollTop = 200;
+  fire('k');
+  assert('modal open: k scrolls up by SCROLL_STEP_PX',
+    streamEl.scrollTop === 200 - window.__liveLog.SCROLL_STEP_PX,
+    'got: ' + streamEl.scrollTop);
+
+  // Modal open: g jumps to top.
+  streamEl.scrollTop = 500;
+  fire('g');
+  assert('modal open: g jumps to top', streamEl.scrollTop === 0,
+    'got: ' + streamEl.scrollTop);
+
+  // Modal open: G jumps to bottom (scrollHeight=1000 from the previous block).
+  streamEl.scrollTop = 0;
+  fire('G');
+  assert('modal open: G jumps to bottom', streamEl.scrollTop === 1000,
+    'got: ' + streamEl.scrollTop);
+
+  // gg chord (two-key vim sequence) also jumps to top. The second g
+  // is a harmless re-jump since we're already at 0, but verifying
+  // both keys are accepted within the chord window matters for
+  // muscle-memory parity with vim.
+  streamEl.scrollTop = 500;
+  fire('g');
+  fire('g');
+  assert('modal open: gg chord lands at top', streamEl.scrollTop === 0,
+    'got: ' + streamEl.scrollTop);
+
+  // Typing guard: when focus is inside an <input>, j/k/g/G must pass
+  // through so the user can type literal characters.
+  const probe = doc.createElement('input');
+  probe.id = 'modal-typing-probe';
+  modal.appendChild(probe);
+  probe.focus();
+  streamEl.scrollTop = 300;
+  fire('j');
+  assert('typing target: j is ignored inside <input>',
+    streamEl.scrollTop === 300, 'got: ' + streamEl.scrollTop);
+  fire('g');
+  assert('typing target: g is ignored inside <input>',
+    streamEl.scrollTop === 300, 'got: ' + streamEl.scrollTop);
+  // ...but Esc still closes the modal (the "get-me-out" override).
+  modal.hidden = false;
+  fire('Escape');
+  assert('typing target: Esc still closes the modal even from <input>',
+    modal.hidden === true);
+  probe.remove();
+}
+
 console.log('\n--------------------------------------------------------------');
 if (failures) {
   console.error(failures + ' assertion(s) failed.');
