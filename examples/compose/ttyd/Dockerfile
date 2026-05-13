@@ -10,27 +10,56 @@
 # "open terminal failed: not a terminal" instead of a version-skew
 # message. See tmux issue #4356 for the upstream confirmation.
 #
-# The upstream image only ships Alpine + Ubuntu tags, so we copy
-# the prebuilt static ttyd binary out of tsl0922/ttyd:1.7.7
-# (Ubuntu-based; the binary is statically linked and works fine on
-# bookworm) and install tmux + tini from bookworm apt.
+# We still copy the prebuilt static ttyd binary out of upstream
+# tsl0922/ttyd:1.7.7 (the C backend hasn't changed for our use case
+# and the binary is statically linked so it works fine on bookworm).
+# But the frontend HTML — which is what xterm.js, the websocket
+# client, and the reconnect logic live in — is rebuilt from our
+# ttyd fork at https://github.com/hndrewaall/ttyd. That fork carries
+# an auto-reconnect-with-exponential-backoff + visibilitychange
+# handler patch that keeps the browser session resilient to laptop
+# sleep / VPN flap / brief network drops (the upstream behaviour is
+# "Press Enter to Reconnect" after any non-1000 close or any single
+# socket error, which is unfriendly for a long-lived in-browser
+# console). Upstream PR: https://github.com/tsl0922/ttyd/pull/1536.
+# Once that merges we'll swap the fork pin back to tsl0922/ttyd:main.
 #
-# Pin a concrete upstream tag for reproducibility.
+# Pin a concrete fork commit for reproducibility. Bump when the fork
+# advances.
 FROM tsl0922/ttyd:1.7.7 AS upstream
 
 # -------------------------------------------------------------------
-# Stage: extract upstream HTML and inject autodark CSS + theme-swap JS.
+# Stage: build the ttyd frontend (xterm.js + reconnect/visibility
+# patch) from our fork.
 #
-# ttyd 1.7.7 ships a single self-contained index.html (~730 KB, all
-# CSS + JS inlined) embedded in the binary. There's no static-asset
-# directory to drop a CSS file into — `-I/--index` is the only hook,
-# and it replaces the served HTML entirely. So at build time we:
-#   1. Boot ttyd briefly inside this stage on 127.0.0.1.
-#   2. Fetch the bundled HTML via wget.
-#   3. Run our inject script to splice <style>/<script> before </head>.
-#   4. Carry the patched HTML into the runtime stage.
+# ttyd serves a single self-contained index.html (~730 KB, all CSS +
+# JS inlined) — `yarn build` runs webpack to produce dist/index.html
+# and then `npx gulp inline` rolls every asset into a single
+# dist/inline.html that we hand to ttyd via `-I` at runtime. This
+# bypasses the C-binary-embedded copy entirely, so we can ship our
+# fork's frontend on top of any upstream-prebuilt binary.
+# -------------------------------------------------------------------
+FROM node:20-bookworm-slim AS frontend-builder
+ARG TTYD_FORK_REF=c2a942d4486236bd8c9e3d4d62f3818fc4589eb4
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable
+WORKDIR /build
+RUN git clone --depth 50 https://github.com/hndrewaall/ttyd.git ttyd \
+    && cd ttyd \
+    && git checkout ${TTYD_FORK_REF}
+WORKDIR /build/ttyd/html
+RUN yarn install --immutable
+RUN yarn build && npx gulp inline
+# /build/ttyd/html/dist/inline.html is the single-file self-contained
+# bundle we hand to ttyd via `-I` in the runtime stage below.
+
+# -------------------------------------------------------------------
+# Stage: apply autodark CSS + theme-swap JS to the fork-built HTML.
 #
-# The patched HTML adds:
+# Same injection pipeline as before — the patched HTML adds:
 #   - A @media (prefers-color-scheme) <style> block painting body /
 #     html background Solarized base03 (dark) or base3 (light) so the
 #     page chrome around xterm.js matches the system color-scheme.
@@ -38,28 +67,18 @@ FROM tsl0922/ttyd:1.7.7 AS upstream
 #     dark/light matching prefers-color-scheme, with a setInterval
 #     reapply to defend against ttyd's post-connect SET_PREFERENCES
 #     overwrite (full race details in inject-autodark.py).
+#
+# Inputs/outputs are now files on disk rather than a live HTTP fetch
+# from a backgrounded ttyd instance (the fork-build above gives us
+# the canonical HTML directly).
 # -------------------------------------------------------------------
 FROM debian:bookworm-slim AS html-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
-        wget \
-        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=upstream /usr/bin/ttyd /usr/bin/ttyd
 COPY inject-autodark.py /tmp/inject-autodark.py
-# Run ttyd in the background on loopback, fetch its self-served HTML,
-# inject, then kill the bootstrap ttyd. `echo hi` is a placeholder
-# command — ttyd needs a child program but exits on first close, which
-# is fine because we only need the HTTP listener to come up briefly.
+COPY --from=frontend-builder /build/ttyd/html/dist/inline.html /tmp/index.upstream.html
 RUN set -eux; \
-    ttyd -p 17681 -i 127.0.0.1 echo hi & \
-    TTYD_PID=$!; \
-    for i in 1 2 3 4 5 6 7 8 9 10; do \
-        wget -q -O /tmp/index.upstream.html http://127.0.0.1:17681/ && break || sleep 0.5; \
-    done; \
-    test -s /tmp/index.upstream.html; \
-    kill $TTYD_PID 2>/dev/null || true; \
-    wait $TTYD_PID 2>/dev/null || true; \
     python3 /tmp/inject-autodark.py /tmp/index.upstream.html /tmp/index.patched.html; \
     grep -q 'prefers-color-scheme' /tmp/index.patched.html; \
     grep -q 'autodark-injected' /tmp/index.patched.html
