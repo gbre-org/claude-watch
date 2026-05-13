@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -101,6 +101,15 @@ test-claude-tmux-env:
 test-hooks-shim:
 	container/hooks-shim/tests/exec-hook.test
 	container/hooks-shim/tests/generate-hooks-shim-settings.test
+
+# Run the entrypoint CLAUDE_CMD construction tests. Extracts the
+# CLAUDE_CMD-building shell block from container/entrypoint.sh by regex
+# and exercises it in a fresh `bash -c` subshell against a matrix of
+# CLAUDE_SHIM_SETTINGS_PATH values. Guards against the v19 regression
+# where the user-tier was loaded alongside the rewritten shim file
+# (additive merge → bare cross-arch hooks still fired). 6 cases, <1s.
+test-entrypoint:
+	container/tests/entrypoint-claude-cmd.test
 
 # Release build
 build:

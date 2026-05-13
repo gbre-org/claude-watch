@@ -92,9 +92,34 @@ esac
 #
 # Instead: when CLAUDE_CONTAINER_REWRITE_HOOKS=1, generate a CONTAINER-LOCAL
 # copy of settings.json with every hook command wrapped in
-# /usr/local/bin/exec-hook, and tell the in-container claude to merge it
-# via `--settings <path>` (additive on top of the user/project/local
-# cascade). The host file is never touched.
+# /usr/local/bin/exec-hook, and tell the in-container claude to load it as
+# the user-tier settings file. The host file is never touched.
+#
+# Wiring: `claude --setting-sources project,local --settings <shim-path>`.
+#
+# - `--setting-sources project,local` filters the bind-mounted host
+#   `~/.claude/settings.json` (the "user" tier) OUT of Claude Code's
+#   settings cascade. Without this, the bare host hook commands would
+#   STILL load and fire alongside the wrapped ones (additive merge), and
+#   the bare ones would STILL hit "Exec format error" on every hook
+#   event — exactly the symptom the v19 workbot validation surfaced.
+# - `--settings <shim-path>` then loads our rewritten file as an
+#   additional settings source. Because the user tier is filtered out,
+#   the shim's wrapped hooks (plus its env / permissions passthrough,
+#   preserved by generate-hooks-shim-settings) effectively REPLACE the
+#   host user tier inside the container, while leaving the host file
+#   untouched on disk.
+# - Project (`<cwd>/.claude/settings.json`) and local
+#   (`<cwd>/.claude/settings.local.json`) tiers continue to load
+#   normally so per-repo overrides still work.
+#
+# Claude Code's default `settingSources` is `["user","project","local"]`
+# (verified in the binary, ~/.local/share/claude/versions/2.1.141: the
+# default literal lives next to `kh5=["user","project","local"]`). Passing
+# `--setting-sources project,local` drops the user tier explicitly; Claude
+# Code logs "userSettings source is disabled (--setting-sources)" on
+# unrelated retention-cleanup paths so the suppression is internally
+# observable.
 #
 # Default OFF so existing operators see no behaviour change. Mac-host
 # operators flip the flag in their .env / docker-compose.override.yml.
@@ -178,12 +203,16 @@ fi
 # Phase 2+ can revisit if users need post-exit inspection. See Phase 1f §8
 # "Bug #2" in the project doc.
 # Build the claude invocation. When the rewritten settings file exists
-# (CLAUDE_CONTAINER_REWRITE_HOOKS=1 path above), pass it via --settings so
-# Claude Code merges the wrapped hook commands on top of the user/project
-# cascade. Otherwise launch claude bare to preserve the existing default.
+# (CLAUDE_CONTAINER_REWRITE_HOOKS=1 path above), drop the user tier from
+# the settings cascade with `--setting-sources project,local` AND load
+# the rewritten shim file via `--settings`. That combo REPLACES the
+# bind-mounted host ~/.claude/settings.json's hooks (which would still
+# hit "Exec format error" against cross-arch binaries) with the
+# exec-hook-wrapped copy — without mutating the host file. Otherwise
+# launch claude bare to preserve the existing default.
 CLAUDE_CMD="exec claude"
 if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
-    CLAUDE_CMD="exec claude --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+    CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
 fi
 
 tmux new-session -d -s "$SESSION" -x 200 -y 50 \

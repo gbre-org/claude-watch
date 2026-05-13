@@ -108,3 +108,6 @@ jobs:
 
       - name: Run exec-hook shim tests
         run: make test-hooks-shim
+
+      - name: Run entrypoint CLAUDE_CMD construction tests
+        run: make test-entrypoint

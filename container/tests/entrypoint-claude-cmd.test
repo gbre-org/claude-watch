@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Tests for container/entrypoint.sh's CLAUDE_CMD construction.
+
+The entrypoint builds the `claude` invocation conditionally on
+CLAUDE_CONTAINER_REWRITE_HOOKS / CLAUDE_SHIM_SETTINGS_PATH. We test
+that branch without actually invoking docker / tmux by extracting
+the relevant block, simulating the surrounding state with shell
+fixtures, and asserting the final `CLAUDE_CMD` value.
+
+The block under test (from container/entrypoint.sh, near the bottom):
+
+    CLAUDE_CMD="exec claude"
+    if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
+        CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+    fi
+
+Coverage:
+  - CLAUDE_SHIM_SETTINGS_PATH unset            -> "exec claude" only
+  - CLAUDE_SHIM_SETTINGS_PATH empty            -> "exec claude" only
+  - CLAUDE_SHIM_SETTINGS_PATH=/tmp/foo.json    -> includes
+        "--setting-sources project,local"
+        "--settings /tmp/foo.json"
+    in that ORDER. The order matters: `--setting-sources` filters the
+    user tier OUT of the cascade and `--settings` then loads the shim
+    file. (Functionally Claude Code is order-insensitive for these two
+    flags, but the order-of-appearance is the contract the code review
+    + readers walk through left-to-right.)
+
+The v19 regression that motivated this test: PR #143's entrypoint
+emitted `exec claude --settings <shim>` only, without
+`--setting-sources project,local`. Claude Code's settings merge is
+ADDITIVE, so it loaded BOTH the bind-mounted host
+`~/.claude/settings.json` (bare hooks, hit "Exec format error") AND
+the shim (wrapped hooks). Both fired on every event; the bare ones
+still spammed the log. This test asserts the v20 fix: the
+`--setting-sources project,local` filter MUST be present whenever a
+shim path is.
+
+Run:  ./entrypoint-claude-cmd.test
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ENTRYPOINT = HERE.parent / "entrypoint.sh"
+
+if not ENTRYPOINT.exists():
+    print(f"FAIL: cannot locate entrypoint at {ENTRYPOINT}", file=sys.stderr)
+    sys.exit(2)
+
+
+# Extract the CLAUDE_CMD-building block. We anchor on the well-known
+# block opener (`CLAUDE_CMD="exec claude"`) and end at the next blank
+# line — robust against future edits that don't change the block shape.
+def extract_claude_cmd_block(path: Path) -> str:
+    src = path.read_text(encoding="utf-8")
+    m = re.search(
+        r'(CLAUDE_CMD="exec claude".*?fi\n)',
+        src,
+        re.DOTALL,
+    )
+    if not m:
+        raise AssertionError(
+            "could not locate CLAUDE_CMD block in entrypoint.sh "
+            "(this test extracts it by regex; update the regex if "
+            "the block shape changes)"
+        )
+    return m.group(1)
+
+
+def run_block(block: str, env: dict) -> str:
+    """Run the extracted bash block under bash -c with the given env,
+    then echo $CLAUDE_CMD. Returns the printed value."""
+    script = f"set -u\n{block}\nprintf '%s\\n' \"$CLAUDE_CMD\"\n"
+    # The block reads CLAUDE_SHIM_SETTINGS_PATH; bash needs it set or
+    # unset depending on the test case. We pass via env.
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"bash exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    # Last line is the CLAUDE_CMD value.
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        raise AssertionError(f"no output from block; stdout was:\n{result.stdout}")
+    return lines[-1]
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+BLOCK = extract_claude_cmd_block(ENTRYPOINT)
+
+
+def test_unset_shim_path_bare_claude() -> None:
+    """CLAUDE_SHIM_SETTINGS_PATH unset → exec claude (no flags)."""
+    env = {"PATH": "/usr/bin:/bin"}
+    cmd = run_block(BLOCK, env)
+    expect(cmd == "exec claude",
+           f"unset shim path: expected bare 'exec claude', got {cmd!r}")
+
+
+def test_empty_shim_path_bare_claude() -> None:
+    """CLAUDE_SHIM_SETTINGS_PATH='' → exec claude (no flags)."""
+    env = {"PATH": "/usr/bin:/bin", "CLAUDE_SHIM_SETTINGS_PATH": ""}
+    cmd = run_block(BLOCK, env)
+    expect(cmd == "exec claude",
+           f"empty shim path: expected bare 'exec claude', got {cmd!r}")
+
+
+def test_set_shim_path_includes_setting_sources() -> None:
+    """CLAUDE_SHIM_SETTINGS_PATH=/tmp/foo.json → includes --setting-sources."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
+    }
+    cmd = run_block(BLOCK, env)
+    expect("--setting-sources project,local" in cmd,
+           f"set shim path: missing --setting-sources flag, got {cmd!r}")
+    expect("--settings /tmp/foo.json" in cmd,
+           f"set shim path: missing --settings <path>, got {cmd!r}")
+
+
+def test_set_shim_path_order() -> None:
+    """--setting-sources must appear BEFORE --settings (left-to-right
+    readability contract; functionally equivalent either order)."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
+    }
+    cmd = run_block(BLOCK, env)
+    ss_idx = cmd.find("--setting-sources")
+    s_idx = cmd.find("--settings ")
+    expect(ss_idx >= 0 and s_idx >= 0,
+           f"order: both flags should be present, got {cmd!r}")
+    expect(ss_idx < s_idx,
+           f"order: --setting-sources should come before --settings, got {cmd!r}")
+
+
+def test_set_shim_path_exact_form() -> None:
+    """Exact match against the documented contract — guard against drift
+    (e.g. someone changes the source list to include 'user' or drops the
+    --setting-sources flag entirely)."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+    }
+    cmd = run_block(BLOCK, env)
+    expected = (
+        "exec claude --setting-sources project,local "
+        "--settings /tmp/claude-shim/settings.json"
+    )
+    expect(cmd == expected,
+           f"exact form: expected {expected!r}, got {cmd!r}")
+
+
+def test_user_tier_not_in_source_list() -> None:
+    """Regression guard for the v19 bug: the source list MUST NOT include
+    'user' — otherwise the bind-mounted host settings.json's bare hooks
+    would still load and fire 'Exec format error' on every event."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
+    }
+    cmd = run_block(BLOCK, env)
+    # Pull the comma-separated source list out and verify 'user' isn't there.
+    m = re.search(r"--setting-sources\s+([^\s]+)", cmd)
+    expect(m is not None,
+           f"user-tier guard: --setting-sources flag missing, got {cmd!r}")
+    if m:
+        sources = m.group(1).split(",")
+        expect("user" not in sources,
+               f"user-tier guard: 'user' must not be in source list, got {sources}")
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_unset_shim_path_bare_claude,
+    test_empty_shim_path_bare_claude,
+    test_set_shim_path_includes_setting_sources,
+    test_set_shim_path_order,
+    test_set_shim_path_exact_form,
+    test_user_tier_not_in_source_list,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")
