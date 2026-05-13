@@ -155,6 +155,71 @@ SITE_LOGO_DEFAULT = os.environ.get("QUEUE_SITE_LOGO_DEFAULT", "").strip() in (
 app = Flask(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Static-asset cache-busting
+# ---------------------------------------------------------------------------
+# The reverse proxy passes upstream Cache-Control through, and we serve
+# ``Cache-Control: no-cache`` for /static/* (Flask default for ``send_file``
+# with ``cache_timeout=0``). That's fine for a cold reload — the browser
+# revalidates via If-None-Match. BUT the modal's live-log EventSource holds
+# a reference to the live-log.js renderer in memory across deploys: a tab
+# opened before a JS update keeps running the OLD code, even after the
+# container restarts and EventSource reconnects. q-2026-05-13-d57b
+# (PR #133 follow-up) caught this — after deploying \r-transient render
+# support the modal STILL stacked rsync progress lines for any tab opened
+# pre-deploy because that tab's JS didn't know about the new ``transient``
+# field. Hard-refresh worked, but that's a manual step we shouldn't need.
+#
+# Fix: append ``?v=<mtime>`` to every ``url_for('static', ...)`` call so a
+# new-mtime deploy produces a new URL the browser MUST refetch. Mtime is
+# stat'd lazily and cached forever per-path within a process — a deploy
+# restarts the container so the cache is wiped naturally. Missing files
+# (typo / wrong filename) silently fall through with no version param so
+# the normal Flask 404 still surfaces.
+_STATIC_MTIME_CACHE: dict[str, str] = {}
+
+
+def _static_mtime_version(filename: str) -> str:
+    """Return a short version token derived from the file's mtime.
+
+    Empty string on stat failure so the caller renders the bare URL.
+    """
+    cached = _STATIC_MTIME_CACHE.get(filename)
+    if cached is not None:
+        return cached
+    try:
+        # ``app.static_folder`` is set by Flask to ``<app_root>/static`` by
+        # default; resolve filename against it so we can't escape via "..".
+        # ``send_static_file`` does the same safe-join — we mirror it here.
+        full = os.path.join(app.static_folder or "", filename)
+        # Reject path-traversal: the resolved path must live under the
+        # static folder.
+        full_real = os.path.realpath(full)
+        root_real = os.path.realpath(app.static_folder or "")
+        if not full_real.startswith(root_real + os.sep) and full_real != root_real:
+            _STATIC_MTIME_CACHE[filename] = ""
+            return ""
+        mtime = int(os.path.getmtime(full_real))
+        version = format(mtime, "x")
+    except OSError:
+        version = ""
+    _STATIC_MTIME_CACHE[filename] = version
+    return version
+
+
+@app.url_defaults
+def _add_static_version(endpoint: str, values: dict[str, Any]) -> None:
+    """Inject ``v=<mtime>`` into every ``url_for('static', ...)`` call."""
+    if endpoint != "static":
+        return
+    filename = values.get("filename")
+    if not filename or "v" in values:
+        return
+    version = _static_mtime_version(filename)
+    if version:
+        values["v"] = version
+
+
 @dataclass
 class _Cache:
     payload: dict[str, Any] = field(default_factory=dict)

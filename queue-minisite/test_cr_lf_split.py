@@ -185,5 +185,149 @@ class WorkloadOutputCrFlavorTests(unittest.TestCase):
             os.unlink(path)
 
 
+class TsRsyncRealWorldTests(unittest.TestCase):
+    """Regression test for the exact pattern the production batch1
+    stv-promote workload emitted that triggered q-2026-05-13-d57b.
+
+    ``stv-promote`` pipes rsync's ``--info=progress2`` through ``ts``
+    which prepends an ISO-8601 timestamp to each ``\\n``-terminated
+    line. A SINGLE logical line therefore looks like::
+
+        <TS>  \\r<prog1>\\r<prog2>\\n
+
+    where each ``<progN>`` is a partial-bytes/percent update. PR #133's
+    ``cr-test4`` synthetic only exercised the bare ``\\r%d%%`` shape;
+    this case adds the ts-prefixed flavor so a future regression
+    (e.g. someone special-cases the prefix or trims leading whitespace
+    out of transient frames) is caught at unit-test time.
+    """
+
+    def test_ts_prefixed_rsync_logical_line(self) -> None:
+        # One logical rsync line: TS prefix + 2 \r updates + final \n.
+        # Mirrors a real stv-promote progress2 line for a 33KB file.
+        buf = (
+            "2026-05-13T01:23:59-0400  "  # ts prefix
+            "\r          32,768   98%  238.81kB/s    0:00:00  "
+            "\r          33,431  100%  243.64kB/s    0:00:00 (xfr#82, to-chk=154/249)"
+            "\n"
+        )
+        segs, rem = _split_cr_lf_segments(buf, flush_remainder=True)
+        self.assertEqual(rem, "")
+        # 3 segments: 2 transient + 1 permanent. The TS-prefix segment
+        # is itself transient — the next \r segment REPLACES it in the UI.
+        self.assertEqual(len(segs), 3)
+        self.assertTrue(segs[0][1])  # transient
+        self.assertIn("2026-05-13T01:23:59-0400", segs[0][0])
+        self.assertTrue(segs[1][1])  # transient
+        self.assertIn("32,768", segs[1][0])
+        self.assertFalse(segs[2][1])  # permanent — graduates
+        self.assertIn("xfr#82", segs[2][0])
+        self.assertIn("100%", segs[2][0])
+
+    def test_ts_prefixed_rsync_many_files(self) -> None:
+        # Three back-to-back ts+rsync logical lines (3 files) — the same
+        # shape that produced 367KB of \r-rich output in q-2026-05-13-41b3.
+        per_file = (
+            "2026-05-13T01:00:00  "
+            "\r 32%  1.2MB/s  0:00:01  "
+            "\r 64%  2.4MB/s  0:00:00  "
+            "\r100% (xfr#N, to-chk=0/1)\n"
+        )
+        buf = per_file.replace("xfr#N", "xfr#a") \
+            + per_file.replace("xfr#N", "xfr#b") \
+            + per_file.replace("xfr#N", "xfr#c")
+        segs, rem = _split_cr_lf_segments(buf, flush_remainder=True)
+        self.assertEqual(rem, "")
+        # 3 files × 4 segments = 12 segments. Each block has the same
+        # transient/permanent shape: T, T, T, F.
+        self.assertEqual(len(segs), 12)
+        for i, (text, transient) in enumerate(segs):
+            block = i // 4
+            within = i % 4
+            self.assertEqual(
+                transient, within != 3,
+                f"segment {i} (block {block}/{within}) transient mismatch: "
+                f"got transient={transient}, text={text!r}"
+            )
+
+    def test_cr_only_inside_logical_line(self) -> None:
+        # If the producer buffer ends mid-line on a bare \r (rsync hasn't
+        # written its terminating \n yet), the splitter must defer that \r
+        # as remainder so the next read can fuse a possible \r\n or \n.
+        buf = "2026-05-13T01:00:00  \r 32%\r"  # ends on bare \r
+        segs, rem = _split_cr_lf_segments(buf)
+        self.assertEqual(len(segs), 1)  # only the TS prefix emitted
+        self.assertTrue(segs[0][1])
+        self.assertIn("2026-05-13T01:00:00", segs[0][0])
+        # The trailing " 32%\r" carried as remainder for the next read.
+        self.assertEqual(rem, " 32%\r")
+
+
+class StaticVersionUrlDefaultsTests(unittest.TestCase):
+    """``app.url_defaults`` cache-buster injection for ``url_for('static', ...)``.
+
+    A tab opened before a JS deploy keeps running the OLD code from
+    in-memory state even after the container restarts; EventSource
+    reconnects through the stale renderer. Pinning the static-asset URL
+    to file mtime forces the browser to refetch on every deploy.
+
+    q-2026-05-13-d57b — Andrew saw stacked rsync progress lines in a
+    modal opened pre-PR-#133 even after the deploy. The hard-refresh
+    workaround works but shouldn't be required.
+    """
+
+    def setUp(self) -> None:
+        # Late import to keep the heavy flask import out of the
+        # splitter-only path. Clear the per-process mtime cache so each
+        # test sees a clean state.
+        from app import app, _STATIC_MTIME_CACHE
+        self.app = app
+        _STATIC_MTIME_CACHE.clear()
+        self.client = app.test_client()
+
+    def test_url_for_static_includes_v_param(self) -> None:
+        from flask import url_for
+        with self.app.test_request_context("/"):
+            url = url_for("static", filename="live-log.js")
+        self.assertIn("?v=", url, f"expected ?v= in {url!r}")
+        # Param value is a non-empty hex token.
+        version = url.rsplit("?v=", 1)[1]
+        self.assertTrue(version, "version param is empty")
+        self.assertTrue(all(c in "0123456789abcdef" for c in version),
+                        f"version {version!r} is not pure hex")
+
+    def test_url_for_non_static_endpoint_unchanged(self) -> None:
+        from flask import url_for
+        with self.app.test_request_context("/"):
+            url = url_for("index")
+        self.assertNotIn("?v=", url, f"non-static URL should not carry ?v=: {url!r}")
+
+    def test_url_for_missing_static_file_falls_through(self) -> None:
+        from flask import url_for
+        with self.app.test_request_context("/"):
+            url = url_for("static", filename="this-file-does-not-exist.js")
+        # Missing file -> empty version -> bare URL (no ?v= appended).
+        self.assertNotIn("?v=", url, f"missing file should not get ?v=: {url!r}")
+
+    def test_url_for_traversal_attempt_falls_through(self) -> None:
+        from flask import url_for
+        with self.app.test_request_context("/"):
+            # Path-traversal target outside the static folder must not
+            # leak file mtimes via the version param.
+            url = url_for("static", filename="../app.py")
+        self.assertNotIn("?v=", url)
+
+    def test_index_html_renders_versioned_script_tag(self) -> None:
+        # End-to-end: GET / and verify the rendered HTML carries ?v=
+        # in the live-log.js script tag.
+        resp = self.client.get("/")
+        # The index handler tolerates a missing queue.json by rendering
+        # an empty-queue page — the script tags still render.
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertIn("live-log.js?v=", body,
+                      "expected versioned live-log.js script tag in /")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
