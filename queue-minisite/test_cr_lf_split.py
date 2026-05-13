@@ -22,7 +22,7 @@ sys.path.insert(0, str(HERE))
 
 # Late import — the parent app.py pulls in flask via app-level imports,
 # so the import time isn't free but we only pay it once per test run.
-from app import _split_cr_lf_segments  # noqa: E402
+from app import _split_cr_lf_segments, _collapse_transient_runs  # noqa: E402
 
 
 class SplitCrLfSegmentsTests(unittest.TestCase):
@@ -327,6 +327,140 @@ class StaticVersionUrlDefaultsTests(unittest.TestCase):
         body = resp.get_data(as_text=True)
         self.assertIn("live-log.js?v=", body,
                       "expected versioned live-log.js script tag in /")
+
+
+class CollapseTransientRunsTests(unittest.TestCase):
+    """Backfill-path transient collapser.
+
+    The live tail keeps every ``\\r``-terminated frame so the front-end
+    can render in-place rewrite animation. The BACKFILL path collapses
+    consecutive transient runs to the LAST frame before applying the
+    line-budget trim, so a long rsync (1000s of progress frames) doesn't
+    starve the actual ``\\n``-terminated context out of the modal.
+
+    Regression target: q-2026-05-13-65b0 — modal opened on a live rsync
+    showed only the latest progress frame in the backfill; the
+    stv-promote header + prior shows' completion lines had been
+    crowded out by transient frames in the 200-segment budget.
+    """
+
+    def test_empty_input(self) -> None:
+        self.assertEqual(_collapse_transient_runs([]), [])
+
+    def test_no_transients_unchanged(self) -> None:
+        segs = [("a", False), ("b", False), ("c", False)]
+        self.assertEqual(_collapse_transient_runs(segs), segs)
+
+    def test_single_transient_preserved(self) -> None:
+        segs = [("a", False), ("p", True), ("b", False)]
+        self.assertEqual(_collapse_transient_runs(segs), segs)
+
+    def test_transient_run_before_permanent_keeps_last(self) -> None:
+        # T T T F  ->  T F  (only the last transient is kept; the F
+        # ultimately graduates so the user sees "final transient state"
+        # then "permanent line").
+        segs = [
+            ("10%", True),
+            ("20%", True),
+            ("30%", True),
+            ("done", False),
+        ]
+        self.assertEqual(
+            _collapse_transient_runs(segs),
+            [("30%", True), ("done", False)],
+        )
+
+    def test_trailing_transient_run_at_eof(self) -> None:
+        # T T T (no graduating F) -> single T (the latest mid-flight
+        # progress frame).
+        segs = [("10%", True), ("20%", True), ("30%", True)]
+        self.assertEqual(_collapse_transient_runs(segs), [("30%", True)])
+
+    def test_multiple_transient_runs(self) -> None:
+        # T T F T T F T -> T F T F T
+        segs = [
+            ("a1", True),
+            ("a2", True),
+            ("A", False),
+            ("b1", True),
+            ("b2", True),
+            ("B", False),
+            ("c1", True),
+        ]
+        self.assertEqual(
+            _collapse_transient_runs(segs),
+            [
+                ("a2", True),
+                ("A", False),
+                ("b2", True),
+                ("B", False),
+                ("c1", True),
+            ],
+        )
+
+    def test_docstring_example_under_trim(self) -> None:
+        # End-to-end example from the q-2026-05-13-65b0 spec:
+        #   \r\r\rfinal\r\nA\r\r\rfinal2\r\nB\n
+        # The splitter sees \r\n pairs and collapses them, so "final\r\n"
+        # graduates "final" as PERMANENT (not transient). Pre-split this
+        # is 9 segments: ['', '', '', 'final', 'A', '', '', 'final2', 'B'].
+        # transients are the bare-\r-terminated empty heads of each
+        # progress run; the "final"/"final2" lines graduate via the
+        # collapsed \r\n.
+        buf = "\r\r\rfinal\r\nA\r\r\rfinal2\r\nB\n"
+        segs, rem = _split_cr_lf_segments(buf, flush_remainder=True)
+        self.assertEqual(rem, "")
+        # Pre-collapse: 5 transients (3 \r-prefix + 1 between A and
+        # final2 + 1 between A and final2's \r-prefix) interleaved with
+        # 4 permanents = 9. The transients are empty because the actual
+        # payload lives in the \r\n-terminated row that follows.
+        self.assertEqual(len(segs), 9)
+        collapsed = _collapse_transient_runs(segs)
+        # Post-collapse: each leading transient run reduces to one empty
+        # transient, then the \n-terminated permanent line.
+        # Run 1 (\r\r\r): "" "" "" -> ""      (T)
+        # final (was followed by \r\n)        (F)
+        # A (\n-terminated)                   (F)
+        # Run 2 (\r\r\r): "" "" "" -> ""      (T)
+        # final2 (was followed by \r\n)       (F)
+        # B (\n-terminated)                   (F)
+        self.assertEqual(
+            collapsed,
+            [
+                ("", True),
+                ("final", False),
+                ("", True),
+                ("final2", False),
+                ("B", False),
+            ],
+        )
+        # Sanity: under a trim limit of 10 the user sees all 5 rows —
+        # not 9 stacked rows, and not just one "final" row.
+        self.assertLessEqual(len(collapsed), 10)
+
+    def test_real_world_rsync_backfill_shape(self) -> None:
+        # 100 progress frames per file × 5 files, each terminated by
+        # a final \n line. Pre-collapse: 100×5 + 5 = 505 segments.
+        # The 200-line budget would catch ~2 full progress runs and the
+        # actual context (the 5 \n lines) would be invisible. After
+        # collapse: 5 transients + 5 permanents = 10 segments, all of
+        # which fit comfortably under the 200-line budget.
+        parts: list[str] = []
+        for f in range(5):
+            for pct in range(0, 100):
+                parts.append(f"prog-{f}-{pct}%\r")
+            parts.append(f"file{f} done\n")
+        buf = "".join(parts)
+        segs, _ = _split_cr_lf_segments(buf, flush_remainder=True)
+        # 100 transients + 1 permanent per file × 5 files = 505 segs.
+        self.assertEqual(len(segs), 505)
+        collapsed = _collapse_transient_runs(segs)
+        # 1 transient + 1 permanent per file × 5 files = 10 segs.
+        self.assertEqual(len(collapsed), 10)
+        # Verify the last transient of each run + permanent line.
+        for f in range(5):
+            self.assertEqual(collapsed[2 * f], (f"prog-{f}-99%", True))
+            self.assertEqual(collapsed[2 * f + 1], (f"file{f} done", False))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1465,6 +1465,47 @@ def _format_sse_comment(text: str) -> bytes:
     return f": {text}\n\n".encode("utf-8")
 
 
+def _collapse_transient_runs(
+    segments: list[tuple[str, bool]],
+) -> list[tuple[str, bool]]:
+    """Collapse consecutive ``transient=True`` segments to their LAST frame.
+
+    Used ONLY by the backfill code path — the live-tail keeps every
+    transient frame on the wire so the front-end can render the in-place
+    rewrite animation. For backfill the user has just opened the modal:
+    showing 1000s of historical rsync progress frames is noise and
+    starves the line budget. We want them to see the FINAL state of each
+    transient run (the last `\\r`-terminated frame before a `\\n`
+    graduates the line, or the bare trailing transient at EOF) plus all
+    permanent lines.
+
+    Input: ``[(text, transient)]`` from ``_split_cr_lf_segments``.
+    Output: same shape, with runs of ``transient=True`` collapsed.
+
+    Examples (``T``=transient, ``F``=permanent)::
+
+        T T T F  ->  T F        (keep last transient before the LF graduates)
+        T T T    ->  T          (bare trailing transient run at EOF)
+        F T F    ->  F T F      (single transient untouched)
+        F F      ->  F F        (no transients, no change)
+    """
+    if not segments:
+        return segments
+    out: list[tuple[str, bool]] = []
+    last_transient: tuple[str, bool] | None = None
+    for text, transient in segments:
+        if transient:
+            last_transient = (text, transient)
+        else:
+            if last_transient is not None:
+                out.append(last_transient)
+                last_transient = None
+            out.append((text, transient))
+    if last_transient is not None:
+        out.append(last_transient)
+    return out
+
+
 def _split_cr_lf_segments(
     buf: str, *, flush_remainder: bool = False
 ) -> tuple[list[tuple[str, bool]], str]:
@@ -1717,6 +1758,15 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
         # written so far; if it's mid-line we'd rather surface it than
         # hide it. The tail loop below starts fresh from the live EOF.
         backfill_segments, _ = _split_cr_lf_segments(initial, flush_remainder=True)
+        # Collapse consecutive transient (\r-terminated) frames to their
+        # LAST member BEFORE applying the line-budget trim. Without this,
+        # a long rsync (1000s of progress frames in the .output) eats the
+        # entire 200-line budget with mid-flight progress percentages and
+        # the actual context (stv-promote header, file completions,
+        # earlier shows) falls off the top. q-2026-05-13-65b0. The live
+        # tail path is UNCHANGED — every transient still streams so the
+        # front-end can animate in-place rewrites.
+        backfill_segments = _collapse_transient_runs(backfill_segments)
         if len(backfill_segments) > SSE_TAIL_BACKFILL_LINES:
             backfill_segments = backfill_segments[-SSE_TAIL_BACKFILL_LINES:]
 
@@ -2067,6 +2117,11 @@ def _replay_workload_output(path: Path) -> Iterator[bytes]:
         # curl) surface their final state instead of replaying every
         # \r-terminated frame as a stacked permanent row.
         segments, _ = _split_cr_lf_segments(data, flush_remainder=True)
+        # Collapse consecutive transient (\r-terminated) frames to their
+        # LAST member — archived workloads see the final state of each
+        # progress run, not every mid-flight frame. Same rationale as
+        # the live backfill path in _tail_workload_output.
+        segments = _collapse_transient_runs(segments)
         for text, transient in segments:
             yield _format_sse({
                 "type": "event",
