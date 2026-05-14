@@ -113,6 +113,66 @@ If the operator gives you a job that genuinely needs a host-side
 watcher / notifier, run it on the host instead (via the operator's host
 Claude Code session) or bridge the watch event over `host-bash`.
 
+## Main loop is a coordinator, not a worker
+
+The in-container Claude Code session has two execution tiers, and the
+default tier for substantive work is **not** the main loop:
+
+- **Agent tool calls** — semantic LLM work with bounded scope. Reading
+  multiple files, multi-file edits, running tests, shipping a PR,
+  investigating a bug, drafting prose with research, anything that
+  would chain more than ~1 tool call. Agents are subject to the
+  queue-protocol PreToolUse hook (see next section).
+- **Main loop** — dispatcher. Single bounded commands. Reads a
+  notification, classifies it, decides what to do, and **delegates**.
+  Validates the agent's return value. Composes the operator-facing
+  reply. That's it.
+
+**Bias toward delegation.** Any operation that involves more than ~1
+tool call, OR that reads multiple files, OR that makes multi-file
+edits, OR that runs tests, OR that ships code through review →
+delegate it to an Agent. Do not do it inline in the main loop.
+
+Why this matters even when nothing is forcing the choice:
+
+- **Context is precious in the main loop.** Every tool result the
+  main loop sees costs context the operator can never get back. A
+  subagent runs in its own context window — large reads, long test
+  output, verbose CI logs all stay there, not in the main loop's
+  transcript. When the agent returns, the main loop sees only the
+  agent's final summary.
+- **Failures are easier to recover from when bounded.** If a
+  subagent goes sideways (wrong direction, infinite loop, bad
+  edit), the main loop can abandon the queue item and try again
+  from a clean slate. An inline failure pollutes the main loop's
+  state — the operator sees the half-finished work, the wrong
+  edits, the dead-end exploration.
+- **Parallelism.** While an agent is working, the main loop can
+  handle inbound (queue events, notifications, operator messages)
+  instead of blocking. Many in-flight subagents at once is normal
+  and healthy.
+- **The queue is the audit trail.** Every queue item is a
+  durable record of "the main loop decided to spawn an agent for
+  X scope at Y time." Inline work leaves no such record — it's
+  invisible to the operator and to anyone reviewing what the
+  session did.
+
+Tier choice in practice:
+
+- **Interpret / decide / multi-file edit / validate / ship a PR**
+  → Agent.
+- **Single bounded command + check the result** → main loop.
+- **External wait** (CI run, long build, sleep-based poll) →
+  spawn an Agent that does the wait, not the main loop. The main
+  loop should never sit in a polling sleep loop.
+
+If you're in the main loop and find yourself about to chain
+`Read` → `Edit` → `Edit` → `Bash` → `Bash`, **stop and queue an
+Agent for the whole sequence instead.** The PreToolUse queue-gate
+hook (next section) enforces "Agent spawns require a queue item"
+— this section enforces the upstream policy that the spawn should
+happen in the first place.
+
 ## Queue protocol — every Agent tool call
 
 Before firing **any** `Agent` tool call, you MUST first add a queue
