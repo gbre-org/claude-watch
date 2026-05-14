@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# mcp-host-bash — host-side launcher for a generic "run a bash command on
+# the host" MCP server, fronted by mcp-proxy so the in-container claude
+# can reach it via CLAUDE_MCP_HTTP_BRIDGE.
+#
+# What this gives you
+#
+# A second MCP server visible inside the containerised claude (alongside
+# any other bridged servers such as the Salesforce mcp-adaptor) that
+# exposes a single `run_command` tool. The tool executes argv against
+# whitelisted binaries on the **host**, so the container can drive
+# host-only operations (corp git, host-only CLIs, scripts under the
+# operator's home dir) without needing the binaries themselves installed
+# inside the Linux container.
+#
+# How it's wired
+#
+#   container claude                       host
+#   ───────────────                       ────
+#   .mcp.json: host-bash, type=http
+#       │
+#       ▼                       (HTTP, streamable)
+#   http://host.docker.internal:8766/mcp ───────► mcp-proxy --port 8766
+#                                                    │
+#                                                    ▼  (stdio)
+#                                                 cli-mcp-server
+#                                                    │
+#                                                    ▼  (subprocess)
+#                                                 the actual command
+#
+# The container side is the existing CLAUDE_MCP_HTTP_BRIDGE plumbing
+# (claude-watch PR #148). The HOST side is what this script stands up.
+#
+# Off-the-shelf pieces (no hand-rolled MCP server needed):
+#
+#   - mcp-proxy:     PyPI 'mcp-proxy', runs via `uvx`. Hosts a stdio
+#                    MCP server over HTTP. Same component validated in
+#                    v24 workbot for the mcp-adaptor bridge.
+#   - cli-mcp-server: PyPI 'cli-mcp-server', runs via `uvx`. Generic
+#                    stdio MCP server with an `run_command` tool and an
+#                    env-var-driven allow-list (ALLOWED_COMMANDS /
+#                    ALLOWED_FLAGS / ALLOWED_DIR / COMMAND_TIMEOUT /
+#                    ALLOW_SHELL_OPERATORS). MIT, last release 2025-07.
+#
+# Security model
+#
+# `run_command` is a substantial privilege escalation: anything that has
+# API access to the in-container claude can run code on the host. The
+# allow-list is your safety floor.
+#
+#   ALLOWED_COMMANDS — comma-separated list of binary names the server
+#                      will exec. NEVER set this to "all" in production.
+#                      Default (intentionally conservative): a small set
+#                      of read-only / version-control tools.
+#   ALLOWED_FLAGS    — comma-separated flag whitelist, OR "all" to skip
+#                      flag filtering (still bounded by ALLOWED_COMMANDS).
+#   ALLOWED_DIR      — absolute path. The server refuses commands that
+#                      would resolve outside this tree. Default: $HOME.
+#   COMMAND_TIMEOUT  — per-command wall-clock cap, seconds. Default: 30.
+#   ALLOW_SHELL_OPERATORS — "true"/"false". When false (default), the
+#                      server rejects pipes/redirects/&&/||, so the
+#                      container can't string commands together.
+#
+# Override via a config file at $MCP_HOST_BASH_CONFIG (default:
+# $HOME/.config/claude-container/mcp-host-bash.env). The file is
+# sourced before launch — standard KEY=VALUE lines, comments with #.
+# Operator-supplied values override the defaults below.
+#
+# Logging
+#
+# mcp-proxy logs JSON-RPC traffic to stderr. cli-mcp-server logs each
+# `run_command` invocation to stderr including the resolved argv. We
+# tee both into $MCP_HOST_BASH_LOG (default:
+# $HOME/.local/state/claude-container/mcp-host-bash.log) AND to stdout/
+# stderr so the operator can either follow live (foreground) or audit
+# later (when running under launchd / a tmux pane).
+#
+# Off switch
+#
+# Two ways to stop the server:
+#   1. Ctrl-C in the foreground (this script traps SIGTERM/SIGINT and
+#      tears mcp-proxy down cleanly).
+#   2. Set MCP_HOST_BASH_DISABLED=1 in your shell env before launch;
+#      the script refuses to start, exit 0. Use this as a "soft kill
+#      switch" when the launcher is wired into launchd / login startup.
+#
+# Usage
+#
+#   mcp-host-bash                  # start in foreground (Ctrl-C to stop)
+#   mcp-host-bash --port 9000      # custom port (default: 8766)
+#   mcp-host-bash --print-cmd      # print the planned exec argv + exit 0
+#   mcp-host-bash --help           # this help
+#
+# Container .env wiring
+#
+#   CLAUDE_MCP_HTTP_BRIDGE=host-bash=http://host.docker.internal:8766/mcp
+#
+# (Combine with the existing mcp-adaptor entry via `:` if you have both:
+#   CLAUDE_MCP_HTTP_BRIDGE=mcp-adaptor=...8765/mcp:host-bash=...8766/mcp )
+#
+# Inside the container, after `docker compose up -d`:
+#   claude mcp list                # should show host-bash, Connected
+#   /mcp                           # in the claude REPL — same surface
+#
+# Exit codes
+#   0   normal shutdown (or --help / --print-cmd / MCP_HOST_BASH_DISABLED)
+#   1   missing uvx / unreachable PyPI / port already bound
+#   2   bad flag / argv parse error
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Defaults
+# -----------------------------------------------------------------------------
+
+DEFAULT_PORT=8766
+DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo"
+DEFAULT_ALLOWED_FLAGS="all"
+DEFAULT_COMMAND_TIMEOUT=30
+DEFAULT_ALLOW_SHELL_OPERATORS="false"
+
+# Honor XDG-ish locations on macOS too (just paths, not the spec itself).
+MCP_HOST_BASH_CONFIG="${MCP_HOST_BASH_CONFIG:-${HOME}/.config/claude-container/mcp-host-bash.env}"
+MCP_HOST_BASH_LOG="${MCP_HOST_BASH_LOG:-${HOME}/.local/state/claude-container/mcp-host-bash.log}"
+
+# -----------------------------------------------------------------------------
+# Argv parsing
+# -----------------------------------------------------------------------------
+
+usage() {
+    sed -n '2,/^set -euo/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^set -euo/d'
+}
+
+PORT=""
+PRINT_CMD=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --port)
+            shift
+            if [ "$#" -eq 0 ]; then
+                echo "mcp-host-bash: --port requires a value" >&2
+                exit 2
+            fi
+            PORT="$1"
+            shift
+            ;;
+        --port=*)
+            PORT="${1#--port=}"
+            shift
+            ;;
+        --print-cmd)
+            # Test-only hook: build the planned exec argv but print it
+            # (one-per-line) instead of executing. No uvx / network /
+            # port-bind probe runs in this mode — used by the test
+            # suite to verify argv construction without external deps.
+            PRINT_CMD=1
+            shift
+            ;;
+        *)
+            printf 'mcp-host-bash: unknown argument %q\n' "$1" >&2
+            echo 'See --help for usage.' >&2
+            exit 2
+            ;;
+    esac
+done
+
+PORT="${PORT:-$DEFAULT_PORT}"
+
+# -----------------------------------------------------------------------------
+# Soft kill switch
+# -----------------------------------------------------------------------------
+
+if [ "${MCP_HOST_BASH_DISABLED:-0}" = "1" ] && [ "$PRINT_CMD" = "0" ]; then
+    echo "mcp-host-bash: MCP_HOST_BASH_DISABLED=1 — refusing to start. Unset to enable." >&2
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Load operator overrides
+#
+# The config file is plain KEY=VALUE lines (bash-source compatible). We
+# only honor the env-var keys cli-mcp-server / this script consume —
+# stray keys are harmless because we explicitly export the curated set
+# below.
+# -----------------------------------------------------------------------------
+
+if [ -f "$MCP_HOST_BASH_CONFIG" ] && [ "$PRINT_CMD" = "0" ]; then
+    # shellcheck disable=SC1090
+    . "$MCP_HOST_BASH_CONFIG"
+elif [ -f "$MCP_HOST_BASH_CONFIG" ] && [ "$PRINT_CMD" = "1" ]; then
+    # In test mode, still source so --print-cmd reflects operator overrides.
+    # shellcheck disable=SC1090
+    . "$MCP_HOST_BASH_CONFIG"
+fi
+
+# Apply defaults for any keys the config file didn't set. Done AFTER
+# sourcing so operator overrides win.
+ALLOWED_COMMANDS="${ALLOWED_COMMANDS:-$DEFAULT_ALLOWED_COMMANDS}"
+ALLOWED_FLAGS="${ALLOWED_FLAGS:-$DEFAULT_ALLOWED_FLAGS}"
+ALLOWED_DIR="${ALLOWED_DIR:-${HOME}}"
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-$DEFAULT_COMMAND_TIMEOUT}"
+ALLOW_SHELL_OPERATORS="${ALLOW_SHELL_OPERATORS:-$DEFAULT_ALLOW_SHELL_OPERATORS}"
+
+# -----------------------------------------------------------------------------
+# Build the exec argv
+#
+# We launch mcp-proxy as the foreground process; it spawns cli-mcp-server
+# as a subprocess and forwards stdio<->HTTP. mcp-proxy's `--port N` /
+# `--host` flags are stable; the trailing `--` + stdio-server argv tells
+# it which binary to spawn.
+#
+# `--host 0.0.0.0` is REQUIRED for the in-container claude to reach the
+# host adapter via host.docker.internal. mcp-proxy's default
+# (127.0.0.1) only accepts loopback connections, which the container's
+# bridge network can't reach. Operators concerned about exposing the
+# port to the LAN should bind via firewall (or `--host 127.0.0.1` +
+# `--network host` on the container side); host.docker.internal
+# resolution goes through Docker's NAT and `0.0.0.0` is the supported
+# shape.
+# -----------------------------------------------------------------------------
+
+argv=(
+    uvx mcp-proxy
+    --port "$PORT"
+    --host 0.0.0.0
+    # mcp-proxy --env NAME=VALUE pairs forward env into the stdio
+    # subprocess. cli-mcp-server reads its allow-list from env, so
+    # this is how we apply the policy.
+    --env "ALLOWED_COMMANDS=$ALLOWED_COMMANDS"
+    --env "ALLOWED_FLAGS=$ALLOWED_FLAGS"
+    --env "ALLOWED_DIR=$ALLOWED_DIR"
+    --env "COMMAND_TIMEOUT=$COMMAND_TIMEOUT"
+    --env "ALLOW_SHELL_OPERATORS=$ALLOW_SHELL_OPERATORS"
+    --
+    uvx cli-mcp-server
+)
+
+if [ "$PRINT_CMD" = "1" ]; then
+    printf '%s\n' "${argv[@]}"
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Pre-flight: uvx must be installed (we don't try to bootstrap uv)
+# -----------------------------------------------------------------------------
+
+if ! command -v uvx >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+mcp-host-bash: cannot find `uvx` on PATH.
+
+Install uv first (https://docs.astral.sh/uv/getting-started/installation/):
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+
+`uvx` ships with `uv`; once installed, re-run this script.
+EOF
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Logging setup
+# -----------------------------------------------------------------------------
+
+mkdir -p "$(dirname "$MCP_HOST_BASH_LOG")"
+
+# Trap SIGTERM/SIGINT so Ctrl-C cleanly tears down mcp-proxy + its
+# stdio child. mcp-proxy already SIGTERMs the child on its own exit;
+# we just need to forward the signal to mcp-proxy's PID.
+child_pid=""
+cleanup() {
+    if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
+        kill -TERM "$child_pid" 2>/dev/null || true
+        # Give it a beat to flush logs.
+        sleep 0.5
+        kill -KILL "$child_pid" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap cleanup TERM INT
+
+# -----------------------------------------------------------------------------
+# Banner + launch
+#
+# Print the effective policy to stderr at startup so the operator can
+# eyeball what's about to be exposed before the bridge gets dialed.
+# -----------------------------------------------------------------------------
+
+{
+    echo "mcp-host-bash: starting"
+    echo "  port:                  $PORT"
+    echo "  ALLOWED_COMMANDS:      $ALLOWED_COMMANDS"
+    echo "  ALLOWED_FLAGS:         $ALLOWED_FLAGS"
+    echo "  ALLOWED_DIR:           $ALLOWED_DIR"
+    echo "  COMMAND_TIMEOUT:       $COMMAND_TIMEOUT"
+    echo "  ALLOW_SHELL_OPERATORS: $ALLOW_SHELL_OPERATORS"
+    echo "  log:                   $MCP_HOST_BASH_LOG"
+    echo "  config:                $MCP_HOST_BASH_CONFIG (present: $([ -f "$MCP_HOST_BASH_CONFIG" ] && echo yes || echo no))"
+    echo
+    echo "In your .env, set:"
+    echo "  CLAUDE_MCP_HTTP_BRIDGE=host-bash=http://host.docker.internal:${PORT}/mcp"
+    echo
+    echo "Ctrl-C to stop."
+    echo
+} >&2
+
+# Run mcp-proxy in foreground; tee its stderr to the log file. `script`
+# / `unbuffer` aren't portable on macOS without coreutils; we use
+# `tee -a` on a stderr fd-swap pattern instead.
+"${argv[@]}" 2> >(tee -a "$MCP_HOST_BASH_LOG" >&2) &
+child_pid=$!
+wait "$child_pid"

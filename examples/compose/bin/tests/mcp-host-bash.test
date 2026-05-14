@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Tests for examples/compose/bin/mcp-host-bash — the host-side
+mcp-proxy + cli-mcp-server launcher that exposes a generic
+"run a bash command on the host" MCP server for the in-container
+claude to dial via CLAUDE_MCP_HTTP_BRIDGE.
+
+Exercises the script's argv construction WITHOUT actually invoking
+mcp-proxy / cli-mcp-server / uvx by using the `--print-cmd` debug hook
+(the script builds the planned exec argv and prints it one-per-line,
+then exits 0). The hook also skips the uvx-availability probe so the
+test runs on any host with Python 3.
+
+Coverage:
+  - Default invocation: uvx mcp-proxy --port 8766 --host 0.0.0.0
+    --env <policy> -- uvx cli-mcp-server.
+  - --port override: changes the port number in argv.
+  - --port=N form: equals-sign argument shape.
+  - Bad --port (missing value): exits 2.
+  - Bad flag: exits 2.
+  - --help: prints usage, exits 0.
+  - Config-file override: ALLOWED_COMMANDS / ALLOWED_DIR etc. from the
+    config file land in the argv's --env flags.
+  - Default policy: ALLOWED_COMMANDS is conservative (no `bash` / `sh`),
+    ALLOWED_DIR is $HOME, COMMAND_TIMEOUT is 30, ALLOW_SHELL_OPERATORS
+    is false. Guards against accidental relaxation in future edits.
+  - MCP_HOST_BASH_DISABLED=1: refuses to start (--print-cmd flag means
+    we still build the argv for inspection — but the live-launch path
+    exits 0 before reaching exec).
+
+Run:  ./mcp-host-bash.test
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "mcp-host-bash"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate mcp-host-bash at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+def run_script(
+    args: list[str] | None = None,
+    env: dict | None = None,
+    expect_rc: int = 0,
+) -> tuple[list[str], str, str, int]:
+    """Run mcp-host-bash with the given argv + env. Returns
+    (stdout_lines, stdout, stderr, returncode)."""
+    if args is None:
+        args = []
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": "/tmp/fake-home-mcp-host-bash",
+        # Pin config / log to a fresh tmpdir per call so the suite
+        # doesn't trip over operator config on the test host.
+        "MCP_HOST_BASH_CONFIG": "/dev/null",
+    }
+    if env:
+        base_env.update(env)
+    result = subprocess.run(
+        [str(SCRIPT), *args],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if expect_rc is not None and result.returncode != expect_rc:
+        raise AssertionError(
+            f"mcp-host-bash exited {result.returncode}, expected {expect_rc}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout.splitlines(), result.stdout, result.stderr, result.returncode
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def find_env_value(lines: list[str], key: str) -> str | None:
+    """Return the value of an `--env KEY=...` pair in the printed argv,
+    or None if no such pair exists."""
+    for i, line in enumerate(lines):
+        if line == "--env" and i + 1 < len(lines):
+            payload = lines[i + 1]
+            if payload.startswith(f"{key}="):
+                return payload[len(key) + 1:]
+    return None
+
+
+def test_print_cmd_default_argv() -> None:
+    """Default: uvx mcp-proxy --port 8766 --host 0.0.0.0 --env ... --
+    uvx cli-mcp-server."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    expect(lines[0] == "uvx",
+           f"default: argv[0] should be uvx, got {lines[0]!r}")
+    expect(lines[1] == "mcp-proxy",
+           f"default: argv[1] should be mcp-proxy, got {lines[1]!r}")
+    expect("--port" in lines,
+           f"default: argv should include --port, got {lines}")
+    port_idx = lines.index("--port")
+    expect(lines[port_idx + 1] == "8766",
+           f"default: --port should be 8766, got {lines[port_idx + 1]!r}")
+    expect("--host" in lines,
+           f"default: argv should include --host (for host.docker.internal "
+           f"reachability), got {lines}")
+    host_idx = lines.index("--host")
+    expect(lines[host_idx + 1] == "0.0.0.0",
+           f"default: --host should be 0.0.0.0 (NOT 127.0.0.1 — the "
+           f"container's bridge net can't reach loopback), got {lines[host_idx + 1]!r}")
+    expect("--" in lines,
+           f"default: argv should include the stdio-subprocess separator '--', got {lines}")
+    sep_idx = lines.index("--")
+    expect(sep_idx + 1 < len(lines) and lines[sep_idx + 1] == "uvx"
+           and lines[sep_idx + 2] == "cli-mcp-server",
+           f"default: after '--', argv should be `uvx cli-mcp-server`, "
+           f"got {lines[sep_idx+1:sep_idx+3]}")
+
+
+def test_default_policy_conservative() -> None:
+    """The default allow-list must NOT include arbitrary shell-exec
+    binaries (bash, sh, zsh) and must enforce shell-operator blocking.
+    Guards against future edits accidentally relaxing the floor."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    cmds = find_env_value(lines, "ALLOWED_COMMANDS") or ""
+    cmd_list = [c.strip() for c in cmds.split(",")]
+    for forbidden in ("bash", "sh", "zsh", "fish", "all"):
+        expect(forbidden not in cmd_list,
+               f"default ALLOWED_COMMANDS should NOT include {forbidden!r} "
+               f"(would let the container exec arbitrary shell payloads); "
+               f"got {cmd_list}")
+    operators = find_env_value(lines, "ALLOW_SHELL_OPERATORS")
+    expect(operators == "false",
+           f"default ALLOW_SHELL_OPERATORS should be 'false' (block pipes / "
+           f"&&  / redirects / etc.), got {operators!r}")
+    timeout = find_env_value(lines, "COMMAND_TIMEOUT")
+    expect(timeout == "30",
+           f"default COMMAND_TIMEOUT should be 30s, got {timeout!r}")
+    dir_ = find_env_value(lines, "ALLOWED_DIR")
+    expect(dir_ == "/tmp/fake-home-mcp-host-bash",
+           f"default ALLOWED_DIR should be $HOME, got {dir_!r}")
+
+
+def test_port_override_space_form() -> None:
+    """--port 9000 → argv reflects 9000."""
+    lines, _, _, _ = run_script(["--print-cmd", "--port", "9000"])
+    port_idx = lines.index("--port")
+    expect(lines[port_idx + 1] == "9000",
+           f"--port 9000: argv should have port 9000, got {lines[port_idx + 1]!r}")
+
+
+def test_port_override_equals_form() -> None:
+    """--port=9001 → argv reflects 9001."""
+    lines, _, _, _ = run_script(["--print-cmd", "--port=9001"])
+    port_idx = lines.index("--port")
+    expect(lines[port_idx + 1] == "9001",
+           f"--port=9001: argv should have port 9001, got {lines[port_idx + 1]!r}")
+
+
+def test_missing_port_value() -> None:
+    """--port with no following arg → exit 2."""
+    _, _, stderr, rc = run_script(["--port"], expect_rc=2)
+    expect(rc == 2, f"missing --port value: rc should be 2, got {rc}")
+    expect("--port" in stderr,
+           f"missing --port value: stderr should mention --port, got {stderr!r}")
+
+
+def test_bad_flag() -> None:
+    """--bogus → exit 2."""
+    _, _, stderr, rc = run_script(["--bogus"], expect_rc=2)
+    expect(rc == 2, f"bad flag: rc should be 2, got {rc}")
+    expect("unknown argument" in stderr,
+           f"bad flag: stderr should mention 'unknown argument', got {stderr!r}")
+
+
+def test_help_exits_zero() -> None:
+    """--help prints usage and exits 0."""
+    lines, _, _, rc = run_script(["--help"])
+    expect(rc == 0, f"--help: rc should be 0, got {rc}")
+    expect(any("mcp-host-bash" in ln for ln in lines),
+           f"--help: stdout should mention the script name, got {lines[:5]}")
+    expect(any("Usage" in ln or "usage" in ln for ln in lines),
+           f"--help: stdout should contain usage block, got first 30 lines:\n"
+           f"{chr(10).join(lines[:30])}")
+
+
+def test_config_file_overrides_defaults() -> None:
+    """ALLOWED_COMMANDS / ALLOWED_DIR etc. from the config file land in
+    the argv's --env flags (overrides the defaults)."""
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "policy.env"
+        cfg.write_text(
+            "ALLOWED_COMMANDS=git,gh,make\n"
+            "ALLOWED_DIR=/Users/me/work\n"
+            "COMMAND_TIMEOUT=60\n"
+            "ALLOW_SHELL_OPERATORS=true\n"
+        )
+        lines, _, _, _ = run_script(
+            ["--print-cmd"],
+            env={"MCP_HOST_BASH_CONFIG": str(cfg)},
+        )
+        cmds = find_env_value(lines, "ALLOWED_COMMANDS")
+        expect(cmds == "git,gh,make",
+               f"config override: ALLOWED_COMMANDS should be from file, got {cmds!r}")
+        dir_ = find_env_value(lines, "ALLOWED_DIR")
+        expect(dir_ == "/Users/me/work",
+               f"config override: ALLOWED_DIR should be from file, got {dir_!r}")
+        timeout = find_env_value(lines, "COMMAND_TIMEOUT")
+        expect(timeout == "60",
+               f"config override: COMMAND_TIMEOUT should be from file, got {timeout!r}")
+        operators = find_env_value(lines, "ALLOW_SHELL_OPERATORS")
+        expect(operators == "true",
+               f"config override: ALLOW_SHELL_OPERATORS should be from file, "
+               f"got {operators!r}")
+
+
+def test_config_missing_falls_back_to_defaults() -> None:
+    """If the config file doesn't exist, we fall back to defaults (no
+    error). Already exercised by the default tests (MCP_HOST_BASH_CONFIG
+    points at /dev/null which is not a regular file). This case
+    pins a NON-existent path explicitly."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_CONFIG": "/nonexistent/path/to/policy.env"},
+    )
+    cmds = find_env_value(lines, "ALLOWED_COMMANDS")
+    expect(cmds is not None and "git" in cmds,
+           f"missing config: should fall back to defaults (git included), got {cmds!r}")
+
+
+def test_disabled_kill_switch() -> None:
+    """MCP_HOST_BASH_DISABLED=1 + no --print-cmd → exit 0 immediately
+    with a stderr message."""
+    _, _, stderr, rc = run_script(
+        [],  # no --print-cmd, so the kill-switch path is exercised
+        env={"MCP_HOST_BASH_DISABLED": "1"},
+        expect_rc=0,
+    )
+    expect(rc == 0, f"kill switch: rc should be 0 (refused start), got {rc}")
+    expect("MCP_HOST_BASH_DISABLED" in stderr,
+           f"kill switch: stderr should mention MCP_HOST_BASH_DISABLED, got {stderr!r}")
+
+
+def test_separator_position() -> None:
+    """The `--` separator must come AFTER all --env / --port / --host
+    flags and IMMEDIATELY BEFORE the stdio subprocess argv. mcp-proxy
+    treats everything after `--` as the spawned subprocess, so a
+    mis-positioned separator would either leak --env into the spawned
+    binary or drop the bridge."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    sep_idx = lines.index("--")
+    # All --env flags must come BEFORE the separator.
+    env_indices = [i for i, ln in enumerate(lines) if ln == "--env"]
+    for ei in env_indices:
+        expect(ei < sep_idx,
+               f"separator: --env at {ei} should precede '--' at {sep_idx}; "
+               f"got {lines}")
+    # Nothing after the separator should be a flag.
+    after = lines[sep_idx + 1:]
+    expect(after == ["uvx", "cli-mcp-server"],
+           f"separator: after '--', expected ['uvx', 'cli-mcp-server'], got {after}")
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+tests = [
+    test_print_cmd_default_argv,
+    test_default_policy_conservative,
+    test_port_override_space_form,
+    test_port_override_equals_form,
+    test_missing_port_value,
+    test_bad_flag,
+    test_help_exits_zero,
+    test_config_file_overrides_defaults,
+    test_config_missing_falls_back_to_defaults,
+    test_disabled_kill_switch,
+    test_separator_position,
+]
+
+for t in tests:
+    try:
+        t()
+        if not any(t.__name__ in f for f in failures[-len(tests):]):
+            # crude — print PASS only when this test added no failures
+            current_count = sum(1 for f in failures if t.__name__ in f)
+            if current_count == 0:
+                print(f"PASS  {t.__name__}")
+            else:
+                print(f"FAIL  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}")
+
+if failures:
+    print()
+    print(f"FAILED: {len(failures)} failure(s).")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+else:
+    print()
+    print(f"All {len(tests)} tests passed.")
+    sys.exit(0)

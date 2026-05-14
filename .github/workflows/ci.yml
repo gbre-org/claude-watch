@@ -114,3 +114,6 @@ jobs:
 
       - name: Run cw host-shim tests
         run: make test-cw
+
+      - name: Run mcp-host-bash host-shim tests
+        run: make test-mcp-host-bash

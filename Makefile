@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -122,6 +122,15 @@ test-entrypoint:
 # verify argv construction without requiring docker. 7 cases, <1s.
 test-cw:
 	examples/compose/bin/tests/cw.test
+
+# Run the mcp-host-bash host-shim tests (examples/compose/bin/mcp-host-bash —
+# uvx mcp-proxy + uvx cli-mcp-server launcher that fronts a generic
+# "run a bash command on the host" MCP server for the in-container claude
+# via CLAUDE_MCP_HTTP_BRIDGE). Uses the script's --print-cmd debug hook to
+# verify argv construction + default-policy floor + config-file overrides
+# without requiring uvx / mcp-proxy / cli-mcp-server. 11 cases, <1s.
+test-mcp-host-bash:
+	examples/compose/bin/tests/mcp-host-bash.test
 
 # Release build
 build:

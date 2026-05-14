@@ -238,6 +238,36 @@ docker compose --project-directory <examples/compose> exec -it claude-container 
 
 `tmux new-session -A` attaches if the session exists and creates it otherwise — same resilient pattern the `ttyd` service uses. The compose dir, service name, and tmux session name are all overridable via `CW_COMPOSE_DIR` / `CW_SERVICE` / `CW_SESSION`.
 
+### `mcp-host-bash` — generic "run a bash command on the host" MCP server
+
+When the in-container `claude` needs to drive operations the container itself can't reach (corp git pushes, host-only CLIs, scripts under the operator's `$HOME`), the repo bundles a host-side launcher at [`examples/compose/bin/mcp-host-bash`](bin/mcp-host-bash). It runs `uvx mcp-proxy` + `uvx cli-mcp-server` (both off-the-shelf, no hand-rolled MCP server) and surfaces a single `run_command` tool inside the container via `CLAUDE_MCP_HTTP_BRIDGE`.
+
+Setup (one-time, three steps):
+
+1. Add a `host-bash` placeholder entry to your host's `~/.claude.json` `mcpServers` so the bridge has a name to rewrite (the `command`/`args` get dropped — only the name matters):
+
+   ```sh
+   claude mcp add host-bash echo placeholder
+   ```
+
+2. Start the host-side adapter (foreground / tmux / launchd):
+
+   ```sh
+   examples/compose/bin/mcp-host-bash
+   ```
+
+   Default port `8766`. Run `mcp-host-bash --help` for the full surface.
+
+3. Set `CLAUDE_MCP_HTTP_BRIDGE` in `.env` to include `host-bash` (combine with other bridged servers via `:`):
+
+   ```ini
+   CLAUDE_MCP_HTTP_BRIDGE=host-bash=http://host.docker.internal:8766/mcp
+   ```
+
+   Rebuild + restart the container (`docker compose down && docker compose up -d`). Inside the container, `claude mcp list` should show `host-bash: Connected`.
+
+Security: the launcher applies a conservative `cli-mcp-server` allow-list by default — `ALLOWED_COMMANDS=ls,cat,pwd,git,gh,head,tail,grep,find,echo`, `ALLOWED_DIR=$HOME`, `COMMAND_TIMEOUT=30`, `ALLOW_SHELL_OPERATORS=false`. Override per-host via `~/.config/claude-container/mcp-host-bash.env` (plain `KEY=VALUE` lines). Audit log at `~/.local/state/claude-container/mcp-host-bash.log`. Soft kill switch: `MCP_HOST_BASH_DISABLED=1` in the launcher's shell env. See the `host-bash` block in [`.env.example`](.env.example) for the full security write-up — `run_command` is a privilege escalation, keep the allow-list tight.
+
 ### Auto-resume the prior conversation (`CLAUDE_AUTO_CONTINUE`)
 
 Set `CLAUDE_AUTO_CONTINUE=resume` in `.env` (commented example near the bottom of `.env.example`) to have the in-container claude launch with `--continue "resume"` instead of bare `claude`. This matches the standard host alias most operators already use:
