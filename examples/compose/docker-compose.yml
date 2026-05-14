@@ -113,6 +113,14 @@ services:
       # trust-workspace pre-seed so the workspace at the bind-mounted
       # host project path is pre-trusted (skips the first-launch dialog).
       CLAUDE_HOST_PROJECT_DIR: ${CLAUDE_HOST_PROJECT_DIR:-}
+      # CLAUDE_AUTO_CONTINUE — when non-empty, the entrypoint appends
+      # `--continue "$value"` to the in-container claude invocation so
+      # the prior conversation auto-resumes with the value as the seed
+      # prompt. Matches the host alias shape `claude --continue resume`.
+      # Pair with CLAUDE_HOST_PROJECT_DIR to anchor the cwd-derived
+      # project-memory key to the host path; the resume picks up the
+      # conversation tied to that cwd. Default unset = bare claude.
+      CLAUDE_AUTO_CONTINUE: ${CLAUDE_AUTO_CONTINUE:-}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in

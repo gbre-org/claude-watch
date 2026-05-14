@@ -328,6 +328,20 @@ def test_rewrite_hooks_flag_unset_not_forwarded() -> None:
            "rewrite-hooks: unset var should NOT be forwarded")
 
 
+def test_claude_auto_continue_forwarded() -> None:
+    """CLAUDE_AUTO_CONTINUE picked up by the wildcard CLAUDE_* loop."""
+    argv = run_script({"CLAUDE_AUTO_CONTINUE": "resume"})
+    expect(find_env_arg(argv, "CLAUDE_AUTO_CONTINUE") == "resume",
+           "auto-continue: CLAUDE_AUTO_CONTINUE should be forwarded")
+
+
+def test_claude_auto_continue_unset_not_forwarded() -> None:
+    """CLAUDE_AUTO_CONTINUE unset => not in env args."""
+    argv = run_script({})
+    expect(find_env_arg(argv, "CLAUDE_AUTO_CONTINUE") is None,
+           "auto-continue: unset var should NOT be forwarded")
+
+
 def test_claude_wildcard_still_forwarded() -> None:
     """Regression: existing CLAUDE_* / ANTHROPIC_* passthrough still works."""
     argv = run_script({
@@ -483,6 +497,8 @@ TESTS = [
     test_warning_fires_for_missing_project_dir,
     test_rewrite_hooks_flag_forwarded,
     test_rewrite_hooks_flag_unset_not_forwarded,
+    test_claude_auto_continue_forwarded,
+    test_claude_auto_continue_unset_not_forwarded,
 ]
 
 for t in TESTS:

@@ -34,6 +34,15 @@
 #                               # instead of spamming "Exec format error".
 #                               # Off by default to preserve existing
 #                               # behaviour; opt-in for Mac-host operators.
+#   CLAUDE_AUTO_CONTINUE        # When non-empty, the entrypoint appends
+#                               # `--continue "$CLAUDE_AUTO_CONTINUE"` to
+#                               # the in-container claude invocation so the
+#                               # prior conversation auto-resumes with the
+#                               # value as the seed prompt. Matches a host
+#                               # alias of shape `claude --continue resume`.
+#                               # Default unset = bare claude. Forwarded
+#                               # via the wildcard CLAUDE_* passthrough
+#                               # below.
 #
 # Env vars passed through to the container (only if set on the host):
 #   CLAUDE_CODE_SSE_PORT        # load-bearing for VSCode IDE integration

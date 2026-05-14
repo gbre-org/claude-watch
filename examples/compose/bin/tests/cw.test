@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Tests for examples/compose/bin/cw — the host-side shim that attaches
+to the claude-container tmux session via `docker compose exec`.
+
+Exercises the script's argv construction WITHOUT actually invoking docker
+by using the `--print-cmd` debug hook (the script builds the exec argv it
+would otherwise run and prints it one-per-line, then exits 0). The hook
+also skips the docker probe so the test runs in CI without docker access.
+
+Coverage:
+  - Default invocation: `docker compose --project-directory <dir> exec -it
+    claude-container tmux -u new-session -A -s claude-container`.
+  - CW_SERVICE override: changes the compose service name.
+  - CW_SESSION override: changes the tmux session name.
+  - CW_COMPOSE_DIR override: changes the --project-directory value.
+  - Missing docker-compose.yml: clean exit 1 with a helpful message.
+  - --help: prints usage, exits 0.
+  - Bad flag: exits 2.
+
+Run:  ./cw.test
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "cw"
+COMPOSE_DIR = HERE.parent.parent  # examples/compose/
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate cw at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+def run_cw(
+    args: list[str] | None = None,
+    env: dict | None = None,
+    expect_rc: int = 0,
+) -> tuple[list[str], str, str, int]:
+    """Run cw with the given argv + env. Returns (stdout_lines, stdout,
+    stderr, returncode)."""
+    if args is None:
+        args = []
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": "/tmp/fake-home",
+    }
+    if env:
+        base_env.update(env)
+    result = subprocess.run(
+        [str(SCRIPT), *args],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if expect_rc is not None and result.returncode != expect_rc:
+        raise AssertionError(
+            f"cw exited {result.returncode}, expected {expect_rc}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout.splitlines(), result.stdout, result.stderr, result.returncode
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_print_cmd_default_invocation() -> None:
+    """Default: docker compose --project-directory <compose> exec -it
+    claude-container tmux -u new-session -A -s claude-container."""
+    lines, _, _, _ = run_cw(["--print-cmd"])
+    # Find the trailing exec invocation by looking for 'exec' + service.
+    joined = " ".join(lines)
+    expect("docker" == lines[0],
+           f"default: argv[0] should be docker, got {lines[0]!r}")
+    expect("compose" in lines,
+           f"default: argv should include 'compose', got {lines}")
+    expect("--project-directory" in lines,
+           f"default: argv should include --project-directory, got {lines}")
+    # The compose dir resolves via the script's canonical path, so it
+    # should end with examples/compose.
+    pd_idx = lines.index("--project-directory")
+    expect(lines[pd_idx + 1].endswith("examples/compose"),
+           f"default: --project-directory should end with examples/compose, "
+           f"got {lines[pd_idx + 1]!r}")
+    expect("exec" in lines,
+           f"default: argv should include 'exec', got {lines}")
+    expect("-it" in lines,
+           f"default: argv should include -it, got {lines}")
+    expect("claude-container" in lines,
+           f"default: service name should be claude-container, got {lines}")
+    expect("tmux" in lines,
+           f"default: argv should run tmux, got {lines}")
+    expect("new-session" in lines,
+           f"default: argv should run new-session, got {lines}")
+    expect("-A" in lines,
+           f"default: argv should include -A (attach-or-create), got {lines}")
+    # Session name appears AFTER `-s`.
+    s_idx = lines.index("-s")
+    expect(lines[s_idx + 1] == "claude-container",
+           f"default: -s session name should be claude-container, "
+           f"got {lines[s_idx + 1]!r}")
+    # -u flag for UTF-8.
+    expect("-u" in lines,
+           f"default: tmux argv should include -u, got {lines}")
+
+
+def test_print_cmd_service_override() -> None:
+    """CW_SERVICE=foo => `exec -it foo tmux ...`."""
+    lines, _, _, _ = run_cw(["--print-cmd"], env={"CW_SERVICE": "my-svc"})
+    exec_idx = lines.index("exec")
+    # exec -it <service>
+    expect(lines[exec_idx + 1] == "-it",
+           f"service-override: -it should follow exec, got {lines}")
+    expect(lines[exec_idx + 2] == "my-svc",
+           f"service-override: service name should be my-svc, got {lines}")
+
+
+def test_print_cmd_session_override() -> None:
+    """CW_SESSION=foo => `tmux -u new-session -A -s foo`."""
+    lines, _, _, _ = run_cw(["--print-cmd"], env={"CW_SESSION": "my-sess"})
+    s_idx = lines.index("-s")
+    expect(lines[s_idx + 1] == "my-sess",
+           f"session-override: -s value should be my-sess, "
+           f"got {lines[s_idx + 1]!r}")
+
+
+def test_print_cmd_compose_dir_override() -> None:
+    """CW_COMPOSE_DIR=<override> => --project-directory <override>."""
+    with tempfile.TemporaryDirectory(prefix="cw-test-") as d:
+        # Need a docker-compose.yml in the override dir for the script
+        # to accept it.
+        Path(d, "docker-compose.yml").write_text("services: {}\n")
+        lines, _, _, _ = run_cw(["--print-cmd"], env={"CW_COMPOSE_DIR": d})
+        pd_idx = lines.index("--project-directory")
+        expect(lines[pd_idx + 1] == d,
+               f"compose-dir-override: --project-directory should be {d}, "
+               f"got {lines[pd_idx + 1]!r}")
+
+
+def test_missing_compose_dir() -> None:
+    """CW_COMPOSE_DIR with no docker-compose.yml => exit 1 + helpful msg."""
+    with tempfile.TemporaryDirectory(prefix="cw-empty-") as d:
+        _, _, stderr, rc = run_cw(
+            ["--print-cmd"],
+            env={"CW_COMPOSE_DIR": d},
+            expect_rc=1,
+        )
+        expect("docker-compose.yml" in stderr,
+               f"missing-compose-dir: stderr should name the missing file, "
+               f"got {stderr!r}")
+        expect("CW_COMPOSE_DIR" in stderr,
+               f"missing-compose-dir: stderr should mention the env var, "
+               f"got {stderr!r}")
+
+
+def test_help_exits_zero() -> None:
+    """--help prints usage and exits 0 (works offline / without docker)."""
+    _, stdout, _, _ = run_cw(["--help"], expect_rc=0)
+    expect("Usage:" in stdout,
+           f"--help: stdout should include 'Usage:', got {stdout!r}")
+    expect("cw" in stdout,
+           f"--help: stdout should mention 'cw', got {stdout!r}")
+    expect("attach" in stdout.lower(),
+           f"--help: stdout should mention 'attach', got {stdout!r}")
+
+
+def test_bad_flag_exits_two() -> None:
+    """Unknown flag => exit 2 + usage to stderr."""
+    _, _, stderr, _ = run_cw(["--no-such-flag"], expect_rc=2)
+    expect("unknown" in stderr.lower(),
+           f"bad-flag: stderr should mention 'unknown', got {stderr!r}")
+    expect("Usage:" in stderr,
+           f"bad-flag: stderr should include usage, got {stderr!r}")
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_print_cmd_default_invocation,
+    test_print_cmd_service_override,
+    test_print_cmd_session_override,
+    test_print_cmd_compose_dir_override,
+    test_missing_compose_dir,
+    test_help_exits_zero,
+    test_bad_flag_exits_two,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")

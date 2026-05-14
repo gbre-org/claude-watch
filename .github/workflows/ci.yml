@@ -111,3 +111,6 @@ jobs:
 
       - name: Run entrypoint CLAUDE_CMD construction tests
         run: make test-entrypoint
+
+      - name: Run cw host-shim tests
+        run: make test-cw

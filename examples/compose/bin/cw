@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# cw — host-side shim that attaches to the claude-container tmux session.
+#
+# Drops the operator's terminal (typically VSCode's integrated terminal)
+# directly into the in-container tmux session that examples/compose's
+# claude-container service spins up at startup. Same view as:
+#
+#     docker compose exec claude-container tmux attach -t claude-container
+#
+# but discoverable from any cwd, with an `up -d` fallback if the stack
+# isn't running yet.
+#
+# Usage:
+#   cw                  # attach to the running container tmux session
+#   cw --up             # bring the compose stack up first, then attach
+#   cw --help           # show usage and exit
+#
+# Env var overrides:
+#   CW_COMPOSE_DIR      # absolute path to examples/compose. Default: the
+#                       # parent of this script (assumes the script lives
+#                       # at examples/compose/bin/cw and is run via its
+#                       # canonical path; resolves symlinks). Override
+#                       # when the script is symlinked into ~/bin etc.
+#   CW_SERVICE          # compose service name (default: claude-container).
+#   CW_SESSION          # tmux session name inside the container.
+#                       # Default: claude-container (matches the entrypoint).
+#
+# Exit codes:
+#   0   tmux attach exited normally (operator detached or container exited)
+#   1   compose dir not found / compose down / docker not reachable
+#   2   usage / bad flag
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Usage / flag parsing
+# -----------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+cw — attach to the claude-container tmux session from the host.
+
+Usage:
+  cw              Attach to the running container's tmux session.
+  cw --up         `docker compose up -d` the stack first, then attach.
+  cw --help       Show this help and exit.
+
+Env overrides:
+  CW_COMPOSE_DIR   examples/compose absolute path (default: script's
+                   compose dir).
+  CW_SERVICE       compose service name (default: claude-container).
+  CW_SESSION       tmux session name (default: claude-container).
+
+Examples:
+  # From any cwd, attach to the running stack:
+  cw
+
+  # Cold start: bring stack up, then attach:
+  cw --up
+
+The script is safe to symlink into ~/bin / /usr/local/bin. It resolves
+its own canonical path via readlink so the default CW_COMPOSE_DIR still
+points at the examples/compose/ that ships it.
+EOF
+}
+
+UP_FIRST=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --up)
+            UP_FIRST=1
+            shift
+            ;;
+        --print-cmd)
+            # Test-only hook: build the docker compose exec argv but
+            # print it (one-per-line) instead of executing. Used by
+            # examples/compose/bin/tests/cw.test to verify the exec
+            # invocation without requiring docker. Hidden from --help
+            # because it's not an operator-facing flag.
+            PRINT_CMD=1
+            shift
+            ;;
+        *)
+            printf 'cw: unknown argument %q\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+: "${PRINT_CMD:=0}"
+
+# -----------------------------------------------------------------------------
+# Locate examples/compose. Two paths:
+#   1. CW_COMPOSE_DIR override wins.
+#   2. Otherwise resolve the script's own canonical location and walk up
+#      one level (script lives at examples/compose/bin/cw → ../).
+#
+# `readlink -f` is GNU-specific but BSD/macOS readlink also supports it
+# on recent macOS (12+) via the Homebrew coreutils-shimmed version OR
+# the native -f flag. We fall back to a python one-liner for portability.
+# -----------------------------------------------------------------------------
+
+resolve_canonical() {
+    local target="$1"
+    if command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+        readlink -f "$target"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$target"
+    else
+        # Last-resort: assume the path is already canonical.
+        echo "$target"
+    fi
+}
+
+if [ -z "${CW_COMPOSE_DIR:-}" ]; then
+    SELF="$(resolve_canonical "$0")"
+    CW_COMPOSE_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+fi
+
+if [ ! -f "$CW_COMPOSE_DIR/docker-compose.yml" ]; then
+    cat >&2 <<EOF
+cw: cannot find docker-compose.yml at $CW_COMPOSE_DIR.
+
+Set CW_COMPOSE_DIR=/abs/path/to/examples/compose explicitly, or symlink
+this script via its canonical path so the default location resolution
+works.
+EOF
+    exit 1
+fi
+
+SERVICE="${CW_SERVICE:-claude-container}"
+SESSION="${CW_SESSION:-claude-container}"
+
+# -----------------------------------------------------------------------------
+# Pick a docker invocation that works: bare first, sudo fallback.
+# Mirrors the claude-tmux probe so the same hosts succeed.
+# -----------------------------------------------------------------------------
+
+DOCKER_CMD=()
+if [ "$PRINT_CMD" = "1" ]; then
+    # Skip the docker probe in test mode — runs in CI without docker.
+    DOCKER_CMD=(docker)
+elif docker ps >/dev/null 2>&1; then
+    DOCKER_CMD=(docker)
+elif sudo -n docker ps >/dev/null 2>&1; then
+    DOCKER_CMD=(sudo docker)
+else
+    cat >&2 <<'EOF'
+cw: cannot reach the Docker daemon.
+
+Tried `docker ps` (failed) and `sudo -n docker ps` (failed).
+
+Fix one of:
+  - Add your user to the docker group:  sudo usermod -aG docker $USER  (then re-login)
+  - Ensure sudo docker works without a password (NOPASSWD entry in sudoers).
+EOF
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Optional pre-attach `up -d`. Idempotent — compose treats already-running
+# services as no-ops.
+# -----------------------------------------------------------------------------
+
+if [ "$UP_FIRST" = "1" ] && [ "$PRINT_CMD" = "0" ]; then
+    "${DOCKER_CMD[@]}" compose --project-directory "$CW_COMPOSE_DIR" up -d
+fi
+
+# -----------------------------------------------------------------------------
+# Attach. Uses `tmux new-session -A` so it ATTACHES if the session exists
+# and CREATES it (running an interactive shell) if not — matches the same
+# resilient pattern the ttyd service uses. The container entrypoint creates
+# the session at startup, so under normal operation we always attach.
+#
+# -t / -i flags: tmux needs a real TTY. We pass them through unconditionally
+# because the operator-facing use case is "from a vscode terminal" — that
+# IS a TTY. CI / non-tty callers get a clear error rather than silent
+# misbehaviour.
+# -----------------------------------------------------------------------------
+
+attach_argv=(
+    "${DOCKER_CMD[@]}" compose
+    --project-directory "$CW_COMPOSE_DIR"
+    exec -it "$SERVICE"
+    tmux -u new-session -A -s "$SESSION"
+)
+
+if [ "$PRINT_CMD" = "1" ]; then
+    printf '%s\n' "${attach_argv[@]}"
+    exit 0
+fi
+
+exec "${attach_argv[@]}"

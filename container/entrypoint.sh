@@ -266,9 +266,27 @@ fi
 # hit "Exec format error" against cross-arch binaries) with the
 # exec-hook-wrapped copy — without mutating the host file. Otherwise
 # launch claude bare to preserve the existing default.
+#
+# CLAUDE_AUTO_CONTINUE — when non-empty, append `--continue "$value"` so
+# the in-container claude auto-resumes the operator's prior conversation
+# at the project-key's cwd (typically CLAUDE_HOST_PROJECT_DIR) and seeds
+# the resume with the value as the initial prompt. This matches a host
+# alias of the shape:
+#     cd ~/repos && exec claude --continue "resume"
+# Default unset = bare claude (no auto-resume; existing behaviour).
+# Recommended value: "resume" (matches the host-side alias most operators
+# already use). Set CLAUDE_AUTO_CONTINUE=resume in .env to opt in.
 CLAUDE_CMD="exec claude"
 if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
     CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+fi
+if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
+    # Single-quote the value so it survives the tmux-command-string shell
+    # parse as ONE argv element even when it contains spaces. Any literal
+    # single quote in the value is escaped via the standard '\'' trick
+    # (close-quote, escaped-quote, reopen-quote).
+    _auto_continue_quoted="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
+    CLAUDE_CMD="$CLAUDE_CMD --continue $_auto_continue_quoted"
 fi
 
 tmux new-session -d -s "$SESSION" -x 200 -y 50 \

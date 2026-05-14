@@ -212,6 +212,45 @@ claude
 
 Or use the standalone `claude-tmux` wrapper at [`container/bin/claude-tmux`](../../container/bin/claude-tmux) — it's a more ergonomic entrypoint than `docker compose exec` for interactive use. See [`container/README.md`](../../container/README.md) for details.
 
+### `cw` — one-shot attach from any host terminal
+
+For the most common workflow (VSCode integrated terminal, want to drop straight into the running container's tmux session), the repo ships [`examples/compose/bin/cw`](bin/cw). Symlink it onto your `$PATH`:
+
+```sh
+ln -s "$PWD/examples/compose/bin/cw" ~/bin/cw
+# or: ln -s "$PWD/examples/compose/bin/cw" /usr/local/bin/cw
+```
+
+Then from any host cwd:
+
+```sh
+cw                  # attach to the running stack
+cw --up             # `docker compose up -d` first, then attach
+cw --help           # usage
+```
+
+Under the hood `cw` resolves its own canonical path to find `examples/compose/`, then runs:
+
+```sh
+docker compose --project-directory <examples/compose> exec -it claude-container \
+    tmux -u new-session -A -s claude-container
+```
+
+`tmux new-session -A` attaches if the session exists and creates it otherwise — same resilient pattern the `ttyd` service uses. The compose dir, service name, and tmux session name are all overridable via `CW_COMPOSE_DIR` / `CW_SERVICE` / `CW_SESSION`.
+
+### Auto-resume the prior conversation (`CLAUDE_AUTO_CONTINUE`)
+
+Set `CLAUDE_AUTO_CONTINUE=resume` in `.env` (commented example near the bottom of `.env.example`) to have the in-container claude launch with `--continue "resume"` instead of bare `claude`. This matches the standard host alias most operators already use:
+
+```bash
+#!/usr/bin/env bash
+cd ~/repos && exec claude --continue "resume"
+```
+
+For the in-container equivalent, pair `CLAUDE_AUTO_CONTINUE=resume` with `CLAUDE_HOST_PROJECT_DIR=<your host repos root>` so Claude Code's cwd-derived project-memory key matches the host (otherwise the resume lands in the empty `/workspace` project bucket).
+
+The value is forwarded verbatim as the `--continue` argument; any non-empty string works. Default unset = bare `claude` (existing behaviour).
+
 ### First-launch trust prompt
 
 Claude Code normally shows a "Quick safety check: Is this a project you created or one you trust?" prompt the first time it runs in a new cwd. The `claude-container` entrypoint pre-seeds the trust state for `/workspace` (the Dockerfile `WORKDIR` and the in-container tmux pane's cwd) before launching tmux, so the prompt is skipped on every boot — you land directly at the Claude Code idle prompt.

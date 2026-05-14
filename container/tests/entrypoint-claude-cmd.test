@@ -56,12 +56,17 @@ if not ENTRYPOINT.exists():
 
 
 # Extract the CLAUDE_CMD-building block. We anchor on the well-known
-# block opener (`CLAUDE_CMD="exec claude"`) and end at the next blank
-# line — robust against future edits that don't change the block shape.
+# block opener (`CLAUDE_CMD="exec claude"`) and end at the LAST `fi`
+# in the consecutive run of `if [...]; then ... fi` blocks below it.
+# This keeps the regex resilient against new conditional appends (e.g.
+# CLAUDE_AUTO_CONTINUE) as long as they share the same block shape.
 def extract_claude_cmd_block(path: Path) -> str:
     src = path.read_text(encoding="utf-8")
+    # Greedy match through the final `fi\n` immediately followed by a
+    # blank line — that's the documented contract for new appenders:
+    # add another `if [...]; then ...; fi` before the trailing blank.
     m = re.search(
-        r'(CLAUDE_CMD="exec claude".*?fi\n)',
+        r'(CLAUDE_CMD="exec claude"\n(?:if \[.*?fi\n)+)',
         src,
         re.DOTALL,
     )
@@ -176,6 +181,92 @@ def test_set_shim_path_exact_form() -> None:
            f"exact form: expected {expected!r}, got {cmd!r}")
 
 
+def test_auto_continue_unset_no_flag() -> None:
+    """CLAUDE_AUTO_CONTINUE unset → no --continue in the command."""
+    env = {"PATH": "/usr/bin:/bin"}
+    cmd = run_block(BLOCK, env)
+    expect("--continue" not in cmd,
+           f"auto-continue unset: --continue should NOT appear, got {cmd!r}")
+
+
+def test_auto_continue_empty_no_flag() -> None:
+    """CLAUDE_AUTO_CONTINUE='' → no --continue (empty treated as unset)."""
+    env = {"PATH": "/usr/bin:/bin", "CLAUDE_AUTO_CONTINUE": ""}
+    cmd = run_block(BLOCK, env)
+    expect("--continue" not in cmd,
+           f"auto-continue empty: --continue should NOT appear, got {cmd!r}")
+
+
+def test_auto_continue_single_word() -> None:
+    """CLAUDE_AUTO_CONTINUE=resume → exec claude --continue 'resume'."""
+    env = {"PATH": "/usr/bin:/bin", "CLAUDE_AUTO_CONTINUE": "resume"}
+    cmd = run_block(BLOCK, env)
+    expect(cmd == "exec claude --continue 'resume'",
+           f"auto-continue 'resume': expected exec claude --continue 'resume', "
+           f"got {cmd!r}")
+
+
+def test_auto_continue_with_shim() -> None:
+    """Both CLAUDE_AUTO_CONTINUE and CLAUDE_SHIM_SETTINGS_PATH set:
+    --setting-sources + --settings come first, --continue last."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
+        "CLAUDE_AUTO_CONTINUE": "resume",
+    }
+    cmd = run_block(BLOCK, env)
+    expect("--setting-sources project,local" in cmd,
+           f"both: --setting-sources should be present, got {cmd!r}")
+    expect("--settings /tmp/foo.json" in cmd,
+           f"both: --settings should be present, got {cmd!r}")
+    expect("--continue 'resume'" in cmd,
+           f"both: --continue 'resume' should be present, got {cmd!r}")
+    # Order: --settings appears before --continue (settings are construction-
+    # time, --continue is invocation-time).
+    expect(cmd.index("--settings ") < cmd.index("--continue"),
+           f"both: --settings should precede --continue, got {cmd!r}")
+
+
+def test_auto_continue_multiword_quoted() -> None:
+    """CLAUDE_AUTO_CONTINUE='hello world' → value survives as a single
+    quoted argv element so tmux's command-string shell parse doesn't
+    split it."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_AUTO_CONTINUE": "hello world",
+    }
+    cmd = run_block(BLOCK, env)
+    expect("--continue 'hello world'" in cmd,
+           f"auto-continue multiword: should be single-quoted as one argv "
+           f"element, got {cmd!r}")
+
+
+def test_auto_continue_value_with_single_quote() -> None:
+    """A literal apostrophe in the value must be escape-quoted via the
+    standard '\\'' trick so the surrounding single-quote pair stays
+    balanced under shell parsing."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_AUTO_CONTINUE": "it's me",
+    }
+    cmd = run_block(BLOCK, env)
+    # The value 'it's me' becomes 'it'\''s me' inside single quotes.
+    expect("--continue 'it'\\''s me'" in cmd,
+           f"auto-continue with apostrophe: should be escape-quoted, "
+           f"got {cmd!r}")
+    # Sanity: re-parse via `bash -c "echo --continue $value"` and
+    # confirm we get back the original.
+    result = subprocess.run(
+        ["bash", "-c", f"set -- {cmd}; printf '%s\\n' \"$@\""],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    expect("it's me" in result.stdout,
+           f"auto-continue roundtrip: shell should parse value back as "
+           f"\"it's me\", got stdout {result.stdout!r}")
+
+
 def test_user_tier_not_in_source_list() -> None:
     """Regression guard for the v19 bug: the source list MUST NOT include
     'user' — otherwise the bind-mounted host settings.json's bare hooks
@@ -206,6 +297,12 @@ TESTS = [
     test_set_shim_path_order,
     test_set_shim_path_exact_form,
     test_user_tier_not_in_source_list,
+    test_auto_continue_unset_no_flag,
+    test_auto_continue_empty_no_flag,
+    test_auto_continue_single_word,
+    test_auto_continue_with_shim,
+    test_auto_continue_multiword_quoted,
+    test_auto_continue_value_with_single_quote,
 ]
 
 for t in TESTS:
