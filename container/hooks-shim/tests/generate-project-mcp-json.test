@@ -272,6 +272,85 @@ def test_project_scoped_servers_merged() -> None:
         )
 
 
+def test_only_project_scoped_servers_picked_up() -> None:
+    """When ~/.claude.json has ONLY projects.<host-path>.mcpServers (no
+    top-level mcpServers), the project-scoped servers are still picked
+    up and written to .mcp.json. This is the typical state after
+    `claude mcp add host-bash echo placeholder` — `claude mcp add`
+    writes to project scope by default (PROJECT-scoped, keyed off cwd)
+    rather than top-level.
+
+    Workbot v26 surfaced this: a bare `claude mcp add host-bash ...`
+    placed the entry under `projects["/Users/hallandrew/repos/claude-config"].mcpServers`
+    not the top-level mcpServers, and an older version of this helper
+    only walked the top-level block — so the in-container .mcp.json
+    came up empty for host-bash. The fix is to ALSO walk
+    `projects[<cwd>].mcpServers` when CLAUDE_HOST_PROJECT_DIR is set
+    (matches Claude Code's own user-tier > project-tier precedence
+    within the .claude.json file)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        project = Path(td) / "project"
+        project.mkdir()
+        host_path = str(project)
+        write_json(inp, {
+            # NO top-level mcpServers — only project-scoped.
+            "projects": {
+                host_path: {
+                    "mcpServers": {
+                        "host-bash": {
+                            "command": "echo",
+                            "args": ["placeholder"],
+                        },
+                    },
+                },
+            },
+        })
+        run_helper(str(inp), str(project))
+        out = load_output(project)
+        expect(
+            "host-bash" in out["mcpServers"],
+            f"project-only: host-bash entry should be picked up from "
+            f"projects.<cwd>.mcpServers, got keys {list(out['mcpServers'].keys())}",
+        )
+        expect(
+            out["mcpServers"]["host-bash"]["command"] == f"{EXEC_HOOK} echo",
+            f"project-only: command should be wrapped, got "
+            f"{out['mcpServers']['host-bash']['command']!r}",
+        )
+
+
+def test_neither_top_level_nor_project_scoped_no_output() -> None:
+    """When ~/.claude.json has NEITHER top-level mcpServers NOR a
+    `projects[<cwd>].mcpServers` block, the helper writes nothing
+    (graceful no-op, exit 0). Mirrors test_no_mcp_servers_no_output
+    but explicitly with a `projects` block present for a DIFFERENT
+    cwd, to pin that an unrelated project's mcpServers don't leak
+    in."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        project = Path(td) / "project"
+        project.mkdir()
+        # `projects` has an entry for a DIFFERENT cwd — should NOT be
+        # picked up.
+        write_json(inp, {
+            "projects": {
+                "/some/other/cwd": {
+                    "mcpServers": {
+                        "leaked": {"command": "/should/not/appear"},
+                    },
+                },
+            },
+            "numStartups": 7,
+        })
+        run_helper(str(inp), str(project))
+        expect(
+            not (project / ".mcp.json").exists(),
+            "neither-scope: should not write .mcp.json when neither "
+            "top-level nor projects[<cwd>] has mcpServers",
+        )
+
+
 def test_output_format() -> None:
     """Output is a valid JSON object with single `mcpServers` key, trailing newline."""
     with tempfile.TemporaryDirectory() as td:
@@ -905,6 +984,8 @@ TESTS = [
     test_top_level_servers_wrapped,
     test_already_wrapped_not_double,
     test_project_scoped_servers_merged,
+    test_only_project_scoped_servers_picked_up,
+    test_neither_top_level_nor_project_scoped_no_output,
     test_output_format,
     test_idempotent_same_input_unchanged,
     test_changed_input_rewrites,

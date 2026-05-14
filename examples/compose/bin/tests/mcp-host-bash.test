@@ -92,13 +92,16 @@ def expect(cond: bool, msg: str) -> None:
 
 
 def find_env_value(lines: list[str], key: str) -> str | None:
-    """Return the value of an `--env KEY=...` pair in the printed argv,
-    or None if no such pair exists."""
+    """Return the value of an `--env KEY VALUE` triple in the printed
+    argv, or None if no such triple exists.
+
+    mcp-proxy 0.11.0 changed `--env` from `--env KEY=VALUE` (single
+    arg, two-line printed form) to `--env KEY VALUE` (two args,
+    three-line printed form). The argv builder in mcp-host-bash
+    follows the new shape; this helper parses it back out."""
     for i, line in enumerate(lines):
-        if line == "--env" and i + 1 < len(lines):
-            payload = lines[i + 1]
-            if payload.startswith(f"{key}="):
-                return payload[len(key) + 1:]
+        if line == "--env" and i + 2 < len(lines) and lines[i + 1] == key:
+            return lines[i + 2]
     return None
 
 

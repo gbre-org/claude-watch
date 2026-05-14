@@ -228,14 +228,20 @@ argv=(
     uvx mcp-proxy
     --port "$PORT"
     --host 0.0.0.0
-    # mcp-proxy --env NAME=VALUE pairs forward env into the stdio
+    # mcp-proxy --env NAME VALUE pairs forward env into the stdio
     # subprocess. cli-mcp-server reads its allow-list from env, so
     # this is how we apply the policy.
-    --env "ALLOWED_COMMANDS=$ALLOWED_COMMANDS"
-    --env "ALLOWED_FLAGS=$ALLOWED_FLAGS"
-    --env "ALLOWED_DIR=$ALLOWED_DIR"
-    --env "COMMAND_TIMEOUT=$COMMAND_TIMEOUT"
-    --env "ALLOW_SHELL_OPERATORS=$ALLOW_SHELL_OPERATORS"
+    #
+    # NB: mcp-proxy 0.11.0 changed `--env` from a single `KEY=VALUE`
+    # arg to two separate args (`KEY` and `VALUE`). Earlier
+    # versions of this script used the old single-arg form and
+    # mcp-proxy 0.11.0 errors with "argument -e/--env: expected 2
+    # arguments". The two-arg form is what 0.11.0+ accepts.
+    --env ALLOWED_COMMANDS "$ALLOWED_COMMANDS"
+    --env ALLOWED_FLAGS "$ALLOWED_FLAGS"
+    --env ALLOWED_DIR "$ALLOWED_DIR"
+    --env COMMAND_TIMEOUT "$COMMAND_TIMEOUT"
+    --env ALLOW_SHELL_OPERATORS "$ALLOW_SHELL_OPERATORS"
     --
     uvx cli-mcp-server
 )

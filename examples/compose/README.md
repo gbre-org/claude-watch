@@ -252,8 +252,10 @@ Setup (one-time, three steps):
 1. Add a `host-bash` placeholder entry to your host's `~/.claude.json` `mcpServers` so the bridge has a name to rewrite (the `command`/`args` get dropped — only the name matters):
 
    ```sh
-   claude mcp add host-bash echo placeholder
+   claude mcp add --scope user host-bash echo placeholder
    ```
+
+   `--scope user` writes to the top-level `mcpServers` block, which is what `generate-project-mcp-json` reads first. Bare `claude mcp add` (no `--scope`) defaults to **project** scope and writes under `projects["<cwd>"].mcpServers` instead. The helper now also reads that project-scoped block when `CLAUDE_HOST_PROJECT_DIR` matches the cwd, so either invocation works, but `--scope user` is the simpler operator path — the entry survives running `claude mcp add` from any cwd, and won't accidentally end up under a one-off cwd that doesn't match `CLAUDE_HOST_PROJECT_DIR`.
 
 2. Start the host-side adapter (foreground / tmux / launchd):
 
