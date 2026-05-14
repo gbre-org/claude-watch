@@ -190,6 +190,20 @@ RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
 COPY hooks-shim/generate-hooks-shim-settings /usr/local/bin/generate-hooks-shim-settings
 RUN chmod +x /usr/local/bin/generate-hooks-shim-settings
 
+# generate-project-mcp-json — sibling helper that writes a project-tier
+# .mcp.json into CLAUDE_HOST_PROJECT_DIR. Claude Code v2.1.141 does NOT
+# read MCP server definitions from any settings.json tier — it loads
+# them from ~/.claude.json via a code path gated on the `user` tier
+# being in --setting-sources. The entrypoint filters `user` out (to
+# drop bare host hooks), which also suppresses MCP discovery. This
+# helper sidesteps the problem by writing a standard project-tier
+# .mcp.json (`<cwd>/.mcp.json`) inside the container, populated from
+# ~/.claude.json mcpServers with each command wrapped in exec-hook.
+# v21 workbot validation surfaced this; embedded tests at
+# container/hooks-shim/tests/generate-project-mcp-json.test.
+COPY hooks-shim/generate-project-mcp-json /usr/local/bin/generate-project-mcp-json
+RUN chmod +x /usr/local/bin/generate-project-mcp-json
+
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
 # "Quick safety check" trust dialog. Invoked by entrypoint.sh before tmux

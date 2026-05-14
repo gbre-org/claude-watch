@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Generate a project-tier `.mcp.json` inside the in-container project
+dir so MCP server definitions survive the entrypoint's
+`--setting-sources project,local` filter.
+
+WHY THIS EXISTS
+
+PR #145 (v21 attempt) tried to merge `mcpServers` into the shim
+settings.json. v21 workbot validation surfaced that Claude Code
+v2.1.141 does NOT read MCP server definitions from settings.json at
+ANY tier — it loads them from `~/.claude.json` via a separate code
+path that's gated on the `user` tier being in `--setting-sources`.
+
+The entrypoint passes `--setting-sources project,local` (to drop the
+bare host hooks from the cascade — see PR #144), which suppresses the
+`~/.claude.json` MCP discovery path entirely. Claude Code reports
+"No MCP servers configured" regardless of what's in the shim
+settings.json.
+
+Project tier (`<cwd>/.mcp.json` + `<cwd>/.claude/settings.json`) IS
+in `--setting-sources project,local`. Claude Code's standard project-
+level MCP config file is `.mcp.json` at the project root. This helper
+writes that file inside the container's project dir, populated from
+the operator's `~/.claude.json` `mcpServers` block (where
+`claude mcp add ...` writes), with each server's `command` wrapped in
+`/usr/local/bin/exec-hook` so cross-arch host binaries (Mac Mach-O,
+etc.) silently no-op instead of spamming "Exec format error".
+
+WHAT IT WRITES
+
+Path: `${CLAUDE_HOST_PROJECT_DIR}/.mcp.json` inside the container.
+
+Format (Claude Code's project-tier MCP schema):
+  {
+    "mcpServers": {
+      "<name>": {
+        "command": "/usr/local/bin/exec-hook <original-command>",
+        "args": [...],
+        "env": {...}
+      },
+      ...
+    }
+  }
+
+The output file is a STANDARD Claude Code project-tier MCP config — if
+the bind-mounted project dir is a git tree, the operator may want to
+add `.mcp.json` to `.gitignore`. The file ITSELF is harmless outside
+the container (paths reference `/usr/local/bin/exec-hook`, which won't
+exist on the host); Claude Code's loader will just fail to start those
+servers on the host. README documents this.
+
+INPUT SOURCES
+
+- `--mcp-input` (default `~/.claude.json`): top-level `mcpServers`
+  block. This is where `claude mcp add ...` writes by default.
+- `--mcp-input` AND the same file's `projects.<output-dir-host-path>.mcpServers`:
+  project-scoped server definitions (`claude mcp add --scope project`).
+  Top-level takes precedence on collision (matches Claude Code's own
+  user-tier > project-tier precedence within the .claude.json file).
+
+We do NOT read from `~/.claude/settings.json` for MCP — `claude mcp
+add` doesn't write there, so it would be a no-op in practice; and
+this script's whole point is sidestepping the settings.json path.
+
+EXIT CODES
+
+  0  output written, or no MCP servers to write (graceful no-op)
+  1  unexpected error (e.g. unwritable output dir)
+
+The script is fail-safe: missing / unparseable input is a no-op
+exit 0, NOT a hard failure. Bad-input cases shouldn't break the
+container startup.
+
+IDEMPOTENCY
+
+If the output file already exists with byte-identical content, no
+rewrite (avoids touching mtime). If the file exists but differs,
+overwrite (the bind-mounted host file might have stale content from a
+previous container run with a different host mcpServers list).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+EXEC_HOOK_PATH = "/usr/local/bin/exec-hook"
+
+
+def wrap_command(cmd: str) -> str:
+    """Prefix `cmd` with `exec-hook ` unless already wrapped.
+
+    Mirrors generate-hooks-shim-settings::wrap_command to keep the
+    wrapping behaviour consistent across the two helpers.
+    """
+    if not cmd:
+        return cmd
+    stripped = cmd.lstrip()
+    if stripped.startswith("exec-hook ") or stripped.startswith(f"{EXEC_HOOK_PATH} "):
+        return cmd
+    if stripped == "exec-hook" or stripped == EXEC_HOOK_PATH:
+        return cmd
+    return f"{EXEC_HOOK_PATH} {cmd}"
+
+
+def load_mcp_servers(path: Path, project_key: str | None, quiet: bool) -> dict:
+    """Read `path` (typically ~/.claude.json), extract top-level
+    `mcpServers` plus `projects[<project_key>].mcpServers` if
+    `project_key` is given, and return the merged dict.
+
+    Top-level entries win on collision (Claude Code's user-tier >
+    project-tier precedence within .claude.json).
+
+    Returns an empty dict if the file is missing / unparseable / has
+    no servers. Never raises.
+    """
+    if not path.exists():
+        if not quiet:
+            print(
+                f"generate-project-mcp-json: mcp-input {path} does not exist; nothing to write.",
+                file=sys.stderr,
+            )
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(
+            f"generate-project-mcp-json: failed to parse mcp-input {path}: {e}; skipping.",
+            file=sys.stderr,
+        )
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    merged: dict = {}
+
+    # Project-scoped first so top-level can override on collision.
+    if project_key:
+        projects = data.get("projects")
+        if isinstance(projects, dict):
+            project_entry = projects.get(project_key)
+            if isinstance(project_entry, dict):
+                proj_mcp = project_entry.get("mcpServers")
+                if isinstance(proj_mcp, dict):
+                    for name, definition in proj_mcp.items():
+                        if isinstance(name, str):
+                            merged[name] = definition
+
+    top_mcp = data.get("mcpServers")
+    if isinstance(top_mcp, dict):
+        for name, definition in top_mcp.items():
+            if isinstance(name, str):
+                merged[name] = definition
+
+    return merged
+
+
+def wrap_mcp_servers(servers: dict) -> dict:
+    """Wrap each server's `command` field with exec-hook. Pass weird
+    shapes (non-dict definitions, non-string commands) through
+    unchanged — Claude Code's own validator will complain at load
+    time and we don't try to fix what we don't understand.
+    """
+    wrapped: dict = {}
+    for name, definition in servers.items():
+        if not isinstance(definition, dict):
+            wrapped[name] = definition
+            continue
+        new_def = dict(definition)
+        cmd = definition.get("command")
+        if isinstance(cmd, str):
+            new_def["command"] = wrap_command(cmd)
+        wrapped[name] = new_def
+    return wrapped
+
+
+def render(servers: dict) -> str:
+    """Render the final .mcp.json content. We always serialize as a
+    dict-with-mcpServers-key so Claude Code's project-tier loader
+    finds the block."""
+    return json.dumps({"mcpServers": servers}, indent=2, ensure_ascii=False) + "\n"
+
+
+def write_if_changed(out_path: Path, content: str, quiet: bool) -> str:
+    """Write `content` to `out_path` atomically iff it differs from
+    the existing file (or the file is missing). Returns:
+      "wrote"     — file was missing or had different content
+      "unchanged" — file already had byte-identical content
+    """
+    if out_path.exists():
+        try:
+            existing = out_path.read_text(encoding="utf-8")
+        except Exception:
+            existing = None
+        if existing == content:
+            return "unchanged"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp_path, 0o644)
+    os.replace(tmp_path, out_path)
+    return "wrote"
+
+
+def derive_project_key(host_project_dir: str | None) -> str | None:
+    """The `projects` key in ~/.claude.json is the absolute host path
+    (matching how `claude mcp add --scope project` records the project).
+    Inside the container, CLAUDE_HOST_PROJECT_DIR IS that same absolute
+    host path (the wrapper bind-mounts it at the SAME path inside the
+    container — see compose `working_dir` flip). So we can use it
+    directly as the lookup key.
+
+    Returns None if the var is unset / empty — we'll only look at the
+    top-level mcpServers block in that case.
+    """
+    if not host_project_dir:
+        return None
+    return host_project_dir
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        description="Write a project-tier .mcp.json inside the container "
+                    "project dir, populated from ~/.claude.json mcpServers "
+                    "with each command wrapped in /usr/local/bin/exec-hook.",
+    )
+    p.add_argument(
+        "--mcp-input", "-m",
+        default=os.environ.get("CLAUDE_PROJECT_MCP_INPUT", "/home/hndrewaall/.claude.json"),
+        help="Path to ~/.claude.json (default: ~/.claude.json). Read-only.",
+    )
+    p.add_argument(
+        "--output-dir", "-d",
+        default=os.environ.get("CLAUDE_HOST_PROJECT_DIR", ""),
+        help="Project directory to write .mcp.json into. Typically the "
+             "container's WORKDIR / CLAUDE_HOST_PROJECT_DIR. If empty / "
+             "missing, the helper is a graceful no-op.",
+    )
+    p.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress stderr 'wrote N servers' summary on success.",
+    )
+    args = p.parse_args(argv)
+
+    out_dir = args.output_dir.strip() if args.output_dir else ""
+    if not out_dir:
+        if not args.quiet:
+            print(
+                "generate-project-mcp-json: --output-dir / CLAUDE_HOST_PROJECT_DIR "
+                "is empty; nothing to write.",
+                file=sys.stderr,
+            )
+        return 0
+
+    out_dir_path = Path(out_dir)
+    if not out_dir_path.is_dir():
+        if not args.quiet:
+            print(
+                f"generate-project-mcp-json: output dir {out_dir_path} does not exist; "
+                f"nothing to write.",
+                file=sys.stderr,
+            )
+        return 0
+
+    project_key = derive_project_key(out_dir)
+    servers = load_mcp_servers(Path(args.mcp_input), project_key, args.quiet)
+
+    if not servers:
+        if not args.quiet:
+            print(
+                f"generate-project-mcp-json: no mcpServers found in "
+                f"{args.mcp_input} (top-level or projects[{project_key!r}]); "
+                f"nothing to write.",
+                file=sys.stderr,
+            )
+        return 0
+
+    wrapped = wrap_mcp_servers(servers)
+    content = render(wrapped)
+    out_path = out_dir_path / ".mcp.json"
+
+    try:
+        action = write_if_changed(out_path, content, args.quiet)
+    except Exception as e:
+        print(
+            f"generate-project-mcp-json: failed to write {out_path}: {e}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not args.quiet:
+        n_total = len(wrapped)
+        n_wrapped = sum(
+            1
+            for d in wrapped.values()
+            if isinstance(d, dict)
+            and isinstance(d.get("command"), str)
+            and d["command"].startswith(f"{EXEC_HOOK_PATH} ")
+        )
+        print(
+            f"generate-project-mcp-json: {action} {out_path} "
+            f"({n_total} server(s), {n_wrapped} wrapped)",
+            file=sys.stderr,
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

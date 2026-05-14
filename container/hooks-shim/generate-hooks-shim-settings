@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Generate a container-local settings JSON that wraps each hook command (and
-each MCP server `command`) in /usr/local/bin/exec-hook, so cross-arch host
-binaries no-op silently instead of spamming "Exec format error" on every
-invocation.
+"""Generate a container-local settings JSON that wraps each hook command in
+/usr/local/bin/exec-hook, so cross-arch host binaries no-op silently instead
+of spamming "Exec format error" on every invocation.
 
 WHY THIS EXISTS
 
@@ -31,41 +30,21 @@ writable). The entrypoint then launches claude with
 `--settings $OUTPUT_PATH` so Claude Code merges the rewritten hooks
 on top of its normal user/project/local cascade.
 
-WHY MCP SERVERS ARE WRAPPED TOO
+WHY MCP SERVERS ARE NOT HANDLED HERE
 
-The entrypoint launches claude with `--setting-sources project,local`
-to filter the bind-mounted host `~/.claude/settings.json` (user tier)
-OUT of the cascade — otherwise the bare host hook commands would
-load alongside the shim's wrapped copies and still hit "Exec format
-error". As a side effect, anything the user-tier settings.json
-provides (like `mcpServers` blocks, if the operator put them there)
-also gets filtered. Worse, Andrew's corp setup keeps MCP server
-definitions in `~/.claude.json` (the per-user Claude Code config that
-`claude mcp add` writes to), which is bind-mounted too but is NOT a
-"settings tier" — it's loaded by Claude Code via a separate code path
-and survives `--setting-sources` filtering, but its own MCP server
-`command` fields can still be host-native binaries that hit "Exec
-format error" inside the container.
+PR #145 tried to merge `mcpServers` into this shim file. v21 workbot
+validation surfaced that Claude Code v2.1.141 does NOT read MCP server
+definitions from settings.json files at any tier — it loads them from
+`~/.claude.json` via a separate code path that is gated on the `user`
+tier being in `--setting-sources`. Since the entrypoint passes
+`--setting-sources project,local` (to drop the bare host hooks), the
+`.claude.json` MCP path is suppressed and Claude Code reports "No MCP
+servers configured" regardless of what's in the shim settings.json.
 
-This helper therefore ALSO:
-  1. Copies `mcpServers` from the input settings.json into the shim
-     verbatim (so any user-tier MCP servers survive the
-     `--setting-sources project,local` filter).
-  2. Merges `mcpServers` from a SECOND input — the bind-mounted
-     `~/.claude.json` (`--mcp-input`, default ~/.claude.json) — into
-     the same `mcpServers` block. Settings-side entries win on key
-     collision; `.claude.json`-side entries fill in keys the settings
-     file doesn't define.
-  3. Wraps each MCP server's `command` field with the same exec-hook
-     prefix. The shim handles all magic bytes uniformly: ELF/shebang
-     pass through, Mach-O / unknown silently no-op. So Mac-native
-     MCP server binaries quietly fail to start (the server is just
-     missing from the running set) rather than spamming Exec format
-     error on each invocation. Cross-platform servers (node, python)
-     run normally — the shim is transparent for shebang scripts.
-
-If you depend on a Mac-native MCP server, build a Linux-compatible
-replacement (or accept the silent no-op).
+The fix lives in a sibling helper `generate-project-mcp-json` which
+writes a `.mcp.json` file into the project dir (project tier IS in
+`--setting-sources project,local`). This script no longer touches
+mcpServers at all.
 
 NON-GOALS
 
@@ -77,8 +56,6 @@ NON-GOALS
   hop per fire, which is negligible.
 - We do NOT mutate the host's settings.json. The output is a
   container-local file at a deterministic path under /tmp.
-- We do NOT mutate the host's ~/.claude.json. We only READ it for
-  its `mcpServers` block.
 
 INPUT FORMAT
 
@@ -97,40 +74,16 @@ INPUT FORMAT
       ],
       ...
     },
-    "mcpServers": {
-      "<name>": {
-        "command": "/path/to/server-binary",
-        "args": [...],
-        "env": {...}
-      },
-      ...
-    },
     "<other-top-level-keys>": ...
   }
 
-~/.claude.json schema (the `claude mcp add ...` config — Claude Code's
-per-user config, distinct from the user-tier settings.json):
-  {
-    "mcpServers": {
-      "<name>": { "command": "...", "args": [...], "env": {...} },
-      ...
-    },
-    "<lots-of-other-internal-keys>": ...
-  }
-
-We only read its top-level `mcpServers` block; everything else is
-ignored.
-
 This script rewrites:
-  - `hooks.<event>.[*].hooks[*].command` (existing)
-  - `mcpServers.<name>.command` (new)
-All other top-level keys are passed through unchanged (Claude Code's
-merge semantics will combine them with the user/project/local
-cascade).
+  - `hooks.<event>.[*].hooks[*].command`
+All other top-level keys are passed through unchanged.
 
 OUTPUT FORMAT
 
-Same settings.json schema with each hook + MCP command rewritten:
+Same settings.json schema with each hook command rewritten:
   "command": "/usr/local/bin/exec-hook <original-command-verbatim>"
 
 The original command may already start with "exec-hook " (the
@@ -138,7 +91,7 @@ operator pre-wrapped on the host). In that case we don't double-wrap.
 
 EXIT CODES
 
-  0  output written successfully, or input lacks any hooks / MCP servers
+  0  output written successfully, or input lacks any hooks
      (graceful no-op)
   1  unexpected error parsing input / writing output
 
@@ -152,7 +105,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import sys
 from pathlib import Path
 
@@ -233,115 +185,6 @@ def rewrite_hooks(settings: dict) -> dict:
     return out
 
 
-def rewrite_mcp_servers(settings: dict, claude_json_mcp: dict | None) -> dict:
-    """Merge MCP server definitions from settings.json + .claude.json,
-    wrap every server's `command` field with exec-hook, and write the
-    result back into the output's `mcpServers` key.
-
-    Merge precedence: settings-side entries win on key collision (i.e.,
-    if the same server name is defined in BOTH settings.json AND
-    .claude.json, the settings.json version is used). The .claude.json
-    side fills in keys the settings file doesn't define. This matches
-    Claude Code's own precedence (settings.json > .claude.json) and is
-    the safest default — if the operator deliberately overrode an MCP
-    server in settings.json, we honor that.
-
-    Args:
-      settings: parsed settings.json (input). May or may not have a
-        top-level `mcpServers` key.
-      claude_json_mcp: top-level `mcpServers` from a parsed
-        ~/.claude.json (or None if the file is missing / unparseable
-        / has no mcpServers block).
-
-    Returns a new dict (input not mutated). If neither source has any
-    MCP servers, `mcpServers` is OMITTED from the output (no
-    false-positive injection of an empty block).
-
-    Tolerates non-dict values throughout — the function never raises
-    on malformed input, just passes the input value through unchanged.
-    """
-    out = dict(settings)
-    settings_mcp = settings.get("mcpServers")
-    settings_mcp_dict = settings_mcp if isinstance(settings_mcp, dict) else None
-
-    # If both inputs lack a usable mcpServers block, drop the key from
-    # the output entirely. We don't want to inject an empty {} that
-    # might shadow a tier we'd otherwise inherit.
-    if not settings_mcp_dict and not claude_json_mcp:
-        # If settings.json had a NON-DICT `mcpServers` value, preserve
-        # the original so Claude Code's own validator can complain. We
-        # don't try to "fix" something we don't understand.
-        return out
-
-    merged: dict = {}
-    # Start with .claude.json side so settings.json wins on collision.
-    if isinstance(claude_json_mcp, dict):
-        for name, definition in claude_json_mcp.items():
-            if isinstance(name, str):
-                merged[name] = definition
-    if settings_mcp_dict:
-        for name, definition in settings_mcp_dict.items():
-            if isinstance(name, str):
-                merged[name] = definition
-
-    # Wrap each server's `command` field. Definition may be a dict
-    # (typical) or something weird; pass weird shapes through unchanged.
-    wrapped: dict = {}
-    for name, definition in merged.items():
-        if not isinstance(definition, dict):
-            wrapped[name] = definition
-            continue
-        new_def = dict(definition)
-        cmd = definition.get("command")
-        if isinstance(cmd, str):
-            new_def["command"] = wrap_command(cmd)
-        wrapped[name] = new_def
-
-    out["mcpServers"] = wrapped
-    return out
-
-
-def load_claude_json_mcp(path: Path, quiet: bool) -> dict | None:
-    """Read `path` (typically ~/.claude.json), return its top-level
-    `mcpServers` block as a dict, or None if missing / unparseable /
-    no such key. Never raises.
-
-    This is a separate input from settings.json because `claude mcp
-    add ...` writes MCP server definitions here, NOT to settings.json
-    — and Claude Code loads them at a separate layer from the
-    settings cascade. We need both sources merged into the shim so
-    the entrypoint's `--setting-sources project,local` filter doesn't
-    accidentally drop the operator's MCP definitions.
-    """
-    if not path.exists():
-        if not quiet:
-            print(
-                f"generate-hooks-shim-settings: mcp-input {path} does not exist; "
-                f"skipping mcpServers merge.",
-                file=sys.stderr,
-            )
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        # Don't fail-stop on a corrupt .claude.json — it's not our
-        # primary input and the host's own claude binary will yell at
-        # the operator if it's broken.
-        print(
-            f"generate-hooks-shim-settings: failed to parse mcp-input {path}: {e}; "
-            f"skipping mcpServers merge.",
-            file=sys.stderr,
-        )
-        return None
-    if not isinstance(data, dict):
-        return None
-    mcp = data.get("mcpServers")
-    if not isinstance(mcp, dict):
-        return None
-    return mcp
-
-
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         description="Generate a container-local settings JSON with every "
@@ -357,14 +200,6 @@ def main(argv: list[str]) -> int:
         default=os.environ.get("CLAUDE_SHIM_OUTPUT", "/tmp/claude-shim/settings.json"),
         help="Path to write the rewritten settings.json to. Created with "
              "0600 perms; parent dir created if missing.",
-    )
-    p.add_argument(
-        "--mcp-input", "-m",
-        default=os.environ.get("CLAUDE_SHIM_MCP_INPUT", "/home/hndrewaall/.claude.json"),
-        help="Path to the per-user Claude Code config file (~/.claude.json) "
-             "whose top-level `mcpServers` block should be merged into the "
-             "shim output (default: ~/.claude.json). Pass /dev/null or a "
-             "non-existent path to skip the mcpServers merge.",
     )
     p.add_argument(
         "--quiet", "-q",
@@ -401,12 +236,7 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    # Pull MCP servers from ~/.claude.json (the `claude mcp add ...`
-    # store). Missing / unparseable .claude.json is non-fatal.
-    claude_json_mcp = load_claude_json_mcp(Path(args.mcp_input), args.quiet)
-
     rewritten = rewrite_hooks(settings)
-    rewritten = rewrite_mcp_servers(rewritten, claude_json_mcp)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp file then atomic-rename so a concurrent claude
@@ -419,7 +249,7 @@ def main(argv: list[str]) -> int:
     os.replace(tmp_path, out_path)
 
     if not args.quiet:
-        # Count hooks + MCP servers we touched for the operator's awareness.
+        # Count hooks we touched for the operator's awareness.
         n_hooks = 0
         hooks = rewritten.get("hooks") or {}
         for entries in hooks.values():
@@ -430,15 +260,8 @@ def main(argv: list[str]) -> int:
                 for hook in inner:
                     if isinstance((hook or {}).get("command"), str):
                         n_hooks += 1
-        n_mcp = 0
-        mcp_servers = rewritten.get("mcpServers") or {}
-        if isinstance(mcp_servers, dict):
-            for definition in mcp_servers.values():
-                if isinstance(definition, dict) and isinstance(definition.get("command"), str):
-                    n_mcp += 1
         print(
-            f"generate-hooks-shim-settings: wrote {n_hooks} hook(s) + "
-            f"{n_mcp} MCP server(s) -> {out_path}",
+            f"generate-hooks-shim-settings: wrote {n_hooks} hook(s) -> {out_path}",
             file=sys.stderr,
         )
 

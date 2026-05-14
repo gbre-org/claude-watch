@@ -126,25 +126,41 @@ esac
 CLAUDE_SHIM_SETTINGS_PATH=""
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
-    # The helper ALSO merges mcpServers from ~/.claude.json (where
-    # `claude mcp add ...` writes server definitions) into the shim
-    # output. The `--setting-sources project,local` filter below drops
-    # the user-tier settings.json from the cascade, which would
-    # accidentally drop any `mcpServers` block the operator put there;
-    # the helper copies it (and the .claude.json side) into the shim
-    # so MCP servers survive the filter. Each MCP server `command`
-    # gets the same exec-hook prefix as hook commands — Mac-native
-    # binaries silently no-op (server fails to start, but no log spam)
-    # and cross-platform / Linux-native servers run normally.
     /usr/local/bin/generate-hooks-shim-settings \
         --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
-        --mcp-input "${HOME:-/home/hndrewaall}/.claude.json" \
         --output "$CLAUDE_SHIM_SETTINGS_PATH" || true
     # If the helper didn't produce an output file (input missing,
     # unparseable), clear the var so we don't pass a broken --settings
     # path to claude.
     if [ ! -f "$CLAUDE_SHIM_SETTINGS_PATH" ]; then
         CLAUDE_SHIM_SETTINGS_PATH=""
+    fi
+
+    # MCP server definitions live in ~/.claude.json (where `claude mcp
+    # add ...` writes by default) and load via a code path that's
+    # gated on the `user` tier being in --setting-sources. Since we
+    # filter `user` out below, the `~/.claude.json` MCP discovery path
+    # is suppressed and Claude Code reports "No MCP servers
+    # configured" inside the container. v21 workbot validation
+    # confirmed: PR #145's attempt to inject `mcpServers` into the
+    # shim settings.json had zero effect — Claude Code doesn't read
+    # MCP definitions from any settings.json tier.
+    #
+    # Fix: write a project-tier `.mcp.json` inside CLAUDE_HOST_PROJECT_DIR.
+    # Project tier IS in `--setting-sources project,local`, and
+    # `.mcp.json` is Claude Code's standard project-level MCP config
+    # file. The helper wraps each server's `command` with
+    # /usr/local/bin/exec-hook so cross-arch host binaries (Mac
+    # Mach-O, etc.) silently no-op instead of spamming "Exec format
+    # error" on each invocation.
+    #
+    # No-op when CLAUDE_HOST_PROJECT_DIR is unset (default WORKDIR
+    # /workspace doesn't get a .mcp.json — operators without a host
+    # project dir get the existing pre-PR behavior of no MCP servers).
+    if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_HOST_PROJECT_DIR" ]; then
+        /usr/local/bin/generate-project-mcp-json \
+            --mcp-input "${HOME:-/home/hndrewaall}/.claude.json" \
+            --output-dir "$CLAUDE_HOST_PROJECT_DIR" || true
     fi
 fi
 export CLAUDE_SHIM_SETTINGS_PATH

@@ -94,13 +94,16 @@ test-claude-tmux-env:
 
 # Run the exec-hook shim tests (settings.json hook safe-exec wrapper for
 # cross-arch hooks — ELF passthrough, Mach-O / unknown / missing no-op,
-# dedup flag file) AND the generate-hooks-shim-settings rewrite tests
+# dedup flag file), the generate-hooks-shim-settings rewrite tests
 # (container-local settings.json with every hook command wrapped in
-# /usr/local/bin/exec-hook). Both run directly on Linux against
-# synthetic inputs; no container needed. 22 cases total, ~1s.
+# /usr/local/bin/exec-hook), AND the generate-project-mcp-json tests
+# (project-tier .mcp.json with MCP server commands wrapped, the v21
+# follow-up fix). All run directly on Linux against synthetic inputs;
+# no container needed.
 test-hooks-shim:
 	container/hooks-shim/tests/exec-hook.test
 	container/hooks-shim/tests/generate-hooks-shim-settings.test
+	container/hooks-shim/tests/generate-project-mcp-json.test
 
 # Run the entrypoint CLAUDE_CMD construction tests. Extracts the
 # CLAUDE_CMD-building shell block from container/entrypoint.sh by regex

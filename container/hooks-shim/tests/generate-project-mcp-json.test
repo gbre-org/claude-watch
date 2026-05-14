@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Tests for container/hooks-shim/generate-project-mcp-json.
+
+Coverage:
+  - Empty / missing inputs: graceful no-op, exit 0, no file written.
+  - Top-level mcpServers in ~/.claude.json: written to <project>/.mcp.json
+    with each command wrapped in /usr/local/bin/exec-hook, args + env
+    preserved verbatim.
+  - Already-wrapped commands: not double-wrapped.
+  - Project-scoped mcpServers (~/.claude.json projects.<host-path>.mcpServers):
+    merged in.
+  - Top-level wins on collision with project-scoped.
+  - Missing project dir / output-dir: no-op (no crash).
+  - Unparseable ~/.claude.json: graceful no-op (no crash, no output).
+  - Idempotency: second run with identical input does not re-write
+    (mtime preserved).
+  - Output format: `{"mcpServers": {...}}` shape, valid JSON, trailing
+    newline.
+
+Run:  ./generate-project-mcp-json.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "generate-project-mcp-json"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate helper at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+EXEC_HOOK = "/usr/local/bin/exec-hook"
+
+
+def run_helper(
+    mcp_input: str,
+    output_dir: str,
+    expect_rc: int = 0,
+    quiet: bool = True,
+) -> tuple[str, str]:
+    cmd = [str(SCRIPT), "--mcp-input", mcp_input, "--output-dir", output_dir]
+    if quiet:
+        cmd.append("--quiet")
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != expect_rc:
+        raise AssertionError(
+            f"helper exited {result.returncode} (expected {expect_rc})\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout, result.stderr
+
+
+def write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f)
+
+
+def load_output(project_dir: Path) -> dict:
+    with (project_dir / ".mcp.json").open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_missing_input_no_output() -> None:
+    """~/.claude.json missing: graceful no-op, no .mcp.json written."""
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper("/this/does/not/exist.json", str(project))
+        expect(
+            not (project / ".mcp.json").exists(),
+            "missing-input: should not write .mcp.json when input missing",
+        )
+
+
+def test_empty_output_dir_no_output() -> None:
+    """Empty CLAUDE_HOST_PROJECT_DIR: graceful no-op."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {"foo": {"command": "/bin/foo"}}})
+        run_helper(str(inp), "")  # empty dir = no-op
+
+
+def test_missing_output_dir_no_output() -> None:
+    """Nonexistent project dir: graceful no-op (no crash)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {"foo": {"command": "/bin/foo"}}})
+        run_helper(str(inp), "/this/project/dir/does/not/exist")
+
+
+def test_unparseable_input_no_output() -> None:
+    """Corrupt ~/.claude.json: graceful no-op."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        inp.write_text("not json {{{")
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+        expect(
+            not (project / ".mcp.json").exists(),
+            "unparseable-input: should not write .mcp.json on parse error",
+        )
+
+
+def test_no_mcp_servers_no_output() -> None:
+    """~/.claude.json exists but has no mcpServers: no .mcp.json written."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"numStartups": 42})
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+        expect(
+            not (project / ".mcp.json").exists(),
+            "no-servers: should not write empty .mcp.json",
+        )
+
+
+def test_top_level_servers_wrapped() -> None:
+    """Top-level mcpServers wrapped with exec-hook, args + env preserved."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {
+            "mcpServers": {
+                "mcp-adaptor": {
+                    "command": "/Users/me/.mcp-adaptor/bin/mcp-adaptor-go-v2.0.5-darwin-arm64",
+                    "args": ["--stdio"],
+                    "env": {"DEBUG": "1"},
+                },
+                "chrome-devtools": {
+                    "command": "npx",
+                    "args": ["-y", "chrome-devtools-mcp@latest"],
+                },
+            },
+            "numStartups": 42,
+            "someUnrelatedKey": True,
+        })
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+
+        out = load_output(project)
+        expect("mcpServers" in out, "top-level: output should have mcpServers key")
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            adaptor["command"]
+            == f"{EXEC_HOOK} /Users/me/.mcp-adaptor/bin/mcp-adaptor-go-v2.0.5-darwin-arm64",
+            f"top-level: adaptor command not wrapped, got {adaptor['command']!r}",
+        )
+        expect(
+            adaptor["args"] == ["--stdio"],
+            f"top-level: adaptor args not preserved, got {adaptor['args']!r}",
+        )
+        expect(
+            adaptor["env"] == {"DEBUG": "1"},
+            f"top-level: adaptor env not preserved, got {adaptor['env']!r}",
+        )
+
+        cd = out["mcpServers"]["chrome-devtools"]
+        expect(
+            cd["command"] == f"{EXEC_HOOK} npx",
+            f"top-level: chrome-devtools command not wrapped, got {cd['command']!r}",
+        )
+
+        # We do NOT copy other top-level .claude.json keys.
+        expect(
+            "numStartups" not in out,
+            "top-level: should not import unrelated .claude.json keys",
+        )
+        expect(
+            "someUnrelatedKey" not in out,
+            "top-level: should not import unrelated .claude.json keys",
+        )
+
+
+def test_already_wrapped_not_double() -> None:
+    """Already-wrapped commands pass through unchanged (no double-prefix)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {
+            "mcpServers": {
+                "a": {"command": "exec-hook /Users/me/server"},
+                "b": {"command": f"{EXEC_HOOK} /Users/me/server2"},
+            },
+        })
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["a"]["command"] == "exec-hook /Users/me/server",
+            f"double-wrap: bare exec-hook should pass through, got {out['mcpServers']['a']['command']!r}",
+        )
+        expect(
+            out["mcpServers"]["b"]["command"] == f"{EXEC_HOOK} /Users/me/server2",
+            f"double-wrap: absolute exec-hook should pass through, got {out['mcpServers']['b']['command']!r}",
+        )
+
+
+def test_project_scoped_servers_merged() -> None:
+    """projects.<host-path>.mcpServers merges into output (top-level wins)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        # Project dir IS the .claude.json `projects` key inside the
+        # container — see derive_project_key.
+        project = Path(td) / "project"
+        project.mkdir()
+        host_path = str(project)
+        write_json(inp, {
+            "mcpServers": {
+                "shared": {"command": "/top-level/wins"},
+            },
+            "projects": {
+                host_path: {
+                    "mcpServers": {
+                        "shared": {"command": "/project-scope/loses"},
+                        "project-only": {"command": "/project-scope/only"},
+                    },
+                },
+            },
+        })
+        run_helper(str(inp), str(project))
+        out = load_output(project)
+        # Top-level wins on collision.
+        expect(
+            out["mcpServers"]["shared"]["command"] == f"{EXEC_HOOK} /top-level/wins",
+            f"merge: top-level should win on collision, got {out['mcpServers']['shared']['command']!r}",
+        )
+        # Project-only survives.
+        expect(
+            out["mcpServers"]["project-only"]["command"]
+            == f"{EXEC_HOOK} /project-scope/only",
+            f"merge: project-only server should survive, got {out['mcpServers']['project-only']['command']!r}",
+        )
+
+
+def test_output_format() -> None:
+    """Output is a valid JSON object with single `mcpServers` key, trailing newline."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {"a": {"command": "/bin/a"}}})
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+        raw = (project / ".mcp.json").read_text(encoding="utf-8")
+        expect(raw.endswith("\n"), "format: output should end with newline")
+        parsed = json.loads(raw)
+        expect(
+            list(parsed.keys()) == ["mcpServers"],
+            f"format: only mcpServers key expected, got {list(parsed.keys())}",
+        )
+
+
+def test_idempotent_same_input_unchanged() -> None:
+    """Second run with identical input does not rewrite (mtime preserved)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {"a": {"command": "/bin/a"}}})
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+        out_file = project / ".mcp.json"
+        mtime1 = out_file.stat().st_mtime_ns
+        # Sleep just enough that a real rewrite would tick mtime.
+        time.sleep(0.05)
+        run_helper(str(inp), str(project))
+        mtime2 = out_file.stat().st_mtime_ns
+        expect(
+            mtime1 == mtime2,
+            f"idempotent: mtime should be preserved on no-change rerun, got {mtime1} -> {mtime2}",
+        )
+
+
+def test_changed_input_rewrites() -> None:
+    """When input changes between runs, the output is rewritten."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {"a": {"command": "/bin/a"}}})
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+        out1 = load_output(project)
+        expect(
+            out1["mcpServers"]["a"]["command"] == f"{EXEC_HOOK} /bin/a",
+            f"rewrite: initial write should have wrapped /bin/a",
+        )
+        # Mutate the input.
+        write_json(inp, {"mcpServers": {"a": {"command": "/bin/b"}}})
+        run_helper(str(inp), str(project))
+        out2 = load_output(project)
+        expect(
+            out2["mcpServers"]["a"]["command"] == f"{EXEC_HOOK} /bin/b",
+            f"rewrite: changed input should propagate, got {out2['mcpServers']['a']['command']!r}",
+        )
+
+
+def test_weird_definition_passes_through() -> None:
+    """Non-dict server definitions pass through unchanged."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {
+            "mcpServers": {
+                "weird": "this is not a dict",
+                "normal": {"command": "/bin/normal"},
+            },
+        })
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["weird"] == "this is not a dict",
+            f"weird: non-dict definition should pass through, got {out['mcpServers']['weird']!r}",
+        )
+        expect(
+            out["mcpServers"]["normal"]["command"] == f"{EXEC_HOOK} /bin/normal",
+            f"weird: normal sibling still wrapped, got {out['mcpServers']['normal']['command']!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_missing_input_no_output,
+    test_empty_output_dir_no_output,
+    test_missing_output_dir_no_output,
+    test_unparseable_input_no_output,
+    test_no_mcp_servers_no_output,
+    test_top_level_servers_wrapped,
+    test_already_wrapped_not_double,
+    test_project_scoped_servers_merged,
+    test_output_format,
+    test_idempotent_same_input_unchanged,
+    test_changed_input_rewrites,
+    test_weird_definition_passes_through,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")
