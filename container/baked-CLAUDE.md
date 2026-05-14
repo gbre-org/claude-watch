@@ -422,17 +422,25 @@ so the host file is never mutated.
 
 **Implication for corporate telemetry hooks**: a Mac-host telemetry
 binary referenced from `~/.claude/settings.json` (typical pattern: under
-`~/.devbar/bin/` or similar) **does not fire inside the container**.
-exec-hook detects the Mach-O and silently no-ops, intentionally — the
+`~/.devbar/bin/` or similar) by default **does not fire inside the
+container**. exec-hook detects the Mach-O and silently no-ops — the
 alternative ("Exec format error" on every hook event) is worse. If your
 team requires telemetry from container sessions, the options are:
 
 1. Ship a Linux-amd64 build of the hook binary and bind-mount it at the
    same path the host config references. (Coordinate with the team that
    owns the hook.)
-2. Bridge the hook event over `host-bash` MCP — the in-container claude
-   could invoke the host-native binary via the host-bash bridge at
-   session-start. This is a per-team plumbing exercise, not built in.
+2. **Enable the host-bash bridge** (`CLAUDE_HOST_HOOK_BRIDGE=1`). When
+   set, exec-hook hands every Mach-O / wrong-arch hook off to
+   `exec-hook-bridge`, which marshals the call across the host-bash MCP
+   server (`mcp-host-bash` at `host.docker.internal:8766/mcp` by
+   default) so the REAL host binary runs with the same env + args and
+   its exit code propagates back into the in-container claude session.
+   The operator must also add the hook binary basename to the
+   `mcp-host-bash` allow-list via `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook`
+   (comma-separated for multiple). Bridge failures (host-bash
+   unreachable, allow-list reject) fall back to the legacy silent-no-op
+   contract — a misconfigured bridge never brings the session down.
 3. Accept that in-container sessions are not telemetered into the host's
    pipeline. Coordinate with your team's privacy / observability stance.
 

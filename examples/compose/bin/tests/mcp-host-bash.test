@@ -593,6 +593,53 @@ def test_cw_profile_operator_override_wins() -> None:
         )
 
 
+def test_hook_bridge_bins_merged_into_allow_list() -> None:
+    """CLAUDE_HOOK_BRIDGE_BINS adds operator-declared hook binary
+    basenames to ALLOWED_COMMANDS so the in-container exec-hook bridge
+    can invoke them via cli-mcp-server's run_command tool."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"CLAUDE_HOOK_BRIDGE_BINS": "telemetry-hook,corp-trace-hook"},
+    )
+    cmds = find_env_value(lines, "ALLOWED_COMMANDS") or ""
+    cmd_list = [c.strip() for c in cmds.split(",")]
+    expect("telemetry-hook" in cmd_list,
+           f"CLAUDE_HOOK_BRIDGE_BINS: telemetry-hook missing from ALLOWED_COMMANDS, got {cmd_list}")
+    expect("corp-trace-hook" in cmd_list,
+           f"CLAUDE_HOOK_BRIDGE_BINS: corp-trace-hook missing from ALLOWED_COMMANDS, got {cmd_list}")
+    # The conservative default floor must still be present.
+    expect("git" in cmd_list,
+           f"CLAUDE_HOOK_BRIDGE_BINS: profile default should still be present, got {cmd_list}")
+
+
+def test_hook_bridge_bins_works_with_trusted_profile() -> None:
+    """CLAUDE_HOOK_BRIDGE_BINS layers ON TOP of CW_PROFILE=corp-dev-trusted."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={
+            "CW_PROFILE": "corp-dev-trusted",
+            "CLAUDE_HOOK_BRIDGE_BINS": "telemetry-hook",
+        },
+    )
+    cmds = find_env_value(lines, "ALLOWED_COMMANDS") or ""
+    cmd_list = [c.strip() for c in cmds.split(",")]
+    expect("telemetry-hook" in cmd_list,
+           f"trusted+bridge-bins: telemetry-hook missing, got {cmd_list}")
+    # corp-dev-trusted extras (e.g. docker, curl) should still be present.
+    expect("docker" in cmd_list,
+           f"trusted+bridge-bins: trusted-profile extras dropped, got {cmd_list}")
+
+
+def test_hook_bridge_bins_unset_no_effect() -> None:
+    """No CLAUDE_HOOK_BRIDGE_BINS => ALLOWED_COMMANDS unchanged from profile default."""
+    lines_with, _, _, _ = run_script(["--print-cmd"])
+    cmds_default = find_env_value(lines_with, "ALLOWED_COMMANDS") or ""
+    cmd_list_default = set(c.strip() for c in cmds_default.split(","))
+    # Spot-check: telemetry-hook is NOT in the default list.
+    expect("telemetry-hook" not in cmd_list_default,
+           f"unset bridge-bins: telemetry-hook should NOT leak into default, got {cmd_list_default}")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -616,6 +663,9 @@ tests = [
     test_cw_profile_trusted_widens,
     test_cw_profile_unknown_falls_back,
     test_cw_profile_operator_override_wins,
+    test_hook_bridge_bins_merged_into_allow_list,
+    test_hook_bridge_bins_works_with_trusted_profile,
+    test_hook_bridge_bins_unset_no_effect,
     test_launcher_source_has_no_uvx_invocations,
     test_preflight_error_points_to_installer,
     test_install_host_deps_script_exists_and_parses,

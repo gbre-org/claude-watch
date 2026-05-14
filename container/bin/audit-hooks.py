@@ -87,6 +87,11 @@ SHEBANG_MAGIC = b"#!"
 KNOWN_BUILTINS = {
     "claude-watch",
     "exec-hook",
+    # Host-bash bridge helper invoked by exec-hook when
+    # CLAUDE_HOST_HOOK_BRIDGE=1. Listed here so audit-hooks reports
+    # bare references to it (e.g. in custom settings.json shapes) as
+    # `builtin` rather than `missing`.
+    "exec-hook-bridge",
     "session-task",
     "claude-event",
     "obligations",

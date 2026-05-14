@@ -47,14 +47,18 @@ def run_shim(
     target: str | None,
     *args: str,
     tmpdir: str | None = None,
+    extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     """Run exec-hook against `target` with the given args.
 
     Pass target=None to invoke with no argv (exercises the usage path).
+    `extra_env` overlays additional env vars (used by bridge tests).
     """
     env = os.environ.copy()
     if tmpdir is not None:
         env["TMPDIR"] = tmpdir
+    if extra_env:
+        env.update(extra_env)
     argv: list[str] = [str(SCRIPT)]
     if target is not None:
         argv.append(target)
@@ -211,6 +215,90 @@ def test_empty_argv_usage() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bridge integration (CLAUDE_HOST_HOOK_BRIDGE=1)
+#
+# These tests exercise the maybe_bridge_to_host hand-off in exec-hook.
+# Full bridge protocol coverage lives in exec-hook-bridge.test; here we
+# just confirm exec-hook DOES exec the bridge when opted in, and DOES
+# NOT exec it when bridge mode is off.
+# ---------------------------------------------------------------------------
+
+
+def test_mach_o_bridge_off_silent_noop() -> None:
+    """Mach-O target without CLAUDE_HOST_HOOK_BRIDGE=1 -> still silent no-op."""
+    with tempfile.TemporaryDirectory() as td:
+        mach = Path(td) / "telemetry-hook"
+        write_mach_o_stub(mach)
+        r = run_shim(str(mach), tmpdir=td)
+        expect(r.returncode == 0,
+               f"bridge-off Mach-O: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        expect("[hook-shim]" in r.stderr,
+               f"bridge-off Mach-O: expected silent-no-op heads-up, got:\n{r.stderr}")
+        expect("[hook-bridge]" not in r.stderr,
+               f"bridge-off Mach-O: bridge should NOT have fired, got:\n{r.stderr}")
+
+
+def test_mach_o_bridge_on_invokes_bridge() -> None:
+    """Mach-O target with CLAUDE_HOST_HOOK_BRIDGE=1 -> hands off to the bridge.
+
+    We don't have a real host-bash MCP server in test, so the bridge
+    will fall back to no-op + emit its `[hook-bridge]` stderr line.
+    Either the bridge fires (we see [hook-bridge] in stderr) or — if
+    the bridge can't be located — exec-hook emits an additional
+    `[hook-shim]` line about the missing helper. EITHER outcome proves
+    the hand-off path is wired.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        mach = Path(td) / "telemetry-hook"
+        write_mach_o_stub(mach)
+        # Point bridge at unreachable port so the bridge falls back
+        # cleanly without needing a real MCP server.
+        r = run_shim(
+            str(mach),
+            tmpdir=td,
+            extra_env={
+                "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                "CLAUDE_HOST_HOOK_BRIDGE_URL": "http://127.0.0.1:1/mcp",
+                "CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT": "2",
+            },
+        )
+        expect(r.returncode == 0,
+               f"bridge-on Mach-O: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        # Either the bridge surfaced its fall-back line OR the bridge
+        # helper was missing and exec-hook emitted a heads-up about it.
+        bridge_fired = "[hook-bridge]" in r.stderr
+        helper_missing = "bridge requested but helper not installed" in r.stderr
+        expect(bridge_fired or helper_missing,
+               f"bridge-on Mach-O: expected bridge attempt or helper-missing heads-up, "
+               f"got stderr:\n{r.stderr}")
+
+
+def test_missing_target_bridge_on_invokes_bridge() -> None:
+    """Missing path with CLAUDE_HOST_HOOK_BRIDGE=1 -> still attempts bridge.
+
+    The host-only binary case: the path doesn't exist in the container,
+    but the bridge should still try to reach it on the host.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        r = run_shim(
+            "/this/file/does/not/exist",
+            tmpdir=td,
+            extra_env={
+                "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                "CLAUDE_HOST_HOOK_BRIDGE_URL": "http://127.0.0.1:1/mcp",
+                "CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT": "2",
+            },
+        )
+        expect(r.returncode == 0,
+               f"bridge-on missing: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        bridge_fired = "[hook-bridge]" in r.stderr
+        helper_missing = "bridge requested but helper not installed" in r.stderr
+        expect(bridge_fired or helper_missing,
+               f"bridge-on missing: expected bridge attempt or helper-missing heads-up, "
+               f"got stderr:\n{r.stderr}")
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -224,6 +312,9 @@ TESTS = [
     test_missing_target,
     test_unknown_format_noop,
     test_empty_argv_usage,
+    test_mach_o_bridge_off_silent_noop,
+    test_mach_o_bridge_on_invokes_bridge,
+    test_missing_target_bridge_on_invokes_bridge,
 ]
 
 for t in TESTS:

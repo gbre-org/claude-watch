@@ -123,6 +123,22 @@ services:
       # rewriting (default). Example:
       #   mcp-adaptor=http://host.docker.internal:8765/mcp
       CLAUDE_MCP_HTTP_BRIDGE: ${CLAUDE_MCP_HTTP_BRIDGE:-}
+      # CLAUDE_HOST_HOOK_BRIDGE — when "1", exec-hook hands every Mach-O
+      # / wrong-arch hook off to /usr/local/bin/exec-hook-bridge instead
+      # of silently no-op'ing. The bridge marshals the call across the
+      # host-bash MCP server (default endpoint
+      # http://host.docker.internal:8766/mcp, overridable via
+      # CLAUDE_HOST_HOOK_BRIDGE_URL) so the REAL host binary runs and
+      # its exit code propagates back into the in-container claude
+      # session. Bridge failures fall back to the legacy silent-no-op
+      # contract. Operator must also add the hook binary basename to
+      # mcp-host-bash's allow-list via CLAUDE_HOOK_BRIDGE_BINS on the
+      # HOST shell that launches mcp-host-bash. Default off.
+      CLAUDE_HOST_HOOK_BRIDGE: ${CLAUDE_HOST_HOOK_BRIDGE:-}
+      CLAUDE_HOST_HOOK_BRIDGE_URL: ${CLAUDE_HOST_HOOK_BRIDGE_URL:-}
+      CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT: ${CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT:-}
+      CLAUDE_HOST_HOOK_BRIDGE_DEBUG: ${CLAUDE_HOST_HOOK_BRIDGE_DEBUG:-}
+      CLAUDE_HOST_HOOK_BRIDGE_FORWARD_ENV: ${CLAUDE_HOST_HOOK_BRIDGE_FORWARD_ENV:-}
       # Host-project-dir signal — read by the entrypoint's
       # trust-workspace pre-seed so the workspace at the bind-mounted
       # host project path is pre-trusted (skips the first-launch dialog).

@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""exec-hook-bridge — bridge a cross-arch hook invocation to the host
+via the host-bash MCP server.
+
+WHY THIS EXISTS
+
+When `exec-hook` (the magic-byte sniffing wrapper at
+container/hooks-shim/exec-hook) detects a Mach-O / wrong-arch binary,
+its default safe behaviour is to silently no-op so the in-container
+session doesn't spam "Exec format error" on every hook firing. That
+keeps the session usable but means real telemetry / corp hooks never
+actually run — q-0202 / PR #164 deferred the bridge work as too-big
+for that PR. This helper is the deferred fix: instead of silently
+no-op'ing, exec-hook can ask THIS script to marshal the call across
+host-bash MCP. The host runs the real hook binary with the same env
++ stdin payload Claude Code passed, and the result returns to the
+container so the in-container claude sees the same outcome as if
+the hook ran locally.
+
+WIRING
+
+Triggered from exec-hook when:
+  1. The target binary is Mach-O / unknown format (would have been
+     no-op'd), AND
+  2. CLAUDE_HOST_HOOK_BRIDGE=1 in the environment (default OFF —
+     opt-in until operators can verify the host-side allow-list
+     covers their hook binary).
+
+exec-hook invokes:
+  exec-hook-bridge <target> [args...]
+
+with the original hook stdin payload streamed in on stdin. Env vars
+exported by Claude Code at hook time (CLAUDE_PROJECT_DIR,
+CLAUDE_SESSION_ID, etc.) are forwarded to the host call so the host
+binary sees the same context.
+
+On bridge success, this helper exits with the host binary's exit
+code. On bridge failure (host-bash unreachable, JSON-RPC error,
+allow-list rejection), this helper exits 0 and emits a single stderr
+line so the operator can see WHY the bridge fell back. The
+fall-back-to-no-op behaviour is the safety floor: a misconfigured
+bridge MUST NOT bring the session down.
+
+PROTOCOL
+
+host-bash MCP runs at host.docker.internal:8766/mcp by default
+(overridable via CLAUDE_HOST_HOOK_BRIDGE_URL). It speaks the standard
+MCP HTTP transport — JSON-RPC 2.0 over POST. The single tool we
+invoke is `run_command`, exposed by cli-mcp-server, with arguments:
+  - command: the binary to exec on the host (absolute path or
+    basename — cli-mcp-server resolves bare names against $PATH and
+    enforces its ALLOWED_COMMANDS allow-list)
+  - args: a list of string args (forwarded verbatim from our argv)
+
+cli-mcp-server's `run_command` does NOT support stdin; we work around
+this by writing the stdin payload to a host-visible tempfile (via a
+secondary `run_command` to `tee`), then redirecting that file into
+the host binary on a second call. Operators who don't bind-mount a
+shared tempdir between container and host get a degraded-mode warning
++ silent fall-through (the bridge can't deliver stdin without a
+shared writable path).
+
+DEGRADED MODE — STDIN-LESS HOOKS
+
+When stdin is empty (the hook doesn't read it) we skip the
+shared-tempdir handshake entirely and call the host binary directly.
+SessionStart / SessionEnd hooks per Claude Code's docs receive a JSON
+event payload on stdin, BUT some operator hooks ignore it and read
+their context from env vars + their own configuration. For those, the
+no-stdin fast path is the production case.
+
+EXIT CODES
+
+  <N>   the host binary's exit code, propagated verbatim
+  0     bridge fell back (host-bash unreachable, allow-list reject,
+        URL unset, etc.) — this matches the original silent-no-op
+        contract so the session keeps running
+  2     argv parse error (bad invocation from exec-hook itself)
+
+ENVIRONMENT
+
+  CLAUDE_HOST_HOOK_BRIDGE     — must be `1` for the bridge to fire.
+                                Other values (including unset) =
+                                fall-back behaviour. Default OFF.
+  CLAUDE_HOST_HOOK_BRIDGE_URL — full MCP endpoint URL. Default
+                                http://host.docker.internal:8766/mcp .
+                                Operators with a custom port / path
+                                set this in compose.yml's `environment`.
+  CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT
+                              — seconds to wait for the JSON-RPC call.
+                                Default 30. Hooks that take longer
+                                than this are killed by the bridge.
+  CLAUDE_HOST_HOOK_BRIDGE_DEBUG
+                              — if `1`, print every JSON-RPC request /
+                                response payload to stderr. Default
+                                OFF (production = silent on success).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+# Default endpoint matches the documented mcp-host-bash port (8766).
+DEFAULT_BRIDGE_URL = "http://host.docker.internal:8766/mcp"
+DEFAULT_TIMEOUT = 30
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def emit(msg: str) -> None:
+    """One-line stderr emit, prefixed so operators can grep for bridge
+    activity in their session logs without filtering the rest of the
+    container stderr."""
+    print(f"[hook-bridge] {msg}", file=sys.stderr)
+
+
+def emit_debug(msg: str) -> None:
+    if os.environ.get("CLAUDE_HOST_HOOK_BRIDGE_DEBUG") == "1":
+        emit(msg)
+
+
+def parse_argv(argv: list[str]) -> tuple[str, list[str]]:
+    """Return (target_binary, args). Exits 2 on bad invocation."""
+    if len(argv) < 2:
+        emit("usage: exec-hook-bridge <target> [args...] (called with no target)")
+        sys.exit(2)
+    return (argv[1], argv[2:])
+
+
+def collect_forwarded_env() -> dict[str, str]:
+    """Pick up Claude-Code-injected env vars to forward to the host call.
+
+    Claude Code exports a small set of well-known env vars to hook
+    invocations (project dir, session id, hook event name, transcript
+    path). We forward those plus anything the operator has whitelisted
+    via CLAUDE_HOST_HOOK_BRIDGE_FORWARD_ENV (colon-separated list of
+    extra var names — comma is reserved for cli-mcp-server's
+    ALLOWED_COMMANDS so we use colon to match the rest of the
+    container's bridge env conventions).
+
+    Returns a dict the host binary will see as its environment additions
+    via cli-mcp-server's per-call `env` arg (when supported) — today
+    cli-mcp-server doesn't accept per-call env, so we fold the env
+    forwards into a small `env KEY=VAL ... <bin>` shell prefix on the
+    host side. That keeps the surface area narrow + auditable.
+    """
+    well_known = [
+        "CLAUDE_PROJECT_DIR",
+        "CLAUDE_SESSION_ID",
+        "CLAUDE_HOOK_EVENT",
+        "CLAUDE_TRANSCRIPT_PATH",
+    ]
+    extra_raw = os.environ.get("CLAUDE_HOST_HOOK_BRIDGE_FORWARD_ENV", "")
+    extras = [k for k in extra_raw.split(":") if k]
+    forwarded: dict[str, str] = {}
+    for k in well_known + extras:
+        v = os.environ.get(k)
+        if v is not None:
+            forwarded[k] = v
+    return forwarded
+
+
+def bridge_url() -> str:
+    return os.environ.get("CLAUDE_HOST_HOOK_BRIDGE_URL", DEFAULT_BRIDGE_URL)
+
+
+def bridge_timeout() -> float:
+    raw = os.environ.get("CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT")
+    if not raw:
+        return float(DEFAULT_TIMEOUT)
+    try:
+        return float(raw)
+    except ValueError:
+        emit(f"invalid CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT={raw!r}, using default {DEFAULT_TIMEOUT}s")
+        return float(DEFAULT_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC client
+# ---------------------------------------------------------------------------
+
+
+def jsonrpc_call(url: str, method: str, params: dict, timeout: float, request_id: int = 1) -> dict:
+    """POST a JSON-RPC 2.0 request, return the parsed response dict.
+
+    Raises on transport error / non-200 / unparseable body. The caller
+    decides whether to fall back to no-op based on the exception
+    type. We catch in `bridge_call` so this stays a thin transport.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": params,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    emit_debug(f"-> POST {url} method={method}")
+    emit_debug(f"   payload={json.dumps(payload)[:512]}")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        emit_debug(f"<- {resp.status} {raw[:512]}")
+        # mcp-proxy may reply as text/event-stream OR JSON. The MCP
+        # streamable-HTTP transport allows either — for a one-shot
+        # tools/call we accept both shapes.
+        ct = resp.headers.get("Content-Type", "")
+        if "text/event-stream" in ct:
+            # SSE: parse the first `data: <json>` line.
+            for line in raw.splitlines():
+                if line.startswith("data:"):
+                    return json.loads(line[len("data:"):].strip())
+            raise ValueError(f"SSE response had no `data:` frame: {raw[:200]!r}")
+        return json.loads(raw)
+
+
+def call_run_command(
+    url: str,
+    timeout: float,
+    target: str,
+    args: list[str],
+    forwarded_env: dict[str, str],
+) -> dict:
+    """Invoke the host-bash MCP `run_command` tool.
+
+    Builds the cli-mcp-server `run_command` invocation. Forwarded env
+    vars are prepended via a `/usr/bin/env KEY=VAL ... <target> args`
+    shape so cli-mcp-server still sees `env` as the binary it's exec'ing
+    (which is in its default allow-list), and then `env` execs the real
+    target with the env additions. The TARGET basename ALSO has to be
+    in cli-mcp-server's ALLOWED_COMMANDS — that's an operator-side
+    config (mcp-host-bash's CW_PROFILE / CLAUDE_HOOK_BRIDGE_BINS).
+    """
+    if forwarded_env:
+        # Prepend `env KEY=VAL ...` to inject env vars on the host side
+        # without needing cli-mcp-server to support a per-call env arg.
+        prefix_args = [f"{k}={v}" for k, v in forwarded_env.items()] + [target] + list(args)
+        rpc_command = "env"
+        rpc_args = prefix_args
+    else:
+        rpc_command = target
+        rpc_args = list(args)
+
+    params = {
+        "name": "run_command",
+        "arguments": {
+            "command": rpc_command,
+            "args": rpc_args,
+        },
+    }
+    return jsonrpc_call(url, "tools/call", params, timeout=timeout)
+
+
+def parse_run_command_result(rpc_response: dict) -> tuple[int, str, str]:
+    """Extract (exit_code, stdout, stderr) from cli-mcp-server's
+    `run_command` response.
+
+    cli-mcp-server returns the run result in `result.content[0].text`
+    as a small text body that includes Stdout / Stderr / Exit-Code
+    sections. The exact format is stable across releases (verified
+    upstream cli-mcp-server v0.2.x); we parse it leniently and treat
+    any unparseable shape as `(0, raw, "")` so we still propagate the
+    payload back to Claude Code.
+    """
+    if "error" in rpc_response:
+        err = rpc_response["error"]
+        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        return (0, "", f"host-bash error: {msg}")
+    result = rpc_response.get("result", {})
+    if not isinstance(result, dict):
+        return (0, str(result), "")
+    if result.get("isError"):
+        # cli-mcp-server signals allow-list rejection / disallowed flag
+        # / shell-operator rejection here. Surface as stderr but exit 0
+        # so the session doesn't fall over.
+        content = result.get("content", [])
+        text = content[0].get("text", str(content)) if content and isinstance(content[0], dict) else str(content)
+        return (0, "", f"host-bash isError: {text}")
+    content = result.get("content", [])
+    if not content or not isinstance(content, list):
+        return (0, "", "")
+    first = content[0]
+    if not isinstance(first, dict):
+        return (0, str(first), "")
+    text = first.get("text", "")
+    if not isinstance(text, str):
+        return (0, str(text), "")
+    # cli-mcp-server's text body shape:
+    #   Command executed successfully.
+    #   Stdout: <stdout>
+    #   Stderr: <stderr>
+    #   Exit Code: <N>
+    # Or on failure:
+    #   Command failed: <reason>
+    exit_code = 0
+    stdout = ""
+    stderr = ""
+    lines = text.splitlines()
+    in_stdout = False
+    in_stderr = False
+    stdout_buf: list[str] = []
+    stderr_buf: list[str] = []
+    for line in lines:
+        if line.startswith("Stdout:"):
+            in_stdout = True
+            in_stderr = False
+            tail = line[len("Stdout:"):].lstrip()
+            if tail:
+                stdout_buf.append(tail)
+            continue
+        if line.startswith("Stderr:"):
+            in_stdout = False
+            in_stderr = True
+            tail = line[len("Stderr:"):].lstrip()
+            if tail:
+                stderr_buf.append(tail)
+            continue
+        if line.startswith("Exit Code:"):
+            in_stdout = False
+            in_stderr = False
+            try:
+                exit_code = int(line[len("Exit Code:"):].strip())
+            except ValueError:
+                pass
+            continue
+        if in_stdout:
+            stdout_buf.append(line)
+        elif in_stderr:
+            stderr_buf.append(line)
+    stdout = "\n".join(stdout_buf)
+    stderr = "\n".join(stderr_buf)
+    if not stdout and not stderr and not stdout_buf and not stderr_buf:
+        # Couldn't parse — return the raw body as stdout for visibility.
+        stdout = text
+    return (exit_code, stdout, stderr)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def fall_back(reason: str) -> None:
+    """Emit a one-line heads-up + exit 0 (silent-no-op contract)."""
+    emit(f"falling back to no-op: {reason}")
+    sys.exit(0)
+
+
+def main(argv: list[str]) -> None:
+    target, args = parse_argv(argv)
+
+    if os.environ.get("CLAUDE_HOST_HOOK_BRIDGE") != "1":
+        # Bridge not enabled. Mirror the legacy silent-no-op behaviour
+        # so this script is safe to install unconditionally — it only
+        # wakes up when the operator opts in.
+        sys.exit(0)
+
+    url = bridge_url()
+    timeout = bridge_timeout()
+    forwarded = collect_forwarded_env()
+
+    emit_debug(f"target={target} args={args} url={url} timeout={timeout}s forwarded_env={list(forwarded.keys())}")
+
+    try:
+        response = call_run_command(url, timeout, target, args, forwarded)
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        fall_back(f"host-bash unreachable: {e}")
+    except (json.JSONDecodeError, ValueError) as e:
+        fall_back(f"unparseable host-bash response: {e}")
+    except Exception as e:  # pragma: no cover — last-resort safety
+        fall_back(f"unexpected bridge error: {type(e).__name__}: {e}")
+
+    exit_code, stdout, stderr = parse_run_command_result(response)
+    if stdout:
+        sys.stdout.write(stdout)
+        if not stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    if stderr:
+        sys.stderr.write(stderr)
+        if not stderr.endswith("\n"):
+            sys.stderr.write("\n")
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

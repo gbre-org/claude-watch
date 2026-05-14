@@ -102,6 +102,7 @@ test-claude-tmux-env:
 # no container needed.
 test-hooks-shim:
 	container/hooks-shim/tests/exec-hook.test
+	container/hooks-shim/tests/exec-hook-bridge.test
 	container/hooks-shim/tests/generate-hooks-shim-settings.test
 	container/hooks-shim/tests/generate-project-mcp-json.test
 

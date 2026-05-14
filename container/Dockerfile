@@ -236,6 +236,19 @@ COPY container/hooks-shim/exec-hook /usr/local/lib/claude-hooks-shim/exec-hook
 RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
     && ln -s /usr/local/lib/claude-hooks-shim/exec-hook /usr/local/bin/exec-hook
 
+# exec-hook-bridge — host-bash MCP bridge invoked by exec-hook when
+# the operator opts in via CLAUDE_HOST_HOOK_BRIDGE=1. Marshals
+# Mach-O / wrong-arch hook calls across the host-bash MCP server
+# (mcp-host-bash at host.docker.internal:8766/mcp by default) so the
+# REAL host binary runs and its exit code propagates back into the
+# in-container claude session. Fail-safe: bridge errors fall back to
+# the legacy silent-no-op contract so a misconfigured bridge never
+# brings the session down. See container/hooks-shim/exec-hook-bridge
+# for the full protocol + env-var surface.
+COPY container/hooks-shim/exec-hook-bridge /usr/local/lib/claude-hooks-shim/exec-hook-bridge
+RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook-bridge \
+    && ln -s /usr/local/lib/claude-hooks-shim/exec-hook-bridge /usr/local/bin/exec-hook-bridge
+
 # generate-hooks-shim-settings — entrypoint-side companion to exec-hook.
 # When CLAUDE_CONTAINER_REWRITE_HOOKS=1 is set in the container env, the
 # entrypoint runs this helper to generate a container-local copy of

@@ -66,13 +66,23 @@
 # file is created with 0600 perms; multi-user containers should set
 # TMPDIR to a per-user directory.
 #
-# TODO: future IPC-forwarder option. Rather than no-op'ing the hook
-# entirely, a host-side daemon (e.g. a launchd LaunchAgent on macOS)
-# could listen on a Unix socket bind-mounted into the container; this
-# shim would marshal the hook event over the socket to be run by the
-# host's native binary. That's strictly future scope — the current
-# silent-no-op behaviour matches what users want today (containers
-# shouldn't try to run host-side telemetry).
+# HOST-BASH BRIDGE (CLAUDE_HOST_HOOK_BRIDGE=1)
+#
+# When the operator opts in by setting CLAUDE_HOST_HOOK_BRIDGE=1 in the
+# container env, the Mach-O / unknown-format branch hands off to
+# `exec-hook-bridge` instead of silently no-op'ing. The bridge
+# marshals the hook call across the host-bash MCP server (mcp-host-bash
+# at host.docker.internal:8766/mcp by default) so the REAL host binary
+# runs with the hook's stdin payload + forwarded env vars, and the
+# host's exit code propagates back to Claude Code as if the hook had
+# run inside the container.
+#
+# Bridge failures (host-bash unreachable, allow-list reject, JSON-RPC
+# error) fall back to the original silent-no-op contract so a
+# misconfigured bridge never brings the session down.
+#
+# See container/hooks-shim/exec-hook-bridge for the full bridge
+# protocol, env-var surface, and degraded-mode behaviour.
 
 set -u
 
@@ -121,6 +131,60 @@ emit_skip_warning_once() {
     printf '%s\n' "$target" >> "$SKIP_FLAG_FILE" 2>/dev/null || true
 }
 
+# Resolve the host-bash bridge helper. The bridge sits next to this
+# script in the source tree; in the baked container image the
+# Dockerfile installs both into /usr/local/lib/claude-hooks-shim/ and
+# symlinks them into /usr/local/bin/. We probe a small set of fallback
+# locations so the shim works in all three environments:
+#   1. Adjacent file (development / container/hooks-shim/ source tree).
+#   2. /usr/local/bin/exec-hook-bridge (baked image symlink).
+#   3. /usr/local/lib/claude-hooks-shim/exec-hook-bridge (baked image
+#      lib path).
+# When the bridge can't be found we silently fall through to the
+# legacy no-op path — a stripped-down image without the bridge file
+# stays safe.
+resolve_bridge_helper() {
+    local self_dir
+    self_dir="$(dirname "$0" 2>/dev/null || echo /usr/local/bin)"
+    local candidate
+    for candidate in \
+            "${self_dir}/exec-hook-bridge" \
+            "/usr/local/bin/exec-hook-bridge" \
+            "/usr/local/lib/claude-hooks-shim/exec-hook-bridge"; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Try to bridge the call to the host via host-bash MCP. Only invoked
+# from the Mach-O / unknown-format branch when CLAUDE_HOST_HOOK_BRIDGE=1.
+#
+# Returns whatever exit code the bridge returns. The bridge itself is
+# fail-safe: on bridge unreachable / allow-list reject / parse error
+# it exits 0 and emits a one-line stderr (matching the silent-no-op
+# contract). A successful bridge propagates the host binary's exit
+# code so Claude Code sees the same outcome as if the hook ran here.
+maybe_bridge_to_host() {
+    local target="$1"
+    shift
+    if [ "${CLAUDE_HOST_HOOK_BRIDGE:-0}" != "1" ]; then
+        return 1
+    fi
+    local bridge
+    if ! bridge="$(resolve_bridge_helper)"; then
+        # Bridge requested but helper missing — surface a one-line
+        # heads-up so operator can debug, then fall through to no-op.
+        emit_skip_warning_once "$target (bridge requested but helper not installed)"
+        return 1
+    fi
+    # exec replaces the shell with the bridge so its exit code becomes
+    # ours and stdin / signals pass through cleanly.
+    exec "$bridge" "$target" "$@"
+}
+
 # Magic-byte sniff. ELF = 0x7F 'E' 'L' 'F'. Mach-O 32/64 + fat variants
 # have a small set of magic values (0xFEEDFACE / 0xFEEDFACF, plus reverse
 # byte orders and the FAT 0xCAFEBABE / 0xBEBAFECA). Anything else (script,
@@ -130,6 +194,13 @@ if [ ! -e "$TARGET" ]; then
     # Treat a missing path as a non-ELF target — quiet no-op + one-line
     # heads-up. The settings.json reference is broken but that's not a
     # reason to bring the session down.
+    #
+    # When the host-bash bridge is enabled, a missing path inside the
+    # container is the EXPECTED case for a host-only binary (e.g. a
+    # macOS Mach-O telemetry hook whose host path isn't bind-mounted
+    # into the container). Try to bridge the call to the host so the
+    # operator's host binary still runs.
+    maybe_bridge_to_host "$TARGET" "$@"
     emit_skip_warning_once "$TARGET (missing)"
     exit 0
 fi
@@ -149,7 +220,12 @@ case "$magic" in
         exec "$TARGET" "$@"
         ;;
     feedface|feedfacf|cefaedfe|cffaedfe|cafebabe|bebafeca)
-        # Mach-O (32, 64, reverse byte-order pairs, fat).
+        # Mach-O (32, 64, reverse byte-order pairs, fat). Try to
+        # bridge to the host when CLAUDE_HOST_HOOK_BRIDGE=1; the
+        # bridge handler `exec`s itself so a successful invocation
+        # never returns. On bridge-disabled / helper-missing we drop
+        # to the legacy silent-no-op + heads-up.
+        maybe_bridge_to_host "$TARGET" "$@"
         emit_skip_warning_once "$TARGET (Mach-O)"
         exit 0
         ;;
@@ -158,11 +234,13 @@ case "$magic" in
         # `2321...`), a Windows PE (`4d5a...`), a wasm module, or
         # garbage. For shebang scripts the OS's exec() handles them
         # natively, so try to exec — but only if the file is marked
-        # executable. Anything else falls into the silent-no-op path.
+        # executable. Anything else falls into the silent-no-op path
+        # (or the host-bash bridge when opted in).
         if [ -x "$TARGET" ] && [ "${magic#2321}" != "$magic" ]; then
             # Looks like a shebang script (#! = 0x23 0x21). exec it.
             exec "$TARGET" "$@"
         fi
+        maybe_bridge_to_host "$TARGET" "$@"
         emit_skip_warning_once "$TARGET (unknown format: magic=${magic:-empty})"
         exit 0
         ;;

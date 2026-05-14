@@ -324,6 +324,27 @@ case "${CW_PROFILE:-}" in
         ;;
 esac
 
+# CLAUDE_HOOK_BRIDGE_BINS — operator-declared comma-separated list of
+# host hook binary BASENAMES the in-container exec-hook bridge is
+# allowed to invoke via `run_command`. Merged into the effective
+# ALLOWED_COMMANDS list below.
+#
+# Why a separate knob (vs. just adding telemetry-hook etc. to
+# TRUSTED_EXTRAS): hook binary basenames are operator-specific. Andrew's
+# corp telemetry hook is `telemetry-hook`; another operator's corp
+# environment may have `corp-trace-hook`, `audit-fire`, etc. Forcing
+# every operator to fork mcp-host-bash to add their hook binary is
+# friction we don't need; a single env var covers the bridge use case
+# without expanding the trust profile floor.
+#
+# The merged result is the union of (profile default ∪ hook bridge
+# bins). Operator-supplied ALLOWED_COMMANDS in $MCP_HOST_BASH_CONFIG
+# still wins absolute when set (matches the existing behaviour).
+HOOK_BRIDGE_BINS="${CLAUDE_HOOK_BRIDGE_BINS:-}"
+if [ -n "$HOOK_BRIDGE_BINS" ]; then
+    PROFILE_ALLOWED_COMMANDS="${PROFILE_ALLOWED_COMMANDS},${HOOK_BRIDGE_BINS}"
+fi
+
 # Apply defaults for any keys the config file didn't set. Done AFTER
 # sourcing so operator overrides win. Operator's explicit
 # ALLOWED_COMMANDS (from $MCP_HOST_BASH_CONFIG) wins over the
@@ -451,6 +472,9 @@ trap cleanup TERM INT
     echo "  CW_PROFILE:            ${CW_PROFILE:-<unset; corp-dev default>}"
     if [ -n "$PROFILE_WARN" ]; then
         echo "  WARNING:               $PROFILE_WARN"
+    fi
+    if [ -n "$HOOK_BRIDGE_BINS" ]; then
+        echo "  CLAUDE_HOOK_BRIDGE_BINS: $HOOK_BRIDGE_BINS"
     fi
     echo "  ALLOWED_COMMANDS:      $ALLOWED_COMMANDS"
     echo "  ALLOWED_FLAGS:         $ALLOWED_FLAGS"
