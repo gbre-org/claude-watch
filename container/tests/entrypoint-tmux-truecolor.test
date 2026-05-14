@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Tests for container/entrypoint.sh's tmux truecolor + passthrough config.
+
+After the detached `tmux new-session` call, the entrypoint runs a small
+block of `tmux set -g ...` / `tmux set-environment -g ...` invocations
+that configure the session for VS Code image paste (allow-passthrough)
+and 24-bit truecolor advertising (terminal-overrides + COLORTERM).
+
+The truecolor pair was added in q-2026-05-14-2d6d after the cw container
+shipped a noticeable bit-depth regression in ttyd vs VS Code's terminal:
+tmux defaulted to 256-color output because COLORTERM wasn't propagated
+and the RGB capability flag was missing from terminal-overrides. xterm.js
+(ttyd) renders what tmux advertises, so the same tmux session looked
+washed out in the browser console.
+
+This test asserts both new lines are present AND come AFTER the existing
+`tmux set -g allow-passthrough on` line. Ordering matters because the
+truecolor pair was the v2 addition right below the original passthrough
+line, and a future refactor that moves the passthrough block away from
+the truecolor block (e.g. into a function, before/after the tmux session
+build) could silently regress the layout the v1+v2 fixes were designed
+to share.
+
+Run:  ./entrypoint-tmux-truecolor.test
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ENTRYPOINT = HERE.parent / "entrypoint.sh"
+
+if not ENTRYPOINT.exists():
+    print(f"FAIL: cannot locate entrypoint at {ENTRYPOINT}", file=sys.stderr)
+    sys.exit(2)
+
+
+SRC = ENTRYPOINT.read_text(encoding="utf-8")
+
+# Exact lines under test. Match strict literal substrings — the test
+# breaks if anyone reformats whitespace or argv order, which is the
+# point: tmux is picky about both.
+PASSTHROUGH_LINE = "tmux set -g allow-passthrough on"
+TERMINAL_OVERRIDES_LINE = (
+    "tmux set -g terminal-overrides ',xterm-256color:RGB,tmux-256color:RGB'"
+)
+COLORTERM_LINE = "tmux set-environment -g COLORTERM truecolor"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_passthrough_line_present() -> None:
+    """The existing `tmux set -g allow-passthrough on` line is still there
+    (sanity check — the truecolor patch should NOT have replaced it, it
+    should have been appended after it)."""
+    expect(
+        PASSTHROUGH_LINE in SRC,
+        f"missing passthrough line: {PASSTHROUGH_LINE!r}",
+    )
+
+
+def test_terminal_overrides_line_present() -> None:
+    """`tmux set -g terminal-overrides ',xterm-256color:RGB,tmux-256color:RGB'`
+    is present verbatim. The leading comma + comma-separated entries
+    are intentional — they merge with tmux's default terminal-overrides
+    list rather than replacing it."""
+    expect(
+        TERMINAL_OVERRIDES_LINE in SRC,
+        f"missing terminal-overrides line: {TERMINAL_OVERRIDES_LINE!r}",
+    )
+
+
+def test_colorterm_line_present() -> None:
+    """`tmux set-environment -g COLORTERM truecolor` is present verbatim.
+    This propagates COLORTERM into every pane Claude Code spawns, so
+    children (e.g. less, vim) also see truecolor."""
+    expect(
+        COLORTERM_LINE in SRC,
+        f"missing COLORTERM set-environment line: {COLORTERM_LINE!r}",
+    )
+
+
+def test_terminal_overrides_after_passthrough() -> None:
+    """The terminal-overrides line must come AFTER the allow-passthrough
+    line. They were added as a v2 patch immediately below the v1
+    passthrough line; keeping them clustered makes the tmux-config block
+    self-documenting. A refactor that splits them risks silently
+    dropping one without the other."""
+    pt_idx = SRC.find(PASSTHROUGH_LINE)
+    to_idx = SRC.find(TERMINAL_OVERRIDES_LINE)
+    expect(
+        pt_idx >= 0 and to_idx >= 0,
+        f"both lines must be present (passthrough={pt_idx}, terminal-overrides={to_idx})",
+    )
+    if pt_idx >= 0 and to_idx >= 0:
+        expect(
+            pt_idx < to_idx,
+            f"terminal-overrides must come after allow-passthrough "
+            f"(passthrough_idx={pt_idx}, terminal_overrides_idx={to_idx})",
+        )
+
+
+def test_colorterm_after_passthrough() -> None:
+    """The COLORTERM set-environment line must come AFTER the
+    allow-passthrough line. Same ordering rationale as the
+    terminal-overrides assertion."""
+    pt_idx = SRC.find(PASSTHROUGH_LINE)
+    ct_idx = SRC.find(COLORTERM_LINE)
+    expect(
+        pt_idx >= 0 and ct_idx >= 0,
+        f"both lines must be present (passthrough={pt_idx}, colorterm={ct_idx})",
+    )
+    if pt_idx >= 0 and ct_idx >= 0:
+        expect(
+            pt_idx < ct_idx,
+            f"COLORTERM must come after allow-passthrough "
+            f"(passthrough_idx={pt_idx}, colorterm_idx={ct_idx})",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_passthrough_line_present,
+    test_terminal_overrides_line_present,
+    test_colorterm_line_present,
+    test_terminal_overrides_after_passthrough,
+    test_colorterm_after_passthrough,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")

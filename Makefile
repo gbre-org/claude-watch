@@ -123,6 +123,7 @@ test-hooks-shim:
 # materialises ~/.local/bin/claude.
 test-entrypoint:
 	container/tests/entrypoint-claude-cmd.test
+	container/tests/entrypoint-tmux-truecolor.test
 	container/tests/container-path-includes-local-bin.test
 	container/tests/baked-dirs.test
 	container/tests/baked-obligations-hooks.test

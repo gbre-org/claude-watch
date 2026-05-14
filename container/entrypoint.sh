@@ -392,6 +392,16 @@ tmux new-session -d -s "$SESSION" -x 200 -y 50 \
 # sequences and screenshot paste silently fails.
 tmux set -g allow-passthrough on
 
+# Advertise 24-bit truecolor to tmux + the shell. Without this, tmux
+# caps output at 256 colors even when the outer terminal (VS Code,
+# iTerm2, etc) supports truecolor, because tmux's COLORTERM detection
+# never gets a value and the `RGB` capability flag is missing from the
+# default terminal-overrides. Manifested as a "lower bit depth" visual
+# difference between VS Code's terminal and ttyd, even on the same
+# tmux session, because xterm.js renders only what tmux advertises.
+tmux set -g terminal-overrides ',xterm-256color:RGB,tmux-256color:RGB'
+tmux set-environment -g COLORTERM truecolor
+
 # Optional sidebar: when CLAUDE_CONTAINER_SIDEBAR=1, split off a 25%-wide
 # right pane running the in-container claude-watch daemon. Bare
 # `claude-watch` with no subcommand runs the daemon (same invocation as
