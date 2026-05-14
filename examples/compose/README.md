@@ -76,7 +76,7 @@ behavior or claude-watch monitoring.
 
 | Host path (default) | env-var override | Container path | Mode | Why |
 |---|---|---|---|---|
-| `/etc/claude-code` | `CLAUDE_HOST_MANAGED_SETTINGS_DIR` | `/etc/claude-code` | `ro` | Managed / enterprise Claude Code settings tier (`managed-settings.json`, etc.). macOS default is `/Library/Application Support/ClaudeCode` — override. |
+| `/dev/null` _(default; managed-settings dir)_ | `CLAUDE_HOST_MANAGED_SETTINGS_DIR` | _(same path as source when set)_ | `ro` | Host managed / enterprise Claude Code settings tier (`managed-settings.json`, etc.). Set to your host's managed-settings dir to opt in — Linux default `/etc/claude-code`, macOS default `/Library/Application Support/ClaudeCode`. Default `/dev/null` is a no-op so the image-baked `/etc/claude-code/CLAUDE.md` (managed-policy CLAUDE.md describing the container runtime) stays visible. Setting the override replaces the baked dir wholesale. |
 | `~/.claude` | `CLAUDE_HOST_CONFIG_DIR` | `/home/hndrewaall/.claude` | `rw` | User-global Claude Code state: session JSONLs, project state, cache, agent definitions (`agents/*.md`). Claude writes here continuously. |
 | `~/.claude.json` | `CLAUDE_HOST_CONFIG_FILE` | `/home/hndrewaall/.claude.json` | `rw` | User-global top-level Claude Code config (MCP servers, model prefs, project allow-list). |
 | `~/repos` | `CLAUDE_HOST_REPOS_DIR` | `/home/hndrewaall/repos` | `ro` | Host repo trees (also carries project-tier Claude Code config in each repo's `.claude/`). Read-only — confine container edits to `/workspace` or explicit clones. |
@@ -165,10 +165,15 @@ no override needed unless your host intentionally relocates them. The
 **managed-settings tier** is the one that does differ between Linux and
 macOS, and is the env var most macOS operators will want to set.
 
-A minimal macOS `.env`:
+A minimal macOS `.env` (only needed if you actually have host managed
+settings to surface; the image ships a baked managed-policy CLAUDE.md
+that describes the in-container runtime when this is unset):
 
 ```ini
-# Point at the macOS managed-settings location instead of /etc/claude-code.
+# Point at the macOS managed-settings location. Replaces the baked
+# /etc/claude-code/ in the image (including the managed-policy CLAUDE.md);
+# bring your own CLAUDE.md if you set this and still want the
+# container-runtime description in context.
 CLAUDE_HOST_MANAGED_SETTINGS_DIR=/Library/Application Support/ClaudeCode
 ```
 

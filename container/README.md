@@ -228,7 +228,31 @@ The mechanism is a small `/etc/profile.d/claude-tools.sh` fragment baked into th
 
 Operational tooling that the operator runs on the **host** (alerting, monitoring, media post-processing, ingest pipelines, etc.) is intentionally NOT installed in the container. The image is meant to be a generic Claude Code + claude-watch sandbox; host-specific tooling stays on the host where it has the right environment, credentials, and filesystem layout. Layer that in via your own image or a sibling bind-mount when you need it.
 
-The [example compose stack](../examples/compose/) takes that "sibling bind-mount" path further by mounting `~/bin` (read-only) alongside `~/repos`, so host-installed CLI symlinks resolve inside the container. Every host-side source path in that compose file is overridable via a `CLAUDE_HOST_*` env var (defaults work for Linux; macOS operators typically override at least `CLAUDE_HOST_MANAGED_SETTINGS_DIR` to point at `/Library/Application Support/ClaudeCode/`). See [examples/compose/README.md](../examples/compose/README.md) "Host state bind-mounts" + "Host paths on non-default layouts (env-var overrides)" for the full table of mounts the example wires up (claude-events, settings dirs, etc.), the per-tier Claude Code settings hierarchy, and the macOS graceful-no-op behavior for paths that don't exist on the host. Host-specific integration mounts (shell-history DBs, messaging attachment dirs, etc.) live in a local `docker-compose.override.yml`, not the public example.
+The [example compose stack](../examples/compose/) takes that "sibling bind-mount" path further by mounting `~/bin` (read-only) alongside `~/repos`, so host-installed CLI symlinks resolve inside the container. Every host-side source path in that compose file is overridable via a `CLAUDE_HOST_*` env var (defaults work for Linux without further config; macOS or corporate-managed-config operators set `CLAUDE_HOST_MANAGED_SETTINGS_DIR` to opt into a host managed-settings dir — note that doing so REPLACES the image-baked `/etc/claude-code/` including the managed-policy CLAUDE.md the image ships). See [examples/compose/README.md](../examples/compose/README.md) "Host state bind-mounts" + "Host paths on non-default layouts (env-var overrides)" for the full table of mounts the example wires up (claude-events, settings dirs, etc.), the per-tier Claude Code settings hierarchy, and the macOS graceful-no-op behavior for paths that don't exist on the host. Host-specific integration mounts (shell-history DBs, messaging attachment dirs, etc.) live in a local `docker-compose.override.yml`, not the public example.
+
+## Baked managed-policy CLAUDE.md
+
+The image ships `container/baked-CLAUDE.md` at `/etc/claude-code/CLAUDE.md` —
+the [standard Linux managed-policy location](https://code.claude.com/docs/en/memory#deploy-organization-wide-claude-md)
+that Claude Code loads before the user-tier `~/.claude/CLAUDE.md` and the
+project-tier `<cwd>/CLAUDE.md`. Managed CLAUDE.md cannot be excluded by
+user or project `claudeMdExcludes` settings — that's the contract.
+
+The contents describe the in-container runtime (you're in Linux not on the
+host; what's bind-mounted vs not; the cross-arch hook situation; which MCP
+bridges are available) so every session starts with a load-bearing
+description of the environment, not a vanilla blank slate. The full text
+is in [`baked-CLAUDE.md`](baked-CLAUDE.md) in this directory; rebuild the
+image to update.
+
+The example compose stack's `CLAUDE_HOST_MANAGED_SETTINGS_DIR` env-var
+mount is `/dev/null` by default (graceful no-op) so the baked CLAUDE.md
+stays visible. Operators who have a host managed-settings dir set the env
+var explicitly — doing so replaces the baked `/etc/claude-code/` wholesale,
+which means the host dir must include its own CLAUDE.md if you want the
+container-runtime description to remain in context. The simplest path is
+to symlink or copy `container/baked-CLAUDE.md` into your host
+managed-settings dir alongside whatever else lives there.
 
 ## Volume management
 

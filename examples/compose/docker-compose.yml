@@ -162,12 +162,21 @@ services:
       # Managed-settings dir — ro: the in-container claude resolves
       # /etc/claude-code/managed-settings.json (its Linux managed-config
       # path) so host-level MDM / enterprise policy applied on the host
-      # carries into the container. Default source on Linux is
-      # /etc/claude-code/; macOS hosts override to
-      # `/Library/Application Support/ClaudeCode` (no escaping needed
-      # when set via .env). Missing dir = empty mount = "no managed
-      # policy" — same graceful-no-op as the other mounts.
-      - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/etc/claude-code}:/etc/claude-code:ro"
+      # carries into the container. Set CLAUDE_HOST_MANAGED_SETTINGS_DIR
+      # to your host's managed-settings dir to opt in (Linux default
+      # /etc/claude-code/, macOS default /Library/Application Support/
+      # ClaudeCode/; no escaping needed when set via .env).
+      #
+      # Default is /dev/null so the image-baked /etc/claude-code/CLAUDE.md
+      # (the managed-policy CLAUDE.md describing the container runtime,
+      # shipped via the Dockerfile) is NOT shadowed for operators who
+      # don't have a host managed-settings dir. Previously this defaulted
+      # to /etc/claude-code which silently shadowed the baked file when
+      # the host happened to have an empty /etc/claude-code directory or
+      # when docker auto-created the source path on first up. Operators
+      # who DO want host managed policy in the container set the env
+      # var explicitly; the override replaces the baked dir wholesale.
+      - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:ro"
       # ~/.claude — rw: Claude Code writes session JSONLs, project state,
       # cache, telemetry here on every interaction. Also the location of
       # agent definition files (~/.claude/agents/*.md) the in-container

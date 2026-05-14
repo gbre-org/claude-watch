@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Integration test that exercises container/bin/audit-hooks.py.
+
+We run the script's embedded `--test` mode (which itself contains the unit
+suite) plus a few outside-the-box checks that verify the script works as a
+black-box CLI invoked from elsewhere (matching how the Dockerfile installs
+it at /usr/local/bin/audit-hooks).
+
+Coverage:
+  1. `audit-hooks --test` exits 0 and prints PASS.
+  2. `audit-hooks --json` on a synthesized settings.json produces parseable
+     JSON with the expected fate-per-hook breakdown.
+  3. `audit-hooks --strict` exits non-zero when there's a silent-no-op hook,
+     0 when all hooks pass.
+  4. Missing settings file is reported cleanly (exit 1, no traceback).
+
+Run:  ./audit-hooks.test
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+SCRIPT = CONTAINER_DIR / "bin" / "audit-hooks.py"
+
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate audit-hooks at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def run(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+# 1. Embedded --test mode passes.
+r = run("--test")
+expect(r.returncode == 0, f"audit-hooks --test exit={r.returncode}; stderr={r.stderr!r}")
+expect("PASS" in r.stdout, f"audit-hooks --test stdout did not contain PASS: {r.stdout!r}")
+
+
+# 2. --json with a synthetic settings.json.
+with tempfile.TemporaryDirectory() as td:
+    tdp = Path(td)
+
+    # Make a fake ELF, a fake Mach-O, and a shebang script so the audit
+    # walks live paths and produces stable fates.
+    elf = tdp / "fake-elf"
+    elf.write_bytes(b"\x7fELF" + b"\x00" * 32)
+    macho = tdp / "fake-macho"
+    macho.write_bytes(b"\xfe\xed\xfa\xcf" + b"\x00" * 32)
+    script = tdp / "fake-script"
+    script.write_bytes(b"#!/bin/sh\necho hi\n")
+
+    settings = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "startup",
+                    "hooks": [
+                        {"type": "command", "command": f"exec-hook {elf}"},
+                        {"type": "command", "command": f"exec-hook {macho}"},
+                        {"type": "command", "command": f"exec-hook {script}"},
+                    ],
+                },
+            ],
+        }
+    }
+    settings_path = tdp / "settings.json"
+    settings_path.write_text(json.dumps(settings))
+
+    r = run("--settings", str(settings_path), "--json")
+    expect(r.returncode == 0, f"audit-hooks --json exit={r.returncode}; stderr={r.stderr!r}")
+    try:
+        parsed = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        parsed = None
+        failures.append(f"audit-hooks --json output not parseable: {e}; out={r.stdout!r}")
+    if parsed is not None:
+        expect(len(parsed) == 3, f"want 3 findings, got {len(parsed)}")
+        fates = sorted(f["fate"] for f in parsed)
+        expect(
+            fates == ["ok-elf", "ok-script", "silent-no-op"],
+            f"want [ok-elf, ok-script, silent-no-op] fates, got {fates}",
+        )
+        for f in parsed:
+            expect(f["is_wrapped"] is True, f"all three are wrapped; got {f}")
+
+    # 3a. --strict exits non-zero on silent-no-op.
+    r = run("--settings", str(settings_path), "--strict")
+    expect(
+        r.returncode != 0,
+        f"audit-hooks --strict should exit non-zero with a Mach-O hook; "
+        f"got {r.returncode}",
+    )
+
+    # 3b. --strict exits 0 when all hooks are good. Strip the Mach-O entry.
+    settings_clean = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "startup",
+                    "hooks": [
+                        {"type": "command", "command": f"exec-hook {elf}"},
+                        {"type": "command", "command": f"exec-hook {script}"},
+                    ],
+                },
+            ],
+        }
+    }
+    settings_path.write_text(json.dumps(settings_clean))
+    r = run("--settings", str(settings_path), "--strict")
+    expect(
+        r.returncode == 0,
+        f"audit-hooks --strict with all-good hooks should exit 0; got {r.returncode}",
+    )
+
+# 4. Missing settings file → exit 1 with a clean error, no traceback.
+r = run("--settings", "/nonexistent/no-such-settings.json")
+expect(
+    r.returncode != 0,
+    f"audit-hooks on missing file should exit non-zero; got {r.returncode}",
+)
+expect(
+    "Traceback" not in r.stderr,
+    f"audit-hooks should NOT raise a traceback on missing file; stderr={r.stderr!r}",
+)
+
+
+if failures:
+    print("FAIL audit-hooks.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS audit-hooks.test")
+sys.exit(0)

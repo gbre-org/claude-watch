@@ -118,6 +118,29 @@ RUN claude-watch --help >/dev/null
 # without this file the daemon would FATAL on "no config file found". Phase 1e.
 COPY claude-watch.config.toml /etc/claude-watch/config.toml
 
+# Managed-policy CLAUDE.md — baked at the standard Linux managed-CLAUDE.md
+# location (/etc/claude-code/CLAUDE.md per the Claude Code memory docs:
+# https://code.claude.com/docs/en/memory#deploy-organization-wide-claude-md).
+# Claude Code loads this BEFORE the user-tier ~/.claude/CLAUDE.md and the
+# project-tier <cwd>/CLAUDE.md and it CANNOT be excluded by user or project
+# settings — that's the "managed policy" contract.
+#
+# The contents describe the in-container runtime so every session starts with
+# a load-bearing reminder that it's running inside the container (not on the
+# host), what's bind-mounted, what hooks no-op (cross-arch Mach-O), and where
+# to read more. Source of truth lives at container/baked-CLAUDE.md in the
+# claude-watch repo — rebuild the image to update.
+#
+# IMPORTANT mount interaction: the example compose stack
+# (examples/compose/docker-compose.yml) optionally bind-mounts a host-side
+# managed-settings dir over /etc/claude-code/ when the operator sets
+# CLAUDE_HOST_MANAGED_SETTINGS_DIR. The compose default for that env var is
+# /dev/null (graceful no-op), so an unset operator's session sees the baked
+# CLAUDE.md unshielded. Operators who DO set the override take responsibility
+# for whatever managed-settings dir they point at — their dir replaces the
+# baked one wholesale.
+COPY baked-CLAUDE.md /etc/claude-code/CLAUDE.md
+
 # Bake CLAUDE_WATCH_CONFIG into the image-level env (Phase 1.5 fix #3,
 # q-2026-05-11-d7c0). entrypoint.sh exports it for its own children (pane 0/1
 # under tmux), but `docker exec <container> claude-watch ...` spawns a fresh
@@ -218,6 +241,21 @@ RUN chmod +x /usr/local/bin/generate-project-mcp-json
 # EBUSY fallback path).
 COPY bin/trust-workspace.py /usr/local/bin/trust-workspace
 RUN chmod +x /usr/local/bin/trust-workspace
+
+# audit-hooks — per-hook fate audit for the host's bind-mounted
+# ~/.claude/settings.json. Walks every command, reports ok-elf /
+# ok-script / silent-no-op / not-wrapped / missing / builtin. Useful
+# for operators verifying that corp telemetry hooks land where they
+# expect (typical: a macOS Mach-O hook bind-mounted into the Linux
+# container reports `silent-no-op` because exec-hook intercepts; the
+# operator can then decide to ship a Linux build, bridge via
+# host-bash MCP, or accept that telemetry doesn't fire in the
+# container). The script is observability ONLY — it does not mutate
+# settings.json and does not fire the hooks. Embedded `--test` mode
+# runs the self-tests; integrated into container/tests/audit-hooks.test
+# for the make-test loop.
+COPY bin/audit-hooks.py /usr/local/bin/audit-hooks
+RUN chmod +x /usr/local/bin/audit-hooks
 
 # Entrypoint script — tmux session bootstrap + env passthrough + signal handling.
 # Phase 1e (q-2026-05-11-8a96): pane 1 now runs the real claude-watch daemon

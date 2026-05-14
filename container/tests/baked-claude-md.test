@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Tests for the container/baked-CLAUDE.md → /etc/claude-code/CLAUDE.md wiring.
+
+The Dockerfile copies container/baked-CLAUDE.md to /etc/claude-code/CLAUDE.md,
+which is the standard Linux managed-policy CLAUDE.md location per
+https://code.claude.com/docs/en/memory#deploy-organization-wide-claude-md.
+Claude Code loads it before user-tier and project-tier CLAUDE.md files at
+session start, and it CANNOT be excluded by user / project settings — that's
+the managed-policy contract.
+
+This test asserts:
+
+  1. container/baked-CLAUDE.md exists at the expected path.
+  2. It is non-empty markdown with the load-bearing "you are inside a container"
+     heading. The exact wording can drift; we just sanity-check the file's
+     intent hasn't been gutted.
+  3. The Dockerfile contains a `COPY baked-CLAUDE.md /etc/claude-code/CLAUDE.md`
+     line. This is the wiring that puts the file in the standard managed-policy
+     path inside the image. Mis-targeting (e.g. `/etc/claude.md` or
+     `/usr/local/etc/...`) would silently break the load path — Claude Code
+     would walk past the file because it's not at the documented location.
+  4. examples/compose/docker-compose.yml defaults
+     CLAUDE_HOST_MANAGED_SETTINGS_DIR to /dev/null (graceful no-op), NOT to
+     /etc/claude-code. The previous default silently shadowed the baked
+     CLAUDE.md whenever the host had an empty /etc/claude-code (or docker
+     auto-created it on first up); the no-op default keeps the baked file
+     visible until operators explicitly opt in.
+  5. Public-repo hygiene: baked-CLAUDE.md does NOT reference any private homelab
+     path (no /mnt/Raiden, no /home/<known-personal-user>, no ADHPrivate, etc).
+     The file ships in a public repo and lands in every container session as
+     load-bearing context, so it must stand alone.
+
+Run:  ./baked-claude-md.test
+
+No external dependencies beyond Python 3.8+ stdlib.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+BAKED = CONTAINER_DIR / "baked-CLAUDE.md"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+COMPOSE = REPO_ROOT / "examples" / "compose" / "docker-compose.yml"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. baked-CLAUDE.md exists.
+expect(BAKED.exists(), f"baked-CLAUDE.md missing at {BAKED}")
+if BAKED.exists():
+    text = BAKED.read_text(encoding="utf-8")
+
+    # 2. Non-empty, has the load-bearing heading. We accept any heading-style
+    #    line that mentions "running inside" or "inside a ... container" —
+    #    rewording is fine, the load-bearing concept ("you're in a container,
+    #    not on the host") just has to be present near the top.
+    expect(len(text) > 200, "baked-CLAUDE.md is suspiciously short (<200 chars)")
+    head = "\n".join(text.splitlines()[:40])
+    has_runtime_callout = re.search(
+        r"(running inside|inside a .* container|in a Linux container|inside the .* container)",
+        head,
+        re.IGNORECASE,
+    )
+    expect(
+        has_runtime_callout is not None,
+        "baked-CLAUDE.md missing 'you are running inside the container' "
+        "callout in first 40 lines — the load-bearing 'host vs container' "
+        "distinction must be visible up top",
+    )
+
+    # 5. Public-repo hygiene. baked-CLAUDE.md ships in a public repo (this
+    #    one — github.com/hndrewaall/claude-watch). Check for accidental
+    #    private-path leakage. The substrings below are sentinels Andrew
+    #    flagged as private-only paths that must never appear in public
+    #    artifacts. (We deliberately do not check for "/home/hndrewaall"
+    #    because that string is the in-container user's home and legitimately
+    #    appears in the file as part of bind-mount documentation.)
+    private_sentinels = [
+        "/mnt/Raiden",
+        "/mnt/Scorpion",
+        "ADHPrivate",
+        "~/repos/claude-config",
+        "~/repos/server-config",
+        "/home/hndrewaall/repos/claude-config",
+    ]
+    for sentinel in private_sentinels:
+        expect(
+            sentinel not in text,
+            f"baked-CLAUDE.md contains private-path sentinel {sentinel!r}; "
+            f"must not leak into a public-repo file",
+        )
+
+# 3. Dockerfile COPY line.
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    # The COPY line must reference baked-CLAUDE.md as the source and the
+    # canonical managed-policy path as the destination. We tolerate
+    # leading/trailing whitespace and the exact form
+    #     COPY baked-CLAUDE.md /etc/claude-code/CLAUDE.md
+    # but reject any other destination path because Claude Code only reads
+    # the documented managed-policy location.
+    copy_pattern = re.compile(
+        r"^\s*COPY\s+baked-CLAUDE\.md\s+/etc/claude-code/CLAUDE\.md\s*$",
+        re.MULTILINE,
+    )
+    expect(
+        copy_pattern.search(df) is not None,
+        "Dockerfile missing `COPY baked-CLAUDE.md /etc/claude-code/CLAUDE.md` "
+        "— the baked managed-policy CLAUDE.md must land at the documented "
+        "Linux managed-policy path (per Claude Code memory docs); any other "
+        "destination silently breaks the load path",
+    )
+
+# 4. Compose default is /dev/null (graceful no-op).
+expect(COMPOSE.exists(), f"compose.yml missing at {COMPOSE}")
+if COMPOSE.exists():
+    yml = COMPOSE.read_text(encoding="utf-8")
+    # Look for the managed-settings mount line. The pattern we WANT is the
+    # graceful-no-op shape used by the other optional mounts:
+    #   - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:${...}:ro"
+    # The pattern we want to REJECT is the old default that shadowed the
+    # baked CLAUDE.md:
+    #   - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/etc/claude-code}:..."
+    good = re.search(
+        r'\$\{CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null\}\s*:\s*'
+        r'\$\{CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null\}\s*:\s*ro',
+        yml,
+    )
+    bad = re.search(
+        r'\$\{CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/etc/claude-code\}\s*:\s*'
+        r'/etc/claude-code',
+        yml,
+    )
+    expect(
+        good is not None,
+        "compose.yml managed-settings mount line missing the graceful-no-op "
+        "default shape `${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:"
+        "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:ro` — without it the "
+        "mount shadows the baked /etc/claude-code/CLAUDE.md when the env var "
+        "is unset",
+    )
+    expect(
+        bad is None,
+        "compose.yml still uses the old default that mounts an empty host "
+        "/etc/claude-code over the baked one. Switch to the /dev/null "
+        "graceful-no-op default so the baked CLAUDE.md stays visible by "
+        "default.",
+    )
+
+
+if failures:
+    print("FAIL baked-claude-md.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS baked-claude-md.test")
+sys.exit(0)
