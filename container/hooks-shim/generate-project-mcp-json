@@ -303,6 +303,11 @@ def rewrite_to_http(definition: dict, url: str) -> dict:
     `alwaysLoad`, `oauth`, `headersHelper`, ...). Top-level `type` is
     overwritten with "http"; `url` is overwritten with the bridge URL.
 
+    When CLAUDE_HOST_HOOK_BRIDGE_BEARER is set in the environment and
+    the definition doesn't already have an Authorization header, inject
+    one using the ${ENV_VAR} placeholder syntax that Claude Code
+    substitutes at connect time.
+
     Why drop env: HTTP MCP transport doesn't pass env to the remote
     endpoint — env vars belong to the host-side adapter that
     actually spawns the MCP binary. Keeping `env` in the rewritten
@@ -314,6 +319,11 @@ def rewrite_to_http(definition: dict, url: str) -> dict:
         new_def.pop(stdio_key, None)
     new_def["type"] = "http"
     new_def["url"] = url
+    if os.environ.get("CLAUDE_HOST_HOOK_BRIDGE_BEARER"):
+        headers = new_def.get("headers", {})
+        if "Authorization" not in headers:
+            headers["Authorization"] = "Bearer ${CLAUDE_HOST_HOOK_BRIDGE_BEARER}"
+            new_def["headers"] = headers
     return new_def
 
 
