@@ -387,6 +387,11 @@ fi
 tmux new-session -d -s "$SESSION" -x 200 -y 50 \
     "$CLAUDE_CMD"
 
+# Allow terminal passthrough so VS Code image paste (OSC sequences) reaches
+# Claude Code through tmux. Without this, tmux 3.3+ strips passthrough
+# sequences and screenshot paste silently fails.
+tmux set -g allow-passthrough on
+
 # Optional sidebar: when CLAUDE_CONTAINER_SIDEBAR=1, split off a 25%-wide
 # right pane running the in-container claude-watch daemon. Bare
 # `claude-watch` with no subcommand runs the daemon (same invocation as
