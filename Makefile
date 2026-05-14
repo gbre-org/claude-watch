@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-install-host-deps build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-install-host-deps test-launchd-plist build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -151,6 +151,15 @@ test-mcp-host-bash:
 # never actually fetch from PyPI. 10 cases, <1s.
 test-install-host-deps:
 	examples/compose/bin/tests/install-host-deps.test
+
+# Tests for examples/compose/launchd/com.anthropic.claude-watch.mcp-host-bash.plist
+# — the macOS LaunchAgent template that persistently auto-starts
+# mcp-host-bash on operator-login. File-level structural validation
+# only (parses via stdlib plistlib + plutil-lint when available);
+# does NOT exercise launchctl because the test runs on Linux CI.
+# 19 cases, <1s.
+test-launchd-plist:
+	examples/compose/bin/tests/launchd-plist.test
 
 # Release build
 build:

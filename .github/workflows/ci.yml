@@ -120,3 +120,6 @@ jobs:
 
       - name: Run install-host-deps shim tests
         run: make test-install-host-deps
+
+      - name: Run launchd plist tests
+        run: make test-launchd-plist

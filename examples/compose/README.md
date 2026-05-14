@@ -429,3 +429,7 @@ docker compose down -v           # also nuke the claude-container-versions volum
 ```
 
 The bind-mounted host state under `~/.claude`, `~/.config/session`, `~/.local/share/eichi`, etc. is untouched by `down` — only named volumes go.
+
+## Persistent macOS auto-start for `mcp-host-bash`
+
+For operators who want `mcp-host-bash` to stay running across logouts and reboots without manually respawning it after each one, the repo ships a macOS `launchd` LaunchAgent template at [`launchd/com.anthropic.claude-watch.mcp-host-bash.plist`](launchd/com.anthropic.claude-watch.mcp-host-bash.plist). See [`launchd/README.md`](launchd/README.md) for the full install walkthrough (copy into `~/Library/LaunchAgents/`, edit absolute paths + `EnvironmentVariables`, `launchctl bootstrap`, verify with `launchctl print` + `lsof -i :8766`, and the bootout / re-bootstrap flow for picking up changes).

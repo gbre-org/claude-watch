@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the host-side mcp-host-bash launcher.
+
+  This is a TEMPLATE — you MUST search/replace the placeholders before
+  loading it into launchd:
+
+    /PATH/TO/REPO   absolute path to your local claude-watch checkout
+                    (no `~`, no `${HOME}` — launchd does NOT expand
+                    either in plist values; use the literal path).
+    /PATH/TO/HOME   absolute path to your home directory
+                    (e.g. /Users/yourname). Same rule — no `~` / no
+                    `${HOME}` in plist values.
+
+  See examples/compose/launchd/README.md for the full installation
+  walkthrough. Do not load this file straight from the repo with
+  `launchctl bootstrap` — copy it to ~/Library/LaunchAgents/ first
+  (launchd refuses to follow symlinks or load files outside that
+  directory).
+
+  Why a LaunchAgent and not a LaunchDaemon: mcp-host-bash runs as the
+  operator's user (it dials cli-mcp-server which exec's commands under
+  the operator's $HOME, $PATH, login keychain, etc.) and binds a
+  loopback port that the docker-desktop VM reaches through
+  host.docker.internal. None of that requires root, and a LaunchDaemon
+  would invert the trust model.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.anthropic.claude-watch.mcp-host-bash</string>
+
+    <!--
+      ProgramArguments: full argv launchd will exec. The launcher
+      script is `examples/compose/bin/mcp-host-bash` in the repo.
+      Replace /PATH/TO/REPO with the absolute path to your local
+      claude-watch checkout (no `~`, no `${HOME}`). Append
+      `<dash><dash>port N` after the script path if you want a
+      non-default port.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/PATH/TO/REPO/examples/compose/bin/mcp-host-bash</string>
+    </array>
+
+    <!--
+      EnvironmentVariables: every key is OPTIONAL. launchd does not
+      inherit your interactive shell's environment (no .zshrc / .bash_profile
+      sourcing), so anything mcp-host-bash needs to see has to be
+      declared here OR sourced from the operator config file at
+      ${HOME}/.config/claude-container/mcp-host-bash.env (which the
+      launcher itself sources at startup).
+
+      - CW_PROFILE: trust profile selector. Unset / `corp-dev` keeps
+        the read-y default allow-list. `corp-dev-trusted` widens to
+        include host scheduling, file mutation, outbound bytes, key/cert
+        tooling, and container management. See the launcher script
+        header for the full surface.
+
+      - ALLOW_SHELL_OPERATORS: `true` lets the in-container claude
+        chain commands with pipes / `&&` / redirects. Default `false`.
+        Leave the default unless you specifically need it.
+
+      - SSL_CERT_FILE / REQUESTS_CA_BUNDLE: corporate CA bundle for
+        operators behind a TLS MITM proxy. mcp-host-bash itself does
+        NOT make outbound HTTPS calls (the static install via
+        install-host-deps already happened), but downstream `run_command`
+        invocations of curl / git / pip etc. need this to validate
+        the corp chain. Match the absolute path you'd set in your
+        interactive shell.
+
+      - CLAUDE_HOOK_BRIDGE_BINS: comma-separated basenames of host
+        hook binaries the in-container exec-hook bridge is allowed
+        to invoke via run_command. e.g. `telemetry-hook,corp-trace-hook`.
+        Layered on top of CW_PROFILE.
+
+      - PATH: launchd starts with a minimal PATH. The launcher needs
+        to find `mcp-proxy` and `cli-mcp-server`, both of which
+        install-host-deps drops into ${HOME}/.local/bin/. If your
+        operator config doesn't set PATH separately, declare it here
+        so the pre-flight binary check passes.
+
+      Replace /PATH/TO/HOME with your home directory (e.g.
+      /Users/yourname) — no `~`, no `${HOME}` in plist values.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CW_PROFILE</key>
+        <string>corp-dev</string>
+
+        <key>ALLOW_SHELL_OPERATORS</key>
+        <string>false</string>
+
+        <key>SSL_CERT_FILE</key>
+        <string></string>
+
+        <key>CLAUDE_HOOK_BRIDGE_BINS</key>
+        <string></string>
+
+        <key>PATH</key>
+        <string>/PATH/TO/HOME/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!--
+      KeepAlive=true: relaunch on any exit (clean or crash). Combined
+      with ThrottleInterval below to prevent a crashloop from saturating
+      the CPU.
+    -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!--
+      RunAtLoad=true: start at login (when launchctl bootstraps the
+      LaunchAgent on user-session startup). Without this, launchd
+      registers the unit but doesn't fire it until something else
+      requests the service.
+    -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      ThrottleInterval: minimum seconds between (re)spawns. launchd's
+      default is 10s; bumping to 30s gives the launcher more room to
+      bootstrap before another KeepAlive cycle if the previous run
+      died early (e.g. install-host-deps not run yet, port already
+      bound). Tune down if you're actively debugging.
+    -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!--
+      WorkingDirectory: cwd launchd sets before exec'ing the launcher.
+      The launcher itself is cwd-agnostic, but a sensible cwd helps if
+      operator config files use relative paths. Replace /PATH/TO/HOME.
+    -->
+    <key>WorkingDirectory</key>
+    <string>/PATH/TO/HOME</string>
+
+    <!--
+      StandardOutPath / StandardErrorPath: launchd captures the
+      launcher's stdout / stderr. The launcher already mirrors stderr
+      into ${HOME}/.local/state/claude-container/mcp-host-bash.log
+      via tee, so these are mostly a launchd-side mirror for triage
+      from `launchctl print`.
+
+      Replace /PATH/TO/HOME. Pre-create the parent dir
+      (~/Library/Logs/) once — launchd auto-creates the file but not
+      the directory.
+    -->
+    <key>StandardOutPath</key>
+    <string>/PATH/TO/HOME/Library/Logs/mcp-host-bash.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/PATH/TO/HOME/Library/Logs/mcp-host-bash.err.log</string>
+
+    <!--
+      ProcessType=Interactive: launchd schedules at the same priority
+      as a foreground shell. The launcher fronts a low-latency MCP
+      bridge that the in-container claude dials synchronously, so it
+      should not be backgrounded by the standard `Background` class.
+    -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
