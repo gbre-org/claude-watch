@@ -95,7 +95,7 @@ class FakeMCPHandler(http.server.BaseHTTPRequestHandler):
       requests            : list   — every POST observed, in order.
                                      Each entry: {"method": str,
                                      "body": dict|str, "session_id":
-                                     str|None}
+                                     str|None, "auth": str|None}
       issued_session_id   : str    — UUID handed out by initialize.
     """
 
@@ -116,8 +116,14 @@ class FakeMCPHandler(http.server.BaseHTTPRequestHandler):
 
         method = body.get("method", "") if isinstance(body, dict) else ""
         session_hdr = self.headers.get("mcp-session-id")
+        auth_hdr = self.headers.get("Authorization")
         FakeMCPHandler.requests.append(
-            {"method": method, "body": body, "session_id": session_hdr}
+            {
+                "method": method,
+                "body": body,
+                "session_id": session_hdr,
+                "auth": auth_hdr,
+            }
         )
 
         if method == "initialize":
@@ -574,6 +580,96 @@ def test_bridge_tools_call_jsonrpc_error_falls_back() -> None:
                f"jsonrpc-error: stderr should explain, got: {r.stderr!r}")
 
 
+def test_bearer_header_sent_on_every_request_when_env_set() -> None:
+    """CLAUDE_HOST_HOOK_BRIDGE_BEARER set => every POST (initialize,
+    notifications/initialized, tools/call) carries
+    `Authorization: Bearer <token>`. The shim on the host side
+    validates this header and 401's anything without it; the bridge
+    must put the header on EVERY request, not just one."""
+    reset_fake()
+    with fake_server() as url:
+        set_tools_call_response(stdout="auth-ok", exit_code=0)
+        r = run_bridge(
+            "/host/path/telemetry-hook",
+            bridge_env={
+                "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                "CLAUDE_HOST_HOOK_BRIDGE_URL": url,
+                "CLAUDE_HOST_HOOK_BRIDGE_BEARER": "test-secret-123",
+            },
+        )
+        expect(
+            r.returncode == 0,
+            f"bearer-on: expected exit 0, got {r.returncode}; stderr: {r.stderr!r}",
+        )
+        # All three requests must carry the bearer header.
+        expect(
+            len(FakeMCPHandler.requests) >= 1,
+            f"bearer-on: at least initialize should fire, got {FakeMCPHandler.requests!r}",
+        )
+        for req in FakeMCPHandler.requests:
+            expect(
+                req["auth"] == "Bearer test-secret-123",
+                f"bearer-on: request {req['method']!r} missing or wrong "
+                f"Authorization header, got {req['auth']!r}",
+            )
+
+
+def test_no_bearer_header_when_env_unset() -> None:
+    """No CLAUDE_HOST_HOOK_BRIDGE_BEARER => no Authorization header on
+    any request. The bridge stays backward-compatible with deployments
+    that don't run the shim (pre-PR-B and loopback-only stacks)."""
+    reset_fake()
+    with fake_server() as url:
+        set_tools_call_response(stdout="no-auth-ok", exit_code=0)
+        r = run_bridge(
+            "/host/path/telemetry-hook",
+            bridge_env={
+                "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                "CLAUDE_HOST_HOOK_BRIDGE_URL": url,
+            },
+        )
+        expect(
+            r.returncode == 0,
+            f"no-bearer: expected exit 0, got {r.returncode}; stderr: {r.stderr!r}",
+        )
+        for req in FakeMCPHandler.requests:
+            expect(
+                req["auth"] is None,
+                f"no-bearer: request {req['method']!r} should have NO "
+                f"Authorization header when CLAUDE_HOST_HOOK_BRIDGE_BEARER "
+                f"is unset, got {req['auth']!r}",
+            )
+
+
+def test_empty_bearer_env_treated_as_unset() -> None:
+    """CLAUDE_HOST_HOOK_BRIDGE_BEARER="" (empty string) => no header.
+    Treats empty same as unset so an operator wiring an empty .env
+    value doesn't end up sending `Authorization: Bearer ` (literal
+    empty token, which would 401 against a real shim AND noise up
+    the logs)."""
+    reset_fake()
+    with fake_server() as url:
+        set_tools_call_response(stdout="empty-bearer-ok", exit_code=0)
+        r = run_bridge(
+            "/host/path/telemetry-hook",
+            bridge_env={
+                "CLAUDE_HOST_HOOK_BRIDGE": "1",
+                "CLAUDE_HOST_HOOK_BRIDGE_URL": url,
+                "CLAUDE_HOST_HOOK_BRIDGE_BEARER": "",
+            },
+        )
+        expect(
+            r.returncode == 0,
+            f"empty-bearer: expected exit 0, got {r.returncode}; stderr: {r.stderr!r}",
+        )
+        for req in FakeMCPHandler.requests:
+            expect(
+                req["auth"] is None,
+                f"empty-bearer: request {req['method']!r} should have NO "
+                f"Authorization header for empty env value, got {req['auth']!r}",
+            )
+
+
 def test_bridge_stateless_server_skips_session_header() -> None:
     """If initialize doesn't issue a session id (server in stateless
     mode), the bridge still completes tools/call — just without the
@@ -616,6 +712,9 @@ TESTS = [
     test_bridge_sse_response_shape,
     test_bridge_bad_argv,
     test_bridge_tools_call_jsonrpc_error_falls_back,
+    test_bearer_header_sent_on_every_request_when_env_set,
+    test_no_bearer_header_when_env_unset,
+    test_empty_bearer_env_treated_as_unset,
     test_bridge_stateless_server_skips_session_header,
 ]
 

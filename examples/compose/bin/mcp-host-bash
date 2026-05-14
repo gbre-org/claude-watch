@@ -75,6 +75,37 @@
 #                      server rejects pipes/redirects/&&/||, so the
 #                      container can't string commands together.
 #
+# Bearer-token authentication
+#
+#   `mcp-proxy` upstream has NO inbound-auth feature (verified via
+#   README + source read 2026-05-14). To gate access without depending
+#   on the network layer alone, the launcher can front mcp-proxy with
+#   `mcp-proxy-auth-shim` (a tiny stdlib-only reverse proxy that
+#   validates `Authorization: Bearer <secret>` on every request).
+#
+#   Set `MCP_HOST_BASH_BEARER` to a random secret to enable the shim.
+#   Generate one once and keep it OUT of version control:
+#
+#       head -c 32 /dev/urandom | base64
+#
+#   When the bearer is set, the launcher binds mcp-proxy to
+#   127.0.0.1 on an internal port (default: $PORT + 1; override with
+#   `MCP_HOST_BASH_UPSTREAM_PORT`) and binds the shim on the
+#   operator-facing `$MCP_HOST_BASH_BIND:$PORT`. Callers MUST send
+#   `Authorization: Bearer $MCP_HOST_BASH_BEARER` on every POST or
+#   the shim 401's them without forwarding.
+#
+#   Container callers (exec-hook-bridge) read the SAME secret from
+#   `CLAUDE_HOST_HOOK_BRIDGE_BEARER` — wire both vars in your `.env`
+#   to the same generated value.
+#
+#   When `MCP_HOST_BASH_BEARER` is UNSET/empty:
+#     - The launcher logs a startup warning (especially loud when the
+#       bind is non-loopback — that combination is the worst-case
+#       LAN-exposed-no-auth profile).
+#     - mcp-proxy binds directly at `$MCP_HOST_BASH_BIND:$PORT`, no
+#       shim in front. Behavior matches the pre-bearer-auth launcher.
+#
 # Override via a config file at $MCP_HOST_BASH_CONFIG (default:
 # $HOME/.config/claude-container/mcp-host-bash.env). The file is
 # sourced before launch — standard KEY=VALUE lines, comments with #.
@@ -408,10 +439,27 @@ ALLOW_SHELL_OPERATORS="${ALLOW_SHELL_OPERATORS:-$DEFAULT_ALLOW_SHELL_OPERATORS}"
 # explicitly set MCP_HOST_BASH_BIND to widen the listener.
 BIND_HOST="${MCP_HOST_BASH_BIND:-127.0.0.1}"
 
+# Resolve bearer-auth mode. When MCP_HOST_BASH_BEARER is set, we
+# launch mcp-proxy on an internal loopback port and front it with
+# mcp-proxy-auth-shim on the public-facing port. When unset, mcp-proxy
+# binds the public-facing port directly (no shim, no auth — matches
+# pre-bearer-auth behavior; the startup banner warns loudly in this
+# mode, especially when the bind is non-loopback).
+BEARER="${MCP_HOST_BASH_BEARER:-}"
+if [ -n "$BEARER" ]; then
+    UPSTREAM_PORT="${MCP_HOST_BASH_UPSTREAM_PORT:-$((PORT + 1))}"
+    MCP_PROXY_PORT="$UPSTREAM_PORT"
+    MCP_PROXY_HOST="127.0.0.1"
+else
+    UPSTREAM_PORT=""
+    MCP_PROXY_PORT="$PORT"
+    MCP_PROXY_HOST="$BIND_HOST"
+fi
+
 argv=(
     mcp-proxy
-    --port "$PORT"
-    --host "$BIND_HOST"
+    --port "$MCP_PROXY_PORT"
+    --host "$MCP_PROXY_HOST"
     # mcp-proxy --env NAME VALUE pairs forward env into the stdio
     # subprocess. cli-mcp-server reads its allow-list from env, so
     # this is how we apply the policy.
@@ -430,7 +478,32 @@ argv=(
     cli-mcp-server
 )
 
+# When the bearer is set, build the shim argv too. The shim binds the
+# operator-facing port, validates the bearer header on every request,
+# and forwards authenticated requests to mcp-proxy's internal port.
+shim_argv=()
+if [ -n "$BEARER" ]; then
+    shim_argv=(
+        mcp-proxy-auth-shim
+        --listen-host "$BIND_HOST"
+        --listen-port "$PORT"
+        --upstream-host 127.0.0.1
+        --upstream-port "$UPSTREAM_PORT"
+    )
+fi
+
 if [ "$PRINT_CMD" = "1" ]; then
+    # Print mode: one argv per line for the test suite. When the shim
+    # is in play, print the shim argv first (separator-less header
+    # `SHIM:`), then a blank line, then the mcp-proxy argv. Tests can
+    # parse either both blocks or just the mcp-proxy block depending
+    # on what they assert.
+    if [ "${#shim_argv[@]}" -gt 0 ]; then
+        echo "SHIM:"
+        printf '%s\n' "${shim_argv[@]}"
+        echo
+        echo "MCP_PROXY:"
+    fi
     printf '%s\n' "${argv[@]}"
     exit 0
 fi
@@ -452,6 +525,27 @@ for bin in mcp-proxy cli-mcp-server; do
         missing_bins+=("$bin")
     fi
 done
+
+# The auth shim is needed only when MCP_HOST_BASH_BEARER is set. It
+# ships alongside the launcher in examples/compose/bin/, so look it up
+# beside this script first (handles the in-tree dev path), then fall
+# back to a PATH lookup (handles a `make install` deployment).
+SHIM_BIN=""
+if [ -n "$BEARER" ]; then
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    if [ -x "$script_dir/mcp-proxy-auth-shim" ]; then
+        SHIM_BIN="$script_dir/mcp-proxy-auth-shim"
+    elif command -v mcp-proxy-auth-shim >/dev/null 2>&1; then
+        SHIM_BIN="$(command -v mcp-proxy-auth-shim)"
+    else
+        missing_bins+=("mcp-proxy-auth-shim")
+    fi
+    # Update the shim argv's first element to the resolved path so the
+    # exec finds it without re-running PATH lookup.
+    if [ -n "$SHIM_BIN" ]; then
+        shim_argv[0]="$SHIM_BIN"
+    fi
+fi
 
 if [ "${#missing_bins[@]}" -gt 0 ]; then
     cat >&2 <<EOF
@@ -478,17 +572,25 @@ fi
 
 mkdir -p "$(dirname "$MCP_HOST_BASH_LOG")"
 
-# Trap SIGTERM/SIGINT so Ctrl-C cleanly tears down mcp-proxy + its
-# stdio child. mcp-proxy already SIGTERMs the child on its own exit;
-# we just need to forward the signal to mcp-proxy's PID.
+# Trap SIGTERM/SIGINT so Ctrl-C cleanly tears down mcp-proxy + the
+# auth shim (when running) + their stdio children. mcp-proxy already
+# SIGTERMs the cli-mcp-server child on its own exit; we just need to
+# forward the signal to both top-level PIDs.
 child_pid=""
+shim_pid=""
 cleanup() {
-    if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
-        kill -TERM "$child_pid" 2>/dev/null || true
-        # Give it a beat to flush logs.
-        sleep 0.5
-        kill -KILL "$child_pid" 2>/dev/null || true
-    fi
+    for pid in "$shim_pid" "$child_pid"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+    # Give them a beat to flush logs.
+    sleep 0.5
+    for pid in "$shim_pid" "$child_pid"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
     exit 0
 }
 trap cleanup TERM INT
@@ -504,11 +606,17 @@ trap cleanup TERM INT
     echo "mcp-host-bash: starting"
     echo "  port:                  $PORT"
     echo "  bind host:             $BIND_HOST${MCP_HOST_BASH_BIND:+ (MCP_HOST_BASH_BIND override)}"
-    if [ "$BIND_HOST" != "127.0.0.1" ] && [ "$BIND_HOST" != "localhost" ]; then
-        echo "  WARNING:               binding non-loopback ($BIND_HOST) exposes the host"
-        echo "                         shell-exec surface to every reachable caller. PAIR"
-        echo "                         WITH BEARER-TOKEN AUTH (see .env.example host-bash"
-        echo "                         block) before relying on this in production."
+    if [ -n "$BEARER" ]; then
+        echo "  bearer auth:           ENABLED (shim on $BIND_HOST:$PORT -> mcp-proxy on 127.0.0.1:$UPSTREAM_PORT)"
+    else
+        echo "  bearer auth:           DISABLED (MCP_HOST_BASH_BEARER unset)"
+        if [ "$BIND_HOST" != "127.0.0.1" ] && [ "$BIND_HOST" != "localhost" ]; then
+            echo "  WARNING:               binding non-loopback ($BIND_HOST) WITHOUT bearer auth"
+            echo "                         exposes the host shell-exec surface to every reachable"
+            echo "                         caller, with no authentication. Set MCP_HOST_BASH_BEARER"
+            echo "                         (see .env.example host-bash block) before running this"
+            echo "                         shape in production."
+        fi
     fi
     echo "  CW_PROFILE:            ${CW_PROFILE:-<unset; corp-dev default>}"
     if [ -n "$PROFILE_WARN" ]; then
@@ -527,6 +635,9 @@ trap cleanup TERM INT
     echo
     echo "In your .env, set:"
     echo "  CLAUDE_MCP_HTTP_BRIDGE=host-bash=http://host.docker.internal:${PORT}/mcp"
+    if [ -n "$BEARER" ]; then
+        echo "  CLAUDE_HOST_HOOK_BRIDGE_BEARER=<same value as MCP_HOST_BASH_BEARER>"
+    fi
     echo
     echo "Ctrl-C to stop."
     echo
@@ -537,4 +648,24 @@ trap cleanup TERM INT
 # `tee -a` on a stderr fd-swap pattern instead.
 "${argv[@]}" 2> >(tee -a "$MCP_HOST_BASH_LOG" >&2) &
 child_pid=$!
-wait "$child_pid"
+
+if [ -n "$BEARER" ]; then
+    # Brief sleep so mcp-proxy's listener is up before the shim tries
+    # to forward the first request. Without this, an in-container
+    # caller racing to fire `tools/call` immediately after the launcher
+    # boots can hit a `Connection refused` from the shim's
+    # http.client.HTTPConnection before mcp-proxy has bind()ed the
+    # internal port.
+    sleep 0.5
+    "${shim_argv[@]}" 2> >(tee -a "$MCP_HOST_BASH_LOG" >&2) &
+    shim_pid=$!
+    # Poll-wait on BOTH children. If EITHER dies, take the other down
+    # too so we don't leak half a bridge to KeepAlive's respawn loop.
+    # Avoids `wait -n` (bash 4.3+) for compatibility with macOS bash 3.2.
+    while kill -0 "$child_pid" 2>/dev/null && kill -0 "$shim_pid" 2>/dev/null; do
+        sleep 1
+    done
+    cleanup
+else
+    wait "$child_pid"
+fi
