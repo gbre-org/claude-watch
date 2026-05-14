@@ -2,6 +2,8 @@
 
 Watcher source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each watcher is a long-running background process the in-container session can launch via the `/start-watchers` skill (defined in [`container/skills/start-watchers.md`](../skills/start-watchers.md)).
 
+> **Authoring a new watcher?** Read [`docs/adding-watchers.md`](../../docs/adding-watchers.md) — covers the fire-and-exit lifecycle contract, the metadata schema below, and a fully-worked Jenkins-build-failure example.
+
 ## Current state
 
 **Empty.** No watchers ship in this container today. This dir is a stub for phase-2 watcher integrations. The `/start-watchers` skill is honest about this and reports "nothing to start" when run in a fresh image.

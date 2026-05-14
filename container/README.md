@@ -294,7 +294,7 @@ on-disk schema, the bake target, and the add-a-new-entry walkthrough.
 | --- | --- | --- | --- |
 | [`container/skills/`](skills/) | `/etc/claude-code/skills/` (canonical) + `/etc/claude-code/plugin/commands/` (plugin loader) | One `<name>.md` per slash command | `--plugin-dir /etc/claude-code/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`); skills callable as `/claude-container:<name>` |
 | [`container/agents/`](agents/) | `/etc/claude-code/agents/` (canonical) + `/etc/claude-code/plugin/agents/` (plugin loader) | One `<name>.md` per custom agent (frontmatter + body) | Same `--plugin-dir`; agents spawned with `subagent_type="claude-container:<name>"` |
-| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per long-running watcher | Probed by the `/claude-container:start-watchers` skill via `ls /etc/claude-code/watchers/*.toml` |
+| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per long-running watcher | Probed by the `/claude-container:start-watchers` skill via `ls /etc/claude-code/watchers/*.toml`. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
 
 The plugin namespace `claude-container` is set by
 [`container/plugin/.claude-plugin/plugin.json`](plugin/.claude-plugin/plugin.json),

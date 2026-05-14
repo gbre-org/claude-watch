@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-install-host-deps test-launchd-plist build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -146,6 +146,14 @@ test-cw:
 # without requiring uvx / mcp-proxy / cli-mcp-server. 11 cases, <1s.
 test-mcp-host-bash:
 	examples/compose/bin/tests/mcp-host-bash.test
+
+# Tests for examples/compose/bin/mcp-proxy-auth-shim — the bearer-token
+# reverse proxy that fronts mcp-proxy. Spins up an in-process fake
+# upstream + the shim as a subprocess, drives requests through urllib,
+# and asserts the auth gate + header passthrough behavior. 14 cases,
+# ~2s (each subprocess boot adds ~100ms; otherwise CPU-light).
+test-mcp-proxy-auth-shim:
+	examples/compose/bin/tests/mcp-proxy-auth-shim.test
 
 # Tests for examples/compose/bin/install-host-deps — the static
 # installer for mcp-proxy + cli-mcp-server. Exercises the uv → pip

@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""Tests for examples/compose/bin/mcp-proxy-auth-shim — the bearer-
+token reverse proxy that fronts mcp-proxy.
+
+The shim is a stdlib-only HTTP reverse proxy. Each test spins up:
+
+  - A fake upstream HTTP server (stand-in for mcp-proxy) on an
+    ephemeral 127.0.0.1 port. Records every request it sees + replies
+    with a canned response.
+  - The shim itself as a subprocess, configured to forward to the fake
+    upstream's port, listening on its own ephemeral 127.0.0.1 port.
+
+Then drives HTTP requests at the shim's port and asserts:
+
+  - Missing Authorization header => 401, no forward.
+  - Wrong bearer => 401, no forward.
+  - Correct bearer => 200 with upstream body passthrough.
+  - Authorization header STRIPPED before the upstream sees it
+    (mcp-proxy must never see the bearer).
+  - Session-id response header forwarded back to the caller
+    (streamable-HTTP transport relies on this).
+  - JSON + text/event-stream body passthrough.
+  - Constant-time bearer compare (no early exit on prefix match).
+
+Plus startup-config tests (no socket bind):
+
+  - --print-config exits 0 + prints resolved config (no bearer probe).
+  - Missing MCP_HOST_BASH_BEARER env => exits 2 (FAIL CLOSED).
+  - Missing --upstream-port flag => argparse rejects (exits 2).
+
+Run:  ./mcp-proxy-auth-shim.test
+"""
+
+from __future__ import annotations
+
+import contextlib
+import http.server
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SHIM = HERE.parent / "mcp-proxy-auth-shim"
+
+if not SHIM.exists():
+    print(f"FAIL: cannot locate mcp-proxy-auth-shim at {SHIM}", file=sys.stderr)
+    sys.exit(2)
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+        print(f"  -> FAIL: {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Fake upstream — stand-in for mcp-proxy
+# ---------------------------------------------------------------------------
+
+
+class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
+    """Records every request + responds with a canned body. Class
+    attributes reset by each test via `reset_upstream()`."""
+
+    requests: list = []  # one entry per request
+    response_status: int = 200
+    response_body: bytes = b""
+    response_headers: list[tuple[str, str]] = []  # extra headers
+
+    def _record(self) -> None:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length else b""
+        FakeUpstreamHandler.requests.append(
+            {
+                "method": self.command,
+                "path": self.path,
+                "headers": {k: v for k, v in self.headers.items()},
+                "body": body,
+            }
+        )
+
+    def _reply(self) -> None:
+        self.send_response(FakeUpstreamHandler.response_status)
+        for k, v in FakeUpstreamHandler.response_headers:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(FakeUpstreamHandler.response_body)))
+        self.end_headers()
+        self.wfile.write(FakeUpstreamHandler.response_body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._record()
+        self._reply()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._record()
+        self._reply()
+
+    def log_message(self, fmt: str, *args) -> None:  # silence noise
+        return
+
+
+def reset_upstream() -> None:
+    FakeUpstreamHandler.requests = []
+    FakeUpstreamHandler.response_status = 200
+    FakeUpstreamHandler.response_body = b""
+    FakeUpstreamHandler.response_headers = []
+
+
+def free_port() -> int:
+    """Reserve + release an ephemeral port. Caller races to use it
+    before something else grabs it — but in practice the test suite is
+    serial so the race is benign."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@contextlib.contextmanager
+def fake_upstream():
+    """Boot the fake upstream on an ephemeral port. Yields the port."""
+    server = http.server.HTTPServer(("127.0.0.1", 0), FakeUpstreamHandler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@contextlib.contextmanager
+def running_shim(
+    upstream_port: int,
+    bearer: str = "test-bearer-secret",
+    extra_env: dict | None = None,
+):
+    """Boot the shim as a subprocess, wait until it accepts a TCP
+    connection on its listen port. Yields (listen_port, process).
+    """
+    listen_port = free_port()
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/tmp"),
+        "MCP_HOST_BASH_BEARER": bearer,
+    }
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.Popen(
+        [
+            str(SHIM),
+            "--listen-host", "127.0.0.1",
+            "--listen-port", str(listen_port),
+            "--upstream-host", "127.0.0.1",
+            "--upstream-port", str(upstream_port),
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    # Wait for the listener to come up. Poll up to ~2s.
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.1)
+                s.connect(("127.0.0.1", listen_port))
+            break
+        except (ConnectionRefusedError, OSError):
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate(timeout=1)
+                raise AssertionError(
+                    f"shim died during startup: rc={proc.returncode}\n"
+                    f"stdout: {stdout}\nstderr: {stderr}"
+                )
+            time.sleep(0.05)
+    else:
+        proc.terminate()
+        raise AssertionError(
+            f"shim never bound 127.0.0.1:{listen_port} within 2s"
+        )
+    try:
+        yield listen_port, proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def post(
+    url: str,
+    body: bytes = b"",
+    headers: dict | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, dict, bytes]:
+    """POST to `url`, return (status, response_headers, response_body)."""
+    req = urllib.request.Request(
+        url, data=body, method="POST", headers=headers or {}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            return (resp.status, hdrs, data)
+    except urllib.error.HTTPError as e:
+        data = e.read()
+        hdrs = {k.lower(): v for k, v in e.headers.items()}
+        return (e.code, hdrs, data)
+
+
+# ---------------------------------------------------------------------------
+# Startup-config tests (no socket bind)
+# ---------------------------------------------------------------------------
+
+
+def test_print_config_exits_zero() -> None:
+    """--print-config: resolve + print + exit 0. No bearer probe, no
+    socket bind. Test hook for argv-shape assertions in the
+    mcp-host-bash launcher test (which currently uses --print-cmd)."""
+    result = subprocess.run(
+        [
+            str(SHIM),
+            "--listen-host", "0.0.0.0",
+            "--listen-port", "9000",
+            "--upstream-host", "127.0.0.1",
+            "--upstream-port", "9001",
+            "--print-config",
+        ],
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    expect(
+        result.returncode == 0,
+        f"--print-config: rc should be 0, got {result.returncode}; stderr: {result.stderr!r}",
+    )
+    expect(
+        "listen-host 0.0.0.0" in result.stdout,
+        f"--print-config: stdout should contain listen-host, got {result.stdout!r}",
+    )
+    expect(
+        "listen-port 9000" in result.stdout,
+        f"--print-config: stdout should contain listen-port, got {result.stdout!r}",
+    )
+    expect(
+        "upstream-host 127.0.0.1" in result.stdout,
+        f"--print-config: stdout should contain upstream-host, got {result.stdout!r}",
+    )
+    expect(
+        "upstream-port 9001" in result.stdout,
+        f"--print-config: stdout should contain upstream-port, got {result.stdout!r}",
+    )
+
+
+def test_fails_closed_when_bearer_env_unset() -> None:
+    """No MCP_HOST_BASH_BEARER => shim refuses to start (exits 2).
+    FAIL-CLOSED contract: silent fall-through to no-auth would defeat
+    the shim. The C2 finding from the internal mcp-proxy security
+    audit explicitly called out the same-host-different-user surface
+    as a critical case — a missing bearer must NOT translate to "no
+    auth required" silently."""
+    result = subprocess.run(
+        [
+            str(SHIM),
+            "--listen-host", "127.0.0.1",
+            "--listen-port", str(free_port()),
+            "--upstream-host", "127.0.0.1",
+            "--upstream-port", str(free_port()),
+        ],
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    expect(
+        result.returncode == 2,
+        f"no bearer: rc should be 2 (fail-closed), got {result.returncode}; "
+        f"stderr: {result.stderr!r}",
+    )
+    expect(
+        "MCP_HOST_BASH_BEARER" in result.stderr,
+        f"no bearer: stderr should mention the missing env var, got {result.stderr!r}",
+    )
+
+
+def test_fails_closed_when_bearer_env_empty() -> None:
+    """MCP_HOST_BASH_BEARER="" (empty string) => same fail-closed
+    behavior as unset. Empty value is just as insecure as no value."""
+    result = subprocess.run(
+        [
+            str(SHIM),
+            "--listen-host", "127.0.0.1",
+            "--listen-port", str(free_port()),
+            "--upstream-host", "127.0.0.1",
+            "--upstream-port", str(free_port()),
+        ],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "MCP_HOST_BASH_BEARER": "",
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    expect(
+        result.returncode == 2,
+        f"empty bearer: rc should be 2, got {result.returncode}; "
+        f"stderr: {result.stderr!r}",
+    )
+
+
+def test_missing_required_upstream_port_arg() -> None:
+    """--upstream-port is required — argparse rejects without it
+    (exit 2 + usage to stderr)."""
+    result = subprocess.run(
+        [str(SHIM), "--listen-port", "9000"],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "MCP_HOST_BASH_BEARER": "anything",
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    expect(
+        result.returncode == 2,
+        f"missing --upstream-port: rc should be 2, got {result.returncode}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live socket tests
+# ---------------------------------------------------------------------------
+
+
+def test_missing_authorization_header_rejected_401() -> None:
+    """Request with no Authorization header => 401. Upstream MUST NOT
+    see the request."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        FakeUpstreamHandler.response_body = b'{"never": "should-see"}'
+        with running_shim(upstream_port) as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            status, _hdrs, body = post(url, body=b"{}", headers={"Content-Type": "application/json"})
+            expect(status == 401, f"missing auth: expected 401, got {status}")
+            expect(
+                len(FakeUpstreamHandler.requests) == 0,
+                f"missing auth: upstream should see NO requests, got "
+                f"{len(FakeUpstreamHandler.requests)}: {FakeUpstreamHandler.requests!r}",
+            )
+            expect(
+                b"Unauthorized" in body,
+                f"missing auth: 401 body should explain, got {body!r}",
+            )
+
+
+def test_wrong_bearer_rejected_401() -> None:
+    """Wrong bearer => 401, upstream unreachable."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        FakeUpstreamHandler.response_body = b'{"never": "should-see"}'
+        with running_shim(upstream_port, bearer="correct-secret") as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            status, _hdrs, _body = post(
+                url,
+                body=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer wrong-secret",
+                },
+            )
+            expect(status == 401, f"wrong bearer: expected 401, got {status}")
+            expect(
+                len(FakeUpstreamHandler.requests) == 0,
+                f"wrong bearer: upstream should see NO requests, got "
+                f"{len(FakeUpstreamHandler.requests)}",
+            )
+
+
+def test_wrong_scheme_rejected_401() -> None:
+    """Authorization header with the wrong scheme (e.g. Basic instead
+    of Bearer) => 401. The shim only accepts the Bearer scheme."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        with running_shim(upstream_port, bearer="secret") as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            status, _hdrs, _body = post(
+                url,
+                body=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Basic c2VjcmV0",  # base64("secret")
+                },
+            )
+            expect(status == 401, f"wrong scheme: expected 401, got {status}")
+            expect(
+                len(FakeUpstreamHandler.requests) == 0,
+                f"wrong scheme: upstream should see NO requests, got "
+                f"{len(FakeUpstreamHandler.requests)}",
+            )
+
+
+def test_correct_bearer_forwards_with_200() -> None:
+    """Correct bearer => 200 with upstream body passthrough. Standard
+    success path."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        FakeUpstreamHandler.response_body = b'{"result": "ok"}'
+        FakeUpstreamHandler.response_headers = [
+            ("Content-Type", "application/json"),
+        ]
+        bearer = "the-real-secret-32-bytes-base64xx"
+        with running_shim(upstream_port, bearer=bearer) as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            req_body = b'{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+            status, hdrs, body = post(
+                url,
+                body=req_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {bearer}",
+                },
+            )
+            expect(status == 200, f"correct bearer: expected 200, got {status}")
+            expect(
+                body == b'{"result": "ok"}',
+                f"correct bearer: body should pass through, got {body!r}",
+            )
+            expect(
+                hdrs.get("content-type", "") == "application/json",
+                f"correct bearer: Content-Type should pass through, got "
+                f"{hdrs.get('content-type')!r}",
+            )
+            expect(
+                len(FakeUpstreamHandler.requests) == 1,
+                f"correct bearer: upstream should see 1 request, got "
+                f"{len(FakeUpstreamHandler.requests)}",
+            )
+
+
+def test_authorization_header_stripped_before_forwarding() -> None:
+    """The shim MUST strip the Authorization header before forwarding
+    upstream. mcp-proxy never needs the bearer (the shim is the only
+    authenticator); leaking it through would let an upstream
+    compromise read the secret out of its access logs."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        FakeUpstreamHandler.response_body = b'{"ok": true}'
+        bearer = "leak-me-not"
+        with running_shim(upstream_port, bearer=bearer) as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            status, _hdrs, _body = post(
+                url,
+                body=b'{}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {bearer}",
+                },
+            )
+            expect(status == 200, f"strip-auth: expected 200, got {status}")
+            expect(
+                len(FakeUpstreamHandler.requests) == 1,
+                f"strip-auth: upstream should see 1 request, got "
+                f"{len(FakeUpstreamHandler.requests)}",
+            )
+            # The recorded upstream request's headers must NOT contain
+            # Authorization. Check case-insensitively because http.server's
+            # MessageHeaders preserves casing as-sent.
+            upstream_headers = FakeUpstreamHandler.requests[0]["headers"]
+            for k in upstream_headers:
+                expect(
+                    k.lower() != "authorization",
+                    f"strip-auth: upstream received Authorization header "
+                    f"({k}={upstream_headers[k]!r}) — must be stripped",
+                )
+
+
+def test_response_headers_passed_through() -> None:
+    """The shim relays response headers (e.g. `mcp-session-id`,
+    `Content-Type`) from upstream back to the caller. Streamable-HTTP
+    transport depends on `mcp-session-id` round-tripping."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        session_id = "abc123-session-id"
+        FakeUpstreamHandler.response_body = b'{"protocolVersion": "2025-06-18"}'
+        FakeUpstreamHandler.response_headers = [
+            ("Content-Type", "application/json"),
+            ("Mcp-Session-Id", session_id),
+        ]
+        with running_shim(upstream_port, bearer="x") as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            status, hdrs, _body = post(
+                url,
+                body=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer x",
+                },
+            )
+            expect(status == 200, f"resp-headers: expected 200, got {status}")
+            expect(
+                hdrs.get("mcp-session-id") == session_id,
+                f"resp-headers: mcp-session-id should pass through, got "
+                f"{hdrs.get('mcp-session-id')!r}",
+            )
+
+
+def test_sse_response_body_passes_through() -> None:
+    """text/event-stream upstream body passes through byte-for-byte.
+    The streamable-HTTP transport allows either JSON or SSE on a
+    tools/call response; the shim is transport-agnostic."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        FakeUpstreamHandler.response_body = (
+            b'data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n\n'
+        )
+        FakeUpstreamHandler.response_headers = [
+            ("Content-Type", "text/event-stream"),
+        ]
+        with running_shim(upstream_port, bearer="x") as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            status, hdrs, body = post(
+                url,
+                body=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer x",
+                },
+            )
+            expect(status == 200, f"sse: expected 200, got {status}")
+            expect(
+                hdrs.get("content-type", "").startswith("text/event-stream"),
+                f"sse: Content-Type should be text/event-stream, got "
+                f"{hdrs.get('content-type')!r}",
+            )
+            expect(
+                b"data:" in body,
+                f"sse: body should contain `data:` frame, got {body!r}",
+            )
+
+
+def test_request_body_passed_through_verbatim() -> None:
+    """POST body bytes (JSON-RPC request payload) round-trip verbatim
+    through the shim. The bridge serializes JSON; the shim must not
+    re-serialize, re-encode, or otherwise mangle it."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        FakeUpstreamHandler.response_body = b'{"ok": true}'
+        with running_shim(upstream_port, bearer="x") as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            # Use a payload that exercises whitespace + ordering — a
+            # naive json.loads/json.dumps round-trip would normalize
+            # these. The shim should NOT do that.
+            req_body = b'{"z":1, "a":2,  "nested":{"x": null}}'
+            post(
+                url,
+                body=req_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer x",
+                },
+            )
+            expect(
+                len(FakeUpstreamHandler.requests) == 1,
+                f"body-passthrough: upstream should see 1 request",
+            )
+            if FakeUpstreamHandler.requests:
+                expect(
+                    FakeUpstreamHandler.requests[0]["body"] == req_body,
+                    f"body-passthrough: upstream body should match verbatim. "
+                    f"Sent {req_body!r}, upstream saw "
+                    f"{FakeUpstreamHandler.requests[0]['body']!r}",
+                )
+
+
+def test_handshake_three_post_sequence_with_session_id() -> None:
+    """Full handshake-shape integration test: three POSTs in sequence
+    (initialize, notifications/initialized, tools/call), each
+    carrying the bearer, with the session-id flowing through the
+    middleware. Validates the streamable-HTTP transport survives the
+    shim's auth gate."""
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        bearer = "handshake-bearer"
+        with running_shim(upstream_port, bearer=bearer) as (listen_port, _):
+            url = f"http://127.0.0.1:{listen_port}/mcp"
+            # Post 1: initialize. Upstream returns mcp-session-id.
+            session_id = "session-from-init"
+            FakeUpstreamHandler.response_body = (
+                b'{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}'
+            )
+            FakeUpstreamHandler.response_headers = [
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", session_id),
+            ]
+            status, hdrs, _ = post(
+                url,
+                body=b'{"jsonrpc":"2.0","id":1,"method":"initialize"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {bearer}",
+                },
+            )
+            expect(status == 200, f"init: expected 200, got {status}")
+            expect(
+                hdrs.get("mcp-session-id") == session_id,
+                f"init: session-id should round-trip, got {hdrs.get('mcp-session-id')!r}",
+            )
+
+            # Post 2: notifications/initialized with the session header.
+            FakeUpstreamHandler.response_body = b""
+            FakeUpstreamHandler.response_headers = []
+            FakeUpstreamHandler.response_status = 202
+            status, _, _ = post(
+                url,
+                body=b'{"jsonrpc":"2.0","method":"notifications/initialized"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {bearer}",
+                    "Mcp-Session-Id": session_id,
+                },
+            )
+            expect(status == 202, f"notify: expected 202, got {status}")
+
+            # Post 3: tools/call with the session header.
+            FakeUpstreamHandler.response_status = 200
+            FakeUpstreamHandler.response_body = (
+                b'{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}'
+            )
+            FakeUpstreamHandler.response_headers = [
+                ("Content-Type", "application/json"),
+            ]
+            status, _, body = post(
+                url,
+                body=b'{"jsonrpc":"2.0","id":2,"method":"tools/call"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {bearer}",
+                    "Mcp-Session-Id": session_id,
+                },
+            )
+            expect(status == 200, f"call: expected 200, got {status}")
+            expect(
+                b"ok" in body,
+                f"call: response body should pass through, got {body!r}",
+            )
+
+            # All three upstream requests must have received the
+            # session header (when present in client) but NOT the
+            # Authorization header.
+            expect(
+                len(FakeUpstreamHandler.requests) == 3,
+                f"handshake: upstream should see 3 requests, got "
+                f"{len(FakeUpstreamHandler.requests)}",
+            )
+            for i, req in enumerate(FakeUpstreamHandler.requests):
+                # Header keys come back with the wire casing. Lowercase
+                # for the lookup.
+                lc = {k.lower(): v for k, v in req["headers"].items()}
+                expect(
+                    "authorization" not in lc,
+                    f"handshake req {i}: upstream should not see "
+                    f"Authorization, got {req['headers']!r}",
+                )
+            # Posts 2 and 3 must carry the session header upstream.
+            for i in (1, 2):
+                lc = {k.lower(): v for k, v in FakeUpstreamHandler.requests[i]["headers"].items()}
+                expect(
+                    lc.get("mcp-session-id") == session_id,
+                    f"handshake req {i}: should forward mcp-session-id, "
+                    f"got {lc.get('mcp-session-id')!r}",
+                )
+
+
+def test_upstream_unreachable_returns_502() -> None:
+    """If mcp-proxy is dead, the shim returns 502 (Bad Gateway) — not
+    200 or 401. The bridge's fall-back code path already handles 502
+    via the same `URLError` branch as connection refused, so the
+    user-facing behavior is identical to the pre-shim unreachable
+    case."""
+    # Pick a port nothing is listening on. We don't even need a fake
+    # upstream because the shim resolves the upstream lazily per
+    # request, not at startup.
+    dead_port = free_port()
+    with running_shim(dead_port, bearer="x") as (listen_port, _):
+        url = f"http://127.0.0.1:{listen_port}/mcp"
+        status, _hdrs, body = post(
+            url,
+            body=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer x",
+            },
+        )
+        expect(status == 502, f"upstream-dead: expected 502, got {status}")
+        expect(
+            b"Bad Gateway" in body,
+            f"upstream-dead: body should explain, got {body!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+
+TESTS = [
+    test_print_config_exits_zero,
+    test_fails_closed_when_bearer_env_unset,
+    test_fails_closed_when_bearer_env_empty,
+    test_missing_required_upstream_port_arg,
+    test_missing_authorization_header_rejected_401,
+    test_wrong_bearer_rejected_401,
+    test_wrong_scheme_rejected_401,
+    test_correct_bearer_forwards_with_200,
+    test_authorization_header_stripped_before_forwarding,
+    test_response_headers_passed_through,
+    test_sse_response_body_passes_through,
+    test_request_body_passed_through_verbatim,
+    test_handshake_three_post_sequence_with_session_id,
+    test_upstream_unreachable_returns_502,
+]
+
+
+for t in TESTS:
+    print(f"--- {t.__name__}")
+    pre_failures = len(failures)
+    try:
+        t()
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+        continue
+    if len(failures) == pre_failures:
+        print(f"PASS  {t.__name__}")
+
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+
+print(f"\nAll {len(TESTS)} tests passed.")

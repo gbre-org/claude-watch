@@ -5,6 +5,14 @@ surface external state changes to a Claude Code main loop. They MUST be
 spawned, supervised, and restarted following the rules below — drift
 silently turns watchers into orphans that fire into the void.
 
+> **Writing a new watcher?** See [`adding-watchers.md`](adding-watchers.md)
+> for the authoring walkthrough — the on-disk file layout, the
+> fire-and-exit lifecycle contract, the `watchers.conf` schema (host)
+> and `<name>.toml` schema (container), and a fully worked Jenkins-
+> build-failure example for either surface. This file covers the
+> operator-side hygiene rules; the authoring doc covers how to write
+> the watcher itself.
+
 ## Cardinal rule: watchers belong to the main loop
 
 > **Watchers can ONLY ever be started by Claude Code's main loop**, via the

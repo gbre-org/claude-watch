@@ -118,6 +118,9 @@ jobs:
       - name: Run mcp-host-bash host-shim tests
         run: make test-mcp-host-bash
 
+      - name: Run mcp-proxy-auth-shim bearer-auth tests
+        run: make test-mcp-proxy-auth-shim
+
       - name: Run install-host-deps shim tests
         run: make test-install-host-deps
 

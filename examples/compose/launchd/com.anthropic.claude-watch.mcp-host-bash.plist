@@ -52,6 +52,30 @@
       ${HOME}/.config/claude-container/mcp-host-bash.env (which the
       launcher itself sources at startup).
 
+      - MCP_HOST_BASH_BIND: host address mcp-proxy listens on. Default
+        (omit or set to 127.0.0.1) binds loopback only — safe floor. To
+        allow a Linux Docker bridge-net container to reach the launcher
+        via host.docker.internal, set this to `0.0.0.0` AND pair with
+        MCP_HOST_BASH_BEARER (below). macOS Docker Desktop reaches
+        loopback through host.docker.internal NAT, so the default Just
+        Works there. Bare 0.0.0.0 without auth exposes the host
+        shell-exec surface to every reachable caller — do not run that
+        in production.
+
+      - MCP_HOST_BASH_BEARER: shared-secret bearer token. When set, the
+        launcher fronts mcp-proxy with mcp-proxy-auth-shim, which
+        validates `Authorization: Bearer <token>` on every request and
+        forwards only authenticated requests to mcp-proxy on an
+        internal loopback port. Required when MCP_HOST_BASH_BIND is
+        non-loopback. Generate once + keep out of version control:
+
+            head -c 32 /dev/urandom | base64
+
+        The same secret must be set as CLAUDE_HOST_HOOK_BRIDGE_BEARER
+        in the docker-compose .env file (the in-container exec-hook
+        bridge reads it from there). Default empty = no shim, no auth
+        (matches pre-bearer-auth launcher behavior).
+
       - CW_PROFILE: trust profile selector. Unset / `corp-dev` keeps
         the read-y default allow-list. `corp-dev-trusted` widens to
         include host scheduling, file mutation, outbound bytes, key/cert
@@ -86,6 +110,30 @@
     -->
     <key>EnvironmentVariables</key>
     <dict>
+        <!--
+          MCP_HOST_BASH_BIND: omit / 127.0.0.1 = loopback only (safe
+          default for macOS Docker Desktop, where host.docker.internal
+          routes via NAT to host loopback). Set to 0.0.0.0 to expose
+          beyond loopback for Linux Docker bridge-net containers —
+          PAIR with MCP_HOST_BASH_BEARER (below) so the public port is
+          gated by the auth shim.
+        -->
+        <key>MCP_HOST_BASH_BIND</key>
+        <string>127.0.0.1</string>
+
+        <!--
+          MCP_HOST_BASH_BEARER: shared-secret bearer token. When set,
+          the launcher fronts mcp-proxy with mcp-proxy-auth-shim, which
+          validates `Authorization: Bearer <token>` on every request.
+          Required for any non-loopback bind. Generate once with
+          `head -c 32 /dev/urandom | base64`; mirror the same value
+          into CLAUDE_HOST_HOOK_BRIDGE_BEARER in the docker-compose
+          .env file. Empty / unset = no shim, no auth (matches
+          pre-bearer-auth launcher behavior).
+        -->
+        <key>MCP_HOST_BASH_BEARER</key>
+        <string></string>
+
         <key>CW_PROFILE</key>
         <string>corp-dev</string>
 

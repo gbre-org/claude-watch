@@ -111,10 +111,14 @@ def find_env_value(lines: list[str], key: str) -> str | None:
 
 
 def test_print_cmd_default_argv() -> None:
-    """Default: mcp-proxy --port 8766 --host 0.0.0.0 --env ... --
+    """Default: mcp-proxy --port 8766 --host 127.0.0.1 --env ... --
     cli-mcp-server. NO `uvx` prefix — both binaries are statically
     installed via install-host-deps; the launcher exec's them
-    directly so each start is offline (no per-launch PyPI fetch)."""
+    directly so each start is offline (no per-launch PyPI fetch).
+
+    The default bind is 127.0.0.1 (loopback only). Operators who need
+    LAN / Docker-bridge reachability set MCP_HOST_BASH_BIND=0.0.0.0
+    explicitly — see test_bind_env_override_widens_listener."""
     lines, _, _, _ = run_script(["--print-cmd"])
     expect(lines[0] == "mcp-proxy",
            f"default: argv[0] should be mcp-proxy (statically installed, "
@@ -125,12 +129,12 @@ def test_print_cmd_default_argv() -> None:
     expect(lines[port_idx + 1] == "8766",
            f"default: --port should be 8766, got {lines[port_idx + 1]!r}")
     expect("--host" in lines,
-           f"default: argv should include --host (for host.docker.internal "
-           f"reachability), got {lines}")
+           f"default: argv should include --host, got {lines}")
     host_idx = lines.index("--host")
-    expect(lines[host_idx + 1] == "0.0.0.0",
-           f"default: --host should be 0.0.0.0 (NOT 127.0.0.1 — the "
-           f"container's bridge net can't reach loopback), got {lines[host_idx + 1]!r}")
+    expect(lines[host_idx + 1] == "127.0.0.1",
+           f"default: --host should be 127.0.0.1 (loopback only — the "
+           f"safe floor; operators set MCP_HOST_BASH_BIND=0.0.0.0 to "
+           f"opt into LAN exposure), got {lines[host_idx + 1]!r}")
     expect("--" in lines,
            f"default: argv should include the stdio-subprocess separator '--', got {lines}")
     sep_idx = lines.index("--")
@@ -630,6 +634,271 @@ def test_hook_bridge_bins_works_with_trusted_profile() -> None:
            f"trusted+bridge-bins: trusted-profile extras dropped, got {cmd_list}")
 
 
+def test_bind_default_is_loopback() -> None:
+    """Defense-in-depth: with MCP_HOST_BASH_BIND unset, --host MUST
+    resolve to 127.0.0.1. Guards against a future edit accidentally
+    restoring the 0.0.0.0 default (the C1 finding from the
+    2026-05-14 internal mcp-proxy security audit).
+
+    The audit found that the previous 0.0.0.0 default exposed the
+    host shell-exec surface to every device on the LAN + every
+    sibling Docker container + every local UID, with no
+    authentication. Loopback default closes the LAN + sibling-uid
+    surface; operators who need wider reach set MCP_HOST_BASH_BIND
+    explicitly + (in a follow-up PR) bearer-auth their callers."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    host_idx = lines.index("--host")
+    expect(
+        lines[host_idx + 1] == "127.0.0.1",
+        f"loopback default: --host MUST be 127.0.0.1 when "
+        f"MCP_HOST_BASH_BIND is unset, got {lines[host_idx + 1]!r}",
+    )
+
+
+def test_bind_env_override_widens_listener() -> None:
+    """MCP_HOST_BASH_BIND=0.0.0.0 in env => --host 0.0.0.0 in argv.
+    Operator-explicit opt-in path for Linux Docker bridge-net
+    containers that need host.docker.internal reachability."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_BIND": "0.0.0.0"},
+    )
+    host_idx = lines.index("--host")
+    expect(
+        lines[host_idx + 1] == "0.0.0.0",
+        f"bind override: --host should be 0.0.0.0 when "
+        f"MCP_HOST_BASH_BIND=0.0.0.0, got {lines[host_idx + 1]!r}",
+    )
+
+
+def test_bind_env_override_specific_interface() -> None:
+    """MCP_HOST_BASH_BIND=172.17.0.1 => --host 172.17.0.1. The
+    value is passed verbatim — operators can pin to a specific
+    interface IP for a tighter listen surface than bare 0.0.0.0."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_BIND": "172.17.0.1"},
+    )
+    host_idx = lines.index("--host")
+    expect(
+        lines[host_idx + 1] == "172.17.0.1",
+        f"bind specific IP: --host should pass through verbatim, "
+        f"got {lines[host_idx + 1]!r}",
+    )
+
+
+def find_shim_value(lines: list[str], key: str) -> str | None:
+    """Return the value of `--<key> VALUE` in the SHIM argv block of
+    --print-cmd output. The launcher prints `SHIM:` header, then the
+    shim argv one-per-line, then a blank line, then `MCP_PROXY:`,
+    then the mcp-proxy argv. We scope this lookup to the SHIM block."""
+    flag = f"--{key}"
+    in_shim = False
+    for i, line in enumerate(lines):
+        if line == "SHIM:":
+            in_shim = True
+            continue
+        if line == "MCP_PROXY:" or line == "":
+            in_shim = False
+            continue
+        if in_shim and line == flag and i + 1 < len(lines):
+            return lines[i + 1]
+    return None
+
+
+def find_mcp_proxy_index(lines: list[str], flag: str) -> int | None:
+    """Find a flag inside the MCP_PROXY block of --print-cmd output.
+    Returns the index of the flag (caller looks one line ahead for
+    the value), or None if not found."""
+    in_mcp = False
+    for i, line in enumerate(lines):
+        if line == "MCP_PROXY:":
+            in_mcp = True
+            continue
+        if line == "SHIM:":
+            in_mcp = False
+            continue
+        if in_mcp and line == flag:
+            return i
+    # If no SHIM/MCP_PROXY headers (bearer not set), the whole output
+    # IS the mcp-proxy argv.
+    if "SHIM:" not in lines and flag in lines:
+        return lines.index(flag)
+    return None
+
+
+def test_bearer_mode_emits_shim_argv() -> None:
+    """When MCP_HOST_BASH_BEARER is set, --print-cmd output includes a
+    SHIM: block with the auth shim's argv, then a MCP_PROXY: block
+    with mcp-proxy on the internal loopback port (PORT+1 by default).
+    The shim binds the public-facing port; mcp-proxy binds
+    127.0.0.1:<internal>."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_BEARER": "test-secret-not-real"},
+    )
+    expect(
+        "SHIM:" in lines,
+        f"bearer mode: --print-cmd should emit SHIM: header, got {lines!r}",
+    )
+    expect(
+        "MCP_PROXY:" in lines,
+        f"bearer mode: --print-cmd should emit MCP_PROXY: header, got {lines!r}",
+    )
+    listen_host = find_shim_value(lines, "listen-host")
+    listen_port = find_shim_value(lines, "listen-port")
+    upstream_host = find_shim_value(lines, "upstream-host")
+    upstream_port = find_shim_value(lines, "upstream-port")
+    expect(
+        listen_host == "127.0.0.1",
+        f"bearer mode: shim --listen-host should match default BIND "
+        f"(127.0.0.1), got {listen_host!r}",
+    )
+    expect(
+        listen_port == "8766",
+        f"bearer mode: shim --listen-port should match the public PORT "
+        f"(8766), got {listen_port!r}",
+    )
+    expect(
+        upstream_host == "127.0.0.1",
+        f"bearer mode: shim --upstream-host should be 127.0.0.1 (mcp-proxy "
+        f"must stay loopback so only the shim reaches it), got "
+        f"{upstream_host!r}",
+    )
+    expect(
+        upstream_port == "8767",
+        f"bearer mode: shim --upstream-port should default to PORT+1 "
+        f"(8767), got {upstream_port!r}",
+    )
+    # mcp-proxy itself must be bound to the internal loopback port, NOT
+    # the public-facing port — otherwise the shim and mcp-proxy race for
+    # the public port AND the shim's auth gate is bypassable.
+    mcp_port_idx = find_mcp_proxy_index(lines, "--port")
+    mcp_host_idx = find_mcp_proxy_index(lines, "--host")
+    expect(mcp_port_idx is not None, "bearer mode: MCP_PROXY block missing --port")
+    expect(mcp_host_idx is not None, "bearer mode: MCP_PROXY block missing --host")
+    if mcp_port_idx is not None:
+        expect(
+            lines[mcp_port_idx + 1] == "8767",
+            f"bearer mode: mcp-proxy --port should be the internal port "
+            f"(8767), got {lines[mcp_port_idx + 1]!r}",
+        )
+    if mcp_host_idx is not None:
+        expect(
+            lines[mcp_host_idx + 1] == "127.0.0.1",
+            f"bearer mode: mcp-proxy --host should be 127.0.0.1 (so only "
+            f"the shim can dial it), got {lines[mcp_host_idx + 1]!r}",
+        )
+
+
+def test_bearer_mode_with_bind_override() -> None:
+    """MCP_HOST_BASH_BIND=0.0.0.0 + bearer set => shim binds 0.0.0.0
+    (public-facing LAN listener gated by bearer), mcp-proxy still binds
+    127.0.0.1 (internal loopback). The split-binding is the whole
+    point of the shim — public surface authenticated, internal surface
+    unreachable to non-shim callers."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={
+            "MCP_HOST_BASH_BIND": "0.0.0.0",
+            "MCP_HOST_BASH_BEARER": "test-secret-not-real",
+        },
+    )
+    listen_host = find_shim_value(lines, "listen-host")
+    expect(
+        listen_host == "0.0.0.0",
+        f"bearer+bind override: shim --listen-host should be 0.0.0.0 "
+        f"(public-facing), got {listen_host!r}",
+    )
+    mcp_host_idx = find_mcp_proxy_index(lines, "--host")
+    if mcp_host_idx is not None:
+        expect(
+            lines[mcp_host_idx + 1] == "127.0.0.1",
+            f"bearer+bind override: mcp-proxy --host MUST stay 127.0.0.1 "
+            f"(only the shim reaches it; LAN callers hit the shim's auth "
+            f"gate), got {lines[mcp_host_idx + 1]!r}",
+        )
+
+
+def test_bearer_mode_with_custom_upstream_port() -> None:
+    """MCP_HOST_BASH_UPSTREAM_PORT overrides the internal port (default
+    PORT+1). Useful when PORT+1 is already bound by another service."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={
+            "MCP_HOST_BASH_BEARER": "test-secret-not-real",
+            "MCP_HOST_BASH_UPSTREAM_PORT": "9999",
+        },
+    )
+    expect(
+        find_shim_value(lines, "upstream-port") == "9999",
+        f"upstream port override: shim --upstream-port should be 9999, "
+        f"got {find_shim_value(lines, 'upstream-port')!r}",
+    )
+    mcp_port_idx = find_mcp_proxy_index(lines, "--port")
+    if mcp_port_idx is not None:
+        expect(
+            lines[mcp_port_idx + 1] == "9999",
+            f"upstream port override: mcp-proxy --port should be 9999, "
+            f"got {lines[mcp_port_idx + 1]!r}",
+        )
+
+
+def test_bearer_unset_no_shim_in_argv() -> None:
+    """No bearer => no SHIM: / MCP_PROXY: headers, just bare mcp-proxy
+    argv binding the public-facing port directly. Matches the
+    pre-bearer-auth launcher shape so existing operators see no
+    behavior change until they opt into bearer auth."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    expect(
+        "SHIM:" not in lines,
+        f"no bearer: should NOT emit SHIM: header, got {lines!r}",
+    )
+    expect(
+        "MCP_PROXY:" not in lines,
+        f"no bearer: should NOT emit MCP_PROXY: header, got {lines!r}",
+    )
+    # First arg is mcp-proxy itself.
+    expect(
+        lines[0] == "mcp-proxy",
+        f"no bearer: argv[0] should be mcp-proxy, got {lines[0]!r}",
+    )
+
+
+def test_bearer_empty_string_treated_as_unset() -> None:
+    """MCP_HOST_BASH_BEARER="" (empty value) => no shim, no auth gate.
+    Treats empty same as unset so an operator accidentally exporting
+    an empty variable doesn't end up running the shim with an empty
+    bearer (the shim would fail-closed at startup anyway, but
+    treating empty as "no bearer mode" at the launcher level is the
+    clearer contract)."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_BEARER": ""},
+    )
+    expect(
+        "SHIM:" not in lines,
+        f"empty bearer: should NOT emit SHIM: header, got {lines!r}",
+    )
+
+
+def test_bind_env_empty_falls_back_to_loopback() -> None:
+    """MCP_HOST_BASH_BIND="" (empty string) => default to 127.0.0.1.
+    Treats an empty value the same as unset — operators
+    accidentally exporting an empty variable still get the safe
+    floor."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_BIND": ""},
+    )
+    host_idx = lines.index("--host")
+    expect(
+        lines[host_idx + 1] == "127.0.0.1",
+        f"empty bind env: --host should fall back to 127.0.0.1, "
+        f"got {lines[host_idx + 1]!r}",
+    )
+
+
 def test_hook_bridge_bins_unset_no_effect() -> None:
     """No CLAUDE_HOOK_BRIDGE_BINS => ALLOWED_COMMANDS unchanged from profile default."""
     lines_with, _, _, _ = run_script(["--print-cmd"])
@@ -665,6 +934,15 @@ tests = [
     test_cw_profile_operator_override_wins,
     test_hook_bridge_bins_merged_into_allow_list,
     test_hook_bridge_bins_works_with_trusted_profile,
+    test_bind_default_is_loopback,
+    test_bind_env_override_widens_listener,
+    test_bind_env_override_specific_interface,
+    test_bearer_mode_emits_shim_argv,
+    test_bearer_mode_with_bind_override,
+    test_bearer_mode_with_custom_upstream_port,
+    test_bearer_unset_no_shim_in_argv,
+    test_bearer_empty_string_treated_as_unset,
+    test_bind_env_empty_falls_back_to_loopback,
     test_hook_bridge_bins_unset_no_effect,
     test_launcher_source_has_no_uvx_invocations,
     test_preflight_error_points_to_installer,

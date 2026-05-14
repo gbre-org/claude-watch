@@ -115,6 +115,17 @@ ENVIRONMENT
                                 http://host.docker.internal:8766/mcp .
                                 Operators with a custom port / path
                                 set this in compose.yml's `environment`.
+  CLAUDE_HOST_HOOK_BRIDGE_BEARER
+                              — bearer token sent as
+                                `Authorization: Bearer <token>` on every
+                                request, when the host launcher is
+                                running behind mcp-proxy-auth-shim. Must
+                                match MCP_HOST_BASH_BEARER on the host
+                                launcher side. Empty / unset = no
+                                Authorization header sent (works against
+                                a launcher that doesn't have a bearer
+                                configured; gets 401-rejected by a
+                                launcher that does). Default unset.
   CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT
                               — seconds to wait for the JSON-RPC call.
                                 Default 30. Hooks that take longer
@@ -215,6 +226,25 @@ def bridge_url() -> str:
     return os.environ.get("CLAUDE_HOST_HOOK_BRIDGE_URL", DEFAULT_BRIDGE_URL)
 
 
+def bearer_header() -> dict[str, str]:
+    """Return `{"Authorization": "Bearer <token>"}` if
+    CLAUDE_HOST_HOOK_BRIDGE_BEARER is set, else empty dict.
+
+    The shim on the host side (mcp-proxy-auth-shim) validates this
+    header on every request when the launcher is configured with
+    MCP_HOST_BASH_BEARER. If the host launcher is running WITHOUT
+    bearer auth (older deployments / loopback-only setups), the
+    header is harmless — mcp-proxy ignores it. If the host launcher
+    is running WITH bearer auth and we don't send the header, the
+    shim 401's us and the bridge falls back to no-op (the standard
+    misconfig safety net).
+    """
+    token = os.environ.get("CLAUDE_HOST_HOOK_BRIDGE_BEARER", "")
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
+
+
 def bridge_timeout() -> float:
     raw = os.environ.get("CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT")
     if not raw:
@@ -313,7 +343,11 @@ def initialize_session(url: str, timeout: float) -> str:
             "clientInfo": MCP_CLIENT_INFO,
         },
     }
-    body, headers, _status = jsonrpc_post(url, init_payload, timeout=timeout)
+    auth_headers = bearer_header()
+    body, headers, _status = jsonrpc_post(
+        url, init_payload, timeout=timeout,
+        extra_headers=auth_headers if auth_headers else None,
+    )
     if body and "error" in body:
         # JSON-RPC error envelope on initialize — surface upwards.
         err = body["error"]
@@ -341,11 +375,13 @@ def initialize_session(url: str, timeout: float) -> str:
         "params": {},
     }
     try:
+        notif_headers = {MCP_SESSION_ID_HEADER: session_id}
+        notif_headers.update(bearer_header())
         jsonrpc_post(
             url,
             initialized_payload,
             timeout=timeout,
-            extra_headers={MCP_SESSION_ID_HEADER: session_id},
+            extra_headers=notif_headers,
         )
     except (urllib.error.HTTPError, ValueError, json.JSONDecodeError) as e:
         # Some servers return non-2xx or odd shapes on notifications.
@@ -401,9 +437,13 @@ def call_run_command(
             },
         },
     }
-    extra_headers = {MCP_SESSION_ID_HEADER: session_id} if session_id else None
+    extra_headers: dict[str, str] = {}
+    if session_id:
+        extra_headers[MCP_SESSION_ID_HEADER] = session_id
+    extra_headers.update(bearer_header())
     body, _headers, _status = jsonrpc_post(
-        url, payload, timeout=timeout, extra_headers=extra_headers
+        url, payload, timeout=timeout,
+        extra_headers=extra_headers if extra_headers else None,
     )
     if body is None:
         # tools/call should always return a body. Empty = server bug;
