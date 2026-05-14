@@ -102,6 +102,50 @@ If the operator gives you a job that genuinely needs a host-side
 watcher / notifier, run it on the host instead (via the operator's host
 Claude Code session) or bridge the watch event over `host-bash`.
 
+## Queue protocol — every Agent tool call
+
+Before firing **any** `Agent` tool call, you MUST first add a queue
+item via `session-task queue`. The queue serializes work that touches
+overlapping scopes (e.g. two agents editing the same repo at once),
+and the in-container scope namespace is **shared with the host** —
+`repo:claude-watch` covers BOTH host-side and container-side work
+touching that repo. An in-container agent that skips the queue can
+race against host-side work on the same repo, lose edits to a parallel
+agent, or stomp on a long-running build.
+
+**The host's `pre-agent-queue-gate-hook` PreToolUse hook is NOT active
+inside this container.** On the host that hook hard-DENIES any Agent
+spawn missing a `Queue item: q-XXXX` line in its prompt; in the
+container, no such gate fires. Compliance is on YOUR discipline. Spawning
+without queue-add → race against parallel work, scope conflicts, lost
+edits, no audit trail.
+
+The five-step protocol (mirrors the host CLAUDE.md `## Resume Actions`
+spawn workflow):
+
+1. `session-task queue add "<task description>" --scope <scope> --summary "~10 word headline"`
+   → returns JSON with a queue id (`q-YYYY-MM-DD-XXXX`). **Exit 3 =
+   HARD REFUSED for scope overlap; DO NOT spawn.** Wait or pick a
+   different scope.
+2. Read `ready_now` from the JSON. If `false`, DO NOT FIRE — another
+   item with overlapping scope is in flight. Wait for blockers and
+   re-check via `session-task queue spawn-check <id>`.
+3. If `ready_now=true`: `session-task queue register <id>` to claim
+   the slot.
+4. **Include the line `Queue item: q-XXXX` in the Agent's prompt.**
+   The host hook would deny without it; in-container it's the
+   audit trail that lets `session-task queue list` show what each
+   running agent is doing.
+5. Fire the Agent. On completion: `session-task queue done <id>`
+   (success) or `session-task queue abandon <id> --reason "..."`
+   (failure / cancelled).
+
+Quick reference: `session-task queue --help` for the full subcommand
+surface (`add | list | spawn-check | register | done | abandon | show`).
+The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
+if it's not on PATH, the operator hasn't wired the bind-mount and you
+should flag that before spawning agents at all.
+
 ## Avoid `sudo` — fingerprint prompt is prohibitive
 
 On the operator's host (typically macOS), every `sudo` invocation

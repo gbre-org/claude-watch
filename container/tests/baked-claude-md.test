@@ -153,6 +153,59 @@ if BAKED.exists():
         "host; the session itself stays inside the container)",
     )
 
+    # 5b.2.5. Queue protocol. The in-container claude must be told to
+    #         use `session-task queue` before every Agent spawn, because
+    #         the host's pre-agent-queue-gate PreToolUse hook is not
+    #         active in the container — compliance is on the agent's
+    #         own discipline. Without the protocol, in-container agents
+    #         race against host-side work on overlapping scopes (e.g.
+    #         repo:claude-watch is shared between host + container).
+    expect(
+        re.search(
+            r"^##\s+Queue protocol",
+            text,
+            re.MULTILINE,
+        )
+        is not None,
+        "baked-CLAUDE.md missing a top-level `## Queue protocol` "
+        "section — the in-container agent needs an explicit "
+        "queue-before-spawn protocol because the host's "
+        "pre-agent-queue-gate PreToolUse hook does not fire "
+        "inside the container",
+    )
+    queue_keywords = [
+        "session-task queue add",
+        "session-task queue register",
+        "Queue item:",
+    ]
+    for kw in queue_keywords:
+        expect(
+            kw in text,
+            f"baked-CLAUDE.md queue-protocol section should mention "
+            f"`{kw}` — it's part of the canonical 5-step spawn "
+            f"workflow mirrored from the host CLAUDE.md",
+        )
+    expect(
+        "session-task queue done" in text or "queue abandon" in text,
+        "baked-CLAUDE.md queue-protocol section should mention "
+        "`session-task queue done` (or `queue abandon`) so the "
+        "agent knows to close the loop after Agent completion",
+    )
+    expect(
+        re.search(
+            r"pre-agent-queue-gate.{0,80}(NOT active|not active|not.{0,10}fire|"
+            r"does not fire|isn't active|is not active)",
+            text,
+            re.IGNORECASE,
+        )
+        is not None,
+        "baked-CLAUDE.md queue-protocol section should explicitly "
+        "call out that the host's `pre-agent-queue-gate` hook is "
+        "NOT active inside the container — without that callout "
+        "the agent may assume the hook will catch missing queue "
+        "items and skip the discipline",
+    )
+
     # 5b.3. Host-OS-agnostic scheduling guidance. The host can be
     #       Linux / macOS / Windows; baked content must not hardcode
     #       any one OS's scheduler.
