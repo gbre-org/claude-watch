@@ -33,14 +33,23 @@
 #
 # Off-the-shelf pieces (no hand-rolled MCP server needed):
 #
-#   - mcp-proxy:     PyPI 'mcp-proxy', runs via `uvx`. Hosts a stdio
-#                    MCP server over HTTP. Same component validated in
-#                    v24 workbot for the mcp-adaptor bridge.
-#   - cli-mcp-server: PyPI 'cli-mcp-server', runs via `uvx`. Generic
-#                    stdio MCP server with an `run_command` tool and an
-#                    env-var-driven allow-list (ALLOWED_COMMANDS /
-#                    ALLOWED_FLAGS / ALLOWED_DIR / COMMAND_TIMEOUT /
+#   - mcp-proxy:     PyPI 'mcp-proxy'. Hosts a stdio MCP server over
+#                    HTTP. Same component validated in v24 workbot for
+#                    the mcp-adaptor bridge.
+#   - cli-mcp-server: PyPI 'cli-mcp-server'. Generic stdio MCP server
+#                    with an `run_command` tool and an env-var-driven
+#                    allow-list (ALLOWED_COMMANDS / ALLOWED_FLAGS /
+#                    ALLOWED_DIR / COMMAND_TIMEOUT /
 #                    ALLOW_SHELL_OPERATORS). MIT, last release 2025-07.
+#
+# Both packages are statically installed once via `uv tool install`
+# (see `examples/compose/bin/install-host-deps`); the launcher exec's
+# the installed binaries directly with NO per-launch network fetch.
+# Earlier versions called `uvx mcp-proxy` / `uvx cli-mcp-server` which
+# re-resolved + re-fetched from PyPI on every start — slow, fragile
+# (TLS / network blips fail the launcher), and broken under corp-CA
+# environments. Static install is operator-run once; subsequent
+# launches are offline.
 #
 # Security model
 #
@@ -132,7 +141,8 @@
 #
 # Exit codes
 #   0   normal shutdown (or --help / --print-cmd / MCP_HOST_BASH_DISABLED)
-#   1   missing uvx / unreachable PyPI / port already bound
+#   1   missing mcp-proxy / cli-mcp-server on PATH (run install-host-deps)
+#       or port already bound
 #   2   bad flag / argv parse error
 
 set -euo pipefail
@@ -344,7 +354,7 @@ ALLOW_SHELL_OPERATORS="${ALLOW_SHELL_OPERATORS:-$DEFAULT_ALLOW_SHELL_OPERATORS}"
 # -----------------------------------------------------------------------------
 
 argv=(
-    uvx mcp-proxy
+    mcp-proxy
     --port "$PORT"
     --host 0.0.0.0
     # mcp-proxy --env NAME VALUE pairs forward env into the stdio
@@ -362,7 +372,7 @@ argv=(
     --env COMMAND_TIMEOUT "$COMMAND_TIMEOUT"
     --env ALLOW_SHELL_OPERATORS "$ALLOW_SHELL_OPERATORS"
     --
-    uvx cli-mcp-server
+    cli-mcp-server
 )
 
 if [ "$PRINT_CMD" = "1" ]; then
@@ -371,17 +381,38 @@ if [ "$PRINT_CMD" = "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Pre-flight: uvx must be installed (we don't try to bootstrap uv)
+# Pre-flight: the static binaries must be installed.
+#
+# We deliberately do NOT call `uvx mcp-proxy` here — that would
+# re-fetch the package from PyPI on every launch, slow + fragile +
+# corp-CA-hostile (TLS errors at launch even with UV_NATIVE_TLS=1).
+# Run `examples/compose/bin/install-host-deps` ONCE to populate
+# ~/.local/bin/{mcp-proxy,cli-mcp-server} statically; subsequent
+# launches are entirely offline.
 # -----------------------------------------------------------------------------
 
-if ! command -v uvx >/dev/null 2>&1; then
-    cat >&2 <<'EOF'
-mcp-host-bash: cannot find `uvx` on PATH.
+missing_bins=()
+for bin in mcp-proxy cli-mcp-server; do
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        missing_bins+=("$bin")
+    fi
+done
 
-Install uv first (https://docs.astral.sh/uv/getting-started/installation/):
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+if [ "${#missing_bins[@]}" -gt 0 ]; then
+    cat >&2 <<EOF
+mcp-host-bash: cannot find required binaries on PATH: ${missing_bins[*]}
 
-`uvx` ships with `uv`; once installed, re-run this script.
+These ship as PyPI packages and must be installed once (statically).
+Run the bundled installer:
+
+  examples/compose/bin/install-host-deps
+
+That uses \`uv tool install mcp-proxy cli-mcp-server\` so the launcher
+can exec them directly with no per-launch network fetch. Re-running the
+installer is idempotent — pass \`--upgrade\` to force a refresh.
+
+If \`uv tool install\` puts shims somewhere not on your PATH, add
+\$HOME/.local/bin to PATH or run \`uv tool update-shell\`.
 EOF
     exit 1
 fi

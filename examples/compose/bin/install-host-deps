@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# install-host-deps — one-shot installer for the host-side dependencies
+# that mcp-host-bash needs at launch.
+#
+# Why this exists
+#
+# Earlier versions of mcp-host-bash invoked `uvx mcp-proxy` and `uvx
+# cli-mcp-server` directly. `uvx` resolves + (re)installs the package
+# from PyPI on every launch — slow, fragile (TLS / network blips fail
+# the launcher), and especially painful for corp-CA users whose
+# launch-time environment doesn't have the corporate trust roots wired
+# into uv (`invalid peer certificate: UnknownIssuer`).
+#
+# This script does the install ONCE, statically, into uv's tool dir
+# (`~/.local/share/uv/tools/<pkg>/`) with a shim on PATH at
+# `~/.local/bin/<pkg>`. Subsequent launches of mcp-host-bash exec the
+# installed binary with no network round-trip.
+#
+# Idempotency
+#
+# `uv tool install <pkg>` is a no-op when the requested version is
+# already installed. Re-running the script is safe and cheap. Pass
+# `--upgrade` to force a refresh (delegated to `uv tool install
+# --upgrade`).
+#
+# Corp-CA users
+#
+# Honor SSL_CERT_FILE / REQUESTS_CA_BUNDLE / UV_NATIVE_TLS during the
+# install. Operators who have those wired in their shell can run this
+# script once and never hit TLS issues again — the launcher itself
+# never touches PyPI.
+#
+# Usage
+#
+#   examples/compose/bin/install-host-deps          # install if missing
+#   examples/compose/bin/install-host-deps --upgrade  # force-refresh both
+#   examples/compose/bin/install-host-deps --help     # this help
+#
+# Exit codes
+#   0   install succeeded (or already current)
+#   1   uv missing / install failed
+#   2   bad flag
+
+set -euo pipefail
+
+PACKAGES=(mcp-proxy cli-mcp-server)
+UPGRADE=0
+
+usage() {
+    sed -n '2,/^set -euo/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^set -euo/d'
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --upgrade)
+            UPGRADE=1
+            shift
+            ;;
+        *)
+            printf 'install-host-deps: unknown argument %q\n' "$1" >&2
+            echo 'See --help for usage.' >&2
+            exit 2
+            ;;
+    esac
+done
+
+if ! command -v uv >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+install-host-deps: cannot find `uv` on PATH.
+
+Install uv first (https://docs.astral.sh/uv/getting-started/installation/):
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+
+Then re-run this script.
+EOF
+    exit 1
+fi
+
+echo "install-host-deps: installing host-side mcp dependencies via uv tool install" >&2
+echo "  packages: ${PACKAGES[*]}" >&2
+echo "  upgrade:  $([ "$UPGRADE" = "1" ] && echo yes || echo "no (idempotent)")" >&2
+if [ -n "${SSL_CERT_FILE:-}" ]; then
+    echo "  SSL_CERT_FILE:        $SSL_CERT_FILE" >&2
+fi
+if [ -n "${REQUESTS_CA_BUNDLE:-}" ]; then
+    echo "  REQUESTS_CA_BUNDLE:   $REQUESTS_CA_BUNDLE" >&2
+fi
+if [ -n "${UV_NATIVE_TLS:-}" ]; then
+    echo "  UV_NATIVE_TLS:        $UV_NATIVE_TLS" >&2
+fi
+echo >&2
+
+install_args=(tool install)
+if [ "$UPGRADE" = "1" ]; then
+    install_args+=(--upgrade)
+fi
+
+for pkg in "${PACKAGES[@]}"; do
+    echo "install-host-deps: uv ${install_args[*]} $pkg" >&2
+    uv "${install_args[@]}" "$pkg"
+done
+
+echo >&2
+echo "install-host-deps: done. Verifying binaries on PATH:" >&2
+missing=0
+for bin in mcp-proxy cli-mcp-server; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        echo "  $bin: $(command -v "$bin")" >&2
+    else
+        echo "  $bin: MISSING (expected on PATH after uv tool install)" >&2
+        missing=1
+    fi
+done
+
+if [ "$missing" = "1" ]; then
+    cat >&2 <<'EOF'
+
+install-host-deps: one or more binaries did not land on PATH.
+
+uv tool install drops shims into ~/.local/bin/. Make sure that
+directory is on your PATH:
+
+  export PATH="$HOME/.local/bin:$PATH"
+
+Then re-run this script (or `uv tool update-shell` to wire it up
+permanently).
+EOF
+    exit 1
+fi
+
+echo >&2
+echo "install-host-deps: ready. mcp-host-bash will now exec the installed binaries directly." >&2

@@ -5,14 +5,15 @@ mcp-proxy + cli-mcp-server launcher that exposes a generic
 claude to dial via CLAUDE_MCP_HTTP_BRIDGE.
 
 Exercises the script's argv construction WITHOUT actually invoking
-mcp-proxy / cli-mcp-server / uvx by using the `--print-cmd` debug hook
-(the script builds the planned exec argv and prints it one-per-line,
-then exits 0). The hook also skips the uvx-availability probe so the
+mcp-proxy / cli-mcp-server by using the `--print-cmd` debug hook (the
+script builds the planned exec argv and prints it one-per-line, then
+exits 0). The hook also skips the binary-availability probe so the
 test runs on any host with Python 3.
 
 Coverage:
-  - Default invocation: uvx mcp-proxy --port 8766 --host 0.0.0.0
-    --env <policy> -- uvx cli-mcp-server.
+  - Default invocation: mcp-proxy --port 8766 --host 0.0.0.0
+    --env <policy> -- cli-mcp-server (NO `uvx` prefix — both binaries
+    are statically installed; see install-host-deps).
   - --port override: changes the port number in argv.
   - --port=N form: equals-sign argument shape.
   - Bad --port (missing value): exits 2.
@@ -26,6 +27,10 @@ Coverage:
   - MCP_HOST_BASH_DISABLED=1: refuses to start (--print-cmd flag means
     we still build the argv for inspection — but the live-launch path
     exits 0 before reaching exec).
+  - Static install: the launcher script source must NOT contain `uvx
+    mcp-proxy` / `uvx cli-mcp-server` invocations (regression guard
+    against re-introducing dynamic per-launch fetches), and the
+    pre-flight error message must point operators at install-host-deps.
 
 Run:  ./mcp-host-bash.test
 """
@@ -106,13 +111,14 @@ def find_env_value(lines: list[str], key: str) -> str | None:
 
 
 def test_print_cmd_default_argv() -> None:
-    """Default: uvx mcp-proxy --port 8766 --host 0.0.0.0 --env ... --
-    uvx cli-mcp-server."""
+    """Default: mcp-proxy --port 8766 --host 0.0.0.0 --env ... --
+    cli-mcp-server. NO `uvx` prefix — both binaries are statically
+    installed via install-host-deps; the launcher exec's them
+    directly so each start is offline (no per-launch PyPI fetch)."""
     lines, _, _, _ = run_script(["--print-cmd"])
-    expect(lines[0] == "uvx",
-           f"default: argv[0] should be uvx, got {lines[0]!r}")
-    expect(lines[1] == "mcp-proxy",
-           f"default: argv[1] should be mcp-proxy, got {lines[1]!r}")
+    expect(lines[0] == "mcp-proxy",
+           f"default: argv[0] should be mcp-proxy (statically installed, "
+           f"NOT uvx-wrapped), got {lines[0]!r}")
     expect("--port" in lines,
            f"default: argv should include --port, got {lines}")
     port_idx = lines.index("--port")
@@ -128,10 +134,14 @@ def test_print_cmd_default_argv() -> None:
     expect("--" in lines,
            f"default: argv should include the stdio-subprocess separator '--', got {lines}")
     sep_idx = lines.index("--")
-    expect(sep_idx + 1 < len(lines) and lines[sep_idx + 1] == "uvx"
-           and lines[sep_idx + 2] == "cli-mcp-server",
-           f"default: after '--', argv should be `uvx cli-mcp-server`, "
-           f"got {lines[sep_idx+1:sep_idx+3]}")
+    expect(sep_idx + 1 < len(lines) and lines[sep_idx + 1] == "cli-mcp-server",
+           f"default: after '--', argv should be `cli-mcp-server` (statically "
+           f"installed, NOT uvx-wrapped), got {lines[sep_idx+1:sep_idx+2]}")
+    # Guard against re-introducing the uvx wrapper anywhere in the argv.
+    expect("uvx" not in lines,
+           f"default: argv must NOT contain `uvx` (would re-fetch from PyPI "
+           f"on every launch — slow, fragile, broken under corp-CA); "
+           f"got {lines}")
 
 
 def test_default_policy_conservative() -> None:
@@ -274,8 +284,9 @@ def test_separator_position() -> None:
                f"got {lines}")
     # Nothing after the separator should be a flag.
     after = lines[sep_idx + 1:]
-    expect(after == ["uvx", "cli-mcp-server"],
-           f"separator: after '--', expected ['uvx', 'cli-mcp-server'], got {after}")
+    expect(after == ["cli-mcp-server"],
+           f"separator: after '--', expected ['cli-mcp-server'] (statically "
+           f"installed, NOT uvx-wrapped), got {after}")
 
 
 # The expected default ALLOWED_COMMANDS string. Mirrors
@@ -459,6 +470,108 @@ def test_cw_profile_unknown_falls_back() -> None:
     )
 
 
+def test_launcher_source_has_no_uvx_invocations() -> None:
+    """Regression guard: the launcher script must NOT invoke `uvx
+    mcp-proxy` or `uvx cli-mcp-server` directly. Those forms re-fetch
+    the package from PyPI on every launch (slow, fragile, broken under
+    corp-CA). Both binaries are statically installed via the bundled
+    `install-host-deps`; the launcher exec's them directly."""
+    src = SCRIPT.read_text()
+    # Strip comment lines so historical references in the header
+    # documentation don't false-positive (we explain WHY uvx was
+    # removed). Only flag actual code references.
+    code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    code = "\n".join(code_lines)
+    for forbidden in ("uvx mcp-proxy", "uvx cli-mcp-server"):
+        expect(forbidden not in code,
+               f"launcher source: must not invoke {forbidden!r} (would "
+               f"re-fetch from PyPI per launch). Run install-host-deps "
+               f"once and exec the static binary instead.")
+
+
+def test_preflight_error_points_to_installer() -> None:
+    """When mcp-proxy / cli-mcp-server are missing on PATH, the
+    pre-flight error must point the operator at install-host-deps so
+    they know how to fix it. We exercise this by running the launcher
+    with a PATH that excludes both binaries (and crucially, includes
+    the standard /usr/bin so `command -v` itself still works)."""
+    # Use a deliberately-empty PATH so neither binary resolves.
+    _, _, stderr, rc = run_script(
+        [],
+        env={
+            "PATH": "/usr/bin:/bin",  # standard utilities, but no mcp-proxy
+            "HOME": "/tmp/fake-home-mcp-host-bash",
+            "MCP_HOST_BASH_CONFIG": "/dev/null",
+        },
+        expect_rc=1,
+    )
+    expect(rc == 1, f"missing binaries: rc should be 1, got {rc}")
+    expect("install-host-deps" in stderr,
+           f"missing binaries: stderr should point at install-host-deps, "
+           f"got {stderr!r}")
+    expect("mcp-proxy" in stderr,
+           f"missing binaries: stderr should mention mcp-proxy by name, "
+           f"got {stderr!r}")
+
+
+def test_install_host_deps_script_exists_and_parses() -> None:
+    """The bundled installer must exist, be executable, and parse as
+    valid bash. We don't actually run `uv tool install` (would hit
+    PyPI in CI). Instead we smoke-check the script itself: shebang,
+    bash -n parse, and that it lists both packages it's supposed to
+    install."""
+    installer = SCRIPT.parent / "install-host-deps"
+    expect(installer.exists(),
+           f"installer: install-host-deps should exist next to mcp-host-bash, "
+           f"looked at {installer}")
+    if installer.exists():
+        expect(os.access(installer, os.X_OK),
+               f"installer: install-host-deps should be executable")
+        # bash -n: parse-only, no execution.
+        result = subprocess.run(
+            ["bash", "-n", str(installer)],
+            capture_output=True, text=True, timeout=5,
+        )
+        expect(result.returncode == 0,
+               f"installer: install-host-deps must parse cleanly under "
+               f"bash -n; stderr:\n{result.stderr}")
+        body = installer.read_text()
+        # Both packages must appear in the script's package list.
+        for pkg in ("mcp-proxy", "cli-mcp-server"):
+            expect(pkg in body,
+                   f"installer: install-host-deps must reference {pkg!r}")
+        # And it must use `uv tool install` (the static-install verb).
+        expect("uv tool install" in body or "uv \"${install_args" in body
+               or "uv \"${install_args[@]}\"" in body
+               or "tool install" in body,
+               f"installer: install-host-deps must invoke `uv tool install` "
+               f"(the static-install verb)")
+        # --help must work.
+        result = subprocess.run(
+            [str(installer), "--help"],
+            capture_output=True, text=True, timeout=5,
+        )
+        expect(result.returncode == 0,
+               f"installer: --help should exit 0, got {result.returncode}; "
+               f"stderr:\n{result.stderr}")
+
+
+def test_install_host_deps_rejects_bad_flag() -> None:
+    """Installer with an unknown flag must exit 2 with a usage hint."""
+    installer = SCRIPT.parent / "install-host-deps"
+    if not installer.exists():
+        return  # covered by the existence test above
+    result = subprocess.run(
+        [str(installer), "--bogus"],
+        capture_output=True, text=True, timeout=5,
+    )
+    expect(result.returncode == 2,
+           f"installer: --bogus should exit 2, got {result.returncode}")
+    expect("unknown argument" in result.stderr,
+           f"installer: --bogus stderr should mention 'unknown argument', "
+           f"got {result.stderr!r}")
+
+
 def test_cw_profile_operator_override_wins() -> None:
     """Operator's ALLOWED_COMMANDS in config beats CW_PROFILE default."""
     with tempfile.TemporaryDirectory(prefix="mcp-host-bash-test-") as d:
@@ -503,6 +616,10 @@ tests = [
     test_cw_profile_trusted_widens,
     test_cw_profile_unknown_falls_back,
     test_cw_profile_operator_override_wins,
+    test_launcher_source_has_no_uvx_invocations,
+    test_preflight_error_points_to_installer,
+    test_install_host_deps_script_exists_and_parses,
+    test_install_host_deps_rejects_bad_flag,
 ]
 
 for t in tests:
