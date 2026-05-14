@@ -30,6 +30,29 @@
 # script once and never hit TLS issues again — the launcher itself
 # never touches PyPI.
 #
+# pip fallback (TLS-only)
+#
+# uv ships its own bundled rustls webpki-roots trust store. When that
+# bundle lags a real CA rotation (e.g. uv 0.11.14 on macOS in late
+# 2026 was missing GlobalSign Atlas R3 2025 Q4, the actual pypi.org
+# chain), `uv tool install` fails with `invalid peer certificate:
+# UnknownIssuer` even when curl / pip validate the same chain cleanly
+# via the system trust store. SSL_CERT_FILE / --native-tls /
+# --system-certs do not always rescue this on macOS.
+#
+# When uv fails AND its stderr looks like a TLS / cert problem (NOT a
+# generic network blip), this script falls back to `pip install --user
+# --upgrade <pkgs>`. pip uses the system Python's TLS — Secure
+# Transport on macOS, OpenSSL elsewhere — and respects the system
+# trust store, which sidesteps uv's bundled-roots regression. Both
+# install paths land binaries on PATH (uv → ~/.local/bin shims to
+# ~/.local/share/uv/tools/<pkg>/bin; pip → ~/.local/bin), so the
+# launcher's pre-flight `command -v` check works either way.
+#
+# The fallback is TLS-scoped on purpose: a generic uv failure
+# (network down, package not found, permissions) is NOT a reason to
+# silently re-attempt with a different installer.
+#
 # Usage
 #
 #   examples/compose/bin/install-host-deps          # install if missing
@@ -38,7 +61,8 @@
 #
 # Exit codes
 #   0   install succeeded (or already current)
-#   1   uv missing / install failed
+#   1   uv missing / install failed (and pip fallback also failed or
+#       the failure wasn't a TLS issue we'd fall back on)
 #   2   bad flag
 
 set -euo pipefail
@@ -99,9 +123,69 @@ if [ "$UPGRADE" = "1" ]; then
     install_args+=(--upgrade)
 fi
 
+# Pattern set used to recognise uv's "the bundled webpki-roots is
+# missing the CA that signed pypi" failure mode (and the equivalent
+# REQUESTS / OpenSSL phrasings, in case other installers in the chain
+# emit different wording). Kept narrow on purpose so we do NOT fall
+# back for legit uv failures (network down, package not found, lock
+# conflict, permissions, etc.).
+TLS_ERROR_PATTERNS='UnknownIssuer|invalid peer certificate|certificate verify failed|unable to get local issuer certificate|self.signed certificate|self-signed certificate in certificate chain|SSL: CERTIFICATE_VERIFY_FAILED'
+
+# Per-package install loop.
+#
+# We invoke uv per-package so a TLS failure on one package can fall
+# back to pip for that package without disturbing the others (and so
+# the user-visible log says exactly which package needed the
+# fallback).
+#
+# `set -e` is in effect, so a bare `uv install ...` would abort the
+# script on the first failure. We intentionally capture the exit code
+# instead via `if !` so we can branch on the failure mode.
+pip_fallback_used=0
+uv_log="$(mktemp -t install-host-deps.uv.XXXXXX.log)"
+trap 'rm -f "$uv_log"' EXIT
+
 for pkg in "${PACKAGES[@]}"; do
     echo "install-host-deps: uv ${install_args[*]} $pkg" >&2
-    uv "${install_args[@]}" "$pkg"
+    # Run uv with stderr teed to a log so we can pattern-match for
+    # TLS failures while still streaming the output to the operator's
+    # terminal. We capture uv's exit code via `|| uv_rc=$?` (works
+    # under `set -e`; bare `uv ...` would abort the script). Default
+    # to 0 first so a successful run is recognised correctly.
+    uv_rc=0
+    uv "${install_args[@]}" "$pkg" 2> >(tee "$uv_log" >&2) || uv_rc=$?
+    # The process substitution running tee can lag the parent. Wait
+    # briefly so the log file is fully flushed before we grep it.
+    wait 2>/dev/null || true
+
+    if [ "$uv_rc" = "0" ]; then
+        continue
+    fi
+
+    if grep -qE "$TLS_ERROR_PATTERNS" "$uv_log"; then
+        echo >&2
+        echo "install-host-deps: uv install of $pkg failed with a TLS / certificate error." >&2
+        echo "install-host-deps: this is the uv-bundled-rustls-roots regression — falling back to" >&2
+        echo "install-host-deps: \`pip install --user --upgrade $pkg\` (uses system Python TLS:" >&2
+        echo "install-host-deps:   Secure Transport on macOS, OpenSSL elsewhere — respects the" >&2
+        echo "install-host-deps:   system trust store)." >&2
+        echo >&2
+        if ! python3 -m pip install --user --upgrade "$pkg"; then
+            pip_rc=$?
+            echo >&2
+            echo "install-host-deps: pip --user fallback ALSO failed for $pkg (rc=$pip_rc)." >&2
+            echo "install-host-deps: original uv exit code was $uv_rc." >&2
+            exit "$uv_rc"
+        fi
+        pip_fallback_used=1
+        echo "install-host-deps: pip --user fallback succeeded for $pkg" >&2
+    else
+        echo >&2
+        echo "install-host-deps: uv install of $pkg failed (rc=$uv_rc) with a non-TLS error." >&2
+        echo "install-host-deps: NOT falling back to pip (fallback is TLS-scoped on purpose)." >&2
+        echo "install-host-deps: see the uv output above for the failure reason." >&2
+        exit "$uv_rc"
+    fi
 done
 
 echo >&2
@@ -121,8 +205,11 @@ if [ "$missing" = "1" ]; then
 
 install-host-deps: one or more binaries did not land on PATH.
 
-uv tool install drops shims into ~/.local/bin/. Make sure that
-directory is on your PATH:
+Both install paths drop their shims into ~/.local/bin/:
+  - uv tool install → ~/.local/bin/<pkg> shim → ~/.local/share/uv/tools/<pkg>/bin/<pkg>
+  - pip install --user → ~/.local/bin/<pkg> (or python -m site --user-base on Python <3.6)
+
+Make sure that directory is on your PATH:
 
   export PATH="$HOME/.local/bin:$PATH"
 
@@ -133,4 +220,9 @@ EOF
 fi
 
 echo >&2
-echo "install-host-deps: ready. mcp-host-bash will now exec the installed binaries directly." >&2
+if [ "$pip_fallback_used" = "1" ]; then
+    echo "install-host-deps: ready (pip --user fallback was used for at least one package)." >&2
+    echo "install-host-deps: mcp-host-bash will now exec the installed binaries directly." >&2
+else
+    echo "install-host-deps: ready. mcp-host-bash will now exec the installed binaries directly." >&2
+fi

@@ -117,3 +117,6 @@ jobs:
 
       - name: Run mcp-host-bash host-shim tests
         run: make test-mcp-host-bash
+
+      - name: Run install-host-deps shim tests
+        run: make test-install-host-deps

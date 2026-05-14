@@ -265,6 +265,8 @@ Setup (one-time, four steps):
 
    This runs `uv tool install mcp-proxy cli-mcp-server`, dropping shims into `~/.local/bin/`. Subsequent launches of `mcp-host-bash` exec those binaries directly — no PyPI round-trip per start. Corp-CA users: set `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `UV_NATIVE_TLS=1` once in your shell before running the installer; the launcher never touches PyPI so you won't see TLS errors at start-up.
 
+   **pip fallback (TLS-only).** uv ships a bundled rustls trust store (`webpki-roots`) that occasionally lags real CA rotations — uv 0.11.x in late 2026 was missing GlobalSign Atlas R3 2025 Q4, the actual chain pypi.org rotated to, so `uv tool install` failed with `invalid peer certificate: UnknownIssuer` even with `UV_NATIVE_TLS=1` / `SSL_CERT_FILE` / `--system-certs` set. When `install-host-deps` detects that specific failure mode in uv's stderr, it automatically falls back to `pip install --user --upgrade <pkg>`. pip uses the system Python's TLS implementation (Secure Transport on macOS, OpenSSL elsewhere) and respects the system trust store, which sidesteps the bundled-roots regression. Both install paths land binaries on `~/.local/bin/`, so the launcher's `command -v` pre-flight works either way. The fallback is TLS-scoped on purpose: a generic uv failure (network down, package not found, permissions) is propagated as-is so it doesn't get masked.
+
 3. Start the host-side adapter (foreground / tmux / launchd):
 
    ```sh

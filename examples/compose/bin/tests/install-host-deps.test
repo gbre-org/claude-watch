@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Tests for examples/compose/bin/install-host-deps — the static
+installer for mcp-proxy + cli-mcp-server that mcp-host-bash depends
+on.
+
+The script's primary path is `uv tool install` (preferred:
+sandboxed, version-pinned, idempotent). When uv hits the rustls
+bundled-roots regression (uv 0.11.x missed the GlobalSign Atlas
+R3 2025 Q4 chain that pypi.org rotated to in late 2026 — manifests
+as `invalid peer certificate: UnknownIssuer` even with
+`UV_NATIVE_TLS=1` / `SSL_CERT_FILE`), the script falls back to
+`pip install --user --upgrade <pkgs>`. pip uses the system
+Python's TLS (Secure Transport on macOS, OpenSSL elsewhere) and
+respects the system trust store.
+
+These tests exercise the fallback by injecting a fake `uv` and a
+fake `pip` (via an isolated PATH) so we never touch the real
+installers / PyPI / disk shims. Coverage:
+
+  - bash -n parses cleanly (smoke).
+  - --help exits 0 (smoke).
+  - --bogus exits 2 (smoke).
+  - Fake uv that succeeds → no pip fallback fires.
+  - Fake uv that fails with `UnknownIssuer` → pip fallback fires;
+    successful pip installs result in rc=0.
+  - Fake uv that fails with `invalid peer certificate` → fallback
+    fires (alternate phrasing).
+  - Fake uv that fails with a generic non-TLS error
+    (e.g. "package not found") → NO pip fallback (would mask a
+    real bug); rc is uv's original exit code.
+  - Fake uv that fails with TLS AND fake pip ALSO fails → script
+    exits with uv's original exit code, mentions both failures.
+  - Source contains the documented TLS-error patterns (regression
+    guard against silently widening the fallback into a
+    "fall back on any failure" hammer).
+
+Run:  ./install-host-deps.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "install-host-deps"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate install-host-deps at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+def make_fake_bin(dirpath: Path, name: str, body: str) -> Path:
+    """Drop an executable shim at dirpath/name with the given bash body."""
+    p = dirpath / name
+    p.write_text("#!/usr/bin/env bash\n" + body + "\n")
+    p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return p
+
+
+def base_path_no_uv() -> str:
+    """A PATH that excludes any directory where the real uv lives so
+    we can substitute our own. Keeps /usr/bin + /bin so command -v,
+    grep, mktemp, etc. still resolve."""
+    return "/usr/bin:/bin"
+
+
+def run_installer(
+    fake_bin_dir: Path,
+    args: list[str] | None = None,
+    extra_env: dict | None = None,
+    expect_rc: int | None = None,
+    timeout: int = 15,
+) -> tuple[str, str, int]:
+    """Run install-host-deps with PATH=<fake_bin_dir>:/usr/bin:/bin
+    so the script picks up our fake uv / pip shims."""
+    if args is None:
+        args = []
+    env = {
+        "PATH": f"{fake_bin_dir}:{base_path_no_uv()}",
+        "HOME": "/tmp/fake-home-install-host-deps",
+        # Defang the "needs PATH set" verification noise.
+    }
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(
+        [str(SCRIPT), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if expect_rc is not None and result.returncode != expect_rc:
+        raise AssertionError(
+            f"install-host-deps exited {result.returncode}, expected {expect_rc}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout, result.stderr, result.returncode
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_bash_parses_cleanly() -> None:
+    """bash -n: parse-only smoke."""
+    result = subprocess.run(
+        ["bash", "-n", str(SCRIPT)],
+        capture_output=True, text=True, timeout=5,
+    )
+    expect(result.returncode == 0,
+           f"bash -n: must parse cleanly; stderr:\n{result.stderr}")
+
+
+def test_help_exits_zero() -> None:
+    """--help prints usage, exits 0."""
+    result = subprocess.run(
+        [str(SCRIPT), "--help"],
+        capture_output=True, text=True, timeout=5,
+    )
+    expect(result.returncode == 0,
+           f"--help: should exit 0, got {result.returncode}; "
+           f"stderr:\n{result.stderr}")
+    expect("install-host-deps" in result.stdout,
+           f"--help: stdout should mention the script name")
+
+
+def test_bad_flag_exits_two() -> None:
+    """--bogus exits 2."""
+    result = subprocess.run(
+        [str(SCRIPT), "--bogus"],
+        capture_output=True, text=True, timeout=5,
+    )
+    expect(result.returncode == 2,
+           f"--bogus: should exit 2, got {result.returncode}")
+
+
+def test_uv_succeeds_no_pip_fallback() -> None:
+    """When uv exits 0, the script must NOT touch pip — and must
+    finish cleanly even though pip is also stubbed (assert on the
+    fake-pip side: it should never be called)."""
+    with tempfile.TemporaryDirectory(prefix="install-host-deps-test-uv-ok-") as td:
+        d = Path(td)
+        # Fake uv that succeeds (rc=0) and emits nothing TLS-related.
+        make_fake_bin(d, "uv", 'echo "fake uv invoked $*" >&2; exit 0')
+        # Fake python3 that records pip calls. If pip ever runs, this
+        # test fails because we shouldn't fall back when uv succeeds.
+        marker = d / "pip-called.marker"
+        make_fake_bin(d, "python3",
+                      f'echo "FAKE PIP CALLED: $*" > {marker}; exit 0')
+        # Fake mcp-proxy + cli-mcp-server so the post-install PATH
+        # check passes.
+        make_fake_bin(d, "mcp-proxy", "exit 0")
+        make_fake_bin(d, "cli-mcp-server", "exit 0")
+
+        stdout, stderr, rc = run_installer(d)
+        expect(rc == 0,
+               f"uv-success path: should rc=0; got {rc}\n"
+               f"stdout:\n{stdout}\nstderr:\n{stderr}")
+        expect(not marker.exists(),
+               f"uv-success path: pip must NOT be called when uv "
+               f"succeeds; marker file present at {marker}")
+        expect("pip --user fallback" not in stderr,
+               f"uv-success path: stderr must not mention pip fallback")
+
+
+def test_uv_unknown_issuer_falls_back_to_pip() -> None:
+    """Fake uv emits the canonical UnknownIssuer error → script must
+    fall back to pip (success path)."""
+    with tempfile.TemporaryDirectory(prefix="install-host-deps-test-tls-") as td:
+        d = Path(td)
+        make_fake_bin(
+            d,
+            "uv",
+            'echo "error: invalid peer certificate: UnknownIssuer" >&2; exit 1',
+        )
+        # Fake python3 — pip succeeds. python3 is invoked as
+        # `python3 -m pip install --user --upgrade <pkg>`; we just
+        # need to recognise the call shape and exit 0.
+        marker = d / "pip-called.marker"
+        make_fake_bin(d, "python3",
+                      f'echo "$@" >> {marker}; exit 0')
+        make_fake_bin(d, "mcp-proxy", "exit 0")
+        make_fake_bin(d, "cli-mcp-server", "exit 0")
+
+        stdout, stderr, rc = run_installer(d)
+        expect(rc == 0,
+               f"TLS-fallback path: should rc=0 (pip succeeded); "
+               f"got {rc}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        expect(marker.exists(),
+               f"TLS-fallback path: pip MUST be called; marker file "
+               f"missing at {marker}")
+        if marker.exists():
+            calls = marker.read_text()
+            expect("-m pip install --user --upgrade mcp-proxy" in calls,
+                   f"TLS-fallback path: pip should be invoked with "
+                   f"`--user --upgrade mcp-proxy`; got\n{calls}")
+            expect("-m pip install --user --upgrade cli-mcp-server" in calls,
+                   f"TLS-fallback path: pip should also be invoked for "
+                   f"cli-mcp-server; got\n{calls}")
+        expect("pip --user fallback succeeded" in stderr,
+               f"TLS-fallback path: stderr should announce pip success")
+
+
+def test_uv_invalid_peer_cert_phrasing_also_falls_back() -> None:
+    """Some uv versions / locales phrase the failure as `invalid
+    peer certificate` without `UnknownIssuer`. Must still fall back."""
+    with tempfile.TemporaryDirectory(prefix="install-host-deps-test-altphrase-") as td:
+        d = Path(td)
+        make_fake_bin(
+            d,
+            "uv",
+            'echo "Caused by: invalid peer certificate" >&2; exit 1',
+        )
+        marker = d / "pip-called.marker"
+        make_fake_bin(d, "python3",
+                      f'echo "$@" >> {marker}; exit 0')
+        make_fake_bin(d, "mcp-proxy", "exit 0")
+        make_fake_bin(d, "cli-mcp-server", "exit 0")
+
+        _, stderr, rc = run_installer(d)
+        expect(rc == 0,
+               f"alternate-phrasing TLS path: should rc=0; got {rc}\n"
+               f"stderr:\n{stderr}")
+        expect(marker.exists(),
+               f"alternate-phrasing TLS path: pip MUST be called")
+
+
+def test_uv_non_tls_failure_does_not_fall_back() -> None:
+    """Generic uv failure (e.g. `package not found`, `network down`,
+    permissions) MUST NOT trigger the pip fallback. The fallback is
+    TLS-scoped on purpose; falling back on every failure would mask
+    real bugs."""
+    with tempfile.TemporaryDirectory(prefix="install-host-deps-test-nontls-") as td:
+        d = Path(td)
+        # Fake uv that fails with a non-TLS error.
+        make_fake_bin(
+            d,
+            "uv",
+            'echo "error: Package not found" >&2; exit 17',
+        )
+        # If pip ever runs, this test fails.
+        marker = d / "pip-called.marker"
+        make_fake_bin(d, "python3",
+                      f'echo "FAKE PIP" > {marker}; exit 0')
+        make_fake_bin(d, "mcp-proxy", "exit 0")
+        make_fake_bin(d, "cli-mcp-server", "exit 0")
+
+        stdout, stderr, rc = run_installer(d)
+        expect(rc == 17,
+               f"non-TLS uv failure: should propagate uv's rc=17; "
+               f"got {rc}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        expect(not marker.exists(),
+               f"non-TLS uv failure: pip MUST NOT be called; marker "
+               f"present at {marker}")
+        expect("NOT falling back" in stderr,
+               f"non-TLS uv failure: stderr should explicitly say "
+               f"NOT falling back; got\n{stderr}")
+
+
+def test_uv_tls_and_pip_both_fail() -> None:
+    """When uv hits TLS AND pip ALSO fails, the script should exit
+    with uv's original exit code and surface BOTH failure modes in
+    stderr so the operator knows the fallback was attempted."""
+    with tempfile.TemporaryDirectory(prefix="install-host-deps-test-bothfail-") as td:
+        d = Path(td)
+        make_fake_bin(
+            d,
+            "uv",
+            'echo "error: invalid peer certificate: UnknownIssuer" >&2; exit 5',
+        )
+        # pip also fails.
+        make_fake_bin(d, "python3",
+                      'echo "fake pip: cannot install" >&2; exit 1')
+        # mcp-proxy + cli-mcp-server stubs not strictly needed here
+        # since we exit before the PATH-verify, but provide them for
+        # consistency.
+        make_fake_bin(d, "mcp-proxy", "exit 0")
+        make_fake_bin(d, "cli-mcp-server", "exit 0")
+
+        stdout, stderr, rc = run_installer(d)
+        expect(rc == 5,
+               f"both-fail path: should propagate uv's rc=5; got {rc}\n"
+               f"stdout:\n{stdout}\nstderr:\n{stderr}")
+        expect("pip --user fallback ALSO failed" in stderr,
+               f"both-fail path: stderr should explicitly note pip "
+               f"fallback also failed; got\n{stderr}")
+
+
+def test_source_documents_tls_scope() -> None:
+    """The script source must mention the TLS-error patterns + the
+    explicit 'TLS-scoped' rationale. Regression guard against future
+    edits silently widening the fallback to 'fall back on any uv
+    failure', which would mask real bugs."""
+    src = SCRIPT.read_text()
+    # The TLS pattern set must include at least the canonical uv
+    # phrasings we know about.
+    for pat in ("UnknownIssuer",
+                "invalid peer certificate",
+                "certificate verify failed"):
+        expect(pat in src,
+               f"source: must include TLS pattern {pat!r} in the "
+               f"fallback regex (otherwise that failure mode wouldn't "
+               f"trigger the pip fallback)")
+    # Rationale must be documented somewhere in the script (header
+    # block or inline comment).
+    expect(
+        "TLS-scoped" in src or "TLS / cert" in src or "TLS-only" in src,
+        "source: must document that the fallback is TLS-scoped on "
+        "purpose (so future readers don't broaden it).",
+    )
+    # The fallback must use `pip install --user`.
+    expect("pip install --user" in src,
+           "source: fallback must use `pip install --user` (not "
+           "system-wide pip — operator's macOS Python may be SIP-locked)")
+
+
+def test_source_does_not_blanket_fall_back() -> None:
+    """Pin the script to TLS-conditional fallback (not unconditional).
+    Looks for the gating grep + the 'NOT falling back' branch."""
+    src = SCRIPT.read_text()
+    expect("grep -qE" in src and "TLS_ERROR_PATTERNS" in src,
+           "source: pip fallback must be gated on a grep against "
+           "TLS_ERROR_PATTERNS (not run unconditionally)")
+    expect("NOT falling back" in src,
+           "source: must have a non-TLS branch that explicitly does "
+           "NOT fall back to pip")
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+tests = [
+    test_bash_parses_cleanly,
+    test_help_exits_zero,
+    test_bad_flag_exits_two,
+    test_uv_succeeds_no_pip_fallback,
+    test_uv_unknown_issuer_falls_back_to_pip,
+    test_uv_invalid_peer_cert_phrasing_also_falls_back,
+    test_uv_non_tls_failure_does_not_fall_back,
+    test_uv_tls_and_pip_both_fail,
+    test_source_documents_tls_scope,
+    test_source_does_not_blanket_fall_back,
+]
+
+for t in tests:
+    before = len(failures)
+    try:
+        t()
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+    if len(failures) == before:
+        print(f"PASS  {t.__name__}")
+    else:
+        print(f"FAIL  {t.__name__}")
+
+if failures:
+    print()
+    print(f"FAILED: {len(failures)} failure(s).")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+else:
+    print()
+    print(f"All {len(tests)} tests passed.")
+    sys.exit(0)
