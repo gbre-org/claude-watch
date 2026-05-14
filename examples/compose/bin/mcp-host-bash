@@ -80,6 +80,32 @@
 # sourced before launch — standard KEY=VALUE lines, comments with #.
 # Operator-supplied values override the defaults below.
 #
+# Bind address
+#
+#   MCP_HOST_BASH_BIND — host address mcp-proxy listens on. Default:
+#       127.0.0.1 (loopback only). Defense-in-depth floor — any caller
+#       reachable on the port can issue `run_command` against the host
+#       shell, so the safe default is "no LAN exposure, no
+#       sibling-uid exposure" unless the operator explicitly opts in.
+#       Set MCP_HOST_BASH_BIND=0.0.0.0 (or a specific interface IP) to
+#       expose beyond loopback — typical case is an in-container claude
+#       on a Linux Docker bridge network reaching the host via
+#       `host.docker.internal`. The value is passed verbatim to
+#       `mcp-proxy --host`. PAIR THIS WITH BEARER-TOKEN AUTH (see the
+#       host-bash block in examples/compose/.env.example) when opening
+#       beyond loopback — anything reachable on the port can exec
+#       binaries on the host as the operator user.
+#
+#       Linux Docker bridge net specifics: the in-container claude
+#       reaches the host's docker0 gateway (172.17.0.1 by default),
+#       which CANNOT route to host loopback. Those operators have two
+#       options: (a) set MCP_HOST_BASH_BIND=0.0.0.0 and gate access with
+#       the bearer token; (b) run the container with `--network host`
+#       so it shares the host netns and can dial 127.0.0.1:8766
+#       directly. macOS Docker Desktop's host.docker.internal NAT
+#       routes loopback by default so the safe default Just Works for
+#       the typical Mac compose stack.
+#
 # CW_PROFILE — opt-in trust profile that widens the default allow-list
 # for specific operator workflows:
 #
@@ -364,20 +390,28 @@ ALLOW_SHELL_OPERATORS="${ALLOW_SHELL_OPERATORS:-$DEFAULT_ALLOW_SHELL_OPERATORS}"
 # `--host` flags are stable; the trailing `--` + stdio-server argv tells
 # it which binary to spawn.
 #
-# `--host 0.0.0.0` is REQUIRED for the in-container claude to reach the
-# host adapter via host.docker.internal. mcp-proxy's default
-# (127.0.0.1) only accepts loopback connections, which the container's
-# bridge network can't reach. Operators concerned about exposing the
-# port to the LAN should bind via firewall (or `--host 127.0.0.1` +
-# `--network host` on the container side); host.docker.internal
-# resolution goes through Docker's NAT and `0.0.0.0` is the supported
-# shape.
+# `--host` defaults to 127.0.0.1 (loopback only) — that is the safe
+# floor. `run_command` is a privilege escalation: anything reachable on
+# the port can exec binaries on the host as the operator user, so the
+# default must NOT expose the port to the LAN / sibling Docker
+# containers / other local UIDs without explicit operator opt-in.
+#
+# To allow non-loopback callers (typical case: an in-container claude
+# on a Linux Docker bridge network reaching the host via
+# host.docker.internal), set MCP_HOST_BASH_BIND=0.0.0.0 (or any
+# interface IP) in the launcher's env. The value is passed verbatim to
+# mcp-proxy --host. PAIR WITH BEARER-TOKEN AUTH (see .env.example
+# host-bash block) when opening beyond loopback.
 # -----------------------------------------------------------------------------
+
+# Resolve the bind address. Default 127.0.0.1 (loopback) — operator must
+# explicitly set MCP_HOST_BASH_BIND to widen the listener.
+BIND_HOST="${MCP_HOST_BASH_BIND:-127.0.0.1}"
 
 argv=(
     mcp-proxy
     --port "$PORT"
-    --host 0.0.0.0
+    --host "$BIND_HOST"
     # mcp-proxy --env NAME VALUE pairs forward env into the stdio
     # subprocess. cli-mcp-server reads its allow-list from env, so
     # this is how we apply the policy.
@@ -469,6 +503,13 @@ trap cleanup TERM INT
 {
     echo "mcp-host-bash: starting"
     echo "  port:                  $PORT"
+    echo "  bind host:             $BIND_HOST${MCP_HOST_BASH_BIND:+ (MCP_HOST_BASH_BIND override)}"
+    if [ "$BIND_HOST" != "127.0.0.1" ] && [ "$BIND_HOST" != "localhost" ]; then
+        echo "  WARNING:               binding non-loopback ($BIND_HOST) exposes the host"
+        echo "                         shell-exec surface to every reachable caller. PAIR"
+        echo "                         WITH BEARER-TOKEN AUTH (see .env.example host-bash"
+        echo "                         block) before relying on this in production."
+    fi
     echo "  CW_PROFILE:            ${CW_PROFILE:-<unset; corp-dev default>}"
     if [ -n "$PROFILE_WARN" ]; then
         echo "  WARNING:               $PROFILE_WARN"
