@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""Tests for the Microsoft VS Code CLI (`code`) install in the Dockerfile.
+
+Background — the operator-side workflow for editing in-container files
+in a VS Code window relies on the standalone `code` CLI being on PATH
+inside the container. Without it, `code <file>` / `code .` /
+`code tunnel` either fail with "command not found" or require the
+operator to install the binary ad-hoc after every fresh container
+start, which is exactly the kind of soft-fail Path B
+(q-2026-05-14-ee13) was designed to eliminate.
+
+The canonical source-of-truth URL for the linux-x64 standalone CLI is
+`https://update.code.visualstudio.com/latest/cli-linux-x64/stable` —
+Microsoft's stable channel; it redirects to the current pinned tarball
+on `vscode.download.prss.microsoft.com`. The tarball contains a single
+`code` binary at the root. The documented Alpine variant at
+https://code.visualstudio.com/docs/remote/tunnels uses the parallel
+`cli-alpine-x64` URL; this is the linux-x64 equivalent.
+
+Path B trade-off — `code tunnel` authentication happens interactively
+on first invocation post-deploy (NOT at image-build time). The
+Dockerfile bakes only the BINARY; no GitHub / Microsoft credentials
+are required at build time. This test enforces that contract by
+asserting the install RUN does NOT reference `code tunnel`, `login`,
+or `--auth` in a way that would block a clean image build.
+
+This test verifies the FILE-LEVEL wiring (Dockerfile install layer +
+docs). It does NOT spin up a container or exec into one — the runtime
+assertion (`code --version` exits 0 inside the built image) is the
+embedded smoke-test the Dockerfile already runs at the end of the RUN
+block, and is also exercised on every `docker compose build` of the
+operator's image.
+
+Coverage:
+  1. Dockerfile RUN block downloads the linux-x64 tarball from the
+     canonical Microsoft URL, extracts the `code` binary into
+     /usr/local/bin/, chmod +x's it, and runs a build-time
+     `code --version` smoke-test.
+  2. The install RUN does NOT mention `code tunnel` / `login` /
+     `--auth` (Path B requires the bake to be auth-free; auth happens
+     when the OPERATOR runs `code tunnel` post-deploy).
+  3. container/README.md or examples/compose/README.md has an
+     auth-bootstrap section documenting the operator workflow,
+     including the known trade-off that the tunneled VS Code window
+     may not be the operator's currently-active window.
+
+Run:  ./code-cli-installed.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+CONTAINER_README = CONTAINER_DIR / "README.md"
+COMPOSE_README = REPO_ROOT / "examples" / "compose" / "README.md"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# 1. Dockerfile: code CLI install layer is present and shaped correctly.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    # The install must hit Microsoft's canonical stable-channel URL
+    # for the standalone linux-x64 CLI. We allow either:
+    #   https://update.code.visualstudio.com/latest/cli-linux-x64/stable
+    # or the alternate documented form on code.visualstudio.com:
+    #   https://code.visualstudio.com/sha/download?build=stable&os=cli-linux-x64
+    # so a future maintainer who picks the other documented variant
+    # doesn't trip this guard. Both URLs deliver the same tarball.
+    url_match = re.search(
+        r"https://update\.code\.visualstudio\.com/latest/cli-linux-x64/stable"
+        r"|https://code\.visualstudio\.com/sha/download\?build=stable&os=cli-linux-x64",
+        df,
+    )
+    expect(
+        url_match is not None,
+        "Dockerfile: missing a download of the VS Code CLI standalone "
+        "linux-x64 tarball from Microsoft. Expected one of:\n"
+        "  https://update.code.visualstudio.com/latest/cli-linux-x64/stable\n"
+        "  https://code.visualstudio.com/sha/download?build=stable&os=cli-linux-x64\n"
+        "in a RUN block. Without the install, `code` / `code tunnel` "
+        "are missing from PATH inside the container and the operator "
+        "has to install them ad-hoc after every fresh container start.",
+    )
+
+    # The install must land the binary at /usr/local/bin/code. We
+    # match a `tar ... -C /usr/local/bin/` extract or a final
+    # destination path of /usr/local/bin/code.
+    extract_match = re.search(
+        r"tar\s+[^\n]*-C\s+/usr/local/bin/?[^\n]*\bcode\b"
+        r"|mv\s+[^\n]+\s+/usr/local/bin/code\b"
+        r"|install\s+[^\n]+\s+/usr/local/bin/code\b",
+        df,
+    )
+    expect(
+        extract_match is not None,
+        "Dockerfile: VS Code CLI install must land the binary at "
+        "/usr/local/bin/code (tar extract -C /usr/local/bin/, or "
+        "explicit `mv ... /usr/local/bin/code`, or `install ... "
+        "/usr/local/bin/code`). Anywhere else and the binary won't "
+        "resolve on the default PATH inside the container.",
+    )
+
+    # The binary must be made executable. tar already preserves the
+    # +x bit on the upstream archive, but the spec called for an
+    # explicit `chmod +x /usr/local/bin/code` after the extract as a
+    # defence-in-depth step (matches the pattern of every other bake
+    # in the Dockerfile).
+    chmod_match = re.search(
+        r"chmod\s+\+x\s+(?:[^\n]*\s)?/usr/local/bin/code\b",
+        df,
+    )
+    expect(
+        chmod_match is not None,
+        "Dockerfile: VS Code CLI install must `chmod +x "
+        "/usr/local/bin/code` after the extract. The upstream tarball "
+        "already preserves the +x bit, but the explicit chmod matches "
+        "the defence-in-depth pattern every other bake step uses and "
+        "guards against a future refactor that switches to a fetch "
+        "format that drops execute bits.",
+    )
+
+    # Path B contract: the install must be AUTH-FREE at build time.
+    # `code tunnel` / `login` / `--auth` would either block the
+    # build on an interactive prompt or fail outright in a non-TTY
+    # context. Auth happens when the operator runs `code tunnel`
+    # interactively POST-deploy. Scope this check to the EXECUTED
+    # lines of the install RUN block (strip leading comments + only
+    # consider lines after the `RUN ` directive); operator-workflow
+    # references in the Dockerfile's comment block legitimately use
+    # `code tunnel` to document the post-deploy step.
+    if url_match:
+        url_idx = url_match.start()
+        run_start = df.rfind("RUN ", 0, url_idx)
+        # End of the RUN block: walk forward line-by-line from the
+        # RUN line and stop at the first line that does not end in
+        # `\` (the shell-continuation marker). This captures only
+        # the executable shell, not surrounding comments.
+        if run_start >= 0:
+            run_lines: list[str] = []
+            for line in df[run_start:].splitlines(keepends=False):
+                run_lines.append(line)
+                # The RUN directive itself ends the block when its
+                # OWN line doesn't end in `\` AND we've consumed at
+                # least the directive line itself.
+                if not line.rstrip().endswith("\\"):
+                    break
+            run_block_exec = "\n".join(run_lines)
+        else:
+            run_block_exec = ""
+
+        forbidden_in_install = re.search(
+            r"\bcode\s+tunnel\b|\b--auth\b|\blogin\b",
+            run_block_exec,
+        )
+        expect(
+            forbidden_in_install is None,
+            "Dockerfile VS Code CLI install RUN block: contains "
+            "`code tunnel` / `login` / `--auth` in the EXECUTED "
+            "shell. Path B requires the bake step to be auth-free — "
+            "auth happens when the OPERATOR runs `code tunnel` "
+            "interactively post-deploy. Invoking `code tunnel` at "
+            "image build time will hang on an interactive "
+            "device-code prompt in a non-TTY build context (and a "
+            "successful one would bake the operator's credentials "
+            "into the image, which is wrong on every axis). "
+            "References to `code tunnel` in the surrounding comment "
+            "block are fine and expected — this check is scoped to "
+            "the RUN ... && ... && ... continuation lines only.",
+        )
+
+    # Build-time smoke-test: the install RUN should exercise
+    # `code --version` so a broken download or wrong-arch binary
+    # fails the build instead of shipping a silently-unusable image.
+    # This mirrors the `claude-watch --help >/dev/null` smoke-test
+    # the Dockerfile already runs after the claude-watch binary
+    # copy.
+    version_smoke = re.search(
+        r"/usr/local/bin/code\s+--version\b|^\s*code\s+--version\b",
+        df,
+        re.MULTILINE,
+    )
+    expect(
+        version_smoke is not None,
+        "Dockerfile: VS Code CLI install should run a `code "
+        "--version` smoke-test inside the RUN block (e.g. `&& "
+        "/usr/local/bin/code --version >/dev/null`). `code "
+        "--version` exits 0 only if the binary loads and the CLI "
+        "parses, mirroring the `claude-watch --help` guard the "
+        "Dockerfile already runs after the claude-watch copy. "
+        "Without it, a corrupt download or wrong-arch fetch ships "
+        "to the operator and surfaces only when they try `code .` "
+        "inside a running container.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Docs: at least one README documents the auth bootstrap workflow.
+# ---------------------------------------------------------------------------
+# Path B's known trade-off — the tunneled window may not be the
+# operator's currently-active VS Code window — has to be called out
+# explicitly so a future operator picking up the container doesn't
+# burn an hour on "why does my edit open in the wrong window?".
+expect(
+    CONTAINER_README.exists() or COMPOSE_README.exists(),
+    "Neither container/README.md nor examples/compose/README.md "
+    "exists; cannot document the VS Code tunnel auth workflow.",
+)
+
+doc_has_auth_section = False
+doc_has_trade_off = False
+doc_has_code_tunnel = False
+
+for readme in (CONTAINER_README, COMPOSE_README):
+    if not readme.exists():
+        continue
+    text = readme.read_text(encoding="utf-8")
+    # Section header that names VS Code or `code tunnel`.
+    section_match = re.search(
+        r"##\s+[^\n]*(VS Code|code tunnel|code CLI)",
+        text,
+        re.IGNORECASE,
+    )
+    if section_match:
+        doc_has_auth_section = True
+    if re.search(r"code\s+tunnel\b", text):
+        doc_has_code_tunnel = True
+    # Path B trade-off: explicit acknowledgment that the tunneled
+    # window may not be the operator's currently-active VS Code
+    # window. We match on the substantive phrases the spec called
+    # out.
+    if re.search(
+        r"may not be[^\n]*currently[\s-]active|"
+        r"may not be[^\n]*current[\s-]active|"
+        r"may not be[^\n]*active VS Code window|"
+        r"first authenticat|"
+        r"separate (tunnel|VS Code) session|"
+        r"creates its own session",
+        text,
+        re.IGNORECASE,
+    ):
+        doc_has_trade_off = True
+
+expect(
+    doc_has_auth_section,
+    "VS Code auth-bootstrap section missing from both "
+    "container/README.md and examples/compose/README.md. At least one "
+    "README must have a `## ... VS Code ...` or `## ... code tunnel "
+    "...` section that walks the operator through the first-time "
+    "`code tunnel` interactive authentication. Path B's whole point "
+    "is that auth happens at first use post-deploy, not at image "
+    "build — without a doc pointer the operator hits a bare "
+    "`code tunnel` prompt with no context.",
+)
+
+expect(
+    doc_has_code_tunnel,
+    "VS Code auth-bootstrap section: must reference the `code tunnel` "
+    "command literally (the entry-point operators paste into the "
+    "in-container shell to bootstrap auth). Without the explicit "
+    "command an operator reading the section can't reproduce the "
+    "workflow.",
+)
+
+expect(
+    doc_has_trade_off,
+    "VS Code auth-bootstrap section: must explicitly acknowledge the "
+    "Path B trade-off that the tunneled VS Code window may NOT be the "
+    "operator's currently-active VS Code window. The tunnel creates "
+    "its own session, and clicks open in whichever VS Code instance "
+    "the operator first authenticated with. Match on phrases like "
+    "'may not be the currently-active', 'first authenticated', "
+    "'creates its own session', or 'separate tunnel session'. Without "
+    "this callout an operator will hit the wrong-window confusion and "
+    "have no doc pointer explaining why.",
+)
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+if failures:
+    print("FAIL code-cli-installed.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS code-cli-installed.test")
+sys.exit(0)

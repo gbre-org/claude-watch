@@ -158,6 +158,43 @@ RUN npm install -g @anthropic-ai/claude-code
 COPY --from=claude-watch-builder /build/target/release/claude-watch /usr/local/bin/claude-watch
 RUN claude-watch --help >/dev/null
 
+# VS Code CLI (`code` / `code tunnel`) — Microsoft's standalone CLI binary.
+#
+# Baked so the operator can run `code <file>` / `code .` / `code tunnel`
+# inside the in-container shell and have a working VS Code window open
+# without first installing anything host-side OR inside the container.
+#
+# Path B trade-off (chosen 2026-05-14, q-2026-05-14-ee13): we bake the
+# BINARY at image build time and the operator authenticates
+# interactively the first time they run `code tunnel` post-deploy. The
+# tunnel may not be the operator's currently-active VS Code window —
+# `code tunnel` creates its own session and clicks open in whichever VS
+# Code instance the operator first authenticated with. Path A
+# (`devcontainer.json` reattach) was rejected because it'd break the
+# current cw / ttyd / `docker compose exec` model. See
+# container/README.md "VS Code CLI" + examples/compose/README.md
+# "VS Code tunnel auth bootstrap" for the full operator workflow.
+#
+# Source-of-truth URL: `https://update.code.visualstudio.com/latest/cli-linux-x64/stable`
+# redirects to the current pinned `vscode_cli_linux_x64_cli.tar.gz`
+# build on `vscode.download.prss.microsoft.com`. The tarball contains a
+# single `code` binary at the root. Verified 2026-05-14: code 1.120.0
+# (commit 0958016b...) tarball ~11MB, extracted binary ~30MB. The
+# documented Alpine pattern at https://code.visualstudio.com/docs/remote/tunnels
+# uses the parallel `cli-alpine-x64` URL — this is the linux-x64
+# equivalent.
+#
+# `code --version` at the end is a smoke-test guard: it exits 0 only if
+# the binary loads + the clap CLI parses, mirroring the claude-watch
+# `--help` guard above. No runtime auth is required for `--version` —
+# auth only happens when the operator runs `code tunnel` interactively
+# post-deploy.
+RUN curl -fsSL "https://update.code.visualstudio.com/latest/cli-linux-x64/stable" -o /tmp/vscode_cli.tar.gz \
+    && tar -xzf /tmp/vscode_cli.tar.gz -C /usr/local/bin/ code \
+    && chmod +x /usr/local/bin/code \
+    && rm -f /tmp/vscode_cli.tar.gz \
+    && /usr/local/bin/code --version >/dev/null
+
 # Container-tailored claude-watch config — pins the daemon to the in-container
 # tmux session `claude-container:0.0` (the claude pane created by
 # entrypoint.sh), points all writes at uid-1000-writable paths (/tmp/, ~/.cache),
