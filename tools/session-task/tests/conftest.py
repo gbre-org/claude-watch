@@ -31,7 +31,21 @@ If a future test starts shelling out to a process that calls real
 ``claude-event`` against the real ``$HOME``, that test should set the
 suppression itself (via the same ``env[...] = "0"`` pattern), not push
 the burden up here.
+
+Why ``CLAUDE_AGENTS_STATE_FALLBACK_BIN`` is suppressed here:
+
+* When ``CLAUDE_AGENTS_STATE`` points at a missing / empty tmp file
+  (the normal test setup), session-task's _load_active_agents_state
+  falls back to invoking ``claude-watch active-agents --json`` off
+  PATH. On a developer machine ``claude-watch`` IS on PATH, so the
+  fallback returns the live host's agent map — silently overriding
+  the test's curated empty state and breaking "no agent record"
+  assertions.
+* Tests that WANT to exercise the fallback path (``test_queue_archive``'s
+  fallback-specific tests) explicitly install a shim on PATH and
+  override the env back to ``"claude-watch"``.
 """
 import os
 
 os.environ.setdefault("PINGME_SESSION_TASK", "0")
+os.environ.setdefault("CLAUDE_AGENTS_STATE_FALLBACK_BIN", "")

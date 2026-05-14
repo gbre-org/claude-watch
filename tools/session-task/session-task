@@ -179,6 +179,22 @@ CLAUDE_AGENTS_STATE = Path(
     )
 )
 
+# Fallback: when CLAUDE_AGENTS_STATE is missing / unreadable / empty AND the
+# `claude-watch` binary is on PATH, invoke `claude-watch active-agents --json`
+# inline to produce the same shape. The state-file path is just a perf
+# optimization (a cron writes it every minute on canonical homelab deploys)
+# so the JSONL FS walk doesn't repeat on every read; the binary fallback is
+# the bootstrap / container deploy path where the cron doesn't exist.
+#
+# Empty string ("") or "0" disables the fallback entirely (skip archive in
+# that case, matching the historical behavior). Default is the bare command
+# name so the binary is resolved off PATH. Tests override to a shim that
+# can return a deterministic JSON blob.
+CLAUDE_AGENTS_STATE_FALLBACK_BIN = os.environ.get(
+    "CLAUDE_AGENTS_STATE_FALLBACK_BIN",
+    "claude-watch",
+)
+
 # Root of `~/.claude/projects/<host-token>/` (per-session subagent transcript
 # trees). The archive-on-done helper walks `<root>/<session-uuid>/subagents/
 # agent-<id>.jsonl`. Container deploys override.
@@ -1413,19 +1429,94 @@ def _elapsed_seconds(started_at_iso):
     return max(0, int(delta.total_seconds()))
 
 
-def _agent_id_for_queue(queue_id):
-    """Look up the spawned agent_id for a queue item via claude-watch state.
+def _load_active_agents_state():
+    """Load the active-agents JSON via state-file with binary-fallback.
 
-    Returns the agent_id string, or None if the state file is missing /
-    unreadable / has no record for ``queue_id``. Mirrors the dedup rule
-    in ``claude_agents.agents_by_queue_id`` (live > stale, smaller jsonl
-    age wins) but inlined here so this script stays stdlib-only.
+    Returns a parsed dict ({"agents": [...]}) or None when both paths
+    fail. Two layers:
+
+      1. ``CLAUDE_AGENTS_STATE`` — atomic file maintained by a cron that
+         runs ``claude-watch active-agents --json --write-state``. Read
+         first because it's cheap (one open + json.load) and always
+         current within ~60s on canonical homelab deploys.
+
+      2. Binary fallback (``CLAUDE_AGENTS_STATE_FALLBACK_BIN``) — when
+         the state file is missing / unreadable / empty AND the
+         ``claude-watch`` binary is on PATH, shell out to
+         ``claude-watch active-agents --json`` and parse the result.
+         This is the bootstrap / container-deploy path where no cron
+         exists. Idempotent: walks the JSONL trees in
+         ``~/.claude/projects/<host>/<session>/subagents/`` and prints
+         the same JSON shape the cron would publish.
+
+    The fallback is opt-out: set ``CLAUDE_AGENTS_STATE_FALLBACK_BIN=""``
+    (or ``"0"``) to disable, which matches the pre-fallback behavior
+    (skip archive when the state file is missing).
+
+    Failures inside the fallback are non-fatal — a missing binary,
+    non-zero exit, or invalid JSON yields None so callers degrade to
+    the historical "no agent record" stderr warning and skip the
+    archive.
     """
+    state = None
     try:
         with open(CLAUDE_AGENTS_STATE, "r") as f:
             state = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return None
+        state = None
+    if isinstance(state, dict) and state.get("agents"):
+        return state
+
+    # State file missing / empty / unreadable — try the binary fallback.
+    fallback_bin = CLAUDE_AGENTS_STATE_FALLBACK_BIN
+    if not fallback_bin or fallback_bin in ("0", "false", "False"):
+        return state if isinstance(state, dict) else None
+
+    # Resolve once. shutil.which() avoids a misleading FileNotFoundError
+    # traceback for the common "no claude-watch on PATH" case.
+    resolved = shutil.which(fallback_bin)
+    if resolved is None:
+        return state if isinstance(state, dict) else None
+
+    try:
+        # 10s cap — the FS walk is typically <500ms even on busy hosts.
+        # capture both streams so a verbose stderr from the binary
+        # doesn't bleed into our own stderr (callers print their own
+        # diagnostic).
+        r = subprocess.run(
+            [resolved, "active-agents", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return state if isinstance(state, dict) else None
+    if r.returncode != 0:
+        return state if isinstance(state, dict) else None
+
+    try:
+        live = json.loads(r.stdout)
+    except (ValueError, TypeError):
+        return state if isinstance(state, dict) else None
+    if not isinstance(live, dict):
+        return state if isinstance(state, dict) else None
+    return live
+
+
+def _agent_id_for_queue(queue_id):
+    """Look up the spawned agent_id for a queue item via claude-watch state.
+
+    Returns the agent_id string, or None if no record is locatable for
+    ``queue_id``. Uses ``_load_active_agents_state`` (state-file with
+    binary fallback) so container deploys without the cron-written
+    state file still get a current agent map by invoking
+    ``claude-watch active-agents --json`` inline.
+
+    Dedup rule when the same queue_id appears on multiple records
+    mirrors ``claude_agents.agents_by_queue_id``: live > stale; among
+    same liveness, smaller jsonl_age_seconds wins.
+    """
+    state = _load_active_agents_state()
     if not isinstance(state, dict):
         return None
     best = None

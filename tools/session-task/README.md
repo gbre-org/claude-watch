@@ -69,6 +69,36 @@ cd tools/session-task
 uv run --python 3.11 --with pytest pytest tests/ -v
 ```
 
-The 5 failing tests in `test_queue_claude_event.py` are pre-existing — the
-`queue-added` event was retired in 2026-04-27 ("too noisy") but those test
-expectations were never updated. All other 47 tests pass.
+165 cases, ~36s. All tests are self-contained — each runs against a
+tempdir `$HOME` so the live `~/.config/session/queue.json` is never
+touched. CI runs the same suite via `make test-session-task`.
+
+### Archive-on-done behavior
+
+`session-task queue done <id>` / `queue abandon <id>` copy the
+spawning subagent's JSONL transcript (or workload `.output` file, for
+workload-bound items) into `~/.config/session/queue-logs/<id>.jsonl`
+and stamp `log_archive_path` on the item. The queue-minisite UI
+surfaces a "View log" affordance on historical entries via that field.
+
+The lookup chain for the spawning agent is:
+
+1. **State file** — `$CLAUDE_AGENTS_STATE` (default
+   `/var/lib/claude-watch/active-agents.json`). Maintained by a cron
+   that runs `claude-watch active-agents --json --write-state` every
+   minute on canonical homelab deploys. Cheap (one open + json.load)
+   and current within ~60s.
+
+2. **Binary fallback** — when the state file is missing / unreadable
+   / empty AND `$CLAUDE_AGENTS_STATE_FALLBACK_BIN` resolves on PATH
+   (default `claude-watch`), shell out to `<bin> active-agents
+   --json` and parse the result inline. This is the container-deploy
+   path where no cron exists — the in-container claude-watch binary
+   walks the bind-mounted `~/.claude/projects/` tree on demand.
+
+Both paths are best-effort: failures (missing binary, malformed JSON,
+non-zero exit, subprocess timeout) yield a `[archive] no agent
+record` stderr warning and skip the archive step. The lifecycle
+transition (done / abandon) always completes regardless.
+
+Set `CLAUDE_AGENTS_STATE_FALLBACK_BIN=""` to disable the fallback.

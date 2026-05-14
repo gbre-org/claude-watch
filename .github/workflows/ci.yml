@@ -126,3 +126,11 @@ jobs:
 
       - name: Run launchd plist tests
         run: make test-launchd-plist
+
+      - name: Install uv (for session-task tests)
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Run session-task Python tests
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          make test-session-task
