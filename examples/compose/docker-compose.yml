@@ -158,6 +158,10 @@ services:
       # project-memory key to the host path; the resume picks up the
       # conversation tied to that cwd. Default unset = bare claude.
       CLAUDE_AUTO_CONTINUE: ${CLAUDE_AUTO_CONTINUE:-}
+      # Skip all permission prompts. Set to "1" in .env for sandboxed
+      # containers with no internet risk. The entrypoint appends
+      # --dangerously-skip-permissions to the claude argv when set.
+      CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS: ${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in

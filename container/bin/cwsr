@@ -143,6 +143,9 @@ build_claude_cmd() {
     if [ -d "$plugin_dir/.claude-plugin" ]; then
         cmd="$cmd --plugin-dir $plugin_dir"
     fi
+    if [ "${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}" = "1" ]; then
+        cmd="$cmd --dangerously-skip-permissions"
+    fi
     if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
         local q="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
         cmd="$cmd --continue $q"
