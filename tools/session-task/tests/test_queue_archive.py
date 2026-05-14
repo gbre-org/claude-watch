@@ -319,3 +319,246 @@ def test_archive_dir_env_override():
         _run(env, "queue", "register", qid)
         _run(env, "queue", "done", qid)
         assert (custom / f"{qid}.jsonl").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Binary fallback when state file is missing (container deploys)
+# ---------------------------------------------------------------------------
+#
+# When CLAUDE_AGENTS_STATE doesn't exist (typical inside the claude-container
+# where no cron writes the state file), session-task falls back to invoking
+# the `claude-watch` binary inline to produce the same JSON shape. These
+# tests install a shell-script shim on PATH so the fallback is exercised
+# deterministically without depending on a real claude-watch install.
+
+
+def _install_fallback_shim(tmp, payload):
+    """Write a shell-script shim that prints `payload` as JSON on `active-agents`.
+
+    Returns the directory the shim lives in (caller prepends it to PATH).
+    The shim mirrors `claude-watch active-agents --json`: prints the JSON
+    to stdout, exit 0. Any other subcommand exits 99 so a misuse fails
+    loudly in test output.
+    """
+    bin_dir = Path(tmp) / "shim-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "claude-watch"
+    payload_json = json.dumps(payload)
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "active-agents" ]; then\n'
+        f"  cat <<'EOF'\n{payload_json}\nEOF\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 99\n"
+    )
+    shim.chmod(0o755)
+    return bin_dir
+
+
+def test_done_falls_back_to_binary_when_state_file_missing():
+    """No CLAUDE_AGENTS_STATE file: session-task shells out to claude-watch.
+
+    Verifies the container-deploy regression that motivated this fallback:
+    /var/lib/claude-watch/active-agents.json doesn't exist inside the
+    container, but `claude-watch active-agents --json` resolves the
+    agent map by walking the bind-mounted ~/.claude/projects tree.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        item = _add(env, "fallback smoke", ["repo:fb"], "--summary", "fb")
+        qid = item["id"]
+        agent_id = "afallbackbin01234"
+
+        # JSONL transcript exists so the helper has something to copy.
+        src = _stamp_jsonl(
+            env,
+            agent_id,
+            [json.dumps({"type": "user", "message": {"role": "user", "content": "fb"}})],
+        )
+
+        # CLAUDE_AGENTS_STATE file DOES NOT EXIST (we never call
+        # _stamp_agent_state). The shim returns the agent map inline.
+        shim_dir = _install_fallback_shim(
+            tmp,
+            {
+                "subagents": [],
+                "workloads": [],
+                "agents": [
+                    {
+                        "agent_id": agent_id,
+                        "queue_id": qid,
+                        "alive": True,
+                        "jsonl_age_seconds": 1,
+                    }
+                ],
+            },
+        )
+
+        # Re-enable the fallback (suppressed in conftest) and point it at
+        # the shim by name — _load_active_agents_state resolves it via
+        # shutil.which() against the override PATH.
+        env["CLAUDE_AGENTS_STATE_FALLBACK_BIN"] = "claude-watch"
+        env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"
+
+        _run(env, "queue", "register", qid)
+        _run(env, "queue", "done", qid)
+
+        shown = _show(env, qid)
+        assert shown.get("log_archive_path") == f"{qid}.jsonl", (
+            f"expected archive stamp, got: {shown}"
+        )
+        archive = Path(env["QUEUE_LOG_ARCHIVE_DIR"]) / shown["log_archive_path"]
+        assert archive.is_file()
+        assert archive.read_bytes() == src.read_bytes()
+
+
+def test_fallback_disabled_by_empty_env():
+    """CLAUDE_AGENTS_STATE_FALLBACK_BIN="" disables the fallback entirely.
+
+    The conftest sets this to "" by default precisely so unit tests
+    don't accidentally pick up a real claude-watch on the developer's
+    host. This test asserts the suppression actually works — even with
+    a shim wired onto PATH, the empty env var skips the subprocess
+    invocation.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        item = _add(env, "fallback off", ["repo:fboff"], "--summary", "fboff")
+        qid = item["id"]
+        agent_id = "afallbackoff01234"
+        _stamp_jsonl(
+            env,
+            agent_id,
+            [json.dumps({"type": "user", "message": {"role": "user", "content": "x"}})],
+        )
+
+        shim_dir = _install_fallback_shim(
+            tmp,
+            {
+                "subagents": [],
+                "workloads": [],
+                "agents": [
+                    {
+                        "agent_id": agent_id,
+                        "queue_id": qid,
+                        "alive": True,
+                        "jsonl_age_seconds": 1,
+                    }
+                ],
+            },
+        )
+        # Shim is on PATH but fallback is disabled.
+        env["CLAUDE_AGENTS_STATE_FALLBACK_BIN"] = ""
+        env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"
+
+        _run(env, "queue", "register", qid)
+        r = _run(env, "queue", "done", qid)
+
+        assert "no agent record" in r.stderr, (
+            f"expected suppression to skip archive, got stderr: {r.stderr!r}"
+        )
+        shown = _show(env, qid)
+        assert "log_archive_path" not in shown
+
+
+def test_fallback_skipped_when_binary_missing_from_path():
+    """Fallback set to a non-existent binary: graceful no-op, no crash."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        item = _add(env, "no binary", ["repo:nobin"], "--summary", "nb")
+        qid = item["id"]
+        env["CLAUDE_AGENTS_STATE_FALLBACK_BIN"] = "this-binary-does-not-exist-anywhere"
+        _run(env, "queue", "register", qid)
+        r = _run(env, "queue", "done", qid)
+        assert "no agent record" in r.stderr
+        shown = _show(env, qid)
+        assert "log_archive_path" not in shown
+
+
+def test_state_file_wins_over_fallback_when_both_present():
+    """CLAUDE_AGENTS_STATE file with valid records short-circuits the binary call.
+
+    The cron-driven state file is the fast path; the binary fallback is
+    only invoked when the file is missing / empty / unreadable.
+    Verifies that with both present, the state file's agent_id wins —
+    proving we don't pay the subprocess cost on every done.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        item = _add(env, "both present", ["repo:both"], "--summary", "bp")
+        qid = item["id"]
+
+        # Two distinct agent ids — the state file points at the "winner"
+        # while the shim claims a different "loser" id. We assert the
+        # winner's transcript ends up archived, proving the binary was
+        # not consulted.
+        winner = "awinnerstate0000a"
+        loser = "aloserbinary0000a"
+        _stamp_agent_state(env, qid, winner)
+        winner_src = _stamp_jsonl(
+            env,
+            winner,
+            [json.dumps({"type": "user", "message": {"role": "user", "content": "win"}})],
+        )
+        _stamp_jsonl(
+            env,
+            loser,
+            [json.dumps({"type": "user", "message": {"role": "user", "content": "lose"}})],
+        )
+        shim_dir = _install_fallback_shim(
+            tmp,
+            {
+                "subagents": [],
+                "workloads": [],
+                "agents": [
+                    {
+                        "agent_id": loser,
+                        "queue_id": qid,
+                        "alive": True,
+                        "jsonl_age_seconds": 1,
+                    }
+                ],
+            },
+        )
+        env["CLAUDE_AGENTS_STATE_FALLBACK_BIN"] = "claude-watch"
+        env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"
+
+        _run(env, "queue", "register", qid)
+        _run(env, "queue", "done", qid)
+
+        shown = _show(env, qid)
+        archive = Path(env["QUEUE_LOG_ARCHIVE_DIR"]) / shown["log_archive_path"]
+        assert archive.read_bytes() == winner_src.read_bytes(), (
+            "state file should have won over the binary fallback"
+        )
+
+
+def test_fallback_handles_invalid_json_from_binary():
+    """Binary fallback returns garbage: graceful skip, no crash."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        item = _add(env, "bad json", ["repo:bj"], "--summary", "bj")
+        qid = item["id"]
+
+        bin_dir = Path(tmp) / "shim-bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        shim = bin_dir / "claude-watch"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            'echo "not json at all"\n'
+            "exit 0\n"
+        )
+        shim.chmod(0o755)
+
+        env["CLAUDE_AGENTS_STATE_FALLBACK_BIN"] = "claude-watch"
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+
+        _run(env, "queue", "register", qid)
+        r = _run(env, "queue", "done", qid)
+        assert "no agent record" in r.stderr
+        shown = _show(env, qid)
+        assert "log_archive_path" not in shown

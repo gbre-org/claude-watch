@@ -31,8 +31,8 @@ test-live:
 		cargo test -- --ignored
 
 # Run the session-task Python tests (cross-session queue CLI under tools/).
-# Pre-existing 5 failures in test_queue_claude_event.py are tracked in
-# tools/session-task/README.md and are unrelated to this migration.
+# Self-contained: each test runs against a tempdir HOME so the live
+# ~/.config/session/queue.json is never touched. ~36s, 165 cases.
 test-session-task:
 	uv run --python 3.11 --with pytest pytest tools/session-task/tests/ -v
 
