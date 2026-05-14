@@ -1,0 +1,99 @@
+# docker-compose.override.yml.example — operator-specific bind-mount template
+#
+# Copy this file to `docker-compose.override.yml` (sibling, gitignored) and
+# uncomment the mounts that apply to your host. Docker Compose
+# automatically merges any `docker-compose.override.yml` into the main
+# `docker-compose.yml` at `up` time — no extra `-f` flag needed.
+#
+# Why an override file (and not the main compose):
+#
+#   - Personal bind-mounts (gh token, gitconfig, ssh-agent socket, the
+#     paths to your work bare-repo directories, etc.) are operator-
+#     specific. Hardcoding them in the public `docker-compose.yml`
+#     bakes one operator's host layout into the public artifact, which
+#     is wrong for a shared/templated stack and leaks personal paths.
+#   - Operators on a Linux host need different paths than Docker
+#     Desktop / macOS operators (e.g. `$SSH_AUTH_SOCK` is at
+#     `/run/user/<uid>/keyring/ssh`, not the Docker Desktop magic path).
+#     A template-with-comments accommodates both shapes without forcing
+#     a least-common-denominator default into the canonical compose.
+#   - The override file pattern is also re-runnable: the in-container
+#     `/claude-container:edit-host-mounts` skill probes your host via
+#     `host-bash` and writes / updates this file for you, so you can
+#     iterate (add a new path, remove an obsolete one) without manually
+#     editing YAML.
+#
+# After editing this file (or running the skill), apply changes with:
+#
+#   cd examples/compose
+#   docker compose up -d --force-recreate claude-container
+#
+# `--force-recreate` is required because docker doesn't pick up
+# bind-mount changes on a plain `up -d`; it has to recreate the
+# container to apply the new mount set.
+
+services:
+  claude-container:
+    # ----------------------------------------------------------------
+    # GitHub auth surface — gh CLI token, git identity, ssh-agent.
+    # Uncomment the three mounts below to wire `gh` and `git` end-to-
+    # end inside the container. The `SSH_AUTH_SOCK` env var goes hand
+    # in hand with the ssh socket bind-mount; both are required for
+    # `ssh git@github.com` / `git push git@...` to work.
+    # ----------------------------------------------------------------
+    # environment:
+    #   # In-container ssh / git clients dial this socket. The path is
+    #   # the Docker Desktop magic socket; on Linux hosts, set it to
+    #   # the same in-container path you use as the destination of the
+    #   # ssh-agent bind-mount below (Docker Desktop's magic path
+    #   # works as a stable in-container destination regardless of
+    #   # what the host source is).
+    #   SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
+    volumes:
+      # gh CLI token storage. RW so an in-container `gh auth login`
+      # (token refresh, scope upgrade) propagates back to the host.
+      # - "${HOME}/.config/gh:/home/hndrewaall/.config/gh:rw"
+
+      # git user.name / user.email / credential.helper. RO because the
+      # host gitconfig is the source of truth for identity. If your
+      # host gitconfig is itself a symlink into a tracked dotfiles
+      # repo, Docker follows the symlink at mount time — make sure the
+      # symlink target is also reachable inside the container (e.g.
+      # via the `~/repos` mount in the main compose).
+      # - "${HOME}/.gitconfig:/home/hndrewaall/.gitconfig:ro"
+
+      # Host ssh-agent socket forwarded into the container. NO private
+      # keys are bind-mounted; the host agent does the signing on the
+      # host side and the container only sees the public-key
+      # handshake.
+      #
+      # macOS / Windows (Docker Desktop): use the magic path
+      # `/run/host-services/ssh-auth.sock` on the LEFT side too —
+      # Docker Desktop wires it to the host agent automatically.
+      # Linux: replace the LEFT side with your host's actual
+      # `$SSH_AUTH_SOCK` (typically `/run/user/<uid>/keyring/ssh` or a
+      # gpg-agent socket). Find it on the host with `echo
+      # $SSH_AUTH_SOCK`.
+      # - "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock"
+
+      # ----------------------------------------------------------------
+      # Work-private bare-repo paths — operator-specific source paths
+      # for projects that aren't in `~/repos/` (e.g. work repos under
+      # a corp Google Drive sync path, projects on an external SSD,
+      # etc.). Mount each at a sensible in-container path so the
+      # in-container claude can clone / edit them. The
+      # `/edit-host-mounts` skill probes for common Google Drive bare-
+      # repo paths and proposes mounts here.
+      # ----------------------------------------------------------------
+      # - "${HOME}/Library/CloudStorage/GoogleDrive-<you>/My Drive/work-repos:/home/hndrewaall/work-repos:rw"
+      # - "/Volumes/SSD/projects:/home/hndrewaall/projects:rw"
+
+      # ----------------------------------------------------------------
+      # ssh config + known_hosts — read-only. Useful if you have host
+      # entries (Host aliases, ProxyJump rules, IdentitiesOnly, etc.)
+      # that the in-container ssh client needs to honor. The agent-
+      # forwarded socket above signs key material, but ssh still needs
+      # config to know which Host stanza applies.
+      # ----------------------------------------------------------------
+      # - "${HOME}/.ssh/config:/home/hndrewaall/.ssh/config:ro"
+      # - "${HOME}/.ssh/known_hosts:/home/hndrewaall/.ssh/known_hosts:ro"

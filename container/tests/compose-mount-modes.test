@@ -36,10 +36,15 @@ Coverage:
      mutate it).
  10. claude-container's host-hooks dir mount is RO (operator's hook
      scripts; container has no reason to mutate them).
- 11. queue-minisite's `:ro` mounts stay RO (canonical session-task
+ 11. PUBLIC compose stays personal-paths-FREE: no `~/.config/gh`,
+     `~/.gitconfig`, or ssh-agent socket bind-mounts in the
+     committed `docker-compose.yml`. Those live in the gitignored
+     `docker-compose.override.yml` — see
+     `compose-override-template.test` for the template-side checks.
+ 12. queue-minisite's `:ro` mounts stay RO (canonical session-task
      script + JSONL transcripts the SSE log endpoint tails are
      read-only by design).
- 12. eichi-search's `:ro` mounts stay RO (eichi container reads
+ 13. eichi-search's `:ro` mounts stay RO (eichi container reads
      index + config + HF model cache; never writes).
 
 The test parses the compose file with a regex-based volume-string
@@ -415,6 +420,66 @@ expect(
     "claude-container has a long-form `read_only: true` mount entry — "
     "audit it; the operator-as-daily-driver shape demands RW for any "
     "host state path the operator routinely writes",
+)
+
+# 11. PUBLIC compose stays personal-paths-FREE. The personal mount
+#     surface (gh CLI token, gitconfig, ssh-agent socket) belongs in
+#     the gitignored docker-compose.override.yml, NOT the public
+#     docker-compose.yml. Personal paths in the public file would
+#     leak operator-specific shape into the public artifact, and the
+#     defaults can't be one-size-fits-all anyway (Docker Desktop's
+#     magic ssh-agent socket vs Linux $SSH_AUTH_SOCK, /Users/x vs
+#     /home/x, etc.).
+forbidden_personal_dests = [
+    "/home/hndrewaall/.config/gh",
+    "/home/hndrewaall/.gitconfig",
+    "/home/hndrewaall/.ssh",
+    "/run/host-services/ssh-auth.sock",
+]
+for dest in forbidden_personal_dests:
+    m = find_by_dest(claude_volumes, dest)
+    expect(
+        m is None,
+        f"public docker-compose.yml claude-container has a {dest!r} "
+        f"bind-mount — that belongs in the gitignored "
+        f"docker-compose.override.yml, NOT the public file. Personal "
+        f"paths leak operator-specific shape into the public artifact "
+        f"and the defaults can't be one-size-fits-all "
+        f"(Docker Desktop's magic ssh socket vs Linux \\$SSH_AUTH_SOCK, "
+        f"/Users vs /home, etc.). See "
+        f"docker-compose.override.yml.example for the canonical "
+        f"template.",
+    )
+
+# 11b. The public compose's claude-container env block must NOT carry
+#      personal env vars either (notably SSH_AUTH_SOCK — only meaningful
+#      paired with the personal ssh-agent bind-mount).
+def parse_environment(service_block: str) -> dict[str, str]:
+    m = re.search(r"^    environment:\s*$", service_block, re.MULTILINE)
+    if not m:
+        return {}
+    after = service_block[m.end():]
+    next_key = re.search(r"^    [a-z][a-z0-9_-]*:\s*$", after, re.MULTILINE)
+    block = after[:next_key.start()] if next_key else after
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        line_match = re.match(
+            r"^      ([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$",
+            line,
+        )
+        if line_match:
+            key, val = line_match.group(1), line_match.group(2)
+            out[key] = val
+    return out
+
+
+claude_env = parse_environment(service_blocks.get("claude-container", ""))
+expect(
+    "SSH_AUTH_SOCK" not in claude_env,
+    "public docker-compose.yml claude-container `environment:` "
+    "declares `SSH_AUTH_SOCK` — that belongs in the gitignored "
+    "docker-compose.override.yml (paired with the ssh-agent socket "
+    "bind-mount). The public compose stays personal-env-FREE.",
 )
 
 # --- Assertions: queue-minisite (intentionally-RO mounts stay RO) ------

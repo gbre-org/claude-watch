@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Tests for the operator-specific bind-mount override pattern.
+
+The committed `docker-compose.override.yml.example` is the canonical
+template; each operator copies it to `docker-compose.override.yml`
+(gitignored) and uncomments the mounts that apply to their host. The
+in-container `/claude-container:edit-host-mounts` skill automates the
+copy + maintenance loop.
+
+This test asserts the template + gitignore + skill all stay in sync:
+
+  1. examples/compose/docker-compose.override.yml.example exists, is
+     non-empty, and explicitly under `services: claude-container:` (so
+     compose's auto-merge actually attaches the overrides to the right
+     service).
+  2. The template documents the three GitHub auth mount candidates
+     (gh CLI token, gitconfig, ssh-agent socket) AND the SSH_AUTH_SOCK
+     env var pairing — but as COMMENTED-OUT lines (so a copy of the
+     template into `docker-compose.override.yml` doesn't immediately
+     try to mount paths the operator may not have).
+  3. The template explicitly mentions the no-private-keys design
+     (ssh-agent forwarding, NOT bind-mounting `~/.ssh/id_*`).
+  4. The template reminds the operator to
+     `docker compose up -d --force-recreate claude-container` after
+     editing.
+  5. .gitignore at the repo root excludes
+     `examples/compose/docker-compose.override.yml` (the actual
+     override, NOT the .example template).
+  6. container/skills/edit-host-mounts.md exists, references
+     `host-bash`, the override file by name, and the `--force-recreate`
+     follow-up.
+
+Run:  ./compose-override-template.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent.parent
+
+TEMPLATE = REPO_ROOT / "examples" / "compose" / "docker-compose.override.yml.example"
+GITIGNORE = REPO_ROOT / ".gitignore"
+SKILL = REPO_ROOT / "container" / "skills" / "edit-host-mounts.md"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. Template exists + scoped under claude-container.
+expect(TEMPLATE.is_file(), f"override template missing at {TEMPLATE}")
+if TEMPLATE.is_file():
+    text = TEMPLATE.read_text(encoding="utf-8")
+    expect(
+        len(text) > 500,
+        f"override template suspiciously short (<500 chars): {len(text)}",
+    )
+    expect(
+        re.search(r"^services:\s*$", text, re.MULTILINE) is not None,
+        "override template missing top-level `services:` key — "
+        "compose can't auto-merge without it",
+    )
+    expect(
+        re.search(r"^  claude-container:\s*$", text, re.MULTILINE) is not None,
+        "override template missing `services: claude-container:` "
+        "block — operator-specific mounts attach to that service",
+    )
+
+    # 2. Three GitHub auth mount candidates are documented (commented
+    #    out). We look for the in-container destinations rather than
+    #    the host sources, since destinations stay stable across host
+    #    OSes.
+    auth_mount_destinations = [
+        "/home/hndrewaall/.config/gh",
+        "/home/hndrewaall/.gitconfig",
+        "/run/host-services/ssh-auth.sock",
+    ]
+    for dest in auth_mount_destinations:
+        expect(
+            dest in text,
+            f"override template missing the {dest!r} mount line — "
+            f"operators should be able to find the canonical "
+            f"in-container destination by skimming the template",
+        )
+        # Each auth mount line must be COMMENTED-OUT in the template
+        # (uncomment-on-copy pattern). Find the line containing dest
+        # and verify it starts with `#` after the indent.
+        for line in text.splitlines():
+            if dest in line and line.strip().startswith("- "):
+                expect(
+                    line.lstrip().startswith("# "),
+                    f"override template line containing {dest!r} is "
+                    f"NOT commented-out: {line!r}. The template ships "
+                    f"with all mounts commented so a bare copy doesn't "
+                    f"immediately try to mount paths that may not "
+                    f"exist on the operator's host.",
+                )
+
+    # SSH_AUTH_SOCK env var must also appear (commented-out — paired
+    # with the ssh socket bind-mount). It can land either as a YAML
+    # mapping line `SSH_AUTH_SOCK:` or as a list entry; we just check
+    # the var name is present.
+    expect(
+        "SSH_AUTH_SOCK" in text,
+        "override template missing SSH_AUTH_SOCK env var reference — "
+        "the ssh socket bind-mount only works if SSH_AUTH_SOCK in the "
+        "container points at it",
+    )
+    # And it should also be commented out — we don't want a bare
+    # template-copy to declare an env var pointing at a nonexistent
+    # socket.
+    for line in text.splitlines():
+        if "SSH_AUTH_SOCK:" in line and not line.lstrip().startswith("#"):
+            failures.append(
+                f"override template SSH_AUTH_SOCK line is NOT "
+                f"commented-out: {line!r}. The env var should ship "
+                f"commented because it requires the matching ssh socket "
+                f"bind-mount to also be enabled."
+            )
+
+    # 3. No-private-keys design is explicitly documented. The pattern
+    #     spans line breaks because comment wrapping in the template
+    #     splits "NO private\n      # keys are bind-mounted" — DOTALL
+    #     so `.` matches newlines.
+    expect(
+        re.search(
+            r"no private\s+(?:#\s*)?keys?.{0,160}(bind.?mounted|"
+            r"in the container|mounted)",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        is not None,
+        "override template should explicitly call out that no private "
+        "SSH keys are bind-mounted (the agent socket forwards signing "
+        "to the host) — without that callout, operators may try to "
+        "add an `~/.ssh:` mount which exposes private keys",
+    )
+
+    # 4. Force-recreate reminder.
+    expect(
+        "--force-recreate" in text,
+        "override template should mention `docker compose up -d "
+        "--force-recreate` — bind-mount changes don't apply on a "
+        "plain `up -d`",
+    )
+
+# 5. .gitignore excludes the actual (non-.example) override file.
+expect(GITIGNORE.is_file(), f".gitignore missing at {GITIGNORE}")
+if GITIGNORE.is_file():
+    text = GITIGNORE.read_text(encoding="utf-8")
+    expect(
+        re.search(
+            r"^examples/compose/docker-compose\.override\.yml\s*$",
+            text,
+            re.MULTILINE,
+        )
+        is not None,
+        ".gitignore must exclude `examples/compose/"
+        "docker-compose.override.yml` (the operator's actual override, "
+        "NOT the .example template) — without the gitignore line, "
+        "personal paths leak into commits",
+    )
+    # Make sure we didn't accidentally also gitignore the template.
+    expect(
+        re.search(
+            r"^examples/compose/docker-compose\.override\.yml\.example\s*$",
+            text,
+            re.MULTILINE,
+        )
+        is None,
+        ".gitignore must NOT exclude `docker-compose.override.yml.example` "
+        "— that file is the canonical template and ships in the repo",
+    )
+
+# 6. /edit-host-mounts skill present + references the right things.
+expect(SKILL.is_file(), f"edit-host-mounts skill missing at {SKILL}")
+if SKILL.is_file():
+    text = SKILL.read_text(encoding="utf-8")
+    expect(
+        len(text) > 500,
+        f"edit-host-mounts skill suspiciously short (<500 chars): {len(text)}",
+    )
+    skill_keywords = [
+        "host-bash",
+        "docker-compose.override.yml",
+        "--force-recreate",
+        ".example",
+    ]
+    for kw in skill_keywords:
+        expect(
+            kw in text,
+            f"edit-host-mounts skill should mention `{kw}` — it's "
+            f"part of the canonical loop the skill orchestrates",
+        )
+    # Re-runnable framing: the skill must explicitly say it preserves /
+    # updates an existing override rather than overwriting.
+    expect(
+        re.search(
+            r"re-runnable|preserve|updates? .{0,20}existing|"
+            r"merges? .{0,20}new|never blows",
+            text,
+            re.IGNORECASE,
+        )
+        is not None,
+        "edit-host-mounts skill should explicitly frame itself as "
+        "re-runnable / preserves the existing override — without "
+        "that framing, operators may avoid re-running it for fear "
+        "of losing manually-added mounts",
+    )
+    # No-private-keys directive — the skill must NOT propose mounting
+    # `~/.ssh/id_*` even if asked.
+    expect(
+        re.search(
+            r"no private keys?|never bind.?mount.{0,20}private|"
+            r"won't propose .{0,20}private",
+            text,
+            re.IGNORECASE,
+        )
+        is not None,
+        "edit-host-mounts skill should explicitly refuse to propose "
+        "mounting private SSH keys directly — agent forwarding is the "
+        "right shape",
+    )
+
+
+if failures:
+    print("FAIL compose-override-template.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS compose-override-template.test")
+sys.exit(0)

@@ -211,6 +211,14 @@ services:
       # claude-event-watch reads + acks them. rw because the watcher
       # rewrites/truncates the spool as it consumes events.
       - "${CLAUDE_HOST_EVENTS_DIR:-${HOME}/claude-events}:/home/hndrewaall/claude-events:rw"
+      # Operator-specific host paths (gh CLI token, gitconfig, ssh-agent
+      # socket, work-private bare-repo paths, etc.) are intentionally
+      # NOT wired here. Drop them in a local
+      # `docker-compose.override.yml` (gitignored) — see
+      # `docker-compose.override.yml.example` for the canonical shape.
+      # The in-container `/claude-container:edit-host-mounts` skill can
+      # generate / update that override file for you by probing the
+      # host via `host-bash` and writing the detected mounts.
       # Host-specific integration mounts (shell-history DB, messaging
       # client attachment dirs, etc.) are intentionally NOT wired here.
       # Add them in a local `docker-compose.override.yml` if your

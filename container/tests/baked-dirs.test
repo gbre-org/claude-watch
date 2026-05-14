@@ -108,6 +108,33 @@ if restart.is_file():
         f"claude process (host parity), got: {text.splitlines()[0]!r}",
     )
 
+# 3b. edit-host-mounts.md present + references host-bash and the
+#     override file. The skill is the canonical way to generate /
+#     update the operator's docker-compose.override.yml.
+edit_host_mounts = SKILLS_DIR / "edit-host-mounts.md"
+expect(
+    edit_host_mounts.is_file(),
+    f"{edit_host_mounts} missing — the operator-specific bind-mount "
+    f"override pattern needs an automated path or operators end up "
+    f"hand-editing YAML for every host-state change",
+)
+if edit_host_mounts.is_file():
+    text = edit_host_mounts.read_text(encoding="utf-8")
+    expect(
+        len(text) > 200,
+        f"{edit_host_mounts} suspiciously short (<200 chars)",
+    )
+    expect(
+        "host-bash" in text,
+        f"{edit_host_mounts} should reference `host-bash` — the skill "
+        f"needs it to probe the host filesystem + write the override",
+    )
+    expect(
+        "docker-compose.override.yml" in text,
+        f"{edit_host_mounts} should reference "
+        f"`docker-compose.override.yml` — the file the skill writes",
+    )
+
 # 4. start-watchers.md present + references the watchers dir + honest
 #    "no watchers today" framing.
 start_watchers = SKILLS_DIR / "start-watchers.md"

@@ -206,6 +206,78 @@ if BAKED.exists():
         "items and skip the discipline",
     )
 
+    # 5b.2.6. Operator-specific bind-mount override section. The
+    #         public compose stays personal-paths-FREE — gh CLI token,
+    #         gitconfig, ssh-agent socket, work-private bare-repo
+    #         paths all live in a gitignored
+    #         `docker-compose.override.yml`. The baked CLAUDE.md must
+    #         document that pattern so the in-container agent (a)
+    #         doesn't try to add personal mounts to the public
+    #         compose, (b) knows the override file exists + is
+    #         gitignored, and (c) knows about the
+    #         `/edit-host-mounts` skill that auto-generates /
+    #         updates the override.
+    expect(
+        re.search(
+            r"^##\s+Operator-specific bind-mounts",
+            text,
+            re.MULTILINE,
+        )
+        is not None,
+        "baked-CLAUDE.md missing a top-level `## Operator-specific "
+        "bind-mounts` section — the in-container agent needs to know "
+        "the override-file pattern (personal paths live in the "
+        "gitignored docker-compose.override.yml, NOT the public "
+        "compose) and the `/edit-host-mounts` skill that automates "
+        "it",
+    )
+    override_pattern_keywords = [
+        "docker-compose.override.yml",
+        "docker-compose.override.yml.example",
+        "gitignored",
+        "edit-host-mounts",
+        "host-bash",
+    ]
+    for kw in override_pattern_keywords:
+        expect(
+            kw in text,
+            f"baked-CLAUDE.md override-pattern section should mention "
+            f"`{kw}` — the agent needs to recognize the file shape, "
+            f"the gitignored status, and the skill that automates it",
+        )
+    # Re-auth-on-the-host directive: when in-container `gh auth
+    # status` says "not logged in", the right default is to re-auth on
+    # the host (operator's keychain) rather than store new credentials
+    # in the container. This phrasing is load-bearing — a container-
+    # only re-auth reflex is the wrong default.
+    expect(
+        re.search(
+            r"re-?auth on the\s*\*?\*?host\*?\*?",
+            text,
+            re.IGNORECASE,
+        )
+        is not None,
+        "baked-CLAUDE.md should direct the agent to re-auth on the "
+        "HOST (not the container) when the gh token is invalid — the "
+        "operator's keychain lives on the host",
+    )
+    # No-private-keys-in-container directive: the design choice that
+    # makes ssh-agent forwarding the right shape rather than mounting
+    # `~/.ssh`. The agent should be able to recite this when an "I
+    # need to add my SSH key to the container" reflex fires.
+    expect(
+        re.search(
+            r"no private keys.{0,40}(bind.?mounted|in the container|mounted)",
+            text,
+            re.IGNORECASE,
+        )
+        is not None,
+        "baked-CLAUDE.md should explicitly state that no private SSH "
+        "keys are bind-mounted into the container — the host agent "
+        "does the signing on the host side, the container only sees "
+        "the public-key handshake",
+    )
+
     # 5b.3. Host-OS-agnostic scheduling guidance. The host can be
     #       Linux / macOS / Windows; baked content must not hardcode
     #       any one OS's scheduler.

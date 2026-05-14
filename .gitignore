@@ -5,3 +5,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Operator-specific bind-mount overrides for the example compose stack.
+# The committed `docker-compose.override.yml.example` is the canonical
+# template; each operator copies it to `docker-compose.override.yml` and
+# uncomments the mounts that apply to their host. The actual override
+# file leaks personal paths (gh token dir, gitconfig, ssh-agent socket,
+# work-private bare-repo paths) and must NOT be committed.
+examples/compose/docker-compose.override.yml

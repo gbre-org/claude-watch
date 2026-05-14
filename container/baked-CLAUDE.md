@@ -246,6 +246,75 @@ the container against a path under `/home/hndrewaall/repos/`. Use
 `${CLAUDE_HOST_PROJECT_DIR}` (rw) for development work, or `git push`
 from the host.
 
+## Operator-specific bind-mounts (override pattern)
+
+The public `examples/compose/docker-compose.yml` is intentionally
+**personal-paths-FREE** — it ships with the host-state surface that's
+universal to any operator (`~/.claude`, `~/.claude.json`, `~/repos`,
+`~/bin`, `~/claude-events`, `~/.config/session`, plus the optional
+`CLAUDE_HOST_*` env-driven mounts) and nothing else. Personal paths
+(`gh` token dir, `gitconfig`, `ssh-agent` socket, work-private
+bare-repo paths under Google Drive / external SSDs / etc.) live in a
+**gitignored** sibling file: `examples/compose/docker-compose.override.yml`.
+Docker Compose auto-merges any `docker-compose.override.yml` into the
+main file at `up` time, so no extra `-f` flag is needed.
+
+The shape:
+
+| File | Tracked? | Purpose |
+| --- | --- | --- |
+| `examples/compose/docker-compose.yml` | yes | Universal services + bind-mounts. Personal-paths-free. |
+| `examples/compose/docker-compose.override.yml.example` | yes | Canonical template with commented-out mount blocks. Operators copy this to `.override.yml` and uncomment what applies. |
+| `examples/compose/docker-compose.override.yml` | **no** (gitignored) | The operator's actual personal mounts. Generated from the template (manually, or via the `/edit-host-mounts` skill). |
+
+**Why the override pattern instead of hardcoding?** Personal paths
+differ per operator (`/Users/<you>/.config/gh` vs `/home/<you>/.config/gh`),
+per host OS (Docker Desktop's magic `/run/host-services/ssh-auth.sock`
+vs Linux `/run/user/<uid>/keyring/ssh`), and per work setup (work-private
+repo paths leak company / project names). Baking any one operator's
+shape into the public compose would either (a) leak personal paths into
+a public artifact, or (b) silently mis-mount on every other operator's
+host. The override file keeps the personal surface local.
+
+### `/claude-container:edit-host-mounts` — generate / update the override
+
+The baked skill `/claude-container:edit-host-mounts` automates the
+override-file lifecycle:
+
+1. Reads the existing override (if any) via `host-bash`.
+2. Probes the host for standard candidates (`gh` token dir, gitconfig,
+   ssh-agent socket, common Google Drive bare-repo paths, etc.).
+3. Diffs against the existing override → proposes adds / removes / keeps.
+4. Confirms with the operator before writing.
+5. Writes the updated override on the host via `host-bash`.
+6. Reminds the operator to `docker compose up -d --force-recreate
+   claude-container` to pick up the new mounts.
+
+Re-runnable: invoking the skill on a host that already has an override
+**updates** the file (preserves comments, merges new mounts) rather than
+overwriting it. Operators can also use the skill to add an ad-hoc path
+(e.g. "mount `/Users/x/work/scripts` as `~/work-scripts`") without
+hand-editing YAML.
+
+**The skill needs `host-bash`.** If `claude mcp list` doesn't show
+`host-bash` as Connected, tell the operator before invoking the skill —
+without `host-bash`, you'd be guessing host paths blindly. Fall back to
+hand-editing from the `.example` template.
+
+**No private keys are bind-mounted.** The override pattern includes the
+host's `ssh-agent` socket (forwarded via `SSH_AUTH_SOCK` env var) so
+`ssh git@github.com` and `git push git@...` use the host agent for key
+signing on the host side. The container never sees private key files —
+that's deliberate, and `/edit-host-mounts` won't propose a private-key
+mount even if asked.
+
+**If `gh auth status` says "not logged in" inside the container**: the
+override either isn't wired (no `~/.config/gh` mount) or the host's
+`~/.config/gh/hosts.yml` is empty. Run `/edit-host-mounts` to wire it
+up, or re-auth on the **host** (not the container — keep the credential
+surface where the operator's keychain lives). The mount is RW so a host-
+side `gh auth login` propagates into the container immediately.
+
 ## CLAUDE.md load order inside the container
 
 Claude Code walks several locations at session start. In the container,
