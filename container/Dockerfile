@@ -257,6 +257,17 @@ RUN chmod +x /usr/local/bin/trust-workspace
 COPY bin/audit-hooks.py /usr/local/bin/audit-hooks
 RUN chmod +x /usr/local/bin/audit-hooks
 
+# cwsr — in-container self-restart for the claude CLI. Upgrades
+# @anthropic-ai/claude-code via npm-global and uses `tmux respawn-pane
+# -k` to roll the inner claude process WITHOUT requiring a host-side
+# `docker compose restart`. Operator workflow: a new claude version
+# ships; from inside the in-container tmux session (or from another
+# container shell via `docker compose exec`), run `cwsr` and the inner
+# pane swaps to the new version while the tmux session, MCP state, and
+# named-volume claude versions/ dir all survive.
+COPY bin/cwsr /usr/local/bin/cwsr
+RUN chmod +x /usr/local/bin/cwsr
+
 # Entrypoint script — tmux session bootstrap + env passthrough + signal handling.
 # Phase 1e (q-2026-05-11-8a96): pane 1 now runs the real claude-watch daemon
 # instead of the Phase 0 placeholder bash banner. Pane 1 keeps itself open with

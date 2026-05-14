@@ -66,6 +66,19 @@
 # sourced before launch — standard KEY=VALUE lines, comments with #.
 # Operator-supplied values override the defaults below.
 #
+# CW_PROFILE — opt-in trust profile that widens the default allow-list
+# for specific operator workflows:
+#
+#   CW_PROFILE=corp-dev (default): conservative read-only set.
+#   CW_PROFILE=corp-dev-trusted: adds host-scheduling tooling (cron /
+#       launchd / systemd timers / Task Scheduler) so the container
+#       can wire periodic claude-event jobs on the host. Host-OS
+#       agnostic — the relevant subset depends on the operator's host.
+#
+# Explicit ALLOWED_COMMANDS in $MCP_HOST_BASH_CONFIG always wins over
+# the profile default; the profile is a convenience baseline, not a
+# ceiling.
+#
 # Logging
 #
 # mcp-proxy logs JSON-RPC traffic to stderr. cli-mcp-server logs each
@@ -118,6 +131,42 @@ DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo"
 DEFAULT_ALLOWED_FLAGS="all"
 DEFAULT_COMMAND_TIMEOUT=30
 DEFAULT_ALLOW_SHELL_OPERATORS="false"
+
+# Trust profiles — opt-in widened allow-lists for specific operator
+# workflows. CW_PROFILE selects one of the named profiles below. The
+# default (unset / empty) keeps the conservative read-only list above.
+#
+# Each profile ADDS to (not replaces) the read-only default — the goal
+# is "let the container do its job without losing the safety floor".
+#
+# Operator sets CW_PROFILE=corp-dev-trusted in their .env when they
+# want the container to manage host-side scheduled jobs (cron /
+# launchd / systemd timers / Task Scheduler) for periodic
+# claude-event emission. The widened list is host-OS-agnostic: the
+# operator's actual OS determines which subset is meaningful (cron on
+# Linux, launchctl on macOS, schtasks on Windows), but the allow-list
+# carries enough binaries to cover all three.
+#
+# - `corp-dev` (default-equivalent): the conservative read-only set.
+# - `corp-dev-trusted`: adds host scheduling + small filesystem
+#   creation tooling so the container can wire periodic events:
+#     * `uname` / `sw_vers` / `lsb_release` — OS detection probe.
+#     * `crontab` — Linux + macOS cron entry mgmt.
+#     * `launchctl` — macOS launchd load/unload.
+#     * `systemctl` — Linux systemd unit mgmt (user units; no sudo).
+#     * `schtasks` / `powershell` — Windows Task Scheduler.
+#     * `mkdir` / `tee` / `chmod` — drop scheduled-task definition files.
+#     * `cp` / `mv` / `rm` — rotate / dismantle scheduled-task files.
+#     * `curl` — claude-event POST or webhook firing.
+#   ALLOWED_DIR stays the operator's $HOME by default (no /etc, no /usr,
+#   no /System) so the widening doesn't escape the home tree.
+#
+# Operators can override either profile's expanded list by setting
+# ALLOWED_COMMANDS explicitly in $MCP_HOST_BASH_CONFIG; that file is
+# sourced AFTER the profile defaults are applied, so the operator's
+# value wins. Setting CW_PROFILE to an unknown name logs a warning
+# and falls back to the conservative default.
+TRUSTED_EXTRAS="uname,sw_vers,lsb_release,crontab,launchctl,systemctl,schtasks,powershell,pwsh,mkdir,tee,chmod,cp,mv,rm,curl"
 
 # Honor XDG-ish locations on macOS too (just paths, not the spec itself).
 MCP_HOST_BASH_CONFIG="${MCP_HOST_BASH_CONFIG:-${HOME}/.config/claude-container/mcp-host-bash.env}"
@@ -198,9 +247,31 @@ elif [ -f "$MCP_HOST_BASH_CONFIG" ] && [ "$PRINT_CMD" = "1" ]; then
     . "$MCP_HOST_BASH_CONFIG"
 fi
 
+# Compose the profile-derived default allow-list. CW_PROFILE selects.
+# Unknown profile names fall back to the conservative default with a
+# stderr warning so the operator notices (rather than silently dropping
+# their requested expansion). PROFILE_WARN is captured for the banner
+# below.
+PROFILE_WARN=""
+case "${CW_PROFILE:-}" in
+    ""|corp-dev)
+        PROFILE_ALLOWED_COMMANDS="$DEFAULT_ALLOWED_COMMANDS"
+        ;;
+    corp-dev-trusted)
+        PROFILE_ALLOWED_COMMANDS="${DEFAULT_ALLOWED_COMMANDS},${TRUSTED_EXTRAS}"
+        ;;
+    *)
+        PROFILE_WARN="mcp-host-bash: unknown CW_PROFILE='${CW_PROFILE}', falling back to default."
+        PROFILE_ALLOWED_COMMANDS="$DEFAULT_ALLOWED_COMMANDS"
+        ;;
+esac
+
 # Apply defaults for any keys the config file didn't set. Done AFTER
-# sourcing so operator overrides win.
-ALLOWED_COMMANDS="${ALLOWED_COMMANDS:-$DEFAULT_ALLOWED_COMMANDS}"
+# sourcing so operator overrides win. Operator's explicit
+# ALLOWED_COMMANDS (from $MCP_HOST_BASH_CONFIG) wins over the
+# profile-derived default; that lets the operator narrow or expand
+# beyond the profile without editing this script.
+ALLOWED_COMMANDS="${ALLOWED_COMMANDS:-$PROFILE_ALLOWED_COMMANDS}"
 ALLOWED_FLAGS="${ALLOWED_FLAGS:-$DEFAULT_ALLOWED_FLAGS}"
 ALLOWED_DIR="${ALLOWED_DIR:-${HOME}}"
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-$DEFAULT_COMMAND_TIMEOUT}"
@@ -298,6 +369,10 @@ trap cleanup TERM INT
 {
     echo "mcp-host-bash: starting"
     echo "  port:                  $PORT"
+    echo "  CW_PROFILE:            ${CW_PROFILE:-<unset; corp-dev default>}"
+    if [ -n "$PROFILE_WARN" ]; then
+        echo "  WARNING:               $PROFILE_WARN"
+    fi
     echo "  ALLOWED_COMMANDS:      $ALLOWED_COMMANDS"
     echo "  ALLOWED_FLAGS:         $ALLOWED_FLAGS"
     echo "  ALLOWED_DIR:           $ALLOWED_DIR"

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Tests for container/bin/cwsr — in-container self-restart for claude.
+
+Exercises argv-construction WITHOUT actually invoking npm or tmux by
+using the `--print` debug hook (the script builds the planned NPM and
+TMUX commands and prints them, then exits 0). Tests run on any
+host with bash 3.2+; no docker / tmux / npm required.
+
+Coverage:
+  - Default invocation: `npm install -g @anthropic-ai/claude-code@latest`
+    + `tmux respawn-pane -k -t claude-container:0.0 exec claude`.
+  - --version pins the npm version in the install argv.
+  - CLAUDE_AUTO_CONTINUE / CLAUDE_SHIM_SETTINGS_PATH env vars appear in
+    the rebuilt claude argv (so the self-restart preserves the same
+    shape entrypoint.sh built at container startup).
+  - --no-upgrade drops the NPM line.
+  - --upgrade-only drops the TMUX line.
+  - --no-upgrade + --upgrade-only = exit 2 (sanity-rejected no-op).
+  - CWSR_SESSION env override changes the tmux pane target.
+  - --help exits 0 with usage text.
+  - Bad flag exits 2.
+
+Run:  ./cwsr.test
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+SCRIPT = CONTAINER_DIR / "bin" / "cwsr"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate cwsr at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+def run_cwsr(
+    args: list[str] | None = None,
+    env: dict | None = None,
+    expect_rc: int = 0,
+) -> tuple[list[str], str, str, int]:
+    """Run cwsr with the given argv + env. Returns (stdout_lines,
+    stdout, stderr, returncode)."""
+    if args is None:
+        args = []
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": "/tmp/fake-home",
+    }
+    if env:
+        base_env.update(env)
+    result = subprocess.run(
+        [str(SCRIPT), *args],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if expect_rc is not None and result.returncode != expect_rc:
+        raise AssertionError(
+            f"cwsr exited {result.returncode}, expected {expect_rc}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return (
+        result.stdout.splitlines(),
+        result.stdout,
+        result.stderr,
+        result.returncode,
+    )
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_print_default() -> None:
+    """Default: prints both NPM and TMUX lines with @latest."""
+    lines, _, _, _ = run_cwsr(["--print"])
+    npm = [l for l in lines if l.startswith("NPM:")]
+    tmux = [l for l in lines if l.startswith("TMUX:")]
+    expect(
+        len(npm) == 1 and "claude-code@latest" in npm[0],
+        f"default: should print NPM line with @latest, got {lines!r}",
+    )
+    expect(
+        len(tmux) == 1 and "respawn-pane -k -t claude-container:0.0" in tmux[0],
+        f"default: should print TMUX line targeting claude-container:0.0, "
+        f"got {lines!r}",
+    )
+    expect(
+        "exec claude" in tmux[0],
+        f"default: TMUX line should respawn with `exec claude`, got {tmux[0]!r}",
+    )
+
+
+def test_print_version_pin() -> None:
+    """--version pins npm install."""
+    lines, _, _, _ = run_cwsr(["--print", "--version", "2.1.150"])
+    npm = [l for l in lines if l.startswith("NPM:")][0]
+    expect(
+        "claude-code@2.1.150" in npm,
+        f"--version: should pin npm version, got {npm!r}",
+    )
+
+
+def test_print_with_auto_continue() -> None:
+    """CLAUDE_AUTO_CONTINUE in env => --continue in claude argv."""
+    lines, _, _, _ = run_cwsr(
+        ["--print"], env={"CLAUDE_AUTO_CONTINUE": "resume"}
+    )
+    tmux = [l for l in lines if l.startswith("TMUX:")][0]
+    expect(
+        "--continue 'resume'" in tmux,
+        f"auto-continue: TMUX line should include --continue 'resume', "
+        f"got {tmux!r}",
+    )
+
+
+def test_print_with_shim_settings() -> None:
+    """CLAUDE_SHIM_SETTINGS_PATH => --setting-sources project,local
+    + --settings <path>."""
+    lines, _, _, _ = run_cwsr(
+        ["--print"], env={"CLAUDE_SHIM_SETTINGS_PATH": "/tmp/shim.json"}
+    )
+    tmux = [l for l in lines if l.startswith("TMUX:")][0]
+    expect(
+        "--setting-sources project,local" in tmux,
+        f"shim-settings: TMUX line should include --setting-sources "
+        f"project,local, got {tmux!r}",
+    )
+    expect(
+        "--settings /tmp/shim.json" in tmux,
+        f"shim-settings: TMUX line should include --settings <path>, "
+        f"got {tmux!r}",
+    )
+
+
+def test_print_no_upgrade() -> None:
+    """--no-upgrade drops the NPM line."""
+    lines, _, _, _ = run_cwsr(["--print", "--no-upgrade"])
+    npm = [l for l in lines if l.startswith("NPM:")]
+    tmux = [l for l in lines if l.startswith("TMUX:")]
+    expect(len(npm) == 0, f"--no-upgrade: NPM line should be absent, got {lines!r}")
+    expect(len(tmux) == 1, f"--no-upgrade: TMUX line should still print, got {lines!r}")
+
+
+def test_print_upgrade_only() -> None:
+    """--upgrade-only drops the TMUX line."""
+    lines, _, _, _ = run_cwsr(["--print", "--upgrade-only"])
+    npm = [l for l in lines if l.startswith("NPM:")]
+    tmux = [l for l in lines if l.startswith("TMUX:")]
+    expect(len(npm) == 1, f"--upgrade-only: NPM line should print, got {lines!r}")
+    expect(
+        len(tmux) == 0, f"--upgrade-only: TMUX line should be absent, got {lines!r}"
+    )
+
+
+def test_conflicting_flags_rejected() -> None:
+    """--no-upgrade + --upgrade-only is a no-op; exit 2."""
+    _, _, stderr, _ = run_cwsr(
+        ["--print", "--no-upgrade", "--upgrade-only"], expect_rc=2
+    )
+    expect(
+        "no-op" in stderr.lower(),
+        f"conflicting-flags: stderr should mention 'no-op', got {stderr!r}",
+    )
+
+
+def test_session_override() -> None:
+    """CWSR_SESSION env var changes the tmux pane target."""
+    lines, _, _, _ = run_cwsr(["--print"], env={"CWSR_SESSION": "alt-sess"})
+    tmux = [l for l in lines if l.startswith("TMUX:")][0]
+    expect(
+        "-t alt-sess:0.0" in tmux,
+        f"session-override: TMUX target should be alt-sess:0.0, got {tmux!r}",
+    )
+
+
+def test_help_exits_zero() -> None:
+    _, stdout, _, _ = run_cwsr(["--help"], expect_rc=0)
+    expect("Usage:" in stdout, f"--help: should print Usage:, got {stdout!r}")
+    expect("cwsr" in stdout, f"--help: should mention 'cwsr', got {stdout!r}")
+    expect(
+        "respawn" in stdout.lower() or "restart" in stdout.lower(),
+        f"--help: should mention respawn/restart, got {stdout!r}",
+    )
+
+
+def test_bad_flag_exits_two() -> None:
+    _, _, stderr, _ = run_cwsr(["--no-such-flag"], expect_rc=2)
+    expect(
+        "unknown" in stderr.lower(),
+        f"bad-flag: stderr should mention 'unknown', got {stderr!r}",
+    )
+
+
+def test_version_missing_arg() -> None:
+    """--version with no value => exit 2 + helpful message."""
+    _, _, stderr, _ = run_cwsr(["--version"], expect_rc=2)
+    expect(
+        "requires" in stderr.lower(),
+        f"--version-missing: stderr should explain, got {stderr!r}",
+    )
+
+
+TESTS = [
+    test_print_default,
+    test_print_version_pin,
+    test_print_with_auto_continue,
+    test_print_with_shim_settings,
+    test_print_no_upgrade,
+    test_print_upgrade_only,
+    test_conflicting_flags_rejected,
+    test_session_override,
+    test_help_exits_zero,
+    test_bad_flag_exits_two,
+    test_version_missing_arg,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")

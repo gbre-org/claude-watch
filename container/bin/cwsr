@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# cwsr — claude-watch self-restart for in-container Claude Code.
+#
+# Upgrades the in-container `claude` CLI (npm install -g) and respawns
+# the pane-0 process in the tmux session that entrypoint.sh created, so
+# the operator gets a freshly-installed claude WITHOUT having to
+# `docker compose restart` the whole container.
+#
+# Use cases:
+#   - Anthropic ships a new @anthropic-ai/claude-code version and the
+#     in-container session needs to pick it up.
+#   - A long-lived container session (tmux survives detach/reattach, MCP
+#     state survives, named-volume claude versions/ dir persists) wants
+#     to roll the inner process without losing the wrapping container.
+#
+# What it does:
+#   1. Optionally `npm install -g @anthropic-ai/claude-code@<version>`
+#      (default: @latest). The named volume mounted at
+#      ~/.local/share/claude carries the new versions/<ver>/ across
+#      container restarts; the npm-global path itself is uid-1000
+#      writable thanks to the Dockerfile chown.
+#   2. Uses `tmux respawn-pane -k -t claude-container:0.0 <cmd>` to kill
+#      whatever process pane 0 currently runs (the old claude) and start
+#      the new claude in its place. The pane, window, and session all
+#      survive — only the inner process rolls.
+#   3. Reconstructs the claude argv from the same env vars entrypoint.sh
+#      uses: CLAUDE_SHIM_SETTINGS_PATH (set by entrypoint when
+#      CLAUDE_CONTAINER_REWRITE_HOOKS=1 produced a shim file) and
+#      CLAUDE_AUTO_CONTINUE (so the resume flag survives the roll). Any
+#      operator-side change requiring a *different* claude argv shape
+#      (e.g. toggling REWRITE_HOOKS, changing AUTO_CONTINUE) still needs
+#      a real `docker compose up -d --force-recreate` — cwsr only rolls
+#      the inner process, not the entrypoint-time argv decisions.
+#
+# Usage:
+#   cwsr                       # upgrade to @latest and respawn
+#   cwsr --version 2.1.150     # pin a specific npm version
+#   cwsr --no-upgrade          # respawn current claude (no npm install)
+#   cwsr --upgrade-only        # npm install without respawning
+#   cwsr --print               # print the planned npm + tmux argv, don't run
+#   cwsr --help                # usage + exit
+#
+# Exit codes:
+#   0   success (or --print)
+#   1   npm install failed / tmux respawn failed / tmux session not found
+#   2   usage / bad flag
+
+set -euo pipefail
+
+SESSION="${CWSR_SESSION:-claude-container}"
+PANE="${SESSION}:0.0"
+PACKAGE="${CWSR_PACKAGE:-@anthropic-ai/claude-code}"
+
+usage() {
+    cat <<'EOF'
+cwsr — upgrade + respawn the in-container claude process.
+
+Usage:
+  cwsr                      Upgrade claude to @latest then respawn pane 0.
+  cwsr --version <ver>      Upgrade to a specific npm version.
+  cwsr --no-upgrade         Respawn pane 0 without upgrading.
+  cwsr --upgrade-only       npm install only, no respawn.
+  cwsr --print              Print planned commands and exit (no side effects).
+  cwsr --help               Show this help.
+
+The tmux session (claude-container) and the wrapping container both
+survive — only the inner claude process rolls. Operator's shell, env,
+and named-volume state persist across the roll.
+
+Re-execs claude with the same argv shape entrypoint.sh built (honors
+CLAUDE_SHIM_SETTINGS_PATH and CLAUDE_AUTO_CONTINUE). To change those
+shape variables you still need a real docker compose recreate.
+
+Env overrides (mostly for testing):
+  CWSR_SESSION   tmux session name (default: claude-container)
+  CWSR_PACKAGE   npm package to install (default: @anthropic-ai/claude-code)
+EOF
+}
+
+UPGRADE=1
+RESPAWN=1
+PRINT_ONLY=0
+NPM_VERSION="latest"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --no-upgrade)
+            UPGRADE=0
+            shift
+            ;;
+        --upgrade-only)
+            RESPAWN=0
+            shift
+            ;;
+        --version)
+            if [ "$#" -lt 2 ]; then
+                printf 'cwsr: --version requires an argument\n' >&2
+                exit 2
+            fi
+            NPM_VERSION="$2"
+            shift 2
+            ;;
+        --print)
+            PRINT_ONLY=1
+            shift
+            ;;
+        *)
+            printf 'cwsr: unknown argument %q\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [ "$UPGRADE" = "0" ] && [ "$RESPAWN" = "0" ]; then
+    printf 'cwsr: --no-upgrade and --upgrade-only together is a no-op\n' >&2
+    exit 2
+fi
+
+# Build the claude argv the same way entrypoint.sh does. Mirror the
+# logic at container/entrypoint.sh:279-290 — when CLAUDE_SHIM_SETTINGS_PATH
+# is set (REWRITE_HOOKS produced a shim file), append the
+# --setting-sources / --settings flags; when CLAUDE_AUTO_CONTINUE is
+# non-empty, append --continue. Both flags are shape-stable across a
+# self-restart because the env vars are exported by entrypoint.sh and
+# inherited by the tmux server, which then exports them to every pane.
+build_claude_cmd() {
+    local cmd="exec claude"
+    if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
+        cmd="$cmd --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+    fi
+    if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
+        local q="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
+        cmd="$cmd --continue $q"
+    fi
+    printf '%s' "$cmd"
+}
+
+CLAUDE_CMD="$(build_claude_cmd)"
+
+NPM_ARGV=(npm install -g "${PACKAGE}@${NPM_VERSION}")
+TMUX_ARGV=(tmux respawn-pane -k -t "$PANE" "$CLAUDE_CMD")
+
+if [ "$PRINT_ONLY" = "1" ]; then
+    if [ "$UPGRADE" = "1" ]; then
+        printf 'NPM:  %s\n' "${NPM_ARGV[*]}"
+    fi
+    if [ "$RESPAWN" = "1" ]; then
+        printf 'TMUX: %s\n' "${TMUX_ARGV[*]}"
+    fi
+    exit 0
+fi
+
+# Sanity: refuse to respawn if the tmux session doesn't exist. Without
+# this the respawn fails with a confusing "can't find pane" error.
+if [ "$RESPAWN" = "1" ]; then
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        cat >&2 <<EOF
+cwsr: tmux session '$SESSION' is not running.
+
+cwsr only rolls the inner claude inside an already-running container.
+If the container itself is down, run \`docker compose up -d\` (or
+\`cw --up\` from the host) to bring it up — that path already installs
+the freshest baked claude version.
+EOF
+        exit 1
+    fi
+fi
+
+if [ "$UPGRADE" = "1" ]; then
+    printf '[cwsr] upgrading: %s\n' "${NPM_ARGV[*]}" >&2
+    if ! "${NPM_ARGV[@]}"; then
+        printf '[cwsr] npm install failed; not respawning pane\n' >&2
+        exit 1
+    fi
+    # Sanity: confirm claude binary is invocable post-install. A failed
+    # install leaving a half-written symlink would surface as a broken
+    # respawn otherwise.
+    if ! command -v claude >/dev/null 2>&1; then
+        printf '[cwsr] post-install: claude not on PATH; not respawning\n' >&2
+        exit 1
+    fi
+fi
+
+if [ "$RESPAWN" = "1" ]; then
+    printf '[cwsr] respawning pane: %s\n' "$CLAUDE_CMD" >&2
+    if ! "${TMUX_ARGV[@]}"; then
+        printf '[cwsr] tmux respawn-pane failed\n' >&2
+        exit 1
+    fi
+fi
+
+printf '[cwsr] done.\n' >&2
+exit 0

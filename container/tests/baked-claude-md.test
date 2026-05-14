@@ -81,13 +81,107 @@ if BAKED.exists():
         "distinction must be visible up top",
     )
 
-    # 5. Public-repo hygiene. baked-CLAUDE.md ships in a public repo (this
-    #    one — github.com/hndrewaall/claude-watch). Check for accidental
-    #    private-path leakage. The substrings below are sentinels Andrew
-    #    flagged as private-only paths that must never appear in public
-    #    artifacts. (We deliberately do not check for "/home/hndrewaall"
-    #    because that string is the in-container user's home and legitimately
-    #    appears in the file as part of bind-mount documentation.)
+    # 5a. Session-start checklist. The baked file must instruct the
+    #     in-container agent to run a mandatory checklist as its first
+    #     action — surface bridges, hooks, scope. Without it the agent
+    #     drifts into host-side assumptions on every fresh session.
+    expect(
+        re.search(
+            r"session.?start checklist|first action|on every session start",
+            text,
+            re.IGNORECASE,
+        )
+        is not None,
+        "baked-CLAUDE.md missing a session-start checklist directive — "
+        "the in-container agent needs an explicit 'run this first on "
+        "every session' block so it doesn't drift into host-side "
+        "assumptions about watchers / surfaces that aren't here",
+    )
+    expect(
+        "claude mcp list" in text,
+        "baked-CLAUDE.md session-start checklist should reference "
+        "`claude mcp list` so the agent verifies bridged MCP servers "
+        "are reachable as its first action",
+    )
+    expect(
+        "audit-hooks" in text,
+        "baked-CLAUDE.md session-start checklist should reference "
+        "`audit-hooks` so the agent reports the hook fate summary",
+    )
+
+    # 5b. Sudo guidance. Andrew's host fingerprint prompt fires on every
+    #     sudo, so the baked file must steer the agent toward non-sudo
+    #     paths and away from reflexive `sudo`.
+    expect(
+        re.search(r"avoid.{0,20}sudo|prefer non.?sudo|never need.{0,10}sudo",
+                  text, re.IGNORECASE)
+        is not None,
+        "baked-CLAUDE.md missing sudo-avoidance guidance — the agent "
+        "should be told to prefer non-sudo paths for docker / git / "
+        "claude / language toolchains because the host fingerprint "
+        "prompt fires on every sudo",
+    )
+
+    # 5b.1. Self-restart (cwsr) guidance. The agent should know to use
+    #       cwsr (not docker compose restart) when upgrading claude.
+    expect(
+        "cwsr" in text,
+        "baked-CLAUDE.md should document cwsr so the in-container "
+        "agent can self-restart for a claude upgrade without "
+        "requiring the operator to docker compose restart the "
+        "container",
+    )
+
+    # 5b.2. Host-bash framing. Treat host-bash as a normal tool and
+    #       maintain the container/host boundary in self-reports —
+    #       don't hedge it as "last-resort", but DO reaffirm that the
+    #       session is running inside the container.
+    expect(
+        re.search(r"host.bash.*normal tool|normal tool.*host.bash|"
+                  r"reach for host.?bash",
+                  text, re.IGNORECASE) is not None,
+        "baked-CLAUDE.md should frame host-bash as a normal tool to "
+        "reach for, not a last-resort hedge — Andrew's directive is "
+        "to use it second-nature without obscuring the container "
+        "boundary",
+    )
+    expect(
+        re.search(r"window to the host|not the host|orchestrat",
+                  text, re.IGNORECASE) is not None,
+        "baked-CLAUDE.md should reaffirm the container/host boundary "
+        "when describing host-bash (host-bash is a window to the "
+        "host; the session itself stays inside the container)",
+    )
+
+    # 5b.3. Host-OS-agnostic scheduling guidance. The host can be
+    #       Linux / macOS / Windows; baked content must not hardcode
+    #       any one OS's scheduler.
+    expect(
+        all(
+            kw in text
+            for kw in ["uname", "cron", "launchctl", "schtasks"]
+        ),
+        "baked-CLAUDE.md scheduled-tasks section should cover all "
+        "three plausible host OSes (Linux cron, macOS launchd via "
+        "launchctl, Windows Task Scheduler via schtasks) plus the "
+        "uname-based OS probe — the host is not guaranteed to be "
+        "macOS",
+    )
+    expect(
+        re.search(r"dismantle|teardown|tear.?down|clean.?up",
+                  text, re.IGNORECASE) is not None,
+        "baked-CLAUDE.md scheduled-tasks section should document the "
+        "dismantle command — a scheduled job is durable on the host "
+        "long after the container session ends",
+    )
+
+    # 5c. Public-repo hygiene. baked-CLAUDE.md ships in a public repo (this
+    #     one — github.com/hndrewaall/claude-watch). Check for accidental
+    #     private-path leakage. The substrings below are sentinels Andrew
+    #     flagged as private-only paths that must never appear in public
+    #     artifacts. (We deliberately do not check for "/home/hndrewaall"
+    #     because that string is the in-container user's home and legitimately
+    #     appears in the file as part of bind-mount documentation.)
     private_sentinels = [
         "/mnt/Raiden",
         "/mnt/Scorpion",

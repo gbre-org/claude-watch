@@ -278,6 +278,98 @@ def test_separator_position() -> None:
            f"separator: after '--', expected ['uvx', 'cli-mcp-server'], got {after}")
 
 
+def test_cw_profile_unset_is_default() -> None:
+    """CW_PROFILE unset => same conservative allow-list as before."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    # Find ALLOWED_COMMANDS value (line after the marker).
+    idx = lines.index("ALLOWED_COMMANDS")
+    val = lines[idx + 1]
+    expect(
+        val == "ls,cat,pwd,git,gh,head,tail,grep,find,echo",
+        f"cw_profile unset: ALLOWED_COMMANDS should be conservative default, "
+        f"got {val!r}",
+    )
+
+
+def test_cw_profile_corp_dev_equals_default() -> None:
+    """CW_PROFILE=corp-dev is explicit-equivalent to unset."""
+    lines, _, _, _ = run_script(["--print-cmd"], env={"CW_PROFILE": "corp-dev"})
+    idx = lines.index("ALLOWED_COMMANDS")
+    val = lines[idx + 1]
+    expect(
+        val == "ls,cat,pwd,git,gh,head,tail,grep,find,echo",
+        f"cw_profile=corp-dev: ALLOWED_COMMANDS should match default, "
+        f"got {val!r}",
+    )
+
+
+def test_cw_profile_trusted_widens() -> None:
+    """CW_PROFILE=corp-dev-trusted adds host-scheduling tooling."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"], env={"CW_PROFILE": "corp-dev-trusted"}
+    )
+    idx = lines.index("ALLOWED_COMMANDS")
+    val = lines[idx + 1]
+    # Must contain the conservative default PLUS the trusted extras.
+    expect(
+        val.startswith("ls,cat,pwd,git,gh,head,tail,grep,find,echo,"),
+        f"cw_profile=corp-dev-trusted: should start with conservative "
+        f"default, got {val!r}",
+    )
+    # Spot-check a few trusted extras (host-OS-agnostic: cron, launchd,
+    # systemd, Task Scheduler each represented).
+    for extra in [
+        "crontab",
+        "launchctl",
+        "systemctl",
+        "schtasks",
+        "powershell",
+        "uname",
+        "tee",
+        "mkdir",
+    ]:
+        expect(
+            extra in val.split(","),
+            f"cw_profile=corp-dev-trusted: should include {extra!r}, "
+            f"got {val!r}",
+        )
+
+
+def test_cw_profile_unknown_falls_back() -> None:
+    """Unknown CW_PROFILE value => fall back to default + stderr warning."""
+    lines, _, stderr, _ = run_script(
+        ["--print-cmd"], env={"CW_PROFILE": "made-up-profile"}
+    )
+    idx = lines.index("ALLOWED_COMMANDS")
+    val = lines[idx + 1]
+    expect(
+        val == "ls,cat,pwd,git,gh,head,tail,grep,find,echo",
+        f"cw_profile=unknown: should fall back to conservative default, "
+        f"got {val!r}",
+    )
+
+
+def test_cw_profile_operator_override_wins() -> None:
+    """Operator's ALLOWED_COMMANDS in config beats CW_PROFILE default."""
+    with tempfile.TemporaryDirectory(prefix="mcp-host-bash-test-") as d:
+        cfg = Path(d, "mcp-host-bash.env")
+        cfg.write_text("ALLOWED_COMMANDS=only-this\n")
+        lines, _, _, _ = run_script(
+            ["--print-cmd"],
+            env={
+                "CW_PROFILE": "corp-dev-trusted",
+                "MCP_HOST_BASH_CONFIG": str(cfg),
+            },
+        )
+        idx = lines.index("ALLOWED_COMMANDS")
+        val = lines[idx + 1]
+        expect(
+            val == "only-this",
+            f"operator override should beat profile default; "
+            f"got ALLOWED_COMMANDS={val!r}",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -294,6 +386,11 @@ tests = [
     test_config_missing_falls_back_to_defaults,
     test_disabled_kill_switch,
     test_separator_position,
+    test_cw_profile_unset_is_default,
+    test_cw_profile_corp_dev_equals_default,
+    test_cw_profile_trusted_widens,
+    test_cw_profile_unknown_falls_back,
+    test_cw_profile_operator_override_wins,
 ]
 
 for t in tests:

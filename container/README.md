@@ -217,10 +217,14 @@ artifacts.
 
 ## Host-only CLIs
 
-The image bakes exactly two binaries:
+The image bakes the following binaries:
 
 - `claude` — the Claude Code CLI (installed via `npm install -g @anthropic-ai/claude-code`).
 - `claude-watch` — the Rust daemon, built from source in the multi-stage `claude-watch-builder` stage and copied into `/usr/local/bin/claude-watch`.
+- `audit-hooks` — observability tool that walks `~/.claude/settings.json` and reports per-hook fate (ok-elf / ok-script / silent-no-op / missing / not-wrapped / builtin). See `bin/audit-hooks.py`.
+- `cwsr` — in-container self-restart for the `claude` CLI. Runs `npm install -g @anthropic-ai/claude-code@<ver>` then `tmux respawn-pane -k -t claude-container:0.0` so the inner claude rolls in-place WITHOUT requiring the operator to `docker compose restart` the whole container. The wrapping container, MCP bridges, named-volume `~/.local/share/claude/versions/`, and operator's tmux attach all survive — only the inner process rolls. See `bin/cwsr` (`cwsr --help` for usage).
+- `trust-workspace` — pre-trusts a workspace path in `~/.claude.json` so Claude Code skips its first-launch trust prompt at that cwd.
+- `exec-hook` — magic-byte safe-exec wrapper for hook commands whose target may not be Linux-native. ELF / shebang scripts pass through transparently; cross-arch (Mach-O / PE / unknown) targets silently no-op.
 
 Everything else from the claude-watch source tree — including the Python CLIs under `tools/` (`session-task`, `claude-event`, `obligations`) — is NOT installed into the image. They're discoverable on `PATH` only when the operator bind-mounts `~/repos/claude-watch` into the container at `/home/hndrewaall/repos/claude-watch` (which the [example compose](../examples/compose/) does by default).
 
