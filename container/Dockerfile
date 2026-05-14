@@ -81,8 +81,44 @@ RUN groupadd --gid 1000 hndrewaall \
 # Permission denied. Phase 1d (q-2026-05-11-c0b9). Empirical proof: the
 # first wired-up test of the named volume failed with EACCES on `touch`
 # until this pre-creation step landed.
-RUN mkdir -p /home/hndrewaall/.local/share/claude \
+#
+# Also pre-create ~/.local/bin so Claude Code's "native install" self-
+# updater (which writes a `claude` symlink there pointing into
+# ~/.local/share/claude/versions/<ver>/) has a uid-1000-writable target
+# directory ready. Without it, the updater either no-ops silently or
+# leaves a partially-written entry on first run.
+RUN mkdir -p /home/hndrewaall/.local/share/claude /home/hndrewaall/.local/bin \
     && chown -R 1000:1000 /home/hndrewaall/.local
+
+# Add ~/.local/bin to PATH at the image level. Claude Code's startup
+# probes for a "native install" of itself at $HOME/.local/bin/claude
+# (the path the in-process self-updater writes to). When that file
+# exists but $HOME/.local/bin is NOT on PATH, claude prints a yellow
+# warning on every launch:
+#
+#   Native installation exists but ~/.local/bin is not in your PATH. Run:
+#   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bash...
+#
+# Once a single in-container `claude` self-update has fired (or once an
+# operator's host-side `~/.local/bin/claude` becomes visible — e.g. via
+# a downstream image that bind-mounts ~/.local), the warning fires on
+# every subsequent claude launch and clutters the splash banner of
+# every fresh tmux pane.
+#
+# Fix: make the container's baseline PATH match the warning's hint.
+# `~/.local/bin` precedes the npm-global /usr/bin so any self-updated
+# binary takes precedence over the image-baked floor — that's the
+# documented native-install precedence (compose.yml volume notes
+# already describe this expectation; this ENV makes it actually true).
+#
+# ENV PATH propagates to every child process the container ever spawns
+# — entrypoint.sh, every tmux pane it opens, every `docker compose
+# exec` invocation, and `cwsr`'s respawned claude — without each shell
+# having to re-source /etc/profile. Source-code research conventions
+# (use the path the warning suggests, don't silence the check itself):
+# Claude Code's native-install probe is correct; the container's PATH
+# is what was wrong.
+ENV PATH=/home/hndrewaall/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Pre-create the tmux default socket dir for uid 1000 with the
 # permissions tmux requires (owner-writable, not world-writable).

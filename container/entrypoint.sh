@@ -79,6 +79,23 @@ case ":${PATH}:" in
     *) export PATH="/usr/local/lib/claude-hooks-shim:${PATH}" ;;
 esac
 
+# Defensively prepend $HOME/.local/bin (Claude Code's "native install"
+# location). The Dockerfile already sets ENV PATH with this dir in front,
+# but a downstream image or a `docker run -e PATH=...` override could
+# clobber it. Without this dir on PATH and a self-updated
+# $HOME/.local/bin/claude present, every launch prints a yellow:
+#
+#   Native installation exists but ~/.local/bin is not in your PATH.
+#
+# warning. Belt-and-suspenders so the warning stays gone regardless of
+# how PATH is set on the way in.
+_local_bin="${HOME:-/home/hndrewaall}/.local/bin"
+case ":${PATH}:" in
+    *":${_local_bin}:"*) ;;
+    *) export PATH="${_local_bin}:${PATH}" ;;
+esac
+unset _local_bin
+
 # CLAUDE_CONTAINER_REWRITE_HOOKS — opt-in entrypoint-side hook wrapper.
 #
 # When the host is non-Linux (typical: a Mac laptop bind-mounting

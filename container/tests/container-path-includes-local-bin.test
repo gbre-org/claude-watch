@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Tests for the container's PATH including $HOME/.local/bin.
+
+Claude Code's startup probes for a "native install" of itself at
+$HOME/.local/bin/claude (the path the in-process self-updater writes
+to). When that file exists but $HOME/.local/bin is NOT on PATH,
+claude prints a yellow warning on every launch:
+
+    Native installation exists but ~/.local/bin is not in your PATH. Run:
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bash...
+
+Once a single in-container `claude` self-update fires (or an operator
+bind-mounts a host ~/.local/bin/claude into the container), the warning
+clutters the splash banner of every fresh tmux pane / `docker exec`
+launch.
+
+Fix surface (two layers, belt-and-suspenders):
+
+  1. Dockerfile `ENV PATH=...` includes /home/hndrewaall/.local/bin
+     in FRONT of /usr/local/bin / /usr/bin etc. This propagates to
+     every child process the container ever spawns without needing a
+     login shell.
+  2. entrypoint.sh prepends ${HOME}/.local/bin to PATH defensively
+     in case a downstream image or `docker run -e PATH=...` override
+     clobbered the image-level ENV.
+
+This test asserts both fix surfaces remain in place. It does NOT
+spin up docker; the assertions are static parses of the Dockerfile +
+entrypoint.sh + a `bash -c` execution of the entrypoint's PATH-prepend
+block to confirm the resulting PATH order under realistic env shapes.
+
+Run:  ./container-path-includes-local-bin.test
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+
+if not DOCKERFILE.exists():
+    print(f"FAIL: cannot locate Dockerfile at {DOCKERFILE}", file=sys.stderr)
+    sys.exit(2)
+if not ENTRYPOINT.exists():
+    print(f"FAIL: cannot locate entrypoint.sh at {ENTRYPOINT}", file=sys.stderr)
+    sys.exit(2)
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# Dockerfile assertions
+# ---------------------------------------------------------------------------
+
+
+def test_dockerfile_env_path_includes_local_bin() -> None:
+    """The image ENV PATH must include /home/hndrewaall/.local/bin in
+    front of /usr/local/bin / /usr/bin so the native-install warning
+    cannot fire on a fresh `docker exec` shell."""
+    src = DOCKERFILE.read_text(encoding="utf-8")
+    # Find the ENV PATH directive (single-line form). Ignore commented-
+    # out variants by stripping leading whitespace then matching `ENV `.
+    matches = []
+    for line in src.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        m = re.match(r"ENV\s+PATH\s*=\s*(\S+)", stripped)
+        if m:
+            matches.append(m.group(1))
+    expect(
+        len(matches) >= 1,
+        "Dockerfile: no `ENV PATH=...` directive found — the image must "
+        "set PATH so /home/hndrewaall/.local/bin is on it."
+    )
+    if matches:
+        # We only care about the LAST one (Dockerfile semantics: later
+        # ENV directives win for the final image-level env).
+        path_value = matches[-1]
+        parts = path_value.split(":")
+        expect(
+            "/home/hndrewaall/.local/bin" in parts,
+            f"Dockerfile ENV PATH: missing /home/hndrewaall/.local/bin "
+            f"(got {path_value!r})"
+        )
+        if "/home/hndrewaall/.local/bin" in parts:
+            local_idx = parts.index("/home/hndrewaall/.local/bin")
+            # Must come BEFORE /usr/local/bin and /usr/bin so a self-
+            # updated ~/.local/bin/claude wins over the npm-baked
+            # /usr/bin/claude. This matches the documented native-install
+            # precedence (compose.yml notes: ".local/bin/claude wins on
+            # PATH because ~/.local/bin precedes /usr/local/bin").
+            for floor in ("/usr/local/bin", "/usr/bin"):
+                if floor in parts:
+                    floor_idx = parts.index(floor)
+                    expect(
+                        local_idx < floor_idx,
+                        f"Dockerfile ENV PATH: /home/hndrewaall/.local/bin "
+                        f"must come before {floor} (got {path_value!r})"
+                    )
+
+
+def test_dockerfile_local_bin_dir_precreated() -> None:
+    """The image must mkdir + chown /home/hndrewaall/.local/bin so the
+    native-install self-updater has a uid-1000-writable target dir
+    ready. Without it the updater either no-ops or leaves a partially
+    written entry on first run."""
+    src = DOCKERFILE.read_text(encoding="utf-8")
+    # We accept any RUN line that creates the dir (mkdir -p combined with
+    # other paths is fine) AND a chown that covers /home/hndrewaall/.local
+    # (recursive). Both currently land in the same RUN block.
+    expect(
+        "/home/hndrewaall/.local/bin" in src,
+        "Dockerfile: /home/hndrewaall/.local/bin is never mentioned — "
+        "the dir must be pre-created so the self-updater symlink lands."
+    )
+    # Look for chown -R 1000:1000 covering /home/hndrewaall/.local
+    m = re.search(r"chown\s+-R\s+1000:1000\s+/home/hndrewaall/\.local\b", src)
+    expect(
+        m is not None,
+        "Dockerfile: missing `chown -R 1000:1000 /home/hndrewaall/.local` — "
+        "the .local subtree must be uid-1000-owned for self-updater writes."
+    )
+
+
+# ---------------------------------------------------------------------------
+# entrypoint.sh assertions
+# ---------------------------------------------------------------------------
+
+
+def test_entrypoint_prepends_local_bin_to_path() -> None:
+    """entrypoint.sh must defensively prepend ${HOME}/.local/bin to
+    PATH so a downstream image or `docker run -e PATH=...` override
+    can't suppress the fix."""
+    src = ENTRYPOINT.read_text(encoding="utf-8")
+    # The block uses ${HOME:-/home/hndrewaall}/.local/bin — match either
+    # the literal env-var form or the resolved path.
+    has_block = (
+        ".local/bin" in src and "PATH=" in src
+    )
+    expect(has_block, "entrypoint.sh: no PATH manipulation involving .local/bin found")
+
+
+def test_entrypoint_path_block_runs_and_prepends() -> None:
+    """Functional: extract the entrypoint's local-bin PATH-prepend block
+    and execute it under bash -c with PATH starting EMPTY of local-bin.
+    Assert the result has $HOME/.local/bin at the front."""
+    src = ENTRYPOINT.read_text(encoding="utf-8")
+    # The block is the second `case ":${PATH}:" in ... esac` followed by
+    # `unset _local_bin`. Anchor on the comment header line that introduces
+    # the local-bin block to keep the regex resilient.
+    m = re.search(
+        r"(_local_bin=.*?\n"
+        r"case \":\$\{PATH\}:\".*?\nesac\n"
+        r"unset _local_bin)",
+        src,
+        re.DOTALL,
+    )
+    expect(
+        m is not None,
+        "entrypoint.sh: could not find local-bin PATH-prepend block "
+        "(expected `_local_bin=...; case ...; esac; unset _local_bin`)"
+    )
+    if m:
+        block = m.group(1)
+        script = (
+            "set -u\n"
+            "export HOME=/home/hndrewaall\n"
+            "export PATH=/usr/bin:/bin\n"
+            f"{block}\n"
+            "printf '%s\\n' \"$PATH\"\n"
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        expect(
+            result.returncode == 0,
+            f"bash exited {result.returncode}; stderr={result.stderr!r}"
+        )
+        out = result.stdout.strip().splitlines()
+        if out:
+            new_path = out[-1]
+            expect(
+                new_path.startswith("/home/hndrewaall/.local/bin:"),
+                f"entrypoint block: expected PATH to start with "
+                f"/home/hndrewaall/.local/bin, got {new_path!r}"
+            )
+
+
+def test_entrypoint_path_block_idempotent() -> None:
+    """Running the block twice (or against a PATH that already includes
+    .local/bin) MUST NOT duplicate the dir. The case-glob guard handles
+    this."""
+    src = ENTRYPOINT.read_text(encoding="utf-8")
+    m = re.search(
+        r"(_local_bin=.*?\n"
+        r"case \":\$\{PATH\}:\".*?\nesac\n"
+        r"unset _local_bin)",
+        src,
+        re.DOTALL,
+    )
+    if not m:
+        return  # already failed in the previous test
+    block = m.group(1)
+    script = (
+        "set -u\n"
+        "export HOME=/home/hndrewaall\n"
+        # Pre-seed PATH with .local/bin already in front.
+        "export PATH=/home/hndrewaall/.local/bin:/usr/bin:/bin\n"
+        f"{block}\n"
+        "printf '%s\\n' \"$PATH\"\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    expect(
+        result.returncode == 0,
+        f"bash exited {result.returncode}; stderr={result.stderr!r}"
+    )
+    out = result.stdout.strip().splitlines()
+    if out:
+        new_path = out[-1]
+        # Count occurrences of the dir — must be exactly 1.
+        count = new_path.split(":").count("/home/hndrewaall/.local/bin")
+        expect(
+            count == 1,
+            f"entrypoint block: idempotency violated — PATH contains "
+            f"/home/hndrewaall/.local/bin {count} times: {new_path!r}"
+        )
+
+
+def test_entrypoint_path_block_unset_home_fallback() -> None:
+    """When $HOME is unset (atypical but possible under a stripped env),
+    the block must fall back to the literal /home/hndrewaall path."""
+    src = ENTRYPOINT.read_text(encoding="utf-8")
+    m = re.search(
+        r"(_local_bin=.*?\n"
+        r"case \":\$\{PATH\}:\".*?\nesac\n"
+        r"unset _local_bin)",
+        src,
+        re.DOTALL,
+    )
+    if not m:
+        return
+    block = m.group(1)
+    script = (
+        "set -u\n"
+        "unset HOME\n"
+        "export PATH=/usr/bin:/bin\n"
+        f"{block}\n"
+        "printf '%s\\n' \"$PATH\"\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    expect(
+        result.returncode == 0,
+        f"bash exited {result.returncode} (HOME-unset case); "
+        f"stderr={result.stderr!r}"
+    )
+    out = result.stdout.strip().splitlines()
+    if out:
+        new_path = out[-1]
+        expect(
+            new_path.startswith("/home/hndrewaall/.local/bin:"),
+            f"entrypoint block (HOME unset): expected PATH to start with "
+            f"/home/hndrewaall/.local/bin (the ${{HOME:-...}} fallback), "
+            f"got {new_path!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_dockerfile_env_path_includes_local_bin,
+    test_dockerfile_local_bin_dir_precreated,
+    test_entrypoint_prepends_local_bin_to_path,
+    test_entrypoint_path_block_runs_and_prepends,
+    test_entrypoint_path_block_idempotent,
+    test_entrypoint_path_block_unset_home_fallback,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")

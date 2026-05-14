@@ -113,8 +113,16 @@ test-hooks-shim:
 # rewritten shim file (additive merge → bare cross-arch hooks still
 # fired) AND the CLAUDE_AUTO_CONTINUE auto-resume integration. 12 cases,
 # <1s.
+#
+# Also runs the container-PATH tests that assert
+# /home/hndrewaall/.local/bin lives on the image PATH (Dockerfile ENV +
+# entrypoint defensive prepend). Without these, Claude Code's
+# native-install warning (`Native installation exists but ~/.local/bin
+# is not in your PATH`) prints on every launch as soon as a self-update
+# materialises ~/.local/bin/claude.
 test-entrypoint:
 	container/tests/entrypoint-claude-cmd.test
+	container/tests/container-path-includes-local-bin.test
 
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host
 # terminal to the running claude-container's tmux session via
