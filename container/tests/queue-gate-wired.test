@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Tests that the pre-agent-queue-gate-hook is actually wired to fire
+inside the container.
+
+The earlier `baked-obligations-hooks.test` checks that the hook scripts
+are copied into the image and that the entrypoint runs
+generate-hooks-shim-settings with --inject-obligations. This test
+goes one layer further: it INVOKES the shim generator (with the
+production flags the entrypoint uses) and asserts the OUTPUT file
+contains a PreToolUse `Agent`-matcher entry whose `command` is the
+baked path `/usr/local/bin/pre-agent-queue-gate-hook`. Without that
+exact shape, the hook ships in the image but never fires.
+
+It then invokes the hook script directly with the standard
+PreToolUse stdin payload Claude Code would deliver and asserts:
+
+  - No `Queue item:` marker  → permissionDecision == "deny"
+    (banner mentions "BLOCKED").
+  - Marker present, session-task CLI absent on PATH →
+    permissionDecision == "deny" with reason mentioning
+    `session-task`. This is the "lookup failed" branch: the
+    marker proves the agent knows the protocol, so the hook
+    surfaces a debuggable deny instead of silently allowing.
+
+These together prove the runtime behaviour matches what the baked
+CLAUDE.md tells the in-container model: the gate IS active and
+fires deterministically.
+
+We deliberately exercise the production wiring shape:
+
+  generate-hooks-shim-settings
+    --input <synthetic empty settings.json>
+    --output <tmpfile>
+    --inject-obligations 1
+    --obligations-only
+
+Matches the entrypoint's `CLAUDE_CONTAINER_OBLIGATIONS=1` /
+`CLAUDE_CONTAINER_REWRITE_HOOKS=0` (Linux-host) branch. The
+REWRITE_HOOKS=1 branch (Mac-host cross-arch path) layers the same
+obligations injection on top, so the matcher shape we assert here
+is the same in both branches.
+
+Run:  ./queue-gate-wired.test
+
+No external deps beyond Python 3.8+ stdlib + the in-tree helper
+script. Does NOT require docker / a built image / a running claude.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+GENERATOR = CONTAINER_DIR / "hooks-shim" / "generate-hooks-shim-settings"
+GATE_HOOK = REPO_ROOT / "tools" / "hooks" / "pre-agent-queue-gate-hook"
+
+# Path the hook is BAKED at inside the container (per Dockerfile COPY).
+# The shim writes this absolute path into the rewritten settings.json
+# regardless of where the source repo lives on the host, because the
+# in-container claude only ever loads the rewritten file.
+EXPECTED_BAKED_HOOK_PATH = "/usr/local/bin/pre-agent-queue-gate-hook"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# Pre-flight: helper + hook script exist.
+if not GENERATOR.is_file():
+    print(f"FAIL: generator missing at {GENERATOR}", file=sys.stderr)
+    sys.exit(2)
+if not GATE_HOOK.is_file():
+    print(f"FAIL: gate hook source missing at {GATE_HOOK}", file=sys.stderr)
+    sys.exit(2)
+
+
+def run_generator(input_path: str, output_path: str, *,
+                  obligations_only: bool = True,
+                  inject_obligations: bool = True) -> None:
+    """Invoke the shim generator the same way entrypoint.sh does in
+    the obligations-only path (the Linux-host default when
+    CLAUDE_CONTAINER_OBLIGATIONS=1 and CLAUDE_CONTAINER_REWRITE_HOOKS
+    is unset / 0)."""
+    cmd = [
+        sys.executable, str(GENERATOR),
+        "--input", input_path,
+        "--output", output_path,
+        "--quiet",
+        "--inject-obligations", "1" if inject_obligations else "0",
+    ]
+    if obligations_only:
+        cmd.append("--obligations-only")
+    env = dict(os.environ)
+    # Wipe env-supplied overrides so the test is deterministic.
+    for var in ("CLAUDE_SHIM_PATTERNS", "CLAUDE_CONTAINER_OBLIGATIONS",
+                "CLAUDE_SHIM_OBLIGATIONS_ONLY", "CLAUDE_SHIM_INPUT",
+                "CLAUDE_SHIM_OUTPUT"):
+        env.pop(var, None)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"generator exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
+def test_shim_emits_agent_matcher_with_baked_hook_path() -> None:
+    """The obligations-only output must contain a PreToolUse block
+    with matcher 'Agent' whose hook command is the baked container
+    path. Anything else (missing block, wrong matcher, host path)
+    means the gate ships disabled.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        inp.write_text("{}", encoding="utf-8")
+        run_generator(str(inp), str(out))
+        if not out.exists():
+            failures.append("shim output not written")
+            return
+
+        try:
+            settings = json.loads(out.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            failures.append(f"shim output is not valid JSON: {e}")
+            return
+
+        pre_blocks = (settings.get("hooks") or {}).get("PreToolUse") or []
+        agent_block = None
+        for entry in pre_blocks:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("matcher", "")) == "Agent":
+                agent_block = entry
+                break
+
+        expect(
+            agent_block is not None,
+            "shim output missing a PreToolUse entry with "
+            "matcher == 'Agent'. Claude Code's PreToolUse hooks "
+            "dispatch by matcher; without this entry the queue "
+            "gate hook never fires for Agent (a.k.a. Task) "
+            "invocations. The shim helper's OBLIGATIONS_HOOKS "
+            "constant must include "
+            "(\"PreToolUse\", \"Agent\", "
+            f"\"{EXPECTED_BAKED_HOOK_PATH}\").",
+        )
+        if agent_block is None:
+            return
+
+        cmds = [
+            (h or {}).get("command")
+            for h in (agent_block.get("hooks") or [])
+            if isinstance(h, dict)
+        ]
+        expect(
+            EXPECTED_BAKED_HOOK_PATH in cmds,
+            f"Agent-matcher block's hooks list does NOT include "
+            f"{EXPECTED_BAKED_HOOK_PATH!r}. Got: {cmds!r}. "
+            "The bake path drift between the Dockerfile COPY "
+            "(/usr/local/bin/pre-agent-queue-gate-hook) and the "
+            "shim helper's emitted command would mean the hook "
+            "ships but Claude Code calls a non-existent path on "
+            "each Agent dispatch.",
+        )
+
+
+def test_gate_hook_denies_missing_queue_marker() -> None:
+    """Direct hook invocation with the standard Claude Code
+    PreToolUse stdin payload. An Agent prompt missing the
+    `Queue item: q-XXXX` marker must produce a JSON deny on stdout.
+    """
+    payload = json.dumps({
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "general-purpose",
+            "prompt": "just say hi",
+        },
+    })
+    result = subprocess.run(
+        [sys.executable, str(GATE_HOOK)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        failures.append(
+            f"gate hook exited {result.returncode} "
+            f"(expected 0); stderr={result.stderr!r}"
+        )
+        return
+    try:
+        out = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        failures.append(
+            f"gate hook stdout not JSON: {e}; "
+            f"stdout={result.stdout!r}"
+        )
+        return
+    hook_specific = out.get("hookSpecificOutput") or {}
+    expect(
+        hook_specific.get("permissionDecision") == "deny",
+        "gate hook should deny an Agent call without a "
+        "`Queue item: q-XXXX` marker, got "
+        f"hookSpecificOutput={hook_specific!r}",
+    )
+    expect(
+        "BLOCKED" in (out.get("systemMessage") or ""),
+        "gate hook deny should include the 'BLOCKED' banner in "
+        "systemMessage so the deny is visible to the model; "
+        f"got systemMessage={out.get('systemMessage')!r}",
+    )
+
+
+def test_gate_hook_denies_when_session_task_missing() -> None:
+    """Marker present but session-task CLI absent → deny with a
+    reason that mentions `session-task`. The hook only default-opens
+    on truly unexpected internal errors (the broad except at the
+    bottom of main()); a missing CLI is a routine "queue id not
+    found" path that should produce an informative deny.
+    """
+    payload = json.dumps({
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "general-purpose",
+            "prompt": "Queue item: q-2026-01-01-zzzz\n\nsay hi",
+        },
+    })
+    # Run with an empty PATH so session-task can never resolve. The
+    # hook's _queue_status() must return (None, False) and the script
+    # must DENY with "queue id not found". That's the expected fail-
+    # closed behavior for "marker present, queue lookup failed": the
+    # marker proves the model knows about the protocol, so the deny
+    # is informative ("did you forget queue add?"). The script only
+    # default-OPENS on truly unexpected errors (the broad except at
+    # the bottom of main()).
+    env = {
+        "PATH": "/nonexistent-stub-dir",
+        # HOME needed for the bypass-log writer not to crash.
+        "HOME": os.environ.get("HOME", "/tmp"),
+    }
+    result = subprocess.run(
+        [sys.executable, str(GATE_HOOK)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    expect(
+        result.returncode == 0,
+        f"gate hook should exit 0 even when session-task is "
+        f"missing (default-open on lookup failure), got rc="
+        f"{result.returncode} stderr={result.stderr!r}",
+    )
+    try:
+        out = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        failures.append(
+            f"gate hook stdout not JSON: {e}; "
+            f"stdout={result.stdout!r}"
+        )
+        return
+    hook_specific = out.get("hookSpecificOutput") or {}
+    # The lookup-failed branch denies with a specific "not found"
+    # reason. We assert that the reason mentions the queue id we
+    # supplied AND mentions session-task (not a different code path).
+    decision = hook_specific.get("permissionDecision")
+    reason = hook_specific.get("permissionDecisionReason") or ""
+    expect(
+        decision == "deny",
+        f"gate hook should deny when queue lookup fails, got "
+        f"permissionDecision={decision!r}",
+    )
+    expect(
+        "session-task" in reason,
+        f"deny reason should mention session-task so the operator "
+        f"can debug, got reason={reason!r}",
+    )
+
+
+def test_dockerfile_bakes_hook_at_expected_path() -> None:
+    """The Dockerfile must COPY the gate hook to the path we asserted
+    above. If a future refactor moves the bake target without also
+    updating the shim helper's OBLIGATIONS_HOOKS, the wiring breaks
+    silently; this test catches drift between the two.
+    """
+    dockerfile = CONTAINER_DIR / "Dockerfile"
+    text = dockerfile.read_text(encoding="utf-8")
+    expect(
+        f"COPY tools/hooks/pre-agent-queue-gate-hook {EXPECTED_BAKED_HOOK_PATH}"
+        in text,
+        f"Dockerfile must COPY the gate hook to "
+        f"{EXPECTED_BAKED_HOOK_PATH} so the shim's emitted "
+        "settings.json points at a real file. Drift between the "
+        "Dockerfile COPY target and the shim helper's emitted "
+        "command silently disables the gate.",
+    )
+
+
+def test_shim_helper_obligations_list_includes_agent_matcher() -> None:
+    """Source-level assertion against the shim helper's
+    OBLIGATIONS_HOOKS constant. Catches refactors that drop the
+    Agent matcher without touching the JSON-output tests above.
+    """
+    text = GENERATOR.read_text(encoding="utf-8")
+    # Look for the tuple literal we care about. We accept either
+    # double or single quotes (Python lets either) and any whitespace.
+    pattern = re.compile(
+        r'\(\s*[\'"]PreToolUse[\'"]\s*,\s*'
+        r'[\'"]Agent[\'"]\s*,\s*'
+        rf'[\'"]\s*{re.escape(EXPECTED_BAKED_HOOK_PATH)}\s*[\'"]\s*\)'
+    )
+    expect(
+        pattern.search(text) is not None,
+        "generate-hooks-shim-settings OBLIGATIONS_HOOKS list must "
+        "include ('PreToolUse', 'Agent', "
+        f"'{EXPECTED_BAKED_HOOK_PATH}'). Without this tuple, the "
+        "rewritten settings.json never grows the Agent-matcher "
+        "block and the in-container queue gate ships disabled.",
+    )
+
+
+TESTS = [
+    test_shim_emits_agent_matcher_with_baked_hook_path,
+    test_gate_hook_denies_missing_queue_marker,
+    test_gate_hook_denies_when_session_task_missing,
+    test_dockerfile_bakes_hook_at_expected_path,
+    test_shim_helper_obligations_list_includes_agent_matcher,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")

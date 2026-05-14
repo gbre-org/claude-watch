@@ -175,12 +175,17 @@ if BAKED.exists():
     )
 
     # 5b.2.5. Queue protocol. The in-container claude must be told to
-    #         use `session-task queue` before every Agent spawn, because
-    #         the host's pre-agent-queue-gate PreToolUse hook is not
-    #         active in the container — compliance is on the agent's
-    #         own discipline. Without the protocol, in-container agents
-    #         race against host-side work on overlapping scopes (e.g.
-    #         repo:claude-watch is shared between host + container).
+    #         use `session-task queue` before every Agent spawn. As of
+    #         the obligations-hooks bake (the PR that wired
+    #         /usr/local/bin/pre-agent-queue-gate-hook into the shim
+    #         settings.json under matcher "Agent"), the gate hook IS
+    #         active inside the container and hard-DENIES Agent calls
+    #         missing a `Queue item: q-XXXX` marker. Earlier image
+    #         builds had no such gate and treated compliance as
+    #         agent-discipline-only; baked-CLAUDE.md previously
+    #         documented that older state. Both this test and the
+    #         baked file have been updated to reflect the gate's
+    #         current behaviour.
     expect(
         re.search(
             r"^##\s+Queue protocol",
@@ -190,9 +195,8 @@ if BAKED.exists():
         is not None,
         "baked-CLAUDE.md missing a top-level `## Queue protocol` "
         "section — the in-container agent needs an explicit "
-        "queue-before-spawn protocol because the host's "
-        "pre-agent-queue-gate PreToolUse hook does not fire "
-        "inside the container",
+        "queue-before-spawn protocol AND a callout that the "
+        "PreToolUse hook hard-denies undisciplined Agent spawns",
     )
     queue_keywords = [
         "session-task queue add",
@@ -212,19 +216,42 @@ if BAKED.exists():
         "`session-task queue done` (or `queue abandon`) so the "
         "agent knows to close the loop after Agent completion",
     )
+    # The gate is now active in-container (CLAUDE_CONTAINER_OBLIGATIONS=1
+    # default). The baked CLAUDE.md MUST tell the in-container model that
+    # the hook is active so it doesn't assume compliance is best-effort.
+    # Match a positive-active phrasing: "is active", "active inside",
+    # "HARD-DENIED", "DENIES the spawn", or "hard-deny". One of those
+    # must appear within 200 chars of a `pre-agent-queue-gate` mention.
     expect(
         re.search(
-            r"pre-agent-queue-gate.{0,80}(NOT active|not active|not.{0,10}fire|"
+            r"pre-agent-queue-gate.{0,200}"
+            r"(is active|active inside|HARD-DENIED|DENIES|"
+            r"hard-?deny|denies the spawn)",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        is not None,
+        "baked-CLAUDE.md queue-protocol section should explicitly "
+        "say the `pre-agent-queue-gate` hook IS active inside the "
+        "container (hard-denies missing-queue-marker spawns). Older "
+        "wording said the hook was NOT active — that's no longer "
+        "true after the obligations-hooks bake landed.",
+    )
+    # Belt-and-suspenders: the file should NOT carry the legacy
+    # "hook is NOT active" wording, which contradicts the runtime
+    # behaviour and would mislead the in-container model into
+    # treating compliance as discipline-only.
+    expect(
+        re.search(
+            r"pre-agent-queue-gate.{0,80}(NOT active|not active|"
             r"does not fire|isn't active|is not active)",
             text,
             re.IGNORECASE,
         )
-        is not None,
-        "baked-CLAUDE.md queue-protocol section should explicitly "
-        "call out that the host's `pre-agent-queue-gate` hook is "
-        "NOT active inside the container — without that callout "
-        "the agent may assume the hook will catch missing queue "
-        "items and skip the discipline",
+        is None,
+        "baked-CLAUDE.md still claims the pre-agent-queue-gate hook "
+        "is NOT active — that text is stale; the hook fires + denies "
+        "via the entrypoint's shim settings. Remove the stale claim.",
     )
 
     # 5b.2.6. Operator-specific bind-mount override section. The

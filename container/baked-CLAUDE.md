@@ -124,12 +124,28 @@ touching that repo. An in-container agent that skips the queue can
 race against host-side work on the same repo, lose edits to a parallel
 agent, or stomp on a long-running build.
 
-**The host's `pre-agent-queue-gate-hook` PreToolUse hook is NOT active
-inside this container.** On the host that hook hard-DENIES any Agent
-spawn missing a `Queue item: q-XXXX` line in its prompt; in the
-container, no such gate fires. Compliance is on YOUR discipline. Spawning
-without queue-add → race against parallel work, scope conflicts, lost
-edits, no audit trail.
+**The `pre-agent-queue-gate-hook` PreToolUse hook IS active inside
+this container** when `CLAUDE_CONTAINER_OBLIGATIONS=1` (the default,
+set by the entrypoint). The hook is baked at
+`/usr/local/bin/pre-agent-queue-gate-hook` and wired into Claude
+Code's PreToolUse cascade via the entrypoint-generated
+`/tmp/claude-shim/settings.json` (matcher `"Agent"`). Any `Agent`
+tool call that lacks a `Queue item: q-XXXX` marker in its prompt
+— or carries an unknown / non-`running` queue id — is HARD-DENIED
+at dispatch time, exactly like on the host. The model never sees
+the spawn happen; it gets the deny banner back as a tool-use
+permission denial.
+
+The hook resolves queue state by shelling out to
+`session-task queue show <id>`. That CLI ships in the bind-mounted
+`~/repos/claude-watch/tools/session-task/` tree. When the bind-mount
+is absent (stripped-down `docker run` without `~/repos`), the
+lookup returns "not found" and the hook still DENIES — the deny
+reason names `session-task` so the operator can see why. If you
+hit that in a fresh container, ask the operator to bind-mount
+`~/repos/claude-watch` (the example compose does this by default).
+The hook only default-opens on TRULY unexpected internal errors
+(broad-except fail-safe), not on the routine "CLI missing" path.
 
 The five-step protocol (mirrors the host CLAUDE.md `## Resume Actions`
 spawn workflow):
@@ -144,9 +160,7 @@ spawn workflow):
 3. If `ready_now=true`: `session-task queue register <id>` to claim
    the slot.
 4. **Include the line `Queue item: q-XXXX` in the Agent's prompt.**
-   The host hook would deny without it; in-container it's the
-   audit trail that lets `session-task queue list` show what each
-   running agent is doing.
+   The hook DENIES the spawn without it.
 5. Fire the Agent. On completion: `session-task queue done <id>`
    (success) or `session-task queue abandon <id> --reason "..."`
    (failure / cancelled).

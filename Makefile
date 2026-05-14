@@ -126,6 +126,7 @@ test-entrypoint:
 	container/tests/container-path-includes-local-bin.test
 	container/tests/baked-dirs.test
 	container/tests/baked-obligations-hooks.test
+	container/tests/queue-gate-wired.test
 	container/tests/compose-mount-modes.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
