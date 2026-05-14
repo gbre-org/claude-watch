@@ -84,6 +84,7 @@ optional; defaults match a fresh install:
 
 | Key | Default in the template | When to change |
 |---|---|---|
+| `MCP_HOST_BASH_BIND` | `127.0.0.1` (loopback only) | `0.0.0.0` (or a specific interface IP) for Linux Docker bridge-net containers that reach the host via `host.docker.internal` — those callers can't dial host loopback. Pair with bearer-token auth (see [`examples/compose/.env.example`](../.env.example) host-bash block) when widening — `run_command` is a host-shell privilege escalator, anything reachable on the port can exec as the operator user. macOS Docker Desktop's `host.docker.internal` NAT routes loopback for the default setup, so the safe default works there. |
 | `CW_PROFILE` | `corp-dev` (read-y allow-list) | `corp-dev-trusted` to widen for host scheduling, file mutation, container management. See the launcher's script header for the full surface. |
 | `ALLOW_SHELL_OPERATORS` | `false` (block pipes / `&&` / redirects) | `true` only if a workflow specifically needs shell operators. Loosens the safety floor. |
 | `SSL_CERT_FILE` | empty | Absolute path to your corporate CA bundle if `run_command` invocations of curl / git / pip have to validate a corp chain. |

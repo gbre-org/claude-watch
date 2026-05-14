@@ -52,6 +52,17 @@
       ${HOME}/.config/claude-container/mcp-host-bash.env (which the
       launcher itself sources at startup).
 
+      - MCP_HOST_BASH_BIND: host address mcp-proxy listens on. Default
+        (omit or set to 127.0.0.1) binds loopback only — safe floor. To
+        allow a Linux Docker bridge-net container to reach the launcher
+        via host.docker.internal, set this to `0.0.0.0` AND pair with
+        bearer-token auth (see the host-bash block in
+        examples/compose/.env.example once bearer auth lands). macOS
+        Docker Desktop reaches loopback through host.docker.internal
+        NAT, so the default Just Works there. Bare 0.0.0.0 without auth
+        exposes the host shell-exec surface to every reachable caller —
+        do not run that in production.
+
       - CW_PROFILE: trust profile selector. Unset / `corp-dev` keeps
         the read-y default allow-list. `corp-dev-trusted` widens to
         include host scheduling, file mutation, outbound bytes, key/cert
@@ -86,6 +97,16 @@
     -->
     <key>EnvironmentVariables</key>
     <dict>
+        <!--
+          MCP_HOST_BASH_BIND: omit / 127.0.0.1 = loopback only (safe
+          default for macOS Docker Desktop, where host.docker.internal
+          routes via NAT to host loopback). Set to 0.0.0.0 to expose
+          beyond loopback for Linux Docker bridge-net containers —
+          PAIR with bearer-token auth once that lands.
+        -->
+        <key>MCP_HOST_BASH_BIND</key>
+        <string>127.0.0.1</string>
+
         <key>CW_PROFILE</key>
         <string>corp-dev</string>
 

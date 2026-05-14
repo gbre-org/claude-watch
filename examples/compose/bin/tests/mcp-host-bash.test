@@ -111,10 +111,14 @@ def find_env_value(lines: list[str], key: str) -> str | None:
 
 
 def test_print_cmd_default_argv() -> None:
-    """Default: mcp-proxy --port 8766 --host 0.0.0.0 --env ... --
+    """Default: mcp-proxy --port 8766 --host 127.0.0.1 --env ... --
     cli-mcp-server. NO `uvx` prefix — both binaries are statically
     installed via install-host-deps; the launcher exec's them
-    directly so each start is offline (no per-launch PyPI fetch)."""
+    directly so each start is offline (no per-launch PyPI fetch).
+
+    The default bind is 127.0.0.1 (loopback only). Operators who need
+    LAN / Docker-bridge reachability set MCP_HOST_BASH_BIND=0.0.0.0
+    explicitly — see test_bind_env_override_widens_listener."""
     lines, _, _, _ = run_script(["--print-cmd"])
     expect(lines[0] == "mcp-proxy",
            f"default: argv[0] should be mcp-proxy (statically installed, "
@@ -125,12 +129,12 @@ def test_print_cmd_default_argv() -> None:
     expect(lines[port_idx + 1] == "8766",
            f"default: --port should be 8766, got {lines[port_idx + 1]!r}")
     expect("--host" in lines,
-           f"default: argv should include --host (for host.docker.internal "
-           f"reachability), got {lines}")
+           f"default: argv should include --host, got {lines}")
     host_idx = lines.index("--host")
-    expect(lines[host_idx + 1] == "0.0.0.0",
-           f"default: --host should be 0.0.0.0 (NOT 127.0.0.1 — the "
-           f"container's bridge net can't reach loopback), got {lines[host_idx + 1]!r}")
+    expect(lines[host_idx + 1] == "127.0.0.1",
+           f"default: --host should be 127.0.0.1 (loopback only — the "
+           f"safe floor; operators set MCP_HOST_BASH_BIND=0.0.0.0 to "
+           f"opt into LAN exposure), got {lines[host_idx + 1]!r}")
     expect("--" in lines,
            f"default: argv should include the stdio-subprocess separator '--', got {lines}")
     sep_idx = lines.index("--")
@@ -630,6 +634,76 @@ def test_hook_bridge_bins_works_with_trusted_profile() -> None:
            f"trusted+bridge-bins: trusted-profile extras dropped, got {cmd_list}")
 
 
+def test_bind_default_is_loopback() -> None:
+    """Defense-in-depth: with MCP_HOST_BASH_BIND unset, --host MUST
+    resolve to 127.0.0.1. Guards against a future edit accidentally
+    restoring the 0.0.0.0 default (the C1 finding from the
+    2026-05-14 internal mcp-proxy security audit).
+
+    The audit found that the previous 0.0.0.0 default exposed the
+    host shell-exec surface to every device on the LAN + every
+    sibling Docker container + every local UID, with no
+    authentication. Loopback default closes the LAN + sibling-uid
+    surface; operators who need wider reach set MCP_HOST_BASH_BIND
+    explicitly + (in a follow-up PR) bearer-auth their callers."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    host_idx = lines.index("--host")
+    expect(
+        lines[host_idx + 1] == "127.0.0.1",
+        f"loopback default: --host MUST be 127.0.0.1 when "
+        f"MCP_HOST_BASH_BIND is unset, got {lines[host_idx + 1]!r}",
+    )
+
+
+def test_bind_env_override_widens_listener() -> None:
+    """MCP_HOST_BASH_BIND=0.0.0.0 in env => --host 0.0.0.0 in argv.
+    Operator-explicit opt-in path for Linux Docker bridge-net
+    containers that need host.docker.internal reachability."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_BIND": "0.0.0.0"},
+    )
+    host_idx = lines.index("--host")
+    expect(
+        lines[host_idx + 1] == "0.0.0.0",
+        f"bind override: --host should be 0.0.0.0 when "
+        f"MCP_HOST_BASH_BIND=0.0.0.0, got {lines[host_idx + 1]!r}",
+    )
+
+
+def test_bind_env_override_specific_interface() -> None:
+    """MCP_HOST_BASH_BIND=172.17.0.1 => --host 172.17.0.1. The
+    value is passed verbatim — operators can pin to a specific
+    interface IP for a tighter listen surface than bare 0.0.0.0."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_BIND": "172.17.0.1"},
+    )
+    host_idx = lines.index("--host")
+    expect(
+        lines[host_idx + 1] == "172.17.0.1",
+        f"bind specific IP: --host should pass through verbatim, "
+        f"got {lines[host_idx + 1]!r}",
+    )
+
+
+def test_bind_env_empty_falls_back_to_loopback() -> None:
+    """MCP_HOST_BASH_BIND="" (empty string) => default to 127.0.0.1.
+    Treats an empty value the same as unset — operators
+    accidentally exporting an empty variable still get the safe
+    floor."""
+    lines, _, _, _ = run_script(
+        ["--print-cmd"],
+        env={"MCP_HOST_BASH_BIND": ""},
+    )
+    host_idx = lines.index("--host")
+    expect(
+        lines[host_idx + 1] == "127.0.0.1",
+        f"empty bind env: --host should fall back to 127.0.0.1, "
+        f"got {lines[host_idx + 1]!r}",
+    )
+
+
 def test_hook_bridge_bins_unset_no_effect() -> None:
     """No CLAUDE_HOOK_BRIDGE_BINS => ALLOWED_COMMANDS unchanged from profile default."""
     lines_with, _, _, _ = run_script(["--print-cmd"])
@@ -665,6 +739,10 @@ tests = [
     test_cw_profile_operator_override_wins,
     test_hook_bridge_bins_merged_into_allow_list,
     test_hook_bridge_bins_works_with_trusted_profile,
+    test_bind_default_is_loopback,
+    test_bind_env_override_widens_listener,
+    test_bind_env_override_specific_interface,
+    test_bind_env_empty_falls_back_to_loopback,
     test_hook_bridge_bins_unset_no_effect,
     test_launcher_source_has_no_uvx_invocations,
     test_preflight_error_points_to_installer,

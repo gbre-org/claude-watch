@@ -273,7 +273,12 @@ Setup (one-time, four steps):
    examples/compose/bin/mcp-host-bash
    ```
 
-   Default port `8766`. Run `mcp-host-bash --help` for the full surface. If the launcher complains about missing `mcp-proxy` / `cli-mcp-server` on PATH, re-run step 2 (or add `~/.local/bin` to your PATH).
+   Default port `8766`. The launcher binds `127.0.0.1` by default (loopback only — `run_command` is a host-shell privilege escalator, so the safe floor is "no LAN / sibling-container / sibling-uid exposure"). macOS Docker Desktop's `host.docker.internal` NAT routes loopback for the default network setup, so the safe default Just Works for the typical Mac compose stack. Linux Docker bridge-net containers that can't reach host loopback have two options:
+
+   - Set `MCP_HOST_BASH_BIND=0.0.0.0` in the launcher's shell env (or in the launchd plist's `EnvironmentVariables`) to expose beyond loopback. **Pair with bearer-token auth** (see the host-bash block in [`.env.example`](.env.example)) when widening — bare `0.0.0.0` without auth exposes the host shell-exec surface to every reachable caller.
+   - OR run the container with `--network host` so it shares the host netns and can dial `127.0.0.1:8766` directly.
+
+   Run `mcp-host-bash --help` for the full surface. If the launcher complains about missing `mcp-proxy` / `cli-mcp-server` on PATH, re-run step 2 (or add `~/.local/bin` to your PATH).
 
 4. Set `CLAUDE_MCP_HTTP_BRIDGE` in `.env` to include `host-bash` (combine with other bridged servers via `:`):
 
