@@ -215,6 +215,32 @@ artifacts.
 
 **Signal handling**: the wrapper traps `SIGTERM`/`SIGINT` on the host and forwards them via `docker kill --signal=...` to a per-PID container name (`claude-tmux-$$`), so `Ctrl-C` from the host cleanly tears down the in-container tmux session.
 
+## PID 1 supervisor (tini)
+
+The image installs [`tini`](https://github.com/krallin/tini) from the Debian
+`bookworm` apt repo and runs it as PID 1. The Dockerfile `ENTRYPOINT` is:
+
+```
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/claude-tmux-entrypoint"]
+```
+
+Why tini, not bash-as-PID-1:
+
+- **Zombie reap**: `entrypoint.sh` spawns the in-container `claude-watch` daemon via `nohup setsid claude-watch ... &` so it survives the entrypoint's subsequent `exec tmux attach-session`. Anything that daemon (or any MCP subprocess, host-bash bridge call, etc.) leaves orphaned re-parents to PID 1. Without a real init, those orphans accumulate as `<defunct>` entries in `ps` and never get reaped. tini handles `SIGCHLD` and reaps them.
+- **Signal forwarding**: bash's default signal handling around `exec tmux attach-session` is fragile — `docker stop` sends SIGTERM to PID 1, and a bash-as-PID-1 in an `exec` chain can race against tmux for the signal. tini delivers signals to its child cleanly, so the entrypoint's `trap cleanup TERM INT` actually fires.
+- **Exit status propagation**: tini exits with its child's status (or `128 + signal` on signalled exit), so `docker stop --time=N` returns the expected exit code instead of whatever bash decides under exec.
+
+The entrypoint script keeps its existing `trap cleanup TERM INT` block (tini forwards the signal into the script's process, the trap runs, the cleanup kills the tmux session + the daemon PID before exit).
+
+### Future-tier supervision
+
+tini is a single-process supervisor — it doesn't restart its child, doesn't model service dependencies, and doesn't ship per-service health checks. That's the right tier for today: the container has two long-running children that the entrypoint manages directly (the tmux session's claude pane, plus the headless `claude-watch` daemon). When the container grows past two services — metrics exporters, an in-container queue tail, a host-bash bridge proxy, anything that wants declared dependencies and restart-on-failure — tini stops being enough. The next tier is a real supervisor. Two candidates worth evaluating at that point:
+
+- **[process-compose](https://github.com/F1bonacc1/process-compose)** — single static Go binary with a docker-compose-style YAML schema (`depends_on`, health checks, restart policies, log streaming, a TUI for live process state). Mental model matches the existing `compose.yml` so an operator already comfortable with compose finds it immediately legible. Younger ecosystem than s6.
+- **[s6-overlay](https://github.com/just-containers/s6-overlay)** — the docker-community standard (LinuxServer.io et al). Mature, well-documented `/etc/cont-init.d` + `/etc/services.d` model with a learning curve that's steeper than process-compose but pays off in flexibility.
+
+Default lean: **process-compose** when we add the third long-running service, with **s6-overlay** as the maturity fallback if process-compose hits a gap. Don't migrate preemptively — tini is sufficient until the service count grows.
+
 ## Host-only CLIs
 
 The image bakes the following binaries:

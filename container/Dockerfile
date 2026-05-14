@@ -47,8 +47,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # vim for in-container emergency edits, curl/ca-certs for NodeSource bootstrap.
 # Host-specific shell-history integrations are intentionally omitted —
 # layer them on via a downstream image if you need them.
+#
+# tini is the PID 1 supervisor (installed at /usr/bin/tini by the Debian
+# package). Without an explicit PID 1 init, entrypoint.sh runs as PID 1
+# itself — bash inherits no zombie-reap behaviour and no kernel-level
+# default signal handlers, so grandchildren orphaned by daemonising
+# helpers (nohup setsid claude-watch &, mcp/MCP subprocesses, etc.) pile
+# up as <defunct> entries and `docker stop` signals can race or get
+# dropped entirely. tini re-parents orphaned grandchildren, reaps them
+# on SIGCHLD, and forwards SIGTERM/SIGINT cleanly into the entrypoint
+# script's own trap handler. The image now wires tini in via
+# ENTRYPOINT ["/usr/bin/tini", "--", ...] below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux \
+        tini \
         git \
         curl \
         ca-certificates \
@@ -433,4 +445,11 @@ RUN chmod +x /usr/local/bin/claude-tmux-entrypoint
 USER hndrewaall
 WORKDIR /workspace
 
-ENTRYPOINT ["/usr/local/bin/claude-tmux-entrypoint"]
+# tini as PID 1: forwards SIGTERM/SIGINT to the entrypoint script's
+# `trap cleanup TERM INT` handler, reaps zombie grandchildren (the
+# nohup setsid claude-watch daemon spawned by the entrypoint, MCP
+# subprocesses, anything else that orphans), and exits with the
+# entrypoint's status. See the apt-get layer above for the why.
+# Future-tier alternatives (s6-overlay, process-compose) live in
+# container/README.md "Future-tier supervision".
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/claude-tmux-entrypoint"]
