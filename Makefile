@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -167,9 +167,19 @@ test-install-host-deps:
 # mcp-host-bash on operator-login. File-level structural validation
 # only (parses via stdlib plistlib + plutil-lint when available);
 # does NOT exercise launchctl because the test runs on Linux CI.
-# 19 cases, <1s.
+# 21 cases, <1s.
 test-launchd-plist:
 	examples/compose/bin/tests/launchd-plist.test
+
+# Tests for examples/compose/bin/load-bearer-from-keychain — the
+# macOS-only Keychain wrapper that fetches the bearer from the user's
+# login Keychain and exec's mcp-host-bash. Mocks the `security` CLI
+# and mcp-host-bash via PATH override so the suite runs on Linux CI.
+# Covers Keychain hit / miss / empty / non-macOS / unknown failure,
+# plist-plaintext fallback, argv passthrough, secret-leak invariants,
+# special-char round-trip, custom service-name. 12 cases, <1s.
+test-load-bearer-from-keychain:
+	examples/compose/bin/tests/load-bearer-from-keychain.test
 
 # Release build
 build:

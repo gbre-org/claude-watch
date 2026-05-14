@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""Tests for examples/compose/bin/load-bearer-from-keychain — the
+macOS-only Keychain wrapper for mcp-host-bash.
+
+Coverage:
+  - Keychain hit (non-empty value): exports MCP_HOST_BASH_BEARER and
+    exec's mcp-host-bash with the passed-through argv.
+  - Keychain hit (EMPTY value): refuses to start (exit 2).
+  - Keychain miss (security exit 44 = errSecItemNotFound): passes
+    through to mcp-host-bash WITHOUT setting MCP_HOST_BASH_BEARER, so
+    any plist-plaintext / shell-export fallback path still works.
+  - `security` CLI missing entirely (non-macOS hosts): silent
+    pass-through with a one-line stderr heads-up.
+  - Unknown `security` failure: pass-through (don't fail closed),
+    surface the security stderr on the wrapper's stderr.
+  - Operator-supplied secret never appears in stdout / stderr / argv
+    (only in the resolved MCP_HOST_BASH_BEARER env var passed to the
+    real launcher).
+  - LOAD_BEARER_PRINT_ENV inspectable state for each branch.
+  - --print-cmd round-trips argv to the real launcher without
+    requiring mcp-host-bash to be installed.
+
+All tests run on Linux CI by mocking `security` via PATH override (a
+tempdir with a synthetic `security` script that exits with the
+operator-specified rc + stdout). The real launcher (`mcp-host-bash`)
+is also mocked via PATH (a script that prints its own argv and the
+inherited `MCP_HOST_BASH_BEARER` env state so tests can assert what
+the wrapper actually passed through).
+
+Run:  ./load-bearer-from-keychain.test
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+WRAPPER = HERE.parent / "load-bearer-from-keychain"
+
+if not WRAPPER.exists():
+    print(f"FAIL: cannot locate wrapper at {WRAPPER}", file=sys.stderr)
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Mock infra
+# ---------------------------------------------------------------------------
+
+
+def write_mock_security(
+    bin_dir: Path,
+    *,
+    rc: int = 0,
+    stdout: str = "",
+    stderr: str = "",
+) -> None:
+    """Drop a synthetic `security` executable into `bin_dir` that exits
+    with `rc`, prints `stdout` (with trailing newline matching what the
+    real macOS `security -w` does), and `stderr`. The wrapper invokes
+    `security find-generic-password -s <svc> -a <acct> -w` — we don't
+    bother validating the argv shape in the mock; tests assert the
+    wrapper's BEHAVIOR (env state, exit code, stdout) instead."""
+    path = bin_dir / "security"
+    # Use a Python shim so we can express stdout/stderr/rc precisely
+    # across platforms. The wrapper invokes `security` via PATH lookup,
+    # not via a hard-coded path.
+    body = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"sys.stdout.write({stdout!r})\n"
+        f"sys.stderr.write({stderr!r})\n"
+        f"sys.exit({rc})\n"
+    )
+    path.write_text(body)
+    path.chmod(0o755)
+
+
+def remove_mock_security(bin_dir: Path) -> None:
+    """Ensure no `security` binary is on the synthetic PATH (simulates
+    a non-macOS host where the CLI doesn't ship)."""
+    path = bin_dir / "security"
+    if path.exists():
+        path.unlink()
+
+
+def write_mock_launcher(bin_dir: Path) -> Path:
+    """Drop a synthetic `mcp-host-bash` into `bin_dir` that prints its
+    own argv + the inherited MCP_HOST_BASH_BEARER state to stdout, so
+    tests can assert what the wrapper exec'd. The mock exits 0.
+
+    Output format (one line each, prefix-tagged so tests can grep):
+      ARGV0: <argv[0]>
+      ARGV1: <argv[1]>
+      ...
+      BEARER_SET: <yes|no>
+      BEARER_VALUE_LEN: <int>     # length, never the secret itself
+    """
+    path = bin_dir / "mcp-host-bash"
+    body = (
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "for i, a in enumerate(sys.argv):\n"
+        "    print(f'ARGV{i}: {a}')\n"
+        "bearer = os.environ.get('MCP_HOST_BASH_BEARER')\n"
+        "if bearer is None:\n"
+        "    print('BEARER_SET: no')\n"
+        "    print('BEARER_VALUE_LEN: 0')\n"
+        "else:\n"
+        "    print('BEARER_SET: yes')\n"
+        "    print(f'BEARER_VALUE_LEN: {len(bearer)}')\n"
+        "sys.exit(0)\n"
+    )
+    path.write_text(body)
+    path.chmod(0o755)
+    return path
+
+
+def run_wrapper(
+    *argv: str,
+    mock_bin: Path | None = None,
+    security_rc: int | None = 0,
+    security_stdout: str = "",
+    security_stderr: str = "",
+    extra_env: dict[str, str] | None = None,
+    print_env: bool = True,
+    print_cmd: bool = False,
+    mcp_host_bash_bin: Path | None = None,
+) -> subprocess.CompletedProcess:
+    """Run the wrapper with a synthetic PATH that contains the mocked
+    `security` (unless `security_rc is None`, in which case the bin
+    is removed → simulates "not macOS / non-existent") and the mocked
+    `mcp-host-bash` launcher.
+
+    `print_env=True` sets LOAD_BEARER_PRINT_ENV=1 so the wrapper
+    emits its decision-path tag.
+
+    `print_cmd=True` sets LOAD_BEARER_PRINT_CMD=1 so the wrapper
+    prints the exec argv and exits before exec'ing.
+
+    `mcp_host_bash_bin` overrides MCP_HOST_BASH_BIN — useful when a
+    test wants to point the wrapper at a specific binary path
+    instead of the sibling default."""
+    assert mock_bin is not None, "tests must supply a tempdir for mocks"
+
+    # Stage the mocks.
+    if security_rc is None:
+        remove_mock_security(mock_bin)
+    else:
+        write_mock_security(
+            mock_bin,
+            rc=security_rc,
+            stdout=security_stdout,
+            stderr=security_stderr,
+        )
+    real_launcher = write_mock_launcher(mock_bin)
+
+    env = {
+        # Drop the inherited PATH entirely so we only see our mocks +
+        # the system minimum needed to run /usr/bin/env python3.
+        "PATH": f"{mock_bin}:/usr/bin:/bin",
+        "USER": "test-user",
+        "HOME": str(mock_bin),
+    }
+    if print_env:
+        env["LOAD_BEARER_PRINT_ENV"] = "1"
+    if print_cmd:
+        env["LOAD_BEARER_PRINT_CMD"] = "1"
+    if extra_env:
+        env.update(extra_env)
+    # If a test wants the wrapper to exec a SPECIFIC mcp-host-bash
+    # path, pin it via env. Otherwise the wrapper will resolve the
+    # sibling next to itself in the real repo tree, which is also
+    # fine — but we usually want the mock launcher to fire so we can
+    # see what was passed through.
+    if mcp_host_bash_bin is not None:
+        env["MCP_HOST_BASH_BIN"] = str(mcp_host_bash_bin)
+    else:
+        env["MCP_HOST_BASH_BIN"] = str(real_launcher)
+
+    return subprocess.run(
+        [str(WRAPPER), *argv],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Runner + helpers
+# ---------------------------------------------------------------------------
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def parse_mock_launcher_output(stdout: str) -> dict:
+    """Parse the synthetic launcher's prefix-tagged output."""
+    out: dict = {"argv": [], "bearer_set": None, "bearer_len": None}
+    for line in stdout.splitlines():
+        if line.startswith("ARGV"):
+            _, _, rest = line.partition(": ")
+            out["argv"].append(rest)
+        elif line.startswith("BEARER_SET: "):
+            out["bearer_set"] = line.split(": ", 1)[1].strip()
+        elif line.startswith("BEARER_VALUE_LEN: "):
+            out["bearer_len"] = int(line.split(": ", 1)[1].strip())
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+def test_keychain_hit_exports_bearer() -> None:
+    """`security` exit 0 with a real value: MCP_HOST_BASH_BEARER is
+    set in the env passed to mcp-host-bash, secret value matches
+    exactly (length check, not value — we never log the secret)."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        secret = "EpHEMERAL-tEsT-vAlUe-1234567890ab"
+        # `security -w` outputs the value followed by a newline.
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=0,
+            security_stdout=secret + "\n",
+        )
+        expect(
+            result.returncode == 0,
+            f"hit: wrapper should exit 0, got {result.returncode}\n"
+            f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}",
+        )
+        expect(
+            "state=set" in result.stderr,
+            f"hit: state tag should be 'set', got stderr={result.stderr!r}",
+        )
+        parsed = parse_mock_launcher_output(result.stdout)
+        expect(
+            parsed["bearer_set"] == "yes",
+            f"hit: launcher should see MCP_HOST_BASH_BEARER set, "
+            f"got {parsed!r}",
+        )
+        expect(
+            parsed["bearer_len"] == len(secret),
+            f"hit: bearer length should match exactly (no extra newline / "
+            f"whitespace), got {parsed['bearer_len']} expected {len(secret)}",
+        )
+        # The secret value must NOT appear in the wrapper's stdout
+        # or stderr — only the env-var-tagged length.
+        expect(
+            secret not in result.stdout and secret not in result.stderr,
+            "hit: literal bearer value MUST NOT appear in wrapper "
+            "stdout / stderr (only ARGV from the launcher mock)",
+        )
+
+
+def test_keychain_hit_empty_value_refuses() -> None:
+    """`security` exit 0 with an empty value (operator stored an empty
+    Keychain entry): refuse to start (exit 2). Silently falling
+    through to no-auth is worse than a noisy refusal."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=0,
+            security_stdout="\n",  # Just the trailing newline.
+        )
+        expect(
+            result.returncode == 2,
+            f"empty: wrapper should exit 2 on empty bearer, "
+            f"got {result.returncode}",
+        )
+        expect(
+            "state=error-empty" in result.stderr,
+            f"empty: state tag should be 'error-empty', "
+            f"got stderr={result.stderr!r}",
+        )
+        expect(
+            "Refusing to start" in result.stderr,
+            f"empty: stderr should explain refusal, got {result.stderr!r}",
+        )
+
+
+def test_keychain_miss_passes_through() -> None:
+    """`security` exit 44 (errSecItemNotFound) → fall back to whatever
+    MCP_HOST_BASH_BEARER is already in the env (could be plist
+    plaintext fallback, could be genuinely unset). The wrapper does
+    NOT export the bearer; the launcher decides whether bearer-auth
+    is on based on env-var presence."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=44,
+            security_stdout="",
+            security_stderr="security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n",
+        )
+        expect(
+            result.returncode == 0,
+            f"miss: wrapper should pass through (exit 0), "
+            f"got {result.returncode}\nstderr: {result.stderr!r}",
+        )
+        expect(
+            "state=miss" in result.stderr,
+            f"miss: state tag should be 'miss', got stderr={result.stderr!r}",
+        )
+        parsed = parse_mock_launcher_output(result.stdout)
+        # No env-side bearer set → launcher sees BEARER_SET: no.
+        expect(
+            parsed["bearer_set"] == "no",
+            f"miss: launcher should see MCP_HOST_BASH_BEARER unset, "
+            f"got {parsed!r}",
+        )
+
+
+def test_keychain_miss_with_env_fallback() -> None:
+    """`security` exit 44 + caller already has MCP_HOST_BASH_BEARER in
+    env (the plist-plaintext fallback path): the wrapper does NOT
+    clobber that value. Launcher gets the fallback bearer.
+
+    This is the hybrid path: Keychain wins, plist plaintext fallback.
+    Migrating operators rely on this."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=44,
+            extra_env={"MCP_HOST_BASH_BEARER": "from-plist-plaintext"},
+        )
+        expect(
+            result.returncode == 0,
+            f"miss-fallback: wrapper should pass through, "
+            f"got {result.returncode}",
+        )
+        expect(
+            "state=miss" in result.stderr,
+            f"miss-fallback: state should be 'miss', got {result.stderr!r}",
+        )
+        parsed = parse_mock_launcher_output(result.stdout)
+        expect(
+            parsed["bearer_set"] == "yes",
+            f"miss-fallback: launcher should see the env-supplied bearer, "
+            f"got {parsed!r}",
+        )
+        expect(
+            parsed["bearer_len"] == len("from-plist-plaintext"),
+            f"miss-fallback: bearer length should match plist value, "
+            f"got {parsed['bearer_len']}",
+        )
+
+
+def test_security_missing_passes_through() -> None:
+    """No `security` CLI on PATH (i.e. Linux / non-macOS): silent
+    pass-through with a one-line stderr heads-up. Launcher gets
+    whatever's already in the env."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        # Don't write a mock security — simulates non-macOS.
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=None,  # signal: don't drop mock
+        )
+        expect(
+            result.returncode == 0,
+            f"no-security: wrapper should pass through, "
+            f"got {result.returncode}\nstderr: {result.stderr!r}",
+        )
+        expect(
+            "state=passthrough-no-security" in result.stderr,
+            f"no-security: state tag should be 'passthrough-no-security', "
+            f"got stderr={result.stderr!r}",
+        )
+        expect(
+            "'security' not on PATH" in result.stderr,
+            f"no-security: stderr should explain that 'security' is missing, "
+            f"got {result.stderr!r}",
+        )
+        parsed = parse_mock_launcher_output(result.stdout)
+        expect(
+            parsed["bearer_set"] == "no",
+            f"no-security: launcher should see MCP_HOST_BASH_BEARER unset, "
+            f"got {parsed!r}",
+        )
+
+
+def test_security_unknown_failure_passes_through() -> None:
+    """An unknown `security` exit code (lockout, malformed argv, etc.)
+    is treated as pass-through — failing closed on every transient
+    Keychain hiccup would break the plist-plaintext fallback path.
+    The wrapper surfaces the security stderr so the operator can
+    triage."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=99,  # unknown
+            security_stderr="security: hypothetical lockout\n",
+        )
+        expect(
+            result.returncode == 0,
+            f"unknown-fail: wrapper should pass through (exit 0), "
+            f"got {result.returncode}",
+        )
+        expect(
+            "state=passthrough-security-error" in result.stderr,
+            f"unknown-fail: state tag should be passthrough-security-error, "
+            f"got stderr={result.stderr!r}",
+        )
+        # The security stderr should be surfaced (triage aid).
+        expect(
+            "hypothetical lockout" in result.stderr,
+            f"unknown-fail: security stderr should be surfaced, "
+            f"got {result.stderr!r}",
+        )
+
+
+def test_argv_passes_through_to_launcher() -> None:
+    """Any argv the wrapper receives must propagate verbatim to
+    mcp-host-bash. The wrapper itself doesn't consume any flags;
+    `--port 9000` belongs to mcp-host-bash, not the wrapper."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        result = run_wrapper(
+            "--port",
+            "9000",
+            mock_bin=mock_bin,
+            security_rc=0,
+            security_stdout="secret\n",
+        )
+        parsed = parse_mock_launcher_output(result.stdout)
+        # argv[0] is the launcher's own path; argv[1:] is what we passed.
+        expect(
+            parsed["argv"][1:] == ["--port", "9000"],
+            f"argv-passthrough: launcher should see --port 9000, "
+            f"got {parsed['argv']!r}",
+        )
+
+
+def test_print_cmd_mode_skips_exec() -> None:
+    """--print-cmd mode (LOAD_BEARER_PRINT_CMD=1): the wrapper prints
+    the planned exec argv to stdout (one per line) and exits 0
+    without actually exec'ing mcp-host-bash. Used by the test suite +
+    operator debugging."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        result = run_wrapper(
+            "--port", "9000",
+            mock_bin=mock_bin,
+            security_rc=44,  # miss, just to keep things simple
+            print_cmd=True,
+        )
+        expect(
+            result.returncode == 0,
+            f"print-cmd: should exit 0, got {result.returncode}\n"
+            f"stderr: {result.stderr!r}",
+        )
+        # Output should be: <launcher_path>\n--port\n9000\n
+        out_lines = result.stdout.strip().splitlines()
+        expect(
+            len(out_lines) == 3,
+            f"print-cmd: should print 3 lines (launcher + 2 args), "
+            f"got {out_lines!r}",
+        )
+        if len(out_lines) >= 3:
+            expect(
+                out_lines[0].endswith("mcp-host-bash"),
+                f"print-cmd: line 0 should be the launcher, "
+                f"got {out_lines[0]!r}",
+            )
+            expect(
+                out_lines[1] == "--port" and out_lines[2] == "9000",
+                f"print-cmd: lines 1-2 should be the passed args, "
+                f"got {out_lines[1]!r} {out_lines[2]!r}",
+            )
+
+
+def test_custom_keychain_service_name() -> None:
+    """Operator can override KEYCHAIN_SERVICE to point at a different
+    Keychain entry. The wrapper invokes `security
+    find-generic-password -s <KEYCHAIN_SERVICE>`. We don't have a way
+    to inspect the EXACT argv the mock `security` received from inside
+    Python (the mock's a separate process), so we assert behavioral
+    equivalence: setting the env var doesn't break the happy path."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=0,
+            security_stdout="custom-service-secret\n",
+            extra_env={"KEYCHAIN_SERVICE": "my-corp.mcp-host-bash"},
+        )
+        expect(
+            result.returncode == 0,
+            f"custom-service: should succeed, got {result.returncode}",
+        )
+        parsed = parse_mock_launcher_output(result.stdout)
+        expect(
+            parsed["bearer_set"] == "yes",
+            f"custom-service: bearer should be set, got {parsed!r}",
+        )
+
+
+def test_secret_never_appears_in_argv_or_stdout() -> None:
+    """Defense-in-depth: the bearer value the wrapper resolves from
+    Keychain must NEVER appear in the wrapper's stderr, in argv to
+    mcp-host-bash, or in stdout (the mock launcher prints argv only;
+    the bearer goes via env)."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        secret = "SHOULD-NOT-APPEAR-IN-LOGS-9d8e7c"
+        result = run_wrapper(
+            "--port", "9000",
+            mock_bin=mock_bin,
+            security_rc=0,
+            security_stdout=secret + "\n",
+        )
+        # The mock launcher's stdout prints ARGV{i}: <value>. None
+        # of those values should equal the secret — argv is for
+        # launcher flags only.
+        for line in result.stdout.splitlines():
+            if line.startswith("ARGV"):
+                _, _, value = line.partition(": ")
+                expect(
+                    value != secret,
+                    f"argv-leak: bearer leaked into argv: {line!r}",
+                )
+        expect(
+            secret not in result.stderr,
+            f"stderr-leak: bearer must not appear in wrapper stderr, "
+            f"got {result.stderr!r}",
+        )
+
+
+def test_bearer_with_special_chars_preserved() -> None:
+    """Bearers with shell-special characters (base64 / and +, !, $)
+    round-trip exactly. The wrapper must not shell-interpret the
+    value."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        special = "abc/def+ghi$jkl!mn=pq"  # base64-ish + extras
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=0,
+            security_stdout=special + "\n",
+        )
+        parsed = parse_mock_launcher_output(result.stdout)
+        expect(
+            parsed["bearer_set"] == "yes",
+            f"special-chars: bearer should be set, got {parsed!r}",
+        )
+        expect(
+            parsed["bearer_len"] == len(special),
+            f"special-chars: length should round-trip exactly, "
+            f"got {parsed['bearer_len']} expected {len(special)}",
+        )
+
+
+def test_bearer_only_trailing_newline_stripped() -> None:
+    """`security -w` adds exactly one trailing newline. The wrapper
+    must strip ONLY that newline (not interior whitespace or leading
+    newlines)."""
+    with tempfile.TemporaryDirectory() as td:
+        mock_bin = Path(td) / "bin"
+        mock_bin.mkdir()
+        # Real-world: secrets with embedded newlines or trailing
+        # spaces are pathological but legal. We don't try to fix
+        # them, just don't make them worse.
+        secret = "  leading-spaces-stay  "
+        result = run_wrapper(
+            mock_bin=mock_bin,
+            security_rc=0,
+            security_stdout=secret + "\n",
+        )
+        parsed = parse_mock_launcher_output(result.stdout)
+        expect(
+            parsed["bearer_len"] == len(secret),
+            f"trim: only the trailing newline should be stripped, "
+            f"got {parsed['bearer_len']} expected {len(secret)}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+tests = [
+    test_keychain_hit_exports_bearer,
+    test_keychain_hit_empty_value_refuses,
+    test_keychain_miss_passes_through,
+    test_keychain_miss_with_env_fallback,
+    test_security_missing_passes_through,
+    test_security_unknown_failure_passes_through,
+    test_argv_passes_through_to_launcher,
+    test_print_cmd_mode_skips_exec,
+    test_custom_keychain_service_name,
+    test_secret_never_appears_in_argv_or_stdout,
+    test_bearer_with_special_chars_preserved,
+    test_bearer_only_trailing_newline_stripped,
+]
+
+for t in tests:
+    pre = len(failures)
+    try:
+        t()
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+    if len(failures) == pre:
+        print(f"PASS  {t.__name__}")
+    else:
+        print(f"FAIL  {t.__name__}")
+
+if failures:
+    print()
+    print(f"FAILED: {len(failures)} failure(s).")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+else:
+    print()
+    print(f"All {len(tests)} tests passed.")
+    sys.exit(0)

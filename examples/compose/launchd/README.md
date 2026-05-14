@@ -14,6 +14,29 @@ This directory ships a macOS LaunchAgent that registers
 `mcp-host-bash` with `launchd` so it starts automatically at login,
 restarts if it dies, and survives reboots without manual intervention.
 
+The default plist invokes
+[`examples/compose/bin/load-bearer-from-keychain`](../bin/load-bearer-from-keychain),
+a macOS-only wrapper that fetches the bearer token from the user's
+login Keychain and exports it as `MCP_HOST_BASH_BEARER` before exec'ing
+the real launcher — so the secret never lives in the plist or any
+backup that captures `~/Library/LaunchAgents/`. Operators who prefer
+the v50 plist-plaintext path can opt out (see Step 0 below).
+
+**Non-macOS operators** (Linux laptops / servers) don't get a clean
+Keychain analog — `libsecret` / `secret-service` is fragmented across
+desktop environments, and headless servers don't have a graphical
+session for password prompts. The documented alternatives:
+
+1. Plain env-var path in a systemd `user@.service` drop-in:
+   `Environment=MCP_HOST_BASH_BEARER=...` (still plaintext, but in a
+   root-readable unit file rather than the operator's home).
+2. `EnvironmentFile=` pointing at a 600-mode file under the operator's
+   home (`~/.config/claude-container/mcp-host-bash.env`); the
+   launcher already sources that file at startup, so adding
+   `MCP_HOST_BASH_BEARER=...` to it Just Works.
+3. A `gnome-keyring` / `kwallet` / `pass(1)`-based wrapper modeled on
+   `load-bearer-from-keychain`; out of scope for this directory.
+
 LaunchAgent (NOT LaunchDaemon): the launcher runs as the operator's
 user. It dials `cli-mcp-server`, which exec's commands under the
 operator's `$HOME` / `$PATH` / login keychain, and it binds a loopback
@@ -47,6 +70,84 @@ of that needs root, and a LaunchDaemon would invert the trust model
   examples/compose/bin/mcp-host-bash
   # Ctrl-C after you see the "starting" banner.
   ```
+
+### Step 0: store the bearer in the macOS Keychain (recommended)
+
+The default `ProgramArguments[0]` in the shipped plist invokes
+`examples/compose/bin/load-bearer-from-keychain`, which looks up the
+bearer in the macOS login Keychain and exports it as
+`MCP_HOST_BASH_BEARER` before exec'ing the real launcher. This keeps
+the secret out of `~/Library/LaunchAgents/<plist>` (and out of any
+backup that captures that directory).
+
+Bootstrap (one-time per host) — pick **one** of:
+
+```sh
+# Interactive prompt. The value never appears in shell history.
+security add-generic-password -s claude-watch.mcp-host-bash \
+                              -a "$USER" -w
+```
+
+```sh
+# Scripted. Acknowledged trade-off: the secret appears in `history`
+# (and any shell-history sync). Prefer the interactive form unless
+# you're piping the value from a secrets manager.
+security add-generic-password -s claude-watch.mcp-host-bash \
+                              -a "$USER" -w "$BEARER"
+```
+
+Default service name is `claude-watch.mcp-host-bash` (reverse-DNS-ish
+naming the `security` tool's users expect). The default account is
+`$USER`. Override either via `KEYCHAIN_SERVICE` /
+`KEYCHAIN_ACCOUNT` env vars on the launcher (set them in the plist's
+`EnvironmentVariables` block).
+
+Generate a fresh secret if you don't have one yet:
+
+```sh
+head -c 32 /dev/urandom | base64
+```
+
+The SAME secret must be set as `CLAUDE_HOST_HOOK_BRIDGE_BEARER` in
+the compose `.env` so the in-container hook bridge sends the matching
+header. Open `~/repos/claude-watch/examples/compose/.env` and set it
+once after generating.
+
+Verify the entry is in place (prints the bearer to stdout; pipe to
+`pbcopy` if you want the clipboard instead of the screen):
+
+```sh
+security find-generic-password -s claude-watch.mcp-host-bash \
+                               -a "$USER" -w
+```
+
+The first time `launchd` exec's the wrapper, macOS will pop a
+permission prompt asking whether the `security` helper can read this
+keychain item. Click **Always Allow** so the prompt doesn't fire on
+every (re)spawn.
+
+#### Opting out: plist plaintext path
+
+Operators who don't want a Keychain hop can point
+`ProgramArguments[0]` directly at
+`examples/compose/bin/mcp-host-bash` and add an
+`MCP_HOST_BASH_BEARER` `<string>` entry inside `EnvironmentVariables`.
+The launcher itself reads `MCP_HOST_BASH_BEARER` from its env regardless
+of how it got there — Keychain wrapper, plist plaintext, or an
+interactive shell `export`. Keychain is the default for new installs;
+operators upgrading from the v50 plist plaintext plist keep working
+unchanged until they migrate.
+
+The wrapper also implements a **fallback** path: when the Keychain
+entry is missing (`security` exit 44, `errSecItemNotFound`), it
+exec's `mcp-host-bash` without touching the env. If the plist
+`EnvironmentVariables` carries a value, the launcher picks that up.
+This means a hybrid configuration (Keychain wins, plist plaintext
+fallback) works out of the box, useful while migrating.
+
+If the Keychain entry exists but is **empty**, the wrapper refuses
+to start (exit 2) — an empty bearer would defeat the auth shim, and
+silently falling through to no-auth is worse than a noisy refusal.
 
 ## 1. Copy the plist into `~/Library/LaunchAgents/`
 
@@ -85,7 +186,7 @@ optional; defaults match a fresh install:
 | Key | Default in the template | When to change |
 |---|---|---|
 | `MCP_HOST_BASH_BIND` | `127.0.0.1` (loopback only) | `0.0.0.0` (or a specific interface IP) for Linux Docker bridge-net containers that reach the host via `host.docker.internal` — those callers can't dial host loopback. Pair with `MCP_HOST_BASH_BEARER` (below) when widening — `run_command` is a host-shell privilege escalator, anything reachable on the port can exec as the operator user. macOS Docker Desktop's `host.docker.internal` NAT routes loopback for the default setup, so the safe default works there. |
-| `MCP_HOST_BASH_BEARER` | empty (no auth shim) | Shared-secret bearer token. When set, the launcher fronts mcp-proxy with `mcp-proxy-auth-shim` which validates `Authorization: Bearer <token>` on every request and rejects anything without the header. Required for any non-loopback bind. Generate once with `head -c 32 /dev/urandom \| base64` and keep out of version control. Mirror the same value into `CLAUDE_HOST_HOOK_BRIDGE_BEARER` in the docker-compose `.env` file. |
+| `MCP_HOST_BASH_BEARER` | (not in template) | Default is supplied by the `load-bearer-from-keychain` wrapper via macOS Keychain — see Step 0 above. Opt-out to plist plaintext by pointing ProgramArguments[0] at `examples/compose/bin/mcp-host-bash` directly AND adding `MCP_HOST_BASH_BEARER` as a `<string>` entry here. The launcher itself reads the env var regardless of how it got there. Required for any non-loopback bind. Generate once with `head -c 32 /dev/urandom \| base64` and keep out of version control. Mirror the same value into `CLAUDE_HOST_HOOK_BRIDGE_BEARER` in the docker-compose `.env` file. |
 | `CW_PROFILE` | `corp-dev` (read-y allow-list) | `corp-dev-trusted` to widen for host scheduling, file mutation, container management. See the launcher's script header for the full surface. |
 | `ALLOW_SHELL_OPERATORS` | `false` (block pipes / `&&` / redirects) | `true` only if a workflow specifically needs shell operators. Loosens the safety floor. |
 | `SSL_CERT_FILE` | empty | Absolute path to your corporate CA bundle if `run_command` invocations of curl / git / pip have to validate a corp chain. |
@@ -223,6 +324,14 @@ rm -f ~/Library/Logs/mcp-host-bash.out.log
 rm -f ~/Library/Logs/mcp-host-bash.err.log
 rm -f ~/.local/state/claude-container/mcp-host-bash.log
 rm -f ~/.config/claude-container/mcp-host-bash.env
+```
+
+And the Keychain entry from Step 0 (skip if you went the plist
+plaintext route and never bootstrapped it):
+
+```sh
+security delete-generic-password -s claude-watch.mcp-host-bash \
+                                 -a "$USER"
 ```
 
 ## Troubleshooting

@@ -187,17 +187,29 @@ def test_program_arguments_first_is_absolute() -> None:
 
 
 def test_program_arguments_first_points_at_launcher() -> None:
-    """ProgramArguments[0] must end in `bin/mcp-host-bash` — guards
-    against a refactor renaming the launcher without updating the
-    template (or a typo in the template itself)."""
+    """ProgramArguments[0] must end in either the launcher binary
+    (`bin/mcp-host-bash`) OR the Keychain wrapper
+    (`bin/load-bearer-from-keychain`) — both are valid bootstrap
+    targets. Guards against a refactor renaming the launcher without
+    updating the template (or a typo in the template itself).
+
+    The Keychain wrapper exec's mcp-host-bash after fetching the
+    bearer from the macOS login Keychain; the bare-launcher form is
+    the opt-out for operators who prefer plist plaintext."""
     pa = PARSED.get("ProgramArguments")
     if not (isinstance(pa, list) and pa):
         return
     first = pa[0]
+    accepted_suffixes = (
+        "/bin/mcp-host-bash",
+        "/mcp-host-bash",
+        "/bin/load-bearer-from-keychain",
+        "/load-bearer-from-keychain",
+    )
     expect(
-        first.endswith("/bin/mcp-host-bash") or first.endswith("/mcp-host-bash"),
-        f"ProgramArguments[0] should end with the launcher basename "
-        f"(`bin/mcp-host-bash`); got {first!r}",
+        any(first.endswith(s) for s in accepted_suffixes),
+        f"ProgramArguments[0] should end with one of "
+        f"{accepted_suffixes!r}; got {first!r}",
     )
 
 
@@ -351,6 +363,49 @@ def test_readme_documents_required_steps() -> None:
         )
 
 
+def test_readme_documents_keychain_bootstrap() -> None:
+    """The Step 0 Keychain bootstrap section must call out the
+    `security add-generic-password` one-liner with the standard
+    service-name convention. Operators copy/paste this verbatim, so
+    drift breaks the on-ramp."""
+    if not LAUNCHD_README.exists():
+        return
+    body = LAUNCHD_README.read_text()
+    for needle in (
+        "security add-generic-password",  # bootstrap one-liner
+        "claude-watch.mcp-host-bash",  # canonical service name
+        "load-bearer-from-keychain",  # the wrapper script
+        "Keychain",  # section header
+    ):
+        expect(
+            needle in body,
+            f"launchd/README.md must mention {needle!r} (Step 0 "
+            f"Keychain bootstrap walkthrough)",
+        )
+
+
+def test_keychain_wrapper_script_exists_and_executable() -> None:
+    """The Keychain wrapper script must exist alongside the launcher
+    and be executable. launchd won't / can't `chmod +x` ProgramArguments
+    targets at bootstrap time; the bit has to be set in the
+    checked-in repo."""
+    wrapper = (
+        HERE.parent.parent
+        / "bin"
+        / "load-bearer-from-keychain"
+    )
+    expect(
+        wrapper.exists(),
+        f"load-bearer-from-keychain wrapper must exist; looked at {wrapper}",
+    )
+    if wrapper.exists():
+        expect(
+            os.access(str(wrapper), os.X_OK),
+            f"load-bearer-from-keychain must be executable (chmod +x); "
+            f"got mode {oct(wrapper.stat().st_mode)}",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Compose README references
 # ---------------------------------------------------------------------------
@@ -397,6 +452,8 @@ tests = [
     test_readme_exists,
     test_readme_references_label,
     test_readme_documents_required_steps,
+    test_readme_documents_keychain_bootstrap,
+    test_keychain_wrapper_script_exists_and_executable,
     test_compose_readme_links_to_launchd,
 ]
 

@@ -127,6 +127,9 @@ jobs:
       - name: Run launchd plist tests
         run: make test-launchd-plist
 
+      - name: Run load-bearer-from-keychain wrapper tests
+        run: make test-load-bearer-from-keychain
+
       - name: Install uv (for session-task tests)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 

@@ -32,8 +32,27 @@
     <string>com.anthropic.claude-watch.mcp-host-bash</string>
 
     <!--
-      ProgramArguments: full argv launchd will exec. The launcher
-      script is `examples/compose/bin/mcp-host-bash` in the repo.
+      ProgramArguments: full argv launchd will exec. Default points at
+      the `load-bearer-from-keychain` wrapper, which fetches the bearer
+      from the macOS login Keychain (service:
+      `claude-watch.mcp-host-bash`, account: `$USER`) and then exec's
+      `examples/compose/bin/mcp-host-bash`. The wrapper is the
+      preferred path on macOS — it keeps the secret out of this plist
+      file and out of any backup that captures `~/Library/LaunchAgents`.
+
+      Bootstrap (one-time, see launchd/README.md "Step 0"):
+        security add-generic-password -s claude-watch.mcp-host-bash \
+                                      -a "$USER" -w
+      (interactive prompt; doesn't leak via shell history).
+
+      Operators who don't want the Keychain hop can point this directly
+      at `examples/compose/bin/mcp-host-bash` and stash the bearer in
+      `EnvironmentVariables.MCP_HOST_BASH_BEARER` below — that path
+      still works (and was the v50 default). The wrapper falls back to
+      whatever's already in the env when the Keychain entry is missing,
+      so a populated EnvironmentVariables value plus the wrapper is also
+      valid; the Keychain entry just supersedes it when present.
+
       Replace /PATH/TO/REPO with the absolute path to your local
       claude-watch checkout (no `~`, no `${HOME}`). Append
       `<dash><dash>port N` after the script path if you want a
@@ -41,7 +60,7 @@
     -->
     <key>ProgramArguments</key>
     <array>
-        <string>/PATH/TO/REPO/examples/compose/bin/mcp-host-bash</string>
+        <string>/PATH/TO/REPO/examples/compose/bin/load-bearer-from-keychain</string>
     </array>
 
     <!--
@@ -62,12 +81,33 @@
         shell-exec surface to every reachable caller — do not run that
         in production.
 
-      - MCP_HOST_BASH_BEARER: shared-secret bearer token. When set, the
-        launcher fronts mcp-proxy with mcp-proxy-auth-shim, which
-        validates `Authorization: Bearer <token>` on every request and
-        forwards only authenticated requests to mcp-proxy on an
-        internal loopback port. Required when MCP_HOST_BASH_BIND is
-        non-loopback. Generate once + keep out of version control:
+      - MCP_HOST_BASH_BEARER: shared-secret bearer token. INTENTIONALLY
+        ABSENT from the default EnvironmentVariables block — the
+        default ProgramArguments[0] above invokes the
+        `load-bearer-from-keychain` wrapper, which reads the bearer
+        from the macOS login Keychain (service:
+        claude-watch.mcp-host-bash, account: $USER) and exports it
+        before exec'ing the launcher.
+
+        Bootstrap (one-time, interactive prompt — doesn't leak via
+        shell history):
+
+            security add-generic-password -s claude-watch.mcp-host-bash \
+                                          -a "$USER" -w
+
+        OPT-OUT to plist plaintext: point ProgramArguments[0] at
+        examples/compose/bin/mcp-host-bash directly (skipping the
+        wrapper) AND add MCP_HOST_BASH_BEARER here as a <string> entry.
+        The launcher itself reads MCP_HOST_BASH_BEARER from its env
+        regardless of how it got there, so the plist-plaintext path
+        still works — it's just no longer the default.
+
+        When set (via Keychain wrapper OR plist plaintext OR shell
+        env), the launcher fronts mcp-proxy with mcp-proxy-auth-shim,
+        which validates `Authorization: Bearer <token>` on every
+        request and forwards only authenticated requests to mcp-proxy
+        on an internal loopback port. Required when MCP_HOST_BASH_BIND
+        is non-loopback. Generate once + keep out of version control:
 
             head -c 32 /dev/urandom | base64
 
@@ -122,17 +162,41 @@
         <string>127.0.0.1</string>
 
         <!--
-          MCP_HOST_BASH_BEARER: shared-secret bearer token. When set,
-          the launcher fronts mcp-proxy with mcp-proxy-auth-shim, which
-          validates `Authorization: Bearer <token>` on every request.
-          Required for any non-loopback bind. Generate once with
-          `head -c 32 /dev/urandom | base64`; mirror the same value
-          into CLAUDE_HOST_HOOK_BRIDGE_BEARER in the docker-compose
-          .env file. Empty / unset = no shim, no auth (matches
+          MCP_HOST_BASH_BEARER is INTENTIONALLY ABSENT from this template.
+          The default ProgramArguments above invokes
+          `load-bearer-from-keychain`, which fetches the bearer from the
+          macOS login Keychain (service: claude-watch.mcp-host-bash,
+          account: $USER) and exports MCP_HOST_BASH_BEARER before exec'ing
+          the launcher. The plist therefore never has to carry the secret
+          in plaintext.
+
+          Bootstrap (one-time):
+            security add-generic-password -s claude-watch.mcp-host-bash \
+                                          -a "$USER" -w
+          (interactive prompt; doesn't leak via shell history).
+
+          OPT-OUT (operators who prefer plist plaintext): point
+          ProgramArguments[0] at examples/compose/bin/mcp-host-bash
+          (skip the wrapper) AND add MCP_HOST_BASH_BEARER as a <string>
+          entry inside this EnvironmentVariables dict. The launcher
+          itself reads MCP_HOST_BASH_BEARER from its env regardless of
+          how it got there, so the plist-plaintext path still works —
+          it's just no longer the default.
+
+          HYBRID: keep load-bearer-from-keychain in ProgramArguments AND
+          set MCP_HOST_BASH_BEARER here. The Keychain entry wins when
+          present; the plist value is the fallback when the Keychain
+          entry is missing. Useful while migrating from the plaintext
+          path to Keychain.
+
+          The host-side mcp-proxy-auth-shim validates
+          `Authorization: Bearer <token>` on every request — generate
+          the secret once with `head -c 32 /dev/urandom | base64` and
+          mirror the same value into CLAUDE_HOST_HOOK_BRIDGE_BEARER in
+          the docker-compose .env file. Required for any non-loopback
+          bind; empty / unset = no shim, no auth (matches the
           pre-bearer-auth launcher behavior).
         -->
-        <key>MCP_HOST_BASH_BEARER</key>
-        <string></string>
 
         <key>CW_PROFILE</key>
         <string>corp-dev</string>

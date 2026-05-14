@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# load-bearer-from-keychain — macOS-only Keychain wrapper for mcp-host-bash.
+#
+# Why this exists
+#
+# The original LaunchAgent plist carries MCP_HOST_BASH_BEARER as a
+# plaintext <string> inside EnvironmentVariables. That works (and is
+# the v50-acceptable trade-off) but stores the shared secret in a
+# user-readable plist file that's easy to accidentally commit, screen-
+# share, or scoop up in a backup snapshot.
+#
+# This helper supersedes the plist plaintext when present. It looks up
+# the bearer token in the macOS login Keychain via `security
+# find-generic-password -w`, exports it as MCP_HOST_BASH_BEARER, then
+# exec's the real mcp-host-bash launcher. The plist still wires
+# `MCP_HOST_BASH_BIND`, `CW_PROFILE`, etc. via EnvironmentVariables —
+# only the secret moves out.
+#
+# Operator bootstrap (once per host):
+#
+#   # Interactive prompt (doesn't leak via shell history):
+#   security add-generic-password -s claude-watch.mcp-host-bash \
+#                                 -a "$USER" -w
+#
+#   # Or scripted (acknowledged: appears in `history`):
+#   security add-generic-password -s claude-watch.mcp-host-bash \
+#                                 -a "$USER" -w "$BEARER"
+#
+# Behavior:
+#   - Keychain hit, non-empty: export MCP_HOST_BASH_BEARER and exec
+#     mcp-host-bash with whatever argv was passed through. Auth shim
+#     starts.
+#   - Keychain hit, empty value: refuse to start (exit 2). An empty
+#     entry is operator error — DO NOT silently fall through to no-auth
+#     mode. The launcher's no-auth path is for operators who never set
+#     a bearer; if you bootstrapped a Keychain entry you meant it to be
+#     a real secret.
+#   - Keychain miss (`security` exit 44, errSecItemNotFound): EITHER
+#     fall back to whatever MCP_HOST_BASH_BEARER is already in the env
+#     (e.g. plist EnvironmentVariables) OR exec mcp-host-bash bare and
+#     let it print its no-auth-mode banner. Operators who want the
+#     Keychain helper but haven't set it up yet stay functional; the
+#     plist plaintext path still works.
+#   - `security` not on PATH (i.e. not a Mac, or a stripped-down macOS):
+#     pass through to mcp-host-bash without modifying the env. This
+#     helper is macOS-only by design; other OSes use the plist /
+#     environment path. We log a one-line stderr heads-up so operators
+#     who copy this script to Linux notice.
+#   - Any other `security` error (lockout, malformed argv, etc.): pass
+#     through to mcp-host-bash without modifying the env, log the
+#     security stderr so the operator can triage. We deliberately
+#     don't `exit 1` here — failing closed on every transient Keychain
+#     hiccup would break operators who rely on the plist plaintext
+#     fallback.
+#
+# Tunables (env vars consumed BEFORE the launcher's own env handling):
+#
+#   KEYCHAIN_SERVICE   — service-name passed to `security
+#                        find-generic-password -s`. Default
+#                        `claude-watch.mcp-host-bash` (reverse-DNS-ish
+#                        naming most operators expect).
+#   KEYCHAIN_ACCOUNT   — account-name passed via `-a`. Default `$USER`.
+#   KEYCHAIN_KEYCHAIN  — optional keychain file to query. Default: the
+#                        operator's default search list (login + system
+#                        + iCloud). Set to e.g. `~/Library/Keychains/
+#                        login.keychain-db` to pin the lookup.
+#   MCP_HOST_BASH_BIN  — absolute path to the mcp-host-bash launcher.
+#                        Default: the sibling script next to this one.
+#   LOAD_BEARER_PRINT_ENV — debug knob. When `1`, print the resolved
+#                        MCP_HOST_BASH_BEARER state to stderr (`set`,
+#                        `unset`, `error`) WITHOUT logging the secret
+#                        itself. Used by the test suite to inspect the
+#                        decision path.
+#   LOAD_BEARER_PRINT_CMD — debug knob. When `1`, print the full argv
+#                        the helper WOULD exec (mcp-host-bash + args)
+#                        to stdout, one per line, and exit 0. Lets the
+#                        test suite verify exec-arg construction
+#                        without actually launching mcp-host-bash.
+#
+# Exit codes:
+#   0  normal — exec'd mcp-host-bash (or printed exec argv in
+#               LOAD_BEARER_PRINT_CMD mode).
+#   2  Keychain entry exists but value is empty — refuse to start.
+#
+# Security:
+#   - The bearer never appears in argv. We pass it via env only.
+#   - We never log the bearer to stdout / stderr / launchd logs.
+#     `security -w` writes the value to stdout ONCE; we capture it
+#     into a shell-local variable and pipe it into export.
+#   - The plist's EnvironmentVariables MCP_HOST_BASH_BEARER value is
+#     overwritten before exec (the export wins). Operators can leave
+#     the plist value empty when using this helper.
+#
+# Bootstrap walkthrough lives in
+# examples/compose/launchd/README.md "Step 0".
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Defaults
+# -----------------------------------------------------------------------------
+
+KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-claude-watch.mcp-host-bash}"
+KEYCHAIN_ACCOUNT="${KEYCHAIN_ACCOUNT:-${USER:-}}"
+KEYCHAIN_KEYCHAIN="${KEYCHAIN_KEYCHAIN:-}"
+
+# Resolve the real launcher path. Default to a sibling script (the
+# repo layout under examples/compose/bin/); operators with `make
+# install`-deployed scripts can override via MCP_HOST_BASH_BIN.
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+MCP_HOST_BASH_BIN="${MCP_HOST_BASH_BIN:-${script_dir}/mcp-host-bash}"
+
+PRINT_ENV="${LOAD_BEARER_PRINT_ENV:-0}"
+PRINT_CMD="${LOAD_BEARER_PRINT_CMD:-0}"
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+emit_env_state() {
+    # Inspectable signal for tests. Never includes the secret itself.
+    if [ "$PRINT_ENV" = "1" ]; then
+        printf 'load-bearer-from-keychain: state=%s\n' "$1" >&2
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Resolve the bearer.
+# -----------------------------------------------------------------------------
+
+if ! command -v security >/dev/null 2>&1; then
+    # Not macOS (or stripped-down). Pass through to the launcher; the
+    # plist plaintext fallback (or whatever the operator wired) handles
+    # the bearer. One-line stderr heads-up so a misplaced copy on Linux
+    # doesn't silently swallow the helper's purpose.
+    echo "load-bearer-from-keychain: 'security' not on PATH — Keychain lookup skipped (macOS-only)." >&2
+    emit_env_state "passthrough-no-security"
+else
+    # Build the `security find-generic-password` argv. We pass `-w`
+    # to print only the password value to stdout, and rely on the
+    # tool's per-line output to make capture trivial.
+    security_argv=(security find-generic-password
+                   -s "$KEYCHAIN_SERVICE"
+                   -a "$KEYCHAIN_ACCOUNT"
+                   -w)
+    if [ -n "$KEYCHAIN_KEYCHAIN" ]; then
+        security_argv+=("$KEYCHAIN_KEYCHAIN")
+    fi
+
+    bearer_value=""
+    security_rc=0
+    bearer_value="$("${security_argv[@]}" 2>/tmp/load-bearer-from-keychain.err)" || security_rc=$?
+    security_stderr="$(cat /tmp/load-bearer-from-keychain.err 2>/dev/null || true)"
+    rm -f /tmp/load-bearer-from-keychain.err
+
+    case "$security_rc" in
+        0)
+            # `security -w` ends with a trailing newline; strip ONLY
+            # the trailing newline (not interior whitespace) so secrets
+            # with leading / trailing spaces round-trip exactly.
+            bearer_value="${bearer_value%$'\n'}"
+            if [ -z "$bearer_value" ]; then
+                cat >&2 <<EOF
+load-bearer-from-keychain: FATAL: Keychain entry exists for
+       service=$KEYCHAIN_SERVICE account=$KEYCHAIN_ACCOUNT
+       but its value is empty. Refusing to start mcp-host-bash —
+       this is operator error (an empty bearer would defeat the
+       auth-shim entirely). Remove the entry or set it to a real
+       secret:
+
+         security delete-generic-password -s '$KEYCHAIN_SERVICE' -a '$KEYCHAIN_ACCOUNT'
+         security add-generic-password -s '$KEYCHAIN_SERVICE' -a '$KEYCHAIN_ACCOUNT' -w
+EOF
+                emit_env_state "error-empty"
+                exit 2
+            fi
+            export MCP_HOST_BASH_BEARER="$bearer_value"
+            emit_env_state "set"
+            ;;
+        44|45)
+            # 44 = errSecItemNotFound. 45 = errSecAuthFailed (the
+            # user clicked "Deny" on the keychain prompt). Treat both
+            # as miss: fall back to whatever's already in the env,
+            # which may be the plist plaintext path or genuinely
+            # unset. The launcher itself decides whether bearer-auth
+            # is on or off based on the env var presence.
+            emit_env_state "miss"
+            ;;
+        *)
+            # Unknown failure. Don't fail closed — that would break
+            # the plist plaintext fallback. Surface the security
+            # stderr so the operator can triage in launchd logs.
+            if [ -n "$security_stderr" ]; then
+                printf 'load-bearer-from-keychain: security exit %s; stderr: %s\n' \
+                    "$security_rc" "$security_stderr" >&2
+            else
+                printf 'load-bearer-from-keychain: security exit %s (no stderr)\n' \
+                    "$security_rc" >&2
+            fi
+            emit_env_state "passthrough-security-error"
+            ;;
+    esac
+fi
+
+# -----------------------------------------------------------------------------
+# Exec the real launcher (pass through every arg from our argv).
+# -----------------------------------------------------------------------------
+
+if [ "$PRINT_CMD" = "1" ]; then
+    # Test hook: print the planned exec argv and exit. Never logs the
+    # secret. The MCP_HOST_BASH_BEARER state (if set) is observable
+    # via LOAD_BEARER_PRINT_ENV=1.
+    printf '%s\n' "$MCP_HOST_BASH_BIN"
+    for a in "$@"; do
+        printf '%s\n' "$a"
+    done
+    exit 0
+fi
+
+exec "$MCP_HOST_BASH_BIN" "$@"
