@@ -49,6 +49,8 @@ def run_helper(
     env_patterns: str | None = None,
     http_bridge: str | None = None,
     env_http_bridge: str | None = None,
+    bearer_env: str | None = None,
+    bearer_value: str | None = None,
 ) -> tuple[str, str]:
     cmd = [str(SCRIPT), "--mcp-input", mcp_input, "--output-dir", output_dir]
     if quiet:
@@ -57,13 +59,23 @@ def run_helper(
         cmd += ["--shim-patterns", patterns]
     if http_bridge is not None:
         cmd += ["--http-bridge", http_bridge]
+    if bearer_env is not None:
+        cmd += ["--bearer-env", bearer_env]
     env = dict(os.environ)
     env.pop("CLAUDE_SHIM_PATTERNS", None)
     env.pop("CLAUDE_MCP_HTTP_BRIDGE", None)
+    # Always start from a clean slate for the default bearer env var.
+    # Individual tests opt into setting it via `bearer_value`.
+    env.pop("CLAUDE_HOST_HOOK_BRIDGE_BEARER", None)
     if env_patterns is not None:
         env["CLAUDE_SHIM_PATTERNS"] = env_patterns
     if env_http_bridge is not None:
         env["CLAUDE_MCP_HTTP_BRIDGE"] = env_http_bridge
+    if bearer_value is not None:
+        # Set whichever env var name the test cares about. Default
+        # matches the helper's --bearer-env default.
+        var_name = bearer_env if bearer_env else "CLAUDE_HOST_HOOK_BRIDGE_BEARER"
+        env[var_name] = bearer_value
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -972,6 +984,284 @@ def test_http_bridge_malformed_pair_ignored() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bearer-auth header auto-inject (--bearer-env / CLAUDE_HOST_HOOK_BRIDGE_BEARER)
+# ---------------------------------------------------------------------------
+
+
+def test_bearer_env_set_injects_authorization_header() -> None:
+    """When the bearer env var is set non-empty, http-bridged entries
+    pick up `Authorization: Bearer ${<var>}` (note the `${...}` form —
+    Claude Code's MCP loader expands env vars at runtime; the literal
+    secret never lives in the file)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            # Set the default env var that --bearer-env points at.
+            bearer_value="dont-care-the-secret-value",
+        )
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            isinstance(adaptor.get("headers"), dict),
+            f"bearer-set: headers should be a dict, got {adaptor.get('headers')!r}",
+        )
+        expect(
+            adaptor.get("headers", {}).get("Authorization")
+            == "Bearer ${CLAUDE_HOST_HOOK_BRIDGE_BEARER}",
+            f"bearer-set: Authorization header should reference env var, "
+            f"got {adaptor.get('headers', {}).get('Authorization')!r}",
+        )
+        # The literal secret must NOT appear in the serialized file.
+        raw = (project / ".mcp.json").read_text(encoding="utf-8")
+        expect(
+            "dont-care-the-secret-value" not in raw,
+            "bearer-set: literal secret should NEVER appear in .mcp.json — "
+            "only the ${VAR} reference",
+        )
+
+
+def test_bearer_env_unset_no_headers_field() -> None:
+    """When the bearer env var is UNSET, no headers field is added
+    (exact match to pre-PR behavior). Other http-bridge behavior
+    unchanged."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        # bearer_value=None means run_helper does NOT set the env var.
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+        )
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            adaptor.get("type") == "http",
+            f"bearer-unset: rewrite still happens, "
+            f"got type={adaptor.get('type')!r}",
+        )
+        expect(
+            "headers" not in adaptor,
+            f"bearer-unset: no headers field should be added when env "
+            f"var unset, got {adaptor!r}",
+        )
+
+
+def test_bearer_env_empty_no_headers_field() -> None:
+    """An env var set to the empty string is equivalent to unset —
+    no headers field added. Guards against accidentally injecting
+    `Authorization: Bearer ${VAR}` when VAR=""."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            bearer_value="",  # explicit empty
+        )
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            "headers" not in adaptor,
+            f"bearer-empty: empty env var should NOT inject Authorization, "
+            f"got {adaptor!r}",
+        )
+
+
+def test_bearer_env_disabled_via_empty_flag() -> None:
+    """`--bearer-env ''` explicitly disables the auto-inject even when
+    the default env var (CLAUDE_HOST_HOOK_BRIDGE_BEARER) is set —
+    operator escape hatch for "I want to manage headers myself"."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        # Set the env var BUT pass --bearer-env '' to disable.
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            bearer_env="",
+            bearer_value="dont-care",
+        )
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            "headers" not in adaptor,
+            f"bearer-disabled: --bearer-env '' should suppress auto-inject "
+            f"even with env var set, got {adaptor!r}",
+        )
+
+
+def test_bearer_env_custom_var_name() -> None:
+    """Operator can point --bearer-env at a custom env var name (not
+    the CLAUDE_HOST_HOOK_BRIDGE_BEARER default) and the auto-inject
+    reads from that variable, references that name in the header."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            bearer_env="MY_CORP_BEARER",
+            bearer_value="some-other-secret",
+        )
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            adaptor.get("headers", {}).get("Authorization")
+            == "Bearer ${MY_CORP_BEARER}",
+            f"bearer-custom: Authorization should reference custom var, "
+            f"got {adaptor.get('headers', {}).get('Authorization')!r}",
+        )
+
+
+def test_bearer_env_preserves_existing_headers() -> None:
+    """When the operator already declared `headers` on the HTTP entry
+    (e.g. X-Trace), the bearer auto-inject MERGES with those headers
+    instead of clobbering them."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {
+            "mcpServers": {
+                "mcp-adaptor": {
+                    "command": "/Users/me/.mcp-adaptor/bin/x",
+                    "headers": {"X-Trace": "1", "X-Operator": "andrew"},
+                },
+            },
+        })
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            bearer_value="zz",
+        )
+        out = load_output(project)
+        headers = out["mcpServers"]["mcp-adaptor"].get("headers", {})
+        expect(
+            headers.get("X-Trace") == "1",
+            f"bearer-merge: X-Trace should survive, got {headers!r}",
+        )
+        expect(
+            headers.get("X-Operator") == "andrew",
+            f"bearer-merge: X-Operator should survive, got {headers!r}",
+        )
+        expect(
+            headers.get("Authorization")
+            == "Bearer ${CLAUDE_HOST_HOOK_BRIDGE_BEARER}",
+            f"bearer-merge: Authorization should be added, got {headers!r}",
+        )
+
+
+def test_bearer_env_operator_authorization_wins() -> None:
+    """If the operator explicitly pinned an `Authorization` header,
+    the auto-inject does NOT clobber it. Escape hatch for operators
+    who want to use a different header value (e.g. a static token,
+    OAuth bearer, etc.)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {
+            "mcpServers": {
+                "mcp-adaptor": {
+                    "command": "/Users/me/.mcp-adaptor/bin/x",
+                    "headers": {"Authorization": "Bearer hardcoded-by-operator"},
+                },
+            },
+        })
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            bearer_value="zz",
+        )
+        out = load_output(project)
+        auth = out["mcpServers"]["mcp-adaptor"]["headers"]["Authorization"]
+        expect(
+            auth == "Bearer hardcoded-by-operator",
+            f"bearer-operator-wins: operator's explicit Authorization "
+            f"should survive, got {auth!r}",
+        )
+
+
+def test_bearer_env_non_bridged_server_unaffected() -> None:
+    """A server that's NOT in the http-bridge mapping stays in
+    stdio+exec-hook shape — no headers, no Authorization, no http
+    rewrite — even when the bearer env var is set."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            # ONLY bridge mcp-adaptor; chrome-devtools stays stdio.
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            bearer_value="zz",
+        )
+        out = load_output(project)
+        cd = out["mcpServers"]["chrome-devtools"]
+        expect(
+            cd.get("type") != "http",
+            f"bearer-non-bridged: chrome-devtools should stay stdio, "
+            f"got type={cd.get('type')!r}",
+        )
+        expect(
+            "headers" not in cd,
+            f"bearer-non-bridged: stdio entry should not get headers, "
+            f"got {cd!r}",
+        )
+
+
+def test_bearer_env_unset_default_var_no_inject() -> None:
+    """Defense-in-depth: the default --bearer-env points at
+    CLAUDE_HOST_HOOK_BRIDGE_BEARER. When that var isn't set in the
+    process env, no headers field is added — exact match to pre-PR
+    behavior. Mirrors test_bearer_env_unset_no_headers_field but
+    explicit about the default var name."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        # run_helper pops CLAUDE_HOST_HOOK_BRIDGE_BEARER from env when
+        # bearer_value is None; this asserts the helper observes
+        # "unset" via os.environ.get("VAR", "") == "".
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+        )
+        out = load_output(project)
+        # No headers added => exact pre-PR shape.
+        for name, entry in out["mcpServers"].items():
+            expect(
+                "headers" not in entry or "Authorization" not in entry.get("headers", {}),
+                f"bearer-default-unset: {name} should NOT have Authorization, "
+                f"got {entry!r}",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -1009,6 +1299,15 @@ TESTS = [
     test_http_bridge_preserves_http_specific_keys,
     test_http_bridge_combines_with_pattern_filter,
     test_http_bridge_malformed_pair_ignored,
+    test_bearer_env_set_injects_authorization_header,
+    test_bearer_env_unset_no_headers_field,
+    test_bearer_env_empty_no_headers_field,
+    test_bearer_env_disabled_via_empty_flag,
+    test_bearer_env_custom_var_name,
+    test_bearer_env_preserves_existing_headers,
+    test_bearer_env_operator_authorization_wins,
+    test_bearer_env_non_bridged_server_unaffected,
+    test_bearer_env_unset_default_var_no_inject,
 ]
 
 for t in TESTS:

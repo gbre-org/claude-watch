@@ -121,6 +121,35 @@ with a stdio→HTTP wrapper such as `mcp-proxy`, `mcphost`, or the
 upstream `@modelcontextprotocol/sdk` server-side helpers, or a
 hand-rolled shim. See container/README.md for operator setup notes.
 
+BEARER-AUTH HEADER AUTO-INJECT (--bearer-env)
+
+When the host-side mcp-host-bash launcher is fronted by
+`mcp-proxy-auth-shim` (i.e. the operator set `MCP_HOST_BASH_BEARER`),
+in-container MCP clients must send `Authorization: Bearer <token>` on
+every request or the shim 401's them. Pre-PR, the operator had to
+hand-edit the generated `.mcp.json` to add a `headers` block on every
+http-bridged entry — friction the workbot v50 validation surfaced
+loud and clear.
+
+The `--bearer-env` flag (default: `CLAUDE_HOST_HOOK_BRIDGE_BEARER`)
+names an env var the helper reads at script-run time. When the var is
+SET TO A NON-EMPTY VALUE in the helper's environment, every
+http-bridged entry gets `"Authorization": "Bearer ${<var-name>}"`
+injected into its `headers` map. The `${...}` form is critical —
+Claude Code's MCP loader EXPANDS env vars at runtime, so the literal
+secret never lives in the file; the file just references the env var
+(which is also set in the docker-compose `.env` and propagated into
+the in-container claude's environment).
+
+When the var is UNSET or EMPTY, NO headers field is added — exact
+match to pre-PR behavior. Existing operator-supplied `headers` keys
+(including an explicit `Authorization`) survive the rewrite verbatim
+— the auto-inject only fills in the field when the operator didn't
+pin it themselves.
+
+Pass `--bearer-env ''` to disable the auto-inject entirely regardless
+of which env vars are set.
+
 IDEMPOTENCY
 
 If the output file already exists with byte-identical content, no
@@ -295,13 +324,27 @@ def parse_http_bridge(raw: str | None) -> dict[str, str]:
     return out
 
 
-def rewrite_to_http(definition: dict, url: str) -> dict:
+def rewrite_to_http(definition: dict, url: str, bearer_env: str | None = None) -> dict:
     """Return a fresh definition dict in Claude Code's HTTP MCP
     transport shape, pointing at `url`. Drops stdio-specific fields
     (`command`, `args`, `env`, `transport: "stdio"`); preserves any
     HTTP-specific fields the operator already had (`headers`,
     `alwaysLoad`, `oauth`, `headersHelper`, ...). Top-level `type` is
     overwritten with "http"; `url` is overwritten with the bridge URL.
+
+    When `bearer_env` names a non-empty env var on the entrypoint host
+    (i.e. the operator wired `CLAUDE_HOST_HOOK_BRIDGE_BEARER` into the
+    docker-compose `.env`), inject an `Authorization: Bearer
+    ${<bearer_env>}` header into the rewritten entry. The `${...}` form
+    is critical — Claude Code's MCP loader expands env vars at runtime,
+    so the literal secret never lives in `.mcp.json`; the file just
+    references the env var. Operators without the bearer set get the
+    prior behavior (no `headers` field added; any operator-supplied
+    `headers` are preserved verbatim).
+
+    When `bearer_env` is None / empty / unset-in-env, the function does
+    NOT touch the `headers` field — matching pre-bearer behavior
+    exactly. Existing operator-supplied `headers` keys are preserved.
 
     Why drop env: HTTP MCP transport doesn't pass env to the remote
     endpoint — env vars belong to the host-side adapter that
@@ -314,6 +357,26 @@ def rewrite_to_http(definition: dict, url: str) -> dict:
         new_def.pop(stdio_key, None)
     new_def["type"] = "http"
     new_def["url"] = url
+
+    # Auto-inject Authorization header when the bearer env var is set
+    # (non-empty). The MCP loader expands `${VAR}` at runtime, so the
+    # literal secret never gets serialized into the file — only the env
+    # var REFERENCE does.
+    if bearer_env:
+        bearer_value = os.environ.get(bearer_env, "")
+        if bearer_value:
+            existing_headers = new_def.get("headers")
+            if isinstance(existing_headers, dict):
+                merged_headers = dict(existing_headers)
+            else:
+                merged_headers = {}
+            # Operator-supplied Authorization (if any) wins — we don't
+            # clobber. The auto-inject only fills the field when the
+            # operator didn't pin it themselves.
+            if "Authorization" not in merged_headers:
+                merged_headers["Authorization"] = f"Bearer ${{{bearer_env}}}"
+            new_def["headers"] = merged_headers
+
     return new_def
 
 
@@ -321,6 +384,7 @@ def wrap_mcp_servers(
     servers: dict,
     patterns: list[str] | None = None,
     http_bridge: dict[str, str] | None = None,
+    bearer_env: str | None = None,
 ) -> dict:
     """Wrap each server's `command` field with exec-hook (subject to
     `patterns` filtering — see wrap_command). Pass weird shapes
@@ -334,6 +398,10 @@ def wrap_mcp_servers(
     is skipped for those entries — there's no stdio command to
     wrap. Other servers fall through to the default stdio +
     exec-hook path.
+
+    When `bearer_env` names a non-empty env var, the http-bridged
+    entries also get an `Authorization: Bearer ${<bearer_env>}` header
+    injected. See rewrite_to_http for the precise semantics.
     """
     bridge = http_bridge or {}
     wrapped: dict = {}
@@ -342,7 +410,7 @@ def wrap_mcp_servers(
             wrapped[name] = definition
             continue
         if name in bridge:
-            wrapped[name] = rewrite_to_http(definition, bridge[name])
+            wrapped[name] = rewrite_to_http(definition, bridge[name], bearer_env)
             continue
         new_def = dict(definition)
         cmd = definition.get("command")
@@ -440,6 +508,21 @@ def main(argv: list[str]) -> int:
              "'mcp-adaptor=http://host.docker.internal:8765/mcp'.",
     )
     p.add_argument(
+        "--bearer-env",
+        default="CLAUDE_HOST_HOOK_BRIDGE_BEARER",
+        help="Name of the env var that holds the bearer token for "
+             "http-bridged MCP servers. When this env var is set to a "
+             "non-empty value at script-run time, each http-bridged entry "
+             "gets an `Authorization: Bearer ${<var-name>}` header "
+             "injected (note the `${...}` form — Claude Code's MCP loader "
+             "expands env vars at runtime, so the literal secret never "
+             "lives in the file). When the env var is unset / empty, NO "
+             "headers field is added (exact match to pre-bearer behavior). "
+             "Default: CLAUDE_HOST_HOOK_BRIDGE_BEARER. Pass an empty "
+             "string ('') to disable the auto-inject entirely regardless "
+             "of which env vars are set.",
+    )
+    p.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress stderr 'wrote N servers' summary on success.",
@@ -447,6 +530,11 @@ def main(argv: list[str]) -> int:
     args = p.parse_args(argv)
     patterns = parse_patterns(args.shim_patterns)
     http_bridge = parse_http_bridge(args.http_bridge)
+    # Resolve the bearer-env knob. Empty string explicitly disables the
+    # auto-inject regardless of which env vars are populated.
+    bearer_env = args.bearer_env or None
+    if bearer_env == "":
+        bearer_env = None
 
     out_dir = args.output_dir.strip() if args.output_dir else ""
     if not out_dir:
@@ -481,7 +569,7 @@ def main(argv: list[str]) -> int:
             )
         return 0
 
-    wrapped = wrap_mcp_servers(servers, patterns, http_bridge)
+    wrapped = wrap_mcp_servers(servers, patterns, http_bridge, bearer_env)
     content = render(wrapped)
     out_path = out_dir_path / ".mcp.json"
 
@@ -508,11 +596,23 @@ def main(argv: list[str]) -> int:
             for d in wrapped.values()
             if isinstance(d, dict) and d.get("type") == "http"
         )
+        n_bearer_headed = sum(
+            1
+            for d in wrapped.values()
+            if isinstance(d, dict)
+            and d.get("type") == "http"
+            and isinstance(d.get("headers"), dict)
+            and "Authorization" in d["headers"]
+        )
         trailer_bits = []
         if patterns:
             trailer_bits.append(f"patterns={patterns}")
         if http_bridge:
             trailer_bits.append(f"http_bridge={sorted(http_bridge.keys())}")
+        if bearer_env and n_bearer_headed:
+            trailer_bits.append(
+                f"bearer_auth={n_bearer_headed} (via ${{{bearer_env}}})"
+            )
         trailer = (", " + ", ".join(trailer_bits)) if trailer_bits else ""
         print(
             f"generate-project-mcp-json: {action} {out_path} "
