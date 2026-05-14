@@ -278,16 +278,27 @@ def test_separator_position() -> None:
            f"separator: after '--', expected ['uvx', 'cli-mcp-server'], got {after}")
 
 
+# The expected default ALLOWED_COMMANDS string. Mirrors
+# DEFAULT_ALLOWED_COMMANDS in mcp-host-bash. Bumped when the script's
+# default widens — keep in sync, this is the load-bearing assertion.
+EXPECTED_DEFAULT_ALLOWED = (
+    "ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,"
+    "wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,"
+    "hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,"
+    "host,dig,nslookup,envchain,jenkins-builds,sfdx,force,sf,sfdc"
+)
+
+
 def test_cw_profile_unset_is_default() -> None:
-    """CW_PROFILE unset => same conservative allow-list as before."""
+    """CW_PROFILE unset => same default allow-list as the canonical string."""
     lines, _, _, _ = run_script(["--print-cmd"])
     # Find ALLOWED_COMMANDS value (line after the marker).
     idx = lines.index("ALLOWED_COMMANDS")
     val = lines[idx + 1]
     expect(
-        val == "ls,cat,pwd,git,gh,head,tail,grep,find,echo",
-        f"cw_profile unset: ALLOWED_COMMANDS should be conservative default, "
-        f"got {val!r}",
+        val == EXPECTED_DEFAULT_ALLOWED,
+        f"cw_profile unset: ALLOWED_COMMANDS should be the canonical "
+        f"default, got {val!r}",
     )
 
 
@@ -297,39 +308,126 @@ def test_cw_profile_corp_dev_equals_default() -> None:
     idx = lines.index("ALLOWED_COMMANDS")
     val = lines[idx + 1]
     expect(
-        val == "ls,cat,pwd,git,gh,head,tail,grep,find,echo",
+        val == EXPECTED_DEFAULT_ALLOWED,
         f"cw_profile=corp-dev: ALLOWED_COMMANDS should match default, "
         f"got {val!r}",
     )
 
 
+def test_default_includes_corp_dev_tooling() -> None:
+    """Default profile must include the SF/ACME_ORG corp-dev tooling
+    Andrew bumped into (envchain, jenkins-builds, sfdx, force, sf, sfdc)
+    plus the standard dev-language toolchains and read-y network probes
+    so the day-to-day workflow doesn't need CW_PROFILE flips."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    idx = lines.index("ALLOWED_COMMANDS")
+    cmd_list = [c.strip() for c in lines[idx + 1].split(",")]
+    # Corp-dev binaries (the gap that surfaced 2026-05-14).
+    for needed in ("envchain", "jenkins-builds", "sfdx", "force", "sf", "sfdc"):
+        expect(
+            needed in cmd_list,
+            f"default must include corp-dev tool {needed!r}; got {cmd_list}",
+        )
+    # Common dev-language toolchains.
+    for needed in ("node", "npm", "yarn", "python", "python3", "pip", "make"):
+        expect(
+            needed in cmd_list,
+            f"default must include dev toolchain {needed!r}; got {cmd_list}",
+        )
+    # Read-y network probes.
+    for needed in ("ping", "host", "dig", "nslookup"):
+        expect(
+            needed in cmd_list,
+            f"default must include read-y network probe {needed!r}; "
+            f"got {cmd_list}",
+        )
+    # Pure-observation binaries.
+    for needed in ("uname", "hostname", "date", "basename", "dirname",
+                   "which", "env", "printenv"):
+        expect(
+            needed in cmd_list,
+            f"default must include observation tool {needed!r}; "
+            f"got {cmd_list}",
+        )
+
+
+def test_default_excludes_destructive_and_scheduling() -> None:
+    """Destructive / privileged / scheduling / outbound-bytes binaries
+    MUST stay out of the default — they live in CW_PROFILE=corp-dev-trusted.
+    Guards against future drift collapsing the trust gradient."""
+    lines, _, _, _ = run_script(["--print-cmd"])
+    idx = lines.index("ALLOWED_COMMANDS")
+    cmd_list = [c.strip() for c in lines[idx + 1].split(",")]
+    # Destructive / mutating filesystem.
+    for forbidden in ("rm", "chmod", "mv", "cp", "mkdir", "tee"):
+        expect(
+            forbidden not in cmd_list,
+            f"default must NOT include destructive tool {forbidden!r} "
+            f"(only in corp-dev-trusted); got {cmd_list}",
+        )
+    # Host scheduling.
+    for forbidden in ("crontab", "launchctl", "systemctl", "schtasks",
+                      "powershell", "pwsh"):
+        expect(
+            forbidden not in cmd_list,
+            f"default must NOT include scheduling tool {forbidden!r} "
+            f"(only in corp-dev-trusted); got {cmd_list}",
+        )
+    # Outbound bytes.
+    for forbidden in ("curl", "wget", "scp"):
+        expect(
+            forbidden not in cmd_list,
+            f"default must NOT include outbound-bytes tool {forbidden!r} "
+            f"(only in corp-dev-trusted); got {cmd_list}",
+        )
+    # Key / cert tooling.
+    for forbidden in ("openssl", "ssh-keygen"):
+        expect(
+            forbidden not in cmd_list,
+            f"default must NOT include key/cert tool {forbidden!r} "
+            f"(only in corp-dev-trusted); got {cmd_list}",
+        )
+
+
 def test_cw_profile_trusted_widens() -> None:
-    """CW_PROFILE=corp-dev-trusted adds host-scheduling tooling."""
+    """CW_PROFILE=corp-dev-trusted adds host-scheduling, file-mutation,
+    outbound-bytes, and key/cert tooling on top of the read-y default."""
     lines, _, _, _ = run_script(
         ["--print-cmd"], env={"CW_PROFILE": "corp-dev-trusted"}
     )
     idx = lines.index("ALLOWED_COMMANDS")
     val = lines[idx + 1]
-    # Must contain the conservative default PLUS the trusted extras.
+    # Must contain the default PLUS the trusted extras.
     expect(
-        val.startswith("ls,cat,pwd,git,gh,head,tail,grep,find,echo,"),
-        f"cw_profile=corp-dev-trusted: should start with conservative "
+        val.startswith(EXPECTED_DEFAULT_ALLOWED + ","),
+        f"cw_profile=corp-dev-trusted: should start with the canonical "
         f"default, got {val!r}",
     )
-    # Spot-check a few trusted extras (host-OS-agnostic: cron, launchd,
-    # systemd, Task Scheduler each represented).
+    cmd_list = val.split(",")
+    # Spot-check trusted extras (scheduling, mutation, network, keys).
     for extra in [
         "crontab",
         "launchctl",
         "systemctl",
         "schtasks",
         "powershell",
-        "uname",
+        "pwsh",
         "tee",
         "mkdir",
+        "chmod",
+        "rm",
+        "cp",
+        "mv",
+        "curl",
+        "wget",
+        "scp",
+        "openssl",
+        "ssh-keygen",
+        "sw_vers",
+        "lsb_release",
     ]:
         expect(
-            extra in val.split(","),
+            extra in cmd_list,
             f"cw_profile=corp-dev-trusted: should include {extra!r}, "
             f"got {val!r}",
         )
@@ -343,8 +441,8 @@ def test_cw_profile_unknown_falls_back() -> None:
     idx = lines.index("ALLOWED_COMMANDS")
     val = lines[idx + 1]
     expect(
-        val == "ls,cat,pwd,git,gh,head,tail,grep,find,echo",
-        f"cw_profile=unknown: should fall back to conservative default, "
+        val == EXPECTED_DEFAULT_ALLOWED,
+        f"cw_profile=unknown: should fall back to canonical default, "
         f"got {val!r}",
     )
 
@@ -388,6 +486,8 @@ tests = [
     test_separator_position,
     test_cw_profile_unset_is_default,
     test_cw_profile_corp_dev_equals_default,
+    test_default_includes_corp_dev_tooling,
+    test_default_excludes_destructive_and_scheduling,
     test_cw_profile_trusted_widens,
     test_cw_profile_unknown_falls_back,
     test_cw_profile_operator_override_wins,

@@ -50,8 +50,13 @@
 #
 #   ALLOWED_COMMANDS — comma-separated list of binary names the server
 #                      will exec. NEVER set this to "all" in production.
-#                      Default (intentionally conservative): a small set
-#                      of read-only / version-control tools.
+#                      Default: a read-y / observation / standard-dev-tool
+#                      floor (file inspection, text munging, VCS, language
+#                      toolchains, common corp-dev binaries, read-only
+#                      network probes). See DEFAULT_ALLOWED_COMMANDS in
+#                      this script for the exact list. Destructive,
+#                      privileged, scheduling, and outbound-bytes binaries
+#                      are gated behind CW_PROFILE=corp-dev-trusted.
 #   ALLOWED_FLAGS    — comma-separated flag whitelist, OR "all" to skip
 #                      flag filtering (still bounded by ALLOWED_COMMANDS).
 #   ALLOWED_DIR      — absolute path. The server refuses commands that
@@ -69,11 +74,19 @@
 # CW_PROFILE — opt-in trust profile that widens the default allow-list
 # for specific operator workflows:
 #
-#   CW_PROFILE=corp-dev (default): conservative read-only set.
+#   CW_PROFILE=corp-dev (default): the read-y dev-tooling floor — file
+#       inspection, text munging, VCS, language toolchains (node / npm /
+#       python / make / etc.), common corp-dev binaries (envchain / sfdx
+#       / jenkins-builds), and read-only network probes (ping / dig /
+#       host / nslookup). Excludes anything that writes off-host or
+#       mutates system state.
 #   CW_PROFILE=corp-dev-trusted: adds host-scheduling tooling (cron /
-#       launchd / systemd timers / Task Scheduler) so the container
-#       can wire periodic claude-event jobs on the host. Host-OS
-#       agnostic — the relevant subset depends on the operator's host.
+#       launchd / systemd timers / Task Scheduler), file mutation
+#       (rm / chmod / mkdir / tee / cp / mv), key/cert tooling
+#       (openssl / ssh-keygen), and outbound bytes (curl / wget /
+#       scp) so the container can wire periodic claude-event jobs and
+#       push artifacts. Host-OS agnostic — the relevant subset depends
+#       on the operator's host.
 #
 # Explicit ALLOWED_COMMANDS in $MCP_HOST_BASH_CONFIG always wins over
 # the profile default; the profile is a convenience baseline, not a
@@ -127,7 +140,28 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 
 DEFAULT_PORT=8766
-DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo"
+# The default allow-list is the read-y / observation / standard-dev-tool
+# floor most operators want without having to opt in. It covers:
+#   - file inspection: ls, cat, head, tail, grep, find, file, stat, diff,
+#     sort, uniq, wc
+#   - text munging: awk, sed, cut, tr, xargs, base64, jq, yq
+#     (sed/awk -i flags can write, but allow-list filters by command name
+#     not args; the ALLOWED_DIR fence still bounds writes to $HOME.)
+#   - VCS / forge: git, gh
+#   - shell discovery: pwd, echo, which, env, printenv, hostname, uname,
+#     date, basename, dirname
+#   - language toolchains: node, npm, yarn, python, python3, pip, make
+#   - corp-dev toolset (Andrew/ACME_ORG surface): envchain, jenkins-builds,
+#     sfdx, force, sf, sfdc
+#   - read-y network probes: ping, host, dig, nslookup
+#
+# Deliberately NOT in the default (escalation requires CW_PROFILE=corp-dev-trusted):
+#   - curl, wget, scp — write files / push bytes off-host
+#   - openssl, ssh-keygen — generate / write keys
+#   - bash, sh, zsh, fish — arbitrary script exec
+#   - rm, chmod, mv, cp — destructive / privilege-changing
+#   - crontab, launchctl, systemctl, schtasks — host scheduling
+DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,host,dig,nslookup,envchain,jenkins-builds,sfdx,force,sf,sfdc"
 DEFAULT_ALLOWED_FLAGS="all"
 DEFAULT_COMMAND_TIMEOUT=30
 DEFAULT_ALLOW_SHELL_OPERATORS="false"
@@ -147,17 +181,21 @@ DEFAULT_ALLOW_SHELL_OPERATORS="false"
 # Linux, launchctl on macOS, schtasks on Windows), but the allow-list
 # carries enough binaries to cover all three.
 #
-# - `corp-dev` (default-equivalent): the conservative read-only set.
-# - `corp-dev-trusted`: adds host scheduling + small filesystem
-#   creation tooling so the container can wire periodic events:
-#     * `uname` / `sw_vers` / `lsb_release` — OS detection probe.
+# - `corp-dev` (default): the read-y dev-tooling floor (see
+#   DEFAULT_ALLOWED_COMMANDS above).
+# - `corp-dev-trusted`: adds host scheduling, file mutation, key/cert
+#   tooling, and outbound bytes so the container can wire periodic
+#   events and push artifacts:
+#     * `sw_vers` / `lsb_release` — extra OS detection (uname is in default).
 #     * `crontab` — Linux + macOS cron entry mgmt.
 #     * `launchctl` — macOS launchd load/unload.
 #     * `systemctl` — Linux systemd unit mgmt (user units; no sudo).
-#     * `schtasks` / `powershell` — Windows Task Scheduler.
+#     * `schtasks` / `powershell` / `pwsh` — Windows Task Scheduler.
 #     * `mkdir` / `tee` / `chmod` — drop scheduled-task definition files.
 #     * `cp` / `mv` / `rm` — rotate / dismantle scheduled-task files.
-#     * `curl` — claude-event POST or webhook firing.
+#     * `curl` / `wget` — claude-event POST, webhook firing, file fetch.
+#     * `scp` — push artifacts to remote hosts.
+#     * `openssl` / `ssh-keygen` — generate / inspect keys + certs.
 #   ALLOWED_DIR stays the operator's $HOME by default (no /etc, no /usr,
 #   no /System) so the widening doesn't escape the home tree.
 #
@@ -166,7 +204,7 @@ DEFAULT_ALLOW_SHELL_OPERATORS="false"
 # sourced AFTER the profile defaults are applied, so the operator's
 # value wins. Setting CW_PROFILE to an unknown name logs a warning
 # and falls back to the conservative default.
-TRUSTED_EXTRAS="uname,sw_vers,lsb_release,crontab,launchctl,systemctl,schtasks,powershell,pwsh,mkdir,tee,chmod,cp,mv,rm,curl"
+TRUSTED_EXTRAS="sw_vers,lsb_release,crontab,launchctl,systemctl,schtasks,powershell,pwsh,mkdir,tee,chmod,cp,mv,rm,curl,wget,scp,openssl,ssh-keygen"
 
 # Honor XDG-ish locations on macOS too (just paths, not the spec itself).
 MCP_HOST_BASH_CONFIG="${MCP_HOST_BASH_CONFIG:-${HOME}/.config/claude-container/mcp-host-bash.env}"
