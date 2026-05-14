@@ -51,12 +51,69 @@ In `~/.claude/settings.json` (after `make install` puts the binaries in
 | Script | Hook event | Matcher | Purpose |
 |--------|------------|---------|---------|
 | `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses `Agent` spawns missing a `Queue item: q-XXXX` marker, or whose marker isn't `running` in the queue. |
-| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces a built-in cardinal rule against bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`). |
+| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces built-in architectural gates: (a) bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`); (b) `Monitor` tool denied inside subagent context (see "Hardcoded gates" below). |
 | `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories) and manages a sidecar registry for `no_pending_watcher_outputs`. |
 | `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks external-messaging attachments as read via a host-specific `*-mark-read` shim when Claude opens a file under a configured attachment dir. Host-specific integration; safe no-op when neither the shim nor the dir is present. |
 
 All hooks default-open on internal error. A broken hook must NEVER blackhole
 the loop.
+
+## Hardcoded architectural gates
+
+`pre-tool-obligations-gate-hook` enforces two architectural rules in
+script-local code, BEFORE the obligations CLI dispatch. These run even
+with an empty obligations store -- they encode invariants that must hold
+regardless of stored-state health.
+
+### Bare `watcher-ctl run`
+
+Watchers MUST be spawned via Claude Code's `run_in_background: true`
+Bash parameter, never via shell `&` / pipes / subshells / compound
+operators. Any of those constructs reparents the watcher to init,
+orphaning it from Claude Code's process tree. The gate denies any
+`watcher-ctl run` Bash command whose whole form isn't a bare
+`watcher-ctl run <name>` (optionally with `2>&1`).
+
+### `Monitor` tool in subagent context
+
+The `Monitor` tool is denied inside subagent context (non-empty
+`agent_id` on the PreToolUse payload). The harness fires a
+task-completion event on every Monitor event, which conflicts with
+subagent process semantics: subagents that use `Monitor` to wait on a
+long-running background job (CI checks, container builds, etc.)
+reliably return mid-wait with thin partial reports while the job is
+still in flight -- the agent process dies and whoever spawned the
+agent has to clean up.
+
+Soft prompt clauses ("DO NOT use the Monitor tool for CI-wait") have
+been observed to fail repeatedly across PR-shipping subagents. The
+gate is the hard fix.
+
+Main-loop Monitor calls (watcher captured-output, external-messaging
+threads, etc.) are unaffected -- detection uses the same `agent_id`
+signal as the obligations CLI's `is_main_loop` predicate.
+
+Recovery path (use this instead of `Monitor` to wait for CI):
+
+```bash
+for i in $(seq 1 60); do
+    rollup=$(gh pr view <PR#> --json statusCheckRollup \
+        --jq '.statusCheckRollup')
+    # break on all-green, exit 1 on any FAILURE conclusion
+    sleep 30
+done
+gh pr merge <PR#> --squash --delete-branch
+```
+
+Run that loop with `run_in_background: true` so the agent blocks in a
+normal tool-call wait state (not a Monitor-event-driven async state).
+The harness's "agent is done" semantics correctly distinguish the two.
+
+### Bypass
+
+Both hardcoded gates honor `OBLIGATIONS_BYPASS=1` (audited to
+`~/.config/claude/obligations-bypass.log`) and per-obligation overrides
+fired via `obligations override "<reason>" --duration <60|5m|1h>`.
 
 ## Obligations gate
 

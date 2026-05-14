@@ -14,7 +14,7 @@ blackhole the loop.
 | Script | Hook event | Matcher | Purpose |
 |--------|------------|---------|---------|
 | `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses Agent spawns missing `Queue item: q-XXXX` markers, or whose marker isn't `running`. |
-| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces the bare-`watcher-ctl run` cardinal rule. |
+| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces two hardcoded architectural gates: (a) bare-`watcher-ctl run` cardinal rule; (b) `Monitor` tool denied inside subagent context (`agent_id` non-empty) -- see [`docs/hooks.md`](../../docs/hooks.md#hardcoded-architectural-gates). |
 | `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories), and manages the `no_pending_watcher_outputs` sidecar registry. |
 | `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks external-messaging attachments as read via a host-specific `*-mark-read` shim when Claude opens a file under a configured attachment dir. Safe no-op when neither the shim nor the dir is present. |
 
@@ -76,9 +76,10 @@ Two test scripts live under `tests/`:
     live queue. ~8 cases.
   - `tests/pre-tool-obligations-gate-hook.test` — exercises the
     obligations gate (PreToolUse + PostToolUse) end-to-end against an
-    isolated `HOME=$tmpdir` sandbox. 100 cases covering every predicate
+    isolated `HOME=$tmpdir` sandbox. ~140 cases covering every predicate
     (including `stale_ready_queue_present`), enforcement mode,
     exempt-patterns, overrides (including the pingme push-notification
-    hook), and the watcher-ctl cardinal-rule gate.
+    hook), the watcher-ctl cardinal-rule gate, and the `Monitor`
+    subagent-block gate.
 
 Run from the repo root with `make test-hooks`.

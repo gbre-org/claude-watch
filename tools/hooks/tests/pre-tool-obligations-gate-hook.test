@@ -79,6 +79,14 @@ Test cases (PreToolUse):
  72. watcher-ctl gate: subshell `$()` -> deny
  73. watcher-ctl gate: OBLIGATIONS_BYPASS=1 forces allow
  74. watcher-ctl gate: Bash-only (Read tool with watcher-text path -> allow)
+ 74a. Monitor gate: subagent + Monitor -> deny with educational banner
+ 74b. Monitor gate: main-loop + Monitor (no agent_id) -> allow
+ 74c. Monitor gate: main-loop + Monitor (empty agent_id) -> allow
+ 74d. Monitor gate: whitespace-only agent_id -> allow (treated as main-loop)
+ 74e. Monitor gate: subagent + Bash -> allow (only Monitor gated)
+ 74f. Monitor gate: subagent + Read -> allow
+ 74g. Monitor gate: OBLIGATIONS_BYPASS=1 forces allow
+ 74h. Monitor gate: null agent_id -> allow (defensive coerce)
  75. stale_ready_queue_present: empty queue -> allow
  76. stale_ready_queue_present: queue file missing -> allow (default-open)
  77. stale_ready_queue_present: malformed queue.json -> allow (default-open)
@@ -2366,6 +2374,137 @@ def main() -> int:
             )
             results.append(_check(
                 "74. watcher-ctl gate: Bash-only (Read tool not gated)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # ---------------------------------------------------------
+            # Tests 74a-74h: Monitor-tool subagent gate (hardcoded).
+            #
+            # Re-uses the same isolated env (no obligations registered)
+            # so we exercise the hardcoded path independent of stored
+            # obligations state. Same policy as the watcher-ctl gate
+            # above: the gate must fire even with an empty obligations
+            # store.
+            # ---------------------------------------------------------
+
+            # 74a: subagent + Monitor -> DENY with educational banner
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Monitor",
+                 "tool_input": {"task_id": "some-task-id"},
+                 "agent_id": "agent-uuid-abc123"},
+                env_w,
+            )
+            banner = (out or {}).get("systemMessage", "")
+            reason = (
+                ((out or {}).get("hookSpecificOutput") or {})
+                .get("permissionDecisionReason", "")
+            )
+            results.append(_check(
+                "74a. Monitor gate: subagent + Monitor -> deny + banner",
+                (rc == 0 and _is_deny(out)
+                 and "Monitor tool is disabled for subagents" in banner
+                 and "gh pr view" in banner
+                 and "run_in_background" in banner
+                 and "gh pr view" in reason),
+                f"rc={rc} banner={banner!r} reason={reason!r}",
+            ))
+
+            # 74b: main-loop + Monitor (no agent_id) -> ALLOW
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Monitor",
+                 "tool_input": {"task_id": "some-task-id"}},
+                env_w,
+            )
+            results.append(_check(
+                "74b. Monitor gate: main-loop + Monitor -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74c: main-loop + Monitor (explicit empty agent_id) -> ALLOW
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Monitor",
+                 "tool_input": {"task_id": "some-task-id"},
+                 "agent_id": ""},
+                env_w,
+            )
+            results.append(_check(
+                "74c. Monitor gate: empty agent_id -> allow (main-loop)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74d: main-loop + Monitor (whitespace-only agent_id) -> ALLOW
+            # The hook strips before truthiness check, matching the
+            # obligations CLI's is_main_loop predicate.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Monitor",
+                 "tool_input": {"task_id": "t"},
+                 "agent_id": "   \t  "},
+                env_w,
+            )
+            results.append(_check(
+                "74d. Monitor gate: whitespace agent_id -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74e: subagent + non-Monitor tool -> ALLOW (only Monitor is
+            # gated; Bash/Read/etc inside a subagent are fine)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "ls"},
+                 "agent_id": "agent-uuid-abc123"},
+                env_w,
+            )
+            results.append(_check(
+                "74e. Monitor gate: subagent + Bash -> allow (gate inert)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74f: subagent + Read tool -> ALLOW
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Read",
+                 "tool_input": {"file_path": "/tmp/foo"},
+                 "agent_id": "agent-uuid-abc123"},
+                env_w,
+            )
+            results.append(_check(
+                "74f. Monitor gate: subagent + Read -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74g: OBLIGATIONS_BYPASS=1 forces allow even for subagent
+            # Monitor calls -- the audited bypass is the documented
+            # escape hatch, same as for the watcher-ctl gate.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Monitor",
+                 "tool_input": {"task_id": "t"},
+                 "agent_id": "agent-uuid-abc123"},
+                env_w,
+                extra_env={"OBLIGATIONS_BYPASS": "1"},
+            )
+            results.append(_check(
+                "74g. Monitor gate: OBLIGATIONS_BYPASS=1 forces allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74h: subagent + null agent_id (JSON null) -> ALLOW
+            # Defensive: a non-string agent_id should be coerced to "".
+            # `_hook_pre` JSON-encodes the dict, so a Python None becomes
+            # JSON null on the wire.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Monitor",
+                 "tool_input": {"task_id": "t"},
+                 "agent_id": None},
+                env_w,
+            )
+            results.append(_check(
+                "74h. Monitor gate: null agent_id -> allow (defensive)",
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))

@@ -34,6 +34,20 @@ Behavior:
   broken hook must NEVER blackhole the loop.
 - Bypass: if ``OBLIGATIONS_BYPASS=1`` is set in the environment, log to
   ``~/.config/claude/obligations-bypass.log`` and exit 0.
+
+Hardcoded architectural gates (enforced before the obligations CLI
+dispatch, so stored-state bugs can't disable them):
+
+- ``watcher-ctl run`` must be a BARE invocation (no shell ``&``, pipes,
+  subshells, etc.) -- watchers must be spawned via the Bash tool's
+  ``run_in_background: true`` parameter, never reparented to init.
+- The ``Monitor`` tool is denied inside subagent context (non-empty
+  ``agent_id``). Monitor fires task-completion events on every event,
+  which conflicts with subagent process semantics -- subagents using
+  Monitor to wait on long jobs (CI, etc.) reliably return mid-wait
+  with thin partial reports. Main-loop Monitor usage is unaffected.
+  Recovery: poll ``gh pr view <PR#> --json statusCheckRollup`` in a
+  Bash loop with ``run_in_background: true``.
 """
 
 from __future__ import annotations
@@ -182,6 +196,89 @@ def _watcher_ctl_deny(op: str, cmd: str) -> dict:
         f"watcher-ctl run must be a bare invocation; detected {op}. "
         "Use `run_in_background: true` instead of shell `&` "
         "(see feedback_watcher-architecture-cardinal.md)."
+    )
+    return _deny(banner, reason)
+
+
+# ---------------------------------------------------------------------------
+# Hardcoded gate: the Monitor tool is disabled inside subagent context.
+#
+# Why: Claude Code's harness fires a task-completion event on EVERY Monitor
+# event regardless of the subagent's final-message text. Subagents that use
+# Monitor to wait on a long-running background job (CI checks, container
+# builds, etc.) reliably return mid-wait with thin partial reports while
+# the underlying job is still in flight -- the harness treats the
+# message-text composition as the agent's completion, the agent process
+# dies, and whoever spawned the agent has to clean up.
+#
+# Soft prompt clauses ("DO NOT use the Monitor tool for CI-wait") have been
+# observed to fail repeatedly across multiple PR-shipping agents. This gate
+# is the hard fix at the tool layer.
+#
+# Detection signal: the PreToolUse JSON payload carries an `agent_id` field
+# ONLY when the call originates inside a subagent. Main-loop calls have no
+# `agent_id` (or empty) -- same signal the obligations CLI's `is_main_loop`
+# predicate uses. Main-loop Monitor usage (watcher captured-output, etc.)
+# is unaffected.
+#
+# We implement this in the hook script itself (NOT as a stored obligation
+# row) for the same reason as the `watcher-ctl run` gate: it's an
+# architectural axiom that must be enforced even with no obligations
+# state, and the deny banner needs custom recovery guidance (point at the
+# `gh pr view <PR#> --json statusCheckRollup` Bash-loop pattern, which
+# keeps the agent in a normal tool-call wait state and avoids the
+# Monitor-event harness semantics entirely).
+# ---------------------------------------------------------------------------
+
+MONITOR_TOOL_NAME = "Monitor"
+
+
+def _monitor_subagent_deny() -> dict:
+    banner_lines = [
+        "!! BLOCKED: Monitor tool is disabled for subagents",
+        "!!",
+        "!! Why: the harness fires a task-completion event on EVERY Monitor",
+        "!! event, regardless of your final-message text. Subagents that use",
+        "!! Monitor to wait on a long-running job (CI, container build, etc.)",
+        "!! reliably return mid-wait with thin partial reports while the job",
+        "!! is still in flight -- whoever spawned the agent then has to",
+        "!! clean up.",
+        "!!",
+        "!! Use this pattern instead for CI-wait:",
+        "!!",
+        "!!     for i in $(seq 1 60); do",
+        "!!         rollup=$(gh pr view <PR#> --json statusCheckRollup \\",
+        "!!             --jq '.statusCheckRollup')",
+        "!!         # break on all-green, exit 1 on any FAILURE",
+        "!!         sleep 30",
+        "!!     done",
+        "!!     gh pr merge <PR#> --squash --delete-branch",
+        "!!",
+        "!! Run that loop with `run_in_background: true` so the agent blocks",
+        "!! in a normal tool-call wait state (NOT a Monitor-event-driven",
+        "!! async state). The harness's \"agent is done\" semantics correctly",
+        "!! distinguish the two.",
+        "!!",
+        "!! For non-CI waits (long-running computation), prefer a workload",
+        "!! runner that survives /clear and lets the spawner pick up the",
+        "!! completion notification.",
+        "!!",
+        "!! Main-loop callers: this gate does NOT apply to you -- Monitor",
+        "!! is allowed from the main loop (watcher captured-output,",
+        "!! external-messaging threads, etc.).",
+        "!!",
+        "!! Hook source:   pre-tool-obligations-gate-hook (claude-watch tools/hooks/)",
+        "!! Emergency bypass: set OBLIGATIONS_BYPASS=1 (audited)",
+    ]
+    banner = "\n".join(banner_lines)
+    reason = (
+        "Monitor tool is disabled for subagents. The harness treats every "
+        "Monitor event as a task-completion signal, so subagents that use "
+        "Monitor to wait for CI/long jobs reliably return mid-wait with "
+        "thin partial reports. For CI-wait, poll `gh pr view <PR#> --json "
+        "statusCheckRollup` in a Bash loop with `run_in_background: true` "
+        "and `sleep 30-60` between iterations -- that pattern blocks the "
+        "agent in a normal tool-call wait state."
     )
     return _deny(banner, reason)
 
@@ -389,6 +486,20 @@ def main() -> int:
             "agent_id": agent_id,
         })
         print(json.dumps(_allow()))
+        return 0
+
+    # ---------------------------------------------------------------------
+    # Hardcoded Monitor-tool subagent gate. See `_monitor_subagent_deny`
+    # above for the full rationale (Monitor's harness-level task-completion
+    # semantics conflict with subagent semantics -- the agent process dies
+    # mid-wait while the underlying job is still in flight).
+    #
+    # Main-loop calls (empty agent_id) are unaffected. We run this BEFORE
+    # the obligations CLI dispatch so a stored-state bug can't disable the
+    # architectural axiom -- same policy as the watcher-ctl gate below.
+    # ---------------------------------------------------------------------
+    if tool_name == MONITOR_TOOL_NAME and agent_id:
+        print(json.dumps(_monitor_subagent_deny()))
         return 0
 
     # ---------------------------------------------------------------------
