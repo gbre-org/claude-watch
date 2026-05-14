@@ -42,9 +42,21 @@ if not SCRIPT.exists():
 EXEC_HOOK = "/usr/local/bin/exec-hook"
 
 
-def run_helper(input_path: str, output_path: str, expect_rc: int = 0) -> tuple[str, str]:
+def run_helper(
+    input_path: str,
+    output_path: str,
+    mcp_input: str | None = None,
+    expect_rc: int = 0,
+) -> tuple[str, str]:
+    """Run the helper. mcp_input defaults to /dev/null so tests that
+    don't care about the mcpServers merge get a clean (no-merge) run.
+    Tests that DO exercise the merge pass an explicit path."""
+    cmd = [str(SCRIPT), "--input", input_path, "--output", output_path, "--quiet"]
+    if mcp_input is None:
+        mcp_input = "/dev/null"
+    cmd.extend(["--mcp-input", mcp_input])
     result = subprocess.run(
-        [str(SCRIPT), "--input", input_path, "--output", output_path, "--quiet"],
+        cmd,
         capture_output=True,
         text=True,
         timeout=10,
@@ -340,6 +352,229 @@ def test_realistic_corp_settings() -> None:
 
 
 # ---------------------------------------------------------------------------
+# MCP server merge / wrap tests (added with the v21 mcpServers fix).
+#
+# These exercise the new mcpServers logic in generate-hooks-shim-settings:
+# the script copies mcpServers from settings.json into the shim, merges in
+# mcpServers from a second input (~/.claude.json by default — the
+# `claude mcp add` store), and wraps every server's `command` field with
+# the same /usr/local/bin/exec-hook prefix used on hook commands.
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_in_settings_wrapped() -> None:
+    """settings.json has mcpServers; each server's command is wrapped."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "mcpServers": {
+                "telemetry": {
+                    "command": "/Users/me/.devbar/bin/mcp-adaptor",
+                    "args": ["--port", "9999"],
+                    "env": {"FOO": "bar"},
+                },
+                "filesystem": {
+                    "command": "/usr/local/bin/node",
+                    "args": ["/path/to/server.js"],
+                },
+            },
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        telem = result["mcpServers"]["telemetry"]
+        expect(
+            telem["command"] == f"{EXEC_HOOK} /Users/me/.devbar/bin/mcp-adaptor",
+            f"mcp-in-settings: telemetry command not wrapped, got {telem['command']!r}",
+        )
+        expect(
+            telem["args"] == ["--port", "9999"],
+            f"mcp-in-settings: args should be preserved, got {telem['args']!r}",
+        )
+        expect(
+            telem["env"] == {"FOO": "bar"},
+            f"mcp-in-settings: env should be preserved, got {telem['env']!r}",
+        )
+        fs = result["mcpServers"]["filesystem"]
+        expect(
+            fs["command"] == f"{EXEC_HOOK} /usr/local/bin/node",
+            f"mcp-in-settings: filesystem command not wrapped, got {fs['command']!r}",
+        )
+
+
+def test_mcp_missing_no_false_positive() -> None:
+    """No mcpServers in either input => no mcpServers key in output."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"env": {"FOO": "bar"}})
+        # mcp-input defaults to /dev/null in run_helper, so no merge.
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(
+            "mcpServers" not in result,
+            f"mcp-missing: should not inject empty mcpServers, got {result!r}",
+        )
+
+
+def test_mcp_merged_from_claude_json() -> None:
+    """mcpServers from ~/.claude.json are merged into the output and wrapped."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        claude_json = Path(td) / ".claude.json"
+        out = Path(td) / "out.json"
+        # settings.json has no mcpServers; .claude.json carries them.
+        write_json(inp, {"env": {"FOO": "bar"}})
+        write_json(claude_json, {
+            "numStartups": 42,
+            "mcpServers": {
+                "ide": {
+                    "command": "/Users/me/.local/bin/ide-mcp",
+                    "args": ["--stdio"],
+                },
+                "filesystem": {
+                    "command": "node",
+                    "args": ["/some/server.js"],
+                },
+            },
+            "someOtherClaudeKey": True,
+        })
+        run_helper(str(inp), str(out), mcp_input=str(claude_json))
+        result = load_output(out)
+        # mcpServers populated from .claude.json side.
+        expect(
+            "mcpServers" in result,
+            "mcp-merge: mcpServers should be present in output",
+        )
+        ide = result["mcpServers"]["ide"]
+        expect(
+            ide["command"] == f"{EXEC_HOOK} /Users/me/.local/bin/ide-mcp",
+            f"mcp-merge: ide command not wrapped, got {ide['command']!r}",
+        )
+        expect(
+            ide["args"] == ["--stdio"],
+            f"mcp-merge: ide args should be preserved, got {ide['args']!r}",
+        )
+        fs = result["mcpServers"]["filesystem"]
+        expect(
+            fs["command"] == f"{EXEC_HOOK} node",
+            f"mcp-merge: filesystem command not wrapped, got {fs['command']!r}",
+        )
+        # We do NOT copy other top-level .claude.json keys.
+        expect(
+            "numStartups" not in result,
+            "mcp-merge: should not import unrelated .claude.json keys",
+        )
+        expect(
+            "someOtherClaudeKey" not in result,
+            "mcp-merge: should not import unrelated .claude.json keys",
+        )
+
+
+def test_mcp_settings_wins_on_collision() -> None:
+    """If both inputs define the same server name, settings.json wins
+    (matches Claude Code's own user-tier > .claude.json precedence)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        claude_json = Path(td) / ".claude.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "mcpServers": {
+                "shared": {
+                    "command": "/from/settings",
+                    "args": ["--settings-wins"],
+                },
+            },
+        })
+        write_json(claude_json, {
+            "mcpServers": {
+                "shared": {
+                    "command": "/from/claude-json",
+                    "args": ["--should-be-overridden"],
+                },
+                "extra": {
+                    "command": "/only/in/claude-json",
+                },
+            },
+        })
+        run_helper(str(inp), str(out), mcp_input=str(claude_json))
+        result = load_output(out)
+        shared = result["mcpServers"]["shared"]
+        expect(
+            shared["command"] == f"{EXEC_HOOK} /from/settings",
+            f"mcp-collision: settings.json should win, got {shared['command']!r}",
+        )
+        expect(
+            shared["args"] == ["--settings-wins"],
+            f"mcp-collision: settings.json args should win, got {shared['args']!r}",
+        )
+        # The .claude.json-only entry survives.
+        extra = result["mcpServers"]["extra"]
+        expect(
+            extra["command"] == f"{EXEC_HOOK} /only/in/claude-json",
+            f"mcp-collision: extra .claude.json server should survive, got {extra['command']!r}",
+        )
+
+
+def test_mcp_unparseable_claude_json_no_crash() -> None:
+    """Corrupt ~/.claude.json => skip merge, don't fail the rewrite."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        claude_json = Path(td) / ".claude.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "mcpServers": {"a": {"command": "/from/settings"}},
+        })
+        claude_json.write_text("totally not json {{{")
+        # Should still exit 0 and write the output (settings-only mcpServers).
+        run_helper(str(inp), str(out), mcp_input=str(claude_json))
+        result = load_output(out)
+        expect(
+            result["mcpServers"]["a"]["command"] == f"{EXEC_HOOK} /from/settings",
+            f"mcp-unparseable: settings-side should still be wrapped, got {result!r}",
+        )
+
+
+def test_mcp_mixed_machos_and_elf_all_wrapped() -> None:
+    """Mixed Mach-O + ELF + cross-platform MCP servers: every command
+    gets the exec-hook prefix at generation time. The shim itself
+    decides at runtime which to no-op vs exec — see exec-hook.test for
+    that path. Here we just assert the wrapper is applied uniformly."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "mcpServers": {
+                "mac-native": {
+                    # Would be a Mach-O binary on a Mac host
+                    "command": "/Users/me/.devbar/pkgs/mcp-adaptor/2.1.0/mcp-adaptor-go-darwin-arm64",
+                },
+                "linux-native": {
+                    # ELF binary, would run fine in the container
+                    "command": "/usr/local/bin/some-linux-mcp",
+                },
+                "node-script": {
+                    # Cross-platform, shebang script
+                    "command": "/usr/bin/node",
+                    "args": ["/opt/mcp/server.js"],
+                },
+                "python-script": {
+                    "command": "python3",
+                    "args": ["-m", "some_mcp_module"],
+                },
+            },
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        for name, definition in result["mcpServers"].items():
+            cmd = definition["command"]
+            expect(
+                cmd.startswith(f"{EXEC_HOOK} "),
+                f"mcp-mixed: {name} should be wrapped, got {cmd!r}",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -357,6 +592,12 @@ TESTS = [
     test_output_parent_dir_auto_created,
     test_no_tmp_leftover,
     test_realistic_corp_settings,
+    test_mcp_in_settings_wrapped,
+    test_mcp_missing_no_false_positive,
+    test_mcp_merged_from_claude_json,
+    test_mcp_settings_wins_on_collision,
+    test_mcp_unparseable_claude_json_no_crash,
+    test_mcp_mixed_machos_and_elf_all_wrapped,
 ]
 
 for t in TESTS:

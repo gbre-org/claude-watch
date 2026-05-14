@@ -126,10 +126,19 @@ esac
 CLAUDE_SHIM_SETTINGS_PATH=""
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
-    # Best-effort generation; the helper is fail-safe (returns 0 even
-    # on parse errors and logs to stderr).
+    # The helper ALSO merges mcpServers from ~/.claude.json (where
+    # `claude mcp add ...` writes server definitions) into the shim
+    # output. The `--setting-sources project,local` filter below drops
+    # the user-tier settings.json from the cascade, which would
+    # accidentally drop any `mcpServers` block the operator put there;
+    # the helper copies it (and the .claude.json side) into the shim
+    # so MCP servers survive the filter. Each MCP server `command`
+    # gets the same exec-hook prefix as hook commands — Mac-native
+    # binaries silently no-op (server fails to start, but no log spam)
+    # and cross-platform / Linux-native servers run normally.
     /usr/local/bin/generate-hooks-shim-settings \
         --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
+        --mcp-input "${HOME:-/home/hndrewaall}/.claude.json" \
         --output "$CLAUDE_SHIM_SETTINGS_PATH" || true
     # If the helper didn't produce an output file (input missing,
     # unparseable), clear the var so we don't pass a broken --settings
