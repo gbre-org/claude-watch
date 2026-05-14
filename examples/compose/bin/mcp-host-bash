@@ -578,6 +578,12 @@ mkdir -p "$(dirname "$MCP_HOST_BASH_LOG")"
 # forward the signal to both top-level PIDs.
 child_pid=""
 shim_pid=""
+# Exit code cleanup() uses when it ends the script. Defaults to 0 (the
+# normal Ctrl-C / SIGTERM teardown path); the fatal-error branches in
+# the probe set it to non-zero before invoking cleanup so the caller
+# (e.g. launchd / KeepAlive, systemd, the entrypoint smoke test) sees
+# the failure.
+cleanup_exit_code=0
 cleanup() {
     for pid in "$shim_pid" "$child_pid"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -591,9 +597,85 @@ cleanup() {
             kill -KILL "$pid" 2>/dev/null || true
         fi
     done
-    exit 0
+    exit "$cleanup_exit_code"
 }
-trap cleanup TERM INT
+# Flag flipped by the cleanup trap so wait_for_listener can bail out
+# cleanly mid-poll if SIGTERM / SIGINT arrives during startup. Without
+# this, a fast Ctrl-C while we're still probing the upstream port would
+# spend up to the full timeout draining sleeps before cleanup runs.
+shutting_down=0
+trap 'shutting_down=1; cleanup' TERM INT
+
+# -----------------------------------------------------------------------------
+# Upstream listener probe (bearer mode only)
+#
+# Verifies that mcp-proxy is actually accepting TCP connections on
+# 127.0.0.1:<UPSTREAM_PORT> BEFORE we spawn the auth shim in front of
+# it. The previous shape used a bare `sleep 0.5` as a race-tolerance
+# placeholder — that hid a real failure mode: when the upstream port
+# was already bound by a stale prior instance (errno 48 "Address already
+# in use"), mcp-proxy would crash silently on stderr and the shim would
+# come up 0.5s later announcing itself bound on the operator-facing
+# port. The operator saw a "running" launcher with every request 502'ing
+# (or hanging until the connect timeout) because the shim was forwarding
+# to a dead upstream.
+#
+# Return codes from wait_for_listener:
+#   0 — port is in LISTEN, TCP connect succeeded
+#   1 — timed out without a successful connect
+#   2 — child mcp-proxy process exited before binding
+#   3 — shutdown trap fired mid-poll (TERM/INT)
+#
+# Implementation: Python 3 is already a runtime dep (mcp-proxy and
+# mcp-proxy-auth-shim are both stdlib Python). We use a 300ms-timeout
+# TCP connect against 127.0.0.1:<port> in a tight 200ms-cadence poll.
+# `kill -0 "$child_pid"` re-checked each iteration so a fast-failing
+# mcp-proxy surfaces a clear "exited before binding" error instead of
+# the operator watching the launcher spin to the timeout.
+# -----------------------------------------------------------------------------
+
+wait_for_listener() {
+    local host=$1 port=$2 timeout=$3
+    local deadline
+    deadline=$(( $(date +%s) + timeout ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if [ "$shutting_down" = "1" ]; then
+            return 3
+        fi
+        if ! kill -0 "$child_pid" 2>/dev/null; then
+            return 2
+        fi
+        if python3 -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(0.3)
+try:
+    s.connect(('$host', $port))
+    s.close()
+except OSError:
+    sys.exit(1)
+" 2>/dev/null; then
+            # Confirm the connect didn't race past a child that died
+            # mid-poll. If the child crashed (e.g. errno 48 EADDRINUSE
+            # because a stale prior instance still owned the port), a
+            # TCP connect to that port may still succeed against the
+            # foreign listener. We require the child to still be alive
+            # AFTER a successful connect; if not, return "child died
+            # before binding" so the operator gets the accurate
+            # diagnosis instead of a false-positive verify.
+            sleep 0.2
+            if [ "$shutting_down" = "1" ]; then
+                return 3
+            fi
+            if ! kill -0 "$child_pid" 2>/dev/null; then
+                return 2
+            fi
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
 
 # -----------------------------------------------------------------------------
 # Banner + launch
@@ -650,13 +732,48 @@ trap cleanup TERM INT
 child_pid=$!
 
 if [ -n "$BEARER" ]; then
-    # Brief sleep so mcp-proxy's listener is up before the shim tries
-    # to forward the first request. Without this, an in-container
-    # caller racing to fire `tools/call` immediately after the launcher
-    # boots can hit a `Connection refused` from the shim's
-    # http.client.HTTPConnection before mcp-proxy has bind()ed the
-    # internal port.
-    sleep 0.5
+    # Verify mcp-proxy is actually accepting TCP connections on its
+    # internal loopback port BEFORE spawning the shim in front of it.
+    # See wait_for_listener above for why a bare `sleep` was not safe.
+    #
+    # `|| probe_rc=$?` keeps set -e from killing the script on a
+    # non-zero return — we want to handle the rc ourselves.
+    probe_rc=0
+    wait_for_listener 127.0.0.1 "$UPSTREAM_PORT" 10 || probe_rc=$?
+    case "$probe_rc" in
+        0)
+            echo "  mcp-proxy upstream:    127.0.0.1:$UPSTREAM_PORT (bound, verified)" >&2
+            ;;
+        2)
+            cat >&2 <<EOF
+mcp-host-bash: FATAL: mcp-proxy exited before binding 127.0.0.1:$UPSTREAM_PORT.
+       Common cause: port already owned by a stale prior instance
+       (errno 48 "Address already in use"). On macOS this happens when
+       a launchd-managed instance is still running.
+       Check: lsof -nP -iTCP:$UPSTREAM_PORT -sTCP:LISTEN
+       Kill the prior PID and re-launch, or wait ~30s for the kernel
+       to release the port. Upstream stderr: $MCP_HOST_BASH_LOG
+EOF
+            cleanup_exit_code=1
+            cleanup
+            ;;
+        3)
+            # cleanup already fired from the trap; the trap left us
+            # at exit "$cleanup_exit_code" — fall through to a final
+            # non-zero exit in case we somehow re-enter.
+            exit 1
+            ;;
+        *)
+            cat >&2 <<EOF
+mcp-host-bash: FATAL: mcp-proxy did not bind 127.0.0.1:$UPSTREAM_PORT within 10s.
+       The process is still running but has not opened the listen
+       socket. Check the log at $MCP_HOST_BASH_LOG for upstream stderr.
+EOF
+            cleanup_exit_code=1
+            cleanup
+            ;;
+    esac
+
     "${shim_argv[@]}" 2> >(tee -a "$MCP_HOST_BASH_LOG" >&2) &
     shim_pid=$!
     # Poll-wait on BOTH children. If EITHER dies, take the other down

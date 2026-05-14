@@ -38,9 +38,12 @@ Run:  ./mcp-host-bash.test
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -910,6 +913,315 @@ def test_hook_bridge_bins_unset_no_effect() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bearer-mode upstream-listener probe tests
+#
+# The launcher used to fire `sleep 0.5` before spawning the auth shim
+# in bearer mode. When mcp-proxy failed to bind its internal port (e.g.
+# the port was already taken by a stale prior instance), the launcher
+# silently announced the shim "started" while pointing it at a dead
+# upstream — every request 502'd. The fix replaces the bare sleep with
+# a real TCP-connect probe that times out cleanly, names the actual
+# failure mode (port-already-bound vs upstream-died-early vs slow), and
+# refuses to spawn the shim if mcp-proxy is not actually listening.
+#
+# These two tests live-launch the script (no --print-cmd) with mock
+# mcp-proxy / mcp-proxy-auth-shim binaries on a temp PATH so we can
+# control the bind behavior without depending on the real PyPI packages
+# being installed in CI.
+# ---------------------------------------------------------------------------
+
+
+def free_port_pair() -> tuple[int, int]:
+    """Reserve + release two ephemeral 127.0.0.1 ports. We hold both
+    sockets open until both ports are picked so we don't accidentally
+    pick the same number twice. The caller then races against the
+    kernel + the rest of the system to use them — fine for serial
+    tests."""
+    s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s1.bind(("127.0.0.1", 0))
+        s2.bind(("127.0.0.1", 0))
+        return s1.getsockname()[1], s2.getsockname()[1]
+    finally:
+        s1.close()
+        s2.close()
+
+
+def write_mock_mcp_proxy(bin_dir: Path, listen_port_var: str = "UPSTREAM_PORT") -> Path:
+    """Drop a fake `mcp-proxy` script into bin_dir that binds the
+    requested port (read from --port arg). Stays alive until killed.
+
+    We deliberately do NOT consume any of the mcp-proxy-specific flags
+    (--env, --host, --) — they're just argv noise. We only care about
+    --port so the mock binds the same port the real one would."""
+    path = bin_dir / "mcp-proxy"
+    path.write_text(textwrap.dedent("""\
+        #!/usr/bin/env python3
+        # Fake mcp-proxy for mcp-host-bash launcher tests. Binds the
+        # --port value on 127.0.0.1 and stays in accept() forever.
+        import socket, sys, time, signal
+        port = None
+        argv = sys.argv[1:]
+        for i, a in enumerate(argv):
+            if a == "--port" and i + 1 < len(argv):
+                port = int(argv[i + 1])
+                break
+        if port is None:
+            sys.stderr.write("fake-mcp-proxy: no --port\\n")
+            sys.exit(2)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError as e:
+            sys.stderr.write(f"fake-mcp-proxy: bind failed: {e}\\n")
+            sys.exit(1)
+        s.listen(8)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        while True:
+            try:
+                conn, _ = s.accept()
+                conn.close()
+            except OSError:
+                break
+    """))
+    path.chmod(0o755)
+    return path
+
+
+def write_mock_shim(bin_dir: Path) -> Path:
+    """Drop a fake `mcp-proxy-auth-shim` into bin_dir that binds the
+    --listen-port and stays alive. Used to verify the shim DOES come
+    up in the happy path."""
+    path = bin_dir / "mcp-proxy-auth-shim"
+    path.write_text(textwrap.dedent("""\
+        #!/usr/bin/env python3
+        # Fake mcp-proxy-auth-shim for mcp-host-bash launcher tests.
+        # Binds --listen-port and prints a started banner to stderr,
+        # then stays in accept() forever.
+        import socket, sys, signal
+        port = None
+        host = "127.0.0.1"
+        argv = sys.argv[1:]
+        for i, a in enumerate(argv):
+            if a == "--listen-port" and i + 1 < len(argv):
+                port = int(argv[i + 1])
+            if a == "--listen-host" and i + 1 < len(argv):
+                host = argv[i + 1]
+        if port is None:
+            sys.stderr.write("fake-shim: no --listen-port\\n")
+            sys.exit(2)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.listen(8)
+        sys.stderr.write(f"[mcp-proxy-auth-shim] started: {host}:{port}\\n")
+        sys.stderr.flush()
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        while True:
+            try:
+                conn, _ = s.accept()
+                conn.close()
+            except OSError:
+                break
+    """))
+    path.chmod(0o755)
+    return path
+
+
+def write_mock_cli_mcp_server(bin_dir: Path) -> Path:
+    """Drop a stub `cli-mcp-server` into bin_dir. The launcher only
+    needs it on PATH for the pre-flight check; the mock mcp-proxy
+    above never actually exec's it."""
+    path = bin_dir / "cli-mcp-server"
+    path.write_text("#!/usr/bin/env python3\nimport sys, time\nwhile True: time.sleep(60)\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_bearer_mode_port_already_taken_fatal() -> None:
+    """Bearer mode: when something else is already bound on
+    127.0.0.1:$UPSTREAM_PORT, the fake mcp-proxy fails its bind() and
+    exits non-zero on stderr. The launcher's probe MUST detect that
+    the child died before binding, surface a FATAL message naming the
+    actual problem (port-already-bound), and exit non-zero WITHOUT
+    spawning the shim.
+
+    Regression guard against the bare `sleep 0.5` shape that hid this
+    failure mode behind a working-looking shim banner."""
+    public_port, upstream_port = free_port_pair()
+    with tempfile.TemporaryDirectory(prefix="mcp-host-bash-probe-") as tmp:
+        tmp_path = Path(tmp)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        write_mock_mcp_proxy(bin_dir)
+        write_mock_shim(bin_dir)
+        write_mock_cli_mcp_server(bin_dir)
+
+        # Pre-occupy the upstream port so the fake mcp-proxy's bind()
+        # fails. We hold the socket open for the duration of the
+        # launcher run.
+        squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        squatter.bind(("127.0.0.1", upstream_port))
+        squatter.listen(1)
+        try:
+            env = {
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "HOME": tmp,
+                "MCP_HOST_BASH_CONFIG": "/dev/null",
+                "MCP_HOST_BASH_LOG": str(tmp_path / "mcp-host-bash.log"),
+                "MCP_HOST_BASH_BEARER": "test-secret-not-real",
+                "MCP_HOST_BASH_UPSTREAM_PORT": str(upstream_port),
+            }
+            result = subprocess.run(
+                [str(SCRIPT), "--port", str(public_port)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        finally:
+            squatter.close()
+
+    expect(
+        result.returncode != 0,
+        f"port-already-taken: launcher must exit non-zero, got rc={result.returncode}\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+    )
+    expect(
+        "FATAL" in result.stderr,
+        f"port-already-taken: stderr must contain FATAL message, "
+        f"got stderr:\n{result.stderr}",
+    )
+    expect(
+        "exited before binding" in result.stderr
+        or "did not bind" in result.stderr,
+        f"port-already-taken: stderr must name the bind-failure "
+        f"condition, got stderr:\n{result.stderr}",
+    )
+    expect(
+        str(upstream_port) in result.stderr,
+        f"port-already-taken: stderr must include the upstream port "
+        f"number ({upstream_port}) so the operator knows which port "
+        f"to check, got stderr:\n{result.stderr}",
+    )
+    # The shim must NOT have started. Mock shim prints
+    # `[mcp-proxy-auth-shim] started:` on stderr when it binds — if
+    # that appears, the launcher spawned it despite mcp-proxy being
+    # dead (the exact bug we're fixing).
+    expect(
+        "[mcp-proxy-auth-shim] started" not in result.stderr,
+        f"port-already-taken: shim must NOT have been spawned (its "
+        f"banner appearing in stderr means the launcher spawned it "
+        f"despite mcp-proxy dying), got stderr:\n{result.stderr}",
+    )
+
+
+def test_bearer_mode_normal_bind_verified() -> None:
+    """Bearer mode happy path: with free ports for both mcp-proxy
+    (internal) and the shim (public), the launcher must:
+      1. Spawn mcp-proxy, wait for its internal port to LISTEN.
+      2. Print the new 'bound, verified' banner line.
+      3. Spawn the shim, which prints its own started banner.
+      4. Keep both children alive.
+    We start the launcher in the background, wait briefly for both
+    children to come up, assert banners + listen sockets, then send
+    SIGTERM and assert clean teardown."""
+    public_port, upstream_port = free_port_pair()
+    with tempfile.TemporaryDirectory(prefix="mcp-host-bash-probe-") as tmp:
+        tmp_path = Path(tmp)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        write_mock_mcp_proxy(bin_dir)
+        write_mock_shim(bin_dir)
+        write_mock_cli_mcp_server(bin_dir)
+
+        env = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "HOME": tmp,
+            "MCP_HOST_BASH_CONFIG": "/dev/null",
+            "MCP_HOST_BASH_LOG": str(tmp_path / "mcp-host-bash.log"),
+            "MCP_HOST_BASH_BEARER": "test-secret-not-real",
+            "MCP_HOST_BASH_UPSTREAM_PORT": str(upstream_port),
+        }
+        proc = subprocess.Popen(
+            [str(SCRIPT), "--port", str(public_port)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            # Give the launcher up to ~5s to come up — that covers the
+            # 200ms-cadence probe + the mock processes' Python startup.
+            deadline = time.time() + 5.0
+            shim_listening = False
+            mcp_listening = False
+            while time.time() < deadline:
+                # Probe public port (shim) and upstream port (mcp-proxy).
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.1)
+                        s.connect(("127.0.0.1", public_port))
+                    shim_listening = True
+                except OSError:
+                    pass
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.1)
+                        s.connect(("127.0.0.1", upstream_port))
+                    mcp_listening = True
+                except OSError:
+                    pass
+                if shim_listening and mcp_listening:
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+
+            expect(
+                proc.poll() is None,
+                f"normal-bind: launcher must still be running after "
+                f"startup, got rc={proc.returncode}",
+            )
+            expect(
+                mcp_listening,
+                f"normal-bind: mcp-proxy must be LISTEN on "
+                f"127.0.0.1:{upstream_port}",
+            )
+            expect(
+                shim_listening,
+                f"normal-bind: shim must be LISTEN on "
+                f"127.0.0.1:{public_port} (proves the probe let the "
+                f"launcher proceed past the bare sleep)",
+            )
+        finally:
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate(timeout=2)
+
+    expect(
+        "bound, verified" in stderr,
+        f"normal-bind: banner must contain the new 'bound, verified' "
+        f"line (proves the probe ran + succeeded), got stderr:\n{stderr}",
+    )
+    expect(
+        f"127.0.0.1:{upstream_port}" in stderr,
+        f"normal-bind: banner must reference the actual upstream "
+        f"address (127.0.0.1:{upstream_port}), got stderr:\n{stderr}",
+    )
+    expect(
+        "[mcp-proxy-auth-shim] started" in stderr,
+        f"normal-bind: shim banner must appear AFTER the probe lets "
+        f"the launcher proceed, got stderr:\n{stderr}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -948,6 +1260,8 @@ tests = [
     test_preflight_error_points_to_installer,
     test_install_host_deps_script_exists_and_parses,
     test_install_host_deps_rejects_bad_flag,
+    test_bearer_mode_port_already_taken_fatal,
+    test_bearer_mode_normal_bind_verified,
 ]
 
 for t in tests:
