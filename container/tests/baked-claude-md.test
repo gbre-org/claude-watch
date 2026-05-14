@@ -108,6 +108,27 @@ if BAKED.exists():
         "baked-CLAUDE.md session-start checklist should reference "
         "`audit-hooks` so the agent reports the hook fate summary",
     )
+    # 5a.1. Session-start checklist must invoke /claude-container:start-watchers.
+    #       The skill self-discovers /etc/claude-code/watchers/*.toml and
+    #       launches each via Bash run_in_background. Today the dir is
+    #       empty (the skill reports "nothing to start"), but invoking it
+    #       at every session start means future image builds that DO ship
+    #       watchers self-start without requiring a baked-CLAUDE.md edit
+    #       per addition. The 2026-05-14 v28b/v29 workbot run flagged that
+    #       baked watcher launchers existed but no checklist step
+    #       triggered them.
+    expect(
+        re.search(
+            r"/claude-container:start-watchers",
+            text,
+        )
+        is not None,
+        "baked-CLAUDE.md session-start checklist should invoke "
+        "`/claude-container:start-watchers` (the skill that self-"
+        "discovers /etc/claude-code/watchers/*.toml and launches each). "
+        "Without an explicit checklist step, future image builds that "
+        "ship watcher launchers will sit unstarted on every session.",
+    )
 
     # 5b. Sudo guidance. Andrew's host fingerprint prompt fires on every
     #     sudo, so the baked file must steer the agent toward non-sudo
@@ -327,18 +348,19 @@ expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
 if DOCKERFILE.exists():
     df = DOCKERFILE.read_text(encoding="utf-8")
     # The COPY line must reference baked-CLAUDE.md as the source and the
-    # canonical managed-policy path as the destination. We tolerate
-    # leading/trailing whitespace and the exact form
-    #     COPY baked-CLAUDE.md /etc/claude-code/CLAUDE.md
-    # but reject any other destination path because Claude Code only reads
-    # the documented managed-policy location.
+    # canonical managed-policy path as the destination. The Dockerfile
+    # build context is the repo root (so it can COPY from sibling
+    # tools/hooks/ alongside container/), so the source path is
+    # `container/baked-CLAUDE.md`. Tolerate leading/trailing whitespace
+    # but reject any other destination path because Claude Code only
+    # reads the documented managed-policy location.
     copy_pattern = re.compile(
-        r"^\s*COPY\s+baked-CLAUDE\.md\s+/etc/claude-code/CLAUDE\.md\s*$",
+        r"^\s*COPY\s+(?:container/)?baked-CLAUDE\.md\s+/etc/claude-code/CLAUDE\.md\s*$",
         re.MULTILINE,
     )
     expect(
         copy_pattern.search(df) is not None,
-        "Dockerfile missing `COPY baked-CLAUDE.md /etc/claude-code/CLAUDE.md` "
+        "Dockerfile missing `COPY [container/]baked-CLAUDE.md /etc/claude-code/CLAUDE.md` "
         "— the baked managed-policy CLAUDE.md must land at the documented "
         "Linux managed-policy path (per Claude Code memory docs); any other "
         "destination silently breaks the load path",

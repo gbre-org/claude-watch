@@ -181,14 +181,18 @@ if ENTRYPOINT.exists():
 expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
 if DOCKERFILE.exists():
     df = DOCKERFILE.read_text(encoding="utf-8")
+    # The Dockerfile build context is the repo root (so it can COPY from
+    # sibling tools/hooks/), so the source path is `container/bin/self-clear`.
+    # Tolerate either prefix to keep the test stable across the
+    # build-context migration.
     self_clear_copy = re.search(
-        r'^\s*COPY\s+bin/self-clear\s+/usr/local/bin/self-clear\s*$',
+        r'^\s*COPY\s+(?:container/)?bin/self-clear\s+/usr/local/bin/self-clear\s*$',
         df,
         re.MULTILINE,
     )
     expect(
         self_clear_copy is not None,
-        "Dockerfile missing `COPY bin/self-clear /usr/local/bin/self-clear` "
+        "Dockerfile missing `COPY [container/]bin/self-clear /usr/local/bin/self-clear` "
         "— the in-container claude-watch daemon's wedged-pane recovery "
         "path (claude-watch/src/policy.rs spawn_immediate_clear) calls "
         "`Command::new(\"self-clear\")`. Without the baked copy at "

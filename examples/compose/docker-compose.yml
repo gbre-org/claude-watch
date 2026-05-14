@@ -47,8 +47,12 @@ services:
   # ---------------------------------------------------------------------
   claude-container:
     build:
-      context: ../../container
-      dockerfile: Dockerfile
+      # Build context is the claude-watch repo root so the Dockerfile
+      # can COPY from sibling tools/hooks/ (the canonical home of the
+      # obligations gate hook scripts that bake into /usr/local/bin/).
+      # Same shape as the queue-minisite service below.
+      context: ../..
+      dockerfile: container/Dockerfile
     image: claude-container:dev
     depends_on:
       tmux-socket-init:
@@ -88,6 +92,16 @@ services:
       # silently no-op instead of spamming "Exec format error" on every
       # hook event. Off by default; Mac-host operators enable it via .env.
       CLAUDE_CONTAINER_REWRITE_HOOKS: ${CLAUDE_CONTAINER_REWRITE_HOOKS:-}
+      # CLAUDE_CONTAINER_OBLIGATIONS — wire the canonical obligations
+      # gate hooks (pre-agent-queue-gate, pre-tool-obligations-gate,
+      # post-tool-obligations-update, post-tool-mark-attachment-read)
+      # into the in-container claude. Default-on (the entrypoint
+      # treats unset / "" as 1). Set to "0" to disable for a "raw"
+      # Claude Code sandbox container without the host-side guardrails.
+      # The hooks resolve `obligations` from PATH, so the
+      # bind-mounted ~/repos/claude-watch/tools/obligations CLI is the
+      # live source; missing CLI → default-open per the hook fail-safe.
+      CLAUDE_CONTAINER_OBLIGATIONS: ${CLAUDE_CONTAINER_OBLIGATIONS:-1}
       # Operator-tunable glob list that narrows which commands the
       # rewrite touches. Colon-separated globs; first whitespace-
       # separated token of each command is matched against each glob.

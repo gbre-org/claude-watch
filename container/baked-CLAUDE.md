@@ -91,6 +91,17 @@ all that's needed.
    [`container/skills/`](https://github.com/hndrewaall/claude-watch/tree/main/container/skills),
    [`container/agents/`](https://github.com/hndrewaall/claude-watch/tree/main/container/agents),
    [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers).
+7. **Invoke `/claude-container:start-watchers`** to start whatever
+   watcher launchers ship in this image build. The skill self-discovers
+   `/etc/claude-code/watchers/*.toml` and launches each via `Bash` with
+   `run_in_background: true`. **Today this is mostly a no-op** — the
+   image ships zero baked watchers by default and the skill will report
+   "nothing to start"; that's the honest answer, not a sign the skill
+   failed. Invoke it anyway so future image builds that DO ship watchers
+   (e.g. an in-container queue-event tail, an MCP-bridge health pinger)
+   self-start without requiring a baked-CLAUDE.md edit per addition.
+   Future watcher additions update the skill's discovered set — this
+   step's contract is "ask the skill what's there", not "hand-wave".
 
 **There are no long-running watchers inside this container.** This is
 deliberate — the container is a code-writing sandbox, not a host

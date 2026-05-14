@@ -155,29 +155,74 @@ unset _local_bin
 # inherited environment. The two `--shim-patterns "$CLAUDE_SHIM_PATTERNS"`
 # lines below make that contract visible to anyone scanning the
 # entrypoint without having to grep into the python helpers.
+# CLAUDE_CONTAINER_OBLIGATIONS — opt-in obligations gate hook installation.
+#
+# When "1" (the default), the entrypoint runs generate-hooks-shim-settings
+# REGARDLESS of CLAUDE_CONTAINER_REWRITE_HOOKS so the rewritten settings
+# include the canonical obligations gate hooks (pre-agent-queue-gate,
+# pre-tool-obligations-gate, post-tool-obligations-update,
+# post-tool-mark-attachment-read). When "0", the obligations gate is not
+# wired; useful for container builds where the operator wants the
+# container to be a "raw" Claude Code sandbox without the host's
+# guardrails. The hooks themselves default-open when the `obligations`
+# CLI is missing, so the worst case is a NO-OP per hook fire.
+CLAUDE_CONTAINER_OBLIGATIONS="${CLAUDE_CONTAINER_OBLIGATIONS:-1}"
 CLAUDE_SHIM_SETTINGS_PATH=""
+# CLAUDE_SHIM_FILTER_USER tracks whether the eventual claude invocation
+# should pass `--setting-sources project,local` (filter the host user
+# tier OUT) or load the shim ADDITIVELY (let the host user tier load
+# normally + layer the obligations gates on top). REWRITE_HOOKS=1 wants
+# the filter (the shim contains the wrapped host hooks; user-tier
+# would re-add the unwrapped ones); obligations-only wants additive
+# (host hooks load via user tier, shim only adds the obligations gates).
+CLAUDE_SHIM_FILTER_USER=""
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
     /usr/local/bin/generate-hooks-shim-settings \
         --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
         --output "$CLAUDE_SHIM_SETTINGS_PATH" \
-        --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" || true
-    # If the helper didn't produce an output file (input missing,
-    # unparseable), clear the var so we don't pass a broken --settings
-    # path to claude.
-    if [ ! -f "$CLAUDE_SHIM_SETTINGS_PATH" ]; then
-        CLAUDE_SHIM_SETTINGS_PATH=""
-    fi
+        --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
+        --inject-obligations "$CLAUDE_CONTAINER_OBLIGATIONS" || true
+    CLAUDE_SHIM_FILTER_USER=1
+elif [ "$CLAUDE_CONTAINER_OBLIGATIONS" = "1" ]; then
+    # Obligations gate without the cross-arch hook rewrite. Generate a
+    # MINIMAL shim that contains ONLY the obligations gate hooks; the
+    # host's user-tier settings.json continues to load normally and the
+    # shim layers additively on top. No `--setting-sources project,local`
+    # filter — that would drop the host's other hooks (claude-watch
+    # hook-fire, inject-signal-context-hook, etc.) along with the
+    # cross-arch ones. This path is the right shape for Linux hosts
+    # (no Mach-O pain) that still want the gates wired.
+    CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
+    /usr/local/bin/generate-hooks-shim-settings \
+        --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
+        --output "$CLAUDE_SHIM_SETTINGS_PATH" \
+        --inject-obligations 1 \
+        --obligations-only || true
+fi
+# If the helper didn't produce an output file (e.g. input missing AND
+# obligations injection disabled, or unparseable input), clear the var
+# so we don't pass a broken --settings path to claude.
+if [ -n "$CLAUDE_SHIM_SETTINGS_PATH" ] && [ ! -f "$CLAUDE_SHIM_SETTINGS_PATH" ]; then
+    CLAUDE_SHIM_SETTINGS_PATH=""
+fi
 
+# MCP server json generation runs ONLY when CLAUDE_CONTAINER_REWRITE_HOOKS=1
+# (operator opts in to dropping the user-tier settings, which is what
+# suppresses the ~/.claude.json MCP discovery path and necessitates the
+# project-tier .mcp.json fix). The obligations gate path above does NOT
+# require dropping the user tier, so we keep the MCP json generation
+# scoped to the rewrite-hooks opt-in.
+if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     # MCP server definitions live in ~/.claude.json (where `claude mcp
     # add ...` writes by default) and load via a code path that's
     # gated on the `user` tier being in --setting-sources. Since we
-    # filter `user` out below, the `~/.claude.json` MCP discovery path
-    # is suppressed and Claude Code reports "No MCP servers
-    # configured" inside the container. v21 workbot validation
-    # confirmed: PR #145's attempt to inject `mcpServers` into the
-    # shim settings.json had zero effect — Claude Code doesn't read
-    # MCP definitions from any settings.json tier.
+    # filter `user` out below (only when CLAUDE_CONTAINER_REWRITE_HOOKS=1),
+    # the `~/.claude.json` MCP discovery path is suppressed and Claude
+    # Code reports "No MCP servers configured" inside the container.
+    # v21 workbot validation confirmed: PR #145's attempt to inject
+    # `mcpServers` into the shim settings.json had zero effect — Claude
+    # Code doesn't read MCP definitions from any settings.json tier.
     #
     # Fix: write a project-tier `.mcp.json` inside CLAUDE_HOST_PROJECT_DIR.
     # Project tier IS in `--setting-sources project,local`, and
@@ -325,8 +370,11 @@ fi
 #      single-quoted so multi-word values survive the tmux-command-
 #      string shell parse as one argv element.
 CLAUDE_CMD="exec claude"
-if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
+if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
     CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+fi
+if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -z "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
+    CLAUDE_CMD="exec claude --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
 fi
 if [ -d /etc/claude-code/plugin/.claude-plugin ]; then
     CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /etc/claude-code/plugin"

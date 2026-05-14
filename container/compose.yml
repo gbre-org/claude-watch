@@ -11,7 +11,12 @@
 
 services:
   claude-container:
-    build: .
+    build:
+      # Repo-root context so the Dockerfile can COPY from sibling
+      # tools/hooks/ (canonical home of the obligations gate hooks
+      # baked into /usr/local/bin/).
+      context: ..
+      dockerfile: container/Dockerfile
     image: claude-container:dev
     # Bridge networking (default): no network_mode line. The container lives in
     # its own netns; cross-container/host traffic goes through the bridge and

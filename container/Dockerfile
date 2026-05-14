@@ -152,7 +152,7 @@ RUN claude-watch --help >/dev/null
 # task_watch) that have no in-container backing yet (Phase 2 work). The host's
 # ~/.config/claude-watch/config.toml is NOT bind-mounted by the wrapper, so
 # without this file the daemon would FATAL on "no config file found". Phase 1e.
-COPY claude-watch.config.toml /etc/claude-watch/config.toml
+COPY container/claude-watch.config.toml /etc/claude-watch/config.toml
 
 # Managed-policy CLAUDE.md — baked at the standard Linux managed-CLAUDE.md
 # location (/etc/claude-code/CLAUDE.md per the Claude Code memory docs:
@@ -175,7 +175,7 @@ COPY claude-watch.config.toml /etc/claude-watch/config.toml
 # CLAUDE.md unshielded. Operators who DO set the override take responsibility
 # for whatever managed-settings dir they point at — their dir replaces the
 # baked one wholesale.
-COPY baked-CLAUDE.md /etc/claude-code/CLAUDE.md
+COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md
 
 # Bake CLAUDE_WATCH_CONFIG into the image-level env (Phase 1.5 fix #3,
 # q-2026-05-11-d7c0). entrypoint.sh exports it for its own children (pane 0/1
@@ -205,7 +205,7 @@ ENV CLAUDE_WATCH_CONFIG=/etc/claude-watch/config.toml
 # non-login shells (e.g. `docker compose exec <c> bash`) source
 # /etc/bash.bashrc, so we also append a one-liner there that pulls this
 # same fragment in.
-COPY claude-tools.profile.sh /etc/profile.d/claude-tools.sh
+COPY container/claude-tools.profile.sh /etc/profile.d/claude-tools.sh
 RUN chmod 0644 /etc/profile.d/claude-tools.sh \
     && chown root:root /etc/profile.d/claude-tools.sh \
     && printf '\n# Pull in claude-watch bind-mounted CLI dirs for non-login shells.\nif [ -r /etc/profile.d/claude-tools.sh ]; then\n    . /etc/profile.d/claude-tools.sh\nfi\n' >> /etc/bash.bashrc
@@ -232,7 +232,7 @@ RUN chmod 0644 /etc/profile.d/claude-tools.sh \
 #
 # See container/hooks-shim/exec-hook for the full magic-byte table,
 # dedup mechanism, and the future-scope IPC-forwarder TODO.
-COPY hooks-shim/exec-hook /usr/local/lib/claude-hooks-shim/exec-hook
+COPY container/hooks-shim/exec-hook /usr/local/lib/claude-hooks-shim/exec-hook
 RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
     && ln -s /usr/local/lib/claude-hooks-shim/exec-hook /usr/local/bin/exec-hook
 
@@ -246,7 +246,7 @@ RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
 # host file. See container/hooks-shim/generate-hooks-shim-settings for the
 # rewrite logic and the embedded test suite at
 # container/hooks-shim/tests/generate-hooks-shim-settings.test.
-COPY hooks-shim/generate-hooks-shim-settings /usr/local/bin/generate-hooks-shim-settings
+COPY container/hooks-shim/generate-hooks-shim-settings /usr/local/bin/generate-hooks-shim-settings
 RUN chmod +x /usr/local/bin/generate-hooks-shim-settings
 
 # generate-project-mcp-json — sibling helper that writes a project-tier
@@ -260,8 +260,43 @@ RUN chmod +x /usr/local/bin/generate-hooks-shim-settings
 # ~/.claude.json mcpServers with each command wrapped in exec-hook.
 # v21 workbot validation surfaced this; embedded tests at
 # container/hooks-shim/tests/generate-project-mcp-json.test.
-COPY hooks-shim/generate-project-mcp-json /usr/local/bin/generate-project-mcp-json
+COPY container/hooks-shim/generate-project-mcp-json /usr/local/bin/generate-project-mcp-json
 RUN chmod +x /usr/local/bin/generate-project-mcp-json
+
+# Obligations gate hook scripts — bake the canonical PreToolUse +
+# PostToolUse hook scripts from tools/hooks/ into /usr/local/bin/ so
+# the in-container claude can install the obligations gate even when
+# the host's settings.json has no obligations hook entries (or the
+# user tier is filtered out via --setting-sources project,local).
+#
+# Wiring shape: generate-hooks-shim-settings INJECTS these hooks into
+# the rewritten settings.json when CLAUDE_CONTAINER_OBLIGATIONS=1
+# (default ON). The hooks resolve via $PATH so $BIN_DIR/obligations
+# (bind-mounted from ~/repos/claude-watch/tools/obligations/obligations
+# via the claude-tools.profile.sh) is the live CLI source. When the
+# bind-mount is absent (stripped-down `docker run` without
+# ~/repos/claude-watch), the hooks default-open per their built-in
+# fail-safe (CLI-missing → empty allow).
+#
+# Hooks installed:
+#   - pre-agent-queue-gate-hook            (PreToolUse Agent matcher)
+#   - pre-tool-obligations-gate-hook       (PreToolUse * matcher)
+#   - post-tool-obligations-update-hook    (PostToolUse * matcher)
+#   - post-tool-mark-attachment-read-hook  (PostToolUse Read matcher)
+#
+# Each script is the canonical source of truth from tools/hooks/ in
+# this repo (the same scripts `make install` symlinks into
+# ~/bin/ on the host). Baking them at the container's
+# /usr/local/bin/ ensures the obligations gate fires inside the
+# container regardless of host state.
+COPY tools/hooks/pre-agent-queue-gate-hook /usr/local/bin/pre-agent-queue-gate-hook
+COPY tools/hooks/pre-tool-obligations-gate-hook /usr/local/bin/pre-tool-obligations-gate-hook
+COPY tools/hooks/post-tool-obligations-update-hook /usr/local/bin/post-tool-obligations-update-hook
+COPY tools/hooks/post-tool-mark-attachment-read-hook /usr/local/bin/post-tool-mark-attachment-read-hook
+RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
+            /usr/local/bin/pre-tool-obligations-gate-hook \
+            /usr/local/bin/post-tool-obligations-update-hook \
+            /usr/local/bin/post-tool-mark-attachment-read-hook
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
@@ -275,7 +310,7 @@ RUN chmod +x /usr/local/bin/generate-project-mcp-json
 # container/bin/trust-workspace.py for the full safety contract and the
 # embedded `--test` mode (11 unit tests, including the Linux file-bind-mount
 # EBUSY fallback path).
-COPY bin/trust-workspace.py /usr/local/bin/trust-workspace
+COPY container/bin/trust-workspace.py /usr/local/bin/trust-workspace
 RUN chmod +x /usr/local/bin/trust-workspace
 
 # audit-hooks — per-hook fate audit for the host's bind-mounted
@@ -290,7 +325,7 @@ RUN chmod +x /usr/local/bin/trust-workspace
 # settings.json and does not fire the hooks. Embedded `--test` mode
 # runs the self-tests; integrated into container/tests/audit-hooks.test
 # for the make-test loop.
-COPY bin/audit-hooks.py /usr/local/bin/audit-hooks
+COPY container/bin/audit-hooks.py /usr/local/bin/audit-hooks
 RUN chmod +x /usr/local/bin/audit-hooks
 
 # cwsr — in-container self-restart for the claude CLI. Upgrades
@@ -301,7 +336,7 @@ RUN chmod +x /usr/local/bin/audit-hooks
 # container shell via `docker compose exec`), run `cwsr` and the inner
 # pane swaps to the new version while the tmux session, MCP state, and
 # named-volume claude versions/ dir all survive.
-COPY bin/cwsr /usr/local/bin/cwsr
+COPY container/bin/cwsr /usr/local/bin/cwsr
 RUN chmod +x /usr/local/bin/cwsr
 
 # self-clear — fresh-context-injection helper that the in-container
@@ -328,7 +363,7 @@ RUN chmod +x /usr/local/bin/cwsr
 # host's `~/bin/self-clear -> tools/watchers/self-clear` chain and the
 # container build (whose context is container/) end up running the
 # same bytes.
-COPY bin/self-clear /usr/local/bin/self-clear
+COPY container/bin/self-clear /usr/local/bin/self-clear
 RUN chmod +x /usr/local/bin/self-clear
 
 # Baked skills / agents / watchers — three top-level dirs in the repo
@@ -367,18 +402,18 @@ RUN chmod +x /usr/local/bin/self-clear
 # operator to think about the plugin layout. Watchers do NOT land in the
 # plugin dir because they aren't slash commands or agents — they're
 # shell scripts the agent runs via the Bash tool with run_in_background.
-COPY skills/ /etc/claude-code/skills/
-COPY skills/ /etc/claude-code/plugin/commands/
-COPY agents/ /etc/claude-code/agents/
-COPY agents/ /etc/claude-code/plugin/agents/
-COPY watchers/ /etc/claude-code/watchers/
-COPY plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude-plugin/plugin.json
+COPY container/skills/ /etc/claude-code/skills/
+COPY container/skills/ /etc/claude-code/plugin/commands/
+COPY container/agents/ /etc/claude-code/agents/
+COPY container/agents/ /etc/claude-code/plugin/agents/
+COPY container/watchers/ /etc/claude-code/watchers/
+COPY container/plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude-plugin/plugin.json
 
 # Entrypoint script — tmux session bootstrap + env passthrough + signal handling.
 # Phase 1e (q-2026-05-11-8a96): pane 1 now runs the real claude-watch daemon
 # instead of the Phase 0 placeholder bash banner. Pane 1 keeps itself open with
 # a shell on daemon failure so errors surface on `tmux attach`.
-COPY entrypoint.sh /usr/local/bin/claude-tmux-entrypoint
+COPY container/entrypoint.sh /usr/local/bin/claude-tmux-entrypoint
 RUN chmod +x /usr/local/bin/claude-tmux-entrypoint
 
 # Drop privileges before runtime — root in a bind-mounted layout breaks host perms.

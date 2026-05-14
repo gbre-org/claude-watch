@@ -203,7 +203,11 @@ expect(DOCKERFILE.is_file(), f"{DOCKERFILE} missing")
 if DOCKERFILE.is_file():
     df = DOCKERFILE.read_text(encoding="utf-8")
     required_copy_lines = [
-        # source pattern, destination
+        # source pattern, destination. The Dockerfile build context is
+        # the repo root (so it can COPY from sibling tools/hooks/), so
+        # the source paths are prefixed with `container/`. The regex
+        # below tolerates either prefix to keep the test stable across
+        # the build-context migration.
         ("skills/", "/etc/claude-code/skills/"),
         ("skills/", "/etc/claude-code/plugin/commands/"),
         ("agents/", "/etc/claude-code/agents/"),
@@ -214,15 +218,16 @@ if DOCKERFILE.is_file():
     ]
     for src, dst in required_copy_lines:
         # Tolerate any whitespace; require both src and dst on the same
-        # COPY line.
+        # COPY line. The optional `container/` prefix accommodates the
+        # repo-root build context.
         pat = re.compile(
-            rf"^\s*COPY\s+{re.escape(src)}\s+{re.escape(dst)}\s*$",
+            rf"^\s*COPY\s+(?:container/)?{re.escape(src)}\s+{re.escape(dst)}\s*$",
             re.MULTILINE,
         )
         expect(
             pat.search(df) is not None,
-            f"Dockerfile missing `COPY {src} {dst}` — required to bake "
-            f"the {src.rstrip('/')} dir into the image at {dst}",
+            f"Dockerfile missing `COPY [container/]{src} {dst}` — required "
+            f"to bake the {src.rstrip('/')} dir into the image at {dst}",
         )
 
 # 9. baked-CLAUDE.md session-start checklist references the new dirs.

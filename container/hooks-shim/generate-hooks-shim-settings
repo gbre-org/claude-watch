@@ -143,6 +143,80 @@ from pathlib import Path
 
 EXEC_HOOK_PATH = "/usr/local/bin/exec-hook"
 
+# Obligations gate hook scripts baked into the container at /usr/local/bin/.
+# When CLAUDE_CONTAINER_OBLIGATIONS=1 (the default), `inject_obligations_hooks`
+# adds these to the rewritten settings so the in-container claude enforces
+# the same gates the host-side main loop does (queue discipline, generic
+# obligations gate, attachment auto-mark, post-tool obligation satisfy).
+#
+# Each entry is (event, matcher, hook-binary). matcher="" means no
+# matcher (Claude Code applies the hook to every tool call of that
+# event). The binary names mirror the COPY targets in container/Dockerfile.
+OBLIGATIONS_HOOKS: list[tuple[str, str, str]] = [
+    # Block Agent spawns missing a `Queue item: q-XXXX` line. Mirrors the
+    # host's PreToolUse "Agent" matcher in ~/.claude/settings.json.
+    ("PreToolUse", "Agent", "/usr/local/bin/pre-agent-queue-gate-hook"),
+    # Generic obligations gate (one row per active obligation, denies any
+    # tool call whose tool/command-string matches an unsatisfied row).
+    # Mirrors the host's PreToolUse "*" matcher.
+    ("PreToolUse", "*", "/usr/local/bin/pre-tool-obligations-gate-hook"),
+    # Auto-satisfy obligations whose `satisfied_by` pattern matches the
+    # just-completed tool. Mirrors the host's PostToolUse "*" matcher.
+    ("PostToolUse", "*", "/usr/local/bin/post-tool-obligations-update-hook"),
+    # Auto-mark Signal attachment files as read after a Read of any path
+    # under ~/signal-queue/attachments/. Mirrors the host's PostToolUse
+    # "Read" matcher. Inert in the container by default (no signal-queue
+    # dir bind-mounted), but harmless and keeps parity with the host
+    # cascade — operators who DO bind-mount the signal queue (rare; this
+    # is a homelab pattern) get the auto-mark behaviour for free.
+    ("PostToolUse", "Read", "/usr/local/bin/post-tool-mark-attachment-read-hook"),
+]
+
+
+def inject_obligations_hooks(settings: dict) -> dict:
+    """Add the canonical obligations-gate hooks to settings["hooks"].
+
+    Idempotent: if a hook with the same `command` is already present in
+    the same (event, matcher) bucket, we skip it. This keeps the helper
+    safe to run against a settings.json that already references our
+    /usr/local/bin/ hooks (e.g. an operator pre-wired them on the host
+    and the host file was bind-mounted in).
+
+    Returns a new dict; input is not mutated.
+    """
+    out = dict(settings)
+    hooks = dict(settings.get("hooks") or {})
+    for event, matcher, command in OBLIGATIONS_HOOKS:
+        entries = list(hooks.get(event) or [])
+        # Look for an existing matcher block.
+        target_block = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("matcher", "")) == matcher:
+                target_block = entry
+                break
+        if target_block is None:
+            target_block = {"matcher": matcher, "hooks": []}
+            entries.append(target_block)
+        # Skip if a hook with the same command is already wired.
+        existing = target_block.get("hooks") or []
+        already = any(
+            isinstance(h, dict) and h.get("command") == command
+            for h in existing
+        )
+        if not already:
+            new_hooks_list = list(existing)
+            new_hooks_list.append({
+                "type": "command",
+                "command": command,
+                "timeout": 5,
+            })
+            target_block["hooks"] = new_hooks_list
+        hooks[event] = entries
+    out["hooks"] = hooks
+    return out
+
 
 def parse_patterns(raw: str | None) -> list[str]:
     """Split a colon-separated pattern list into a clean list of globs.
@@ -309,13 +383,63 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Suppress stderr 'wrote N hooks' summary on success.",
     )
+    p.add_argument(
+        "--inject-obligations",
+        default=os.environ.get("CLAUDE_CONTAINER_OBLIGATIONS", "1"),
+        help="When '1' (the default), inject the canonical obligations-gate "
+             "hooks (pre-agent-queue-gate, pre-tool-obligations, post-tool-"
+             "obligations-update, post-tool-mark-attachment-read) into the "
+             "rewritten settings.json so the in-container claude enforces "
+             "the same gates the host main loop does. Set to '0' (or "
+             "CLAUDE_CONTAINER_OBLIGATIONS=0) to disable. Default-on so the "
+             "container ships with the gates wired without operator opt-in.",
+    )
+    p.add_argument(
+        "--obligations-only",
+        action="store_true",
+        default=os.environ.get("CLAUDE_SHIM_OBLIGATIONS_ONLY", "").strip()
+            not in ("", "0"),
+        help="When set, the output settings.json contains ONLY the "
+             "injected obligations-gate hooks — the host's existing hooks "
+             "are NOT copied through. Useful when the entrypoint loads "
+             "the shim ADDITIVELY (no `--setting-sources project,local` "
+             "filter) so the host's hooks continue to load via the user "
+             "tier and the shim only adds the obligations gates on top. "
+             "Falls back to CLAUDE_SHIM_OBLIGATIONS_ONLY env var.",
+    )
     args = p.parse_args(argv)
     patterns = parse_patterns(args.shim_patterns)
+    inject_obligations = args.inject_obligations.strip() not in ("", "0")
+    obligations_only = bool(args.obligations_only)
 
     in_path = Path(args.input)
     out_path = Path(args.output)
 
-    if not in_path.exists():
+    # Synthesize an empty settings dict when the input is missing so we can
+    # still emit the obligations-gate hooks (the in-container claude
+    # otherwise has no hook surface at all). Without this, a host with no
+    # ~/.claude/settings.json (stripped-down `docker run`) would silently
+    # skip the obligations gate.
+    settings: dict = {}
+    if in_path.exists():
+        try:
+            with in_path.open("r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except Exception as e:
+            print(
+                f"generate-hooks-shim-settings: failed to parse {in_path}: {e}",
+                file=sys.stderr,
+            )
+            return 0  # fail-safe: don't break the container
+
+        if not isinstance(settings, dict):
+            print(
+                f"generate-hooks-shim-settings: {in_path} root is not a JSON object; skipping.",
+                file=sys.stderr,
+            )
+            return 0
+    elif not inject_obligations:
+        # No input AND not injecting obligations hooks → nothing to write.
         if not args.quiet:
             print(
                 f"generate-hooks-shim-settings: input {in_path} does not exist; nothing to rewrite.",
@@ -323,24 +447,18 @@ def main(argv: list[str]) -> int:
             )
         return 0
 
-    try:
-        with in_path.open("r", encoding="utf-8") as f:
-            settings = json.load(f)
-    except Exception as e:
-        print(
-            f"generate-hooks-shim-settings: failed to parse {in_path}: {e}",
-            file=sys.stderr,
-        )
-        return 0  # fail-safe: don't break the container
-
-    if not isinstance(settings, dict):
-        print(
-            f"generate-hooks-shim-settings: {in_path} root is not a JSON object; skipping.",
-            file=sys.stderr,
-        )
-        return 0
-
-    rewritten = rewrite_hooks(settings, patterns)
+    # In obligations-only mode, drop everything but the obligations hooks
+    # so we can layer the shim ADDITIVELY on top of the host's settings
+    # (without duplicating the host hooks). When NOT obligations-only,
+    # we rewrite the host's hooks and (optionally) tack the obligations
+    # hooks on the end — appropriate for the REWRITE_HOOKS=1 path that
+    # drops the user tier.
+    if obligations_only:
+        rewritten = {"hooks": {}}
+    else:
+        rewritten = rewrite_hooks(settings, patterns)
+    if inject_obligations:
+        rewritten = inject_obligations_hooks(rewritten)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp file then atomic-rename so a concurrent claude

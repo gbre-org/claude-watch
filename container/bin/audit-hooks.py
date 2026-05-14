@@ -93,6 +93,14 @@ KNOWN_BUILTINS = {
     "trust-workspace",
     "generate-hooks-shim-settings",
     "generate-project-mcp-json",
+    # Obligations gate hooks baked at /usr/local/bin/ when
+    # CLAUDE_CONTAINER_OBLIGATIONS=1 (default). Listed here so audit-hooks
+    # reports them as `builtin` (not `missing`) when they appear in the
+    # rewritten settings.json's hooks tree.
+    "pre-agent-queue-gate-hook",
+    "pre-tool-obligations-gate-hook",
+    "post-tool-obligations-update-hook",
+    "post-tool-mark-attachment-read-hook",
 }
 
 

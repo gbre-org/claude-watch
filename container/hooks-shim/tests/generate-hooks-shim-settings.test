@@ -51,14 +51,23 @@ def run_helper(
     expect_rc: int = 0,
     patterns: str | None = None,
     env_patterns: str | None = None,
+    inject_obligations: bool = False,
 ) -> tuple[str, str]:
     cmd = [str(SCRIPT), "--input", input_path, "--output", output_path, "--quiet"]
     if patterns is not None:
         cmd += ["--shim-patterns", patterns]
+    # Default to NOT injecting obligations hooks in tests so the
+    # rewrite-only path stays inspectable. Production callers (entrypoint.sh)
+    # pass --inject-obligations explicitly via $CLAUDE_CONTAINER_OBLIGATIONS.
+    cmd += ["--inject-obligations", "1" if inject_obligations else "0"]
     env = dict(os.environ)
     # Always wipe CLAUDE_SHIM_PATTERNS so a host-set value doesn't leak
     # into tests that don't explicitly opt in.
     env.pop("CLAUDE_SHIM_PATTERNS", None)
+    # Likewise wipe the obligations env var so a host-set value doesn't
+    # override the explicit per-test default above.
+    env.pop("CLAUDE_CONTAINER_OBLIGATIONS", None)
+    env.pop("CLAUDE_SHIM_OBLIGATIONS_ONLY", None)
     if env_patterns is not None:
         env["CLAUDE_SHIM_PATTERNS"] = env_patterns
     result = subprocess.run(
@@ -608,6 +617,220 @@ def test_pattern_preserves_already_wrapped() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Obligations injection tests
+# ---------------------------------------------------------------------------
+
+OBLIGATIONS_HOOKS_BY_EVENT_MATCHER = {
+    ("PreToolUse", "Agent"): "/usr/local/bin/pre-agent-queue-gate-hook",
+    ("PreToolUse", "*"): "/usr/local/bin/pre-tool-obligations-gate-hook",
+    ("PostToolUse", "*"): "/usr/local/bin/post-tool-obligations-update-hook",
+    ("PostToolUse", "Read"): "/usr/local/bin/post-tool-mark-attachment-read-hook",
+}
+
+
+def _collect_hook_commands(settings: dict, event: str, matcher: str) -> list[str]:
+    """Collect every command string under settings.hooks[event] whose
+    matcher block matches `matcher`."""
+    out = []
+    entries = (settings.get("hooks") or {}).get(event) or []
+    for entry in entries:
+        if str((entry or {}).get("matcher", "")) != matcher:
+            continue
+        for h in (entry or {}).get("hooks") or []:
+            cmd = (h or {}).get("command")
+            if isinstance(cmd, str):
+                out.append(cmd)
+    return out
+
+
+def test_obligations_inject_into_empty_settings() -> None:
+    """--inject-obligations 1 against an empty settings.json adds all four
+    obligations gate hooks at the right (event, matcher) buckets."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {})
+        run_helper(str(inp), str(out), inject_obligations=True)
+        result = load_output(out)
+        for (event, matcher), command in OBLIGATIONS_HOOKS_BY_EVENT_MATCHER.items():
+            cmds = _collect_hook_commands(result, event, matcher)
+            expect(
+                command in cmds,
+                f"obligations: {event}.{matcher!r} should include {command}, got {cmds}",
+            )
+
+
+def test_obligations_idempotent_no_duplicates() -> None:
+    """Running the helper twice does NOT duplicate the injected hooks
+    (the same command in the same matcher bucket is detected and
+    skipped)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        mid = Path(td) / "mid.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {})
+        # First pass: empty → mid (with obligations).
+        run_helper(str(inp), str(mid), inject_obligations=True)
+        # Second pass: mid → out (with obligations again).
+        run_helper(str(mid), str(out), inject_obligations=True)
+        result = load_output(out)
+        for (event, matcher), command in OBLIGATIONS_HOOKS_BY_EVENT_MATCHER.items():
+            cmds = _collect_hook_commands(result, event, matcher)
+            expect(
+                cmds.count(command) == 1,
+                f"idempotent: {event}.{matcher!r} should have exactly ONE "
+                f"copy of {command}, got {cmds}",
+            )
+
+
+def test_obligations_preserves_host_hooks() -> None:
+    """When the input has host hooks AND --inject-obligations 1, both the
+    wrapped host hooks AND the obligations hooks land in the output. The
+    obligations hooks layer alongside, not replacing."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup|resume",
+                        "hooks": [
+                            {"type": "command",
+                             "command": "/Users/me/.devbar/bin/telemetry"},
+                        ],
+                    },
+                ],
+            },
+        })
+        run_helper(str(inp), str(out), inject_obligations=True)
+        result = load_output(out)
+        # Host hook still present + wrapped.
+        ss = _collect_hook_commands(result, "SessionStart", "startup|resume")
+        expect(
+            f"{EXEC_HOOK} /Users/me/.devbar/bin/telemetry" in ss,
+            f"preserve: host SessionStart hook should be wrapped + present, got {ss}",
+        )
+        # Obligations hooks all present.
+        for (event, matcher), command in OBLIGATIONS_HOOKS_BY_EVENT_MATCHER.items():
+            cmds = _collect_hook_commands(result, event, matcher)
+            expect(
+                command in cmds,
+                f"preserve: {event}.{matcher!r} should still have obligations "
+                f"{command}, got {cmds}",
+            )
+
+
+def test_obligations_only_drops_host_hooks() -> None:
+    """--obligations-only mode emits ONLY the obligations gate hooks; the
+    host's hooks are NOT copied through. This is the right shape for
+    additive layering on top of the live user-tier settings."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup|resume",
+                        "hooks": [
+                            {"type": "command",
+                             "command": "/Users/me/.devbar/bin/telemetry"},
+                        ],
+                    },
+                ],
+            },
+        })
+        cmd = [str(SCRIPT), "--input", str(inp), "--output", str(out),
+               "--quiet", "--inject-obligations", "1", "--obligations-only"]
+        env = dict(os.environ)
+        env.pop("CLAUDE_SHIM_PATTERNS", None)
+        env.pop("CLAUDE_CONTAINER_OBLIGATIONS", None)
+        env.pop("CLAUDE_SHIM_OBLIGATIONS_ONLY", None)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, env=env,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"helper exited {result.returncode}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        out_settings = load_output(out)
+        # Host SessionStart hook NOT carried forward.
+        ss = _collect_hook_commands(out_settings, "SessionStart", "startup|resume")
+        expect(
+            ss == [],
+            f"obligations-only: host SessionStart hook should be DROPPED, got {ss}",
+        )
+        # Obligations hooks all present.
+        for (event, matcher), command in OBLIGATIONS_HOOKS_BY_EVENT_MATCHER.items():
+            cmds = _collect_hook_commands(out_settings, event, matcher)
+            expect(
+                command in cmds,
+                f"obligations-only: {event}.{matcher!r} should have obligations "
+                f"{command}, got {cmds}",
+            )
+
+
+def test_obligations_disabled_via_flag() -> None:
+    """--inject-obligations 0 → obligations hooks are NOT added even
+    against an empty input. Default-off in the test helper is already the
+    workhorse; this is the explicit guard."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/p/x"}]}]},
+        })
+        run_helper(str(inp), str(out), inject_obligations=False)
+        result = load_output(out)
+        for (event, matcher), command in OBLIGATIONS_HOOKS_BY_EVENT_MATCHER.items():
+            cmds = _collect_hook_commands(result, event, matcher)
+            expect(
+                command not in cmds,
+                f"disabled: {event}.{matcher!r} should NOT have {command}, got {cmds}",
+            )
+
+
+def test_obligations_only_writes_output_with_missing_input() -> None:
+    """When the input file is missing AND obligations injection is on,
+    the helper still writes an output containing just the obligations
+    hooks (so the entrypoint's no-host-settings.json case still gets
+    the gates wired)."""
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "out.json"
+        cmd = [str(SCRIPT), "--input", "/this/does/not/exist.json",
+               "--output", str(out), "--quiet",
+               "--inject-obligations", "1"]
+        env = dict(os.environ)
+        env.pop("CLAUDE_SHIM_PATTERNS", None)
+        env.pop("CLAUDE_CONTAINER_OBLIGATIONS", None)
+        env.pop("CLAUDE_SHIM_OBLIGATIONS_ONLY", None)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, env=env,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"helper exited {result.returncode}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        expect(
+            out.exists(),
+            "missing-input + inject-obligations: output should be written so "
+            "the in-container claude still gets the gates wired",
+        )
+        if out.exists():
+            settings = load_output(out)
+            for (event, matcher), command in OBLIGATIONS_HOOKS_BY_EVENT_MATCHER.items():
+                cmds = _collect_hook_commands(settings, event, matcher)
+                expect(
+                    command in cmds,
+                    f"missing-input: {event}.{matcher!r} should have {command}, "
+                    f"got {cmds}",
+                )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -635,6 +858,12 @@ TESTS = [
     test_flag_overrides_env_var,
     test_pattern_matches_command_with_args,
     test_pattern_preserves_already_wrapped,
+    test_obligations_inject_into_empty_settings,
+    test_obligations_idempotent_no_duplicates,
+    test_obligations_preserves_host_hooks,
+    test_obligations_only_drops_host_hooks,
+    test_obligations_disabled_via_flag,
+    test_obligations_only_writes_output_with_missing_input,
 ]
 
 for t in TESTS:

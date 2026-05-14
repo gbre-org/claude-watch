@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Tests for the obligations gate hook scripts baked into the container.
+
+The Dockerfile copies tools/hooks/{pre-agent-queue-gate-hook,
+pre-tool-obligations-gate-hook, post-tool-obligations-update-hook,
+post-tool-mark-attachment-read-hook} into /usr/local/bin/ so the
+in-container claude can install the obligations gate even when the
+host's settings.json doesn't reference these hooks (or the user tier
+is filtered out via --setting-sources project,local).
+
+This test asserts:
+
+  1. tools/hooks/{four hook scripts} exist in the repo (sources of
+     truth, the same scripts the host installs into ~/bin/ via
+     `make install`).
+  2. Each is an executable script (#!/usr/bin/env python3 shebang
+     plus chmod +x in the repo).
+  3. The Dockerfile contains COPY lines for all four hook scripts
+     targeting /usr/local/bin/<name>.
+  4. The Dockerfile chmod's all four after copy (so they actually
+     execute inside the container).
+  5. The entrypoint runs generate-hooks-shim-settings with
+     --inject-obligations when CLAUDE_CONTAINER_OBLIGATIONS=1
+     (the default).
+  6. The audit-hooks KNOWN_BUILTINS list includes all four
+     obligations hook names so the audit doesn't flag them as
+     `missing` when they appear in the rewritten settings.json.
+  7. baked-CLAUDE.md (or the entrypoint) documents the
+     CLAUDE_CONTAINER_OBLIGATIONS env var so operators know how
+     to disable the gate for a "raw" Claude Code sandbox.
+
+Run:  ./baked-obligations-hooks.test
+
+No external dependencies beyond Python 3.8+ stdlib.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+COMPOSE = REPO_ROOT / "examples" / "compose" / "docker-compose.yml"
+AUDIT_HOOKS = CONTAINER_DIR / "bin" / "audit-hooks.py"
+TOOLS_HOOKS_DIR = REPO_ROOT / "tools" / "hooks"
+
+OBLIGATIONS_HOOK_NAMES = [
+    "pre-agent-queue-gate-hook",
+    "pre-tool-obligations-gate-hook",
+    "post-tool-obligations-update-hook",
+    "post-tool-mark-attachment-read-hook",
+]
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. Source-of-truth hook scripts exist.
+for name in OBLIGATIONS_HOOK_NAMES:
+    src = TOOLS_HOOKS_DIR / name
+    expect(
+        src.is_file(),
+        f"tools/hooks/{name} missing — required source-of-truth for the "
+        f"baked obligations hook (Dockerfile COPY references this path)",
+    )
+
+# 2. Each is an executable script.
+for name in OBLIGATIONS_HOOK_NAMES:
+    src = TOOLS_HOOKS_DIR / name
+    if src.is_file():
+        head = src.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+        expect(
+            head and head[0].startswith("#!/"),
+            f"tools/hooks/{name}: missing shebang on first line — required "
+            f"so Dockerfile chmod +x results in an executable script",
+        )
+        # In-tree files must have +x bit so the Docker COPY preserves it.
+        # (Docker's COPY copies the source file's perms; we don't chmod
+        # the script in tools/, so the +x bit must be on the source.)
+        expect(
+            os.access(str(src), os.X_OK),
+            f"tools/hooks/{name}: source file is NOT executable — Docker "
+            f"COPY preserves source perms; chmod +x in-tree",
+        )
+
+# 3. Dockerfile COPY lines for each obligations hook.
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+df = DOCKERFILE.read_text(encoding="utf-8") if DOCKERFILE.is_file() else ""
+for name in OBLIGATIONS_HOOK_NAMES:
+    pat = re.compile(
+        rf"^\s*COPY\s+tools/hooks/{re.escape(name)}\s+/usr/local/bin/{re.escape(name)}\s*$",
+        re.MULTILINE,
+    )
+    expect(
+        pat.search(df) is not None,
+        f"Dockerfile missing `COPY tools/hooks/{name} /usr/local/bin/{name}` "
+        f"— obligations gate hook will not be baked into the image",
+    )
+
+# 4. The Dockerfile chmod's the obligations hooks.
+if df:
+    # We accept either a single multi-target chmod line or per-script
+    # chmod lines. Just verify the path appears at least once in a
+    # `RUN chmod +x` line.
+    for name in OBLIGATIONS_HOOK_NAMES:
+        chmod_pat = re.compile(
+            rf"^\s*RUN\s+chmod\s+\+x\s+(?:[^\n]*\s+)?/usr/local/bin/{re.escape(name)}",
+            re.MULTILINE,
+        )
+        # Allow continuation-line chmod via `\`; collapse to a single
+        # line for a coarse check.
+        df_collapsed = re.sub(r"\\\n\s*", " ", df)
+        chmod_pat = re.compile(
+            rf"RUN\s+chmod\s+\+x\s+[^\n]*/usr/local/bin/{re.escape(name)}",
+        )
+        expect(
+            chmod_pat.search(df_collapsed) is not None,
+            f"Dockerfile missing `RUN chmod +x /usr/local/bin/{name}` "
+            f"(or equivalent multi-target chmod) — without the +x bit "
+            f"the hook script can't be exec'd by Claude Code",
+        )
+
+# 5. Entrypoint runs generate-hooks-shim-settings with --inject-obligations
+#    when CLAUDE_CONTAINER_OBLIGATIONS=1 (default-on path).
+expect(ENTRYPOINT.is_file(), f"entrypoint.sh missing at {ENTRYPOINT}")
+if ENTRYPOINT.is_file():
+    ep = ENTRYPOINT.read_text(encoding="utf-8")
+    expect(
+        "CLAUDE_CONTAINER_OBLIGATIONS" in ep,
+        "entrypoint.sh should reference CLAUDE_CONTAINER_OBLIGATIONS — "
+        "the env var that gates the obligations injection. Without it, "
+        "operators have no way to disable the gate for a raw sandbox.",
+    )
+    expect(
+        "--inject-obligations" in ep,
+        "entrypoint.sh should pass --inject-obligations to "
+        "generate-hooks-shim-settings — that's the flag that flips the "
+        "obligations injection on",
+    )
+    # Default is "1" — assert the env-var read uses ${X:-1}.
+    expect(
+        re.search(r'CLAUDE_CONTAINER_OBLIGATIONS:?-1', ep) is not None,
+        "entrypoint.sh should default CLAUDE_CONTAINER_OBLIGATIONS to "
+        '"1" via the standard ${VAR:-1} parameter expansion. Default-on '
+        "is the contract — operators opt OUT, not IN.",
+    )
+
+# 6. audit-hooks KNOWN_BUILTINS includes all four obligations hooks.
+expect(AUDIT_HOOKS.is_file(), f"audit-hooks.py missing at {AUDIT_HOOKS}")
+if AUDIT_HOOKS.is_file():
+    ah = AUDIT_HOOKS.read_text(encoding="utf-8")
+    for name in OBLIGATIONS_HOOK_NAMES:
+        expect(
+            f'"{name}"' in ah,
+            f"audit-hooks.py KNOWN_BUILTINS missing {name!r} — the "
+            f"audit will report the obligations gate hooks as `missing` "
+            f"when they appear in the rewritten settings.json. Add them "
+            f"to KNOWN_BUILTINS so the audit reports `builtin` instead.",
+        )
+
+# 7. Compose exposes CLAUDE_CONTAINER_OBLIGATIONS so operators can override.
+if COMPOSE.is_file():
+    yml = COMPOSE.read_text(encoding="utf-8")
+    expect(
+        "CLAUDE_CONTAINER_OBLIGATIONS" in yml,
+        "examples/compose/docker-compose.yml should list "
+        "CLAUDE_CONTAINER_OBLIGATIONS in the claude-container "
+        "environment block so operators can override the default-on "
+        "obligations gate from .env without editing the entrypoint",
+    )
+
+
+if failures:
+    print("FAIL baked-obligations-hooks.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS baked-obligations-hooks.test")
+sys.exit(0)

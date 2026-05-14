@@ -136,10 +136,16 @@ def test_empty_shim_path_bare_claude() -> None:
 
 
 def test_set_shim_path_includes_setting_sources() -> None:
-    """CLAUDE_SHIM_SETTINGS_PATH=/tmp/foo.json → includes --setting-sources."""
+    """CLAUDE_SHIM_SETTINGS_PATH=/tmp/foo.json + CLAUDE_SHIM_FILTER_USER=1 →
+    includes --setting-sources project,local. The filter-user flag tracks
+    REWRITE_HOOKS=1 mode where the shim contains wrapped copies of the
+    host hooks; without filtering the user tier we'd get duplicate (bare
+    + wrapped) host hooks. Obligations-only mode (FILTER_USER unset)
+    layers additively without the filter."""
     env = {
         "PATH": "/usr/bin:/bin",
         "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
     }
     cmd = run_block(BLOCK, env)
     expect("--setting-sources project,local" in cmd,
@@ -154,6 +160,7 @@ def test_set_shim_path_order() -> None:
     env = {
         "PATH": "/usr/bin:/bin",
         "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
     }
     cmd = run_block(BLOCK, env)
     ss_idx = cmd.find("--setting-sources")
@@ -167,10 +174,12 @@ def test_set_shim_path_order() -> None:
 def test_set_shim_path_exact_form() -> None:
     """Exact match against the documented contract — guard against drift
     (e.g. someone changes the source list to include 'user' or drops the
-    --setting-sources flag entirely)."""
+    --setting-sources flag entirely). Tests the REWRITE_HOOKS=1 path
+    (FILTER_USER=1)."""
     env = {
         "PATH": "/usr/bin:/bin",
         "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
     }
     cmd = run_block(BLOCK, env)
     expected = (
@@ -179,6 +188,30 @@ def test_set_shim_path_exact_form() -> None:
     )
     expect(cmd == expected,
            f"exact form: expected {expected!r}, got {cmd!r}")
+
+
+def test_obligations_only_additive_no_filter() -> None:
+    """Obligations-only path: CLAUDE_SHIM_SETTINGS_PATH set BUT
+    CLAUDE_SHIM_FILTER_USER unset → claude loads the shim ADDITIVELY
+    on top of the user tier (no `--setting-sources project,local`
+    filter). The shim contains only the obligations gate hooks; the
+    host's user-tier hooks (claude-watch hook-fire,
+    inject-signal-context-hook, etc.) keep loading normally and the
+    obligations gates layer on top. Filtering the user tier here
+    would silently drop the host's other hooks, which is the wrong
+    shape for Linux hosts that don't suffer the cross-arch Mach-O
+    pain."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+    }
+    cmd = run_block(BLOCK, env)
+    expect("--setting-sources" not in cmd,
+           f"obligations-only: --setting-sources should NOT appear "
+           f"(we want the user tier to keep loading), got {cmd!r}")
+    expect("--settings /tmp/claude-shim/settings.json" in cmd,
+           f"obligations-only: --settings should still load the shim "
+           f"additively, got {cmd!r}")
 
 
 def test_auto_continue_unset_no_flag() -> None:
@@ -207,11 +240,13 @@ def test_auto_continue_single_word() -> None:
 
 
 def test_auto_continue_with_shim() -> None:
-    """Both CLAUDE_AUTO_CONTINUE and CLAUDE_SHIM_SETTINGS_PATH set:
-    --setting-sources + --settings come first, --continue last."""
+    """Both CLAUDE_AUTO_CONTINUE and CLAUDE_SHIM_SETTINGS_PATH set
+    (FILTER_USER=1 path): --setting-sources + --settings come first,
+    --continue last."""
     env = {
         "PATH": "/usr/bin:/bin",
         "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
         "CLAUDE_AUTO_CONTINUE": "resume",
     }
     cmd = run_block(BLOCK, env)
@@ -309,12 +344,15 @@ def test_plugin_dir_present_appends_flag() -> None:
 
 
 def test_user_tier_not_in_source_list() -> None:
-    """Regression guard for the v19 bug: the source list MUST NOT include
-    'user' — otherwise the bind-mounted host settings.json's bare hooks
-    would still load and fire 'Exec format error' on every event."""
+    """Regression guard for the v19 bug: when the FILTER_USER path fires
+    (REWRITE_HOOKS=1 / shim contains wrapped host hooks), the source list
+    MUST NOT include 'user' — otherwise the bind-mounted host
+    settings.json's bare hooks would still load and fire 'Exec format
+    error' on every event."""
     env = {
         "PATH": "/usr/bin:/bin",
         "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
     }
     cmd = run_block(BLOCK, env)
     # Pull the comma-separated source list out and verify 'user' isn't there.
@@ -337,6 +375,7 @@ TESTS = [
     test_set_shim_path_includes_setting_sources,
     test_set_shim_path_order,
     test_set_shim_path_exact_form,
+    test_obligations_only_additive_no_filter,
     test_plugin_dir_absent_no_flag,
     test_plugin_dir_present_appends_flag,
     test_user_tier_not_in_source_list,
