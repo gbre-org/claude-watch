@@ -387,6 +387,15 @@ def test_default_excludes_destructive_and_scheduling() -> None:
             f"default must NOT include key/cert tool {forbidden!r} "
             f"(only in corp-dev-trusted); got {cmd_list}",
         )
+    # Container management — destructive subcommands (docker rm / stop /
+    # kill) share the binary with read-y ones (docker ps / logs), so the
+    # binary is trusted-only.
+    for forbidden in ("docker", "docker-compose"):
+        expect(
+            forbidden not in cmd_list,
+            f"default must NOT include container mgmt tool {forbidden!r} "
+            f"(only in corp-dev-trusted); got {cmd_list}",
+        )
 
 
 def test_cw_profile_trusted_widens() -> None:
@@ -404,7 +413,8 @@ def test_cw_profile_trusted_widens() -> None:
         f"default, got {val!r}",
     )
     cmd_list = val.split(",")
-    # Spot-check trusted extras (scheduling, mutation, network, keys).
+    # Spot-check trusted extras (scheduling, mutation, network, keys,
+    # container mgmt).
     for extra in [
         "crontab",
         "launchctl",
@@ -425,6 +435,8 @@ def test_cw_profile_trusted_widens() -> None:
         "ssh-keygen",
         "sw_vers",
         "lsb_release",
+        "docker",
+        "docker-compose",
     ]:
         expect(
             extra in cmd_list,

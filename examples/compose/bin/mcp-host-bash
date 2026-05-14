@@ -83,10 +83,12 @@
 #   CW_PROFILE=corp-dev-trusted: adds host-scheduling tooling (cron /
 #       launchd / systemd timers / Task Scheduler), file mutation
 #       (rm / chmod / mkdir / tee / cp / mv), key/cert tooling
-#       (openssl / ssh-keygen), and outbound bytes (curl / wget /
-#       scp) so the container can wire periodic claude-event jobs and
-#       push artifacts. Host-OS agnostic — the relevant subset depends
-#       on the operator's host.
+#       (openssl / ssh-keygen), outbound bytes (curl / wget /
+#       scp), and container management (docker / docker-compose) so
+#       the container can wire periodic claude-event jobs, push
+#       artifacts, and recreate its own stack from inside its session.
+#       Host-OS agnostic — the relevant subset depends on the
+#       operator's host.
 #
 # Explicit ALLOWED_COMMANDS in $MCP_HOST_BASH_CONFIG always wins over
 # the profile default; the profile is a convenience baseline, not a
@@ -184,8 +186,9 @@ DEFAULT_ALLOW_SHELL_OPERATORS="false"
 # - `corp-dev` (default): the read-y dev-tooling floor (see
 #   DEFAULT_ALLOWED_COMMANDS above).
 # - `corp-dev-trusted`: adds host scheduling, file mutation, key/cert
-#   tooling, and outbound bytes so the container can wire periodic
-#   events and push artifacts:
+#   tooling, outbound bytes, and container management so the container
+#   can wire periodic events, push artifacts, and recreate its own
+#   stack from inside its session:
 #     * `sw_vers` / `lsb_release` — extra OS detection (uname is in default).
 #     * `crontab` — Linux + macOS cron entry mgmt.
 #     * `launchctl` — macOS launchd load/unload.
@@ -196,6 +199,13 @@ DEFAULT_ALLOW_SHELL_OPERATORS="false"
 #     * `curl` / `wget` — claude-event POST, webhook firing, file fetch.
 #     * `scp` — push artifacts to remote hosts.
 #     * `openssl` / `ssh-keygen` — generate / inspect keys + certs.
+#     * `docker` / `docker-compose` — recreate the compose stack from
+#       inside the container session (`docker compose up -d
+#       --force-recreate <svc>`, `docker compose exec <svc> ...`).
+#       Trusted-only because the binary covers destructive subcommands
+#       (`docker rm`, `docker stop`, `docker kill`) alongside read-y
+#       ones (`docker ps`, `docker logs`); cli-mcp-server's allow-list
+#       is per-binary, not per-subcommand.
 #   ALLOWED_DIR stays the operator's $HOME by default (no /etc, no /usr,
 #   no /System) so the widening doesn't escape the home tree.
 #
@@ -204,7 +214,7 @@ DEFAULT_ALLOW_SHELL_OPERATORS="false"
 # sourced AFTER the profile defaults are applied, so the operator's
 # value wins. Setting CW_PROFILE to an unknown name logs a warning
 # and falls back to the conservative default.
-TRUSTED_EXTRAS="sw_vers,lsb_release,crontab,launchctl,systemctl,schtasks,powershell,pwsh,mkdir,tee,chmod,cp,mv,rm,curl,wget,scp,openssl,ssh-keygen"
+TRUSTED_EXTRAS="sw_vers,lsb_release,crontab,launchctl,systemctl,schtasks,powershell,pwsh,mkdir,tee,chmod,cp,mv,rm,curl,wget,scp,openssl,ssh-keygen,docker,docker-compose"
 
 # Honor XDG-ish locations on macOS too (just paths, not the spec itself).
 MCP_HOST_BASH_CONFIG="${MCP_HOST_BASH_CONFIG:-${HOME}/.config/claude-container/mcp-host-bash.env}"
