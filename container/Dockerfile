@@ -69,6 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         vim \
         gnupg \
+        iproute2 \
         procps \
     && rm -rf /var/lib/apt/lists/*
 

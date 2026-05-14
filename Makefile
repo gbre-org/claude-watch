@@ -130,6 +130,7 @@ test-entrypoint:
 	container/tests/queue-gate-wired.test
 	container/tests/compose-mount-modes.test
 	container/tests/tini-pid1.test
+	container/tests/iproute2-installed.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host
