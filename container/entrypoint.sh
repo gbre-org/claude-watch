@@ -174,10 +174,24 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     # /workspace doesn't get a .mcp.json — operators without a host
     # project dir get the existing pre-PR behavior of no MCP servers).
     if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_HOST_PROJECT_DIR" ]; then
+        # CLAUDE_MCP_HTTP_BRIDGE — colon-separated `name=url` pairs.
+        # Cross-arch MCP servers (e.g. macOS Mach-O like the
+        # Salesforce mcp-adaptor) can't exec inside the Linux
+        # container; exec-hook silent-no-ops them, which surfaces in
+        # /mcp as "Failed to reconnect: ENOENT". When the operator
+        # runs a host-side HTTP→stdio adapter for those binaries
+        # (mcp-proxy / mcphost / hand-rolled) they can rewrite the
+        # in-container entry to Claude Code's native HTTP transport
+        # by setting this env var. The helper consumes it natively
+        # (reads from CLAUDE_MCP_HTTP_BRIDGE when --http-bridge isn't
+        # passed), but the explicit flag here makes the contract
+        # visible to anyone scanning the entrypoint without grepping
+        # into the helper.
         /usr/local/bin/generate-project-mcp-json \
             --mcp-input "${HOME:-/home/hndrewaall}/.claude.json" \
             --output-dir "$CLAUDE_HOST_PROJECT_DIR" \
-            --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" || true
+            --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
+            --http-bridge "${CLAUDE_MCP_HTTP_BRIDGE:-}" || true
     fi
 fi
 export CLAUDE_SHIM_SETTINGS_PATH

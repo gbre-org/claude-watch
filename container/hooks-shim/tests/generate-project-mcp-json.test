@@ -47,16 +47,23 @@ def run_helper(
     quiet: bool = True,
     patterns: str | None = None,
     env_patterns: str | None = None,
+    http_bridge: str | None = None,
+    env_http_bridge: str | None = None,
 ) -> tuple[str, str]:
     cmd = [str(SCRIPT), "--mcp-input", mcp_input, "--output-dir", output_dir]
     if quiet:
         cmd.append("--quiet")
     if patterns is not None:
         cmd += ["--shim-patterns", patterns]
+    if http_bridge is not None:
+        cmd += ["--http-bridge", http_bridge]
     env = dict(os.environ)
     env.pop("CLAUDE_SHIM_PATTERNS", None)
+    env.pop("CLAUDE_MCP_HTTP_BRIDGE", None)
     if env_patterns is not None:
         env["CLAUDE_SHIM_PATTERNS"] = env_patterns
+    if env_http_bridge is not None:
+        env["CLAUDE_MCP_HTTP_BRIDGE"] = env_http_bridge
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -578,6 +585,314 @@ def test_pattern_idempotent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# HTTP bridge (--http-bridge / CLAUDE_MCP_HTTP_BRIDGE)
+# ---------------------------------------------------------------------------
+
+
+def _mcp_input_for_bridge() -> dict:
+    """Common input: two MCP servers, mcp-adaptor (the typical
+    Mach-O cross-arch case) + chrome-devtools (npx-spawned)."""
+    return {
+        "mcpServers": {
+            "mcp-adaptor": {
+                "command": "/Users/me/.mcp-adaptor/bin/mcp-adaptor-go-darwin-arm64",
+                "args": ["--stdio"],
+                "transport": "stdio",
+                "env": {"GW_PROFILE": "default", "MCP_ADAPTOR_ENV": "prod"},
+            },
+            "chrome-devtools": {
+                "command": "npx",
+                "args": ["-y", "chrome-devtools-mcp@latest"],
+            },
+        },
+    }
+
+
+def test_http_bridge_rewrites_matching_server() -> None:
+    """A named server in the bridge map is rewritten to type=http +
+    url=<value>, with stdio fields dropped."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+        )
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            adaptor.get("type") == "http",
+            f"http-bridge: mcp-adaptor type should be 'http', got {adaptor.get('type')!r}",
+        )
+        expect(
+            adaptor.get("url") == "http://host.docker.internal:8765/mcp",
+            f"http-bridge: mcp-adaptor url incorrect, got {adaptor.get('url')!r}",
+        )
+        for stdio_key in ("command", "args", "transport", "env"):
+            expect(
+                stdio_key not in adaptor,
+                f"http-bridge: stdio key {stdio_key!r} should be dropped, "
+                f"got {adaptor!r}",
+            )
+
+
+def test_http_bridge_leaves_other_servers_alone() -> None:
+    """Servers NOT in the bridge map keep their stdio shape + get
+    exec-hook wrapping (default behaviour preserved)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+        )
+        out = load_output(project)
+        cd = out["mcpServers"]["chrome-devtools"]
+        expect(
+            cd.get("command") == f"{EXEC_HOOK} npx",
+            f"http-bridge: chrome-devtools should keep stdio + wrapping, "
+            f"got command={cd.get('command')!r}",
+        )
+        expect(
+            cd.get("type") != "http",
+            f"http-bridge: chrome-devtools should NOT be rewritten to http, "
+            f"got type={cd.get('type')!r}",
+        )
+
+
+def test_http_bridge_multiple_servers_colon_separated() -> None:
+    """Multiple `name=url` pairs separated by `:` all get rewritten."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge=(
+                "mcp-adaptor=http://host.docker.internal:8765/mcp"
+                ":chrome-devtools=http://host.docker.internal:9999/cdp"
+            ),
+        )
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["mcp-adaptor"].get("type") == "http",
+            f"multi-bridge: mcp-adaptor rewrite failed, "
+            f"got {out['mcpServers']['mcp-adaptor']!r}",
+        )
+        expect(
+            out["mcpServers"]["mcp-adaptor"].get("url")
+            == "http://host.docker.internal:8765/mcp",
+            f"multi-bridge: mcp-adaptor url wrong, "
+            f"got {out['mcpServers']['mcp-adaptor'].get('url')!r}",
+        )
+        expect(
+            out["mcpServers"]["chrome-devtools"].get("type") == "http",
+            f"multi-bridge: chrome-devtools rewrite failed, "
+            f"got {out['mcpServers']['chrome-devtools']!r}",
+        )
+        expect(
+            out["mcpServers"]["chrome-devtools"].get("url")
+            == "http://host.docker.internal:9999/cdp",
+            f"multi-bridge: chrome-devtools url wrong, "
+            f"got {out['mcpServers']['chrome-devtools'].get('url')!r}",
+        )
+
+
+def test_http_bridge_empty_no_rewrite() -> None:
+    """Empty bridge string = no rewriting (default stdio + exec-hook)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project), http_bridge="")
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            adaptor.get("command", "").startswith(f"{EXEC_HOOK} "),
+            f"empty-bridge: mcp-adaptor should fall back to stdio + exec-hook, "
+            f"got command={adaptor.get('command')!r}",
+        )
+        expect(
+            adaptor.get("type") != "http",
+            f"empty-bridge: mcp-adaptor should NOT be rewritten to http, "
+            f"got type={adaptor.get('type')!r}",
+        )
+
+
+def test_http_bridge_unknown_name_no_rewrite() -> None:
+    """A name in the bridge that doesn't match any mcpServer is ignored."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="nonexistent=http://host.docker.internal:9000/mcp",
+        )
+        out = load_output(project)
+        # Both servers keep their stdio + exec-hook shape.
+        for name in ("mcp-adaptor", "chrome-devtools"):
+            entry = out["mcpServers"][name]
+            expect(
+                entry.get("type") != "http",
+                f"unknown-bridge-name: {name} should NOT be http, "
+                f"got type={entry.get('type')!r}",
+            )
+
+
+def test_http_bridge_env_var_supplies_value() -> None:
+    """CLAUDE_MCP_HTTP_BRIDGE env var is honored when --http-bridge flag absent."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            env_http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+        )
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            adaptor.get("type") == "http",
+            f"env-bridge: mcp-adaptor should be http-rewritten from env var, "
+            f"got type={adaptor.get('type')!r}",
+        )
+
+
+def test_http_bridge_flag_overrides_env_var() -> None:
+    """--http-bridge CLI flag wins over CLAUDE_MCP_HTTP_BRIDGE env."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="chrome-devtools=http://host.docker.internal:9000/cdp",
+            env_http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+        )
+        out = load_output(project)
+        # Flag wins: chrome-devtools gets bridged, mcp-adaptor doesn't.
+        expect(
+            out["mcpServers"]["chrome-devtools"].get("type") == "http",
+            f"flag-overrides-env: chrome-devtools should be http, "
+            f"got {out['mcpServers']['chrome-devtools']!r}",
+        )
+        expect(
+            out["mcpServers"]["mcp-adaptor"].get("type") != "http",
+            f"flag-overrides-env: mcp-adaptor should NOT be http, "
+            f"got {out['mcpServers']['mcp-adaptor']!r}",
+        )
+
+
+def test_http_bridge_preserves_http_specific_keys() -> None:
+    """HTTP-specific fields the operator already had (headers,
+    alwaysLoad, etc.) survive the rewrite."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {
+            "mcpServers": {
+                "mcp-adaptor": {
+                    "command": "/Users/me/.mcp-adaptor/bin/mcp-adaptor-go-darwin-arm64",
+                    "args": [],
+                    "transport": "stdio",
+                    "env": {"GW_PROFILE": "default"},
+                    "headers": {"X-Trace": "1"},
+                    "alwaysLoad": True,
+                },
+            },
+        })
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+        )
+        out = load_output(project)
+        adaptor = out["mcpServers"]["mcp-adaptor"]
+        expect(
+            adaptor.get("headers") == {"X-Trace": "1"},
+            f"preserve-http-keys: headers should survive rewrite, "
+            f"got {adaptor.get('headers')!r}",
+        )
+        expect(
+            adaptor.get("alwaysLoad") is True,
+            f"preserve-http-keys: alwaysLoad should survive rewrite, "
+            f"got {adaptor.get('alwaysLoad')!r}",
+        )
+
+
+def test_http_bridge_combines_with_pattern_filter() -> None:
+    """HTTP-bridged servers are not eligible for pattern wrapping
+    (they don't have a `command` anymore); non-bridged servers
+    still respect the shim-patterns filter."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            # A pattern that only matches `npx` — chrome-devtools should
+            # still be wrapped; mcp-adaptor is now http and unaffected.
+            patterns="npx",
+        )
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["mcp-adaptor"].get("type") == "http",
+            f"bridge+pattern: mcp-adaptor rewrite should win over pattern, "
+            f"got {out['mcpServers']['mcp-adaptor']!r}",
+        )
+        expect(
+            out["mcpServers"]["chrome-devtools"].get("command")
+            == f"{EXEC_HOOK} npx",
+            f"bridge+pattern: chrome-devtools should still get wrapping, "
+            f"got {out['mcpServers']['chrome-devtools']!r}",
+        )
+
+
+def test_http_bridge_malformed_pair_ignored() -> None:
+    """A bridge token with no `=` is silently dropped (and other
+    valid pairs still apply)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_input_for_bridge())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge=(
+                "nopair"
+                ":mcp-adaptor=http://host.docker.internal:8765/mcp"
+            ),
+        )
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["mcp-adaptor"].get("type") == "http",
+            f"malformed-pair: valid sibling pair should still apply, "
+            f"got {out['mcpServers']['mcp-adaptor']!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -603,6 +918,16 @@ TESTS = [
     test_flag_overrides_env_var,
     test_pattern_with_npx_style_command,
     test_pattern_idempotent,
+    test_http_bridge_rewrites_matching_server,
+    test_http_bridge_leaves_other_servers_alone,
+    test_http_bridge_multiple_servers_colon_separated,
+    test_http_bridge_empty_no_rewrite,
+    test_http_bridge_unknown_name_no_rewrite,
+    test_http_bridge_env_var_supplies_value,
+    test_http_bridge_flag_overrides_env_var,
+    test_http_bridge_preserves_http_specific_keys,
+    test_http_bridge_combines_with_pattern_filter,
+    test_http_bridge_malformed_pair_ignored,
 ]
 
 for t in TESTS:

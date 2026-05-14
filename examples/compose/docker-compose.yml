@@ -96,6 +96,19 @@ services:
       # Honored by both generate-hooks-shim-settings (hooks) and
       # generate-project-mcp-json (MCP server commands).
       CLAUDE_SHIM_PATTERNS: ${CLAUDE_SHIM_PATTERNS:-}
+      # CLAUDE_MCP_HTTP_BRIDGE — operator-tunable map of MCP server
+      # names to host-side HTTP endpoint URLs. Colon-separated
+      # `name=url` pairs. When an entry's name matches a server in
+      # ~/.claude.json mcpServers, the in-container .mcp.json is
+      # rewritten from stdio shape (`command: ...`) to Claude Code's
+      # native HTTP MCP transport (`type: "http"`, `url: <url>`), so
+      # the in-container claude dials the operator-provided host
+      # adapter instead of trying to exec a cross-arch (macOS Mach-O)
+      # binary. Pair with a host-side stdio→HTTP wrapper (mcp-proxy
+      # etc.) that owns the actual MCP binary. Unset / empty = no
+      # rewriting (default). Example:
+      #   mcp-adaptor=http://host.docker.internal:8765/mcp
+      CLAUDE_MCP_HTTP_BRIDGE: ${CLAUDE_MCP_HTTP_BRIDGE:-}
       # Host-project-dir signal — read by the entrypoint's
       # trust-workspace pre-seed so the workspace at the bind-mounted
       # host project path is pre-trusted (skips the first-launch dialog).

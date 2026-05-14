@@ -81,6 +81,46 @@ the rest pass through verbatim. Empty / unset = wrap every server
 (default, backward-compatible). See the hooks helper's pattern docs
 for matching semantics + edge cases.
 
+HTTP BRIDGE (--http-bridge / CLAUDE_MCP_HTTP_BRIDGE)
+
+When the operator's MCP server is a host-only binary that won't run
+inside the container (e.g. a macOS Mach-O binary like the Salesforce
+mcp-adaptor) the default behaviour — wrap with exec-hook → silent
+no-op on Mach-O → "Failed to reconnect: ENOENT" in /mcp — is the
+right safety floor but leaves the server unusable inside the
+container. The escape hatch: have the operator run a tiny HTTP→stdio
+adapter on the host, exposing the host's stdio MCP server on a TCP
+port (e.g. http://host.docker.internal:8765/mcp), and rewrite the
+container-side entry to Claude Code's native HTTP transport so the
+in-container claude dials the adapter instead of trying to exec a
+cross-arch binary.
+
+CLAUDE_MCP_HTTP_BRIDGE (and the equivalent `--http-bridge` flag) is a
+colon-separated list of `name=url` pairs. When a server NAME in the
+operator's `mcpServers` matches one of the keys, the helper rewrites
+that entry to `{"type": "http", "url": "<url>"}` and drops the
+stdio-specific `command` / `args` / `env` fields (HTTP transport
+doesn't use them — env vars belong to the host-side adapter, which
+spawns the actual MCP binary). Servers not named in the mapping keep
+their stdio shape and the exec-hook wrapping kicks in as usual.
+
+Example:
+
+  CLAUDE_MCP_HTTP_BRIDGE='mcp-adaptor=http://host.docker.internal:8765/mcp'
+
+Matching is by exact MCP server name (NOT command path or glob).
+Unknown / unset = no rewriting (default). Empty values for a known
+name are ignored (no rewrite, fall through to stdio + exec-hook).
+
+NB: Claude Code's `type: "http"` MCP transport is the supported way
+to point at a remote MCP endpoint. The helper does not start the
+host-side adapter — the operator wires that up out of band (launchd
+LaunchAgent, manual `mcp-proxy` invocation, etc.). The Salesforce
+mcp-adaptor binary itself doesn't (today) speak HTTP; pair this knob
+with a stdio→HTTP wrapper such as `mcp-proxy`, `mcphost`, or the
+upstream `@modelcontextprotocol/sdk` server-side helpers, or a
+hand-rolled shim. See container/README.md for operator setup notes.
+
 IDEMPOTENCY
 
 If the output file already exists with byte-identical content, no
@@ -208,17 +248,101 @@ def load_mcp_servers(path: Path, project_key: str | None, quiet: bool) -> dict:
     return merged
 
 
-def wrap_mcp_servers(servers: dict, patterns: list[str] | None = None) -> dict:
+def parse_http_bridge(raw: str | None) -> dict[str, str]:
+    """Split a colon-separated `name=url` map into a {name: url} dict.
+
+    Empty / None input returns {}. Pairs without `=` are dropped (and
+    a stderr warning is emitted by the caller when not quiet). Empty
+    names or empty URLs are dropped. Returns the merged dict.
+
+    Why colon-separated: parallel to `CLAUDE_SHIM_PATTERNS`'s
+    separator and to `PATH`. URLs containing `:` (every URL with a
+    scheme!) are the awkward case — but `=` always comes BEFORE the
+    URL's scheme-colon, so a single split on the FIRST `=` per pair
+    is safe. Pairs themselves split on `:` at the TOP level only,
+    and a URL never contains a `:` outside of `scheme:` (which lives
+    after the first `=`), so the outer split is unambiguous.
+
+    Example: 'mcp-adaptor=http://host.docker.internal:8765/mcp:other=http://h:9999/x'
+      → {'mcp-adaptor': 'http://host.docker.internal:8765/mcp',
+         'other': 'http://h:9999/x'}
+    """
+    if not raw:
+        return {}
+    out: dict[str, str] = {}
+    # Split on `:` at the TOP level. A URL like "http://host:8765/mcp"
+    # contains `:` between scheme and host AND between host and port.
+    # But every pair is `name=URL`, and the FIRST `:` in a URL is
+    # always part of `scheme://`. We split on `:` followed by a token
+    # that LOOKS like a name (no `/`, contains `=`) so we don't break
+    # URLs apart. Pragmatic regex: split on `:` only when the next
+    # chunk has `=` before any `/`. Doing this with a single regex
+    # split keeps the implementation under 10 lines.
+    import re
+    # Anchor on `:` that's followed by `<name>=`. `<name>` is letters,
+    # digits, dashes, underscores, dots. Negative lookahead on `//`
+    # rules out scheme separators inside a URL.
+    parts = re.split(r":(?=[A-Za-z0-9._-]+=)", raw)
+    for part in parts:
+        if "=" not in part:
+            continue
+        name, _, url = part.partition("=")
+        name = name.strip()
+        url = url.strip()
+        if not name or not url:
+            continue
+        out[name] = url
+    return out
+
+
+def rewrite_to_http(definition: dict, url: str) -> dict:
+    """Return a fresh definition dict in Claude Code's HTTP MCP
+    transport shape, pointing at `url`. Drops stdio-specific fields
+    (`command`, `args`, `env`, `transport: "stdio"`); preserves any
+    HTTP-specific fields the operator already had (`headers`,
+    `alwaysLoad`, `oauth`, `headersHelper`, ...). Top-level `type` is
+    overwritten with "http"; `url` is overwritten with the bridge URL.
+
+    Why drop env: HTTP MCP transport doesn't pass env to the remote
+    endpoint — env vars belong to the host-side adapter that
+    actually spawns the MCP binary. Keeping `env` in the rewritten
+    output is harmless (Claude Code would ignore it for http
+    transport) but confusing; cleaner to strip.
+    """
+    new_def = dict(definition)
+    for stdio_key in ("command", "args", "env", "transport"):
+        new_def.pop(stdio_key, None)
+    new_def["type"] = "http"
+    new_def["url"] = url
+    return new_def
+
+
+def wrap_mcp_servers(
+    servers: dict,
+    patterns: list[str] | None = None,
+    http_bridge: dict[str, str] | None = None,
+) -> dict:
     """Wrap each server's `command` field with exec-hook (subject to
     `patterns` filtering — see wrap_command). Pass weird shapes
     (non-dict definitions, non-string commands) through unchanged —
     Claude Code's own validator will complain at load time and we
     don't try to fix what we don't understand.
+
+    When `http_bridge` maps a server NAME to a URL, that server's
+    entry is rewritten to Claude Code's HTTP MCP transport shape
+    (`type: "http"`, `url: <url>`) instead. The exec-hook wrapping
+    is skipped for those entries — there's no stdio command to
+    wrap. Other servers fall through to the default stdio +
+    exec-hook path.
     """
+    bridge = http_bridge or {}
     wrapped: dict = {}
     for name, definition in servers.items():
         if not isinstance(definition, dict):
             wrapped[name] = definition
+            continue
+        if name in bridge:
+            wrapped[name] = rewrite_to_http(definition, bridge[name])
             continue
         new_def = dict(definition)
         cmd = definition.get("command")
@@ -303,12 +427,26 @@ def main(argv: list[str]) -> int:
              "Example: '/Users/*/.devbar/bin/*:/Users/*/.mcp-adaptor/bin/*'.",
     )
     p.add_argument(
+        "--http-bridge",
+        default=os.environ.get("CLAUDE_MCP_HTTP_BRIDGE", ""),
+        help="Colon-separated `name=url` pairs. When an MCP server's "
+             "name matches, the entry is rewritten to Claude Code's "
+             "HTTP transport (`type: \"http\"`, `url: <url>`) instead "
+             "of the default stdio + exec-hook wrapping. Use this to "
+             "point the in-container claude at a host-side HTTP→stdio "
+             "adapter for cross-arch MCP binaries (e.g. macOS Mach-O). "
+             "Falls back to CLAUDE_MCP_HTTP_BRIDGE env var if the flag "
+             "isn't given. Example: "
+             "'mcp-adaptor=http://host.docker.internal:8765/mcp'.",
+    )
+    p.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress stderr 'wrote N servers' summary on success.",
     )
     args = p.parse_args(argv)
     patterns = parse_patterns(args.shim_patterns)
+    http_bridge = parse_http_bridge(args.http_bridge)
 
     out_dir = args.output_dir.strip() if args.output_dir else ""
     if not out_dir:
@@ -343,7 +481,7 @@ def main(argv: list[str]) -> int:
             )
         return 0
 
-    wrapped = wrap_mcp_servers(servers, patterns)
+    wrapped = wrap_mcp_servers(servers, patterns, http_bridge)
     content = render(wrapped)
     out_path = out_dir_path / ".mcp.json"
 
@@ -365,19 +503,23 @@ def main(argv: list[str]) -> int:
             and isinstance(d.get("command"), str)
             and d["command"].startswith(f"{EXEC_HOOK_PATH} ")
         )
+        n_bridged = sum(
+            1
+            for d in wrapped.values()
+            if isinstance(d, dict) and d.get("type") == "http"
+        )
+        trailer_bits = []
         if patterns:
-            print(
-                f"generate-project-mcp-json: {action} {out_path} "
-                f"({n_total} server(s), {n_wrapped} wrapped, "
-                f"patterns={patterns})",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"generate-project-mcp-json: {action} {out_path} "
-                f"({n_total} server(s), {n_wrapped} wrapped)",
-                file=sys.stderr,
-            )
+            trailer_bits.append(f"patterns={patterns}")
+        if http_bridge:
+            trailer_bits.append(f"http_bridge={sorted(http_bridge.keys())}")
+        trailer = (", " + ", ".join(trailer_bits)) if trailer_bits else ""
+        print(
+            f"generate-project-mcp-json: {action} {out_path} "
+            f"({n_total} server(s), {n_wrapped} wrapped, "
+            f"{n_bridged} http-bridged{trailer})",
+            file=sys.stderr,
+        )
 
     return 0
 
