@@ -1,0 +1,9 @@
+{
+  "name": "claude-container",
+  "version": "0.1.0",
+  "description": "claude-container baked skills + agents (loaded via --plugin-dir at session start)",
+  "author": {
+    "name": "claude-watch contributors",
+    "url": "https://github.com/hndrewaall/claude-watch"
+  }
+}

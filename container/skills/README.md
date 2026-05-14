@@ -1,0 +1,46 @@
+# container/skills/
+
+Slash-command source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each file is one skill that the in-container `claude` process can invoke as `/<plugin>:<name>` (the plugin name is `claude-container`, set by `/etc/claude-code/plugin/.claude-plugin/plugin.json`).
+
+## What goes here
+
+- One Markdown file per skill: `<name>.md`.
+- Skill bodies follow the same shape as the host's `~/.claude/commands/<name>.md` files: a one-line summary at the top, then `## Steps` / `## Important` / etc. The first line should be the skill's prompt-injection summary so the agent sees it in `--help`-style listings.
+- No frontmatter is required (mirroring the host shape). If a skill needs metadata (description override, allowed-tools restriction), add a YAML frontmatter block at the top — Claude Code's plugin loader honours it.
+
+## How they get baked in
+
+The Dockerfile copies this directory into the image at two paths:
+
+1. `/etc/claude-code/skills/` — canonical bake path; documented for operators who want to inspect what shipped with their image (e.g. `ls /etc/claude-code/skills/`).
+2. `/etc/claude-code/plugin/commands/` — the path Claude Code's plugin loader actually reads. The Dockerfile populates this dir at build time and the entrypoint launches `claude` with `--plugin-dir /etc/claude-code/plugin`, so every baked skill becomes discoverable as `/claude-container:<name>` in the in-container session.
+
+The two paths share contents (the Dockerfile copies `container/skills/` into both). Operators reading `/etc/claude-code/skills/` see the same files Claude Code actually loads.
+
+## How a fresh container session discovers them
+
+`entrypoint.sh` adds `--plugin-dir /etc/claude-code/plugin` to the `CLAUDE_CMD` it spawns under tmux. Claude Code's plugin loader walks `commands/` inside the plugin dir and registers each `<name>.md` as a slash command. Inside an interactive session the agent can verify discovery with:
+
+```
+/claude-container:restart        # invoke the baked /restart skill
+```
+
+Listings: ask the agent "list available skills" — the plugin's commands show up with the `claude-container:` prefix.
+
+## How to add a new skill
+
+1. Drop `container/skills/<name>.md` in this dir. Match the existing tone — short, punchy, references in-container paths (not host paths).
+2. (Optional) Add a test in `container/tests/` asserting the file exists at the baked path. The skeleton in [`container/tests/baked-dirs.test`](../tests/baked-dirs.test) already covers `restart.md` and `start-watchers.md` — extend it for new skills.
+3. Rebuild the image (`make compose-build` from the repo root, or `docker compose build claude-container` from `examples/compose/`).
+4. `cwsr` the running container — wait, that won't pick up the new skill (it only re-execs claude with the same `--plugin-dir` arg pointing at the same already-baked files; the new files only land after a container rebuild). Recommend `docker compose up -d --force-recreate claude-container` instead.
+
+## Test conventions
+
+- Unit-style tests for skill files live alongside other container tests in [`container/tests/`](../tests/).
+- The baseline test ([`container/tests/baked-dirs.test`](../tests/baked-dirs.test)) asserts every documented skill is non-empty and references the right backing tool (e.g. `/restart` references `cwsr`).
+- A skill-discovery integration test ([`container/tests/skill-restart-discovery.test`](../tests/skill-restart-discovery.test)) exercises the `--plugin-dir` wiring against a synthetic input directory — no docker required.
+
+## Currently shipping
+
+- [`restart.md`](restart.md) — restart the in-container `claude` process via `cwsr` (mirrors the host's `/restart` skill, which uses `claude-watch update --force` against the systemd daemon; the container variant rolls only the inner pane-0 process).
+- [`start-watchers.md`](start-watchers.md) — discover and launch any baked container-scoped watchers (today: none; the dir is a stub for phase-2 watcher integrations).

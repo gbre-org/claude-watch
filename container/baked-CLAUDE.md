@@ -79,6 +79,18 @@ all that's needed.
    audit summary, host OS if probed) so the operator can see at a
    glance what you have to work with. Keep it concise — one or two
    sentences.
+6. **List baked skills + agents + watchers**: `ls
+   /etc/claude-code/skills/ /etc/claude-code/agents/
+   /etc/claude-code/watchers/`. Skills land at
+   `/claude-container:<name>` (e.g. `/claude-container:restart`,
+   `/claude-container:start-watchers`); agents are spawned with
+   `Agent(subagent_type="claude-container:<name>", ...)`; watchers are
+   shell scripts the agent launches via the `Bash` tool with
+   `run_in_background: true`. The full convention + how-to-add lives in
+   the per-dir READMEs at the repo's
+   [`container/skills/`](https://github.com/hndrewaall/claude-watch/tree/main/container/skills),
+   [`container/agents/`](https://github.com/hndrewaall/claude-watch/tree/main/container/agents),
+   [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers).
 
 **There are no long-running watchers inside this container.** This is
 deliberate — the container is a code-writing sandbox, not a host

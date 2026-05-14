@@ -304,6 +304,49 @@ RUN chmod +x /usr/local/bin/audit-hooks
 COPY bin/cwsr /usr/local/bin/cwsr
 RUN chmod +x /usr/local/bin/cwsr
 
+# Baked skills / agents / watchers — three top-level dirs in the repo
+# (container/skills/, container/agents/, container/watchers/) that ship
+# in-container slash commands, custom agent prompts, and background
+# watcher launchers respectively. See each dir's README.md for the
+# convention, the on-disk schema (watchers), and the add-a-new-entry
+# walkthrough.
+#
+# Wiring shape:
+#
+#   container/skills/   -> /etc/claude-code/skills/   (canonical bake path,
+#                                                       documented for inspection)
+#                       -> /etc/claude-code/plugin/commands/
+#                                                      (where Claude Code's
+#                                                       plugin loader reads
+#                                                       slash commands)
+#   container/agents/   -> /etc/claude-code/agents/   (canonical bake path)
+#                       -> /etc/claude-code/plugin/agents/
+#                                                      (plugin loader reads
+#                                                       custom agents here)
+#   container/watchers/ -> /etc/claude-code/watchers/ (probed by the
+#                                                       /start-watchers skill;
+#                                                       NOT a plugin loader path)
+#   container/plugin/.claude-plugin/plugin.json
+#                       -> /etc/claude-code/plugin/.claude-plugin/plugin.json
+#                          (manifest the plugin loader requires; sets the
+#                           plugin namespace to `claude-container`, so
+#                           skills land as /claude-container:<name>)
+#
+# entrypoint.sh appends `--plugin-dir /etc/claude-code/plugin` to the
+# claude argv so the plugin loader picks up the baked commands/agents at
+# session start. The two-target COPY (skills -> {skills,plugin/commands};
+# agents -> {agents,plugin/agents}) keeps the canonical paths
+# inspectable AND the plugin-loader paths populated, without forcing the
+# operator to think about the plugin layout. Watchers do NOT land in the
+# plugin dir because they aren't slash commands or agents — they're
+# shell scripts the agent runs via the Bash tool with run_in_background.
+COPY skills/ /etc/claude-code/skills/
+COPY skills/ /etc/claude-code/plugin/commands/
+COPY agents/ /etc/claude-code/agents/
+COPY agents/ /etc/claude-code/plugin/agents/
+COPY watchers/ /etc/claude-code/watchers/
+COPY plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude-plugin/plugin.json
+
 # Entrypoint script — tmux session bootstrap + env passthrough + signal handling.
 # Phase 1e (q-2026-05-11-8a96): pane 1 now runs the real claude-watch daemon
 # instead of the Phase 0 placeholder bash banner. Pane 1 keeps itself open with

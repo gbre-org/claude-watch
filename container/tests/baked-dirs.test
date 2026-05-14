@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Tests for the container/skills/, container/agents/, container/watchers/
+source dirs and the Dockerfile wiring that bakes them into the image.
+
+The PR introducing these dirs (q-2026-05-14-f966) establishes the
+convention: each top-level dir gets a README.md describing the on-disk
+schema, the bake path, and the discovery mechanism. This test asserts
+the convention holds at commit-time:
+
+  1. container/skills/, container/agents/, container/watchers/ all exist
+     in the repo.
+  2. Each dir has a non-empty README.md.
+  3. container/skills/restart.md exists, references `cwsr` (the
+     in-container self-restart binary; the host's /restart skill calls
+     `claude-watch update --force` against systemd, the container variant
+     calls cwsr against tmux).
+  4. container/skills/start-watchers.md exists, references the watchers
+     dir AND honestly tells the agent there are no built-in watchers
+     today.
+  5. container/agents/ ships only its README.md (stub for future agent
+     ports; see the dir's README "Future plan" section).
+  6. container/watchers/ ships only its README.md (stub for future
+     watcher integrations; see the dir's README "Currently shipping"
+     section).
+  7. container/plugin/.claude-plugin/plugin.json exists with name
+     `claude-container`. This sets the plugin namespace; baked skills
+     land as /claude-container:<name>.
+  8. Dockerfile COPY lines wire the source dirs into the right targets:
+       - skills/   -> /etc/claude-code/skills/
+                   -> /etc/claude-code/plugin/commands/   (loader path)
+       - agents/   -> /etc/claude-code/agents/
+                   -> /etc/claude-code/plugin/agents/      (loader path)
+       - watchers/ -> /etc/claude-code/watchers/           (no loader path)
+       - plugin.json -> /etc/claude-code/plugin/.claude-plugin/plugin.json
+  9. baked-CLAUDE.md session-start checklist references the new dirs so
+     a fresh in-container session discovers them on every start.
+
+Run:  ./baked-dirs.test
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+SKILLS_DIR = CONTAINER_DIR / "skills"
+AGENTS_DIR = CONTAINER_DIR / "agents"
+WATCHERS_DIR = CONTAINER_DIR / "watchers"
+PLUGIN_JSON = CONTAINER_DIR / "plugin" / ".claude-plugin" / "plugin.json"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+BAKED = CONTAINER_DIR / "baked-CLAUDE.md"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. The three top-level dirs exist.
+for d in (SKILLS_DIR, AGENTS_DIR, WATCHERS_DIR):
+    expect(d.is_dir(), f"directory missing: {d}")
+
+# 2. Each dir has a non-empty README.md.
+for d in (SKILLS_DIR, AGENTS_DIR, WATCHERS_DIR):
+    readme = d / "README.md"
+    expect(readme.is_file(), f"README.md missing in {d}")
+    if readme.is_file():
+        text = readme.read_text(encoding="utf-8")
+        expect(
+            len(text) > 200,
+            f"{readme} is suspiciously short (<200 chars)",
+        )
+        # Each README must explain bake target + add-a-new-entry shape.
+        expect(
+            "/etc/claude-code/" in text,
+            f"{readme} should reference the /etc/claude-code/ bake path so "
+            f"operators know where the files actually land in the image",
+        )
+
+# 3. restart.md present + references cwsr.
+restart = SKILLS_DIR / "restart.md"
+expect(restart.is_file(), f"{restart} missing — required by PR")
+if restart.is_file():
+    text = restart.read_text(encoding="utf-8")
+    expect(len(text) > 200, f"{restart} suspiciously short (<200 chars)")
+    expect(
+        "cwsr" in text,
+        f"{restart} should reference cwsr (the in-container self-restart "
+        f"binary). Without cwsr, /claude-container:restart has no backing "
+        f"tool — it's the container counterpart to the host's "
+        f"`claude-watch update --force` invocation.",
+    )
+    # The host's /restart skill description is "Restart the Claude Code
+    # process to pick up a new binary version" — the container variant
+    # mirrors that intent. Sanity-check the opening line carries the
+    # same idea so operators aren't confused about scope.
+    first_line = text.splitlines()[0].lower()
+    expect(
+        "restart" in first_line and "claude" in first_line.lower(),
+        f"{restart} first line should describe restarting the in-container "
+        f"claude process (host parity), got: {text.splitlines()[0]!r}",
+    )
+
+# 4. start-watchers.md present + references the watchers dir + honest
+#    "no watchers today" framing.
+start_watchers = SKILLS_DIR / "start-watchers.md"
+expect(start_watchers.is_file(), f"{start_watchers} missing — required by PR")
+if start_watchers.is_file():
+    text = start_watchers.read_text(encoding="utf-8")
+    expect(len(text) > 200, f"{start_watchers} suspiciously short (<200 chars)")
+    expect(
+        "/etc/claude-code/watchers" in text,
+        f"{start_watchers} should reference /etc/claude-code/watchers/ — "
+        f"the path it probes via `ls`",
+    )
+    # Honest "no watchers today" framing — the skill must NOT lie about
+    # what's available in a fresh image. Look for either an explicit
+    # "no watchers" callout or a "ships zero" / "empty" framing.
+    has_honest_framing = re.search(
+        r"no (long-running )?watchers|zero (long-running )?watchers|"
+        r"watcher.{0,5}light|empty|nothing to start",
+        text,
+        re.IGNORECASE,
+    )
+    expect(
+        has_honest_framing is not None,
+        f"{start_watchers} should honestly report that the container ships "
+        f"no built-in watchers today (don't pretend the dir is populated)",
+    )
+
+# 5. agents/ only ships README.md today.
+agent_files = sorted(p.name for p in AGENTS_DIR.iterdir() if p.is_file())
+expect(
+    agent_files == ["README.md"],
+    f"container/agents/ should ship only README.md today (stub for future "
+    f"agent ports), got: {agent_files}",
+)
+
+# 6. watchers/ only ships README.md today.
+watcher_files = sorted(p.name for p in WATCHERS_DIR.iterdir() if p.is_file())
+expect(
+    watcher_files == ["README.md"],
+    f"container/watchers/ should ship only README.md today (stub for future "
+    f"watcher integrations), got: {watcher_files}",
+)
+
+# 7. plugin.json present, name=claude-container.
+expect(PLUGIN_JSON.is_file(), f"{PLUGIN_JSON} missing — required to register "
+       f"the plugin namespace for baked skills + agents")
+if PLUGIN_JSON.is_file():
+    try:
+        manifest = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
+        expect(
+            manifest.get("name") == "claude-container",
+            f"plugin.json `name` must be 'claude-container' (sets the "
+            f"namespace; skills land as /claude-container:<name>), got: "
+            f"{manifest.get('name')!r}",
+        )
+        expect(
+            "version" in manifest and isinstance(manifest["version"], str),
+            f"plugin.json must have a string `version`, got: "
+            f"{manifest.get('version')!r}",
+        )
+    except json.JSONDecodeError as e:
+        failures.append(f"plugin.json is not valid JSON: {e}")
+
+# 8. Dockerfile COPY wiring — six lines, exact targets.
+expect(DOCKERFILE.is_file(), f"{DOCKERFILE} missing")
+if DOCKERFILE.is_file():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    required_copy_lines = [
+        # source pattern, destination
+        ("skills/", "/etc/claude-code/skills/"),
+        ("skills/", "/etc/claude-code/plugin/commands/"),
+        ("agents/", "/etc/claude-code/agents/"),
+        ("agents/", "/etc/claude-code/plugin/agents/"),
+        ("watchers/", "/etc/claude-code/watchers/"),
+        ("plugin/.claude-plugin/plugin.json",
+         "/etc/claude-code/plugin/.claude-plugin/plugin.json"),
+    ]
+    for src, dst in required_copy_lines:
+        # Tolerate any whitespace; require both src and dst on the same
+        # COPY line.
+        pat = re.compile(
+            rf"^\s*COPY\s+{re.escape(src)}\s+{re.escape(dst)}\s*$",
+            re.MULTILINE,
+        )
+        expect(
+            pat.search(df) is not None,
+            f"Dockerfile missing `COPY {src} {dst}` — required to bake "
+            f"the {src.rstrip('/')} dir into the image at {dst}",
+        )
+
+# 9. baked-CLAUDE.md session-start checklist references the new dirs.
+expect(BAKED.is_file(), f"{BAKED} missing")
+if BAKED.is_file():
+    text = BAKED.read_text(encoding="utf-8")
+    # The checklist should mention all three dirs by name so a fresh
+    # session knows to enumerate them.
+    expect(
+        "/etc/claude-code/skills" in text,
+        "baked-CLAUDE.md should reference /etc/claude-code/skills/ in the "
+        "session-start checklist so the agent enumerates baked skills on "
+        "every fresh session",
+    )
+    expect(
+        "/etc/claude-code/agents" in text,
+        "baked-CLAUDE.md should reference /etc/claude-code/agents/ in the "
+        "session-start checklist",
+    )
+    expect(
+        "/etc/claude-code/watchers" in text,
+        "baked-CLAUDE.md should reference /etc/claude-code/watchers/ in "
+        "the session-start checklist",
+    )
+    expect(
+        "claude-container:" in text,
+        "baked-CLAUDE.md should reference the `claude-container:` plugin "
+        "namespace so the agent knows how to invoke baked skills "
+        "(e.g. /claude-container:restart)",
+    )
+
+
+if failures:
+    print("FAIL baked-dirs.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS baked-dirs.test")
+sys.exit(0)

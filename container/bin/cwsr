@@ -133,6 +133,16 @@ build_claude_cmd() {
     if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
         cmd="$cmd --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
     fi
+    # Mirror entrypoint.sh: append --plugin-dir for the baked container
+    # plugin (skills + agents) when it's present. Without this, a cwsr
+    # respawn would silently drop the baked /claude-container:<name>
+    # commands until the next docker compose recreate. The dir check
+    # falls back gracefully on older images that pre-date the plugin
+    # bake (no plugin dir => no flag).
+    local plugin_dir="${CWSR_PLUGIN_DIR:-/etc/claude-code/plugin}"
+    if [ -d "$plugin_dir/.claude-plugin" ]; then
+        cmd="$cmd --plugin-dir $plugin_dir"
+    fi
     if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
         local q="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
         cmd="$cmd --continue $q"

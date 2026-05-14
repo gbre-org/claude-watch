@@ -293,15 +293,37 @@ fi
 # Default unset = bare claude (no auto-resume; existing behaviour).
 # Recommended value: "resume" (matches the host-side alias most operators
 # already use). Set CLAUDE_AUTO_CONTINUE=resume in .env to opt in.
+#
+# CLAUDE_CMD-block contract for new appenders: keep every conditional
+# `if [...]; then ... fi` immediately back-to-back (no comments between
+# blocks; blank lines also break the consecutive-if regex used by
+# container/tests/entrypoint-claude-cmd.test). Document each block's
+# purpose with a one-line trailing comment INSIDE the `if` body, OR
+# keep a block-level comment WITHIN the `if`. The block-extraction
+# regex in the test file matches greedily through the final `fi\n`
+# only as long as `if`s are consecutive.
+#
+# Existing blocks:
+#   1. CLAUDE_SHIM_SETTINGS_PATH set => add --setting-sources +
+#      --settings (filters user tier, loads exec-hook-wrapped shim).
+#   2. /etc/claude-code/plugin/.claude-plugin exists => add
+#      --plugin-dir for the baked container skills + agents (plugin
+#      namespace `claude-container`; skills invoked as
+#      /claude-container:<name>, agents as subagent_type
+#      claude-container:<name>). The dir always exists in container
+#      images built from this Dockerfile; the existence check is a
+#      defensive no-op for older images.
+#   3. CLAUDE_AUTO_CONTINUE non-empty => add --continue '<value>',
+#      single-quoted so multi-word values survive the tmux-command-
+#      string shell parse as one argv element.
 CLAUDE_CMD="exec claude"
 if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
     CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
 fi
+if [ -d /etc/claude-code/plugin/.claude-plugin ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /etc/claude-code/plugin"
+fi
 if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
-    # Single-quote the value so it survives the tmux-command-string shell
-    # parse as ONE argv element even when it contains spaces. Any literal
-    # single quote in the value is escaped via the standard '\'' trick
-    # (close-quote, escaped-quote, reopen-quote).
     _auto_continue_quoted="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
     CLAUDE_CMD="$CLAUDE_CMD --continue $_auto_continue_quoted"
 fi

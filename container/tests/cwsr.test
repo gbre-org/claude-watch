@@ -175,6 +175,36 @@ def test_conflicting_flags_rejected() -> None:
     )
 
 
+def test_plugin_dir_absent_no_flag() -> None:
+    """No /etc/claude-code/plugin/.claude-plugin (default on the test
+    host) => no --plugin-dir flag in the rebuilt argv."""
+    lines, _, _, _ = run_cwsr(["--print"])
+    tmux = [l for l in lines if l.startswith("TMUX:")][0]
+    expect(
+        "--plugin-dir" not in tmux,
+        f"plugin-dir absent: --plugin-dir should not appear, got {tmux!r}",
+    )
+
+
+def test_plugin_dir_present_appends_flag() -> None:
+    """CWSR_PLUGIN_DIR env override points at an existing plugin dir
+    => --plugin-dir <dir> is appended (preserves shape across
+    self-restart in a container where /etc/claude-code/plugin exists)."""
+    import tempfile as tf
+    with tf.TemporaryDirectory() as td:
+        plug = Path(td) / "plugin"
+        (plug / ".claude-plugin").mkdir(parents=True)
+        lines, _, _, _ = run_cwsr(
+            ["--print"], env={"CWSR_PLUGIN_DIR": str(plug)}
+        )
+        tmux = [l for l in lines if l.startswith("TMUX:")][0]
+        expect(
+            f"--plugin-dir {plug}" in tmux,
+            f"plugin-dir present: should append --plugin-dir <plug>, "
+            f"got {tmux!r}",
+        )
+
+
 def test_session_override() -> None:
     """CWSR_SESSION env var changes the tmux pane target."""
     lines, _, _, _ = run_cwsr(["--print"], env={"CWSR_SESSION": "alt-sess"})
@@ -220,6 +250,8 @@ TESTS = [
     test_print_no_upgrade,
     test_print_upgrade_only,
     test_conflicting_flags_rejected,
+    test_plugin_dir_absent_no_flag,
+    test_plugin_dir_present_appends_flag,
     test_session_override,
     test_help_exits_zero,
     test_bad_flag_exits_two,

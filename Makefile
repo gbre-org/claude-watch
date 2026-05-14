@@ -123,6 +123,8 @@ test-hooks-shim:
 test-entrypoint:
 	container/tests/entrypoint-claude-cmd.test
 	container/tests/container-path-includes-local-bin.test
+	container/tests/baked-dirs.test
+	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host
 # terminal to the running claude-container's tmux session via

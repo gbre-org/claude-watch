@@ -267,6 +267,47 @@ def test_auto_continue_value_with_single_quote() -> None:
            f"\"it's me\", got stdout {result.stdout!r}")
 
 
+def test_plugin_dir_absent_no_flag() -> None:
+    """When /etc/claude-code/plugin/.claude-plugin does NOT exist, the
+    --plugin-dir flag must not appear (defensive no-op for older images
+    pre-dating the baked container plugin)."""
+    env = {"PATH": "/usr/bin:/bin"}
+    cmd = run_block(BLOCK, env)
+    expect(
+        "--plugin-dir" not in cmd,
+        f"plugin-dir absent: --plugin-dir should not appear, got {cmd!r}",
+    )
+
+
+def test_plugin_dir_present_appends_flag() -> None:
+    """When /etc/claude-code/plugin/.claude-plugin exists, --plugin-dir
+    /etc/claude-code/plugin is appended unconditionally — the baked
+    container plugin (skills + agents) loads at session start.
+
+    We can't create /etc/claude-code/plugin without root, but the test
+    can still verify the conditional fires by re-extracting the block
+    with the dir literal substituted to an existing tmpdir, then
+    re-running."""
+    with tempfile.TemporaryDirectory() as td:
+        plug = Path(td) / "plugin"
+        (plug / ".claude-plugin").mkdir(parents=True)
+        # Substitute the hard-coded path in the extracted block. The block
+        # references the path twice (once in the test, once in the assignment).
+        patched_block = BLOCK.replace(
+            "/etc/claude-code/plugin/.claude-plugin",
+            str(plug / ".claude-plugin"),
+        ).replace(
+            "/etc/claude-code/plugin", str(plug)
+        )
+        env = {"PATH": "/usr/bin:/bin"}
+        cmd = run_block(patched_block, env)
+        expect(
+            f"--plugin-dir {plug}" in cmd,
+            f"plugin-dir present: should append --plugin-dir <plug>, "
+            f"got {cmd!r}",
+        )
+
+
 def test_user_tier_not_in_source_list() -> None:
     """Regression guard for the v19 bug: the source list MUST NOT include
     'user' — otherwise the bind-mounted host settings.json's bare hooks
@@ -296,6 +337,8 @@ TESTS = [
     test_set_shim_path_includes_setting_sources,
     test_set_shim_path_order,
     test_set_shim_path_exact_form,
+    test_plugin_dir_absent_no_flag,
+    test_plugin_dir_present_appends_flag,
     test_user_tier_not_in_source_list,
     test_auto_continue_unset_no_flag,
     test_auto_continue_empty_no_flag,

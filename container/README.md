@@ -258,6 +258,48 @@ container-runtime description to remain in context. The simplest path is
 to symlink or copy `container/baked-CLAUDE.md` into your host
 managed-settings dir alongside whatever else lives there.
 
+## Baked skills, agents, watchers
+
+Three top-level dirs in `container/` ship in-container content baked
+into the image at well-known paths. Each dir has a `README.md` with the
+on-disk schema, the bake target, and the add-a-new-entry walkthrough.
+
+| Source dir | Bake target(s) | What it ships | Loader path |
+| --- | --- | --- | --- |
+| [`container/skills/`](skills/) | `/etc/claude-code/skills/` (canonical) + `/etc/claude-code/plugin/commands/` (plugin loader) | One `<name>.md` per slash command | `--plugin-dir /etc/claude-code/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`); skills callable as `/claude-container:<name>` |
+| [`container/agents/`](agents/) | `/etc/claude-code/agents/` (canonical) + `/etc/claude-code/plugin/agents/` (plugin loader) | One `<name>.md` per custom agent (frontmatter + body) | Same `--plugin-dir`; agents spawned with `subagent_type="claude-container:<name>"` |
+| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per long-running watcher | Probed by the `/claude-container:start-watchers` skill via `ls /etc/claude-code/watchers/*.toml` |
+
+The plugin namespace `claude-container` is set by
+[`container/plugin/.claude-plugin/plugin.json`](plugin/.claude-plugin/plugin.json),
+which the Dockerfile copies to
+`/etc/claude-code/plugin/.claude-plugin/plugin.json` so Claude Code's
+plugin loader treats the baked dir as a real plugin.
+
+**Currently shipping:**
+
+- Skills: [`restart`](skills/restart.md) (mirrors the host's `/restart`
+  but invokes the in-container `cwsr` instead of `claude-watch update
+  --force`); [`start-watchers`](skills/start-watchers.md) (probes
+  `/etc/claude-code/watchers/`; today reports "nothing to start"
+  because the dir is empty).
+- Agents: none yet — the dir is a stub for future agent ports (Explore,
+  general-purpose, note-writer, etc. — see
+  [`container/agents/README.md`](agents/README.md) for the plan).
+- Watchers: none yet — the dir is a stub for future container-scoped
+  watchers (e.g. an in-container queue-event tail). The session-start
+  checklist in `baked-CLAUDE.md` honestly states "no long-running
+  watchers inside this container".
+
+To add a new skill / agent / watcher: drop the file in the appropriate
+`container/<dir>/`, add a test under `container/tests/baked-dirs.test`
+if it deserves a regression guard, rebuild the image (`make
+compose-build` or `docker compose build claude-container`), and
+`docker compose up -d --force-recreate claude-container` to pick it
+up. `cwsr` does NOT pick up new skills (it re-execs claude with the
+same already-baked plugin dir; rebuild is required to ship new
+content).
+
 ## Volume management
 
 The `claude-container-versions` named docker volume holds the in-container claude binary's auto-updated `versions/<ver>/` tree at `/home/hndrewaall/.local/share/claude/`. It is created on first `claude-tmux` invocation (or first `docker compose up`) and persists across `--rm` exits — that's its whole purpose.

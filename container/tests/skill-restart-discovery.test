@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Tests for the in-container baked plugin's slash-command discovery.
+
+The Dockerfile bakes container/skills/<name>.md into
+/etc/claude-code/plugin/commands/<name>.md and entrypoint.sh appends
+`--plugin-dir /etc/claude-code/plugin` to the claude argv. Claude Code's
+plugin loader walks `<plugin-dir>/commands/` and registers each
+`<name>.md` as a slash command at `/<plugin-name>:<name>`.
+
+This test verifies the wiring at the source-tree level (no docker /
+no live claude required):
+
+  1. The plugin source tree (container/plugin/.claude-plugin/plugin.json)
+     parses as valid JSON with the expected `name` field.
+  2. Constructing a synthetic plugin layout from the in-tree sources
+     (container/skills/ + plugin.json) produces a `claude plugin
+     validate`-passable directory.
+  3. Each baked skill (restart.md, start-watchers.md) is present and
+     non-empty in the synthetic layout.
+  4. The synthetic layout is invokable via `claude --plugin-dir ...
+     --print '/claude-container:<name>'` AND the response is something
+     OTHER than "Unknown command" — proving the loader picked up the
+     skill. (Skipped gracefully if `claude` is not on PATH.)
+
+The full integration check (claude inside the running container, with
+the actual baked /etc/claude-code/plugin dir) lives in the v31 workbot
+prompt — this test covers what we can verify without docker.
+
+Run:  ./skill-restart-discovery.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+SKILLS_DIR = CONTAINER_DIR / "skills"
+AGENTS_DIR = CONTAINER_DIR / "agents"
+PLUGIN_JSON = CONTAINER_DIR / "plugin" / ".claude-plugin" / "plugin.json"
+
+EXPECTED_SKILLS = ["restart", "start-watchers"]
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. plugin.json parses + has expected name.
+if not PLUGIN_JSON.is_file():
+    print(f"FAIL: {PLUGIN_JSON} missing", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    manifest = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
+except json.JSONDecodeError as e:
+    print(f"FAIL: plugin.json is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+PLUGIN_NAME = manifest.get("name")
+expect(PLUGIN_NAME == "claude-container",
+       f"plugin.json name must be 'claude-container', got {PLUGIN_NAME!r}")
+
+
+# 2 & 3. Construct a synthetic plugin layout matching what the Dockerfile
+# produces, then check each expected skill is present + non-empty.
+with tempfile.TemporaryDirectory() as td:
+    plug = Path(td) / "plugin"
+    (plug / ".claude-plugin").mkdir(parents=True)
+    (plug / "commands").mkdir()
+    (plug / "agents").mkdir()
+
+    # Mirror Dockerfile's COPY lines.
+    shutil.copy2(PLUGIN_JSON, plug / ".claude-plugin" / "plugin.json")
+    for skill in SKILLS_DIR.glob("*.md"):
+        # README.md doesn't go to commands/ in the real bake either —
+        # the Dockerfile COPYs the whole dir so README.md DOES land in
+        # commands/, but Claude Code's plugin loader ignores READMEs.
+        # We mirror the exact bake to keep the test honest.
+        shutil.copy2(skill, plug / "commands" / skill.name)
+    for agent in AGENTS_DIR.glob("*.md"):
+        shutil.copy2(agent, plug / "agents" / agent.name)
+
+    for skill_name in EXPECTED_SKILLS:
+        baked_path = plug / "commands" / f"{skill_name}.md"
+        expect(
+            baked_path.is_file(),
+            f"baked skill missing: {baked_path} (Dockerfile COPY of "
+            f"container/skills/ should include {skill_name}.md)",
+        )
+        if baked_path.is_file():
+            text = baked_path.read_text(encoding="utf-8")
+            expect(
+                len(text) > 100,
+                f"baked skill {baked_path} is suspiciously short",
+            )
+
+    # 4. claude plugin validate the synthetic layout. This is the same
+    #    code path the in-container claude uses to load --plugin-dir, so
+    #    a `validate` pass means the loader will accept the layout at
+    #    runtime. The CI and dev hosts have `claude` on PATH; if it's
+    #    missing (e.g. minimal docker test image), skip gracefully.
+    claude = shutil.which("claude")
+    if claude is None:
+        print("SKIP claude not on PATH; skipping plugin-validate live check")
+    else:
+        result = subprocess.run(
+            [claude, "plugin", "validate", str(plug)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        expect(
+            result.returncode == 0,
+            f"`claude plugin validate {plug}` exited "
+            f"{result.returncode}; stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+
+    # 5. Live `claude --print` discoverability check. We invoke the
+    #    in-tree claude with --plugin-dir pointing at the synthetic
+    #    layout, ask it to list available skills, and assert the
+    #    `claude-container:<name>` namespace shows up. This is the
+    #    closest non-docker proxy for the v31 workbot's interactive
+    #    discovery test.
+    if claude is not None and os.environ.get("SKIP_LIVE_CLAUDE") != "1":
+        # Use an empty cwd so no project-level commands shadow the
+        # plugin's namespace.
+        empty_cwd = Path(td) / "empty-cwd"
+        empty_cwd.mkdir()
+        # Probe invocation, not listing. The plugin loader registers
+        # `/claude-container:<name>` as a callable slash command but
+        # doesn't always surface it in "list available skills"-style
+        # answers (Claude Code's skills listing is curated separately).
+        # Invocation is the load-bearing behaviour: when the agent
+        # invokes /claude-container:restart, the loader resolves it
+        # to the baked file and the skill body becomes part of the
+        # response. We assert the skill body's signature line lands
+        # in the output — that's only possible if the loader picked
+        # up the file.
+        for skill_name in EXPECTED_SKILLS:
+            prompt = (
+                f"Invoke /claude-container:{skill_name} and quote the "
+                f"literal first sentence of the resolved skill body."
+            )
+            result = subprocess.run(
+                [
+                    claude,
+                    "--plugin-dir", str(plug),
+                    "--print", prompt,
+                ],
+                cwd=str(empty_cwd),
+                capture_output=True,
+                text=True,
+                timeout=180,
+                stdin=subprocess.DEVNULL,
+            )
+            if result.returncode != 0:
+                print(
+                    f"SKIP live --plugin-dir check ({skill_name}): claude "
+                    f"--print exited {result.returncode} (likely auth / "
+                    f"network); stderr head: {result.stderr[:200]!r}",
+                    file=sys.stderr,
+                )
+                break
+            stdout = result.stdout
+            # Pull a distinctive fragment from each skill's first line
+            # to assert against the model's response. We pick a fragment
+            # that's specific enough to only appear if the skill body
+            # was actually loaded — not something the model could
+            # plausibly paraphrase about an "unknown command".
+            distinctive_fragments = {
+                "restart": "Restart the in-container Claude Code process",
+                "start-watchers": "Start the in-container background watchers",
+            }
+            fragment = distinctive_fragments[skill_name]
+            # The model usually quotes verbatim when explicitly asked;
+            # accept any case in which the fragment appears in the
+            # response. Strong signal that the loader resolved the
+            # skill file (rather than reporting "Unknown command").
+            expect(
+                fragment.lower() in stdout.lower(),
+                f"live --plugin-dir: response for "
+                f"/claude-container:{skill_name} should quote the skill's "
+                f"distinctive opener ({fragment!r}); got: {stdout!r}. "
+                f"This usually means the plugin loader did not pick up "
+                f"the skill file at the synthetic plugin layout (check "
+                f"plugin.json + commands/ wiring).",
+            )
+    else:
+        if claude is None:
+            print("SKIP live --plugin-dir check: claude not on PATH")
+        else:
+            print("SKIP live --plugin-dir check: SKIP_LIVE_CLAUDE=1")
+
+
+if failures:
+    print("FAIL skill-restart-discovery.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS skill-restart-discovery.test")
+sys.exit(0)
