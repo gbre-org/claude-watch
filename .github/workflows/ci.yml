@@ -130,7 +130,22 @@ jobs:
       - name: Install uv (for session-task tests)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
+      - name: Install session-task companion CLIs onto PATH
+        # `make install` would build claude-watch via cargo (heavy), so
+        # we mirror just the script-symlink portion here. The
+        # session-task force-start tests shell out to `obligations` and
+        # `claude-event`; without both on PATH the registration / emit
+        # calls silently no-op and tests assert on a missing
+        # obligations.json. Symlinks let in-tree edits take effect
+        # without a re-install round-trip.
+        run: |
+          mkdir -p "$HOME/bin"
+          ln -sfn "$(pwd)/tools/session-task/session-task" "$HOME/bin/session-task"
+          ln -sfn "$(pwd)/tools/obligations/obligations" "$HOME/bin/obligations"
+          ln -sfn "$(pwd)/tools/claude-event/claude-event" "$HOME/bin/claude-event"
+          ln -sfn "$(pwd)/tools/claude-event/claude-event-tail" "$HOME/bin/claude-event-tail"
+
       - name: Run session-task Python tests
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
           make test-session-task
