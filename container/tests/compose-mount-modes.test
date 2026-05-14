@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""Tests that examples/compose/docker-compose.yml's bind-mounts carry the
+right read-only / read-write flags for the operator-as-daily-driver
+shape (q-2026-05-14-7aaa).
+
+Background: Andrew uses the in-container `claude` (cw stack) as his
+primary code editor in vscode. Mounts that the previous "sandbox-only"
+framing kept read-only (~/repos, ~/bin) need to be writable so a
+routine edit-commit-push round-trip works without detouring through
+/workspace or dropping to a host shell. Mounts that protect baked
+content or operator-curated state stay read-only.
+
+Coverage:
+
+  1. claude-container's `~/.claude` bind-mount is RW (Claude Code
+     writes session JSONLs / project state / cache continuously).
+  2. claude-container's `~/.claude.json` bind-mount is RW (Claude Code
+     updates user-global config).
+  3. claude-container's `~/repos` bind-mount is RW (the daily-driver
+     contract — see PR header).
+  4. claude-container's `~/bin` bind-mount is RW (symmetric with
+     ~/repos so an operator can `ln -s` new shims from inside the
+     container).
+  5. claude-container's `~/claude-events` bind-mount is RW (event
+     watcher consumes + acks).
+  6. claude-container's `~/.config/session` bind-mount is RW
+     (session-task queue.json mutations).
+  7. claude-container's `${CLAUDE_HOST_PROJECT_DIR}` bind-mount is RW
+     when set (working_dir of the operator's project).
+  8. claude-container's managed-settings dir mount is RO (image-baked
+     /etc/claude-code/CLAUDE.md must not be writable from inside —
+     operator could accidentally clobber the in-container managed
+     policy CLAUDE.md and lose the session-start checklist).
+  9. claude-container's CORP-CA-bundle mount is RO (CA bundle is
+     operator-curated host content; container has no reason to
+     mutate it).
+ 10. claude-container's host-hooks dir mount is RO (operator's hook
+     scripts; container has no reason to mutate them).
+ 11. queue-minisite's `:ro` mounts stay RO (canonical session-task
+     script + JSONL transcripts the SSE log endpoint tails are
+     read-only by design).
+ 12. eichi-search's `:ro` mounts stay RO (eichi container reads
+     index + config + HF model cache; never writes).
+
+The test parses the compose file with a regex-based volume-string
+parser (compose volume strings are well-defined as
+`<src>:<dst>[:<mode>]`), so it doesn't depend on PyYAML being available
+in the CI runner. Any `read_only: true` long-form mount triggers a
+failure too — both spellings count.
+
+Run:  ./compose-mount-modes.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+COMPOSE = HERE.parent.parent / "examples" / "compose" / "docker-compose.yml"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# --- Minimal compose parser: scoped to this file's shape -----------------
+#
+# We don't need a full YAML parser. The compose file uses the short-form
+# string volume syntax `"<src>:<dst>[:<mode>]"` exclusively for bind
+# mounts (named volumes also use the same shape but with a bare name on
+# the left, which we recognise + skip). We also flag any `read_only:
+# true` line under a service block — both spellings need to match the
+# expected shape.
+#
+# Service-block detection: top-level `services:` → 2-space indent
+# `<service-name>:` keys → 4-space `volumes:` blocks → 6-space `- "..."`
+# entries. Indentation discipline is enforced by the compose YAML spec
+# anyway, so a regex pass is reliable here.
+
+text = COMPOSE.read_text(encoding="utf-8")
+
+# Split into per-service blocks. A service starts at a line matching
+# `^  <name>:$` and ends at the next service line or EOF.
+SERVICE_BLOCK_RE = re.compile(
+    r"^  ([a-z0-9][a-z0-9_-]*):\s*$",
+    re.MULTILINE,
+)
+
+service_starts: list[tuple[int, str]] = []
+in_services_section = False
+section_re = re.compile(r"^([a-z][a-z0-9_-]*):\s*$", re.MULTILINE)
+sections = list(section_re.finditer(text))
+services_section_start = None
+for sec in sections:
+    if sec.group(1) == "services":
+        services_section_start = sec.end()
+        # The services section ends at the next top-level key.
+        next_section = next(
+            (s for s in sections if s.start() > sec.end()),
+            None,
+        )
+        services_section_end = next_section.start() if next_section else len(text)
+        services_section_text = text[services_section_start:services_section_end]
+        services_section_offset = services_section_start
+        break
+else:
+    failures.append("compose file has no top-level `services:` key")
+    services_section_text = ""
+    services_section_offset = 0
+    services_section_end = 0
+
+# Find service-name boundaries within the services section.
+service_name_re = re.compile(r"^  ([a-z0-9][a-z0-9_-]*):\s*$", re.MULTILINE)
+matches = list(service_name_re.finditer(services_section_text))
+service_blocks: dict[str, str] = {}
+for i, m in enumerate(matches):
+    name = m.group(1)
+    start = m.end()
+    end = matches[i + 1].start() if i + 1 < len(matches) else len(services_section_text)
+    service_blocks[name] = services_section_text[start:end]
+
+
+# Extract a service's `volumes:` list as a list of (raw_string, mode)
+# tuples. mode is "ro" / "rw" / "default" (where "default" means rw —
+# docker treats unspecified as rw).
+VOLUME_LINE_RE = re.compile(
+    r'^      -\s+"([^"]+)"\s*$',
+    re.MULTILINE,
+)
+
+
+def parse_volumes(service_block: str) -> list[tuple[str, str]]:
+    # Only collect the volumes: section. Other list keys (environment:,
+    # extra_hosts:, command:, etc.) also use 6-space `- "..."` lines, so
+    # we have to scope the regex to the volumes block.
+    m = re.search(r"^    volumes:\s*$", service_block, re.MULTILINE)
+    if not m:
+        return []
+    after = service_block[m.end():]
+    # Volume block ends at the next 4-space `<key>:` line or EOF.
+    next_key = re.search(r"^    [a-z][a-z0-9_-]*:\s*$", after, re.MULTILINE)
+    block = after[:next_key.start()] if next_key else after
+    out: list[tuple[str, str]] = []
+    for line in VOLUME_LINE_RE.finditer(block):
+        raw = line.group(1)
+        # Use the brace-aware splitter to identify the source field.
+        # If the source has no `/` and doesn't start with `$`, it's a
+        # docker named-volume reference (e.g. `claude-tmux-socket`),
+        # which is always rw — skip for this audit.
+        # split_volume is defined below the parser; forward-call by
+        # inlining the split logic here would be duplicative. Use a
+        # small local heuristic instead: brace-depth-zero first colon.
+        depth = 0
+        first_colon = -1
+        for i, c in enumerate(raw):
+            if c == "$" and i + 1 < len(raw) and raw[i + 1] == "{":
+                depth += 1
+                continue
+            if c == "}" and depth > 0:
+                depth -= 1
+                continue
+            if c == ":" and depth == 0:
+                first_colon = i
+                break
+        first_seg = raw if first_colon == -1 else raw[:first_colon]
+        if "/" not in first_seg and not first_seg.startswith("$"):
+            continue
+        # Find the LAST brace-depth-zero colon to identify the mode.
+        depth = 0
+        last_colon = -1
+        for i, c in enumerate(raw):
+            if c == "$" and i + 1 < len(raw) and raw[i + 1] == "{":
+                depth += 1
+                continue
+            if c == "}" and depth > 0:
+                depth -= 1
+                continue
+            if c == ":" and depth == 0:
+                last_colon = i
+        if last_colon != -1 and last_colon != first_colon:
+            tail = raw[last_colon + 1:]
+            if tail in ("ro", "rw"):
+                mode = tail
+            else:
+                mode = "default"
+        else:
+            mode = "default"  # docker default = rw
+        out.append((raw, mode))
+    return out
+
+
+def has_long_form_read_only(service_block: str) -> bool:
+    # Long-form mount with `read_only: true` would land as a sibling
+    # `read_only: true` line under the volume entry. None of the current
+    # mounts use long form, but defend against future regressions.
+    return re.search(r"^\s+read_only:\s*true\s*$", service_block, re.MULTILINE) is not None
+
+
+claude_volumes = parse_volumes(service_blocks.get("claude-container", ""))
+queue_volumes = parse_volumes(service_blocks.get("queue-minisite", ""))
+eichi_volumes = parse_volumes(service_blocks.get("eichi-search", ""))
+
+
+# Helper: split a volume string into (src, dst, mode) honouring
+# `${VAR:-default}` interpolation on the source side. Compose volume
+# strings are `<src>:<dst>[:<mode>]` where `<src>` may contain
+# `${VAR:-default}` — the embedded `:-` colon makes naive `split(":")`
+# wrong. We track `${...}` brace depth so colons inside an
+# interpolation block don't count as field separators.
+def split_volume(raw: str) -> tuple[str, str, str]:
+    fields: list[str] = []
+    cur = []
+    depth = 0
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if c == "$" and i + 1 < len(raw) and raw[i + 1] == "{":
+            depth += 1
+            cur.append(c)
+            cur.append(raw[i + 1])
+            i += 2
+            continue
+        if c == "}" and depth > 0:
+            depth -= 1
+            cur.append(c)
+            i += 1
+            continue
+        if c == ":" and depth == 0:
+            fields.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    fields.append("".join(cur))
+    if len(fields) < 2:
+        return (fields[0], "", "default")
+    src = fields[0]
+    dst = fields[1]
+    mode = fields[2] if len(fields) >= 3 and fields[2] in ("ro", "rw") else "default"
+    return (src, dst, mode)
+
+
+# Helper: find the volume entry whose source matches a substring.
+def find_by_source(volumes: list[tuple[str, str]], needle: str) -> tuple[str, str] | None:
+    for raw, mode in volumes:
+        src, _, _ = split_volume(raw)
+        if needle in src:
+            return (raw, mode)
+    return None
+
+
+# Helper: same but match by destination (for entries whose source uses
+# host-only env vars, the destination is the stable identifier).
+def find_by_dest(volumes: list[tuple[str, str]], needle: str) -> tuple[str, str] | None:
+    for raw, mode in volumes:
+        _, dst, _ = split_volume(raw)
+        if needle in dst:
+            return (raw, mode)
+    return None
+
+
+# --- Assertions: claude-container --------------------------------------
+
+# 1. ~/.claude bind-mount RW.
+m = find_by_dest(claude_volumes, "/home/hndrewaall/.claude")
+expect(m is not None, "claude-container missing /home/hndrewaall/.claude bind-mount")
+if m is not None:
+    raw, mode = m
+    expect(
+        mode in ("rw", "default"),
+        f"~/.claude must be RW (Claude Code writes session state continuously); got mode={mode!r} in {raw!r}",
+    )
+
+# 2. ~/.claude.json bind-mount RW.
+m = find_by_dest(claude_volumes, "/home/hndrewaall/.claude.json")
+expect(m is not None, "claude-container missing /home/hndrewaall/.claude.json bind-mount")
+if m is not None:
+    raw, mode = m
+    expect(
+        mode in ("rw", "default"),
+        f"~/.claude.json must be RW (Claude Code mutates user-global config); got mode={mode!r} in {raw!r}",
+    )
+
+# 3. ~/repos bind-mount RW.
+m = find_by_dest(claude_volumes, "/home/hndrewaall/repos")
+expect(m is not None, "claude-container missing /home/hndrewaall/repos bind-mount")
+if m is not None:
+    raw, mode = m
+    expect(
+        mode in ("rw", "default"),
+        f"~/repos must be RW: the in-container claude is the operator's "
+        f"daily-driver editor (q-2026-05-14-7aaa). The previous RO framing "
+        f"forced detours through /workspace for every git workflow. "
+        f"Got mode={mode!r} in {raw!r}",
+    )
+
+# 4. ~/bin bind-mount RW.
+m = find_by_dest(claude_volumes, "/home/hndrewaall/bin")
+expect(m is not None, "claude-container missing /home/hndrewaall/bin bind-mount")
+if m is not None:
+    raw, mode = m
+    expect(
+        mode in ("rw", "default"),
+        f"~/bin must be RW: symmetric with ~/repos so the operator can "
+        f"add new shim symlinks from inside the container without a host "
+        f"shell. Got mode={mode!r} in {raw!r}",
+    )
+
+# 5. ~/claude-events bind-mount RW.
+m = find_by_dest(claude_volumes, "/home/hndrewaall/claude-events")
+expect(m is not None, "claude-container missing /home/hndrewaall/claude-events bind-mount")
+if m is not None:
+    raw, mode = m
+    expect(
+        mode in ("rw", "default"),
+        f"~/claude-events must be RW (claude-event-watch consumes + acks); got mode={mode!r}",
+    )
+
+# 6. ~/.config/session bind-mount RW.
+m = find_by_dest(claude_volumes, "/home/hndrewaall/.config/session")
+expect(m is not None, "claude-container missing /home/hndrewaall/.config/session bind-mount")
+if m is not None:
+    raw, mode = m
+    expect(
+        mode in ("rw", "default"),
+        f"~/.config/session must be RW (session-task queue.json mutations); got mode={mode!r}",
+    )
+
+# 7. CLAUDE_HOST_PROJECT_DIR mount RW (operator's project working dir).
+# Source uses ${CLAUDE_HOST_PROJECT_DIR:-/dev/null}; we identify by the
+# raw string containing CLAUDE_HOST_PROJECT_DIR.
+project_dir_entry = None
+for raw, mode in claude_volumes:
+    if "CLAUDE_HOST_PROJECT_DIR" in raw:
+        project_dir_entry = (raw, mode)
+        break
+expect(
+    project_dir_entry is not None,
+    "claude-container missing CLAUDE_HOST_PROJECT_DIR bind-mount (operator's project working dir)",
+)
+if project_dir_entry is not None:
+    raw, mode = project_dir_entry
+    expect(
+        mode in ("rw", "default"),
+        f"CLAUDE_HOST_PROJECT_DIR mount must be RW (operator edits their "
+        f"project from inside the container); got mode={mode!r}",
+    )
+
+# 8. Managed-settings dir mount RO (image-baked content).
+managed_entry = None
+for raw, mode in claude_volumes:
+    if "CLAUDE_HOST_MANAGED_SETTINGS_DIR" in raw:
+        managed_entry = (raw, mode)
+        break
+expect(
+    managed_entry is not None,
+    "claude-container missing CLAUDE_HOST_MANAGED_SETTINGS_DIR bind-mount",
+)
+if managed_entry is not None:
+    raw, mode = managed_entry
+    expect(
+        mode == "ro",
+        f"managed-settings dir must stay RO: image-baked "
+        f"/etc/claude-code/CLAUDE.md (managed-policy CLAUDE.md describing "
+        f"the container runtime + session-start checklist) must not be "
+        f"mutable from inside the container. Got mode={mode!r}",
+    )
+
+# 9. CORP-CA bundle mount RO.
+corp_ca_entry = None
+for raw, mode in claude_volumes:
+    if "CLAUDE_HOST_CORP_CA_BUNDLE" in raw:
+        corp_ca_entry = (raw, mode)
+        break
+expect(
+    corp_ca_entry is not None,
+    "claude-container missing CLAUDE_HOST_CORP_CA_BUNDLE bind-mount",
+)
+if corp_ca_entry is not None:
+    raw, mode = corp_ca_entry
+    expect(
+        mode == "ro",
+        f"CORP-CA bundle must stay RO: operator-curated host content; "
+        f"container has no reason to mutate the corp CA bundle. Got mode={mode!r}",
+    )
+
+# 10. Host-hooks dir mount RO.
+hooks_entry = None
+for raw, mode in claude_volumes:
+    if "CLAUDE_HOST_HOOKS_DIR" in raw:
+        hooks_entry = (raw, mode)
+        break
+expect(
+    hooks_entry is not None,
+    "claude-container missing CLAUDE_HOST_HOOKS_DIR bind-mount",
+)
+if hooks_entry is not None:
+    raw, mode = hooks_entry
+    expect(
+        mode == "ro",
+        f"host-hooks dir must stay RO: operator's hook scripts; container "
+        f"has no reason to mutate them. Got mode={mode!r}",
+    )
+
+# Defense against any future long-form `read_only: true` regression on
+# claude-container.
+expect(
+    not has_long_form_read_only(service_blocks.get("claude-container", "")),
+    "claude-container has a long-form `read_only: true` mount entry — "
+    "audit it; the operator-as-daily-driver shape demands RW for any "
+    "host state path the operator routinely writes",
+)
+
+# --- Assertions: queue-minisite (intentionally-RO mounts stay RO) ------
+
+# Canonical session-task script — bind-mounted RO so the container always
+# runs the upstream version without rebuilding.
+session_task_script = find_by_dest(queue_volumes, "/app/session-task")
+expect(
+    session_task_script is not None,
+    "queue-minisite missing canonical session-task script bind-mount",
+)
+if session_task_script is not None:
+    raw, mode = session_task_script
+    expect(
+        mode == "ro",
+        f"queue-minisite session-task script bind must stay RO (canonical "
+        f"upstream version, container should never rewrite it); got mode={mode!r}",
+    )
+
+# Per-session JSONL transcript dir — minisite only READS for SSE log
+# endpoint, RO is correct.
+agents_jsonl = find_by_dest(queue_volumes, "/agents-jsonl")
+expect(
+    agents_jsonl is not None,
+    "queue-minisite missing /agents-jsonl bind-mount",
+)
+if agents_jsonl is not None:
+    raw, mode = agents_jsonl
+    expect(
+        mode == "ro",
+        f"queue-minisite /agents-jsonl mount must stay RO (SSE log endpoint "
+        f"only tails JSONL transcripts; never writes them); got mode={mode!r}",
+    )
+
+# --- Assertions: eichi-search (read-only by design) --------------------
+
+# eichi repo bind — minisite only reads source for the venv editable .pth.
+eichi_repo = find_by_dest(eichi_volumes, "/home/hndrewaall/repos/eichi")
+expect(
+    eichi_repo is not None,
+    "eichi-search missing eichi-repo bind-mount",
+)
+if eichi_repo is not None:
+    raw, mode = eichi_repo
+    expect(
+        mode == "ro",
+        f"eichi-search eichi-repo mount must stay RO (minisite container "
+        f"only imports the venv-installed source; never writes); got mode={mode!r}",
+    )
+
+# .config/eichi RO (operator's local config; container shouldn't mutate).
+eichi_config = find_by_dest(eichi_volumes, "/home/hndrewaall/.config/eichi")
+expect(
+    eichi_config is not None,
+    "eichi-search missing /home/hndrewaall/.config/eichi bind-mount",
+)
+if eichi_config is not None:
+    raw, mode = eichi_config
+    expect(
+        mode == "ro",
+        f"eichi-search ~/.config/eichi mount must stay RO (operator's "
+        f"local sources.toml; container should not mutate); got mode={mode!r}",
+    )
+
+# HuggingFace model cache RO (pre-warmed on host).
+hf_cache = find_by_dest(eichi_volumes, "/home/hndrewaall/.cache/huggingface")
+expect(
+    hf_cache is not None,
+    "eichi-search missing HuggingFace cache bind-mount",
+)
+if hf_cache is not None:
+    raw, mode = hf_cache
+    expect(
+        mode == "ro",
+        f"eichi-search HuggingFace cache mount must stay RO (pre-warmed on "
+        f"host before first launch; container reads only); got mode={mode!r}",
+    )
+
+
+if failures:
+    print("FAIL compose-mount-modes.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS compose-mount-modes.test")
+sys.exit(0)

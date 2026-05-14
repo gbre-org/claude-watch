@@ -186,18 +186,26 @@ services:
       # registry, model preferences, project allow-lists). Claude updates
       # this on settings changes.
       - "${CLAUDE_HOST_CONFIG_FILE:-${HOME}/.claude.json}:/home/hndrewaall/.claude.json:rw"
-      # ~/repos — ro: host repo trees so in-container scripts under
-      # ~/bin (next mount) can resolve their symlink targets. Read-only
-      # because in-container edits should be confined to /workspace or
-      # explicit clones; we don't want the container scribbling on the
-      # operator's working trees.
-      - "${CLAUDE_HOST_REPOS_DIR:-${HOME}/repos}:/home/hndrewaall/repos:ro"
-      # ~/bin — ro: host launcher / shim scripts (mostly symlinks into
+      # ~/repos — rw: host repo trees so in-container scripts under
+      # ~/bin (next mount) can resolve their symlink targets. Read-write
+      # because the in-container claude is the operator's daily-driver
+      # editor — they expect to land in a repo, edit, commit, and push
+      # exactly like a native shell session. The previous "confine edits
+      # to /workspace or explicit clones" framing reflected an earlier
+      # phase when the container was a sandbox; once the container is the
+      # primary editor (q-2026-05-14-7aaa), forcing the operator to detour
+      # through /workspace breaks every routine git workflow.
+      - "${CLAUDE_HOST_REPOS_DIR:-${HOME}/repos}:/home/hndrewaall/repos:rw"
+      # ~/bin — rw: host launcher / shim scripts (mostly symlinks into
       # ~/repos/*/bin). Lets the in-container claude-watch shell out to
-      # the same tools the host operator runs. Read-only because these
-      # are operator-curated; the container has no reason to install
-      # into ~/bin.
-      - "${CLAUDE_HOST_BIN_DIR:-${HOME}/bin}:/home/hndrewaall/bin:ro"
+      # the same tools the host operator runs. Read-write so the operator
+      # can `ln -s` a new shim from inside the container without dropping
+      # to a host shell — symmetric with the ~/repos mount above. Most
+      # entries here are symlinks pointing into ~/repos/*/bin/, which
+      # require ~/repos to be writable for any actual content edit; this
+      # mount being RW lets the operator add / remove the symlink itself
+      # in the same workflow.
+      - "${CLAUDE_HOST_BIN_DIR:-${HOME}/bin}:/home/hndrewaall/bin:rw"
       # ~/claude-events — rw: claude-event JSONL spool. Host cron /
       # alertmanager / queue producers write here; the in-container
       # claude-event-watch reads + acks them. rw because the watcher
