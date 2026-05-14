@@ -52,6 +52,35 @@ invoke is `run_command`, exposed by cli-mcp-server, with arguments:
     enforces its ALLOWED_COMMANDS allow-list)
   - args: a list of string args (forwarded verbatim from our argv)
 
+STREAMABLE-HTTP SESSION HANDSHAKE
+
+mcp-proxy 0.11+ uses the MCP streamable-HTTP transport with
+`stateless=False` by default. A bare POST of `tools/call` against a
+fresh connection returns HTTP 400 ("Bad Request: Missing session ID")
+— the client MUST first POST a JSON-RPC `initialize` request,
+capture the server-issued `mcp-session-id` from the response headers,
+and include that header on every subsequent request.
+
+The bridge therefore makes 2 or 3 sequential POSTs:
+
+  1. POST <url>  initialize request -> response carries the
+                 `mcp-session-id` header. The body is the standard
+                 initialize ack (serverInfo + capabilities).
+  2. POST <url>  `notifications/initialized` (notification — no `id`,
+                 no response body beyond HTTP 202). Sent with the
+                 mcp-session-id header. Some MCP implementations
+                 enforce this before tools/* calls; we send it for
+                 protocol-correctness even when the current
+                 mcp-proxy + SDK don't enforce it.
+  3. POST <url>  `tools/call` with the mcp-session-id header. The
+                 response is parsed for the cli-mcp-server
+                 `run_command` text body shape.
+
+The whole handshake stays within `CLAUDE_HOST_HOOK_BRIDGE_TIMEOUT`
+(applied per-request) — typical handshake completes in <100ms on a
+warm mcp-proxy. Failures at any step fall back to silent no-op via
+the same path as a transport-level failure.
+
 cli-mcp-server's `run_command` does NOT support stdin; we work around
 this by writing the stdin payload to a host-visible tempfile (via a
 secondary `run_command` to `tee`), then redirecting that file into
@@ -107,6 +136,21 @@ import urllib.request
 # Default endpoint matches the documented mcp-host-bash port (8766).
 DEFAULT_BRIDGE_URL = "http://host.docker.internal:8766/mcp"
 DEFAULT_TIMEOUT = 30
+
+# MCP streamable-HTTP transport constants. Pinned to a real protocol
+# version (2025-06-18 is the version mcp-proxy 0.11.x ships against).
+# If the server prefers a different version it negotiates down in the
+# initialize response; we don't enforce a match here because the
+# subsequent tools/call doesn't care which version was picked.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_SESSION_ID_HEADER = "mcp-session-id"
+MCP_CLIENT_INFO = {
+    "name": "claude-watch/exec-hook-bridge",
+    # Bumped when the bridge's wire shape changes in a way servers
+    # might log or branch on. Independent of the claude-watch crate
+    # version (this script ships in the image, not in cargo).
+    "version": "1",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -187,34 +231,51 @@ def bridge_timeout() -> float:
 # ---------------------------------------------------------------------------
 
 
-def jsonrpc_call(url: str, method: str, params: dict, timeout: float, request_id: int = 1) -> dict:
-    """POST a JSON-RPC 2.0 request, return the parsed response dict.
+def jsonrpc_post(
+    url: str,
+    payload: dict,
+    timeout: float,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[dict | None, dict[str, str], int]:
+    """POST a JSON-RPC 2.0 payload, return (parsed_body, response_headers, status).
 
-    Raises on transport error / non-200 / unparseable body. The caller
-    decides whether to fall back to no-op based on the exception
-    type. We catch in `bridge_call` so this stays a thin transport.
+    `payload` may be a request (with `id`) or a notification (without `id`).
+    For notifications the server typically returns HTTP 202 with no body;
+    `parsed_body` is None in that case.
+
+    `extra_headers` lets the caller inject the streamable-HTTP
+    `mcp-session-id` header on follow-up calls.
+
+    `response_headers` is a dict the caller can read for the
+    server-issued `mcp-session-id` after the initialize call.
+
+    Raises on transport error / non-2xx / unparseable JSON body. The
+    caller decides whether to fall back to no-op based on the exception
+    type.
     """
-    payload = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": method,
-        "params": params,
-    }
     body = json.dumps(payload).encode("utf-8")
+    method = payload.get("method", "<unknown>")
     emit_debug(f"-> POST {url} method={method}")
     emit_debug(f"   payload={json.dumps(payload)[:512]}")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        },
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
         emit_debug(f"<- {resp.status} {raw[:512]}")
+        # Header keys are case-insensitive on the wire; normalize to
+        # lowercase so the caller can `.get("mcp-session-id")` without
+        # worrying about server casing (`Mcp-Session-Id` etc).
+        resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+        if not raw.strip():
+            # Notification ack (HTTP 202 with empty body) — no JSON to
+            # parse. Return None body so the caller knows not to
+            # interpret it as a response.
+            return (None, resp_headers, resp.status)
         # mcp-proxy may reply as text/event-stream OR JSON. The MCP
         # streamable-HTTP transport allows either — for a one-shot
         # tools/call we accept both shapes.
@@ -223,9 +284,77 @@ def jsonrpc_call(url: str, method: str, params: dict, timeout: float, request_id
             # SSE: parse the first `data: <json>` line.
             for line in raw.splitlines():
                 if line.startswith("data:"):
-                    return json.loads(line[len("data:"):].strip())
+                    return (
+                        json.loads(line[len("data:"):].strip()),
+                        resp_headers,
+                        resp.status,
+                    )
             raise ValueError(f"SSE response had no `data:` frame: {raw[:200]!r}")
-        return json.loads(raw)
+        return (json.loads(raw), resp_headers, resp.status)
+
+
+def initialize_session(url: str, timeout: float) -> str:
+    """Run the MCP streamable-HTTP session handshake.
+
+    POSTs `initialize`, captures the server-issued `mcp-session-id`,
+    then POSTs `notifications/initialized` so a strict server transitions
+    from "initializing" to "ready" before our tools/call.
+
+    Returns the session id. Raises if the handshake fails (transport
+    error, missing session-id header, JSON-RPC error envelope).
+    """
+    init_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": MCP_CLIENT_INFO,
+        },
+    }
+    body, headers, _status = jsonrpc_post(url, init_payload, timeout=timeout)
+    if body and "error" in body:
+        # JSON-RPC error envelope on initialize — surface upwards.
+        err = body["error"]
+        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        raise ValueError(f"initialize returned JSON-RPC error: {msg}")
+    session_id = headers.get(MCP_SESSION_ID_HEADER)
+    if not session_id:
+        # Streamable-HTTP server that didn't issue a session id is
+        # either misconfigured or `stateless=True` — the latter is
+        # valid + needs no session header on follow-ups. We treat
+        # missing-header as "stateless mode" so the bridge still
+        # works against a stateless proxy. Caller's tools/call will
+        # be sent without the header in that case.
+        emit_debug("initialize: no mcp-session-id returned; assuming stateless mode")
+        return ""
+
+    # Fire the notifications/initialized acknowledgment. Strict MCP
+    # servers stay in "initializing" until they see this; lax ones
+    # (current mcp-proxy / python-sdk) don't enforce it but accept it
+    # silently. Sent as a JSON-RPC notification (no `id` -> no
+    # response envelope expected).
+    initialized_payload = {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {},
+    }
+    try:
+        jsonrpc_post(
+            url,
+            initialized_payload,
+            timeout=timeout,
+            extra_headers={MCP_SESSION_ID_HEADER: session_id},
+        )
+    except (urllib.error.HTTPError, ValueError, json.JSONDecodeError) as e:
+        # Some servers return non-2xx or odd shapes on notifications.
+        # That's not fatal — the session is established; the
+        # tools/call below is the real test. Emit a debug crumb so
+        # operators can spot weird servers, but don't abort.
+        emit_debug(f"notifications/initialized non-fatal failure: {e}")
+
+    return session_id
 
 
 def call_run_command(
@@ -234,6 +363,7 @@ def call_run_command(
     target: str,
     args: list[str],
     forwarded_env: dict[str, str],
+    session_id: str,
 ) -> dict:
     """Invoke the host-bash MCP `run_command` tool.
 
@@ -244,6 +374,10 @@ def call_run_command(
     target with the env additions. The TARGET basename ALSO has to be
     in cli-mcp-server's ALLOWED_COMMANDS — that's an operator-side
     config (mcp-host-bash's CW_PROFILE / CLAUDE_HOOK_BRIDGE_BINS).
+
+    `session_id` is the streamable-HTTP session id from
+    `initialize_session`. Empty string means stateless mode (server
+    didn't issue a session id), in which case we skip the header.
     """
     if forwarded_env:
         # Prepend `env KEY=VAL ...` to inject env vars on the host side
@@ -255,14 +389,27 @@ def call_run_command(
         rpc_command = target
         rpc_args = list(args)
 
-    params = {
-        "name": "run_command",
-        "arguments": {
-            "command": rpc_command,
-            "args": rpc_args,
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": {
+                "command": rpc_command,
+                "args": rpc_args,
+            },
         },
     }
-    return jsonrpc_call(url, "tools/call", params, timeout=timeout)
+    extra_headers = {MCP_SESSION_ID_HEADER: session_id} if session_id else None
+    body, _headers, _status = jsonrpc_post(
+        url, payload, timeout=timeout, extra_headers=extra_headers
+    )
+    if body is None:
+        # tools/call should always return a body. Empty = server bug;
+        # treat as unparseable so we fall back.
+        raise ValueError("tools/call returned an empty body")
+    return body
 
 
 def parse_run_command_result(rpc_response: dict) -> tuple[int, str, str]:
@@ -376,7 +523,13 @@ def main(argv: list[str]) -> None:
     emit_debug(f"target={target} args={args} url={url} timeout={timeout}s forwarded_env={list(forwarded.keys())}")
 
     try:
-        response = call_run_command(url, timeout, target, args, forwarded)
+        # MCP streamable-HTTP transport (mcp-proxy 0.11+ default) requires
+        # a session handshake before tools/call — a bare tools/call POST
+        # returns HTTP 400 "Bad Request: Missing session ID". We initialize
+        # first, capture the server's mcp-session-id, then send tools/call
+        # carrying that header.
+        session_id = initialize_session(url, timeout)
+        response = call_run_command(url, timeout, target, args, forwarded, session_id)
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         fall_back(f"host-bash unreachable: {e}")
     except (json.JSONDecodeError, ValueError) as e:
