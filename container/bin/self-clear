@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""Inject /clear + resume prompt into the Claude Code tmux pane.
+
+Performs a clean context reset:
+  1. Injects /clear via vim mode send-keys
+  2. Polls tmux state until /clear completes (tokens drop + prompt visible)
+  3. Injects the resume prompt
+
+Called as the final step of a compact-prep procedure. Eliminates the wait
+for the daemon's resume-injection path to fire on its own.
+
+Configuration (defaults are portable; override via CLI flag or env var):
+  --log-file PATH       (env $CLAUDE_SELF_CLEAR_LOG)
+  --lock-file PATH      (env $CLAUDE_SELF_CLEAR_LOCK)
+  --resume-prompt TEXT  (env $CLAUDE_SELF_CLEAR_RESUME_PROMPT)
+  --no-resume           inject /clear only
+
+Defaults:
+  log file:    $XDG_STATE_HOME/claude-watch/self-clear.log
+               (or ~/.local/state/claude-watch/self-clear.log)
+  lock file:   $XDG_RUNTIME_DIR/claude-self-clear.lock
+               (or /tmp/claude-self-clear.lock fallback)
+  resume:      "[SELF-CLEAR-RESUME] Clean context reset completed.
+                Resume the previous task / checklist."
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+# Augment PATH so claude-watch + tmux are findable regardless of how the
+# script was launched (cron, tmux-inject, manual). Append-only — the
+# caller's PATH still wins for everything else.
+_HOME = os.path.expanduser("~")
+for _p in (
+    f"{_HOME}/bin",
+    f"{_HOME}/.local/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+):
+    _existing = os.environ.get("PATH", "").split(os.pathsep)
+    if _p not in _existing:
+        _existing.append(_p)
+        os.environ["PATH"] = os.pathsep.join(p for p in _existing if p)
+
+
+def _default_log_file() -> str:
+    """Default log path. Honors $CLAUDE_SELF_CLEAR_LOG."""
+    env = os.environ.get("CLAUDE_SELF_CLEAR_LOG", "").strip()
+    if env:
+        return env
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip() or str(
+        Path.home() / ".local" / "state"
+    )
+    return str(Path(state_home) / "claude-watch" / "self-clear.log")
+
+
+def _default_lock_file() -> str:
+    """Default lock path. Honors $CLAUDE_SELF_CLEAR_LOCK."""
+    env = os.environ.get("CLAUDE_SELF_CLEAR_LOCK", "").strip()
+    if env:
+        return env
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return str(Path(runtime) / "claude-self-clear.lock")
+    return "/tmp/claude-self-clear.lock"
+
+
+def _default_resume_prompt() -> str:
+    """Default resume-prompt text. Honors $CLAUDE_SELF_CLEAR_RESUME_PROMPT."""
+    env = os.environ.get("CLAUDE_SELF_CLEAR_RESUME_PROMPT", "").strip()
+    if env:
+        return env
+    return (
+        "[SELF-CLEAR-RESUME] Clean context reset completed. "
+        "Resume the previous task / checklist."
+    )
+
+
+# Bound at argparse time; default-eval'd via helpers so tests can monkey-
+# patch the env vars and re-import.
+RESUME_PROMPT = _default_resume_prompt()
+LOG_FILE = _default_log_file()
+LOCKFILE = _default_lock_file()
+
+# After /clear, a fresh session should be well under this token count.
+# Above this means exo-watcher (or the user) already injected resume
+# and the session is bootstrapping — skip our resume inject.
+FRESH_SESSION_MAX_TOKENS = 30000
+
+
+def log(msg):
+    """Append a timestamped message to the self-clear log."""
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def capture_pane_text(pane):
+    """Capture the last 5 lines of the tmux pane for logging."""
+    try:
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        if rc != 0 or not out:
+            return "(capture failed)"
+        lines = out.strip().split("\n")
+        return " | ".join(lines[-5:])
+    except Exception:
+        return "(capture error)"
+
+
+def run(cmd):
+    """Run a subprocess with timeout. Returns (stdout, returncode).
+
+    Never raises — returns ('', -1) on any error. This is critical
+    because callers (is_idle, wait_for_idle) loop without try/except,
+    and an uncaught exception would silently kill the forked child.
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return r.stdout.strip(), r.returncode
+    except Exception:
+        return "", -1
+
+
+def find_claude_pane():
+    """Find the Claude Code tmux pane dynamically.
+
+    Primary: claude-watch status --json (has pane field).
+    Fallback: direct tmux pane scan (handles claude-watch failures).
+    """
+    # Primary: claude-watch
+    try:
+        status_json, _ = run(["claude-watch", "status", "--json"])
+        data = json.loads(status_json)
+        pane = data.get("pane") or data.get("pane_id")
+        if pane:
+            return pane
+    except Exception:
+        pass
+
+    # Fallback: scan tmux panes directly
+    try:
+        out, rc = run(["tmux", "list-panes", "-a", "-F",
+                        "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}"])
+        if rc != 0 or not out:
+            return None
+
+        candidates = []
+        for line in out.strip().split("\n"):
+            parts = line.split(" ", 1)
+            if len(parts) == 2:
+                if parts[1] == "claude":
+                    return parts[0]
+                if parts[1] in ("bash", "node"):
+                    candidates.append(parts[0])
+
+        # Check bash/node candidates for Claude Code indicators
+        for pane in candidates:
+            content, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+            if rc == 0 and content and "tokens" in content:
+                if any(s in content for s in ("❯", "-- INSERT --", "bypass permissions",
+                                               "auto-compact", "latest", "current:")):
+                    return pane
+    except Exception:
+        pass
+
+    return None
+
+
+def get_token_count():
+    """Get current token count from claude-watch status."""
+    try:
+        status_json, _ = run(["claude-watch", "status", "--json"])
+        data = json.loads(status_json)
+        return data.get("tokens", 0)
+    except Exception:
+        return 0
+
+
+def has_feedback_prompt(pane):
+    """Check if the session feedback prompt is visible.
+
+    After /clear, Claude Code v2.1.70+ shows:
+      How is Claude doing this session? (optional)
+      1: Bad    2: Fine   3: Good   0: Dismiss
+
+    This prompt intercepts keystrokes — pressing 0-3 dismisses it.
+    Must be dismissed before injecting the resume prompt.
+    """
+    out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+    if rc != 0 or not out:
+        return False
+    return "How is Claude doing" in out or "0: Dismiss" in out
+
+
+def dismiss_feedback_prompt(pane, max_attempts=3):
+    """Dismiss the post-/clear feedback prompt by sending '0' (Dismiss).
+
+    Returns True if dismissed (or not present), False if stuck.
+    """
+    for attempt in range(1, max_attempts + 1):
+        if not has_feedback_prompt(pane):
+            return True
+        log(f"  feedback prompt detected (attempt {attempt}), sending '0' to dismiss")
+        run(["tmux", "send-keys", "-t", pane, "-l", "0"])
+        time.sleep(1)
+    still_present = has_feedback_prompt(pane)
+    if still_present:
+        log("  WARNING: feedback prompt still present after dismiss attempts")
+    return not still_present
+
+
+def is_idle(pane):
+    """Check if Claude Code is ready to accept input.
+
+    Only checks for prompt visibility (❯). Does NOT check thinking
+    indicators — Escape interrupts thinking, so we don't need to wait
+    for thinking to stop. We just need the prompt to be visible.
+    """
+    out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+    if rc != 0 or not out:
+        return False
+
+    lines = out.strip().split("\n")
+    last_lines = lines[-15:]
+
+    for line in last_lines:
+        if "❯" in line:
+            return True
+
+    return False
+
+
+def wait_for_idle(pane, timeout=60, poll_interval=0.5):
+    """Poll tmux pane until Claude Code is idle or timeout.
+
+    Returns True if idle detected, False on timeout.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if is_idle(pane):
+            # Small buffer to ensure we're truly settled
+            time.sleep(0.5)
+            if is_idle(pane):
+                return True
+        time.sleep(poll_interval)
+    return False
+
+
+def interrupt_and_wait(pane, timeout=60, poll_interval=0.5):
+    """Actively interrupt Claude Code and wait for idle prompt.
+
+    Rapid-fire Escape approach: press Escape, check quickly, repeat.
+    A single Escape often doesn't register during stuck API calls.
+    Every 5 Escape attempts, try Ctrl-B x2 (backgrounds foreground bash).
+
+    Returns True if idle confirmed, False on timeout.
+    """
+    deadline = time.time() + timeout
+    escape_count = 0
+    while time.time() < deadline:
+        if is_idle(pane):
+            time.sleep(0.3)
+            if is_idle(pane):
+                log("  interrupt_and_wait: idle confirmed")
+                return True
+
+        if escape_count > 0 and escape_count % 5 == 0:
+            log(f"  interrupt_and_wait: trying Ctrl-B x2 (attempt {escape_count})")
+            run(["tmux", "send-keys", "-t", pane, "C-b"])
+            time.sleep(0.3)
+            run(["tmux", "send-keys", "-t", pane, "C-b"])
+            time.sleep(poll_interval)
+        else:
+            run(["tmux", "send-keys", "-t", pane, "Escape"])
+            time.sleep(poll_interval)
+
+        escape_count += 1
+
+    log(f"  interrupt_and_wait: TIMEOUT after {escape_count} attempts")
+    return False
+
+
+def wait_for_condition(pane, check_fn, description, timeout=3, poll=0.2):
+    """Poll tmux pane until check_fn(pane_text) returns True.
+
+    Returns (True, pane_text) on success, (False, last_pane_text) on timeout.
+    """
+    deadline = time.time() + timeout
+    last_text = ""
+    while time.time() < deadline:
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        last_text = out.strip() if rc == 0 and out else ""
+        if check_fn(last_text):
+            return True, last_text
+        time.sleep(poll)
+    return False, last_text
+
+
+def pane_is_stable(pane, settle=0.3):
+    """Verify pane content is stable (two captures match)."""
+    out1, rc1 = run(["tmux", "capture-pane", "-t", pane, "-p"])
+    time.sleep(settle)
+    out2, rc2 = run(["tmux", "capture-pane", "-t", pane, "-p"])
+    if rc1 != 0 or rc2 != 0:
+        return False
+    return out1 == out2
+
+
+def get_prompt_line_text(pane_text):
+    """Extract text after the ❯ prompt character on the prompt line.
+
+    Returns the text after ❯ (stripped), or None if no prompt found.
+    """
+    for line in reversed(pane_text.split("\n")):
+        if "❯" in line:
+            idx = line.index("❯")
+            return line[idx + 1:].strip()
+    return None
+
+
+def is_insert_mode(pane_text):
+    """Check if Claude Code is in INSERT mode (vim keybindings)."""
+    return "-- INSERT" in pane_text
+
+
+def inject(pane, text, label="inject", slash_command=False):
+    """Inject text into Claude Code and submit (vim mode).
+
+    Key constraints:
+    - Ctrl-C: triggers interrupt handler. Never use.
+    - Escape x2+: triggers exit confirmation. Only use ONE.
+    - S: re-triggers autocomplete. Use dd instead.
+
+    Each step verifies tmux pane state before proceeding, replacing
+    blind sleeps with polled verification. This prevents mistimed
+    keystrokes when Escape doesn't land (autocomplete ghost text, etc.).
+
+    For slash commands (slash_command=True), uses a simpler submission
+    sequence: just Enter after typing. The Tab+Escape sequence used for
+    regular text breaks slash commands because Escape goes INSERT→NORMAL
+    in vim mode, and Enter in NORMAL mode doesn't submit.
+    """
+    log(f"  [{label}] pane before: {capture_pane_text(pane)}")
+
+    # Step 1: Escape — INSERT→NORMAL, dismisses autocomplete
+    # When autocomplete is active, first Escape dismisses the dropdown
+    # but stays in INSERT mode. Need a second Escape to reach NORMAL.
+    # Verify by checking that "-- INSERT" disappears from the pane.
+    for esc_attempt in range(1, 4):
+        run(["tmux", "send-keys", "-t", pane, "Escape"])
+
+        ok, snap = wait_for_condition(
+            pane,
+            lambda t: not is_insert_mode(t) and pane_is_stable(pane),
+            "NORMAL mode after Escape",
+            timeout=2, poll=0.3,
+        )
+        if ok:
+            log(f"  [{label}] Escape: NORMAL mode confirmed (attempt {esc_attempt})")
+            break
+        still_insert = is_insert_mode(snap)
+        log(f"  [{label}] Escape attempt {esc_attempt}: stable={not still_insert}, insert={still_insert}")
+        if not still_insert:
+            break
+    else:
+        log(f"  [{label}] WARNING: still in INSERT mode after 3 Escapes, continuing anyway")
+
+    # Step 2: dd — delete entire line in NORMAL mode
+    # Verify: prompt line has no text after ❯
+    run(["tmux", "send-keys", "-t", pane, "d"])
+    time.sleep(0.1)
+    run(["tmux", "send-keys", "-t", pane, "d"])
+
+    ok, snap = wait_for_condition(
+        pane,
+        lambda t: get_prompt_line_text(t) is not None and get_prompt_line_text(t) == "",
+        "prompt line empty after dd",
+        timeout=2, poll=0.2,
+    )
+    log(f"  [{label}] dd: line_empty={ok}, prompt_text={get_prompt_line_text(snap)!r}")
+    if not ok:
+        # dd may not have landed — retry once
+        log(f"  [{label}] dd retry")
+        run(["tmux", "send-keys", "-t", pane, "d"])
+        time.sleep(0.1)
+        run(["tmux", "send-keys", "-t", pane, "d"])
+        ok2, snap = wait_for_condition(
+            pane,
+            lambda t: get_prompt_line_text(t) is not None and get_prompt_line_text(t) == "",
+            "prompt line empty after dd retry",
+            timeout=2, poll=0.2,
+        )
+        log(f"  [{label}] dd retry: line_empty={ok2}")
+
+    # Step 3: i — enter INSERT mode on empty line
+    # Autocomplete/ghost text can trigger immediately on INSERT entry.
+    # If pane is unstable after 'i', dismiss autocomplete with Escape
+    # and re-enter INSERT. This prevents autocomplete from capturing
+    # the typed text (especially '/' triggering slash-command dropdown).
+    for i_attempt in range(1, 4):
+        run(["tmux", "send-keys", "-t", pane, "i"])
+
+        ok, snap = wait_for_condition(
+            pane,
+            lambda _: pane_is_stable(pane, settle=0.3),
+            "pane stable after i",
+            timeout=2, poll=0.3,
+        )
+        log(f"  [{label}] i attempt {i_attempt}: stable={ok}")
+
+        if ok:
+            break
+
+        # Unstable = autocomplete/ghost text active. Dismiss with Escape
+        # (goes back to NORMAL), wait for settle, then retry 'i'.
+        log(f"  [{label}] dismissing autocomplete (Escape back to NORMAL)")
+        run(["tmux", "send-keys", "-t", pane, "Escape"])
+        wait_for_condition(
+            pane,
+            lambda t: not is_insert_mode(t) and pane_is_stable(pane, settle=0.3),
+            "NORMAL after autocomplete dismiss",
+            timeout=2, poll=0.3,
+        )
+        time.sleep(0.3)  # Extra settle before retrying
+    else:
+        log(f"  [{label}] WARNING: pane still unstable after 3 i attempts, continuing")
+
+    # Step 4: Type the text literally
+    # Verify: the text appears on the prompt line
+    run(["tmux", "send-keys", "-t", pane, "-l", text])
+
+    # For verification, check that at least the first 10 chars appear
+    # (full text may wrap or get truncated by tmux column width)
+    check_prefix = text[:10]
+    ok, snap = wait_for_condition(
+        pane,
+        lambda t: check_prefix in t,
+        f"text '{check_prefix}...' visible",
+        timeout=3, poll=0.3,
+    )
+    log(f"  [{label}] text: visible={ok}")
+    if not ok:
+        log(f"  [{label}] WARNING: typed text not visible in pane, continuing anyway")
+        log(f"  [{label}] pane snapshot: {' | '.join(snap.split(chr(10))[-5:])}")
+
+    # Step 5: Submit
+    if slash_command:
+        # Slash commands: just Enter. We're in INSERT mode after typing,
+        # so Enter submits directly. The autocomplete dropdown showing
+        # command suggestions is harmless — Enter submits the input as
+        # a slash command.
+        #
+        # DO NOT use Tab+Escape here. Escape goes INSERT→NORMAL in vim
+        # mode, and then Enter doesn't submit. This was the bug that
+        # caused /clear to be sent as regular text 3 times in a row
+        # (2026-03-01 session, all 3 attempts failed, tokens increased
+        # instead of dropping).
+
+        # Pre-submit verification: check that the prompt line contains
+        # our text and not something mangled by autocomplete.
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        if rc == 0 and out:
+            prompt_text = get_prompt_line_text(out.strip())
+            log(f"  [{label}] pre-submit prompt: {prompt_text!r}")
+            if prompt_text and text not in prompt_text:
+                log(f"  [{label}] WARNING: prompt doesn't contain '{text}', "
+                    f"got '{prompt_text}'. Clearing and retyping.")
+                # Clear the garbled input and retype
+                run(["tmux", "send-keys", "-t", pane, "Escape"])
+                time.sleep(0.3)
+                run(["tmux", "send-keys", "-t", pane, "d"])
+                time.sleep(0.1)
+                run(["tmux", "send-keys", "-t", pane, "d"])
+                time.sleep(0.3)
+                run(["tmux", "send-keys", "-t", pane, "i"])
+                time.sleep(0.5)  # Longer settle for retry
+                run(["tmux", "send-keys", "-t", pane, "-l", text])
+                time.sleep(0.3)
+
+        run(["tmux", "send-keys", "-t", pane, "Enter"])
+
+        # Verify: the typed text disappears from the prompt line
+        # (submission clears the input)
+        ok, snap = wait_for_condition(
+            pane,
+            lambda t: check_prefix not in t,
+            "text cleared after Enter",
+            timeout=3, poll=0.3,
+        )
+        log(f"  [{label}] submitted (Enter, slash_command=True): cleared={ok}")
+    else:
+        # Regular text (resume prompt, etc.): Tab to accept autocomplete,
+        # then Escape to dismiss ghost text that re-triggers after Tab,
+        # then Enter to submit.
+        run(["tmux", "send-keys", "-t", pane, "Tab"])
+
+        # Verify Tab landed: pane should stabilize
+        ok, snap = wait_for_condition(
+            pane,
+            lambda _: pane_is_stable(pane),
+            "stable after Tab",
+            timeout=2, poll=0.3,
+        )
+        log(f"  [{label}] Tab: stable={ok}")
+
+        # Escape: dismiss any ghost text / re-triggered autocomplete
+        run(["tmux", "send-keys", "-t", pane, "Escape"])
+
+        ok, snap = wait_for_condition(
+            pane,
+            lambda _: pane_is_stable(pane),
+            "stable after Escape (dismiss ghost)",
+            timeout=2, poll=0.3,
+        )
+        log(f"  [{label}] Escape (dismiss ghost): stable={ok}")
+
+        # Enter: submit from NORMAL mode (always submits current line)
+        run(["tmux", "send-keys", "-t", pane, "Enter"])
+
+        ok, snap = wait_for_condition(
+            pane,
+            lambda t: check_prefix not in t,
+            "text cleared after Enter",
+            timeout=3, poll=0.3,
+        )
+        log(f"  [{label}] submitted (Tab+Escape+Enter): cleared={ok}")
+
+
+def child_main(pane, args):
+    """Main logic for the forked child process.
+
+    Separated from main() so we can wrap it in a global try/except.
+    Any uncaught exception in the child would otherwise die silently
+    (stdout/stderr are /dev/null).
+    """
+    log(f"START: pane={pane}, timeout={args.timeout}, delay={args.delay}")
+    log(f"  pane state: {capture_pane_text(pane)}")
+
+    # Actively interrupt thinking by sending Escape and verifying via tmux.
+    idle_ok = interrupt_and_wait(pane, timeout=args.timeout)
+    log(f"  interrupt_and_wait: {'idle confirmed' if idle_ok else 'TIMEOUT'}")
+    log(f"  pane after interrupt: {capture_pane_text(pane)}")
+
+    max_clear_attempts = 3
+    clear_confirmed = False
+
+    for attempt in range(1, max_clear_attempts + 1):
+        tokens_before = get_token_count()
+        log(f"  /clear attempt {attempt}/{max_clear_attempts}: tokens before={tokens_before}")
+        inject(pane, "/clear", label=f"/clear-{attempt}", slash_command=True)
+
+        if args.no_resume:
+            log("DONE: /clear injected (--no-resume)")
+            return
+
+        # Poll tmux state: wait for tokens to drop AND prompt to be visible.
+        # Much faster than fixed sleep — /clear typically completes in 2-3s.
+        log(f"  polling for /clear completion (max {args.delay}s)...")
+        poll_end = time.time() + args.delay
+        while time.time() < poll_end:
+            time.sleep(0.5)
+            tokens_now = get_token_count()
+            idle_now = is_idle(pane)
+            log(f"  poll: tokens={tokens_now} idle={idle_now}")
+            if tokens_now < FRESH_SESSION_MAX_TOKENS and idle_now:
+                log(f"  /clear confirmed (tokens {tokens_before} -> {tokens_now})")
+                clear_confirmed = True
+                break
+        if clear_confirmed:
+            break
+
+        tokens_after = get_token_count()
+        log(f"  attempt {attempt} FAILED: tokens {tokens_before} -> {tokens_after}")
+
+        if attempt < max_clear_attempts:
+            # Wait for idle before retrying — /clear text may have been
+            # submitted as a regular message and Claude Code is processing it
+            log(f"  waiting for idle before retry...")
+            if not wait_for_idle(pane, timeout=15):
+                log(f"  idle wait timed out before retry")
+
+    tokens_after = get_token_count()
+    log(f"  final: tokens={tokens_after} confirmed={clear_confirmed}")
+
+    if tokens_after > FRESH_SESSION_MAX_TOKENS:
+        # Session is already running — exo-watcher or user got there first,
+        # or all /clear attempts failed.
+        log(f"SKIP-RESUME: session at {tokens_after} tokens > {FRESH_SESSION_MAX_TOKENS}. "
+            f"{'All attempts failed' if not clear_confirmed else 'Already running'}.")
+        return
+
+    # Either /clear worked and nobody resumed yet, or /clear didn't work.
+    # In both cases, injecting resume is safe:
+    # - If /clear worked: resume kicks off the fresh session
+    # - If /clear didn't work: resume triggers checklist in existing session (harmless)
+
+    # Dismiss the session feedback prompt if present.
+    # Claude Code v2.1.70+ shows "How is Claude doing this session?" after /clear.
+    # This prompt intercepts keystrokes and must be dismissed before resume inject.
+    dismiss_feedback_prompt(pane)
+
+    if not wait_for_idle(pane, timeout=30):
+        log("  WARNING: idle wait timed out before resume inject")
+    inject(pane, RESUME_PROMPT, label="resume")
+    log("SUCCESS: /clear + resume injected")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--delay", type=int, default=15,
+                        help="Max seconds to wait between /clear and resume prompt (default: 15)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Only inject /clear, skip resume prompt")
+    parser.add_argument("--timeout", type=int, default=60,
+                        help="Max seconds to wait for idle state (default: 60)")
+    parser.add_argument("--log-file", default=None,
+                        help="Override log path (default: $CLAUDE_SELF_CLEAR_LOG "
+                             "or $XDG_STATE_HOME/claude-watch/self-clear.log)")
+    parser.add_argument("--lock-file", default=None,
+                        help="Override lockfile path (default: $CLAUDE_SELF_CLEAR_LOCK "
+                             "or $XDG_RUNTIME_DIR/claude-self-clear.lock)")
+    parser.add_argument("--resume-prompt", default=None,
+                        help="Override the post-/clear resume-prompt text "
+                             "(default: $CLAUDE_SELF_CLEAR_RESUME_PROMPT or "
+                             "the built-in placeholder)")
+    args = parser.parse_args()
+
+    # Bind config from CLI flags (overrides) → env (defaults).
+    global LOG_FILE, LOCKFILE, RESUME_PROMPT
+    if args.log_file:
+        LOG_FILE = args.log_file
+    if args.lock_file:
+        LOCKFILE = args.lock_file
+    if args.resume_prompt:
+        RESUME_PROMPT = args.resume_prompt
+
+    # Make sure the log directory exists; touching a fresh log file with
+    # `open(..., "a")` doesn't create intermediate directories.
+    try:
+        Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    pane = find_claude_pane()
+    if not pane:
+        print("ERROR: Could not find Claude Code tmux pane", file=sys.stderr)
+        sys.exit(1)
+
+    # Daemonize: fork so the parent returns immediately. This lets the
+    # calling Bash tool call complete, allowing Claude Code to finish its
+    # turn and become idle before we inject /clear.
+    pid = os.fork()
+    if pid > 0:
+        # Parent returns — Bash tool call completes, Claude becomes idle
+        print(f"Self-clear backgrounded (PID {pid}). "
+              f"Polling tmux for idle state (up to {args.timeout}s).")
+        return
+
+    # Child: detach from parent's process group and close inherited
+    # stdout/stderr. Without this, the calling process (context-watch)
+    # waits for the pipe to close — which doesn't happen until the child
+    # exits, causing a timeout.
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+
+    # Signal handlers — log before dying so we can diagnose silent deaths.
+    def signal_handler(signum, frame):
+        signame = signal.Signals(signum).name
+        log(f"KILLED: received {signame} ({signum})")
+        sys.exit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGPIPE, signal.SIGALRM):
+        signal.signal(sig, signal_handler)
+
+    # Acquire exclusive lock to prevent concurrent self-clear processes.
+    # Two processes racing on tmux send-keys corrupt each other's keystrokes
+    # (one process's Escape interrupts the other's typing, etc.).
+    try:
+        lock_fd = os.open(LOCKFILE, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        log("SKIP: another self-clear is already running (lockfile held)")
+        sys.exit(0)
+
+    # Global exception handler — the 17:48 child death had no log entries
+    # after "submitted", meaning an uncaught exception killed it silently
+    # (stdout/stderr were /dev/null). This catches everything.
+    try:
+        child_main(pane, args)
+    except Exception:
+        log(f"CRASH: {traceback.format_exc()}")
+        sys.exit(1)
+    finally:
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

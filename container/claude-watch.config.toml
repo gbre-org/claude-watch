@@ -110,3 +110,15 @@ max_stuck_secs = 1800
 # (Phase 1b). Keep the daemon-side hybrid OFF until we audit the
 # in-container hook-fire path end-to-end in Phase 2.
 enabled = false
+
+[auto_respawn_on_hang]
+# Default OFF — auto-killing the inner claude is destructive even inside
+# the container. Operators flip `enabled = true` here (or via SIGHUP +
+# config reload) when they want claude-watch to roll a wedged pane on
+# its own. Even when disabled, the override below is the right shape
+# for whenever operators DO opt in: respawn must invoke `cwsr` (in-
+# container, rolls pane 0 via `tmux respawn-pane -k`) instead of the
+# host-side `dashboard --detach` script (which doesn't exist inside the
+# container — calling it would fall straight through to LaunchFailed).
+enabled = false
+respawn_command = ["cwsr", "--no-upgrade"]

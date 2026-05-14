@@ -140,14 +140,45 @@ pub fn is_own_command(cmd: &str) -> bool {
 }
 
 /// Find the main Claude Code process PID by checking /proc/PID/exe.
+///
+/// Matches against `${HOME}/.local/share/claude/versions/` (Claude Code's
+/// native-install path).
+///
+/// When `CLAUDE_WATCH_CONTAINER_MODE=1` is set in the daemon's
+/// environment, ALSO matches against the npm-global install path used
+/// by the in-container Claude Code build:
+/// `/usr/lib/node_modules/@anthropic-ai/claude-code/`. The container
+/// image bakes Claude Code via `npm install -g`, so before any in-
+/// container self-update lands a versions/<ver>/ entry into the
+/// claude-container-versions named volume, the running exe lives at the
+/// npm-global path. The diagnostic at claude-watch-container-diagnostic.md
+/// flagged this mismatch as one of the reasons the host daemon could see
+/// the container's claude PID via `/proc` (PID namespace flat-visible)
+/// but never returned it from this function.
 pub fn find_claude_pid() -> Option<u32> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let versions_dir = format!("{}/.local/share/claude/versions", home);
     find_claude_pid_with_versions_dir(&versions_dir)
 }
 
+/// Container-mode npm-global install path. Constant so the test suite
+/// can assert against it without duplicating the literal.
+pub const CONTAINER_CLAUDE_EXE_PREFIX: &str =
+    "/usr/lib/node_modules/@anthropic-ai/claude-code/";
+
 /// Testable version of find_claude_pid with configurable versions dir.
 pub fn find_claude_pid_with_versions_dir(versions_dir: &str) -> Option<u32> {
+    let container_mode = std::env::var("CLAUDE_WATCH_CONTAINER_MODE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    find_claude_pid_with_paths(versions_dir, container_mode)
+}
+
+/// Pure variant: caller chooses both the versions-dir prefix and whether
+/// to ALSO accept the container npm-global install path. Used directly
+/// by tests so they don't need to mutate process env.
+pub fn find_claude_pid_with_paths(versions_dir: &str, container_mode: bool) -> Option<u32> {
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return None,
@@ -163,6 +194,9 @@ pub fn find_claude_pid_with_versions_dir(versions_dir: &str) -> Option<u32> {
         if let Ok(target) = std::fs::read_link(&exe_path) {
             let target_str = target.to_string_lossy();
             if target_str.starts_with(versions_dir) {
+                return name_str.parse().ok();
+            }
+            if container_mode && target_str.starts_with(CONTAINER_CLAUDE_EXE_PREFIX) {
                 return name_str.parse().ok();
             }
         }
@@ -981,6 +1015,33 @@ mod tests {
     fn test_parse_ps_output_whitespace_only() {
         let children = parse_ps_output("   \n  \n");
         assert!(children.is_empty());
+    }
+
+    #[test]
+    fn test_container_claude_exe_prefix_constant() {
+        // The constant must point at npm-global's @anthropic-ai/claude-code
+        // dir — that's where the container's `npm install -g
+        // @anthropic-ai/claude-code` lands the binary before any in-container
+        // self-update populates the named-volume versions/<ver>/ tree.
+        // Changing this constant in isolation would silently break
+        // find_claude_pid_with_paths(container_mode=true) for fresh container
+        // boots. Diagnostic context: claude-watch-container-diagnostic.md
+        // confirms /proc/<container-claude-pid>/exe ->
+        // /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe.
+        assert_eq!(
+            CONTAINER_CLAUDE_EXE_PREFIX,
+            "/usr/lib/node_modules/@anthropic-ai/claude-code/"
+        );
+    }
+
+    #[test]
+    fn test_find_claude_pid_with_paths_no_proc_panic_safety() {
+        // Pure-data sanity: calling find_claude_pid_with_paths with bogus
+        // versions_dir + container_mode=false must not panic. The function
+        // walks /proc which exists on Linux test runners; the assertion
+        // here is just "doesn't crash and returns Option<u32>".
+        let _ = find_claude_pid_with_paths("/nonexistent/path/that/does/not/exist", false);
+        let _ = find_claude_pid_with_paths("/nonexistent/path/that/does/not/exist", true);
     }
 
     #[test]

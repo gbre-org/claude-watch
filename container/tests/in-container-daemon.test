@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Tests for the in-container claude-watch daemon wiring.
+
+Background — claude-watch-container-diagnostic.md (q-e1c1, 2026-05-14)
+found the host's claude-watch.service is tmux-bound to the host tmux
+server and CANNOT reach the container's tmux server at all. Without an
+in-container daemon, every claude-watch feature (activity / token
+monitor, fresh-/clear detection, resume injection, self-clear,
+prolonged-thinking interrupt, auto-respawn) silently no-ops for the cw
+container. The fix: spawn `claude-watch` as a headless background child
+of PID 1 from `entrypoint.sh`, gated behind `CLAUDE_CONTAINER_DAEMON`
+(default ON).
+
+This test verifies the FILE-LEVEL wiring (entrypoint.sh + Dockerfile +
+claude-watch.config.toml). It does NOT spawn a container or shell into
+one — that path is exercised by the v38 workbot prompt
+(~/dropbox/workbot/prompts/v38-in-container-daemon.md) which actually
+runs `docker compose up` and `docker exec ps -ef` to confirm the daemon
+is alive.
+
+Coverage:
+  1. entrypoint.sh has the CLAUDE_CONTAINER_DAEMON spawn block (gated
+     by `if [ "${CLAUDE_CONTAINER_DAEMON:-1}" != "0" ]; then`, default
+     ON), exporting CLAUDE_WATCH_CONTAINER_MODE=1 so find_claude_pid
+     accepts the npm-global exe path.
+  2. The spawn block uses nohup + setsid + & so the daemon survives
+     entrypoint's subsequent `exec tmux attach-session`. stdout/stderr
+     redirect to /tmp/claude-watch.log (config legacy_log_file).
+  3. The cleanup() trap explicitly SIGTERMs the daemon PID so it
+     journals daemon_stop before docker SIGKILLs the container PID
+     namespace.
+  4. Dockerfile bakes container/bin/self-clear at /usr/local/bin/self-clear
+     so the daemon's `Command::new("self-clear")` (policy.rs
+     spawn_immediate_clear / spawn_deferred_clear) resolves regardless
+     of whether the operator bind-mounts host ~/bin.
+  5. claude-watch.config.toml has [auto_respawn_on_hang] with
+     respawn_command = ["cwsr", "--no-upgrade"] so when an operator opts
+     IN to auto-respawn, the daemon rolls the inner pane via cwsr (which
+     uses tmux respawn-pane -k inside the container) instead of trying
+     to invoke the host-side `dashboard --detach` (which doesn't exist
+     in the container — would fall straight through to LaunchFailed).
+  6. tools/watchers/self-clear is a symlink to ../../container/bin/self-clear
+     so the host's `~/bin/self-clear -> tools/watchers/self-clear` chain
+     and the container build (whose context is container/) end up running
+     the same bytes. Without the symlink the two copies drift silently.
+
+Run:  ./in-container-daemon.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+CONFIG_TOML = CONTAINER_DIR / "claude-watch.config.toml"
+SELF_CLEAR_BIN = CONTAINER_DIR / "bin" / "self-clear"
+TOOLS_SELF_CLEAR = REPO_ROOT / "tools" / "watchers" / "self-clear"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# 1. entrypoint.sh CLAUDE_CONTAINER_DAEMON spawn block.
+# ---------------------------------------------------------------------------
+expect(ENTRYPOINT.exists(), f"entrypoint.sh missing at {ENTRYPOINT}")
+if ENTRYPOINT.exists():
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+
+    # 1a. The gate must be `${CLAUDE_CONTAINER_DAEMON:-1}` (default ON).
+    #     `:-0` would default OFF and silently regress the diagnostic fix.
+    gate_default_on = re.search(
+        r'\$\{CLAUDE_CONTAINER_DAEMON:-1\}',
+        text,
+    )
+    expect(
+        gate_default_on is not None,
+        "entrypoint.sh missing the `${CLAUDE_CONTAINER_DAEMON:-1}` gate "
+        "with default ON — the in-container daemon is the whole point of "
+        "this fix; defaulting OFF would silently regress to the "
+        "diagnostic-flagged behaviour where every claude-watch feature "
+        "silently no-ops for the cw container",
+    )
+
+    # 1b. The spawn block must be present (CLAUDE_CONTAINER_DAEMON != 0).
+    #     We check for the specific shape `!= "0"` so a future refactor
+    #     to `= "1"` (which would break opt-in via any non-empty value)
+    #     surfaces here.
+    spawn_gate = re.search(
+        r'if\s*\[\s*"\$\{CLAUDE_CONTAINER_DAEMON:-1\}"\s*!=\s*"0"\s*\]',
+        text,
+    )
+    expect(
+        spawn_gate is not None,
+        "entrypoint.sh missing the `if [ \"${CLAUDE_CONTAINER_DAEMON:-1}\" "
+        "!= \"0\" ]` spawn gate — operators disable via "
+        "CLAUDE_CONTAINER_DAEMON=0 (any other value, including unset, "
+        "spawns the daemon)",
+    )
+
+    # 1c. CLAUDE_WATCH_CONTAINER_MODE=1 export inside the spawn block —
+    #     enables the npm-global exe-path fallback in
+    #     find_claude_pid_with_paths so auto-respawn can locate the
+    #     in-container claude PID before any self-update lands a
+    #     versions/<ver>/ entry.
+    container_mode_export = re.search(
+        r'export\s+CLAUDE_WATCH_CONTAINER_MODE=1',
+        text,
+    )
+    expect(
+        container_mode_export is not None,
+        "entrypoint.sh missing `export CLAUDE_WATCH_CONTAINER_MODE=1` "
+        "inside the daemon-spawn block — without this, "
+        "find_claude_pid() walks /proc/<pid>/exe looking only at "
+        "${HOME}/.local/share/claude/versions/ and misses the npm-"
+        "global-installed claude exe at "
+        "/usr/lib/node_modules/@anthropic-ai/claude-code/, breaking "
+        "auto-respawn + agent-tracking until the in-container claude "
+        "self-updates",
+    )
+
+    # 1d. The actual spawn line — nohup + setsid + claude-watch + & so
+    #     the daemon survives `exec tmux attach-session` at the end of
+    #     entrypoint.  `\` line continuations between tokens are allowed.
+    spawn_line = re.search(
+        r'nohup\s+setsid\s+claude-watch\s*\\?\s*\n?\s*'
+        r'>>\s*/tmp/claude-watch\.log\s+2>&1\s+</dev/null\s+&',
+        text,
+    )
+    expect(
+        spawn_line is not None,
+        "entrypoint.sh missing the `nohup setsid claude-watch "
+        ">>/tmp/claude-watch.log 2>&1 </dev/null &` spawn line — "
+        "without setsid the daemon is reaped when entrypoint execs into "
+        "tmux; without nohup it dies on docker stop's SIGHUP; without "
+        "the redirects stderr garbles the tmux attach view; without `&` "
+        "the entrypoint blocks waiting for the daemon to exit (which "
+        "never happens)",
+    )
+
+    # 1e. CLAUDE_WATCH_DAEMON_PID captured ($!) so cleanup() can SIGTERM
+    #     it during graceful shutdown.
+    pid_capture = "CLAUDE_WATCH_DAEMON_PID=$!" in text
+    expect(
+        pid_capture,
+        "entrypoint.sh missing `CLAUDE_WATCH_DAEMON_PID=$!` capture "
+        "after the spawn — without it cleanup() can't signal the daemon "
+        "and it gets SIGKILLed by docker without journalling the "
+        "daemon_stop event",
+    )
+
+    # 1f. cleanup() trap signals the daemon PID. We tolerate either
+    #     `"${VAR}"` or `"${VAR:-}"` since both work post the
+    #     `if [ -n ... ]` guard above.
+    cleanup_kill = re.search(
+        r'kill\s+"\$\{CLAUDE_WATCH_DAEMON_PID(:-)?\}"\s+2>/dev/null',
+        text,
+    )
+    expect(
+        cleanup_kill is not None,
+        "entrypoint.sh cleanup() must SIGTERM the captured "
+        "CLAUDE_WATCH_DAEMON_PID before exit so the daemon journals a "
+        "clean daemon_stop event",
+    )
+
+# ---------------------------------------------------------------------------
+# 2. Dockerfile bakes self-clear at /usr/local/bin/self-clear.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    self_clear_copy = re.search(
+        r'^\s*COPY\s+bin/self-clear\s+/usr/local/bin/self-clear\s*$',
+        df,
+        re.MULTILINE,
+    )
+    expect(
+        self_clear_copy is not None,
+        "Dockerfile missing `COPY bin/self-clear /usr/local/bin/self-clear` "
+        "— the in-container claude-watch daemon's wedged-pane recovery "
+        "path (claude-watch/src/policy.rs spawn_immediate_clear) calls "
+        "`Command::new(\"self-clear\")`. Without the baked copy at "
+        "/usr/local/bin/self-clear the call falls through to "
+        "operator-supplied bind-mounts, and operator-stripped containers "
+        "(no ~/bin mount) silently lose recovery",
+    )
+
+# ---------------------------------------------------------------------------
+# 3. claude-watch.config.toml has the auto-respawn override pointed at cwsr.
+# ---------------------------------------------------------------------------
+expect(CONFIG_TOML.exists(), f"claude-watch.config.toml missing at {CONFIG_TOML}")
+if CONFIG_TOML.exists():
+    cfg = CONFIG_TOML.read_text(encoding="utf-8")
+
+    # The section header must be present (TOML parser otherwise would
+    # accept the keys at the top level).
+    expect(
+        re.search(r'^\[auto_respawn_on_hang\]', cfg, re.MULTILINE) is not None,
+        "claude-watch.config.toml missing the `[auto_respawn_on_hang]` "
+        "section header",
+    )
+
+    # respawn_command must point at cwsr (with --no-upgrade — we don't
+    # want auto-respawn to also trigger an unsolicited npm install).
+    cwsr_command = re.search(
+        r'^\s*respawn_command\s*=\s*\[\s*"cwsr"\s*,\s*"--no-upgrade"\s*\]',
+        cfg,
+        re.MULTILINE,
+    )
+    expect(
+        cwsr_command is not None,
+        "claude-watch.config.toml [auto_respawn_on_hang] missing "
+        "`respawn_command = [\"cwsr\", \"--no-upgrade\"]` — without "
+        "this override the daemon falls back to the host's "
+        "`dashboard --detach` script (which doesn't exist in the "
+        "container, so respawn would always fall through to "
+        "LaunchFailed)",
+    )
+
+# ---------------------------------------------------------------------------
+# 4. tools/watchers/self-clear is a symlink into container/bin/self-clear
+#    so host + container both run the same bytes.
+# ---------------------------------------------------------------------------
+expect(SELF_CLEAR_BIN.exists(), f"container/bin/self-clear missing at {SELF_CLEAR_BIN}")
+if SELF_CLEAR_BIN.exists():
+    expect(
+        SELF_CLEAR_BIN.is_file() and not SELF_CLEAR_BIN.is_symlink(),
+        "container/bin/self-clear must be a regular file (the source "
+        "of truth) — if it's a symlink the Docker COPY can't reach the "
+        "target (build context is container/, can't traverse out)",
+    )
+
+expect(
+    TOOLS_SELF_CLEAR.is_symlink(),
+    "tools/watchers/self-clear must be a symlink into "
+    "container/bin/self-clear so the host's `~/bin/self-clear -> "
+    "tools/watchers/self-clear` chain and the container build run the "
+    "same bytes — drift between the two would silently break either "
+    "host or container recovery",
+)
+if TOOLS_SELF_CLEAR.is_symlink():
+    target = TOOLS_SELF_CLEAR.readlink()
+    expect(
+        str(target) in (
+            "../../container/bin/self-clear",
+            "../../../container/bin/self-clear",
+        ),
+        f"tools/watchers/self-clear symlink target must point at "
+        f"container/bin/self-clear (got {target!r})",
+    )
+    # The target must resolve.
+    resolved = (TOOLS_SELF_CLEAR.parent / target).resolve()
+    expect(
+        resolved == SELF_CLEAR_BIN.resolve(),
+        f"tools/watchers/self-clear symlink resolves to {resolved}, "
+        f"expected {SELF_CLEAR_BIN.resolve()}",
+    )
+
+if failures:
+    print("FAIL in-container-daemon.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS in-container-daemon.test")
+sys.exit(0)

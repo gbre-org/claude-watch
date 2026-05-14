@@ -109,6 +109,21 @@ pub struct AutoRespawnConfig {
     /// long-running thoughts.
     #[serde(default = "default_pane_unchanged_secs")]
     pub pane_unchanged_secs: u64,
+    /// Command + argv to launch a fresh Claude Code session after the
+    /// hung process tree is killed. Default: `["dashboard", "--detach"]`
+    /// — the host's systemd-boot path (bare tmux session +
+    /// `claude --continue`).
+    ///
+    /// Container deployments override this to `["cwsr", "--no-upgrade"]`
+    /// so respawn rolls the inner pane via `tmux respawn-pane -k`
+    /// instead of trying to invoke the host-side `dashboard` script
+    /// (which doesn't exist inside the container — the diagnostic at
+    /// claude-watch-container-diagnostic.md flagged this as one of the
+    /// host-tmux-bound features that silently no-op'd from the host
+    /// daemon's perspective when the operator was actually running
+    /// inside the cw container).
+    #[serde(default = "default_respawn_command")]
+    pub respawn_command: Vec<String>,
 }
 
 impl Default for AutoRespawnConfig {
@@ -121,6 +136,7 @@ impl Default for AutoRespawnConfig {
             kill_grace_secs: default_kill_grace_secs(),
             respawn_verify_secs: default_respawn_verify_secs(),
             pane_unchanged_secs: default_pane_unchanged_secs(),
+            respawn_command: default_respawn_command(),
         }
     }
 }
@@ -142,6 +158,9 @@ fn default_respawn_verify_secs() -> u64 {
 }
 fn default_pane_unchanged_secs() -> u64 {
     600
+}
+fn default_respawn_command() -> Vec<String> {
+    vec!["dashboard".to_string(), "--detach".to_string()]
 }
 
 /// Per-signal observation history. Persisted in State so the
@@ -422,13 +441,30 @@ pub async fn execute_respawn_with_versions_dir(
     )
     .await;
 
-    // Launch the fresh dashboard. We use the same `--detach` path systemd
-    // uses on boot: builds the bare session + `claude --continue` with
-    // the resume-inject prompt, no layout. setsid via spawn_detached so
-    // the process survives a daemon SIGTERM mid-respawn.
-    info!("auto-respawn: launching fresh dashboard via `dashboard --detach`");
-    if let Err(e) = spawn_detached(&["dashboard", "--detach"]) {
-        warn!(error = %e, "auto-respawn: dashboard launch failed");
+    // Launch a fresh Claude Code session via the configured respawn
+    // command. Default: `dashboard --detach` (host systemd-boot path —
+    // bare tmux session + `claude --continue` with the resume-inject
+    // prompt). Container deployments override to `cwsr --no-upgrade`
+    // so the in-container claude-watch rolls the inner pane via
+    // `tmux respawn-pane -k` instead of trying to shell out to the
+    // host-side `dashboard` script (which does not exist inside the
+    // container). setsid via spawn_detached so the process survives a
+    // daemon SIGTERM mid-respawn.
+    let respawn_argv: Vec<&str> = config
+        .respawn_command
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    info!(
+        respawn_command = ?config.respawn_command,
+        "auto-respawn: launching fresh Claude Code via configured respawn_command"
+    );
+    if respawn_argv.is_empty() {
+        warn!("auto-respawn: respawn_command is empty — aborting launch");
+        return RespawnOutcome::LaunchFailed;
+    }
+    if let Err(e) = spawn_detached(&respawn_argv) {
+        warn!(error = %e, "auto-respawn: respawn_command launch failed");
         return RespawnOutcome::LaunchFailed;
     }
 
@@ -532,6 +568,32 @@ mod tests {
         let cfg = AutoRespawnConfig::default();
         assert_eq!(cfg.signals_required, 2);
         assert!(!cfg.enabled, "auto-respawn must default OFF");
+    }
+
+    #[test]
+    fn respawn_command_defaults_to_dashboard_detach() {
+        // Host-side default — preserves the systemd-boot path so
+        // upgrade lands the new field as a no-op for existing operators
+        // who don't override it. Container deployments override to
+        // `["cwsr", "--no-upgrade"]` via /etc/claude-watch/config.toml.
+        let cfg = AutoRespawnConfig::default();
+        assert_eq!(cfg.respawn_command, vec!["dashboard", "--detach"]);
+    }
+
+    #[test]
+    fn respawn_command_deserialises_from_toml_array() {
+        // Container override shape: an operator-supplied array replaces
+        // the default. The container ships
+        // `respawn_command = ["cwsr", "--no-upgrade"]` so the daemon
+        // rolls the inner pane via tmux respawn-pane instead of
+        // shelling out to the host-only `dashboard` script.
+        let toml_src = r#"
+            enabled = true
+            respawn_command = ["cwsr", "--no-upgrade"]
+        "#;
+        let cfg: AutoRespawnConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.respawn_command, vec!["cwsr", "--no-upgrade"]);
+        assert!(cfg.enabled);
     }
 
     #[test]

@@ -304,6 +304,33 @@ RUN chmod +x /usr/local/bin/audit-hooks
 COPY bin/cwsr /usr/local/bin/cwsr
 RUN chmod +x /usr/local/bin/cwsr
 
+# self-clear — fresh-context-injection helper that the in-container
+# claude-watch daemon shells out to when its policy module decides to
+# /clear the wedged pane. The script (Python 3) sends Escape+dd+i+text
+# keystrokes to the in-container tmux pane via `tmux send-keys` and
+# polls for the post-/clear prompt to come back idle.
+#
+# Baked into the image at /usr/local/bin/self-clear so the daemon's
+# `Command::new("self-clear")` invocation in
+# claude-watch/src/policy.rs (spawn_immediate_clear /
+# spawn_deferred_clear) resolves regardless of whether the operator
+# bind-mounts host ~/bin into the container. The example compose stack
+# DOES bind-mount ~/bin and the host symlink at ~/bin/self-clear ->
+# tools/watchers/self-clear would normally win /usr/local/bin
+# precedence, but operator-stripped containers (which don't bind-mount
+# ~/bin) need the baked copy as the floor so the wedged-pane recovery
+# path doesn't silently fail with "command not found". The script is
+# self-contained Python (no external dependencies beyond stdlib + tmux
+# + claude-watch on PATH).
+#
+# Source-of-truth lives at container/bin/self-clear; the host-side
+# tools/watchers/self-clear is a symlink into this file so both the
+# host's `~/bin/self-clear -> tools/watchers/self-clear` chain and the
+# container build (whose context is container/) end up running the
+# same bytes.
+COPY bin/self-clear /usr/local/bin/self-clear
+RUN chmod +x /usr/local/bin/self-clear
+
 # Baked skills / agents / watchers — three top-level dirs in the repo
 # (container/skills/, container/agents/, container/watchers/) that ship
 # in-container slash commands, custom agent prompts, and background

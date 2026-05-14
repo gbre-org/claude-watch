@@ -250,6 +250,14 @@ cleanup() {
     if tmux has-session -t "$SESSION" 2>/dev/null; then
         tmux kill-session -t "$SESSION" || true
     fi
+    # When CLAUDE_CONTAINER_DAEMON spawned the headless claude-watch
+    # daemon, it lives outside the tmux session (background child of
+    # entrypoint, detached via setsid). Send it SIGTERM so it
+    # journals a clean daemon_stop event and saves state before docker
+    # SIGKILLs the whole container PID namespace.
+    if [ -n "${CLAUDE_WATCH_DAEMON_PID:-}" ]; then
+        kill "${CLAUDE_WATCH_DAEMON_PID}" 2>/dev/null || true
+    fi
     exit 0
 }
 trap cleanup TERM INT
@@ -349,6 +357,62 @@ if [ "${CLAUDE_CONTAINER_SIDEBAR:-0}" = "1" ]; then
             echo; echo '[pane 1] claude-watch exited with code '\$ec; \
             echo '[pane 1] dropping to shell so you can inspect; exit to close'; \
             exec bash; }"
+fi
+
+# CLAUDE_CONTAINER_DAEMON — headless claude-watch daemon (default ON).
+#
+# When CLAUDE_CONTAINER_DAEMON != "0", spawn the in-container
+# `claude-watch` daemon as a background child of PID 1 (this entrypoint
+# script). stdout/stderr go to /tmp/claude-watch.jsonl + .log so the
+# operator can inspect via `docker exec <c> cat /tmp/claude-watch.jsonl`
+# (or `tail -f`). Heartbeat / pane scrape / token monitoring runs
+# automatically.
+#
+# This is the fix recommended by claude-watch-container-diagnostic.md
+# (q-e1c1, 2026-05-14): the host-side claude-watch.service is tmux-bound
+# to the HOST tmux server and cannot reach the container's tmux server
+# at all. Without an in-container daemon, every claude-watch feature
+# (activity detection, fresh-/clear detection, resume injection,
+# self-clear, prolonged-thinking interrupt, auto-respawn) silently
+# no-ops for the cw container. Spawning the daemon inside makes those
+# features actually fire against the in-container pane.
+#
+# Why default-on: the cw container is Andrew's daily-driver Claude Code
+# instance (DM 2026-05-14 04:43 ET). Operators who don't want the
+# daemon (e.g. running the container as a one-shot validation harness
+# under `claude-tmux bash -c "..."`) set CLAUDE_CONTAINER_DAEMON=0 in
+# .env / docker-compose.override.yml.
+#
+# Why headless (no tmux pane): the sidebar pane renders as a too-narrow
+# strip in ttyd (q-2026-05-12-2e6c) — the visual is broken at typical
+# browser-terminal widths. Headless avoids that entirely; inspection
+# happens via the JSONL log.
+#
+# Why CLAUDE_WATCH_CONTAINER_MODE=1: claude-watch's find_claude_pid()
+# walks /proc/<pid>/exe looking for symlinks under
+# ${HOME}/.local/share/claude/versions/. Inside the container the npm-
+# global-installed claude exe lives at
+# /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe, which
+# does NOT match that prefix until a self-update lands a versions/<ver>/
+# entry into the named volume. Setting CLAUDE_WATCH_CONTAINER_MODE=1
+# enables the npm-global fallback in find_claude_pid_with_paths(), so
+# auto-respawn / agent-tracking work on a fresh container (before any
+# self-update fires).
+if [ "${CLAUDE_CONTAINER_DAEMON:-1}" != "0" ]; then
+    export CLAUDE_WATCH_CONTAINER_MODE=1
+    # Make sure the JSONL log file path is uid-1000 writable. The config
+    # already points at /tmp/claude-watch.jsonl which is writable, but
+    # belt-and-suspenders for downstream image overrides.
+    : > /tmp/claude-watch.jsonl 2>/dev/null || true
+    : > /tmp/claude-watch.log 2>/dev/null || true
+    # nohup + setsid + & so the daemon survives entrypoint's subsequent
+    # exec into tmux attach. Redirecting stderr to the .log file (config
+    # legacy_log_file) keeps tracing's stderr-formatted lines colocated
+    # with the JSONL events for post-hoc debugging.
+    nohup setsid claude-watch \
+        >>/tmp/claude-watch.log 2>&1 </dev/null &
+    CLAUDE_WATCH_DAEMON_PID=$!
+    echo "[entrypoint] spawned in-container claude-watch daemon (pid $CLAUDE_WATCH_DAEMON_PID, log /tmp/claude-watch.log, jsonl /tmp/claude-watch.jsonl)" >&2
 fi
 
 # Focus the main claude pane.
