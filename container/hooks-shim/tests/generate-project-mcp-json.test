@@ -45,15 +45,24 @@ def run_helper(
     output_dir: str,
     expect_rc: int = 0,
     quiet: bool = True,
+    patterns: str | None = None,
+    env_patterns: str | None = None,
 ) -> tuple[str, str]:
     cmd = [str(SCRIPT), "--mcp-input", mcp_input, "--output-dir", output_dir]
     if quiet:
         cmd.append("--quiet")
+    if patterns is not None:
+        cmd += ["--shim-patterns", patterns]
+    env = dict(os.environ)
+    env.pop("CLAUDE_SHIM_PATTERNS", None)
+    if env_patterns is not None:
+        env["CLAUDE_SHIM_PATTERNS"] = env_patterns
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         timeout=10,
+        env=env,
     )
     if result.returncode != expect_rc:
         raise AssertionError(
@@ -341,6 +350,234 @@ def test_weird_definition_passes_through() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pattern filtering (--shim-patterns / CLAUDE_SHIM_PATTERNS)
+# ---------------------------------------------------------------------------
+
+
+def _mcp_with_three_servers() -> dict:
+    """Common input: three MCP servers across three command path
+    families, used by multiple pattern tests."""
+    return {
+        "mcpServers": {
+            "devbar": {"command": "/Users/me/.devbar/bin/mcp-adaptor", "args": ["--stdio"]},
+            "pkgs-tool": {"command": "/Users/me/.devbar/pkgs/foo/bin/mcp-tool"},
+            "system-tool": {"command": "/opt/homebrew/bin/native-mcp"},
+        },
+    }
+
+
+def test_empty_pattern_wraps_every_server() -> None:
+    """--shim-patterns "" preserves default: wrap every server."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_with_three_servers())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project), patterns="")
+        out = load_output(project)
+        for name, definition in out["mcpServers"].items():
+            expect(
+                definition["command"].startswith(f"{EXEC_HOOK} "),
+                f"empty-pattern: every server should be wrapped, "
+                f"{name}={definition['command']!r}",
+            )
+
+
+def test_no_pattern_wraps_every_server() -> None:
+    """No --shim-patterns flag at all (and no env) = wrap everything."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_with_three_servers())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project))
+        out = load_output(project)
+        for name, definition in out["mcpServers"].items():
+            expect(
+                definition["command"].startswith(f"{EXEC_HOOK} "),
+                f"no-pattern: every server should be wrapped, "
+                f"{name}={definition['command']!r}",
+            )
+
+
+def test_pattern_narrow_match_only_wraps_matches() -> None:
+    """Narrow pattern: only the devbar/bin path matches; others pass through."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_with_three_servers())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project), patterns="/Users/*/.devbar/bin/*")
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["devbar"]["command"]
+            == f"{EXEC_HOOK} /Users/me/.devbar/bin/mcp-adaptor",
+            f"narrow: devbar/bin should be wrapped, "
+            f"got {out['mcpServers']['devbar']['command']!r}",
+        )
+        expect(
+            out["mcpServers"]["pkgs-tool"]["command"]
+            == "/Users/me/.devbar/pkgs/foo/bin/mcp-tool",
+            f"narrow: pkgs-tool should NOT be wrapped, "
+            f"got {out['mcpServers']['pkgs-tool']['command']!r}",
+        )
+        expect(
+            out["mcpServers"]["system-tool"]["command"]
+            == "/opt/homebrew/bin/native-mcp",
+            f"narrow: system-tool should NOT be wrapped, "
+            f"got {out['mcpServers']['system-tool']['command']!r}",
+        )
+
+
+def test_multiple_patterns_union() -> None:
+    """Colon-separated patterns form a union."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_with_three_servers())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            patterns="/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*",
+        )
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["devbar"]["command"].startswith(f"{EXEC_HOOK} "),
+            f"union: devbar wrapped, got {out['mcpServers']['devbar']['command']!r}",
+        )
+        expect(
+            out["mcpServers"]["pkgs-tool"]["command"].startswith(f"{EXEC_HOOK} "),
+            f"union: pkgs-tool wrapped, got {out['mcpServers']['pkgs-tool']['command']!r}",
+        )
+        expect(
+            out["mcpServers"]["system-tool"]["command"]
+            == "/opt/homebrew/bin/native-mcp",
+            f"union: system-tool passes through, "
+            f"got {out['mcpServers']['system-tool']['command']!r}",
+        )
+
+
+def test_pattern_matches_zero_servers_all_pass_through() -> None:
+    """Pattern matches nothing → no servers wrapped."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_with_three_servers())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project), patterns="/nonexistent/*")
+        out = load_output(project)
+        for name, definition in out["mcpServers"].items():
+            expect(
+                not definition["command"].startswith(f"{EXEC_HOOK} "),
+                f"no-match: nothing should be wrapped, "
+                f"{name}={definition['command']!r}",
+            )
+
+
+def test_env_var_supplies_patterns_when_flag_absent() -> None:
+    """CLAUDE_SHIM_PATTERNS env var is honored when --shim-patterns flag isn't passed."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_with_three_servers())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            env_patterns="/Users/*/.devbar/bin/*",
+        )
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["devbar"]["command"].startswith(f"{EXEC_HOOK} "),
+            f"env: devbar/bin should be wrapped, "
+            f"got {out['mcpServers']['devbar']['command']!r}",
+        )
+        expect(
+            out["mcpServers"]["pkgs-tool"]["command"]
+            == "/Users/me/.devbar/pkgs/foo/bin/mcp-tool",
+            f"env: pkgs-tool should NOT match, "
+            f"got {out['mcpServers']['pkgs-tool']['command']!r}",
+        )
+
+
+def test_flag_overrides_env_var() -> None:
+    """--shim-patterns CLI flag wins over CLAUDE_SHIM_PATTERNS env var."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_with_three_servers())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            patterns="/nonexistent/*",
+            env_patterns="/Users/*",
+        )
+        out = load_output(project)
+        for name, definition in out["mcpServers"].items():
+            expect(
+                not definition["command"].startswith(f"{EXEC_HOOK} "),
+                f"flag-wins: flag should override env, "
+                f"{name}={definition['command']!r}",
+            )
+
+
+def test_pattern_with_npx_style_command() -> None:
+    """A bare-name `npx` command matches a bare-name pattern. Args don't participate."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {
+            "mcpServers": {
+                "chrome-devtools": {
+                    "command": "npx",
+                    "args": ["-y", "chrome-devtools-mcp@latest"],
+                },
+                "node-server": {
+                    "command": "/usr/local/bin/node",
+                    "args": ["/Users/me/server.js"],
+                },
+            },
+        })
+        project = Path(td) / "project"
+        project.mkdir()
+        # Match only `npx` (bare token, no path).
+        run_helper(str(inp), str(project), patterns="npx")
+        out = load_output(project)
+        expect(
+            out["mcpServers"]["chrome-devtools"]["command"]
+            == f"{EXEC_HOOK} npx",
+            f"npx-match: chrome-devtools should be wrapped, "
+            f"got {out['mcpServers']['chrome-devtools']['command']!r}",
+        )
+        expect(
+            out["mcpServers"]["node-server"]["command"] == "/usr/local/bin/node",
+            f"npx-match: node-server should NOT match bare `npx`, "
+            f"got {out['mcpServers']['node-server']['command']!r}",
+        )
+
+
+def test_pattern_idempotent() -> None:
+    """Re-running with same input + same pattern produces the same output (idempotent)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, _mcp_with_three_servers())
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(str(inp), str(project), patterns="/Users/*/.devbar/bin/*")
+        out_file = project / ".mcp.json"
+        mtime1 = out_file.stat().st_mtime_ns
+        time.sleep(0.05)
+        run_helper(str(inp), str(project), patterns="/Users/*/.devbar/bin/*")
+        mtime2 = out_file.stat().st_mtime_ns
+        expect(
+            mtime1 == mtime2,
+            f"pattern-idempotent: mtime should be preserved on identical rerun, "
+            f"got {mtime1} -> {mtime2}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -357,6 +594,15 @@ TESTS = [
     test_idempotent_same_input_unchanged,
     test_changed_input_rewrites,
     test_weird_definition_passes_through,
+    test_empty_pattern_wraps_every_server,
+    test_no_pattern_wraps_every_server,
+    test_pattern_narrow_match_only_wraps_matches,
+    test_multiple_patterns_union,
+    test_pattern_matches_zero_servers_all_pass_through,
+    test_env_var_supplies_patterns_when_flag_absent,
+    test_flag_overrides_env_var,
+    test_pattern_with_npx_style_command,
+    test_pattern_idempotent,
 ]
 
 for t in TESTS:

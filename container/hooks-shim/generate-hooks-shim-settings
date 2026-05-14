@@ -46,16 +46,48 @@ writes a `.mcp.json` file into the project dir (project tier IS in
 `--setting-sources project,local`). This script no longer touches
 mcpServers at all.
 
+PATTERN FILTERING (--shim-patterns / CLAUDE_SHIM_PATTERNS)
+
+By default this helper wraps EVERY hook command it finds. Operators
+who only want a NARROW subset wrapped (e.g. just corp telemetry hooks
+under `/Users/*/.devbar/bin/*`) can pass `--shim-patterns` (or set
+`CLAUDE_SHIM_PATTERNS` in the env) to a colon-separated list of glob
+patterns. When the flag/env is set to a non-empty value, ONLY commands
+whose first token (the binary path) matches at least one pattern are
+wrapped; the rest pass through verbatim.
+
+Matching is done with `fnmatch.fnmatchcase` against the FIRST
+whitespace-separated token of the command (post-`lstrip`). Globs use
+the standard shell wildcards: `*` (any chars except `/` is NOT a
+special case — `fnmatch` treats `*` as any chars, so a pattern like
+`/Users/*/bin/*` will match `/Users/me/bin/foo` AND `/Users/me/sub/bin/foo`
+— mirror what an operator typing the glob into a shell would expect).
+
+Separator is `:` (parallel to `PATH`). Paths containing `:` are
+extraordinarily rare on real systems; if you have one, use a more
+specific pattern that doesn't depend on the colon.
+
+Default behavior preserved: when the flag/env is unset OR an empty
+string, EVERY hook command is wrapped — same as pre-PR-#147 behavior.
+This is the operator-safe default: on a non-Linux host with cross-arch
+hooks, wrap-everything is the right call because the shim is
+transparent on ELF / shebang, no-op on Mach-O, so the only "cost" of
+over-wrapping is one extra exec() hop per hook fire.
+
 NON-GOALS
 
 - We do NOT inspect the target binary's magic bytes here. The shim
   itself does that at hook-fire time, per-target. This helper just
-  wraps EVERY hook command unconditionally. That's safe: the shim
-  is transparent for ELF and shebang targets (exec passthrough); the
-  only behaviour change for native-Linux hooks is one extra exec()
-  hop per fire, which is negligible.
+  wraps EVERY hook command unconditionally (or every command matching
+  the operator's patterns). That's safe: the shim is transparent for
+  ELF and shebang targets (exec passthrough); the only behaviour
+  change for native-Linux hooks is one extra exec() hop per fire,
+  which is negligible.
 - We do NOT mutate the host's settings.json. The output is a
   container-local file at a deterministic path under /tmp.
+- We do NOT support negative patterns yet. If you need an
+  "everything except X" shape, file an issue and we'll add a
+  `!pattern` syntax.
 
 INPUT FORMAT
 
@@ -103,6 +135,7 @@ shouldn't break the container.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import sys
@@ -111,8 +144,60 @@ from pathlib import Path
 EXEC_HOOK_PATH = "/usr/local/bin/exec-hook"
 
 
-def wrap_command(cmd: str) -> str:
-    """Prefix `cmd` with `exec-hook ` unless already wrapped.
+def parse_patterns(raw: str | None) -> list[str]:
+    """Split a colon-separated pattern list into a clean list of globs.
+
+    Empty / None input returns []. Empty tokens (e.g. trailing colon)
+    are dropped so `"foo:"` yields `["foo"]` not `["foo", ""]`. Tokens
+    are NOT stripped of internal whitespace — operator-supplied globs
+    are taken verbatim.
+
+    Returns [] to signal "no filter, wrap everything" (the default).
+    """
+    if not raw:
+        return []
+    return [p for p in raw.split(":") if p]
+
+
+def command_first_token(cmd: str) -> str:
+    """Return the first whitespace-separated token of `cmd` after
+    lstrip(). This is the natural target for pattern matching — the
+    binary the hook actually invokes. Returns "" for empty / all-space
+    input.
+
+    We intentionally do NOT shlex-parse here: hook commands often
+    contain shell pipes / env-var expansions / quoting that shlex
+    would mishandle (or worse, "succeed" with wrong tokenization).
+    Whitespace-split on the head is good enough for matching binary
+    paths, which is the only thing patterns are aimed at.
+    """
+    stripped = cmd.lstrip() if cmd else ""
+    if not stripped:
+        return ""
+    # Split on the first run of whitespace; head is the binary.
+    return stripped.split(None, 1)[0]
+
+
+def command_matches_patterns(cmd: str, patterns: list[str]) -> bool:
+    """True iff `cmd`'s first token matches at least one glob in
+    `patterns`. Empty `patterns` returns True (wrap-everything default).
+
+    Matching uses `fnmatch.fnmatchcase` so patterns are case-sensitive
+    on all platforms (we don't want a pattern like `/Users/*/bin/*` to
+    silently accept a different case on a case-insensitive host volume
+    — operators specify their paths as-is).
+    """
+    if not patterns:
+        return True
+    head = command_first_token(cmd)
+    if not head:
+        return False
+    return any(fnmatch.fnmatchcase(head, p) for p in patterns)
+
+
+def wrap_command(cmd: str, patterns: list[str] | None = None) -> str:
+    """Prefix `cmd` with `exec-hook ` unless already wrapped or filtered
+    out by the operator's pattern list.
 
     `cmd` is the raw "command" string from settings.json — typically a
     shell-ready string like "/path/to/hook arg1 arg2". We DON'T tokenise
@@ -128,6 +213,9 @@ def wrap_command(cmd: str) -> str:
         whitespace round-trips).
       - command is empty: returned as-is (Claude Code will reject it
         on its own; not our problem to validate).
+      - `patterns` is None or [] → wrap unconditionally (default).
+      - `patterns` non-empty → wrap only if the command's first token
+        matches at least one pattern; otherwise pass through unchanged.
     """
     if not cmd:
         return cmd
@@ -141,10 +229,13 @@ def wrap_command(cmd: str) -> str:
     # fire time and exit 2, which is the operator-visible signal we want.
     if stripped == "exec-hook" or stripped == EXEC_HOOK_PATH:
         return cmd
+    # Operator-supplied pattern filter — pass through if no match.
+    if patterns and not command_matches_patterns(cmd, patterns):
+        return cmd
     return f"{EXEC_HOOK_PATH} {cmd}"
 
 
-def rewrite_hooks(settings: dict) -> dict:
+def rewrite_hooks(settings: dict, patterns: list[str] | None = None) -> dict:
     """Walk settings["hooks"] and wrap every nested command. Returns a
     new dict; the input is not mutated.
 
@@ -176,7 +267,7 @@ def rewrite_hooks(settings: dict) -> dict:
                     new_hook = dict(hook)
                     cmd = hook.get("command")
                     if isinstance(cmd, str):
-                        new_hook["command"] = wrap_command(cmd)
+                        new_hook["command"] = wrap_command(cmd, patterns)
                     new_inner.append(new_hook)
                 new_entry["hooks"] = new_inner
             new_entries.append(new_entry)
@@ -202,11 +293,24 @@ def main(argv: list[str]) -> int:
              "0600 perms; parent dir created if missing.",
     )
     p.add_argument(
+        "--shim-patterns",
+        default=os.environ.get("CLAUDE_SHIM_PATTERNS", ""),
+        help="Colon-separated list of glob patterns. When non-empty, "
+             "only hook commands whose first token (the binary path) "
+             "matches at least one pattern are wrapped with exec-hook; "
+             "non-matching commands pass through verbatim. Empty / unset "
+             "= wrap every command (default, backward-compatible). "
+             "Falls back to CLAUDE_SHIM_PATTERNS env var if the flag "
+             "isn't given. Example: "
+             "'/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*'.",
+    )
+    p.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress stderr 'wrote N hooks' summary on success.",
     )
     args = p.parse_args(argv)
+    patterns = parse_patterns(args.shim_patterns)
 
     in_path = Path(args.input)
     out_path = Path(args.output)
@@ -236,7 +340,7 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    rewritten = rewrite_hooks(settings)
+    rewritten = rewrite_hooks(settings, patterns)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp file then atomic-rename so a concurrent claude
@@ -249,8 +353,11 @@ def main(argv: list[str]) -> int:
     os.replace(tmp_path, out_path)
 
     if not args.quiet:
-        # Count hooks we touched for the operator's awareness.
+        # Count hooks we touched for the operator's awareness. With
+        # pattern filtering, the wrapped count may be < total — surface
+        # both so it's obvious when patterns matched 0/N commands.
         n_hooks = 0
+        n_wrapped = 0
         hooks = rewritten.get("hooks") or {}
         for entries in hooks.values():
             if not isinstance(entries, list):
@@ -258,12 +365,23 @@ def main(argv: list[str]) -> int:
             for entry in entries:
                 inner = (entry or {}).get("hooks") or []
                 for hook in inner:
-                    if isinstance((hook or {}).get("command"), str):
+                    cmd = (hook or {}).get("command")
+                    if isinstance(cmd, str):
                         n_hooks += 1
-        print(
-            f"generate-hooks-shim-settings: wrote {n_hooks} hook(s) -> {out_path}",
-            file=sys.stderr,
-        )
+                        if cmd.lstrip().startswith(f"{EXEC_HOOK_PATH} ") or \
+                                cmd.lstrip().startswith("exec-hook "):
+                            n_wrapped += 1
+        if patterns:
+            print(
+                f"generate-hooks-shim-settings: wrote {n_hooks} hook(s), "
+                f"{n_wrapped} wrapped (patterns={patterns}) -> {out_path}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"generate-hooks-shim-settings: wrote {n_hooks} hook(s) -> {out_path}",
+                file=sys.stderr,
+            )
 
     return 0
 

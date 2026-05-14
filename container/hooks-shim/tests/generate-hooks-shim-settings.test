@@ -49,13 +49,24 @@ def run_helper(
     input_path: str,
     output_path: str,
     expect_rc: int = 0,
+    patterns: str | None = None,
+    env_patterns: str | None = None,
 ) -> tuple[str, str]:
     cmd = [str(SCRIPT), "--input", input_path, "--output", output_path, "--quiet"]
+    if patterns is not None:
+        cmd += ["--shim-patterns", patterns]
+    env = dict(os.environ)
+    # Always wipe CLAUDE_SHIM_PATTERNS so a host-set value doesn't leak
+    # into tests that don't explicitly opt in.
+    env.pop("CLAUDE_SHIM_PATTERNS", None)
+    if env_patterns is not None:
+        env["CLAUDE_SHIM_PATTERNS"] = env_patterns
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         timeout=10,
+        env=env,
     )
     if result.returncode != expect_rc:
         raise AssertionError(
@@ -386,6 +397,217 @@ def test_mcp_servers_pass_through_unchanged() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pattern filtering (--shim-patterns / CLAUDE_SHIM_PATTERNS)
+# ---------------------------------------------------------------------------
+
+
+def _settings_with_three_paths() -> dict:
+    """Common input: one command per "/Users/me/.devbar/bin/X",
+    "/Users/me/.devbar/pkgs/y/bin/X", and "/opt/local/bin/X". Used by
+    several pattern tests."""
+    return {
+        "hooks": {
+            "Stop": [
+                {"hooks": [
+                    {"type": "command", "command": "/Users/me/.devbar/bin/telemetry"},
+                    {"type": "command", "command": "/Users/me/.devbar/pkgs/foo/bin/telemetry"},
+                    {"type": "command", "command": "/opt/local/bin/native-tool"},
+                ]},
+            ],
+        },
+    }
+
+
+def test_empty_pattern_flag_wraps_everything() -> None:
+    """--shim-patterns "" preserves default: wrap every command."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, _settings_with_three_paths())
+        run_helper(str(inp), str(out), patterns="")
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        for cmd in cmds:
+            expect(
+                cmd.startswith(f"{EXEC_HOOK} "),
+                f"empty-pattern: every command should still be wrapped, got {cmd!r}",
+            )
+
+
+def test_no_pattern_flag_wraps_everything() -> None:
+    """No --shim-patterns flag at all + no env var = wrap everything."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, _settings_with_three_paths())
+        # No `patterns` kwarg = no flag passed. env_patterns also unset.
+        run_helper(str(inp), str(out))
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        for cmd in cmds:
+            expect(
+                cmd.startswith(f"{EXEC_HOOK} "),
+                f"no-pattern: every command should still be wrapped, got {cmd!r}",
+            )
+
+
+def test_pattern_narrow_match_only_wraps_matches() -> None:
+    """Pattern matches one path family; only matching commands are wrapped."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, _settings_with_three_paths())
+        run_helper(str(inp), str(out), patterns="/Users/*/.devbar/bin/*")
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        # Only the first command matches /Users/*/.devbar/bin/* (the
+        # /pkgs/ path has more segments and doesn't match this glob;
+        # /opt/local doesn't match either).
+        expect(
+            cmds[0] == f"{EXEC_HOOK} /Users/me/.devbar/bin/telemetry",
+            f"narrow: /Users/me/.devbar/bin/telemetry should be wrapped, got {cmds[0]!r}",
+        )
+        expect(
+            cmds[1] == "/Users/me/.devbar/pkgs/foo/bin/telemetry",
+            f"narrow: /pkgs/ path should NOT match /Users/*/.devbar/bin/*, got {cmds[1]!r}",
+        )
+        expect(
+            cmds[2] == "/opt/local/bin/native-tool",
+            f"narrow: /opt/local path should NOT match, got {cmds[2]!r}",
+        )
+
+
+def test_multiple_patterns_union_match() -> None:
+    """Colon-separated patterns form a union — any match wraps the command."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, _settings_with_three_paths())
+        run_helper(
+            str(inp),
+            str(out),
+            patterns="/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*",
+        )
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        # Both /Users/ paths match (different globs); /opt/local doesn't.
+        expect(
+            cmds[0].startswith(f"{EXEC_HOOK} "),
+            f"union: /Users/.../bin/telemetry should be wrapped, got {cmds[0]!r}",
+        )
+        expect(
+            cmds[1].startswith(f"{EXEC_HOOK} "),
+            f"union: /Users/.../pkgs/.../bin/telemetry should be wrapped, got {cmds[1]!r}",
+        )
+        expect(
+            cmds[2] == "/opt/local/bin/native-tool",
+            f"union: /opt/local should still pass through, got {cmds[2]!r}",
+        )
+
+
+def test_pattern_matches_zero_commands_passes_all_through() -> None:
+    """Pattern matches nothing → nothing wrapped, output round-trips."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, _settings_with_three_paths())
+        run_helper(str(inp), str(out), patterns="/nonexistent/path/*")
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        for cmd in cmds:
+            expect(
+                not cmd.startswith(f"{EXEC_HOOK} "),
+                f"no-match: nothing should be wrapped, got {cmd!r}",
+            )
+
+
+def test_env_var_supplies_patterns_when_flag_absent() -> None:
+    """CLAUDE_SHIM_PATTERNS env var is honored when --shim-patterns flag isn't passed."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, _settings_with_three_paths())
+        run_helper(
+            str(inp),
+            str(out),
+            env_patterns="/Users/*/.devbar/bin/*",
+        )
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        expect(
+            cmds[0].startswith(f"{EXEC_HOOK} "),
+            f"env: /Users/.../bin path should be wrapped via env, got {cmds[0]!r}",
+        )
+        expect(
+            cmds[1] == "/Users/me/.devbar/pkgs/foo/bin/telemetry",
+            f"env: /pkgs/ should NOT match, got {cmds[1]!r}",
+        )
+
+
+def test_flag_overrides_env_var() -> None:
+    """--shim-patterns CLI flag wins over CLAUDE_SHIM_PATTERNS env var."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, _settings_with_three_paths())
+        # Env says "match everything"; flag says "match nothing".
+        run_helper(
+            str(inp),
+            str(out),
+            patterns="/nonexistent/*",
+            env_patterns="/Users/*",
+        )
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        for cmd in cmds:
+            expect(
+                not cmd.startswith(f"{EXEC_HOOK} "),
+                f"flag-wins: flag pattern should override env, got {cmd!r}",
+            )
+
+
+def test_pattern_matches_command_with_args() -> None:
+    """Pattern matches against the FIRST token only — args are not part of the match."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {
+                "Stop": [{"hooks": [
+                    {"type": "command", "command": "/Users/me/.devbar/bin/hook --flag value | grep foo"},
+                ]}],
+            },
+        })
+        run_helper(str(inp), str(out), patterns="/Users/*/.devbar/bin/*")
+        cmd = load_output(out)["hooks"]["Stop"][0]["hooks"][0]["command"]
+        expect(
+            cmd == f"{EXEC_HOOK} /Users/me/.devbar/bin/hook --flag value | grep foo",
+            f"args-not-matched: shell args should NOT participate in matching, got {cmd!r}",
+        )
+
+
+def test_pattern_preserves_already_wrapped() -> None:
+    """Already-wrapped commands are still passed through unchanged regardless of patterns."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "hooks": {
+                "Stop": [{"hooks": [
+                    {"type": "command", "command": f"{EXEC_HOOK} /opt/local/bin/native"},
+                    {"type": "command", "command": "/opt/local/bin/native2"},
+                ]}],
+            },
+        })
+        # Pattern wouldn't match /opt/local; the already-wrapped one
+        # must still pass through verbatim (no de-wrap), and the bare
+        # one stays bare because pattern doesn't match.
+        run_helper(str(inp), str(out), patterns="/Users/*")
+        cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
+        expect(
+            cmds[0] == f"{EXEC_HOOK} /opt/local/bin/native",
+            f"already-wrapped-with-pattern: pre-wrapped command should pass through, got {cmds[0]!r}",
+        )
+        expect(
+            cmds[1] == "/opt/local/bin/native2",
+            f"non-matching: bare command should stay bare, got {cmds[1]!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -404,6 +626,15 @@ TESTS = [
     test_no_tmp_leftover,
     test_realistic_corp_settings,
     test_mcp_servers_pass_through_unchanged,
+    test_empty_pattern_flag_wraps_everything,
+    test_no_pattern_flag_wraps_everything,
+    test_pattern_narrow_match_only_wraps_matches,
+    test_multiple_patterns_union_match,
+    test_pattern_matches_zero_commands_passes_all_through,
+    test_env_var_supplies_patterns_when_flag_absent,
+    test_flag_overrides_env_var,
+    test_pattern_matches_command_with_args,
+    test_pattern_preserves_already_wrapped,
 ]
 
 for t in TESTS:

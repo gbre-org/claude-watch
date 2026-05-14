@@ -123,12 +123,28 @@ esac
 #
 # Default OFF so existing operators see no behaviour change. Mac-host
 # operators flip the flag in their .env / docker-compose.override.yml.
+#
+# CLAUDE_SHIM_PATTERNS — operator-tunable glob list that narrows which
+# hook + MCP commands get wrapped with /usr/local/bin/exec-hook. When
+# unset / empty (the default), every command is wrapped (preserves the
+# pre-PR-#147 behaviour exactly). Set to a colon-separated list of
+# globs to wrap only matching commands; first whitespace-separated
+# token of each command is matched against each glob (fnmatch.fnmatchcase).
+# Example: CLAUDE_SHIM_PATTERNS='/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*'
+# Both generate-hooks-shim-settings and generate-project-mcp-json honor
+# this env var natively (they each have a `--shim-patterns` flag that
+# defaults to $CLAUDE_SHIM_PATTERNS), so we don't need to plumb the
+# value through explicitly here — it's read directly from the
+# inherited environment. The two `--shim-patterns "$CLAUDE_SHIM_PATTERNS"`
+# lines below make that contract visible to anyone scanning the
+# entrypoint without having to grep into the python helpers.
 CLAUDE_SHIM_SETTINGS_PATH=""
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
     /usr/local/bin/generate-hooks-shim-settings \
         --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
-        --output "$CLAUDE_SHIM_SETTINGS_PATH" || true
+        --output "$CLAUDE_SHIM_SETTINGS_PATH" \
+        --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" || true
     # If the helper didn't produce an output file (input missing,
     # unparseable), clear the var so we don't pass a broken --settings
     # path to claude.
@@ -160,7 +176,8 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_HOST_PROJECT_DIR" ]; then
         /usr/local/bin/generate-project-mcp-json \
             --mcp-input "${HOME:-/home/hndrewaall}/.claude.json" \
-            --output-dir "$CLAUDE_HOST_PROJECT_DIR" || true
+            --output-dir "$CLAUDE_HOST_PROJECT_DIR" \
+            --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" || true
     fi
 fi
 export CLAUDE_SHIM_SETTINGS_PATH

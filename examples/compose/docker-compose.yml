@@ -88,6 +88,14 @@ services:
       # silently no-op instead of spamming "Exec format error" on every
       # hook event. Off by default; Mac-host operators enable it via .env.
       CLAUDE_CONTAINER_REWRITE_HOOKS: ${CLAUDE_CONTAINER_REWRITE_HOOKS:-}
+      # Operator-tunable glob list that narrows which commands the
+      # rewrite touches. Colon-separated globs; first whitespace-
+      # separated token of each command is matched against each glob.
+      # Unset / empty (default) = wrap everything (backward compatible).
+      # Example: '/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*'.
+      # Honored by both generate-hooks-shim-settings (hooks) and
+      # generate-project-mcp-json (MCP server commands).
+      CLAUDE_SHIM_PATTERNS: ${CLAUDE_SHIM_PATTERNS:-}
       # Host-project-dir signal — read by the entrypoint's
       # trust-workspace pre-seed so the workspace at the bind-mounted
       # host project path is pre-trusted (skips the first-launch dialog).

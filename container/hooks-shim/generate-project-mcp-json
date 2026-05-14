@@ -71,6 +71,16 @@ The script is fail-safe: missing / unparseable input is a no-op
 exit 0, NOT a hard failure. Bad-input cases shouldn't break the
 container startup.
 
+PATTERN FILTERING (--shim-patterns / CLAUDE_SHIM_PATTERNS)
+
+Mirrors the pattern-filtering surface in generate-hooks-shim-settings.
+When `--shim-patterns` (or the `CLAUDE_SHIM_PATTERNS` env var) is set
+to a colon-separated list of globs, ONLY MCP servers whose `command`
+first token matches at least one pattern get wrapped with exec-hook;
+the rest pass through verbatim. Empty / unset = wrap every server
+(default, backward-compatible). See the hooks helper's pattern docs
+for matching semantics + edge cases.
+
 IDEMPOTENCY
 
 If the output file already exists with byte-identical content, no
@@ -82,6 +92,7 @@ previous container run with a different host mcpServers list).
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import sys
@@ -90,8 +101,44 @@ from pathlib import Path
 EXEC_HOOK_PATH = "/usr/local/bin/exec-hook"
 
 
-def wrap_command(cmd: str) -> str:
-    """Prefix `cmd` with `exec-hook ` unless already wrapped.
+def parse_patterns(raw: str | None) -> list[str]:
+    """Split a colon-separated pattern list into a list of globs.
+
+    Mirrors generate-hooks-shim-settings::parse_patterns. Empty / None
+    input returns []. Empty tokens are dropped. Returns [] to signal
+    "no filter, wrap everything" (the default).
+    """
+    if not raw:
+        return []
+    return [p for p in raw.split(":") if p]
+
+
+def command_first_token(cmd: str) -> str:
+    """First whitespace-separated token of `cmd` after lstrip(). The
+    natural matching target — the binary the MCP server actually
+    invokes. Returns "" for empty / all-space input. Mirrors the
+    sibling helper's tokenizer."""
+    stripped = cmd.lstrip() if cmd else ""
+    if not stripped:
+        return ""
+    return stripped.split(None, 1)[0]
+
+
+def command_matches_patterns(cmd: str, patterns: list[str]) -> bool:
+    """True iff `cmd`'s first token matches at least one glob in
+    `patterns`. Empty `patterns` returns True (wrap-everything default).
+    Uses `fnmatch.fnmatchcase` for case-sensitive matching."""
+    if not patterns:
+        return True
+    head = command_first_token(cmd)
+    if not head:
+        return False
+    return any(fnmatch.fnmatchcase(head, p) for p in patterns)
+
+
+def wrap_command(cmd: str, patterns: list[str] | None = None) -> str:
+    """Prefix `cmd` with `exec-hook ` unless already wrapped or filtered
+    out by the operator's pattern list.
 
     Mirrors generate-hooks-shim-settings::wrap_command to keep the
     wrapping behaviour consistent across the two helpers.
@@ -102,6 +149,8 @@ def wrap_command(cmd: str) -> str:
     if stripped.startswith("exec-hook ") or stripped.startswith(f"{EXEC_HOOK_PATH} "):
         return cmd
     if stripped == "exec-hook" or stripped == EXEC_HOOK_PATH:
+        return cmd
+    if patterns and not command_matches_patterns(cmd, patterns):
         return cmd
     return f"{EXEC_HOOK_PATH} {cmd}"
 
@@ -159,11 +208,12 @@ def load_mcp_servers(path: Path, project_key: str | None, quiet: bool) -> dict:
     return merged
 
 
-def wrap_mcp_servers(servers: dict) -> dict:
-    """Wrap each server's `command` field with exec-hook. Pass weird
-    shapes (non-dict definitions, non-string commands) through
-    unchanged — Claude Code's own validator will complain at load
-    time and we don't try to fix what we don't understand.
+def wrap_mcp_servers(servers: dict, patterns: list[str] | None = None) -> dict:
+    """Wrap each server's `command` field with exec-hook (subject to
+    `patterns` filtering — see wrap_command). Pass weird shapes
+    (non-dict definitions, non-string commands) through unchanged —
+    Claude Code's own validator will complain at load time and we
+    don't try to fix what we don't understand.
     """
     wrapped: dict = {}
     for name, definition in servers.items():
@@ -173,7 +223,7 @@ def wrap_mcp_servers(servers: dict) -> dict:
         new_def = dict(definition)
         cmd = definition.get("command")
         if isinstance(cmd, str):
-            new_def["command"] = wrap_command(cmd)
+            new_def["command"] = wrap_command(cmd, patterns)
         wrapped[name] = new_def
     return wrapped
 
@@ -242,11 +292,23 @@ def main(argv: list[str]) -> int:
              "missing, the helper is a graceful no-op.",
     )
     p.add_argument(
+        "--shim-patterns",
+        default=os.environ.get("CLAUDE_SHIM_PATTERNS", ""),
+        help="Colon-separated list of glob patterns. When non-empty, "
+             "only MCP servers whose `command` first token matches at "
+             "least one pattern are wrapped with exec-hook; non-matching "
+             "servers pass through verbatim. Empty / unset = wrap every "
+             "server (default, backward-compatible). Falls back to "
+             "CLAUDE_SHIM_PATTERNS env var if the flag isn't given. "
+             "Example: '/Users/*/.devbar/bin/*:/Users/*/.mcp-adaptor/bin/*'.",
+    )
+    p.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress stderr 'wrote N servers' summary on success.",
     )
     args = p.parse_args(argv)
+    patterns = parse_patterns(args.shim_patterns)
 
     out_dir = args.output_dir.strip() if args.output_dir else ""
     if not out_dir:
@@ -281,7 +343,7 @@ def main(argv: list[str]) -> int:
             )
         return 0
 
-    wrapped = wrap_mcp_servers(servers)
+    wrapped = wrap_mcp_servers(servers, patterns)
     content = render(wrapped)
     out_path = out_dir_path / ".mcp.json"
 
@@ -303,11 +365,19 @@ def main(argv: list[str]) -> int:
             and isinstance(d.get("command"), str)
             and d["command"].startswith(f"{EXEC_HOOK_PATH} ")
         )
-        print(
-            f"generate-project-mcp-json: {action} {out_path} "
-            f"({n_total} server(s), {n_wrapped} wrapped)",
-            file=sys.stderr,
-        )
+        if patterns:
+            print(
+                f"generate-project-mcp-json: {action} {out_path} "
+                f"({n_total} server(s), {n_wrapped} wrapped, "
+                f"patterns={patterns})",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"generate-project-mcp-json: {action} {out_path} "
+                f"({n_total} server(s), {n_wrapped} wrapped)",
+                file=sys.stderr,
+            )
 
     return 0
 
