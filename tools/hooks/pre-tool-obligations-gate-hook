@@ -32,8 +32,15 @@ Behavior:
   any other internal error occurs, log to
   ``~/.config/claude/obligations-hook-errors.log`` and exit 0 (allow). A
   broken hook must NEVER blackhole the loop.
-- Bypass: if ``OBLIGATIONS_BYPASS=1`` is set in the environment, log to
-  ``~/.config/claude/obligations-bypass.log`` and exit 0.
+- Bypass: ``OBLIGATIONS_BYPASS=1`` plus a non-empty
+  ``OBLIGATIONS_BYPASS_REASON=<text>`` is the env-var emergency bypass.
+  When both are set the call is allowed, an audit row goes to
+  ``~/.config/claude/obligations-bypass.log``, AND a loud ``claude-event``
+  is emitted (tag ``obligations-bypass``, source ``claude-watch``) so the
+  next UserPromptSubmit surfaces the bypass to the main loop. If
+  ``OBLIGATIONS_BYPASS=1`` is set WITHOUT a reason the call is DENIED with
+  a banner explaining the requirement -- the env-var path is no longer
+  zero-effort to prevent reflex use.
 
 Hardcoded architectural gates (enforced before the obligations CLI
 dispatch, so stored-state bugs can't disable them):
@@ -95,6 +102,74 @@ def _log(path: Path, payload: dict) -> None:
             pass
     except (OSError, ValueError):
         pass
+
+
+def _emit_bypass_event(tool_name: str, cmd_str: str, agent_id: str,
+                       reason: str) -> None:
+    """Emit a loud ``claude-event`` so the env-var bypass surfaces to the
+    main loop on the next UserPromptSubmit.
+
+    Best-effort: any failure (claude-event missing, exec error, timeout)
+    is swallowed -- the bypass path itself must NEVER break. Test-suite
+    isolation: when ``OBLIGATIONS_DISABLE_CLAUDE_EVENT=1`` is set, this
+    is a no-op so hook tests don't litter ``~/claude-events/``.
+    """
+    if os.environ.get("OBLIGATIONS_DISABLE_CLAUDE_EVENT", "").strip() not in ("", "0"):
+        return
+    cli = shutil.which("claude-event")
+    if not cli:
+        return
+    preview = cmd_str[:160] if cmd_str else ""
+    ctx = "subagent" if agent_id else "main-loop"
+    message = (
+        f"OBLIGATIONS_BYPASS used ({ctx}, tool={tool_name}): {reason}"
+    )
+    try:
+        subprocess.run(
+            [cli, message,
+             "--tag", "obligations-bypass",
+             "--source", "claude-watch",
+             "--priority", "high",
+             "--data", f"tool={tool_name}",
+             "--data", f"agent_id={agent_id}",
+             "--data", f"command_preview={preview}",
+             "--data", f"reason={reason}"],
+            capture_output=True, text=True, timeout=4, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _build_bypass_missing_reason_banner() -> str:
+    """Banner shown when ``OBLIGATIONS_BYPASS=1`` is set without a reason.
+
+    The reason requirement exists to make the env-var bypass non-reflex:
+    a typist who reaches for ``OBLIGATIONS_BYPASS=1 cmd`` should be made
+    to articulate WHY before the call goes through, the same way
+    ``obligations override`` already requires one.
+    """
+    return (
+        "!! BLOCKED: OBLIGATIONS_BYPASS requires a reason\n"
+        "!!\n"
+        "!! You set OBLIGATIONS_BYPASS=1 without OBLIGATIONS_BYPASS_REASON.\n"
+        "!! The env-var bypass path is for genuinely stuck broken-guardrail\n"
+        "!! cases only; reflex use hides the audit trail and shortcuts the\n"
+        "!! signal-context re-read that surfaces inbound DMs on the next\n"
+        "!! UserPromptSubmit.\n"
+        "!!\n"
+        "!! Fix 1 (env-var form -- emits a loud claude-event):\n"
+        "!!   OBLIGATIONS_BYPASS=1 OBLIGATIONS_BYPASS_REASON=\"<text>\" <cmd>\n"
+        "!!\n"
+        "!! Fix 2 (audited CLI override -- preferred for >1 call):\n"
+        "!!   obligations override \"<reason>\" --duration <60|5m|1h>\n"
+        "!!   <cmd>                              # bypass applies for the TTL\n"
+        "!!\n"
+        "!! Either path is audited to ~/.config/claude/obligations-bypass.log\n"
+        "!! and surfaces a claude-event to the main loop. The CLI override\n"
+        "!! ALSO fires a Pushover via pingme; the env-var path is single-call.\n"
+        "!!\n"
+        "!! Hook source: pre-tool-obligations-gate-hook (claude-watch tools/hooks/)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +264,7 @@ def _watcher_ctl_deny(op: str, cmd: str) -> dict:
         "!! command (no &, no ;, no |, no &&/||, no $() or backticks).",
         "!!",
         "!! Hook source:   pre-tool-obligations-gate-hook (claude-watch tools/hooks/)",
-        "!! Emergency bypass: set OBLIGATIONS_BYPASS=1 (audited)",
+        "!! Emergency bypass: OBLIGATIONS_BYPASS=1 OBLIGATIONS_BYPASS_REASON=\"<text>\" (audited; emits claude-event)",
     ]
     banner = "\n".join(banner_lines)
     reason = (
@@ -268,7 +343,7 @@ def _monitor_subagent_deny() -> dict:
         "!! external-messaging threads, etc.).",
         "!!",
         "!! Hook source:   pre-tool-obligations-gate-hook (claude-watch tools/hooks/)",
-        "!! Emergency bypass: set OBLIGATIONS_BYPASS=1 (audited)",
+        "!! Emergency bypass: OBLIGATIONS_BYPASS=1 OBLIGATIONS_BYPASS_REASON=\"<text>\" (audited; emits claude-event)",
     ]
     banner = "\n".join(banner_lines)
     reason = (
@@ -401,7 +476,7 @@ def _build_banner(blocking_list, tool_name) -> str:
         "!! Inspect:  obligations list",
         "!! Manual satisfy:  obligations satisfy <id>",
         "!! Hook source: pre-tool-obligations-gate-hook (claude-watch tools/hooks/)",
-        "!! Emergency bypass: set OBLIGATIONS_BYPASS=1 (audited)",
+        "!! Emergency bypass: OBLIGATIONS_BYPASS=1 OBLIGATIONS_BYPASS_REASON=\"<text>\" (audited; emits claude-event)",
     ]
     return "\n".join(lines)
 
@@ -478,13 +553,32 @@ def main() -> int:
     raw_agent_id = payload.get("agent_id", "")
     agent_id = raw_agent_id.strip() if isinstance(raw_agent_id, str) else ""
 
-    # Emergency bypass
+    # Emergency bypass via env-var prefix. Requires BOTH
+    # ``OBLIGATIONS_BYPASS=1`` AND a non-empty ``OBLIGATIONS_BYPASS_REASON``.
+    # Reason-missing DENIES with an explanatory banner so the env-var path
+    # is not zero-effort to reach for. On allow we BOTH append to the audit
+    # log AND emit a loud claude-event so the bypass surfaces in the next
+    # UserPromptSubmit context (addresses the "too quiet" failure mode that
+    # also shortcut signal-context re-reads after a silent bypass).
     if os.environ.get("OBLIGATIONS_BYPASS", "").strip() not in ("", "0"):
+        reason = os.environ.get("OBLIGATIONS_BYPASS_REASON", "").strip()
+        if not reason:
+            print(json.dumps(_deny(
+                _build_bypass_missing_reason_banner(),
+                "OBLIGATIONS_BYPASS=1 set without OBLIGATIONS_BYPASS_REASON; "
+                "supply a non-empty reason or use `obligations override "
+                "\"<reason>\" --duration <T>` for an audited per-call "
+                "bypass.",
+            )))
+            return 0
         _log(BYPASS_LOG_PATH, {
+            "kind": "env-bypass",
             "tool_name": tool_name,
             "command_string_preview": cmd_str[:200],
             "agent_id": agent_id,
+            "reason": reason,
         })
+        _emit_bypass_event(tool_name, cmd_str, agent_id, reason)
         print(json.dumps(_allow()))
         return 0
 

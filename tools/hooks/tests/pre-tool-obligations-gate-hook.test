@@ -7,7 +7,7 @@ Test cases (PreToolUse):
   2. file_mtime_within fresh    -> allowed
   3. file_mtime_within stale    -> denied with banner
   4. Expired obligation (TTL)   -> not enforced (should allow + auto-prune)
-  5. OBLIGATIONS_BYPASS=1       -> allowed even when predicate fails
+  5. OBLIGATIONS_BYPASS=1       -> a/b deny without reason; c allow with reason; d audit row
   6. no_pipe_pattern matching   -> denied
   7. no_pipe_pattern non-match  -> allowed
   8. PostToolUse satisfies      -> next PreToolUse passes
@@ -103,6 +103,10 @@ Test cases (PreToolUse):
  88. stale_ready_queue_present: auto-mandatory refuses override (exit 4)
  89. override: pingme called when override created
  90. override: pingme suppressed by OBLIGATIONS_DISABLE_PINGME=1
+ 90a. override: emits claude-event with tag obligations-bypass + reason
+ 90b. override: claude-event suppressed by OBLIGATIONS_DISABLE_CLAUDE_EVENT
+ 90c. env-var bypass: emits claude-event with reason + tag obligations-bypass
+ 90d. env-var bypass: claude-event suppressed by OBLIGATIONS_DISABLE_CLAUDE_EVENT
  91. universal recovery: `obligations override` allowed even with row-level deny
  92. universal recovery: `session-task queue register` allowed past arbitrary deny
  93. universal recovery: Read of tasks/<id>.output allowed past arbitrary deny
@@ -191,6 +195,13 @@ def _make_isolated_env(tmpdir: Path):
     session_task_dir = TOOLS_DIR / "session-task"
     env["PATH"] = (f"{obligations_dir}:{session_task_dir}:"
                    f"{env.get('PATH','')}")
+    # Side-effect isolation: the bypass code paths fire pingme (Pushover)
+    # AND claude-event by default. Tests must NEVER spam Andrew's phone
+    # or litter the live ~/claude-events/ queue, so both are off-by-
+    # default in the sandbox. Individual tests that exercise either
+    # surface re-enable it explicitly with a fake binary on PATH.
+    env["OBLIGATIONS_DISABLE_PINGME"] = "1"
+    env["OBLIGATIONS_DISABLE_CLAUDE_EVENT"] = "1"
     obligations_path = tmpdir / ".config" / "claude" / "obligations.json"
     return env, obligations_path
 
@@ -365,7 +376,12 @@ def main() -> int:
         # Best-effort cleanup (may already be auto-pruned)
         _run([str(CLI), "satisfy", ob_ttl], env)
 
-        # --- Test 5: bypass env var ---
+        # --- Test 5: env-var bypass requires BOTH OBLIGATIONS_BYPASS=1
+        # AND a non-empty OBLIGATIONS_BYPASS_REASON. We cover three sub-
+        # cases: (a) BYPASS=1 alone (no reason) -> DENY with the
+        # "requires a reason" banner; (b) BYPASS=1 + empty reason ->
+        # also DENY (whitespace-only reason is rejected); (c) BYPASS=1
+        # + real reason -> ALLOW.
         marker3 = tmpdir / "marker-3"  # also nonexistent
         ob_bypass = _add_ob(
             env,
@@ -375,14 +391,51 @@ def main() -> int:
             ttl=120,
             deny_msg="bypass test marker missing",
         )
+        # 5a: BYPASS=1 without reason -> DENY
         rc, out, _err = _hook_pre(
             {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
             extra_env={"OBLIGATIONS_BYPASS": "1"},
         )
+        banner_5a = (out or {}).get("systemMessage", "") if isinstance(out, dict) else ""
         results.append(_check(
-            "5. OBLIGATIONS_BYPASS=1 forces allow",
+            "5a. OBLIGATIONS_BYPASS=1 without reason -> DENY with banner",
+            (rc == 0
+             and _is_deny(out)
+             and "OBLIGATIONS_BYPASS requires a reason" in banner_5a
+             and "OBLIGATIONS_BYPASS_REASON" in banner_5a),
+            f"rc={rc} deny={_is_deny(out)} banner_excerpt={banner_5a[:200]!r}",
+        ))
+        # 5b: BYPASS=1 with whitespace-only reason -> DENY (treated as empty)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+            extra_env={"OBLIGATIONS_BYPASS": "1",
+                       "OBLIGATIONS_BYPASS_REASON": "   "},
+        )
+        results.append(_check(
+            "5b. OBLIGATIONS_BYPASS=1 with whitespace-only reason -> DENY",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        # 5c: BYPASS=1 with real reason -> ALLOW + audit + claude-event
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+            extra_env={"OBLIGATIONS_BYPASS": "1",
+                       "OBLIGATIONS_BYPASS_REASON": "test 5c reason"},
+        )
+        results.append(_check(
+            "5c. OBLIGATIONS_BYPASS=1 with reason -> ALLOW",
             rc == 0 and _is_allow(out),
             f"rc={rc} out={out}",
+        ))
+        # 5d: audit row appears in obligations-bypass.log with reason
+        bypass_log_5 = tmpdir / ".config" / "claude" / "obligations-bypass.log"
+        log_text_5 = bypass_log_5.read_text() if bypass_log_5.exists() else ""
+        results.append(_check(
+            "5d. env-bypass audit row records reason",
+            (bypass_log_5.exists()
+             and "env-bypass" in log_text_5
+             and "test 5c reason" in log_text_5),
+            f"exists={bypass_log_5.exists()} text_excerpt={log_text_5[-300:]!r}",
         ))
         _run([str(CLI), "satisfy", ob_bypass], env)
 
@@ -2373,18 +2426,22 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
 
-            # 73: OBLIGATIONS_BYPASS=1 should still bypass the hardcoded gate
-            # (audited bypass is the documented escape hatch).
+            # 73: OBLIGATIONS_BYPASS=1 (with required reason) should still
+            # bypass the hardcoded gate (audited bypass is the documented
+            # escape hatch).
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
                  "tool_input": {
                      "command": "watcher-ctl run signal-wait-dm &",
                  }},
                 env_w,
-                extra_env={"OBLIGATIONS_BYPASS": "1"},
+                extra_env={
+                    "OBLIGATIONS_BYPASS": "1",
+                    "OBLIGATIONS_BYPASS_REASON": "test 73",
+                },
             )
             results.append(_check(
-                "73. watcher-ctl gate: OBLIGATIONS_BYPASS=1 forces allow",
+                "73. watcher-ctl gate: OBLIGATIONS_BYPASS=1 (with reason) forces allow",
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
@@ -2503,18 +2560,21 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
 
-            # 74g: OBLIGATIONS_BYPASS=1 forces allow even for subagent
-            # Monitor calls -- the audited bypass is the documented
-            # escape hatch, same as for the watcher-ctl gate.
+            # 74g: OBLIGATIONS_BYPASS=1 (with required reason) forces allow
+            # even for subagent Monitor calls -- the audited bypass is the
+            # documented escape hatch, same as for the watcher-ctl gate.
             rc, out, _err = _hook_pre(
                 {"tool_name": "Monitor",
                  "tool_input": {"task_id": "t"},
                  "agent_id": "agent-uuid-abc123"},
                 env_w,
-                extra_env={"OBLIGATIONS_BYPASS": "1"},
+                extra_env={
+                    "OBLIGATIONS_BYPASS": "1",
+                    "OBLIGATIONS_BYPASS_REASON": "test 74g",
+                },
             )
             results.append(_check(
-                "74g. Monitor gate: OBLIGATIONS_BYPASS=1 forces allow",
+                "74g. Monitor gate: OBLIGATIONS_BYPASS=1 (with reason) forces allow",
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
@@ -2957,6 +3017,139 @@ def main() -> int:
             ))
             if ov_off_id:
                 _run([str(CLI), "satisfy", ov_off_id], env_pm_off)
+
+            # ---- New tests for the bypass loud-events hardening ----
+            # We install a fake `claude-event` on PATH that records its
+            # argv to a file. Both bypass surfaces (env-var + obligations
+            # override CLI) must invoke it; both must skip it when
+            # OBLIGATIONS_DISABLE_CLAUDE_EVENT=1 is set.
+            ce_log = tmpdir_s / "claude-event.log"
+            fake_ce = fake_bin / "claude-event"
+            fake_ce.write_text(
+                "#!/usr/bin/env bash\n"
+                # Record argv (one line per invocation).
+                f"echo \"$@\" >> {ce_log}\n"
+                "exit 0\n"
+            )
+            fake_ce.chmod(0o755)
+            # env_pm already has fake_bin on PATH; turn claude-event back ON
+            # so the bypass surfaces exercise the emission. Pingme is still
+            # OFF via OBLIGATIONS_DISABLE_PINGME so this section isolates
+            # the claude-event surface.
+            env_ce = env_pm.copy()
+            env_ce.pop("OBLIGATIONS_DISABLE_CLAUDE_EVENT", None)
+            env_ce["OBLIGATIONS_DISABLE_PINGME"] = "1"
+
+            # --- 90a: `obligations override` emits a claude-event ---
+            ce_log.unlink(missing_ok=True)
+            proc = _run([
+                str(CLI), "override", "test 90a override reason",
+                "--duration", "120",
+                "--created-by", "test",
+                "--json",
+            ], env_ce)
+            ov_90a_id = (json.loads(proc.stdout)["id"]
+                         if proc.returncode == 0 else "")
+            ce_text_90a = ce_log.read_text() if ce_log.exists() else ""
+            results.append(_check(
+                "90a. override: emits claude-event with tag obligations-bypass + reason",
+                (proc.returncode == 0
+                 and ce_log.exists()
+                 and "--tag obligations-bypass" in ce_text_90a
+                 and "--source claude-watch" in ce_text_90a
+                 and ov_90a_id in ce_text_90a
+                 and "test 90a override reason" in ce_text_90a),
+                f"rc={proc.returncode} ce_exists={ce_log.exists()} "
+                f"text={ce_text_90a!r}",
+            ))
+            if ov_90a_id:
+                _run([str(CLI), "satisfy", ov_90a_id], env_ce)
+
+            # --- 90b: override claude-event suppressed by env flag ---
+            ce_log.unlink(missing_ok=True)
+            env_ce_off = env_ce.copy()
+            env_ce_off["OBLIGATIONS_DISABLE_CLAUDE_EVENT"] = "1"
+            proc = _run([
+                str(CLI), "override", "suppressed claude-event override",
+                "--duration", "120",
+                "--created-by", "test",
+                "--json",
+            ], env_ce_off)
+            ov_90b_id = (json.loads(proc.stdout)["id"]
+                         if proc.returncode == 0 else "")
+            results.append(_check(
+                "90b. override: claude-event suppressed by "
+                "OBLIGATIONS_DISABLE_CLAUDE_EVENT",
+                proc.returncode == 0 and not ce_log.exists(),
+                f"rc={proc.returncode} ce_log_exists={ce_log.exists()}",
+            ))
+            if ov_90b_id:
+                _run([str(CLI), "satisfy", ov_90b_id], env_ce_off)
+
+            # --- 90c: env-var bypass (in the hook) emits a claude-event ---
+            # We need an obligation that the env-var bypass will allow
+            # past; reuse the file_exists predicate against a path that
+            # doesn't exist so the predicate would otherwise deny.
+            ce_log.unlink(missing_ok=True)
+            marker_90c = tmpdir_s / "marker-90c"  # never created
+            ob_90c = _add_ob(
+                env_ce,
+                tool_pattern="Bash",
+                predicate="file_exists",
+                params={"path": str(marker_90c)},
+                ttl=120,
+                deny_msg="90c marker missing",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls /tmp"}},
+                env_ce,
+                extra_env={
+                    "OBLIGATIONS_BYPASS": "1",
+                    "OBLIGATIONS_BYPASS_REASON": "90c bypass reason",
+                },
+            )
+            ce_text_90c = ce_log.read_text() if ce_log.exists() else ""
+            results.append(_check(
+                "90c. env-var bypass: emits claude-event with reason + tag "
+                "obligations-bypass",
+                (rc == 0
+                 and _is_allow(out)
+                 and ce_log.exists()
+                 and "--tag obligations-bypass" in ce_text_90c
+                 and "--source claude-watch" in ce_text_90c
+                 and "90c bypass reason" in ce_text_90c
+                 and "OBLIGATIONS_BYPASS used" in ce_text_90c),
+                f"rc={rc} allow={_is_allow(out)} ce_exists={ce_log.exists()} "
+                f"text={ce_text_90c!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_90c], env_ce)
+
+            # --- 90d: env-var bypass claude-event suppressed by env flag ---
+            ce_log.unlink(missing_ok=True)
+            marker_90d = tmpdir_s / "marker-90d"
+            ob_90d = _add_ob(
+                env_ce_off,
+                tool_pattern="Bash",
+                predicate="file_exists",
+                params={"path": str(marker_90d)},
+                ttl=120,
+                deny_msg="90d marker missing",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls /tmp"}},
+                env_ce_off,
+                extra_env={
+                    "OBLIGATIONS_BYPASS": "1",
+                    "OBLIGATIONS_BYPASS_REASON": "90d bypass reason",
+                },
+            )
+            results.append(_check(
+                "90d. env-var bypass: claude-event suppressed by "
+                "OBLIGATIONS_DISABLE_CLAUDE_EVENT",
+                rc == 0 and _is_allow(out) and not ce_log.exists(),
+                f"rc={rc} allow={_is_allow(out)} ce_log_exists={ce_log.exists()}",
+            ))
+            _run([str(CLI), "satisfy", ob_90d], env_ce_off)
 
         # ---------------------------------------------------------------
         # Tests 91-98: UNIVERSAL RECOVERY EXEMPT (deadlock prevention)
@@ -4688,7 +4881,8 @@ def main() -> int:
             ))
             _run([str(CLI), "satisfy", ob_138], env_eval)
 
-            # --- 139: OBLIGATIONS_BYPASS=1 forces allow past evaluator deny ---
+            # --- 139: OBLIGATIONS_BYPASS=1 (with required reason) forces
+            # allow past evaluator deny ---
             ob_139 = _add_ob(
                 env_eval,
                 tool_pattern="Bash",
@@ -4702,10 +4896,13 @@ def main() -> int:
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash", "tool_input": {"command": "ls"}},
                 env_eval,
-                extra_env={"OBLIGATIONS_BYPASS": "1"},
+                extra_env={
+                    "OBLIGATIONS_BYPASS": "1",
+                    "OBLIGATIONS_BYPASS_REASON": "test 139",
+                },
             )
             results.append(_check(
-                "139. evaluator: OBLIGATIONS_BYPASS=1 forces allow",
+                "139. evaluator: OBLIGATIONS_BYPASS=1 (with reason) forces allow",
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))

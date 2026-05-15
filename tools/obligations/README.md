@@ -95,12 +95,22 @@ Three flavors (in order of precedence at gate-evaluation time):
   3. Per-call audited overrides — `obligations override <reason>
      --duration <60|5m|1h>` registers a short-TTL override that bypasses
      ALL gate-mode obligations. Audited to
-     `~/.config/claude/obligations-bypass.log`. 24h cap.
+     `~/.config/claude/obligations-bypass.log`, fires a Pushover via
+     `pingme`, AND emits a loud `claude-event` (tag `obligations-bypass`,
+     source `claude-watch`) so the bypass surfaces to the main loop on
+     the next UserPromptSubmit. 24h cap.
 
-Legacy env-var bypass: `OBLIGATIONS_BYPASS=1` (also audited; only honored
-in the hook script's process env, NOT propagated from a Bash command's
-inline `OBLIGATIONS_BYPASS=1 cmd` prefix — use `obligations override`
-when you need per-call bypass).
+Env-var emergency bypass: `OBLIGATIONS_BYPASS=1` plus a non-empty
+`OBLIGATIONS_BYPASS_REASON=<text>`. Both must be set; the hook DENIES with
+an explanatory banner if `OBLIGATIONS_BYPASS=1` is set without a reason
+(so the env-var path is not reflex-prepended). On allow, the call is
+audited to `obligations-bypass.log` AND a loud `claude-event` (tag
+`obligations-bypass`, source `claude-watch`) is emitted so the next
+UserPromptSubmit surfaces the bypass to the main loop. The env-var path
+is single-call (one bypass = one allowed tool call); use `obligations
+override` for multi-call windows. Honored in the hook script's process
+env only, NOT propagated from a Bash command's inline
+`OBLIGATIONS_BYPASS=1 cmd` prefix.
 
 Design rule: obligations form a logical CONJUNCTION (every active
 gate must allow a tool for it to fire). Two obligations whose exempt

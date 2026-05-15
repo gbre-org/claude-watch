@@ -715,6 +715,42 @@ def _pingme_override(ov_id, reason, duration_secs):
         pass
 
 
+def _emit_override_event(ov_id, reason, duration_secs, created_by):
+    """Emit a loud ``claude-event`` so an audited CLI override surfaces to
+    the main loop on the next UserPromptSubmit.
+
+    Mirrors the env-var-bypass claude-event emitted by
+    pre-tool-obligations-gate-hook: same tag (``obligations-bypass``) so
+    both surfaces share a single inbox for "this just got bypassed",
+    same ``claude-watch`` source. Best-effort; any failure is swallowed
+    so the override path itself never breaks. Test-suite isolation: when
+    ``OBLIGATIONS_DISABLE_CLAUDE_EVENT=1`` is set, this is a no-op.
+    """
+    if os.environ.get("OBLIGATIONS_DISABLE_CLAUDE_EVENT", "").strip() not in ("", "0"):
+        return
+    cli = shutil.which("claude-event")
+    if not cli:
+        return
+    message = (
+        f"obligations override created ({ov_id}, "
+        f"duration={int(duration_secs)}s): {reason}"
+    )
+    try:
+        subprocess.run(
+            [cli, message,
+             "--tag", "obligations-bypass",
+             "--source", "claude-watch",
+             "--priority", "high",
+             "--data", f"override_id={ov_id}",
+             "--data", f"reason={reason}",
+             "--data", f"duration_secs={int(duration_secs)}",
+             "--data", f"created_by={created_by}"],
+            capture_output=True, text=True, timeout=4, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _now() -> float:
     return time.time()
 
@@ -2421,6 +2457,10 @@ def cmd_override(args):
     # Fire-and-forget Pushover so Andrew sees on his phone that an audited
     # bypass just landed. Best-effort -- any pingme failure is swallowed.
     _pingme_override(ov_id, reason, duration)
+    # ALSO emit a loud claude-event so the bypass surfaces in the next
+    # UserPromptSubmit context to the main loop (mirrors the env-var
+    # bypass emission in pre-tool-obligations-gate-hook). Best-effort.
+    _emit_override_event(ov_id, reason, duration, args.created_by)
 
     if args.json:
         print(json.dumps(ov, indent=2))
