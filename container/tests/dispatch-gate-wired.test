@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Tests that the dispatch-gate hook + CLI are actually wired to fire
+inside the container.
+
+Mirrors claude-watch-alert-gate-wired.test. Asserts:
+
+  1. The Dockerfile COPYs `pre-tool-dispatch-gate-hook` and
+     `claude-watch-dispatch` into /usr/local/bin/ and chmods them +x.
+  2. `generate-hooks-shim-settings --obligations-only --inject-obligations 1`
+     emits a PreToolUse `*`-matcher block whose hooks list contains the
+     baked dispatch-gate hook path.
+  3. Ordering: in the emitted settings.json, the alert-gate hook appears
+     BEFORE the dispatch-gate hook within the same PreToolUse[*] block
+     so alert-gate denies first (and the dispatch-gate doesn't
+     mis-count alert-gated calls).
+  4. End-to-end: hook fires correctly given a state file produced by
+     the CLI (status->reset->set-threshold round-trip).
+  5. End-to-end: under default threshold 3, 1st-3rd Bash allow, 4th
+     denies, then Agent allows + resets, then 1st Bash allows again.
+
+Run:  ./dispatch-gate-wired.test
+
+No external deps beyond Python 3.8+ stdlib. Does NOT require docker /
+a built image / a running claude.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+GENERATOR = CONTAINER_DIR / "hooks-shim" / "generate-hooks-shim-settings"
+GATE_HOOK = REPO_ROOT / "tools" / "hooks" / "pre-tool-dispatch-gate-hook"
+ALERT_HOOK = REPO_ROOT / "tools" / "hooks" / "pre-tool-claude-watch-alert-gate-hook"
+CLI = REPO_ROOT / "tools" / "claude-watch-dispatch" / "claude-watch-dispatch"
+
+BAKED_GATE_HOOK = "/usr/local/bin/pre-tool-dispatch-gate-hook"
+BAKED_ALERT_HOOK = "/usr/local/bin/pre-tool-claude-watch-alert-gate-hook"
+BAKED_CLI = "/usr/local/bin/claude-watch-dispatch"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        print(f"  FAIL {msg}")
+        failures.append(msg)
+
+
+for p in (GENERATOR, GATE_HOOK, ALERT_HOOK, CLI):
+    if not p.is_file():
+        print(f"FAIL: required path missing: {p}", file=sys.stderr)
+        sys.exit(2)
+
+
+def run_generator(input_path: str, output_path: str) -> None:
+    cmd = [
+        sys.executable, str(GENERATOR),
+        "--input", input_path,
+        "--output", output_path,
+        "--quiet",
+        "--inject-obligations", "1",
+        "--obligations-only",
+    ]
+    env = dict(os.environ)
+    for var in ("CLAUDE_SHIM_PATTERNS", "CLAUDE_CONTAINER_OBLIGATIONS",
+                "CLAUDE_SHIM_OBLIGATIONS_ONLY", "CLAUDE_SHIM_INPUT",
+                "CLAUDE_SHIM_OUTPUT"):
+        env.pop(var, None)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"generator exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
+def test_shim_emits_dispatch_gate_hook() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        in_path = Path(td) / "settings.json"
+        in_path.write_text("{}", encoding="utf-8")
+        out_path = Path(td) / "rewritten.json"
+        run_generator(str(in_path), str(out_path))
+        data = json.loads(out_path.read_text(encoding="utf-8"))
+        pre_tool = (data.get("hooks") or {}).get("PreToolUse") or []
+        star_block = None
+        for block in pre_tool:
+            if isinstance(block, dict) and str(block.get("matcher", "")) == "*":
+                star_block = block
+                break
+        expect(star_block is not None,
+               "PreToolUse[*] block missing from shim output")
+        if star_block:
+            commands = [h.get("command")
+                        for h in (star_block.get("hooks") or [])
+                        if isinstance(h, dict)]
+            expect(BAKED_GATE_HOOK in commands,
+                   f"PreToolUse[*] block missing command {BAKED_GATE_HOOK!r}; "
+                   f"got: {commands}")
+
+
+def test_alert_gate_precedes_dispatch_gate() -> None:
+    """Within PreToolUse[*], the alert-gate hook must appear BEFORE the
+    dispatch-gate hook so when both have a reason to fire, the alert
+    denies first and dispatch doesn't increment its counter."""
+    with tempfile.TemporaryDirectory() as td:
+        in_path = Path(td) / "settings.json"
+        in_path.write_text("{}", encoding="utf-8")
+        out_path = Path(td) / "rewritten.json"
+        run_generator(str(in_path), str(out_path))
+        data = json.loads(out_path.read_text(encoding="utf-8"))
+        pre_tool = (data.get("hooks") or {}).get("PreToolUse") or []
+        star_block = None
+        for block in pre_tool:
+            if isinstance(block, dict) and str(block.get("matcher", "")) == "*":
+                star_block = block
+                break
+        if not star_block:
+            return
+        commands = [h.get("command")
+                    for h in (star_block.get("hooks") or [])
+                    if isinstance(h, dict)]
+        try:
+            alert_idx = commands.index(BAKED_ALERT_HOOK)
+            disp_idx = commands.index(BAKED_GATE_HOOK)
+        except ValueError:
+            expect(False,
+                   f"PreToolUse[*] missing alert+dispatch hooks; "
+                   f"got: {commands}")
+            return
+        expect(alert_idx < disp_idx,
+               f"alert-gate ({alert_idx}) must precede dispatch-gate "
+               f"({disp_idx}) in PreToolUse[*]; got: {commands}")
+
+
+def test_dockerfile_bakes_dispatch_hook_and_cli() -> None:
+    df = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    for target in (
+        f"COPY tools/hooks/pre-tool-dispatch-gate-hook {BAKED_GATE_HOOK}",
+        f"COPY tools/claude-watch-dispatch/claude-watch-dispatch {BAKED_CLI}",
+    ):
+        expect(target in df, f"Dockerfile missing: `{target}`")
+    # chmod +x line covers both
+    expect(BAKED_GATE_HOOK in df,
+           f"Dockerfile missing reference to {BAKED_GATE_HOOK}")
+    expect(BAKED_CLI in df,
+           f"Dockerfile missing reference to {BAKED_CLI}")
+
+
+def test_e2e_default_threshold() -> None:
+    """End-to-end: default threshold 3 -> 3 ALLOW, 4th DENY, Agent
+    RESETs to 0, next call ALLOW."""
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "claude-watch"
+        override_path = Path(td) / "dispatch-exempt.txt"
+        env = os.environ.copy()
+        env["CLAUDE_WATCH_DISPATCH_STATE_DIR"] = str(state_dir)
+        env["CLAUDE_WATCH_DISPATCH_EXEMPT_PATH"] = str(override_path)
+        env.pop("CLAUDE_WATCH_DISPATCH_THRESHOLD", None)
+        env.pop("CLAUDE_WATCH_DISPATCH_BYPASS", None)
+        env.pop("CLAUDE_WATCH_DISPATCH_ENABLED", None)
+
+        def run_hook(payload):
+            return subprocess.run(
+                [str(GATE_HOOK)], input=json.dumps(payload),
+                capture_output=True, text=True, env=env, timeout=10, check=False,
+            )
+
+        non_exempt = {"tool_name": "Bash",
+                      "tool_input": {"command": "echo hi"}}
+        for i in range(1, 4):
+            proc = run_hook(non_exempt)
+            out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+            decision = (out.get("hookSpecificOutput") or {}).get("permissionDecision")
+            expect(decision != "deny",
+                   f"e2e call #{i}: should allow under threshold; "
+                   f"got decision={decision!r}, out={out}")
+        proc = run_hook(non_exempt)
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        decision = (out.get("hookSpecificOutput") or {}).get("permissionDecision")
+        expect(decision == "deny",
+               f"e2e call #4: should DENY; got decision={decision!r}")
+
+        # Agent resets
+        agent = {"tool_name": "Agent", "tool_input": {"prompt": "go"}}
+        proc = run_hook(agent)
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        decision = (out.get("hookSpecificOutput") or {}).get("permissionDecision")
+        expect(decision != "deny",
+               f"e2e Agent: should allow + reset; got decision={decision!r}")
+
+        # Next call after Agent allows
+        proc = run_hook(non_exempt)
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        decision = (out.get("hookSpecificOutput") or {}).get("permissionDecision")
+        expect(decision != "deny",
+               f"e2e post-Agent call: should allow; got decision={decision!r}")
+
+
+def test_e2e_cli_reset_clears_gate() -> None:
+    """End-to-end: drive over threshold, then `claude-watch-dispatch
+    reset` allows the next call again."""
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "claude-watch"
+        env = os.environ.copy()
+        env["CLAUDE_WATCH_DISPATCH_STATE_DIR"] = str(state_dir)
+        env["CLAUDE_WATCH_DISPATCH_EXEMPT_PATH"] = str(Path(td) / "exempt.txt")
+        env.pop("CLAUDE_WATCH_DISPATCH_THRESHOLD", None)
+
+        def run_hook(payload):
+            return subprocess.run(
+                [str(GATE_HOOK)], input=json.dumps(payload),
+                capture_output=True, text=True, env=env, timeout=10, check=False,
+            )
+
+        for _ in range(4):
+            run_hook({"tool_name": "Bash", "tool_input": {"command": "echo hi"}})
+        # 5th -> deny
+        proc = run_hook({"tool_name": "Bash",
+                         "tool_input": {"command": "echo hi"}})
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        decision = (out.get("hookSpecificOutput") or {}).get("permissionDecision")
+        expect(decision == "deny", f"e2e pre-reset: deny; got {decision!r}")
+
+        # `claude-watch-dispatch reset` via the CLI
+        reset_proc = subprocess.run(
+            [str(CLI), "reset"], env=env, capture_output=True, text=True,
+            timeout=10, check=False,
+        )
+        expect(reset_proc.returncode == 0,
+               f"cli reset rc=0; got {reset_proc.returncode}, "
+               f"stderr={reset_proc.stderr!r}")
+
+        # Next call allows
+        proc = run_hook({"tool_name": "Bash",
+                         "tool_input": {"command": "echo hi"}})
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        decision = (out.get("hookSpecificOutput") or {}).get("permissionDecision")
+        expect(decision != "deny",
+               f"e2e post-reset: allow; got {decision!r}")
+
+
+def main() -> int:
+    tests = [
+        test_shim_emits_dispatch_gate_hook,
+        test_alert_gate_precedes_dispatch_gate,
+        test_dockerfile_bakes_dispatch_hook_and_cli,
+        test_e2e_default_threshold,
+        test_e2e_cli_reset_clears_gate,
+    ]
+    for t in tests:
+        print(f"== {t.__name__} ==")
+        t()
+    if failures:
+        print(f"\nFAIL dispatch-gate-wired.test "
+              f"({len(failures)} assertion(s) failed)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"\nPASS dispatch-gate-wired.test "
+          f"({len(tests)} test functions, all assertions passed)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

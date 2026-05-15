@@ -419,13 +419,26 @@ COPY tools/hooks/user-prompt-claude-watch-alert-record-hook /usr/local/bin/user-
 # only mechanism (besides the audited bypass env-var) to clear the
 # alert gate.
 COPY tools/claude-watch-ack/claude-watch-ack /usr/local/bin/claude-watch-ack
+# Dispatcher gate -- PreToolUse hook that DENIES the (N+1)th
+# consecutive non-exempt non-Agent tool call (default threshold N=3).
+# Spawning an Agent (or running `claude-watch-dispatch reset`) zeros
+# the counter. Together with the companion CLI, this turns the soft
+# baked-CLAUDE.md `dispatcher, not worker` cardinal into a hard
+# tool-layer gate.
+COPY tools/hooks/pre-tool-dispatch-gate-hook /usr/local/bin/pre-tool-dispatch-gate-hook
+# claude-watch-dispatch CLI -- inspect counter, reset, set threshold,
+# list effective exempt patterns. The CLI itself is exempt from the
+# gate so introspection always works.
+COPY tools/claude-watch-dispatch/claude-watch-dispatch /usr/local/bin/claude-watch-dispatch
 RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/pre-tool-obligations-gate-hook \
             /usr/local/bin/post-tool-obligations-update-hook \
             /usr/local/bin/post-tool-mark-attachment-read-hook \
             /usr/local/bin/pre-tool-claude-watch-alert-gate-hook \
             /usr/local/bin/user-prompt-claude-watch-alert-record-hook \
-            /usr/local/bin/claude-watch-ack
+            /usr/local/bin/claude-watch-ack \
+            /usr/local/bin/pre-tool-dispatch-gate-hook \
+            /usr/local/bin/claude-watch-dispatch
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch

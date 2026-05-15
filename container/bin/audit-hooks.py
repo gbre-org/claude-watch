@@ -110,6 +110,9 @@ KNOWN_BUILTINS = {
     "pre-tool-claude-watch-alert-gate-hook",
     "user-prompt-claude-watch-alert-record-hook",
     "claude-watch-ack",
+    # claude-watch dispatch gate hook + CLI (v60).
+    "pre-tool-dispatch-gate-hook",
+    "claude-watch-dispatch",
 }
 
 

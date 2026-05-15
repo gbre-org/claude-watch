@@ -175,6 +175,19 @@ OBLIGATIONS_HOOKS: list[tuple[str, str, str]] = [
     # itself filters on the `[CLAUDE-WATCH]` substring and is a silent
     # no-op for ordinary prompts.
     ("UserPromptSubmit", "*", "/usr/local/bin/user-prompt-claude-watch-alert-record-hook"),
+    # Dispatcher gate -- counts consecutive non-exempt non-Agent tool
+    # calls; DENIES the (N+1)th once the threshold is crossed (default
+    # 3). The companion `claude-watch-dispatch` CLI inspects state +
+    # exposes a `reset` override, and operators can drop a regex list
+    # at /etc/claude-code/dispatch-exempt.txt to extend the exempt set.
+    # This turns the soft baked-CLAUDE.md `dispatcher, not worker`
+    # cardinal (v58 verdict: PARTIAL) into a hard tool-layer gate.
+    #
+    # Ordering note: this entry follows the alert-gate above so that
+    # when both have a reason to fire, the alert-gate denies first
+    # (Claude Code treats the first DENY as authoritative) and the
+    # dispatch-gate does NOT increment its counter for that call.
+    ("PreToolUse", "*", "/usr/local/bin/pre-tool-dispatch-gate-hook"),
     # Auto-satisfy obligations whose `satisfied_by` pattern matches the
     # just-completed tool. Mirrors the host's PostToolUse "*" matcher.
     ("PostToolUse", "*", "/usr/local/bin/post-tool-obligations-update-hook"),

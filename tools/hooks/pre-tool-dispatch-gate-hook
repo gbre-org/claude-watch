@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""PreToolUse hook -- enforces the dispatcher-cardinal as a hard gate.
+
+This hook tracks consecutive non-exempt non-Agent tool calls. When the
+consecutive count exceeds the threshold (default 3), DENY the next
+non-exempt tool call with a banner that tells the operator to spawn an
+Agent via the queue-protocol.
+
+The state file is `~/.config/claude-watch/dispatch-state.json`. The
+companion `claude-watch-dispatch` CLI exposes:
+
+  - status        -- inspect counter / threshold / last-reset
+  - reset         -- zero the counter (operator override)
+  - set-threshold -- persist a threshold override (wins over env)
+  - list-exempt   -- show the effective exempt-pattern set
+
+Why this exists
+---------------
+
+The v58 verdict on the baked-CLAUDE.md `dispatcher, not worker` cardinal
+was PARTIAL: under queue-protocol friction the in-container session
+reverts to Read+Edit+Bash sequences inline in the main loop rather than
+spawning a subagent. Soft prompt guidance is unreliable; a hard
+tool-layer gate is the only mechanism that reliably forces the
+delegation path. Mirrors the alert-gate's shape.
+
+Wiring (in container settings.json via generate-hooks-shim-settings)::
+
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "*",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/usr/local/bin/pre-tool-dispatch-gate-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+This hook runs ALONGSIDE the obligations-gate, the queue-gate, and the
+claude-watch-alert-gate on the `*` matcher; Claude Code runs every
+matching hook and treats the first DENY as authoritative. Ordering note:
+the alert-gate is INTENTIONALLY higher priority -- if a claude-watch
+alert is pending, the alert-gate denies first and this hook does NOT
+increment its counter (the hook only fires AFTER all earlier hooks
+allow). That ordering is enforced by `generate-hooks-shim-settings`,
+which appends in policy order; see OBLIGATIONS_HOOKS in that file.
+
+Tweakability (Andrew explicit: "some tweakability is important")
+-----------------------------------------------------------------
+
+  - CLAUDE_WATCH_DISPATCH_THRESHOLD     override the default 3
+  - CLAUDE_WATCH_DISPATCH_ENABLED=0     disable entirely (allow + no
+                                        state tracking)
+  - CLAUDE_WATCH_DISPATCH_BYPASS=1      one-shot allow + audit log
+                                        (mirrors CLAUDE_WATCH_ALERT_BYPASS)
+  - /etc/claude-code/dispatch-exempt.txt
+        one regex per line, # comments, supplements baked-in patterns
+        without rebuilding the container
+
+Default-open contract
+---------------------
+
+  - State-file missing OR unreadable -> allow + treat as fresh state.
+  - State-file present but malformed -> allow + treat as fresh state.
+  - Hook script internal error       -> allow + audit log.
+  - CLAUDE_WATCH_DISPATCH_ENABLED=0  -> allow + no state mutation.
+  - CLAUDE_WATCH_DISPATCH_BYPASS=1   -> allow + audit log.
+  - Override file unreadable         -> allow with baked-in patterns
+                                        only.
+
+A broken hook MUST NEVER blackhole the loop. The cost of an
+over-permissive failure mode is one un-enforced dispatcher cardinal --
+no worse than the v58 status quo. The cost of an over-restrictive
+failure mode is "every tool call denies" with no recovery path.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths + defaults
+# ---------------------------------------------------------------------------
+
+STATE_DIR = Path(os.environ.get(
+    "CLAUDE_WATCH_DISPATCH_STATE_DIR",
+    os.path.expanduser("~/.config/claude-watch"),
+))
+STATE_PATH = STATE_DIR / "dispatch-state.json"
+
+EXEMPT_OVERRIDE_PATH = Path(os.environ.get(
+    "CLAUDE_WATCH_DISPATCH_EXEMPT_PATH",
+    "/etc/claude-code/dispatch-exempt.txt",
+))
+
+ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+ERR_LOG_PATH = ERR_LOG_DIR / "claude-watch-dispatch-hook-errors.log"
+BYPASS_LOG_PATH = ERR_LOG_DIR / "claude-watch-dispatch-bypass.log"
+
+DEFAULT_THRESHOLD = 3
+
+
+# ---------------------------------------------------------------------------
+# Exempt-pattern matrix -- mirror of CLI's BAKED_BASH_EXEMPT_PATTERNS.
+#
+# We deliberately DUPLICATE the list here rather than importing the CLI
+# module: the CLI lives at /usr/local/bin/claude-watch-dispatch as a flat
+# script (not a Python package on sys.path). Re-defining locally also
+# keeps the hook's import surface zero -- the only allowed imports are
+# stdlib so the hook starts in <10ms.
+# ---------------------------------------------------------------------------
+
+_BAKED_BASH_EXEMPT_PATTERNS = [
+    r"^ls(?:\s|$)",
+    r"^pwd(?:\s|$)",
+    r"^cat(?:\s|$)",
+    r"^grep(?:\s|$)",
+    r"^rg(?:\s|$)",
+    r"^find\s+(?!.*-delete)(?!.*-exec).*",
+    r"^find\s*$",
+    r"^git\s+(?:status|diff|log|show|rev-parse|branch|blame)(?:\s|$)",
+    r"^session-task(?:\s|$)",
+    r"^/usr/local/bin/session-task(?:\s|$)",
+    r"^claude-watch-ack(?:\s|$)",
+    r"^/usr/local/bin/claude-watch-ack(?:\s|$)",
+    r"^claude-watch-dispatch(?:\s|$)",
+    r"^/usr/local/bin/claude-watch-dispatch(?:\s|$)",
+    r"^obligations\s+(?:list|show|status)(?:\s|$)",
+    r"^/usr/local/bin/obligations\s+(?:list|show|status)(?:\s|$)",
+    r"^self-clear(?:\s|$)",
+    r"^/usr/local/bin/self-clear(?:\s|$)",
+    r"^agent-msg\s+(?:inbox|list|status)(?:\s|$)",
+    r"^/usr/local/bin/agent-msg\s+(?:inbox|list|status)(?:\s|$)",
+]
+
+# Tool names that bypass tracking + denial regardless of args. Agent is
+# the desired-behavior trigger -- a successful Agent spawn RESETS the
+# counter to 0. Read is exempt because file inspection is the canonical
+# read-only pattern and we don't want to discourage it.
+_BAKED_EXEMPT_TOOLS = frozenset({"Read", "Agent"})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _allow() -> dict:
+    return {}
+
+
+def _deny(banner: str, reason: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": banner,
+    }
+
+
+def _log(path: Path, payload: dict) -> None:
+    try:
+        ERR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        rec = {"ts": ts, "pid": os.getpid(), **payload}
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _load_state() -> dict:
+    """Default-open: missing / corrupt state -> fresh state."""
+    if not STATE_PATH.exists():
+        return {
+            "count": 0,
+            "last_reset_at_ns": time.time_ns(),
+            "threshold": 0,
+        }
+    try:
+        with STATE_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {
+            "count": 0,
+            "last_reset_at_ns": time.time_ns(),
+            "threshold": 0,
+        }
+    if not isinstance(data, dict):
+        return {
+            "count": 0,
+            "last_reset_at_ns": time.time_ns(),
+            "threshold": 0,
+        }
+    out = {
+        "count": 0,
+        "last_reset_at_ns": time.time_ns(),
+        "threshold": 0,
+    }
+    if isinstance(data.get("count"), int) and data["count"] >= 0:
+        out["count"] = data["count"]
+    if isinstance(data.get("last_reset_at_ns"), int):
+        out["last_reset_at_ns"] = data["last_reset_at_ns"]
+    if isinstance(data.get("threshold"), int) and data["threshold"] >= 0:
+        out["threshold"] = data["threshold"]
+    return out
+
+
+def _save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, STATE_PATH)
+
+
+def _effective_threshold(state: dict) -> int:
+    """State override wins, then env, then default."""
+    if state.get("threshold"):
+        return int(state["threshold"])
+    env = os.environ.get("CLAUDE_WATCH_DISPATCH_THRESHOLD", "").strip()
+    if env:
+        try:
+            n = int(env)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+    return DEFAULT_THRESHOLD
+
+
+def _load_override_patterns() -> list[str]:
+    if not EXEMPT_OVERRIDE_PATH.exists():
+        return []
+    try:
+        text = EXEMPT_OVERRIDE_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
+def _compile_patterns() -> list[re.Pattern]:
+    """Compile the effective pattern list (baked + override).
+
+    Override patterns that fail to compile are silently dropped so a
+    typo in /etc/claude-code/dispatch-exempt.txt can't brick the gate.
+    The error is logged for the operator's awareness.
+    """
+    out: list[re.Pattern] = []
+    for p in _BAKED_BASH_EXEMPT_PATTERNS:
+        try:
+            out.append(re.compile(p))
+        except re.error:
+            # Baked-in pattern broken -> developer error; log + skip.
+            _log(ERR_LOG_PATH, {"kind": "bad-baked-pattern", "pattern": p})
+            continue
+    for p in _load_override_patterns():
+        try:
+            out.append(re.compile(p))
+        except re.error as e:
+            _log(ERR_LOG_PATH, {
+                "kind": "bad-override-pattern", "pattern": p, "exc": str(e),
+            })
+            continue
+    return out
+
+
+def _bash_command_string(tool_input: dict) -> str:
+    cmd = tool_input.get("command", "")
+    return cmd if isinstance(cmd, str) else ""
+
+
+def _is_bash_exempt(cmd: str, compiled: list[re.Pattern]) -> bool:
+    if not cmd:
+        return False
+    stripped = cmd.lstrip()
+    return any(rx.match(stripped) for rx in compiled)
+
+
+def _is_exempt(tool_name: str, tool_input: dict,
+               compiled: list[re.Pattern]) -> bool:
+    if tool_name in _BAKED_EXEMPT_TOOLS:
+        return True
+    if tool_name == "Bash":
+        return _is_bash_exempt(_bash_command_string(tool_input), compiled)
+    return False
+
+
+def _build_banner(count: int, threshold: int, tool_name: str) -> str:
+    lines = [
+        "!! BLOCKED: dispatcher gate "
+        f"({count} consecutive non-exempt tool call(s), threshold {threshold})",
+        "!!",
+        f"!! Tool: {tool_name}",
+        "!!",
+        "!! The baked-CLAUDE.md `dispatcher, not worker` cardinal applies:",
+        "!! any operation needing more than ONE tool call MUST be delegated",
+        "!! to a subagent via the Task / Agent tool.",
+        "!!",
+        "!! Spawn an Agent via the queue-protocol to clear this gate:",
+        "!!   session-task queue add \"<headline>\" --scope <scope>",
+        "!!   session-task queue spawn-check <id>      # check ready_now",
+        "!!   session-task queue register <id>",
+        "!!   # then Agent prompt MUST include: Queue item: q-XXXX",
+        "!!",
+        "!! Or, if delegation isn't applicable (single-step inspection,",
+        "!! operator-driven recovery), use one of:",
+        "!!   claude-watch-dispatch reset              # zero the counter",
+        "!!   export CLAUDE_WATCH_DISPATCH_BYPASS=1    # one-shot, audited",
+        "!!",
+        "!! Tweakability:",
+        "!!   claude-watch-dispatch status             # inspect state",
+        "!!   claude-watch-dispatch list-exempt        # show exempt set",
+        "!!   claude-watch-dispatch set-threshold N    # persist override",
+        "!!   export CLAUDE_WATCH_DISPATCH_THRESHOLD=5 # per-session env",
+        "!!   /etc/claude-code/dispatch-exempt.txt     # operator overrides",
+        "!!",
+        "!! Disable entirely:",
+        "!!   export CLAUDE_WATCH_DISPATCH_ENABLED=0   # allow + no tracking",
+        "!!",
+        "!! Hook source: pre-tool-dispatch-gate-hook",
+        "!!              (claude-watch tools/hooks/)",
+    ]
+    return "\n".join(lines)
+
+
+def _build_reason(count: int, threshold: int, tool_name: str) -> str:
+    return (
+        f"dispatcher gate: {count} consecutive non-exempt tool call(s) "
+        f"(threshold {threshold}); spawn an Agent via the queue-protocol "
+        f"to delegate, or run `claude-watch-dispatch reset`. Triggering "
+        f"tool: {tool_name}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    # Short-circuit: disabled by env.
+    if os.environ.get("CLAUDE_WATCH_DISPATCH_ENABLED", "1").strip() in ("", "0"):
+        print(json.dumps(_allow()))
+        return 0
+
+    # Short-circuit: emergency bypass.
+    if os.environ.get("CLAUDE_WATCH_DISPATCH_BYPASS", "").strip() not in ("", "0"):
+        _log(BYPASS_LOG_PATH, {"kind": "bypass-env"})
+        print(json.dumps(_allow()))
+        return 0
+
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        print(json.dumps(_allow()))
+        return 0
+    if not isinstance(payload, dict):
+        print(json.dumps(_allow()))
+        return 0
+
+    tool_name = payload.get("tool_name", "")
+    if not isinstance(tool_name, str) or not tool_name:
+        print(json.dumps(_allow()))
+        return 0
+
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    # Agent ALWAYS resets to 0 -- that's the whole point of the gate.
+    # We do this BEFORE the exempt-tool short-circuit so Agent spawns
+    # persist the reset to the state file. Read does NOT reset (it's
+    # exempt from tracking but doesn't undo accumulated count).
+    if tool_name == "Agent":
+        state = _load_state()
+        if state["count"] != 0:
+            state["count"] = 0
+            state["last_reset_at_ns"] = time.time_ns()
+            _save_state(state)
+        print(json.dumps(_allow()))
+        return 0
+
+    compiled = _compile_patterns()
+    if _is_exempt(tool_name, tool_input, compiled):
+        # Read + Bash-exempt commands: allow without touching state.
+        print(json.dumps(_allow()))
+        return 0
+
+    state = _load_state()
+    threshold = _effective_threshold(state)
+
+    # This call counts against the gate. We INCREMENT first, then check.
+    # That way the threshold reads as "you may make N consecutive
+    # non-exempt calls; the (N+1)th denies". Default 3 -> 3 inline calls
+    # OK, 4th denies.
+    new_count = int(state["count"]) + 1
+
+    if new_count > threshold:
+        # DENY. Do NOT persist the increment -- otherwise the gate would
+        # keep ratcheting up while the operator tries to comply, and
+        # `reset` would be the only way out. Leaving the counter pinned
+        # at threshold lets the operator spawn an Agent (which decrements
+        # / resets) without an extra hop.
+        banner = _build_banner(state["count"], threshold, tool_name)
+        reason = _build_reason(state["count"], threshold, tool_name)
+        print(json.dumps(_deny(banner, reason)))
+        return 0
+
+    # Under threshold: allow + persist the increment.
+    state["count"] = new_count
+    _save_state(state)
+    print(json.dumps(_allow()))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 -- last-ditch default-open
+        try:
+            _log(ERR_LOG_PATH, {"kind": "uncaught", "exc": str(exc)})
+        except Exception:
+            pass
+        print("{}")
+        sys.exit(0)

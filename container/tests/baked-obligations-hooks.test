@@ -62,6 +62,10 @@ OBLIGATIONS_HOOK_NAMES = [
     # prompts. Companion `claude-watch-ack` CLI clears the gate.
     "pre-tool-claude-watch-alert-gate-hook",
     "user-prompt-claude-watch-alert-record-hook",
+    # Dispatcher gate (v60) -- adds a hard PreToolUse DENY after N
+    # consecutive non-exempt non-Agent tool calls (default N=3).
+    # Companion `claude-watch-dispatch` CLI inspects state + resets.
+    "pre-tool-dispatch-gate-hook",
 ]
 
 failures: list[str] = []

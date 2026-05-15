@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""Tests for pre-tool-dispatch-gate-hook.
+
+Mirrors the shape of pre-tool-claude-watch-alert-gate-hook.test. Covers:
+
+  - State file missing / corrupt -> allow (default-open).
+  - Threshold default 3: 1st/2nd/3rd non-exempt call ALLOW, 4th DENY.
+  - Each baked exempt pattern allows (one assertion per pattern).
+  - Read tool (any path) is exempt + doesn't increment.
+  - Agent tool ALWAYS allows + RESETS the counter to 0.
+  - claude-watch-dispatch reset (via CLI) zeros the counter.
+  - CLAUDE_WATCH_DISPATCH_THRESHOLD env var: picked up immediately.
+  - CLAUDE_WATCH_DISPATCH_BYPASS=1 -> allow + audit log.
+  - CLAUDE_WATCH_DISPATCH_ENABLED=0 -> allow + no state mutation.
+  - Override file (/etc/claude-code/dispatch-exempt.txt): supplements
+    baked-in patterns; bad regex in override is silently dropped.
+  - DENY response shape: hookSpecificOutput.permissionDecision == "deny".
+
+Run:  ./pre-tool-dispatch-gate-hook.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOK = HERE.parent / "pre-tool-dispatch-gate-hook"
+CLI = HERE.parent.parent / "claude-watch-dispatch" / "claude-watch-dispatch"
+
+
+class Harness:
+    def __init__(self, threshold: int | None = None,
+                 override_patterns: list[str] | None = None) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self.tmpdir.name) / "claude-watch"
+        self.env = os.environ.copy()
+        self.env["CLAUDE_WATCH_DISPATCH_STATE_DIR"] = str(self.state_dir)
+        # Always isolate the override file -- never read /etc by accident.
+        self.override_path = Path(self.tmpdir.name) / "dispatch-exempt.txt"
+        self.env["CLAUDE_WATCH_DISPATCH_EXEMPT_PATH"] = str(self.override_path)
+        if override_patterns is not None:
+            self.override_path.write_text(
+                "\n".join(override_patterns) + "\n", encoding="utf-8",
+            )
+        # Clear any inherited dispatch envs that would skew the test.
+        self.env.pop("CLAUDE_WATCH_DISPATCH_BYPASS", None)
+        self.env.pop("CLAUDE_WATCH_DISPATCH_ENABLED", None)
+        self.env.pop("CLAUDE_WATCH_DISPATCH_THRESHOLD", None)
+        if threshold is not None:
+            self.env["CLAUDE_WATCH_DISPATCH_THRESHOLD"] = str(threshold)
+
+    def cleanup(self) -> None:
+        self.tmpdir.cleanup()
+
+    def run_hook(self, payload: dict,
+                 extra_env: dict | None = None) -> tuple[int, dict, str]:
+        env = self.env.copy()
+        if extra_env:
+            env.update(extra_env)
+        proc = subprocess.run(
+            [str(HOOK)],
+            input=json.dumps(payload),
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        try:
+            out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        except json.JSONDecodeError:
+            out = {"__raw__": proc.stdout}
+        return proc.returncode, out, proc.stderr
+
+    def run_cli(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(CLI), *args],
+            capture_output=True, text=True, env=self.env, timeout=10, check=False,
+        )
+
+    def read_state(self) -> dict:
+        sf = self.state_dir / "dispatch-state.json"
+        if not sf.exists():
+            return {}
+        return json.loads(sf.read_text(encoding="utf-8"))
+
+
+def _is_deny(out: dict) -> bool:
+    return (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+
+
+def _is_allow(out: dict) -> bool:
+    return not _is_deny(out)
+
+
+failures: list[str] = []
+
+
+def check(cond: bool, label: str, detail: str = "") -> None:
+    if cond:
+        print(f"  ok  {label}")
+    else:
+        print(f"  FAIL {label}: {detail}")
+        failures.append(label)
+
+
+# -- tests --------------------------------------------------------------------
+
+
+NON_EXEMPT_BASH = {"tool_name": "Bash",
+                   "tool_input": {"command": "echo hello"}}
+
+
+def test_empty_state_allows():
+    h = Harness()
+    try:
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(rc == 0, "empty state: rc=0")
+        check(_is_allow(out), "empty state: allow", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_missing_state_allows():
+    h = Harness()
+    try:
+        # Don't even create the state dir
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(rc == 0, "missing state: rc=0")
+        check(_is_allow(out), "missing state: allow", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_threshold_default_3_denies_on_4th():
+    h = Harness()
+    try:
+        # 3 ALLOWs, 4th DENY.
+        for i in range(1, 4):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+            check(_is_allow(out), f"call #{i} (<=threshold): allow",
+                  f"out={out}")
+        # After 3 incremented allows, counter == 3 == threshold.
+        check(h.read_state().get("count") == 3,
+              "after 3 calls: state.count == 3",
+              f"state={h.read_state()}")
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "call #4: deny", f"out={out}")
+        banner = out.get("systemMessage", "")
+        check("BLOCKED: dispatcher gate" in banner,
+              "deny banner has BLOCKED header")
+        check("Queue item: q-" in banner,
+              "deny banner references queue protocol")
+        check("claude-watch-dispatch reset" in banner,
+              "deny banner mentions reset")
+    finally:
+        h.cleanup()
+
+
+def test_agent_resets_counter():
+    h = Harness()
+    try:
+        # 3 non-exempt calls -> count == 3
+        for _ in range(3):
+            h.run_hook(NON_EXEMPT_BASH)
+        check(h.read_state().get("count") == 3,
+              "pre-Agent: count == 3", f"state={h.read_state()}")
+        # Agent call -> allow + reset to 0
+        rc, out, _ = h.run_hook({"tool_name": "Agent",
+                                 "tool_input": {"prompt": "do stuff"}})
+        check(_is_allow(out), "Agent: allow", f"out={out}")
+        check(h.read_state().get("count") == 0,
+              "post-Agent: count == 0", f"state={h.read_state()}")
+        # Subsequent non-exempt call OK
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_allow(out), "post-Agent non-exempt: allow",
+              f"out={out}")
+        check(h.read_state().get("count") == 1,
+              "post-Agent + 1 call: count == 1", f"state={h.read_state()}")
+    finally:
+        h.cleanup()
+
+
+def test_read_tool_exempt_no_increment():
+    h = Harness()
+    try:
+        for _ in range(5):
+            rc, out, _ = h.run_hook(
+                {"tool_name": "Read", "tool_input": {"file_path": "/tmp/x"}}
+            )
+            check(_is_allow(out), "Read: allow", f"out={out}")
+        # state file shouldn't exist / count should be 0
+        state = h.read_state()
+        check(state.get("count", 0) == 0,
+              "Read: doesn't increment counter", f"state={state}")
+    finally:
+        h.cleanup()
+
+
+def test_baked_bash_exempt_patterns_allow():
+    h = Harness()
+    try:
+        exempt_cmds = [
+            "ls",
+            "ls -la /tmp",
+            "pwd",
+            "cat /etc/hostname",
+            "grep foo bar.txt",
+            "rg --json pattern",
+            "find . -name '*.py'",
+            "git status",
+            "git diff --cached",
+            "git log --oneline -10",
+            "git rev-parse HEAD",
+            "git show HEAD",
+            "git branch",
+            "git blame foo.py",
+            "session-task set 'continue'",
+            "session-task queue add foo --scope x",
+            "/usr/local/bin/session-task clear",
+            "claude-watch-ack list",
+            "claude-watch-ack ack alert-xyz",
+            "/usr/local/bin/claude-watch-ack status",
+            "claude-watch-dispatch status",
+            "claude-watch-dispatch reset",
+            "claude-watch-dispatch list-exempt",
+            "/usr/local/bin/claude-watch-dispatch set-threshold 5",
+            "obligations list",
+            "obligations show ob-2026",
+            "obligations status",
+            "/usr/local/bin/obligations list",
+            "self-clear",
+            "/usr/local/bin/self-clear",
+            "agent-msg inbox",
+            "agent-msg list",
+            "/usr/local/bin/agent-msg status",
+        ]
+        for cmd in exempt_cmds:
+            rc, out, _ = h.run_hook({"tool_name": "Bash",
+                                     "tool_input": {"command": cmd}})
+            check(_is_allow(out), f"exempt: {cmd!r}", f"out={out}")
+        # None of those should have incremented the counter
+        state = h.read_state()
+        check(state.get("count", 0) == 0,
+              "exempt cmds: counter stayed at 0", f"state={state}")
+    finally:
+        h.cleanup()
+
+
+def test_find_with_delete_is_NOT_exempt():
+    """`find ... -delete` and `find ... -exec` are deliberately NOT
+    exempt -- they're destructive enough that they should run through
+    a delegated agent or via explicit operator override."""
+    h = Harness()
+    try:
+        # First, accumulate to threshold-1 with truly exempt calls.
+        # Then verify the destructive find triggers the counter.
+        # Reset state cleanly.
+        h.run_cli("reset")
+        rc, out, _ = h.run_hook({"tool_name": "Bash",
+                                 "tool_input": {"command": "find . -delete"}})
+        check(_is_allow(out), "find -delete first call: allow (under threshold)",
+              f"out={out}")
+        check(h.read_state().get("count") == 1,
+              "find -delete: increments counter",
+              f"state={h.read_state()}")
+    finally:
+        h.cleanup()
+
+
+def test_env_threshold_picked_up_immediately():
+    """CLAUDE_WATCH_DISPATCH_THRESHOLD=5 -> 5 ALLOWs, 6th DENY."""
+    h = Harness(threshold=5)
+    try:
+        for i in range(1, 6):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+            check(_is_allow(out), f"threshold=5 call #{i}: allow", f"out={out}")
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "threshold=5 call #6: deny", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_bypass_env_var():
+    h = Harness()
+    try:
+        # Push above threshold to ensure subsequent calls would deny
+        for _ in range(4):
+            h.run_hook(NON_EXEMPT_BASH)
+        # With bypass set, allow
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH,
+                                extra_env={"CLAUDE_WATCH_DISPATCH_BYPASS": "1"})
+        check(_is_allow(out), "bypass=1: allow even over threshold",
+              f"out={out}")
+        # Without bypass, deny again
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "bypass off: deny resumes", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_disabled_env_var():
+    h = Harness()
+    try:
+        for i in range(10):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH,
+                                    extra_env={"CLAUDE_WATCH_DISPATCH_ENABLED": "0"})
+            check(_is_allow(out), f"disabled call #{i}: allow", f"out={out}")
+        # State should NEVER have been written
+        check(not (h.state_dir / "dispatch-state.json").exists(),
+              "disabled: state file not created")
+    finally:
+        h.cleanup()
+
+
+def test_reset_via_cli():
+    h = Harness()
+    try:
+        for _ in range(3):
+            h.run_hook(NON_EXEMPT_BASH)
+        check(h.read_state().get("count") == 3,
+              "pre-reset: count == 3", f"state={h.read_state()}")
+        proc = h.run_cli("reset")
+        check(proc.returncode == 0, "cli reset: rc=0",
+              f"stderr={proc.stderr!r}")
+        check(h.read_state().get("count") == 0,
+              "post-reset: count == 0", f"state={h.read_state()}")
+    finally:
+        h.cleanup()
+
+
+def test_set_threshold_via_cli():
+    h = Harness()
+    try:
+        proc = h.run_cli("set-threshold", "7")
+        check(proc.returncode == 0, "cli set-threshold: rc=0",
+              f"stderr={proc.stderr!r}")
+        check(h.read_state().get("threshold") == 7,
+              "post-set-threshold: state.threshold == 7",
+              f"state={h.read_state()}")
+        # Now 7 ALLOWs, 8th DENY (env not set, state override wins)
+        for i in range(1, 8):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+            check(_is_allow(out), f"threshold=7 call #{i}: allow",
+                  f"out={out}")
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "threshold=7 call #8: deny", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_override_file_supplements_exempt():
+    """Operator can add a custom exempt regex via dispatch-exempt.txt."""
+    h = Harness(override_patterns=[
+        r"^my-custom-tool(?:\s|$)",
+        "# this is a comment",
+        "",  # blank line
+    ])
+    try:
+        for _ in range(5):
+            rc, out, _ = h.run_hook({"tool_name": "Bash",
+                                     "tool_input": {"command": "my-custom-tool --do-thing"}})
+            check(_is_allow(out), "override: my-custom-tool exempt",
+                  f"out={out}")
+        # Baked-in pattern still works alongside override
+        rc, out, _ = h.run_hook({"tool_name": "Bash",
+                                 "tool_input": {"command": "git status"}})
+        check(_is_allow(out), "override + baked-in: git status still exempt",
+              f"out={out}")
+        # And a non-exempt call still counts toward threshold
+        for _ in range(4):
+            h.run_hook(NON_EXEMPT_BASH)
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "override doesn't soften threshold",
+              f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_bad_override_regex_silently_dropped():
+    """A typo in the override file shouldn't brick the gate."""
+    h = Harness(override_patterns=[
+        r"[unclosed",  # invalid regex
+        r"^safe-cmd(?:\s|$)",  # valid -- should still be picked up
+    ])
+    try:
+        # Bad regex dropped, valid one still works.
+        rc, out, _ = h.run_hook({"tool_name": "Bash",
+                                 "tool_input": {"command": "safe-cmd --arg"}})
+        check(_is_allow(out), "bad override regex: valid pattern still exempts",
+              f"out={out}")
+        # And the hook didn't crash.
+        check(rc == 0, "bad override regex: rc=0")
+    finally:
+        h.cleanup()
+
+
+def test_missing_override_file_falls_back_to_baked():
+    """Override path that doesn't exist -> baked-in patterns only."""
+    h = Harness()
+    try:
+        # Don't write the override file (Harness only writes if patterns given)
+        check(not h.override_path.exists(),
+              "precondition: override file missing")
+        # `git status` is in BAKED set
+        rc, out, _ = h.run_hook({"tool_name": "Bash",
+                                 "tool_input": {"command": "git status"}})
+        check(_is_allow(out), "missing override file: baked git status exempt",
+              f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_corrupt_state_treated_as_fresh():
+    h = Harness()
+    try:
+        h.state_dir.mkdir(parents=True, exist_ok=True)
+        (h.state_dir / "dispatch-state.json").write_text("not json{{",
+                                                          encoding="utf-8")
+        # Should allow + start fresh
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_allow(out), "corrupt state: allow (default-open)",
+              f"out={out}")
+        # After the call, state should be written with count=1
+        check(h.read_state().get("count") == 1,
+              "corrupt state: replaced with fresh count=1",
+              f"state={h.read_state()}")
+    finally:
+        h.cleanup()
+
+
+def test_malformed_stdin_allows():
+    h = Harness()
+    try:
+        proc = subprocess.run(
+            [str(HOOK)], input="this is not json{",
+            capture_output=True, text=True, env=h.env, timeout=10, check=False,
+        )
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        check(_is_allow(out), "malformed stdin: allow", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_deny_response_shape():
+    h = Harness()
+    try:
+        for _ in range(3):
+            h.run_hook(NON_EXEMPT_BASH)
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        hso = out.get("hookSpecificOutput") or {}
+        check(hso.get("hookEventName") == "PreToolUse",
+              "deny shape: hookEventName=PreToolUse")
+        check(hso.get("permissionDecision") == "deny",
+              "deny shape: permissionDecision=deny")
+        check(isinstance(hso.get("permissionDecisionReason"), str)
+              and hso["permissionDecisionReason"],
+              "deny shape: reason is non-empty string")
+        check(isinstance(out.get("systemMessage"), str)
+              and out["systemMessage"],
+              "deny shape: systemMessage is non-empty string")
+    finally:
+        h.cleanup()
+
+
+def test_counter_does_not_ratchet_during_deny():
+    """While denying, the counter should NOT keep increasing (otherwise
+    the operator would have to call reset just to lower it). Pinned at
+    threshold."""
+    h = Harness()
+    try:
+        for _ in range(3):
+            h.run_hook(NON_EXEMPT_BASH)
+        # Fire 5 deny'd calls in a row
+        for _ in range(5):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+            check(_is_deny(out), "deny: holds")
+        # Counter should still be 3, not 8
+        check(h.read_state().get("count") == 3,
+              "deny doesn't ratchet counter", f"state={h.read_state()}")
+    finally:
+        h.cleanup()
+
+
+def test_status_cli_is_exempt_even_at_threshold():
+    """The CLI itself must be reachable even when blocked -- otherwise
+    the operator can't introspect their way out."""
+    h = Harness()
+    try:
+        for _ in range(10):  # push way over threshold
+            h.run_hook(NON_EXEMPT_BASH)
+        rc, out, _ = h.run_hook({"tool_name": "Bash",
+                                 "tool_input": {"command": "claude-watch-dispatch status"}})
+        check(_is_allow(out), "claude-watch-dispatch status: always exempt",
+              f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def main() -> int:
+    tests = [
+        test_empty_state_allows,
+        test_missing_state_allows,
+        test_threshold_default_3_denies_on_4th,
+        test_agent_resets_counter,
+        test_read_tool_exempt_no_increment,
+        test_baked_bash_exempt_patterns_allow,
+        test_find_with_delete_is_NOT_exempt,
+        test_env_threshold_picked_up_immediately,
+        test_bypass_env_var,
+        test_disabled_env_var,
+        test_reset_via_cli,
+        test_set_threshold_via_cli,
+        test_override_file_supplements_exempt,
+        test_bad_override_regex_silently_dropped,
+        test_missing_override_file_falls_back_to_baked,
+        test_corrupt_state_treated_as_fresh,
+        test_malformed_stdin_allows,
+        test_deny_response_shape,
+        test_counter_does_not_ratchet_during_deny,
+        test_status_cli_is_exempt_even_at_threshold,
+    ]
+    for t in tests:
+        print(f"\n== {t.__name__} ==")
+        t()
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)} assertion(s)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"OK: {len(tests)} test functions, all assertions passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -18,7 +18,8 @@ for _claude_tools_dir in \
     "${HOME}/repos/claude-watch/tools/session-task" \
     "${HOME}/repos/claude-watch/tools/claude-event" \
     "${HOME}/repos/claude-watch/tools/obligations" \
-    "${HOME}/repos/claude-watch/tools/claude-watch-ack"
+    "${HOME}/repos/claude-watch/tools/claude-watch-ack" \
+    "${HOME}/repos/claude-watch/tools/claude-watch-dispatch"
 do
     if [ -d "${_claude_tools_dir}" ]; then
         case ":${PATH}:" in
