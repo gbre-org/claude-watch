@@ -148,7 +148,15 @@ RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
 # Install Claude Code CLI globally. Package name confirmed via `npm view`
 # 2026-05-11. In Phase 1+ this is replaced by a bind-mount of host npm-global,
 # so prefer installing into a path a bind-mount can shadow cleanly.
-RUN npm install -g @anthropic-ai/claude-code
+#
+# Chown the installed package tree to uid 1000 so Claude Code's in-process
+# auto-updater (which fires `npm install -g @anthropic-ai/claude-code@latest`
+# as the interactive user) can write to it. Without this, the package tree
+# is root-owned and auto-update fails with EACCES on `/usr/lib/node_modules/`,
+# which also blocks the native-install fallback because the updater detects
+# the existing `/usr/bin/claude` and tries to upgrade it in place.
+RUN npm install -g @anthropic-ai/claude-code \
+    && chown -R 1000:1000 /usr/lib/node_modules/@anthropic-ai
 
 # Bake the claude-watch Rust binary in from stage 1. Glibc compatibility is
 # guaranteed because the builder is `rust:1-bookworm` and this stage is
