@@ -424,6 +424,9 @@ fi
 if [ -d /etc/claude-code/plugin/.claude-plugin ]; then
     CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /etc/claude-code/plugin"
 fi
+if [ "${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}" = "1" ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
+fi
 if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
     _auto_continue_quoted="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
     CLAUDE_CMD="$CLAUDE_CMD --continue $_auto_continue_quoted"
