@@ -173,6 +173,32 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         post-tool-satisfy needed -- the predicate flips as soon as the
         item leaves ready+pending state).
 
+  - subagent_queue_item_running: {bindings_path?}
+        Continuous queue-discipline enforcement for SUBAGENTS. Satisfied
+        (=allow) iff ANY of:
+          (a) the call is from the main loop (no agent_id) -- predicate
+              does not apply, ALLOW.
+          (b) the binding file is missing / corrupt / has no entry for
+              this agent_id -- ALLOW (default-open: subagent launched
+              before this rolled out OR no q-id marker in its prompt).
+          (c) the bound q-id resolves to status=running in the queue --
+              ALLOW.
+        Failure (=deny) means a binding exists for THIS subagent, the
+        bound q-id is non-running (done / abandoned) OR missing from the
+        queue entirely. The deny banner names the q-id + current status
+        so the operator can re-register or stop the subagent.
+
+        Companion: ``post-tool-agent-arm-hook`` writes agent_id -> q-id
+        bindings to ``~/.config/claude/agent-queue-bindings.json`` at
+        PostToolUse:Agent time (when ``async_launched=true``). Bindings
+        are atomically written, 0600. Without a binding the predicate is
+        inert.
+
+        ``bindings_path`` (optional): override the binding file location
+        for tests. Default is ``~/.config/claude/agent-queue-bindings.json``.
+        Env override: ``CLAUDE_AGENT_QUEUE_BINDINGS_PATH`` (used by the
+        post-tool arm hook for matching test isolation).
+
   - is_main_loop: {negate?}
         satisfied iff the tool call is from the main session loop (i.e. the
         hook payload's ``agent_id`` field is empty/missing). With
@@ -332,6 +358,7 @@ VALID_PREDICATE_KINDS = {
     "is_main_loop",
     "stale_ready_queue_present",
     "force_started_unspawned",
+    "subagent_queue_item_running",
     "all_of",
 }
 
@@ -359,6 +386,16 @@ DEFAULT_QUEUE_PATH = Path.home() / ".config" / "session" / "queue.json"
 # Default stale threshold for stale_ready_queue_present (matches
 # DEFAULT_STALE_THRESHOLD_MIN in cron-queue-check: 5 min).
 DEFAULT_STALE_READY_THRESHOLD_SECS = 300
+
+# Default location of the agent-id -> queue-id binding file written by the
+# post-tool-agent-arm-hook at PostToolUse:Agent time and consumed by the
+# ``subagent_queue_item_running`` predicate. Override via the predicate
+# param ``bindings_path`` (for tests) OR the env var
+# ``CLAUDE_AGENT_QUEUE_BINDINGS_PATH`` (for both the predicate and the
+# hook, so they agree on the path under test isolation).
+DEFAULT_AGENT_QUEUE_BINDINGS_PATH = (
+    Path.home() / ".config" / "claude" / "agent-queue-bindings.json"
+)
 
 VALID_ENFORCEMENT_MODES = {"gate", "inform"}
 
@@ -1354,6 +1391,162 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
                 f"subagent has been observed in {agents_state_path} and "
                 f"no fresh pending-spawn record in {pending_spawns_path} "
                 f"-- spawn an Agent for q={qid} before doing anything else.")
+
+    if kind == "subagent_queue_item_running":
+        # Continuous queue-discipline enforcement for subagents. The
+        # PreToolUse:Agent queue-gate hook checks at SPAWN time that the
+        # Agent's prompt carries a `Queue item: q-XXXX` marker and that
+        # q-id is running; this predicate enforces the same invariant
+        # AFTER spawn so a subagent whose q-id has been marked done /
+        # abandoned (or has gone missing) can no longer make tool calls.
+        #
+        # Default-open contracts (any of these => ALLOW):
+        #   - call is from the main loop (no agent_id)
+        #   - bindings file missing / unreadable / corrupt
+        #   - no entry for this agent_id in the binding file
+        #
+        # Deny contracts (bound q-id known => check queue):
+        #   - q-id missing from queue.json (entirely) => DENY
+        #   - q-id status != "running" => DENY
+        #   - q-id status == "running" => ALLOW
+        try:
+            # Main-loop short-circuit: predicate does not apply.
+            if not _is_subagent_context(agent_id):
+                return (True, "predicate does not apply to main loop "
+                              "(no agent_id)")
+
+            # Resolve the binding file. Priority: explicit predicate
+            # param > env override > default. Both the hook and the
+            # predicate honour the same env var so tests can set one
+            # value and both sides agree.
+            bindings_param = params.get("bindings_path")
+            if bindings_param:
+                bindings_path = Path(os.path.expanduser(str(bindings_param)))
+            else:
+                env_override = os.environ.get(
+                    "CLAUDE_AGENT_QUEUE_BINDINGS_PATH", "",
+                ).strip()
+                if env_override:
+                    bindings_path = Path(os.path.expanduser(env_override))
+                else:
+                    bindings_path = DEFAULT_AGENT_QUEUE_BINDINGS_PATH
+
+            if not bindings_path.exists():
+                return (True,
+                        f"binding file {bindings_path} missing "
+                        f"(default-open)")
+            try:
+                raw_b = bindings_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                return (True,
+                        f"binding file {bindings_path} unreadable "
+                        f"(default-open): {e}")
+            if not raw_b.strip():
+                return (True,
+                        f"binding file {bindings_path} empty "
+                        f"(default-open)")
+            try:
+                bdata = json.loads(raw_b)
+            except json.JSONDecodeError as e:
+                return (True,
+                        f"binding file {bindings_path} corrupt JSON "
+                        f"(default-open): {e}")
+
+            # Schema: {"bindings": {agent_id: {"queue_id": "q-...",
+            #                                   "registered_at": <ts>}}}
+            # Accept a bare-dict legacy form for robustness too.
+            if isinstance(bdata, dict):
+                bindings = bdata.get("bindings", {})
+                if not isinstance(bindings, dict):
+                    return (True,
+                            f"binding file {bindings_path} 'bindings' "
+                            f"is not a dict (default-open)")
+            else:
+                return (True,
+                        f"binding file {bindings_path} root is not a "
+                        f"dict (default-open)")
+
+            entry = bindings.get(agent_id)
+            if not isinstance(entry, dict):
+                return (True,
+                        f"no binding for agent_id={agent_id!r} "
+                        f"(default-open -- subagent has no q-id marker "
+                        f"OR was spawned pre-binding)")
+            qid = entry.get("queue_id")
+            if not isinstance(qid, str) or not qid:
+                return (True,
+                        f"binding for agent_id={agent_id!r} has no "
+                        f"queue_id (default-open)")
+
+            # Look up the q-id in the queue. We replicate the lookup
+            # rather than shell out so the predicate is fast and has
+            # no external dependency.
+            queue_path_param = params.get("queue_path")
+            queue_path = (
+                Path(os.path.expanduser(str(queue_path_param)))
+                if queue_path_param else DEFAULT_QUEUE_PATH
+            )
+            if not queue_path.exists():
+                return (True,
+                        f"queue.json {queue_path} missing "
+                        f"(default-open)")
+            try:
+                qraw = queue_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                return (True,
+                        f"queue.json {queue_path} unreadable "
+                        f"(default-open): {e}")
+            if not qraw.strip():
+                return (True,
+                        f"queue.json {queue_path} empty (default-open)")
+            try:
+                qdata = json.loads(qraw)
+            except json.JSONDecodeError as e:
+                return (True,
+                        f"queue.json {queue_path} corrupt JSON "
+                        f"(default-open): {e}")
+            if isinstance(qdata, dict):
+                items = qdata.get("items", [])
+                if not isinstance(items, list):
+                    return (True,
+                            f"queue.json {queue_path} items is not a "
+                            f"list (default-open)")
+            elif isinstance(qdata, list):
+                items = qdata
+            else:
+                return (True,
+                        f"queue.json {queue_path} unrecognised shape "
+                        f"(default-open)")
+
+            target = next(
+                (it for it in items
+                 if isinstance(it, dict) and it.get("id") == qid),
+                None,
+            )
+            if target is None:
+                # Bound q-id has vanished from the queue entirely. This
+                # is the canonical "subagent's work was abandoned by
+                # the main loop and the queue was pruned" case Andrew
+                # wants us to deny on.
+                return (False,
+                        f"subagent's bound queue item {qid} is missing "
+                        f"from {queue_path} -- the main loop has "
+                        f"abandoned this work. Either re-register via "
+                        f"'session-task queue register q-NEW' OR stop "
+                        f"and let the main loop handle this.")
+            status = target.get("status")
+            if status == "running":
+                return (True,
+                        f"subagent's bound queue item {qid} is running")
+            return (False,
+                    f"subagent's queue item {qid} is no longer running "
+                    f"(status: {status!r}). Either re-register via "
+                    f"'session-task queue register q-NEW' OR stop and "
+                    f"let the main loop handle this.")
+        except Exception as e:  # noqa: BLE001 -- default-open on any error
+            return (True,
+                    f"subagent_queue_item_running default-open on "
+                    f"error: {e}")
 
     if kind == "is_main_loop":
         # Satisfied iff the call is from the main loop (no agent_id).

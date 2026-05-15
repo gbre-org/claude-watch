@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Tests for post-tool-agent-arm-hook -- the PostToolUse:Agent hook that
+writes agent_id -> queue_id bindings consumed by the
+``subagent_queue_item_running`` obligations predicate.
+
+Test cases:
+  1. PostToolUse:Agent + async_launched=true + q-id marker  -> binding written
+  2. Re-arm same agent_id refreshes registered_at
+  3. Multiple distinct agent_ids -> separate bindings preserved
+  4. async_launched=false (sync Agent call) -> NO binding written
+  5. Missing agentId -> NO binding written (default-open)
+  6. Missing prompt -> NO binding written
+  7. Prompt without 'Queue item: q-XXXX' marker -> NO binding written
+  8. Non-Agent tool (Bash) -> NO binding written
+  9. Malformed stdin -> default-open (no crash)
+ 10. Corrupt existing bindings file -> overwritten with fresh data
+ 11. Stale entries (>7d) pruned on next write
+ 12. File written with 0600 perms
+ 13. CLAUDE_AGENT_QUEUE_BINDINGS_PATH env override is honored
+
+Each test isolates the bindings file path via the env var so we never
+touch the real ~/.config/claude/agent-queue-bindings.json.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOKS_DIR = HERE.parent
+HOOK = HOOKS_DIR / "post-tool-agent-arm-hook"
+
+
+def _run_hook(payload, env, *, timeout=5):
+    proc = subprocess.run(
+        [str(HOOK)], input=json.dumps(payload),
+        capture_output=True, text=True, env=env, timeout=timeout,
+        check=False,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _read_bindings(path: Path):
+    if not path.exists():
+        return None
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _check(name, cond, detail=""):
+    if cond:
+        print(f"  PASS  {name}")
+        return True
+    print(f"  FAIL  {name}  {detail}")
+    return False
+
+
+def main() -> int:
+    if not HOOK.exists():
+        print(f"ERROR: hook not found at {HOOK}")
+        return 1
+
+    results: list[bool] = []
+
+    with tempfile.TemporaryDirectory(prefix="arm-hook-test-") as td:
+        tmpdir = Path(td)
+        bindings_path = tmpdir / "bindings.json"
+        env = os.environ.copy()
+        env["CLAUDE_AGENT_QUEUE_BINDINGS_PATH"] = str(bindings_path)
+        env["HOME"] = str(tmpdir)
+
+        print(f"=== Sandbox: {tmpdir} ===")
+        print(f"=== Bindings file: {bindings_path} ===")
+
+        # ---- Test 1: happy path -- arm writes binding ----
+        payload_ok = {
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "general-purpose",
+                "prompt": "Do the thing.\nQueue item: q-2026-05-15-aaaa\nMore text.",
+            },
+            "tool_response": {
+                "async_launched": True,
+                "agentId": "agent-test-001",
+            },
+        }
+        rc, _stdout, _stderr = _run_hook(payload_ok, env)
+        data = _read_bindings(bindings_path)
+        ok = (
+            rc == 0
+            and data is not None
+            and isinstance(data.get("bindings"), dict)
+            and "agent-test-001" in data["bindings"]
+            and data["bindings"]["agent-test-001"]["queue_id"]
+            == "q-2026-05-15-aaaa"
+        )
+        results.append(_check(
+            "1. happy-path arm writes agent_id -> q-id binding",
+            ok,
+            f"rc={rc} data={data!r}",
+        ))
+
+        # ---- Test 2: re-arm refreshes registered_at ----
+        # Read the current registered_at, sleep so the new one will be
+        # strictly greater (epoch resolution = 1s).
+        first_ts = data["bindings"]["agent-test-001"]["registered_at"]
+        time.sleep(1.1)
+        rc, _, _ = _run_hook(payload_ok, env)
+        data = _read_bindings(bindings_path)
+        second_ts = data["bindings"]["agent-test-001"]["registered_at"]
+        results.append(_check(
+            "2. re-arm refreshes registered_at",
+            rc == 0 and second_ts > first_ts,
+            f"first={first_ts} second={second_ts}",
+        ))
+
+        # ---- Test 3: multiple agent_ids preserved ----
+        payload_2 = json.loads(json.dumps(payload_ok))  # deep copy
+        payload_2["tool_input"]["prompt"] = (
+            "Other task. Queue item: q-2026-05-15-bbbb"
+        )
+        payload_2["tool_response"]["agentId"] = "agent-test-002"
+        rc, _, _ = _run_hook(payload_2, env)
+        data = _read_bindings(bindings_path)
+        results.append(_check(
+            "3. distinct agent_ids land in separate bindings",
+            (rc == 0
+             and "agent-test-001" in data["bindings"]
+             and "agent-test-002" in data["bindings"]
+             and data["bindings"]["agent-test-002"]["queue_id"]
+             == "q-2026-05-15-bbbb"),
+            f"data={data!r}",
+        ))
+
+        # Clean slate for the next batch.
+        bindings_path.unlink()
+
+        # ---- Test 4: async_launched=false -> no binding ----
+        payload_sync = json.loads(json.dumps(payload_ok))
+        payload_sync["tool_response"]["async_launched"] = False
+        rc, _, _ = _run_hook(payload_sync, env)
+        results.append(_check(
+            "4. async_launched=false -> no binding written",
+            rc == 0 and not bindings_path.exists(),
+            f"rc={rc} exists={bindings_path.exists()}",
+        ))
+
+        # ---- Test 5: missing agentId -> no binding ----
+        payload_no_aid = json.loads(json.dumps(payload_ok))
+        payload_no_aid["tool_response"]["agentId"] = ""
+        rc, _, _ = _run_hook(payload_no_aid, env)
+        results.append(_check(
+            "5. missing agentId -> no binding written",
+            rc == 0 and not bindings_path.exists(),
+            f"rc={rc} exists={bindings_path.exists()}",
+        ))
+
+        # ---- Test 6: missing prompt -> no binding ----
+        payload_no_prompt = json.loads(json.dumps(payload_ok))
+        payload_no_prompt["tool_input"]["prompt"] = ""
+        rc, _, _ = _run_hook(payload_no_prompt, env)
+        results.append(_check(
+            "6. missing prompt -> no binding written",
+            rc == 0 and not bindings_path.exists(),
+            f"rc={rc} exists={bindings_path.exists()}",
+        ))
+
+        # ---- Test 7: prompt without q-id marker -> no binding ----
+        payload_no_marker = json.loads(json.dumps(payload_ok))
+        payload_no_marker["tool_input"]["prompt"] = (
+            "Just plain instructions with no marker line."
+        )
+        rc, _, _ = _run_hook(payload_no_marker, env)
+        results.append(_check(
+            "7. no q-id marker -> no binding written",
+            rc == 0 and not bindings_path.exists(),
+            f"rc={rc} exists={bindings_path.exists()}",
+        ))
+
+        # ---- Test 8: non-Agent tool -> no binding ----
+        payload_bash = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": {"async_launched": True,
+                              "agentId": "irrelevant"},
+        }
+        rc, _, _ = _run_hook(payload_bash, env)
+        results.append(_check(
+            "8. non-Agent tool -> no binding written",
+            rc == 0 and not bindings_path.exists(),
+            f"rc={rc} exists={bindings_path.exists()}",
+        ))
+
+        # ---- Test 9: malformed stdin -> default-open, no crash ----
+        proc = subprocess.run(
+            [str(HOOK)], input="this is not json {",
+            capture_output=True, text=True, env=env, timeout=5,
+            check=False,
+        )
+        results.append(_check(
+            "9. malformed stdin -> default-open (rc=0, no crash)",
+            proc.returncode == 0,
+            f"rc={proc.returncode} stderr={proc.stderr!r}",
+        ))
+
+        # ---- Test 10: corrupt existing bindings file -> overwritten ----
+        bindings_path.write_text("this is corrupt JSON {{{")
+        rc, _, _ = _run_hook(payload_ok, env)
+        data = _read_bindings(bindings_path)
+        results.append(_check(
+            "10. corrupt bindings file overwritten with fresh data",
+            (rc == 0
+             and data is not None
+             and "agent-test-001" in data.get("bindings", {})),
+            f"rc={rc} data={data!r}",
+        ))
+
+        # ---- Test 11: stale entries (>7d) pruned ----
+        # Inject a stale entry directly + arm a fresh one; expect the
+        # stale one pruned.
+        now = int(time.time())
+        stale_age = 8 * 86400  # 8 days
+        bindings_path.write_text(json.dumps({
+            "bindings": {
+                "agent-stale-old": {
+                    "queue_id": "q-ancient",
+                    "registered_at": now - stale_age,
+                    "registered_at_iso": "ignored",
+                    "pid": 1,
+                },
+                "agent-fresh-keeper": {
+                    "queue_id": "q-recent",
+                    "registered_at": now - 60,
+                    "registered_at_iso": "ignored",
+                    "pid": 1,
+                },
+            }
+        }, indent=2))
+        # Arm a NEW agent; the prune logic runs on every write.
+        rc, _, _ = _run_hook(payload_ok, env)
+        data = _read_bindings(bindings_path)
+        results.append(_check(
+            "11. stale (>7d) entries pruned on next write",
+            (rc == 0
+             and "agent-stale-old" not in data.get("bindings", {})
+             and "agent-fresh-keeper" in data.get("bindings", {})
+             and "agent-test-001" in data.get("bindings", {})),
+            f"rc={rc} bindings keys={list(data.get('bindings', {}).keys())}",
+        ))
+
+        # ---- Test 12: file written 0600 ----
+        st = bindings_path.stat()
+        # We care about owner-read/write only.
+        mode = stat.S_IMODE(st.st_mode)
+        results.append(_check(
+            "12. bindings file written with 0600 perms",
+            mode == 0o600,
+            f"mode={oct(mode)}",
+        ))
+
+        # ---- Test 13: env override path is honored ----
+        # Already exercised: we set CLAUDE_AGENT_QUEUE_BINDINGS_PATH at
+        # the top and confirmed writes land there. Add an explicit
+        # smoke check that an unset override falls back to the default
+        # (we can't safely write to ~/.config/claude/, so just verify
+        # the hook doesn't crash when the override is empty -- the
+        # binding goes to the default location under our isolated HOME).
+        env_no_override = env.copy()
+        env_no_override.pop("CLAUDE_AGENT_QUEUE_BINDINGS_PATH", None)
+        # Pre-create the default-path parent dir under our HOME so the
+        # mkdir succeeds.
+        default_parent = tmpdir / ".config" / "claude"
+        default_parent.mkdir(parents=True, exist_ok=True)
+        rc, _, _ = _run_hook(payload_ok, env_no_override)
+        default_bindings = default_parent / "agent-queue-bindings.json"
+        results.append(_check(
+            "13. unset env override falls back to default path under HOME",
+            rc == 0 and default_bindings.exists(),
+            f"rc={rc} default={default_bindings} "
+            f"exists={default_bindings.exists()}",
+        ))
+
+    total = len(results)
+    passed = sum(1 for r in results if r)
+    print()
+    print(f"RESULT: {passed}/{total} passed")
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

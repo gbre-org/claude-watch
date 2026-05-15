@@ -106,6 +106,15 @@ KNOWN_BUILTINS = {
     "pre-tool-obligations-gate-hook",
     "post-tool-obligations-update-hook",
     "post-tool-mark-attachment-read-hook",
+    # post-tool-agent-arm-hook: PostToolUse:Agent hook that writes
+    # agent_id -> queue_id bindings consumed by the
+    # subagent_queue_item_running obligations predicate. Default-baked
+    # alongside the other gate hooks above.
+    "post-tool-agent-arm-hook",
+    # obligations-init: idempotent default-row seeder invoked by the
+    # entrypoint. Not a hook, but it's referenced from settings.json-
+    # adjacent paths in the entrypoint so list it here for completeness.
+    "obligations-init",
     # claude-watch alert gate hooks (v59).
     "pre-tool-claude-watch-alert-gate-hook",
     "user-prompt-claude-watch-alert-record-hook",

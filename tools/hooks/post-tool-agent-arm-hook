@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""PostToolUse hook for the Agent tool -- writes agent_id -> queue_id bindings.
+
+Companion to the ``subagent_queue_item_running`` obligations predicate
+(in ``tools/obligations/obligations``). The predicate enforces "every
+subagent tool call must correspond to a currently-running queue item"
+AFTER spawn; this hook is what populates the binding state the predicate
+reads.
+
+When the Agent tool fires successfully with ``async_launched=true`` (the
+fire-and-forget shape from the main loop's perspective), Claude Code's
+PostToolUse hook receives a payload of the shape::
+
+    {
+      "tool_name": "Agent",
+      "tool_input": {
+        "subagent_type": "general-purpose",
+        "prompt": "...Queue item: q-2026-05-15-XXXX..."
+      },
+      "tool_response": {
+        "async_launched": true,
+        "agentId": "agent-abc123..."
+      },
+      ...
+    }
+
+We extract:
+  - the new subagent's ``agent_id`` from ``tool_response.agentId``
+  - the ``q-XXXX`` marker from ``tool_input.prompt`` (regex match)
+
+and upsert a binding record into the JSON state file at
+``~/.config/claude/agent-queue-bindings.json`` (overridable via
+``CLAUDE_AGENT_QUEUE_BINDINGS_PATH`` for tests). Atomic tmp-file +
+rename, 0600.
+
+Default-open contracts: missing prompt, missing agent_id, no q-id
+marker, fs permission errors -- all silently swallowed. The hook MUST
+never block the spawn it has already observed.
+
+Wiring (in ``~/.claude/settings.json`` or the container's shim
+settings)::
+
+    {
+      "hooks": {
+        "PostToolUse": [
+          {
+            "matcher": "Agent",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/path/to/post-tool-agent-arm-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import errno
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+# Same q-id format as pre-agent-queue-gate-hook. Permissive on the suffix
+# to match session-task's allocation grammar.
+QUEUE_MARKER_RE = re.compile(
+    r"Queue\s+item\s*:\s*(q-[0-9a-zA-Z][0-9a-zA-Z-]*)"
+)
+
+DEFAULT_BINDINGS_PATH = Path(
+    os.path.expanduser("~/.config/claude/agent-queue-bindings.json")
+)
+
+ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+ERR_LOG_PATH = ERR_LOG_DIR / "agent-arm-hook-errors.log"
+
+# Entries older than this are pruned on every write so the file stays
+# bounded. 7 days covers any reasonable subagent lifetime; anything older
+# is almost certainly a dead/orphan binding the GC sweep missed.
+PRUNE_AGE_SECS = 7 * 86400
+
+
+def _log(payload: dict) -> None:
+    """Best-effort append-only log. Swallow all I/O errors."""
+    try:
+        ERR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        rec = {"ts": ts, "pid": os.getpid(), **payload}
+        with ERR_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        try:
+            ERR_LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _bindings_path() -> Path:
+    """Resolve the bindings file path. Env override wins for tests."""
+    override = os.environ.get(
+        "CLAUDE_AGENT_QUEUE_BINDINGS_PATH", "",
+    ).strip()
+    if override:
+        return Path(os.path.expanduser(override))
+    return DEFAULT_BINDINGS_PATH
+
+
+def _upsert_binding(agent_id: str, queue_id: str) -> None:
+    """Atomically write or refresh an agent_id -> queue_id binding.
+
+    Locked via fcntl on a sidecar so concurrent PostToolUse:Agent invocations
+    don't clobber each other. Prunes any entry older than ``PRUNE_AGE_SECS``
+    on every write so the file size stays bounded.
+
+    Best-effort: any IO / permission failure is swallowed via ``_log``.
+    The fallback if writing fails is that the predicate is inert for this
+    subagent (default-open on missing binding), which is the safest
+    behaviour -- a hook bug can never blackhole a real subagent.
+    """
+    path = _bindings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        _log({"kind": "mkdir-fail", "exc": str(e), "path": str(path)})
+        return
+
+    now_ts = int(time.time())
+    new_entry = {
+        "queue_id": queue_id,
+        "registered_at": now_ts,
+        "registered_at_iso": _dt.datetime.fromtimestamp(
+            now_ts, tz=_dt.timezone.utc,
+        ).isoformat(),
+        "pid": os.getpid(),
+    }
+
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_fh = None
+    try:
+        try:
+            lock_fh = open(lock_path, "a+")
+        except OSError as e:
+            _log({"kind": "lock-open-fail", "exc": str(e)})
+            return
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        except OSError as e:
+            _log({"kind": "lock-fail", "exc": str(e)})
+            return
+
+        # Read current state.
+        bindings: dict = {}
+        if path.exists():
+            try:
+                raw = path.read_text(encoding="utf-8")
+                if raw.strip():
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        b = data.get("bindings", {})
+                        if isinstance(b, dict):
+                            bindings = b
+            except (OSError, json.JSONDecodeError, ValueError) as e:
+                # Corrupt file: start fresh. Don't propagate -- we MUST
+                # write a fresh, valid file so the predicate's read path
+                # works again.
+                _log({"kind": "corrupt-bindings", "exc": str(e),
+                      "path": str(path)})
+                bindings = {}
+
+        # Prune stale entries. The predicate is default-open on missing
+        # bindings, so dropping ancient ones is safe -- a long-lived
+        # subagent (>7d) would lose its gate, but that's an edge case
+        # well past any reasonable subagent runtime.
+        cutoff = now_ts - PRUNE_AGE_SECS
+        bindings = {
+            aid: rec for aid, rec in bindings.items()
+            if isinstance(rec, dict)
+            and isinstance(rec.get("registered_at"), int)
+            and rec.get("registered_at", 0) >= cutoff
+        }
+
+        # Upsert.
+        bindings[agent_id] = new_entry
+
+        out_obj = {"bindings": bindings}
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(out_obj, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(tmp_path, 0o600)
+            os.replace(str(tmp_path), str(path))
+        except OSError as e:
+            _log({"kind": "write-fail", "exc": str(e), "path": str(path)})
+            try:
+                tmp_path.unlink()
+            except OSError as unlink_exc:
+                if unlink_exc.errno != errno.ENOENT:
+                    pass
+            return
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                lock_fh.close()
+            except OSError:
+                pass
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        # Malformed / empty stdin: default-open.
+        return 0
+
+    if not isinstance(payload, dict):
+        return 0
+
+    tool_name = payload.get("tool_name", "")
+    if tool_name not in ("Agent", "Task"):
+        return 0
+
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        return 0
+    tool_response = payload.get("tool_response", {})
+    if not isinstance(tool_response, dict):
+        return 0
+
+    # Only act on async_launched spawns -- a sync Agent call that returns
+    # in-band doesn't have a separately-running subagent to bind.
+    if not bool(tool_response.get("async_launched", False)):
+        return 0
+
+    agent_id = tool_response.get("agentId", "")
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        # No agent id to bind. Default-open.
+        return 0
+
+    prompt = tool_input.get("prompt", "")
+    if not isinstance(prompt, str) or not prompt:
+        # Spawn with empty prompt -- nothing to bind. Default-open.
+        return 0
+
+    match = QUEUE_MARKER_RE.search(prompt)
+    if not match:
+        # No q-id marker. The PreToolUse:Agent queue-gate hook would have
+        # denied this spawn upstream, but if a bypass / test / future
+        # change lets it through, default-open here. The predicate stays
+        # inert for this agent_id (no binding written), and any other
+        # active gate still applies.
+        return 0
+    queue_id = match.group(1)
+
+    _upsert_binding(agent_id.strip(), queue_id)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 -- last-ditch default-open
+        try:
+            _log({"kind": "uncaught", "exc": str(exc)})
+        except Exception:
+            pass
+        # Default-open: hook bugs must never block a successful spawn.
+        sys.exit(0)

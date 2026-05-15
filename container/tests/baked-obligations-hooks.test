@@ -66,6 +66,13 @@ OBLIGATIONS_HOOK_NAMES = [
     # consecutive non-exempt non-Agent tool calls (default N=3).
     # Companion `claude-watch-dispatch` CLI inspects state + resets.
     "pre-tool-dispatch-gate-hook",
+    # subagent_queue_item_running gate (v62b) -- continuous queue-
+    # discipline enforcement for subagents. PostToolUse:Agent hook
+    # writes agent_id -> queue_id bindings consumed by the new
+    # `subagent_queue_item_running` obligations predicate, which DENIES
+    # subagent tool calls when the bound queue item is no longer
+    # running. Default-seeded by obligations-init.
+    "post-tool-agent-arm-hook",
 ]
 
 failures: list[str] = []

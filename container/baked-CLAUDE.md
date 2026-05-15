@@ -287,6 +287,63 @@ The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
 if it's not on PATH, the operator hasn't wired the bind-mount and you
 should flag that before spawning agents at all.
 
+### Continuous subagent queue-discipline enforcement
+
+The `pre-agent-queue-gate-hook` above only fires at SPAWN time. A
+second gate, the `subagent_queue_item_running` obligations predicate,
+continues to enforce queue discipline THROUGHOUT a subagent's
+lifetime. The predicate is seeded as a default-bundled obligation row
+by `obligations-init` (run from the entrypoint when
+`CLAUDE_CONTAINER_OBLIGATIONS=1`).
+
+How it works:
+
+  - `post-tool-agent-arm-hook` fires on every successful Agent spawn
+    (`PostToolUse:Agent` with `async_launched=true`), reads the
+    `Queue item: q-XXXX` marker from the spawn prompt + the new
+    subagent's `agentId` from the tool response, and writes a binding
+    record to `~/.config/claude/agent-queue-bindings.json`.
+  - On every subsequent **subagent** tool call, the
+    `subagent_queue_item_running` predicate looks up the agent's q-id
+    in the queue:
+      - `status=running` → **ALLOW**.
+      - `status=done` / `status=abandoned` → **DENY** with a banner
+        naming the q-id + current status.
+      - q-id has vanished from the queue entirely → **DENY**
+        (the canonical "main loop abandoned this work" case).
+  - Main-loop calls are always allowed (the row is scoped via
+    `is_main_loop {negate: true}` inside an `all_of`).
+
+**As a subagent, when you hit this gate:** your queue item has been
+finished, abandoned, or pruned. The right responses are usually:
+
+  - **Re-register**: if the main loop just rotated the queue id (rare
+    but possible during dispatch transitions), `session-task queue
+    register <new-q-id>` is exempt from the gate, so you can run it
+    to pick up the new id.
+  - **Stop**: if your work is genuinely done from the main loop's
+    perspective, return your final value and let your process exit.
+    Don't try to keep working past a `done` queue state — the main
+    loop is no longer tracking your scope.
+
+The exempt set lets you reach `session-task queue
+{status,spawn-check,register,show,list}`, `obligations
+{list,show,status,check,override,satisfy}`, `claude-watch-ack`,
+`claude-watch-dispatch`, and `agent-msg {ack,inbox,gc,disarm}` /
+`agent-tail` even while the gate is firing, so you can always inspect
+state + recover.
+
+Default-open contracts (predicate inert, tool call ALLOWED):
+
+  - Call is from the main loop (no `agent_id`) — predicate doesn't
+    apply.
+  - Binding file missing / corrupt / unreadable — defensive.
+  - No binding entry for this agent_id — subagent was either spawned
+    before the predicate rolled out OR carries no `Queue item: q-XXXX`
+    marker.
+
+A hook bug can never blackhole a real subagent.
+
 ## Agent communication channels — two distinct inbound paths
 
 A spawned subagent has TWO distinct inbound channels you must

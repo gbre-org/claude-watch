@@ -191,6 +191,13 @@ OBLIGATIONS_HOOKS: list[tuple[str, str, str]] = [
     # Auto-satisfy obligations whose `satisfied_by` pattern matches the
     # just-completed tool. Mirrors the host's PostToolUse "*" matcher.
     ("PostToolUse", "*", "/usr/local/bin/post-tool-obligations-update-hook"),
+    # Write agent_id -> queue_id bindings on every successful async-
+    # launched Agent spawn. Companion to the `subagent_queue_item_running`
+    # obligations predicate, which enforces "every subagent tool call
+    # must correspond to a running queue item" AFTER spawn. Default-open
+    # on every error path -- a hook failure can never block a spawn
+    # that already happened.
+    ("PostToolUse", "Agent", "/usr/local/bin/post-tool-agent-arm-hook"),
     # Auto-mark Signal attachment files as read after a Read of any path
     # under ~/signal-queue/attachments/. Mirrors the host's PostToolUse
     # "Read" matcher. Inert in the container by default (no signal-queue

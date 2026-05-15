@@ -122,6 +122,15 @@ Test cases (PreToolUse):
      auto-mandatory + override refused (production cron shape)
 115. cron-queue-check parity: production add invocation
      yields a mandatory row; override refused
+116. subagent_queue_item_running: q-id running -> allow
+117. subagent_queue_item_running: q-id done -> deny + named
+118. subagent_queue_item_running: q-id abandoned -> deny
+119. subagent_queue_item_running: q-id missing from queue -> deny
+120. subagent_queue_item_running: binding file missing -> allow (default-open)
+121. subagent_queue_item_running: corrupt bindings -> allow (default-open)
+122. subagent_queue_item_running: main-loop call -> allow (scope-guard skip)
+123. subagent_queue_item_running: no entry for this agent -> allow
+124. end-to-end: arm-hook -> bind -> queue=running allow -> queue=done deny
 
 Each test uses a SEPARATE OBLIGATIONS_FILE path (not the live ~/.config/claude/
 one) by overriding via environment + an isolated state dir, so we never touch
@@ -3893,6 +3902,308 @@ def main() -> int:
             ))
             if cron_ob_id:
                 _run([str(CLI), "satisfy", cron_ob_id], env_m)
+
+        # ===========================================================
+        # Tests 116-123: subagent_queue_item_running predicate
+        # (Andrew DM 2026-05-15: continuous queue-discipline
+        # enforcement for subagents. Pairs with post-tool-agent-arm-
+        # hook which writes agent_id -> q-id bindings.)
+        # ===========================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-sqr-") as td_sqr:
+            tmpdir_sqr = Path(td_sqr)
+            env_sqr, ob_path_sqr = _make_isolated_env(tmpdir_sqr)
+
+            qfile_sqr = tmpdir_sqr / "queue.json"
+            bindings_sqr = tmpdir_sqr / "agent-queue-bindings.json"
+            test_agent_id = "agent-sqr-test-001"
+
+            def _write_queue_sqr(items):
+                qfile_sqr.write_text(json.dumps({"items": items}))
+
+            def _write_bindings_sqr(agent_id, qid):
+                now_ts = int(time.time())
+                bindings_sqr.write_text(json.dumps({
+                    "bindings": {
+                        agent_id: {
+                            "queue_id": qid,
+                            "registered_at": now_ts,
+                            "registered_at_iso": "ignored",
+                            "pid": 1,
+                        }
+                    }
+                }))
+
+            # Add an `all_of [is_main_loop {negate: true},
+            # subagent_queue_item_running]` row so the predicate only
+            # fires for subagents (matches the production seed shape).
+            def _add_sqr_ob(extra_params=None):
+                params = {"predicates": [
+                    {"kind": "is_main_loop", "params": {"negate": True}},
+                    {"kind": "subagent_queue_item_running",
+                     "params": {
+                         "bindings_path": str(bindings_sqr),
+                         "queue_path": str(qfile_sqr),
+                         **(extra_params or {}),
+                     }},
+                ]}
+                return _add_ob(
+                    env_sqr,
+                    tool_pattern="*",
+                    predicate="all_of",
+                    params=params,
+                    ttl=600,
+                    deny_msg="subagent q-id not running",
+                )
+
+            # --- 116: q-id status=running + subagent -> ALLOW ---
+            _write_queue_sqr([{
+                "id": "q-sqr-001",
+                "scope": "test",
+                "summary": "running item",
+                "status": "running",
+                "created_at": "2026-05-15T00:00:00+00:00",
+                "updated_at": "2026-05-15T00:00:00+00:00",
+            }])
+            _write_bindings_sqr(test_agent_id, "q-sqr-001")
+            ob_116 = _add_sqr_ob()
+            payload_subagent = {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": test_agent_id,
+            }
+            rc, out, _err = _hook_pre(payload_subagent, env_sqr)
+            results.append(_check(
+                "116. subagent_queue_item_running: q-id running -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_116], env_sqr)
+
+            # --- 117: q-id status=done + subagent -> DENY ---
+            _write_queue_sqr([{
+                "id": "q-sqr-001",
+                "scope": "test",
+                "summary": "done item",
+                "status": "done",
+                "created_at": "2026-05-15T00:00:00+00:00",
+                "updated_at": "2026-05-15T00:00:00+00:00",
+            }])
+            ob_117 = _add_sqr_ob()
+            rc, out, _err = _hook_pre(payload_subagent, env_sqr)
+            reason = (out.get("hookSpecificOutput", {})
+                      .get("permissionDecisionReason", "")) if isinstance(out, dict) else ""
+            results.append(_check(
+                "117. subagent_queue_item_running: q-id done -> deny "
+                "+ q-id named in reason",
+                (rc == 0 and _is_deny(out)
+                 and "q-sqr-001" in reason
+                 and "done" in reason),
+                f"rc={rc} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_117], env_sqr)
+
+            # --- 118: q-id status=abandoned + subagent -> DENY ---
+            _write_queue_sqr([{
+                "id": "q-sqr-001",
+                "scope": "test",
+                "summary": "abandoned item",
+                "status": "abandoned",
+                "created_at": "2026-05-15T00:00:00+00:00",
+                "updated_at": "2026-05-15T00:00:00+00:00",
+            }])
+            ob_118 = _add_sqr_ob()
+            rc, out, _err = _hook_pre(payload_subagent, env_sqr)
+            reason = (out.get("hookSpecificOutput", {})
+                      .get("permissionDecisionReason", "")) if isinstance(out, dict) else ""
+            results.append(_check(
+                "118. subagent_queue_item_running: q-id abandoned -> deny",
+                (rc == 0 and _is_deny(out)
+                 and "q-sqr-001" in reason
+                 and "abandoned" in reason),
+                f"rc={rc} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_118], env_sqr)
+
+            # --- 119: q-id missing from queue + subagent -> DENY ---
+            _write_queue_sqr([])  # empty queue
+            ob_119 = _add_sqr_ob()
+            rc, out, _err = _hook_pre(payload_subagent, env_sqr)
+            reason = (out.get("hookSpecificOutput", {})
+                      .get("permissionDecisionReason", "")) if isinstance(out, dict) else ""
+            results.append(_check(
+                "119. subagent_queue_item_running: q-id missing from queue "
+                "-> deny (Andrew's explicit case)",
+                (rc == 0 and _is_deny(out)
+                 and "q-sqr-001" in reason
+                 and "missing" in reason),
+                f"rc={rc} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_119], env_sqr)
+
+            # --- 120: binding file missing + subagent -> ALLOW
+            #         (default-open: subagent pre-binding rollout) ---
+            bindings_sqr.unlink()
+            _write_queue_sqr([{
+                "id": "q-sqr-001",
+                "scope": "test",
+                "summary": "still done",
+                "status": "done",
+                "created_at": "2026-05-15T00:00:00+00:00",
+                "updated_at": "2026-05-15T00:00:00+00:00",
+            }])
+            ob_120 = _add_sqr_ob()
+            rc, out, _err = _hook_pre(payload_subagent, env_sqr)
+            results.append(_check(
+                "120. subagent_queue_item_running: binding file missing "
+                "-> allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_120], env_sqr)
+
+            # --- 121: corrupt bindings file -> ALLOW + audit ---
+            bindings_sqr.write_text("{{ totally corrupt JSON")
+            ob_121 = _add_sqr_ob()
+            rc, out, _err = _hook_pre(payload_subagent, env_sqr)
+            results.append(_check(
+                "121. subagent_queue_item_running: corrupt bindings "
+                "-> allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_121], env_sqr)
+
+            # --- 122: main-loop (no agent_id) -> ALLOW
+            #         (predicate does not apply via scope guard) ---
+            _write_bindings_sqr(test_agent_id, "q-sqr-001")
+            _write_queue_sqr([{
+                "id": "q-sqr-001",
+                "scope": "test",
+                "summary": "would-be-deny if subagent",
+                "status": "done",
+                "created_at": "2026-05-15T00:00:00+00:00",
+                "updated_at": "2026-05-15T00:00:00+00:00",
+            }])
+            ob_122 = _add_sqr_ob()
+            payload_main = {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                # No agent_id field -> main loop.
+            }
+            rc, out, _err = _hook_pre(payload_main, env_sqr)
+            results.append(_check(
+                "122. subagent_queue_item_running: main-loop call "
+                "(no agent_id) -> allow (scope-guard skip)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_122], env_sqr)
+
+            # --- 123: subagent w/o a binding entry -> ALLOW
+            #         (default-open: subagent pre-binding rollout OR
+            #         no q-id marker in original prompt) ---
+            # Bindings file exists but only carries OTHER agents.
+            bindings_sqr.write_text(json.dumps({
+                "bindings": {
+                    "agent-someone-else": {
+                        "queue_id": "q-other-thing",
+                        "registered_at": int(time.time()),
+                        "registered_at_iso": "ignored",
+                        "pid": 1,
+                    }
+                }
+            }))
+            ob_123 = _add_sqr_ob()
+            rc, out, _err = _hook_pre(payload_subagent, env_sqr)
+            results.append(_check(
+                "123. subagent_queue_item_running: no entry for THIS "
+                "agent -> allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_123], env_sqr)
+
+        # ===========================================================
+        # Test 124: end-to-end -- arm via post-hook + mutate queue
+        # status + observe deny on next pre-hook call. This is the
+        # important wiring proof (Step 3 in v62b workbot prompt).
+        # ===========================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-e2e-") as td_e2e:
+            tmpdir_e2e = Path(td_e2e)
+            env_e2e, ob_path_e2e = _make_isolated_env(tmpdir_e2e)
+
+            qfile_e2e = tmpdir_e2e / "queue.json"
+            bindings_e2e = tmpdir_e2e / "agent-queue-bindings.json"
+            env_e2e["CLAUDE_AGENT_QUEUE_BINDINGS_PATH"] = str(bindings_e2e)
+
+            # Register the seed-shape obligation (mirrors what
+            # obligations-init seeds in production).
+            _add_ob(
+                env_e2e,
+                tool_pattern="*",
+                predicate="all_of",
+                params={"predicates": [
+                    {"kind": "is_main_loop", "params": {"negate": True}},
+                    {"kind": "subagent_queue_item_running", "params": {
+                        "bindings_path": str(bindings_e2e),
+                        "queue_path": str(qfile_e2e),
+                    }},
+                ]},
+                ttl=0,
+                deny_msg="subagent q-id not running",
+            )
+
+            # Arm a subagent via post-tool-agent-arm-hook.
+            arm_payload = {
+                "tool_name": "Agent",
+                "tool_input": {
+                    "prompt": "Do the task.\nQueue item: q-e2e-001\n",
+                },
+                "tool_response": {
+                    "async_launched": True,
+                    "agentId": "agent-e2e-001",
+                },
+            }
+            arm_hook = HOOKS_DIR / "post-tool-agent-arm-hook"
+            arm_proc = subprocess.run(
+                [str(arm_hook)], input=json.dumps(arm_payload),
+                capture_output=True, text=True, env=env_e2e, timeout=5,
+                check=False,
+            )
+            armed = bindings_e2e.exists()
+
+            # Queue item is running -> subagent allowed.
+            qfile_e2e.write_text(json.dumps({"items": [{
+                "id": "q-e2e-001",
+                "status": "running",
+                "created_at": "2026-05-15T00:00:00+00:00",
+            }]}))
+            payload_e2e = {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "agent-e2e-001",
+            }
+            rc_running, out_running, _err = _hook_pre(payload_e2e, env_e2e)
+
+            # Flip to done; subagent denied.
+            qfile_e2e.write_text(json.dumps({"items": [{
+                "id": "q-e2e-001",
+                "status": "done",
+                "created_at": "2026-05-15T00:00:00+00:00",
+            }]}))
+            rc_done, out_done, _err = _hook_pre(payload_e2e, env_e2e)
+
+            results.append(_check(
+                "124. end-to-end: post-arm-hook writes binding, "
+                "queue=running -> allow, queue=done -> deny",
+                (arm_proc.returncode == 0
+                 and armed
+                 and rc_running == 0 and _is_allow(out_running)
+                 and rc_done == 0 and _is_deny(out_done)),
+                f"arm_rc={arm_proc.returncode} armed={armed} "
+                f"running_allow={_is_allow(out_running)} "
+                f"done_deny={_is_deny(out_done)}",
+            ))
 
     total = len(results)
     passed = sum(1 for r in results if r)

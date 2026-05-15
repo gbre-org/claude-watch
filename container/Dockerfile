@@ -396,6 +396,7 @@ RUN chmod +x /usr/local/bin/generate-project-mcp-json
 #   - pre-tool-obligations-gate-hook       (PreToolUse * matcher)
 #   - post-tool-obligations-update-hook    (PostToolUse * matcher)
 #   - post-tool-mark-attachment-read-hook  (PostToolUse Read matcher)
+#   - post-tool-agent-arm-hook             (PostToolUse Agent matcher)
 #
 # Each script is the canonical source of truth from tools/hooks/ in
 # this repo (the same scripts `make install` symlinks into
@@ -406,6 +407,16 @@ COPY tools/hooks/pre-agent-queue-gate-hook /usr/local/bin/pre-agent-queue-gate-h
 COPY tools/hooks/pre-tool-obligations-gate-hook /usr/local/bin/pre-tool-obligations-gate-hook
 COPY tools/hooks/post-tool-obligations-update-hook /usr/local/bin/post-tool-obligations-update-hook
 COPY tools/hooks/post-tool-mark-attachment-read-hook /usr/local/bin/post-tool-mark-attachment-read-hook
+# post-tool-agent-arm-hook -- writes agent_id -> queue_id bindings to
+# ~/.config/claude/agent-queue-bindings.json on every successful async-
+# launched Agent spawn. Companion to the `subagent_queue_item_running`
+# obligations predicate, which enforces "every subagent tool call must
+# correspond to a running queue item" AFTER spawn (the existing
+# pre-agent-queue-gate-hook enforces it at SPAWN time; this one
+# continues enforcement throughout the subagent's lifetime by binding
+# the spawned agent_id to its q-id and letting the predicate read the
+# binding on every PreToolUse).
+COPY tools/hooks/post-tool-agent-arm-hook /usr/local/bin/post-tool-agent-arm-hook
 # claude-watch alert gate -- PreToolUse hook that DENIES every non-exempt
 # tool call while any `[CLAUDE-WATCH]` alert is pending in
 # ~/.config/claude-watch/pending-alerts.json. Companion UserPromptSubmit
@@ -456,18 +467,27 @@ COPY tools/claude-watch-dispatch/claude-watch-dispatch /usr/local/bin/claude-wat
 #     enumerates active subagent transcripts and `--follow` for live
 #     streaming.
 COPY tools/obligations/obligations /usr/local/bin/obligations
+# obligations-init -- idempotent seed for the default-bundled obligations
+# rows. Invoked from the container entrypoint after the obligations CLI
+# is available on PATH. Currently seeds the
+# `subagent_queue_item_running` row (continuous subagent queue-discipline
+# enforcement). Best-effort: any failure logs to stderr but exits 0 so
+# entrypoint keeps going.
+COPY tools/obligations/obligations-init /usr/local/bin/obligations-init
 COPY tools/agent-msg/agent-msg /usr/local/bin/agent-msg
 COPY tools/agent-tail/agent-tail /usr/local/bin/agent-tail
 RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/pre-tool-obligations-gate-hook \
             /usr/local/bin/post-tool-obligations-update-hook \
             /usr/local/bin/post-tool-mark-attachment-read-hook \
+            /usr/local/bin/post-tool-agent-arm-hook \
             /usr/local/bin/pre-tool-claude-watch-alert-gate-hook \
             /usr/local/bin/user-prompt-claude-watch-alert-record-hook \
             /usr/local/bin/claude-watch-ack \
             /usr/local/bin/pre-tool-dispatch-gate-hook \
             /usr/local/bin/claude-watch-dispatch \
             /usr/local/bin/obligations \
+            /usr/local/bin/obligations-init \
             /usr/local/bin/agent-msg \
             /usr/local/bin/agent-tail
 

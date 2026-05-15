@@ -207,6 +207,21 @@ if [ -n "$CLAUDE_SHIM_SETTINGS_PATH" ] && [ ! -f "$CLAUDE_SHIM_SETTINGS_PATH" ];
     CLAUDE_SHIM_SETTINGS_PATH=""
 fi
 
+# Seed default-bundled obligations rows when the gate is enabled. The
+# seeder is idempotent: existing rows tagged `[default-seed]` are
+# skipped, so re-running the entrypoint never duplicates rows.
+# Currently seeds the `subagent_queue_item_running` row which enforces
+# "every subagent tool call must correspond to a running queue item"
+# continuously throughout the subagent's lifetime (the existing
+# pre-agent-queue-gate-hook enforces it only at SPAWN time; this row +
+# the post-tool-agent-arm-hook enforce it AFTER spawn). Best-effort:
+# obligations-init exits 0 on any internal failure so a missing
+# obligations CLI / broken state file never blocks container start.
+if [ "$CLAUDE_CONTAINER_OBLIGATIONS" = "1" ] \
+        && [ -x /usr/local/bin/obligations-init ]; then
+    /usr/local/bin/obligations-init -v || true
+fi
+
 # MCP server json generation runs ONLY when CLAUDE_CONTAINER_REWRITE_HOOKS=1
 # (operator opts in to dropping the user-tier settings, which is what
 # suppresses the ~/.claude.json MCP discovery path and necessitates the

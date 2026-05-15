@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Seed the default-bundled obligations rows for a fresh container / install.
+
+Run by the container entrypoint after the obligations CLI is available
+on PATH. Idempotent: each default row carries a marker tag in its
+``deny_message`` so we can detect "already seeded" and skip re-adding.
+
+Currently seeded rows:
+
+  - ``subagent_queue_item_running`` — continuous queue-discipline
+    enforcement for subagents. The PreToolUse:Agent queue-gate hook
+    checks at SPAWN time that the Agent's prompt carries a
+    ``Queue item: q-XXXX`` marker and that q-id is running; this
+    predicate enforces the same invariant AFTER spawn so a subagent
+    whose q-id has been marked done / abandoned (or has gone missing
+    from the queue entirely) can no longer make tool calls. Pairs with
+    the ``post-tool-agent-arm-hook`` (PostToolUse:Agent) which writes
+    agent_id -> q-id bindings to
+    ``~/.config/claude/agent-queue-bindings.json`` on every successful
+    async-launched spawn.
+
+The script is best-effort: any failure (missing CLI, broken state file,
+permission error) is logged to stderr but exits 0 so the entrypoint
+keeps going. The whole obligations system is default-open on internal
+errors anyway -- a missing seed row just means the gate is inert until
+the next ``obligations-init`` run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+
+# Tag in the deny_message used to detect already-seeded rows. Bumping
+# this value (or changing the row shape) effectively re-seeds on next
+# run; existing rows with the OLD tag stay until their TTL expires
+# (or until an operator runs `obligations satisfy <id>` against them).
+SUBAGENT_QID_RUNNING_TAG = "[default-seed] subagent_queue_item_running"
+
+# Exempts that must always pass even when the gate is firing. These are
+# the recovery surface a subagent uses to either re-register a queue
+# item, inspect / ack agent-msg messages, or read claude-watch alerts.
+# Same shape as the agent-msg inbox-gate exempt set.
+DEFAULT_EXEMPT_PATTERNS = [
+    # Queue dispatch surface: a subagent that just got denied needs to
+    # be able to inspect the queue state to figure out whether to re-
+    # register (q-id changed) or stop. ``status``, ``spawn-check``,
+    # ``register``, ``show``, ``list`` cover the read + claim path.
+    r"Bash:^session-task\s+queue\s+(status|spawn-check|register|show|list)",
+    # Obligations inspection / override -- the operator's escape hatch
+    # must always work. ``obligations override`` is universal-exempt at
+    # the framework level too, but listing it here makes the row's
+    # intent self-documenting.
+    r"Bash:^obligations\s+(list|show|status|check|override|satisfy)",
+    # Claude-watch alert ack surface -- a subagent that hits both this
+    # gate AND an active claude-watch alert needs to be able to read
+    # + ack the alert before it can do anything else.
+    r"Bash:^claude-watch-ack\b",
+    r"Bash:^claude-watch-dispatch\b",
+    # agent-msg ack / inbox / gc / disarm -- the subagent's own inbox
+    # surface. Same set the agent-msg inbox gate exempts.
+    r"Bash:^agent-msg\s+(ack|inbox|gc|disarm)\b",
+    # agent-tail self-inspection (rare, but harmless when allowed).
+    r"Bash:^agent-tail\b",
+]
+
+
+def _resolve_cli() -> str | None:
+    """Resolve the obligations CLI path. Prefer PATH, fall back to known
+    install locations. Returns None when not found."""
+    cli = shutil.which("obligations")
+    if cli:
+        return cli
+    for cand in ("/usr/local/bin/obligations",
+                 os.path.expanduser("~/bin/obligations")):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _row_already_present(cli: str, tag: str) -> bool:
+    """True iff an active obligation with the seed tag already exists."""
+    try:
+        proc = subprocess.run(
+            [cli, "list", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    obligations = data.get("obligations", [])
+    if not isinstance(obligations, list):
+        return False
+    for ob in obligations:
+        if not isinstance(ob, dict):
+            continue
+        if ob.get("deny_message") == tag:
+            return True
+    return False
+
+
+def seed_subagent_queue_item_running(cli: str, *, dry_run: bool = False,
+                                       force: bool = False,
+                                       verbose: bool = False) -> int:
+    """Add the default subagent_queue_item_running obligation. Returns 0
+    on success (added or already present), non-zero on hard failure."""
+    if not force and _row_already_present(cli, SUBAGENT_QID_RUNNING_TAG):
+        if verbose:
+            print("subagent_queue_item_running: already seeded -- skipping",
+                  file=sys.stderr)
+        return 0
+
+    # We scope the predicate to subagents only via an `all_of` wrapping
+    # `is_main_loop {negate: true}`. With the scope guard, calls from
+    # the main loop short-circuit to satisfied (the all_of's is_main_loop
+    # child fails, which the all_of treats as "inactive scope" by design)
+    # so the predicate ONLY applies to subagents. This is exactly the
+    # pattern documented in the obligations CLI docstring and used by
+    # cron-queue-check + agent-msg arm.
+    predicate_params = {
+        "predicates": [
+            {"kind": "is_main_loop", "params": {"negate": True}},
+            {"kind": "subagent_queue_item_running", "params": {}},
+        ]
+    }
+
+    cmd = [
+        cli, "add",
+        "--tool-pattern", "*",
+        "--predicate", "all_of",
+        "--params", json.dumps(predicate_params),
+        "--ttl", "0",  # non-expiring
+        "--enforcement", "gate",
+        "--deny-msg", SUBAGENT_QID_RUNNING_TAG,
+        "--created-by", "obligations-init",
+        "--json",
+    ]
+    for pat in DEFAULT_EXEMPT_PATTERNS:
+        cmd.extend(["--exempt-tool-pattern", pat])
+
+    if dry_run:
+        print("DRY-RUN: " + " ".join(cmd))
+        return 0
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print("obligations-init: obligations add failed "
+              f"rc={proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        return 1
+    if verbose:
+        try:
+            row = json.loads(proc.stdout)
+            print(f"subagent_queue_item_running: seeded "
+                  f"id={row.get('id', '?')}", file=sys.stderr)
+        except (json.JSONDecodeError, ValueError):
+            print(f"subagent_queue_item_running: seeded "
+                  f"(rc={proc.returncode})", file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="obligations-init",
+        description="Seed default-bundled obligations rows (idempotent).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="Print the obligations add invocation(s) without registering.",
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="Re-seed even when a matching row already exists. Use to "
+             "refresh exempt patterns after a schema change.",
+    )
+    p.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Print one-line stderr summaries for each row.",
+    )
+    args = p.parse_args()
+
+    cli = _resolve_cli()
+    if not cli:
+        # Default-open: container builds without the obligations CLI on
+        # PATH (broken bind-mount, intentionally stripped) silently skip
+        # seeding. The hook scripts default-open on the same condition.
+        if args.verbose:
+            print("obligations-init: obligations CLI not found -- "
+                  "skipping seed", file=sys.stderr)
+        return 0
+
+    rc = seed_subagent_queue_item_running(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001 -- last-ditch default-open
+        print(f"obligations-init: uncaught: {exc}", file=sys.stderr)
+        # Don't propagate a non-zero exit -- the entrypoint must not
+        # fail to start the container because of a seed-row hiccup.
+        sys.exit(0)
