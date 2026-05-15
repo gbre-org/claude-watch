@@ -91,14 +91,19 @@ all that's needed.
    [`container/skills/`](https://github.com/hndrewaall/claude-watch/tree/main/container/skills),
    [`container/agents/`](https://github.com/hndrewaall/claude-watch/tree/main/container/agents),
    [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers).
-7. **Invoke `/claude-container:start-watchers`** to start whatever
-   watcher launchers ship in this image build. The skill self-discovers
-   `/etc/claude-code/watchers/*.toml` and launches each via `Bash` with
-   `run_in_background: true`. The image currently bakes one watcher
-   (`claude-event-tail`, which surfaces `~/claude-events/*.json` drops
-   to the in-container session); future watcher additions update the
-   skill's discovered set without needing a baked-CLAUDE.md edit. This
-   step's contract is "ask the skill what's there", not "hand-wave".
+7. **Watchers are already running — verify via `/claude-container:start-watchers`**.
+   The container's entrypoint spawns `cw-watcher-supervisor`
+   (`/usr/local/bin/cw-watcher-supervisor`) before tmux. The supervisor
+   reads `/etc/claude-code/watchers/*.toml` and launches each watcher
+   with respawn-on-exit semantics per `restart_policy`. Watchers
+   survive the full container lifetime — not just one session — so
+   you don't have to re-launch them at session start. The
+   `/claude-container:start-watchers` skill is now an INFORMATIONAL
+   probe: it reports which watchers ship in this build and whether the
+   supervisor's launcher processes are alive. The image currently
+   bakes one watcher (`claude-event-tail`, which surfaces
+   `~/claude-events/*.json` drops to the in-container session); future
+   watcher additions get auto-supervised without any session-side action.
 
 **Long-running watchers inside this container are scoped narrowly.**
 The container is a code-writing sandbox, not a host automation hub.

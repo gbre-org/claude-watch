@@ -135,6 +135,9 @@ test-entrypoint:
 	container/tests/dir-watch-script-installed.test
 	container/tests/claude-event-tail-baked.test
 	container/tests/dir-watch-rearms.test
+	container/tests/cw-watcher-supervisor-installed.test
+	container/tests/cw-watcher-supervisor-launches-claude-event-tail.test
+	container/tests/entrypoint-launches-supervisor.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host

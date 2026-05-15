@@ -35,17 +35,26 @@ Each watcher is a pair of files:
 
 The Dockerfile copies this directory into the image at:
 
-- `/etc/claude-code/watchers/` — the path the `/start-watchers` skill probes via `ls /etc/claude-code/watchers/*.toml`.
+- `/etc/claude-code/watchers/` — the path the supervisor + the `/claude-container:start-watchers` skill probe via `ls /etc/claude-code/watchers/*.toml`.
 
-(Watchers do NOT land in `/etc/claude-code/plugin/` — they're not slash commands or agents, just shell scripts the agent runs via the `Bash` tool with `run_in_background: true`.)
+(Watchers do NOT land in `/etc/claude-code/plugin/` — they're not slash commands or agents, just launcher scripts the container-level supervisor runs as long-lived child processes.)
 
-## How a fresh container session discovers them
+## How they get launched at container start
 
-The agent runs `/start-watchers` (the baked skill) which:
+`entrypoint.sh` spawns `/usr/local/bin/cw-watcher-supervisor` (a Python supervisor baked into the image) before tmux launches. The supervisor:
 
-1. `ls /etc/claude-code/watchers/*.toml` — enumerate metadata files.
-2. For each entry: parse the metadata, then launch the `launcher` script via `Bash` with `run_in_background: true`. The skill captures every `bash_id` so the operator can monitor / kill them later.
-3. Reports per-watcher status (started OK, missing launcher, log path).
+1. Reads every `*.toml` under `/etc/claude-code/watchers/` (or `$CW_WATCHERS_DIR`).
+2. Spawns each watcher's launcher script with stdout/stderr appended to its `log_path`.
+3. Re-spawns on exit per `restart_policy` (`always` / `on-failure` / `never`).
+4. Backoff: exponential 1s → 2s → 4s ... capped at 30s. Resets after a child runs for >= 60s.
+5. Crash-loop protection: more than 5 restarts in a 60s window marks the watcher "stuck"; the supervisor stops respawning it until restart.
+6. Forwards SIGTERM/SIGINT to every child on shutdown.
+
+Result: watchers survive the entire container lifetime — they aren't bound to any one Claude Code session.
+
+The in-session `/claude-container:start-watchers` skill is now an **informational probe** that reports which watchers exist + whether the supervisor's launcher processes are alive. It does NOT double-launch watchers when the supervisor is already running.
+
+Operators who want to opt out of supervision (e.g. validation harnesses) set `CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0` in the container env; in that case the skill falls back to its legacy `run_in_background: true` shape (session-scoped watchers).
 
 ## How to add a new watcher
 

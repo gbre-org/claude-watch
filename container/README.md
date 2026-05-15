@@ -329,7 +329,7 @@ on-disk schema, the bake target, and the add-a-new-entry walkthrough.
 | --- | --- | --- | --- |
 | [`container/skills/`](skills/) | `/etc/claude-code/skills/` (canonical) + `/etc/claude-code/plugin/commands/` (plugin loader) | One `<name>.md` per slash command | `--plugin-dir /etc/claude-code/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`); skills callable as `/claude-container:<name>` |
 | [`container/agents/`](agents/) | `/etc/claude-code/agents/` (canonical) + `/etc/claude-code/plugin/agents/` (plugin loader) | One `<name>.md` per custom agent (frontmatter + body) | Same `--plugin-dir`; agents spawned with `subagent_type="claude-container:<name>"` |
-| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per long-running watcher | Probed by the `/claude-container:start-watchers` skill via `ls /etc/claude-code/watchers/*.toml`. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
+| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per long-running watcher | Auto-launched at container start by `cw-watcher-supervisor` (entrypoint-spawned, respawn-on-exit per `restart_policy`). The `/claude-container:start-watchers` skill is an informational probe. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
 
 The plugin namespace `claude-container` is set by
 [`container/plugin/.claude-plugin/plugin.json`](plugin/.claude-plugin/plugin.json),
@@ -341,16 +341,18 @@ plugin loader treats the baked dir as a real plugin.
 
 - Skills: [`restart`](skills/restart.md) (mirrors the host's `/restart`
   but invokes the in-container `cwsr` instead of `claude-watch update
-  --force`); [`start-watchers`](skills/start-watchers.md) (probes
-  `/etc/claude-code/watchers/`; today reports "nothing to start"
-  because the dir is empty).
+  --force`); [`start-watchers`](skills/start-watchers.md)
+  (informational probe — reports which watchers are running under
+  the container-level `cw-watcher-supervisor`).
 - Agents: none yet — the dir is a stub for future agent ports (Explore,
   general-purpose, note-writer, etc. — see
   [`container/agents/README.md`](agents/README.md) for the plan).
-- Watchers: none yet — the dir is a stub for future container-scoped
-  watchers (e.g. an in-container queue-event tail). The session-start
-  checklist in `baked-CLAUDE.md` honestly states "no long-running
-  watchers inside this container".
+- Watchers: [`claude-event-tail`](watchers/claude-event-tail.sh)
+  (surfaces `~/claude-events/*.json` drops to the in-container
+  session). Supervised by `cw-watcher-supervisor`, which entrypoint.sh
+  spawns at container start; watchers respawn-on-exit per their
+  `restart_policy` and survive the full container lifetime
+  independent of any Claude Code session inside.
 
 To add a new skill / agent / watcher: drop the file in the appropriate
 `container/<dir>/`, add a test under `container/tests/baked-dirs.test`
