@@ -344,6 +344,98 @@ Default-open contracts (predicate inert, tool call ALLOWED):
 
 A hook bug can never blackhole a real subagent.
 
+### Generic `evaluator` predicate — delegate gate decisions to a script
+
+`evaluator` is a general-purpose obligation predicate that runs an
+external subprocess and uses its result to allow or deny a tool call.
+Use it whenever a gate needs to defer to an outside decision-maker —
+a deterministic script, an LLM call, an HTTP probe to a policy
+service, a regex audit, etc. The predicate is deliberately
+implementation-agnostic; the obligation row carries the `cmd` and the
+operator supplies whatever the gate should consult.
+
+Register one obligation row per use case:
+
+```sh
+obligations add \
+  --tool-pattern '<tool>' \
+  --predicate evaluator \
+  --params '{
+    "cmd": "/path/to/evaluator-script",
+    "timeout_ms": 5000,
+    "stdin_field": "tool_input.command",
+    "decision_mode": "exit_code"
+  }' \
+  --ttl 0 \
+  --deny-msg "<message shown when the evaluator denies>"
+```
+
+Params:
+
+  - `cmd` (required): shell-style string (run via `/bin/sh -c`) or
+    argv list. Receives `stdin_field` content on stdin and the
+    current tool / command preview via the
+    `OBLIGATIONS_EVAL_TOOL` and `OBLIGATIONS_EVAL_COMMAND_PREVIEW`
+    env vars. Empty / missing => allow + audit-log.
+  - `timeout_ms` (default 5000): hard subprocess timeout. Timeout =>
+    allow + audit-log.
+  - `stdin_field` (default null): which `tool_input` field to pipe to
+    the evaluator. Accepts `tool_input.command`, `command`,
+    `tool_input.prompt`, `prompt`, etc. Null => empty stdin.
+  - `decision_mode` (default `exit_code`):
+      * `exit_code`: allow iff the subprocess exits 0 (flip with
+        `allow_on_zero_exit: false`).
+      * `stdout_pattern`: capture stdout, run `re.search` against
+        `allow_pattern` / `deny_pattern`. `allow` wins on
+        simultaneous match; neither matching => default-open allow +
+        audit-log.
+  - `env` (optional dict): extra env vars merged into the
+    subprocess environment.
+
+Decision contract:
+
+  - Allow => predicate satisfied; obligation does NOT block.
+  - Deny  => predicate fails; obligation blocks the tool call.
+  - Subprocess stderr is captured (truncated at ~2KB) and surfaced
+    verbatim inside the deny banner / `permissionDecisionReason`,
+    so the operator sees the evaluator's own diagnostic right next
+    to the deny.
+
+Default-open posture (a misconfigured evaluator must never blackhole
+the loop):
+
+  - Missing `cmd`, spawn error (file not found / EACCES), timeout,
+    invalid regex, unknown `decision_mode`, undecided
+    `stdout_pattern` match, or any uncaught exception => ALLOW.
+  - Every default-open event is audited to
+    `~/.config/claude/obligations-hook-errors.log` with `source:
+    "obligations:evaluator"` so post-mortems can recover the lost
+    decisions.
+
+Bypass: the standard surface applies. `obligations override
+"<reason>" --duration <N>` bypasses every gate-mode obligation
+including evaluator-backed ones. `OBLIGATIONS_BYPASS=1` also
+bypasses. There is no per-row evaluator env-var bypass — instance-
+specific escape hatches belong inside the evaluator script (the
+operator owns that surface, the primitive stays small).
+
+Use-case sketches (all separate obligation rows, all reusing this one
+primitive):
+
+  - Outbound Signal pronoun audit on `signal-send` invocations —
+    evaluator script parses the staged body, queries the local
+    members.json, denies on pronoun mismatch.
+  - Dispatcher-quality reviewer on every `Agent` spawn — evaluator
+    invokes an LLM-backed audit script that scores the prompt.
+  - Security-classification triage on outbound `gh issue comment` —
+    deterministic grep against a private-path block-list.
+  - HTTP probe to an external policy service — evaluator is a curl
+    wrapper that exits 0 / 1 based on the response.
+
+Each use case is one obligation row with its own `cmd`,
+decision-mode, and patterns. The primitive itself stays
+LLM-agnostic.
+
 ## Agent communication channels — two distinct inbound paths
 
 A spawned subagent has TWO distinct inbound channels you must

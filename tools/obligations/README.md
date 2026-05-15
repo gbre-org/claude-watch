@@ -51,6 +51,19 @@ Bounded set, NOT Turing-complete:
   - `no_pending_watcher_outputs {}` — no captured-but-unread watcher output sidecars
   - `agent_inbox_empty {path}` — agent-msg inbox has no UNREAD messages
   - `is_main_loop {negate?}` — caller is the main session loop (no agent_id)
+  - `evaluator {cmd, timeout_ms?, stdin_field?, decision_mode?,
+    allow_on_zero_exit?, allow_pattern?, deny_pattern?, env?}` —
+    generic delegation primitive. Runs `cmd` (shell string or argv list)
+    and decides allow/deny from its exit code (`decision_mode=exit_code`,
+    default) or stdout regex (`decision_mode=stdout_pattern`). Stderr is
+    captured into the `why` field so the operator sees the evaluator's
+    own diagnostic in the deny banner. Default-open on every failure
+    mode (missing cmd, timeout, spawn error, invalid regex, undecided
+    pattern match); each default-open event is audited to
+    `~/.config/claude/obligations-hook-errors.log`. Use this when an
+    obligation needs to defer to an external decision-maker (script,
+    LLM call, HTTP probe, ...) — one obligation row per use case, the
+    evaluator script is the implementation.
   - `all_of {predicates: [...]}` — meta-predicate; logical AND with
     `is_main_loop` short-circuit semantics (a failing `is_main_loop`
     inside `all_of` returns satisfied=True, i.e. "this rule does not

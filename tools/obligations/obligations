@@ -226,6 +226,104 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         (or the scope-skip note), so the deny banner stays actionable.
         Children are themselves ``{kind, params}`` and may nest
         (``all_of`` inside ``all_of`` is fine, though usually unnecessary).
+  - evaluator: {cmd, timeout_ms?, stdin_field?, decision_mode?,
+                allow_on_zero_exit?, allow_pattern?, deny_pattern?,
+                env?}
+        Generic delegation primitive. Runs ``cmd`` (a shell-style string
+        executed via /bin/sh -c, or a list of argv -- whichever the
+        caller registered) as a subprocess and uses its result to
+        decide allow vs deny. The caller supplies the evaluator
+        implementation; this predicate just wires it into the
+        obligations gate.
+
+        Params:
+          - ``cmd`` (required): the evaluator to run. String => /bin/sh
+            -c <string>. List => argv exec. Empty / missing => allow +
+            audit-log (default-open: a broken row must not blackhole
+            the loop).
+          - ``timeout_ms`` (optional, default 5000): subprocess timeout
+            in milliseconds. Timeout => allow + audit-log.
+          - ``stdin_field`` (optional, default null): which field of
+            the tool's ``tool_input`` to pipe as stdin to the
+            evaluator. Supports dotted paths
+            (``tool_input.command`` / ``tool_input.prompt`` /
+            ``tool_input.file_path`` / etc.). Note: ``_eval_predicate``
+            only has access to the rendered ``command_string`` (the
+            short-form passed by the hook), so the predicate
+            normalises the typical fields by name -- if ``stdin_field``
+            is ``tool_input.command`` (or ``command`` or
+            ``tool_input.prompt`` / ``prompt``), we pass
+            ``command_string`` verbatim. Other field names get the
+            same payload (for now) -- callers who need full structured
+            access can extend the call site to forward
+            ``tool_input``.  null => empty stdin.
+          - ``decision_mode`` (optional, default ``exit_code``):
+              * ``exit_code`` -- ALLOW iff the subprocess exit code is
+                0 (or whichever boolean ``allow_on_zero_exit`` flips
+                to: ``true`` keeps the default; ``false`` inverts so
+                non-zero exits ALLOW).
+              * ``stdout_pattern`` -- capture stdout, match against
+                ``allow_pattern`` and ``deny_pattern``. ``allow`` wins
+                if both match (specificity rule: explicit allow over
+                ambiguous deny). If neither matches => default-open
+                ALLOW + audit-log (the evaluator is undecided).
+          - ``allow_on_zero_exit`` (optional, default true): see
+            above.
+          - ``allow_pattern`` / ``deny_pattern`` (optional regex
+            strings, required only in ``stdout_pattern`` mode):
+            compiled with ``re.search``. Invalid regex => allow +
+            audit-log.
+          - ``env`` (optional dict): extra env vars merged into the
+            subprocess environment. The current tool name and
+            command-string preview are always exported as
+            ``OBLIGATIONS_EVAL_TOOL`` and
+            ``OBLIGATIONS_EVAL_COMMAND_PREVIEW`` (first 2KB) so the
+            evaluator script can branch on context without parsing
+            stdin.
+
+        Decision contract:
+          * Allow == predicate ``satisfied=True`` (obligation gate
+            does NOT block the tool call).
+          * Deny == predicate ``satisfied=False`` (gate blocks).
+          * Subprocess stderr is captured (truncated at ~2KB) and
+            included verbatim in the ``why`` string. The pre-tool
+            obligations hook embeds the first 1.2KB of ``why`` in the
+            deny banner / ``permissionDecisionReason``, so operators
+            see the evaluator's own diagnostic right next to the deny.
+
+        Default-open everywhere:
+          * Empty / missing ``cmd`` => allow + warn.
+          * Subprocess timeout => allow + audit-log.
+          * Subprocess spawn error (FileNotFoundError, PermissionError,
+            etc.) => allow + audit-log.
+          * Invalid regex / unknown ``decision_mode`` => allow +
+            audit-log.
+          * Any uncaught exception in the predicate => allow +
+            audit-log.
+
+        Audit log: every default-open event (timeout, spawn error,
+        invalid config, undecided stdout-pattern) is appended to
+        ``~/.config/claude/obligations-hook-errors.log`` so the
+        operator can later inspect "why did this gate go silent" cases
+        without losing the loop to a blackhole.
+
+        Bypass: per-call ``obligations override <reason>`` bypasses
+        every gate-mode obligation including evaluator-backed ones,
+        unchanged from the rest of the system. ``OBLIGATIONS_BYPASS=1``
+        also bypasses. There is no per-row evaluator bypass env var;
+        instance-specific bypass is the operator's responsibility
+        inside the evaluator script (e.g. ``if [ "$1" = "BYPASS" ]
+        then exit 0; fi`` inside the user-supplied script -- the
+        primitive does not enshrine per-id env-var bypass to keep the
+        surface area small).
+
+        Use cases (orthogonal instances that all reuse this one
+        primitive): pronoun-audit on outbound Signal sends, LLM-backed
+        dispatcher-quality reviewer, deterministic security-class
+        triage script, HTTP probe to an external policy service.
+        Each instance is one obligation row with its own ``cmd``,
+        decision-mode, and patterns. The primitive itself is
+        deliberately LLM-agnostic.
 
 Subcommands: see argparse below.
 
@@ -359,6 +457,7 @@ VALID_PREDICATE_KINDS = {
     "stale_ready_queue_present",
     "force_started_unspawned",
     "subagent_queue_item_running",
+    "evaluator",
     "all_of",
 }
 
@@ -516,6 +615,26 @@ def _new_override_id():
 # also writes here when OBLIGATIONS_BYPASS=1 fires.
 BYPASS_LOG_PATH = Path.home() / ".config" / "claude" / "obligations-bypass.log"
 
+# Audit log path for evaluator-predicate default-open events: timeouts,
+# spawn errors, invalid config, undecided stdout-pattern matches. Shared
+# with other hook diagnostics so operators have one place to look when
+# investigating "why did this gate go silent." Path matches the convention
+# used by the pre-/post-tool obligations hooks.
+EVALUATOR_AUDIT_LOG_PATH = (
+    Path.home() / ".config" / "claude" / "obligations-hook-errors.log"
+)
+
+# Default evaluator subprocess timeout (ms). Tunable per-row via the
+# ``timeout_ms`` param. Modest default -- the gate runs on every tool
+# call so an evaluator that takes seconds will be felt instantly.
+DEFAULT_EVALUATOR_TIMEOUT_MS = 5000
+
+# Truncate captured stderr (and stdout, for stdout_pattern mode) at this
+# many bytes when embedding in the ``why`` string. The pre-tool hook
+# further caps the deny banner at ~1200 chars, but capping at the source
+# keeps memory bounded.
+EVALUATOR_OUTPUT_CAP_BYTES = 2048
+
 
 def _audit_override(record):
     """Append an audit record to the bypass log. Best-effort, swallows I/O errors."""
@@ -526,6 +645,34 @@ def _audit_override(record):
             fh.write(json.dumps({"ts": ts, "pid": os.getpid(), **record}) + "\n")
         try:
             BYPASS_LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _audit_evaluator(record):
+    """Append an evaluator-predicate diagnostic record to the obligations
+    hook-errors log. Best-effort, swallows I/O errors -- the gate must
+    never blackhole the loop because we couldn't write a log line.
+
+    Each record carries (at minimum) ``kind`` (timeout / spawn-error /
+    invalid-config / undecided / exception), ``cmd_preview`` (first
+    160 chars), ``tool_name``, ``elapsed_ms``, and any diagnostic
+    fields the caller wants to surface."""
+    try:
+        EVALUATOR_AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        line = json.dumps({
+            "ts": ts,
+            "pid": os.getpid(),
+            "source": "obligations:evaluator",
+            **record,
+        })
+        with EVALUATOR_AUDIT_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        try:
+            EVALUATOR_AUDIT_LOG_PATH.chmod(0o600)
         except OSError:
             pass
     except (OSError, ValueError):
@@ -830,6 +977,285 @@ def _stale_ready_items(queue_path, threshold_secs, now_unix):
 # ---------------------------------------------------------------------------
 # Predicate evaluation
 # ---------------------------------------------------------------------------
+
+
+def _resolve_evaluator_stdin(stdin_field, command_string):
+    """Return the stdin string to feed to the evaluator subprocess, OR
+    ``None`` for "no stdin" (we'll pass an empty buffer in that case).
+
+    ``stdin_field`` is the predicate param: a dotted-path-like string
+    naming which slice of ``tool_input`` to surface to the evaluator.
+    We don't have access to the full ``tool_input`` dict inside
+    ``_eval_predicate`` -- the hook passes a rendered ``command_string``
+    that for Bash carries the literal command and for other tools
+    carries a JSON-rendered ``tool_input``. So the typical cases
+    (``tool_input.command``, ``command``, ``tool_input.prompt``,
+    ``prompt``) all collapse to "pass command_string verbatim";
+    callers who need richer routing can either extend the call site
+    later or parse command_string themselves from the evaluator (it's
+    JSON for non-Bash tools).
+
+    null / empty / unrecognised value => no stdin.
+    """
+    if not stdin_field:
+        return None
+    s = str(stdin_field).strip()
+    if not s:
+        return None
+    # Strip a leading "tool_input." for convenience.
+    bare = s
+    if bare.startswith("tool_input."):
+        bare = bare[len("tool_input."):]
+    # Recognised aliases. Each currently maps to command_string because
+    # that is what the hook rendered for us. The evaluator can JSON-parse
+    # command_string for non-Bash tools to drill in further.
+    known = {"command", "prompt", "file_path", "args", "raw"}
+    if bare in known or bare == "":
+        return command_string or ""
+    # Unknown field: forward command_string verbatim (best-effort) so the
+    # operator-authored evaluator at least sees the same payload they
+    # would see in the audit logs. This avoids silently dropping
+    # input when a future field name lands.
+    return command_string or ""
+
+
+def _eval_evaluator_predicate(params, tool_name, command_string, agent_id):
+    """Run a user-supplied subprocess and return (satisfied, why) based
+    on its exit code or stdout pattern.
+
+    Default-open on every failure mode: empty cmd, spawn error,
+    timeout, invalid regex, unknown decision_mode, uncaught exception.
+    Every default-open path is audited to
+    ``EVALUATOR_AUDIT_LOG_PATH``.
+    """
+    cmd = params.get("cmd")
+    if not cmd:
+        _audit_evaluator({
+            "kind": "invalid-config",
+            "reason": "missing cmd",
+            "tool_name": tool_name,
+        })
+        return (True, "evaluator predicate: missing cmd (default-open)")
+
+    # Resolve timeout.
+    timeout_ms = params.get("timeout_ms", DEFAULT_EVALUATOR_TIMEOUT_MS)
+    try:
+        timeout_secs = max(0.05, float(timeout_ms) / 1000.0)
+    except (TypeError, ValueError):
+        timeout_secs = DEFAULT_EVALUATOR_TIMEOUT_MS / 1000.0
+
+    # Decision mode + allow_on_zero_exit.
+    decision_mode = str(params.get("decision_mode") or "exit_code")
+    if decision_mode not in ("exit_code", "stdout_pattern"):
+        _audit_evaluator({
+            "kind": "invalid-config",
+            "reason": f"unknown decision_mode {decision_mode!r}",
+            "tool_name": tool_name,
+        })
+        return (True,
+                f"evaluator predicate: unknown decision_mode "
+                f"{decision_mode!r} (default-open)")
+    allow_on_zero_exit = bool(params.get("allow_on_zero_exit", True))
+
+    # Pre-compile patterns (only needed for stdout_pattern). Invalid
+    # regex => default-open + audit.
+    allow_re = None
+    deny_re = None
+    if decision_mode == "stdout_pattern":
+        ap = params.get("allow_pattern")
+        dp = params.get("deny_pattern")
+        if ap is not None:
+            try:
+                allow_re = re.compile(str(ap))
+            except re.error as e:
+                _audit_evaluator({
+                    "kind": "invalid-config",
+                    "reason": f"invalid allow_pattern regex: {e}",
+                    "pattern": str(ap)[:200],
+                    "tool_name": tool_name,
+                })
+                return (True,
+                        f"evaluator predicate: invalid allow_pattern "
+                        f"regex {ap!r} (default-open): {e}")
+        if dp is not None:
+            try:
+                deny_re = re.compile(str(dp))
+            except re.error as e:
+                _audit_evaluator({
+                    "kind": "invalid-config",
+                    "reason": f"invalid deny_pattern regex: {e}",
+                    "pattern": str(dp)[:200],
+                    "tool_name": tool_name,
+                })
+                return (True,
+                        f"evaluator predicate: invalid deny_pattern "
+                        f"regex {dp!r} (default-open): {e}")
+
+    # Resolve stdin.
+    stdin_field = params.get("stdin_field")
+    stdin_payload = _resolve_evaluator_stdin(stdin_field, command_string)
+    stdin_bytes = (stdin_payload or "").encode("utf-8", errors="replace")
+
+    # Build env. Always export the current tool name + a short command
+    # preview so the evaluator can branch on context without parsing
+    # stdin. ``OBLIGATIONS_BYPASS`` and other harness env vars are NOT
+    # filtered -- the evaluator inherits whatever the gate process has.
+    env = os.environ.copy()
+    env["OBLIGATIONS_EVAL_TOOL"] = tool_name or ""
+    env["OBLIGATIONS_EVAL_COMMAND_PREVIEW"] = (
+        (command_string or "")[:2048]
+    )
+    if agent_id:
+        env["OBLIGATIONS_EVAL_AGENT_ID"] = str(agent_id)
+    extra_env = params.get("env")
+    if isinstance(extra_env, dict):
+        for k, v in extra_env.items():
+            if isinstance(k, str) and v is not None:
+                env[k] = str(v)
+
+    # cmd: list => argv exec, string => shell -c.
+    started = time.time()
+    try:
+        if isinstance(cmd, list):
+            proc = subprocess.run(
+                [str(x) for x in cmd],
+                input=stdin_bytes,
+                capture_output=True,
+                timeout=timeout_secs,
+                env=env,
+                check=False,
+            )
+        else:
+            proc = subprocess.run(
+                str(cmd),
+                shell=True,
+                input=stdin_bytes,
+                capture_output=True,
+                timeout=timeout_secs,
+                env=env,
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        elapsed_ms = int((time.time() - started) * 1000)
+        _audit_evaluator({
+            "kind": "timeout",
+            "cmd_preview": str(cmd)[:160],
+            "tool_name": tool_name,
+            "timeout_ms": int(timeout_secs * 1000),
+            "elapsed_ms": elapsed_ms,
+        })
+        return (True,
+                f"evaluator predicate timed out after "
+                f"{int(timeout_secs * 1000)}ms (default-open)")
+    except (FileNotFoundError, PermissionError, NotADirectoryError) as e:
+        elapsed_ms = int((time.time() - started) * 1000)
+        _audit_evaluator({
+            "kind": "spawn-error",
+            "cmd_preview": str(cmd)[:160],
+            "tool_name": tool_name,
+            "elapsed_ms": elapsed_ms,
+            "error": f"{type(e).__name__}: {e}",
+        })
+        return (True,
+                f"evaluator predicate spawn error "
+                f"({type(e).__name__}): {e} (default-open)")
+    except OSError as e:
+        elapsed_ms = int((time.time() - started) * 1000)
+        _audit_evaluator({
+            "kind": "spawn-error",
+            "cmd_preview": str(cmd)[:160],
+            "tool_name": tool_name,
+            "elapsed_ms": elapsed_ms,
+            "error": f"{type(e).__name__}: {e}",
+        })
+        return (True,
+                f"evaluator predicate OS error "
+                f"({type(e).__name__}): {e} (default-open)")
+    except Exception as e:  # noqa: BLE001 -- default-open on every error
+        elapsed_ms = int((time.time() - started) * 1000)
+        _audit_evaluator({
+            "kind": "exception",
+            "cmd_preview": str(cmd)[:160],
+            "tool_name": tool_name,
+            "elapsed_ms": elapsed_ms,
+            "error": f"{type(e).__name__}: {e}",
+        })
+        return (True,
+                f"evaluator predicate raised {type(e).__name__}: {e} "
+                f"(default-open)")
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    # Decode + truncate stderr/stdout to a bounded preview so a chatty
+    # evaluator can't blow up the deny banner.
+    stderr_text = (proc.stderr or b"")
+    if isinstance(stderr_text, bytes):
+        stderr_text = stderr_text.decode("utf-8", errors="replace")
+    if len(stderr_text) > EVALUATOR_OUTPUT_CAP_BYTES:
+        stderr_text = (stderr_text[:EVALUATOR_OUTPUT_CAP_BYTES]
+                       + "... [stderr truncated]")
+    stdout_text = (proc.stdout or b"")
+    if isinstance(stdout_text, bytes):
+        stdout_text = stdout_text.decode("utf-8", errors="replace")
+    stdout_for_match = stdout_text
+    if len(stdout_text) > EVALUATOR_OUTPUT_CAP_BYTES:
+        stdout_text = (stdout_text[:EVALUATOR_OUTPUT_CAP_BYTES]
+                       + "... [stdout truncated]")
+
+    def _format_why(verdict, body):
+        """Compose the ``why`` string. The pre-tool hook embeds this in
+        the deny banner / permissionDecisionReason so we want the
+        evaluator's own stderr surfaced verbatim when relevant."""
+        parts = [f"evaluator {verdict} (elapsed={elapsed_ms}ms): {body}"]
+        if stderr_text.strip():
+            parts.append(f"evaluator stderr: {stderr_text.rstrip()}")
+        return "\n".join(parts)
+
+    if decision_mode == "exit_code":
+        zero = (proc.returncode == 0)
+        allow = zero if allow_on_zero_exit else (not zero)
+        if allow:
+            return (True,
+                    _format_why("ALLOW",
+                                f"exit_code={proc.returncode} "
+                                f"(allow_on_zero_exit="
+                                f"{allow_on_zero_exit})"))
+        return (False,
+                _format_why("DENY",
+                            f"exit_code={proc.returncode} "
+                            f"(allow_on_zero_exit="
+                            f"{allow_on_zero_exit})"))
+
+    # stdout_pattern mode.
+    allow_hit = bool(allow_re and allow_re.search(stdout_for_match))
+    deny_hit = bool(deny_re and deny_re.search(stdout_for_match))
+    # Specificity: explicit allow_pattern match wins over a simultaneous
+    # deny_pattern match (the evaluator opted IN to allow; ambiguous
+    # deny shouldn't override it).
+    if allow_hit:
+        return (True,
+                _format_why("ALLOW",
+                            f"stdout matched allow_pattern; "
+                            f"stdout_preview={stdout_text!r}"))
+    if deny_hit:
+        return (False,
+                _format_why("DENY",
+                            f"stdout matched deny_pattern; "
+                            f"stdout_preview={stdout_text!r}"))
+    # Neither pattern matched => default-open + audit so the operator
+    # can see "evaluator was undecided" cases.
+    _audit_evaluator({
+        "kind": "undecided",
+        "cmd_preview": str(cmd)[:160],
+        "tool_name": tool_name,
+        "elapsed_ms": elapsed_ms,
+        "exit_code": proc.returncode,
+        "stdout_preview": stdout_text[:240],
+    })
+    return (True,
+            _format_why("ALLOW",
+                        f"stdout matched neither allow_pattern nor "
+                        f"deny_pattern (default-open); "
+                        f"stdout_preview={stdout_text!r}"))
 
 
 def _eval_predicate(pred, tool_name, command_string, agent_id=None):
@@ -1547,6 +1973,15 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
             return (True,
                     f"subagent_queue_item_running default-open on "
                     f"error: {e}")
+
+    if kind == "evaluator":
+        # Generic delegation primitive: run a user-supplied subprocess
+        # and use its result (exit code OR stdout-pattern match) to
+        # decide allow vs deny. Default-open on every kind of error
+        # so a misconfigured evaluator can never blackhole the loop.
+        return _eval_evaluator_predicate(
+            params, tool_name, command_string, agent_id,
+        )
 
     if kind == "is_main_loop":
         # Satisfied iff the call is from the main loop (no agent_id).

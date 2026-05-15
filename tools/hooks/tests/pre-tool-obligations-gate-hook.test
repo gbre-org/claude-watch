@@ -131,6 +131,23 @@ Test cases (PreToolUse):
 122. subagent_queue_item_running: main-loop call -> allow (scope-guard skip)
 123. subagent_queue_item_running: no entry for this agent -> allow
 124. end-to-end: arm-hook -> bind -> queue=running allow -> queue=done deny
+125. evaluator (exit_code): cmd returns 0 -> allow
+126. evaluator (exit_code): cmd returns 1 -> deny + stderr in reason
+127. evaluator (exit_code): allow_on_zero_exit=false flips polarity
+128. evaluator (stdout_pattern): stdout matches allow_pattern -> allow
+129. evaluator (stdout_pattern): stdout matches deny_pattern -> deny
+130. evaluator (stdout_pattern): neither pattern matches -> default-open allow
+131. evaluator: subprocess timeout -> allow + audit log
+132. evaluator: cmd not found -> allow + audit log
+133. evaluator: missing cmd config -> allow + audit log
+134. evaluator: invalid allow_pattern regex -> allow + audit log
+135. evaluator: unknown decision_mode -> allow + audit log
+136. evaluator: stdin_field=tool_input.command pipes command to evaluator
+137. evaluator: deny banner / reason carries evaluator stderr verbatim
+138. evaluator end-to-end: PreToolUse gate denies when evaluator says deny
+139. evaluator: OBLIGATIONS_BYPASS=1 forces allow past evaluator deny
+140. evaluator: argv list cmd form works (no shell)
+141. evaluator: env param merged into subprocess environment
 
 Each test uses a SEPARATE OBLIGATIONS_FILE path (not the live ~/.config/claude/
 one) by overriding via environment + an isolated state dir, so we never touch
@@ -4204,6 +4221,551 @@ def main() -> int:
                 f"running_allow={_is_allow(out_running)} "
                 f"done_deny={_is_deny(out_done)}",
             ))
+
+        # ===========================================================
+        # Tests 125-141: evaluator predicate (generic delegation
+        # primitive). Per Andrew DM 2026-05-15 17:00 ET: cw should
+        # provide basic primitives; this one is NOT LLM-specific --
+        # any user-supplied subprocess (script, LLM-call, HTTP probe,
+        # regex audit) can be wired in.
+        # ===========================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-eval-") as td_eval:
+            tmpdir_eval = Path(td_eval)
+            env_eval, ob_path_eval = _make_isolated_env(tmpdir_eval)
+            scripts_dir = tmpdir_eval / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+
+            def _write_script(name: str, body: str) -> str:
+                p = scripts_dir / name
+                p.write_text(body)
+                p.chmod(0o755)
+                return str(p)
+
+            def _audit_log_lines() -> list[str]:
+                """Read the obligations-hook-errors.log under the sandboxed
+                HOME. Each line should be a JSON record; we just return raw
+                lines so callers can grep."""
+                log = (tmpdir_eval / ".config" / "claude"
+                       / "obligations-hook-errors.log")
+                if not log.exists():
+                    return []
+                try:
+                    return [ln for ln in log.read_text(
+                        encoding="utf-8").splitlines() if ln.strip()]
+                except OSError:
+                    return []
+
+            def _audit_log_clear():
+                log = (tmpdir_eval / ".config" / "claude"
+                       / "obligations-hook-errors.log")
+                if log.exists():
+                    log.unlink()
+
+            # --- 125: exit_code mode, cmd exits 0 -> ALLOW ---
+            allow_script = _write_script("allow.sh", "#!/bin/sh\nexit 0\n")
+            ob_125 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": allow_script,
+                        "decision_mode": "exit_code",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            results.append(_check(
+                "125. evaluator exit_code=0 -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_125], env_eval)
+
+            # --- 126: exit_code mode, cmd exits 1 -> DENY ---
+            deny_script = _write_script(
+                "deny.sh",
+                "#!/bin/sh\necho 'POLICY VIOLATION: nope' 1>&2\nexit 1\n",
+            )
+            ob_126 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": deny_script,
+                        "decision_mode": "exit_code",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied call",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            reason = (out.get("hookSpecificOutput", {})
+                      .get("permissionDecisionReason", ""))
+            results.append(_check(
+                "126. evaluator exit_code=1 -> deny + stderr in reason",
+                (rc == 0 and _is_deny(out)
+                 and "POLICY VIOLATION" in reason),
+                f"rc={rc} deny={_is_deny(out)} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_126], env_eval)
+
+            # --- 127: allow_on_zero_exit=false inverts polarity ---
+            ob_127 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": allow_script,  # exits 0
+                        "decision_mode": "exit_code",
+                        "allow_on_zero_exit": False,
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied (inverted)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            results.append(_check(
+                "127. evaluator allow_on_zero_exit=false flips polarity: "
+                "exit 0 -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_127], env_eval)
+
+            # --- 128: stdout_pattern mode, matches allow_pattern -> ALLOW ---
+            ok_stdout = _write_script(
+                "ok-stdout.sh", "#!/bin/sh\necho 'ALLOW: looks fine'\nexit 0\n",
+            )
+            ob_128 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": ok_stdout,
+                        "decision_mode": "stdout_pattern",
+                        "allow_pattern": r"^ALLOW\b",
+                        "deny_pattern": r"^DENY\b",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied stdout",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            results.append(_check(
+                "128. evaluator stdout_pattern allow_pattern match -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_128], env_eval)
+
+            # --- 129: stdout_pattern mode, matches deny_pattern -> DENY ---
+            bad_stdout = _write_script(
+                "bad-stdout.sh",
+                "#!/bin/sh\necho 'DENY: blocked by policy'\nexit 0\n",
+            )
+            ob_129 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": bad_stdout,
+                        "decision_mode": "stdout_pattern",
+                        "allow_pattern": r"^ALLOW\b",
+                        "deny_pattern": r"^DENY\b",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied stdout",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            reason = (out.get("hookSpecificOutput", {})
+                      .get("permissionDecisionReason", ""))
+            results.append(_check(
+                "129. evaluator stdout_pattern deny_pattern match -> deny",
+                (rc == 0 and _is_deny(out)
+                 and "DENY: blocked by policy" in reason),
+                f"rc={rc} deny={_is_deny(out)} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_129], env_eval)
+
+            # --- 130: stdout_pattern, neither matches -> default-open ALLOW ---
+            _audit_log_clear()
+            undecided_stdout = _write_script(
+                "undecided.sh",
+                "#!/bin/sh\necho 'MAYBE: not sure'\nexit 0\n",
+            )
+            ob_130 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": undecided_stdout,
+                        "decision_mode": "stdout_pattern",
+                        "allow_pattern": r"^ALLOW\b",
+                        "deny_pattern": r"^DENY\b",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied stdout",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            audit_lines = _audit_log_lines()
+            undecided_logged = any('"undecided"' in ln for ln in audit_lines)
+            results.append(_check(
+                "130. evaluator stdout_pattern undecided -> default-open "
+                "allow + audit log",
+                rc == 0 and _is_allow(out) and undecided_logged,
+                f"rc={rc} undecided_logged={undecided_logged}",
+            ))
+            _run([str(CLI), "satisfy", ob_130], env_eval)
+
+            # --- 131: subprocess timeout -> ALLOW + audit log ---
+            _audit_log_clear()
+            slow_script = _write_script(
+                "slow.sh", "#!/bin/sh\nsleep 2\nexit 1\n",
+            )
+            ob_131 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": slow_script,
+                        "decision_mode": "exit_code",
+                        "timeout_ms": 200},  # 0.2s, script sleeps 2s
+                ttl=300,
+                deny_msg="evaluator denied (slow)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            audit_lines = _audit_log_lines()
+            timeout_logged = any('"timeout"' in ln for ln in audit_lines)
+            results.append(_check(
+                "131. evaluator timeout -> default-open allow + audit log",
+                rc == 0 and _is_allow(out) and timeout_logged,
+                f"rc={rc} timeout_logged={timeout_logged}",
+            ))
+            _run([str(CLI), "satisfy", ob_131], env_eval)
+
+            # --- 132: cmd not found -> ALLOW + audit log ---
+            _audit_log_clear()
+            ob_132 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": ["/no/such/binary/anywhere-here-12345"],
+                        "decision_mode": "exit_code",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied (missing)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            audit_lines = _audit_log_lines()
+            spawn_logged = any('"spawn-error"' in ln for ln in audit_lines)
+            results.append(_check(
+                "132. evaluator cmd not found -> default-open allow + audit "
+                "log",
+                rc == 0 and _is_allow(out) and spawn_logged,
+                f"rc={rc} spawn_logged={spawn_logged}",
+            ))
+            _run([str(CLI), "satisfy", ob_132], env_eval)
+
+            # --- 133: missing cmd config -> ALLOW + audit log ---
+            _audit_log_clear()
+            ob_133 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"decision_mode": "exit_code"},  # no cmd
+                ttl=300,
+                deny_msg="evaluator denied (no cmd)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            audit_lines = _audit_log_lines()
+            invalid_logged = any('"invalid-config"' in ln
+                                 and "missing cmd" in ln
+                                 for ln in audit_lines)
+            results.append(_check(
+                "133. evaluator missing cmd -> default-open allow + audit log",
+                rc == 0 and _is_allow(out) and invalid_logged,
+                f"rc={rc} invalid_logged={invalid_logged}",
+            ))
+            _run([str(CLI), "satisfy", ob_133], env_eval)
+
+            # --- 134: invalid allow_pattern regex -> ALLOW + audit log ---
+            _audit_log_clear()
+            ob_134 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": ok_stdout,
+                        "decision_mode": "stdout_pattern",
+                        "allow_pattern": "[invalid(regex",  # broken regex
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied (bad regex)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            audit_lines = _audit_log_lines()
+            bad_regex_logged = any('"invalid-config"' in ln
+                                   and "allow_pattern" in ln
+                                   for ln in audit_lines)
+            results.append(_check(
+                "134. evaluator invalid allow_pattern regex -> default-open "
+                "allow + audit log",
+                rc == 0 and _is_allow(out) and bad_regex_logged,
+                f"rc={rc} bad_regex_logged={bad_regex_logged}",
+            ))
+            _run([str(CLI), "satisfy", ob_134], env_eval)
+
+            # --- 135: unknown decision_mode -> ALLOW + audit log ---
+            _audit_log_clear()
+            ob_135 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": allow_script,
+                        "decision_mode": "weird-mode"},
+                ttl=300,
+                deny_msg="evaluator denied (unknown mode)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            audit_lines = _audit_log_lines()
+            unknown_mode_logged = any('"invalid-config"' in ln
+                                      and "decision_mode" in ln
+                                      for ln in audit_lines)
+            results.append(_check(
+                "135. evaluator unknown decision_mode -> default-open allow "
+                "+ audit log",
+                rc == 0 and _is_allow(out) and unknown_mode_logged,
+                f"rc={rc} unknown_mode_logged={unknown_mode_logged}",
+            ))
+            _run([str(CLI), "satisfy", ob_135], env_eval)
+
+            # --- 136: stdin_field pipes command to evaluator ---
+            # The evaluator inspects stdin and denies iff stdin contains
+            # the string "FORBIDDEN-TOKEN". This proves the gate is wiring
+            # tool_input.command -> evaluator stdin.
+            stdin_probe = _write_script(
+                "stdin-probe.sh",
+                "#!/bin/sh\nbody=$(cat)\n"
+                "case \"$body\" in\n"
+                "  *FORBIDDEN-TOKEN*) echo \"matched\" 1>&2; exit 1;;\n"
+                "esac\nexit 0\n",
+            )
+            ob_136 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": stdin_probe,
+                        "decision_mode": "exit_code",
+                        "stdin_field": "tool_input.command",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied (forbidden token)",
+            )
+            # Benign command should pass (no forbidden token in stdin).
+            rc_ok, out_ok, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls -la"}},
+                env_eval,
+            )
+            # Forbidden command should be denied.
+            rc_bad, out_bad, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "rm FORBIDDEN-TOKEN"}},
+                env_eval,
+            )
+            results.append(_check(
+                "136. evaluator stdin_field pipes tool_input.command -> "
+                "evaluator sees the literal command",
+                (rc_ok == 0 and _is_allow(out_ok)
+                 and rc_bad == 0 and _is_deny(out_bad)),
+                f"rc_ok={rc_ok} ok_allow={_is_allow(out_ok)} "
+                f"rc_bad={rc_bad} bad_deny={_is_deny(out_bad)}",
+            ))
+            _run([str(CLI), "satisfy", ob_136], env_eval)
+
+            # --- 137: deny banner / reason carries evaluator stderr ---
+            verbose_deny = _write_script(
+                "verbose-deny.sh",
+                "#!/bin/sh\n"
+                "echo 'EVAL-STDERR-PROBE-MARKER: explained reason here' "
+                "1>&2\nexit 1\n",
+            )
+            ob_137 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": verbose_deny,
+                        "decision_mode": "exit_code",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied (verbose)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            reason = (out.get("hookSpecificOutput", {})
+                      .get("permissionDecisionReason", ""))
+            # Get the structured `why` field too via the CLI (operator-
+            # facing inspection path).
+            check_proc = _run([
+                str(CLI), "check", "--tool", "Bash",
+                "--command-string", "ls", "--json",
+            ], env_eval)
+            why_carries_marker = False
+            try:
+                check_data = json.loads(check_proc.stdout)
+                for b in check_data.get("blocking", []):
+                    if "EVAL-STDERR-PROBE-MARKER" in (b.get("why") or ""):
+                        why_carries_marker = True
+                        break
+            except (json.JSONDecodeError, ValueError):
+                pass
+            results.append(_check(
+                "137. evaluator stderr surfaces in deny reason AND in "
+                "structured `why` field",
+                (rc == 0 and _is_deny(out)
+                 and "EVAL-STDERR-PROBE-MARKER" in reason
+                 and why_carries_marker),
+                f"rc={rc} reason_has_marker="
+                f"{'EVAL-STDERR-PROBE-MARKER' in reason} "
+                f"why_has_marker={why_carries_marker}",
+            ))
+            _run([str(CLI), "satisfy", ob_137], env_eval)
+
+            # --- 138: end-to-end -- evaluator deny propagates to the
+            # pre-tool hook's deny payload (banner systemMessage +
+            # permissionDecisionReason both surface the deny_msg) ---
+            ob_138 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": deny_script,
+                        "decision_mode": "exit_code",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator e2e gate denied",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            banner = out.get("systemMessage", "") if isinstance(out, dict) else ""
+            reason = (out.get("hookSpecificOutput", {})
+                      .get("permissionDecisionReason", "")
+                      if isinstance(out, dict) else "")
+            results.append(_check(
+                "138. evaluator end-to-end: PreToolUse gate denies + "
+                "banner + reason both carry deny_msg",
+                (rc == 0 and _is_deny(out)
+                 and "evaluator e2e gate denied" in banner
+                 and "evaluator e2e gate denied" in reason),
+                f"rc={rc} deny={_is_deny(out)} "
+                f"banner_has_msg={'evaluator e2e gate denied' in banner} "
+                f"reason_has_msg={'evaluator e2e gate denied' in reason}",
+            ))
+            _run([str(CLI), "satisfy", ob_138], env_eval)
+
+            # --- 139: OBLIGATIONS_BYPASS=1 forces allow past evaluator deny ---
+            ob_139 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": deny_script,
+                        "decision_mode": "exit_code",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator denied (should be bypassed)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+                extra_env={"OBLIGATIONS_BYPASS": "1"},
+            )
+            results.append(_check(
+                "139. evaluator: OBLIGATIONS_BYPASS=1 forces allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_139], env_eval)
+
+            # --- 140: argv list cmd form works (no shell interp needed) ---
+            argv_marker = _write_script(
+                "argv-marker.sh",
+                "#!/bin/sh\nif [ \"$1\" = \"sentinel\" ]; then exit 0; "
+                "else echo \"missing sentinel\" 1>&2; exit 1; fi\n",
+            )
+            ob_140 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": [argv_marker, "sentinel"],
+                        "decision_mode": "exit_code",
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator argv form denied",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            results.append(_check(
+                "140. evaluator argv list cmd form -> exit 0 -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_140], env_eval)
+
+            # --- 141: env param merges into subprocess environment ---
+            env_check = _write_script(
+                "env-check.sh",
+                "#!/bin/sh\nif [ \"$EVAL_CUSTOM_KEY\" = \"present\" ]; then "
+                "exit 0; else echo missing 1>&2; exit 1; fi\n",
+            )
+            ob_141 = _add_ob(
+                env_eval,
+                tool_pattern="Bash",
+                predicate="evaluator",
+                params={"cmd": env_check,
+                        "decision_mode": "exit_code",
+                        "env": {"EVAL_CUSTOM_KEY": "present"},
+                        "timeout_ms": 2000},
+                ttl=300,
+                deny_msg="evaluator env merge denied",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_eval,
+            )
+            results.append(_check(
+                "141. evaluator env param is merged into subprocess "
+                "environment",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_141], env_eval)
 
     total = len(results)
     passed = sum(1 for r in results if r)
