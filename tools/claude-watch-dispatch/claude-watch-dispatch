@@ -131,6 +131,16 @@ BAKED_BASH_EXEMPT_PATTERNS = [
     # agent-tail is a pure JSONL transcript viewer; treat like `cat`.
     r"^agent-tail(?:\s|$)",
     r"^/usr/local/bin/agent-tail(?:\s|$)",
+    # Watcher-supervisor recovery. The watcher-monitor alert prompt
+    # tells the main loop to re-run `watcher-ctl run <name>` whenever
+    # a watcher exits; that's operator-driven recovery, not inline
+    # worker behaviour. The bare-invocation cardinal in
+    # pre-tool-obligations-gate-hook already constrains the shape.
+    # Without this exemption, several watcher-down events in a row
+    # would trip the dispatcher gate on the very recovery command the
+    # alert just directed the loop to run.
+    r"^watcher-ctl\s+run(?:\s|$)",
+    r"^/usr/local/bin/watcher-ctl\s+run(?:\s|$)",
 ]
 
 

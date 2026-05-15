@@ -235,6 +235,13 @@ def test_baked_bash_exempt_patterns_allow():
             "agent-msg inbox",
             "agent-msg list",
             "/usr/local/bin/agent-msg status",
+            # Watcher-supervisor recovery -- the canonical operator
+            # response to a watcher-down alert. Without exemption,
+            # consecutive watcher-down events trip the gate on the
+            # recovery command the alert tells the loop to run.
+            "watcher-ctl run signal-wait-dm",
+            "watcher-ctl run signal-wait-dm 2>&1",
+            "/usr/local/bin/watcher-ctl run torrent-check",
         ]
         for cmd in exempt_cmds:
             rc, out, _ = h.run_hook({"tool_name": "Bash",
@@ -483,6 +490,45 @@ def test_counter_does_not_ratchet_during_deny():
         h.cleanup()
 
 
+def test_watcher_ctl_run_exempt_during_recovery_storm():
+    """Several watcher-down events in a row: the main-loop response is
+    to fire `watcher-ctl run <name>` for each. Without exemption, the
+    dispatcher gate would deny the recovery command on the (threshold+1)th
+    consecutive event -- blocking the very action the watcher-monitor
+    alert directs the loop to take.
+
+    Regression for the workbot block at 22:32 ET 2026-05-15.
+    """
+    h = Harness()
+    try:
+        # Fire 6 consecutive watcher-ctl run recoveries -- well past
+        # the default threshold of 3. Each must allow without
+        # incrementing the gate counter.
+        for i in range(6):
+            rc, out, _ = h.run_hook({
+                "tool_name": "Bash",
+                "tool_input": {"command": f"watcher-ctl run watcher-{i}"},
+            })
+            check(_is_allow(out),
+                  f"recovery #{i + 1}: watcher-ctl run allowed",
+                  f"out={out}")
+        # Counter must still be 0 -- no exempt command should have
+        # incremented it.
+        state = h.read_state()
+        check(state.get("count", 0) == 0,
+              "recovery storm: counter stayed at 0",
+              f"state={state}")
+        # And the gate still bites on actual non-exempt commands.
+        for _ in range(3):
+            h.run_hook(NON_EXEMPT_BASH)
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out),
+              "post-recovery: non-exempt 4th call still denies",
+              f"out={out}")
+    finally:
+        h.cleanup()
+
+
 def test_status_cli_is_exempt_even_at_threshold():
     """The CLI itself must be reachable even when blocked -- otherwise
     the operator can't introspect their way out."""
@@ -519,6 +565,7 @@ def main() -> int:
         test_malformed_stdin_allows,
         test_deny_response_shape,
         test_counter_does_not_ratchet_during_deny,
+        test_watcher_ctl_run_exempt_during_recovery_storm,
         test_status_cli_is_exempt_even_at_threshold,
     ]
     for t in tests:

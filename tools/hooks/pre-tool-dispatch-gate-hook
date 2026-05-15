@@ -146,6 +146,18 @@ _BAKED_BASH_EXEMPT_PATTERNS = [
     r"^/usr/local/bin/agent-msg\s+(?:inbox|list|status|ack|gc|disarm|show)(?:\s|$)",
     r"^agent-tail(?:\s|$)",
     r"^/usr/local/bin/agent-tail(?:\s|$)",
+    # Watcher-supervisor recovery. The watcher-monitor alert prompt
+    # directs the main loop to re-run `watcher-ctl run <name>` whenever
+    # a watcher exits; that's the canonical operator-driven recovery
+    # path, NOT inline worker behaviour. Cardinal rule (see
+    # pre-tool-obligations-gate-hook + docs/hooks.md) already forces
+    # the BARE invocation form, so by the time this gate sees a
+    # `watcher-ctl run` command it's known to be the recovery shape.
+    # Without this exemption, repeated watcher-down events in a row
+    # would trip the dispatcher gate on the very command the alert
+    # told the loop to run.
+    r"^watcher-ctl\s+run(?:\s|$)",
+    r"^/usr/local/bin/watcher-ctl\s+run(?:\s|$)",
 ]
 
 # Tool names that bypass tracking + denial regardless of args. Agent is
