@@ -183,8 +183,8 @@ RUN claude-watch --help >/dev/null
 # container/README.md "VS Code CLI" + examples/compose/README.md
 # "VS Code tunnel auth bootstrap" for the full operator workflow.
 #
-# Source-of-truth URL: `https://update.code.visualstudio.com/latest/cli-linux-x64/stable`
-# redirects to the current pinned `vscode_cli_linux_x64_cli.tar.gz`
+# Source-of-truth URL: `https://update.code.visualstudio.com/latest/cli-linux-${ARCH}/stable`
+# redirects to the current pinned `vscode_cli_linux_${ARCH}_cli.tar.gz`
 # build on `vscode.download.prss.microsoft.com`. The tarball contains a
 # single `code` binary at the root. Verified 2026-05-14: code 1.120.0
 # (commit 0958016b...) tarball ~11MB, extracted binary ~30MB. The
@@ -192,12 +192,24 @@ RUN claude-watch --help >/dev/null
 # uses the parallel `cli-alpine-x64` URL — this is the linux-x64
 # equivalent.
 #
+# Arch detection via `uname -m` so the same Dockerfile builds cleanly on
+# both x86_64 (cli-linux-x64) and aarch64 (cli-linux-arm64) hosts. We
+# prefer runtime `uname` over buildx's `TARGETARCH` so the build works
+# under plain `docker build` too (no buildx requirement). Microsoft
+# publishes the linux-arm64 tarball at the parallel URL — verified
+# 2026-05-15 via HEAD redirect to vscode_cli_linux_arm64_cli.tar.gz.
+#
 # `code --version` at the end is a smoke-test guard: it exits 0 only if
 # the binary loads + the clap CLI parses, mirroring the claude-watch
 # `--help` guard above. No runtime auth is required for `--version` —
 # auth only happens when the operator runs `code tunnel` interactively
 # post-deploy.
-RUN curl -fsSL "https://update.code.visualstudio.com/latest/cli-linux-x64/stable" -o /tmp/vscode_cli.tar.gz \
+RUN case "$(uname -m)" in \
+        x86_64)  VSCODE_ARCH=x64 ;; \
+        aarch64) VSCODE_ARCH=arm64 ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://update.code.visualstudio.com/latest/cli-linux-${VSCODE_ARCH}/stable" -o /tmp/vscode_cli.tar.gz \
     && tar -xzf /tmp/vscode_cli.tar.gz -C /usr/local/bin/ code \
     && chmod +x /usr/local/bin/code \
     && rm -f /tmp/vscode_cli.tar.gz \

@@ -78,23 +78,34 @@ if DOCKERFILE.exists():
     df = DOCKERFILE.read_text(encoding="utf-8")
 
     # The install must hit Microsoft's canonical stable-channel URL
-    # for the standalone linux-x64 CLI. We allow either:
+    # for the standalone CLI. We accept any of:
     #   https://update.code.visualstudio.com/latest/cli-linux-x64/stable
+    #   https://update.code.visualstudio.com/latest/cli-linux-arm64/stable
+    #   https://update.code.visualstudio.com/latest/cli-linux-${VAR}/stable
     # or the alternate documented form on code.visualstudio.com:
     #   https://code.visualstudio.com/sha/download?build=stable&os=cli-linux-x64
-    # so a future maintainer who picks the other documented variant
-    # doesn't trip this guard. Both URLs deliver the same tarball.
+    #   https://code.visualstudio.com/sha/download?build=stable&os=cli-linux-arm64
+    #   https://code.visualstudio.com/sha/download?build=stable&os=cli-linux-${VAR}
+    # The templated form (`${VAR}` / `$VAR`) is intended for a
+    # Dockerfile that does runtime arch detection via `uname -m` and
+    # sets a shell variable so the SAME image build works on both
+    # x86_64 and aarch64 hosts. The arch segment is matched as one
+    # of: a literal `x64` / `arm64`, or `${...}` / `$ident` shell
+    # expansion.
+    arch_pat = r"(?:x64|arm64|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)"
     url_match = re.search(
-        r"https://update\.code\.visualstudio\.com/latest/cli-linux-x64/stable"
-        r"|https://code\.visualstudio\.com/sha/download\?build=stable&os=cli-linux-x64",
+        rf"https://update\.code\.visualstudio\.com/latest/cli-linux-{arch_pat}/stable"
+        rf"|https://code\.visualstudio\.com/sha/download\?build=stable&os=cli-linux-{arch_pat}",
         df,
     )
     expect(
         url_match is not None,
         "Dockerfile: missing a download of the VS Code CLI standalone "
-        "linux-x64 tarball from Microsoft. Expected one of:\n"
-        "  https://update.code.visualstudio.com/latest/cli-linux-x64/stable\n"
-        "  https://code.visualstudio.com/sha/download?build=stable&os=cli-linux-x64\n"
+        "linux tarball from Microsoft. Expected one of (where ARCH "
+        "is `x64`, `arm64`, or a shell variable expansion like "
+        "`${VSCODE_ARCH}`):\n"
+        "  https://update.code.visualstudio.com/latest/cli-linux-<ARCH>/stable\n"
+        "  https://code.visualstudio.com/sha/download?build=stable&os=cli-linux-<ARCH>\n"
         "in a RUN block. Without the install, `code` / `code tunnel` "
         "are missing from PATH inside the container and the operator "
         "has to install them ad-hoc after every fresh container start.",
