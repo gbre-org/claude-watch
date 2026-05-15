@@ -157,6 +157,16 @@ all that's needed.
    `~/claude-events/*.json` drops to the in-container session); future
    watcher additions get auto-supervised without any session-side action.
 
+   On top of the supervisor, the in-container `claude-watch` daemon's
+   `[watcher_monitor]` reads `/etc/claude-code/watchmen/watchers.conf`
+   and fires `[CLAUDE-WATCH] WATCHER(S) DOWN: <name>` alerts via
+   tmux-inject when a watcher's `pgrep` pattern stays missing for
+   several consecutive checks (i.e. supervision has actually failed —
+   crash-loop guard tripped or supervisor itself died). If that alert
+   fires, the main loop's job is to restart via `watcher-ctl run
+   <name>` as a background task (multicall alias of `claude-watch`,
+   baked at `/usr/local/bin/watcher-ctl`).
+
 **Long-running watchers inside this container are scoped narrowly.**
 The container is a code-writing sandbox, not a host automation hub.
 Don't try to start signal watchers, torrent watchers, podcast watchers,

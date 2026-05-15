@@ -67,10 +67,31 @@ interrupt_message = "The foreground command was backgrounded by claude-watch bec
 thinking_backoff_multiplier = 3
 
 [watcher_monitor]
-# Disabled in Phase 1 — no in-container watchers yet (Phase 2 line item).
-enabled = false
-watchers_config = "/home/hndrewaall/.config/watchmen/watchers.conf"
+# Enabled: alert-layer over the cw-watcher-supervisor (entrypoint-spawned).
+# The supervisor is the PRIMARY restart mechanism for in-container
+# watchers (it reads /etc/claude-code/watchers/*.toml and respawns
+# per restart_policy). This monitor is the FALLBACK: when the
+# supervisor is wedged (crash-loop -> stuck) or the watcher's
+# pattern is gone from pgrep, the daemon fires
+#   [CLAUDE-WATCH] WATCHER(S) DOWN: <name>
+# into the in-container main loop's tmux pane and the main loop
+# re-spawns via `watcher-ctl run <name>` (a multicall alias of
+# claude-watch). The two layers stack: supervisor restarts in
+# seconds (the common case); monitor injects only when supervision
+# has actually failed.
+enabled = true
+# Baked in-container watcher list. Format documented in the file.
+# Currently registers: claude-event-tail (the in-container
+# equivalent of host claude-event-watch).
+watchers_config = "/etc/claude-code/watchmen/watchers.conf"
+# Used only for the legacy host-side `bin/watchmen` daemon count.
+# Zero in container -- no host-side watchmen daemon runs here.
 expected_watchmen = 0
+# Match the in-container watcher's name so the consumer-self-feedback
+# guard in policy.rs fires when claude-event-tail itself is down.
+# (Host default is "claude-event-watch"; container ships
+# claude-event-tail instead.)
+event_consumer_watcher_name = "claude-event-tail"
 
 [context_monitor]
 enabled = true

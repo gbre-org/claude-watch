@@ -248,11 +248,35 @@ RUN case "$(uname -m)" in \
 # Container-tailored claude-watch config — pins the daemon to the in-container
 # tmux session `claude-container:0.0` (the claude pane created by
 # entrypoint.sh), points all writes at uid-1000-writable paths (/tmp/, ~/.cache),
-# and disables host-only features (watcher_monitor, auto_update, reauth, hybrid,
-# task_watch) that have no in-container backing yet (Phase 2 work). The host's
+# and disables host-only features (auto_update, reauth, hybrid, task_watch)
+# that have no in-container backing yet (Phase 2 work). The host's
 # ~/.config/claude-watch/config.toml is NOT bind-mounted by the wrapper, so
 # without this file the daemon would FATAL on "no config file found". Phase 1e.
 COPY container/claude-watch.config.toml /etc/claude-watch/config.toml
+
+# Baked watchers.conf — the daemon's watcher_monitor list. Stacks on top
+# of cw-watcher-supervisor (which is the primary restart layer): the
+# supervisor reads /etc/claude-code/watchers/*.toml and respawns each
+# watcher per restart_policy. The daemon's watcher_monitor reads this
+# pipe-separated file and fires `[CLAUDE-WATCH] WATCHER(S) DOWN` alerts
+# via tmux-inject if the watcher's pgrep pattern is missing for several
+# consecutive checks (i.e. the supervisor itself has failed). Together
+# the two layers give us "supervisor restarts in seconds" + "daemon
+# alerts the main loop if supervision has actually failed".
+#
+# Path /etc/claude-code/watchmen/watchers.conf mirrors the host's
+# ~/.config/watchmen/watchers.conf convention (the "watchmen" subdir
+# survives from the legacy shell-script supervisor's name). The
+# container's claude-watch.config.toml points watcher_monitor.watchers_config
+# at this exact path.
+COPY container/watchers.conf /etc/claude-code/watchmen/watchers.conf
+
+# watcher-ctl: multicall alias of claude-watch. The daemon's
+# WATCHER(S) DOWN alert prompt injects `watcher-ctl run <name>` into
+# the main loop's pane (the canonical cardinal-rule restart shape).
+# Without this symlink the main loop hits "command not found" when it
+# tries to follow the alert.
+RUN ln -s /usr/local/bin/claude-watch /usr/local/bin/watcher-ctl
 
 # Managed-policy CLAUDE.md — baked at the standard Linux managed-CLAUDE.md
 # location (/etc/claude-code/CLAUDE.md per the Claude Code memory docs:
@@ -287,6 +311,16 @@ COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md
 # `export CLAUDE_WATCH_CONFIG=${CLAUDE_WATCH_CONFIG:-...}` line is now a
 # defensive no-op (the env var is already set) but kept for clarity.
 ENV CLAUDE_WATCH_CONFIG=/etc/claude-watch/config.toml
+
+# Bake WATCHERS_CONFIG into the image-level env so `watcher-ctl run <name>`
+# (multicall alias of claude-watch) finds the baked watchers.conf instead
+# of falling through to the default $HOME/.config/watchmen/watchers.conf,
+# which isn't bind-mounted in the container layout. The daemon's
+# [watcher_monitor].watchers_config TOML key handles the daemon's own
+# read path; this env var covers the CLI path the main loop invokes when
+# the WATCHER(S) DOWN alert prompt tells it to run `watcher-ctl run
+# claude-event-tail`. src/watcher.rs config_path() honors WATCHERS_CONFIG.
+ENV WATCHERS_CONFIG=/etc/claude-code/watchmen/watchers.conf
 
 # /etc/profile.d/claude-tools.sh — discoverability for bind-mounted CLIs.
 #
