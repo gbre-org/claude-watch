@@ -1457,9 +1457,28 @@ SSE_TAIL_BACKFILL_LINES = int(os.environ.get("SSE_TAIL_BACKFILL_LINES", "200"))
 def _find_agent_jsonl(agent_id: str) -> Path | None:
     """Locate the JSONL transcript for ``agent_id`` under AGENTS_JSONL_ROOT.
 
-    Layout (mirrors host ``~/.claude/projects/<project-slug>/``):
+    Supports BOTH deployment shapes of ``AGENTS_JSONL_ROOT``:
 
-        <root>/<session-uuid>/subagents/agent-<agent_id>.jsonl
+      1. One-level (gomorrah-style) — mount lands inside a project slug::
+
+            <root>/<session-uuid>/subagents/agent-<agent_id>.jsonl
+
+         e.g. host ``~/.claude/projects/-home-hndrewaall:/agents-jsonl:ro``.
+
+      2. Two-level (workbot / public ``examples/compose``-style) — mount
+         lands at ``~/.claude/projects`` itself::
+
+            <root>/<project-slug>/<session-uuid>/subagents/agent-<agent_id>.jsonl
+
+         e.g. host ``${HOME}/.claude/projects:/agents-jsonl:ro``.
+
+    The container's queue-minisite has no way to know which shape the
+    operator wired up — both are legitimate bind-mount conventions and
+    the public example compose uses (2). We try (1) first (matching the
+    historical gomorrah resolver behavior), then fall back to (2). The
+    one-level probe is just an ``is_file`` stat per session-dir so the
+    fast path stays fast on gomorrah, and (2) only kicks in when (1)
+    misses entirely.
 
     Returns the most-recently-modified match (handles agent_id reuse
     across sessions, though that's rare). Returns None if the agent_id
@@ -1477,17 +1496,84 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
     needle = f"agent-{agent_id}.jsonl"
     best: tuple[float, Path] | None = None
     try:
-        session_dirs = list(root.iterdir())
+        top_dirs = list(root.iterdir())
     except OSError:
         return None
-    for session in session_dirs:
-        candidate = session / "subagents" / needle
+
+    def _consider(candidate: Path) -> None:
+        nonlocal best
         try:
             mtime = candidate.stat().st_mtime
         except OSError:
-            continue
+            return
         if best is None or mtime > best[0]:
             best = (mtime, candidate)
+
+    # Shape (1): <root>/<session-uuid>/subagents/agent-<id>.jsonl.
+    for entry in top_dirs:
+        _consider(entry / "subagents" / needle)
+    if best is not None:
+        return best[1]
+
+    # Shape (2): <root>/<project-slug>/<session-uuid>/subagents/agent-<id>.jsonl.
+    # Only walked when shape (1) found nothing — keeps the fast path
+    # fast on the gomorrah deployment while still letting workbot's
+    # ${HOME}/.claude/projects mount resolve.
+    for project in top_dirs:
+        if not project.is_dir():
+            continue
+        try:
+            session_dirs = list(project.iterdir())
+        except OSError:
+            continue
+        for session in session_dirs:
+            _consider(session / "subagents" / needle)
+    return best[1] if best else None
+
+
+def _find_parent_session_jsonl(session_id: str) -> Path | None:
+    """Locate the parent session JSONL under AGENTS_JSONL_ROOT.
+
+    Same one-level vs two-level shape tolerance as ``_find_agent_jsonl``
+    — see that function's docstring for the rationale. The parent
+    transcript lives at the SESSION level (not under ``subagents/``):
+
+      Shape (1): ``<root>/<session_id>.jsonl``
+      Shape (2): ``<root>/<project-slug>/<session_id>.jsonl``
+
+    Returns the most-recently-modified match, or ``None``.
+    """
+    if not re.match(r"^[A-Za-z0-9-]{4,64}$", session_id):
+        return None
+    root = Path(AGENTS_JSONL_ROOT)
+    if not root.is_dir():
+        return None
+    needle = f"{session_id}.jsonl"
+    best: tuple[float, Path] | None = None
+
+    def _consider(candidate: Path) -> None:
+        nonlocal best
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            return
+        if best is None or mtime > best[0]:
+            best = (mtime, candidate)
+
+    # Shape (1): <root>/<session-uuid>.jsonl.
+    _consider(root / needle)
+    if best is not None:
+        return best[1]
+
+    # Shape (2): <root>/<project-slug>/<session-uuid>.jsonl.
+    try:
+        top_dirs = list(root.iterdir())
+    except OSError:
+        return None
+    for project in top_dirs:
+        if not project.is_dir():
+            continue
+        _consider(project / needle)
     return best[1] if best else None
 
 
@@ -2385,10 +2471,8 @@ def _fetch_agent_completion(
     """
     if not re.match(r"^[A-Za-z0-9-]{4,64}$", agent_id):
         return None
-    if not re.match(r"^[A-Za-z0-9-]{4,64}$", session_id):
-        return None
-    parent_path = Path(AGENTS_JSONL_ROOT) / f"{session_id}.jsonl"
-    if not parent_path.is_file():
+    parent_path = _find_parent_session_jsonl(session_id)
+    if parent_path is None or not parent_path.is_file():
         return None
     needle = f"<task-id>{agent_id}</task-id>"
     try:

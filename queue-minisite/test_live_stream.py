@@ -86,9 +86,24 @@ def _seed_agent_state(state_path: Path, agent_id: str, queue_id: str,
 
 
 def _seed_jsonl(jsonl_root: Path, session_uuid: str, agent_id: str,
-                *, lines: list[dict]) -> Path:
-    """Write a subagent JSONL at the canonical layout the app expects."""
-    sess_dir = jsonl_root / session_uuid / "subagents"
+                *, lines: list[dict], project_slug: str | None = None) -> Path:
+    """Write a subagent JSONL at the canonical layout the app expects.
+
+    ``project_slug``:
+      * ``None`` (default) — one-level layout: writes at
+        ``<jsonl_root>/<session_uuid>/subagents/agent-<id>.jsonl``.
+        This mirrors gomorrah's production bind-mount which lands inside
+        a single project slug.
+      * ``str``           — two-level layout: writes at
+        ``<jsonl_root>/<project_slug>/<session_uuid>/subagents/agent-<id>.jsonl``.
+        This mirrors workbot's container bind-mount which lands at the
+        ``~/.claude/projects`` parent dir (the public examples/compose
+        default).
+    """
+    if project_slug:
+        sess_dir = jsonl_root / project_slug / session_uuid / "subagents"
+    else:
+        sess_dir = jsonl_root / session_uuid / "subagents"
     sess_dir.mkdir(parents=True, exist_ok=True)
     path = sess_dir / f"agent-{agent_id}.jsonl"
     body = "\n".join(json.dumps(rec) for rec in lines) + "\n"
@@ -247,6 +262,123 @@ class LiveStreamEndpointTest(unittest.TestCase):
         # First line is a user record, second is assistant_text.
         self.assertEqual(line_events[0]["kind"], "user")
         self.assertEqual(line_events[1]["kind"], "assistant_text")
+
+    # ---------- container shape: two-level (project-slug + session-uuid) ----------
+
+    def test_stream_resolves_two_level_container_layout(self):
+        """workbot / container shape: bind-mount lands at
+        ``~/.claude/projects`` so the resolver sees
+        ``<root>/<project-slug>/<session-uuid>/subagents/agent-<id>.jsonl``
+        (one extra directory level above the gomorrah shape).
+
+        The public ``examples/compose/docker-compose.yml`` ships with
+        ``${HOME}/.claude/projects:/agents-jsonl:ro`` which is exactly
+        this layout. Before PR #queue-minisite-container-jsonl-shape the
+        resolver only handled the gomorrah-style mount (one level) and
+        silently missed every agent JSONL on workbot — Andrew's "still
+        not seeing agent logs in workbots queue site" DM
+        (2026-05-15 17:36 ET) was this exact symptom.
+        """
+        item = _add(self.env, self.queue_actual,
+                    "two-level layout", ["repo:two-level-test"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        agent_id = "atwolevel12345678"
+        session_uuid = "b1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        project_slug = "-home-hndrewaall-workspace"  # workbot-style slug
+        _seed_agent_state(self.agent_state, agent_id, qid, alive=True, age=1)
+        _seed_jsonl(
+            self.jsonl_root, session_uuid, agent_id,
+            project_slug=project_slug,
+            lines=[
+                {
+                    "type": "user",
+                    "message": {"role": "user",
+                                "content": "Queue item: " + qid},
+                    "uuid": "u1",
+                    "sessionId": session_uuid,
+                    "agentId": agent_id,
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "two-level"}],
+                    },
+                    "uuid": "a1",
+                    "sessionId": session_uuid,
+                    "agentId": agent_id,
+                },
+            ],
+        )
+        self.appmod._cache.fetched_at = 0.0
+
+        # Shrink the tail loop so the test finishes promptly (same
+        # rationale as the happy-path test above).
+        self.appmod.SSE_TAIL_MAX_IDLE_SECONDS = 0.1
+        self.appmod.SSE_TAIL_POLL_SECONDS = 0.05
+        self.appmod.SSE_TAIL_MAX_LIFETIME_SECONDS = 5.0
+
+        r = self.client.get(f"/api/queue/{qid}/stream")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        events = self._read_sse(r.get_data())
+        self.assertGreater(
+            len(events), 0,
+            "two-level resolver returned NO events — workbot regression",
+        )
+        # stream-start meta must surface the JSONL path (with project slug).
+        self.assertEqual(events[0]["type"], "meta")
+        self.assertEqual(events[0]["kind"], "stream-start")
+        self.assertIn(
+            project_slug, events[0].get("path", ""),
+            f"stream-start path missing project slug: {events[0]!r}",
+        )
+        self.assertIn(
+            f"agent-{agent_id}.jsonl", events[0].get("path", ""),
+            events[0],
+        )
+
+        # 2 transcript events backfilled.
+        line_events = [e for e in events if e.get("type") == "event"]
+        self.assertEqual(
+            len(line_events), 2,
+            f"expected 2 transcript events, got {len(line_events)}",
+        )
+        self.assertEqual(line_events[0]["kind"], "user")
+        self.assertEqual(line_events[1]["kind"], "assistant_text")
+
+    def test_find_agent_jsonl_prefers_one_level_when_both_present(self):
+        """Mixed layout (one-level dir AND two-level slug both contain
+        a JSONL for the same agent_id): the one-level resolver runs
+        first to preserve gomorrah's fast path. The two-level fallback
+        only walks when the one-level probe finds nothing.
+
+        We don't promise a stable picker across both shapes — only that
+        a one-level hit short-circuits the two-level walk. The test
+        asserts that property directly by checking the resolved path
+        lives at the one-level depth.
+        """
+        agent_id = "amixedlayout1234"
+        sess_a = "c1c2c3c4-c5c6-7890-abcd-ef1234567890"
+        sess_b = "d1d2d3d4-d5d6-7890-abcd-ef1234567890"
+        _seed_jsonl(
+            self.jsonl_root, sess_a, agent_id,
+            lines=[{"type": "user",
+                    "message": {"role": "user", "content": "one-level"}}],
+        )
+        _seed_jsonl(
+            self.jsonl_root, sess_b, agent_id,
+            project_slug="-some-project",
+            lines=[{"type": "user",
+                    "message": {"role": "user", "content": "two-level"}}],
+        )
+
+        resolved = self.appmod._find_agent_jsonl(agent_id)
+        self.assertIsNotNone(resolved)
+        # Must be the one-level hit, not the two-level fallback.
+        self.assertIn(f"/{sess_a}/", str(resolved))
+        self.assertNotIn("-some-project", str(resolved))
 
     # ---------- failure: no active-agents record ----------
 
