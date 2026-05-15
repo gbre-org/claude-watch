@@ -84,7 +84,9 @@ Generic re-arming directory watcher. Drop a wrapper script that exports three en
 #!/bin/bash
 export WATCH_DIR="$HOME/my-events"
 export WATCH_PATTERN='*.json'
-export WATCH_CALLBACK='echo "got $1"'   # $1 = full path inside the callback
+# $1 = full path, $2 = action ("created" / "modified" / "deleted").
+export WATCH_CALLBACK='echo "got $2 for $1"'
+export WATCH_EVENTS='all'                # opt into the full lifecycle
 exec /etc/claude-code/watchers/lib/dir-watch.sh
 ```
 
@@ -92,14 +94,26 @@ Required env:
 
 - `WATCH_DIR` — absolute path to the directory to monitor.
 - `WATCH_PATTERN` — bash glob (NOT regex), matched against the basename (e.g. `*.json`, `v[0-9]*.md`, `*`).
-- `WATCH_CALLBACK` — shell snippet invoked once per new matching file; the file's full path is positional `$1` inside the callback.
+- `WATCH_CALLBACK` — shell snippet invoked once per matching event. Positional args inside the callback:
+  - `$1` — the file's full path.
+  - `$2` — the action label (one of `created` / `modified` / `deleted`).
+
+  Callbacks that only consume `$1` continue to work unchanged — the `$2` slot is additive.
 
 Optional env:
 
+- `WATCH_EVENTS` — space-separated list of lifecycle events to fire on. Default: `created` (matches the pre-events behaviour — only new files fire). Allowed values:
+  - `created` — new file appeared (inotify `CREATE` / `MOVED_TO`; poll: filename not in prior snapshot).
+  - `modified` — existing file's content changed (inotify `CLOSE_WRITE`; poll: same filename + newer mtime). Only fires for files that previously fired `created`.
+  - `deleted` — file removed or renamed out of the dir (inotify `DELETE` / `MOVED_FROM`; poll: filename gone from glob).
+  - `moved-in` — alias for `created` (rename into the watched dir).
+  - `moved-out` — alias for `deleted` (rename out of the watched dir).
+  - `all` — shorthand for `created modified deleted`.
 - `POLL_INTERVAL_SECS` — fallback poll interval when `inotifywait` is missing (default 3s).
-- `WATCH_STATE_FILE` — override the state-file path (default `/tmp/dir-watch-<sha1 of WATCH_DIR>.state`).
+- `WATCH_STATE_FILE` — override the state-file path (default `/tmp/dir-watch-<sha1 of WATCH_DIR>.state`). Lines are tab-separated `<filename>\t<mtime>\t<inode>`. The poll fallback diffs against this snapshot to detect created / modified / deleted. The legacy "filenames only" format is auto-migrated on startup with no spurious fires.
+- `WATCH_DISABLE_INOTIFY` — set to any non-empty value to force the poll fallback even when `inotifywait` is on PATH (tests only).
 
-The primitive prints `dir-watch: fire <basename>` to stdout per fire, plus whatever the callback itself emits. It runs foreground forever — the supervisor (`/start-watchers`) keeps the process alive per the watcher's `restart_policy`.
+The primitive prints `dir-watch: fire <action> <basename>` to stdout per fire, plus whatever the callback itself emits. It runs foreground forever — the supervisor (`/start-watchers`) keeps the process alive per the watcher's `restart_policy`.
 
 ## Currently shipping
 

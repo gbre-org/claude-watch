@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""dir-watch.sh: WATCH_EVENTS=created deleted — unlink fires `deleted`.
+
+Drop a file (fires `created`), `rm` it (fires `deleted`). Confirms the
+callback sees the right $2 action label.
+
+Run:  ./dir-watch-events-deleted.test
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+SCRIPT = CONTAINER_DIR / "watchers" / "lib" / "dir-watch.sh"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def wait_for(predicate, timeout: float, interval: float = 0.1) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def start_watcher(watch_dir: Path, pattern: str, callback: str,
+                  state_file: Path, log_path: Path,
+                  events: str) -> subprocess.Popen:
+    env = {
+        **os.environ,
+        "WATCH_DIR": str(watch_dir),
+        "WATCH_PATTERN": pattern,
+        "WATCH_CALLBACK": callback,
+        "WATCH_STATE_FILE": str(state_file),
+        "WATCH_EVENTS": events,
+        "POLL_INTERVAL_SECS": "1",
+    }
+    log_fp = open(log_path, "wb")
+    proc = subprocess.Popen(
+        [str(SCRIPT)],
+        env=env,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
+    )
+    return proc
+
+
+def stop(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=2)
+
+
+def test_create_then_unlink_fires_both_actions() -> None:
+    """create file -> fires `created`; rm file -> fires `deleted`."""
+    with tempfile.TemporaryDirectory(prefix="dwe-deleted-") as td:
+        td_path = Path(td)
+        watch_dir = td_path / "watch"
+        watch_dir.mkdir()
+        state_file = td_path / "state"
+        log_path = td_path / "watcher.log"
+        fired_log = td_path / "fired.log"
+
+        callback = f'printf "%s %s\\n" "$2" "$(basename "$1")" >> "{fired_log}"'
+
+        proc = start_watcher(
+            watch_dir,
+            "*.json",
+            callback,
+            state_file,
+            log_path,
+            events="created deleted",
+        )
+
+        try:
+            target = watch_dir / "doomed.json"
+            target.write_text('{"x":1}')
+
+            got_create = wait_for(
+                lambda: fired_log.exists()
+                and "created doomed.json" in fired_log.read_text(),
+                timeout=10,
+            )
+            expect(
+                got_create,
+                f"`created` event for doomed.json missing within 10s. "
+                f"fired_log="
+                f"{fired_log.read_text() if fired_log.exists() else '<missing>'!r}",
+            )
+
+            # Briefly let the post-create state settle before deleting.
+            time.sleep(0.3)
+            target.unlink()
+
+            got_delete = wait_for(
+                lambda: fired_log.exists()
+                and "deleted doomed.json" in fired_log.read_text(),
+                timeout=10,
+            )
+            expect(
+                got_delete,
+                f"`deleted` event for doomed.json missing within 10s. "
+                f"fired_log="
+                f"{fired_log.read_text() if fired_log.exists() else '<missing>'!r} "
+                f"watcher_log="
+                f"{log_path.read_text() if log_path.exists() else '<missing>'!r}",
+            )
+
+            content = fired_log.read_text()
+            ci = content.find("created doomed.json")
+            di = content.find("deleted doomed.json")
+            expect(
+                ci != -1 and di != -1 and ci < di,
+                f"Event order wrong — created should precede deleted. "
+                f"fired_log={content!r}",
+            )
+
+            expect(
+                proc.poll() is None,
+                f"watcher exited after firing (rc={proc.poll()})",
+            )
+        finally:
+            stop(proc)
+
+
+TESTS = [
+    test_create_then_unlink_fires_both_actions,
+]
+
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")
