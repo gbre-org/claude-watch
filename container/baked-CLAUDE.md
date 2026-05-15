@@ -157,15 +157,17 @@ all that's needed.
    `~/claude-events/*.json` drops to the in-container session); future
    watcher additions get auto-supervised without any session-side action.
 
-   On top of the supervisor, the in-container `claude-watch` daemon's
-   `[watcher_monitor]` reads `/etc/claude-code/watchmen/watchers.conf`
-   and fires `[CLAUDE-WATCH] WATCHER(S) DOWN: <name>` alerts via
-   tmux-inject when a watcher's `pgrep` pattern stays missing for
-   several consecutive checks (i.e. supervision has actually failed —
-   crash-loop guard tripped or supervisor itself died). If that alert
-   fires, the main loop's job is to restart via `watcher-ctl run
-   <name>` as a background task (multicall alias of `claude-watch`,
-   baked at `/usr/local/bin/watcher-ctl`).
+   The `[watcher_monitor]` alert layer (formerly stacked on top of the
+   supervisor and intended to fire `[CLAUDE-WATCH] WATCHER(S) DOWN:
+   <name>` via tmux-inject) is **DISABLED** in the shipped config.
+   PR #200 wired it; a follow-up hotfix flipped `enabled = false`
+   after the layer produced an alert-spam loop (the daemon's pgrep
+   list and the supervisor's TOML set do not cross-reference, so a
+   missing TOML translated into perpetual alerts). The supervisor
+   remains the sole restart mechanism for in-container watchers. The
+   `watcher-ctl -> claude-watch` symlink and the `WATCHERS_CONFIG`
+   env var stay baked into the image for other CLI surfaces that
+   read them.
 
 **Long-running watchers inside this container are scoped narrowly.**
 The container is a code-writing sandbox, not a host automation hub.

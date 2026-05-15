@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Tests for the in-container watcher_monitor alert layer being DISABLED.
+
+Background: PR #200 wired the daemon's `[watcher_monitor]` alert layer
+on top of the cw-watcher-supervisor. In practice the two layers do not
+cross-reference (the daemon pgreps the entries in
+`/etc/claude-code/watchmen/watchers.conf`; the supervisor spawns
+processes from `/etc/claude-code/watchers/*.toml` — distinct file sets,
+distinct schemas). A missing or mis-named TOML translated into pgrep
+returning 0, the alert firing, the main loop kicking off a one-shot
+recovery task, the recovery exiting, and the alert re-firing. The
+stack grew until the operator stepped in.
+
+A follow-up hotfix flipped `[watcher_monitor].enabled` to false. The
+supervisor (entrypoint-spawned, reading /etc/claude-code/watchers/*.toml)
+remains the PRIMARY (and now sole) restart mechanism for in-container
+watchers; the alert-layer design is being revisited separately.
+
+This test verifies the FILE-LEVEL hotfix state:
+
+  1. claude-watch.config.toml [watcher_monitor].enabled is false.
+  2. The watchers_config + event_consumer_watcher_name keys are still
+     present and unchanged (other code paths read them; the disable is
+     only on the alert layer itself).
+  3. Dockerfile artifacts that other surfaces depend on remain in
+     place: the watchers.conf bake, the watcher-ctl -> claude-watch
+     symlink, and the WATCHERS_CONFIG env var. The hotfix disables
+     the alert; it does not delete the wiring.
+  4. container/watchers.conf still exists and still declares
+     claude-event-tail (the file is still consumed by the watcher-ctl
+     CLI surface and by future re-enable paths).
+
+Run:  ./watcher-monitor-disabled.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+WATCHERS_CONF = CONTAINER_DIR / "watchers.conf"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+CONFIG_TOML = CONTAINER_DIR / "claude-watch.config.toml"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def parse_watchers_conf(text: str) -> list[dict]:
+    """Mirror src/status.rs::parse_watchers_config_str — pipe-separated,
+    skip blank + # lines, fields: name|pattern|min_count|enabled|start_cmd.
+    """
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        out.append({
+            "name": parts[0],
+            "pattern": parts[1],
+            "min_count": int(parts[2]) if len(parts) > 2 and parts[2] else 1,
+            "enabled": (parts[3].strip().lower() == "true") if len(parts) > 3 else True,
+            "start_cmd": parts[4].strip() if len(parts) > 4 else "",
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 1. claude-watch.config.toml [watcher_monitor].enabled is false.
+# ---------------------------------------------------------------------------
+expect(CONFIG_TOML.exists(), f"claude-watch.config.toml missing at {CONFIG_TOML}")
+section_body = ""
+if CONFIG_TOML.exists():
+    cfg = CONFIG_TOML.read_text(encoding="utf-8")
+
+    section = re.search(r'^\[watcher_monitor\]', cfg, re.MULTILINE)
+    expect(
+        section is not None,
+        "claude-watch.config.toml missing the `[watcher_monitor]` "
+        "section header — the hotfix keeps the section present and "
+        "flips `enabled = false` (rather than deleting the section "
+        "outright) so the supporting keys remain documented",
+    )
+
+    if section is not None:
+        m = re.search(
+            r'^\[watcher_monitor\]\s*\n(.*?)(?=^\[|\Z)',
+            cfg,
+            re.MULTILINE | re.DOTALL,
+        )
+        if m:
+            section_body = m.group(1)
+
+    # The hotfix: enabled MUST be false. A true value reopens the
+    # alert-spam loop documented in the section's comment block.
+    enabled_false = re.search(
+        r'^\s*enabled\s*=\s*false\b',
+        section_body,
+        re.MULTILINE,
+    )
+    expect(
+        enabled_false is not None,
+        "claude-watch.config.toml [watcher_monitor].enabled must be "
+        "false — the alert layer produced an alert-spam loop when "
+        "enabled (the daemon's pgrep list and the supervisor's TOML "
+        "set do not cross-reference). Re-enable only after the "
+        "follow-up redesign lands",
+    )
+    # Defensive: no stray `enabled = true` anywhere in the section.
+    enabled_true = re.search(
+        r'^\s*enabled\s*=\s*true\b',
+        section_body,
+        re.MULTILINE,
+    )
+    expect(
+        enabled_true is None,
+        "claude-watch.config.toml [watcher_monitor] still contains a "
+        "stray `enabled = true` line — the hotfix must leave the "
+        "section with `enabled = false` and no contradictory line",
+    )
+
+    # 2. Supporting keys remain (watchers_config + event_consumer_watcher_name).
+    expect(
+        re.search(
+            r'^\s*watchers_config\s*=\s*"/etc/claude-code/watchmen/watchers\.conf"',
+            section_body,
+            re.MULTILINE,
+        )
+        is not None,
+        "claude-watch.config.toml [watcher_monitor].watchers_config "
+        "must still point at /etc/claude-code/watchmen/watchers.conf "
+        "(the disable is only on the alert; the path stays so a "
+        "future re-enable doesn't need to re-derive it)",
+    )
+    expect(
+        re.search(
+            r'^\s*event_consumer_watcher_name\s*=\s*"claude-event-tail"',
+            section_body,
+            re.MULTILINE,
+        )
+        is not None,
+        "claude-watch.config.toml [watcher_monitor]."
+        "event_consumer_watcher_name must still be \"claude-event-tail\" "
+        "for the same reason — disable the alert, preserve the wiring",
+    )
+
+# ---------------------------------------------------------------------------
+# 3. Dockerfile artifacts that other surfaces depend on remain in place.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+df = ""
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    expect(
+        re.search(
+            r'^\s*COPY\s+container/watchers\.conf\s+'
+            r'/etc/claude-code/watchmen/watchers\.conf\s*$',
+            df,
+            re.MULTILINE,
+        )
+        is not None,
+        "Dockerfile must still bake "
+        "`COPY container/watchers.conf /etc/claude-code/watchmen/watchers.conf` "
+        "— the watcher-ctl CLI surface (multicall alias) reads it",
+    )
+    expect(
+        re.search(
+            r'^\s*RUN\s+ln\s+-s\s+/usr/local/bin/claude-watch\s+'
+            r'/usr/local/bin/watcher-ctl\s*$',
+            df,
+            re.MULTILINE,
+        )
+        is not None,
+        "Dockerfile must still symlink watcher-ctl -> claude-watch — "
+        "the symlink is independent of the alert layer; other code "
+        "paths invoke `watcher-ctl`",
+    )
+    expect(
+        re.search(
+            r'^\s*ENV\s+WATCHERS_CONFIG=/etc/claude-code/watchmen/watchers\.conf\s*$',
+            df,
+            re.MULTILINE,
+        )
+        is not None,
+        "Dockerfile must still bake "
+        "`ENV WATCHERS_CONFIG=/etc/claude-code/watchmen/watchers.conf` "
+        "— the watcher-ctl CLI honors this env override and would "
+        "otherwise default to a host-only path",
+    )
+
+# ---------------------------------------------------------------------------
+# 4. container/watchers.conf still exists and still declares claude-event-tail.
+# ---------------------------------------------------------------------------
+expect(WATCHERS_CONF.exists(), f"container/watchers.conf missing at {WATCHERS_CONF}")
+if WATCHERS_CONF.exists():
+    text = WATCHERS_CONF.read_text(encoding="utf-8")
+    entries = parse_watchers_conf(text)
+    names = [e["name"] for e in entries]
+    expect(
+        "claude-event-tail" in names,
+        f"container/watchers.conf must still include `claude-event-tail` "
+        f"— the disable is on the daemon's alert layer, not on the "
+        f"watcher registration itself. Got names: {names}",
+    )
+
+if failures:
+    print("FAIL watcher-monitor-disabled.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS watcher-monitor-disabled.test")
+sys.exit(0)

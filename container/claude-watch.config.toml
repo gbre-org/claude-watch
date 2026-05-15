@@ -67,19 +67,29 @@ interrupt_message = "The foreground command was backgrounded by claude-watch bec
 thinking_backoff_multiplier = 3
 
 [watcher_monitor]
-# Enabled: alert-layer over the cw-watcher-supervisor (entrypoint-spawned).
-# The supervisor is the PRIMARY restart mechanism for in-container
-# watchers (it reads /etc/claude-code/watchers/*.toml and respawns
-# per restart_policy). This monitor is the FALLBACK: when the
-# supervisor is wedged (crash-loop -> stuck) or the watcher's
-# pattern is gone from pgrep, the daemon fires
-#   [CLAUDE-WATCH] WATCHER(S) DOWN: <name>
-# into the in-container main loop's tmux pane and the main loop
-# re-spawns via `watcher-ctl run <name>` (a multicall alias of
-# claude-watch). The two layers stack: supervisor restarts in
-# seconds (the common case); monitor injects only when supervision
-# has actually failed.
-enabled = true
+# DISABLED via hotfix — the alert layer wired in PR #200 produced an
+# alert-spam loop in workbot:
+#
+#   1. This monitor pgreps for `claude-event-tail` against the baked
+#      /etc/claude-code/watchmen/watchers.conf registration.
+#   2. The cw-watcher-supervisor reads a DIFFERENT path
+#      (/etc/claude-code/watchers/*.toml — TOML format, separate file
+#      set). The two file sets do not cross-reference.
+#   3. The supervisor never starts `claude-event-tail` if its TOML is
+#      missing or misnamed; pgrep keeps failing; the consecutive-
+#      failure threshold trips; alert fires.
+#   4. The main loop's recovery (`watcher-ctl run <name>` as a
+#      background task) starts a one-shot process that exits quickly;
+#      pgrep still doesn't find it on the next check; alert re-fires;
+#      stack grows.
+#
+# Operator stance: firing alerts/events when watchers are killed is
+# too noisy regardless of the underlying wiring. Follow-up: revisit
+# the alert-layer design separately.
+#
+# The cw-watcher-supervisor (entrypoint-spawned) remains the PRIMARY
+# (and now sole) restart mechanism for in-container watchers.
+enabled = false
 # Baked in-container watcher list. Format documented in the file.
 # Currently registers: claude-event-tail (the in-container
 # equivalent of host claude-event-watch).
