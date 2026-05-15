@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Tests that ~/.config/ is pre-created in the image with uid 1000
+ownership so features writing persistent state under ~/.config/<feature>/
+don't need a sudo / chown workaround on first deploy.
+
+Background: Docker's bind-mount auto-creation walks the target path and
+creates any missing parent directories as root:root mode 0755. The
+example compose stack bind-mounts ~/.config/session (and may optionally
+mount ~/.config/eichi, ~/.config/gh, etc.). On first container start the
+bind-mount's target parent `/home/hndrewaall/.config` does NOT exist in
+the image, so Docker creates it root-owned BEFORE the entrypoint runs.
+The entrypoint runs as uid 1000 (non-root, per the image-level USER
+directive) and cannot fix the ownership without escalating to root.
+
+Observed pain (workbot validation):
+  - v57: needed `mkdir ~/.config/claude-events && touch consumed.jsonl`
+    via root before the dir-watch.sh watcher could record state.
+  - v59: needed `docker exec -u root chown ...` before `claude-watch-ack
+    add` could write `~/.config/claude-watch/pending-alerts.json`.
+
+Fix shape: mirror the existing ~/.local pre-creation pattern. Create
+~/.config/ in the image owned by uid 1000:1000, mode 0755. Docker's
+bind-mount walker then uses the pre-existing parent as-is rather than
+auto-creating a fresh root-owned one.
+
+Asserts:
+  1. Dockerfile contains a RUN line that creates /home/hndrewaall/.config
+     AND chowns it to 1000:1000.
+  2. The chown / mkdir line lives BEFORE the `USER hndrewaall` directive
+     (RUN steps inside the image build run as the current USER; the
+     mkdir + chown must happen while we're still root so the chown
+     actually changes ownership).
+  3. The mode is 0755 (or the chmod is omitted entirely, in which case
+     mkdir's umask-respecting default of 0755 stands).
+  4. Defensive: assert the line appears AFTER the useradd that creates
+     hndrewaall (uid 1000), otherwise the chown would target a non-
+     existent user / group.
+
+Run:  ./config-dir-uid-1000.test
+
+No external dependencies beyond Python 3.8+ stdlib.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+
+if DOCKERFILE.is_file():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    # 1. A RUN line creates /home/hndrewaall/.config and chowns it to
+    #    1000:1000. We tolerate the standard idioms (chown 1000:1000 vs
+    #    chown -R 1000:1000 vs chown hndrewaall:hndrewaall). The mkdir
+    #    and chown must coexist in the same RUN step (otherwise an
+    #    interim image layer leaves the dir root-owned briefly, which
+    #    is fine but the test pins the canonical pattern used by every
+    #    other directory-bootstrap RUN in this Dockerfile).
+    config_run = re.search(
+        r"(?m)^\s*RUN[^\n]*mkdir[^\n]*/home/hndrewaall/\.config"
+        r"(?:[^\n]*\\\s*\n[^\n]*)*"
+        r"[^\n]*chown[^\n]*(?:1000:1000|hndrewaall:hndrewaall)"
+        r"[^\n]*/home/hndrewaall/\.config",
+        text,
+    )
+    expect(
+        config_run is not None,
+        "Dockerfile: must contain a RUN step that creates "
+        "/home/hndrewaall/.config AND chowns it to uid 1000:1000 in the "
+        "same step. Without this, Docker's bind-mount auto-creation of "
+        "/home/hndrewaall/.config (e.g. when mounting ~/.config/session) "
+        "produces a root-owned parent that the uid 1000 entrypoint "
+        "cannot fix.",
+    )
+
+    # 2. The mkdir + chown must run BEFORE `USER hndrewaall` — otherwise
+    #    the build is running as uid 1000 and the chown would fail (only
+    #    root can chown arbitrary uids).
+    user_directive = re.search(r"(?m)^\s*USER\s+hndrewaall\s*$", text)
+    expect(
+        user_directive is not None,
+        "Dockerfile: missing `USER hndrewaall` directive — required to "
+        "drop privileges before runtime",
+    )
+    if config_run is not None and user_directive is not None:
+        expect(
+            config_run.start() < user_directive.start(),
+            "Dockerfile: the ~/.config mkdir/chown RUN step must appear "
+            "BEFORE the `USER hndrewaall` directive. RUN steps execute "
+            "as the current USER; if USER has already been switched to "
+            "uid 1000, the chown will fail (only root can chown other "
+            "uids). Move the RUN block to land while the build is "
+            "still running as root.",
+        )
+
+    # 3. The mkdir + chown must run AFTER the useradd that creates the
+    #    hndrewaall user (so 1000:1000 is a valid uid/gid).
+    useradd_line = re.search(
+        r"useradd\s+--uid\s+1000\s+--gid\s+1000",
+        text,
+    )
+    expect(
+        useradd_line is not None,
+        "Dockerfile: missing the canonical `useradd --uid 1000 --gid 1000` "
+        "line that creates the hndrewaall user. Without this the chown "
+        "in the ~/.config step has no valid target uid/gid to land on.",
+    )
+    if config_run is not None and useradd_line is not None:
+        expect(
+            useradd_line.end() < config_run.start(),
+            "Dockerfile: the ~/.config mkdir/chown RUN step must appear "
+            "AFTER the useradd that creates the hndrewaall user. "
+            "Otherwise the chown targets a uid/gid that doesn't yet "
+            "exist in /etc/passwd (the numeric 1000 still works, but "
+            "future refactors using `chown hndrewaall:hndrewaall` would "
+            "silently break).",
+        )
+
+    # 4. Mode is 0755 (XDG_CONFIG_HOME convention) — or the chmod is
+    #    omitted entirely (mkdir's default already produces 0755 under
+    #    the standard root umask 022). We accept both shapes but pin
+    #    that, if a chmod is present, it's 0755 (NOT 0700 which would
+    #    block group/other reads — atypical for XDG_CONFIG_HOME).
+    chmod_match = re.search(
+        r"chmod\s+0?7[05]?[05]?\s+/home/hndrewaall/\.config",
+        text,
+    )
+    chmod_700_match = re.search(
+        r"chmod\s+0?700\s+/home/hndrewaall/\.config",
+        text,
+    )
+    expect(
+        not chmod_700_match,
+        "Dockerfile: ~/.config chmod is set to 0700, but XDG_CONFIG_HOME "
+        "convention is 0755. Per-feature subdirs under ~/.config/ choose "
+        "their own modes (e.g. ~/.config/gh uses 0700 for OAuth secrets). "
+        "Use 0755 for the parent.",
+    )
+
+    # 5. Inline doc comment justifying the line — at least one comment
+    #    line immediately above the RUN explains the rationale so future
+    #    refactors don't strip the step thinking it's redundant.
+    if config_run is not None:
+        run_start_line = text[: config_run.start()].count("\n")
+        lines = text.splitlines()
+        # Walk upward from the RUN line, skipping blank lines, until we
+        # hit either a comment or a non-comment / non-blank line.
+        i = run_start_line - 1
+        saw_comment = False
+        while i >= 0:
+            stripped = lines[i].strip()
+            if not stripped:
+                i -= 1
+                continue
+            if stripped.startswith("#"):
+                saw_comment = True
+                break
+            break
+        expect(
+            saw_comment,
+            "Dockerfile: the ~/.config mkdir/chown RUN step is missing a "
+            "rationale comment immediately above it. Add a comment "
+            "explaining the bind-mount-auto-creates-root-owned-parent "
+            "problem (otherwise a future refactor may strip the step as "
+            "redundant).",
+        )
+
+
+if failures:
+    print("FAIL config-dir-uid-1000.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS config-dir-uid-1000.test")
+sys.exit(0)

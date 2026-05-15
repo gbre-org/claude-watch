@@ -104,6 +104,35 @@ RUN groupadd --gid 1000 hndrewaall \
 RUN mkdir -p /home/hndrewaall/.local/share/claude /home/hndrewaall/.local/bin \
     && chown -R 1000:1000 /home/hndrewaall/.local
 
+# Pre-create ~/.config/ owned by uid 1000 so features that write
+# persistent state to a subdirectory of ~/.config/ (claude-event-watch
+# consumed.jsonl, claude-watch-ack pending-alerts.json, future state
+# files) can `mkdir -p ~/.config/<feature>/` + write without sudo.
+#
+# Why this is needed: Docker's bind-mount auto-creation walks the target
+# path and creates any missing parent directories as root:root mode 0755.
+# The example compose stack bind-mounts ~/.config/session (and may
+# optionally mount ~/.config/eichi, ~/.config/gh, etc.). On first
+# container start the bind-mount's target parent `/home/hndrewaall/.config`
+# does NOT exist in the image, so Docker creates it root-owned BEFORE the
+# entrypoint runs. The entrypoint runs as uid 1000 (non-root, per the
+# image-level USER directive below) and cannot fix the ownership without
+# escalating to root. Result: every feature that wants to write a new
+# subdir under ~/.config/ has to be paired with a one-shot
+# `docker exec -u root chown` on first deploy — observed in v57
+# (claude-events) and v59 (claude-watch-ack) workbot validation rounds.
+#
+# Fix shape (same pattern the ~/.local pre-creation above uses): create
+# ~/.config/ in the image with uid 1000 ownership. When Docker walks the
+# bind-mount target path next, it finds the pre-existing parent and uses
+# it as-is rather than auto-creating a fresh root-owned one. Mode 0755
+# matches the standard XDG_CONFIG_HOME (~/.config/) convention; 0700
+# isn't required (no secrets live at this layer — per-feature subdirs
+# choose their own modes).
+RUN mkdir -p /home/hndrewaall/.config \
+    && chown 1000:1000 /home/hndrewaall/.config \
+    && chmod 0755 /home/hndrewaall/.config
+
 # Add ~/.local/bin to PATH at the image level. Claude Code's startup
 # probes for a "native install" of itself at $HOME/.local/bin/claude
 # (the path the in-process self-updater writes to). When that file

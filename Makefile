@@ -130,6 +130,7 @@ test-entrypoint:
 	container/tests/container-path-includes-local-bin.test
 	container/tests/baked-dirs.test
 	container/tests/baked-obligations-hooks.test
+	container/tests/config-dir-uid-1000.test
 	container/tests/queue-gate-wired.test
 	container/tests/claude-watch-alert-gate-wired.test
 	container/tests/compose-mount-modes.test
