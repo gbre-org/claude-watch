@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""File-level test that the dir-watch primitive is wired into the image.
+
+Asserts:
+  1. container/watchers/lib/dir-watch.sh exists in the source tree.
+  2. It is executable on disk (the recursive Dockerfile COPY preserves
+     this, but a defensive chmod in the Dockerfile also exists; we
+     verify both source and Dockerfile bake the +x bit).
+  3. The Dockerfile copies container/watchers/ (recursive — includes
+     lib/) into /etc/claude-code/watchers/ and `chmod +x`s the baked
+     dir-watch.sh path.
+  4. The script declares all three required env vars (WATCH_DIR,
+     WATCH_PATTERN, WATCH_CALLBACK) and refuses to start when any is
+     missing (validated by greping for the error strings the script
+     emits).
+
+This test does NOT execute the watcher (the runtime re-arm contract is
+covered by dir-watch-rearms.test). It's the file-level installation
+gate so a refactor of the Dockerfile that drops the COPY / chmod
+fails CI here instead of surfacing as a "command not found" at
+container start.
+
+Run:  ./dir-watch-script-installed.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+SCRIPT = CONTAINER_DIR / "watchers" / "lib" / "dir-watch.sh"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+# The baked path inside the image (what start-watchers' consumers will
+# reference).
+BAKED_LIB_PATH = "/etc/claude-code/watchers/lib/dir-watch.sh"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. Script exists at expected source path.
+expect(SCRIPT.is_file(), f"dir-watch.sh missing at {SCRIPT}")
+
+# 2. Script is executable on disk.
+if SCRIPT.is_file():
+    expect(
+        os.access(SCRIPT, os.X_OK),
+        f"dir-watch.sh at {SCRIPT} is not executable — Dockerfile COPY "
+        f"preserves source-side perms, so the source must have the +x "
+        f"bit set",
+    )
+
+    text = SCRIPT.read_text(encoding="utf-8")
+
+    # The script must declare a bash shebang. (env -S is fine too.)
+    first_line = text.splitlines()[0] if text else ""
+    expect(
+        first_line.startswith("#!") and "bash" in first_line,
+        f"dir-watch.sh first line must be a bash shebang, got "
+        f"{first_line!r}",
+    )
+
+    # All three required env vars must be referenced + validated.
+    for var in ("WATCH_DIR", "WATCH_PATTERN", "WATCH_CALLBACK"):
+        expect(
+            var in text,
+            f"dir-watch.sh must reference env var {var}",
+        )
+
+# 3. Dockerfile wiring.
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.is_file():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    # COPY container/watchers/ -> /etc/claude-code/watchers/ — the
+    # recursive copy that brings lib/dir-watch.sh along. The baked-
+    # dirs.test already covers this exact line, but we re-check here
+    # so the dir-watch test fails loudly if the line is removed.
+    copy_pat = re.compile(
+        r"^\s*COPY\s+(?:container/)?watchers/\s+/etc/claude-code/watchers/\s*$",
+        re.MULTILINE,
+    )
+    expect(
+        copy_pat.search(df) is not None,
+        "Dockerfile: missing `COPY [container/]watchers/ "
+        "/etc/claude-code/watchers/`. Without this the dir-watch "
+        "primitive (and every concrete watcher in the dir) never "
+        "lands in the image and `/start-watchers` finds nothing.",
+    )
+
+    # Defensive chmod on the baked dir-watch.sh path. Mirrors the
+    # pattern every other COPY-then-chmod pair uses (cwsr, exec-hook,
+    # etc.).
+    # Match the chmod across line continuations (`\` newline). The
+    # Dockerfile groups the dir-watch.sh and claude-event-tail.sh
+    # chmods on the same RUN line, so the pattern spans multiple
+    # lines.
+    chmod_pat = re.compile(
+        r"chmod\s+\+x\s+(?:[^\n]|\\\n)*"
+        r"/etc/claude-code/watchers/lib/dir-watch\.sh",
+    )
+    expect(
+        chmod_pat.search(df) is not None,
+        f"Dockerfile: missing `chmod +x {BAKED_LIB_PATH}` after the "
+        f"watchers COPY. The recursive COPY preserves source-side "
+        f"perms today, but the defensive chmod guards against a "
+        f"future refactor that drops the +x bit (matches every other "
+        f"baked-script bake step in the Dockerfile).",
+    )
+
+    # inotify-tools must be installed so the inotifywait path works in
+    # the image. dir-watch.sh falls back to polling when inotifywait
+    # is absent, so this is a perf guard, not a correctness one — but
+    # the image is the documented contract.
+    apt_layer_match = re.search(
+        r"RUN\s+apt-get update\s*&&\s*apt-get install\s+-y\s+"
+        r"--no-install-recommends\s*\\\n"
+        r"((?:\s+\S+\s*\\\n)+)"
+        r"(?:\s+\S+\s*)?"
+        r"\s+&&\s+rm\s+-rf\s+/var/lib/apt/lists/\*",
+        df,
+    )
+    expect(
+        apt_layer_match is not None,
+        "Dockerfile: could not locate the runtime apt-get install layer "
+        "(expected `RUN apt-get update && apt-get install -y "
+        "--no-install-recommends \\` followed by a list of packages "
+        "ending in `&& rm -rf /var/lib/apt/lists/*`)",
+    )
+    if apt_layer_match:
+        packages_block = apt_layer_match.group(0)
+        inotify_line = re.search(
+            r"(?m)^\s+inotify-tools\s*\\\s*$",
+            packages_block,
+        )
+        expect(
+            inotify_line is not None,
+            "Dockerfile apt-get layer: `inotify-tools` is not installed. "
+            "The package must appear on its own line (`        "
+            "inotify-tools \\`) in the runtime apt list. Without "
+            "inotify-tools, `dir-watch.sh` falls back to ls-mtime "
+            "polling — functional but laggy; the image's documented "
+            "contract is that inotifywait is present.",
+        )
+
+
+if failures:
+    print("FAIL dir-watch-script-installed.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS dir-watch-script-installed.test")
+sys.exit(0)

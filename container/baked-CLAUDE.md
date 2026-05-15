@@ -94,20 +94,19 @@ all that's needed.
 7. **Invoke `/claude-container:start-watchers`** to start whatever
    watcher launchers ship in this image build. The skill self-discovers
    `/etc/claude-code/watchers/*.toml` and launches each via `Bash` with
-   `run_in_background: true`. **Today this is mostly a no-op** — the
-   image ships zero baked watchers by default and the skill will report
-   "nothing to start"; that's the honest answer, not a sign the skill
-   failed. Invoke it anyway so future image builds that DO ship watchers
-   (e.g. an in-container queue-event tail, an MCP-bridge health pinger)
-   self-start without requiring a baked-CLAUDE.md edit per addition.
-   Future watcher additions update the skill's discovered set — this
+   `run_in_background: true`. The image currently bakes one watcher
+   (`claude-event-tail`, which surfaces `~/claude-events/*.json` drops
+   to the in-container session); future watcher additions update the
+   skill's discovered set without needing a baked-CLAUDE.md edit. This
    step's contract is "ask the skill what's there", not "hand-wave".
 
-**There are no long-running watchers inside this container.** This is
-deliberate — the container is a code-writing sandbox, not a host
-automation hub. Don't try to start signal watchers, torrent watchers,
-podcast watchers, or anything else from the host's resume-checklist
-playbook; the relevant tools and services aren't installed here.
+**Long-running watchers inside this container are scoped narrowly.**
+The container is a code-writing sandbox, not a host automation hub.
+Don't try to start signal watchers, torrent watchers, podcast watchers,
+or anything else from the host's resume-checklist playbook; the
+relevant tools and services aren't installed here. The baked watchers
+that DO ship cover only in-container event paths (e.g.
+`claude-event-tail` consuming local `~/claude-events/` drops).
 
 If the operator gives you a job that genuinely needs a host-side
 watcher / notifier, run it on the host instead (via the operator's host

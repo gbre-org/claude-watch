@@ -132,6 +132,9 @@ test-entrypoint:
 	container/tests/tini-pid1.test
 	container/tests/iproute2-installed.test
 	container/tests/code-cli-installed.test
+	container/tests/dir-watch-script-installed.test
+	container/tests/claude-event-tail-baked.test
+	container/tests/dir-watch-rearms.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host

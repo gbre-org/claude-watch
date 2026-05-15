@@ -1,13 +1,15 @@
 Start the in-container background watchers documented under `/etc/claude-code/watchers/`. This is the container equivalent of the host's watcher-startup workflow.
 
-## Current state — there are no built-in watchers
+## Current state — one baked watcher (`claude-event-tail`)
 
-**This container ships zero long-running watchers by default.** The container is a code-writing sandbox, not a host automation hub. Host-side watchers (`signal-wait-dm`, `claude-event-watch`, torrent watchers, podcast watchers, etc.) live on the operator's host and are not installed here.
+The container ships **one** long-running watcher today: `claude-event-tail`, which surfaces JSON event drops in `~/claude-events/` to the in-container session via stdout. It uses the generic re-arming `lib/dir-watch.sh` primitive — future watchers that just need "fire callback per new file" should plug in via the same primitive rather than reimplementing inotify / poll / state.
+
+Host-side watchers (`signal-wait-dm`, host `claude-event-watch`, torrent watchers, podcast watchers, etc.) still live on the operator's host and are not installed here — the container scope is intentionally narrow.
 
 This skill exists so the in-container agent has a single canonical place to:
-1. Discover whatever watchers DO ship in a given image build (the set may grow in future PRs as concrete container-scoped use-cases emerge).
+1. Discover whatever watchers DO ship in a given image build (the set may grow as concrete container-scoped use-cases emerge).
 2. Wire them up at session start with consistent semantics (logging path, restart policy, ownership).
-3. Report honestly that there's nothing to start when the watcher dir is empty (instead of inventing a host-style answer).
+3. Report honestly when the watcher dir is otherwise empty (instead of inventing a host-style answer).
 
 ## Steps
 

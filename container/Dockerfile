@@ -71,6 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg \
         iproute2 \
         procps \
+        inotify-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js via NodeSource (LTS 20.x) — Claude Code CLI requires Node >= 20.
@@ -490,6 +491,15 @@ COPY container/skills/ /etc/claude-code/plugin/commands/
 COPY container/agents/ /etc/claude-code/agents/
 COPY container/agents/ /etc/claude-code/plugin/agents/
 COPY container/watchers/ /etc/claude-code/watchers/
+# Defensive chmod +x on the baked watcher scripts. The recursive COPY
+# above preserves source-side perms, but a future refactor that swaps
+# the COPY for a different mechanism (or an upstream tar layer that
+# drops the execute bit) would silently break /start-watchers without
+# the explicit chmod here. Mirrors the same defence-in-depth pattern
+# every other baked-script COPY uses (exec-hook, cwsr, self-clear,
+# etc.).
+RUN chmod +x /etc/claude-code/watchers/lib/dir-watch.sh \
+            /etc/claude-code/watchers/claude-event-tail.sh
 COPY container/plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude-plugin/plugin.json
 
 # Entrypoint script — tmux session bootstrap + env passthrough + signal handling.
