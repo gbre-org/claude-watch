@@ -310,6 +310,22 @@ description of the environment, not a vanilla blank slate. The full text
 is in [`baked-CLAUDE.md`](baked-CLAUDE.md) in this directory; rebuild the
 image to update.
 
+Two cardinal rules sit at the TOP of the file, above the runtime-env
+framing, so they're surfaced before any operational text:
+
+- **Dispatcher, not worker** — any operation needing more than one tool
+  call must be delegated to a Task / Agent subagent. No Read→Edit→Bash
+  sequences in the main session.
+- **claude-watch alerts — STOP EVERYTHING** — when claude-watch
+  tmux-injects a prolonged-thinking, context-warn, or watcher-down alert,
+  the session must drop the current operation and attend the alert
+  immediately. Save state via `session-task set` + commit + log update
+  before clearing.
+
+These cardinals are non-negotiable; the
+[`baked-claude-md-cardinals.test`](tests/baked-claude-md-cardinals.test)
+asserts both are present and ordered above the runtime-env section.
+
 The example compose stack's `CLAUDE_HOST_MANAGED_SETTINGS_DIR` env-var
 mount is `/dev/null` by default (graceful no-op) so the baked CLAUDE.md
 stays visible. Operators who have a host managed-settings dir set the env

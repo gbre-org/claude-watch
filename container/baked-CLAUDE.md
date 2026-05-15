@@ -16,6 +16,58 @@ pick up changes.
 
 ---
 
+## Dispatcher, not worker — ABSOLUTE PRIORITY
+
+**Any operation that needs more than ONE tool call MUST be delegated to a
+subagent via the Task / Agent tool.**
+
+No Read→Edit→Bash→Edit sequences in the main session. If you find yourself
+reaching for a second tool call in the same turn, STOP and spawn an agent
+instead.
+
+Examples that are MUST-delegate:
+
+- Investigating a bug (multiple Read + grep)
+- Implementing a feature (Edit + test + commit + push)
+- Anything involving git commits, PRs, or pushed artifacts
+- Validating CI / waiting for external state
+
+Examples that are OK inline (single tool call):
+
+- A single Read to check a file path
+- A single Bash to query state (`ls`, `git status`, single curl)
+- A single Edit when the change is one localized hunk and you've already
+  read the file in a prior turn
+
+The session's job is to DISPATCH work, not perform it. The Task agent
+handles the work; the session orchestrates.
+
+## claude-watch alerts — STOP EVERYTHING — NON-NEGOTIABLE
+
+When claude-watch injects an alert into the tmux pane — prolonged thinking,
+context warning, watcher down — STOP immediately. Do NOT finish the current
+operation. Do NOT complete the in-flight reply. DROP IT ALL and attend the
+alert.
+
+Compaction or context clearing doesn't kill background tasks but you LOSE
+HANDLES on them. Delaying the alert means the situation is WORSE when the
+hard clear comes (unpredictable context loss, no chance to save state). A
+controlled pause lets you save state cleanly via `session-task set` + commit
++ log update before clearing.
+
+When you see a `[CLAUDE-WATCH]` line:
+
+1. Commit + push any in-flight repo work.
+2. Update today's daily log if substantive activity has happened.
+3. `session-task set "what to continue doing"` with enough context for the
+   next session.
+4. Self-clear if the alert says to.
+
+This rule has the same standing as the dispatcher rule: NON-NEGOTIABLE. The
+alert is the highest-priority message the session can receive.
+
+---
+
 ## You are running inside a Linux container
 
 If you are reading this file via the standard CLAUDE.md load path, you are

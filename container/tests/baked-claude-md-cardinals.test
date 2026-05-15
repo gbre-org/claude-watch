@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Tests that the two top-of-file cardinal rules are baked into
+container/baked-CLAUDE.md.
+
+The in-container claude session was previously exhibiting two failure
+modes:
+
+1. Doing Read→Edit→Bash sequences inline rather than spawning a Task /
+   Agent subagent.
+2. Treating claude-watch tmux-injected alerts (prolonged-thinking,
+   context-warn, watcher-down) as ignorable text rather than STOP-
+   EVERYTHING signals.
+
+Both failures map to missing cardinals at the TOP of the baked file
+that earlier sessions had been silently relying on from host-side
+context. This test asserts the cardinals are present so a future edit
+that drops them breaks the build.
+
+Run:  ./baked-claude-md-cardinals.test
+
+No external dependencies beyond Python 3.8+ stdlib.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+BAKED = CONTAINER_DIR / "baked-CLAUDE.md"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+expect(BAKED.exists(), f"baked-CLAUDE.md missing at {BAKED}")
+if BAKED.exists():
+    text = BAKED.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    # Cardinal 1: "Dispatcher, not worker" must appear as a top-level
+    # heading near the TOP of the file (within the first ~120 lines)
+    # so it's surfaced before the agent drifts into a multi-step
+    # inline action.
+    dispatcher_heading = re.compile(
+        r"^##\s+Dispatcher,\s*not\s*worker",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    m = dispatcher_heading.search(text)
+    expect(
+        m is not None,
+        "baked-CLAUDE.md missing top-level `## Dispatcher, not worker` "
+        "cardinal heading — the in-container session needs this rule "
+        "surfaced up top so it doesn't fall back to multi-tool-call "
+        "inline sequences",
+    )
+    if m is not None:
+        line_no = text[: m.start()].count("\n") + 1
+        expect(
+            line_no <= 120,
+            f"`## Dispatcher, not worker` heading is at line {line_no} — "
+            f"must be in the first 120 lines so it's seen before any "
+            f"other operational content",
+        )
+
+    # Cardinal 1 body must reference the one-tool-call delegation rule.
+    expect(
+        re.search(
+            r"more than one tool call|>1 tool call|second tool call",
+            text,
+            re.IGNORECASE,
+        )
+        is not None,
+        "Dispatcher cardinal should articulate the >1-tool-call "
+        "delegation rule explicitly so the agent has a bright line",
+    )
+
+    # Cardinal 2: claude-watch alerts STOP-EVERYTHING heading.
+    watch_heading = re.compile(
+        r"^##\s+claude-watch alerts.*STOP EVERYTHING",
+        re.MULTILINE,
+    )
+    m2 = watch_heading.search(text)
+    expect(
+        m2 is not None,
+        "baked-CLAUDE.md missing top-level `## claude-watch alerts — "
+        "STOP EVERYTHING` cardinal heading — the in-container session "
+        "needs this rule surfaced up top so it doesn't ignore tmux-"
+        "injected alerts",
+    )
+    if m2 is not None:
+        line_no = text[: m2.start()].count("\n") + 1
+        expect(
+            line_no <= 160,
+            f"`## claude-watch alerts — STOP EVERYTHING` heading is at "
+            f"line {line_no} — must be in the first 160 lines so it's "
+            f"seen before any other operational content",
+        )
+
+    # Cardinal 2 body must mention the NON-NEGOTIABLE framing and the
+    # CLAUDE-WATCH tag the agent will actually see in the pane.
+    expect(
+        "NON-NEGOTIABLE" in text,
+        "claude-watch-alert cardinal should be tagged NON-NEGOTIABLE "
+        "so the agent knows it overrides the in-flight reply",
+    )
+    expect(
+        "[CLAUDE-WATCH]" in text,
+        "claude-watch-alert cardinal should reference the literal "
+        "`[CLAUDE-WATCH]` tag the agent sees in the tmux pane — that's "
+        "the recognizer for the alert",
+    )
+    expect(
+        re.search(r"session-task set", text) is not None,
+        "claude-watch-alert cardinal should reference `session-task "
+        "set` as the controlled-pause checkpoint before clearing",
+    )
+
+    # Both cardinals should appear BEFORE the runtime-environment
+    # section ("## You are running inside a Linux container"). They're
+    # higher-priority than the host/container framing.
+    runtime_heading = re.search(
+        r"^##\s+You are running inside",
+        text,
+        re.MULTILINE,
+    )
+    if m is not None and runtime_heading is not None:
+        expect(
+            m.start() < runtime_heading.start(),
+            "Dispatcher cardinal must appear BEFORE the runtime-env "
+            "section so it sets the tone before any operational text",
+        )
+    if m2 is not None and runtime_heading is not None:
+        expect(
+            m2.start() < runtime_heading.start(),
+            "claude-watch-alert cardinal must appear BEFORE the "
+            "runtime-env section so it sets the tone before any "
+            "operational text",
+        )
+
+
+if failures:
+    print("FAIL baked-claude-md-cardinals.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS baked-claude-md-cardinals.test")
+sys.exit(0)
