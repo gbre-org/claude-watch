@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Tests for the iproute2 package wiring in the Dockerfile.
+
+Background — `iproute2` is the Debian package that provides modern
+networking diagnostic tools: `ss` (socket statistics, modern `netstat`
+replacement), `ip` (interface / route / link config + introspection),
+`tc` (traffic control), and friends. Without `iproute2`, the
+debian:bookworm-slim base image ships only the most minimal procps
+toolchain — `ss` is missing, and diagnosing in-container IPC issues
+(e.g. "is anything listening on $PORT?") requires either bind-mounting
+the host's tools or `apt-get install iproute2` ad-hoc inside a running
+container.
+
+Andrew flagged the gap while investigating a VS Code <-> Claude Code
+IPC question that needed `ss` (or `netstat`) inside the container and
+found neither.
+
+This test verifies the FILE-LEVEL wiring (Dockerfile apt layer). It
+does NOT spin up a container or exec into one — the runtime assertion
+(`ss --version` exits 0 inside the built image) is exercised by the
+operator's `docker compose build` + `cw` smoke test path.
+
+Coverage:
+  1. Dockerfile apt-get install layer includes `iproute2` on its own
+     line in the `--no-install-recommends` list (so a future refactor
+     that reorders or condenses the layer surfaces here instead of
+     silently dropping the package).
+
+Run:  ./iproute2-installed.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# 1. Dockerfile: iproute2 is in the runtime apt-get install layer.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    # Find the multi-line `RUN apt-get update && apt-get install -y
+    # --no-install-recommends ...` block in stage 2 (the runtime image,
+    # not the builder). Mirrors the pattern in tini-pid1.test so a
+    # future apt-layer refactor surfaces here if iproute2 gets dropped.
+    apt_layer_match = re.search(
+        r"RUN\s+apt-get update\s*&&\s*apt-get install\s+-y\s+"
+        r"--no-install-recommends\s*\\\n"
+        r"((?:\s+\S+\s*\\\n)+)"
+        r"(?:\s+\S+\s*)?"
+        r"\s+&&\s+rm\s+-rf\s+/var/lib/apt/lists/\*",
+        df,
+    )
+    expect(
+        apt_layer_match is not None,
+        "Dockerfile: could not locate the runtime apt-get install layer "
+        "(expected `RUN apt-get update && apt-get install -y "
+        "--no-install-recommends \\` followed by a list of packages "
+        "ending in `&& rm -rf /var/lib/apt/lists/*`)",
+    )
+    if apt_layer_match:
+        packages_block = apt_layer_match.group(0)
+        # Look for `iproute2` as a standalone package line (not a
+        # substring of another package). Each continuation line is
+        # `<whitespace>iproute2<whitespace>\`.
+        iproute2_line = re.search(
+            r"(?m)^\s+iproute2\s*\\\s*$",
+            packages_block,
+        )
+        expect(
+            iproute2_line is not None,
+            "Dockerfile apt-get layer: `iproute2` is not installed. The "
+            "package must appear on its own line (`        iproute2 \\`) "
+            "in the runtime apt list. Without iproute2, `ss`, `ip`, and "
+            "related modern networking tools are missing from the image "
+            "and operators have to `apt-get install` them ad-hoc inside "
+            "a running container to diagnose IPC / port-listening "
+            "questions.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+if failures:
+    print("FAIL iproute2-installed.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS iproute2-installed.test")
+sys.exit(0)

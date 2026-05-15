@@ -251,14 +251,52 @@ The image bakes the following binaries:
 - `cwsr` — in-container self-restart for the `claude` CLI. Runs `npm install -g @anthropic-ai/claude-code@<ver>` then `tmux respawn-pane -k -t claude-container:0.0` so the inner claude rolls in-place WITHOUT requiring the operator to `docker compose restart` the whole container. The wrapping container, MCP bridges, named-volume `~/.local/share/claude/versions/`, and operator's tmux attach all survive — only the inner process rolls. See `bin/cwsr` (`cwsr --help` for usage).
 - `trust-workspace` — pre-trusts a workspace path in `~/.claude.json` so Claude Code skips its first-launch trust prompt at that cwd.
 - `exec-hook` — magic-byte safe-exec wrapper for hook commands whose target may not be Linux-native. ELF / shebang scripts pass through transparently; cross-arch (Mach-O / PE / unknown) targets silently no-op.
+- `obligations` — the registry that backs every gate hook in `/usr/local/bin/`. Previously bind-mount-only; baking it makes the obligations gate operational even in stripped-down `docker run` containers without `~/repos/claude-watch` mounted. The bind-mounted source still wins on PATH (via `claude-tools.profile.sh`) when present, so dev iteration stays live.
+- `agent-msg` — host->subagent inbox protocol CLI. The main loop calls `agent-msg send <agent-id> "<message>"` to deliver a message to a running subagent; the existing PreToolUse obligations gate hook DENIES the subagent's next non-exempt tool call until it runs `agent-msg ack <id>`. See [the agent-comms section of `baked-CLAUDE.md`](baked-CLAUDE.md) for the full protocol.
+- `agent-tail` — streams a subagent's JSONL transcript from `~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl`. Companion to `claude-watch active-agents` for inspecting tool history; supports `--list`, `--follow`, `--since`, `--json` modes.
+- `code` — Microsoft's standalone Visual Studio Code CLI. Fetched at image-build time from the canonical stable-channel URL (`https://update.code.visualstudio.com/latest/cli-linux-x64/stable`, redirects to a pinned `vscode_cli_linux_x64_cli.tar.gz` on Microsoft's prss CDN). The tarball contains a single `code` binary, extracted into `/usr/local/bin/code`. Surfaces `code <file>` / `code .` for opening files in a VS Code window, `code tunnel` to bootstrap a remote tunnel, and the rest of the `code --help` surface. See the "VS Code tunnel auth bootstrap" section below for the first-time workflow + the Path B trade-off.
 
-Everything else from the claude-watch source tree — including the Python CLIs under `tools/` (`session-task`, `claude-event`, `obligations`) — is NOT installed into the image. They're discoverable on `PATH` only when the operator bind-mounts `~/repos/claude-watch` into the container at `/home/hndrewaall/repos/claude-watch` (which the [example compose](../examples/compose/) does by default).
+Everything else from the claude-watch source tree — including the Python CLIs under `tools/` (`session-task`, `claude-event`) — is NOT installed into the image. They're discoverable on `PATH` only when the operator bind-mounts `~/repos/claude-watch` into the container at `/home/hndrewaall/repos/claude-watch` (which the [example compose](../examples/compose/) does by default). (`obligations`, `agent-msg`, and `agent-tail` are baked at `/usr/local/bin/` per the list above; the bind-mounted source wins on PATH for live dev iteration when present.)
 
 The mechanism is a small `/etc/profile.d/claude-tools.sh` fragment baked into the image (see `claude-tools.profile.sh` in this directory). At login / new-shell time it checks for each tool dir under `${HOME}/repos/claude-watch/tools/` and prepends it to `PATH` if present. Missing dirs are silently skipped, so a stripped-down `docker run` with no bind mount still gets a working shell — the bind-mounted CLIs just won't be on `PATH`.
 
 Operational tooling that the operator runs on the **host** (alerting, monitoring, media post-processing, ingest pipelines, etc.) is intentionally NOT installed in the container. The image is meant to be a generic Claude Code + claude-watch sandbox; host-specific tooling stays on the host where it has the right environment, credentials, and filesystem layout. Layer that in via your own image or a sibling bind-mount when you need it.
 
 The [example compose stack](../examples/compose/) takes that "sibling bind-mount" path further by mounting `~/bin` (read-only) alongside `~/repos`, so host-installed CLI symlinks resolve inside the container. Every host-side source path in that compose file is overridable via a `CLAUDE_HOST_*` env var (defaults work for Linux without further config; macOS or corporate-managed-config operators set `CLAUDE_HOST_MANAGED_SETTINGS_DIR` to opt into a host managed-settings dir — note that doing so REPLACES the image-baked `/etc/claude-code/` including the managed-policy CLAUDE.md the image ships). See [examples/compose/README.md](../examples/compose/README.md) "Host state bind-mounts" + "Host paths on non-default layouts (env-var overrides)" for the full table of mounts the example wires up (claude-events, settings dirs, etc.), the per-tier Claude Code settings hierarchy, and the macOS graceful-no-op behavior for paths that don't exist on the host. Host-specific integration mounts (shell-history DBs, messaging attachment dirs, etc.) live in a local `docker-compose.override.yml`, not the public example.
+
+## VS Code tunnel auth bootstrap (`code` CLI)
+
+The image bakes Microsoft's standalone VS Code CLI at `/usr/local/bin/code` so an operator can run `code <file>` / `code .` / `code tunnel` from inside the in-container shell without any host-side prep. The binary itself is baked auth-free at image build time — no GitHub / Microsoft credentials are required to build the image — but `code tunnel` (the path that actually opens a VS Code window pointing at the container's filesystem) requires a one-time interactive authentication the first time it runs post-deploy.
+
+### First-time auth flow
+
+From inside the in-container shell:
+
+```
+code tunnel
+```
+
+…or from the host, against an already-running container:
+
+```
+docker compose exec claude-container code tunnel
+```
+
+The CLI prints a `https://github.com/login/device` URL and a short device code. Open the URL in a browser, paste the code, and complete the GitHub / Microsoft sign-in. On success the CLI registers the tunnel, prints a `https://vscode.dev/tunnel/<name>/...` link, and keeps running in the foreground (or as a service if you passed `--accept-server-license-terms` and a service flag — see `code tunnel --help`).
+
+Once the tunnel is up, open the printed `vscode.dev/tunnel/...` link in a browser and you get a VS Code window that's connected to the in-container filesystem. From that window: `Open Folder` → `/workspace` (or whichever path you want). Subsequent `code <file>` / `code .` invocations from the in-container shell open files inside that tunneled VS Code window.
+
+### Path B trade-off (known limitation)
+
+The tunneled VS Code window may NOT be the operator's currently-active VS Code window. `code tunnel` creates its own VS Code session, and `code <file>` opens the file in whichever VS Code instance the operator first authenticated with — typically a `vscode.dev` browser tab or a fresh local VS Code window, not whatever VS Code window the operator already has focused on the host.
+
+This is the explicit trade-off baked into the q-2026-05-14-ee13 decision (Path B). The alternative (Path A) was to wire a `devcontainer.json` reattach flow so the host's existing VS Code window would attach to the container directly, which would have broken the current `cw` / `ttyd` / `docker compose exec` model (the container runs a single in-container tmux session that's the operator's primary attach point — devcontainer reattach assumes the host's VS Code remote-container extension is the primary attach point, and the two don't compose). Path B accepts the wrong-window UX cost to keep the existing model intact.
+
+Practical implication: if you need the tunneled window to be your active VS Code window, close other VS Code instances before running `code tunnel`, or accept that you'll be working in a second VS Code surface alongside whatever else you had open.
+
+### Repeat invocations
+
+After the first authentication, the auth token is cached under `~/.vscode-cli/` inside the container. If you're running with the named-volume layout (the example compose stack persists `~/.local/share/claude` but NOT `~/.vscode-cli`), the cache evaporates on container recreate and you'll re-auth on next `code tunnel`. To persist auth across recreates, add a bind mount or named volume for `~/.vscode-cli` to your `docker-compose.override.yml`.
 
 ## Baked managed-policy CLAUDE.md
 
@@ -274,6 +312,22 @@ bridges are available) so every session starts with a load-bearing
 description of the environment, not a vanilla blank slate. The full text
 is in [`baked-CLAUDE.md`](baked-CLAUDE.md) in this directory; rebuild the
 image to update.
+
+Two cardinal rules sit at the TOP of the file, above the runtime-env
+framing, so they're surfaced before any operational text:
+
+- **Dispatcher, not worker** — any operation needing more than one tool
+  call must be delegated to a Task / Agent subagent. No Read→Edit→Bash
+  sequences in the main session.
+- **claude-watch alerts — STOP EVERYTHING** — when claude-watch
+  tmux-injects a prolonged-thinking, context-warn, or watcher-down alert,
+  the session must drop the current operation and attend the alert
+  immediately. Save state via `session-task set` + commit + log update
+  before clearing.
+
+These cardinals are non-negotiable; the
+[`baked-claude-md-cardinals.test`](tests/baked-claude-md-cardinals.test)
+asserts both are present and ordered above the runtime-env section.
 
 The example compose stack's `CLAUDE_HOST_MANAGED_SETTINGS_DIR` env-var
 mount is `/dev/null` by default (graceful no-op) so the baked CLAUDE.md
@@ -294,7 +348,7 @@ on-disk schema, the bake target, and the add-a-new-entry walkthrough.
 | --- | --- | --- | --- |
 | [`container/skills/`](skills/) | `/etc/claude-code/skills/` (canonical) + `/etc/claude-code/plugin/commands/` (plugin loader) | One `<name>.md` per slash command | `--plugin-dir /etc/claude-code/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`); skills callable as `/claude-container:<name>` |
 | [`container/agents/`](agents/) | `/etc/claude-code/agents/` (canonical) + `/etc/claude-code/plugin/agents/` (plugin loader) | One `<name>.md` per custom agent (frontmatter + body) | Same `--plugin-dir`; agents spawned with `subagent_type="claude-container:<name>"` |
-| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per long-running watcher | Probed by the `/claude-container:start-watchers` skill via `ls /etc/claude-code/watchers/*.toml`. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
+| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per long-running watcher | Auto-launched at container start by `cw-watcher-supervisor` (entrypoint-spawned, respawn-on-exit per `restart_policy`). The `/claude-container:start-watchers` skill is an informational probe. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
 
 The plugin namespace `claude-container` is set by
 [`container/plugin/.claude-plugin/plugin.json`](plugin/.claude-plugin/plugin.json),
@@ -306,16 +360,18 @@ plugin loader treats the baked dir as a real plugin.
 
 - Skills: [`restart`](skills/restart.md) (mirrors the host's `/restart`
   but invokes the in-container `cwsr` instead of `claude-watch update
-  --force`); [`start-watchers`](skills/start-watchers.md) (probes
-  `/etc/claude-code/watchers/`; today reports "nothing to start"
-  because the dir is empty).
+  --force`); [`start-watchers`](skills/start-watchers.md)
+  (informational probe — reports which watchers are running under
+  the container-level `cw-watcher-supervisor`).
 - Agents: none yet — the dir is a stub for future agent ports (Explore,
   general-purpose, note-writer, etc. — see
   [`container/agents/README.md`](agents/README.md) for the plan).
-- Watchers: none yet — the dir is a stub for future container-scoped
-  watchers (e.g. an in-container queue-event tail). The session-start
-  checklist in `baked-CLAUDE.md` honestly states "no long-running
-  watchers inside this container".
+- Watchers: [`claude-event-tail`](watchers/claude-event-tail.sh)
+  (surfaces `~/claude-events/*.json` drops to the in-container
+  session). Supervised by `cw-watcher-supervisor`, which entrypoint.sh
+  spawns at container start; watchers respawn-on-exit per their
+  `restart_policy` and survive the full container lifetime
+  independent of any Claude Code session inside.
 
 To add a new skill / agent / watcher: drop the file in the appropriate
 `container/<dir>/`, add a test under `container/tests/baked-dirs.test`

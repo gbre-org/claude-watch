@@ -16,6 +16,17 @@ Coverage:
   - Missing docker-compose.yml: clean exit 1 with a helpful message.
   - --help: prints usage, exits 0.
   - Bad flag: exits 2.
+  - --no-reconnect: single-shot — first non-zero exit propagates.
+  - Reconnect loop on transient failure: rc=1 first call, rc=0 second call
+    => cw exits 0 after retrying.
+  - Clean detach: rc=0 first call => cw exits 0 without retry.
+  - Retry cap: rc=1 always => cw bails after MAX_ATTEMPTS with the
+    documented message.
+
+The reconnect tests use CW_DOCKER_EXEC to inject a stateful mock that
+simulates docker exec behavior without needing an actual daemon. The
+mock is a tiny shell script that reads/writes a counter file and
+returns rc based on the current call number.
 
 Run:  ./cw.test
 """
@@ -189,6 +200,147 @@ def test_bad_flag_exits_two() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reconnect-loop tests
+#
+# These exercise the CW_DOCKER_EXEC test hook to inject a stateful mock
+# in place of `docker compose ... exec`. The mock is a small shell
+# script written to a temp dir; it increments a counter file each
+# invocation and exits with the rc dictated by the mode under test.
+# ---------------------------------------------------------------------------
+
+
+def _write_mock(mode: str, tmpdir: Path) -> tuple[Path, Path]:
+    """Write a stateful mock 'docker exec' replacement and return
+    (mock_path, counter_path). modes:
+      - "fail_then_succeed": rc=1 on call 1, rc=0 on call 2+.
+      - "always_succeed":   rc=0 every call.
+      - "always_fail":      rc=1 every call.
+    """
+    counter = tmpdir / "calls"
+    counter.write_text("0\n")
+    mock = tmpdir / "mock-exec"
+    body = f"""#!/usr/bin/env bash
+set -u
+counter='{counter}'
+n=$(cat "$counter")
+n=$((n + 1))
+echo "$n" > "$counter"
+mode='{mode}'
+case "$mode" in
+    fail_then_succeed)
+        if [ "$n" = "1" ]; then exit 1; else exit 0; fi
+        ;;
+    always_succeed)
+        exit 0
+        ;;
+    always_fail)
+        exit 1
+        ;;
+    *)
+        echo "mock: unknown mode $mode" >&2
+        exit 99
+        ;;
+esac
+"""
+    mock.write_text(body)
+    mock.chmod(0o755)
+    return mock, counter
+
+
+def test_no_reconnect_propagates_failure() -> None:
+    """--no-reconnect: first non-zero exit propagates immediately, no
+    retry."""
+    with tempfile.TemporaryDirectory(prefix="cw-noreconn-") as d:
+        tmpdir = Path(d)
+        mock, counter = _write_mock("always_fail", tmpdir)
+        _, _, _, rc = run_cw(
+            ["--no-reconnect"],
+            env={"CW_DOCKER_EXEC": str(mock)},
+            expect_rc=1,
+        )
+        expect(counter.read_text().strip() == "1",
+               f"no-reconnect: mock should be called exactly once, "
+               f"got {counter.read_text().strip()!r}")
+
+
+def test_no_reconnect_passes_success() -> None:
+    """--no-reconnect: rc=0 still propagates (no infinite loop)."""
+    with tempfile.TemporaryDirectory(prefix="cw-noreconn-ok-") as d:
+        tmpdir = Path(d)
+        mock, counter = _write_mock("always_succeed", tmpdir)
+        _, _, _, rc = run_cw(
+            ["--no-reconnect"],
+            env={"CW_DOCKER_EXEC": str(mock)},
+            expect_rc=0,
+        )
+        expect(counter.read_text().strip() == "1",
+               f"no-reconnect-ok: mock called exactly once, "
+               f"got {counter.read_text().strip()!r}")
+
+
+def test_reconnect_on_transient_failure() -> None:
+    """Default (reconnect on): rc=1 first call, rc=0 second call =>
+    cw retries once + exits 0."""
+    with tempfile.TemporaryDirectory(prefix="cw-reconn-") as d:
+        tmpdir = Path(d)
+        mock, counter = _write_mock("fail_then_succeed", tmpdir)
+        _, _, stderr, rc = run_cw(
+            [],
+            env={"CW_DOCKER_EXEC": str(mock)},
+            expect_rc=0,
+        )
+        expect(counter.read_text().strip() == "2",
+               f"reconnect: mock should be called twice (fail, then "
+               f"success), got {counter.read_text().strip()!r}")
+        expect("reconnecting" in stderr.lower(),
+               f"reconnect: stderr should mention reconnecting, "
+               f"got {stderr!r}")
+
+
+def test_clean_detach_no_retry() -> None:
+    """Default (reconnect on): rc=0 first call => cw exits 0 without
+    retry (Ctrl-b d path)."""
+    with tempfile.TemporaryDirectory(prefix="cw-detach-") as d:
+        tmpdir = Path(d)
+        mock, counter = _write_mock("always_succeed", tmpdir)
+        _, _, _, rc = run_cw(
+            [],
+            env={"CW_DOCKER_EXEC": str(mock)},
+            expect_rc=0,
+        )
+        expect(counter.read_text().strip() == "1",
+               f"clean-detach: mock should be called exactly once, "
+               f"got {counter.read_text().strip()!r}")
+
+
+def test_retry_cap_bails() -> None:
+    """Default (reconnect on): rc=1 always => cw bails after
+    MAX_ATTEMPTS with the documented stderr message. Use a small
+    window/cap to keep the test fast (3 attempts in 10s)."""
+    with tempfile.TemporaryDirectory(prefix="cw-cap-") as d:
+        tmpdir = Path(d)
+        mock, counter = _write_mock("always_fail", tmpdir)
+        _, _, stderr, rc = run_cw(
+            [],
+            env={
+                "CW_DOCKER_EXEC": str(mock),
+                "CW_RECONNECT_MAX_ATTEMPTS": "3",
+                "CW_RECONNECT_WINDOW_SECS": "10",
+            },
+            expect_rc=1,
+        )
+        expect(counter.read_text().strip() == "3",
+               f"retry-cap: mock should be called exactly 3 times, "
+               f"got {counter.read_text().strip()!r}")
+        expect("bailing" in stderr.lower() or "daemon" in stderr.lower(),
+               f"retry-cap: stderr should mention bailing / daemon, "
+               f"got {stderr!r}")
+        expect("3" in stderr,
+               f"retry-cap: stderr should include the attempt count, "
+               f"got {stderr!r}")
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -200,6 +352,11 @@ TESTS = [
     test_missing_compose_dir,
     test_help_exits_zero,
     test_bad_flag_exits_two,
+    test_no_reconnect_propagates_failure,
+    test_no_reconnect_passes_success,
+    test_reconnect_on_transient_failure,
+    test_clean_detach_no_retry,
+    test_retry_cap_bails,
 ]
 
 for t in TESTS:

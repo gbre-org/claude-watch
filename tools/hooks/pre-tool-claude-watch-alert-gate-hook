@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""PreToolUse hook -- enforces the claude-watch alert gate.
+
+When ANY pending alert is present in `~/.config/claude-watch/pending-alerts.json`,
+DENY every tool call with a banner that tells the operator (or Claude)
+how to clear the gate via `claude-watch-ack ack <id>`.
+
+Why this exists
+---------------
+
+The v58 verdict on baked-CLAUDE.md cardinals was "alert internalized:
+PARTIAL". The soft prompt-layer guidance is unreliable: workbot Claude
+acknowledges the alert in one turn, then resumes inline work without
+running the canonical recovery (session-task set, commit, log update).
+A hard tool-layer DENY is the only mechanism that reliably forces the
+recovery path.
+
+Wiring (in container settings.json via generate-hooks-shim-settings)::
+
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "*",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/usr/local/bin/pre-tool-claude-watch-alert-gate-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+This hook runs ALONGSIDE the existing obligations-gate hook on the `*`
+matcher; Claude Code runs every matching hook and treats the first DENY
+as authoritative.
+
+Exempt patterns
+---------------
+
+The following tool calls pass through even while alerts are pending,
+because they are the recovery path or the only safe inspection:
+
+  - Bash: `claude-watch-ack` (any subcommand: ack, list, status, add)
+  - Bash: `obligations list` / `obligations show` (inspect related state)
+  - Bash: `session-task set`/`set-state`/`clear`/`queue`/`get` (the canonical
+        compact-prep flow; the alert tells you to call `session-task set`)
+  - Bash: `git status`/`git diff`/`git log`/`git commit`/`git push`/`git add`
+        (so commit + push instructions in the alert can run)
+  - Bash: `self-clear` (the alert may instruct it)
+  - Read tool (any path) -- needed to inspect watcher .output files,
+        captured logs, and claude-events during triage.
+
+Default-open contract
+---------------------
+
+  - State-file missing OR unreadable -> allow.
+  - State-file present but empty alerts list -> allow.
+  - Hook script internal error -> allow + log to
+        `~/.config/claude/claude-watch-alert-hook-errors.log`.
+  - `CLAUDE_WATCH_ALERT_BYPASS=1` in env -> allow + log to
+        `~/.config/claude/claude-watch-alert-bypass.log`.
+
+A broken hook MUST NEVER blackhole the loop. The state file write path
+(`claude-watch-ack add`) is the choke point; if THAT breaks, the gate
+silently degrades to "no enforcement" rather than "everything denied".
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# -----------------------------------------------------------------------------
+# State + logging paths
+# -----------------------------------------------------------------------------
+
+STATE_DIR = Path(os.environ.get(
+    "CLAUDE_WATCH_ALERT_STATE_DIR",
+    os.path.expanduser("~/.config/claude-watch"),
+))
+STATE_PATH = STATE_DIR / "pending-alerts.json"
+
+ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+ERR_LOG_PATH = ERR_LOG_DIR / "claude-watch-alert-hook-errors.log"
+BYPASS_LOG_PATH = ERR_LOG_DIR / "claude-watch-alert-bypass.log"
+
+
+# -----------------------------------------------------------------------------
+# Exempt-pattern matrix
+# -----------------------------------------------------------------------------
+
+# For Bash, we match the COMMAND STRING against a list of regex patterns.
+# Match is "any of these prefixes" anchored to the start of the command
+# after `lstrip()`. Compound commands (`a && b`, `a; b`) FAIL the exempt
+# match if the first token isn't in the list -- the gate is intentionally
+# strict so the operator can't trivially smuggle work through the ack path.
+#
+# Each pattern is anchored to start-of-string (after lstrip) to keep the
+# match list short + readable.
+_BASH_EXEMPT_PATTERNS = [
+    # The ack tool itself
+    r"^claude-watch-ack(?:\s|$)",
+    r"^/usr/local/bin/claude-watch-ack(?:\s|$)",
+    # State inspection
+    r"^obligations\s+(?:list|show|status)(?:\s|$)",
+    r"^/usr/local/bin/obligations\s+(?:list|show|status)(?:\s|$)",
+    # Canonical compact-prep flow
+    r"^session-task(?:\s|$)",
+    r"^/usr/local/bin/session-task(?:\s|$)",
+    # Commit + push (recovery instructions in the alert may invoke these)
+    r"^git\s+(?:status|diff|log|show|commit|push|add|stash|rev-parse|branch|checkout)(?:\s|$)",
+    # Self-clear is sometimes the alert's instruction
+    r"^self-clear(?:\s|$)",
+    r"^/usr/local/bin/self-clear(?:\s|$)",
+    # agent-msg inbox-side reads + acks: a subagent that's ALREADY
+    # blocked by its own inbox gate must be able to read/ack the inbox
+    # even when an alert is also pending. Without this, the alert gate
+    # double-deadlocks the subagent: alert gate blocks until acked, but
+    # only the main loop can ack alerts, so the subagent's inbox
+    # never clears either. We allow read-only / cleanup forms (inbox,
+    # ack, gc, disarm); `send` and `arm` stay gated.
+    r"^agent-msg\s+(?:inbox|ack|gc|disarm|list|show|status)(?:\s|$)",
+    r"^/usr/local/bin/agent-msg\s+(?:inbox|ack|gc|disarm|list|show|status)(?:\s|$)",
+]
+_BASH_EXEMPT_RES = [re.compile(p) for p in _BASH_EXEMPT_PATTERNS]
+
+
+# Tool names that are exempt regardless of args. Read is exempt so the
+# operator can inspect watcher .output files / claude-events / logs while
+# triaging the alert.
+_EXEMPT_TOOLS = frozenset({"Read"})
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+
+def _allow() -> dict:
+    return {}
+
+
+def _deny(banner: str, reason: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": banner,
+    }
+
+
+def _log(path: Path, payload: dict) -> None:
+    """Best-effort append-only log. Swallow all I/O errors."""
+    try:
+        ERR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        rec = {"ts": ts, "pid": os.getpid(), **payload}
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _read_pending_alerts() -> list[dict]:
+    """Return the list of pending alerts. Empty list when state file is
+    missing OR unreadable OR malformed -- the gate must default-open
+    rather than blackhole on a broken file.
+    """
+    if not STATE_PATH.exists():
+        return []
+    try:
+        with STATE_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    alerts = data.get("alerts")
+    if not isinstance(alerts, list):
+        return []
+    out = []
+    for a in alerts:
+        if isinstance(a, dict) and isinstance(a.get("id"), str):
+            out.append(a)
+    return out
+
+
+def _bash_command_string(tool_input: dict) -> str:
+    cmd = tool_input.get("command", "")
+    if not isinstance(cmd, str):
+        return ""
+    return cmd
+
+
+def _is_bash_exempt(cmd: str) -> bool:
+    if not cmd:
+        return False
+    stripped = cmd.lstrip()
+    return any(rx.match(stripped) for rx in _BASH_EXEMPT_RES)
+
+
+def _is_exempt(tool_name: str, tool_input: dict) -> bool:
+    if tool_name in _EXEMPT_TOOLS:
+        return True
+    if tool_name == "Bash":
+        cmd = _bash_command_string(tool_input)
+        return _is_bash_exempt(cmd)
+    return False
+
+
+def _build_banner(alerts: list[dict], tool_name: str) -> str:
+    lines = [
+        "!! BLOCKED: claude-watch alert gate (1 or more unack'd alerts)",
+        "!!",
+        f"!! Tool: {tool_name}",
+        "!!",
+        "!! claude-watch fired the following alert(s). STOP EVERYTHING and",
+        "!! attend them before resuming work.",
+        "!!",
+    ]
+    # Show up to 5 alerts inline so the operator can see the full set
+    # without round-tripping through `claude-watch-ack list`.
+    for a in alerts[:5]:
+        aid = a.get("id", "?")
+        msg = (a.get("message") or "").splitlines()[0][:160]
+        source = a.get("source") or "?"
+        lines.append(f"!!   [{aid}] (source={source})")
+        if msg:
+            lines.append(f"!!     {msg}")
+    if len(alerts) > 5:
+        lines.append(f"!!   (+{len(alerts) - 5} more)")
+    lines += [
+        "!!",
+        "!! Canonical recovery (per baked-CLAUDE.md `claude-watch alerts`):",
+        "!!   1. Commit + push any in-flight repo work",
+        "!!   2. Update today's daily log if substantive activity happened",
+        "!!   3. `session-task set \"...\"` with enough context to resume",
+        "!!   4. `self-clear` if the alert says to",
+        "!!",
+        "!! Then clear the gate:",
+        "!!   claude-watch-ack list                 # show pending alerts",
+        "!!   claude-watch-ack ack <id>             # ack a specific alert",
+        "!!   claude-watch-ack ack --all            # ack everything",
+        "!!",
+        "!! Exempt while alerts pending: claude-watch-ack, session-task,",
+        "!!   git status/diff/log/commit/push/add, obligations list/show,",
+        "!!   self-clear, Read (file inspection).",
+        "!!",
+        "!! Hook source:    pre-tool-claude-watch-alert-gate-hook",
+        "!!                 (claude-watch tools/hooks/)",
+        "!! Emergency bypass: set CLAUDE_WATCH_ALERT_BYPASS=1 (audited)",
+    ]
+    return "\n".join(lines)
+
+
+def _build_reason(alerts: list[dict]) -> str:
+    """Compact reason string for `permissionDecisionReason`. Surfaces id
+    + short preview of up to 3 alerts so the deny payload renders
+    usefully in transcripts."""
+    chunks: list[str] = []
+    for a in alerts[:3]:
+        head = a.get("id", "?")
+        preview = (a.get("message") or "").splitlines()[0][:80]
+        if preview:
+            chunks.append(f"{head}: {preview}")
+        else:
+            chunks.append(head)
+    out = "; ".join(chunks)
+    if len(out) > 800:
+        out = out[:797] + "..."
+    return (
+        f"{len(alerts)} pending claude-watch alert(s) -- "
+        f"run `claude-watch-ack ack <id>` (or `ack --all`) to clear. "
+        f"Details: {out}"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+
+def main() -> int:
+    # Emergency bypass: take it before reading anything.
+    if os.environ.get("CLAUDE_WATCH_ALERT_BYPASS", "").strip() not in ("", "0"):
+        _log(BYPASS_LOG_PATH, {"kind": "bypass-env"})
+        print(json.dumps(_allow()))
+        return 0
+
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        print(json.dumps(_allow()))
+        return 0
+    if not isinstance(payload, dict):
+        print(json.dumps(_allow()))
+        return 0
+
+    tool_name = payload.get("tool_name", "")
+    if not isinstance(tool_name, str) or not tool_name:
+        print(json.dumps(_allow()))
+        return 0
+
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    # Cheap exempt check BEFORE reading the state file -- if the call is
+    # for the ack tool itself, we don't even need to know whether alerts
+    # are pending.
+    if _is_exempt(tool_name, tool_input):
+        print(json.dumps(_allow()))
+        return 0
+
+    alerts = _read_pending_alerts()
+    if not alerts:
+        print(json.dumps(_allow()))
+        return 0
+
+    banner = _build_banner(alerts, tool_name)
+    reason = _build_reason(alerts)
+    print(json.dumps(_deny(banner, reason)))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 -- last-ditch default-open
+        try:
+            _log(ERR_LOG_PATH, {"kind": "uncaught", "exc": str(exc)})
+        except Exception:
+            pass
+        print("{}")
+        sys.exit(0)

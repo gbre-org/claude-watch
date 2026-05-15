@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""cw-watcher-supervisor — container-level watcher supervisor.
+
+Reads each `.toml` metadata file under `$CW_WATCHERS_DIR` (default
+`/etc/claude-code/watchers/`) and supervises the watcher's launcher
+process for the lifetime of the container.
+
+Each watcher's `.toml` must declare:
+
+    name           = "<watcher-name>"
+    description    = "<one-line>"
+    launcher       = "/etc/claude-code/watchers/<name>.sh"
+    restart_policy = "always" | "on-failure" | "never"
+    log_path       = "/tmp/claude-container-watchers/<name>.log"
+
+The supervisor:
+  - Spawns each launcher with stdout/stderr appended to log_path.
+  - Re-spawns on exit per restart_policy:
+      always       — always re-spawn.
+      on-failure   — re-spawn only if exit code != 0.
+      never        — don't re-spawn.
+  - Backoff: 1s → 2s → 4s → ... capped at 30s. Resets after a child
+    runs cleanly for >= 60s.
+  - Crash-loop protection: after RESPAWN_LIMIT (5) restarts within
+    RESPAWN_WINDOW_SECS (60s), mark the watcher "stuck" and stop
+    respawning until the supervisor itself restarts.
+  - SIGTERM / SIGINT: forward to every child, wait briefly, exit
+    cleanly. tini at PID 1 reaps the zombies.
+
+Why this exists:
+  Watchers in container/watchers/ are launcher scripts that need to
+  run for the entire container's lifetime, not just one Claude Code
+  session. Before this supervisor existed, the in-session
+  `/claude-container:start-watchers` skill was the only launcher path
+  — watchers died with the session, requiring a re-launch on every
+  fresh session. With the supervisor wired into entrypoint.sh, the
+  /etc/claude-code/watchers/ dir gets auto-launched at container
+  boot, supervised independently of any claude session inside.
+
+Embedded `--test` mode runs the unit suite against tempdirs (no real
+watcher launches required). Run via:
+
+    python3 container/bin/cw-watcher-supervisor --test
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+WATCHERS_DIR_DEFAULT = "/etc/claude-code/watchers"
+
+# Backoff: 1, 2, 4, 8, 16, 30, 30, ... seconds.
+BACKOFF_INITIAL_SECS = 1.0
+BACKOFF_MAX_SECS = 30.0
+
+# A child that ran cleanly for >= STABLE_RUN_SECS resets its backoff
+# counter to 0 (so a transient crash after a long run gets fast retry,
+# not exponential punishment).
+STABLE_RUN_SECS = 60.0
+
+# Crash-loop guard: more than RESPAWN_LIMIT restarts in
+# RESPAWN_WINDOW_SECS marks the watcher stuck (supervisor stops
+# respawning it until restart).
+RESPAWN_LIMIT = 5
+RESPAWN_WINDOW_SECS = 60.0
+
+# Poll interval for the main wait() loop. We use waitpid(WNOHANG) +
+# sleep rather than a blocking wait so SIGTERM / SIGINT can be
+# delivered to the supervisor and the cleanup path fires promptly.
+POLL_INTERVAL_SECS = 0.5
+
+
+# ---------------------------------------------------------------------------
+# TOML parsing — flat string-only key=value, fallback for Python < 3.11.
+# ---------------------------------------------------------------------------
+
+def parse_watcher_toml(path: Path) -> dict[str, str]:
+    """Parse a watcher .toml file. The watcher schema is flat
+    `key = "value"` — no tables, arrays, or nested types. We prefer
+    tomllib (3.11+) but fall back to a regex parser so the script
+    works on older runtimes.
+    """
+    try:
+        import tomllib  # type: ignore[import]
+        with open(path, "rb") as fp:
+            data = tomllib.load(fp)
+    except ImportError:
+        data = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = re.match(
+                r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$',
+                stripped,
+            )
+            if not m:
+                raise ValueError(
+                    f"cw-watcher-supervisor: cannot parse line {line!r} "
+                    f"in {path}"
+                )
+            data[m.group(1)] = m.group(2)
+    # Coerce every value to str so callers get a uniform shape.
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def discover_watchers(watchers_dir: Path) -> list[dict[str, str]]:
+    """Return parsed metadata for every `.toml` under watchers_dir.
+
+    Watchers with missing required fields are reported to stderr and
+    skipped (the supervisor never crashes on a single bad watcher).
+    """
+    out: list[dict[str, str]] = []
+    if not watchers_dir.is_dir():
+        return out
+    required = ("name", "launcher", "restart_policy", "log_path")
+    for toml_path in sorted(watchers_dir.glob("*.toml")):
+        try:
+            meta = parse_watcher_toml(toml_path)
+        except Exception as e:
+            print(
+                f"cw-watcher-supervisor: skipping {toml_path}: parse "
+                f"error: {e}",
+                file=sys.stderr,
+            )
+            continue
+        missing = [k for k in required if k not in meta]
+        if missing:
+            print(
+                f"cw-watcher-supervisor: skipping {toml_path}: missing "
+                f"required keys: {missing}",
+                file=sys.stderr,
+            )
+            continue
+        policy = meta.get("restart_policy", "")
+        if policy not in ("always", "on-failure", "never"):
+            print(
+                f"cw-watcher-supervisor: skipping {toml_path}: invalid "
+                f"restart_policy={policy!r} (must be always / "
+                f"on-failure / never)",
+                file=sys.stderr,
+            )
+            continue
+        out.append(meta)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Supervisor state
+# ---------------------------------------------------------------------------
+
+class WatcherState:
+    """Per-watcher runtime state held by the supervisor."""
+
+    def __init__(self, meta: dict[str, str]) -> None:
+        self.meta = meta
+        self.name = meta["name"]
+        self.launcher = meta["launcher"]
+        self.policy = meta["restart_policy"]
+        self.log_path = meta["log_path"]
+        self.proc: subprocess.Popen | None = None
+        self.started_at: float = 0.0
+        self.consecutive_failures: int = 0
+        # Sliding-window crash count: timestamps of recent restarts.
+        self.recent_restarts: list[float] = []
+        # Once stuck, the supervisor stops respawning until restart.
+        self.stuck: bool = False
+        # Set once the watcher has been instructed not to respawn
+        # (policy decision: never / on-failure with clean exit).
+        # Distinct from `stuck` (crash-loop). When True, the main loop
+        # MUST NOT re-spawn the watcher.
+        self.terminated: bool = False
+
+    def backoff_secs(self) -> float:
+        """Exponential backoff capped at BACKOFF_MAX_SECS. The first
+        restart waits BACKOFF_INITIAL_SECS; each subsequent failure
+        doubles until the cap."""
+        if self.consecutive_failures <= 0:
+            return 0.0
+        # Cap exponent so 2**n doesn't overflow even with absurd inputs.
+        exp = min(self.consecutive_failures - 1, 20)
+        return min(BACKOFF_INITIAL_SECS * (2.0 ** exp), BACKOFF_MAX_SECS)
+
+    def record_exit(self, exit_code: int, run_duration: float) -> None:
+        """Update state after a child exits."""
+        now = time.monotonic()
+        # Reset failure counter on a stable run (clean or not — the
+        # contract is "ran long enough that the next restart should be
+        # treated as fresh"). This matches systemd's RestartSec /
+        # StartLimitIntervalSec semantics.
+        if run_duration >= STABLE_RUN_SECS:
+            self.consecutive_failures = 0
+            self.recent_restarts = []
+        else:
+            self.consecutive_failures += 1
+            self.recent_restarts.append(now)
+        # Prune restarts older than the sliding window.
+        cutoff = now - RESPAWN_WINDOW_SECS
+        self.recent_restarts = [t for t in self.recent_restarts if t >= cutoff]
+        # Mark stuck if too many restarts in the window.
+        if len(self.recent_restarts) >= RESPAWN_LIMIT:
+            self.stuck = True
+
+    def should_respawn(self, exit_code: int) -> bool:
+        """Decide whether to re-spawn based on policy + crash-loop
+        protection."""
+        if self.stuck:
+            return False
+        if self.policy == "always":
+            return True
+        if self.policy == "on-failure":
+            return exit_code != 0
+        # "never"
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Launcher spawning
+# ---------------------------------------------------------------------------
+
+def spawn_launcher(state: WatcherState) -> subprocess.Popen | None:
+    """Spawn the watcher launcher with stdout/stderr appended to its
+    log_path. Returns None if the launcher path is missing or not
+    executable — caller marks the watcher as failed and respects policy.
+    """
+    launcher_path = Path(state.launcher)
+    if not launcher_path.is_file():
+        print(
+            f"cw-watcher-supervisor: {state.name}: launcher missing at "
+            f"{launcher_path}; skipping",
+            file=sys.stderr,
+        )
+        return None
+    if not os.access(launcher_path, os.X_OK):
+        print(
+            f"cw-watcher-supervisor: {state.name}: launcher not "
+            f"executable at {launcher_path}; skipping",
+            file=sys.stderr,
+        )
+        return None
+
+    log_path = Path(state.log_path)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(
+            f"cw-watcher-supervisor: {state.name}: cannot create log "
+            f"dir {log_path.parent}: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        log_fp = open(log_path, "ab")
+    except OSError as e:
+        print(
+            f"cw-watcher-supervisor: {state.name}: cannot open log "
+            f"{log_path}: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+    # New process group so SIGTERM can be sent to the whole subtree on
+    # supervisor shutdown (the launcher may exec dir-watch.sh which may
+    # spawn inotifywait — we want one signal to take everything down).
+    try:
+        proc = subprocess.Popen(
+            [str(launcher_path)],
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env={**os.environ},
+        )
+    except OSError as e:
+        log_fp.close()
+        print(
+            f"cw-watcher-supervisor: {state.name}: spawn failed: {e}",
+            file=sys.stderr,
+        )
+        return None
+    finally:
+        # The Popen child inherited the fd; closing the parent's
+        # handle is safe.
+        try:
+            log_fp.close()
+        except OSError:
+            pass
+
+    state.proc = proc
+    state.started_at = time.monotonic()
+    print(
+        f"cw-watcher-supervisor: {state.name}: started "
+        f"(pid={proc.pid}, log={log_path})",
+        file=sys.stderr,
+    )
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# Main supervisor loop
+# ---------------------------------------------------------------------------
+
+def run_supervisor(
+    watchers_dir: Path,
+    *,
+    iteration_limit: int | None = None,
+    sleep_fn: Any = time.sleep,
+) -> int:
+    """Main loop. Returns process exit code.
+
+    iteration_limit: if set, exit after this many poll iterations
+    (used by tests to bound runtime).
+    """
+    metadata = discover_watchers(watchers_dir)
+    if not metadata:
+        print(
+            "cw-watcher-supervisor: no watchers to supervise "
+            f"(dir={watchers_dir})",
+            file=sys.stderr,
+        )
+        return 0
+
+    states = [WatcherState(m) for m in metadata]
+    # next_spawn_at[name] = monotonic-time after which the watcher
+    # should be respawned. 0.0 means "ready now".
+    next_spawn_at: dict[str, float] = {s.name: 0.0 for s in states}
+
+    shutdown_requested = False
+
+    def _request_shutdown(signum, _frame) -> None:
+        nonlocal shutdown_requested
+        shutdown_requested = True
+
+    # Signal handlers can only be installed from the main thread; the
+    # embedded test suite runs run_supervisor() from worker threads, so
+    # we skip the install in that case. tini at PID 1 propagates the
+    # signal cleanly to whichever thread can handle it on real runs.
+    try:
+        signal.signal(signal.SIGTERM, _request_shutdown)
+        signal.signal(signal.SIGINT, _request_shutdown)
+    except ValueError:
+        pass
+
+    # Spawn all watchers up-front.
+    for state in states:
+        spawn_launcher(state)
+
+    iteration = 0
+    try:
+        while not shutdown_requested:
+            iteration += 1
+            if iteration_limit is not None and iteration > iteration_limit:
+                break
+
+            now = time.monotonic()
+            for state in states:
+                if state.proc is None:
+                    # Not running. Check if it's time to (re)spawn.
+                    if state.stuck or state.terminated:
+                        continue
+                    if now >= next_spawn_at[state.name]:
+                        proc = spawn_launcher(state)
+                        if proc is None:
+                            # Launcher missing / unexecutable — back off
+                            # and try again later, treating as failure.
+                            state.consecutive_failures += 1
+                            next_spawn_at[state.name] = (
+                                now + state.backoff_secs()
+                            )
+                    continue
+
+                ret = state.proc.poll()
+                if ret is None:
+                    # Still running.
+                    continue
+
+                run_duration = now - state.started_at
+                exit_code = ret
+                print(
+                    f"cw-watcher-supervisor: {state.name}: exited "
+                    f"(code={exit_code}, ran_for={run_duration:.1f}s)",
+                    file=sys.stderr,
+                )
+                state.record_exit(exit_code, run_duration)
+                state.proc = None
+
+                if state.stuck:
+                    print(
+                        f"cw-watcher-supervisor: {state.name}: STUCK "
+                        f"(>= {RESPAWN_LIMIT} restarts in "
+                        f"{RESPAWN_WINDOW_SECS:.0f}s window); will not "
+                        f"respawn until supervisor restarts",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                if not state.should_respawn(exit_code):
+                    state.terminated = True
+                    print(
+                        f"cw-watcher-supervisor: {state.name}: not "
+                        f"respawning (policy={state.policy}, "
+                        f"exit_code={exit_code})",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                wait_secs = state.backoff_secs()
+                next_spawn_at[state.name] = now + wait_secs
+                if wait_secs > 0:
+                    print(
+                        f"cw-watcher-supervisor: {state.name}: backing "
+                        f"off {wait_secs:.1f}s before respawn",
+                        file=sys.stderr,
+                    )
+
+            sleep_fn(POLL_INTERVAL_SECS)
+    finally:
+        # Shutdown path: SIGTERM every running child, give them a
+        # moment to drain, then SIGKILL stragglers. tini reaps.
+        for state in states:
+            if state.proc is not None and state.proc.poll() is None:
+                try:
+                    os.killpg(state.proc.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if all(
+                s.proc is None or s.proc.poll() is not None
+                for s in states
+            ):
+                break
+            sleep_fn(0.1)
+        for state in states:
+            if state.proc is not None and state.proc.poll() is None:
+                try:
+                    os.killpg(state.proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    state.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    print(
+        "cw-watcher-supervisor: shutdown complete",
+        file=sys.stderr,
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Embedded test suite
+# ---------------------------------------------------------------------------
+
+def _run_tests() -> int:
+    import tempfile
+    import textwrap
+
+    failures: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    # ----- parse_watcher_toml -----
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        p = td_path / "good.toml"
+        p.write_text(textwrap.dedent('''
+            name = "test-watcher"
+            description = "a test"
+            launcher = "/etc/claude-code/watchers/test-watcher.sh"
+            restart_policy = "always"
+            log_path = "/tmp/test.log"
+        ''').strip())
+        meta = parse_watcher_toml(p)
+        expect(meta.get("name") == "test-watcher",
+               f"parse_watcher_toml: name wrong, got {meta!r}")
+        expect(meta.get("restart_policy") == "always",
+               f"parse_watcher_toml: restart_policy wrong, got {meta!r}")
+
+    # ----- discover_watchers: empty dir -----
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        out = discover_watchers(td_path)
+        expect(out == [], f"discover_watchers: empty dir not empty: {out!r}")
+
+    # ----- discover_watchers: missing dir -----
+    out = discover_watchers(Path("/nonexistent/cw-supervisor-test"))
+    expect(out == [],
+           f"discover_watchers: missing dir not empty: {out!r}")
+
+    # ----- discover_watchers: bad policy is skipped -----
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        (td_path / "bad.toml").write_text(textwrap.dedent('''
+            name = "bad"
+            description = "bad policy"
+            launcher = "/x.sh"
+            restart_policy = "sometimes"
+            log_path = "/tmp/x.log"
+        ''').strip())
+        (td_path / "good.toml").write_text(textwrap.dedent('''
+            name = "good"
+            description = "ok"
+            launcher = "/y.sh"
+            restart_policy = "always"
+            log_path = "/tmp/y.log"
+        ''').strip())
+        out = discover_watchers(td_path)
+        names = [m["name"] for m in out]
+        expect(names == ["good"],
+               f"discover_watchers: bad policy not filtered: {names!r}")
+
+    # ----- discover_watchers: missing required key skipped -----
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        (td_path / "incomplete.toml").write_text(textwrap.dedent('''
+            name = "incomplete"
+        ''').strip())
+        out = discover_watchers(td_path)
+        expect(out == [],
+               f"discover_watchers: incomplete entry kept: {out!r}")
+
+    # ----- WatcherState backoff -----
+    s = WatcherState({
+        "name": "x", "launcher": "/x", "restart_policy": "always",
+        "log_path": "/tmp/x",
+    })
+    expect(s.backoff_secs() == 0.0,
+           f"backoff: fresh state non-zero: {s.backoff_secs()}")
+    s.consecutive_failures = 1
+    expect(s.backoff_secs() == BACKOFF_INITIAL_SECS,
+           f"backoff first: {s.backoff_secs()}")
+    s.consecutive_failures = 2
+    expect(s.backoff_secs() == 2.0,
+           f"backoff second: {s.backoff_secs()}")
+    s.consecutive_failures = 100
+    expect(s.backoff_secs() == BACKOFF_MAX_SECS,
+           f"backoff capped: {s.backoff_secs()}")
+
+    # ----- WatcherState should_respawn -----
+    s = WatcherState({
+        "name": "a", "launcher": "/a", "restart_policy": "always",
+        "log_path": "/tmp/a",
+    })
+    expect(s.should_respawn(0) is True, "always/0 should respawn")
+    expect(s.should_respawn(1) is True, "always/1 should respawn")
+    s.policy = "on-failure"
+    expect(s.should_respawn(0) is False, "on-failure/0 should NOT respawn")
+    expect(s.should_respawn(1) is True, "on-failure/1 should respawn")
+    s.policy = "never"
+    expect(s.should_respawn(0) is False, "never/0 should NOT respawn")
+    expect(s.should_respawn(1) is False, "never/1 should NOT respawn")
+    s.policy = "always"
+    s.stuck = True
+    expect(s.should_respawn(0) is False, "stuck should NOT respawn")
+
+    # ----- WatcherState record_exit / crash-loop -----
+    s = WatcherState({
+        "name": "loop", "launcher": "/x", "restart_policy": "always",
+        "log_path": "/tmp/x",
+    })
+    # Quick crashes ramp up consecutive failures.
+    for _ in range(RESPAWN_LIMIT):
+        s.record_exit(1, run_duration=0.5)
+    expect(s.stuck is True,
+           f"crash-loop: not marked stuck after {RESPAWN_LIMIT} fast "
+           f"crashes (consecutive={s.consecutive_failures}, "
+           f"recent={len(s.recent_restarts)})")
+
+    # Stable run resets the counter.
+    s2 = WatcherState({
+        "name": "ok", "launcher": "/x", "restart_policy": "always",
+        "log_path": "/tmp/x",
+    })
+    s2.record_exit(1, run_duration=0.5)
+    s2.record_exit(1, run_duration=0.5)
+    expect(s2.consecutive_failures == 2,
+           f"failures should be 2, got {s2.consecutive_failures}")
+    s2.record_exit(0, run_duration=120.0)
+    expect(s2.consecutive_failures == 0,
+           f"stable run should reset failures, got "
+           f"{s2.consecutive_failures}")
+    expect(s2.recent_restarts == [],
+           f"stable run should clear restart window, got "
+           f"{s2.recent_restarts}")
+
+    # ----- run_supervisor: empty watchers dir exits 0 -----
+    with tempfile.TemporaryDirectory() as td:
+        rc = run_supervisor(Path(td), iteration_limit=1)
+        expect(rc == 0,
+               f"run_supervisor empty dir rc={rc}")
+
+    # ----- run_supervisor: end-to-end with a sleep-and-exit launcher -----
+    # The launcher prints to its log, then exits cleanly. The
+    # supervisor should respawn it (policy=always). We bound the
+    # iteration count so the test terminates.
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        log_path = td_path / "watcher.log"
+        launcher = td_path / "tiny-launcher.sh"
+        launcher.write_text(textwrap.dedent(f'''
+            #!/bin/bash
+            echo "fired at $(date +%s.%N)" >> {log_path}
+            # exit fast so we can observe a respawn within the test
+            sleep 0.1
+            exit 0
+        ''').strip())
+        launcher.chmod(0o755)
+        toml = td_path / "tiny.toml"
+        toml.write_text(textwrap.dedent(f'''
+            name = "tiny"
+            description = "respawn test"
+            launcher = "{launcher}"
+            restart_policy = "always"
+            log_path = "{log_path}"
+        ''').strip())
+
+        # Patch the backoff so the test doesn't wait the default 1s
+        # on every respawn. We can't easily monkeypatch a constant in
+        # this script; instead we rely on the fact that after a few
+        # iterations + sleeps we'll see multiple fires.
+        import threading
+
+        def run():
+            run_supervisor(td_path, iteration_limit=30)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        # 30 iterations * 0.5s = 15s ceiling. With ~0.1s + 1s backoff,
+        # we should see at least 2 fires within that budget. Generous
+        # safety margin.
+        thread.join(timeout=20.0)
+        expect(not thread.is_alive(),
+               "run_supervisor didn't exit within 20s")
+
+        if log_path.exists():
+            content = log_path.read_text()
+            fire_count = content.count("fired at")
+            expect(fire_count >= 2,
+                   f"expected >=2 fires, got {fire_count}: "
+                   f"{content!r}")
+        else:
+            failures.append(f"log file never created at {log_path}")
+
+    # ----- run_supervisor: never-respawn policy honored -----
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        log_path = td_path / "once.log"
+        launcher = td_path / "once.sh"
+        launcher.write_text(textwrap.dedent(f'''
+            #!/bin/bash
+            echo "ran" >> {log_path}
+            exit 0
+        ''').strip())
+        launcher.chmod(0o755)
+        toml = td_path / "once.toml"
+        toml.write_text(textwrap.dedent(f'''
+            name = "once"
+            description = "never respawn"
+            launcher = "{launcher}"
+            restart_policy = "never"
+            log_path = "{log_path}"
+        ''').strip())
+
+        import threading
+
+        def run():
+            run_supervisor(td_path, iteration_limit=20)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=15.0)
+        expect(not thread.is_alive(),
+               "run_supervisor (never) didn't exit within 15s")
+        if log_path.exists():
+            content = log_path.read_text()
+            fire_count = content.count("ran")
+            expect(fire_count == 1,
+                   f"never-policy: expected exactly 1 fire, got "
+                   f"{fire_count}")
+
+    # ----- run_supervisor: missing launcher does not crash -----
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        toml = td_path / "missing.toml"
+        toml.write_text(textwrap.dedent(f'''
+            name = "missing"
+            description = "no launcher"
+            launcher = "{td_path}/no-such-launcher.sh"
+            restart_policy = "always"
+            log_path = "{td_path}/missing.log"
+        ''').strip())
+        # Should exit cleanly after iteration_limit.
+        rc = run_supervisor(td_path, iteration_limit=3)
+        expect(rc == 0,
+               f"missing launcher: supervisor rc={rc} (should still "
+               f"clean-exit)")
+
+    if failures:
+        print(f"FAIL  {len(failures)} cw-watcher-supervisor unit failures:")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+
+    print("PASS  cw-watcher-supervisor unit tests")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="cw-watcher-supervisor",
+        description=(
+            "Container-level watcher supervisor — reads "
+            "/etc/claude-code/watchers/*.toml, launches each watcher's "
+            "script, respawns per restart_policy."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--watchers-dir",
+        default=os.environ.get("CW_WATCHERS_DIR", WATCHERS_DIR_DEFAULT),
+        help=(
+            f"Directory containing watcher .toml files. Defaults to "
+            f"$CW_WATCHERS_DIR or {WATCHERS_DIR_DEFAULT}."
+        ),
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run the embedded unit test suite and exit.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return _run_tests()
+
+    return run_supervisor(Path(args.watchers_dir))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

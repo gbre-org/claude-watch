@@ -106,6 +106,20 @@ KNOWN_BUILTINS = {
     "pre-tool-obligations-gate-hook",
     "post-tool-obligations-update-hook",
     "post-tool-mark-attachment-read-hook",
+    # claude-watch alert gate hooks (v59).
+    "pre-tool-claude-watch-alert-gate-hook",
+    "user-prompt-claude-watch-alert-record-hook",
+    "claude-watch-ack",
+    # claude-watch dispatch gate hook + CLI (v60).
+    "pre-tool-dispatch-gate-hook",
+    "claude-watch-dispatch",
+    # Agent communication CLIs (v62). agent-msg backs the host->subagent
+    # inbox channel via gate-mode obligations; agent-tail streams a
+    # subagent's JSONL transcript for inspection. Both are baked at
+    # /usr/local/bin/ so they appear as `builtin` not `missing` when
+    # referenced from settings.json or hook payloads.
+    "agent-msg",
+    "agent-tail",
 }
 
 

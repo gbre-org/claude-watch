@@ -66,9 +66,12 @@ if BAKED.exists():
     # 2. Non-empty, has the load-bearing heading. We accept any heading-style
     #    line that mentions "running inside" or "inside a ... container" —
     #    rewording is fine, the load-bearing concept ("you're in a container,
-    #    not on the host") just has to be present near the top.
+    #    not on the host") just has to be present near the top. The window
+    #    is generous (first 100 lines) because higher-priority cardinals
+    #    (dispatcher, claude-watch alerts) sit above the runtime-env
+    #    section now — those cardinals are surfaced first by design.
     expect(len(text) > 200, "baked-CLAUDE.md is suspiciously short (<200 chars)")
-    head = "\n".join(text.splitlines()[:40])
+    head = "\n".join(text.splitlines()[:100])
     has_runtime_callout = re.search(
         r"(running inside|inside a .* container|in a Linux container|inside the .* container)",
         head,
@@ -77,7 +80,7 @@ if BAKED.exists():
     expect(
         has_runtime_callout is not None,
         "baked-CLAUDE.md missing 'you are running inside the container' "
-        "callout in first 40 lines — the load-bearing 'host vs container' "
+        "callout in first 100 lines — the load-bearing 'host vs container' "
         "distinction must be visible up top",
     )
 

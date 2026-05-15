@@ -181,7 +181,7 @@ with tempfile.TemporaryDirectory() as td:
             # plausibly paraphrase about an "unknown command".
             distinctive_fragments = {
                 "restart": "Restart the in-container Claude Code process",
-                "start-watchers": "Start the in-container background watchers",
+                "start-watchers": "Report on the in-container background watchers",
             }
             fragment = distinctive_fragments[skill_name]
             # The model usually quotes verbatim when explicitly asked;

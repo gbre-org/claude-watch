@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Tests that the claude-watch alert gate hooks are actually wired to
+fire inside the container.
+
+The earlier `baked-obligations-hooks.test` checks that the hook scripts
+and `claude-watch-ack` CLI are copied into the image. This test goes one
+layer further: it INVOKES the shim generator (with the production flags
+the entrypoint uses) and asserts the OUTPUT file contains:
+
+  1. A PreToolUse `*`-matcher block whose hooks list includes
+     `/usr/local/bin/pre-tool-claude-watch-alert-gate-hook`.
+  2. A UserPromptSubmit `*`-matcher block whose hooks list includes
+     `/usr/local/bin/user-prompt-claude-watch-alert-record-hook`.
+
+It then exercises end-to-end semantics:
+
+  3. UserPromptSubmit hook + `[CLAUDE-WATCH]` prompt -> alert recorded
+     in state file.
+  4. PreToolUse hook + pending alert + non-exempt Bash command -> deny.
+  5. PreToolUse hook + pending alert + `claude-watch-ack ack <id>`
+     command -> allow (exempt).
+  6. PreToolUse hook + cleared state -> allow.
+
+These together prove the runtime behaviour matches what the v59 docs
+tell the in-container model: the gate IS active and fires
+deterministically.
+
+We deliberately exercise the production wiring shape:
+
+  generate-hooks-shim-settings
+    --input <synthetic empty settings.json>
+    --output <tmpfile>
+    --inject-obligations 1
+    --obligations-only
+
+Matches the entrypoint's `CLAUDE_CONTAINER_OBLIGATIONS=1` /
+`CLAUDE_CONTAINER_REWRITE_HOOKS=0` (Linux-host) branch.
+
+Run:  ./claude-watch-alert-gate-wired.test
+
+No external deps beyond Python 3.8+ stdlib. Does NOT require docker /
+a built image / a running claude.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+GENERATOR = CONTAINER_DIR / "hooks-shim" / "generate-hooks-shim-settings"
+GATE_HOOK = REPO_ROOT / "tools" / "hooks" / "pre-tool-claude-watch-alert-gate-hook"
+RECORD_HOOK = REPO_ROOT / "tools" / "hooks" / "user-prompt-claude-watch-alert-record-hook"
+ACK_CLI = REPO_ROOT / "tools" / "claude-watch-ack" / "claude-watch-ack"
+
+# Paths the hooks + CLI are BAKED at inside the container (per Dockerfile
+# COPY). The shim writes these absolute paths regardless of where the
+# source repo lives on the host.
+BAKED_GATE_HOOK = "/usr/local/bin/pre-tool-claude-watch-alert-gate-hook"
+BAKED_RECORD_HOOK = "/usr/local/bin/user-prompt-claude-watch-alert-record-hook"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        print(f"  FAIL {msg}")
+        failures.append(msg)
+    else:
+        # Quiet success line so the per-assertion output is readable
+        # without dominating logs.
+        pass
+
+
+# Pre-flight
+for p in (GENERATOR, GATE_HOOK, RECORD_HOOK, ACK_CLI):
+    if not p.is_file():
+        print(f"FAIL: required path missing: {p}", file=sys.stderr)
+        sys.exit(2)
+
+
+def run_generator(input_path: str, output_path: str, *,
+                  obligations_only: bool = True,
+                  inject_obligations: bool = True) -> None:
+    """Invoke the shim generator the same way entrypoint.sh does in the
+    obligations-only path."""
+    cmd = [
+        sys.executable, str(GENERATOR),
+        "--input", input_path,
+        "--output", output_path,
+        "--quiet",
+        "--inject-obligations", "1" if inject_obligations else "0",
+    ]
+    if obligations_only:
+        cmd.append("--obligations-only")
+    env = dict(os.environ)
+    for var in ("CLAUDE_SHIM_PATTERNS", "CLAUDE_CONTAINER_OBLIGATIONS",
+                "CLAUDE_SHIM_OBLIGATIONS_ONLY", "CLAUDE_SHIM_INPUT",
+                "CLAUDE_SHIM_OUTPUT"):
+        env.pop(var, None)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"generator exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
+def test_shim_emits_pre_tool_alert_hook() -> None:
+    """obligations-only output must contain a PreToolUse `*`-matcher
+    block whose hooks list includes the baked alert-gate hook path."""
+    with tempfile.TemporaryDirectory() as td:
+        in_path = Path(td) / "settings.json"
+        in_path.write_text("{}", encoding="utf-8")
+        out_path = Path(td) / "rewritten.json"
+        run_generator(str(in_path), str(out_path))
+        data = json.loads(out_path.read_text(encoding="utf-8"))
+        hooks = (data.get("hooks") or {})
+        pre_tool = hooks.get("PreToolUse") or []
+        star_block = None
+        for block in pre_tool:
+            if isinstance(block, dict) and str(block.get("matcher", "")) == "*":
+                star_block = block
+                break
+        expect(star_block is not None,
+               "PreToolUse[*] block missing from shim output")
+        if star_block:
+            commands = [h.get("command") for h in (star_block.get("hooks") or [])
+                        if isinstance(h, dict)]
+            expect(BAKED_GATE_HOOK in commands,
+                   f"PreToolUse[*] block missing command "
+                   f"{BAKED_GATE_HOOK!r}; got: {commands}")
+
+
+def test_shim_emits_user_prompt_record_hook() -> None:
+    """obligations-only output must contain a UserPromptSubmit `*`-matcher
+    block whose hooks list includes the baked record hook path."""
+    with tempfile.TemporaryDirectory() as td:
+        in_path = Path(td) / "settings.json"
+        in_path.write_text("{}", encoding="utf-8")
+        out_path = Path(td) / "rewritten.json"
+        run_generator(str(in_path), str(out_path))
+        data = json.loads(out_path.read_text(encoding="utf-8"))
+        hooks = (data.get("hooks") or {})
+        ups = hooks.get("UserPromptSubmit") or []
+        star_block = None
+        for block in ups:
+            if isinstance(block, dict) and str(block.get("matcher", "")) == "*":
+                star_block = block
+                break
+        expect(star_block is not None,
+               "UserPromptSubmit[*] block missing from shim output")
+        if star_block:
+            commands = [h.get("command") for h in (star_block.get("hooks") or [])
+                        if isinstance(h, dict)]
+            expect(BAKED_RECORD_HOOK in commands,
+                   f"UserPromptSubmit[*] block missing command "
+                   f"{BAKED_RECORD_HOOK!r}; got: {commands}")
+
+
+def test_e2e_record_then_deny_then_ack() -> None:
+    """End-to-end: UserPromptSubmit hook records an alert, PreToolUse
+    hook denies the next non-exempt Bash call, and `claude-watch-ack
+    ack <id>` clears the gate."""
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "claude-watch"
+        env = os.environ.copy()
+        env["CLAUDE_WATCH_ALERT_STATE_DIR"] = str(state_dir)
+
+        # Step 1: UserPromptSubmit with the marker
+        record_proc = subprocess.run(
+            [str(RECORD_HOOK)],
+            input=json.dumps({"prompt": "[CLAUDE-WATCH] watcher-down: signal-wait-dm"}),
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        expect(record_proc.returncode == 0,
+               f"record hook exit nonzero: {record_proc.returncode}, "
+               f"stderr={record_proc.stderr!r}")
+        state_file = state_dir / "pending-alerts.json"
+        expect(state_file.exists(),
+               f"state file not created at {state_file}")
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        expect(len(state.get("alerts", [])) == 1,
+               f"expected 1 alert, got {len(state.get('alerts', []))}")
+        if not state.get("alerts"):
+            return
+        alert_id = state["alerts"][0]["id"]
+
+        # Step 2: PreToolUse on a non-exempt Bash command -> deny
+        gate_proc = subprocess.run(
+            [str(GATE_HOOK)],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": "ls -la"}}),
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        out = json.loads(gate_proc.stdout) if gate_proc.stdout.strip() else {}
+        decision = (out.get("hookSpecificOutput") or {}).get("permissionDecision")
+        expect(decision == "deny",
+               f"non-exempt Bash should be DENIED with alert pending; "
+               f"got decision={decision!r}, out={out}")
+        banner = out.get("systemMessage", "")
+        expect(alert_id in banner,
+               f"deny banner should mention alert id {alert_id!r}; "
+               f"banner preview={banner[:200]!r}")
+
+        # Step 3: PreToolUse on `claude-watch-ack ack <id>` -> allow
+        ack_cmd = f"claude-watch-ack ack {alert_id}"
+        gate_proc2 = subprocess.run(
+            [str(GATE_HOOK)],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": ack_cmd}}),
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        out2 = json.loads(gate_proc2.stdout) if gate_proc2.stdout.strip() else {}
+        decision2 = (out2.get("hookSpecificOutput") or {}).get("permissionDecision")
+        expect(decision2 != "deny",
+               f"claude-watch-ack ack should be EXEMPT; got decision={decision2!r}")
+
+        # Step 4: actually run the ack via the CLI -> state cleared
+        subprocess.run([str(ACK_CLI), "ack", alert_id], env=env,
+                       capture_output=True, text=True, timeout=10, check=True)
+        state2 = json.loads(state_file.read_text(encoding="utf-8"))
+        expect(state2["alerts"] == [],
+               f"ack should clear state; got: {state2}")
+
+        # Step 5: next Bash call -> allow
+        gate_proc3 = subprocess.run(
+            [str(GATE_HOOK)],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": "ls -la"}}),
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        out3 = json.loads(gate_proc3.stdout) if gate_proc3.stdout.strip() else {}
+        decision3 = (out3.get("hookSpecificOutput") or {}).get("permissionDecision")
+        expect(decision3 != "deny",
+               f"post-ack Bash should be ALLOWED; got decision={decision3!r}, "
+               f"out={out3}")
+
+
+def test_dockerfile_bakes_hooks_at_expected_paths() -> None:
+    """The Dockerfile must contain COPY lines for both alert hooks and
+    the ack CLI at the canonical /usr/local/bin/ paths."""
+    df = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    for target in (
+        f"COPY tools/hooks/pre-tool-claude-watch-alert-gate-hook {BAKED_GATE_HOOK}",
+        f"COPY tools/hooks/user-prompt-claude-watch-alert-record-hook {BAKED_RECORD_HOOK}",
+        "COPY tools/claude-watch-ack/claude-watch-ack /usr/local/bin/claude-watch-ack",
+    ):
+        expect(target in df,
+               f"Dockerfile missing: `{target}`")
+
+
+def main() -> int:
+    tests = [
+        test_shim_emits_pre_tool_alert_hook,
+        test_shim_emits_user_prompt_record_hook,
+        test_dockerfile_bakes_hooks_at_expected_paths,
+        test_e2e_record_then_deny_then_ack,
+    ]
+    for t in tests:
+        print(f"== {t.__name__} ==")
+        t()
+
+    if failures:
+        print(f"\nFAIL claude-watch-alert-gate-wired.test "
+              f"({len(failures)} assertion(s) failed)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"\nPASS claude-watch-alert-gate-wired.test "
+          f"({len(tests)} test functions, all assertions passed)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

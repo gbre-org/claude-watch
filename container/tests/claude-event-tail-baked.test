@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""File-level test for the claude-event-tail watcher bake.
+
+Asserts the first concrete consumer of lib/dir-watch.sh ships into the
+image:
+  1. container/watchers/claude-event-tail.sh exists and is executable
+     on disk (the bake preserves source perms; defensive chmod in
+     Dockerfile also exists).
+  2. container/watchers/claude-event-tail.toml exists, parses, and
+     has all five required schema keys with the expected values.
+  3. The .sh wrapper sets up the dir-watch primitive contract:
+     references WATCH_DIR, WATCH_PATTERN, WATCH_CALLBACK, and execs
+     /etc/claude-code/watchers/lib/dir-watch.sh (with override hook).
+  4. Dockerfile chmod-bakes the launcher path.
+
+Does NOT execute the watcher (the runtime fire path is exercised
+implicitly by dir-watch-rearms.test, which is the same primitive). The
+test surface here is "the .sh + .toml pair lands in the image with the
+right shape so /start-watchers can discover and launch it."
+
+Run:  ./claude-event-tail-baked.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+WATCHERS_DIR = CONTAINER_DIR / "watchers"
+
+LAUNCHER = WATCHERS_DIR / "claude-event-tail.sh"
+METADATA = WATCHERS_DIR / "claude-event-tail.toml"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+# Expected baked paths (what the metadata declares + what
+# /start-watchers will probe).
+BAKED_LAUNCHER = "/etc/claude-code/watchers/claude-event-tail.sh"
+BAKED_DIR_WATCH = "/etc/claude-code/watchers/lib/dir-watch.sh"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def parse_toml(path: Path) -> dict:
+    """Minimal TOML parser for the schema we use (string-only
+    top-level keys). Prefer tomllib (3.11+) when available, fall back
+    to a hand-rolled key=value parser so the test runs on 3.10 too.
+
+    The watcher .toml is a flat key = "value" file by spec — no
+    tables, no arrays, no nested types — so the fallback is
+    sufficient."""
+    try:
+        import tomllib  # type: ignore[import]
+        with open(path, "rb") as fp:
+            return tomllib.load(fp)
+    except ImportError:
+        out: dict = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = re.match(
+                r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$',
+                stripped,
+            )
+            if not m:
+                raise AssertionError(
+                    f"TOML fallback parser: cannot parse line {line!r}"
+                )
+            out[m.group(1)] = m.group(2)
+        return out
+
+
+# 1. Launcher: exists + executable.
+expect(LAUNCHER.is_file(), f"claude-event-tail.sh missing at {LAUNCHER}")
+if LAUNCHER.is_file():
+    expect(
+        os.access(LAUNCHER, os.X_OK),
+        f"claude-event-tail.sh at {LAUNCHER} not executable — "
+        f"recursive Dockerfile COPY preserves source perms, source "
+        f"must have +x",
+    )
+
+    text = LAUNCHER.read_text(encoding="utf-8")
+
+    # Bash shebang.
+    first_line = text.splitlines()[0] if text else ""
+    expect(
+        first_line.startswith("#!") and "bash" in first_line,
+        f"claude-event-tail.sh first line must be a bash shebang, got "
+        f"{first_line!r}",
+    )
+
+    # Must wire the three dir-watch primitives.
+    for var in ("WATCH_DIR", "WATCH_PATTERN", "WATCH_CALLBACK"):
+        expect(
+            var in text,
+            f"claude-event-tail.sh must set {var} so the dir-watch "
+            f"primitive picks up the right config (otherwise the exec "
+            f"into lib/dir-watch.sh will exit 2)",
+        )
+
+    # Must point at the baked dir-watch primitive (with the test
+    # override hook DIR_WATCH_LIB for unit testing). Tolerate either
+    # the literal baked path or the env-defaulted reference.
+    expect(
+        BAKED_DIR_WATCH in text or "DIR_WATCH_LIB" in text,
+        f"claude-event-tail.sh must reference {BAKED_DIR_WATCH} "
+        f"(directly or via DIR_WATCH_LIB env hook) — the wrapper's "
+        f"whole shape is exec'ing into the shared primitive, not "
+        f"reimplementing the watch loop",
+    )
+
+    # Must reference the claude-event queue + log paths so we know
+    # the wrapper plumbs the host-side conventions correctly.
+    expect(
+        "CLAUDE_EVENT_QUEUE" in text,
+        "claude-event-tail.sh must reference CLAUDE_EVENT_QUEUE — the "
+        "canonical env var the host's claude-event tooling reads to "
+        "find the queue dir. Without this the in-container watcher "
+        "and the host emitters drift apart on default paths.",
+    )
+
+# 2. Metadata: present + schema valid.
+expect(METADATA.is_file(), f"claude-event-tail.toml missing at {METADATA}")
+if METADATA.is_file():
+    try:
+        meta = parse_toml(METADATA)
+    except Exception as e:
+        failures.append(f"claude-event-tail.toml parse error: {e}")
+        meta = {}
+
+    # Required keys per container/watchers/README.md schema.
+    REQUIRED_KEYS = (
+        "name", "description", "launcher", "restart_policy", "log_path"
+    )
+    for k in REQUIRED_KEYS:
+        expect(
+            k in meta,
+            f"claude-event-tail.toml missing required key {k!r}. "
+            f"Schema (per container/watchers/README.md): {REQUIRED_KEYS}",
+        )
+
+    if meta:
+        expect(
+            meta.get("name") == "claude-event-tail",
+            f"claude-event-tail.toml name must be 'claude-event-tail', "
+            f"got {meta.get('name')!r}",
+        )
+        expect(
+            meta.get("launcher") == BAKED_LAUNCHER,
+            f"claude-event-tail.toml launcher must be {BAKED_LAUNCHER!r} "
+            f"(the baked image path /start-watchers probes), got "
+            f"{meta.get('launcher')!r}",
+        )
+        expect(
+            meta.get("restart_policy") in ("always", "on-failure", "never"),
+            f"claude-event-tail.toml restart_policy must be one of "
+            f"always/on-failure/never, got {meta.get('restart_policy')!r}",
+        )
+        # The spec said restart_policy = "always" — the watcher is
+        # foreground-forever, so any exit IS a failure, but "always"
+        # matches the spec literally.
+        expect(
+            meta.get("restart_policy") == "always",
+            f"claude-event-tail.toml restart_policy expected 'always' "
+            f"(the watcher runs forever; any exit indicates failure "
+            f"and warrants a respawn), got {meta.get('restart_policy')!r}",
+        )
+        log_path = meta.get("log_path") or ""
+        expect(
+            log_path.startswith("/tmp/") or log_path.startswith("/var/log"),
+            f"claude-event-tail.toml log_path should live under /tmp/ "
+            f"or /var/log (uid-1000-writable paths inside the "
+            f"container), got {log_path!r}",
+        )
+
+# 3. Dockerfile bake.
+if DOCKERFILE.is_file():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    # Match the chmod across line continuations (`\` newline). The
+    # Dockerfile groups the dir-watch.sh and claude-event-tail.sh
+    # chmods on the same RUN line, so the pattern spans multiple
+    # lines.
+    chmod_pat = re.compile(
+        r"chmod\s+\+x\s+(?:[^\n]|\\\n)*"
+        r"/etc/claude-code/watchers/claude-event-tail\.sh",
+    )
+    expect(
+        chmod_pat.search(df) is not None,
+        f"Dockerfile: missing `chmod +x {BAKED_LAUNCHER}` after the "
+        f"watchers COPY. Mirrors the defence-in-depth pattern every "
+        f"other baked-script bake uses (cwsr, exec-hook, self-clear).",
+    )
+
+
+if failures:
+    print("FAIL claude-event-tail-baked.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS claude-event-tail-baked.test")
+sys.exit(0)

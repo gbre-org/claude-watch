@@ -69,7 +69,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         vim \
         gnupg \
+        iproute2 \
         procps \
+        inotify-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js via NodeSource (LTS 20.x) — Claude Code CLI requires Node >= 20.
@@ -101,6 +103,35 @@ RUN groupadd --gid 1000 hndrewaall \
 # leaves a partially-written entry on first run.
 RUN mkdir -p /home/hndrewaall/.local/share/claude /home/hndrewaall/.local/bin \
     && chown -R 1000:1000 /home/hndrewaall/.local
+
+# Pre-create ~/.config/ owned by uid 1000 so features that write
+# persistent state to a subdirectory of ~/.config/ (claude-event-watch
+# consumed.jsonl, claude-watch-ack pending-alerts.json, future state
+# files) can `mkdir -p ~/.config/<feature>/` + write without sudo.
+#
+# Why this is needed: Docker's bind-mount auto-creation walks the target
+# path and creates any missing parent directories as root:root mode 0755.
+# The example compose stack bind-mounts ~/.config/session (and may
+# optionally mount ~/.config/eichi, ~/.config/gh, etc.). On first
+# container start the bind-mount's target parent `/home/hndrewaall/.config`
+# does NOT exist in the image, so Docker creates it root-owned BEFORE the
+# entrypoint runs. The entrypoint runs as uid 1000 (non-root, per the
+# image-level USER directive below) and cannot fix the ownership without
+# escalating to root. Result: every feature that wants to write a new
+# subdir under ~/.config/ has to be paired with a one-shot
+# `docker exec -u root chown` on first deploy — observed in v57
+# (claude-events) and v59 (claude-watch-ack) workbot validation rounds.
+#
+# Fix shape (same pattern the ~/.local pre-creation above uses): create
+# ~/.config/ in the image with uid 1000 ownership. When Docker walks the
+# bind-mount target path next, it finds the pre-existing parent and uses
+# it as-is rather than auto-creating a fresh root-owned one. Mode 0755
+# matches the standard XDG_CONFIG_HOME (~/.config/) convention; 0700
+# isn't required (no secrets live at this layer — per-feature subdirs
+# choose their own modes).
+RUN mkdir -p /home/hndrewaall/.config \
+    && chown 1000:1000 /home/hndrewaall/.config \
+    && chmod 0755 /home/hndrewaall/.config
 
 # Add ~/.local/bin to PATH at the image level. Claude Code's startup
 # probes for a "native install" of itself at $HOME/.local/bin/claude
@@ -147,7 +178,15 @@ RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
 # Install Claude Code CLI globally. Package name confirmed via `npm view`
 # 2026-05-11. In Phase 1+ this is replaced by a bind-mount of host npm-global,
 # so prefer installing into a path a bind-mount can shadow cleanly.
-RUN npm install -g @anthropic-ai/claude-code
+#
+# Chown the installed package tree to uid 1000 so Claude Code's in-process
+# auto-updater (which fires `npm install -g @anthropic-ai/claude-code@latest`
+# as the interactive user) can write to it. Without this, the package tree
+# is root-owned and auto-update fails with EACCES on `/usr/lib/node_modules/`,
+# which also blocks the native-install fallback because the updater detects
+# the existing `/usr/bin/claude` and tries to upgrade it in place.
+RUN npm install -g @anthropic-ai/claude-code \
+    && chown -R 1000:1000 /usr/lib/node_modules/@anthropic-ai
 
 # Bake the claude-watch Rust binary in from stage 1. Glibc compatibility is
 # guaranteed because the builder is `rust:1-bookworm` and this stage is
@@ -156,6 +195,55 @@ RUN npm install -g @anthropic-ai/claude-code
 # which exits 0 only if the binary loads and clap parses its CLI.
 COPY --from=claude-watch-builder /build/target/release/claude-watch /usr/local/bin/claude-watch
 RUN claude-watch --help >/dev/null
+
+# VS Code CLI (`code` / `code tunnel`) — Microsoft's standalone CLI binary.
+#
+# Baked so the operator can run `code <file>` / `code .` / `code tunnel`
+# inside the in-container shell and have a working VS Code window open
+# without first installing anything host-side OR inside the container.
+#
+# Path B trade-off (chosen 2026-05-14, q-2026-05-14-ee13): we bake the
+# BINARY at image build time and the operator authenticates
+# interactively the first time they run `code tunnel` post-deploy. The
+# tunnel may not be the operator's currently-active VS Code window —
+# `code tunnel` creates its own session and clicks open in whichever VS
+# Code instance the operator first authenticated with. Path A
+# (`devcontainer.json` reattach) was rejected because it'd break the
+# current cw / ttyd / `docker compose exec` model. See
+# container/README.md "VS Code CLI" + examples/compose/README.md
+# "VS Code tunnel auth bootstrap" for the full operator workflow.
+#
+# Source-of-truth URL: `https://update.code.visualstudio.com/latest/cli-linux-${ARCH}/stable`
+# redirects to the current pinned `vscode_cli_linux_${ARCH}_cli.tar.gz`
+# build on `vscode.download.prss.microsoft.com`. The tarball contains a
+# single `code` binary at the root. Verified 2026-05-14: code 1.120.0
+# (commit 0958016b...) tarball ~11MB, extracted binary ~30MB. The
+# documented Alpine pattern at https://code.visualstudio.com/docs/remote/tunnels
+# uses the parallel `cli-alpine-x64` URL — this is the linux-x64
+# equivalent.
+#
+# Arch detection via `uname -m` so the same Dockerfile builds cleanly on
+# both x86_64 (cli-linux-x64) and aarch64 (cli-linux-arm64) hosts. We
+# prefer runtime `uname` over buildx's `TARGETARCH` so the build works
+# under plain `docker build` too (no buildx requirement). Microsoft
+# publishes the linux-arm64 tarball at the parallel URL — verified
+# 2026-05-15 via HEAD redirect to vscode_cli_linux_arm64_cli.tar.gz.
+#
+# `code --version` at the end is a smoke-test guard: it exits 0 only if
+# the binary loads + the clap CLI parses, mirroring the claude-watch
+# `--help` guard above. No runtime auth is required for `--version` —
+# auth only happens when the operator runs `code tunnel` interactively
+# post-deploy.
+RUN case "$(uname -m)" in \
+        x86_64)  VSCODE_ARCH=x64 ;; \
+        aarch64) VSCODE_ARCH=arm64 ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://update.code.visualstudio.com/latest/cli-linux-${VSCODE_ARCH}/stable" -o /tmp/vscode_cli.tar.gz \
+    && tar -xzf /tmp/vscode_cli.tar.gz -C /usr/local/bin/ code \
+    && chmod +x /usr/local/bin/code \
+    && rm -f /tmp/vscode_cli.tar.gz \
+    && /usr/local/bin/code --version >/dev/null
 
 # Container-tailored claude-watch config — pins the daemon to the in-container
 # tmux session `claude-container:0.0` (the claude pane created by
@@ -318,10 +406,70 @@ COPY tools/hooks/pre-agent-queue-gate-hook /usr/local/bin/pre-agent-queue-gate-h
 COPY tools/hooks/pre-tool-obligations-gate-hook /usr/local/bin/pre-tool-obligations-gate-hook
 COPY tools/hooks/post-tool-obligations-update-hook /usr/local/bin/post-tool-obligations-update-hook
 COPY tools/hooks/post-tool-mark-attachment-read-hook /usr/local/bin/post-tool-mark-attachment-read-hook
+# claude-watch alert gate -- PreToolUse hook that DENIES every non-exempt
+# tool call while any `[CLAUDE-WATCH]` alert is pending in
+# ~/.config/claude-watch/pending-alerts.json. Companion UserPromptSubmit
+# hook auto-records `[CLAUDE-WATCH]` injects from the tmux pane into the
+# state file; companion `claude-watch-ack` CLI clears the gate.
+# Together they turn the soft baked-CLAUDE.md `claude-watch alerts`
+# cardinal into a hard tool-layer gate.
+COPY tools/hooks/pre-tool-claude-watch-alert-gate-hook /usr/local/bin/pre-tool-claude-watch-alert-gate-hook
+COPY tools/hooks/user-prompt-claude-watch-alert-record-hook /usr/local/bin/user-prompt-claude-watch-alert-record-hook
+# claude-watch-ack CLI -- manages the pending-alerts state file, the
+# only mechanism (besides the audited bypass env-var) to clear the
+# alert gate.
+COPY tools/claude-watch-ack/claude-watch-ack /usr/local/bin/claude-watch-ack
+# Dispatcher gate -- PreToolUse hook that DENIES the (N+1)th
+# consecutive non-exempt non-Agent tool call (default threshold N=3).
+# Spawning an Agent (or running `claude-watch-dispatch reset`) zeros
+# the counter. Together with the companion CLI, this turns the soft
+# baked-CLAUDE.md `dispatcher, not worker` cardinal into a hard
+# tool-layer gate.
+COPY tools/hooks/pre-tool-dispatch-gate-hook /usr/local/bin/pre-tool-dispatch-gate-hook
+# claude-watch-dispatch CLI -- inspect counter, reset, set threshold,
+# list effective exempt patterns. The CLI itself is exempt from the
+# gate so introspection always works.
+COPY tools/claude-watch-dispatch/claude-watch-dispatch /usr/local/bin/claude-watch-dispatch
+# Agent communication CLIs -- async host -> subagent inbox protocol.
+#
+#   - obligations: registry that backs every gate hook in /usr/local/bin/.
+#     Previously bind-mount-only via the claude-tools.profile.sh; baking
+#     it makes the obligations gate operational even when ~/repos/claude-
+#     watch isn't bind-mounted (e.g. stripped-down `docker run` without
+#     the host repo). The bind-mounted source still wins on PATH (via
+#     the profile prepend) when present, so dev iteration stays live.
+#
+#   - agent-msg: subagent inbox CLI (send / inbox / ack / arm / disarm /
+#     gc / gc-dead). The main loop calls `agent-msg send <agent-id>
+#     "<message>"` and the spawned subagent's PreToolUse obligations
+#     gate (the existing pre-tool-obligations-gate-hook above) DENIES
+#     every non-ack tool call until the subagent runs `agent-msg ack`
+#     against its inbox. `arm` registers the gate-mode obligation via
+#     the `obligations` CLI; without `obligations` baked, agent-msg
+#     would only work in containers that bind-mount ~/repos/claude-
+#     watch. Baking both keeps the channel operational by default.
+#
+#   - agent-tail: reads a subagent's JSONL transcript at
+#     ~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl.
+#     Companion to `claude-watch active-agents` for inspecting a
+#     running subagent's tool history. Includes `--list` mode that
+#     enumerates active subagent transcripts and `--follow` for live
+#     streaming.
+COPY tools/obligations/obligations /usr/local/bin/obligations
+COPY tools/agent-msg/agent-msg /usr/local/bin/agent-msg
+COPY tools/agent-tail/agent-tail /usr/local/bin/agent-tail
 RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/pre-tool-obligations-gate-hook \
             /usr/local/bin/post-tool-obligations-update-hook \
-            /usr/local/bin/post-tool-mark-attachment-read-hook
+            /usr/local/bin/post-tool-mark-attachment-read-hook \
+            /usr/local/bin/pre-tool-claude-watch-alert-gate-hook \
+            /usr/local/bin/user-prompt-claude-watch-alert-record-hook \
+            /usr/local/bin/claude-watch-ack \
+            /usr/local/bin/pre-tool-dispatch-gate-hook \
+            /usr/local/bin/claude-watch-dispatch \
+            /usr/local/bin/obligations \
+            /usr/local/bin/agent-msg \
+            /usr/local/bin/agent-tail
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
@@ -352,6 +500,21 @@ RUN chmod +x /usr/local/bin/trust-workspace
 # for the make-test loop.
 COPY container/bin/audit-hooks.py /usr/local/bin/audit-hooks
 RUN chmod +x /usr/local/bin/audit-hooks
+
+# cw-watcher-supervisor — container-level watcher supervisor. Reads
+# /etc/claude-code/watchers/*.toml, launches each watcher's launcher
+# script, and respawns on exit per restart_policy. Wired into
+# entrypoint.sh so watchers survive the container's full lifetime
+# rather than dying with whichever Claude Code session happened to
+# launch them. See container/bin/cw-watcher-supervisor for the full
+# policy (backoff, crash-loop guard, signal handling) and the
+# embedded `--test` mode (run via
+# `python3 container/bin/cw-watcher-supervisor --test`).
+#
+# The /claude-container:start-watchers skill is now an informational
+# probe — the supervisor is the real launcher.
+COPY container/bin/cw-watcher-supervisor /usr/local/bin/cw-watcher-supervisor
+RUN chmod +x /usr/local/bin/cw-watcher-supervisor
 
 # cwsr — in-container self-restart for the claude CLI. Upgrades
 # @anthropic-ai/claude-code via npm-global and uses `tmux respawn-pane
@@ -432,6 +595,15 @@ COPY container/skills/ /etc/claude-code/plugin/commands/
 COPY container/agents/ /etc/claude-code/agents/
 COPY container/agents/ /etc/claude-code/plugin/agents/
 COPY container/watchers/ /etc/claude-code/watchers/
+# Defensive chmod +x on the baked watcher scripts. The recursive COPY
+# above preserves source-side perms, but a future refactor that swaps
+# the COPY for a different mechanism (or an upstream tar layer that
+# drops the execute bit) would silently break /start-watchers without
+# the explicit chmod here. Mirrors the same defence-in-depth pattern
+# every other baked-script COPY uses (exec-hook, cwsr, self-clear,
+# etc.).
+RUN chmod +x /etc/claude-code/watchers/lib/dir-watch.sh \
+            /etc/claude-code/watchers/claude-event-tail.sh
 COPY container/plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude-plugin/plugin.json
 
 # Entrypoint script — tmux session bootstrap + env passthrough + signal handling.

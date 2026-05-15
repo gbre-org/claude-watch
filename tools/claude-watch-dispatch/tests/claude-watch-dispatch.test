@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""Tests for claude-watch-dispatch CLI.
+
+Covers:
+  - status: prints state + threshold; --json variant
+  - status when no state file exists: works (fresh / count=0)
+  - reset: zeros the counter; persists; idempotent
+  - set-threshold N: writes to state; rejects N<=0
+  - list-exempt: shows baked-in patterns; --json variant
+  - list-exempt: shows override file contents when present
+  - state file 0600 perms after CLI write
+  - atomic write (tmp + replace)
+  - corrupt state file: CLI handles cleanly (treats as fresh)
+
+Run:  ./claude-watch-dispatch.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CLI = HERE.parent / "claude-watch-dispatch"
+
+
+class Harness:
+    def __init__(self, override_patterns: list[str] | None = None) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self.tmpdir.name) / "claude-watch"
+        self.override_path = Path(self.tmpdir.name) / "dispatch-exempt.txt"
+        if override_patterns is not None:
+            self.override_path.write_text(
+                "\n".join(override_patterns) + "\n", encoding="utf-8",
+            )
+        self.env = os.environ.copy()
+        self.env["CLAUDE_WATCH_DISPATCH_STATE_DIR"] = str(self.state_dir)
+        self.env["CLAUDE_WATCH_DISPATCH_EXEMPT_PATH"] = str(self.override_path)
+        self.env.pop("CLAUDE_WATCH_DISPATCH_THRESHOLD", None)
+        self.env.pop("CLAUDE_WATCH_DISPATCH_ENABLED", None)
+        self.env.pop("CLAUDE_WATCH_DISPATCH_BYPASS", None)
+
+    def cleanup(self) -> None:
+        self.tmpdir.cleanup()
+
+    def run(self, *args: str,
+            extra_env: dict | None = None) -> subprocess.CompletedProcess:
+        env = self.env.copy()
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            [str(CLI), *args],
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+
+    def state_path(self) -> Path:
+        return self.state_dir / "dispatch-state.json"
+
+    def load_state(self) -> dict:
+        p = self.state_path()
+        if not p.exists():
+            return {}
+        return json.loads(p.read_text(encoding="utf-8"))
+
+
+failures: list[str] = []
+
+
+def check(cond: bool, label: str, detail: str = "") -> None:
+    if cond:
+        print(f"  ok  {label}")
+    else:
+        print(f"  FAIL {label}: {detail}")
+        failures.append(label)
+
+
+# -- tests --------------------------------------------------------------------
+
+
+def test_status_no_state_works():
+    h = Harness()
+    try:
+        proc = h.run("status")
+        check(proc.returncode == 0, "status: rc=0",
+              f"stderr={proc.stderr!r}")
+        check("count:" in proc.stdout, "status: prints count line",
+              f"stdout={proc.stdout!r}")
+        check("threshold" in proc.stdout, "status: prints threshold line")
+    finally:
+        h.cleanup()
+
+
+def test_status_json():
+    h = Harness()
+    try:
+        proc = h.run("status", "--json")
+        check(proc.returncode == 0, "status --json: rc=0",
+              f"stderr={proc.stderr!r}")
+        data = json.loads(proc.stdout)
+        for k in ("count", "threshold", "last_reset_at_ns",
+                  "last_reset_at", "enabled", "bypass"):
+            check(k in data, f"status --json has key {k!r}",
+                  f"got: {sorted(data.keys())}")
+        check(data["count"] == 0, "status --json: fresh count=0",
+              f"got: {data['count']}")
+        check(data["threshold"] == 3, "status --json: default threshold=3",
+              f"got: {data['threshold']}")
+    finally:
+        h.cleanup()
+
+
+def test_status_reflects_threshold_env():
+    h = Harness()
+    try:
+        proc = h.run("status", "--json",
+                     extra_env={"CLAUDE_WATCH_DISPATCH_THRESHOLD": "7"})
+        data = json.loads(proc.stdout)
+        check(data["threshold"] == 7,
+              "status --json: env threshold respected",
+              f"got: {data['threshold']}")
+        # threshold_override is the persisted override; env doesn't set it
+        check(data.get("threshold_override", -1) == 0,
+              "status --json: env doesn't set threshold_override",
+              f"got: {data.get('threshold_override')}")
+    finally:
+        h.cleanup()
+
+
+def test_reset():
+    h = Harness()
+    try:
+        # Manually plant a state file with count=5
+        h.state_dir.mkdir(parents=True, exist_ok=True)
+        h.state_path().write_text(json.dumps({
+            "count": 5,
+            "last_reset_at_ns": 1_000_000_000,
+            "threshold": 0,
+        }))
+        proc = h.run("reset")
+        check(proc.returncode == 0, "reset: rc=0",
+              f"stderr={proc.stderr!r}")
+        check("count=0" in proc.stdout, "reset: output mentions count=0",
+              f"stdout={proc.stdout!r}")
+        state = h.load_state()
+        check(state.get("count") == 0, "reset: state count=0",
+              f"state={state}")
+        # last_reset_at_ns should be bumped
+        check(state.get("last_reset_at_ns", 0) > 1_000_000_000,
+              "reset: last_reset_at_ns bumped",
+              f"state={state}")
+    finally:
+        h.cleanup()
+
+
+def test_reset_idempotent():
+    h = Harness()
+    try:
+        proc1 = h.run("reset")
+        proc2 = h.run("reset")
+        check(proc1.returncode == 0 and proc2.returncode == 0,
+              "reset twice: both rc=0")
+        check(h.load_state().get("count") == 0,
+              "reset twice: count still 0")
+    finally:
+        h.cleanup()
+
+
+def test_set_threshold():
+    h = Harness()
+    try:
+        proc = h.run("set-threshold", "8")
+        check(proc.returncode == 0, "set-threshold 8: rc=0",
+              f"stderr={proc.stderr!r}")
+        state = h.load_state()
+        check(state.get("threshold") == 8,
+              "set-threshold: persists value",
+              f"state={state}")
+        # And `status` should reflect it
+        status_proc = h.run("status", "--json")
+        data = json.loads(status_proc.stdout)
+        check(data["threshold"] == 8,
+              "set-threshold: status reads back",
+              f"got: {data['threshold']}")
+        check(data["threshold_override"] == 8,
+              "set-threshold: threshold_override == 8",
+              f"got: {data.get('threshold_override')}")
+    finally:
+        h.cleanup()
+
+
+def test_set_threshold_rejects_zero_and_negative():
+    h = Harness()
+    try:
+        proc = h.run("set-threshold", "0")
+        check(proc.returncode != 0,
+              "set-threshold 0: nonzero exit",
+              f"rc={proc.returncode}")
+        check("must be > 0" in proc.stderr,
+              "set-threshold 0: error message",
+              f"stderr={proc.stderr!r}")
+        proc = h.run("set-threshold", "-1")
+        check(proc.returncode != 0,
+              "set-threshold -1: nonzero exit",
+              f"rc={proc.returncode}")
+    finally:
+        h.cleanup()
+
+
+def test_set_threshold_override_wins_over_env():
+    h = Harness()
+    try:
+        h.run("set-threshold", "10")
+        # env says 5; state says 10 -> state wins
+        proc = h.run("status", "--json",
+                     extra_env={"CLAUDE_WATCH_DISPATCH_THRESHOLD": "5"})
+        data = json.loads(proc.stdout)
+        check(data["threshold"] == 10,
+              "state override wins over env",
+              f"got: {data['threshold']}")
+    finally:
+        h.cleanup()
+
+
+def test_list_exempt_baked():
+    h = Harness()
+    try:
+        proc = h.run("list-exempt")
+        check(proc.returncode == 0, "list-exempt: rc=0")
+        check("baked-in exempt tools:" in proc.stdout,
+              "list-exempt: header")
+        check("Read" in proc.stdout, "list-exempt: Read listed")
+        check("Agent" in proc.stdout, "list-exempt: Agent listed")
+        check("session-task" in proc.stdout,
+              "list-exempt: session-task pattern listed")
+        check("git" in proc.stdout, "list-exempt: git patterns listed")
+        check("not present" in proc.stdout,
+              "list-exempt: notes override file absent")
+    finally:
+        h.cleanup()
+
+
+def test_list_exempt_json():
+    h = Harness()
+    try:
+        proc = h.run("list-exempt", "--json")
+        data = json.loads(proc.stdout)
+        for k in ("baked_tools", "baked_bash_patterns",
+                  "override_path", "override_present", "override_patterns"):
+            check(k in data, f"list-exempt --json has key {k!r}",
+                  f"got: {sorted(data.keys())}")
+        check("Read" in data["baked_tools"],
+              "list-exempt --json: Read in baked_tools")
+        check("Agent" in data["baked_tools"],
+              "list-exempt --json: Agent in baked_tools")
+        check(data["override_present"] is False,
+              "list-exempt --json: override_present false",
+              f"got: {data['override_present']}")
+        check(data["override_patterns"] == [],
+              "list-exempt --json: override_patterns empty",
+              f"got: {data['override_patterns']}")
+    finally:
+        h.cleanup()
+
+
+def test_list_exempt_with_override():
+    h = Harness(override_patterns=[
+        r"^my-tool(?:\s|$)",
+        "# comment line",
+        "",
+        r"^another-tool",
+    ])
+    try:
+        proc = h.run("list-exempt", "--json")
+        data = json.loads(proc.stdout)
+        check(data["override_present"] is True,
+              "list-exempt --json: override_present true")
+        check(data["override_patterns"] == [r"^my-tool(?:\s|$)",
+                                            r"^another-tool"],
+              "list-exempt --json: comments/blanks filtered",
+              f"got: {data['override_patterns']}")
+        # Human output also mentions them
+        proc = h.run("list-exempt")
+        check("my-tool" in proc.stdout, "list-exempt: human shows override")
+    finally:
+        h.cleanup()
+
+
+def test_state_file_perms_0600():
+    h = Harness()
+    try:
+        h.run("reset")
+        check(h.state_path().exists(), "state file written")
+        mode = oct(h.state_path().stat().st_mode)[-3:]
+        check(mode == "600", "state file 0600", f"got: {mode}")
+        # And dir 0700
+        dir_mode = oct(h.state_dir.stat().st_mode)[-3:]
+        check(dir_mode == "700", "state dir 0700", f"got: {dir_mode}")
+    finally:
+        h.cleanup()
+
+
+def test_corrupt_state_handled():
+    h = Harness()
+    try:
+        h.state_dir.mkdir(parents=True, exist_ok=True)
+        h.state_path().write_text("not json{{")
+        # status should still work
+        proc = h.run("status", "--json")
+        check(proc.returncode == 0,
+              "corrupt state: status rc=0",
+              f"stderr={proc.stderr!r}")
+        data = json.loads(proc.stdout)
+        check(data["count"] == 0,
+              "corrupt state: status reports count=0",
+              f"got: {data['count']}")
+        # reset should overwrite cleanly
+        proc = h.run("reset")
+        check(proc.returncode == 0, "corrupt state: reset rc=0")
+        # File now valid JSON
+        valid = json.loads(h.state_path().read_text())
+        check(valid["count"] == 0, "corrupt state: reset replaces with valid")
+    finally:
+        h.cleanup()
+
+
+def test_atomic_write_no_tmp_leftover():
+    h = Harness()
+    try:
+        h.run("reset")
+        h.run("set-threshold", "5")
+        # No .tmp file should be left behind
+        tmps = list(h.state_dir.glob("*.tmp"))
+        check(tmps == [], "no .tmp leftover", f"got: {tmps}")
+    finally:
+        h.cleanup()
+
+
+def main() -> int:
+    tests = [
+        test_status_no_state_works,
+        test_status_json,
+        test_status_reflects_threshold_env,
+        test_reset,
+        test_reset_idempotent,
+        test_set_threshold,
+        test_set_threshold_rejects_zero_and_negative,
+        test_set_threshold_override_wins_over_env,
+        test_list_exempt_baked,
+        test_list_exempt_json,
+        test_list_exempt_with_override,
+        test_state_file_perms_0600,
+        test_corrupt_state_handled,
+        test_atomic_write_no_tmp_leftover,
+    ]
+    for t in tests:
+        print(f"\n== {t.__name__} ==")
+        t()
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)} assertion(s)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"OK: {len(tests)} test functions, all assertions passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -12,7 +12,9 @@
 #
 # Usage:
 #   cw                  # attach to the running container tmux session
+#                       # (auto-reconnects across docker recreates)
 #   cw --up             # bring the compose stack up first, then attach
+#   cw --no-reconnect   # single-shot: exit when inner exec dies
 #   cw --help           # show usage and exit
 #
 # Env var overrides:
@@ -24,10 +26,18 @@
 #   CW_SERVICE          # compose service name (default: claude-container).
 #   CW_SESSION          # tmux session name inside the container.
 #                       # Default: claude-container (matches the entrypoint).
+#   CW_RECONNECT_WINDOW_SECS  # window for the retry-cap counter (default 60).
+#   CW_RECONNECT_MAX_ATTEMPTS # max failed attempts within the window before
+#                             # bailing (default 30).
+#   CW_DOCKER_EXEC      # test-only hook: array-style command to invoke
+#                       # instead of `docker compose ... exec` (used by
+#                       # cw.test to mock the inner without docker).
+#                       # Operator-facing scripts should NOT set this.
 #
 # Exit codes:
-#   0   tmux attach exited normally (operator detached or container exited)
-#   1   compose dir not found / compose down / docker not reachable
+#   0   tmux attach exited normally (operator detached, Ctrl-b d)
+#   1   compose dir not found / compose down / docker not reachable, or
+#       reconnect retry cap exhausted
 #   2   usage / bad flag
 
 set -euo pipefail
@@ -41,22 +51,44 @@ usage() {
 cw — attach to the claude-container tmux session from the host.
 
 Usage:
-  cw              Attach to the running container's tmux session.
-  cw --up         `docker compose up -d` the stack first, then attach.
-  cw --help       Show this help and exit.
+  cw                 Attach to the running container's tmux session.
+                     Auto-reconnects on transient docker exec failures
+                     so the operator's terminal stays live across
+                     `docker compose up -d --force-recreate` cycles.
+  cw --up            `docker compose up -d` the stack first, then attach.
+  cw --no-reconnect  Single-shot: exit immediately when the inner exec
+                     dies (any rc), matching the old behavior. Useful
+                     for CI / scripts that want one-shot semantics.
+  cw --help          Show this help and exit.
+
+Reconnect behavior:
+  When the inner `docker compose exec` exits non-zero (container was
+  recreated, daemon hiccup, etc.), cw sleeps 1s and retries — `tmux
+  new-session -A` re-creates the in-container session on the new
+  container, so the operator sees a fresh attach. Clean detach
+  (Ctrl-b d → rc=0) exits 0 without retry. If exec fails more than
+  CW_RECONNECT_MAX_ATTEMPTS (30) times within CW_RECONNECT_WINDOW_SECS
+  (60), cw bails with exit 1 — most likely the docker daemon is down.
 
 Env overrides:
-  CW_COMPOSE_DIR   examples/compose absolute path (default: script's
-                   compose dir).
-  CW_SERVICE       compose service name (default: claude-container).
-  CW_SESSION       tmux session name (default: claude-container).
+  CW_COMPOSE_DIR             examples/compose absolute path (default:
+                             script's compose dir).
+  CW_SERVICE                 compose service name (default:
+                             claude-container).
+  CW_SESSION                 tmux session name (default:
+                             claude-container).
+  CW_RECONNECT_WINDOW_SECS   retry-cap window (default 60).
+  CW_RECONNECT_MAX_ATTEMPTS  retry-cap max failures (default 30).
 
 Examples:
-  # From any cwd, attach to the running stack:
+  # From any cwd, attach to the running stack (auto-reconnect on):
   cw
 
   # Cold start: bring stack up, then attach:
   cw --up
+
+  # One-shot attach for scripted use:
+  cw --no-reconnect
 
 The script is safe to symlink into ~/bin / /usr/local/bin. It resolves
 its own canonical path via readlink so the default CW_COMPOSE_DIR still
@@ -65,6 +97,7 @@ EOF
 }
 
 UP_FIRST=0
+RECONNECT=1
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --help|-h)
@@ -73,6 +106,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --up)
             UP_FIRST=1
+            shift
+            ;;
+        --no-reconnect)
+            RECONNECT=0
             shift
             ;;
         --print-cmd)
@@ -194,4 +231,73 @@ if [ "$PRINT_CMD" = "1" ]; then
     exit 0
 fi
 
-exec "${attach_argv[@]}"
+# -----------------------------------------------------------------------------
+# Test-only hook: CW_DOCKER_EXEC overrides the inner command. Lets cw.test
+# inject a mock that simulates docker exec failures / successes without
+# requiring an actual docker daemon. Operator scripts must NOT set this.
+#
+# Value is a single string parsed via `read -ra` (whitespace-separated).
+# Sufficient for the tests we want to write; not intended as a
+# general-purpose IFS-safe injection point.
+# -----------------------------------------------------------------------------
+
+if [ -n "${CW_DOCKER_EXEC:-}" ]; then
+    # shellcheck disable=SC2206
+    read -ra attach_argv <<< "$CW_DOCKER_EXEC"
+fi
+
+# -----------------------------------------------------------------------------
+# Reconnect loop. The inner attach (docker compose exec → tmux new-session
+# -A) either:
+#
+#   - exits 0 on a clean Ctrl-b d detach. We exit 0 too.
+#   - exits non-zero when the container is recreated, daemon stutters,
+#     or some other transient hiccup. We sleep 1s and retry. The new
+#     container's daemon-side exec will eventually succeed, `tmux -A`
+#     re-creates the in-container session, and the operator sees a fresh
+#     attach without needing to re-invoke cw.
+#
+# `--no-reconnect` short-circuits to the old single-shot behavior: any
+# exit (zero or not) terminates cw immediately.
+#
+# Retry cap: CW_RECONNECT_MAX_ATTEMPTS failures within
+# CW_RECONNECT_WINDOW_SECS triggers a bail. Catches "docker daemon is
+# permanently dead" instead of busy-looping forever.
+# -----------------------------------------------------------------------------
+
+WINDOW_SECS="${CW_RECONNECT_WINDOW_SECS:-60}"
+MAX_ATTEMPTS="${CW_RECONNECT_MAX_ATTEMPTS:-30}"
+
+declare -a attempts=()
+
+while :; do
+    set +e
+    "${attach_argv[@]}"
+    rc=$?
+    set -e
+
+    # Clean detach OR --no-reconnect: pass through the exit code.
+    if [ "$RECONNECT" = "0" ] || [ "$rc" = "0" ]; then
+        exit "$rc"
+    fi
+
+    # Trim attempts older than the window, then record this attempt.
+    now=$(date +%s)
+    new_attempts=()
+    for ts in "${attempts[@]+"${attempts[@]}"}"; do
+        if [ $((now - ts)) -le "$WINDOW_SECS" ]; then
+            new_attempts+=("$ts")
+        fi
+    done
+    new_attempts+=("$now")
+    attempts=("${new_attempts[@]}")
+
+    if [ "${#attempts[@]}" -ge "$MAX_ATTEMPTS" ]; then
+        printf 'cw: docker exec failed %d times in %ds — bailing. Docker daemon down?\n' \
+            "${#attempts[@]}" "$WINDOW_SECS" >&2
+        exit 1
+    fi
+
+    printf 'cw: container exec exited rc=%d, reconnecting in 1s...\n' "$rc" >&2
+    sleep 1
+done

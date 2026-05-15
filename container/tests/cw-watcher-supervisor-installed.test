@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""File-level test that cw-watcher-supervisor is wired into the image.
+
+Asserts:
+  1. container/bin/cw-watcher-supervisor exists in the source tree.
+  2. It's executable on disk (the Dockerfile defensive `RUN chmod +x`
+     should also fire, but the source side must already have the bit).
+  3. The script's first line is a Python 3 shebang (the script uses
+     stdlib-only modules so the bookworm-slim python3 is sufficient).
+  4. The Dockerfile copies the script to /usr/local/bin/cw-watcher-supervisor
+     and chmod-+x's it (mirrors the defence-in-depth pattern every
+     other baked-script COPY-then-chmod uses).
+  5. The script's embedded `--test` suite passes when executed.
+
+This test does NOT spin up a container or exec into one — the runtime
+respawn assertion lives in
+cw-watcher-supervisor-launches-claude-event-tail.test. This is the
+file-level installation gate so a refactor that drops the COPY / chmod
+fails CI here instead of surfacing as "command not found" at container
+boot.
+
+Run:  ./cw-watcher-supervisor-installed.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+SCRIPT = CONTAINER_DIR / "bin" / "cw-watcher-supervisor"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+BAKED_PATH = "/usr/local/bin/cw-watcher-supervisor"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. Script exists at expected source path.
+expect(SCRIPT.is_file(), f"cw-watcher-supervisor missing at {SCRIPT}")
+
+# 2. Script is executable on disk.
+if SCRIPT.is_file():
+    expect(
+        os.access(SCRIPT, os.X_OK),
+        f"cw-watcher-supervisor at {SCRIPT} is not executable — "
+        f"Dockerfile COPY preserves source perms, so the source must "
+        f"have the +x bit set",
+    )
+
+    text = SCRIPT.read_text(encoding="utf-8")
+    first_line = text.splitlines()[0] if text else ""
+
+    # 3. Python 3 shebang.
+    expect(
+        first_line.startswith("#!") and "python" in first_line,
+        f"cw-watcher-supervisor first line must be a python3 shebang, "
+        f"got {first_line!r}",
+    )
+
+    # The script must declare the public entry points the entrypoint
+    # and Dockerfile rely on.
+    for token in ("def main", "run_supervisor", "discover_watchers",
+                  "restart_policy"):
+        expect(
+            token in text,
+            f"cw-watcher-supervisor source must reference {token!r} — "
+            f"public symbol used by entrypoint + tests",
+        )
+
+# 4. Dockerfile wiring.
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.is_file():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    copy_pat = re.compile(
+        r"^\s*COPY\s+(?:container/)?bin/cw-watcher-supervisor\s+"
+        r"/usr/local/bin/cw-watcher-supervisor\s*$",
+        re.MULTILINE,
+    )
+    expect(
+        copy_pat.search(df) is not None,
+        f"Dockerfile: missing `COPY [container/]bin/cw-watcher-supervisor "
+        f"{BAKED_PATH}`. Without this the supervisor is never baked "
+        f"into the image and entrypoint.sh's launch line fails with "
+        f"'command not found'.",
+    )
+
+    chmod_pat = re.compile(
+        r"chmod\s+\+x\s+(?:[^\n]|\\\n)*"
+        r"/usr/local/bin/cw-watcher-supervisor",
+    )
+    expect(
+        chmod_pat.search(df) is not None,
+        f"Dockerfile: missing `chmod +x {BAKED_PATH}` after the "
+        f"COPY. Mirrors the defence-in-depth pattern every other "
+        f"baked-script bake uses (cwsr, exec-hook, self-clear).",
+    )
+
+# 5. Embedded `--test` suite passes.
+if SCRIPT.is_file():
+    # Use python3 explicitly so the test works on hosts where the
+    # script's shebang resolves to a different interpreter (rare but
+    # possible inside fresh CI runners).
+    result = subprocess.run(
+        ["python3", str(SCRIPT), "--test"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    expect(
+        result.returncode == 0,
+        f"cw-watcher-supervisor --test exited {result.returncode}\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}",
+    )
+
+
+if failures:
+    print("FAIL cw-watcher-supervisor-installed.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS cw-watcher-supervisor-installed.test")
+sys.exit(0)

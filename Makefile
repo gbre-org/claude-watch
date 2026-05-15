@@ -44,6 +44,11 @@ test-session-task:
 test-hooks:
 	tools/hooks/tests/pre-tool-obligations-gate-hook.test
 	tools/hooks/tests/pre-agent-queue-gate-hook.test
+	tools/hooks/tests/pre-tool-claude-watch-alert-gate-hook.test
+	tools/hooks/tests/user-prompt-claude-watch-alert-record-hook.test
+	tools/hooks/tests/pre-tool-dispatch-gate-hook.test
+	tools/claude-watch-ack/tests/claude-watch-ack.test
+	tools/claude-watch-dispatch/tests/claude-watch-dispatch.test
 
 # Run the agent-msg embedded test suite (CLI for delivering async
 # messages to running Claude Code agents via the obligations gate).
@@ -127,9 +132,26 @@ test-entrypoint:
 	container/tests/container-path-includes-local-bin.test
 	container/tests/baked-dirs.test
 	container/tests/baked-obligations-hooks.test
+	container/tests/config-dir-uid-1000.test
 	container/tests/queue-gate-wired.test
+	container/tests/claude-watch-alert-gate-wired.test
+	container/tests/dispatch-gate-wired.test
+	container/tests/agent-comms-baked.test
 	container/tests/compose-mount-modes.test
 	container/tests/tini-pid1.test
+	container/tests/iproute2-installed.test
+	container/tests/code-cli-installed.test
+	container/tests/dir-watch-script-installed.test
+	container/tests/claude-event-tail-baked.test
+	container/tests/dir-watch-rearms.test
+	container/tests/dir-watch-events-modified.test
+	container/tests/dir-watch-events-deleted.test
+	container/tests/dir-watch-events-all.test
+	container/tests/dir-watch-events-default-backcompat.test
+	container/tests/dir-watch-events-poll-fallback.test
+	container/tests/cw-watcher-supervisor-installed.test
+	container/tests/cw-watcher-supervisor-launches-claude-event-tail.test
+	container/tests/entrypoint-launches-supervisor.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host

@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Tests for user-prompt-claude-watch-alert-record-hook.
+
+Covers:
+  - Prompt without `[CLAUDE-WATCH]`: no-op, no state changes, exit 0
+  - Prompt with `[CLAUDE-WATCH]` prefix: state gets a new alert
+  - Prompt with `[CLAUDE-WATCH]` mid-string: detected (anywhere match)
+  - Empty prompt: no-op
+  - Malformed JSON on stdin: no-op
+  - Multiple consecutive prompts with the marker: stack
+  - Source tag is `user-prompt-hook`
+
+Run:  ./user-prompt-claude-watch-alert-record-hook.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOK = HERE.parent / "user-prompt-claude-watch-alert-record-hook"
+ACK_CLI = HERE.parent.parent / "claude-watch-ack" / "claude-watch-ack"
+
+
+class Harness:
+    def __init__(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self.tmpdir.name) / "claude-watch"
+        self.env = os.environ.copy()
+        self.env["CLAUDE_WATCH_ALERT_STATE_DIR"] = str(self.state_dir)
+        # Ensure the hook can find claude-watch-ack via sibling fallback.
+
+    def cleanup(self) -> None:
+        self.tmpdir.cleanup()
+
+    def state_path(self) -> Path:
+        return self.state_dir / "pending-alerts.json"
+
+    def load_state(self) -> dict:
+        p = self.state_path()
+        if not p.exists():
+            return {"alerts": []}
+        with p.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def run_hook(self, payload: dict) -> tuple[int, str, str]:
+        proc = subprocess.run(
+            [str(HOOK)],
+            input=json.dumps(payload),
+            capture_output=True, text=True, env=self.env, timeout=10, check=False,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+
+failures: list[str] = []
+
+
+def check(cond: bool, label: str, detail: str = "") -> None:
+    if cond:
+        print(f"  ok  {label}")
+    else:
+        print(f"  FAIL {label}: {detail}")
+        failures.append(label)
+
+
+# -- tests --------------------------------------------------------------------
+
+
+def test_no_marker_no_op():
+    h = Harness()
+    try:
+        rc, out, err = h.run_hook({"prompt": "ordinary user message"})
+        check(rc == 0, "no marker: exit 0")
+        state = h.load_state()
+        check(state["alerts"] == [], "no marker: no alert recorded",
+              f"state={state}")
+    finally:
+        h.cleanup()
+
+
+def test_marker_records():
+    h = Harness()
+    try:
+        prompt = ("[CLAUDE-WATCH] Prolonged thinking detected (>120s in "
+                  "thinking state, interrupt #2). Resume now.")
+        rc, out, err = h.run_hook({"prompt": prompt})
+        check(rc == 0, "marker: exit 0", f"stderr={err!r}")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1, "marker: 1 alert recorded",
+              f"state={state}")
+        a = state["alerts"][0]
+        check(a["message"] == prompt, "marker: full message stored")
+        check(a["source"] == "user-prompt-hook",
+              "marker: source=user-prompt-hook", f"got: {a['source']}")
+    finally:
+        h.cleanup()
+
+
+def test_marker_anywhere():
+    h = Harness()
+    try:
+        # claude-watch may inject escape-sequence noise; the marker still
+        # appears somewhere in the prompt body.
+        prompt = "i[CLAUDE-WATCH] CONTEXT CRITICALLY LOW (5% remaining)..."
+        rc, out, err = h.run_hook({"prompt": prompt})
+        check(rc == 0, "anywhere: exit 0")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1, "anywhere: 1 alert recorded")
+    finally:
+        h.cleanup()
+
+
+def test_empty_prompt():
+    h = Harness()
+    try:
+        rc, out, err = h.run_hook({"prompt": ""})
+        check(rc == 0, "empty prompt: exit 0")
+        state = h.load_state()
+        check(state["alerts"] == [], "empty prompt: no record")
+    finally:
+        h.cleanup()
+
+
+def test_malformed_stdin():
+    h = Harness()
+    try:
+        proc = subprocess.run(
+            [str(HOOK)], input="not json{",
+            capture_output=True, text=True, env=h.env, timeout=10, check=False,
+        )
+        check(proc.returncode == 0, "malformed stdin: exit 0",
+              f"stderr={proc.stderr!r}")
+        state = h.load_state()
+        check(state["alerts"] == [], "malformed stdin: no record")
+    finally:
+        h.cleanup()
+
+
+def test_multiple_prompts_stack():
+    h = Harness()
+    try:
+        h.run_hook({"prompt": "[CLAUDE-WATCH] first"})
+        h.run_hook({"prompt": "ordinary message"})
+        h.run_hook({"prompt": "[CLAUDE-WATCH] second"})
+        h.run_hook({"prompt": "another normal one"})
+        h.run_hook({"prompt": "[CLAUDE-WATCH] third"})
+        state = h.load_state()
+        check(len(state["alerts"]) == 3,
+              "multi-prompts: 3 alerts stacked",
+              f"got {len(state['alerts'])}")
+        msgs = [a["message"] for a in state["alerts"]]
+        check("[CLAUDE-WATCH] first" in msgs, "multi: first stored")
+        check("[CLAUDE-WATCH] second" in msgs, "multi: second stored")
+        check("[CLAUDE-WATCH] third" in msgs, "multi: third stored")
+    finally:
+        h.cleanup()
+
+
+def test_missing_prompt_field():
+    h = Harness()
+    try:
+        rc, out, err = h.run_hook({"hook_event_name": "UserPromptSubmit"})
+        check(rc == 0, "missing prompt field: exit 0")
+        state = h.load_state()
+        check(state["alerts"] == [], "missing prompt field: no record")
+    finally:
+        h.cleanup()
+
+
+def test_prompt_not_string():
+    h = Harness()
+    try:
+        rc, out, err = h.run_hook({"prompt": 42})
+        check(rc == 0, "prompt=int: exit 0")
+        state = h.load_state()
+        check(state["alerts"] == [], "prompt=int: no record")
+    finally:
+        h.cleanup()
+
+
+def main() -> int:
+    tests = [
+        test_no_marker_no_op,
+        test_marker_records,
+        test_marker_anywhere,
+        test_empty_prompt,
+        test_malformed_stdin,
+        test_multiple_prompts_stack,
+        test_missing_prompt_field,
+        test_prompt_not_string,
+    ]
+    for t in tests:
+        print(f"\n== {t.__name__} ==")
+        t()
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)} test case(s)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"OK: {len(tests)} test functions, all assertions passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

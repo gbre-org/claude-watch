@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""claude-watch-dispatch -- track consecutive non-Agent tool calls.
+
+The companion `pre-tool-dispatch-gate-hook` (PreToolUse) counts every
+non-exempt non-Agent tool call. When the consecutive count exceeds the
+configured threshold (default 3), the hook DENIES the next non-exempt
+tool call and tells the operator to spawn an Agent via the queue
+protocol. Spawning an Agent (or running this CLI's `reset`) zeros the
+counter.
+
+Why this exists
+---------------
+
+The baked-CLAUDE.md `dispatcher, not worker` cardinal is unreliable.
+v58 verdict was PARTIAL: the in-container session reads the cardinal
+but, under queue-protocol friction, falls back to running Read +
+Edit + Bash sequences inline in the main loop instead of spawning a
+subagent. Like the alert gate, the only mechanism that reliably forces
+the delegation path is a hard tool-layer DENY.
+
+State file
+----------
+
+`~/.config/claude-watch/dispatch-state.json` (0600). Schema::
+
+    {
+      "count":            <int>,    # consecutive non-exempt non-Agent calls
+      "last_reset_at_ns": <int>,    # wallclock ns; used for decay
+      "threshold":        <int>     # CLI-set override of env default
+    }
+
+The directory is created on first write with mode 0700; the file with
+mode 0600. Concurrent writes are serialised via a temp-file + atomic
+rename so the gate hook never reads a half-written file.
+
+Subcommands
+-----------
+
+    claude-watch-dispatch status [--json]
+        Print current counter + threshold + last-reset. Exit 0 always.
+        Inspection only -- never modifies state.
+
+    claude-watch-dispatch reset
+        Zero the counter. Operator override. Idempotent.
+
+    claude-watch-dispatch set-threshold <N>
+        Persist a threshold override into the state file. Wins over the
+        CLAUDE_WATCH_DISPATCH_THRESHOLD env var. N must be a positive
+        integer.
+
+    claude-watch-dispatch list-exempt
+        Show the effective exempt-pattern set (baked-in plus operator
+        overrides from /etc/claude-code/dispatch-exempt.txt when
+        present). Read-only; useful for debugging false denies.
+
+Exit codes
+----------
+
+    0  success
+    1  no such state / invalid input
+    2  bad usage / argparse failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths + defaults (kept in sync with pre-tool-dispatch-gate-hook).
+# ---------------------------------------------------------------------------
+
+STATE_DIR = Path(os.environ.get(
+    "CLAUDE_WATCH_DISPATCH_STATE_DIR",
+    os.path.expanduser("~/.config/claude-watch"),
+))
+STATE_PATH = STATE_DIR / "dispatch-state.json"
+
+# Operator override file: one regex per line, # comments, blank lines
+# ignored. Supplements the baked-in exempt list. Present-by-default in
+# /etc; absent on host installs. Both CLI + hook read this path.
+EXEMPT_OVERRIDE_PATH = Path(os.environ.get(
+    "CLAUDE_WATCH_DISPATCH_EXEMPT_PATH",
+    "/etc/claude-code/dispatch-exempt.txt",
+))
+
+DEFAULT_THRESHOLD = 3
+
+
+# Baked-in exempt set -- read-only inspection commands + the gate's own
+# control surface. Mirror in pre-tool-dispatch-gate-hook; any change here
+# must land there too (the hook re-imports this list via duplication, NOT
+# import, so a hot-reload of the CLI doesn't pull a stale list into the
+# hook process).
+BAKED_BASH_EXEMPT_PATTERNS = [
+    # Inspection-only Bash commands.
+    r"^ls(?:\s|$)",
+    r"^pwd(?:\s|$)",
+    r"^cat(?:\s|$)",
+    r"^grep(?:\s|$)",
+    r"^rg(?:\s|$)",
+    r"^find\s+(?!.*-delete)(?!.*-exec).*",
+    r"^find\s*$",
+    # Read-only git inspection (writes like commit/push are NOT exempt
+    # -- we want the agent to do those).
+    r"^git\s+(?:status|diff|log|show|rev-parse|branch|blame)(?:\s|$)",
+    # State-management CLIs (operator must always be free to inspect/clear).
+    r"^session-task(?:\s|$)",
+    r"^/usr/local/bin/session-task(?:\s|$)",
+    r"^claude-watch-ack(?:\s|$)",
+    r"^/usr/local/bin/claude-watch-ack(?:\s|$)",
+    r"^claude-watch-dispatch(?:\s|$)",
+    r"^/usr/local/bin/claude-watch-dispatch(?:\s|$)",
+    r"^obligations\s+(?:list|show|status)(?:\s|$)",
+    r"^/usr/local/bin/obligations\s+(?:list|show|status)(?:\s|$)",
+    r"^self-clear(?:\s|$)",
+    r"^/usr/local/bin/self-clear(?:\s|$)",
+    # agent-msg inbox inspection + ack-side cleanup. ack/gc/disarm/show
+    # are all read-only / state-shrinking and shouldn't trip the
+    # dispatcher counter (a subagent acking its inbox is responding to
+    # a directed channel, not doing inline work). `send` and `arm`
+    # remain non-exempt because they're outbound -- if a session is
+    # spinning sending messages, the dispatcher should still bite.
+    r"^agent-msg\s+(?:inbox|list|status|ack|gc|disarm|show)(?:\s|$)",
+    r"^/usr/local/bin/agent-msg\s+(?:inbox|list|status|ack|gc|disarm|show)(?:\s|$)",
+    # agent-tail is a pure JSONL transcript viewer; treat like `cat`.
+    r"^agent-tail(?:\s|$)",
+    r"^/usr/local/bin/agent-tail(?:\s|$)",
+]
+
+
+# Tool names that are exempt regardless of arguments. Read is exempt
+# because file inspection is the canonical read-only pattern. Agent is
+# exempt because the WHOLE POINT is to spawn an agent -- the hook
+# RESETS the counter on Agent.
+BAKED_EXEMPT_TOOLS = frozenset({"Read", "Agent"})
+
+
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+
+
+def _empty_state() -> dict:
+    return {
+        "count": 0,
+        "last_reset_at_ns": time.time_ns(),
+        "threshold": 0,  # 0 = use env / default
+    }
+
+
+def _load_state() -> dict:
+    """Return a sane state dict. Treats missing/corrupt files as fresh."""
+    if not STATE_PATH.exists():
+        return _empty_state()
+    try:
+        with STATE_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return _empty_state()
+    if not isinstance(data, dict):
+        return _empty_state()
+    # Coerce keys with defaults so the CLI always returns a uniform shape.
+    out = _empty_state()
+    if isinstance(data.get("count"), int) and data["count"] >= 0:
+        out["count"] = data["count"]
+    if isinstance(data.get("last_reset_at_ns"), int):
+        out["last_reset_at_ns"] = data["last_reset_at_ns"]
+    if isinstance(data.get("threshold"), int) and data["threshold"] >= 0:
+        out["threshold"] = data["threshold"]
+    return out
+
+
+def _save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, STATE_PATH)
+
+
+def _effective_threshold(state: dict) -> int:
+    """Per-call threshold: state override wins, then env, then default."""
+    if state.get("threshold"):
+        return int(state["threshold"])
+    env = os.environ.get("CLAUDE_WATCH_DISPATCH_THRESHOLD", "").strip()
+    if env:
+        try:
+            n = int(env)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+    return DEFAULT_THRESHOLD
+
+
+def _load_override_patterns() -> list[str]:
+    """Read /etc/claude-code/dispatch-exempt.txt if present.
+
+    Returns a list of regex strings (one per non-comment, non-blank
+    line). Returns [] when the file is missing OR unreadable -- the
+    baked-in defaults must always be the fallback.
+    """
+    if not EXEMPT_OVERRIDE_PATH.exists():
+        return []
+    try:
+        text = EXEMPT_OVERRIDE_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+
+def _format_age(ns: int) -> str:
+    """Human-friendly age since last reset."""
+    delta_s = max(0, (time.time_ns() - int(ns)) // 1_000_000_000)
+    if delta_s < 60:
+        return f"{delta_s}s"
+    if delta_s < 3600:
+        return f"{delta_s // 60}m{delta_s % 60:02d}s"
+    return f"{delta_s // 3600}h{(delta_s % 3600) // 60:02d}m"
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    state = _load_state()
+    threshold = _effective_threshold(state)
+    last_reset_iso = datetime.fromtimestamp(
+        int(state["last_reset_at_ns"]) / 1e9, tz=timezone.utc,
+    ).isoformat()
+    if args.json:
+        print(json.dumps({
+            "count": int(state["count"]),
+            "threshold": threshold,
+            "threshold_override": int(state.get("threshold") or 0),
+            "last_reset_at_ns": int(state["last_reset_at_ns"]),
+            "last_reset_at": last_reset_iso,
+            "last_reset_age": _format_age(int(state["last_reset_at_ns"])),
+            "enabled": os.environ.get(
+                "CLAUDE_WATCH_DISPATCH_ENABLED", "1",
+            ).strip() not in ("", "0"),
+            "bypass": os.environ.get(
+                "CLAUDE_WATCH_DISPATCH_BYPASS", "",
+            ).strip() not in ("", "0"),
+        }, indent=2))
+        return 0
+    enabled = (os.environ.get("CLAUDE_WATCH_DISPATCH_ENABLED", "1").strip()
+               not in ("", "0"))
+    bypass = (os.environ.get("CLAUDE_WATCH_DISPATCH_BYPASS", "").strip()
+              not in ("", "0"))
+    state_word = "DISABLED" if not enabled else (
+        "BYPASS" if bypass else "active"
+    )
+    print(f"claude-watch-dispatch: {state_word}")
+    print(f"  count:     {state['count']} / threshold {threshold}")
+    if state.get("threshold"):
+        print(f"  threshold-override: {state['threshold']} "
+              f"(set via `set-threshold`; supersedes env)")
+    else:
+        env = os.environ.get("CLAUDE_WATCH_DISPATCH_THRESHOLD", "")
+        if env.strip():
+            print(f"  threshold-env: {env}")
+        else:
+            print(f"  threshold-default: {DEFAULT_THRESHOLD}")
+    print(f"  last reset: {last_reset_iso} "
+          f"({_format_age(int(state['last_reset_at_ns']))} ago)")
+    return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    state = _load_state()
+    state["count"] = 0
+    state["last_reset_at_ns"] = time.time_ns()
+    _save_state(state)
+    print("reset: count=0")
+    return 0
+
+
+def cmd_set_threshold(args: argparse.Namespace) -> int:
+    if args.value <= 0:
+        print(f"claude-watch-dispatch: threshold must be > 0 "
+              f"(got {args.value})", file=sys.stderr)
+        return 1
+    state = _load_state()
+    state["threshold"] = int(args.value)
+    _save_state(state)
+    print(f"set-threshold: {args.value}")
+    return 0
+
+
+def cmd_list_exempt(args: argparse.Namespace) -> int:
+    override = _load_override_patterns()
+    if args.json:
+        print(json.dumps({
+            "baked_tools": sorted(BAKED_EXEMPT_TOOLS),
+            "baked_bash_patterns": list(BAKED_BASH_EXEMPT_PATTERNS),
+            "override_path": str(EXEMPT_OVERRIDE_PATH),
+            "override_present": EXEMPT_OVERRIDE_PATH.exists(),
+            "override_patterns": override,
+        }, indent=2))
+        return 0
+    print(f"baked-in exempt tools: {', '.join(sorted(BAKED_EXEMPT_TOOLS))}")
+    print(f"baked-in Bash patterns ({len(BAKED_BASH_EXEMPT_PATTERNS)}):")
+    for p in BAKED_BASH_EXEMPT_PATTERNS:
+        print(f"  {p}")
+    if EXEMPT_OVERRIDE_PATH.exists():
+        if override:
+            print(f"override file {EXEMPT_OVERRIDE_PATH} ({len(override)} pattern(s)):")
+            for p in override:
+                print(f"  {p}")
+        else:
+            print(f"override file {EXEMPT_OVERRIDE_PATH} present but empty")
+    else:
+        print(f"override file {EXEMPT_OVERRIDE_PATH} not present "
+              f"(baked-in defaults only)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# argparse
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="claude-watch-dispatch",
+        description="Track and inspect the dispatch-gate counter. See "
+                    "pre-tool-dispatch-gate-hook for the gate that blocks "
+                    "the Nth consecutive non-exempt tool call.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    p_status = sub.add_parser("status", help="show counter + threshold")
+    p_status.add_argument("--json", action="store_true",
+                          help="machine-readable output")
+    p_status.set_defaults(func=cmd_status)
+
+    p_reset = sub.add_parser("reset", help="zero the counter")
+    p_reset.set_defaults(func=cmd_reset)
+
+    p_set = sub.add_parser("set-threshold",
+                           help="persist a threshold override (wins over env)")
+    p_set.add_argument("value", type=int,
+                       help="new threshold (positive integer)")
+    p_set.set_defaults(func=cmd_set_threshold)
+
+    p_list = sub.add_parser("list-exempt",
+                            help="show effective exempt-pattern set")
+    p_list.add_argument("--json", action="store_true",
+                        help="machine-readable output")
+    p_list.set_defaults(func=cmd_list_exempt)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

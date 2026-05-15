@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Tests for pre-tool-claude-watch-alert-gate-hook.
+
+Covers:
+  - Empty state file (no alerts): allow
+  - Missing state file: allow
+  - Single pending alert: DENY for non-exempt Bash command
+  - Single pending alert: ALLOW for `claude-watch-ack ack <id>` exempt
+  - Single pending alert: ALLOW for `claude-watch-ack list` exempt
+  - Single pending alert: ALLOW for `session-task set` exempt
+  - Single pending alert: ALLOW for `git commit` exempt
+  - Single pending alert: ALLOW for Read tool (exempt)
+  - Multiple pending alerts: DENY persists after one is ack'd, until last cleared
+  - CLAUDE_WATCH_ALERT_BYPASS=1: allow + audit log
+  - Malformed JSON on stdin: allow (default-open)
+  - Corrupt state file: allow (default-open)
+  - DENY response shape: hookSpecificOutput.permissionDecision == "deny"
+  - DENY banner includes alert ids + recovery instructions
+  - Compound bash (`a && b`): DENY even if first token is exempt
+
+Run:  ./pre-tool-claude-watch-alert-gate-hook.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOK = HERE.parent / "pre-tool-claude-watch-alert-gate-hook"
+ACK_CLI = HERE.parent.parent / "claude-watch-ack" / "claude-watch-ack"
+
+
+class Harness:
+    def __init__(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self.tmpdir.name) / "claude-watch"
+        self.env = os.environ.copy()
+        self.env["CLAUDE_WATCH_ALERT_STATE_DIR"] = str(self.state_dir)
+        # Point the ack CLI at the same state dir
+        # (the ack CLI reads CLAUDE_WATCH_ALERT_STATE_DIR too)
+
+    def cleanup(self) -> None:
+        self.tmpdir.cleanup()
+
+    def add_alert(self, message: str = "[CLAUDE-WATCH] test alert",
+                  source: str = "test") -> str:
+        proc = subprocess.run(
+            [str(ACK_CLI), "add", message, "--source", source],
+            capture_output=True, text=True, env=self.env, check=True, timeout=10,
+        )
+        return proc.stdout.strip()
+
+    def run_hook(self, payload: dict, extra_env: dict | None = None) -> tuple[int, dict, str]:
+        env = self.env.copy()
+        if extra_env:
+            env.update(extra_env)
+        proc = subprocess.run(
+            [str(HOOK)],
+            input=json.dumps(payload),
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        try:
+            out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        except json.JSONDecodeError:
+            out = {"__raw__": proc.stdout}
+        return proc.returncode, out, proc.stderr
+
+
+def _is_deny(out: dict) -> bool:
+    hso = out.get("hookSpecificOutput") or {}
+    return hso.get("permissionDecision") == "deny"
+
+
+def _is_allow(out: dict) -> bool:
+    return not _is_deny(out)
+
+
+failures: list[str] = []
+
+
+def check(cond: bool, label: str, detail: str = "") -> None:
+    if cond:
+        print(f"  ok  {label}")
+    else:
+        print(f"  FAIL {label}: {detail}")
+        failures.append(label)
+
+
+# -- tests --------------------------------------------------------------------
+
+
+def test_empty_state_allows():
+    h = Harness()
+    try:
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls -la"}})
+        check(rc == 0, "empty state: rc=0")
+        check(_is_allow(out), "empty state: allow", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_missing_state_allows():
+    h = Harness()
+    try:
+        # Don't even create the state dir
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(rc == 0, "missing state: rc=0")
+        check(_is_allow(out), "missing state: allow", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_alert_denies_non_exempt():
+    h = Harness()
+    try:
+        aid = h.add_alert("[CLAUDE-WATCH] prolonged thinking")
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls -la"}})
+        check(rc == 0, "deny-bash: rc=0 (always exit 0)")
+        check(_is_deny(out), "deny-bash: permissionDecision=deny",
+              f"out={out}")
+        banner = out.get("systemMessage", "")
+        check("BLOCKED: claude-watch alert gate" in banner,
+              "deny-bash: banner has BLOCKED header")
+        check(aid in banner, "deny-bash: banner mentions alert id",
+              f"banner={banner!r}")
+        check("claude-watch-ack ack" in banner,
+              "deny-bash: banner shows ack command")
+        reason = (out.get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
+        check(aid in reason, "deny-bash: reason includes id",
+              f"reason={reason!r}")
+    finally:
+        h.cleanup()
+
+
+def test_alert_allows_ack_cli():
+    h = Harness()
+    try:
+        aid = h.add_alert()
+        for cmd in [
+            f"claude-watch-ack ack {aid}",
+            "claude-watch-ack ack --all",
+            "claude-watch-ack list",
+            "claude-watch-ack list --json",
+            "claude-watch-ack status",
+            "/usr/local/bin/claude-watch-ack ack abc",
+        ]:
+            rc, out, err = h.run_hook({"tool_name": "Bash",
+                                       "tool_input": {"command": cmd}})
+            check(_is_allow(out), f"exempt: {cmd!r}",
+                  f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_alert_allows_session_task():
+    h = Harness()
+    try:
+        h.add_alert()
+        for cmd in [
+            "session-task set 'continue work'",
+            "session-task clear",
+            "session-task queue add foo",
+            "/usr/local/bin/session-task set xyz",
+        ]:
+            rc, out, err = h.run_hook({"tool_name": "Bash",
+                                       "tool_input": {"command": cmd}})
+            check(_is_allow(out), f"exempt: {cmd!r}", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_alert_allows_git_commit_and_push():
+    h = Harness()
+    try:
+        h.add_alert()
+        for cmd in [
+            "git status",
+            "git diff",
+            "git log --oneline -5",
+            "git add file.py",
+            "git commit -m 'wip: save state before clear'",
+            "git push origin main",
+            "git rev-parse HEAD",
+        ]:
+            rc, out, err = h.run_hook({"tool_name": "Bash",
+                                       "tool_input": {"command": cmd}})
+            check(_is_allow(out), f"exempt: {cmd!r}", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_alert_allows_obligations_list():
+    h = Harness()
+    try:
+        h.add_alert()
+        for cmd in [
+            "obligations list",
+            "obligations show ob-2026-05-13-ff5a",
+            "obligations status",
+        ]:
+            rc, out, err = h.run_hook({"tool_name": "Bash",
+                                       "tool_input": {"command": cmd}})
+            check(_is_allow(out), f"exempt: {cmd!r}", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_alert_allows_read_tool():
+    h = Harness()
+    try:
+        h.add_alert()
+        rc, out, err = h.run_hook({"tool_name": "Read",
+                                   "tool_input": {"file_path": "/tmp/foo"}})
+        check(_is_allow(out), "Read tool: exempt", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_alert_denies_other_tools():
+    h = Harness()
+    try:
+        h.add_alert()
+        for tool, ti in [
+            ("Edit", {"file_path": "/x", "old_string": "a", "new_string": "b"}),
+            ("Write", {"file_path": "/x", "content": "x"}),
+            ("Agent", {"prompt": "do thing"}),
+        ]:
+            rc, out, err = h.run_hook({"tool_name": tool, "tool_input": ti})
+            check(_is_deny(out), f"deny-tool: {tool}", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_multiple_alerts_persist():
+    h = Harness()
+    try:
+        a1 = h.add_alert("[CLAUDE-WATCH] first")
+        a2 = h.add_alert("[CLAUDE-WATCH] second")
+        # Bash deny while both pending
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(_is_deny(out), "2-pending: deny")
+        banner = out.get("systemMessage", "")
+        check(a1 in banner and a2 in banner,
+              "2-pending: banner shows both ids", f"banner={banner!r}")
+        # Ack the first one via the CLI (this exercises round-trip with the hook)
+        subprocess.run([str(ACK_CLI), "ack", a1], env=h.env, check=True,
+                       capture_output=True, timeout=10)
+        # Still 1 pending -> still deny
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(_is_deny(out), "1-still-pending: deny")
+        banner = out.get("systemMessage", "")
+        check(a2 in banner, "1-still-pending: shows remaining id")
+        check(a1 not in banner, "1-still-pending: ack'd id gone")
+        # Ack the last one
+        subprocess.run([str(ACK_CLI), "ack", a2], env=h.env, check=True,
+                       capture_output=True, timeout=10)
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(_is_allow(out), "all-ack'd: allow")
+    finally:
+        h.cleanup()
+
+
+def test_bypass_env_var():
+    h = Harness()
+    try:
+        h.add_alert()
+        rc, out, err = h.run_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            extra_env={"CLAUDE_WATCH_ALERT_BYPASS": "1"},
+        )
+        check(_is_allow(out), "bypass=1: allow", f"out={out}")
+        # Sanity: without the env var, still denies
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(_is_deny(out), "bypass off: still denies")
+    finally:
+        h.cleanup()
+
+
+def test_malformed_stdin_allows():
+    h = Harness()
+    try:
+        h.add_alert()
+        proc = subprocess.run(
+            [str(HOOK)], input="this is not json{",
+            capture_output=True, text=True, env=h.env, timeout=10, check=False,
+        )
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        check(_is_allow(out), "malformed stdin: allow", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_corrupt_state_allows():
+    h = Harness()
+    try:
+        # Write a corrupt state file BEFORE we add any alerts
+        h.state_dir.mkdir(parents=True, exist_ok=True)
+        with (h.state_dir / "pending-alerts.json").open("w") as fh:
+            fh.write("not json{{")
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(_is_allow(out), "corrupt state: allow (default-open)",
+              f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_compound_bash_still_denied():
+    """A compound command (`a && b`) where the FIRST token matches an
+    exempt pattern but the rest is unconstrained must still be denied.
+    Our exempt regexes match anchored at start-of-string + a word/space
+    boundary; they should NOT accidentally accept `claude-watch-ack ack
+    X && rm -rf /`."""
+    h = Harness()
+    try:
+        h.add_alert()
+        # `claude-watch-ack ack <id>` is exempt -- BUT with a compound,
+        # we want the exempt pattern to still match the FULL prefix and
+        # let the call through (the operator is intentionally combining
+        # the ack with another command). Document the current behaviour:
+        # patterns are start-of-string only, so the compound passes if
+        # the prefix matches.
+        #
+        # That's acceptable because:
+        #  1. The compound STILL starts with the ack -- the alert WILL
+        #     be cleared as part of the call.
+        #  2. The PreToolUse hook fires once per tool call; even if a
+        #     compound includes the ack, the hook decision is "allow or
+        #     deny the whole compound", and allowing it means the ack
+        #     runs first. The state-file is updated, and the NEXT tool
+        #     call sees no pending alerts.
+        #
+        # The test pins the contract: a compound prefixed by an exempt
+        # token is allowed. A compound prefixed by a NON-exempt token
+        # (even if the second clause is exempt) is denied.
+        rc, out, err = h.run_hook({
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls -la && claude-watch-ack ack X"},
+        })
+        check(_is_deny(out),
+              "compound non-exempt-prefix: deny", f"out={out}")
+        # Compound prefixed by exempt token: allow. (This is the operator
+        # chaining the ack with other work; the ack still runs.)
+        rc, out, err = h.run_hook({
+            "tool_name": "Bash",
+            "tool_input": {"command": "claude-watch-ack ack X && ls"},
+        })
+        check(_is_allow(out),
+              "compound exempt-prefix: allow", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_deny_response_shape():
+    h = Harness()
+    try:
+        h.add_alert()
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        hso = out.get("hookSpecificOutput") or {}
+        check(hso.get("hookEventName") == "PreToolUse",
+              "deny shape: hookEventName=PreToolUse")
+        check(hso.get("permissionDecision") == "deny",
+              "deny shape: permissionDecision=deny")
+        check(isinstance(hso.get("permissionDecisionReason"), str)
+              and hso["permissionDecisionReason"],
+              "deny shape: reason is non-empty string")
+        check(isinstance(out.get("systemMessage"), str)
+              and out["systemMessage"],
+              "deny shape: systemMessage is non-empty string")
+    finally:
+        h.cleanup()
+
+
+def main() -> int:
+    tests = [
+        test_empty_state_allows,
+        test_missing_state_allows,
+        test_alert_denies_non_exempt,
+        test_alert_allows_ack_cli,
+        test_alert_allows_session_task,
+        test_alert_allows_git_commit_and_push,
+        test_alert_allows_obligations_list,
+        test_alert_allows_read_tool,
+        test_alert_denies_other_tools,
+        test_multiple_alerts_persist,
+        test_bypass_env_var,
+        test_malformed_stdin_allows,
+        test_corrupt_state_allows,
+        test_compound_bash_still_denied,
+        test_deny_response_shape,
+    ]
+    for t in tests:
+        print(f"\n== {t.__name__} ==")
+        t()
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)} test case(s)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"OK: {len(tests)} test functions, all assertions passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -16,6 +16,58 @@ pick up changes.
 
 ---
 
+## Dispatcher, not worker — ABSOLUTE PRIORITY
+
+**Any operation that needs more than ONE tool call MUST be delegated to a
+subagent via the Task / Agent tool.**
+
+No Read→Edit→Bash→Edit sequences in the main session. If you find yourself
+reaching for a second tool call in the same turn, STOP and spawn an agent
+instead.
+
+Examples that are MUST-delegate:
+
+- Investigating a bug (multiple Read + grep)
+- Implementing a feature (Edit + test + commit + push)
+- Anything involving git commits, PRs, or pushed artifacts
+- Validating CI / waiting for external state
+
+Examples that are OK inline (single tool call):
+
+- A single Read to check a file path
+- A single Bash to query state (`ls`, `git status`, single curl)
+- A single Edit when the change is one localized hunk and you've already
+  read the file in a prior turn
+
+The session's job is to DISPATCH work, not perform it. The Task agent
+handles the work; the session orchestrates.
+
+## claude-watch alerts — STOP EVERYTHING — NON-NEGOTIABLE
+
+When claude-watch injects an alert into the tmux pane — prolonged thinking,
+context warning, watcher down — STOP immediately. Do NOT finish the current
+operation. Do NOT complete the in-flight reply. DROP IT ALL and attend the
+alert.
+
+Compaction or context clearing doesn't kill background tasks but you LOSE
+HANDLES on them. Delaying the alert means the situation is WORSE when the
+hard clear comes (unpredictable context loss, no chance to save state). A
+controlled pause lets you save state cleanly via `session-task set` + commit
++ log update before clearing.
+
+When you see a `[CLAUDE-WATCH]` line:
+
+1. Commit + push any in-flight repo work.
+2. Update today's daily log if substantive activity has happened.
+3. `session-task set "what to continue doing"` with enough context for the
+   next session.
+4. Self-clear if the alert says to.
+
+This rule has the same standing as the dispatcher rule: NON-NEGOTIABLE. The
+alert is the highest-priority message the session can receive.
+
+---
+
 ## You are running inside a Linux container
 
 If you are reading this file via the standard CLAUDE.md load path, you are
@@ -91,23 +143,27 @@ all that's needed.
    [`container/skills/`](https://github.com/hndrewaall/claude-watch/tree/main/container/skills),
    [`container/agents/`](https://github.com/hndrewaall/claude-watch/tree/main/container/agents),
    [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers).
-7. **Invoke `/claude-container:start-watchers`** to start whatever
-   watcher launchers ship in this image build. The skill self-discovers
-   `/etc/claude-code/watchers/*.toml` and launches each via `Bash` with
-   `run_in_background: true`. **Today this is mostly a no-op** — the
-   image ships zero baked watchers by default and the skill will report
-   "nothing to start"; that's the honest answer, not a sign the skill
-   failed. Invoke it anyway so future image builds that DO ship watchers
-   (e.g. an in-container queue-event tail, an MCP-bridge health pinger)
-   self-start without requiring a baked-CLAUDE.md edit per addition.
-   Future watcher additions update the skill's discovered set — this
-   step's contract is "ask the skill what's there", not "hand-wave".
+7. **Watchers are already running — verify via `/claude-container:start-watchers`**.
+   The container's entrypoint spawns `cw-watcher-supervisor`
+   (`/usr/local/bin/cw-watcher-supervisor`) before tmux. The supervisor
+   reads `/etc/claude-code/watchers/*.toml` and launches each watcher
+   with respawn-on-exit semantics per `restart_policy`. Watchers
+   survive the full container lifetime — not just one session — so
+   you don't have to re-launch them at session start. The
+   `/claude-container:start-watchers` skill is now an INFORMATIONAL
+   probe: it reports which watchers ship in this build and whether the
+   supervisor's launcher processes are alive. The image currently
+   bakes one watcher (`claude-event-tail`, which surfaces
+   `~/claude-events/*.json` drops to the in-container session); future
+   watcher additions get auto-supervised without any session-side action.
 
-**There are no long-running watchers inside this container.** This is
-deliberate — the container is a code-writing sandbox, not a host
-automation hub. Don't try to start signal watchers, torrent watchers,
-podcast watchers, or anything else from the host's resume-checklist
-playbook; the relevant tools and services aren't installed here.
+**Long-running watchers inside this container are scoped narrowly.**
+The container is a code-writing sandbox, not a host automation hub.
+Don't try to start signal watchers, torrent watchers, podcast watchers,
+or anything else from the host's resume-checklist playbook; the
+relevant tools and services aren't installed here. The baked watchers
+that DO ship cover only in-container event paths (e.g.
+`claude-event-tail` consuming local `~/claude-events/` drops).
 
 If the operator gives you a job that genuinely needs a host-side
 watcher / notifier, run it on the host instead (via the operator's host
@@ -231,6 +287,132 @@ The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
 if it's not on PATH, the operator hasn't wired the bind-mount and you
 should flag that before spawning agents at all.
 
+## Agent communication channels — two distinct inbound paths
+
+A spawned subagent has TWO distinct inbound channels you must
+understand. Both surface at the same `PreToolUse` boundary, but they
+come from different senders and behave differently.
+
+### Channel 1: `agent-msg` — main loop -> subagent inbox
+
+`agent-msg` is the **CLI inbox protocol**. When the main loop wants to
+direct a running subagent (scope correction, status update from a peer
+agent, pivot instruction), it calls:
+
+```sh
+agent-msg send <agent-id> "<message text>"
+```
+
+That appends the message to the subagent's inbox file at
+`~/.config/claude/agent-inbox/<agent-id>.json` and registers a
+**gate-mode obligation** scoped to that agent. The subagent's next
+non-exempt tool call is HARD-DENIED by the existing
+`pre-tool-obligations-gate-hook` (already wired by the entrypoint),
+with the message body in the deny banner.
+
+**As a subagent, when you see a deny banner that includes the message
+text, run:**
+
+```sh
+agent-msg inbox <agent-id> --all   # read the message (always exempt)
+agent-msg ack <agent-id>           # flip every unread message to read
+```
+
+After `ack` the inbox is empty, the gate stops firing, and your next
+tool call goes through. Message bodies persist on disk so you can
+re-read them later via `agent-msg inbox --all`.
+
+Subcommand surface:
+
+```
+agent-msg list                    # show currently tracked agents
+agent-msg show <id>               # metadata for one agent
+agent-msg arm <id>                # main-loop-only: register inbox gate
+agent-msg disarm <id>             # main-loop-only: tear down gate
+agent-msg send <id> <text>        # main-loop-only: deliver a message
+agent-msg inbox <id>              # read inbox (default: unread only)
+agent-msg ack <id>                # subagent-side: clear unread
+agent-msg gc <id>                 # drop read messages older than TTL
+agent-msg gc-dead                 # sweep obligations for dead agents
+```
+
+`agent-msg ack | inbox | gc | disarm | list | status | show` is on the
+exempt list of every gate (inbox gate itself, alert gate, dispatch
+gate) so the subagent can always reach its own inbox. `send` and
+`arm` are NOT exempt — those are main-loop operations.
+
+The `pre-tool-obligations-gate-hook` and the `obligations` CLI it
+shells out to are baked at `/usr/local/bin/`, so the inbox gate
+operates even in stripped-down `docker run` containers without
+`~/repos/claude-watch` bind-mounted.
+
+### Channel 2: Claude Code's built-in agent-chat curses UI — user -> subagent
+
+The second channel is **the operator typing directly to a running
+subagent** via Claude Code's built-in interactive chat panel (a TUI
+released May 2026; not a CLI we ship). The operator opens the chat
+panel against a specific subagent and sends free-form text. That
+text arrives in the subagent's context as a user message, distinct
+from the original spawn prompt and distinct from `agent-msg` inbox
+deliveries.
+
+Critically: **a curses-chat message can override the main loop's
+intent.** If the operator opens the chat panel and tells you to
+pivot, change scope, abandon the task, or surface state, that
+direction outranks the queue item / spawn prompt that brought you
+here. Treat it the same way you'd treat a direct DM from the
+operator on the host side. Examples:
+
+  - Operator types "stop the PR you're working on, instead audit X"
+    -> drop the PR work, audit X, return.
+  - Operator types "what's your current state?" -> respond with a
+    status summary (use `agent-msg send` if you also want the main
+    loop to see it; but the operator's curses panel sees your normal
+    return text).
+  - Operator types "abandon" -> `session-task queue abandon <id>
+    --reason "user-direct: abandon"` and return.
+
+If the curses-chat direction CONFLICTS with an `agent-msg` inbox
+message from the main loop, the curses-chat direction wins (it's the
+operator; the main loop is an automation layer the operator
+delegated to). Document the conflict in your return value so the
+main loop can reconcile.
+
+### Quick triage: which channel is this from?
+
+  - **`PreToolUse` deny with `agent-msg/inbox:` banner**: Channel 1.
+    Run `agent-msg inbox <agent-id> --all` then `agent-msg ack <id>`.
+    Source: main loop.
+  - **Free-form user message in your context with no `Queue item:`
+    line**: Channel 2. Source: operator via curses-chat. Treat as
+    direct user direction.
+
+Both channels are SYNCHRONOUS at the boundary: you receive them, you
+must process them before continuing. Don't poll your inbox between
+tool calls — the gate hook surfaces messages automatically. Don't
+ignore curses-chat messages — they're the operator talking to you
+directly.
+
+### Subagent transcript: `agent-tail`
+
+Companion CLI for inspecting a running subagent's tool history.
+Reads the JSONL transcript at
+`~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl`.
+The main loop uses this for visibility into a subagent's progress;
+subagents themselves rarely need it (you're already inside the
+transcript).
+
+```sh
+agent-tail <id>           # one-shot pretty-print
+agent-tail <id> --follow  # tail -f mode
+agent-tail --list         # enumerate active subagent transcripts
+agent-tail <id> --json    # raw JSONL passthrough
+agent-tail <id> --path    # print resolved transcript path
+```
+
+Both `agent-msg` and `agent-tail` are baked at `/usr/local/bin/` and
+on PATH by default; no bind-mount required.
+
 ## Avoid `sudo` — fingerprint prompt is prohibitive
 
 On the operator's host (typically macOS), every `sudo` invocation
@@ -247,8 +429,8 @@ groups (including `docker`, where applicable) so the following commands
 - `git` — repo trees are bind-mounted with the container user as
   owner; `git status`, `git diff`, `git log` etc. don't need root.
 - `claude`, `claude-watch`, `claude mcp ...`, `claude-event`,
-  `session-task`, `obligations`, `agent-msg` — all run as the
-  container user.
+  `session-task`, `obligations`, `agent-msg`, `agent-tail` — all run
+  as the container user.
 - `npm`, `yarn`, `pnpm`, `node`, `cargo`, `rustc`, `python`, `pip`,
   `uv`, `go`, `make` — language toolchains run as the container user.
 - `audit-hooks`, `trust-workspace` — container-baked helpers, both
@@ -553,10 +735,13 @@ and limits:
 - **`claude` resumes a prior conversation**: when `CLAUDE_AUTO_CONTINUE`
   is set, the entrypoint appends `--continue <value>` to the claude
   invocation. Default is unset (bare `claude`).
-- **`session-task`, `claude-event`, `obligations` on PATH**: only when
-  the operator bind-mounts `~/repos/claude-watch` (the example compose
-  does this). Missing bind mount = these CLIs are unavailable; that's
-  expected for a stripped-down `docker run`.
+- **`session-task`, `claude-event` on PATH**: only when the operator
+  bind-mounts `~/repos/claude-watch` (the example compose does this).
+  Missing bind mount = these two CLIs are unavailable; that's
+  expected for a stripped-down `docker run`. (`obligations`,
+  `agent-msg`, and `agent-tail` are baked at `/usr/local/bin/` so
+  they're always available; the bind-mounted source wins on PATH
+  when present for live dev iteration.)
 - **Permission denied writing into `${HOME}/.local/share/claude/`**:
   the in-container claude binary's auto-update path. Backed by a named
   volume (`claude-container-versions`); should Just Work after the

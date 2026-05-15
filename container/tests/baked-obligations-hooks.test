@@ -56,6 +56,16 @@ OBLIGATIONS_HOOK_NAMES = [
     "pre-tool-obligations-gate-hook",
     "post-tool-obligations-update-hook",
     "post-tool-mark-attachment-read-hook",
+    # claude-watch alert gate (v59) -- adds a hard PreToolUse DENY whenever
+    # any `[CLAUDE-WATCH]` alert is pending in the state file, plus a
+    # UserPromptSubmit hook that auto-records injected `[CLAUDE-WATCH]`
+    # prompts. Companion `claude-watch-ack` CLI clears the gate.
+    "pre-tool-claude-watch-alert-gate-hook",
+    "user-prompt-claude-watch-alert-record-hook",
+    # Dispatcher gate (v60) -- adds a hard PreToolUse DENY after N
+    # consecutive non-exempt non-Agent tool calls (default N=3).
+    # Companion `claude-watch-dispatch` CLI inspects state + resets.
+    "pre-tool-dispatch-gate-hook",
 ]
 
 failures: list[str] = []
