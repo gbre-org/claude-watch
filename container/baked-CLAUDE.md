@@ -287,6 +287,132 @@ The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
 if it's not on PATH, the operator hasn't wired the bind-mount and you
 should flag that before spawning agents at all.
 
+## Agent communication channels — two distinct inbound paths
+
+A spawned subagent has TWO distinct inbound channels you must
+understand. Both surface at the same `PreToolUse` boundary, but they
+come from different senders and behave differently.
+
+### Channel 1: `agent-msg` — main loop -> subagent inbox
+
+`agent-msg` is the **CLI inbox protocol**. When the main loop wants to
+direct a running subagent (scope correction, status update from a peer
+agent, pivot instruction), it calls:
+
+```sh
+agent-msg send <agent-id> "<message text>"
+```
+
+That appends the message to the subagent's inbox file at
+`~/.config/claude/agent-inbox/<agent-id>.json` and registers a
+**gate-mode obligation** scoped to that agent. The subagent's next
+non-exempt tool call is HARD-DENIED by the existing
+`pre-tool-obligations-gate-hook` (already wired by the entrypoint),
+with the message body in the deny banner.
+
+**As a subagent, when you see a deny banner that includes the message
+text, run:**
+
+```sh
+agent-msg inbox <agent-id> --all   # read the message (always exempt)
+agent-msg ack <agent-id>           # flip every unread message to read
+```
+
+After `ack` the inbox is empty, the gate stops firing, and your next
+tool call goes through. Message bodies persist on disk so you can
+re-read them later via `agent-msg inbox --all`.
+
+Subcommand surface:
+
+```
+agent-msg list                    # show currently tracked agents
+agent-msg show <id>               # metadata for one agent
+agent-msg arm <id>                # main-loop-only: register inbox gate
+agent-msg disarm <id>             # main-loop-only: tear down gate
+agent-msg send <id> <text>        # main-loop-only: deliver a message
+agent-msg inbox <id>              # read inbox (default: unread only)
+agent-msg ack <id>                # subagent-side: clear unread
+agent-msg gc <id>                 # drop read messages older than TTL
+agent-msg gc-dead                 # sweep obligations for dead agents
+```
+
+`agent-msg ack | inbox | gc | disarm | list | status | show` is on the
+exempt list of every gate (inbox gate itself, alert gate, dispatch
+gate) so the subagent can always reach its own inbox. `send` and
+`arm` are NOT exempt — those are main-loop operations.
+
+The `pre-tool-obligations-gate-hook` and the `obligations` CLI it
+shells out to are baked at `/usr/local/bin/`, so the inbox gate
+operates even in stripped-down `docker run` containers without
+`~/repos/claude-watch` bind-mounted.
+
+### Channel 2: Claude Code's built-in agent-chat curses UI — user -> subagent
+
+The second channel is **the operator typing directly to a running
+subagent** via Claude Code's built-in interactive chat panel (a TUI
+released May 2026; not a CLI we ship). The operator opens the chat
+panel against a specific subagent and sends free-form text. That
+text arrives in the subagent's context as a user message, distinct
+from the original spawn prompt and distinct from `agent-msg` inbox
+deliveries.
+
+Critically: **a curses-chat message can override the main loop's
+intent.** If the operator opens the chat panel and tells you to
+pivot, change scope, abandon the task, or surface state, that
+direction outranks the queue item / spawn prompt that brought you
+here. Treat it the same way you'd treat a direct DM from the
+operator on the host side. Examples:
+
+  - Operator types "stop the PR you're working on, instead audit X"
+    -> drop the PR work, audit X, return.
+  - Operator types "what's your current state?" -> respond with a
+    status summary (use `agent-msg send` if you also want the main
+    loop to see it; but the operator's curses panel sees your normal
+    return text).
+  - Operator types "abandon" -> `session-task queue abandon <id>
+    --reason "user-direct: abandon"` and return.
+
+If the curses-chat direction CONFLICTS with an `agent-msg` inbox
+message from the main loop, the curses-chat direction wins (it's the
+operator; the main loop is an automation layer the operator
+delegated to). Document the conflict in your return value so the
+main loop can reconcile.
+
+### Quick triage: which channel is this from?
+
+  - **`PreToolUse` deny with `agent-msg/inbox:` banner**: Channel 1.
+    Run `agent-msg inbox <agent-id> --all` then `agent-msg ack <id>`.
+    Source: main loop.
+  - **Free-form user message in your context with no `Queue item:`
+    line**: Channel 2. Source: operator via curses-chat. Treat as
+    direct user direction.
+
+Both channels are SYNCHRONOUS at the boundary: you receive them, you
+must process them before continuing. Don't poll your inbox between
+tool calls — the gate hook surfaces messages automatically. Don't
+ignore curses-chat messages — they're the operator talking to you
+directly.
+
+### Subagent transcript: `agent-tail`
+
+Companion CLI for inspecting a running subagent's tool history.
+Reads the JSONL transcript at
+`~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl`.
+The main loop uses this for visibility into a subagent's progress;
+subagents themselves rarely need it (you're already inside the
+transcript).
+
+```sh
+agent-tail <id>           # one-shot pretty-print
+agent-tail <id> --follow  # tail -f mode
+agent-tail --list         # enumerate active subagent transcripts
+agent-tail <id> --json    # raw JSONL passthrough
+agent-tail <id> --path    # print resolved transcript path
+```
+
+Both `agent-msg` and `agent-tail` are baked at `/usr/local/bin/` and
+on PATH by default; no bind-mount required.
+
 ## Avoid `sudo` — fingerprint prompt is prohibitive
 
 On the operator's host (typically macOS), every `sudo` invocation
@@ -303,8 +429,8 @@ groups (including `docker`, where applicable) so the following commands
 - `git` — repo trees are bind-mounted with the container user as
   owner; `git status`, `git diff`, `git log` etc. don't need root.
 - `claude`, `claude-watch`, `claude mcp ...`, `claude-event`,
-  `session-task`, `obligations`, `agent-msg` — all run as the
-  container user.
+  `session-task`, `obligations`, `agent-msg`, `agent-tail` — all run
+  as the container user.
 - `npm`, `yarn`, `pnpm`, `node`, `cargo`, `rustc`, `python`, `pip`,
   `uv`, `go`, `make` — language toolchains run as the container user.
 - `audit-hooks`, `trust-workspace` — container-baked helpers, both
@@ -609,10 +735,13 @@ and limits:
 - **`claude` resumes a prior conversation**: when `CLAUDE_AUTO_CONTINUE`
   is set, the entrypoint appends `--continue <value>` to the claude
   invocation. Default is unset (bare `claude`).
-- **`session-task`, `claude-event`, `obligations` on PATH**: only when
-  the operator bind-mounts `~/repos/claude-watch` (the example compose
-  does this). Missing bind mount = these CLIs are unavailable; that's
-  expected for a stripped-down `docker run`.
+- **`session-task`, `claude-event` on PATH**: only when the operator
+  bind-mounts `~/repos/claude-watch` (the example compose does this).
+  Missing bind mount = these two CLIs are unavailable; that's
+  expected for a stripped-down `docker run`. (`obligations`,
+  `agent-msg`, and `agent-tail` are baked at `/usr/local/bin/` so
+  they're always available; the bind-mounted source wins on PATH
+  when present for live dev iteration.)
 - **Permission denied writing into `${HOME}/.local/share/claude/`**:
   the in-container claude binary's auto-update path. Backed by a named
   volume (`claude-container-versions`); should Just Work after the

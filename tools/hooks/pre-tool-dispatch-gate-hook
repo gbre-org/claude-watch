@@ -142,8 +142,10 @@ _BAKED_BASH_EXEMPT_PATTERNS = [
     r"^/usr/local/bin/obligations\s+(?:list|show|status)(?:\s|$)",
     r"^self-clear(?:\s|$)",
     r"^/usr/local/bin/self-clear(?:\s|$)",
-    r"^agent-msg\s+(?:inbox|list|status)(?:\s|$)",
-    r"^/usr/local/bin/agent-msg\s+(?:inbox|list|status)(?:\s|$)",
+    r"^agent-msg\s+(?:inbox|list|status|ack|gc|disarm|show)(?:\s|$)",
+    r"^/usr/local/bin/agent-msg\s+(?:inbox|list|status|ack|gc|disarm|show)(?:\s|$)",
+    r"^agent-tail(?:\s|$)",
+    r"^/usr/local/bin/agent-tail(?:\s|$)",
 ]
 
 # Tool names that bypass tracking + denial regardless of args. Agent is

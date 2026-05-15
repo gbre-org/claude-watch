@@ -109,6 +109,12 @@ jobs:
       - name: Run exec-hook shim tests
         run: make test-hooks-shim
 
+      - name: Run agent-msg embedded test suite
+        run: make test-agent-msg
+
+      - name: Run agent-tail embedded test suite
+        run: make test-agent-tail
+
       - name: Run entrypoint CLAUDE_CMD construction tests
         run: make test-entrypoint
 

@@ -120,9 +120,17 @@ BAKED_BASH_EXEMPT_PATTERNS = [
     r"^/usr/local/bin/obligations\s+(?:list|show|status)(?:\s|$)",
     r"^self-clear(?:\s|$)",
     r"^/usr/local/bin/self-clear(?:\s|$)",
-    # agent-msg inbox inspection
-    r"^agent-msg\s+(?:inbox|list|status)(?:\s|$)",
-    r"^/usr/local/bin/agent-msg\s+(?:inbox|list|status)(?:\s|$)",
+    # agent-msg inbox inspection + ack-side cleanup. ack/gc/disarm/show
+    # are all read-only / state-shrinking and shouldn't trip the
+    # dispatcher counter (a subagent acking its inbox is responding to
+    # a directed channel, not doing inline work). `send` and `arm`
+    # remain non-exempt because they're outbound -- if a session is
+    # spinning sending messages, the dispatcher should still bite.
+    r"^agent-msg\s+(?:inbox|list|status|ack|gc|disarm|show)(?:\s|$)",
+    r"^/usr/local/bin/agent-msg\s+(?:inbox|list|status|ack|gc|disarm|show)(?:\s|$)",
+    # agent-tail is a pure JSONL transcript viewer; treat like `cat`.
+    r"^agent-tail(?:\s|$)",
+    r"^/usr/local/bin/agent-tail(?:\s|$)",
 ]
 
 

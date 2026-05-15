@@ -120,6 +120,15 @@ _BASH_EXEMPT_PATTERNS = [
     # Self-clear is sometimes the alert's instruction
     r"^self-clear(?:\s|$)",
     r"^/usr/local/bin/self-clear(?:\s|$)",
+    # agent-msg inbox-side reads + acks: a subagent that's ALREADY
+    # blocked by its own inbox gate must be able to read/ack the inbox
+    # even when an alert is also pending. Without this, the alert gate
+    # double-deadlocks the subagent: alert gate blocks until acked, but
+    # only the main loop can ack alerts, so the subagent's inbox
+    # never clears either. We allow read-only / cleanup forms (inbox,
+    # ack, gc, disarm); `send` and `arm` stay gated.
+    r"^agent-msg\s+(?:inbox|ack|gc|disarm|list|show|status)(?:\s|$)",
+    r"^/usr/local/bin/agent-msg\s+(?:inbox|ack|gc|disarm|list|show|status)(?:\s|$)",
 ]
 _BASH_EXEMPT_RES = [re.compile(p) for p in _BASH_EXEMPT_PATTERNS]
 

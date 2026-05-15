@@ -136,6 +136,7 @@ test-entrypoint:
 	container/tests/queue-gate-wired.test
 	container/tests/claude-watch-alert-gate-wired.test
 	container/tests/dispatch-gate-wired.test
+	container/tests/agent-comms-baked.test
 	container/tests/compose-mount-modes.test
 	container/tests/tini-pid1.test
 	container/tests/iproute2-installed.test

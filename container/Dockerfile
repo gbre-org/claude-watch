@@ -430,6 +430,34 @@ COPY tools/hooks/pre-tool-dispatch-gate-hook /usr/local/bin/pre-tool-dispatch-ga
 # list effective exempt patterns. The CLI itself is exempt from the
 # gate so introspection always works.
 COPY tools/claude-watch-dispatch/claude-watch-dispatch /usr/local/bin/claude-watch-dispatch
+# Agent communication CLIs -- async host -> subagent inbox protocol.
+#
+#   - obligations: registry that backs every gate hook in /usr/local/bin/.
+#     Previously bind-mount-only via the claude-tools.profile.sh; baking
+#     it makes the obligations gate operational even when ~/repos/claude-
+#     watch isn't bind-mounted (e.g. stripped-down `docker run` without
+#     the host repo). The bind-mounted source still wins on PATH (via
+#     the profile prepend) when present, so dev iteration stays live.
+#
+#   - agent-msg: subagent inbox CLI (send / inbox / ack / arm / disarm /
+#     gc / gc-dead). The main loop calls `agent-msg send <agent-id>
+#     "<message>"` and the spawned subagent's PreToolUse obligations
+#     gate (the existing pre-tool-obligations-gate-hook above) DENIES
+#     every non-ack tool call until the subagent runs `agent-msg ack`
+#     against its inbox. `arm` registers the gate-mode obligation via
+#     the `obligations` CLI; without `obligations` baked, agent-msg
+#     would only work in containers that bind-mount ~/repos/claude-
+#     watch. Baking both keeps the channel operational by default.
+#
+#   - agent-tail: reads a subagent's JSONL transcript at
+#     ~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl.
+#     Companion to `claude-watch active-agents` for inspecting a
+#     running subagent's tool history. Includes `--list` mode that
+#     enumerates active subagent transcripts and `--follow` for live
+#     streaming.
+COPY tools/obligations/obligations /usr/local/bin/obligations
+COPY tools/agent-msg/agent-msg /usr/local/bin/agent-msg
+COPY tools/agent-tail/agent-tail /usr/local/bin/agent-tail
 RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/pre-tool-obligations-gate-hook \
             /usr/local/bin/post-tool-obligations-update-hook \
@@ -438,7 +466,10 @@ RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/user-prompt-claude-watch-alert-record-hook \
             /usr/local/bin/claude-watch-ack \
             /usr/local/bin/pre-tool-dispatch-gate-hook \
-            /usr/local/bin/claude-watch-dispatch
+            /usr/local/bin/claude-watch-dispatch \
+            /usr/local/bin/obligations \
+            /usr/local/bin/agent-msg \
+            /usr/local/bin/agent-tail
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch

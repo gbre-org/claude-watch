@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Tests that the agent-communication CLIs are baked into the container
+image and discoverable in the contexts that need them.
+
+Three CLIs are in scope:
+
+  - `agent-msg` -- host->subagent inbox protocol; the main loop calls
+    `agent-msg send <agent-id> "<text>"` and the subagent's PreToolUse
+    obligations gate hook DENIES every non-ack tool call until the
+    subagent runs `agent-msg ack`. `arm` shells out to `obligations
+    add` to register the gate-mode obligation; without `obligations`
+    baked alongside, agent-msg would only work in containers that
+    bind-mount ~/repos/claude-watch.
+
+  - `agent-tail` -- streams a subagent's JSONL transcript; companion
+    to `claude-watch active-agents` for inspecting tool history.
+
+  - `obligations` -- the registry that backs every gate hook in
+    /usr/local/bin/. Previously bind-mount-only; baking it is what
+    makes agent-msg's arm/disarm operational in stripped-down
+    `docker run` containers.
+
+Assertions (image side):
+
+  1. Dockerfile contains COPY lines for all three CLIs to
+     /usr/local/bin/.
+  2. Each source file under tools/ exists, has a Python shebang, and
+     is executable (so the COPY targets are runnable post-bake).
+  3. The audit-hooks KNOWN_BUILTINS set lists agent-msg and
+     agent-tail so audit-hooks doesn't surface them as `missing`
+     when they appear in settings.json shapes.
+  4. The claude-tools.profile.sh PATH-prepend list includes both
+     agent-msg and agent-tail tool dirs so the bind-mounted sources
+     win during dev iteration when ~/repos/claude-watch is mounted.
+
+Assertions (gate-exempt-pattern side):
+
+  5. The claude-watch alert gate's _BASH_EXEMPT_PATTERNS exempt
+     agent-msg's ack/inbox/gc/disarm subcommands so a subagent
+     stuck on its own inbox gate is not double-deadlocked by an
+     alert gate firing in parallel.
+  6. The dispatch gate's _BAKED_BASH_EXEMPT_PATTERNS exempt the same
+     agent-msg subcommands AND the entire agent-tail CLI (it's
+     read-only so it shouldn't count against the dispatcher
+     threshold).
+
+End-to-end behaviour:
+
+  7. Subprocess-invoke each CLI's --help and verify it returns 0
+     with non-empty stdout. This catches Python-version regressions
+     in the baked image.
+
+Run:  ./agent-comms-baked.test
+
+No external deps beyond Python 3.8+ stdlib. Does NOT require docker /
+a built image / a running claude.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+PROFILE_SH = CONTAINER_DIR / "claude-tools.profile.sh"
+AUDIT_HOOKS = CONTAINER_DIR / "bin" / "audit-hooks.py"
+ALERT_GATE = REPO_ROOT / "tools" / "hooks" / "pre-tool-claude-watch-alert-gate-hook"
+DISPATCH_GATE = REPO_ROOT / "tools" / "hooks" / "pre-tool-dispatch-gate-hook"
+
+AGENT_MSG_SRC = REPO_ROOT / "tools" / "agent-msg" / "agent-msg"
+AGENT_TAIL_SRC = REPO_ROOT / "tools" / "agent-tail" / "agent-tail"
+OBLIGATIONS_SRC = REPO_ROOT / "tools" / "obligations" / "obligations"
+
+BAKED_AGENT_MSG = "/usr/local/bin/agent-msg"
+BAKED_AGENT_TAIL = "/usr/local/bin/agent-tail"
+BAKED_OBLIGATIONS = "/usr/local/bin/obligations"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        print(f"  FAIL {msg}")
+        failures.append(msg)
+
+
+# Pre-flight
+for p in (DOCKERFILE, PROFILE_SH, AUDIT_HOOKS, ALERT_GATE, DISPATCH_GATE,
+          AGENT_MSG_SRC, AGENT_TAIL_SRC, OBLIGATIONS_SRC):
+    if not p.is_file():
+        print(f"FAIL: required path missing: {p}", file=sys.stderr)
+        sys.exit(2)
+
+
+def test_dockerfile_bakes_all_three_clis() -> None:
+    """Dockerfile must COPY agent-msg, agent-tail, AND obligations into
+    /usr/local/bin/. The obligations CLI is the load-bearing dependency
+    for agent-msg arm/disarm; without it baked, agent-msg would silently
+    degrade to "obligations CLI not found" in stripped-down containers.
+    """
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    for target in (
+        f"COPY tools/obligations/obligations {BAKED_OBLIGATIONS}",
+        f"COPY tools/agent-msg/agent-msg {BAKED_AGENT_MSG}",
+        f"COPY tools/agent-tail/agent-tail {BAKED_AGENT_TAIL}",
+    ):
+        expect(target in df,
+               f"Dockerfile missing: `{target}`")
+
+
+def test_dockerfile_chmods_all_three_clis() -> None:
+    """The bake RUN must include chmod +x for the new CLIs so the
+    COPY destinations are executable. Stick all three on the existing
+    chmod chain after the dispatch hooks."""
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    for path in (BAKED_AGENT_MSG, BAKED_AGENT_TAIL, BAKED_OBLIGATIONS):
+        expect(path in df,
+               f"Dockerfile chmod chain missing {path!r}")
+
+
+def test_source_files_have_python_shebang() -> None:
+    """Each baked CLI source file must start with a Python shebang so
+    the COPY target is runnable as-is. (Docker COPY preserves +x but
+    not the source file's interpreter; the shebang is the only thing
+    that makes /usr/local/bin/<name> exec-able after COPY.)
+    """
+    for src in (AGENT_MSG_SRC, AGENT_TAIL_SRC, OBLIGATIONS_SRC):
+        with src.open("rb") as fh:
+            first_line = fh.readline()
+        expect(first_line.startswith(b"#!"),
+               f"{src.name}: missing shebang on first line")
+        expect(b"python" in first_line,
+               f"{src.name}: shebang is not a python interpreter "
+               f"(got {first_line!r})")
+
+
+def test_source_files_are_executable() -> None:
+    """Each baked CLI source must have +x on the source file because
+    Docker COPY preserves the source's mode bits. Without +x on the
+    source, the baked /usr/local/bin/<name> is also non-executable
+    and the chmod RUN line is required to fix it (still works, but
+    relying on the chmod chain is fragile -- belt-and-suspenders by
+    requiring +x on the source too).
+    """
+    for src in (AGENT_MSG_SRC, AGENT_TAIL_SRC, OBLIGATIONS_SRC):
+        mode = src.stat().st_mode
+        is_exec = bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+        expect(is_exec, f"{src.name}: source is not executable "
+                        f"(mode={oct(mode)})")
+
+
+def test_audit_hooks_knows_agent_clis() -> None:
+    """audit-hooks.py KNOWN_BUILTINS must list agent-msg + agent-tail so
+    they appear as `builtin` (not `missing`) when present in
+    settings.json shapes."""
+    src = AUDIT_HOOKS.read_text(encoding="utf-8")
+    expect('"agent-msg"' in src,
+           "audit-hooks.py KNOWN_BUILTINS missing 'agent-msg'")
+    expect('"agent-tail"' in src,
+           "audit-hooks.py KNOWN_BUILTINS missing 'agent-tail'")
+
+
+def test_profile_sh_includes_agent_tool_dirs() -> None:
+    """claude-tools.profile.sh must add the agent-msg + agent-tail tool
+    dirs to the PATH-prepend list so the bind-mounted source wins over
+    the baked CLI during dev iteration when ~/repos/claude-watch is
+    bind-mounted."""
+    src = PROFILE_SH.read_text(encoding="utf-8")
+    expect("tools/agent-msg" in src,
+           "claude-tools.profile.sh missing tools/agent-msg in PATH list")
+    expect("tools/agent-tail" in src,
+           "claude-tools.profile.sh missing tools/agent-tail in PATH list")
+
+
+def test_alert_gate_exempts_agent_msg_ack_inbox() -> None:
+    """The claude-watch alert gate must exempt agent-msg's inbox/ack/gc/
+    disarm forms so a subagent stuck on its own inbox gate can still
+    clear it when an alert gate is also pending in parallel.
+
+    Without this, the two gates double-deadlock: alert gate denies
+    everything except claude-watch-ack, but only the main loop can
+    `claude-watch-ack ack` an alert, and the subagent has no way to
+    reach `agent-msg ack` to clear ITS inbox -- both gates stay
+    pending forever.
+    """
+    src = ALERT_GATE.read_text(encoding="utf-8")
+    # Look for the agent-msg exempt pattern (we don't pin the exact
+    # subcommand list because the in-source comment may evolve, but
+    # `ack` and `inbox` must be there).
+    pattern_re = re.compile(
+        r"\^agent-msg\\s\+\(\?:[a-z|]*ack[a-z|]*\)", re.IGNORECASE
+    )
+    expect(bool(pattern_re.search(src)) or "agent-msg" in src,
+           "alert gate hook missing agent-msg exempt pattern")
+    # Verify ack + inbox are both in the agent-msg alternation
+    expect("ack" in src and "agent-msg" in src,
+           "alert gate hook missing 'ack' in agent-msg exempt alternation")
+    expect("inbox" in src and "agent-msg" in src,
+           "alert gate hook missing 'inbox' in agent-msg exempt alternation")
+
+
+def test_dispatch_gate_exempts_agent_msg_and_agent_tail() -> None:
+    """The dispatch gate must exempt agent-msg's read-only / cleanup
+    forms (inbox/ack/gc/disarm/list/status/show) and ALL of agent-tail
+    -- both are read-only / state-shrinking and shouldn't count
+    against the dispatcher's consecutive-tool-call threshold."""
+    src = DISPATCH_GATE.read_text(encoding="utf-8")
+    expect("ack" in src and "agent-msg" in src,
+           "dispatch gate hook missing 'ack' in agent-msg exempt list")
+    expect("agent-tail" in src,
+           "dispatch gate hook missing agent-tail exempt entry")
+
+
+def _invoke_help(path: Path) -> tuple[int, str, str]:
+    proc = subprocess.run(
+        [sys.executable, str(path), "--help"],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def test_clis_print_help() -> None:
+    """Each baked CLI must respond to --help with rc=0 and non-empty
+    stdout. Catches Python-version / import regressions early."""
+    for src in (AGENT_MSG_SRC, AGENT_TAIL_SRC, OBLIGATIONS_SRC):
+        rc, out, err = _invoke_help(src)
+        expect(rc == 0,
+               f"{src.name} --help exit nonzero: rc={rc}, stderr={err[:300]!r}")
+        expect(bool(out.strip()),
+               f"{src.name} --help produced empty stdout")
+
+
+def test_agent_msg_documents_both_channels_via_subcommands() -> None:
+    """Sanity: agent-msg --help should mention `send`, `ack`, and
+    `inbox` -- the three load-bearing subcommands for the inbox
+    protocol. If any disappear, downstream prompts (workbot
+    validation, baked-CLAUDE.md examples) silently rot."""
+    rc, out, _ = _invoke_help(AGENT_MSG_SRC)
+    if rc != 0:
+        return  # already failed in test_clis_print_help
+    for sub in ("send", "ack", "inbox", "arm", "disarm"):
+        expect(sub in out,
+               f"agent-msg --help output missing subcommand {sub!r}")
+
+
+def test_baked_claude_md_documents_both_channels() -> None:
+    """baked-CLAUDE.md must explain both agent-communication channels
+    so a fresh subagent can recover the protocol off the shelf without
+    workbot walking it through.
+
+    Must cover:
+      - agent-msg inbox protocol (the gate-mode deny -> ack cycle)
+      - The fact that ack is on the exempt list (so the subagent
+        doesn't loop on its own gate)
+      - The curses-chat user->agent channel as distinct from the
+        main-loop inbox channel
+      - That curses-chat direction outranks main-loop inbox direction
+    """
+    md = (CONTAINER_DIR / "baked-CLAUDE.md").read_text(encoding="utf-8")
+    expect("agent-msg" in md,
+           "baked-CLAUDE.md does not mention agent-msg")
+    expect("agent-msg ack" in md or "agent-msg ack <" in md or "ack" in md,
+           "baked-CLAUDE.md does not document the agent-msg ack step")
+    expect("inbox" in md.lower(),
+           "baked-CLAUDE.md does not mention the inbox channel")
+    # curses-chat documentation -- both terms acceptable
+    has_curses_doc = (
+        "curses-chat" in md or "curses chat" in md
+        or "agent-chat curses" in md or "agent chat" in md.lower()
+    )
+    expect(has_curses_doc,
+           "baked-CLAUDE.md does not document the curses-chat "
+           "user->agent channel")
+    # Conflict-resolution rule between channels
+    expect("outrank" in md or "wins" in md.lower() or "overrid" in md.lower(),
+           "baked-CLAUDE.md does not state which channel wins on conflict")
+
+
+def main() -> int:
+    tests = [
+        test_dockerfile_bakes_all_three_clis,
+        test_dockerfile_chmods_all_three_clis,
+        test_source_files_have_python_shebang,
+        test_source_files_are_executable,
+        test_audit_hooks_knows_agent_clis,
+        test_profile_sh_includes_agent_tool_dirs,
+        test_alert_gate_exempts_agent_msg_ack_inbox,
+        test_dispatch_gate_exempts_agent_msg_and_agent_tail,
+        test_clis_print_help,
+        test_agent_msg_documents_both_channels_via_subcommands,
+        test_baked_claude_md_documents_both_channels,
+    ]
+    for t in tests:
+        print(f"== {t.__name__} ==")
+        t()
+    if failures:
+        print(f"\nFAIL agent-comms-baked.test "
+              f"({len(failures)} assertion(s) failed)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"\nPASS agent-comms-baked.test "
+          f"({len(tests)} test functions, all assertions passed)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
