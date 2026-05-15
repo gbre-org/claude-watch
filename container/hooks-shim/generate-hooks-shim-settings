@@ -160,6 +160,21 @@ OBLIGATIONS_HOOKS: list[tuple[str, str, str]] = [
     # tool call whose tool/command-string matches an unsatisfied row).
     # Mirrors the host's PreToolUse "*" matcher.
     ("PreToolUse", "*", "/usr/local/bin/pre-tool-obligations-gate-hook"),
+    # claude-watch alert gate -- DENIES every non-exempt tool call while
+    # any `[CLAUDE-WATCH]` alert is pending in
+    # ~/.config/claude-watch/pending-alerts.json. Clear via
+    # `claude-watch-ack ack <id>` or `claude-watch-ack ack --all`. The
+    # companion UserPromptSubmit hook below auto-records incoming
+    # `[CLAUDE-WATCH]` injects into the state file. Together they turn
+    # the soft baked-CLAUDE.md `claude-watch alerts` cardinal into a
+    # hard tool-layer gate (v58 verdict: alert internalized PARTIAL --
+    # this gate is the hard fix).
+    ("PreToolUse", "*", "/usr/local/bin/pre-tool-claude-watch-alert-gate-hook"),
+    # Auto-record `[CLAUDE-WATCH]` injects as pending alerts so the gate
+    # above can fire. Matches every UserPromptSubmit event; the hook
+    # itself filters on the `[CLAUDE-WATCH]` substring and is a silent
+    # no-op for ordinary prompts.
+    ("UserPromptSubmit", "*", "/usr/local/bin/user-prompt-claude-watch-alert-record-hook"),
     # Auto-satisfy obligations whose `satisfied_by` pattern matches the
     # just-completed tool. Mirrors the host's PostToolUse "*" matcher.
     ("PostToolUse", "*", "/usr/local/bin/post-tool-obligations-update-hook"),

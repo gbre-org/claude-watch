@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Tests for claude-watch-ack CLI.
+
+Covers:
+  - add: writes a state file with the new alert
+  - add: returns a fresh id each time
+  - list: empty + populated
+  - ack <id>: removes the named alert; exit 0
+  - ack <missing-id>: exit 1, no state mutation
+  - ack --all: clears every alert
+  - clear: alias for ack --all
+  - status: exit 0 when empty, exit 1 when populated
+  - state file 0600 perms
+  - atomic write (no half-written file even if interrupted)
+  - corrupt state file: default-empty + first add overwrites cleanly
+  - --json on add + list
+
+Run:  ./claude-watch-ack.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CLI = HERE.parent / "claude-watch-ack"
+
+
+class Harness:
+    def __init__(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self.tmpdir.name) / "claude-watch"
+        self.env = os.environ.copy()
+        self.env["CLAUDE_WATCH_ALERT_STATE_DIR"] = str(self.state_dir)
+
+    def cleanup(self) -> None:
+        self.tmpdir.cleanup()
+
+    def run(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(CLI), *args],
+            capture_output=True, text=True, env=self.env, timeout=10, check=False,
+        )
+
+    def state_path(self) -> Path:
+        return self.state_dir / "pending-alerts.json"
+
+    def load_state(self) -> dict:
+        p = self.state_path()
+        if not p.exists():
+            return {"alerts": []}
+        with p.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+
+# -- assertions ---------------------------------------------------------------
+
+failures: list[str] = []
+
+
+def check(cond: bool, label: str, detail: str = "") -> None:
+    if cond:
+        print(f"  ok  {label}")
+    else:
+        print(f"  FAIL {label}: {detail}")
+        failures.append(label)
+
+
+# -- tests --------------------------------------------------------------------
+
+
+def test_add_writes_state():
+    h = Harness()
+    try:
+        proc = h.run("add", "[CLAUDE-WATCH] test alert one")
+        check(proc.returncode == 0, "add: exit 0",
+              f"stderr={proc.stderr!r} stdout={proc.stdout!r}")
+        alert_id = proc.stdout.strip()
+        check(alert_id.startswith("alert-"), "add: prints id",
+              f"got: {alert_id!r}")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1, "add: writes 1 alert",
+              f"state: {state}")
+        check(state["alerts"][0]["id"] == alert_id, "add: id matches stdout")
+        check(state["alerts"][0]["message"] == "[CLAUDE-WATCH] test alert one",
+              "add: message stored verbatim")
+        check(state["alerts"][0]["source"] == "manual",
+              "add: default source=manual")
+        # File perms
+        mode = oct(h.state_path().stat().st_mode)[-3:]
+        check(mode == "600", "add: state file 0600", f"got: {mode}")
+    finally:
+        h.cleanup()
+
+
+def test_add_unique_ids():
+    h = Harness()
+    try:
+        ids: set[str] = set()
+        for i in range(5):
+            proc = h.run("add", f"[CLAUDE-WATCH] msg {i}")
+            check(proc.returncode == 0, f"add #{i}: exit 0")
+            ids.add(proc.stdout.strip())
+        check(len(ids) == 5, "add: 5 unique ids", f"got {len(ids)}")
+        state = h.load_state()
+        check(len(state["alerts"]) == 5, "add: 5 alerts in state",
+              f"got {len(state['alerts'])}")
+    finally:
+        h.cleanup()
+
+
+def test_add_with_source_and_json():
+    h = Harness()
+    try:
+        proc = h.run("add", "[CLAUDE-WATCH] x",
+                     "--source", "user-prompt-hook", "--json")
+        check(proc.returncode == 0, "add --json: exit 0")
+        entry = json.loads(proc.stdout)
+        check(entry["source"] == "user-prompt-hook",
+              "add --source: stored", f"got: {entry['source']}")
+        check(isinstance(entry.get("created_at"), int),
+              "add --json: created_at is int")
+    finally:
+        h.cleanup()
+
+
+def test_list_empty():
+    h = Harness()
+    try:
+        proc = h.run("list")
+        check(proc.returncode == 0, "list (empty): exit 0")
+        check("no pending" in proc.stdout, "list (empty): friendly message",
+              f"stdout={proc.stdout!r}")
+        proc_j = h.run("list", "--json")
+        check(proc_j.returncode == 0, "list --json (empty): exit 0")
+        data = json.loads(proc_j.stdout)
+        check(data["alerts"] == [], "list --json (empty): alerts=[]")
+    finally:
+        h.cleanup()
+
+
+def test_list_populated():
+    h = Harness()
+    try:
+        h.run("add", "[CLAUDE-WATCH] alert A")
+        h.run("add", "[CLAUDE-WATCH] alert B")
+        proc = h.run("list")
+        check(proc.returncode == 0, "list (2): exit 0")
+        check("2 pending" in proc.stdout, "list (2): count",
+              f"stdout={proc.stdout!r}")
+        check("alert A" in proc.stdout, "list (2): shows A")
+        check("alert B" in proc.stdout, "list (2): shows B")
+    finally:
+        h.cleanup()
+
+
+def test_ack_by_id():
+    h = Harness()
+    try:
+        id_a = h.run("add", "[CLAUDE-WATCH] A").stdout.strip()
+        id_b = h.run("add", "[CLAUDE-WATCH] B").stdout.strip()
+        proc = h.run("ack", id_a)
+        check(proc.returncode == 0, "ack <id>: exit 0",
+              f"stderr={proc.stderr!r}")
+        check(id_a in proc.stdout, "ack <id>: confirms id")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1, "ack <id>: state count -> 1",
+              f"got {len(state['alerts'])}")
+        check(state["alerts"][0]["id"] == id_b, "ack <id>: B remains")
+    finally:
+        h.cleanup()
+
+
+def test_ack_missing_id():
+    h = Harness()
+    try:
+        h.run("add", "[CLAUDE-WATCH] A")
+        proc = h.run("ack", "alert-nope-0000")
+        check(proc.returncode == 1, "ack <missing>: exit 1",
+              f"got rc={proc.returncode}, stderr={proc.stderr!r}")
+        check("no such alert" in proc.stderr,
+              "ack <missing>: stderr explains", f"got: {proc.stderr!r}")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1,
+              "ack <missing>: state unchanged", f"got {len(state['alerts'])}")
+    finally:
+        h.cleanup()
+
+
+def test_ack_all():
+    h = Harness()
+    try:
+        h.run("add", "[CLAUDE-WATCH] A")
+        h.run("add", "[CLAUDE-WATCH] B")
+        h.run("add", "[CLAUDE-WATCH] C")
+        proc = h.run("ack", "--all")
+        check(proc.returncode == 0, "ack --all: exit 0")
+        check("ack'd 3" in proc.stdout, "ack --all: count message",
+              f"stdout={proc.stdout!r}")
+        state = h.load_state()
+        check(state["alerts"] == [], "ack --all: state cleared")
+    finally:
+        h.cleanup()
+
+
+def test_clear_alias():
+    h = Harness()
+    try:
+        h.run("add", "[CLAUDE-WATCH] A")
+        h.run("add", "[CLAUDE-WATCH] B")
+        proc = h.run("clear")
+        check(proc.returncode == 0, "clear: exit 0")
+        state = h.load_state()
+        check(state["alerts"] == [], "clear: state cleared")
+    finally:
+        h.cleanup()
+
+
+def test_status():
+    h = Harness()
+    try:
+        proc = h.run("status")
+        check(proc.returncode == 0, "status (empty): exit 0")
+        check("OK" in proc.stdout, "status (empty): prints OK")
+        h.run("add", "[CLAUDE-WATCH] X")
+        proc = h.run("status")
+        check(proc.returncode == 1, "status (1): exit 1",
+              f"got rc={proc.returncode}, stdout={proc.stdout!r}")
+        proc_j = h.run("status", "--json")
+        check(proc_j.returncode == 1, "status --json (1): exit 1")
+        data = json.loads(proc_j.stdout)
+        check(data["pending"] == 1, "status --json: pending=1")
+        check(data["ok"] is False, "status --json: ok=False")
+    finally:
+        h.cleanup()
+
+
+def test_corrupt_state_recovers():
+    h = Harness()
+    try:
+        h.state_dir.mkdir(parents=True, exist_ok=True)
+        with h.state_path().open("w", encoding="utf-8") as fh:
+            fh.write("this is not json{{{")
+        # list should default-open empty
+        proc = h.run("list")
+        check(proc.returncode == 0,
+              "list (corrupt): exit 0", f"stderr={proc.stderr!r}")
+        check("no pending" in proc.stdout, "list (corrupt): empty")
+        # add should overwrite cleanly
+        proc = h.run("add", "[CLAUDE-WATCH] recovered")
+        check(proc.returncode == 0, "add (corrupt): exit 0")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1, "add (corrupt): wrote 1 fresh alert",
+              f"state: {state}")
+    finally:
+        h.cleanup()
+
+
+def test_long_message_truncates():
+    h = Harness()
+    try:
+        # 10kB message -- should clamp to ~4kB
+        big = "x" * 10000
+        proc = h.run("add", f"[CLAUDE-WATCH] {big}")
+        check(proc.returncode == 0, "add (long): exit 0")
+        state = h.load_state()
+        stored = state["alerts"][0]["message"]
+        check(len(stored.encode("utf-8")) < 5000,
+              "add (long): message truncated",
+              f"got len={len(stored.encode('utf-8'))}")
+        check(stored.endswith("[truncated]"), "add (long): suffix")
+    finally:
+        h.cleanup()
+
+
+def main() -> int:
+    tests = [
+        test_add_writes_state,
+        test_add_unique_ids,
+        test_add_with_source_and_json,
+        test_list_empty,
+        test_list_populated,
+        test_ack_by_id,
+        test_ack_missing_id,
+        test_ack_all,
+        test_clear_alias,
+        test_status,
+        test_corrupt_state_recovers,
+        test_long_message_truncates,
+    ]
+    for t in tests:
+        print(f"\n== {t.__name__} ==")
+        t()
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)} test case(s)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"OK: {len(tests)} test functions, all assertions passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

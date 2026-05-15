@@ -15,6 +15,8 @@ blackhole the loop.
 |--------|------------|---------|---------|
 | `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses Agent spawns missing `Queue item: q-XXXX` markers, or whose marker isn't `running`. |
 | `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces two hardcoded architectural gates: (a) bare-`watcher-ctl run` cardinal rule; (b) `Monitor` tool denied inside subagent context (`agent_id` non-empty) -- see [`docs/hooks.md`](../../docs/hooks.md#hardcoded-architectural-gates). |
+| `pre-tool-claude-watch-alert-gate-hook` | PreToolUse | `*` | Denies every non-exempt tool call while any `[CLAUDE-WATCH]` alert is pending in `~/.config/claude-watch/pending-alerts.json`. Clear via `claude-watch-ack ack <id>` or `claude-watch-ack ack --all`. Exempt: the ack CLI itself, `session-task`, `git status/diff/log/commit/push/add`, `obligations list/show`, `self-clear`, and the `Read` tool. Companion `user-prompt-claude-watch-alert-record-hook` auto-records injected alerts. |
+| `user-prompt-claude-watch-alert-record-hook` | UserPromptSubmit | `*` | Detects `[CLAUDE-WATCH]` injects in submitted prompts and records them as pending alerts via `claude-watch-ack add`. Silent no-op for ordinary prompts. |
 | `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories), and manages the `no_pending_watcher_outputs` sidecar registry. |
 | `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks external-messaging attachments as read via a host-specific `*-mark-read` shim when Claude opens a file under a configured attachment dir. Safe no-op when neither the shim nor the dir is present. |
 
@@ -64,8 +66,11 @@ In `~/.claude/settings.json` (after `make install` puts the binaries in
     as allow + audits to `~/.config/claude/obligations-bypass.log`.
   - `QUEUE_GATE_BYPASS=1` env var — pre-agent-queue-gate-hook treats as
     allow + audits to `~/.config/claude/queue-gate-bypass.log`.
+  - `CLAUDE_WATCH_ALERT_BYPASS=1` env var — pre-tool-claude-watch-alert-
+    gate-hook treats as allow + audits to
+    `~/.config/claude/claude-watch-alert-bypass.log`.
   - `obligations override "<reason>" --duration <60|5m|1h>` — preferred
-    audited bypass; self-clears via TTL (24h cap).
+    audited bypass for the obligations gate; self-clears via TTL (24h cap).
 
 ## Tests
 

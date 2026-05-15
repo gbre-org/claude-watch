@@ -106,6 +106,10 @@ KNOWN_BUILTINS = {
     "pre-tool-obligations-gate-hook",
     "post-tool-obligations-update-hook",
     "post-tool-mark-attachment-read-hook",
+    # claude-watch alert gate hooks (v59).
+    "pre-tool-claude-watch-alert-gate-hook",
+    "user-prompt-claude-watch-alert-record-hook",
+    "claude-watch-ack",
 }
 
 

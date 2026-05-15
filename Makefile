@@ -44,6 +44,9 @@ test-session-task:
 test-hooks:
 	tools/hooks/tests/pre-tool-obligations-gate-hook.test
 	tools/hooks/tests/pre-agent-queue-gate-hook.test
+	tools/hooks/tests/pre-tool-claude-watch-alert-gate-hook.test
+	tools/hooks/tests/user-prompt-claude-watch-alert-record-hook.test
+	tools/claude-watch-ack/tests/claude-watch-ack.test
 
 # Run the agent-msg embedded test suite (CLI for delivering async
 # messages to running Claude Code agents via the obligations gate).
@@ -128,6 +131,7 @@ test-entrypoint:
 	container/tests/baked-dirs.test
 	container/tests/baked-obligations-hooks.test
 	container/tests/queue-gate-wired.test
+	container/tests/claude-watch-alert-gate-wired.test
 	container/tests/compose-mount-modes.test
 	container/tests/tini-pid1.test
 	container/tests/iproute2-installed.test

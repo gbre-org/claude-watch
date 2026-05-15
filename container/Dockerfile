@@ -377,10 +377,26 @@ COPY tools/hooks/pre-agent-queue-gate-hook /usr/local/bin/pre-agent-queue-gate-h
 COPY tools/hooks/pre-tool-obligations-gate-hook /usr/local/bin/pre-tool-obligations-gate-hook
 COPY tools/hooks/post-tool-obligations-update-hook /usr/local/bin/post-tool-obligations-update-hook
 COPY tools/hooks/post-tool-mark-attachment-read-hook /usr/local/bin/post-tool-mark-attachment-read-hook
+# claude-watch alert gate -- PreToolUse hook that DENIES every non-exempt
+# tool call while any `[CLAUDE-WATCH]` alert is pending in
+# ~/.config/claude-watch/pending-alerts.json. Companion UserPromptSubmit
+# hook auto-records `[CLAUDE-WATCH]` injects from the tmux pane into the
+# state file; companion `claude-watch-ack` CLI clears the gate.
+# Together they turn the soft baked-CLAUDE.md `claude-watch alerts`
+# cardinal into a hard tool-layer gate.
+COPY tools/hooks/pre-tool-claude-watch-alert-gate-hook /usr/local/bin/pre-tool-claude-watch-alert-gate-hook
+COPY tools/hooks/user-prompt-claude-watch-alert-record-hook /usr/local/bin/user-prompt-claude-watch-alert-record-hook
+# claude-watch-ack CLI -- manages the pending-alerts state file, the
+# only mechanism (besides the audited bypass env-var) to clear the
+# alert gate.
+COPY tools/claude-watch-ack/claude-watch-ack /usr/local/bin/claude-watch-ack
 RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/pre-tool-obligations-gate-hook \
             /usr/local/bin/post-tool-obligations-update-hook \
-            /usr/local/bin/post-tool-mark-attachment-read-hook
+            /usr/local/bin/post-tool-mark-attachment-read-hook \
+            /usr/local/bin/pre-tool-claude-watch-alert-gate-hook \
+            /usr/local/bin/user-prompt-claude-watch-alert-record-hook \
+            /usr/local/bin/claude-watch-ack
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch

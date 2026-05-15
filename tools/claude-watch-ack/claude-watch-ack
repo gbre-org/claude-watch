@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""claude-watch-ack -- track unack'd claude-watch alerts.
+
+The companion `pre-tool-claude-watch-alert-gate-hook` (PreToolUse) DENIES
+all tool calls while ANY alert is pending. This CLI is the only way to
+clear the gate (besides an audited bypass env-var).
+
+Why this exists
+---------------
+
+claude-watch already injects banner prompts into the in-container tmux
+session when it detects prolonged thinking, context-low, or watcher-down
+states. The expectation is that Claude STOPS EVERYTHING and attends the
+alert before continuing.
+
+In practice, soft prompt guidance (`CLAUDE.md` cardinals, baked-CLAUDE.md
+banners) is unreliable: v58 verdict was "alert internalized: PARTIAL".
+After one acknowledgment turn, the session resumes inline work without
+running the canonical recovery steps (session-task set, commit, log).
+
+This CLI + its companion PreToolUse hook turn that soft expectation into
+a hard tool-layer gate. Until the operator (or Claude) calls
+`claude-watch-ack ack <id>`, every tool call DENIES with a reminder banner.
+
+State file
+----------
+
+`~/.config/claude-watch/pending-alerts.json` (0600). Schema::
+
+    {
+      "alerts": [
+        {
+          "id": "alert-YYYYMMDD-HHMMSS-NNNN",
+          "message": "[CLAUDE-WATCH] ...",
+          "created_at": <unix_ts>,
+          "source": "user-prompt-hook" | "manual" | "<tag>"
+        }
+      ]
+    }
+
+The directory is created on first write with mode 0700; the file with
+mode 0600. Concurrent writes are serialised via a temp-file + atomic
+rename so the gate hook never reads a half-written file.
+
+Subcommands
+-----------
+
+    claude-watch-ack add <message> [--source TAG] [--json]
+        Append an alert. Prints the new id (or JSON when --json).
+
+    claude-watch-ack list [--json]
+        Print pending alerts, one per line (id, age, source, message).
+        --json prints the full state dict.
+
+    claude-watch-ack ack <id>
+        Remove a single alert by id. Exit 0 if ack'd, exit 1 if id was
+        not found (printable to stderr).
+
+    claude-watch-ack ack --all
+        Remove every pending alert.
+
+    claude-watch-ack clear
+        Alias for `ack --all`.
+
+    claude-watch-ack status [--json]
+        Print "OK" + exit 0 when no alerts pending; print the count +
+        exit 1 when any are pending. The gate hook does NOT use this --
+        it reads the file directly to avoid an extra subprocess on every
+        tool call. `status` is for human / test invocations.
+
+Exit codes
+----------
+
+    0  success
+    1  no such alert (ack <missing-id>)
+    2  bad usage / argparse failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get(
+    "CLAUDE_WATCH_ALERT_STATE_DIR",
+    os.path.expanduser("~/.config/claude-watch"),
+))
+STATE_PATH = STATE_DIR / "pending-alerts.json"
+
+# Truncate stored messages so a giant injected banner doesn't blow up the
+# state file. The gate hook only needs id + short preview; the full text
+# stays in the tmux scrollback / claude-event log.
+MAX_MESSAGE_BYTES = 4096
+
+
+def _empty_state() -> dict:
+    return {"alerts": []}
+
+
+def _load_state() -> dict:
+    """Read the state file. Returns an empty state dict when the file is
+    missing or unreadable. Callers should NOT trust the returned dict
+    structure beyond `state["alerts"]` being a list.
+    """
+    if not STATE_PATH.exists():
+        return _empty_state()
+    try:
+        with STATE_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        # Corrupt file: don't blackhole. Return empty so the caller can
+        # write a fresh state on the next save.
+        return _empty_state()
+    if not isinstance(data, dict):
+        return _empty_state()
+    alerts = data.get("alerts")
+    if not isinstance(alerts, list):
+        data["alerts"] = []
+    return data
+
+
+def _save_state(state: dict) -> None:
+    """Atomic write to the state path with 0600 perms.
+
+    Writes to a sibling tmp file and `os.replace`s it into place so the
+    gate hook never sees a half-written file. Creates the parent dir
+    with mode 0700 when missing.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        # Best-effort -- we may not own the dir on a freshly bind-mounted
+        # container; the hook tolerates 0755 too.
+        pass
+    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, STATE_PATH)
+
+
+def _new_id() -> str:
+    """Generate a sortable, human-readable alert id.
+
+    Format: `alert-YYYYMMDD-HHMMSS-NNNN` where NNNN is a 4-digit random
+    suffix to avoid collisions when two alerts land in the same second.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    suffix = f"{random.randint(0, 9999):04d}"
+    return f"alert-{now}-{suffix}"
+
+
+def _truncate_message(msg: str) -> str:
+    if msg is None:
+        return ""
+    if not isinstance(msg, str):
+        msg = str(msg)
+    encoded = msg.encode("utf-8", errors="replace")
+    if len(encoded) <= MAX_MESSAGE_BYTES:
+        return msg
+    # Truncate at byte boundary and decode back, then suffix an ellipsis.
+    cut = encoded[:MAX_MESSAGE_BYTES].decode("utf-8", errors="ignore")
+    return cut + "...[truncated]"
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    state = _load_state()
+    alert_id = _new_id()
+    # Ensure uniqueness even within the same microsecond -- exceedingly
+    # rare but a clean append is cheap.
+    existing_ids = {a.get("id") for a in state["alerts"] if isinstance(a, dict)}
+    while alert_id in existing_ids:
+        alert_id = _new_id()
+    entry = {
+        "id": alert_id,
+        "message": _truncate_message(args.message),
+        "created_at": int(time.time()),
+        "source": args.source or "manual",
+    }
+    state["alerts"].append(entry)
+    _save_state(state)
+    if args.json:
+        print(json.dumps(entry, indent=2))
+    else:
+        print(alert_id)
+    return 0
+
+
+def _human_age(created_at: int) -> str:
+    delta = max(0, int(time.time()) - int(created_at))
+    if delta < 60:
+        return f"{delta}s"
+    if delta < 3600:
+        return f"{delta // 60}m{delta % 60:02d}s"
+    return f"{delta // 3600}h{(delta % 3600) // 60:02d}m"
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    state = _load_state()
+    if args.json:
+        print(json.dumps(state, indent=2))
+        return 0
+    alerts = state.get("alerts") or []
+    if not alerts:
+        print("(no pending claude-watch alerts)")
+        return 0
+    print(f"{len(alerts)} pending claude-watch alert(s):")
+    for a in alerts:
+        if not isinstance(a, dict):
+            continue
+        age = _human_age(a.get("created_at", 0))
+        source = a.get("source", "?")
+        preview = (a.get("message") or "").splitlines()[0][:120]
+        print(f"  {a.get('id')}  age={age}  source={source}")
+        if preview:
+            print(f"    {preview}")
+    return 0
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    state = _load_state()
+    alerts = state.get("alerts") or []
+    if args.all:
+        cleared = len(alerts)
+        state["alerts"] = []
+        _save_state(state)
+        print(f"ack'd {cleared} alert(s)")
+        return 0
+    if not args.alert_id:
+        print("claude-watch-ack: ack requires <id> or --all", file=sys.stderr)
+        return 2
+    new_alerts = [a for a in alerts if isinstance(a, dict) and a.get("id") != args.alert_id]
+    if len(new_alerts) == len(alerts):
+        print(f"claude-watch-ack: no such alert: {args.alert_id}", file=sys.stderr)
+        return 1
+    state["alerts"] = new_alerts
+    _save_state(state)
+    print(f"ack'd {args.alert_id}")
+    return 0
+
+
+def cmd_clear(args: argparse.Namespace) -> int:
+    """Alias for `ack --all`."""
+    args.all = True
+    args.alert_id = None
+    return cmd_ack(args)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    state = _load_state()
+    alerts = state.get("alerts") or []
+    pending = len([a for a in alerts if isinstance(a, dict)])
+    if args.json:
+        print(json.dumps({"pending": pending, "ok": pending == 0}))
+    if pending == 0:
+        if not args.json:
+            print("OK")
+        return 0
+    if not args.json:
+        print(f"BLOCKED: {pending} pending alert(s)")
+    return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="claude-watch-ack",
+        description="Track and ack pending claude-watch alerts. See "
+                    "pre-tool-claude-watch-alert-gate-hook for the gate "
+                    "that blocks tool calls while alerts are pending.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add", help="record a new pending alert")
+    p_add.add_argument("message", help="alert text (truncated to 4kB)")
+    p_add.add_argument("--source", default=None,
+                       help="tag for the alert source (e.g. user-prompt-hook)")
+    p_add.add_argument("--json", action="store_true",
+                       help="print the recorded entry as JSON")
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list", help="show pending alerts")
+    p_list.add_argument("--json", action="store_true",
+                        help="print the full state dict as JSON")
+    p_list.set_defaults(func=cmd_list)
+
+    p_ack = sub.add_parser("ack", help="acknowledge an alert")
+    p_ack.add_argument("alert_id", nargs="?", default=None,
+                       help="alert id to ack (omit + use --all to clear all)")
+    p_ack.add_argument("--all", action="store_true",
+                       help="ack every pending alert")
+    p_ack.set_defaults(func=cmd_ack)
+
+    p_clear = sub.add_parser("clear", help="ack every pending alert (alias for `ack --all`)")
+    p_clear.set_defaults(func=cmd_clear, all=True, alert_id=None)
+
+    p_status = sub.add_parser("status", help="exit 0 when clean, exit 1 when blocked")
+    p_status.add_argument("--json", action="store_true",
+                          help="print {pending, ok} JSON regardless of state")
+    p_status.set_defaults(func=cmd_status)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

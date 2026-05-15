@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""UserPromptSubmit hook -- records `[CLAUDE-WATCH]` injects as pending alerts.
+
+claude-watch fires alerts by injecting text into the in-container tmux
+pane via `tmux::inject_text(...)`. When that text is submitted, Claude
+Code fires the UserPromptSubmit hook with the prompt payload. This hook
+detects the canonical `[CLAUDE-WATCH]` banner prefix and records a new
+pending alert via `claude-watch-ack add`.
+
+The companion `pre-tool-claude-watch-alert-gate-hook` (PreToolUse) then
+DENIES every tool call until the alert is ack'd via
+`claude-watch-ack ack <id>`. This turns the soft prompt-layer guidance
+(baked-CLAUDE.md `claude-watch alerts` cardinal) into a hard tool-layer
+gate.
+
+Wiring (in container settings.json via generate-hooks-shim-settings)::
+
+    {
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "matcher": "*",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/usr/local/bin/user-prompt-claude-watch-alert-record-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+Detection contract
+------------------
+
+A prompt is treated as a claude-watch alert iff it CONTAINS the literal
+substring `[CLAUDE-WATCH]` anywhere in the body. We match anywhere (not
+just at the start) because claude-watch's inject pipeline (`tmux::
+inject_text`) sometimes prepends an `i` (insert-mode entry) or other
+escape-sequence noise; the literal banner marker is the stable signal.
+
+Detected prompts:
+  - `[CLAUDE-WATCH] Prolonged thinking detected...`
+  - `[CLAUDE-WATCH] CONTEXT CRITICALLY LOW...`
+  - `[CLAUDE-WATCH] WATCHER(S) DOWN...`
+  - `[CLAUDE-WATCH] AUTO-RESPAWN: dashboard relaunched...`
+  - `[CLAUDE-WATCH] watcher-down (inject suppressed: main loop active)...`
+
+All these strings live in `claude-watch/src/policy.rs` + `src/respawn.rs`.
+
+False-positive safety
+---------------------
+
+Operators copy-pasting a quoted alert (e.g. "the alert said `[CLAUDE-
+WATCH] ...`") will trip the hook. That's acceptable: an extra alert
+clears with one `claude-watch-ack ack <id>` call. The cost of a false
+record is tiny; the cost of a missed real alert (the v58 failure mode)
+is large.
+
+Default-open contract
+---------------------
+
+This hook NEVER blocks the prompt. The UserPromptSubmit hook contract
+allows DENY responses, but a denied user prompt is a poor experience and
+the gate's job is to deny the SUBSEQUENT tool calls, not the alert
+prompt itself. On any error (malformed input, missing claude-watch-ack
+CLI, subprocess failure, etc.), the hook logs to
+`~/.config/claude/claude-watch-alert-hook-errors.log` and exits 0.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+ERR_LOG_PATH = ERR_LOG_DIR / "claude-watch-alert-hook-errors.log"
+
+ALERT_MARKER = "[CLAUDE-WATCH]"
+
+
+def _log(payload: dict) -> None:
+    try:
+        ERR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        rec = {"ts": ts, "pid": os.getpid(), **payload}
+        with ERR_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        try:
+            ERR_LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _resolve_cli() -> str | None:
+    """Locate the claude-watch-ack CLI. Prefer PATH, fall back to a
+    sibling in the tools/ tree (when this hook is run uninstalled).
+    Returns None when not found -- caller treats that as silent no-op.
+    """
+    cli = shutil.which("claude-watch-ack")
+    if cli:
+        return cli
+    here = Path(__file__).resolve().parent
+    # tools/hooks/ -> tools/claude-watch-ack/claude-watch-ack
+    sibling = here.parent / "claude-watch-ack" / "claude-watch-ack"
+    if sibling.exists():
+        return str(sibling)
+    return None
+
+
+def _record_alert(message: str) -> None:
+    cli = _resolve_cli()
+    if not cli:
+        _log({"kind": "cli-missing"})
+        return
+    try:
+        subprocess.run(
+            [cli, "add", message, "--source", "user-prompt-hook"],
+            capture_output=True, text=True, timeout=4, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        _log({"kind": "cli-exception", "exc": str(e)})
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        # No-op: default-open + don't perturb the prompt path.
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+
+    # UserPromptSubmit payload shape (per Claude Code docs):
+    #   {"hook_event_name": "UserPromptSubmit", "prompt": "<text>", ...}
+    prompt = payload.get("prompt", "")
+    if not isinstance(prompt, str) or not prompt:
+        return 0
+    if ALERT_MARKER not in prompt:
+        return 0
+
+    _record_alert(prompt)
+    # Exit 0 unconditionally -- never block / mutate the prompt.
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _log({"kind": "uncaught", "exc": str(exc)})
+        except Exception:
+            pass
+        sys.exit(0)
