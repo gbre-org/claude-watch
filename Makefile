@@ -153,6 +153,7 @@ test-entrypoint:
 	container/tests/cw-watcher-supervisor-launches-claude-event-tail.test
 	container/tests/entrypoint-launches-supervisor.test
 	container/tests/watcher-monitor-disabled.test
+	container/tests/claude-bin-symlink-uid.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host

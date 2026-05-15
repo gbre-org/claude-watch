@@ -185,8 +185,19 @@ RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
 # is root-owned and auto-update fails with EACCES on `/usr/lib/node_modules/`,
 # which also blocks the native-install fallback because the updater detects
 # the existing `/usr/bin/claude` and tries to upgrade it in place.
+#
+# Also chown the /usr/bin/claude SYMLINK itself (-h: change ownership of the
+# link, not its target) to uid 1000. `npm install -g` upgrades unlink the
+# bin-script symlink + relink it to the new version dir; that unlink fails
+# with EACCES when the symlink's parent metadata is owned by root even
+# though the user can write the package tree. Symptom: `claude update`
+# reports "Insufficient permissions to install update / Try running with
+# sudo or fix npm permissions" while the package directory chown above
+# looks correct. Observed in-container 2026-05-15 with claude-code stuck
+# at 2.1.142 while the host successfully self-updated to 2.1.143.
 RUN npm install -g @anthropic-ai/claude-code \
-    && chown -R 1000:1000 /usr/lib/node_modules/@anthropic-ai
+    && chown -R 1000:1000 /usr/lib/node_modules/@anthropic-ai \
+    && chown -h 1000:1000 /usr/bin/claude
 
 # Bake the claude-watch Rust binary in from stage 1. Glibc compatibility is
 # guaranteed because the builder is `rust:1-bookworm` and this stage is

@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Tests for the /usr/bin/claude symlink ownership in the Dockerfile.
+
+Background: workbot-validated 2026-05-15 — the in-container claude-code
+was stuck at 2.1.142 while the host successfully auto-updated to 2.1.143.
+`claude update` reported:
+
+  Insufficient permissions to install update
+  Try running with sudo or fix npm permissions
+
+Ownership audit inside the running container showed:
+  /usr/lib/node_modules/@anthropic-ai/claude-code/  uid 1000  (OK — Dockerfile
+                                                                 already chowns)
+  /usr/lib/node_modules/@anthropic-ai/              uid 1000  (OK)
+  /usr/bin/claude  (symlink)                        uid 0     (root — BUG)
+
+`npm install -g` upgrades unlink the bin-script symlink + relink it to
+the new version dir; the unlink fails with EACCES when the symlink
+itself is owned by root, even though the package tree is uid-1000-
+writable. The fix is a one-liner: `chown -h hndrewaall:hndrewaall
+/usr/bin/claude` (the -h flag changes the symlink's own ownership, not
+its target).
+
+This test asserts the file-level wiring of that fix. It does NOT spin
+up a container (the runtime assertion is the operator's per-deploy
+`stat -c '%U:%G' /usr/bin/claude` check; this test guards against the
+chown -h line being deleted or refactored away in a future commit).
+
+Coverage:
+  1. Dockerfile contains a `chown -h ... /usr/bin/claude` line that
+     sets ownership to uid 1000 (`hndrewaall:hndrewaall` OR a numeric
+     `1000:1000` — both acceptable).
+  2. The chown -h line is ordered AFTER the `npm install -g
+     @anthropic-ai/claude-code` invocation that creates the symlink.
+     A chown that runs before the npm install would target a path that
+     doesn't exist yet and either fail the build or silently no-op
+     depending on the shell semantics.
+  3. The chown -h line is ordered AFTER (or coexists with) the
+     existing `chown -R 1000:1000 /usr/lib/node_modules/@anthropic-ai`
+     line, so a refactor that splits the chown calls into separate
+     RUN layers doesn't accidentally drop the symlink chown.
+
+Run:  ./claude-bin-symlink-uid.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    # 1. The chown -h line is present, targets /usr/bin/claude, and
+    #    sets ownership to uid 1000 (either by name `hndrewaall` or by
+    #    numeric `1000`).
+    chown_pat = re.compile(
+        r"chown\s+-h\s+(?:hndrewaall:hndrewaall|1000:1000)\s+/usr/bin/claude\b"
+    )
+    chown_match = chown_pat.search(df)
+    expect(
+        chown_match is not None,
+        "Dockerfile: missing `chown -h hndrewaall:hndrewaall /usr/bin/claude` "
+        "(or the equivalent `chown -h 1000:1000 /usr/bin/claude`). Without "
+        "this, the /usr/bin/claude symlink is owned by root, `npm install "
+        "-g` upgrades fail with EACCES on the symlink unlink+relink step, "
+        "and `claude update` reports 'Insufficient permissions to install "
+        "update'. The -h flag changes the symlink's ownership, not its "
+        "target. Workbot v67 diagnosis 2026-05-15.",
+    )
+
+    # 2. The chown -h line must come AFTER the `npm install -g
+    #    @anthropic-ai/claude-code` invocation that creates the
+    #    symlink — otherwise the chown targets a path that doesn't
+    #    exist yet.
+    npm_install_match = re.search(
+        r"npm\s+install\s+-g\s+@anthropic-ai/claude-code\b",
+        df,
+    )
+    expect(
+        npm_install_match is not None,
+        "Dockerfile: cannot locate the `npm install -g "
+        "@anthropic-ai/claude-code` line. If the package install moved "
+        "elsewhere, update this test to match.",
+    )
+
+    if chown_match and npm_install_match:
+        expect(
+            chown_match.start() > npm_install_match.start(),
+            "Dockerfile: `chown -h ... /usr/bin/claude` must appear AFTER "
+            "the `npm install -g @anthropic-ai/claude-code` line that "
+            "creates the symlink. Reordering would target a "
+            "not-yet-existing path and either fail the build or silently "
+            "no-op depending on shell semantics.",
+        )
+
+    # 3. The symlink chown must coexist with the existing package-tree
+    #    chown. Either both lines live in the same RUN layer (preferred:
+    #    one filesystem write, one cache invalidation surface) or the
+    #    symlink chown lives in a subsequent RUN. We assert presence of
+    #    BOTH chown lines so a future refactor that drops the package-
+    #    tree chown also surfaces here.
+    pkg_chown_match = re.search(
+        r"chown\s+-R\s+1000:1000\s+/usr/lib/node_modules/@anthropic-ai\b",
+        df,
+    )
+    expect(
+        pkg_chown_match is not None,
+        "Dockerfile: missing the existing `chown -R 1000:1000 "
+        "/usr/lib/node_modules/@anthropic-ai` line. The package-tree "
+        "chown and the symlink chown are companion fixes — both are "
+        "needed for `npm install -g` upgrades to succeed as uid 1000.",
+    )
+
+
+if failures:
+    print("FAIL claude-bin-symlink-uid.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS claude-bin-symlink-uid.test")
+sys.exit(0)
