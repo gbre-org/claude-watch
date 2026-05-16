@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""File-level test that the Dockerfile installs cron + sudo + the
+sudoers carve-out that lets the uid-1000 entrypoint start the cron
+daemon at container boot.
+
+The container ships cron but NO baked /etc/cron.d/ entries — the
+operator's recurring jobs land via a downstream image or a
+docker-compose.override.yml bind-mount of /etc/cron.d/. This test
+asserts the apt packages + sudoers grant + supporting plumbing all
+stay in place so the entrypoint's cron launch path doesn't silently
+break on a future refactor.
+
+Asserts:
+
+  1. Dockerfile installs the `cron` apt package.
+  2. Dockerfile installs the `sudo` apt package (needed for the
+     uid-1000 entrypoint to start cron as root).
+  3. Dockerfile writes /etc/sudoers.d/hndrewaall-cron granting
+     passwordless sudo for /usr/sbin/cron (NOPASSWD, no other
+     binaries broadened — narrow blast radius).
+  4. The sudoers carve-out also grants /bin/kill so the cleanup
+     trap in entrypoint.sh can signal the root-owned cron daemon
+     on docker stop.
+  5. The sudoers file is created with mode 0440 (sudoers refuses to
+     read world-readable files; 0440 is the canonical convention).
+
+Run:  ./cron-installed.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.is_file():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    # 1. cron apt package.
+    expect(
+        re.search(r"^\s+cron\s*\\?\s*$", text, re.MULTILINE) is not None,
+        "Dockerfile: must install the `cron` apt package so the "
+        "in-container cron daemon is available at boot. Without it "
+        "the entrypoint's cron launch path silently no-ops (the "
+        "`command -v /usr/sbin/cron` guard returns false) and any "
+        "operator-supplied /etc/cron.d/ entries never fire.",
+    )
+
+    # 2. sudo apt package.
+    expect(
+        re.search(r"^\s+sudo\s*\\?\s*$", text, re.MULTILINE) is not None,
+        "Dockerfile: must install the `sudo` apt package — the "
+        "uid-1000 entrypoint uses `sudo -n /usr/sbin/cron` to start "
+        "cron as root via the sudoers carve-out below.",
+    )
+
+    # 3. sudoers carve-out for cron.
+    expect(
+        "hndrewaall ALL=(root) NOPASSWD: /usr/sbin/cron" in text,
+        "Dockerfile: must add a sudoers entry granting hndrewaall "
+        "passwordless sudo for /usr/sbin/cron only. The narrow "
+        "carve-out lets the uid-1000 entrypoint start the cron "
+        "daemon without broadening sudo access to other binaries.",
+    )
+
+    # 4. sudoers carve-out for kill (so cleanup trap can signal the
+    #    root-owned cron daemon on docker stop).
+    expect(
+        "hndrewaall ALL=(root) NOPASSWD: /bin/kill" in text,
+        "Dockerfile: must add a sudoers entry granting hndrewaall "
+        "passwordless sudo for /bin/kill. Without it the cleanup "
+        "trap in entrypoint.sh can't signal the root-owned cron "
+        "daemon on docker stop, and cron sticks around as a zombie "
+        "for tini to reap rather than draining its in-flight jobs.",
+    )
+
+    # 5. sudoers file lands at /etc/sudoers.d/hndrewaall-cron with
+    #    mode 0440. sudoers refuses to read world-readable files.
+    expect(
+        "/etc/sudoers.d/hndrewaall-cron" in text,
+        "Dockerfile: must drop the sudoers entry into "
+        "/etc/sudoers.d/hndrewaall-cron (the canonical /etc/sudoers.d/ "
+        "location). Inline edits to /etc/sudoers are not safe because "
+        "a parse error there bricks all sudo access.",
+    )
+    expect(
+        re.search(
+            r"chmod\s+0?440\s+/etc/sudoers\.d/hndrewaall-cron",
+            text,
+        )
+        is not None,
+        "Dockerfile: sudoers file must be chmod 0440 — sudoers "
+        "refuses to read world-readable files, and 0440 is the "
+        "canonical convention.",
+    )
+
+
+if failures:
+    print("FAIL cron-installed.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS cron-installed.test")
+sys.exit(0)

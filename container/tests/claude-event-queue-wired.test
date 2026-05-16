@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""File-level test that the claude-event spool bridging is wired
+end-to-end (mirror bind-mount + in-container CLAUDE_EVENT_QUEUE env
+passthrough).
+
+Background: the in-container claude-event-tail watcher reads JSON
+events from `$CLAUDE_EVENT_QUEUE` (or `$HOME/claude-events` as a
+fallback). The compose stack uses a same-path-on-both-sides mirror
+bind-mount of the operator's host spool — when the operator sets
+`CLAUDE_HOST_EVENTS_DIR=/path/to/spool`, the host path is bound to
+the SAME path inside the container, AND the same value is forwarded
+as `CLAUDE_EVENT_QUEUE` in the container environment so the watcher
++ the in-container claude-event CLI both resolve to that path. This
+sidesteps the q-d64b foot-gun where `sudo docker compose up` would
+resolve `${HOME}` to /root and silently bridge to /root/claude-events
+instead of the operator's actual spool.
+
+This test pins the wiring in source so a refactor that drops either
+the bind-mount or the env passthrough fails CI here instead of at
+runtime (where the symptom is silent: the watcher reports zero
+events, the operator wonders why their host cron jobs don't reach
+the in-container session).
+
+Asserts:
+
+  1. docker-compose.yml's claude-container service `environment:`
+     block forwards CLAUDE_EVENT_QUEUE from CLAUDE_HOST_EVENTS_DIR.
+  2. The bind-mount source and destination both reference
+     `${CLAUDE_HOST_EVENTS_DIR:-/dev/null}` (mirror pattern, matching
+     CLAUDE_HOST_HOOKS_DIR / CLAUDE_HOST_PROJECT_DIR shape).
+  3. .env.example documents the new mirror pattern (no longer the
+     legacy `$HOME/claude-events` default) and explains the sudo
+     `${HOME}` foot-gun motivation.
+
+Run:  ./claude-event-queue-wired.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent.parent
+
+COMPOSE = REPO_ROOT / "examples" / "compose" / "docker-compose.yml"
+ENV_EXAMPLE = REPO_ROOT / "examples" / "compose" / ".env.example"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. CLAUDE_EVENT_QUEUE env passthrough in the claude-container
+#    service block.
+expect(COMPOSE.is_file(), f"docker-compose.yml missing at {COMPOSE}")
+if COMPOSE.is_file():
+    text = COMPOSE.read_text(encoding="utf-8")
+    # The env var should be set to ${CLAUDE_HOST_EVENTS_DIR:-} (empty
+    # default — when unset, the in-container watcher falls back to its
+    # own $HOME/claude-events default rather than getting redirected
+    # to a bogus path).
+    expect(
+        re.search(
+            r"CLAUDE_EVENT_QUEUE:\s*\$\{CLAUDE_HOST_EVENTS_DIR:-\}",
+            text,
+        )
+        is not None,
+        "docker-compose.yml: claude-container `environment:` block "
+        "must forward CLAUDE_EVENT_QUEUE from "
+        "${CLAUDE_HOST_EVENTS_DIR:-}. Without the passthrough, the "
+        "in-container claude-event-tail keeps reading from the "
+        "container-default $HOME/claude-events (= /home/hndrewaall/"
+        "claude-events) instead of the operator's mirrored spool — "
+        "the bind-mount lands events at a path the watcher never "
+        "looks at, and surfacing silently breaks.",
+    )
+
+    # 2. Mirror bind-mount: source == destination, both reference
+    #    CLAUDE_HOST_EVENTS_DIR with /dev/null default.
+    mirror_re = re.search(
+        r'"\$\{CLAUDE_HOST_EVENTS_DIR:-/dev/null\}'
+        r":\$\{CLAUDE_HOST_EVENTS_DIR:-/dev/null\}:rw\"",
+        text,
+    )
+    expect(
+        mirror_re is not None,
+        "docker-compose.yml: claude-event spool bind-mount must use "
+        "the same-path-on-both-sides mirror pattern "
+        "`${CLAUDE_HOST_EVENTS_DIR:-/dev/null}:"
+        "${CLAUDE_HOST_EVENTS_DIR:-/dev/null}:rw` (matching "
+        "CLAUDE_HOST_HOOKS_DIR / CLAUDE_HOST_PROJECT_DIR shape). "
+        "The legacy `${HOME}/claude-events:/home/hndrewaall/"
+        "claude-events` shape silently bridges to /root/claude-events "
+        "when `sudo docker compose up` resolves ${HOME} to /root.",
+    )
+
+# 3. .env.example documents the new pattern.
+expect(ENV_EXAMPLE.is_file(), f".env.example missing at {ENV_EXAMPLE}")
+if ENV_EXAMPLE.is_file():
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    expect(
+        "CLAUDE_HOST_EVENTS_DIR" in text,
+        ".env.example: must document CLAUDE_HOST_EVENTS_DIR — "
+        "operators reading the .env template should be able to find "
+        "the operator-side wiring for claude-event spool bridging.",
+    )
+    # The new docs should mention the sudo / ${HOME} foot-gun
+    # motivation so a future operator hitting `sudo docker compose
+    # up` doesn't repeat the q-d64b investigation.
+    expect(
+        re.search(r"sudo\s+docker\s+compose", text) is not None,
+        ".env.example: should mention the `sudo docker compose up` "
+        "foot-gun (${HOME} resolves to /root) in the "
+        "CLAUDE_HOST_EVENTS_DIR documentation — without that "
+        "context, an operator who hits the same silent-bridge "
+        "failure has to re-derive the q-d64b investigation from "
+        "scratch.",
+    )
+
+
+if failures:
+    print("FAIL claude-event-queue-wired.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS claude-event-queue-wired.test")
+sys.exit(0)

@@ -162,6 +162,17 @@ services:
       # containers with no internet risk. The entrypoint appends
       # --dangerously-skip-permissions to the claude argv when set.
       CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS: ${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}
+      # CLAUDE_EVENT_QUEUE — in-container override for where the
+      # claude-event-tail watcher looks for event JSON files (and
+      # where the in-container claude-event CLI writes to). Wired to
+      # the same operator-supplied path as the bind-mount source/dest
+      # below, so the host writer and the in-container reader hit the
+      # SAME absolute directory regardless of what each side calls
+      # $HOME. Empty / unset = the in-container watcher falls through
+      # to its default of $HOME/claude-events (= /home/hndrewaall/
+      # claude-events inside the container), preserving the legacy
+      # shape for operators who don't bridge the host spool.
+      CLAUDE_EVENT_QUEUE: ${CLAUDE_HOST_EVENTS_DIR:-}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in
@@ -247,11 +258,33 @@ services:
       # mount being RW lets the operator add / remove the symlink itself
       # in the same workflow.
       - "${CLAUDE_HOST_BIN_DIR:-${HOME}/bin}:/home/hndrewaall/bin:rw"
-      # ~/claude-events — rw: claude-event JSONL spool. Host cron /
-      # alertmanager / queue producers write here; the in-container
-      # claude-event-watch reads + acks them. rw because the watcher
-      # rewrites/truncates the spool as it consumes events.
-      - "${CLAUDE_HOST_EVENTS_DIR:-${HOME}/claude-events}:/home/hndrewaall/claude-events:rw"
+      # claude-event spool — rw. Host cron / alertmanager / queue
+      # producers write here; the in-container claude-event-tail reads
+      # + consumes them. Same-path-on-both-sides mirror so the spool
+      # resolves to the SAME absolute path inside and out — the
+      # in-container claude-event-tail picks the path up via the
+      # CLAUDE_EVENT_QUEUE env var (set in the environment: block
+      # above from the same CLAUDE_HOST_EVENTS_DIR value), so the host
+      # writer and container reader hit the same directory regardless
+      # of what each side calls $HOME.
+      #
+      # Why mirror (and not the legacy ${HOME}/claude-events → fixed
+      # /home/hndrewaall/claude-events shape): when the operator
+      # invokes `sudo docker compose up`, Compose resolves ${HOME} to
+      # /root, so the legacy default silently bridged to
+      # /root/claude-events on the host — not the operator's actual
+      # spool. The mirror pattern eliminates the ${HOME}-resolution
+      # foot-gun: the operator sets CLAUDE_HOST_EVENTS_DIR explicitly
+      # and both sides of the bind-mount + the in-container env var
+      # all use the same literal path.
+      #
+      # Default /dev/null (graceful no-op) when CLAUDE_HOST_EVENTS_DIR
+      # is unset — matches the CLAUDE_HOST_HOOKS_DIR / project-dir /
+      # managed-settings patterns above. Operators who want claude-
+      # event bridging set the env var in their .env file or
+      # docker-compose.override.yml; unset operators get a stripped-
+      # down container with no host claude-event integration.
+      - "${CLAUDE_HOST_EVENTS_DIR:-/dev/null}:${CLAUDE_HOST_EVENTS_DIR:-/dev/null}:rw"
       # Operator-specific host paths (gh CLI token, gitconfig, ssh-agent
       # socket, work-private bare-repo paths, etc.) are intentionally
       # NOT wired here. Drop them in a local

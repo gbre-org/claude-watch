@@ -317,14 +317,52 @@ if m is not None:
         f"shell. Got mode={mode!r} in {raw!r}",
     )
 
-# 5. ~/claude-events bind-mount RW.
-m = find_by_dest(claude_volumes, "/home/hndrewaall/claude-events")
-expect(m is not None, "claude-container missing /home/hndrewaall/claude-events bind-mount")
-if m is not None:
-    raw, mode = m
+# 5. CLAUDE_HOST_EVENTS_DIR bind-mount RW (same-path-on-both-sides
+#    mirror; in-container watcher picks the path up via
+#    CLAUDE_EVENT_QUEUE env). The mount is identified by the
+#    CLAUDE_HOST_EVENTS_DIR env-var reference (the raw string) since
+#    the source and destination are both `${CLAUDE_HOST_EVENTS_DIR:-/dev/null}`.
+events_entry = None
+for raw, mode in claude_volumes:
+    if "CLAUDE_HOST_EVENTS_DIR" in raw:
+        events_entry = (raw, mode)
+        break
+expect(
+    events_entry is not None,
+    "claude-container missing CLAUDE_HOST_EVENTS_DIR bind-mount "
+    "(claude-event spool bridging). The mirror pattern eliminates "
+    "the legacy ${HOME}-resolution foot-gun where `sudo docker "
+    "compose up` resolved ${HOME} to /root and silently bridged to "
+    "/root/claude-events; see the env block + .env.example for the "
+    "operator-side wiring.",
+)
+if events_entry is not None:
+    raw, mode = events_entry
     expect(
         mode in ("rw", "default"),
-        f"~/claude-events must be RW (claude-event-watch consumes + acks); got mode={mode!r}",
+        f"CLAUDE_HOST_EVENTS_DIR mount must be RW (claude-event-tail "
+        f"consumes events by reading + deleting the JSON files); got mode={mode!r}",
+    )
+    # Mirror pattern: source == destination so the same absolute path
+    # resolves on both sides. Asserts the foot-gun fix stays in
+    # place — a future refactor that re-introduces the fixed
+    # `/home/hndrewaall/claude-events` destination shape would
+    # re-open the `${HOME}` resolution bug for `sudo docker compose
+    # up` operators.
+    src, dst, _ = split_volume(raw)
+    expect(
+        src == dst,
+        f"CLAUDE_HOST_EVENTS_DIR mount must be same-path-on-both-sides "
+        f"(mirror pattern, matching CLAUDE_HOST_HOOKS_DIR / "
+        f"CLAUDE_HOST_PROJECT_DIR shape) so the in-container watcher "
+        f"sees the same absolute path the host writer does without a "
+        f"${{HOME}}-resolution dance. Got src={src!r} dst={dst!r}",
+    )
+    expect(
+        "/dev/null" in src,
+        f"CLAUDE_HOST_EVENTS_DIR mount source must default to /dev/null "
+        f"(graceful no-op when the operator hasn't set the env var, "
+        f"matching the CLAUDE_HOST_HOOKS_DIR pattern). Got src={src!r}",
     )
 
 # 6. ~/.config/session bind-mount RW.

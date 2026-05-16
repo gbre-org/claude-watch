@@ -72,7 +72,66 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 \
         procps \
         inotify-tools \
+        cron \
+        sudo \
     && rm -rf /var/lib/apt/lists/*
+
+# Passwordless-sudo for uid 1000 to launch the cron daemon. The
+# entrypoint runs as uid 1000 (per the image-level USER directive
+# below) but cron must run as root to read /etc/cron.d/, manage
+# /var/spool/cron/crontabs/, and setuid() into the user named in
+# each crontab line. Granting passwordless sudo for ONLY the cron
+# binary keeps the blast radius minimal: the in-container claude /
+# operator can't sudo arbitrary commands, only start the cron
+# daemon (which the entrypoint already does at boot). The sudoers
+# entry uses NOPASSWD because the entrypoint is non-interactive and
+# nothing in the container has a hndrewaall password set anyway.
+#
+# Why not "drop USER, exec as root, gosu to uid 1000 at the end":
+# the rest of the image / entrypoint / spawned watchers + daemons
+# is built assuming the entrypoint and every child are uid 1000
+# (claude-watch daemon, watcher supervisor, MCP subprocesses,
+# tmux session, npm-global). A USER flip would require auditing
+# every spawn site for re-entrancy as the wrong uid. The narrow
+# sudo-for-cron carve-out is the minimum-change shape that lets
+# cron start without disturbing any existing uid-1000 invariant.
+RUN printf '%s\n%s\n' \
+        'hndrewaall ALL=(root) NOPASSWD: /usr/sbin/cron' \
+        'hndrewaall ALL=(root) NOPASSWD: /bin/kill' \
+        > /etc/sudoers.d/hndrewaall-cron \
+    && chmod 0440 /etc/sudoers.d/hndrewaall-cron
+
+# cron — Debian's vixie-cron daemon for in-container recurring jobs.
+#
+# The image ships cron installed but NO /etc/cron.d/ entries baked in.
+# Operator-side jobs (e.g. a `cron-tv-check` that emits a claude-event
+# for the in-container watcher to surface) belong to the operator's
+# private downstream image or docker-compose.override.yml bind-mount,
+# not the public claude-watch artifact — homelab jobs reference
+# absolute paths to host-side scripts (`/home/<user>/bin/...`) that
+# don't exist on a generic workbot, and one operator's recurring-job
+# layout doesn't carry to another's host.
+#
+# Operator wiring shape (private downstream / override):
+#
+#   services:
+#     claude-container:
+#       volumes:
+#         - "/path/to/host/cron.d/:/etc/cron.d/:ro"
+#
+# The entrypoint starts the cron daemon at container boot regardless
+# of whether /etc/cron.d/ is populated — an empty cron.d is a
+# no-op (zero jobs to run) but the daemon is ready as soon as the
+# operator bind-mounts entries in. Jobs run as whichever user the
+# crontab entry specifies (the cron daemon itself runs as root in
+# the container's PID namespace so it can `su` into any user the
+# operator chooses to schedule under).
+#
+# Entries that drop claude-event JSON into the spool (via the
+# in-container `claude-event` CLI, which honors CLAUDE_EVENT_QUEUE)
+# flow to the in-container claude-event-tail watcher automatically —
+# the cron daemon, the spool dir, and the watcher all live in the
+# same container so no cross-process IPC is needed.
 
 # Node.js via NodeSource (LTS 20.x) — Claude Code CLI requires Node >= 20.
 # Bookworm's apt nodejs is too old. In Phase 1+ this install path is replaced

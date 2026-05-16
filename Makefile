@@ -152,6 +152,9 @@ test-entrypoint:
 	container/tests/cw-watcher-supervisor-installed.test
 	container/tests/cw-watcher-supervisor-launches-claude-event-tail.test
 	container/tests/entrypoint-launches-supervisor.test
+	container/tests/cron-installed.test
+	container/tests/entrypoint-launches-cron.test
+	container/tests/claude-event-queue-wired.test
 	container/tests/watcher-monitor-disabled.test
 	container/tests/claude-bin-symlink-uid.test
 	container/tests/npm-install-as-uid-1000.test

@@ -326,6 +326,17 @@ cleanup() {
     if [ -n "${CW_WATCHER_SUPERVISOR_PID:-}" ]; then
         kill "${CW_WATCHER_SUPERVISOR_PID}" 2>/dev/null || true
     fi
+    # Same shape for the cron daemon: detached via setsid + sudo, so
+    # tini won't reach it via process-group signalling. cron honors
+    # SIGTERM by exiting cleanly (it drains in-flight scheduled jobs
+    # then exits). The kill uses `sudo` to send the signal because
+    # the daemon runs as root (uid 1000 can't signal root processes
+    # without CAP_KILL). Best-effort: a failed kill (cron already
+    # dead, sudoers carve-out somehow gone) is silently dropped so
+    # cleanup doesn't block container shutdown.
+    if [ -n "${CLAUDE_CRON_PID:-}" ]; then
+        sudo -n kill "${CLAUDE_CRON_PID}" 2>/dev/null || true
+    fi
     exit 0
 }
 trap cleanup TERM INT
@@ -373,6 +384,53 @@ if [ "${CLAUDE_CONTAINER_WATCHER_SUPERVISOR:-1}" != "0" ] \
         >>/tmp/claude-container-watchers/supervisor.log 2>&1 </dev/null &
     CW_WATCHER_SUPERVISOR_PID=$!
     echo "[entrypoint] spawned cw-watcher-supervisor (pid $CW_WATCHER_SUPERVISOR_PID, log /tmp/claude-container-watchers/supervisor.log)" >&2
+fi
+
+# CLAUDE_CONTAINER_CRON — in-container cron daemon (default ON).
+#
+# When != "0", start the Debian vixie-cron daemon as root via the
+# sudoers carve-out (see Dockerfile `hndrewaall-cron` sudoers entry).
+# The daemon reads /etc/cron.d/, /etc/crontab, and per-user crontabs
+# from /var/spool/cron/crontabs/ and dispatches scheduled jobs. The
+# image bakes NO /etc/cron.d/ entries by default — the daemon starts
+# with an empty schedule, ready to pick up operator-supplied jobs
+# bind-mounted into /etc/cron.d/ via docker-compose.override.yml or
+# baked into a downstream image.
+#
+# Operator wiring (private downstream / override):
+#
+#   services:
+#     claude-container:
+#       volumes:
+#         - "/path/to/host/cron.d/:/etc/cron.d/:ro"
+#
+# cron jobs that emit claude-event JSON (via the in-container
+# `claude-event` CLI, which honors CLAUDE_EVENT_QUEUE) feed the
+# in-container claude-event-tail watcher with zero cross-process IPC
+# — daemon, spool, and watcher all live in the same container.
+#
+# Set CLAUDE_CONTAINER_CRON=0 in .env to skip the daemon launch
+# (validation harnesses, stripped-down containers, etc.). cron's
+# absence is a silent no-op for everything else in the stack.
+#
+# Logs land at /tmp/claude-container-cron.log — operator inspects via
+# `docker compose exec <c> cat /tmp/claude-container-cron.log`. cron
+# itself prints scheduling decisions + child stderr to syslog; the
+# `-L 15` flag enables LOG_INFO+LOG_NOTICE+LOG_WARNING and routes
+# them to stdout/stderr (capture-able by the tee below) instead of
+# requiring an in-container syslogd.
+if [ "${CLAUDE_CONTAINER_CRON:-1}" != "0" ] \
+        && command -v sudo >/dev/null 2>&1 \
+        && [ -x /usr/sbin/cron ]; then
+    : > /tmp/claude-container-cron.log 2>/dev/null || true
+    # `-f` keeps cron in the foreground (we want our own background
+    # via &, not cron's built-in self-daemonize fork which would lose
+    # the PID we need for the cleanup trap). `-L 15` routes scheduling
+    # logs to stderr so the log file captures them.
+    nohup setsid sudo -n /usr/sbin/cron -f -L 15 \
+        >>/tmp/claude-container-cron.log 2>&1 </dev/null &
+    CLAUDE_CRON_PID=$!
+    echo "[entrypoint] spawned cron daemon (pid $CLAUDE_CRON_PID, log /tmp/claude-container-cron.log)" >&2
 fi
 
 # Build the tmux session. Start detached so we can configure panes before
