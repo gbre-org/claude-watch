@@ -132,6 +132,127 @@ pub fn is_service_process(pid: &str) -> bool {
     false
 }
 
+/// Deployment mode for a Claude Code agent process, used to decide which
+/// interruption channel to use.
+///
+/// See `docs/sse-protocol.md` for the full discussion of why the panel-mode
+/// case has no out-of-process inject path.
+///
+/// `#[allow(dead_code)]` on this enum and the helpers below: this is a
+/// building block landed alongside the SSE-protocol investigation doc.
+/// First in-tree callsite will be the inject-suppression check in
+/// `policy.rs` (planned in a follow-up — keeping this PR scoped to
+/// detection + docs so reviewers can inspect the protocol findings before
+/// any behavior changes ride along). Tests below cover the predicate
+/// surface end-to-end so the helpers don't bit-rot in the meantime.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDeploymentMode {
+    /// Claude is running in a pty (terminal mode). `tmux send-keys` into
+    /// the controlling pane is the correct injection channel. Covers:
+    /// - Native CLI invocations (`claude` from any shell).
+    /// - VSCode integrated terminal running `claude` directly or attached
+    ///   to a tmux session that runs `claude`.
+    /// - The workbot container's tmux-hosted claude.
+    Terminal,
+    /// Claude was spawned by an IDE extension (e.g. VSCode panel mode)
+    /// with `stdio: ["pipe","pipe",...]`. The extension owns the stdin
+    /// pipe; there is no out-of-process input channel. tmux-inject is a
+    /// silent no-op in this mode. For the alternatives, see the
+    /// "Implications for claude-watch" section of
+    /// `docs/sse-protocol.md`.
+    IdePanel,
+    /// Detection failed (process gone, permission denied, etc.). Caller
+    /// should default to Terminal behavior (the historical default) since
+    /// it's strictly broader than IdePanel.
+    Unknown,
+}
+
+/// Read the env block for a process from /proc/PID/environ.
+///
+/// Returns `None` if the file is unreadable (permission, gone, etc.).
+/// The returned string is the raw NUL-separated env block — call
+/// `env_contains_key` to check for a specific key without parsing.
+#[allow(dead_code)]
+pub fn get_pid_environ(pid: &str) -> Option<Vec<u8>> {
+    let path = format!("/proc/{}/environ", pid);
+    std::fs::read(&path).ok()
+}
+
+/// Check whether a raw NUL-separated env block contains the named key
+/// with any value. Matches whole-key (must be preceded by NUL or be the
+/// first byte, followed by '=').
+#[allow(dead_code)]
+pub fn env_contains_key(environ: &[u8], key: &str) -> bool {
+    let needle = format!("{}=", key);
+    let needle_b = needle.as_bytes();
+    if environ.starts_with(needle_b) {
+        return true;
+    }
+    let mut hay = environ;
+    while let Some(pos) = hay.iter().position(|&b| b == 0) {
+        if pos + 1 >= hay.len() {
+            return false;
+        }
+        let rest = &hay[pos + 1..];
+        if rest.starts_with(needle_b) {
+            return true;
+        }
+        hay = rest;
+    }
+    false
+}
+
+/// Resolve /proc/PID/fd/0 to its target and classify it.
+///
+/// Returns:
+/// - `Some(true)` if stdin is a pty (target starts with `/dev/pts/` or
+///   exactly `/dev/tty`).
+/// - `Some(false)` if stdin is a pipe / socket / regular file (target
+///   like `pipe:[12345]`, `socket:[...]`, or a path that's not a pty).
+/// - `None` if the symlink can't be read.
+#[allow(dead_code)]
+pub fn stdin_is_pty(pid: &str) -> Option<bool> {
+    let path = format!("/proc/{}/fd/0", pid);
+    let target = std::fs::read_link(&path).ok()?;
+    let s = target.to_string_lossy();
+    Some(s.starts_with("/dev/pts/") || s == "/dev/tty")
+}
+
+/// Determine the deployment mode of an agent process.
+///
+/// The check order:
+/// 1. If stdin is a pty → Terminal. This catches every CLI launch,
+///    including those connected to a VSCode-extension MCP server via
+///    `/ide` (which sets CLAUDE_CODE_SSE_PORT but keeps stdin as a tty).
+/// 2. If stdin is a pipe AND `CLAUDE_CODE_SSE_PORT` is in the env →
+///    IdePanel. The combination is the signature of an extension
+///    spawning the agent with piped stdio.
+/// 3. If stdin is a pipe but no SSE port → Terminal (some unusual CLI
+///    invocation with stdin redirected, e.g. `claude < script.txt`).
+///    Falling back to Terminal here is the safer default — tmux-inject
+///    is harmless on a process that won't see it, while incorrectly
+///    classifying as IdePanel would suppress a legitimate interrupt.
+/// 4. Anything else → Unknown.
+#[allow(dead_code)]
+pub fn agent_deployment_mode(pid: &str) -> AgentDeploymentMode {
+    match stdin_is_pty(pid) {
+        Some(true) => AgentDeploymentMode::Terminal,
+        Some(false) => {
+            let environ = match get_pid_environ(pid) {
+                Some(e) => e,
+                None => return AgentDeploymentMode::Unknown,
+            };
+            if env_contains_key(&environ, "CLAUDE_CODE_SSE_PORT") {
+                AgentDeploymentMode::IdePanel
+            } else {
+                AgentDeploymentMode::Terminal
+            }
+        }
+        None => AgentDeploymentMode::Unknown,
+    }
+}
+
 /// Check if a task's output file content matches known service signatures.
 ///
 /// Fallback detection for orphaned processes whose parent chain is broken.
@@ -197,5 +318,78 @@ mod tests {
     fn test_is_service_output_no_file() {
         let dir = Path::new("/tmp/nonexistent-task-watch-test");
         assert!(!is_service_output(dir, "fake-task-id"));
+    }
+
+    #[test]
+    fn test_env_contains_key_at_start() {
+        let env = b"CLAUDE_CODE_SSE_PORT=43473\0HOME=/home/test\0";
+        assert!(env_contains_key(env, "CLAUDE_CODE_SSE_PORT"));
+    }
+
+    #[test]
+    fn test_env_contains_key_in_middle() {
+        let env = b"PATH=/usr/bin\0CLAUDE_CODE_SSE_PORT=12345\0HOME=/home/test\0";
+        assert!(env_contains_key(env, "CLAUDE_CODE_SSE_PORT"));
+    }
+
+    #[test]
+    fn test_env_contains_key_at_end() {
+        let env = b"PATH=/usr/bin\0HOME=/home/test\0CLAUDE_CODE_SSE_PORT=9999\0";
+        assert!(env_contains_key(env, "CLAUDE_CODE_SSE_PORT"));
+    }
+
+    #[test]
+    fn test_env_contains_key_absent() {
+        let env = b"PATH=/usr/bin\0HOME=/home/test\0";
+        assert!(!env_contains_key(env, "CLAUDE_CODE_SSE_PORT"));
+    }
+
+    #[test]
+    fn test_env_contains_key_substring_not_a_match() {
+        // A var named MY_CLAUDE_CODE_SSE_PORT_ALT should not match
+        // CLAUDE_CODE_SSE_PORT — the helper must require whole-key match.
+        let env = b"MY_CLAUDE_CODE_SSE_PORT_ALT=oops\0HOME=/home/test\0";
+        assert!(!env_contains_key(env, "CLAUDE_CODE_SSE_PORT"));
+    }
+
+    #[test]
+    fn test_env_contains_key_empty_value() {
+        let env = b"CLAUDE_CODE_SSE_PORT=\0HOME=/home/test\0";
+        assert!(env_contains_key(env, "CLAUDE_CODE_SSE_PORT"));
+    }
+
+    #[test]
+    fn test_env_contains_key_empty_environ() {
+        assert!(!env_contains_key(b"", "CLAUDE_CODE_SSE_PORT"));
+    }
+
+    #[test]
+    fn test_env_contains_key_no_trailing_nul() {
+        // Real /proc/PID/environ ends in NUL; defensive case for one
+        // without a final NUL terminator.
+        let env = b"PATH=/usr/bin\0CLAUDE_CODE_SSE_PORT=42";
+        assert!(env_contains_key(env, "CLAUDE_CODE_SSE_PORT"));
+    }
+
+    #[test]
+    fn test_agent_deployment_mode_unknown_for_bogus_pid() {
+        // /proc/0 / /proc/-1 won't resolve. Function should return Unknown.
+        let m = agent_deployment_mode("99999999");
+        assert_eq!(m, AgentDeploymentMode::Unknown);
+    }
+
+    #[test]
+    fn test_agent_deployment_mode_self_is_terminal_or_unknown() {
+        // The test process is running under cargo nextest / cargo test; its
+        // stdin may be a pty (interactive test run) or a pipe (CI). Either
+        // way, it doesn't have CLAUDE_CODE_SSE_PORT set, so the result
+        // must be Terminal or Unknown — never IdePanel.
+        let pid = std::process::id().to_string();
+        let m = agent_deployment_mode(&pid);
+        assert_ne!(
+            m,
+            AgentDeploymentMode::IdePanel,
+            "test process must not be classified as IdePanel"
+        );
     }
 }
