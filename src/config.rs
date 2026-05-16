@@ -430,7 +430,27 @@ fn default_cooldown_hours() -> u64 {
 }
 
 fn default_update_resume_prompt() -> String {
-    "resume".to_string()
+    // Post-restart injection: bare "resume" wasn't enough — after a
+    // claude-watch auto-update restart, any subagent that was running
+    // at /exit time is orphaned (its tmux pane is gone, its
+    // `claude-watch active-agents` entry is stale), but its queue item
+    // is still marked running and its PR (if any) is still open. The
+    // main loop has to discover those orphans before resuming normal
+    // dispatch, or in-flight PR-shipping work sits unmerged until
+    // something external (WorkQueueOrphaned alert, Andrew) flags it.
+    //
+    // This prompt directs the main loop to: (1) run its normal
+    // session-resume entry, (2) audit `session-task queue list` for
+    // running items, (3) for each orphaned repo-scope item recover
+    // via PR-state probe (green CI → merge agent; no PR → abandon),
+    // (4) leave workload:* items alone (they survive restarts by
+    // design), then (5) resume normal dispatch. Single line so
+    // tmux-inject's vim-mode dd/i pipeline handles it atomically.
+    //
+    // 2026-05-15: q-6477 PR #203 sat green-and-unmerged for ~30 min
+    // post-restart until WorkQueueOrphaned fired; this prompt makes
+    // that recovery deterministic instead of alert-driven.
+    "post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id>` (reason: agent orphaned across restart). Then resume normal dispatch.".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1244,10 +1264,81 @@ cooldown = 300
         assert!(!config.auto_update.enabled);
         assert_eq!(config.auto_update.check_minute, 10);
         assert_eq!(config.auto_update.cooldown_hours, 1);
-        assert_eq!(config.auto_update.resume_prompt, "resume");
+        // Default post-restart prompt instructs orphan-recovery (not bare
+        // "resume" — see default_update_resume_prompt()). Pin a stable
+        // anchor substring rather than the full text so updates to the
+        // procedure prose don't churn this assertion; the dedicated
+        // test_default_update_resume_prompt_includes_orphan_recovery
+        // test below pins the full shape.
+        assert!(
+            config
+                .auto_update
+                .resume_prompt
+                .contains("post-restart recovery"),
+            "default resume_prompt should begin the post-restart recovery checklist, got: {}",
+            config.auto_update.resume_prompt
+        );
         // reauth defaults should also be applied
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
+    }
+
+    #[test]
+    fn test_default_update_resume_prompt_includes_orphan_recovery() {
+        // The post-restart resume prompt must include the orphan-recovery
+        // procedure: session-resume entry + queue audit + repo/workload
+        // discrimination + PR-state probe + abandon-on-no-PR. Anchors
+        // pinned individually so a wording tweak doesn't require
+        // rewriting the test, but a regression that drops a step is
+        // caught.
+        //
+        // 2026-05-15 q-6477 regression test: bare "resume" left
+        // orphaned PR-shipping agents stranded post-restart until an
+        // external alert flagged them. This prompt makes recovery
+        // deterministic. If you're tempted to revert to "resume", read
+        // memory/feedback_post-restart-orphan-recovery.md first.
+        let prompt = default_update_resume_prompt();
+        assert!(
+            prompt.contains("session-resume restart"),
+            "must invoke session-resume restart"
+        );
+        assert!(
+            prompt.contains("session-task queue list"),
+            "must audit running queue items"
+        );
+        assert!(
+            prompt.contains("claude-watch active-agents"),
+            "must probe agent liveness via claude-watch active-agents"
+        );
+        assert!(
+            prompt.contains("repo:*") && prompt.contains("workload:*"),
+            "must discriminate repo:* vs workload:* scopes"
+        );
+        assert!(
+            prompt.contains("PR")
+                && (prompt.contains("CI") || prompt.contains("green")),
+            "must mention PR state + CI for recovery probe"
+        );
+        assert!(
+            prompt.contains("session-task queue abandon"),
+            "must abandon orphaned items with no PR"
+        );
+        // Single-line invariant: tmux inject_text's vim-mode pipeline
+        // sends the payload as one literal send_keys -l call. Embedded
+        // newlines would either land as a multi-line typed message
+        // (Claude Code interprets Enter as submit) or get eaten. Keep
+        // the prompt single-line.
+        assert!(
+            !prompt.contains('\n'),
+            "resume_prompt must be single-line (tmux inject pipeline assumes single-line); got newlines in: {:?}",
+            prompt
+        );
+        // Single-character sanity: never accidentally land back at
+        // bare "resume" (the pre-fix regression target).
+        assert_ne!(
+            prompt, "resume",
+            "regression guard: bare \"resume\" was the q-6477 failure mode"
+        );
     }
 
     #[test]

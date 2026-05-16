@@ -175,8 +175,26 @@ enabled = true
 check_minute = 10
 # Minimum hours between update attempts
 cooldown_hours = 1
-# Text injected into Claude Code after restart completes
-resume_prompt = "resume"
+# Text injected into Claude Code after restart completes.
+#
+# This is the FIRST UserPromptSubmit the main loop sees after a
+# claude-watch auto-update restart. Bare "resume" wasn't enough: at
+# /exit time any in-flight subagent gets orphaned (its tmux pane is
+# gone, its `claude-watch active-agents` entry goes stale, but its
+# session-task queue row stays `running` and its PR — if any — stays
+# open). Without an explicit orphan-recovery step in the resume
+# prompt, PR-shipping work sits unmerged until something external
+# (WorkQueueOrphaned alert, Andrew flagging) notices.
+#
+# This prompt makes recovery deterministic: run normal resume, audit
+# the queue, probe each repo-scope running item against
+# `claude-watch active-agents`, recover via PR state, leave
+# workload:* alone (they survive restarts by design), then proceed.
+#
+# Single-line by design — tmux inject_text's vim-mode dd/i pipeline
+# expects one literal send_keys -l call. Multi-line bodies fight
+# Claude Code's Enter-to-submit input handling.
+resume_prompt = "post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id>` (reason: agent orphaned across restart). Then resume normal dispatch."
 
 [reauth]
 # Detect when Claude Code needs API reauth and send high-priority alerts
