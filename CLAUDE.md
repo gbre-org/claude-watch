@@ -2,6 +2,94 @@
 
 Rust daemon that monitors Claude Code health via tmux pane capture. Detects activity states (Thinking, ToolRunning, Writing, Idle), heartbeat stalls, token stalls, zombie sessions, and foreground blocks. Runs as a systemd service (`claude-watch.service`).
 
+## Alerting hierarchy
+
+claude-watch and its sibling tools form a **three-tier alerting hierarchy**.
+Each tier escalates the intervention level over the one below it. The README
+has a visual diagram and tier table — see
+[`README.md` § Alerting hierarchy](README.md#alerting-hierarchy). The short
+form:
+
+```
+events  <  obligations  <  interruptions
+(mild)     (blocking)        (forced)
+```
+
+### events — informational, non-blocking
+
+- **Mechanism**: watchers + `claude-event` CLI.
+- **Path**: producer drops JSON into `~/claude-events/`; `claude-event-watch`
+  debounces and surfaces an `EVENT[source/tag]` one-liner in the next
+  `UserPromptSubmit` context.
+- **Use when**: the right action is just "next loop pass, check this." Cron
+  ticks, queue state changes, completed-torrent notifications, scheduled
+  reminders, alerts that don't need to block work.
+- **Do NOT use when**: ignoring the signal would let the agent proceed with
+  an invariant violation. Events can be ignored — there's no enforcement
+  beyond the line in context. If you need "the agent MUST handle this before
+  the next destructive tool call," reach for an **obligation** instead.
+
+### obligations — blocking guardrails
+
+- **Mechanism**: `PreToolUse` / `PostToolUse` hooks invoking the
+  `obligations` CLI.
+- **Path**: a hook in `settings.json` fires on every (or matched) tool call;
+  the `obligations` CLI evaluates registered predicates; a failing predicate
+  returns a DENY decision and the tool call never executes. The agent must
+  `obligations satisfy <id>` (after fixing the underlying state) or
+  `obligations override "<reason>" --duration <ttl>` (audited, time-boxed)
+  before the tool call goes through.
+- **Use when**: an invariant must hold before a class of tool calls runs.
+  Must-ack inbox before `signal-send`, must-read captured watcher output
+  before restarting watchers, must-include queue id in `Agent` prompt,
+  no-private-leakage gates on public-repo work, ack-gate enforcement.
+- **Do NOT use when**: the signal is purely advisory (use an **event**), or
+  when the situation is so urgent that waiting for the next tool call is too
+  late (use an **interruption**). Also don't use an obligation as a soft
+  reminder — predicates that DENY frequently and get bypass-overridden lose
+  their audit value.
+
+### interruptions — forced mid-generation intervention
+
+- **Mechanism**: the `claude-watch` Rust daemon directly injects keystrokes
+  into the main-loop tmux pane via `tmux send-keys`.
+- **Path**: claude-watch's monitor loop detects an urgent condition (context
+  usage approaching limit, dead watchers, prolonged thinking >300s, zombie
+  session, token stall) and sends a prompt fragment that cancels current
+  generation and forces the loop to handle the issue.
+- **Use when**: letting the in-flight generation finish would make recovery
+  harder or impossible. Context-window exhaustion is the canonical case —
+  hitting compaction with uncommitted state is worse than canceling a
+  message mid-generation.
+- **Do NOT use when**: a natural turn boundary will arrive within a few
+  seconds. Interruptions are disruptive — they cancel partial work. Reserve
+  them for situations where the cost of NOT interrupting is higher than the
+  cost of a dropped message. For routine signaling, an **event** is correct.
+
+### Escalation
+
+Each layer escalates the one below: events surface state, obligations enforce
+invariants on state, interruptions force the loop to act on state. A correctly
+designed signal lives at the lowest tier that works. Promote a signal when
+the lower tier demonstrably fails (e.g. an event-only reminder that the agent
+routinely ignores becomes an obligation; an obligation that consistently
+fires too late becomes an interruption).
+
+### External alerting (Prometheus / Alertmanager / etc) — out of scope
+
+External alerting systems are **not** a fourth tier and are out of scope for
+claude-watch itself. They route INTO one of the three native tiers per use
+case:
+
+- **into events** (most common): webhook handler emits a `claude-event` so
+  the alert surfaces in the next `UserPromptSubmit` context.
+- **into obligations**: alert state drives a predicate that blocks certain
+  tool calls while firing.
+- **into interruptions**: a sufficiently urgent alert triggers a
+  claude-watch-driven tmux injection.
+
+claude-watch provides the surfaces; external alerting wires INTO them.
+
 ## Build & Test
 
 ```bash

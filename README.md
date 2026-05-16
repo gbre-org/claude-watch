@@ -48,6 +48,66 @@ claude-watch captures the Claude Code tmux pane every few seconds and parses it 
 - **Fresh session detection**: Detects when Claude Code starts fresh (via `dashboard --recreate --fresh`) and injects a resume prompt
 - **Task monitoring**: Watches Claude Code's background task output files, tracks agent lifecycle, cleans up orphaned tmux panes
 
+## Alerting hierarchy
+
+claude-watch and its sibling tools form a three-tier alerting hierarchy. Each
+tier ESCALATES if the lower one is insufficient: an **event** is informational
+(noise in the next loop pass), an **obligation** BLOCKS a tool call until
+satisfied, and an **interruption** CANCELS in-flight generation and forces the
+main loop to handle the underlying issue immediately.
+
+```mermaid
+flowchart LR
+    EXT["external alerting<br/>(Prometheus / Alertmanager / etc)"]:::ext
+    subgraph EV["events (informational)"]
+        direction TB
+        W[watchers] --> E[claude-event CLI]
+        E --> EW[claude-event-watch]
+        EW --> UPS[UserPromptSubmit context]
+    end
+    subgraph OB["obligations (blocking)"]
+        direction TB
+        H[PreToolUse / PostToolUse hooks] --> O[obligations CLI]
+        O -->|predicate fails| DENY[DENY tool call]
+        O -->|satisfied| ALLOW[allow tool call]
+    end
+    subgraph IN["interruptions (forced)"]
+        direction TB
+        CW[claude-watch daemon] --> TSK[tmux send-keys]
+        TSK --> MAIN[main-loop pane]
+    end
+    EV -.escalate.-> OB
+    OB -.escalate.-> IN
+    EXT -.webhook.-> E
+    EXT -.predicate.-> O
+    EXT -.urgent trigger.-> CW
+    classDef ext stroke-dasharray: 5 5,fill:#f5f5f5,color:#555;
+```
+
+| Tier | Mechanism | Implementation surface | Use case |
+|------|-----------|------------------------|----------|
+| **events** (mild) | watchers | `claude-event` CLI emits JSON into `~/claude-events/`; `claude-event-watch` surfaces an `EVENT[source/tag]` one-liner in the next `UserPromptSubmit` context | Routine signaling — cron ticks, queue state changes, non-blocking alerts, completed-torrent notifications, scheduled reminders |
+| **obligations** (blocking) | hooks (PreToolUse / PostToolUse) | `settings.json` hooks invoke the `obligations` CLI; predicates DENY a tool call when invariants are unmet; the agent must `obligations satisfy` or `obligations override` before retrying | Invariants and guardrails — must-ack inbox before sending, must-read captured watcher output before restarting, no-private-leakage gates, queue-spawn ordering, ack-gate enforcement |
+| **interruptions** (forced) | tmux `send-keys` | The `claude-watch` Rust daemon injects directly into the main-loop tmux pane when urgency demands mid-generation intervention (context approaching limit, dead watchers, prolonged thinking >300s, zombie session) | Forced, can't-wait-for-turn-boundary intervention — situations where letting the current generation finish would make recovery harder or impossible |
+
+### External alerting (not a fourth tier)
+
+External alerting systems (Prometheus + Alertmanager, PagerDuty, custom
+webhooks, etc.) are **not** a native tier in this hierarchy and are explicitly
+out of scope for claude-watch itself. Instead, external alerting routes INTO
+one of the three tiers above per use case:
+
+- **into events** (most common): the external system POSTs a webhook that
+  emits a `claude-event`, surfaced in the next `UserPromptSubmit` context.
+- **into obligations**: a Prometheus alert state can drive an `obligations`
+  predicate, blocking certain tool calls while the alert is firing.
+- **into interruptions**: a sufficiently urgent external alert can trigger a
+  claude-watch-driven tmux injection for immediate mid-generation attention.
+
+claude-watch provides the surfaces; wire external alerting to them as
+appropriate. See [`CLAUDE.md`](CLAUDE.md) for guidance on when to reach for
+each tier (and when NOT to).
+
 ## Architecture
 
 ```
