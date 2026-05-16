@@ -126,9 +126,10 @@ if ENTRYPOINT.exists():
         "find_claude_pid() walks /proc/<pid>/exe looking only at "
         "${HOME}/.local/share/claude/versions/ and misses the npm-"
         "global-installed claude exe at "
-        "/usr/lib/node_modules/@anthropic-ai/claude-code/, breaking "
-        "auto-respawn + agent-tracking until the in-container claude "
-        "self-updates",
+        "/home/hndrewaall/.npm-global/lib/node_modules/@anthropic-ai/"
+        "claude-code/ (autoupdate-v2 path; see CONTAINER_CLAUDE_EXE_PREFIX "
+        "in src/agent.rs), breaking auto-respawn + agent-tracking until "
+        "the in-container claude self-updates",
     )
 
     # 1d. The actual spawn line — nohup + setsid + claude-watch + & so

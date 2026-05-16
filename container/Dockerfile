@@ -154,6 +154,17 @@ RUN mkdir -p /home/hndrewaall/.config \
 # documented native-install precedence (compose.yml volume notes
 # already describe this expectation; this ENV makes it actually true).
 #
+# `~/.npm-global/bin` is also on PATH right after `~/.local/bin`. The
+# Dockerfile installs @anthropic-ai/claude-code into this uid-1000-owned
+# npm prefix (see the npm-install RUN block below for the autoupdate-v2
+# rationale), so the baked claude entry point lives at
+# $HOME/.npm-global/bin/claude. The image also ships a /usr/bin/claude
+# symlink pointing at the same file (chowned -h to uid 1000) so
+# `docker compose exec claude-container claude ...` works even when the
+# operator's $PATH doesn't include $HOME/.npm-global/bin (e.g.
+# stripped-down shells). Within the entrypoint and tmux panes the
+# PATH-baked $HOME/.npm-global/bin/claude wins because it comes first.
+#
 # ENV PATH propagates to every child process the container ever spawns
 # — entrypoint.sh, every tmux pane it opens, every `docker compose
 # exec` invocation, and `cwsr`'s respawned claude — without each shell
@@ -161,7 +172,7 @@ RUN mkdir -p /home/hndrewaall/.config \
 # (use the path the warning suggests, don't silence the check itself):
 # Claude Code's native-install probe is correct; the container's PATH
 # is what was wrong.
-ENV PATH=/home/hndrewaall/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/home/hndrewaall/.local/bin:/home/hndrewaall/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Pre-create the tmux default socket dir for uid 1000 with the
 # permissions tmux requires (owner-writable, not world-writable).
@@ -175,28 +186,65 @@ ENV PATH=/home/hndrewaall/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/u
 # and tmux refuses to start with "directory has unsafe permissions".
 RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
 
-# Install Claude Code CLI globally. Package name confirmed via `npm view`
-# 2026-05-11. In Phase 1+ this is replaced by a bind-mount of host npm-global,
-# so prefer installing into a path a bind-mount can shadow cleanly.
+# Install Claude Code CLI globally as uid 1000 with a uid-1000-writable
+# npm prefix. Package name confirmed via `npm view` 2026-05-11.
 #
-# Chown the installed package tree to uid 1000 so Claude Code's in-process
-# auto-updater (which fires `npm install -g @anthropic-ai/claude-code@latest`
-# as the interactive user) can write to it. Without this, the package tree
-# is root-owned and auto-update fails with EACCES on `/usr/lib/node_modules/`,
-# which also blocks the native-install fallback because the updater detects
-# the existing `/usr/bin/claude` and tries to upgrade it in place.
+# Why this shape (autoupdate-v2, 2026-05-15):
 #
-# Also chown the /usr/bin/claude SYMLINK itself (-h: change ownership of the
-# link, not its target) to uid 1000. `npm install -g` upgrades unlink the
-# bin-script symlink + relink it to the new version dir; that unlink fails
-# with EACCES when the symlink's parent metadata is owned by root even
-# though the user can write the package tree. Symptom: `claude update`
-# reports "Insufficient permissions to install update / Try running with
-# sudo or fix npm permissions" while the package directory chown above
-# looks correct. Observed in-container 2026-05-15 with claude-code stuck
-# at 2.1.142 while the host successfully self-updated to 2.1.143.
-RUN npm install -g @anthropic-ai/claude-code \
-    && chown -R 1000:1000 /usr/lib/node_modules/@anthropic-ai \
+# The previous shape `npm install -g` as root → chown the install tree +
+# the /usr/bin/claude symlink to uid 1000 (PR #204) — sat at the boundary
+# of what works because Claude Code's in-process auto-updater calls `npm
+# install -g @anthropic-ai/claude-code@latest` as the interactive user
+# (uid 1000), and npm in that invocation honors its CONFIGURED prefix,
+# not the historical install location. With the image's npm using its
+# stock default of `/usr/local` as the prefix, every auto-update attempt
+# tried to write to `/usr/local/lib/node_modules/` (root-owned) and
+# failed with:
+#
+#   Insufficient permissions to install update
+#   Try running with sudo or fix npm permissions
+#
+# (workbot v68 validation 2026-05-15). Chowning the original install
+# tree didn't help — npm wasn't trying to write there, it was trying to
+# write to its configured prefix.
+#
+# Fix: configure npm's prefix to a uid-1000-owned path under $HOME and
+# run the install as uid 1000 from the start. Both build-time AND
+# self-update-time installs land in the same place under the user's home
+# directory; no chown gymnastics, no /usr/lib vs /usr/local split, no
+# privilege-asymmetric writes. This is the canonical "unprivileged
+# npm-global" pattern documented at
+# https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally.
+#
+# The /usr/bin/claude symlink stays — it's a stable entry point for
+# `docker compose exec claude-container claude ...` invocations that
+# don't pre-resolve $HOME's npm-global bindir on PATH. Chown -h on it
+# (PR #204) stays for the same reason: npm install upgrades unlink + relink
+# the symlink, so it has to be uid-1000-owned. The symlink now points
+# into the npm-global prefix under $HOME instead of /usr/lib/.
+#
+# Pre-create $HOME/.npm-global/{lib,bin} as uid 1000 so npm doesn't have
+# to mkdir them at install time (some npm versions race on parent dir
+# perms when the prefix path doesn't exist yet). The `npm config set
+# prefix` writes to /home/hndrewaall/.npmrc (the per-user npmrc), which
+# is uid-1000-owned.
+#
+# `su - hndrewaall -c '...'` runs the whole install pipeline as uid 1000
+# with a login shell (so $HOME, $PATH etc. are set up correctly) without
+# permanently switching the Dockerfile's USER context — subsequent COPY
+# operations stay simple. The trailing `ln -sf` + `chown -h` recreate
+# the /usr/bin/claude entry point (was previously the npm-emitted symlink
+# into /usr/lib/; now an explicit ln to $HOME/.npm-global/bin/claude).
+# Chown -h flips the symlink's own ownership to uid 1000 so future
+# in-process `npm install -g` upgrades (which unlink+relink the symlink)
+# don't fail with EACCES on a root-owned symlink in /usr/bin/. PR #204's
+# rationale stands; only the target of the symlink changed.
+RUN install -d -o 1000 -g 1000 /home/hndrewaall/.npm-global \
+                                /home/hndrewaall/.npm-global/lib \
+                                /home/hndrewaall/.npm-global/bin \
+    && su - hndrewaall -c 'npm config set prefix /home/hndrewaall/.npm-global \
+                            && npm install -g @anthropic-ai/claude-code' \
+    && ln -sf /home/hndrewaall/.npm-global/bin/claude /usr/bin/claude \
     && chown -h 1000:1000 /usr/bin/claude
 
 # Bake the claude-watch Rust binary in from stage 1. Glibc compatibility is

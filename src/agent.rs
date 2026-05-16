@@ -147,14 +147,19 @@ pub fn is_own_command(cmd: &str) -> bool {
 /// When `CLAUDE_WATCH_CONTAINER_MODE=1` is set in the daemon's
 /// environment, ALSO matches against the npm-global install path used
 /// by the in-container Claude Code build:
-/// `/usr/lib/node_modules/@anthropic-ai/claude-code/`. The container
-/// image bakes Claude Code via `npm install -g`, so before any in-
-/// container self-update lands a versions/<ver>/ entry into the
-/// claude-container-versions named volume, the running exe lives at the
-/// npm-global path. The diagnostic at claude-watch-container-diagnostic.md
-/// flagged this mismatch as one of the reasons the host daemon could see
-/// the container's claude PID via `/proc` (PID namespace flat-visible)
-/// but never returned it from this function.
+/// `/home/hndrewaall/.npm-global/lib/node_modules/@anthropic-ai/claude-code/`.
+/// The container image bakes Claude Code via `npm install -g` with the
+/// npm prefix pointing at $HOME/.npm-global (the canonical unprivileged
+/// npm-global pattern), so before any in-container self-update lands a
+/// versions/<ver>/ entry into the claude-container-versions named
+/// volume, the running exe lives at the npm-global path. The diagnostic
+/// at claude-watch-container-diagnostic.md flagged this mismatch as one
+/// of the reasons the host daemon could see the container's claude PID
+/// via `/proc` (PID namespace flat-visible) but never returned it from
+/// this function. Path moved from /usr/lib/node_modules/ to
+/// $HOME/.npm-global/lib/node_modules/ in the autoupdate-v2 fix
+/// (2026-05-15) so `claude update` can write to its install tree as
+/// uid 1000 without privilege escalation.
 pub fn find_claude_pid() -> Option<u32> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let versions_dir = format!("{}/.local/share/claude/versions", home);
@@ -162,9 +167,11 @@ pub fn find_claude_pid() -> Option<u32> {
 }
 
 /// Container-mode npm-global install path. Constant so the test suite
-/// can assert against it without duplicating the literal.
+/// can assert against it without duplicating the literal. Path is the
+/// uid-1000-owned npm prefix under $HOME — see autoupdate-v2 fix
+/// 2026-05-15 (container Dockerfile npm-install block).
 pub const CONTAINER_CLAUDE_EXE_PREFIX: &str =
-    "/usr/lib/node_modules/@anthropic-ai/claude-code/";
+    "/home/hndrewaall/.npm-global/lib/node_modules/@anthropic-ai/claude-code/";
 
 /// Testable version of find_claude_pid with configurable versions dir.
 pub fn find_claude_pid_with_versions_dir(versions_dir: &str) -> Option<u32> {
@@ -1019,18 +1026,22 @@ mod tests {
 
     #[test]
     fn test_container_claude_exe_prefix_constant() {
-        // The constant must point at npm-global's @anthropic-ai/claude-code
-        // dir — that's where the container's `npm install -g
-        // @anthropic-ai/claude-code` lands the binary before any in-container
-        // self-update populates the named-volume versions/<ver>/ tree.
-        // Changing this constant in isolation would silently break
-        // find_claude_pid_with_paths(container_mode=true) for fresh container
-        // boots. Diagnostic context: claude-watch-container-diagnostic.md
-        // confirms /proc/<container-claude-pid>/exe ->
-        // /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe.
+        // The constant must point at the uid-1000-owned npm-global
+        // @anthropic-ai/claude-code dir — that's where the container's
+        // `npm install -g @anthropic-ai/claude-code` lands the binary
+        // (autoupdate-v2: prefix is /home/hndrewaall/.npm-global under
+        // $HOME so `claude update` can write as uid 1000 without
+        // privilege escalation), before any in-container self-update
+        // populates the named-volume versions/<ver>/ tree. Changing
+        // this constant in isolation would silently break
+        // find_claude_pid_with_paths(container_mode=true) for fresh
+        // container boots. Diagnostic context:
+        // claude-watch-container-diagnostic.md confirms
+        // /proc/<container-claude-pid>/exe ->
+        // <npm-prefix>/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe.
         assert_eq!(
             CONTAINER_CLAUDE_EXE_PREFIX,
-            "/usr/lib/node_modules/@anthropic-ai/claude-code/"
+            "/home/hndrewaall/.npm-global/lib/node_modules/@anthropic-ai/claude-code/"
         );
     }
 

@@ -518,12 +518,15 @@ fi
 # walks /proc/<pid>/exe looking for symlinks under
 # ${HOME}/.local/share/claude/versions/. Inside the container the npm-
 # global-installed claude exe lives at
-# /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe, which
-# does NOT match that prefix until a self-update lands a versions/<ver>/
-# entry into the named volume. Setting CLAUDE_WATCH_CONTAINER_MODE=1
-# enables the npm-global fallback in find_claude_pid_with_paths(), so
-# auto-respawn / agent-tracking work on a fresh container (before any
-# self-update fires).
+# /home/hndrewaall/.npm-global/lib/node_modules/@anthropic-ai/claude-code/
+# bin/claude.exe (autoupdate-v2: prefix moved from /usr/lib to
+# $HOME/.npm-global so `claude update` writes succeed as uid 1000),
+# which does NOT match the versions/ prefix until a self-update lands
+# a versions/<ver>/ entry into the named volume. Setting
+# CLAUDE_WATCH_CONTAINER_MODE=1 enables the npm-global fallback in
+# find_claude_pid_with_paths() — see CONTAINER_CLAUDE_EXE_PREFIX in
+# src/agent.rs for the literal path — so auto-respawn / agent-tracking
+# work on a fresh container (before any self-update fires).
 if [ "${CLAUDE_CONTAINER_DAEMON:-1}" != "0" ]; then
     export CLAUDE_WATCH_CONTAINER_MODE=1
     # Make sure the JSONL log file path is uid-1000 writable. The config
