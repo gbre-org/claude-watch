@@ -261,6 +261,25 @@ consecutive = 1
 # forever). Default 1800 = 30 minutes.
 max_stuck_secs = 1800
 
+[stuck_detection]
+# Workload-heartbeat-driven suppression of false-positive stuck alerts.
+#
+# Long-running `workload run` invocations (stv-promote, big rsyncs, ffmpeg)
+# can pin the main loop in a fire-and-forget wait that looks like
+# heartbeat-stale or prolonged-thinking from the daemon's vantage. The
+# workload wrapper writes + touches a heartbeat file at
+# `<workload_heartbeat_dir>/<label>.heartbeat` every 30s while the
+# user command runs. Before firing heartbeat-stale OR prolonged-thinking
+# alerts, the daemon scans the dir; if ANY file's mtime is within
+# `workload_heartbeat_max_age_secs`, the alert is SUPPRESSED.
+#
+# Distinct from the legacy 15-min `/tmp/claude-workloads/<label>.heartbeat`
+# (consumed by `cron-workload-stale-check` for 1h+ wedged-workload
+# detection). The two heartbeats coexist and serve different purposes.
+enabled = true
+workload_heartbeat_dir = "/run/claude/workloads"
+workload_heartbeat_max_age_secs = 60
+
 [hybrid]
 # Hybrid hooks + daemon-fallback tuning.
 #

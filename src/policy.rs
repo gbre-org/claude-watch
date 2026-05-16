@@ -158,6 +158,89 @@ pub(crate) fn dead_process_restart_suppressed(
     suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
 }
 
+/// Pure predicate: is at least one workload heartbeat fresh?
+///
+/// Scans `dir` for files (any name) and returns `true` if any has an
+/// mtime within `max_age_secs` of `now`. Used to suppress stuck-state
+/// alerts (heartbeat-stale, prolonged-thinking) when an out-of-band
+/// `workload run` is providing proof-of-life that the main loop's
+/// idleness can't otherwise explain.
+///
+/// Returns `false` (no suppression) if:
+///   * `dir` doesn't exist (no workloads ever ran on this host).
+///   * `dir` exists but is empty (no active workloads).
+///   * Every heartbeat file's mtime is older than `max_age_secs`
+///     (workloads stalled — let the existing stuck-alert fire).
+///   * `max_age_secs == 0` AND no file's mtime equals `now` exactly
+///     (mostly useful for tests).
+///
+/// Fail-open behaviour: any I/O error reading `dir` returns `false`
+/// so a transient permissions / mount issue can't accidentally
+/// suppress the entire stuck-detection subsystem.
+pub(crate) fn workload_heartbeat_fresh(
+    dir: &std::path::Path,
+    max_age_secs: u64,
+    now: SystemTime,
+) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only consider regular files. A subdir named like a label
+        // shouldn't ever exist here, but skip it defensively.
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        // Only count files with the `.heartbeat` suffix so unrelated
+        // sidecars (`.alerted`, `.tmp` from a mid-rename touch) don't
+        // accidentally satisfy freshness. The wrapper writes
+        // `<label>.heartbeat` so the suffix is stable.
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_none_or(|s| s != "heartbeat")
+        {
+            continue;
+        }
+        let mtime = match meta.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let age = match now.duration_since(mtime) {
+            Ok(d) => d,
+            Err(_) => {
+                // mtime is in the future relative to now — treat as fresh
+                // (clock skew, but proof the file was very recently written).
+                return true;
+            }
+        };
+        if age.as_secs() <= max_age_secs {
+            return true;
+        }
+    }
+    false
+}
+
+/// Convenience wrapper that pulls the dir + threshold from `Config` and
+/// honours the `enabled` master switch. Always uses `SystemTime::now()`
+/// so callers don't have to thread a clock through.
+pub(crate) fn workload_heartbeat_suppresses_stuck(config: &Config) -> bool {
+    if !config.stuck_detection.enabled {
+        return false;
+    }
+    workload_heartbeat_fresh(
+        std::path::Path::new(&config.stuck_detection.workload_heartbeat_dir),
+        config.stuck_detection.workload_heartbeat_max_age_secs,
+        SystemTime::now(),
+    )
+}
+
 /// Reason a force-inject escalation should fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EscalationReason {
@@ -760,6 +843,39 @@ async fn check_foreground_inner(
                             threshold = next_threshold,
                             cooldown = config.general.post_interrupt_cooldown_secs,
                             "prolonged thinking would fire but global post-interrupt cooldown active"
+                        );
+                        return;
+                    }
+                    // Workload-heartbeat suppression: an active
+                    // `workload run` (stv-promote, big rsync, ffmpeg)
+                    // can pin the main loop in a fire-and-forget wait
+                    // that the prolonged-thinking detector reads as a
+                    // stuck thought. Suppress when any workload
+                    // heartbeat file under
+                    // `config.stuck_detection.workload_heartbeat_dir`
+                    // is younger than
+                    // `workload_heartbeat_max_age_secs`. The thinking
+                    // timer is NOT reset here — the next cycle re-
+                    // evaluates from the same start so the moment the
+                    // workload finishes (heartbeat goes stale) the
+                    // interrupt can fire on the next tick.
+                    if workload_heartbeat_suppresses_stuck(config) {
+                        debug!(
+                            elapsed_secs = elapsed,
+                            threshold = next_threshold,
+                            dir = %config.stuck_detection.workload_heartbeat_dir,
+                            "prolonged thinking suppressed by fresh workload heartbeat"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "prolonged_thinking_suppressed",
+                            serde_json::json!({
+                                "elapsed_secs": elapsed,
+                                "threshold_secs": next_threshold,
+                                "reason": "workload_heartbeat_fresh",
+                                "dir": &config.stuck_detection.workload_heartbeat_dir,
+                                "max_age_secs": config.stuck_detection.workload_heartbeat_max_age_secs,
+                            }),
                         );
                         return;
                     }
@@ -2521,16 +2637,49 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     .as_secs();
                 let stale_secs = config.heartbeat.stale_minutes * 60;
                 if age >= stale_secs {
-                    stuck = true;
-                    let age_min = age / 60;
-                    stuck_reason = format!(
-                        "heartbeat stale ({}min, threshold={}min, watchmen={})",
-                        age_min,
-                        config.heartbeat.stale_minutes,
-                        watchmen_count
-                    );
-                    stuck_stale_minutes = Some(age_min);
-                    state.heartbeat_stale_count += 1;
+                    // Workload-heartbeat suppression: a long-running
+                    // `workload run` (stv-promote, big rsync, ffmpeg)
+                    // can pin the main loop in a fire-and-forget wait
+                    // that looks like heartbeat-stale from the
+                    // memory-remind side. If any workload's per-label
+                    // heartbeat file under
+                    // `config.stuck_detection.workload_heartbeat_dir`
+                    // is younger than
+                    // `workload_heartbeat_max_age_secs`, treat it as
+                    // proof-of-life and skip the stuck flag for THIS
+                    // cycle. The heartbeat-stale counter is also held
+                    // back so a long workload doesn't accumulate
+                    // suppressed-fire history.
+                    if workload_heartbeat_suppresses_stuck(config) {
+                        let age_min = age / 60;
+                        debug!(
+                            stale_age_min = age_min,
+                            threshold_min = config.heartbeat.stale_minutes,
+                            "heartbeat-stale suppressed by fresh workload heartbeat"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "heartbeat_stale_suppressed",
+                            serde_json::json!({
+                                "stale_age_min": age_min,
+                                "threshold_min": config.heartbeat.stale_minutes,
+                                "reason": "workload_heartbeat_fresh",
+                                "dir": &config.stuck_detection.workload_heartbeat_dir,
+                                "max_age_secs": config.stuck_detection.workload_heartbeat_max_age_secs,
+                            }),
+                        );
+                    } else {
+                        stuck = true;
+                        let age_min = age / 60;
+                        stuck_reason = format!(
+                            "heartbeat stale ({}min, threshold={}min, watchmen={})",
+                            age_min,
+                            config.heartbeat.stale_minutes,
+                            watchmen_count
+                        );
+                        stuck_stale_minutes = Some(age_min);
+                        state.heartbeat_stale_count += 1;
+                    }
                 }
             }
         }
@@ -5714,5 +5863,150 @@ pane_unchanged_secs = 600
             !state.hang_signal_history.distinct_active().is_empty(),
             "no fire => history retained"
         );
+    }
+
+    // --- workload_heartbeat_fresh tests ---
+
+    #[test]
+    fn workload_heartbeat_fresh_missing_dir_returns_false() {
+        // Non-existent directory: no workloads ever ran on this host.
+        // Must return false (NOT suppress) so the stuck-alert can fire.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nonexistent = tmp.path().join("does-not-exist");
+        assert!(!workload_heartbeat_fresh(
+            &nonexistent,
+            60,
+            SystemTime::now()
+        ));
+    }
+
+    #[test]
+    fn workload_heartbeat_fresh_empty_dir_returns_false() {
+        // Directory exists but is empty: no active workloads.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(!workload_heartbeat_fresh(
+            tmp.path(),
+            60,
+            SystemTime::now()
+        ));
+    }
+
+    #[test]
+    fn workload_heartbeat_fresh_fresh_file_returns_true() {
+        // A file with mtime "now" (default mtime when fs::write fires)
+        // must satisfy freshness at threshold=60s.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hb = tmp.path().join("active-workload.heartbeat");
+        std::fs::write(&hb, "2026-05-15T22:00:00-04:00").expect("write hb");
+        assert!(workload_heartbeat_fresh(tmp.path(), 60, SystemTime::now()));
+    }
+
+    #[test]
+    fn workload_heartbeat_fresh_stale_file_returns_false() {
+        // A file with mtime 5 minutes ago must NOT satisfy a 60s threshold.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hb = tmp.path().join("stale.heartbeat");
+        std::fs::write(&hb, "old").expect("write hb");
+        let five_min_ago = SystemTime::now() - std::time::Duration::from_secs(300);
+        filetime::set_file_mtime(&hb, filetime::FileTime::from_system_time(five_min_ago))
+            .expect("set mtime");
+        assert!(!workload_heartbeat_fresh(tmp.path(), 60, SystemTime::now()));
+    }
+
+    #[test]
+    fn workload_heartbeat_fresh_one_fresh_among_stale_returns_true() {
+        // Mixed dir: one stale workload + one fresh workload. The fresh
+        // one wins → suppression engages.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stale = tmp.path().join("stale-workload.heartbeat");
+        let fresh = tmp.path().join("fresh-workload.heartbeat");
+        std::fs::write(&stale, "old").expect("write stale");
+        std::fs::write(&fresh, "new").expect("write fresh");
+        let five_min_ago = SystemTime::now() - std::time::Duration::from_secs(300);
+        filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(five_min_ago))
+            .expect("set mtime");
+        assert!(workload_heartbeat_fresh(tmp.path(), 60, SystemTime::now()));
+    }
+
+    #[test]
+    fn workload_heartbeat_fresh_ignores_non_heartbeat_files() {
+        // Random sidecars (.alerted, .output) must not satisfy freshness
+        // — only `.heartbeat`-suffixed files count.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sidecar = tmp.path().join("workload.output");
+        std::fs::write(&sidecar, "x").expect("write");
+        assert!(!workload_heartbeat_fresh(
+            tmp.path(),
+            60,
+            SystemTime::now()
+        ));
+    }
+
+    #[test]
+    fn workload_heartbeat_fresh_future_mtime_returns_true() {
+        // Clock skew: mtime in the future relative to `now`. Treat as
+        // fresh — the file was just touched, the clock just hasn't
+        // caught up. Better to over-suppress one tick than to fire on a
+        // clearly-active workload.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hb = tmp.path().join("future.heartbeat");
+        std::fs::write(&hb, "future").expect("write");
+        let future = SystemTime::now() + std::time::Duration::from_secs(120);
+        filetime::set_file_mtime(&hb, filetime::FileTime::from_system_time(future))
+            .expect("set mtime");
+        assert!(workload_heartbeat_fresh(tmp.path(), 60, SystemTime::now()));
+    }
+
+    #[test]
+    fn workload_heartbeat_suppresses_stuck_respects_master_switch() {
+        // `enabled = false` returns false even when a fresh heartbeat
+        // exists. Confirms the master switch is honored by the wrapper
+        // around the pure helper.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hb = tmp.path().join("a.heartbeat");
+        std::fs::write(&hb, "x").expect("write");
+
+        // Sanity: the pure helper sees the fresh file.
+        assert!(workload_heartbeat_fresh(tmp.path(), 60, SystemTime::now()));
+
+        // Build a StuckDetectionConfig with enabled=false and confirm
+        // that flips the result of the predicate. We test the master-
+        // switch logic against the in-memory struct rather than going
+        // through TOML (the full Config has many required fields that
+        // would make the round-trip boilerplate-heavy and brittle).
+        let stuck = crate::config::StuckDetectionConfig {
+            enabled: false,
+            workload_heartbeat_dir: tmp.path().to_string_lossy().to_string(),
+            workload_heartbeat_max_age_secs: 60,
+        };
+        // Mirror the logic in `workload_heartbeat_suppresses_stuck`
+        // without needing a full Config. The helper short-circuits on
+        // the `enabled` flag before scanning the dir.
+        let suppressed = if !stuck.enabled {
+            false
+        } else {
+            workload_heartbeat_fresh(
+                std::path::Path::new(&stuck.workload_heartbeat_dir),
+                stuck.workload_heartbeat_max_age_secs,
+                SystemTime::now(),
+            )
+        };
+        assert!(!suppressed, "master switch off must suppress nothing");
+
+        // And flipping enabled back on flips the result.
+        let stuck_on = crate::config::StuckDetectionConfig {
+            enabled: true,
+            ..stuck
+        };
+        let suppressed_on = if !stuck_on.enabled {
+            false
+        } else {
+            workload_heartbeat_fresh(
+                std::path::Path::new(&stuck_on.workload_heartbeat_dir),
+                stuck_on.workload_heartbeat_max_age_secs,
+                SystemTime::now(),
+            )
+        };
+        assert!(suppressed_on, "master switch on must let fresh hb suppress");
     }
 }

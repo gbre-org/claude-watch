@@ -33,6 +33,10 @@ pub struct Config {
     /// `crate::respawn` for the design.
     #[serde(default)]
     pub auto_respawn_on_hang: crate::respawn::AutoRespawnConfig,
+    /// Stuck-detection suppression knobs. Default-on, sensible defaults
+    /// so existing configs work without edits. See `StuckDetectionConfig`.
+    #[serde(default)]
+    pub stuck_detection: StuckDetectionConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -658,6 +662,66 @@ fn default_api_retry_max_stuck_secs() -> u64 {
     1800 // 30 minutes
 }
 
+/// Stuck-detection suppression for active long-running workloads.
+///
+/// When a `workload run` invocation is active, its wrapper script
+/// writes + touches `<workload_heartbeat_dir>/<label>.heartbeat` every
+/// 30s as a fast-cadence proof-of-life. Before firing a "stuck" alert
+/// (heartbeat-stale, prolonged-thinking) the daemon scans the dir;
+/// if any heartbeat file has mtime within `workload_heartbeat_max_age_secs`,
+/// the alert is SUPPRESSED — there's an out-of-band workload providing
+/// liveness that the main loop's idleness can't explain on its own.
+///
+/// Distinct from the existing 15-min `/tmp/claude-workloads/<label>.heartbeat`
+/// which `cron-workload-stale-check` consumes to detect wedged workloads
+/// (1h stale threshold). The two heartbeats serve different purposes:
+///   * `/run/claude/workloads/` (this): fast cadence (30s), daemon-side
+///     suppression of false-positive stuck alerts.
+///   * `/tmp/claude-workloads/`: slow cadence (15min), cron-side
+///     detection of stalled workloads.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StuckDetectionConfig {
+    /// Master switch. Default: true. Set to false to disable workload-
+    /// heartbeat suppression and revert to the old behaviour (every
+    /// stuck-state fire regardless of in-flight workloads).
+    #[serde(default = "default_stuck_detection_enabled")]
+    pub enabled: bool,
+    /// Directory scanned for `<label>.heartbeat` files. Defaults to
+    /// `/run/claude/workloads` — same `tmpfs` mount as the main-loop
+    /// heartbeat at `/run/claude/heartbeat`, uid 1000 writable.
+    #[serde(default = "default_workload_heartbeat_dir")]
+    pub workload_heartbeat_dir: String,
+    /// Maximum age (seconds) of a workload heartbeat to count as
+    /// "fresh" (proof-of-life). Default: 60. Must be >= the wrapper's
+    /// touch interval (default 30s) plus headroom for missed ticks.
+    /// Set to 0 to require an exact-now match (mostly useful for
+    /// tests).
+    #[serde(default = "default_workload_heartbeat_max_age_secs")]
+    pub workload_heartbeat_max_age_secs: u64,
+}
+
+impl Default for StuckDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_stuck_detection_enabled(),
+            workload_heartbeat_dir: default_workload_heartbeat_dir(),
+            workload_heartbeat_max_age_secs: default_workload_heartbeat_max_age_secs(),
+        }
+    }
+}
+
+fn default_stuck_detection_enabled() -> bool {
+    true
+}
+
+fn default_workload_heartbeat_dir() -> String {
+    "/run/claude/workloads".to_string()
+}
+
+fn default_workload_heartbeat_max_age_secs() -> u64 {
+    60
+}
+
 /// Load config from well-known paths or CLAUDE_WATCH_CONFIG env var.
 /// Exits the process on failure — suitable for the daemon, not for
 /// best-effort subcommands. Use `try_load_config` for those.
@@ -1123,6 +1187,30 @@ cooldown = 300
         assert_eq!(config.task_watch.agent_done_delay, 120);
         assert_eq!(config.task_watch.max_panes, 20);
         assert!(!config.task_watch.show_all);
+    }
+
+    #[test]
+    fn test_stuck_detection_defaults() {
+        // No [stuck_detection] in SAMPLE_CONFIG → all defaults applied.
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert!(config.stuck_detection.enabled);
+        assert_eq!(
+            config.stuck_detection.workload_heartbeat_dir,
+            "/run/claude/workloads"
+        );
+        assert_eq!(config.stuck_detection.workload_heartbeat_max_age_secs, 60);
+    }
+
+    #[test]
+    fn test_stuck_detection_override() {
+        let cfg_str = format!(
+            "{}\n[stuck_detection]\nenabled = false\nworkload_heartbeat_dir = \"/tmp/wl-hb\"\nworkload_heartbeat_max_age_secs = 120\n",
+            SAMPLE_CONFIG
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert!(!config.stuck_detection.enabled);
+        assert_eq!(config.stuck_detection.workload_heartbeat_dir, "/tmp/wl-hb");
+        assert_eq!(config.stuck_detection.workload_heartbeat_max_age_secs, 120);
     }
 
     #[test]
