@@ -26,6 +26,7 @@ mod cmd;
 mod config;
 mod event_bus;
 mod hook_fire;
+mod inject_probe;
 mod logging;
 mod metrics;
 mod policy;
@@ -149,6 +150,24 @@ enum Commands {
         /// to a sensible per-type value (Stop / SessionStart / PreCompact).
         #[arg(long)]
         hook_event: Option<String>,
+    },
+    /// Probe out-of-process inject into a panel-mode Claude Code agent
+    /// (Linux pidfd_getfd). Confirms the inject works; does NOT replace
+    /// daemon-driven interruption logic. See `docs/sse-protocol.md` for
+    /// the empirical re-probe write-up.
+    #[command(name = "inject-probe")]
+    InjectProbe {
+        /// Target agent PID (a `claude --input-format stream-json ...`
+        /// process spawned by an IDE extension or SDK caller).
+        #[arg(long)]
+        pid: u32,
+        /// Plain UTF-8 message text. Will be wrapped in a stream-json
+        /// `{"type":"user","message":...}` line before injection.
+        #[arg(long)]
+        text: String,
+        /// Emit machine-readable JSON outcome on stdout.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1296,6 +1315,12 @@ async fn main() {
         }
         Some(Commands::HookFire { kind, hook_event }) => {
             let code = hook_fire::cmd_hook_fire(&kind, hook_event.as_deref()).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::InjectProbe { pid, text, json }) => {
+            let code = inject_probe::cmd_inject_probe(pid, &text, json);
             if code != 0 {
                 std::process::exit(code);
             }

@@ -1,22 +1,31 @@
-# VSCode IDE-mode injection — protocol findings (May 2026)
+# IDE-mode injection — protocol findings (May 2026)
 
 ## Summary
 
 claude-watch's interruption mechanism (`tmux send-keys` into the monitored
 pane) reaches Claude Code when the agent runs in **terminal mode** (the
-default, when launched with `claude` in any terminal, including VSCode's
-integrated terminal that is attached to a tmux session). It does **not**
-reach Claude Code when the agent runs in **VSCode panel mode** (the
-extension's native chat UI, when `claudeCode.useTerminal=false`, which is
-the install default).
+default, when launched with `claude` in any terminal, including the
+integrated terminal of any IDE that is attached to a tmux session). It does
+**not** reach Claude Code when the agent runs in **IDE panel mode** (the
+extension's native chat UI, when `claudeCode.useTerminal=false`).
 
 This document records the protocol investigation done to determine whether
 a second injection path (alongside `tmux send-keys`) could be added to
-reach panel-mode agents. The investigation concluded that **no
-out-of-process injection path exists** — the extension owns the only input
-channel into the agent process. The "SSE inject" hypothesis floated during
-earlier probe research was based on a misreading of what
-`CLAUDE_CODE_SSE_PORT` does.
+reach panel-mode agents.
+
+**Two passes**:
+
+1. **VSIX-string pass (initial)** — concluded *no out-of-process inject
+   path exists*. That conclusion was reached by reasoning from string
+   constants in the bundled extension JS, not by running a live agent. It
+   was wrong.
+2. **Empirical re-probe (2026-05-16)** — spawned a live panel-mode-shape
+   agent, observed its file descriptors and syscalls, and found an inject
+   path that the string pass missed. See § "EMPIRICAL re-probe 2026-05-16"
+   below. The string-pass conclusion is **superseded** for the inject-path
+   question; the rest of the protocol surface (what the SSE port does, how
+   the chat UI is wired) was correctly characterised and is retained
+   verbatim.
 
 ## What the SSE port actually is
 
@@ -100,22 +109,31 @@ setup.
 
 ### Panel mode (extension's native chat UI)
 
-No out-of-process injection path exists. claude-watch cannot deliver
-mid-generation text into a panel-mode agent because:
+**Superseded by the empirical re-probe (2026-05-16).** See § "EMPIRICAL
+re-probe 2026-05-16" below — an out-of-process inject path DOES exist via
+Linux `pidfd_getfd(2)`. The text below describes what the string pass
+incorrectly concluded; it is kept for historical reference and for the
+non-inject fallback ladder (events / MCP polling / URI handler) which are
+still useful when the pidfd path can't be used (different uid, locked-down
+`ptrace_scope`, non-Linux host, etc.).
 
-- The agent process has no listening socket.
-- The stdin pipe is owned by the extension's Node process and is not
-  reachable from another process. `/proc/<pid>/fd/0` for the agent points
-  at the read-side of the pipe, which is correctly readable but not
-  writable — only the extension holds the write end.
-- The MCP-IDE server hosted by the extension is for tool calls
-  (agent → IDE), not user input.
-- The webview-bridge is a VSCode-internal IPC channel with no external
-  surface.
+(Historical string-pass conclusion, **superseded** by the empirical pass:)
 
-The available fallbacks all share the same limitation: they cannot
-**interrupt** the agent mid-generation. They can only deliver context that
-the agent will see on a turn boundary it reaches on its own.
+> No out-of-process injection path exists. claude-watch cannot deliver
+> mid-generation text into a panel-mode agent because:
+>
+> - The agent process has no listening socket.
+> - The stdin pipe is owned by the extension's Node process and is not
+>   reachable from another process. `/proc/<pid>/fd/0` for the agent points
+>   at the read-side of the pipe, which is correctly readable but not
+>   writable — only the extension holds the write end.
+> - The MCP-IDE server hosted by the extension is for tool calls
+>   (agent → IDE), not user input.
+> - The webview-bridge is an IDE-internal IPC channel with no external
+>   surface.
+
+The non-inject fallback ladder remains a useful reference for the cases
+where pidfd inject is unavailable:
 
 | Approach | What it delivers | When | Latency |
 |---|---|---|---|
@@ -125,9 +143,12 @@ the agent will see on a turn boundary it reaches on its own.
 | URI handler `vscode://...?prompt=...` | New tab pre-filled with prompt text | When user clicks/opens the tab | User-driven |
 
 None of these are equivalent to `tmux send-keys` (which cancels the
-in-flight generation by sending Escape + typing). The only generation
-cancel path inside panel mode is a user-initiated stop button in the
-webview UI, which has no external API.
+in-flight generation by sending Escape + typing) — and neither is the
+pidfd inject path: it appends a user message to the agent's stream-json
+stdin, which the agent processes on its next event-loop tick, but it does
+NOT cancel an in-flight model generation. For cancellation, only the
+user-initiated stop button in the webview UI has the needed effect; that
+button has no external API.
 
 ### Recommended product shape
 
@@ -197,18 +218,162 @@ pipe → panel mode.
    localhost callback for MCP server auth flows) and as MCP client setup
    for `http`/`sse`/`ws` transports, never as a chat-input server.
 
-## Verdict
+## Verdict (string-pass — superseded)
 
 There is **no MCP-server-side hook**, **no chat-input HTTP endpoint**, and
 **no filesystem channel** on the claude process that claude-watch can use
-to inject user-input text into a VSCode-panel-mode agent. Adding an
+to inject user-input text into a panel-mode agent. Adding an
 `sse_inject` codepath would require shipping a fake protocol that doesn't
-exist on the wire. The queue item's "don't ship a hack that fakes SSE if
-the real protocol can't be cracked" guardrail therefore applies — the
-real protocol IS cracked, and the answer is that the protocol does not
-contain the surface the feature would need.
+exist on the wire.
+
+**This verdict is wrong for the inject question.** It is correct that the
+MCP-IDE server is for tool calls and not user input, and that there's no
+HTTP endpoint or filesystem channel — but the string pass missed Linux's
+`pidfd_getfd(2)` route to the extension host's matching socketpair
+endpoint. See the empirical re-probe below.
 
 The tmux-inject codepath remains correct for every deployment that runs
 claude in a tty (which includes the workbot container today). Panel-mode
-users are best served by the events / obligations tiers rather than
-interruptions.
+users now have two options: events / obligations (cross-platform, latency
+bounded by next turn) and pidfd inject (Linux only, latency = next
+event-loop tick).
+
+## EMPIRICAL re-probe 2026-05-16
+
+### Trigger
+
+Andrew pushed back on the string-pass conclusion: image-paste in panel
+mode demonstrably gets data from the webview UI into the running agent
+without going through the integrated terminal, so *some* channel must
+exist. The right response was to run a live agent and inspect what it
+actually opens / reads / writes, not to re-read more VSIX strings.
+
+### Setup
+
+Spawned a `claude --output-format stream-json --verbose --input-format
+stream-json --permission-mode bypassPermissions` process from a small
+Node wrapper that mimics the extension's `child_process.spawn(..., {stdio:
+['pipe','pipe','pipe'], env: {...CLAUDE_CODE_SSE_PORT='0'...}})` call.
+This reproduces the panel-mode shape exactly (same SDK transport, same
+piped stdio, same env vars) on a host where no real VSCode extension is
+running. The same `@anthropic-ai/claude-agent-sdk` code path serves both
+the real extension and this test wrapper.
+
+### Findings
+
+1. **`stdio: 'pipe'` in Node is AF_UNIX SOCK_STREAM, not anonymous pipes.**
+   `ls -la /proc/<agent-pid>/fd/` shows `0 -> socket:[N]`, `1 -> socket:[N+2]`,
+   `2 -> socket:[N+4]`. `/proc/net/unix` lists each as type 0001
+   (`SOCK_STREAM`), state 03 (`CONNECTED`), with no pathname (anonymous
+   socketpair endpoints — `socketpair(AF_UNIX, SOCK_STREAM, ...)` allocates
+   the inode pair with consecutive numbers).
+
+2. **`/proc/<agent-pid>/fd/0` is NOT openable from outside.** Tried `echo
+   X > /proc/PID/fd/0` (same uid), `sudo tee /proc/PID/fd/0`, `dd
+   of=/proc/PID/fd/0`. All three fail with `ENXIO` ("No such device or
+   address"). This is a kernel restriction: `open(2)` on the `/proc/fd/N`
+   magic symlink for an anonymous AF_UNIX endpoint returns ENXIO because
+   the socket has no pathname to bind / connect through.
+
+3. **The agent has NO listening socket.** Walked the full fd list and
+   cross-referenced `/proc/net/tcp` + `/proc/net/tcp6`. The only IPv4/IPv6
+   sockets the agent owns are outbound TCP connections to the Anthropic
+   API. There is no localhost listener — the agent is purely an MCP
+   *client* of the extension's SSE port; it is never an input *server*.
+
+4. **`strace -p <agent-pid>` shows input arrives via `recvfrom(0, ...)`.**
+   With the agent in its normal `epoll_wait` sleep, sending a stream-json
+   line via the parent's stdin pipe wakes the agent and the next syscall
+   is `recvfrom(0, "{\"type\":\"user\",...PROBE...}", 262144, MSG_DONTWAIT,
+   NULL, NULL) = N`. The fd is 0 (stdin), the syscall is `recvfrom`
+   (proves it's a socket, not a pipe), and the bytes are the full NDJSON
+   line. No separate input fd. Image-paste flows the same channel as
+   plain text: the webview encodes the image as base64, posts to the
+   extension via `webview.postMessage`, the extension wraps it in a
+   stream-json `user` message with a `{"type":"image","source":{"type":
+   "base64","media_type":...,"data":...}}` content block, and writes the
+   resulting NDJSON line to the same stdin socket. No side channel.
+
+5. **`pidfd_getfd(2)` DOES dup the parent's matching socketpair end.**
+   On Linux 5.6+ with `kernel.yama.ptrace_scope = 0` (default Debian
+   desktop), a same-uid process can `pidfd_open(parent_pid)` then
+   `pidfd_getfd(pidfd, parent_fd)` to obtain a writable copy of the
+   parent's stdin-write-end. Writing a stream-json line to that dup'd fd
+   places the bytes in the agent's stdin receive queue, where the agent
+   picks them up via `recvfrom` on its next event-loop tick. Tested
+   live: three sequential injects produced three sequential responses
+   ("ready" / "ok" / "yes") from the agent's stdout. Total kernel write
+   round-trip = ~5–6 KB of streamed JSON per inject (init events +
+   assistant message + result block).
+
+   Discovery: the matching parent-side fd is the one whose socket inode
+   equals `agent_fd0_inode - 1`. Linux's `socketpair()` allocates the two
+   endpoints with consecutive inode numbers; the parent-side end gets the
+   lower of the two (the parent keeps its end and dup's the child's end
+   into the child's fd 0 during fork+exec). Walking
+   `/proc/<parent-pid>/fd/*` for a socket fd whose readlink target
+   matches the expected inode finds it in one pass.
+
+### Why the string pass missed this
+
+The string pass focused on user-space protocols: SSE / WebSocket / HTTP /
+MCP. It correctly identified that none of those carry user-input text
+into the agent. What it missed was that the **kernel-level fd plumbing**
+between two same-uid processes is itself an injection surface on Linux —
+`pidfd_getfd` was merged in Linux 5.6 (March 2020) specifically to
+support exactly this kind of "give me a handle to a fd you have, that I
+otherwise couldn't open" pattern. The check the string pass should have
+made is "does the same-uid attacker model expose any of the agent's fds
+via kernel APIs" — not just "does the user-space protocol carry inject".
+
+### What ships in this PR
+
+- `src/inject_probe.rs` — implementation of the pidfd-inject path:
+  - `parse_socket_inode` / `expected_parent_inode` — pure helpers.
+  - `agent_stdin_socket_inode` / `parent_pid` / `find_parent_stdin_fd` —
+    /proc scanners.
+  - `build_user_message` — stream-json NDJSON builder.
+  - `linux_inject::inject` — the `pidfd_open` + `pidfd_getfd` + `write`
+    sequence (Linux-only, cfg-gated).
+  - `probe` — end-to-end function returning `ProbeOutcome`
+    (`Ok` / `WrongMode` / `AgentUnreadable` / `ParentFdNotFound` /
+    `SyscallFailed`).
+  - `cmd_inject_probe` — CLI handler with text + JSON output modes.
+- `claude-watch inject-probe --pid <agent-pid> --text <text> [--json]`
+  CLI subcommand. Exit codes: `0` = Ok, `1` = lookup / syscall failure,
+  `2` = WrongMode (use tmux-inject instead).
+- Unit tests covering inode parsing, payload shape, the saturating-sub
+  edge case, and the self-pid / bogus-pid sad paths.
+
+### What does NOT ship in this PR
+
+- **No daemon-loop integration.** `policy.rs` is unchanged; this is a
+  manual probe at this stage. Wiring inject-mode selection into the
+  interrupt policy (terminal → tmux, panel → pidfd, otherwise → event)
+  is a follow-up so the inject path can be reviewed in isolation first.
+- **No prompt-injection cancellation.** The pidfd inject appends a user
+  message to the stream-json stdin; the agent processes it on its next
+  event-loop tick. It does NOT cancel an in-flight model generation
+  (`tmux send-keys` sends Escape, which the panel UI does not). For
+  cancellation, panel-mode agents are still bounded by the next natural
+  turn boundary.
+- **No cross-uid / locked-down ptrace_scope support.** The probe returns
+  `SyscallFailed{stage: "pidfd_open"}` with `EPERM` in those cases. The
+  fallback ladder (events / obligations) covers those deployments.
+
+### Reproduction
+
+```bash
+# Spawn a panel-mode-shape agent (e.g. via the SDK)
+node -e '...spawn claude with stdio:pipe stream-json...'
+
+# Inspect fds
+ls -la /proc/<agent-pid>/fd/0   # → socket:[N], not /dev/pts/M, not pipe:[N]
+
+# Try /proc/fd/0 inject — will fail
+echo '{"type":"user",...}' > /proc/<agent-pid>/fd/0   # → ENXIO
+
+# Run the pidfd-inject probe
+claude-watch inject-probe --pid <agent-pid> --text "hello from outside"
+# → ok: wrote N bytes via pidfd_getfd(parent_pid=P, parent_fd=F)
+```
