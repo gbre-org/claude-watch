@@ -34,6 +34,31 @@ Lock-awareness (rev 2026-05-09 — queue lock feature):
   `worktask_queue_item_locked_age_seconds` gauge (same shape, different
   name) so the lock state is visible in Grafana without triggering alerts.
 
+Progress-vs-runtime (rev 2026-05-16 — workload heartbeat):
+
+  Running items whose `scope` includes a `workload:<label>` token are
+  long-lived fire-and-forget system jobs (stv-promote, rsync, ffmpeg)
+  that the main loop has dispatched to the `tasks` tmux session via
+  `workload run`. For these, raw elapsed-since-registered is a poor
+  stuck signal — a healthy 90-minute rsync is not stuck, even though
+  `worktask_queue_items_running_elapsed_seconds` will read 5400s.
+
+  PR #208 / #209 in claude-watch wired a per-workload progress
+  heartbeat at `/run/claude/workloads/<label>.heartbeat` — a sidecar
+  re-touches the file ONLY when the workload's `.output` file grows
+  (i.e. real progress, not a dumb timer). Stat that file and expose
+  `now - mtime` as `worktask_queue_item_progress_age_seconds`. The
+  WorkQueueStuck alert can then require BOTH long runtime AND stale
+  progress before firing, eliminating false-positives on legitimately
+  long-running tasks.
+
+  Items without a `workload:*` scope token (i.e. agent tasks) do NOT
+  emit this gauge — they have no progress signal of their own.
+  WorkQueueStuck handles them via the `unless on(id)` join: the alert
+  fires only on items WITHOUT a progress_age series (agents) OR items
+  WITH stale progress (workloads). Either-or, never both timers AND'd
+  against an absent metric.
+
 Metrics:
   - worktask_queue_items_total{status}       gauge  (pending/running/done/abandoned)
   - worktask_queue_duration_seconds{phase}   histogram (wait/run/total)
@@ -57,6 +82,17 @@ Metrics:
         (seconds since `created_at` for items that are pending AND
         group_head=true AND whose scope intersects locked_scopes. These
         are intentionally held; they MUST NOT drive the ReadyStuck alert.)
+  - worktask_queue_item_progress_age_seconds{id,summary,workload_label}
+        gauge (seconds since the per-workload heartbeat file at
+        WORKLOAD_HEARTBEAT_DIR/<label>.heartbeat was last touched.
+        Emitted ONLY for running queue items with a `workload:*` scope
+        token. The heartbeat is progress-driven (claude-watch PR #209):
+        sidecar re-touches the file only when the workload's `.output`
+        file grows, so a hung wrapped command produces a stale
+        heartbeat. WorkQueueStuck uses this gauge to distinguish
+        genuinely-stuck workloads from healthy long-running ones.
+        Absent if the heartbeat file is missing — the alert join
+        accounts for that case. )
   - worktask_queue_file_last_modified        gauge  (mtime of queue.json)
   - worktask_queue_agent_state_last_modified gauge  (mtime of active-agents.json,
         OR 0 if file missing — useful for alerting when claude-watch
@@ -95,6 +131,17 @@ QUEUE_PATH = os.environ.get("QUEUE_JSON", "/queue/queue.json")
 AGENT_STATE_PATH = os.environ.get(
     "AGENT_STATE_JSON", "/agents-state/active-agents.json"
 )
+# Directory holding per-workload progress heartbeat files written by
+# claude-watch's workload wrapper (PR #208 / #209). One file per active
+# workload, named `<label>.heartbeat`. Re-touched only when the wrapped
+# command emits new bytes to its .output file. The exporter stats each
+# file's mtime to compute `worktask_queue_item_progress_age_seconds`.
+# Host path is /run/claude/workloads/; in the container we bind-mount
+# it at /workload-heartbeats:ro.
+WORKLOAD_HEARTBEAT_DIR = os.environ.get(
+    "WORKLOAD_HEARTBEAT_DIR", "/workload-heartbeats"
+)
+WORKLOAD_SCOPE_PREFIX = "workload:"
 
 REG = CollectorRegistry()
 
@@ -174,6 +221,24 @@ g_locked_age = Gauge(
     ["id", "summary", "lock_scope"],
     registry=REG,
 )
+g_progress_age = Gauge(
+    "worktask_queue_item_progress_age_seconds",
+    (
+        "Seconds since the per-workload progress heartbeat file at "
+        "WORKLOAD_HEARTBEAT_DIR/<label>.heartbeat was last touched. "
+        "Emitted ONLY for running queue items whose `scope` includes a "
+        "`workload:<label>` token. The heartbeat is progress-driven "
+        "(claude-watch PR #209): the wrapper sidecar re-touches the "
+        "file only when the wrapped command's .output file grows, so "
+        "a hung command yields a stale heartbeat. WorkQueueStuck joins "
+        "this gauge against worktask_queue_items_running_elapsed_seconds "
+        "to require BOTH long runtime AND stale progress before firing, "
+        "eliminating false-positives on healthy long-running tasks. "
+        "Absent if the heartbeat file is missing."
+    ),
+    ["id", "summary", "workload_label"],
+    registry=REG,
+)
 g_file_mtime = Gauge(
     "worktask_queue_file_last_modified",
     "Unix mtime of queue.json",
@@ -223,6 +288,25 @@ h_duration = Histogram(
 _seen_forced_ids = set()
 _seen_done_ids_by_creator = set()
 _seen_duration_ids = set()
+
+
+def _workload_label_from_scope(scope):
+    """Return the workload label from a `workload:<label>` scope token,
+    or None if `scope` doesn't include one.
+
+    `scope` is the queue item's scope list (e.g. ["workload:stv-promote",
+    "repo:media-tools"]). Workload items have exactly one such token by
+    construction (claude-watch workload.rs builds `format!("workload:{label}")`)
+    but defensively we return the first match.
+    """
+    if not scope:
+        return None
+    for token in scope:
+        if isinstance(token, str) and token.startswith(WORKLOAD_SCOPE_PREFIX):
+            label = token[len(WORKLOAD_SCOPE_PREFIX):]
+            if label:
+                return label
+    return None
 
 
 def _parse_ts(s):
@@ -278,6 +362,7 @@ def collect():
     g_agent_jsonl_age.clear()
     g_ready_age.clear()
     g_locked_age.clear()
+    g_progress_age.clear()
 
     status_counts = {
         "pending": 0, "running": 0, "wedged": 0, "blocked": 0,
@@ -321,6 +406,36 @@ def collect():
                 # this metric.
                 elapsed = max(0.0, (now - reg_ts).total_seconds())
                 g_running_elapsed.labels(id=iid, summary=summary).set(elapsed)
+
+                # Workload progress heartbeat — emitted only for running
+                # items with a `workload:<label>` scope token. The wrapper
+                # sidecar (claude-watch PR #209) re-touches the heartbeat
+                # file ONLY when the wrapped command's .output file grows,
+                # so a stale mtime means "no real progress" -- the load-
+                # bearing signal WorkQueueStuck needs to distinguish a
+                # healthy long-running rsync from a wedged one.
+                workload_label = _workload_label_from_scope(it.get("scope"))
+                if workload_label:
+                    hb_path = os.path.join(
+                        WORKLOAD_HEARTBEAT_DIR, f"{workload_label}.heartbeat"
+                    )
+                    try:
+                        hb_mtime = os.stat(hb_path).st_mtime
+                        progress_age = max(0.0, time.time() - hb_mtime)
+                        g_progress_age.labels(
+                            id=iid, summary=summary,
+                            workload_label=workload_label,
+                        ).set(progress_age)
+                    except OSError:
+                        # Heartbeat file missing -- could be a workload
+                        # in startup before the sidecar lands, or one
+                        # that exited but didn't `queue done` yet, or a
+                        # workload run under a uid that couldn't write
+                        # to /run/claude/workloads (fail-soft per PR #208).
+                        # Stay silent rather than emit a misleading
+                        # "infinite age" series; WorkQueueStuck's
+                        # `unless` clause handles the absence.
+                        pass
 
             # Look up agent by queue_id. Emit has_live_owner ONLY when we
             # have an agent record -- silent on no-signal items.

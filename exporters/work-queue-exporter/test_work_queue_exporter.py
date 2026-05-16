@@ -30,6 +30,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from importlib.util import spec_from_file_location, module_from_spec
 
@@ -507,6 +508,119 @@ def run_scenarios():
     )
     check("S12 has_live_owner NOT emitted with status='blocked'",
           v12_block is None, f"got {v12_block!r}")
+
+    # ---- Scenario 13: running workload item with fresh heartbeat ->
+    # progress_age emitted, value small. The point of this scenario is
+    # the load-bearing one: an actively-progressing workload must NOT
+    # trip WorkQueueStuck even if running_elapsed is large.
+    print("\nScenario 13: workload item w/ fresh heartbeat -> progress_age emitted (small)")
+    hb_dir = tempfile.mkdtemp(prefix="wqe-hb-")
+    hb_path = os.path.join(hb_dir, "stv-promote-batch.heartbeat")
+    with open(hb_path, "w") as f:
+        f.write("progress\n")
+    # Make the file very fresh -- now-ish.
+    fresh_env = dict(env)
+    fresh_env["WORKLOAD_HEARTBEAT_DIR"] = hb_dir
+    item = make_running_item("q-s13", "stv-promote workload")
+    item["scope"] = ["workload:stv-promote-batch", "repo:media-tools"]
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(fresh_env)
+    mod.collect()
+    pa = find_sample(
+        mod, "worktask_queue_item_progress_age_seconds",
+        {"id": "q-s13", "workload_label": "stv-promote-batch"},
+    )
+    check(
+        "S13 progress_age emitted",
+        pa is not None and 0.0 <= pa < 30.0,
+        f"expected fresh value < 30s, got {pa!r}",
+    )
+
+    # ---- Scenario 14: running workload item with STALE heartbeat ->
+    # progress_age emitted with large value. WorkQueueStuck should
+    # eventually fire on this.
+    print("\nScenario 14: workload item w/ stale heartbeat -> progress_age large")
+    stale_hb = os.path.join(hb_dir, "stuck-rsync.heartbeat")
+    with open(stale_hb, "w") as f:
+        f.write("stale\n")
+    # Back-date mtime to 2 hours ago.
+    two_hr_ago = time.time() - 7200
+    os.utime(stale_hb, (two_hr_ago, two_hr_ago))
+    item = make_running_item("q-s14", "stuck rsync workload")
+    item["scope"] = ["workload:stuck-rsync"]
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(fresh_env)
+    mod.collect()
+    pa = find_sample(
+        mod, "worktask_queue_item_progress_age_seconds",
+        {"id": "q-s14", "workload_label": "stuck-rsync"},
+    )
+    check(
+        "S14 progress_age reflects stale mtime",
+        pa is not None and pa >= 7000,
+        f"expected >= 7000s, got {pa!r}",
+    )
+
+    # ---- Scenario 15: running workload item with NO heartbeat file ->
+    # progress_age silent (load-bearing for the alert's `unless` clause).
+    print("\nScenario 15: workload item w/ missing heartbeat -> progress_age absent")
+    item = make_running_item("q-s15", "workload no heartbeat")
+    item["scope"] = ["workload:never-started"]
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(fresh_env)
+    mod.collect()
+    pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s15")
+    check("S15 progress_age absent", pa is None, f"got {pa!r}")
+
+    # ---- Scenario 16: running AGENT item (no workload scope) ->
+    # progress_age absent. Agents don't have a progress signal of their
+    # own; WorkQueueStuck relies on the `unless` clause to handle them
+    # via the runtime floor only.
+    print("\nScenario 16: agent item (no workload scope) -> progress_age absent")
+    item = make_running_item("q-s16", "agent task")
+    item["scope"] = ["repo:server-config"]
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(fresh_env)
+    mod.collect()
+    pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s16")
+    check("S16 progress_age absent for agent item", pa is None, f"got {pa!r}")
+
+    # ---- Scenario 17: blocked workload item -> progress_age absent
+    # (only running items emit the gauge). A blocked workload is parked
+    # on an external blocker; "progress age" isn't a meaningful concept.
+    print("\nScenario 17: blocked workload item -> progress_age absent")
+    item = make_blocked_item("q-s17", "blocked workload")
+    item["scope"] = ["workload:parked-job"]
+    # Heartbeat file even exists, but blocked items shouldn't emit.
+    parked_hb = os.path.join(hb_dir, "parked-job.heartbeat")
+    with open(parked_hb, "w") as f:
+        f.write("\n")
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(fresh_env)
+    mod.collect()
+    pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s17")
+    check("S17 progress_age absent for blocked item", pa is None, f"got {pa!r}")
+
+    # ---- Scenario 18: helper edge cases.
+    print("\nScenario 18: _workload_label_from_scope edge cases")
+    mod = load_exporter(env)
+    check("S18 None scope -> None",
+          mod._workload_label_from_scope(None) is None, "got non-None")
+    check("S18 empty scope -> None",
+          mod._workload_label_from_scope([]) is None, "got non-None")
+    check("S18 non-workload scope -> None",
+          mod._workload_label_from_scope(["repo:foo"]) is None, "got non-None")
+    check("S18 workload scope -> label",
+          mod._workload_label_from_scope(["workload:abc"]) == "abc", "wrong label")
+    check("S18 mixed scope -> label",
+          mod._workload_label_from_scope(["repo:x", "workload:y"]) == "y", "wrong label")
+    check("S18 empty label -> None",
+          mod._workload_label_from_scope(["workload:"]) is None, "got non-None")
 
     print()
     if failures:
