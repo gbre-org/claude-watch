@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::alert;
 use crate::config::Config;
+use crate::inject_dispatch;
 use crate::logging::{write_jsonl_log, write_legacy_log};
 use crate::reminders::{seconds_since_fire, should_defer_to_hook, ReminderType};
 use crate::state::{FailureDetail, State, StatusSnapshot, WatcherState};
@@ -935,7 +936,7 @@ async fn check_foreground_inner(
                                 next_threshold,
                                 state.thinking_interrupt_count,
                             );
-                        tmux::inject_text(pane, &msg).await;
+                        inject_dispatch::inject_to_agent(pane, &msg).await;
                         write_jsonl_log(
                             &config.general.log_file,
                             "thinking_interrupted",
@@ -1011,8 +1012,11 @@ async fn check_foreground_inner(
                             // 5s budget — see comment at the prolonged-thinking
                             // interrupt site above.
                             tmux::interrupt_and_wait(pane, 5).await;
-                            tmux::inject_text(pane, &config.foreground_monitor.interrupt_message)
-                                .await;
+                            inject_dispatch::inject_to_agent(
+                                pane,
+                                &config.foreground_monitor.interrupt_message,
+                            )
+                            .await;
                             write_jsonl_log(
                                 &config.general.log_file,
                                 "foreground_interrupted",
@@ -1207,7 +1211,7 @@ async fn inject_context_warning(pane: &str, pct: f64, compact_remaining: Option<
     );
     // 5s budget — same rationale as the other inline interrupt sites.
     tmux::interrupt_and_wait(pane, 5).await;
-    tmux::inject_text(pane, &msg).await;
+    inject_dispatch::inject_to_agent(pane, &msg).await;
 }
 
 /// Below this token count, Claude Code is treated as "fresh / just-cleared"
@@ -1358,7 +1362,7 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
         // Inject /login once per reauth cycle so the login screen appears
         if !state.login_injected {
             info!("injecting /login command into pane");
-            tmux::inject_text(pane, "/login").await;
+            inject_dispatch::inject_to_agent(pane, "/login").await;
             state.login_injected = true;
             state.reauth_inject_interrupts_total = state
                 .reauth_inject_interrupts_total
@@ -1690,7 +1694,7 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
 
     // Step 2: Inject /exit
     info!("auto-update: injecting /exit...");
-    tmux::inject_text(pane, "/exit").await;
+    inject_dispatch::inject_to_agent(pane, "/exit").await;
 
     // Step 3: Wait for Claude to exit
     info!("auto-update: waiting for Claude Code to exit...");
@@ -1788,7 +1792,7 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
 
     // Step 9: Inject resume text
     info!("auto-update: injecting resume prompt...");
-    tmux::inject_text(pane, &config.auto_update.resume_prompt).await;
+    inject_dispatch::inject_to_agent(pane, &config.auto_update.resume_prompt).await;
 
     // Step 10: Log and notify
     write_jsonl_log(
@@ -2128,7 +2132,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         }
         if tmux::is_idle(pane).await {
             info!("post-restart: injecting resume prompt");
-            tmux::inject_text(
+            inject_dispatch::inject_to_agent(
                 pane,
                 "[CLAUDE-WATCH-RESUME] Claude Code was restarted after a crash. \
                  All background task handles were lost. Run the full resume \
@@ -2430,7 +2434,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     dead_checks,
                     "fresh external session detected — injecting resume"
                 );
-                tmux::inject_text(&effective_pane, "resume").await;
+                inject_dispatch::inject_to_agent(&effective_pane, "resume").await;
                 state.fresh_session_injected = true;
                 state.was_alive_since_inject = false;
                 state.last_fresh_inject = Some(Local::now().to_rfc3339());
@@ -2603,7 +2607,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // Dismiss feedback prompt if present
             tmux::dismiss_feedback_prompt(&effective_pane).await;
 
-            tmux::inject_text(&effective_pane, &config.alerts.resume_prompt).await;
+            inject_dispatch::inject_to_agent(&effective_pane, &config.alerts.resume_prompt).await;
 
             state.last_fast_path_alert = Some(now.clone());
             state.last_alert = Some(now.clone());
@@ -3370,7 +3374,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         missing_list,
                         restart_cmds.join(", ")
                     );
-                    tmux::inject_text(&effective_pane, &prompt).await;
+                    inject_dispatch::inject_to_agent(&effective_pane, &prompt).await;
                     // Third sink: claude-event so the main loop sees the
                     // missing-watchers list as structured data and can
                     // decide which restart command(s) to actually run,

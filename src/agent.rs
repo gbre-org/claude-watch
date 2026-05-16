@@ -182,6 +182,94 @@ pub fn find_claude_pid_with_versions_dir(versions_dir: &str) -> Option<u32> {
     find_claude_pid_with_paths(versions_dir, container_mode)
 }
 
+/// Walk a process subtree rooted at `root_pid` (typically a tmux pane's
+/// pane_pid, i.e. the shell) looking for a claude binary descendant.
+/// Returns the first matching PID found, or `None` if no descendant
+/// matches the configured claude installation paths within `max_depth`.
+///
+/// Used by the inject dispatcher to map a tmux pane to the actual
+/// claude PID whose deployment mode we want to interrogate — terminal-
+/// mode panes have claude running directly as the pane's child of
+/// child; IDE panel mode never goes through tmux, so this helper
+/// inherently returns `None` for those cases (the dispatcher uses that
+/// signal to fall through to claude-event).
+///
+/// Honors `CLAUDE_WATCH_CONTAINER_MODE` like `find_claude_pid`.
+pub fn find_claude_pid_in_tree(root_pid: u32, max_depth: u32) -> Option<u32> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+    let versions_dir = format!("{}/.local/share/claude/versions", home);
+    let container_mode = std::env::var("CLAUDE_WATCH_CONTAINER_MODE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    find_claude_pid_in_tree_with_paths(root_pid, max_depth, &versions_dir, container_mode)
+}
+
+/// Pure variant: caller chooses the versions-dir prefix + container-mode
+/// toggle. Walks the process subtree via `/proc/PID/task/PID/children`
+/// (cheap, no fork). Returns the first claude descendant PID, depth-first.
+pub fn find_claude_pid_in_tree_with_paths(
+    root_pid: u32,
+    max_depth: u32,
+    versions_dir: &str,
+    container_mode: bool,
+) -> Option<u32> {
+    walk_for_claude(root_pid, 0, max_depth, versions_dir, container_mode)
+}
+
+fn walk_for_claude(
+    pid: u32,
+    depth: u32,
+    max_depth: u32,
+    versions_dir: &str,
+    container_mode: bool,
+) -> Option<u32> {
+    if depth > max_depth {
+        return None;
+    }
+    if pid_is_claude(pid, versions_dir, container_mode) {
+        return Some(pid);
+    }
+    // Read children via /proc/PID/task/PID/children. This file lists
+    // direct children space-separated. Falls back to pgrep -P if the
+    // children file is missing (e.g. on a kernel without
+    // CONFIG_PROC_CHILDREN, vanishingly rare).
+    let children = read_proc_children(pid);
+    for child in children {
+        if let Some(found) =
+            walk_for_claude(child, depth + 1, max_depth, versions_dir, container_mode)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn pid_is_claude(pid: u32, versions_dir: &str, container_mode: bool) -> bool {
+    let exe_path = format!("/proc/{}/exe", pid);
+    if let Ok(target) = std::fs::read_link(&exe_path) {
+        let target_str = target.to_string_lossy();
+        if target_str.starts_with(versions_dir) {
+            return true;
+        }
+        if container_mode && target_str.starts_with(CONTAINER_CLAUDE_EXE_PREFIX) {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_proc_children(pid: u32) -> Vec<u32> {
+    let path = format!("/proc/{}/task/{}/children", pid, pid);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => content
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Pure variant: caller chooses both the versions-dir prefix and whether
 /// to ALSO accept the container npm-global install path. Used directly
 /// by tests so they don't need to mutate process env.

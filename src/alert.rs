@@ -21,6 +21,7 @@
 
 use crate::cmd::run_cmd;
 use crate::event_bus::{self, ClaudeWatchAlert};
+use crate::inject_dispatch;
 use crate::tmux;
 
 pub async fn send_pingme(message: &str) {
@@ -65,8 +66,14 @@ pub async fn alert(
     // perceived recovery latency low; if the pane never goes idle we
     // proceed with the inject anyway (Claude has typically responded long
     // before the timeout fires).
+    //
+    // The Escape/interrupt phase only matters for terminal-mode panes —
+    // for panel-mode agents the pidfd path appends rather than cancels,
+    // so the interrupt is a no-op there. We still call interrupt_and_wait
+    // because the cost is bounded and a stray Escape into a defunct pane
+    // is harmless.
     tmux::interrupt_and_wait(pane, 5).await;
-    tmux::inject_text(pane, resume_prompt).await;
+    inject_dispatch::inject_to_agent(pane, resume_prompt).await;
 }
 
 /// Convenience: emit a claude-event for a fire-and-forget alert path

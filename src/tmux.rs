@@ -862,6 +862,26 @@ pub async fn wait_for_claude_binary(pane: &str, timeout_secs: u64) -> bool {
     false
 }
 
+/// Resolve a tmux pane spec to its top-level pane PID via
+/// `tmux display-message -p '#{pane_pid}'`. Returns `None` on tmux error,
+/// empty output, or non-numeric output.
+///
+/// This is the entry point for the inject dispatcher's pane → claude-PID
+/// walk: caller passes the pane PID to `agent::find_claude_pid_in_tree`
+/// to locate the actual claude binary PID (which may be a descendant of
+/// the pane's shell).
+pub async fn get_pane_pid(pane: &str) -> Option<u32> {
+    let (pid_str, ok) = run_cmd_any(
+        &["tmux", "display-message", "-t", pane, "-p", "#{pane_pid}"],
+        5,
+    )
+    .await;
+    if !ok || pid_str.is_empty() {
+        return None;
+    }
+    pid_str.trim().parse::<u32>().ok()
+}
+
 /// Check if the pane's process tree includes the actual claude binary.
 async fn has_claude_binary(pane: &str) -> bool {
     let (pid_str, ok) = run_cmd_any(

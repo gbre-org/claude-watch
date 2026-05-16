@@ -26,6 +26,7 @@ mod cmd;
 mod config;
 mod event_bus;
 mod hook_fire;
+mod inject_dispatch;
 mod inject_probe;
 mod logging;
 mod metrics;

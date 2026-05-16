@@ -34,11 +34,13 @@
 //!
 //! ## Scope of this module
 //!
-//! This is a **probe** — a one-shot CLI helper that confirms the inject
-//! works against a live agent. It is NOT wired into the daemon's automatic
-//! interrupt policy. That follow-up (deciding when claude-watch should
-//! choose pidfd-inject vs tmux-inject vs an event drop) is intentionally
-//! left as a separate change so this module can be inspected in isolation.
+//! This module hosts both the one-shot probe CLI (`cw inject-probe`) and
+//! the library-callable inject function (`inject`) wired into the daemon's
+//! deployment-mode dispatcher in `inject_dispatch.rs`. The dispatcher
+//! routes panel-mode agents here; terminal-mode agents continue to use
+//! `tmux::inject_text`; unknown / failed cases fall through to the
+//! claude-event escalation tier. See `inject_dispatch::inject_to_agent`
+//! for the call site.
 //!
 //! ## Constraints
 //!
@@ -302,6 +304,23 @@ pub fn probe(agent_pid: u32, payload_text: &str) -> ProbeOutcome {
             msg: "pidfd inject is Linux-only".to_string(),
         }
     }
+}
+
+/// Library-callable inject. Wraps `probe` so non-CLI callers (the
+/// daemon's `inject_dispatch::inject_to_agent`) can use the IDE-panel
+/// inject path without reaching into CLI plumbing.
+///
+/// Returns the raw `ProbeOutcome` so callers can pattern-match on the
+/// failure stages (pidfd_open EPERM → fall through to claude-event,
+/// WrongMode → caller mis-classified, etc.). Same error semantics as
+/// `probe` — non-Ok variants are non-fatal for the caller; they describe
+/// why the inject didn't land.
+///
+/// Library API stability: this is the supported entry point for daemon
+/// integration. `probe` remains exported for the CLI but is documented
+/// as a probe (one-shot test), not the daemon path.
+pub fn inject(pid: u32, text: &str) -> ProbeOutcome {
+    probe(pid, text)
 }
 
 /// CLI entry point for `claude-watch inject-probe`.
