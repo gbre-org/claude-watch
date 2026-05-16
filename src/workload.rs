@@ -29,17 +29,31 @@ const WORKLOAD_DIR: &str = "/tmp/claude-workloads";
 
 /// Per-workload runtime heartbeat directory. Used by the daemon's
 /// stuck-detection suppression path — see `policy::workload_heartbeat_fresh`.
-/// The wrapper touches `<RUNTIME_HEARTBEAT_DIR>/<label>.heartbeat` every
-/// `WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS` seconds (default 30s) while
-/// the user command is running.
+///
+/// **The runtime heartbeat is PROGRESS-driven, not timer-driven.** The
+/// wrapper script writes an initial touch on startup (covers warm-up
+/// before the wrapped command emits anything), then a sidecar polls the
+/// workload's `.output` file size on a fixed interval
+/// (`WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS`, default 30s) and only
+/// re-touches the heartbeat when the output grew since the last check.
+/// If the wrapped command hangs (no new output), the heartbeat goes
+/// stale — the daemon's `policy::workload_heartbeat_fresh` then STOPS
+/// suppressing stuck-alerts, so the real stuck state surfaces.
+///
+/// The original PR #208 design touched the heartbeat unconditionally on
+/// a timer, which falsely suppressed alerts whenever the wrapper was
+/// alive but its child had hung. Andrew flagged that design flaw
+/// 2026-05-16 04:16 UTC. The progress-based variant detects "wrapped
+/// command is making progress" (proxied by stdout growth), not "the
+/// wrapper's timer is running".
 ///
 /// Distinct from the slow-cadence (`heartbeat_file` above, 15-min interval,
 /// `/tmp/claude-workloads/`) which `cron-workload-stale-check` consumes
 /// to fire `workload-stale` claude-events at 1h+ stalls. The two
 /// heartbeats coexist:
-///   * runtime heartbeat (this, `/run/claude/workloads/`): 30s cadence,
+///   * runtime heartbeat (this, `/run/claude/workloads/`): progress-driven,
 ///     used by claude-watch daemon to suppress prolonged-thinking +
-///     heartbeat-stale alerts while a workload is actively running.
+///     heartbeat-stale alerts while a workload is actively making progress.
 ///   * legacy heartbeat (15-min, `/tmp/claude-workloads/`): cron-side
 ///     stale-detection.
 ///
@@ -77,10 +91,15 @@ fn heartbeat_file(label: &str) -> PathBuf {
 }
 
 /// Per-workload runtime heartbeat file under `RUNTIME_HEARTBEAT_DIR`.
-/// Touched every `WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS` seconds
-/// (default 30s) by the wrapper. The claude-watch daemon scans
-/// `RUNTIME_HEARTBEAT_DIR` for fresh-mtime files to suppress
-/// prolonged-thinking + heartbeat-stale alerts during active workloads.
+/// Initial touch on wrapper startup, then re-touched only when the
+/// workload's `.output` file grows (i.e. the wrapped command emitted
+/// new bytes since the last poll). Poll interval is
+/// `WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS` (default 30s). The
+/// claude-watch daemon scans `RUNTIME_HEARTBEAT_DIR` for fresh-mtime
+/// files to suppress prolonged-thinking + heartbeat-stale alerts ONLY
+/// while a workload is actively making progress. A hung wrapped command
+/// produces no stdout → heartbeat goes stale → suppression lifts →
+/// real stuck state surfaces.
 fn runtime_heartbeat_file(label: &str) -> PathBuf {
     PathBuf::from(RUNTIME_HEARTBEAT_DIR).join(format!("{label}.heartbeat"))
 }
@@ -793,17 +812,45 @@ fn build_wrapper_script(
                done' </dev/null >/dev/null 2>&1 &\n\
              HEARTBEAT_PID=$!\n\
          fi\n\
-         # Runtime heartbeat (fast cadence, 30s default). Consumed by the\n\
+         # Runtime heartbeat (progress-driven). Consumed by the\n\
          # claude-watch daemon's stuck-detection suppression path — see\n\
          # `policy::workload_heartbeat_fresh`. While ANY workload's file\n\
          # under {rt_hb_dir_q} has mtime within the daemon's\n\
          # `workload_heartbeat_max_age_secs` window (default 60s), the\n\
          # daemon SUPPRESSES heartbeat-stale + prolonged-thinking alerts\n\
          # on the assumption the main loop is legitimately waiting on an\n\
-         # out-of-band long-running workload. Set\n\
-         # WORKLOAD_RUNTIME_HEARTBEAT=0 to disable (e.g. for tests).\n\
+         # out-of-band long-running workload that is MAKING PROGRESS.\n\
+         #\n\
+         # PROGRESS = the workload's combined stdout+stderr (everything\n\
+         # the wrapper has already redirected to {out_q} via the\n\
+         # `exec >> {out_q} 2>&1` above) is GROWING. Polling the file\n\
+         # size on a fixed interval (default 30s) is dirt-cheap, picks up\n\
+         # both line- and progress-frame (`\\r`) writes the wrapped\n\
+         # command makes, and naturally debounces (one heartbeat touch\n\
+         # per interval at most, regardless of output rate).\n\
+         #\n\
+         # If the wrapped command hangs (no new bytes for N intervals)\n\
+         # the heartbeat goes stale -> daemon suppression lifts -> the\n\
+         # real stuck state surfaces. This is the intended behavior --\n\
+         # the original PR #208 design was a dumb timer that touched the\n\
+         # heartbeat unconditionally, giving false-confidence whenever\n\
+         # the wrapper was alive but its child had hung.\n\
+         #\n\
+         # The initial touch BEFORE the poll loop covers warm-up: a\n\
+         # daemon check that races the very-first second of the workload\n\
+         # sees a fresh heartbeat even if the wrapped command hasn't\n\
+         # emitted anything yet.\n\
+         #\n\
+         # Set WORKLOAD_RUNTIME_HEARTBEAT=0 to disable (e.g. for tests).\n\
          # Separate sidecar PID + separate trap so the legacy 15-min\n\
          # heartbeat above is unaffected by changes here.\n\
+         #\n\
+         # Edge case (intentionally NOT papered over): a workload that\n\
+         # legitimately runs silent for long stretches (e.g. a `sleep\n\
+         # 600` in a script) will trip stuck-detection. That's a design\n\
+         # fact, not a bug -- if the operator wants suppression during\n\
+         # silent stretches the workload itself should emit periodic\n\
+         # progress lines.\n\
          RUNTIME_HEARTBEAT_PID=\n\
          if [ \"${{WORKLOAD_RUNTIME_HEARTBEAT:-1}}\" != \"0\" ]; then\n\
              # Ensure the runtime heartbeat dir exists. `/run/claude/` is\n\
@@ -814,12 +861,29 @@ fn build_wrapper_script(
              if mkdir -p {rt_hb_dir_q} 2>/dev/null; then\n\
                  # Initial touch + atomic mv mirrors the slow heartbeat\n\
                  # — a daemon check on the same tick reads a non-empty\n\
-                 # file with a current mtime.\n\
+                 # file with a current mtime. Covers the warm-up window\n\
+                 # before the wrapped command produces output.\n\
                  date -Iseconds > {rt_hb_q}.tmp 2>/dev/null && mv -f {rt_hb_q}.tmp {rt_hb_q} 2>/dev/null || true\n\
-                 WORKLOAD_RT_HB_FILE={rt_hb_q} setsid bash -c 'while true; do\n\
-                     sleep \"${{WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS:-30}}\"\n\
-                     date -Iseconds > \"$WORKLOAD_RT_HB_FILE.tmp\" 2>/dev/null && mv -f \"$WORKLOAD_RT_HB_FILE.tmp\" \"$WORKLOAD_RT_HB_FILE\" 2>/dev/null || true\n\
-                   done' </dev/null >/dev/null 2>&1 &\n\
+                 # Pass paths via env vars so the inner `bash -c '...'`\n\
+                 # body doesn't have to nest single-quoted shell-escape\n\
+                 # (same trick as the slow-heartbeat sidecar above).\n\
+                 # `WORKLOAD_RT_HB_OUTPUT` is the workload's combined\n\
+                 # stdout+stderr file; the sidecar polls its size and\n\
+                 # only re-touches the heartbeat when it has grown.\n\
+                 # `stat -c %s` is the cheap path; if the output file is\n\
+                 # missing (e.g. racy startup) we treat size as 0 and\n\
+                 # try again on the next tick.\n\
+                 WORKLOAD_RT_HB_FILE={rt_hb_q} WORKLOAD_RT_HB_OUTPUT={out_q} setsid bash -c '\n\
+                     prev_size=$(stat -c %s \"$WORKLOAD_RT_HB_OUTPUT\" 2>/dev/null || echo 0)\n\
+                     while true; do\n\
+                         sleep \"${{WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS:-30}}\"\n\
+                         cur_size=$(stat -c %s \"$WORKLOAD_RT_HB_OUTPUT\" 2>/dev/null || echo 0)\n\
+                         if [ \"$cur_size\" != \"$prev_size\" ]; then\n\
+                             date -Iseconds > \"$WORKLOAD_RT_HB_FILE.tmp\" 2>/dev/null && mv -f \"$WORKLOAD_RT_HB_FILE.tmp\" \"$WORKLOAD_RT_HB_FILE\" 2>/dev/null || true\n\
+                             prev_size=$cur_size\n\
+                         fi\n\
+                     done\n\
+                 ' </dev/null >/dev/null 2>&1 &\n\
                  RUNTIME_HEARTBEAT_PID=$!\n\
              fi\n\
          fi\n\
@@ -3198,19 +3262,26 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         );
     }
 
-    /// End-to-end: actually run the wrapper with a fast heartbeat interval
-    /// and verify (a) the heartbeat file is written immediately on start,
-    /// (b) the file mtime is fresh after the user command exits, and
-    /// (c) the sidecar is NOT still petting the watchdog after wrapper
-    /// teardown (else the EXIT trap is broken). Catches shell-syntax
-    /// regressions the contains-tests can't.
+    /// Asserts the runtime heartbeat sidecar is wired into the wrapper as
+    /// a PROGRESS-driven re-touch loop (not a dumb timer). The sidecar
+    /// must:
+    ///   * be gated by WORKLOAD_RUNTIME_HEARTBEAT (default-on, opt-out)
+    ///   * poll on `WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS` (default 30s)
+    ///   * write to the per-label heartbeat path under
+    ///     `/run/claude/workloads/`
+    ///   * `mkdir -p` the parent dir (fresh tmpfs boot)
+    ///   * `stat -c %s "$WORKLOAD_RT_HB_OUTPUT"` to read the workload's
+    ///     output file size each tick and only re-touch the heartbeat
+    ///     when the size has grown since the last poll
+    ///   * receive the workload's `.output` file path via
+    ///     `WORKLOAD_RT_HB_OUTPUT=<out_q>` (so the touch loop can stat
+    ///     it without nested single-quoting)
+    ///   * still touch the heartbeat ONCE on startup (warm-up coverage)
+    ///   * be spawned via `setsid` for clean process-group kill on EXIT
+    ///   * be reaped both in the EXIT trap and BEFORE `emit-done`
+    ///   * have its heartbeat file removed on EXIT (no leftover freshness)
     #[test]
     fn wrapper_script_contains_runtime_heartbeat_sidecar() {
-        // The runtime heartbeat is a separate fast-cadence sidecar
-        // (30s default vs the slow heartbeat's 900s) that writes to
-        // `/run/claude/workloads/<label>.heartbeat`. Consumed by the
-        // claude-watch daemon's stuck-detection suppression path —
-        // see `policy::workload_heartbeat_fresh`.
         let script = build_wrapper_script(
             "rt",
             "true",
@@ -3226,10 +3297,10 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             script.contains("WORKLOAD_RUNTIME_HEARTBEAT:-1"),
             "wrapper must default WORKLOAD_RUNTIME_HEARTBEAT to 1:\n{script}"
         );
-        // Default touch interval = 30s.
+        // Default poll interval = 30s.
         assert!(
             script.contains("WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS:-30"),
-            "wrapper must default runtime heartbeat interval to 30s:\n{script}"
+            "wrapper must default runtime heartbeat poll interval to 30s:\n{script}"
         );
         // Must reference the runtime heartbeat path (not just the
         // legacy 15-min one).
@@ -3251,14 +3322,56 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             script.contains("kill -TERM -\"$RUNTIME_HEARTBEAT_PID\""),
             "wrapper must kill the runtime sidecar's whole process group on EXIT trap:\n{script}"
         );
-        // Sidecar runs via setsid so it owns its own pgid (kill -- -pgid works).
+        // PROGRESS-DRIVEN design (the load-bearing change vs PR #208):
+        //   1. The workload's combined-output file path is passed via
+        //      WORKLOAD_RT_HB_OUTPUT so the touch loop can stat it.
+        //   2. Each tick the loop stats the output size; only when it
+        //      has grown does it re-touch the heartbeat file. A hung
+        //      wrapped command produces no new bytes → no re-touch →
+        //      the daemon's stuck-detection suppression lifts.
+        //   3. There must be an initial touch BEFORE the loop, to cover
+        //      the warm-up window before any output is produced.
+        //   4. There must NOT be an unconditional per-tick re-touch —
+        //      that's the bug we're fixing.
         let rt_sidecar_idx = script
             .find("WORKLOAD_RT_HB_FILE=")
             .expect("runtime sidecar spawn present");
-        let rt_sidecar_tail = &script[rt_sidecar_idx..];
+        // Slice from sidecar start to the trailing `&` so we test only
+        // the loop body, not the EXIT-trap touch logic later in the
+        // script.
+        let rt_sidecar_end = rt_sidecar_idx + script[rt_sidecar_idx..]
+            .find("RUNTIME_HEARTBEAT_PID=$!")
+            .expect("sidecar end marker present");
+        let rt_sidecar_block = &script[rt_sidecar_idx..rt_sidecar_end];
+
         assert!(
-            rt_sidecar_tail.contains("setsid bash -c 'while true"),
-            "runtime sidecar must run via setsid for clean process-group kill:\n{rt_sidecar_tail}"
+            rt_sidecar_block.contains("WORKLOAD_RT_HB_OUTPUT="),
+            "runtime sidecar must receive the workload output path via WORKLOAD_RT_HB_OUTPUT:\n{rt_sidecar_block}"
+        );
+        assert!(
+            rt_sidecar_block.contains("setsid bash -c"),
+            "runtime sidecar must run via setsid for clean process-group kill:\n{rt_sidecar_block}"
+        );
+        assert!(
+            rt_sidecar_block.contains("stat -c %s \"$WORKLOAD_RT_HB_OUTPUT\""),
+            "runtime sidecar must stat the workload's .output file size each tick (progress detection):\n{rt_sidecar_block}"
+        );
+        assert!(
+            rt_sidecar_block.contains("prev_size") && rt_sidecar_block.contains("cur_size"),
+            "runtime sidecar must compare previous + current output size to detect progress:\n{rt_sidecar_block}"
+        );
+        assert!(
+            rt_sidecar_block.contains("if [ \"$cur_size\" != \"$prev_size\" ]"),
+            "runtime sidecar must only re-touch heartbeat when output size changed:\n{rt_sidecar_block}"
+        );
+        // Initial touch BEFORE the sidecar spawn — covers warm-up
+        // before the wrapped command produces any output. Search the
+        // whole pre-sidecar region (don't tight-window, since the
+        // template's comments can grow without breaking semantics).
+        let pre_sidecar = &script[..rt_sidecar_idx];
+        assert!(
+            pre_sidecar.contains("date -Iseconds > '/run/claude/workloads/rt.heartbeat'.tmp"),
+            "wrapper must do an initial heartbeat touch BEFORE the progress-poll sidecar starts"
         );
         // Runtime heartbeat FILE removed on EXIT so daemon sees no
         // leftover freshness from a crashed wrapper.
@@ -3275,6 +3388,49 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         assert!(
             post_exit.contains("RUNTIME_HEARTBEAT_PID"),
             "wrapper must kill runtime sidecar after user command exits (not just EXIT trap):\n{post_exit}"
+        );
+    }
+
+    /// Anti-regression: the runtime sidecar loop body must NOT contain
+    /// an unconditional "touch the heartbeat on every tick" pattern.
+    /// That was the PR #208 design flaw — wrapper alive + child hung =
+    /// heartbeat stays fresh = real stuck state hidden.
+    #[test]
+    fn wrapper_script_runtime_sidecar_does_not_touch_unconditionally() {
+        let script = build_wrapper_script(
+            "rt2",
+            "true",
+            Path::new("/tmp/rt2.output"),
+            Path::new("/tmp/rt2.exit"),
+            Path::new("/tmp/rt2.heartbeat"),
+            Path::new("/run/claude/workloads/rt2.heartbeat"),
+            "/usr/local/bin/claude-watch",
+            None,
+        );
+        let rt_idx = script
+            .find("WORKLOAD_RT_HB_FILE=")
+            .expect("runtime sidecar present");
+        // The loop body starts after the `setsid bash -c '` opening and
+        // ends at the closing `'`. Find the end of the loop body so we
+        // don't false-positive on the initial touch above.
+        let loop_start = rt_idx + script[rt_idx..]
+            .find("while true; do")
+            .expect("while true present");
+        let loop_end = loop_start + script[loop_start..]
+            .find("done\n")
+            .expect("done marker present");
+        let loop_body = &script[loop_start..loop_end];
+        // The dumb-timer pattern was:
+        //     sleep N
+        //     date -Iseconds > $HB.tmp && mv -f $HB.tmp $HB
+        // i.e. NO conditional / NO size-comparison between the sleep
+        // and the touch. The fixed loop wraps the touch in
+        // `if [ "$cur_size" != "$prev_size" ]; then ... fi`. Assert
+        // the conditional is present.
+        assert!(
+            loop_body.contains("if [ \"$cur_size\" != \"$prev_size\" ]"),
+            "runtime sidecar loop body must guard the heartbeat touch with a progress check; \
+             unconditional per-tick touch is the regression we're guarding against:\n{loop_body}"
         );
     }
 
@@ -3350,6 +3506,188 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         // Exit file must also exist with the user-command rc.
         let ec = std::fs::read_to_string(&exit_path).expect("read exit");
         assert_eq!(ec.trim(), "0", "expected exit 0; got {ec:?}");
+    }
+
+    /// End-to-end: a workload that emits MANY progress lines triggers
+    /// many heartbeat re-touches. The happy-path proof that the
+    /// progress-driven sidecar fires when the wrapped command IS
+    /// making progress.
+    ///
+    /// Strategy: run a wrapped command that emits one line per second
+    /// for 5 seconds. After it exits, capture the heartbeat mtime
+    /// AND compare it to the wrapper-start time. The heartbeat must
+    /// have advanced by at least 3 seconds past wrapper-start (one
+    /// touch per output line, debounced to one touch per poll
+    /// interval). We snapshot via the wrapped command itself
+    /// (writing `stat -c %Y` to a side file BEFORE the wrapper's EXIT
+    /// trap can remove the heartbeat).
+    #[test]
+    fn wrapper_script_runtime_heartbeat_refreshes_when_output_grows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("prog.output");
+        let exit_path = tmp.path().join("prog.exit");
+        let hb_path = tmp.path().join("prog.heartbeat");
+        let rt_hb_path = tmp.path().join("runtime").join("prog.heartbeat");
+        let script_path = tmp.path().join("prog.sh");
+        let start_mtime_path = tmp.path().join("start.mtime");
+        let final_mtime_path = tmp.path().join("final.mtime");
+        // The wrapped command snapshots the heartbeat mtime up-front
+        // (a baseline from the wrapper's initial touch), then emits 5
+        // lines on a 1s cadence (5x the poll interval), then captures
+        // the heartbeat mtime again. The progress-driven sidecar must
+        // have re-touched at least once -> final_mtime > start_mtime.
+        let user_cmd = format!(
+            "stat -c %Y {hb_s} > {start}; \
+             echo line1; sleep 1; \
+             echo line2; sleep 1; \
+             echo line3; sleep 1; \
+             echo line4; sleep 1; \
+             echo line5; sleep 1; \
+             stat -c %Y {hb_f} > {final}",
+            hb_s = rt_hb_path.display(),
+            hb_f = rt_hb_path.display(),
+            start = start_mtime_path.display(),
+            final = final_mtime_path.display(),
+        );
+
+        let script_full = build_wrapper_script(
+            "prog",
+            &user_cmd,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            "/bin/true",
+            None,
+        );
+        let script = script_full.replace("sleep 30\n", "sleep 0\n");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        // Slow heartbeat OFF; runtime heartbeat poll = 1s. PTY OFF
+        // for hermetic behavior on CI (no PTY echo / EOL conversion
+        // noise from `script`).
+        let status = Command::new("bash")
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS", "1")
+            .env("WORKLOAD_PTY", "0")
+            .arg(&script_path)
+            .status()
+            .expect("run wrapper");
+        assert!(
+            status.success(),
+            "wrapper exited non-zero: {status:?}\nscript:\n{script}"
+        );
+
+        let start = std::fs::read_to_string(&start_mtime_path)
+            .expect("read start.mtime")
+            .trim()
+            .parse::<i64>()
+            .expect("start mtime int");
+        let final_mt = std::fs::read_to_string(&final_mtime_path)
+            .expect("read final.mtime")
+            .trim()
+            .parse::<i64>()
+            .expect("final mtime int");
+        let delta = final_mt - start;
+        assert!(
+            delta >= 2,
+            "runtime heartbeat mtime must advance by >=2s across 5x 1s output lines: \
+             start={start} final={final_mt} delta={delta}s\n\
+             (delta < 2 means the sidecar is not re-touching on progress)"
+        );
+    }
+
+    /// End-to-end: a workload that emits NOTHING after startup leaves
+    /// the heartbeat mtime stuck. Load-bearing proof that the
+    /// progress-driven sidecar does NOT give false-confidence when
+    /// the wrapped command hangs (the PR #208 regression case).
+    ///
+    /// Strategy: the wrapped command captures the heartbeat mtime
+    /// immediately on entry (baseline), then `sleep 5` silently (5x
+    /// the 1s poll interval, no output writes at all), then captures
+    /// again. The progress-driven sidecar sees zero growth across all
+    /// polls -> the second mtime equals the first.
+    ///
+    /// This test is hermetic in a way the earlier `exec >/dev/null;
+    /// sleep` variant was not: there's no inner bash output, no
+    /// flushable libstdbuf buffer, no race between snap_a and the
+    /// sidecar's first poll. The only growth in `.output` after
+    /// snap_a is the wrapper's `=== DONE ===` footer, which lands
+    /// AFTER snap_b has already captured the heartbeat mtime.
+    #[test]
+    fn wrapper_script_runtime_heartbeat_does_not_refresh_when_silent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("hung.output");
+        let exit_path = tmp.path().join("hung.exit");
+        let hb_path = tmp.path().join("hung.heartbeat");
+        let rt_hb_path = tmp.path().join("runtime").join("hung.heartbeat");
+        let script_path = tmp.path().join("hung.sh");
+        let start_mtime_path = tmp.path().join("start.mtime");
+        let final_mtime_path = tmp.path().join("final.mtime");
+        // Capture heartbeat mtime on entry, sleep 5s silently,
+        // capture again. `stat -c %Y > file` writes to a SIDE file,
+        // not stdout, so the .output file genuinely doesn't grow
+        // between the two snapshots.
+        let user_cmd = format!(
+            "stat -c %Y {hb_s} > {start}; \
+             sleep 5; \
+             stat -c %Y {hb_f} > {final}",
+            hb_s = rt_hb_path.display(),
+            hb_f = rt_hb_path.display(),
+            start = start_mtime_path.display(),
+            final = final_mtime_path.display(),
+        );
+
+        let script_full = build_wrapper_script(
+            "hung",
+            &user_cmd,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            "/bin/true",
+            None,
+        );
+        let script = script_full.replace("sleep 30\n", "sleep 0\n");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        // Slow heartbeat OFF; runtime heartbeat poll = 1s. PTY OFF
+        // for hermetic behavior.
+        let status = Command::new("bash")
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS", "1")
+            .env("WORKLOAD_PTY", "0")
+            .arg(&script_path)
+            .status()
+            .expect("run wrapper");
+        assert!(
+            status.success(),
+            "wrapper exited non-zero: {status:?}\nscript:\n{script}"
+        );
+
+        let start = std::fs::read_to_string(&start_mtime_path)
+            .expect("read start.mtime")
+            .trim()
+            .parse::<i64>()
+            .expect("start mtime int");
+        let final_mt = std::fs::read_to_string(&final_mtime_path)
+            .expect("read final.mtime")
+            .trim()
+            .parse::<i64>()
+            .expect("final mtime int");
+        let out_body = std::fs::read_to_string(&out_path).unwrap_or_default();
+        assert_eq!(
+            start, final_mt,
+            "runtime heartbeat mtime must NOT advance during a 5s silent stretch: \
+             start={start} final={final_mt} delta={delta}s\n\
+             .output body:\n{out_body}\n\
+             (if final > start: sidecar is still touching on a timer — the PR #208 regression)",
+            delta = final_mt - start,
+        );
     }
 
     #[test]
