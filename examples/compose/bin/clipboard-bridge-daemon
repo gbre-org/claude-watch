@@ -53,7 +53,7 @@
 #
 #   # Background (launchd-managed):
 #   # install the .plist from examples/compose/launchd/
-#   launchctl load ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+#   launchctl load ~/Library/LaunchAgents/org.gbre.claude-watch.clipboard-bridge.plist
 #
 #   # Override poll interval / remote path:
 #   clipboard-bridge-daemon --interval 0.5 --remote-host gomorrah \

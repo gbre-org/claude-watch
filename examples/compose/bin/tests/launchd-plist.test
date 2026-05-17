@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for examples/compose/launchd/com.anthropic.claude-watch.mcp-host-bash.plist
+"""Tests for examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist
 — the macOS LaunchAgent template for persistent auto-start of
 mcp-host-bash on operator-login.
 
@@ -39,7 +39,7 @@ HERE = Path(__file__).resolve().parent
 PLIST = (
     HERE.parent.parent
     / "launchd"
-    / "com.anthropic.claude-watch.mcp-host-bash.plist"
+    / "org.gbre.claude-watch.mcp-host-bash.plist"
 )
 LAUNCHD_README = HERE.parent.parent / "launchd" / "README.md"
 
@@ -109,7 +109,7 @@ def test_label_matches_filename() -> None:
     minus `.plist`. The plist's `Label` MUST match or the operator's
     workflow (copy file in, then `bootstrap gui/$(id -u)/<label>`)
     breaks at the bootstrap step."""
-    expected_label = PLIST.stem  # "com.anthropic.claude-watch.mcp-host-bash"
+    expected_label = PLIST.stem  # "org.gbre.claude-watch.mcp-host-bash"
     actual = PARSED.get("Label")
     expect(
         actual == expected_label,
@@ -423,7 +423,7 @@ def test_compose_readme_links_to_launchd() -> None:
         return
     body = compose_readme.read_text()
     expect(
-        "launchd/README.md" in body or "launchd/com.anthropic" in body,
+        "launchd/README.md" in body or "launchd/org.gbre" in body,
         "examples/compose/README.md should link to the launchd "
         "subdirectory so operators find the persistent-launch path",
     )

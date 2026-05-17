@@ -111,10 +111,10 @@ else
 fi
 
 section "launchd plist"
-PLIST="$HOME/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist"
+PLIST="$HOME/Library/LaunchAgents/org.gbre.claude-watch.clipboard-bridge.plist"
 if [[ -f "$PLIST" ]]; then
     ok "launchd plist installed at $PLIST"
-    if launchctl list 2>/dev/null | grep -q com.anthropic.claude-watch.clipboard-bridge; then
+    if launchctl list 2>/dev/null | grep -q org.gbre.claude-watch.clipboard-bridge; then
         ok "launchd agent loaded (clipboard-bridge daemon is running)"
     else
         warn "plist present but agent not loaded"
@@ -122,7 +122,7 @@ if [[ -f "$PLIST" ]]; then
     fi
 else
     warn "launchd plist not installed yet"
-    hint "Copy from examples/compose/launchd/com.anthropic.claude-watch.clipboard-bridge.plist.example"
+    hint "Copy from examples/compose/launchd/org.gbre.claude-watch.clipboard-bridge.plist.example"
     hint "Install: cp ...example $PLIST && launchctl load $PLIST"
 fi
 

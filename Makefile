@@ -192,7 +192,7 @@ test-mcp-proxy-auth-shim:
 test-install-host-deps:
 	examples/compose/bin/tests/install-host-deps.test
 
-# Tests for examples/compose/launchd/com.anthropic.claude-watch.mcp-host-bash.plist
+# Tests for examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist
 # — the macOS LaunchAgent template that persistently auto-starts
 # mcp-host-bash on operator-login. File-level structural validation
 # only (parses via stdlib plistlib + plutil-lint when available);

@@ -11,7 +11,7 @@ and image paste silently no-ops.
 This shim intercepts those exact invocations and reads the clipboard
 bytes from a host-side bridge file instead. The bridge file is dropped
 by an operator-side daemon (the example launchd plist in
-examples/compose/launchd/com.anthropic.claude-watch.clipboard-bridge.plist
+examples/compose/launchd/org.gbre.claude-watch.clipboard-bridge.plist
 sets up the pattern on macOS) whenever the operator's clipboard changes
 to an image. The container reads the file via a bind-mount at the
 canonical path /host-clipboard/ (configurable via XCLIP_BRIDGE_DIR).

@@ -636,7 +636,7 @@ clipboard daemon. Detail per option:
   `XCLIP_BRIDGE_DIR`). The operator-side daemon at
   `examples/compose/bin/clipboard-bridge-daemon` (Mac launchd agent;
   example plist at
-  `examples/compose/launchd/com.anthropic.claude-watch.clipboard-bridge.plist.example`)
+  `examples/compose/launchd/org.gbre.claude-watch.clipboard-bridge.plist.example`)
   polls the Mac clipboard via `osascript` (preferred: `pngpaste` if
   installed), sha256-de-dupes, atomic-renames into a local bridge
   dir, and rsync's to the remote host on every clipboard change. The

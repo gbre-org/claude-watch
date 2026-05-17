@@ -3,14 +3,14 @@
 <!-- clipboard-bridge LaunchAgent (per-user) for cross-host claude image paste.
 
      Install:
-       cp com.anthropic.claude-watch.clipboard-bridge.plist.example \
-          ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+       cp org.gbre.claude-watch.clipboard-bridge.plist.example \
+          ~/Library/LaunchAgents/org.gbre.claude-watch.clipboard-bridge.plist
        # edit the plist: set REMOTE_HOST / REMOTE_DIR for your setup
-       launchctl load ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+       launchctl load ~/Library/LaunchAgents/org.gbre.claude-watch.clipboard-bridge.plist
 
      Uninstall:
-       launchctl unload ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
-       rm ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+       launchctl unload ~/Library/LaunchAgents/org.gbre.claude-watch.clipboard-bridge.plist
+       rm ~/Library/LaunchAgents/org.gbre.claude-watch.clipboard-bridge.plist
 
      What this does:
        Runs examples/compose/bin/clipboard-bridge-daemon at login. Polls
@@ -24,7 +24,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.anthropic.claude-watch.clipboard-bridge</string>
+    <string>org.gbre.claude-watch.clipboard-bridge</string>
 
     <key>ProgramArguments</key>
     <array>

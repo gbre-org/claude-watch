@@ -29,7 +29,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.anthropic.claude-watch.mcp-host-bash</string>
+    <string>org.gbre.claude-watch.mcp-host-bash</string>
 
     <!--
       ProgramArguments: full argv launchd will exec. Default points at

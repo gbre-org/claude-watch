@@ -107,7 +107,7 @@ services:
       # operator-side daemon (examples/compose/bin/clipboard-bridge-
       # daemon, runs on the Mac via launchd) watches the Mac clipboard
       # and rsync's PNG bytes to the path mounted here. See
-      # examples/compose/launchd/com.anthropic.claude-watch.clipboard-
+      # examples/compose/launchd/org.gbre.claude-watch.clipboard-
       # bridge.plist.example for the Mac side.
       #
       # Mount the operator's clipboard-bridge cache dir read-only at
