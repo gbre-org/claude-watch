@@ -1,6 +1,10 @@
 # Two-channel design — orchestration tmux + rich-UX panel
 
-> Status: design proposal, 2026-05-16. No code changes accompany this doc.
+> Status: design proposal, 2026-05-16; image-paste section added
+> 2026-05-17 with empirical findings that contradict the original
+> 2026-05-16 revision's claim that "image paste works via tmux
+> passthrough" in the cw container shape. See § 3.7. No code changes
+> accompany this doc.
 
 ## 1. Problem statement
 
@@ -317,7 +321,7 @@ The trade-off vs the chat webview:
 | Persists across operator-quit | Yes — tmux+docker | Yes — extension host |
 | claude-watch can observe | Yes — pane scrape | No — no surface |
 | claude-watch can interrupt | Yes — tmux send-keys | Partial — pidfd inject (no Escape) |
-| Image paste from clipboard | Yes — VSCode terminal forwards OSC; tmux passes through (PR #173) | Yes — base64-wraps into stream-json |
+| Image paste from clipboard | Only on the same host as the operator's display server (Mac CLI in iTerm2 / VSCode integrated terminal native — `osascript` reads the Mac clipboard directly). Container / SSH / remote-tmux: NO — see § 3.7 below. | Yes — base64-wraps into stream-json |
 | Rich diff rendering | TUI-rendered (claude does its own diff UI in terminal) | Native VSCode diff editor (webview → extension → workspace) |
 | @-mention picker | TUI completion menu (no LSP integration) | Native VSCode quick-pick with workspace symbols |
 | Click-to-open files | Limited (terminal hyperlinks if supported) | Native (extension uses workspace.openTextDocument) |
@@ -507,6 +511,150 @@ transport at agent startup (`--input-format text` (TUI) vs
 `--input-format stream-json` (webview)) is also the choice of which UX
 features the operator gets. There's no `--input-format both`.
 
+### 3.7 Image paste in TUI mode — empirical mechanism (2026-05-17)
+
+The 2026-05-16 design doc claimed (line 320 of the original revision)
+"Yes — VSCode terminal forwards OSC; tmux passes through (PR #173)" for
+image paste in the cw container shape. **This is wrong.** Empirical
+investigation (q-2026-05-17-a70e) found the actual code path:
+
+**Where the bytes come from.** The bundled `claude` binary
+(`@anthropic-ai/claude-code-linux-x64/claude`, v2.1.143) implements
+TUI-mode clipboard image-paste as a subprocess invocation against the
+host's native clipboard utility. Reverse-engineering the bundled JS:
+
+```js
+// Linux branch (paraphrased; same shape for darwin / win32)
+{
+  checkImage:  `xclip -selection clipboard -t TARGETS -o 2>/dev/null \
+                | grep -E "image/(png|jpeg|jpg|gif|webp|bmp)" \
+                || wl-paste -l 2>/dev/null | grep -E "image/..."`,
+  saveImage:   `xclip -selection clipboard -t image/png -o \
+                > $tmppath 2>/dev/null \
+                || wl-paste --type image/png > $tmppath \
+                || xclip -selection clipboard -t image/bmp -o > $tmppath \
+                || wl-paste --type image/bmp > $tmppath`,
+  // ... + osascript on darwin, powershell.exe on win32 / WSL
+}
+```
+
+The binary then:
+
+1. Spawns `xclip -selection clipboard -t TARGETS -o` (or `wl-paste -l`)
+   to enumerate clipboard MIME types.
+2. If an `image/*` MIME is present, spawns `xclip -selection clipboard
+   -t image/png -o > /tmp/.../claude_cli_latest_screenshot.png`.
+3. Reads the saved PNG bytes back, base64-encodes, attaches to the
+   prompt as an image content block.
+4. Emits a `tengu_paste_image` telemetry event with `input_image_paste`
+   or `input_image_drag` as the sub-kind.
+
+There is **no** OSC sequence, **no** SSE port use, **no** MCP-IDE call,
+and **no** stdin-side image data. The TUI binary always reads the
+clipboard through a subprocess against the host's display server.
+
+**Why it works on Mac in iTerm2 / native VSCode integrated terminal.**
+Both `claude` and the operator's clipboard live on the same Mac. The
+`darwin` branch invokes `osascript -e 'the clipboard as «class PNGf»'`
+which talks to the Mac WindowServer directly. Same host, same display
+server, the clipboard is reachable. Works.
+
+**Why it doesn't work in the cw container shape.** The cw container has
+no display server (no `DISPLAY`, no `WAYLAND_DISPLAY`, no Mac
+WindowServer). `xclip` / `wl-paste` either are missing entirely or
+return an empty TARGETS list (the container's `xclip -selection
+clipboard -t TARGETS -o` would fail with "Can't open display"). The
+host operating the container also has no path to forward its clipboard
+into the container — Docker's stdin / tmux / OSC sequences don't carry
+clipboard data. Empirically verified on gomorrah (2026-05-17):
+
+```
+$ docker exec compose-claude-container-1 bash -c \
+    'which xclip; echo "DISPLAY=$DISPLAY"; echo "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"'
+                                  # ← no xclip in container
+DISPLAY=
+WAYLAND_DISPLAY=
+```
+
+Even with `xclip` installed inside the container, there's nothing for it
+to talk to. Confirmation also on the host: `gomorrah` itself has
+`/usr/bin/xclip` but `DISPLAY=` is empty in shells reached via SSH from
+a remote VSCode integrated terminal. Image paste in a remote-SSH +
+terminal-mode claude on gomorrah doesn't work either, for the same
+reason.
+
+**Why env-var propagation (`CLAUDE_CODE_SSE_PORT`, etc.) does NOT fix
+it.** The hypothesis going in was "the VSCode extension hosts an MCP
+server, the integrated terminal sets `CLAUDE_CODE_SSE_PORT`, claude
+auto-connects via `/ide`, and image-paste flows over that channel."
+Code inspection of the binary shows this is not the case:
+
+- The IDE MCP server hosts only `mcp__ide__getDiagnostics` and
+  `mcp__ide__executeCode` as model-visible tools, plus a dozen
+  CLI-internal RPCs for diff / selection / save. None of them is an
+  image-paste delivery channel.
+- `CLAUDE_CODE_SSE_PORT` is only consumed by the auto-connect path
+  (`process.env.CLAUDE_CODE_SSE_PORT, K=q?parseInt(q):null`) to
+  validate IDE lockfile entries against the current workspace. Setting
+  it without a reachable corresponding lockfile under `~/.claude/ide/`
+  on the right host accomplishes nothing — the lockfile validation
+  also checks `process.ppid === lockfile.pid || lockfile.pid in
+  ancestors(claude)`, which fails inside a container because the
+  extension host isn't a process ancestor of the in-container claude.
+- The clipboard read path quoted above ignores
+  `CLAUDE_CODE_SSE_PORT` entirely and always shells out to
+  xclip / wl-paste / osascript.
+
+**The actual upstream gap.** This is exactly the feature request in
+anthropics/claude-code#51244 — bridge the host clipboard image data
+into the in-container CLI via the VSCode IPC socket
+(`VSCODE_IPC_HOOK_CLI`, the same channel VSCode already uses to let
+`code` invocations inside Remote SSH / devcontainers open files in the
+host editor). Until that lands upstream, no env-var, no wrapper script,
+no tmux setting on the claude-watch side can make image-paste work in
+TUI mode against a remote host.
+
+**Cancelled mitigations.** During investigation we considered:
+
+- **`xclip` shim that calls back to the host over SSH.** Possible but
+  requires the host to be SSH-reachable from the container with a
+  pre-shared key, the host clipboard utility to be available in a
+  `DISPLAY`-aware shell on the host, and a re-auth dance every time
+  the SSH key rotates. Even then it only works for hosts that have a
+  display server (rules out gomorrah-style SSH-only hosts where there
+  is no `DISPLAY` to read).
+- **OSC 52 clipboard read.** OSC 52 is `\033]52;c;<base64>\007` — used
+  to *write* the terminal's clipboard. There is no widely-supported OSC
+  for the inverse direction (read clipboard from terminal back to the
+  process). xterm has a write-only `52;c;?` query that some terminals
+  respond to, but it's rate-limited / disabled-by-default in many
+  emulators (security: prevents pages from reading clipboard), and the
+  claude binary doesn't implement reading it.
+- **Wayland / X11 socket bind-mount.** `-v /tmp/.X11-unix:/tmp/.X11-unix
+  -e DISPLAY=$DISPLAY` would in principle let in-container xclip talk
+  to the host display. Two killers: (1) the gomorrah host has no
+  display server at all (headless server, no `DISPLAY` to forward),
+  and (2) Andrew's actual workflow is Mac VSCode → SSH → tmux+docker on
+  gomorrah, so even if a display did exist on gomorrah it wouldn't be
+  the Mac's clipboard.
+
+**Conclusion.** The original Option A "image paste works via tmux
+passthrough" claim is incorrect for any remote setup. For the cw
+container shape on a headless host, terminal-mode image paste cannot
+work without the upstream change tracked in
+anthropics/claude-code#51244. The right options today are:
+
+- **Option B** (webview sidecar) — paste images into the webview UI;
+  the extension wraps them as base64 in stream-json and they reach the
+  webview agent. Cross-poll via claude-events as documented in
+  Appendix B.
+- **Save-to-file** — drop the image in `~/scratch/` (or any
+  bind-mounted host path), `@`-mention or reference the file path in
+  the agent's prompt. Loses paste-and-go ergonomics but works without
+  any infrastructure change.
+- **Option D** (upstream) — track anthropics/claude-code#51244. No
+  homelab-side fix.
+
 ## 4. Design proposals
 
 ### 4.1 Option A — keep the cw container shape (status quo, working today)
@@ -534,8 +682,17 @@ Cons:
   proposed changes, native @-mention picker with workspace symbols,
   click-to-open files from chat history, speech-to-text, accept /
   reject buttons in the editor toolbar.
-- Image paste works (PR #173 enabled tmux allow-passthrough) but the
-  agent renders the image as a TUI ASCII preview, not a real preview.
+- Image paste does NOT work in the cw container shape, regardless of
+  tmux `allow-passthrough`. The TUI clipboard read path is a subprocess
+  invocation of `xclip` / `wl-paste` / `osascript`; inside a Linux
+  container there is no display server and the host clipboard is not
+  reachable. This is the same gap tracked upstream in
+  anthropics/claude-code#51244 (request: bridge the host clipboard into
+  the CLI via the VSCode IPC socket). PR #173's tmux
+  `allow-passthrough on` is still correct — it covers OSC sequences that
+  carry truecolor / hyperlinks / bracketed-paste-of-text — but no part
+  of the clipboard-image read path goes through tmux. See § 3.7 for the
+  empirical investigation behind this correction.
 
 ### 4.2 Option B — operator runs both, claude-event cross-pollination
 
@@ -585,7 +742,13 @@ Cons:
   ourselves, which is what the extension already is. Compete with the
   extension, lose.
 
-### 4.4 Option D — upstream feature ask: agent transport "attach to existing"
+### 4.4 Option D — upstream feature asks
+
+Two separate upstream feature requests fall under this umbrella. They
+target different limitations and can land independently.
+
+**D.1 — agent transport "attach to existing"** (the one-agent-two-surfaces
+ask):
 
 - File an Anthropic-side feature request: add an SDK transport mode for
   "this agent is already running, here's how to plumb to it" (e.g.
@@ -593,6 +756,26 @@ Cons:
   similar).
 - The extension would then have a way to use an existing agent instead
   of spawning a fresh one.
+
+**D.2 — TUI clipboard bridge via VSCode IPC socket** (the image-paste-in-
+container ask):
+
+- Tracked upstream as anthropics/claude-code#51244 (open / stale as of
+  2026-05-17).
+- Request: when the in-container claude CLI detects
+  `VSCODE_IPC_HOOK_CLI` in its env (set by VSCode's remote / devcontainer
+  / Remote SSH bootstrap), have the clipboard-image-read path issue an
+  IPC request to the VSCode host process over that socket instead of
+  shelling out to `xclip` / `wl-paste` / `osascript`. The host-side
+  VSCode would read its native clipboard and return the PNG bytes to
+  the in-container CLI over the same socket.
+- For the cw container shape specifically, also need `cw` to set
+  `VSCODE_IPC_HOOK_CLI` in the `docker exec` env when the operator's
+  integrated terminal has one, so it reaches the in-container claude
+  process. This is the one piece we can ship locally — but it's only
+  load-bearing once the upstream change lands; without the
+  corresponding CLI codepath, propagating the env var alone
+  accomplishes nothing (see § 3.7).
 
 Pros:
 - Clean architectural fix. Lets the extension be the rendering layer
@@ -667,9 +850,20 @@ between a tmux-hosted agent and a transient webview agent smoother:
   with a pre-seeded "I'm a sidecar, the orchestration agent is in tmux"
   system-prompt fragment. Not blocking on this for the initial doc.
 
-**Phase 4 — upstream feature request.** File the
-"attach-to-existing-agent transport" ask with Anthropic. No code on our
-side; just a github issue / support ticket. Track its status in this doc.
+**Phase 4 — upstream feature requests.** Two separate asks (see § 4.4):
+
+- File the "attach-to-existing-agent transport" ask with Anthropic
+  (D.1). No code on our side; github issue / support ticket. Track
+  its status in this doc.
+- Track / +1 anthropics/claude-code#51244 for the
+  "TUI-mode-clipboard-bridge over VSCode IPC socket" ask (D.2). This
+  is the prerequisite for image-paste in the cw container shape (see
+  § 3.7 for the empirical investigation behind why it doesn't work
+  today). When upstream lands, follow up with a small `cw` change to
+  pass `-e VSCODE_IPC_HOOK_CLI=$VSCODE_IPC_HOOK_CLI` through `docker
+  exec`. Until then, neither env-var propagation nor any local shim
+  recovers image-paste in TUI mode against a remote / containerised
+  host.
 
 ## 6. Open questions / unknowns
 
@@ -697,13 +891,18 @@ side; just a github issue / support ticket. Track its status in this doc.
   everywhere). For Option B we'd need to verify the chat webview is
   available in the operator's specific fork.
 
-- **Image-paste UX gap.** Option A passes images through tmux to the TUI
-  agent (PR #173). The agent receives them as base64-wrapped content
-  blocks and the TUI renders an ASCII preview. The webview agent gets
-  a real preview. Closing this gap would require either a terminal-side
-  image rendering protocol (sixel / kitty graphics — partial VSCode
-  support) or accepting the TUI rendering limitation. Not blocking, but
-  flag for operator expectations.
+- **Image-paste in the cw container shape (and any remote setup).**
+  The 2026-05-17 investigation (§ 3.7) found that TUI-mode image paste
+  shells out to `xclip` / `wl-paste` / `osascript` against the local
+  display server. In the cw container (and any SSH-from-Mac-to-headless
+  -host setup) there's no display server reachable, so image-paste
+  doesn't work. Closing this gap requires the upstream
+  anthropics/claude-code#51244 (Option D.2) — there is no claude-watch
+  side fix. PR #173's tmux `allow-passthrough` is still correct for the
+  OSC sequences it actually covers (truecolor, hyperlinks, bracketed
+  paste of text) but it is not load-bearing for clipboard images.
+  Operator workarounds today: paste into a webview sidecar (Option B)
+  or save-to-file and `@`-mention.
 
 - **Where to default-recommend Option A vs Option B for new operators.**
   This doc recommends Option A as the canonical shape. The operator
