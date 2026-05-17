@@ -699,6 +699,45 @@ RUN chmod +x /usr/local/bin/cw-watcher-supervisor
 COPY container/bin/cwsr /usr/local/bin/cwsr
 RUN chmod +x /usr/local/bin/cwsr
 
+# xclip — cross-host clipboard image-paste shim.
+#
+# The bundled `claude` binary's TUI image-paste code path shells out to
+# `xclip -selection clipboard -t TARGETS -o` (to enumerate clipboard
+# MIME types) and then `xclip -selection clipboard -t image/png -o > $tmp`
+# (to read the PNG bytes). Inside this container on a headless host
+# there is NO display server reachable from xclip — the real
+# /usr/bin/xclip fails with "Can't open display" and image paste
+# silently no-ops.
+#
+# This shim, baked at /usr/local/bin/xclip (which beats /usr/bin/xclip
+# in PATH order from the ENV PATH line above), interprets the
+# specific argv shapes claude emits and reads the bytes from a
+# bind-mounted host directory (/host-clipboard/ by default; override
+# via XCLIP_BRIDGE_DIR). An operator-side daemon on the Mac (see
+# examples/compose/bin/clipboard-bridge-daemon + the launchd plist
+# under examples/compose/launchd/) watches the Mac clipboard and
+# rsync's PNG bytes to the path that's bind-mounted here. When no
+# bridge directory is mounted (no operator setup), the shim returns
+# "empty clipboard" gracefully — claude's image-paste path treats
+# that as "nothing to paste" rather than crashing.
+#
+# Empirical history (q-2026-05-17-a0ff): the prior investigation
+# concluded "no xclip-shim path works for this layout." Andrew pushed
+# back ("we should at least be able to shim xclip"), and the empirical
+# re-investigation found that the file-watch bridge approach DOES work
+# end-to-end. The shim has 11 embedded tests; run them at any time
+# inside the container with `python3 /usr/local/bin/xclip --self-test`.
+#
+# Opt-out (debugging / containers that actually have a real X server):
+#   XCLIP_SHIM=disabled  → the shim execs /usr/bin/xclip directly.
+#
+# Real xclip is NOT installed in the base image (the shim does the
+# whole job for the canonical claude invocations); a downstream image
+# that needs the real binary for non-claude callers can apt-get
+# install xclip and set XCLIP_SHIM=disabled.
+COPY container/bin/xclip /usr/local/bin/xclip
+RUN chmod +x /usr/local/bin/xclip
+
 # self-clear — fresh-context-injection helper that the in-container
 # claude-watch daemon shells out to when its policy module decides to
 # /clear the wedged pane. The script (Python 3) sends Escape+dd+i+text

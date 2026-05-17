@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Integration test for container/bin/xclip (cross-host clipboard shim).
+
+Coverage:
+  1. The shim's embedded `--self-test` mode exits 0 (all 11 unit tests pass).
+  2. TARGETS query against a populated bridge dir returns image/png on
+     stdout and exits 0.
+  3. Image read returns the exact PNG bytes that were written to the
+     bridge dir.
+  4. Missing bridge dir is graceful (TARGETS exits 0 + empty; read exits 1).
+  5. Stale bridge file (mtime > XCLIP_BRIDGE_STALE_SECONDS ago) is treated
+     as empty.
+  6. Disable-via-env path: XCLIP_SHIM=disabled with no real xclip exits 1
+     with a clean message.
+
+Run:  ./xclip-shim.test
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+SCRIPT = CONTAINER_DIR / "bin" / "xclip"
+
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate xclip shim at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def run(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    return subprocess.run(
+        ["python3", str(SCRIPT), *args],
+        capture_output=True,
+        env=merged_env,
+    )
+
+
+# 1. Embedded self-tests pass.
+r = run("--self-test")
+expect(
+    r.returncode == 0,
+    f"xclip --self-test should exit 0; got {r.returncode}, "
+    f"stderr={r.stderr.decode('utf-8', errors='replace')!r}",
+)
+
+
+# 2. TARGETS query against populated bridge.
+with tempfile.TemporaryDirectory() as tmp:
+    bridge = Path(tmp)
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    (bridge / "clipboard.png").write_bytes(png_bytes)
+    (bridge / "clipboard.mime").write_text("image/png\n")
+    r = run(
+        "-selection", "clipboard", "-t", "TARGETS", "-o",
+        env={"XCLIP_BRIDGE_DIR": str(bridge)},
+    )
+    expect(r.returncode == 0, f"TARGETS exit {r.returncode}, stderr={r.stderr!r}")
+    expect(
+        b"image/png" in r.stdout,
+        f"TARGETS should include image/png, got {r.stdout!r}",
+    )
+
+    # 3. Image read returns exact bytes.
+    r = run(
+        "-selection", "clipboard", "-t", "image/png", "-o",
+        env={"XCLIP_BRIDGE_DIR": str(bridge)},
+    )
+    expect(r.returncode == 0, f"image read exit {r.returncode}")
+    expect(
+        r.stdout == png_bytes,
+        f"image read bytes mismatch: got {len(r.stdout)} bytes, "
+        f"expected {len(png_bytes)}",
+    )
+
+
+# 4. Missing bridge dir is graceful.
+r = run(
+    "-selection", "clipboard", "-t", "TARGETS", "-o",
+    env={"XCLIP_BRIDGE_DIR": "/nonexistent/totally/bogus/path"},
+)
+expect(
+    r.returncode == 0 and r.stdout == b"",
+    f"missing-bridge TARGETS should be (0,''); got ({r.returncode},{r.stdout!r})",
+)
+
+r = run(
+    "-selection", "clipboard", "-t", "image/png", "-o",
+    env={"XCLIP_BRIDGE_DIR": "/nonexistent/totally/bogus/path"},
+)
+expect(
+    r.returncode == 1,
+    f"missing-bridge image read should exit 1; got {r.returncode}",
+)
+
+
+# 5. Stale bridge file.
+with tempfile.TemporaryDirectory() as tmp:
+    bridge = Path(tmp)
+    png = bridge / "clipboard.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    (bridge / "clipboard.mime").write_text("image/png\n")
+    old = time.time() - 7200  # 2h ago, > default 1h stale threshold
+    os.utime(png, (old, old))
+    os.utime(bridge / "clipboard.mime", (old, old))
+    r = run(
+        "-selection", "clipboard", "-t", "TARGETS", "-o",
+        env={"XCLIP_BRIDGE_DIR": str(bridge)},
+    )
+    expect(
+        r.returncode == 0 and r.stdout == b"",
+        f"stale-bridge TARGETS should be (0,''); got ({r.returncode},{r.stdout!r})",
+    )
+
+
+# 6. XCLIP_SHIM=disabled without real xclip → exit 1 with clear stderr.
+# We probe a path where /usr/bin/xclip likely does NOT exist; if the host
+# DOES have xclip installed, this test no-ops (which is fine — the disabled
+# path is supposed to fall through to the real binary in that case).
+if not Path("/usr/bin/xclip").exists():
+    r = run(
+        "-selection", "clipboard", "-t", "TARGETS", "-o",
+        env={"XCLIP_SHIM": "disabled"},
+    )
+    expect(
+        r.returncode != 0,
+        f"XCLIP_SHIM=disabled without /usr/bin/xclip should exit non-zero; got {r.returncode}",
+    )
+    expect(
+        b"not installed" in r.stderr or b"XCLIP_SHIM" in r.stderr,
+        f"disabled-without-real-xclip stderr should mention the missing binary; got {r.stderr!r}",
+    )
+
+
+if failures:
+    print("FAIL xclip-shim.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS xclip-shim.test")
+sys.exit(0)

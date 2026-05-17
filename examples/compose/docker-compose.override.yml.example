@@ -97,3 +97,23 @@ services:
       # ----------------------------------------------------------------
       # - "${HOME}/.ssh/config:/home/hndrewaall/.ssh/config:ro"
       # - "${HOME}/.ssh/known_hosts:/home/hndrewaall/.ssh/known_hosts:ro"
+
+      # ----------------------------------------------------------------
+      # Cross-host clipboard image-paste bridge.
+      #
+      # The in-container `xclip` shim (container/bin/xclip) reads PNG
+      # bytes from /host-clipboard/ when claude's TUI image-paste path
+      # invokes `xclip -selection clipboard -t image/png -o`. An
+      # operator-side daemon (examples/compose/bin/clipboard-bridge-
+      # daemon, runs on the Mac via launchd) watches the Mac clipboard
+      # and rsync's PNG bytes to the path mounted here. See
+      # examples/compose/launchd/com.anthropic.claude-watch.clipboard-
+      # bridge.plist.example for the Mac side.
+      #
+      # Mount the operator's clipboard-bridge cache dir read-only at
+      # /host-clipboard/. The directory must exist on the host (the
+      # daemon creates it on first push); the bind-mount uses :ro
+      # because the container only ever reads bytes the operator's
+      # Mac has already written.
+      # ----------------------------------------------------------------
+      # - "${HOME}/.cache/claude-clipboard-bridge:/host-clipboard:ro"

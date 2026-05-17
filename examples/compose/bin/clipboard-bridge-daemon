@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# clipboard-bridge-daemon — Mac-side clipboard watcher for cross-host paste.
+#
+# Polls the macOS clipboard at a low rate; on any change, snapshots the
+# current image (if present) as PNG bytes and pushes the file to a remote
+# host's bridge directory. The in-container xclip shim
+# (container/bin/xclip) reads from that bridge directory and serves the
+# bytes back to the claude TUI's image-paste path.
+#
+# Architecture (the cross-host hop):
+#
+#   ┌────────────────────────────────────────────────────────────────┐
+#   │ Mac (operator)                                                 │
+#   │                                                                │
+#   │   launchd → clipboard-bridge-daemon (this script)              │
+#   │      │                                                          │
+#   │      ├─ pbpaste / osascript «class PNGf» → local bridge dir    │
+#   │      │     ~/.cache/claude-clipboard-bridge/                    │
+#   │      │                                                          │
+#   │      └─ rsync / scp on change → remote bridge dir              │
+#   │                                                                │
+#   └──────────────────────────────────┬─────────────────────────────┘
+#                                      │  SSH
+#   ┌──────────────────────────────────▼─────────────────────────────┐
+#   │ remote host (gomorrah)                                          │
+#   │                                                                │
+#   │   ~/.cache/claude-clipboard-bridge/  ← rsync target            │
+#   │      ↑                                                          │
+#   │      └─ bind-mount into container at /host-clipboard/          │
+#   │                                                                │
+#   └────────────────────────────────────────────────────────────────┘
+#                                      │  docker volume bind-mount
+#   ┌──────────────────────────────────▼─────────────────────────────┐
+#   │ claude-container                                                │
+#   │                                                                │
+#   │   /usr/local/bin/xclip (shim)  ←─ called by claude TUI         │
+#   │      reads /host-clipboard/clipboard.png                       │
+#   │                                                                │
+#   └────────────────────────────────────────────────────────────────┘
+#
+# Why polling + rsync, not a long-lived SSH tunnel:
+#   - macOS has no clipboard-change notification API exposed to launchd.
+#     Polling (1s default) is the canonical pattern (Alfred, Maccy, etc.).
+#   - rsync is idempotent and survives transient network blips. A persistent
+#     SSH socket would need re-auth on every keychain timeout.
+#   - Latency is operator-perceptible only at the moment they Cmd+V — adding
+#     ~250ms there (one rsync round-trip on local-network SSH) is fine.
+#
+# Usage:
+#
+#   # Foreground (debugging):
+#   clipboard-bridge-daemon --remote-host hndrewaall@gomorrah
+#
+#   # Background (launchd-managed):
+#   # install the .plist from examples/compose/launchd/
+#   launchctl load ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+#
+#   # Override poll interval / remote path:
+#   clipboard-bridge-daemon --interval 0.5 --remote-host gomorrah \
+#                           --remote-dir '~/.cache/claude-clipboard-bridge/'
+#
+# Env var override (matches what launchd typically passes):
+#   CLIPBOARD_BRIDGE_REMOTE_HOST   (e.g. hndrewaall@gomorrah)
+#   CLIPBOARD_BRIDGE_REMOTE_DIR    (default: ~/.cache/claude-clipboard-bridge/)
+#   CLIPBOARD_BRIDGE_INTERVAL      (default: 1.0 seconds)
+#   CLIPBOARD_BRIDGE_LOCAL_DIR     (default: ~/.cache/claude-clipboard-bridge/)
+#
+# Security:
+#
+# Mac clipboard contents are sensitive — passwords from 1Password, etc.
+# This daemon copies ANY clipboard change. Operators who care should:
+#   1. Whitelist by SSH ProxyJump host (the daemon talks to ONE host).
+#   2. Use a dedicated SSH key with restricted command-permitlist
+#      (~/.ssh/authorized_keys: `command="rsync --server -e.LsfxC ..."`).
+#   3. Run the daemon ONLY when a claude container session is active
+#      (start via cw wrapper, stop on cw exit).
+# This script doesn't currently auto-pause when no session is active —
+# follow-up if it becomes a problem.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Argparse
+# ---------------------------------------------------------------------------
+
+REMOTE_HOST="${CLIPBOARD_BRIDGE_REMOTE_HOST:-}"
+REMOTE_DIR="${CLIPBOARD_BRIDGE_REMOTE_DIR:-.cache/claude-clipboard-bridge/}"
+LOCAL_DIR="${CLIPBOARD_BRIDGE_LOCAL_DIR:-$HOME/.cache/claude-clipboard-bridge}"
+INTERVAL="${CLIPBOARD_BRIDGE_INTERVAL:-1.0}"
+ONESHOT=0
+DRY_RUN=0
+VERBOSE=0
+
+usage() {
+    sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --remote-host) REMOTE_HOST="$2"; shift 2 ;;
+        --remote-dir)  REMOTE_DIR="$2";  shift 2 ;;
+        --local-dir)   LOCAL_DIR="$2";   shift 2 ;;
+        --interval)    INTERVAL="$2";    shift 2 ;;
+        --oneshot)     ONESHOT=1;        shift ;;
+        --dry-run)     DRY_RUN=1;        shift ;;
+        --verbose|-v)  VERBOSE=1;        shift ;;
+        -h|--help)     usage 0 ;;
+        *) echo "unknown arg: $1" >&2; usage 1 ;;
+    esac
+done
+
+mkdir -p "$LOCAL_DIR"
+
+# ---------------------------------------------------------------------------
+# Snapshot the macOS clipboard. Returns 0 with PNG bytes on stdout if the
+# clipboard currently holds an image; non-zero otherwise.
+# ---------------------------------------------------------------------------
+
+snapshot_clipboard_png() {
+    # osascript exits 0 with the binary representation of the clipboard's
+    # PNGf class on success, non-zero if clipboard has no image.
+    # Use the canonical Apple-Script idiom + write to stdout via shell.
+    local tmp
+    tmp="$(mktemp -t clipboard-bridge-XXXXXX)"
+    if osascript -e 'on error
+                          return 1
+                      end
+                      try
+                          set the_png to (the clipboard as «class PNGf»)
+                          set out_file to (POSIX file "'"$tmp"'") as alias
+                          set fh to open for access out_file with write permission
+                          write the_png to fh
+                          close access fh
+                      on error errMsg
+                          return 1
+                      end' >/dev/null 2>&1; then
+        if [[ -s "$tmp" ]]; then
+            cat "$tmp"
+            rm -f "$tmp"
+            return 0
+        fi
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# Fallback path: use macOS's `pngpaste` if installed (`brew install pngpaste`).
+# More reliable than the AppleScript pipe and handles more clipboard
+# image variants. Preferred when available.
+snapshot_via_pngpaste() {
+    command -v pngpaste >/dev/null 2>&1 || return 2
+    local tmp
+    tmp="$(mktemp -t clipboard-bridge-XXXXXX)"
+    if pngpaste "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        cat "$tmp"
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Hash-then-push: avoid re-rsync'ing the same image on every poll. macOS's
+# clipboard generation counter would be cleaner but it's not exposed to
+# shell; sha256 of the bytes is a fine substitute.
+# ---------------------------------------------------------------------------
+
+LAST_HASH=""
+
+push_image_if_changed() {
+    local bytes_file
+    bytes_file="$(mktemp -t clipboard-bridge-bytes-XXXXXX)"
+    if snapshot_via_pngpaste > "$bytes_file" 2>/dev/null || \
+       snapshot_clipboard_png > "$bytes_file" 2>/dev/null; then
+        :
+    else
+        rm -f "$bytes_file"
+        return 1
+    fi
+    if [[ ! -s "$bytes_file" ]]; then
+        rm -f "$bytes_file"
+        return 1
+    fi
+    local hash
+    hash="$(shasum -a 256 < "$bytes_file" | cut -d' ' -f1)"
+    if [[ "$hash" = "$LAST_HASH" ]]; then
+        rm -f "$bytes_file"
+        return 0  # no change; don't rsync
+    fi
+    LAST_HASH="$hash"
+
+    # Atomic-rename into the local bridge dir.
+    local target="$LOCAL_DIR/clipboard.png"
+    mv -f "$bytes_file" "$target"
+
+    # Companion files: mime + meta.
+    printf 'image/png\n' > "$LOCAL_DIR/clipboard.mime"
+    printf '{"hash":"%s","ts":%d,"source":"mac-osascript"}\n' \
+        "$hash" "$(date +%s)" > "$LOCAL_DIR/clipboard.meta.json"
+
+    if (( VERBOSE )); then
+        printf '[clipboard-bridge] new image: %d bytes, hash %s\n' \
+            "$(stat -f%z "$target")" "${hash:0:12}" >&2
+    fi
+
+    # Push to remote if configured.
+    if [[ -n "$REMOTE_HOST" ]]; then
+        if (( DRY_RUN )); then
+            printf '[clipboard-bridge] DRY-RUN: would rsync %s -> %s:%s\n' \
+                "$LOCAL_DIR/" "$REMOTE_HOST" "$REMOTE_DIR" >&2
+        else
+            rsync -a --partial \
+                "$LOCAL_DIR/clipboard.png" \
+                "$LOCAL_DIR/clipboard.mime" \
+                "$LOCAL_DIR/clipboard.meta.json" \
+                "$REMOTE_HOST:$REMOTE_DIR" 2>&1 \
+                | { (( VERBOSE )) && cat || cat >/dev/null; } || true
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+if (( ONESHOT )); then
+    push_image_if_changed || true
+    exit 0
+fi
+
+if (( VERBOSE )); then
+    printf '[clipboard-bridge] starting (remote=%s, interval=%s)\n' \
+        "${REMOTE_HOST:-<none>}" "$INTERVAL" >&2
+fi
+
+while :; do
+    push_image_if_changed || true
+    sleep "$INTERVAL"
+done

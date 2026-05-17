@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# clipboard-bridge-probe — Mac-side environment probe for cross-host
+# clipboard image paste. Run this BEFORE installing the launchd agent
+# to verify the prerequisites are in place.
+#
+# Usage:
+#   ./clipboard-bridge-probe [REMOTE_HOST]
+#
+# Example:
+#   ./clipboard-bridge-probe hndrewaall@gomorrah
+#
+# Output: a self-explanatory checklist with per-item ✓/✗ and the
+# fix for each ✗.
+
+set -euo pipefail
+
+REMOTE_HOST="${1:-}"
+FAIL=0
+WARN=0
+
+ok()    { printf '  \033[32m✓\033[0m  %s\n' "$*"; }
+warn()  { printf '  \033[33m!\033[0m  %s\n' "$*"; WARN=$((WARN+1)); }
+fail()  { printf '  \033[31m✗\033[0m  %s\n' "$*"; FAIL=$((FAIL+1)); }
+hint()  { printf '       %s\n' "$*"; }
+
+section() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+section "OS"
+if [[ "$(uname)" = "Darwin" ]]; then
+    ok "running on macOS ($(sw_vers -productVersion 2>/dev/null || uname -r))"
+else
+    fail "expected macOS; got $(uname). This probe is Mac-only."
+    hint "If you're testing the daemon on Linux, run clipboard-bridge-daemon directly."
+    exit 1
+fi
+
+section "osascript (Apple Script) — the AppleScript clipboard read"
+if command -v osascript >/dev/null 2>&1; then
+    ok "osascript present at $(command -v osascript)"
+else
+    fail "osascript not on PATH; this is a macOS built-in — check your PATH"
+fi
+
+section "pngpaste (optional, preferred)"
+if command -v pngpaste >/dev/null 2>&1; then
+    ok "pngpaste present at $(command -v pngpaste)"
+else
+    warn "pngpaste not installed (the AppleScript fallback works but is slower)"
+    hint "Install with: brew install pngpaste"
+fi
+
+section "rsync"
+if command -v rsync >/dev/null 2>&1; then
+    rsync_ver="$(rsync --version 2>/dev/null | head -1)"
+    ok "rsync: $rsync_ver"
+else
+    fail "rsync not on PATH"
+    hint "macOS ships rsync at /usr/bin/rsync; you may have an exotic PATH."
+fi
+
+section "ssh"
+if command -v ssh >/dev/null 2>&1; then
+    ok "ssh present at $(command -v ssh)"
+else
+    fail "ssh not on PATH"
+fi
+
+if [[ -n "$REMOTE_HOST" ]]; then
+    section "SSH connectivity to $REMOTE_HOST"
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$REMOTE_HOST" 'echo ok' 2>/dev/null | grep -q ok; then
+        ok "passwordless SSH to $REMOTE_HOST works"
+    else
+        fail "passwordless SSH to $REMOTE_HOST FAILED"
+        hint "Set up SSH keys: ssh-copy-id $REMOTE_HOST"
+        hint "Or check ~/.ssh/config for ProxyJump / IdentityFile issues."
+    fi
+
+    section "remote bridge directory"
+    if ssh -o BatchMode=yes "$REMOTE_HOST" 'mkdir -p ~/.cache/claude-clipboard-bridge && ls -ld ~/.cache/claude-clipboard-bridge' 2>/dev/null; then
+        ok "remote ~/.cache/claude-clipboard-bridge exists / created"
+    else
+        fail "couldn't create remote bridge directory"
+        hint "ssh $REMOTE_HOST 'mkdir -p ~/.cache/claude-clipboard-bridge'"
+    fi
+else
+    warn "no REMOTE_HOST argument — skipping SSH / remote checks"
+    hint "Re-run with: ./clipboard-bridge-probe hndrewaall@gomorrah"
+fi
+
+section "current clipboard contents"
+if osascript -e 'try
+                     set t to the clipboard as «class PNGf»
+                     return "image"
+                 on error
+                     return "non-image"
+                 end' 2>/dev/null | grep -q image; then
+    ok "clipboard currently holds an image (good — daemon will sync it)"
+else
+    warn "clipboard currently holds non-image content (or nothing)"
+    hint "To test end-to-end: take a screenshot (Cmd+Shift+Ctrl+4) to put"
+    hint "an image on the clipboard, then re-run this probe."
+fi
+
+section "local bridge directory"
+LOCAL_BRIDGE="$HOME/.cache/claude-clipboard-bridge"
+if [[ -d "$LOCAL_BRIDGE" ]]; then
+    ok "local bridge dir $LOCAL_BRIDGE exists"
+else
+    warn "local bridge dir $LOCAL_BRIDGE does not exist yet"
+    hint "The daemon creates it on first run — not a hard error."
+fi
+
+section "launchd plist"
+PLIST="$HOME/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist"
+if [[ -f "$PLIST" ]]; then
+    ok "launchd plist installed at $PLIST"
+    if launchctl list 2>/dev/null | grep -q com.anthropic.claude-watch.clipboard-bridge; then
+        ok "launchd agent loaded (clipboard-bridge daemon is running)"
+    else
+        warn "plist present but agent not loaded"
+        hint "Load it: launchctl load $PLIST"
+    fi
+else
+    warn "launchd plist not installed yet"
+    hint "Copy from examples/compose/launchd/com.anthropic.claude-watch.clipboard-bridge.plist.example"
+    hint "Install: cp ...example $PLIST && launchctl load $PLIST"
+fi
+
+printf '\n'
+if (( FAIL > 0 )); then
+    printf '\033[31m%d hard failure(s); fix before installing the daemon.\033[0m\n' "$FAIL"
+    exit 1
+fi
+if (( WARN > 0 )); then
+    printf '\033[33m%d warning(s) — daemon should still work, but see hints above.\033[0m\n' "$WARN"
+    exit 0
+fi
+printf '\033[32mAll checks passed.\033[0m\n'

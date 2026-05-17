@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- clipboard-bridge LaunchAgent (per-user) for cross-host claude image paste.
+
+     Install:
+       cp com.anthropic.claude-watch.clipboard-bridge.plist.example \
+          ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+       # edit the plist: set REMOTE_HOST / REMOTE_DIR for your setup
+       launchctl load ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+
+     Uninstall:
+       launchctl unload ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+       rm ~/Library/LaunchAgents/com.anthropic.claude-watch.clipboard-bridge.plist
+
+     What this does:
+       Runs examples/compose/bin/clipboard-bridge-daemon at login. Polls
+       the Mac clipboard at 1s intervals; on every clipboard-image change,
+       rsync's the PNG bytes to REMOTE_HOST:REMOTE_DIR. The remote host
+       bind-mounts that directory into the claude-container at
+       /host-clipboard/, where the in-container xclip shim reads it.
+
+     See ~/repos/claude-watch/container/bin/xclip header for the shim
+     side of the protocol. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.anthropic.claude-watch.clipboard-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Adjust this path to wherever you clone claude-watch on the Mac. -->
+        <string>/Users/YOURUSER/repos/claude-watch/examples/compose/bin/clipboard-bridge-daemon</string>
+        <string>--verbose</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- The SSH target where your claude-container compose stack
+             lives. The remote-side ~/.cache/claude-clipboard-bridge/
+             directory must be bind-mounted into the container at
+             /host-clipboard/ (see compose snippet in
+             examples/compose/docker-compose.override.yml.example). -->
+        <key>CLIPBOARD_BRIDGE_REMOTE_HOST</key>
+        <string>USERNAME@REMOTE-HOST.example.com</string>
+
+        <!-- Path on the remote host. Trailing slash matters for rsync. -->
+        <key>CLIPBOARD_BRIDGE_REMOTE_DIR</key>
+        <string>.cache/claude-clipboard-bridge/</string>
+
+        <key>CLIPBOARD_BRIDGE_INTERVAL</key>
+        <string>1.0</string>
+
+        <!-- PATH must include /usr/bin (osascript), brew bin (optional
+             pngpaste), and rsync. -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Keep-alive on crash: clipboard-bridge-daemon should never exit on
+         its own. If it does (e.g. SIGPIPE on a broken SSH connection),
+         launchd respawns within ~5s. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle respawns: don't tight-loop on persistent osascript
+         failures (e.g. Screen Recording permission denied for the
+         clipboard). -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/clipboard-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/clipboard-bridge.log</string>
+</dict>
+</plist>

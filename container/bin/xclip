@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""xclip shim — cross-host clipboard image bridge for in-container claude.
+
+The bundled claude binary's image-paste path (TUI mode) shells out to
+`xclip -selection clipboard -t TARGETS -o` to enumerate clipboard MIME
+types, then `xclip -selection clipboard -t image/png -o > $tmp` to read
+the bytes. When claude runs inside this container on a headless host
+(no DISPLAY), the real /usr/bin/xclip fails with "Can't open display"
+and image paste silently no-ops.
+
+This shim intercepts those exact invocations and reads the clipboard
+bytes from a host-side bridge file instead. The bridge file is dropped
+by an operator-side daemon (the example launchd plist in
+examples/compose/launchd/com.anthropic.claude-watch.clipboard-bridge.plist
+sets up the pattern on macOS) whenever the operator's clipboard changes
+to an image. The container reads the file via a bind-mount at the
+canonical path /host-clipboard/ (configurable via XCLIP_BRIDGE_DIR).
+
+Bridge file format:
+  /host-clipboard/clipboard.png       — most recent image, atomic-rename
+  /host-clipboard/clipboard.mime      — MIME type one-liner (e.g. "image/png")
+  /host-clipboard/clipboard.txt       — optional text content
+  /host-clipboard/clipboard.meta.json — optional metadata (ctime, source host)
+
+Only the `-selection clipboard -t TARGETS -o` and `-selection clipboard
+-t <mime> -o` invocations are interpreted. Every other argv form falls
+through to the real xclip (if present on PATH) or exits 1 with a stderr
+hint.
+
+Wiring inside the container:
+  /usr/local/bin/xclip      → this shim (PATH precedence over /usr/bin/xclip)
+  /host-clipboard/          → bind-mounted host directory (read-only OK)
+
+Opt-out (debugging, or in containers that have a real X server):
+  XCLIP_SHIM=disabled       → exec /usr/bin/xclip directly
+
+Embedded tests:
+  $ python3 xclip --self-test
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import unittest
+from pathlib import Path
+from typing import Optional
+
+
+DEFAULT_BRIDGE_DIR = "/host-clipboard"
+BRIDGE_ENV = "XCLIP_BRIDGE_DIR"
+DISABLE_ENV = "XCLIP_SHIM"
+REAL_XCLIP = "/usr/bin/xclip"
+STALE_SECONDS_ENV = "XCLIP_BRIDGE_STALE_SECONDS"
+DEFAULT_STALE_SECONDS = 3600  # 1 hour: anything older than this is "no clipboard"
+
+
+# Mimetype suffixes we look for under bridge_dir. claude probes only
+# image/* in TUI mode (see binary reverse: image/png, image/jpeg,
+# image/jpg, image/gif, image/webp, image/bmp). image/png is the
+# universal saveImage call so we always emit it when we have ANY image.
+KNOWN_IMAGE_MIMES = [
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+]
+
+
+def _bridge_dir() -> Path:
+    return Path(os.environ.get(BRIDGE_ENV, DEFAULT_BRIDGE_DIR))
+
+
+def _bridge_stale_seconds() -> int:
+    raw = os.environ.get(STALE_SECONDS_ENV, "")
+    try:
+        v = int(raw)
+        return v if v > 0 else DEFAULT_STALE_SECONDS
+    except (TypeError, ValueError):
+        return DEFAULT_STALE_SECONDS
+
+
+def _read_bridge_mime(bridge: Path) -> Optional[str]:
+    """Returns the MIME type currently in the bridge, or None if empty/stale."""
+    mime_file = bridge / "clipboard.mime"
+    img_file = bridge / "clipboard.png"
+    if not mime_file.exists() and not img_file.exists():
+        return None
+    # Stale check: clipboard.png mtime vs DEFAULT_STALE_SECONDS
+    target = mime_file if mime_file.exists() else img_file
+    try:
+        age = time.time() - target.stat().st_mtime
+        if age > _bridge_stale_seconds():
+            return None
+    except OSError:
+        return None
+    if mime_file.exists():
+        try:
+            return mime_file.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+    # No mime file but PNG exists → assume image/png
+    return "image/png"
+
+
+def _read_bridge_bytes(bridge: Path, mime: str) -> Optional[bytes]:
+    """Read the bytes for the requested MIME from the bridge.
+
+    For any image/* MIME we serve from clipboard.png (the universal
+    container; the upstream daemon converts whatever the OS clipboard
+    has into PNG before writing). For image/jpeg etc. claude will
+    re-encode anyway after reading the PNG bytes back via Sharp.
+    """
+    if mime.startswith("image/"):
+        path = bridge / "clipboard.png"
+    elif mime in ("text/plain", "UTF8_STRING", "STRING"):
+        path = bridge / "clipboard.txt"
+    else:
+        return None
+    if not path.exists():
+        return None
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _write(out, data):
+    """Write bytes-or-str to a stream regardless of binary/text mode."""
+    if isinstance(data, str):
+        try:
+            out.write(data)
+            return
+        except TypeError:
+            out.write(data.encode("utf-8"))
+            return
+    try:
+        out.write(data)
+    except TypeError:
+        out.write(data.decode("utf-8", errors="replace"))
+
+
+def handle_targets(bridge: Path, out) -> int:
+    """Emit the TARGETS list claude expects: one MIME per line."""
+    mime = _read_bridge_mime(bridge)
+    if mime is None:
+        # Empty clipboard: emit nothing, exit 0 (matches real xclip's
+        # "no targets" behaviour better than exit 1 which would make
+        # claude treat it as a hard failure rather than "no image").
+        return 0
+    # claude greps for /image\/(png|jpeg|jpg|gif|webp|bmp)/ on this
+    # output. We emit the actual MIME we have + image/png as a fallback
+    # so the saveImage call (which always asks for image/png) succeeds.
+    seen = set()
+    lines = []
+    if mime:
+        seen.add(mime)
+        lines.append(mime)
+    if mime.startswith("image/") and "image/png" not in seen:
+        seen.add("image/png")
+        lines.append("image/png")
+    _write(out, "\n".join(lines) + "\n")
+    return 0
+
+
+def handle_read(bridge: Path, mime: str, out_bytes) -> int:
+    data = _read_bridge_bytes(bridge, mime)
+    if data is None:
+        # Match real xclip exit-1 on "no data for this target".
+        return 1
+    out_bytes.write(data)
+    return 0
+
+
+def _parse_xclip_argv(argv: list[str]) -> tuple[Optional[str], Optional[str]]:
+    """Returns (selection, target) tuple. None values mean unspecified.
+
+    Recognises the canonical claude invocations:
+      xclip -selection clipboard -t TARGETS -o
+      xclip -selection clipboard -t image/png -o
+      xclip -selection clipboard -o     (defaults to UTF8_STRING)
+    Plus the short forms `-sel clipboard`, `-target`, etc.
+    """
+    selection: Optional[str] = None
+    target: Optional[str] = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-selection", "-sel"):
+            i += 1
+            if i < len(argv):
+                selection = argv[i]
+        elif arg.startswith("-selection="):
+            selection = arg.split("=", 1)[1]
+        elif arg in ("-t", "-target"):
+            i += 1
+            if i < len(argv):
+                target = argv[i]
+        elif arg.startswith("-t="):
+            target = arg.split("=", 1)[1]
+        elif arg == "-o":
+            pass  # -o is the read-out mode; default for this shim
+        elif arg in ("-i", "-in"):
+            # Write mode — not supported, fall through to real xclip.
+            return ("__write__", None)
+        # silently ignore other flags
+        i += 1
+    return (selection, target)
+
+
+def main(argv: list[str], *, stdout=None, stderr=None) -> int:
+    if stdout is None:
+        stdout = sys.stdout.buffer
+    if stderr is None:
+        stderr = sys.stderr
+
+    # Opt-out: exec the real xclip if it exists.
+    if os.environ.get(DISABLE_ENV, "").lower() in ("disabled", "0", "off", "no"):
+        if Path(REAL_XCLIP).exists():
+            os.execv(REAL_XCLIP, [REAL_XCLIP] + argv)
+        print(
+            "xclip-shim: XCLIP_SHIM=disabled but /usr/bin/xclip not installed",
+            file=stderr,
+        )
+        return 1
+
+    if "--self-test" in argv:
+        return _run_self_tests()
+
+    selection, target = _parse_xclip_argv(argv)
+
+    # Write mode: not supported by shim. Fall through to real xclip if available.
+    if selection == "__write__":
+        if Path(REAL_XCLIP).exists():
+            os.execv(REAL_XCLIP, [REAL_XCLIP] + argv)
+        print(
+            "xclip-shim: write mode (-i) not supported by shim; real xclip not installed",
+            file=stderr,
+        )
+        return 1
+
+    # Only handle clipboard selection — primary/secondary are X-only.
+    if selection and selection not in ("clipboard", "c"):
+        print(
+            f"xclip-shim: only -selection clipboard is supported (got {selection!r}); no bridge",
+            file=stderr,
+        )
+        return 1
+
+    bridge = _bridge_dir()
+    if not bridge.exists():
+        # No bridge → empty clipboard, not an error (claude treats this
+        # as "no image to paste" and moves on).
+        if target and target.upper() == "TARGETS":
+            return 0
+        return 1
+
+    # TARGETS query
+    if target and target.upper() == "TARGETS":
+        return handle_targets(bridge, stdout)
+
+    # Specific MIME read
+    if target:
+        return handle_read(bridge, target, stdout)
+
+    # No target specified → default to text read (matches real xclip
+    # behaviour: `xclip -selection clipboard -o` returns UTF8_STRING).
+    return handle_read(bridge, "text/plain", stdout)
+
+
+# ---------------------------------------------------------------------------
+# Embedded tests
+# ---------------------------------------------------------------------------
+
+
+class XclipShimTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.bridge = Path(self._tmp.name)
+        os.environ[BRIDGE_ENV] = str(self.bridge)
+        os.environ.pop(DISABLE_ENV, None)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        os.environ.pop(BRIDGE_ENV, None)
+
+    def _run(self, argv):
+        import io
+        buf = io.BytesIO()
+        err = io.StringIO()
+        rc = main(argv, stdout=buf, stderr=err)
+        return rc, buf.getvalue(), err.getvalue()
+
+    def _run_text(self, argv):
+        import io
+        buf = io.StringIO()
+        err = io.StringIO()
+        rc = main(argv, stdout=buf, stderr=err)
+        return rc, buf.getvalue(), err.getvalue()
+
+    def test_empty_bridge_targets_returns_zero_empty(self):
+        rc, out, _ = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+
+    def test_empty_bridge_image_read_returns_one(self):
+        rc, _, _ = self._run(["-selection", "clipboard", "-t", "image/png", "-o"])
+        self.assertEqual(rc, 1)
+
+    def test_image_in_bridge_targets_includes_png(self):
+        (self.bridge / "clipboard.png").write_bytes(b"\x89PNG\r\n\x1a\n...")
+        (self.bridge / "clipboard.mime").write_text("image/png\n")
+        rc, out, _ = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        self.assertEqual(rc, 0)
+        self.assertIn(b"image/png", out)
+
+    def test_image_read_returns_png_bytes(self):
+        sample = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        (self.bridge / "clipboard.png").write_bytes(sample)
+        (self.bridge / "clipboard.mime").write_text("image/png\n")
+        rc, out, _ = self._run(["-selection", "clipboard", "-t", "image/png", "-o"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, sample)
+
+    def test_stale_image_treated_as_empty(self):
+        sample = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        png = self.bridge / "clipboard.png"
+        png.write_bytes(sample)
+        (self.bridge / "clipboard.mime").write_text("image/png\n")
+        # mtime in the distant past
+        old = time.time() - (DEFAULT_STALE_SECONDS + 10)
+        os.utime(png, (old, old))
+        os.utime(self.bridge / "clipboard.mime", (old, old))
+        rc, out, _ = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+
+    def test_jpeg_serves_via_png_path(self):
+        # When the bridge mime is image/jpeg but only clipboard.png exists,
+        # claude's saveImage call still asks for image/png — that's the
+        # universal fallback. Bridge writers should always write a PNG.
+        (self.bridge / "clipboard.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x")
+        (self.bridge / "clipboard.mime").write_text("image/jpeg\n")
+        rc, out, _ = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        self.assertEqual(rc, 0)
+        self.assertIn(b"image/jpeg", out)
+        self.assertIn(b"image/png", out)
+
+    def test_unsupported_selection_exits_one(self):
+        rc, _, err = self._run(["-selection", "primary", "-t", "TARGETS", "-o"])
+        self.assertEqual(rc, 1)
+        self.assertIn("only -selection clipboard", err)
+
+    def test_argv_parser_default_target(self):
+        sel, tgt = _parse_xclip_argv(["-selection", "clipboard", "-o"])
+        self.assertEqual(sel, "clipboard")
+        self.assertIsNone(tgt)
+
+    def test_argv_parser_targets_uppercase(self):
+        sel, tgt = _parse_xclip_argv(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        self.assertEqual(sel, "clipboard")
+        self.assertEqual(tgt, "TARGETS")
+
+    def test_argv_parser_write_mode_signalled(self):
+        sel, tgt = _parse_xclip_argv(["-selection", "clipboard", "-i"])
+        self.assertEqual(sel, "__write__")
+
+    def test_missing_bridge_dir_is_graceful(self):
+        os.environ[BRIDGE_ENV] = "/nonexistent/bridge/dir/totally"
+        rc, out, _ = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+
+
+def _run_self_tests() -> int:
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromTestCase(XclipShimTests)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

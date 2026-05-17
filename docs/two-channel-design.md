@@ -321,7 +321,7 @@ The trade-off vs the chat webview:
 | Persists across operator-quit | Yes — tmux+docker | Yes — extension host |
 | claude-watch can observe | Yes — pane scrape | No — no surface |
 | claude-watch can interrupt | Yes — tmux send-keys | Partial — pidfd inject (no Escape) |
-| Image paste from clipboard | Only on the same host as the operator's display server (Mac CLI in iTerm2 / VSCode integrated terminal native — `osascript` reads the Mac clipboard directly). Container / SSH / remote-tmux: NO — see § 3.7 below. | Yes — base64-wraps into stream-json |
+| Image paste from clipboard | Same-host (Mac iTerm2 / native VSCode terminal): yes (osascript). Container / SSH / remote-tmux: yes WITH the xclip shim + Mac-side launchd daemon shipped in this PR; bare container without the daemon: no. See § 3.7. | Yes — base64-wraps into stream-json |
 | Rich diff rendering | TUI-rendered (claude does its own diff UI in terminal) | Native VSCode diff editor (webview → extension → workspace) |
 | @-mention picker | TUI completion menu (no LSP integration) | Native VSCode quick-pick with workspace symbols |
 | Click-to-open files | Limited (terminal hyperlinks if supported) | Native (extension uses workspace.openTextDocument) |
@@ -559,14 +559,19 @@ Both `claude` and the operator's clipboard live on the same Mac. The
 which talks to the Mac WindowServer directly. Same host, same display
 server, the clipboard is reachable. Works.
 
-**Why it doesn't work in the cw container shape.** The cw container has
-no display server (no `DISPLAY`, no `WAYLAND_DISPLAY`, no Mac
-WindowServer). `xclip` / `wl-paste` either are missing entirely or
-return an empty TARGETS list (the container's `xclip -selection
-clipboard -t TARGETS -o` would fail with "Can't open display"). The
-host operating the container also has no path to forward its clipboard
-into the container — Docker's stdin / tmux / OSC sequences don't carry
-clipboard data. Empirically verified on gomorrah (2026-05-17):
+**Why it doesn't work in the cw container shape OUT OF THE BOX.** The
+cw container has no display server (no `DISPLAY`, no
+`WAYLAND_DISPLAY`, no Mac WindowServer). `xclip` / `wl-paste` either
+are missing entirely or return an empty TARGETS list (the container's
+`xclip -selection clipboard -t TARGETS -o` would fail with "Can't open
+display"). The host operating the container also has no path to
+forward its clipboard into the container — Docker's stdin / tmux / OSC
+sequences don't carry clipboard data. The 2026-05-17 follow-up POC
+ships an **xclip shim + file-watch bridge** (see Mitigations below)
+that closes this gap end-to-end for operators willing to install a
+small Mac-side launchd daemon; without that daemon, image paste in
+TUI mode remains a no-op. Empirically verified on gomorrah
+(2026-05-17):
 
 ```
 $ docker exec compose-claude-container-1 bash -c \
@@ -605,55 +610,158 @@ Code inspection of the binary shows this is not the case:
   `CLAUDE_CODE_SSE_PORT` entirely and always shells out to
   xclip / wl-paste / osascript.
 
-**The actual upstream gap.** This is exactly the feature request in
+**The actual upstream gap.** This is also the feature request in
 anthropics/claude-code#51244 — bridge the host clipboard image data
 into the in-container CLI via the VSCode IPC socket
 (`VSCODE_IPC_HOOK_CLI`, the same channel VSCode already uses to let
 `code` invocations inside Remote SSH / devcontainers open files in the
-host editor). Until that lands upstream, no env-var, no wrapper script,
-no tmux setting on the claude-watch side can make image-paste work in
-TUI mode against a remote host.
+host editor). Until that lands upstream there is no zero-config fix;
+the shim shipped in this PR is a configuration-required workaround
+that closes the gap for operators who set up the Mac-side launchd
+daemon.
 
-**Cancelled mitigations.** During investigation we considered:
+**Mitigations considered and where each lands.** The 2026-05-17 push-
+back (Andrew: "i think we should at least be able to shim xclip")
+forced an empirical re-investigation of each option below. Result:
+**the xclip-shim path DOES work** when paired with an operator-side
+clipboard daemon. Detail per option:
 
-- **`xclip` shim that calls back to the host over SSH.** Possible but
-  requires the host to be SSH-reachable from the container with a
-  pre-shared key, the host clipboard utility to be available in a
-  `DISPLAY`-aware shell on the host, and a re-auth dance every time
-  the SSH key rotates. Even then it only works for hosts that have a
-  display server (rules out gomorrah-style SSH-only hosts where there
-  is no `DISPLAY` to read).
-- **OSC 52 clipboard read.** OSC 52 is `\033]52;c;<base64>\007` — used
-  to *write* the terminal's clipboard. There is no widely-supported OSC
-  for the inverse direction (read clipboard from terminal back to the
-  process). xterm has a write-only `52;c;?` query that some terminals
-  respond to, but it's rate-limited / disabled-by-default in many
-  emulators (security: prevents pages from reading clipboard), and the
-  claude binary doesn't implement reading it.
-- **Wayland / X11 socket bind-mount.** `-v /tmp/.X11-unix:/tmp/.X11-unix
-  -e DISPLAY=$DISPLAY` would in principle let in-container xclip talk
-  to the host display. Two killers: (1) the gomorrah host has no
-  display server at all (headless server, no `DISPLAY` to forward),
-  and (2) Andrew's actual workflow is Mac VSCode → SSH → tmux+docker on
-  gomorrah, so even if a display did exist on gomorrah it wouldn't be
-  the Mac's clipboard.
+- **`xclip` shim backed by a file-watch bridge** — IMPLEMENTED
+  (q-2026-05-17-a0ff). The shim at `container/bin/xclip` (installed
+  at `/usr/local/bin/xclip` in the image, beating `/usr/bin/xclip` in
+  PATH order) interprets the canonical claude argv shapes
+  (`-selection clipboard -t TARGETS -o`, `-selection clipboard -t
+  image/png -o`) and reads PNG bytes from a bind-mounted host
+  directory (`/host-clipboard/` by default; override via
+  `XCLIP_BRIDGE_DIR`). The operator-side daemon at
+  `examples/compose/bin/clipboard-bridge-daemon` (Mac launchd agent;
+  example plist at
+  `examples/compose/launchd/com.anthropic.claude-watch.clipboard-bridge.plist.example`)
+  polls the Mac clipboard via `osascript` (preferred: `pngpaste` if
+  installed), sha256-de-dupes, atomic-renames into a local bridge
+  dir, and rsync's to the remote host on every clipboard change. The
+  remote host bind-mounts that directory into the container at
+  `/host-clipboard/:ro`. xclip-shim self-tests (11 cases) pass; the
+  integration test (`container/tests/xclip-shim.test`) is wired into
+  `make test-entrypoint`. The shim is graceful when the bridge dir
+  is absent (returns "empty clipboard" rather than crashing), so a
+  stripped-down `docker run` without the bridge is unaffected.
 
-**Conclusion.** The original Option A "image paste works via tmux
-passthrough" claim is incorrect for any remote setup. For the cw
-container shape on a headless host, terminal-mode image paste cannot
-work without the upstream change tracked in
-anthropics/claude-code#51244. The right options today are:
+  Operator one-time setup steps (Mac side):
+  1. Install rsync / pngpaste optionally:
+     `brew install pngpaste` (recommended; faster + more reliable
+     than the AppleScript fallback).
+  2. Copy the launchd plist example, edit
+     `CLIPBOARD_BRIDGE_REMOTE_HOST` / `CLIPBOARD_BRIDGE_REMOTE_DIR`,
+     `launchctl load` it.
+  3. On the remote host, ensure the bridge dir exists
+     (`mkdir -p ~/.cache/claude-clipboard-bridge`).
+  4. In `docker-compose.override.yml`, uncomment the
+     `${HOME}/.cache/claude-clipboard-bridge:/host-clipboard:ro`
+     bind-mount (see `docker-compose.override.yml.example`).
+  5. `docker compose up -d --force-recreate claude-container`.
 
+  Trust / privacy notes: the daemon copies ANY clipboard image
+  change while it's running. Operators who care should
+  `launchctl unload` the agent when not in a claude session, or
+  restrict the rsync target with an SSH key whose `authorized_keys`
+  forced-command pins it to `rsync --server -e.LsfxC ...` against a
+  single directory.
+
+- **`xclip` shim backed by SSH-to-Mac (direct callback)** — REJECTED
+  for the Mac→gomorrah→container path. The shim would need to dial
+  back to the Mac (the only host with the clipboard); that's a
+  reverse direction across the SSH hop the operator initiated, which
+  requires either a reverse-port-forward at SSH-time
+  (`ssh -R 0.0.0.0:9999:localhost:22 gomorrah`, plus a Mac sshd, plus
+  a pre-shared key) or a persistent control socket the daemon
+  maintains. Strictly more moving parts than the file-watch bridge
+  above for the same outcome. Re-evaluate if Andrew explicitly asks
+  for the no-rsync-poll shape.
+
+- **Native xclip via SSH X11 forwarding** — REJECTED for Andrew's
+  layout. Theoretically: Mac runs XQuartz; `ssh -X hndrewaall@gomorrah`
+  sets `DISPLAY=localhost:10.0` on gomorrah; docker exec passes
+  `-e DISPLAY=$DISPLAY` into the container; in-container xclip dials
+  gomorrah's localhost:6010 listener which sshd tunnels to Mac
+  XQuartz; XQuartz pastes the Mac clipboard. In practice:
+    1. **XQuartz is not pre-installed on macOS**; Andrew would need to
+       install it. (Probe: `ls /Applications/Utilities/XQuartz.app`.)
+    2. **VSCode's Remote-SSH integrated terminal does not enable X11
+       forwarding by default**; operator would need a `RequestX11
+       Forwarding yes` stanza in `~/.ssh/config` for the host AND a
+       VSCode setting to pass through.
+    3. **Container netns isolates localhost**: the in-container
+       `xclip` can't reach gomorrah's `localhost:6010` listener
+       without `--network=host` (which the compose stack does NOT
+       use, for good reasons — port collisions, security).
+       Workaround: `-e DISPLAY=host.docker.internal:10` on Linux only
+       works with `--add-host=host.docker.internal:host-gateway` and
+       a gomorrah-side sshd listening on the right interface. More
+       knobs than the file-watch bridge for the same outcome.
+
+  Empirically observed today: `DISPLAY=` is empty in shells reached
+  via SSH from a remote VSCode terminal on Andrew's setup (the
+  variable was never set on the gomorrah side), so the prerequisites
+  are not in place. If a future operator DOES have XQuartz + VSCode
+  X11 forwarding + a host-network container, the real
+  `/usr/bin/xclip` (and `XCLIP_SHIM=disabled` to bypass the shim)
+  would work — but for the dominant headless-Linux-host shape, the
+  file-watch bridge is the supported path.
+
+- **VSCODE_IPC_HOOK_CLI socket bridge** — REJECTED on empirical
+  evidence. The IPC socket lives on the Mac at
+  `/var/folders/.../vscode-ipc-XXX.sock`. VSCode Remote-SSH does NOT
+  tunnel that socket back to the remote host; the `code` CLI inside
+  a Remote-SSH terminal talks to the *remote* VSCode server (a
+  different IPC endpoint synthesized on gomorrah). Probed via
+  `code --help` inside the container — the `code` binary exposes
+  `code --status`, `code --diff`, `code --add`, etc.; there is no
+  clipboard read or write subcommand. The remote-side
+  `VSCODE_IPC_HOOK_CLI` is reachable but has no clipboard API. Dead
+  end without a VSCode extension running in the *Mac-side* extension
+  host (Option D below).
+
+- **OSC 52 clipboard read.** OSC 52 is `\033]52;c;<base64>\007` —
+  used to *write* the terminal's clipboard. There is no widely-
+  supported OSC for the inverse direction (read clipboard from
+  terminal back to the process). xterm has a write-only `52;c;?`
+  query that some terminals respond to, but it's rate-limited /
+  disabled-by-default in many emulators (security: prevents pages
+  from reading clipboard), and the claude binary doesn't implement
+  reading it.
+
+- **Wayland / X11 socket bind-mount on a headless remote host.** Not
+  applicable: gomorrah has no display server. Local-Linux operators
+  with a real display could `-v /tmp/.X11-unix:/tmp/.X11-unix
+  -e DISPLAY=$DISPLAY` and use the real xclip, but that's a
+  different deployment shape than the Mac-VSCode-Remote-SSH path
+  Andrew uses.
+
+**Conclusion (revised 2026-05-17).** The original Option A "image
+paste works via tmux passthrough" claim is incorrect for any remote
+setup. For the cw container shape on a headless host, the shipping
+path forward is the **xclip shim + file-watch bridge** documented
+above. The webview / upstream / save-to-file options below remain
+valid alternatives operators can use without the launchd-daemon
+prerequisite:
+
+- **Shim path (this PR)** — install the launchd agent on the Mac,
+  bind-mount `/host-clipboard` into the container, paste images
+  directly in the TUI. ~250ms latency per paste (one rsync hop on a
+  local LAN).
 - **Option B** (webview sidecar) — paste images into the webview UI;
-  the extension wraps them as base64 in stream-json and they reach the
-  webview agent. Cross-poll via claude-events as documented in
-  Appendix B.
+  the extension wraps them as base64 in stream-json and they reach
+  the webview agent. Cross-poll via claude-events as documented in
+  Appendix B. Useful when the operator doesn't want to install the
+  launchd daemon.
 - **Save-to-file** — drop the image in `~/scratch/` (or any
   bind-mounted host path), `@`-mention or reference the file path in
   the agent's prompt. Loses paste-and-go ergonomics but works without
   any infrastructure change.
-- **Option D** (upstream) — track anthropics/claude-code#51244. No
-  homelab-side fix.
+- **Option D** (upstream VSCode IPC bridge) — track
+  anthropics/claude-code#51244. Would obviate the launchd agent
+  entirely. No homelab-side fix until it lands.
 
 ## 4. Design proposals
 
@@ -682,17 +790,21 @@ Cons:
   proposed changes, native @-mention picker with workspace symbols,
   click-to-open files from chat history, speech-to-text, accept /
   reject buttons in the editor toolbar.
-- Image paste does NOT work in the cw container shape, regardless of
-  tmux `allow-passthrough`. The TUI clipboard read path is a subprocess
-  invocation of `xclip` / `wl-paste` / `osascript`; inside a Linux
-  container there is no display server and the host clipboard is not
-  reachable. This is the same gap tracked upstream in
-  anthropics/claude-code#51244 (request: bridge the host clipboard into
-  the CLI via the VSCode IPC socket). PR #173's tmux
-  `allow-passthrough on` is still correct — it covers OSC sequences that
-  carry truecolor / hyperlinks / bracketed-paste-of-text — but no part
-  of the clipboard-image read path goes through tmux. See § 3.7 for the
-  empirical investigation behind this correction.
+- Image paste in the cw container shape requires the **xclip shim +
+  file-watch bridge** documented in § 3.7. The TUI clipboard read path
+  is a subprocess invocation of `xclip` / `wl-paste` / `osascript`;
+  inside a Linux container there is no display server, but the shim
+  (baked at `/usr/local/bin/xclip` in the image) reads PNG bytes from
+  a bind-mounted `/host-clipboard/` directory that a Mac-side launchd
+  daemon populates via rsync on every clipboard change. Without the
+  daemon installed, image paste no-ops gracefully (the shim treats an
+  empty bridge dir as "no clipboard"). The remaining upstream gap is
+  tracked at anthropics/claude-code#51244 (request: bridge the host
+  clipboard into the CLI via the VSCode IPC socket). PR #173's tmux
+  `allow-passthrough on` is still correct — it covers OSC sequences
+  that carry truecolor / hyperlinks / bracketed-paste-of-text — but no
+  part of the clipboard-image read path goes through tmux. See § 3.7
+  for the full empirical investigation + mitigation matrix.
 
 ### 4.2 Option B — operator runs both, claude-event cross-pollination
 

@@ -158,6 +158,7 @@ test-entrypoint:
 	container/tests/watcher-monitor-disabled.test
 	container/tests/claude-bin-symlink-uid.test
 	container/tests/npm-install-as-uid-1000.test
+	container/tests/xclip-shim.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 
 # Run the cw host-shim tests (examples/compose/bin/cw — attaches a host
