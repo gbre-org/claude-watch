@@ -305,7 +305,11 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     home = os.environ.get("HOME", "/home/hndrewaall")
-    default_settings = Path(home) / ".claude" / "settings.json"
+    shim_settings = Path("/tmp/claude-shim/settings.json")
+    if os.environ.get("CLAUDE_CONTAINER_REWRITE_HOOKS") == "1" and shim_settings.exists():
+        default_settings = shim_settings
+    else:
+        default_settings = Path(home) / ".claude" / "settings.json"
     ap.add_argument(
         "--settings",
         type=Path,
