@@ -379,19 +379,70 @@ def _classify_owner(
     }
 
 
+_TASK_TOKEN_PREFIX = "task:"
+
+
+def _task_token_target(tok: Any) -> str | None:
+    """Return the queue id referenced by a ``task:<id>`` scope token, or None.
+
+    Mirrors session-task's helper of the same name. Inert dep markers live
+    in an item's ``scope`` as ``task:q-XXXX`` tokens (canonical encoding
+    since 2026-05-08); ``--depends-on`` is parser sugar that appends one,
+    and the read-time migration in session-task translates any legacy
+    ``depends_on`` list entries into the same shape.
+    """
+    if not isinstance(tok, str):
+        return None
+    if not tok.startswith(_TASK_TOKEN_PREFIX):
+        return None
+    target = tok[len(_TASK_TOKEN_PREFIX):]
+    return target or None
+
+
+def _iter_dep_ids(item: dict[str, Any]) -> list[str]:
+    """Return the queue ids ``item`` depends on, deduplicated, stable order.
+
+    Mirrors session-task's ``_iter_dep_ids``. Combines two encodings:
+
+      * ``task:<id>`` scope tokens — canonical surface since 2026-05-08.
+      * ``depends_on: [...]`` legacy field — older queue.json files; the
+        session-task read-time migration usually translates these into
+        task: scope tokens, but we honor either for back-compat.
+
+    Both are unioned: either source blocks readiness. Without this, the
+    SPA computed ``ready_now`` only off ``depends_on`` and rendered the
+    READY badge on items whose dep was encoded as a ``task:`` scope token
+    (Bug q-2026-05-17-87b5: false READY while q-2026-05-17-ad86 still
+    running).
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in (item.get("scope") or []):
+        target = _task_token_target(tok)
+        if target and target not in seen:
+            seen.add(target)
+            out.append(target)
+    for d in (item.get("depends_on") or []):
+        if isinstance(d, str) and d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
 def _has_dep_cycle(items: list[dict[str, Any]], root_id: str) -> bool:
     """Detect a dependency cycle reachable from ``root_id``.
 
     Mirrors session-task's ``_has_dep_cycle`` (iterative DFS, lazy at read
     time). Used by ``_compute_ready_now`` so the SPA's READY badge flips
     False the moment a cycle is reachable, matching the dispatcher's
-    spawn-gate behavior.
+    spawn-gate behavior. Walks deps from BOTH ``task:<id>`` scope tokens
+    and the legacy ``depends_on`` field (see ``_iter_dep_ids``).
     """
     by_id = {it.get("id"): it for it in items if isinstance(it.get("id"), str)}
     visited: set[str] = set()
     on_path: set[str] = set()
     walk: list[tuple[str, Any]] = [
-        (root_id, iter((by_id.get(root_id, {}).get("depends_on") or [])))
+        (root_id, iter(_iter_dep_ids(by_id.get(root_id, {}))))
     ]
     on_path.add(root_id)
     while walk:
@@ -414,7 +465,7 @@ def _has_dep_cycle(items: list[dict[str, Any]], root_id: str) -> bool:
             visited.add(child)
             continue
         on_path.add(child)
-        walk.append((child, iter(child_item.get("depends_on") or [])))
+        walk.append((child, iter(_iter_dep_ids(child_item))))
     return False
 
 
@@ -463,8 +514,11 @@ def _compute_ready_now(items: list[dict[str, Any]], item: dict[str, Any]) -> boo
     if head.get("id") != item.get("id"):
         return False
 
-    # Explicit dep edges.
-    deps = item.get("depends_on") or []
+    # Explicit dep edges. Reads from BOTH the legacy ``depends_on`` field
+    # AND ``task:<id>`` scope tokens (the canonical encoding since
+    # 2026-05-08). Either source blocks readiness — must match
+    # session-task's ``_item_is_ready`` byte-for-byte.
+    deps = _iter_dep_ids(item)
     if deps:
         if _has_dep_cycle(items, item.get("id", "")):
             return False
@@ -522,15 +576,14 @@ def _shape(
     summary = item.get("summary") or item.get("description") or "(no summary)"
     summary = summary[:200]
 
-    # depends_on — list of queue ids this item is blocked on. Field
-    # does not yet exist in queue.json (model side pending); surface as
-    # an empty list so the front-end's depends-on badge renders cleanly
-    # the moment the field lands.
-    raw_deps = item.get("depends_on") or []
-    if isinstance(raw_deps, list):
-        depends_on = [d for d in raw_deps if isinstance(d, str)]
-    else:
-        depends_on = []
+    # depends_on — list of queue ids this item is blocked on. Surfaces
+    # BOTH encodings (see ``_iter_dep_ids``):
+    #   * ``task:<id>`` scope tokens (canonical since 2026-05-08)
+    #   * ``depends_on: [...]`` legacy field
+    # Surfacing only the legacy field caused Bug q-2026-05-17-87b5 — the
+    # template hid the dep-chain badge (and the ready-badge gate was
+    # short-circuiting through the legacy field too).
+    depends_on = _iter_dep_ids(item)
 
     # depends_on_status — per-edge resolution so the SPA can render
     # the dep chip with its target's current state ("done" deps fade,
