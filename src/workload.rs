@@ -2,9 +2,28 @@
 //! survive Claude Code /clear and compaction.
 //!
 //! Straight Rust port of the Python `workload` script. State lives under
-//! `/tmp/claude-workloads/` (state.json, <label>.output, <label>.exit,
-//! <label>.sh) for compatibility with the existing layout so in-flight
-//! workloads from the old script keep working during the transition.
+//! `/var/run/claude/workload-state/` (state.json, <label>.output,
+//! <label>.exit, <label>.sh, <label>.heartbeat, <label>.script.json).
+//! `/var/run` is a tmpfs (Debian symlink to `/run`) and
+//! `/var/run/claude/` is provisioned at boot by
+//! `/etc/tmpfiles.d/claude.conf` (`d /var/run/claude 0755 hndrewaall
+//! hndrewaall -`) so the dir is uid-1000 writable and reset on reboot —
+//! no systemd-tmpfiles cron sweep can prune live workload artifacts out
+//! from under us (the failure mode that pushed us off `/tmp`, Andrew
+//! 2026-05-18 02:52 UTC).
+//!
+//! Note the subdir name — `workload-state/`, NOT `workloads/`. The
+//! runtime heartbeat sidecar already owns `/run/claude/workloads/`
+//! (`<label>.heartbeat`), and since `/var/run -> /run` is a symlink we
+//! can't reuse `workloads/` for the slow 15-min heartbeat file without
+//! both sidecars clobbering each other's `<label>.heartbeat` write.
+//! Distinct subdirs keep the two heartbeat layers independent.
+//!
+//! A backward-compat symlink `/tmp/claude-workloads -> /var/run/claude/workload-state`
+//! is created lazily by `cmd_run` so legacy consumers (docker bind-mount
+//! into queue-minisite, `cron-workload-stale-check`) keep working
+//! transparently. The symlink is best-effort: failure to create it does
+//! not block workload startup.
 //!
 //! On workload completion (natural or via `workload kill`), an event of
 //! `tag=workload-done`, `source=workload` is emitted into
@@ -25,7 +44,29 @@ use std::process::Command;
 use std::time::Duration;
 
 const SESSION: &str = "tasks";
-const WORKLOAD_DIR: &str = "/tmp/claude-workloads";
+
+/// Where live workload artifacts (state.json + per-label .output / .exit /
+/// .heartbeat / .sh / .script.json) live. Migrated off `/tmp` 2026-05-18
+/// after Andrew flagged `/tmp` as sketchy — systemd-tmpfiles can prune
+/// `/tmp/claude-workloads` mid-run, and the dir's traversal mode (1777)
+/// leaks workload labels to other uids. `/var/run/claude/` is uid-1000
+/// owned (provisioned at boot by `/etc/tmpfiles.d/claude.conf`, same dir
+/// that already holds the main-loop `/run/claude/heartbeat` and the
+/// runtime workload heartbeat under `/run/claude/workloads/`). `/var/run`
+/// is a symlink to `/run` on Debian-style systems.
+///
+/// Subdir is `workload-state/` rather than `workloads/` to keep the
+/// slow-cadence (15-min) heartbeat file `<label>.heartbeat` from
+/// colliding with the runtime (30s, progress-driven) heartbeat at
+/// `/run/claude/workloads/<label>.heartbeat`. Same filename, distinct
+/// dirs.
+const WORKLOAD_DIR: &str = "/var/run/claude/workload-state";
+
+/// Legacy artifact path. Kept as a symlink target for one cycle so
+/// out-of-tree consumers (docker bind-mount into queue-minisite,
+/// `cron-workload-stale-check` in server-config) keep working without a
+/// coordinated multi-repo deploy.
+const LEGACY_WORKLOAD_DIR: &str = "/tmp/claude-workloads";
 
 /// Per-workload runtime heartbeat directory. Used by the daemon's
 /// stuck-detection suppression path — see `policy::workload_heartbeat_fresh`.
@@ -48,14 +89,19 @@ const WORKLOAD_DIR: &str = "/tmp/claude-workloads";
 /// wrapper's timer is running".
 ///
 /// Distinct from the slow-cadence (`heartbeat_file` above, 15-min interval,
-/// `/tmp/claude-workloads/`) which `cron-workload-stale-check` consumes
-/// to fire `workload-stale` claude-events at 1h+ stalls. The two
-/// heartbeats coexist:
+/// `/var/run/claude/workloads/`) which `cron-workload-stale-check`
+/// consumes to fire `workload-stale` claude-events at 1h+ stalls. The
+/// two heartbeats coexist:
 ///   * runtime heartbeat (this, `/run/claude/workloads/`): progress-driven,
 ///     used by claude-watch daemon to suppress prolonged-thinking +
 ///     heartbeat-stale alerts while a workload is actively making progress.
-///   * legacy heartbeat (15-min, `/tmp/claude-workloads/`): cron-side
-///     stale-detection.
+///   * legacy heartbeat (15-min, `/var/run/claude/workloads/`): cron-side
+///     stale-detection. Same parent dir as the slow-cadence sidecar
+///     post-migration; they share the workloads dir but write to
+///     different per-label files (`<label>.heartbeat` for the 15-min
+///     pet vs. `/run/claude/workloads/<label>.heartbeat` for the 30s
+///     progress pet — note `/run` vs `/var/run/claude`, two different
+///     dirs that happen to live on the same tmpfs).
 ///
 /// `/run/claude/` is a tmpfs (cleared on reboot, same mount as the
 /// main-loop heartbeat at `/run/claude/heartbeat`) so leftover files
@@ -357,6 +403,54 @@ pub fn save_state(state: &WorkloadState) -> std::io::Result<()> {
     fs::write(state_file(), json)
 }
 
+/// Best-effort: ensure `/tmp/claude-workloads -> /var/run/claude/workload-state`
+/// exists so out-of-tree consumers (docker bind-mount into queue-minisite,
+/// `cron-workload-stale-check` in server-config) keep finding workload
+/// artifacts at the legacy path. The symlink is intentionally lazy —
+/// created on first `workload run` after a reboot — so a fresh tmpfs
+/// always lands us in a known state without depending on a separate
+/// boot-time hook.
+///
+/// Skipped (no error) when:
+///   * `legacy` already exists as a directory (real state from a
+///     still-running legacy workload — do NOT clobber it, the operator
+///     can clean it up manually once everything has migrated). The new
+///     path is authoritative regardless.
+///   * `legacy` already exists as a symlink (idempotent).
+///   * Any I/O error (best-effort; legacy consumers will fail soft).
+fn ensure_legacy_compat_symlink() {
+    create_compat_symlink(Path::new(LEGACY_WORKLOAD_DIR), Path::new(WORKLOAD_DIR));
+}
+
+/// Inner helper extracted for testability. Idempotent + fail-soft.
+fn create_compat_symlink(legacy: &Path, target: &Path) {
+    // symlink_metadata so we don't traverse if it already points
+    // somewhere — we want to know if the link exists, not what it
+    // points to.
+    match fs::symlink_metadata(legacy) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                // Already a symlink — idempotent no-op. We don't
+                // re-target even if the existing link points
+                // somewhere else; that's the operator's call to fix.
+                return;
+            }
+            // It's a real directory (or file) — leave it alone. The
+            // operator can clean it up after the legacy consumers
+            // have all migrated.
+            return;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Fall through to create the symlink.
+        }
+        Err(_) => {
+            // Permission / other I/O error — silently skip.
+            return;
+        }
+    }
+    let _ = std::os::unix::fs::symlink(target, legacy);
+}
+
 /// POSIX single-quote shell escape.
 fn shell_quote(s: &str) -> String {
     let escaped = s.replace('\'', "'\\''");
@@ -427,7 +521,7 @@ fn find_session_task_cli() -> Option<PathBuf> {
 /// 21:02 ET): if `workload run` wasn't given an explicit `--queue-id`,
 /// we synthesise one so the workload appears in `session-task queue
 /// list` alongside agent items. Scope is `workload:<label>` (label is
-/// already unique within `/tmp/claude-workloads/state.json` — kill+run
+/// already unique within `/var/run/claude/workloads/state.json` — kill+run
 /// of the same label is the only collision case, which is the same
 /// constraint workloads have always had). `--force-enqueue` bypasses
 /// scope-conflict checks: peer workloads with overlapping scope
@@ -1064,6 +1158,11 @@ pub fn cmd_run(
         eprintln!("Failed to create {WORKLOAD_DIR}: {e}");
         return 1;
     }
+    // Best-effort: maintain the legacy `/tmp/claude-workloads` path as
+    // a symlink so out-of-tree consumers (docker bind-mount,
+    // cron-workload-stale-check) keep working without a coordinated
+    // multi-repo deploy. Lazy + idempotent — see helper docs.
+    ensure_legacy_compat_symlink();
 
     let out_path = output_file(label);
     let exit_path = exit_file(label);
@@ -1609,8 +1708,9 @@ mod tests {
 
     #[test]
     fn state_loads_legacy_entry_without_queue_id_field() {
-        // Existing /tmp/claude-workloads/state.json files predate the
-        // queue_id field — must deserialize cleanly with queue_id=None.
+        // Existing state.json files predate the queue_id field — must
+        // deserialize cleanly with queue_id=None. (Path doesn't matter
+        // here; we're testing JSON shape, not on-disk location.)
         let raw = r#"{"foo":{"pane_id":"%5","command":"x","output":"/tmp/x","started_at":"2026"}}"#;
         let parsed: WorkloadState = serde_json::from_str(raw).expect("legacy parse");
         assert_eq!(parsed["foo"].queue_id, None);
@@ -4002,5 +4102,74 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let j = serde_json::to_string(&cap).expect("serialize");
         let back: ScriptCapture = serde_json::from_str(&j).expect("deserialize");
         assert_eq!(cap, back);
+    }
+
+    // ----- legacy compat symlink helper -------------------------------------
+
+    /// Fresh-tempdir case: the legacy path doesn't exist yet, so we
+    /// create the symlink pointing at the real WORKLOAD_DIR.
+    #[test]
+    fn create_compat_symlink_links_when_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("workload-state");
+        std::fs::create_dir(&target).expect("mkdir target");
+        let legacy = tmp.path().join("legacy");
+        // Pre-condition: legacy doesn't exist.
+        assert!(
+            !legacy.exists(),
+            "legacy path must not exist before the test"
+        );
+        create_compat_symlink(&legacy, &target);
+        // Post-condition: legacy IS a symlink to target.
+        let meta = std::fs::symlink_metadata(&legacy)
+            .expect("symlink metadata after create");
+        assert!(meta.file_type().is_symlink(), "legacy must be a symlink");
+        let resolved = std::fs::read_link(&legacy).expect("read_link");
+        assert_eq!(resolved, target, "symlink target mismatch");
+    }
+
+    /// Idempotency case: helper runs twice in a row, no error, no panic.
+    /// The pre-existing symlink stays as-is.
+    #[test]
+    fn create_compat_symlink_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("workload-state");
+        std::fs::create_dir(&target).expect("mkdir target");
+        let legacy = tmp.path().join("legacy");
+        create_compat_symlink(&legacy, &target);
+        // Second invocation should be a no-op.
+        create_compat_symlink(&legacy, &target);
+        let meta = std::fs::symlink_metadata(&legacy)
+            .expect("symlink metadata after second create");
+        assert!(
+            meta.file_type().is_symlink(),
+            "legacy must still be a symlink"
+        );
+    }
+
+    /// Real-directory case: legacy already exists as a directory (a
+    /// still-running legacy workload pre-migration). Helper must NOT
+    /// touch it — the operator owns cleanup.
+    #[test]
+    fn create_compat_symlink_skips_existing_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("workload-state");
+        std::fs::create_dir(&target).expect("mkdir target");
+        let legacy = tmp.path().join("legacy");
+        std::fs::create_dir(&legacy).expect("mkdir legacy as real dir");
+        // Drop a file inside so we can verify nothing got clobbered.
+        let canary = legacy.join("canary");
+        std::fs::write(&canary, b"untouched").expect("write canary");
+        create_compat_symlink(&legacy, &target);
+        // Post-condition: legacy is still a dir (NOT a symlink), canary
+        // still exists.
+        let meta = std::fs::symlink_metadata(&legacy)
+            .expect("symlink metadata after create");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "real legacy dir must NOT be replaced with a symlink"
+        );
+        assert!(meta.is_dir(), "legacy must still be a directory");
+        assert!(canary.exists(), "canary inside legacy must survive");
     }
 }
