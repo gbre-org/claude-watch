@@ -1240,7 +1240,17 @@ pub fn cmd_run(
     }
     let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700));
 
-    // Create pane running the script
+    // Create pane running the script. We invoke as `bash <path>`
+    // rather than executing the script directly because the script
+    // lives under `/var/run/claude/workload-state/` and `/run` is
+    // mounted `noexec` on most Linux distros — direct `exec` of a
+    // file on a noexec mount fails with EACCES even when the file
+    // has the +x bit. Passing the path as a bash arg side-steps
+    // that: bash reads-and-interprets the file, which only needs
+    // read permission on the underlying inode. (The +x bit set via
+    // `set_permissions` above is now belt-and-suspenders for any
+    // operator who runs the script directly from a shell.)
+    let script_path_str = script_path.to_string_lossy().to_string();
     let out = Command::new("tmux")
         .args([
             "split-window",
@@ -1250,7 +1260,8 @@ pub fn cmd_run(
             "-P",
             "-F",
             "#{pane_id}",
-            &script_path.to_string_lossy(),
+            "bash",
+            &script_path_str,
         ])
         .output();
     let pane_id = match out {
