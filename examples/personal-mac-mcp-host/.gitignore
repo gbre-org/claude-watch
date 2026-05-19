@@ -1,0 +1,10 @@
+# Operator-specific config — contains REMOTE_HOST, SSH_KEY_PATH, and
+# optionally MCP_HOST_BASH_BEARER. Never commit.
+.env
+
+# Operator's local copy of the launchd plist with absolute paths
+# substituted in. The committed template lives under launchd/.
+launchd/local.plist
+
+# Anything else operators might drop here for triage.
+*.log

@@ -678,13 +678,16 @@ fn default_api_retry_max_stuck_secs() -> u64 {
 /// the alert is SUPPRESSED — there's an out-of-band workload providing
 /// liveness that the main loop's idleness can't explain on its own.
 ///
-/// Distinct from the existing 15-min `/tmp/claude-workloads/<label>.heartbeat`
-/// which `cron-workload-stale-check` consumes to detect wedged workloads
-/// (1h stale threshold). The two heartbeats serve different purposes:
+/// Distinct from the existing 15-min
+/// `/var/run/claude/workload-state/<label>.heartbeat` which
+/// `cron-workload-stale-check` consumes to detect wedged workloads
+/// (1h stale threshold). The two heartbeats serve different purposes
+/// and live in different subdirs of `/var/run/claude/`:
 ///   * `/run/claude/workloads/` (this): fast cadence (30s), daemon-side
 ///     suppression of false-positive stuck alerts.
-///   * `/tmp/claude-workloads/`: slow cadence (15min), cron-side
-///     detection of stalled workloads.
+///   * `/var/run/claude/workload-state/`: slow cadence (15min), cron-side
+///     detection of stalled workloads. The legacy `/tmp/claude-workloads`
+///     path is symlinked to it for back-compat with out-of-tree consumers.
 #[derive(Debug, Deserialize, Clone)]
 pub struct StuckDetectionConfig {
     /// Master switch. Default: true. Set to false to disable workload-

@@ -801,12 +801,14 @@ body.modal-open { overflow: hidden; }
   color: var(--critical);
 }
 
-/* When a pending item has unmet dependencies, give it a faint left
- * border accent so the "blocked by an explicit dep" state is visually
- * distinct from "blocked by queue head". */
-.item.has-deps {
-  border-left: 3px solid var(--ready);
-}
+/* The .has-deps class is set on any pending item whose depends_on list
+ * is non-empty (resolved OR unresolved). Earlier this overrode the
+ * left-border to var(--ready) violet, which gave blocked items the
+ * visual signal of being ready to spawn (Bug: pending+has-deps without
+ * .ready still rendered violet). The state classes already encode the
+ * correct border color: .state-pending = yellow, .state-pending.ready =
+ * violet. The dep badge in the item body carries the "I have a dep"
+ * affordance, so we don't need a separate border treatment here. */
 
 /* Brief flash applied by depend.js when scrolling to a dep target so
  * the user sees where the link landed them. */

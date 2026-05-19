@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# cw-tmux-bootstrap — creates the in-container tmux session in detached
+# mode. Invoked by process-compose as the `setup-tmux-session` oneshot
+# (see /etc/claude-code/process-compose.yml).
+#
+# This script extracts the tmux-session-creation logic from
+# /usr/local/bin/claude-tmux-entrypoint so process-compose can run it
+# as a discrete oneshot ahead of the foreground `tmux attach-session`
+# process and the claude-watch daemon (both of which depend on the
+# session existing).
+#
+# The CLAUDE_* env vars consumed below (CLAUDE_SHIM_SETTINGS_PATH,
+# CLAUDE_SHIM_FILTER_USER, CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS,
+# CLAUDE_AUTO_CONTINUE) are set by /usr/local/bin/claude-tmux-entrypoint
+# during the pre-process-compose setup phase and propagated into this
+# script via process-compose's environment-inheritance (every spawned
+# process inherits the supervisor's env, which is the entrypoint's env).
+#
+# Re-runs are idempotent: if the session already exists (operator
+# restarted process-compose without container teardown), we skip the
+# creation step. `tmux has-session` is the canonical idempotency check.
+
+set -euo pipefail
+
+SESSION="claude-container"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "[cw-tmux-bootstrap] session $SESSION already exists; skipping create" >&2
+    exit 0
+fi
+
+# Build the claude invocation. Mirrors the logic in
+# claude-tmux-entrypoint (see comments there for the full rationale of
+# each conditional block).
+CLAUDE_CMD="exec claude"
+if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
+    CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+fi
+if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -z "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
+    CLAUDE_CMD="exec claude --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+fi
+if [ -d /etc/claude-code/plugin/.claude-plugin ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /etc/claude-code/plugin"
+fi
+if [ "${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}" = "1" ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
+fi
+if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
+    _auto_continue_quoted="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
+    CLAUDE_CMD="$CLAUDE_CMD --continue $_auto_continue_quoted"
+fi
+
+tmux new-session -d -s "$SESSION" -x 200 -y 50 \
+    "$CLAUDE_CMD"
+
+# Allow terminal passthrough so VS Code image paste (OSC sequences)
+# reaches Claude Code through tmux.
+tmux set -g allow-passthrough on
+
+# Advertise 24-bit truecolor.
+tmux set -g terminal-overrides ',xterm-256color:RGB,tmux-256color:RGB'
+tmux set-environment -g COLORTERM truecolor
+
+# Optional sidebar pane.
+if [ "${CLAUDE_CONTAINER_SIDEBAR:-0}" = "1" ]; then
+    tmux split-window -h -t "$SESSION:0" -p 25 \
+        "echo '[pane 1] starting claude-watch (config=${CLAUDE_WATCH_CONFIG:-/etc/claude-watch/config.toml})'; \
+         claude-watch 2>&1 || { ec=\$?; \
+            echo; echo '[pane 1] claude-watch exited with code '\$ec; \
+            echo '[pane 1] dropping to shell so you can inspect; exit to close'; \
+            exec bash; }"
+fi
+
+# Focus the main claude pane.
+tmux select-pane -t "$SESSION:0.0"
+
+echo "[cw-tmux-bootstrap] session $SESSION created" >&2

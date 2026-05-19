@@ -273,9 +273,12 @@ max_stuck_secs = 1800
 # alerts, the daemon scans the dir; if ANY file's mtime is within
 # `workload_heartbeat_max_age_secs`, the alert is SUPPRESSED.
 #
-# Distinct from the legacy 15-min `/tmp/claude-workloads/<label>.heartbeat`
+# Distinct from the legacy 15-min `/var/run/claude/workload-state/<label>.heartbeat`
 # (consumed by `cron-workload-stale-check` for 1h+ wedged-workload
 # detection). The two heartbeats coexist and serve different purposes.
+# Note the workload-state subdir lives off `/var/run/claude/` post-2026-05-18
+# migration off `/tmp`; a `/tmp/claude-workloads` symlink is maintained
+# for back-compat with out-of-tree consumers.
 enabled = true
 workload_heartbeat_dir = "/run/claude/workloads"
 workload_heartbeat_max_age_secs = 60

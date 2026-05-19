@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Tests for container/entrypoint.sh's tmux truecolor + passthrough config.
+"""Tests for the tmux truecolor + passthrough config that runs at
+session-creation time.
 
-After the detached `tmux new-session` call, the entrypoint runs a small
-block of `tmux set -g ...` / `tmux set-environment -g ...` invocations
-that configure the session for VS Code image paste (allow-passthrough)
+After the detached `tmux new-session` call, a small block of
+`tmux set -g ...` / `tmux set-environment -g ...` invocations
+configures the session for VS Code image paste (allow-passthrough)
 and 24-bit truecolor advertising (terminal-overrides + COLORTERM).
 
 The truecolor pair was added in q-2026-05-14-2d6d after the cw container
@@ -13,13 +14,16 @@ and the RGB capability flag was missing from terminal-overrides. xterm.js
 (ttyd) renders what tmux advertises, so the same tmux session looked
 washed out in the browser console.
 
-This test asserts both new lines are present AND come AFTER the existing
+Post-process-compose migration: this block now lives in
+container/bin/cw-tmux-bootstrap (the script process-compose runs as
+the `setup-tmux-session` oneshot ahead of the foreground tmux-attach
+process). The test parses that file instead of entrypoint.sh.
+
+This test asserts both lines are present AND come AFTER the existing
 `tmux set -g allow-passthrough on` line. Ordering matters because the
 truecolor pair was the v2 addition right below the original passthrough
-line, and a future refactor that moves the passthrough block away from
-the truecolor block (e.g. into a function, before/after the tmux session
-build) could silently regress the layout the v1+v2 fixes were designed
-to share.
+line; keeping them clustered makes the tmux-config block self-
+documenting.
 
 Run:  ./entrypoint-tmux-truecolor.test
 """
@@ -30,14 +34,14 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ENTRYPOINT = HERE.parent / "entrypoint.sh"
+BOOTSTRAP = HERE.parent / "bin" / "cw-tmux-bootstrap"
 
-if not ENTRYPOINT.exists():
-    print(f"FAIL: cannot locate entrypoint at {ENTRYPOINT}", file=sys.stderr)
+if not BOOTSTRAP.exists():
+    print(f"FAIL: cannot locate bootstrap at {BOOTSTRAP}", file=sys.stderr)
     sys.exit(2)
 
 
-SRC = ENTRYPOINT.read_text(encoding="utf-8")
+SRC = BOOTSTRAP.read_text(encoding="utf-8")
 
 # Exact lines under test. Match strict literal substrings — the test
 # breaks if anyone reformats whitespace or argv order, which is the

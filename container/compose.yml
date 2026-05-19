@@ -50,6 +50,38 @@ services:
       - ${HOME}/repos:/home/hndrewaall/repos
       - ${PWD}:/workspace
       - claude-container-versions:/home/hndrewaall/.local/share/claude
+      # claude-watch state dir — holds active-agents.json (the JSON state
+      # file the in-container claude-watch active-agents writer cron
+      # publishes every minute) and any other in-container daemon state
+      # that needs to survive container recreate.
+      #
+      # Default: anonymous named volume `claude-watch-state`, managed by
+      # docker, mounted at /var/lib/claude-watch. Works out of the box on
+      # any host — `docker compose up` and the writer has a place to land
+      # bytes without any operator setup.
+      #
+      # Override: set CW_STATE_PATH=/absolute/host/path before invoking
+      # compose to bind-mount that host directory instead. Useful for
+      # deployments that want sibling containers (queue-minisite et al)
+      # on the same host to read the state file directly from the host
+      # filesystem rather than via docker volume plumbing. The
+      # `${CW_STATE_PATH:-claude-watch-state}` interpolation expands to
+      # the host path when set (compose treats absolute paths as bind
+      # mounts) or to the named-volume literal when unset.
+      - ${CW_STATE_PATH:-claude-watch-state}:/var/lib/claude-watch
+      # Operator-specific cron entries (PR-watch loops, custom event
+      # emitters, anything referencing host paths). Default cron
+      # entries baked into the image at /etc/cron.d/cw-default fire
+      # regardless; this slot is for the per-host additions.
+      #
+      # Files inside the bind-mounted dir must be root:root mode 0644
+      # (cron's standard requirement for /etc/cron.d/ entries). Each
+      # file follows the standard `m h dom mon dow user command`
+      # format. Files inside the private dir are picked up by cron's
+      # recursive read of /etc/cron.d/.
+      #
+      # Uncomment + set the host path to enable:
+      # - "/host/path/to/private-cron.d/:/etc/cron.d/private/:ro"
     environment:
       # Explicit passthrough of the Claude Code SSE port set by VSCode.
       - CLAUDE_CODE_SSE_PORT
@@ -71,3 +103,13 @@ volumes:
   # Inspect: `docker volume inspect claude-container-versions`.
   # Nuke:    `docker volume rm claude-container-versions`.
   claude-container-versions:
+  # claude-watch-state — default backing store for /var/lib/claude-watch
+  # inside the container. Holds active-agents.json and any other in-
+  # container daemon state that needs to survive `docker compose up
+  # --force-recreate`. Only declared (and only used) when CW_STATE_PATH
+  # is unset; when CW_STATE_PATH is set the compose interpolation
+  # rewrites the volume reference to a host bind-mount, and this named
+  # volume is left dangling (no-op).
+  # Inspect: `docker volume inspect claude-watch-state`.
+  # Nuke:    `docker volume rm claude-watch-state`.
+  claude-watch-state:

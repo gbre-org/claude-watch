@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Tests for the baked default cron entries + the /etc/cron.d/private
+operator-override slot.
+
+Background: every claude-watch container needs the same two recurring
+jobs (active-agents JSON state writer + claude-watch metrics emit).
+Pre-process-compose, the image shipped cron installed but with an
+empty /etc/cron.d/ — every host needed to bind-mount its own cron
+files in, which was particularly painful on macOS Docker Desktop
+(LaunchAgents, Full Disk Access prompts). Now the image bakes the
+two default-public entries at /etc/cron.d/cw-default and reserves
+/etc/cron.d/private as a bind-mount slot for operator-specific
+recurring jobs.
+
+This test verifies the FILE-LEVEL wiring (cron.d file contents +
+Dockerfile COPY + Dockerfile mkdir for the private slot). Runtime
+exercise (cron actually firing the baked entries, claude-watch
+actually writing active-agents.json) lives in workbot v-prompts.
+
+Coverage:
+
+  1. container/cron.d/cw-default exists with the two default entries
+     (active-agents writer + metrics emit), running as uid `hndrewaall`,
+     scheduled every minute (* * * * *).
+  2. Both entries reference /usr/local/bin/claude-watch (the baked
+     binary, not a bind-mounted host path).
+  3. The active-agents writer writes to /var/lib/claude-watch/active-agents.json
+     (the in-container path backed by the claude-watch-state volume).
+  4. Dockerfile COPYs cron.d/cw-default to /etc/cron.d/cw-default with
+     mode 0644 + root:root ownership (cron rejects world-writable or
+     non-root-owned files in /etc/cron.d/).
+  5. Dockerfile creates /etc/cron.d/private as a directory (the
+     operator bind-mount slot). Empty by default; populated by
+     operator-supplied compose override.
+
+Run:  ./cron-default-baked.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+CRON_DEFAULT = CONTAINER_DIR / "cron.d" / "cw-default"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# 1-3. cron.d/cw-default content.
+# ---------------------------------------------------------------------------
+expect(CRON_DEFAULT.is_file(), f"cron.d/cw-default missing at {CRON_DEFAULT}")
+if CRON_DEFAULT.is_file():
+    cron_text = CRON_DEFAULT.read_text(encoding="utf-8")
+
+    # Extract non-comment, non-blank lines (the actual schedule
+    # entries).
+    schedule_lines = [
+        line for line in cron_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+    expect(
+        len(schedule_lines) >= 2,
+        f"cron.d/cw-default must declare at least 2 schedule entries "
+        f"(active-agents writer + metrics emit); found "
+        f"{len(schedule_lines)}: {schedule_lines!r}",
+    )
+
+    # 1. active-agents writer entry.
+    active_agents_line = next(
+        (line for line in schedule_lines if "active-agents" in line),
+        None,
+    )
+    expect(
+        active_agents_line is not None,
+        "cron.d/cw-default must include an `active-agents` writer "
+        "entry. queue-minisite + work-queue-exporter + cron-queue-check "
+        "all consume active-agents.json; without the writer they have "
+        "no data to read.",
+    )
+    if active_agents_line is not None:
+        # 1a. * * * * * schedule.
+        expect(
+            active_agents_line.startswith("* * * * *"),
+            f"active-agents writer entry must run every minute "
+            f"(`* * * * *`); got {active_agents_line!r}",
+        )
+        # 1b. Runs as `hndrewaall` user.
+        expect(
+            "hndrewaall" in active_agents_line,
+            f"active-agents writer entry must run as the hndrewaall "
+            f"user (uid 1000); got {active_agents_line!r}. cron daemon "
+            f"runs as root in the container and setuid()s into the "
+            f"named user — the user MUST be specified in /etc/cron.d/ "
+            f"entries (unlike /var/spool/cron/crontabs/ entries).",
+        )
+        # 2. References the baked claude-watch binary.
+        expect(
+            "/usr/local/bin/claude-watch" in active_agents_line,
+            f"active-agents writer entry must reference the baked "
+            f"/usr/local/bin/claude-watch binary, not a bind-mounted "
+            f"host path; got {active_agents_line!r}",
+        )
+        # 3. Writes to /var/lib/claude-watch/active-agents.json.
+        expect(
+            "/var/lib/claude-watch/active-agents.json" in active_agents_line,
+            f"active-agents writer must write to "
+            f"/var/lib/claude-watch/active-agents.json (the in-container "
+            f"path backed by the claude-watch-state volume); got "
+            f"{active_agents_line!r}",
+        )
+
+    # Metrics emit entry.
+    metrics_line = next(
+        (line for line in schedule_lines if "metrics" in line),
+        None,
+    )
+    expect(
+        metrics_line is not None,
+        "cron.d/cw-default must include a `claude-watch metrics` emit "
+        "entry. Without it work-queue-exporter has no metrics to "
+        "scrape and the Grafana queue dashboard goes blank.",
+    )
+    if metrics_line is not None:
+        expect(
+            metrics_line.startswith("* * * * *"),
+            f"metrics emit entry must run every minute; got "
+            f"{metrics_line!r}",
+        )
+        expect(
+            "hndrewaall" in metrics_line,
+            f"metrics emit entry must run as the hndrewaall user; "
+            f"got {metrics_line!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4-5. Dockerfile bakes the file + creates the private slot.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.is_file():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    # 4a. COPY cron.d/cw-default -> /etc/cron.d/cw-default.
+    expect(
+        re.search(
+            r"COPY\s+container/cron\.d/cw-default\s+"
+            r"/etc/cron\.d/cw-default",
+            df,
+        )
+        is not None,
+        "Dockerfile must COPY container/cron.d/cw-default to "
+        "/etc/cron.d/cw-default. Without this the baked default "
+        "entries never land in the image and cron starts with an "
+        "empty schedule.",
+    )
+
+    # 4b. chmod 0644 (cron rejects non-0644 files).
+    expect(
+        re.search(r"chmod\s+0644\s+/etc/cron\.d/cw-default", df)
+        is not None,
+        "Dockerfile must chmod /etc/cron.d/cw-default to 0644. cron "
+        "refuses to run schedule entries from world-writable files; "
+        "without the chmod the baked entries fire only if the source "
+        "file happened to be 0644 on the build host (fragile).",
+    )
+
+    # 4c. chown root:root.
+    expect(
+        re.search(r"chown\s+root:root\s+/etc/cron\.d/cw-default", df)
+        is not None,
+        "Dockerfile must chown /etc/cron.d/cw-default to root:root. "
+        "cron refuses entries owned by non-root.",
+    )
+
+    # 5. Private slot — mkdir /etc/cron.d/private.
+    expect(
+        re.search(r"mkdir\s+-p\s+/etc/cron\.d/private", df) is not None,
+        "Dockerfile must `mkdir -p /etc/cron.d/private` so the "
+        "operator bind-mount slot exists with the right perms BEFORE "
+        "docker auto-creates it root-owned 0755 on first bind-mount. "
+        "Same auto-creation gotcha as /home/hndrewaall/.config got hit "
+        "by.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+if failures:
+    print("FAIL cron-default-baked.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS cron-default-baked.test")
+sys.exit(0)

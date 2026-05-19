@@ -136,6 +136,12 @@ jobs:
       - name: Run load-bearer-from-keychain wrapper tests
         run: make test-load-bearer-from-keychain
 
+      - name: Run personal-mcp-host wrapper tests
+        run: make test-personal-mcp-host
+
+      - name: Run personal-mcp-host launchd plist tests
+        run: make test-personal-mcp-host-plist
+
       - name: Install uv (for session-task tests)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 

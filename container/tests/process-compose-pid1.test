@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Tests for the process-compose PID 1 supervisor wiring (replaces the
+prior tini-pid1.test).
+
+Background — when the container grew to three long-running services
+(claude-watch daemon + crond + cw-watcher-supervisor, alongside the
+foreground tmux session), tini stopped being sufficient. tini reaps
+zombies and forwards signals but doesn't model service dependencies,
+doesn't restart on failure, and doesn't centralize per-process logs.
+process-compose (a single static Go binary with a docker-compose-style
+YAML schema) provides those service contracts.
+
+Wiring: the Dockerfile installs process-compose from upstream releases
+(pinned version), copies a baked /etc/claude-code/process-compose.yml
+service config, and sets ENTRYPOINT to the entrypoint script
+(which does setup then `exec`s process-compose). process-compose is
+PID 1 from there forward; it reaps zombies + forwards signals to its
+supervised children and exits when all foreground processes complete.
+
+This test verifies the FILE-LEVEL wiring (Dockerfile install layer,
+ENTRYPOINT directive, process-compose.yml schema). It does NOT spin up
+a container — the runtime assertion (`cat /proc/1/comm` reports
+`process-compose`, supervised processes restart on simulated crash) is
+exercised by a workbot v-prompt against an actual `docker compose up`.
+
+Coverage:
+  1. Dockerfile installs the process-compose binary from upstream
+     releases (pinned ARG, curl + tar extract, --version smoke check).
+  2. Dockerfile DOES NOT install tini anymore (the apt layer's
+     tini line is gone). Forgetting to remove it would silently
+     pin an unused binary; harmless but bloats the image.
+  3. Dockerfile ENTRYPOINT no longer wraps with /usr/bin/tini.
+     It's a bare exec-form list pointing at the entrypoint script
+     (which itself execs process-compose after setup).
+  4. container/process-compose.yml exists and declares the canonical
+     service set (setup-tmux-session, tmux-attach, claude-watch,
+     crond, cw-watcher-supervisor).
+  5. Long-running services declare `restart: on_failure` so a
+     crash triggers a restart instead of a dead container.
+  6. entrypoint.sh execs /usr/local/bin/process-compose at the end
+     (replaces the prior `exec tmux attach-session`).
+  7. README documents the PID 1 migration.
+
+Run:  ./process-compose-pid1.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+README = CONTAINER_DIR / "README.md"
+PC_CONFIG = CONTAINER_DIR / "process-compose.yml"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# 1. Dockerfile: process-compose is installed from upstream releases.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    # Pinned-version ARG.
+    expect(
+        re.search(r"ARG\s+PROCESS_COMPOSE_VERSION=v[\d.]+", df) is not None,
+        "Dockerfile must pin process-compose via "
+        "`ARG PROCESS_COMPOSE_VERSION=v<x.y.z>`. Without the pin the "
+        "image silently drifts to upstream HEAD on each rebuild.",
+    )
+
+    # Install via curl + tar to /usr/local/bin/.
+    expect(
+        re.search(
+            r"github\.com/F1bonacc1/process-compose/releases/download/"
+            r"\$\{PROCESS_COMPOSE_VERSION\}",
+            df,
+        )
+        is not None,
+        "Dockerfile must fetch process-compose from the upstream GitHub "
+        "releases URL using the pinned ARG. Failure to interpolate the "
+        "ARG would silently pull HEAD.",
+    )
+
+    expect(
+        re.search(r"tar\s+-xzf\s+/tmp/process-compose\.tar\.gz", df)
+        is not None,
+        "Dockerfile must extract the process-compose tarball — "
+        "`tar -xzf /tmp/process-compose.tar.gz ...`.",
+    )
+
+    # Smoke-test on install: `process-compose version`.
+    expect(
+        re.search(r"/usr/local/bin/process-compose\s+version", df)
+        is not None,
+        "Dockerfile must smoke-test the installed binary with "
+        "`/usr/local/bin/process-compose version >/dev/null` so a "
+        "broken download / arch mismatch surfaces at image build time.",
+    )
+
+    # 2. tini is no longer installed.
+    apt_layer_match = re.search(
+        r"RUN\s+apt-get update\s*&&\s*apt-get install\s+-y\s+"
+        r"--no-install-recommends\s*\\\n"
+        r"((?:\s+\S+\s*\\\n)+)"
+        r"(?:\s+\S+\s*)?"
+        r"\s+&&\s+rm\s+-rf\s+/var/lib/apt/lists/\*",
+        df,
+    )
+    if apt_layer_match:
+        packages_block = apt_layer_match.group(0)
+        tini_line = re.search(
+            r"(?m)^\s+tini\s*\\\s*$",
+            packages_block,
+        )
+        expect(
+            tini_line is None,
+            "Dockerfile apt-get layer: `tini` should NOT be installed "
+            "anymore. process-compose is PID 1 and reaps zombies itself; "
+            "leaving tini in the apt-install list is unused bloat that "
+            "implies dual-supervisor wiring (which would be wrong).",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3. Dockerfile ENTRYPOINT — no /usr/bin/tini wrap.
+# ---------------------------------------------------------------------------
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    entrypoint_lines = []
+    for line in df.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        m = re.match(r"ENTRYPOINT\s+(.+)$", stripped)
+        if m:
+            entrypoint_lines.append(m.group(1).rstrip())
+
+    expect(
+        len(entrypoint_lines) >= 1,
+        "Dockerfile: no non-commented ENTRYPOINT directive found.",
+    )
+    if entrypoint_lines:
+        entrypoint = entrypoint_lines[-1].strip()
+        expect(
+            entrypoint.startswith("["),
+            "Dockerfile ENTRYPOINT must stay exec-form JSON.",
+        )
+        if entrypoint.startswith("["):
+            import json
+            try:
+                argv = json.loads(entrypoint)
+            except json.JSONDecodeError as e:
+                argv = None
+                failures.append(
+                    f"Dockerfile ENTRYPOINT: could not parse argv JSON "
+                    f"({entrypoint!r}): {e}"
+                )
+            if argv is not None and isinstance(argv, list):
+                expect(
+                    "/usr/bin/tini" not in argv,
+                    "Dockerfile ENTRYPOINT must not reference "
+                    "/usr/bin/tini. process-compose replaces tini at "
+                    "PID 1; a stale `/usr/bin/tini` in the argv would "
+                    "either fail (if tini is uninstalled) or layer two "
+                    "supervisors (if it isn't), neither of which is "
+                    "what we want.",
+                )
+                expect(
+                    argv[-1] == "/usr/local/bin/claude-tmux-entrypoint"
+                    or "/usr/local/bin/claude-tmux-entrypoint" in argv,
+                    "Dockerfile ENTRYPOINT must invoke "
+                    "/usr/local/bin/claude-tmux-entrypoint (the script "
+                    "that does setup + execs process-compose).",
+                )
+
+
+# ---------------------------------------------------------------------------
+# 4. container/process-compose.yml — service declarations.
+# ---------------------------------------------------------------------------
+expect(PC_CONFIG.exists(), f"process-compose.yml missing at {PC_CONFIG}")
+if PC_CONFIG.exists():
+    pc_text = PC_CONFIG.read_text(encoding="utf-8")
+
+    # Canonical service names — each must appear as a top-level key
+    # under `processes:`. We do a coarse regex check rather than full
+    # YAML parse (PyYAML may not be available in CI).
+    required_services = [
+        "setup-tmux-session",
+        "tmux-attach",
+        "claude-watch",
+        "crond",
+        "cw-watcher-supervisor",
+    ]
+    for svc in required_services:
+        # Service block headers look like `  <name>:` at indent level 2.
+        # Avoid matching `<name>:` that's a property of a different
+        # block (`depends_on: <name>:`) by anchoring on column 2.
+        pat = re.compile(rf"(?m)^  {re.escape(svc)}:\s*$")
+        expect(
+            pat.search(pc_text) is not None,
+            f"process-compose.yml must declare a `{svc}` process. "
+            f"This is one of the canonical supervised services; "
+            f"dropping it would leave the container without a real "
+            f"supervisor for that role.",
+        )
+
+    # 5. Long-running services must declare restart: on_failure.
+    # Coarse check: the literal `restart: on_failure` must appear
+    # at least 3 times (once per long-running process: claude-watch,
+    # crond, cw-watcher-supervisor). The oneshot setup-tmux-session
+    # has `restart: no` and the interactive tmux-attach also has
+    # `restart: no` (operator-controlled).
+    on_failure_count = len(re.findall(r"restart:\s*on_failure", pc_text))
+    expect(
+        on_failure_count >= 3,
+        f"process-compose.yml must declare `restart: on_failure` on "
+        f"each of the 3 long-running supervised processes "
+        f"(claude-watch, crond, cw-watcher-supervisor); found "
+        f"{on_failure_count} occurrence(s). Without restart policies, "
+        f"a daemon crash leaves the container in a half-dead state.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. entrypoint.sh execs process-compose at the end.
+# ---------------------------------------------------------------------------
+expect(ENTRYPOINT.exists(), f"entrypoint.sh missing at {ENTRYPOINT}")
+if ENTRYPOINT.exists():
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+
+    # Must exec process-compose, not tmux directly.
+    expect(
+        re.search(
+            r"exec\s+/usr/local/bin/process-compose\s+up", text
+        )
+        is not None,
+        "entrypoint.sh must end with "
+        "`exec /usr/local/bin/process-compose up --config ...` so "
+        "process-compose becomes PID 1 of the container. Without the "
+        "exec replacement, entrypoint.sh stays PID 1 and signal "
+        "forwarding is fragile.",
+    )
+
+    # Must reference the baked config path.
+    expect(
+        "/etc/claude-code/process-compose.yml" in text,
+        "entrypoint.sh must reference "
+        "/etc/claude-code/process-compose.yml as the process-compose "
+        "--config arg. That's where the Dockerfile bakes the service "
+        "declarations.",
+    )
+
+    # Must NOT contain the old `nohup setsid claude-watch &` daemon
+    # spawns — process-compose owns that lifecycle now.
+    expect(
+        re.search(r"nohup\s+setsid\s+claude-watch", text) is None,
+        "entrypoint.sh must NOT contain a `nohup setsid claude-watch &` "
+        "block anymore. process-compose declares claude-watch as a "
+        "supervised process with restart policy; the entrypoint-side "
+        "spawn was the pre-process-compose shape.",
+    )
+    expect(
+        re.search(r"nohup\s+setsid\s+sudo[^&]*cron", text) is None,
+        "entrypoint.sh must NOT contain a `nohup setsid sudo cron -f &` "
+        "block anymore. process-compose declares crond as a supervised "
+        "process.",
+    )
+    expect(
+        re.search(r"nohup\s+setsid\s+/usr/local/bin/cw-watcher-supervisor", text) is None,
+        "entrypoint.sh must NOT contain a `nohup setsid "
+        "cw-watcher-supervisor &` block anymore. process-compose "
+        "declares the supervisor as a supervised process.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. README documents process-compose as PID 1.
+# ---------------------------------------------------------------------------
+expect(README.exists(), f"container/README.md missing at {README}")
+if README.exists():
+    text = README.read_text(encoding="utf-8")
+    expect(
+        re.search(r"##\s+PID 1 supervisor", text) is not None,
+        "container/README.md: missing a `## PID 1 supervisor` section.",
+    )
+    expect(
+        "process-compose" in text,
+        "container/README.md: missing reference to `process-compose` "
+        "as the PID 1 supervisor.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+if failures:
+    print("FAIL process-compose-pid1.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS process-compose-pid1.test")
+sys.exit(0)

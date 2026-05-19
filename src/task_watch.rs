@@ -728,7 +728,7 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
     // Orphan pane cleanup: scan existing panes in the session and kill any
     // that aren't tracked (leftover from a previous daemon instance).
     // Pane 0 is the daemon/status pane — never kill it.
-    // Workload panes (registered in /tmp/claude-workloads/state.json by the
+    // Workload panes (registered in /var/run/claude/workload-state/state.json by the
     // `workload` CLI) are NOT in state.tracked but must also be preserved —
     // see the 2026-04-30 promote-layl-s01 incident (pane %1832 killed mid-run).
     let existing_panes = list_existing_panes(&session).await;
@@ -1209,14 +1209,17 @@ fn setup_notify_watcher(
 ///
 /// The `workload` CLI writes a JSON registry keyed by workload label, with
 /// each entry containing a `pane_id`. Tests can override the path via the
-/// `CLAUDE_WATCH_WORKLOAD_STATE` env var (default: `/tmp/claude-workloads/state.json`).
+/// `CLAUDE_WATCH_WORKLOAD_STATE` env var (default:
+/// `/var/run/claude/workload-state/state.json`). The default must stay
+/// in sync with `workload::WORKLOAD_DIR` — the two are read-only mirrors
+/// of the same on-disk file.
 fn workload_state_path() -> PathBuf {
     if let Ok(p) = std::env::var("CLAUDE_WATCH_WORKLOAD_STATE") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
-    PathBuf::from("/tmp/claude-workloads/state.json")
+    PathBuf::from("/var/run/claude/workload-state/state.json")
 }
 
 /// Load the set of pane IDs registered as active workloads.
@@ -2037,7 +2040,7 @@ mod tests {
         std::env::remove_var("CLAUDE_WATCH_WORKLOAD_STATE");
         assert_eq!(
             workload_state_path(),
-            PathBuf::from("/tmp/claude-workloads/state.json")
+            PathBuf::from("/var/run/claude/workload-state/state.json")
         );
     }
 
@@ -2060,7 +2063,7 @@ mod tests {
         // Empty string should NOT redirect to "" — fall back to the default path.
         assert_eq!(
             workload_state_path(),
-            PathBuf::from("/tmp/claude-workloads/state.json")
+            PathBuf::from("/var/run/claude/workload-state/state.json")
         );
     }
 }

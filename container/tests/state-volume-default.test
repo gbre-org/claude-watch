@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Tests for the CW_STATE_PATH-overridable claude-watch state volume.
+
+Background: the in-container `/var/lib/claude-watch` state dir holds
+`active-agents.json` (the JSON state file the active-agents writer
+cron emits per minute) plus any other in-container daemon state that
+needs to survive `docker compose up --force-recreate`. The volume
+backing that path is configurable:
+
+  - Default: a docker-managed named volume `claude-watch-state`. Works
+    on any host with zero operator setup.
+  - Override: `CW_STATE_PATH=/absolute/host/path` swaps the named
+    volume for a host bind-mount. Useful when sibling containers on
+    the same host need to read the state file directly from disk.
+
+Mechanism: the compose volume reference uses
+`${CW_STATE_PATH:-claude-watch-state}` — compose interpolation expands
+to the host path when the env var is set (absolute path → bind mount)
+or to the named-volume literal when unset.
+
+This test verifies the FILE-LEVEL wiring (compose.yml + Dockerfile).
+It does NOT spin up a container — the runtime assertion (named volume
+gets created on `docker compose up`, host path gets bind-mounted when
+CW_STATE_PATH is set) is exercised by a workbot v-prompt against an
+actual `docker compose up`.
+
+Coverage:
+  1. compose.yml's claude-container service has a volume entry
+     using `${CW_STATE_PATH:-claude-watch-state}` as the source and
+     `/var/lib/claude-watch` as the destination.
+  2. compose.yml's top-level `volumes:` block declares the
+     `claude-watch-state` named volume so the default code path
+     resolves to a real volume name.
+  3. Dockerfile pre-creates /var/lib/claude-watch with uid 1000
+     ownership so the default named-volume path inherits the right
+     perms via docker's bind-mount-copy-up behaviour.
+  4. container/README.md documents the CW_STATE_PATH override.
+
+Run:  ./state-volume-default.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+COMPOSE = CONTAINER_DIR / "compose.yml"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+README = CONTAINER_DIR / "README.md"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# 1. compose.yml: claude-container has the env-overridable state volume entry.
+# ---------------------------------------------------------------------------
+expect(COMPOSE.is_file(), f"compose.yml missing at {COMPOSE}")
+if COMPOSE.is_file():
+    compose_text = COMPOSE.read_text(encoding="utf-8")
+
+    # Match the canonical compose-interpolation shape:
+    #   ${CW_STATE_PATH:-claude-watch-state}:/var/lib/claude-watch
+    # Allow optional surrounding whitespace / leading `-` (compose list
+    # item). The `:-default` syntax is the operative bit — that's what
+    # makes the override work without a second compose file.
+    pattern = re.compile(
+        r"\$\{CW_STATE_PATH:-claude-watch-state\}:/var/lib/claude-watch",
+    )
+    expect(
+        pattern.search(compose_text) is not None,
+        "compose.yml must mount ${CW_STATE_PATH:-claude-watch-state} "
+        "at /var/lib/claude-watch on claude-container. The "
+        "`${CW_STATE_PATH:-claude-watch-state}` interpolation expands "
+        "to the host bind path when CW_STATE_PATH is set, or to the "
+        "named-volume literal when unset.",
+    )
+
+    # 2. top-level volumes: block declares claude-watch-state. Without
+    #    this, the default code path (CW_STATE_PATH unset) references
+    #    an undeclared volume name and compose errors at boot.
+    #
+    #    The volumes block is the trailing `volumes:` section at the
+    #    end of the file. We just check the literal key appears under
+    #    a `volumes:` heading; a fuller YAML parse would be overkill.
+    volumes_section = re.search(
+        r"\nvolumes:\s*\n(?P<body>(?:^[ \t#].*\n|^\s*\n)+)",
+        compose_text,
+        re.MULTILINE,
+    )
+    expect(
+        volumes_section is not None,
+        "compose.yml must have a top-level `volumes:` section "
+        "declaring named volumes. Without it the default "
+        "`claude-watch-state` reference is undefined and compose "
+        "rejects the file.",
+    )
+    if volumes_section is not None:
+        body = volumes_section.group("body")
+        expect(
+            re.search(r"^\s+claude-watch-state:\s*$", body, re.MULTILINE)
+            is not None,
+            "compose.yml's top-level `volumes:` section must declare "
+            "the `claude-watch-state` named volume. This is the "
+            "default backing store for /var/lib/claude-watch when "
+            "CW_STATE_PATH is unset.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3. Dockerfile: /var/lib/claude-watch pre-created uid-1000-owned.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.is_file():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+
+    # Must `mkdir -p /var/lib/claude-watch`.
+    expect(
+        re.search(r"mkdir\s+-p\s+/var/lib/claude-watch\b", df) is not None,
+        "Dockerfile: must `mkdir -p /var/lib/claude-watch` so the "
+        "default named-volume mountpoint exists with the right "
+        "ownership BEFORE docker initializes the volume on first "
+        "launch. Docker's bind-mount-perm-copy-up reads the existing "
+        "dir's owner + perms into the fresh volume; without this "
+        "step the volume defaults to root:root and the uid-1000 "
+        "cron entries fail to write active-agents.json.",
+    )
+
+    # Must `chown 1000:1000 /var/lib/claude-watch`.
+    expect(
+        re.search(
+            r"chown\s+(-R\s+)?1000:1000\s+/var/lib/claude-watch\b", df
+        )
+        is not None,
+        "Dockerfile: must `chown 1000:1000 /var/lib/claude-watch` so "
+        "the in-container uid-1000 process can write into the dir. "
+        "Same Docker bind-mount-perm-inheritance rationale as the "
+        "/home/hndrewaall/.local pre-creation above.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. README documents the override.
+# ---------------------------------------------------------------------------
+expect(README.is_file(), f"README.md missing at {README}")
+if README.is_file():
+    readme_text = README.read_text(encoding="utf-8")
+    expect(
+        "CW_STATE_PATH" in readme_text,
+        "container/README.md must document the CW_STATE_PATH override "
+        "env var. Operators reading the README should learn how to "
+        "swap the default named volume for a host bind mount without "
+        "having to read compose.yml directly.",
+    )
+    expect(
+        "claude-watch-state" in readme_text,
+        "container/README.md must mention the `claude-watch-state` "
+        "named volume by name so operators can `docker volume "
+        "inspect` it.",
+    )
+    expect(
+        "/var/lib/claude-watch" in readme_text,
+        "container/README.md must mention /var/lib/claude-watch as "
+        "the in-container path so operators understand which path "
+        "inside the container is backed by the volume.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report.
+# ---------------------------------------------------------------------------
+if failures:
+    print(f"FAIL ({len(failures)} failure(s)):", file=sys.stderr)
+    for msg in failures:
+        print(f"  - {msg}", file=sys.stderr)
+    sys.exit(1)
+
+print("OK")

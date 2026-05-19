@@ -48,19 +48,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Host-specific shell-history integrations are intentionally omitted —
 # layer them on via a downstream image if you need them.
 #
-# tini is the PID 1 supervisor (installed at /usr/bin/tini by the Debian
-# package). Without an explicit PID 1 init, entrypoint.sh runs as PID 1
-# itself — bash inherits no zombie-reap behaviour and no kernel-level
-# default signal handlers, so grandchildren orphaned by daemonising
-# helpers (nohup setsid claude-watch &, mcp/MCP subprocesses, etc.) pile
-# up as <defunct> entries and `docker stop` signals can race or get
-# dropped entirely. tini re-parents orphaned grandchildren, reaps them
-# on SIGCHLD, and forwards SIGTERM/SIGINT cleanly into the entrypoint
-# script's own trap handler. The image now wires tini in via
-# ENTRYPOINT ["/usr/bin/tini", "--", ...] below.
+# Service supervision (PID 1 init) is handled by process-compose, a
+# single static Go binary installed below from upstream. We don't ship
+# tini anymore — process-compose handles SIGCHLD reaping and
+# SIGTERM/SIGINT forwarding to its supervised children, and provides
+# the declarative restart-on-failure / depends_on contract that tini
+# (a single-process supervisor) couldn't. See
+# /etc/claude-code/process-compose.yml for the service declarations
+# and container/README.md "PID 1 supervisor" for the migration
+# rationale.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux \
-        tini \
         git \
         curl \
         ca-certificates \
@@ -103,35 +101,60 @@ RUN printf '%s\n%s\n' \
 
 # cron — Debian's vixie-cron daemon for in-container recurring jobs.
 #
-# The image ships cron installed but NO /etc/cron.d/ entries baked in.
-# Operator-side jobs (e.g. a `cron-tv-check` that emits a claude-event
-# for the in-container watcher to surface) belong to the operator's
-# private downstream image or docker-compose.override.yml bind-mount,
-# not the public claude-watch artifact — homelab jobs reference
-# absolute paths to host-side scripts (`/home/<user>/bin/...`) that
-# don't exist on a generic workbot, and one operator's recurring-job
-# layout doesn't carry to another's host.
+# The image bakes a /etc/cron.d/cw-default entry containing the two
+# default-public cron lines every claude-watch deployment needs:
+#   - active-agents JSON state writer (consumed by queue-minisite,
+#     work-queue-exporter, cron-queue-check).
+#   - claude-watch metrics emit.
+# Both run as uid 1000 (hndrewaall) and write to /var/lib/claude-watch/
+# (the named-volume-backed state dir) and /tmp/ respectively.
 #
-# Operator wiring shape (private downstream / override):
+# Operator-side jobs (host-specific PR-watch loops, custom event
+# emitters that reference absolute paths to host-side scripts, etc.)
+# DO NOT belong in the baked default — every operator's wiring is
+# different. The /etc/cron.d/private path is reserved for operator
+# bind-mounts. compose.yml has a commented-out volume declaration
+# showing the canonical override shape:
 #
 #   services:
 #     claude-container:
 #       volumes:
-#         - "/path/to/host/cron.d/:/etc/cron.d/:ro"
+#         - "/host/path/to/private-cron.d/:/etc/cron.d/private/:ro"
 #
-# The entrypoint starts the cron daemon at container boot regardless
-# of whether /etc/cron.d/ is populated — an empty cron.d is a
-# no-op (zero jobs to run) but the daemon is ready as soon as the
-# operator bind-mounts entries in. Jobs run as whichever user the
-# crontab entry specifies (the cron daemon itself runs as root in
-# the container's PID namespace so it can `su` into any user the
-# operator chooses to schedule under).
+# The supervisor starts cron at container boot regardless of whether
+# /etc/cron.d/private is populated — an empty dir is a no-op (zero
+# jobs to run from there) but the baked /etc/cron.d/cw-default
+# entries still fire. Jobs run as whichever user the crontab entry
+# specifies (the cron daemon runs as root in the container's PID
+# namespace so it can setuid() into the user named in each line).
 #
 # Entries that drop claude-event JSON into the spool (via the
 # in-container `claude-event` CLI, which honors CLAUDE_EVENT_QUEUE)
 # flow to the in-container claude-event-tail watcher automatically —
 # the cron daemon, the spool dir, and the watcher all live in the
 # same container so no cross-process IPC is needed.
+
+# Bake the default cron entries. /etc/cron.d/ files must be owned by
+# root and mode 0644 (cron rejects world-writable or non-root-owned
+# files in /etc/cron.d/). The COPY chowns to root:root by default;
+# the trailing chmod 0644 belt-and-suspenders against operator-side
+# umask drift.
+COPY container/cron.d/cw-default /etc/cron.d/cw-default
+RUN chmod 0644 /etc/cron.d/cw-default \
+    && chown root:root /etc/cron.d/cw-default
+
+# Reserve /etc/cron.d/private as the operator-bind-mount slot. The dir
+# exists with mode 0755 + root:root ownership so a `:ro` bind-mount
+# over it works without docker auto-creating a fresh root-owned dir
+# with wrong perms on first launch (same auto-creation gotcha
+# /home/hndrewaall/.config got hit by). Empty by default — operators
+# drop their per-host cron.d files into the bind-mounted path. cron's
+# default /etc/cron.d/ behaviour reads the directory recursively;
+# entries inside /etc/cron.d/private/ are picked up just like baked
+# entries.
+RUN mkdir -p /etc/cron.d/private \
+    && chmod 0755 /etc/cron.d/private \
+    && chown root:root /etc/cron.d/private
 
 # Node.js via NodeSource (LTS 20.x) — Claude Code CLI requires Node >= 20.
 # Bookworm's apt nodejs is too old. In Phase 1+ this install path is replaced
@@ -162,6 +185,59 @@ RUN groupadd --gid 1000 hndrewaall \
 # leaves a partially-written entry on first run.
 RUN mkdir -p /home/hndrewaall/.local/share/claude /home/hndrewaall/.local/bin \
     && chown -R 1000:1000 /home/hndrewaall/.local
+
+# process-compose — service supervisor (replaces tini at PID 1).
+#
+# Escalation past the README's "tini sufficient until three services"
+# threshold rule: claude-watch daemon + crond + cw-watcher-supervisor
+# are the three long-running services living alongside the foreground
+# tmux session. tini reaps zombies + forwards signals but doesn't
+# model dependencies, restart on failure, or centralize logs.
+# process-compose declares those service contracts in
+# /etc/claude-code/process-compose.yml and runs them with restart
+# policies + depends_on ordering.
+#
+# Static binary release from upstream (single-binary Go); no apt
+# package available. Pinned by version + sha-checked via the upstream
+# `process-compose_checksums.txt`. Linux amd64 + arm64 supported via
+# runtime `uname -m` dispatch — same pattern the VS Code CLI install
+# above uses.
+#
+# Source-of-truth URL:
+#   https://github.com/F1bonacc1/process-compose/releases/download/v1.110.0/process-compose_linux_<arch>.tar.gz
+ARG PROCESS_COMPOSE_VERSION=v1.110.0
+RUN case "$(uname -m)" in \
+        x86_64)  PC_ARCH=amd64 ;; \
+        aarch64) PC_ARCH=arm64 ;; \
+        *) echo "unsupported arch for process-compose: $(uname -m)" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/F1bonacc1/process-compose/releases/download/${PROCESS_COMPOSE_VERSION}/process-compose_linux_${PC_ARCH}.tar.gz" \
+        -o /tmp/process-compose.tar.gz \
+    && tar -xzf /tmp/process-compose.tar.gz -C /usr/local/bin/ process-compose \
+    && chmod +x /usr/local/bin/process-compose \
+    && rm -f /tmp/process-compose.tar.gz \
+    && /usr/local/bin/process-compose version >/dev/null
+
+# Pre-create /var/lib/claude-watch with uid-1000 ownership. This is the
+# canonical in-container state dir for claude-watch — active-agents.json
+# (the per-minute JSON state file the active-agents writer cron emits),
+# plus any other daemon state that needs to survive container recreate,
+# lands here. compose.yml mounts a backing volume (named volume by
+# default, or a host bind-mount when CW_STATE_PATH is set) at this path.
+#
+# Same Docker bind-mount-perm-inheritance rationale as
+# /home/hndrewaall/.local above: when docker initializes a fresh named
+# volume on a directory that already exists in the image, it copies the
+# directory's ownership + perms into the new volume. Pre-creating uid
+# 1000 means the in-container writer cron (running as uid 1000 via the
+# baked /etc/cron.d/cw-default crontab) can write to the path on first
+# launch without an out-of-band `chown`. When the operator overrides
+# with CW_STATE_PATH=/host/path, docker bind-mounts the host dir
+# wholesale and the image-side ownership is irrelevant — the operator
+# is responsible for making the host path uid-1000 writable.
+RUN mkdir -p /var/lib/claude-watch \
+    && chown 1000:1000 /var/lib/claude-watch \
+    && chmod 0755 /var/lib/claude-watch
 
 # Pre-create ~/.config/ owned by uid 1000 so features that write
 # persistent state to a subdirectory of ~/.config/ (claude-event-watch
@@ -812,10 +888,31 @@ RUN chmod +x /etc/claude-code/watchers/lib/dir-watch.sh \
             /etc/claude-code/watchers/claude-event-tail.sh
 COPY container/plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude-plugin/plugin.json
 
-# Entrypoint script — tmux session bootstrap + env passthrough + signal handling.
-# Phase 1e (q-2026-05-11-8a96): pane 1 now runs the real claude-watch daemon
-# instead of the Phase 0 placeholder bash banner. Pane 1 keeps itself open with
-# a shell on daemon failure so errors surface on `tmux attach`.
+# process-compose service config + helper launchers. The supervisor
+# runs as PID 1 (see ENTRYPOINT below) and reads
+# /etc/claude-code/process-compose.yml at startup to drive the
+# in-container service set: tmux session bootstrap (oneshot), tmux
+# attach (foreground TTY), claude-watch daemon (long-running), crond
+# (long-running), cw-watcher-supervisor (long-running). Each
+# long-running process has an `availability: restart: on_failure`
+# policy so a crash triggers a restart instead of a dead container.
+#
+# cw-tmux-bootstrap creates the in-container tmux session in detached
+# mode (extracted from entrypoint.sh's tmux session-creation logic).
+# cw-claude-watch-launch wraps the claude-watch invocation with the
+# CLAUDE_WATCH_CONTAINER_MODE=1 env + log-file plumbing.
+COPY container/process-compose.yml /etc/claude-code/process-compose.yml
+COPY container/bin/cw-tmux-bootstrap /usr/local/bin/cw-tmux-bootstrap
+COPY container/bin/cw-claude-watch-launch /usr/local/bin/cw-claude-watch-launch
+RUN chmod +x /usr/local/bin/cw-tmux-bootstrap \
+            /usr/local/bin/cw-claude-watch-launch
+
+# Entrypoint script — env setup + hooks-shim generation + trust-workspace
+# pre-seeding. Replaces the prior tmux-session-creation responsibilities
+# (which now live in /usr/local/bin/cw-tmux-bootstrap, invoked by
+# process-compose as the setup-tmux-session oneshot). After setup, the
+# entrypoint execs process-compose with the baked config; process-compose
+# is PID 1 from there forward.
 COPY container/entrypoint.sh /usr/local/bin/claude-tmux-entrypoint
 RUN chmod +x /usr/local/bin/claude-tmux-entrypoint
 
@@ -823,11 +920,21 @@ RUN chmod +x /usr/local/bin/claude-tmux-entrypoint
 USER hndrewaall
 WORKDIR /workspace
 
-# tini as PID 1: forwards SIGTERM/SIGINT to the entrypoint script's
-# `trap cleanup TERM INT` handler, reaps zombie grandchildren (the
-# nohup setsid claude-watch daemon spawned by the entrypoint, MCP
-# subprocesses, anything else that orphans), and exits with the
-# entrypoint's status. See the apt-get layer above for the why.
-# Future-tier alternatives (s6-overlay, process-compose) live in
-# container/README.md "Future-tier supervision".
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/claude-tmux-entrypoint"]
+# process-compose as PID 1 (escalation past tini's threshold). The
+# binary forwards SIGTERM/SIGINT to all supervised processes, reaps
+# zombies, and exits when all foreground processes complete.
+#
+# The entrypoint script is the FIRST process under process-compose's
+# supervision — it runs setup (PATH, hooks-shim, trust-workspace,
+# obligations-init) then execs `process-compose up` with the baked
+# /etc/claude-code/process-compose.yml. process-compose then
+# supervises the tmux session + daemons per the declared restart
+# policies.
+#
+# Why not s6-overlay: process-compose's mental model maps 1:1 onto
+# docker-compose.yml (depends_on, restart policies, health checks),
+# which is the model operators already use for the outer compose
+# stack. s6-overlay's /etc/cont-init.d + /etc/services.d shape is
+# strictly more flexible but has a steeper learning curve; we'll
+# revisit if process-compose hits a gap.
+ENTRYPOINT ["/usr/local/bin/claude-tmux-entrypoint"]
