@@ -750,6 +750,13 @@ RUN chmod +x /usr/local/bin/xclip
 COPY container/bin/self-clear /usr/local/bin/self-clear
 RUN chmod +x /usr/local/bin/self-clear
 
+# claude-event-watch — the canonical block-print-exit event watcher.
+# Session runs this as a `run_in_background` task; it blocks on inotifywait,
+# prints pending events, and exits. Baked so it's on PATH without depending
+# on the ~/repos bind-mount.
+COPY tools/watchers/claude-event-watch /usr/local/bin/claude-event-watch
+RUN chmod +x /usr/local/bin/claude-event-watch
+
 # Baked skills / agents / watchers — three top-level dirs in the repo
 # (container/skills/, container/agents/, container/watchers/) that ship
 # in-container slash commands, custom agent prompts, and background

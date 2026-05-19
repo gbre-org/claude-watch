@@ -298,6 +298,27 @@ The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
 if it's not on PATH, the operator hasn't wired the bind-mount and you
 should flag that before spawning agents at all.
 
+### Queue IMMEDIATELY — never defer
+
+**Queue items the moment you intend to do the work.** Never say "I'll
+queue it once X finishes." If you intend to do something, queue it NOW.
+Use scopes and the blocking mechanism to prevent it from RUNNING until
+the right time — that's what scopes are for. Holding a task in your head
+instead of the queue means it gets lost on compaction/clear.
+
+Wrong:
+```
+# scope conflict — "I'll queue it later"
+```
+
+Right:
+```
+session-task queue add "..." --scope <non-conflicting-scope> --summary "..."
+# OR if the scope genuinely conflicts:
+session-task queue add "..." --scope <same-scope> --force-enqueue
+# (it'll be serialized behind the running item automatically)
+```
+
 ### Continuous subagent queue-discipline enforcement
 
 The `pre-agent-queue-gate-hook` above only fires at SPAWN time. A
