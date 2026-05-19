@@ -168,6 +168,7 @@ The `claude-tmux` wrapper passes EXACTLY the following surface into the containe
 
 **Named volumes** (managed by docker, not bind-mounted from the host):
 - `claude-container-versions` -> `/home/hndrewaall/.local/share/claude` — persists the in-container claude binary's auto-updated `versions/<ver>/` directories across `--rm` container exits. Without this, every container restart resets to the image-baked claude version. See "Volume management" below.
+- `claude-watch-state` -> `/var/lib/claude-watch` — default backing store for the in-container `claude-watch` state dir (holds `active-agents.json` and any other daemon state). Override with `CW_STATE_PATH=/absolute/host/path` to swap the named volume for a host bind-mount instead (useful when sibling containers on the same host need to read the state file directly from disk). See "Host-state override" below.
 
 **Env vars passed in** (only forwarded if set on the host; everything else is filtered):
 - `CLAUDE_CODE_SSE_PORT` — VSCode IDE integration port (HTTP/SSE on host loopback, load-bearing)
@@ -407,3 +408,20 @@ docker volume rm claude-container-versions
 ```
 
 **Drift risk**: the image bakes a known-good claude (`/usr/local/bin/claude`). The named volume captures whatever the in-container claude has self-installed on top. The `~/.local/bin/claude` symlink inside the volume (if present from a prior auto-update) wins on PATH because `~/.local/bin` precedes `/usr/local/bin` — that's expected. If the volume gets torn (partial download, dangling symlink), nuke it; the image-baked floor still works.
+
+## Host-state override (`CW_STATE_PATH`)
+
+The in-container `/var/lib/claude-watch` state dir holds `active-agents.json` (the JSON state file the in-container active-agents writer cron emits every minute) and any other daemon state that needs to survive container recreate. By default, `compose.yml` backs that path with a docker-managed named volume (`claude-watch-state`) — works out of the box on any host with zero operator setup.
+
+Some deployments want the state file on the host filesystem instead — typically when a sibling container (such as a queue-frontend that consumes `active-agents.json`) is running on the same host and needs to bind-mount the same path. For that case, set `CW_STATE_PATH` to an absolute host path before invoking compose:
+
+```
+export CW_STATE_PATH=/var/lib/claude-watch
+sudo mkdir -p "$CW_STATE_PATH"
+sudo chown 1000:1000 "$CW_STATE_PATH"
+docker compose -f container/compose.yml up -d
+```
+
+`compose.yml` uses `${CW_STATE_PATH:-claude-watch-state}` in the volume reference: when the env var is set, compose treats it as an absolute path and creates a bind mount; when unset, compose treats it as a volume name and uses the declared `claude-watch-state` named volume. No alternate compose file is required.
+
+**Host-path ownership**: when overriding to a bind mount, the host directory must be uid-1000 writable so the in-container cron entries can write `active-agents.json`. The image's pre-created `/var/lib/claude-watch` ownership only propagates into the default named-volume path; a host bind-mount is whatever ownership the host filesystem has. The `chown 1000:1000` above is the canonical fix when the in-container user is uid 1000 (the typical case for hosts where the invoking user is also uid 1000).

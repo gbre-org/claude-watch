@@ -138,6 +138,7 @@ test-entrypoint:
 	container/tests/dispatch-gate-wired.test
 	container/tests/agent-comms-baked.test
 	container/tests/compose-mount-modes.test
+	container/tests/state-volume-default.test
 	container/tests/tini-pid1.test
 	container/tests/iproute2-installed.test
 	container/tests/code-cli-installed.test

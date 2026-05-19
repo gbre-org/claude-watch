@@ -163,6 +163,27 @@ RUN groupadd --gid 1000 hndrewaall \
 RUN mkdir -p /home/hndrewaall/.local/share/claude /home/hndrewaall/.local/bin \
     && chown -R 1000:1000 /home/hndrewaall/.local
 
+# Pre-create /var/lib/claude-watch with uid-1000 ownership. This is the
+# canonical in-container state dir for claude-watch — active-agents.json
+# (the per-minute JSON state file the active-agents writer cron emits),
+# plus any other daemon state that needs to survive container recreate,
+# lands here. compose.yml mounts a backing volume (named volume by
+# default, or a host bind-mount when CW_STATE_PATH is set) at this path.
+#
+# Same Docker bind-mount-perm-inheritance rationale as
+# /home/hndrewaall/.local above: when docker initializes a fresh named
+# volume on a directory that already exists in the image, it copies the
+# directory's ownership + perms into the new volume. Pre-creating uid
+# 1000 means the in-container writer cron (running as uid 1000 via the
+# baked /etc/cron.d/cw-default crontab) can write to the path on first
+# launch without an out-of-band `chown`. When the operator overrides
+# with CW_STATE_PATH=/host/path, docker bind-mounts the host dir
+# wholesale and the image-side ownership is irrelevant — the operator
+# is responsible for making the host path uid-1000 writable.
+RUN mkdir -p /var/lib/claude-watch \
+    && chown 1000:1000 /var/lib/claude-watch \
+    && chmod 0755 /var/lib/claude-watch
+
 # Pre-create ~/.config/ owned by uid 1000 so features that write
 # persistent state to a subdirectory of ~/.config/ (claude-event-watch
 # consumed.jsonl, claude-watch-ack pending-alerts.json, future state
