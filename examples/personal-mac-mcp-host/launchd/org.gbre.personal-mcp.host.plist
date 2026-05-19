@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for personal-mcp-host.sh — the on-demand reverse-tunnelled
+  MCP host bridge for an operator's MacBook.
+
+  This is a TEMPLATE — you MUST search/replace the placeholders before
+  bootstrapping:
+
+    /PATH/TO/REPO   absolute path to your local claude-watch checkout
+                    (no `~`, no `${HOME}` — launchd does NOT expand
+                    either in plist values; literal paths only).
+    /PATH/TO/HOME   absolute path to your home directory
+                    (e.g. /Users/yourname). Same rule.
+
+  See launchd/README.md for the full installation walkthrough. Do NOT
+  load this file straight from the repo with `launchctl bootstrap` —
+  copy it to ~/Library/LaunchAgents/ first (launchd refuses to follow
+  symlinks or load files outside that directory).
+
+  Why a LaunchAgent and not a LaunchDaemon: personal-mcp-host.sh runs
+  as the operator's user (it dials cli-mcp-server via mcp-host-bash,
+  which exec's commands under the operator's $HOME / $PATH / login
+  keychain) and opens an outbound SSH connection with the operator's
+  private key. None of that requires root.
+
+  Why RunAtLoad=false: this is the on-demand "open remote access for a
+  bit" pattern. The plist registers the unit but does NOT fire it at
+  login. The operator triggers a session with
+    launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
+  and tears it down with
+    launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
+  See launchd/README.md for the lifecycle.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.gbre.personal-mcp.host</string>
+
+    <!--
+      ProgramArguments: absolute path to personal-mcp-host.sh.
+
+      Replace /PATH/TO/REPO with the absolute path to your local
+      claude-watch checkout (no `~`, no `${HOME}`).
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/PATH/TO/REPO/examples/personal-mac-mcp-host/personal-mcp-host.sh</string>
+    </array>
+
+    <!--
+      EnvironmentVariables: launchd starts each LaunchAgent with a near-
+      empty environment. Anything personal-mcp-host.sh or its children
+      need from the operator's interactive shell has to be declared
+      here or in the sibling .env (which the wrapper sources).
+
+      The PATH below adds ${HOME}/.local/bin so mcp-host-bash can find
+      mcp-proxy / cli-mcp-server (both installed there by
+      examples/compose/bin/install-host-deps). Extend if your tooling
+      lives elsewhere.
+
+      Replace /PATH/TO/HOME with your home directory (e.g.
+      /Users/yourname) — no `~`, no `${HOME}`.
+
+      All operator-specific config (REMOTE_HOST, REMOTE_USER,
+      REMOTE_PORT, MCP_LOCAL_PORT, SSH_KEY_PATH, MCP_HOST_BASH_BEARER,
+      CW_PROFILE, etc.) lives in the sibling .env file — NOT here.
+      The wrapper sources it on every start, so changes there take
+      effect on the next launchctl kickstart without re-bootstrapping
+      this plist.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/PATH/TO/HOME/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!--
+      RunAtLoad=false: do NOT fire on launchctl bootstrap. Operator
+      runs this on-demand via `launchctl kickstart` (see
+      launchd/README.md).
+    -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!--
+      KeepAlive=true: while the unit IS running, relaunch on any exit
+      (clean or crash). Combined with RunAtLoad=false:
+        - operator `kickstart`s the unit  -> it comes up
+        - tunnel / launcher dies          -> KeepAlive respawns it
+        - operator `bootout`s the unit    -> it stays down
+
+      ThrottleInterval below bounds the respawn cadence so a
+      crashloop doesn't saturate CPU.
+    -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!--
+      ThrottleInterval: minimum seconds between (re)spawns. 30s gives
+      the launcher + ssh time to bootstrap before another respawn cycle
+      if the previous run died early.
+    -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!--
+      WorkingDirectory: cwd launchd sets before exec'ing the wrapper.
+      Set to the directory holding the .env so a misconfigured
+      PERSONAL_MCP_ENV_FILE-less call lands in the right place by
+      default. Replace /PATH/TO/REPO.
+    -->
+    <key>WorkingDirectory</key>
+    <string>/PATH/TO/REPO/examples/personal-mac-mcp-host</string>
+
+    <!--
+      StandardOutPath / StandardErrorPath: launchd captures the
+      wrapper's stdout / stderr. The wrapper itself logs to stderr
+      (banner + child process output), so .err.log is where the
+      interesting content lives.
+
+      Replace /PATH/TO/HOME. Pre-create ~/Library/Logs/ once — launchd
+      auto-creates the log files but not the parent directory.
+    -->
+    <key>StandardOutPath</key>
+    <string>/PATH/TO/HOME/Library/Logs/personal-mcp-host.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/PATH/TO/HOME/Library/Logs/personal-mcp-host.err.log</string>
+
+    <!--
+      ProcessType=Interactive: launchd schedules at foreground-shell
+      priority. The remote-side Claude dials this bridge synchronously
+      via MCP, so it should not be backgrounded by the default
+      `Background` class.
+    -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

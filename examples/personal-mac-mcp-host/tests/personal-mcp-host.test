@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""Tests for examples/personal-mac-mcp-host/personal-mcp-host.sh —
+the wrapper that spawns mcp-host-bash + the reverse SSH tunnel.
+
+Exercises the script's argv construction WITHOUT actually invoking
+mcp-host-bash / ssh by using the `--print-cmd` debug hook (the script
+builds the planned argv and prints it block-formatted, then exits 0).
+The hook also skips the binary-availability + listener-probe paths so
+the test runs on any host with Python 3 + bash.
+
+Coverage:
+  - Required-env enforcement: missing .env file → exit 2.
+  - Required-env enforcement: missing keys in .env → bash exits via
+    `: "${KEY:?...}"` (non-zero).
+  - Default invocation: planned argv has both an `MCP_HOST_BASH_BIN:`
+    block (with --port $MCP_LOCAL_PORT) and an `SSH:` block.
+  - SSH argv contains the expected hardening options
+    (ExitOnForwardFailure=yes, BatchMode=yes, etc.).
+  - SSH argv reflects the values from .env (REMOTE_USER@REMOTE_HOST,
+    REMOTE_PORT:127.0.0.1:MCP_LOCAL_PORT, -i SSH_KEY_PATH).
+  - PERSONAL_MCP_SSH_EXTRA gets appended to the ssh argv.
+  - Bad flag exits 2.
+  - --help exits 0 with the usage block.
+  - PERSONAL_MCP_DISABLED=1 (without --print-cmd) exits 0 immediately.
+  - PERSONAL_MCP_ENV_FILE override is honored.
+
+Run:  ./personal-mcp-host.test
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "personal-mcp-host.sh"
+ENV_EXAMPLE = HERE.parent / ".env.example"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate personal-mcp-host.sh at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def write_env(
+    path: Path,
+    *,
+    remote_host: str = "remote.example.com",
+    remote_user: str = "operator",
+    remote_port: str = "18766",
+    mcp_local_port: str = "8766",
+    ssh_key_path: str | None = None,
+    extra_lines: list[str] | None = None,
+) -> None:
+    """Write a valid .env file for the wrapper to source. If ssh_key_path
+    is None, default to the script-test fake key path created by the
+    caller (whatever they pass in extra_lines must match)."""
+    if ssh_key_path is None:
+        ssh_key_path = str(path.parent / "fake-ssh-key")
+    lines = [
+        f'REMOTE_HOST="{remote_host}"',
+        f'REMOTE_USER="{remote_user}"',
+        f'REMOTE_PORT="{remote_port}"',
+        f'MCP_LOCAL_PORT="{mcp_local_port}"',
+        f'SSH_KEY_PATH="{ssh_key_path}"',
+    ]
+    if extra_lines:
+        lines.extend(extra_lines)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def run_script(
+    args: list[str] | None = None,
+    env: dict | None = None,
+    env_file: Path | None = None,
+    expect_rc: int | None = 0,
+) -> tuple[list[str], str, str, int]:
+    """Run personal-mcp-host.sh and return (stdout_lines, stdout, stderr, rc).
+
+    If env_file is given, PERSONAL_MCP_ENV_FILE points there so the
+    wrapper sources our test fixture instead of looking next to the
+    script (which would pick up the operator's real .env on
+    interactive hosts)."""
+    if args is None:
+        args = []
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/tmp"),
+    }
+    if env_file is not None:
+        base_env["PERSONAL_MCP_ENV_FILE"] = str(env_file)
+    if env:
+        base_env.update(env)
+    result = subprocess.run(
+        [str(SCRIPT), *args],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if expect_rc is not None and result.returncode != expect_rc:
+        raise AssertionError(
+            f"personal-mcp-host.sh exited {result.returncode}, expected {expect_rc}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout.splitlines(), result.stdout, result.stderr, result.returncode
+
+
+def parse_blocks(lines: list[str]) -> dict[str, list[str]]:
+    """Parse `--print-cmd` output: blocks delimited by `KEY:` header
+    lines and blank-line separators."""
+    blocks: dict[str, list[str]] = {}
+    current_key: str | None = None
+    for line in lines:
+        if line.endswith(":") and not line.startswith(("-", "/")):
+            current_key = line[:-1]
+            blocks[current_key] = []
+        elif line == "":
+            current_key = None
+        elif current_key is not None:
+            blocks[current_key].append(line)
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_help_exits_zero() -> None:
+    """--help prints usage and exits 0."""
+    lines, _, _, rc = run_script(["--help"])
+    expect(rc == 0, f"--help: rc should be 0, got {rc}")
+    expect(
+        any("personal-mcp-host" in ln for ln in lines),
+        f"--help: stdout should mention the script name, got first 5 lines: {lines[:5]}",
+    )
+
+
+def test_bad_flag_exits_two() -> None:
+    """--bogus → exit 2."""
+    _, _, stderr, rc = run_script(["--bogus"], expect_rc=2)
+    expect(
+        "unknown argument" in stderr,
+        f"bad flag: stderr should mention 'unknown argument', got {stderr!r}",
+    )
+
+
+def test_missing_env_file_exits_two() -> None:
+    """No .env at the configured path → exit 2 with operator
+    walkthrough in stderr."""
+    with tempfile.TemporaryDirectory() as td:
+        nonexistent = Path(td) / "does-not-exist.env"
+        _, _, stderr, rc = run_script(
+            ["--print-cmd"],
+            env_file=nonexistent,
+            expect_rc=2,
+        )
+        expect(
+            "missing .env" in stderr,
+            f"missing env: stderr should mention 'missing .env', got {stderr!r}",
+        )
+        expect(
+            ".env.example" in stderr,
+            f"missing env: stderr should point operator at .env.example, "
+            f"got {stderr!r}",
+        )
+
+
+def test_missing_required_key_in_env_fails() -> None:
+    """An .env that omits a required key triggers bash's `${KEY:?...}`
+    parameter expansion error → non-zero exit, message names the key."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / "incomplete.env"
+        # Deliberately omit REMOTE_HOST.
+        env_path.write_text(
+            'REMOTE_USER="operator"\n'
+            'REMOTE_PORT="18766"\n'
+            'MCP_LOCAL_PORT="8766"\n'
+            'SSH_KEY_PATH="/tmp/fake-key"\n'
+        )
+        _, _, stderr, rc = run_script(
+            ["--print-cmd"],
+            env_file=env_path,
+            expect_rc=None,
+        )
+        expect(
+            rc != 0,
+            f"missing required key: rc should be non-zero, got {rc}",
+        )
+        expect(
+            "REMOTE_HOST" in stderr,
+            f"missing required key: stderr should mention REMOTE_HOST, "
+            f"got {stderr!r}",
+        )
+
+
+def test_print_cmd_emits_two_blocks() -> None:
+    """--print-cmd output has both MCP_HOST_BASH_BIN: and SSH: blocks."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        blocks = parse_blocks(lines)
+        expect(
+            "MCP_HOST_BASH_BIN" in blocks,
+            f"--print-cmd: should emit MCP_HOST_BASH_BIN: block; got blocks {sorted(blocks)}",
+        )
+        expect(
+            "SSH" in blocks,
+            f"--print-cmd: should emit SSH: block; got blocks {sorted(blocks)}",
+        )
+
+
+def test_mcp_host_bash_bin_block_contains_port() -> None:
+    """The MCP_HOST_BASH_BIN: block has the launcher path + --port
+    MCP_LOCAL_PORT."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path, mcp_local_port="9876")
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        blocks = parse_blocks(lines)
+        mcp = blocks.get("MCP_HOST_BASH_BIN", [])
+        expect(
+            len(mcp) >= 3,
+            f"MCP_HOST_BASH_BIN block should have 3 entries "
+            f"(path, --port, value); got {mcp}",
+        )
+        if len(mcp) >= 3:
+            expect(
+                mcp[0].endswith("/mcp-host-bash"),
+                f"MCP_HOST_BASH_BIN[0] should end in /mcp-host-bash; got {mcp[0]!r}",
+            )
+            expect(
+                mcp[1] == "--port",
+                f"MCP_HOST_BASH_BIN[1] should be '--port'; got {mcp[1]!r}",
+            )
+            expect(
+                mcp[2] == "9876",
+                f"MCP_HOST_BASH_BIN[2] should be the MCP_LOCAL_PORT (9876); got {mcp[2]!r}",
+            )
+
+
+def test_ssh_block_first_token_is_ssh() -> None:
+    """The SSH: block argv starts with `ssh`."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        blocks = parse_blocks(lines)
+        ssh = blocks.get("SSH", [])
+        expect(
+            ssh and ssh[0] == "ssh",
+            f"SSH argv should start with 'ssh'; got {ssh[:3] if ssh else ssh}",
+        )
+
+
+def test_ssh_block_contains_minus_N() -> None:
+    """ssh -N: no remote command, just hold the tunnel."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        ssh = parse_blocks(lines).get("SSH", [])
+        expect(
+            "-N" in ssh,
+            f"SSH argv should include `-N` (no remote command); got {ssh}",
+        )
+
+
+def test_ssh_block_reverse_forward_shape() -> None:
+    """ssh -R REMOTE_PORT:127.0.0.1:MCP_LOCAL_PORT."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path, remote_port="20001", mcp_local_port="20002")
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        ssh = parse_blocks(lines).get("SSH", [])
+        expect(
+            "-R" in ssh,
+            f"SSH argv should include `-R` (reverse forward); got {ssh}",
+        )
+        if "-R" in ssh:
+            r_idx = ssh.index("-R")
+            expect(
+                r_idx + 1 < len(ssh) and ssh[r_idx + 1] == "20001:127.0.0.1:20002",
+                f"SSH -R value should be REMOTE_PORT:127.0.0.1:MCP_LOCAL_PORT "
+                f"(20001:127.0.0.1:20002); got {ssh[r_idx + 1] if r_idx + 1 < len(ssh) else None!r}",
+            )
+
+
+def test_ssh_block_has_hardening_options() -> None:
+    """ssh argv MUST include the hardening options the wrapper sets:
+    ExitOnForwardFailure=yes, ServerAliveInterval=30,
+    ServerAliveCountMax=3, BatchMode=yes,
+    StrictHostKeyChecking=accept-new. Guards against future edits
+    accidentally relaxing the floor (e.g. someone dropping
+    ExitOnForwardFailure and turning the tunnel into a silent no-op
+    when the remote bind fails)."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        ssh = parse_blocks(lines).get("SSH", [])
+        for option in (
+            "ExitOnForwardFailure=yes",
+            "ServerAliveInterval=30",
+            "ServerAliveCountMax=3",
+            "BatchMode=yes",
+            "StrictHostKeyChecking=accept-new",
+        ):
+            expect(
+                option in ssh,
+                f"SSH argv should include {option!r} (hardening default); "
+                f"got {ssh}",
+            )
+
+
+def test_ssh_block_has_key_path() -> None:
+    """ssh -i SSH_KEY_PATH."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        key_path = Path(td) / "tunnel-key"
+        write_env(env_path, ssh_key_path=str(key_path))
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        ssh = parse_blocks(lines).get("SSH", [])
+        expect(
+            "-i" in ssh,
+            f"SSH argv should include `-i`; got {ssh}",
+        )
+        if "-i" in ssh:
+            i_idx = ssh.index("-i")
+            expect(
+                i_idx + 1 < len(ssh) and ssh[i_idx + 1] == str(key_path),
+                f"SSH -i value should be SSH_KEY_PATH ({key_path}); "
+                f"got {ssh[i_idx + 1] if i_idx + 1 < len(ssh) else None!r}",
+            )
+
+
+def test_ssh_block_ends_with_remote_target() -> None:
+    """Last ssh argv element is REMOTE_USER@REMOTE_HOST."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path, remote_user="bob", remote_host="bastion.example.com")
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        ssh = parse_blocks(lines).get("SSH", [])
+        expect(
+            ssh and ssh[-1] == "bob@bastion.example.com",
+            f"SSH argv last token should be REMOTE_USER@REMOTE_HOST "
+            f"(bob@bastion.example.com); got {ssh[-1] if ssh else None!r}",
+        )
+
+
+def test_personal_mcp_ssh_extra_appended() -> None:
+    """PERSONAL_MCP_SSH_EXTRA tokens land in the ssh argv before the
+    REMOTE_USER@REMOTE_HOST tail. Lets operators set ProxyJump /
+    custom ServerAliveInterval / etc. without editing the wrapper."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(
+            env_path,
+            extra_lines=[
+                'PERSONAL_MCP_SSH_EXTRA="-o ProxyJump=bastion.example.com -o ServerAliveInterval=15"',
+            ],
+        )
+        lines, _, _, _ = run_script(["--print-cmd"], env_file=env_path)
+        ssh = parse_blocks(lines).get("SSH", [])
+        # Both tokens should appear, in order, before the remote target.
+        expect(
+            "ProxyJump=bastion.example.com" in ssh,
+            f"PERSONAL_MCP_SSH_EXTRA: ProxyJump value missing from ssh argv; got {ssh}",
+        )
+        # ServerAliveInterval=15 (the override) should also be there,
+        # even though the default block already sets ServerAliveInterval=30.
+        # ssh's CLI semantics: first value wins, so the operator's
+        # override would need to come BEFORE the default to take effect.
+        # We don't reorder here — that's a documented operator
+        # responsibility. Just assert the token landed in the argv.
+        expect(
+            "ServerAliveInterval=15" in ssh,
+            f"PERSONAL_MCP_SSH_EXTRA: ServerAliveInterval=15 missing from ssh argv; got {ssh}",
+        )
+        # The remote-target tail must still be last.
+        expect(
+            ssh[-1].endswith("@remote.example.com"),
+            f"PERSONAL_MCP_SSH_EXTRA: remote target should still be last; got {ssh[-3:]}",
+        )
+
+
+def test_disabled_kill_switch_exits_zero() -> None:
+    """PERSONAL_MCP_DISABLED=1 (no --print-cmd) → exit 0 immediately
+    with stderr message."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        # No --print-cmd here — exercise the kill-switch path.
+        _, _, stderr, rc = run_script(
+            [],
+            env={"PERSONAL_MCP_DISABLED": "1"},
+            env_file=env_path,
+            expect_rc=0,
+        )
+        expect(
+            "PERSONAL_MCP_DISABLED" in stderr,
+            f"kill switch: stderr should mention PERSONAL_MCP_DISABLED; got {stderr!r}",
+        )
+
+
+def test_env_example_exists_and_has_required_keys() -> None:
+    """The committed .env.example template must exist + name every
+    required key so operators can `cp .env.example .env` and fill
+    in. Guards against a refactor dropping a key from the template."""
+    expect(
+        ENV_EXAMPLE.exists(),
+        f".env.example must exist at {ENV_EXAMPLE}",
+    )
+    if ENV_EXAMPLE.exists():
+        body = ENV_EXAMPLE.read_text()
+        for key in (
+            "REMOTE_HOST",
+            "REMOTE_USER",
+            "REMOTE_PORT",
+            "MCP_LOCAL_PORT",
+            "SSH_KEY_PATH",
+        ):
+            expect(
+                key in body,
+                f".env.example must mention required key {key!r}",
+            )
+
+
+def test_gitignore_excludes_env() -> None:
+    """The directory's .gitignore must exclude the operator's real
+    `.env` so a secret-bearing copy doesn't get committed by accident."""
+    gitignore = HERE.parent / ".gitignore"
+    expect(
+        gitignore.exists(),
+        f".gitignore must exist at {gitignore}",
+    )
+    if gitignore.exists():
+        body = gitignore.read_text()
+        # Either bare `.env` or a glob covering it.
+        expect(
+            any(
+                line.strip() in (".env", "*.env", "/.env")
+                for line in body.splitlines()
+            ),
+            f".gitignore must exclude `.env`; got:\n{body}",
+        )
+
+
+def test_script_uses_ssh_minus_capital_R_not_lowercase() -> None:
+    """Regression guard: confirm the wrapper uses `-R` (reverse
+    forward), not `-L` (local forward). A typo here would send the
+    tunnel the wrong direction — local Mac dials remote, instead of
+    remote-side loopback reaching local Mac."""
+    body = SCRIPT.read_text()
+    expect(
+        "-R " in body or '"-R"' in body,
+        "wrapper script should use `ssh -R` (reverse forward) — "
+        "remote-side loopback reaches local Mac. Found neither '-R ' "
+        "nor '\"-R\"' in the wrapper.",
+    )
+    expect(
+        "ssh -L" not in body and '"-L"' not in body,
+        "wrapper script should NOT use `ssh -L` (would forward Mac "
+        "loopback to remote, opposite of the intended direction)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+tests = [
+    test_help_exits_zero,
+    test_bad_flag_exits_two,
+    test_missing_env_file_exits_two,
+    test_missing_required_key_in_env_fails,
+    test_print_cmd_emits_two_blocks,
+    test_mcp_host_bash_bin_block_contains_port,
+    test_ssh_block_first_token_is_ssh,
+    test_ssh_block_contains_minus_N,
+    test_ssh_block_reverse_forward_shape,
+    test_ssh_block_has_hardening_options,
+    test_ssh_block_has_key_path,
+    test_ssh_block_ends_with_remote_target,
+    test_personal_mcp_ssh_extra_appended,
+    test_disabled_kill_switch_exits_zero,
+    test_env_example_exists_and_has_required_keys,
+    test_gitignore_excludes_env,
+    test_script_uses_ssh_minus_capital_R_not_lowercase,
+]
+
+for t in tests:
+    pre = len(failures)
+    try:
+        t()
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+    if len(failures) == pre:
+        print(f"PASS  {t.__name__}")
+    else:
+        print(f"FAIL  {t.__name__}")
+
+if failures:
+    print()
+    print(f"FAILED: {len(failures)} failure(s).")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+else:
+    print()
+    print(f"All {len(tests)} tests passed.")
+    sys.exit(0)

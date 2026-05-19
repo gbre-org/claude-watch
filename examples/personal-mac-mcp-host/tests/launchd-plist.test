@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Tests for examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.host.plist
+— the macOS LaunchAgent template for on-demand bring-up of
+personal-mcp-host.sh (reverse-tunnelled MCP host bridge).
+
+Coverage:
+  - File-level structural validation only (no `launchctl` invocation).
+  - Plist parses cleanly via Python's stdlib `plistlib`.
+  - When `plutil` is available (macOS hosts), lint via that too.
+  - `Label` matches the filename convention launchd enforces.
+  - `ProgramArguments[0]` looks like an absolute path and points at
+    personal-mcp-host.sh.
+  - `RunAtLoad=false` (this is the on-demand pattern — operator runs
+    `launchctl kickstart` to start a session).
+  - `KeepAlive=true` (while running, respawn on exit).
+  - `EnvironmentVariables` has a `PATH` entry that includes
+    `.local/bin` (where install-host-deps drops the mcp-host-bash
+    deps).
+  - `WorkingDirectory`, `StandardOutPath`, `StandardErrorPath`,
+    `ThrottleInterval`, `ProcessType` all present + sane.
+  - README walkthrough hits the major operator steps.
+
+Run:  ./launchd-plist.test
+"""
+
+from __future__ import annotations
+
+import plistlib
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PLIST = (
+    HERE.parent
+    / "launchd"
+    / "org.gbre.personal-mcp.host.plist"
+)
+LAUNCHD_README = HERE.parent / "launchd" / "README.md"
+MAIN_README = HERE.parent / "README.md"
+WRAPPER = HERE.parent / "personal-mcp-host.sh"
+
+if not PLIST.exists():
+    print(f"FAIL: cannot locate launchd plist at {PLIST}", file=sys.stderr)
+    sys.exit(2)
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+with open(PLIST, "rb") as fp:
+    PARSED = plistlib.load(fp)
+
+
+def test_plistlib_parses() -> None:
+    """plistlib accepted the file."""
+    expect(
+        isinstance(PARSED, dict),
+        f"plistlib should return a dict at the top level; got {type(PARSED)}",
+    )
+
+
+def test_plutil_lint_when_available() -> None:
+    """If `plutil` is on PATH (macOS), use it as a second parser.
+    plistlib is permissive about issues real launchd-side plutil
+    rejects. On Linux CI plutil is absent — skip silently."""
+    plutil = shutil.which("plutil")
+    if not plutil:
+        return
+    result = subprocess.run(
+        [plutil, "-lint", str(PLIST)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    expect(
+        result.returncode == 0,
+        f"plutil -lint should accept the plist; rc={result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}",
+    )
+
+
+def test_label_matches_filename() -> None:
+    """launchd keys bootstrap / bootout / print / kickstart off the
+    filename minus `.plist`. The plist's `Label` MUST match."""
+    expected_label = PLIST.stem  # "org.gbre.personal-mcp.host"
+    actual = PARSED.get("Label")
+    expect(
+        actual == expected_label,
+        f"Label should match plist filename stem; "
+        f"expected {expected_label!r}, got {actual!r}",
+    )
+
+
+def test_label_uses_org_gbre_namespace() -> None:
+    """Per the claude-watch naming convention, operator-owned launchd
+    Labels live under the `org.gbre.*` namespace (NOT `com.anthropic.*`,
+    which implies vendor ownership). Guards against a regression that
+    renames the unit under the wrong namespace."""
+    label = PARSED.get("Label", "")
+    expect(
+        isinstance(label, str) and label.startswith("org.gbre."),
+        f"Label must use the org.gbre.* reverse-DNS namespace "
+        f"(operator-owned); got {label!r}",
+    )
+
+
+def test_keep_alive_true() -> None:
+    """KeepAlive=true → while the unit is running, launchd respawns
+    on exit. Combined with RunAtLoad=false, that means `kickstart`
+    starts it + tunnel-death respawns it, but `bootout` stops it for
+    good."""
+    keep_alive = PARSED.get("KeepAlive")
+    expect(
+        keep_alive is True,
+        f"KeepAlive should be the boolean true; got {keep_alive!r}",
+    )
+
+
+def test_run_at_load_false() -> None:
+    """RunAtLoad=false: this is the ON-DEMAND pattern. The unit
+    registers via `bootstrap` but does NOT fire — operator runs
+    `launchctl kickstart` to start a session. Without this, every
+    login would auto-open the remote-access tunnel, which inverts
+    the "only run as needed" intent."""
+    run_at_load = PARSED.get("RunAtLoad")
+    expect(
+        run_at_load is False,
+        f"RunAtLoad should be the boolean false (on-demand bring-up); "
+        f"got {run_at_load!r}",
+    )
+
+
+def test_program_arguments_present() -> None:
+    """ProgramArguments[0] is the binary launchd exec's. Non-empty
+    list of strings."""
+    pa = PARSED.get("ProgramArguments")
+    expect(
+        isinstance(pa, list) and len(pa) >= 1,
+        f"ProgramArguments must be a non-empty list; got {pa!r}",
+    )
+    if isinstance(pa, list) and pa:
+        expect(
+            all(isinstance(x, str) for x in pa),
+            f"ProgramArguments entries must all be strings; got {pa!r}",
+        )
+
+
+def test_program_arguments_first_is_absolute() -> None:
+    """ProgramArguments[0] must be an absolute path. launchd does NOT
+    do PATH lookup or `~` expansion."""
+    pa = PARSED.get("ProgramArguments")
+    if not (isinstance(pa, list) and pa):
+        return
+    first = pa[0]
+    expect(
+        first.startswith("/"),
+        f"ProgramArguments[0] must be an absolute path; got {first!r}",
+    )
+
+
+def test_program_arguments_first_points_at_wrapper() -> None:
+    """ProgramArguments[0] must point at personal-mcp-host.sh. Guards
+    against typo / refactor renaming the wrapper without updating the
+    template."""
+    pa = PARSED.get("ProgramArguments")
+    if not (isinstance(pa, list) and pa):
+        return
+    first = pa[0]
+    expect(
+        first.endswith("/personal-mcp-host.sh"),
+        f"ProgramArguments[0] should end with `/personal-mcp-host.sh`; "
+        f"got {first!r}",
+    )
+
+
+def test_environment_variables_dict() -> None:
+    """EnvironmentVariables exists and is a dict."""
+    ev = PARSED.get("EnvironmentVariables")
+    expect(
+        isinstance(ev, dict),
+        f"EnvironmentVariables must be a dict; got {ev!r}",
+    )
+
+
+def test_environment_variables_has_path() -> None:
+    """Launchd's default PATH does not include ~/.local/bin (where
+    install-host-deps drops mcp-proxy / cli-mcp-server). The plist
+    MUST declare a PATH entry that adds it."""
+    ev = PARSED.get("EnvironmentVariables") or {}
+    path = ev.get("PATH")
+    expect(
+        isinstance(path, str) and path.strip() != "",
+        f"EnvironmentVariables.PATH must be a non-empty string; got {path!r}",
+    )
+    if isinstance(path, str):
+        expect(
+            ".local/bin" in path,
+            f"EnvironmentVariables.PATH should include `.local/bin` so "
+            f"the install-host-deps shims resolve; got {path!r}",
+        )
+
+
+def test_working_directory_present() -> None:
+    """WorkingDirectory is set so the wrapper finds its sibling .env
+    via the default `${script_dir}/.env` resolution."""
+    wd = PARSED.get("WorkingDirectory")
+    expect(
+        isinstance(wd, str) and wd.startswith("/"),
+        f"WorkingDirectory must be an absolute path; got {wd!r}",
+    )
+
+
+def test_log_paths_present_and_absolute() -> None:
+    """StandardOutPath / StandardErrorPath capture wrapper stdout /
+    stderr. Both must be absolute paths."""
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        val = PARSED.get(key)
+        expect(
+            isinstance(val, str) and val.startswith("/"),
+            f"{key} must be an absolute path; got {val!r}",
+        )
+
+
+def test_throttle_interval_reasonable() -> None:
+    """ThrottleInterval bounds the KeepAlive respawn cadence. Must
+    be a positive integer."""
+    ti = PARSED.get("ThrottleInterval")
+    expect(
+        isinstance(ti, int) and ti >= 1,
+        f"ThrottleInterval must be a positive integer (>=1s); got {ti!r}",
+    )
+
+
+def test_process_type_present() -> None:
+    """ProcessType controls launchd's scheduling class. Interactive is
+    the right default for a low-latency synchronous bridge."""
+    pt = PARSED.get("ProcessType")
+    expect(
+        isinstance(pt, str) and pt != "",
+        f"ProcessType must be a non-empty string; got {pt!r}",
+    )
+
+
+def test_no_disallowed_top_level_keys() -> None:
+    """Catch obvious typos / accidental adds at the top level. New
+    keys land here intentionally."""
+    allowed = {
+        "Label",
+        "ProgramArguments",
+        "EnvironmentVariables",
+        "KeepAlive",
+        "RunAtLoad",
+        "ThrottleInterval",
+        "WorkingDirectory",
+        "StandardOutPath",
+        "StandardErrorPath",
+        "ProcessType",
+    }
+    actual = set(PARSED.keys())
+    extras = actual - allowed
+    expect(
+        not extras,
+        f"Unexpected top-level keys in plist (likely typos / accidental "
+        f"adds — update the allowed set if intentional): {sorted(extras)}",
+    )
+
+
+def test_wrapper_exists_and_executable() -> None:
+    """The wrapper script must exist alongside the plist subdirectory
+    and be executable. launchd won't chmod +x ProgramArguments at
+    bootstrap time."""
+    import os
+
+    expect(
+        WRAPPER.exists(),
+        f"personal-mcp-host.sh must exist; looked at {WRAPPER}",
+    )
+    if WRAPPER.exists():
+        expect(
+            os.access(str(WRAPPER), os.X_OK),
+            f"personal-mcp-host.sh must be executable (chmod +x); "
+            f"got mode {oct(WRAPPER.stat().st_mode)}",
+        )
+
+
+def test_readme_exists() -> None:
+    expect(
+        LAUNCHD_README.exists(),
+        f"launchd/README.md must exist next to the plist; looked at {LAUNCHD_README}",
+    )
+
+
+def test_readme_references_label() -> None:
+    """The README walks operators through copy/paste commands keyed
+    off the Label — drift breaks the on-ramp."""
+    if not LAUNCHD_README.exists():
+        return
+    body = LAUNCHD_README.read_text()
+    label = PARSED.get("Label", "")
+    expect(
+        label and label in body,
+        f"launchd/README.md must reference the Label {label!r}",
+    )
+
+
+def test_readme_documents_required_steps() -> None:
+    """Spot-check the README hits the major operator steps."""
+    if not LAUNCHD_README.exists():
+        return
+    body = LAUNCHD_README.read_text()
+    for needle in (
+        "~/Library/LaunchAgents",  # step 1: copy target
+        "/PATH/TO/REPO",  # step 2: search/replace placeholder
+        "/PATH/TO/HOME",  # step 2: search/replace placeholder
+        "launchctl bootstrap",  # step 3: bootstrap verb
+        "launchctl kickstart",  # step 4: per-session start
+        "launchctl bootout",  # step 5: per-session stop
+        "~/Library/Logs",  # step 7: log paths
+        "PERSONAL_MCP_DISABLED",  # soft kill switch path
+    ):
+        expect(
+            needle in body,
+            f"launchd/README.md must mention {needle!r} (operator "
+            f"walkthrough relies on it)",
+        )
+
+
+def test_readme_documents_on_demand_pattern() -> None:
+    """The README must call out that this is the ON-DEMAND pattern,
+    not start-at-login. Operators landing here without context should
+    immediately see the difference vs the compose-stack LaunchAgent."""
+    if not LAUNCHD_README.exists():
+        return
+    body = LAUNCHD_README.read_text()
+    expect(
+        "on-demand" in body.lower() or "on demand" in body.lower(),
+        "launchd/README.md must call out the on-demand pattern (vs "
+        "the persistent compose-stack LaunchAgent)",
+    )
+    expect(
+        "RunAtLoad" in body or "RunAtLoad=false" in body,
+        "launchd/README.md should mention RunAtLoad to explain why "
+        "the unit registers without firing",
+    )
+
+
+def test_main_readme_links_to_launchd() -> None:
+    """The directory's main README must link to the launchd
+    subfolder."""
+    if not MAIN_README.exists():
+        failures.append(
+            f"examples/personal-mac-mcp-host/README.md not found at {MAIN_README}"
+        )
+        return
+    body = MAIN_README.read_text()
+    expect(
+        "launchd/README.md" in body,
+        "examples/personal-mac-mcp-host/README.md should link to "
+        "launchd/README.md so operators find the persistent-launch path",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+tests = [
+    test_plistlib_parses,
+    test_plutil_lint_when_available,
+    test_label_matches_filename,
+    test_label_uses_org_gbre_namespace,
+    test_keep_alive_true,
+    test_run_at_load_false,
+    test_program_arguments_present,
+    test_program_arguments_first_is_absolute,
+    test_program_arguments_first_points_at_wrapper,
+    test_environment_variables_dict,
+    test_environment_variables_has_path,
+    test_working_directory_present,
+    test_log_paths_present_and_absolute,
+    test_throttle_interval_reasonable,
+    test_process_type_present,
+    test_no_disallowed_top_level_keys,
+    test_wrapper_exists_and_executable,
+    test_readme_exists,
+    test_readme_references_label,
+    test_readme_documents_required_steps,
+    test_readme_documents_on_demand_pattern,
+    test_main_readme_links_to_launchd,
+]
+
+for t in tests:
+    pre = len(failures)
+    try:
+        t()
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+    if len(failures) == pre:
+        print(f"PASS  {t.__name__}")
+    else:
+        print(f"FAIL  {t.__name__}")
+
+if failures:
+    print()
+    print(f"FAILED: {len(failures)} failure(s).")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+else:
+    print()
+    print(f"All {len(tests)} tests passed.")
+    sys.exit(0)
