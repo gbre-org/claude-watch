@@ -1,10 +1,11 @@
-//! Alerting: pingme notifications, claude-event emission, and
+//! Alerting: push notifications, claude-event emission, and
 //! interrupt-then-inject.
 //!
 //! Three sinks fire from this module:
-//! 1. **Push notification** via `pingme` — operator's phone alert (the
-//!    `pingme` shim is pluggable; route it to whatever push service
-//!    your local setup uses).
+//! 1. **Push notification** via `$CLAUDE_WATCH_NOTIFY_CMD` — operator's
+//!    phone alert. The env var names the executable (e.g. `pingme`).
+//!    When unset/empty, push notifications are silently skipped.
+//!    The command is invoked as: `<cmd> -p <priority> <message>`.
 //! 2. **claude-event** via `event_bus::emit` — structured JSON dropped
 //!    into `~/claude-events/` so `claude-event-watch` surfaces the
 //!    alert to the main loop with parseable fields (alert_type,
@@ -29,7 +30,19 @@ pub async fn send_pingme(message: &str) {
 }
 
 pub async fn send_pingme_with_priority(message: &str, priority: &str) {
-    let _ = run_cmd(&["pingme", "-p", priority, message, "claude-watch"], 15).await;
+    let cmd = match std::env::var("CLAUDE_WATCH_NOTIFY_CMD") {
+        Ok(c) if !c.is_empty() => c,
+        _ => return,
+    };
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return;
+    }
+    let mut args: Vec<&str> = parts.clone();
+    args.push("-p");
+    args.push(priority);
+    args.push(message);
+    let _ = run_cmd(&args, 15).await;
 }
 
 /// Pingme + claude-event emission in one shot. Use this for any alert

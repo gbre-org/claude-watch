@@ -318,14 +318,6 @@ cleanup() {
     if [ -n "${CLAUDE_WATCH_DAEMON_PID:-}" ]; then
         kill "${CLAUDE_WATCH_DAEMON_PID}" 2>/dev/null || true
     fi
-    # Same shape for the cw-watcher-supervisor: detached via setsid,
-    # tini at PID 1 reaps zombies but won't propagate SIGTERM into our
-    # detached process group on its own. Send the signal explicitly so
-    # the supervisor's own SIGTERM handler fires (drains its launcher
-    # children, then exits cleanly).
-    if [ -n "${CW_WATCHER_SUPERVISOR_PID:-}" ]; then
-        kill "${CW_WATCHER_SUPERVISOR_PID}" 2>/dev/null || true
-    fi
     # Same shape for the cron daemon: detached via setsid + sudo, so
     # tini won't reach it via process-group signalling. cron honors
     # SIGTERM by exiting cleanly (it drains in-flight scheduled jobs
@@ -349,42 +341,6 @@ if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
 
-# CLAUDE_CONTAINER_WATCHER_SUPERVISOR — container-level watcher
-# supervisor (default ON).
-#
-# When != "0", spawn /usr/local/bin/cw-watcher-supervisor as a
-# background child of PID 1 (this entrypoint script). The supervisor
-# reads /etc/claude-code/watchers/*.toml and launches each watcher's
-# launcher script with respawn-on-exit semantics per restart_policy.
-#
-# Why container-level: the previous shape ran watchers only inside an
-# active Claude Code session via the /claude-container:start-watchers
-# skill, so they died when the session exited or restarted. Container-
-# level supervision lets watchers (claude-event-tail today, future
-# additions tomorrow) survive the full container lifetime. tini at PID
-# 1 reaps any zombies the supervisor's child processes leak.
-#
-# Logs land at /tmp/claude-container-watchers/supervisor.log — operator
-# inspects via `docker compose exec <c> cat /tmp/claude-container-watchers/supervisor.log`.
-# Each watcher's own stdout/stderr goes to the log_path declared in its
-# .toml (already a path under /tmp/claude-container-watchers/).
-#
-# Set CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0 in .env to disable (useful
-# for validation harnesses that don't want supervised background
-# watchers).
-if [ "${CLAUDE_CONTAINER_WATCHER_SUPERVISOR:-1}" != "0" ] \
-        && [ -x /usr/local/bin/cw-watcher-supervisor ]; then
-    mkdir -p /tmp/claude-container-watchers 2>/dev/null || true
-    : > /tmp/claude-container-watchers/supervisor.log 2>/dev/null || true
-    # nohup + setsid + & so the supervisor survives entrypoint's
-    # subsequent exec into `tmux attach-session`. tini (PID 1) reaps
-    # zombie grandchildren the supervisor and its launcher children
-    # accumulate.
-    nohup setsid /usr/local/bin/cw-watcher-supervisor \
-        >>/tmp/claude-container-watchers/supervisor.log 2>&1 </dev/null &
-    CW_WATCHER_SUPERVISOR_PID=$!
-    echo "[entrypoint] spawned cw-watcher-supervisor (pid $CW_WATCHER_SUPERVISOR_PID, log /tmp/claude-container-watchers/supervisor.log)" >&2
-fi
 
 # CLAUDE_CONTAINER_CRON — in-container cron daemon (default ON).
 #
@@ -501,7 +457,12 @@ if [ "${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}" = "1" ]; then
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
 fi
 if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
-    _auto_continue_quoted="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
+    if [ -n "${CLAUDE_AUTO_CONTINUE_PROMPT:-}" ]; then
+        _auto_continue_val="$CLAUDE_AUTO_CONTINUE_PROMPT"
+    else
+        _auto_continue_val="The claude-container process was just (re)created. Run your session-start checklist, start event watchers, then check session-task for pending work."
+    fi
+    _auto_continue_quoted="'${_auto_continue_val//\'/\'\\\'\'}'"
     CLAUDE_CMD="$CLAUDE_CMD --continue $_auto_continue_quoted"
 fi
 

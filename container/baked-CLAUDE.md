@@ -143,39 +143,38 @@ all that's needed.
    [`container/skills/`](https://github.com/hndrewaall/claude-watch/tree/main/container/skills),
    [`container/agents/`](https://github.com/hndrewaall/claude-watch/tree/main/container/agents),
    [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers).
-7. **Watchers are already running — verify via `/claude-container:start-watchers`**.
-   The container's entrypoint spawns `cw-watcher-supervisor`
-   (`/usr/local/bin/cw-watcher-supervisor`) before tmux. The supervisor
-   reads `/etc/claude-code/watchers/*.toml` and launches each watcher
-   with respawn-on-exit semantics per `restart_policy`. Watchers
-   survive the full container lifetime — not just one session — so
-   you don't have to re-launch them at session start. The
-   `/claude-container:start-watchers` skill is now an INFORMATIONAL
-   probe: it reports which watchers ship in this build and whether the
-   supervisor's launcher processes are alive. The image currently
-   bakes one watcher (`claude-event-tail`, which surfaces
-   `~/claude-events/*.json` drops to the in-container session); future
-   watcher additions get auto-supervised without any session-side action.
+7. **Start event watchers via `/claude-container:start-watchers`**.
+   Watchers are **session-scoped `run_in_background` Bash tasks** that
+   must be (re)started on every session start, `/clear`, resume, or
+   context compaction. They do NOT survive across sessions — there is
+   no long-lived supervisor process.
 
-   The `[watcher_monitor]` alert layer (formerly stacked on top of the
-   supervisor and intended to fire `[CLAUDE-WATCH] WATCHER(S) DOWN:
-   <name>` via tmux-inject) is **DISABLED** in the shipped config.
-   PR #200 wired it; a follow-up hotfix flipped `enabled = false`
-   after the layer produced an alert-spam loop (the daemon's pgrep
-   list and the supervisor's TOML set do not cross-reference, so a
-   missing TOML translated into perpetual alerts). The supervisor
-   remains the sole restart mechanism for in-container watchers. The
-   `watcher-ctl -> claude-watch` symlink and the `WATCHERS_CONFIG`
-   env var stay baked into the image for other CLI surfaces that
-   read them.
+   The canonical watcher is `claude-event-watch` (block-print-exit
+   pattern):
+   - Blocks on `inotifywait` until a new `.json` event file appears
+     in `~/claude-events/` (or `$CLAUDE_EVENT_QUEUE`)
+   - Debounces (default 30s) to batch burst events
+   - Prints all pending events as one-liners:
+     `EVENT[source/tag] message`
+   - Deletes processed event files
+   - Prints a restart banner and **EXITS**
 
-**Long-running watchers inside this container are scoped narrowly.**
+   Claude Code delivers the watcher's stdout back to the session as a
+   background-task completion notification. **On receiving watcher
+   output, IMMEDIATELY restart the watcher** (before processing the
+   events) to avoid missing events during processing.
+
+   The `/claude-container:start-watchers` skill starts (or restarts)
+   all watchers. Run it at step 7 of this checklist and again whenever
+   a watcher exits with output.
+
+**Event watchers inside this container are scoped narrowly.**
 The container is a code-writing sandbox, not a host automation hub.
 Don't try to start signal watchers, torrent watchers, podcast watchers,
 or anything else from the host's resume-checklist playbook; the
-relevant tools and services aren't installed here. The baked watchers
-that DO ship cover only in-container event paths (e.g.
-`claude-event-tail` consuming local `~/claude-events/` drops).
+relevant tools and services aren't installed here. The baked watcher
+(`claude-event-watch`) covers the in-container event bus at
+`~/claude-events/`.
 
 If the operator gives you a job that genuinely needs a host-side
 watcher / notifier, run it on the host instead (via the operator's host

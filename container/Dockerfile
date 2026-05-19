@@ -673,21 +673,6 @@ RUN chmod +x /usr/local/bin/trust-workspace
 COPY container/bin/audit-hooks.py /usr/local/bin/audit-hooks
 RUN chmod +x /usr/local/bin/audit-hooks
 
-# cw-watcher-supervisor — container-level watcher supervisor. Reads
-# /etc/claude-code/watchers/*.toml, launches each watcher's launcher
-# script, and respawns on exit per restart_policy. Wired into
-# entrypoint.sh so watchers survive the container's full lifetime
-# rather than dying with whichever Claude Code session happened to
-# launch them. See container/bin/cw-watcher-supervisor for the full
-# policy (backoff, crash-loop guard, signal handling) and the
-# embedded `--test` mode (run via
-# `python3 container/bin/cw-watcher-supervisor --test`).
-#
-# The /claude-container:start-watchers skill is now an informational
-# probe — the supervisor is the real launcher.
-COPY container/bin/cw-watcher-supervisor /usr/local/bin/cw-watcher-supervisor
-RUN chmod +x /usr/local/bin/cw-watcher-supervisor
-
 # cwsr — in-container self-restart for the claude CLI. Upgrades
 # @anthropic-ai/claude-code via npm-global and uses `tmux respawn-pane
 # -k` to roll the inner claude process WITHOUT requiring a host-side

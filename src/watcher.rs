@@ -24,6 +24,14 @@ pub fn config_path() -> String {
     format!("{}/{}", home, DEFAULT_CONFIG)
 }
 
+/// Resolve the optional extra watchers.conf path (respects $WATCHERS_CONFIG_EXTRA).
+/// Returns None when the env var is unset or empty.
+pub fn config_path_extra() -> Option<String> {
+    std::env::var("WATCHERS_CONFIG_EXTRA")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Status of a single watcher.
 ///
 /// `status` values:
@@ -115,9 +123,20 @@ fn is_supervisor_comm(pid: u32) -> bool {
     }
 }
 
+/// Load watcher entries from the primary config and an optional extra config,
+/// concatenating entries from both. Missing extra file is silently ignored
+/// (parse_watchers_config already returns an empty vec for missing files).
+fn load_entries(config_path: &str, extra_config_path: Option<&str>) -> Vec<WatcherEntry> {
+    let mut entries = parse_watchers_config(config_path);
+    if let Some(extra) = extra_config_path {
+        entries.extend(parse_watchers_config(extra));
+    }
+    entries
+}
+
 /// List all watcher entries from config.
-pub fn watcher_list(config_path: &str) -> Vec<WatcherEntry> {
-    parse_watchers_config(config_path)
+pub fn watcher_list(config_path: &str, extra_config_path: Option<&str>) -> Vec<WatcherEntry> {
+    load_entries(config_path, extra_config_path)
 }
 
 /// Get status for all watchers.
@@ -135,8 +154,8 @@ pub fn watcher_list(config_path: &str) -> Vec<WatcherEntry> {
 /// clean up its predecessors. The PID-file check that `watcher-status`
 /// USED to do was completely blind to this — we'd report `ok` while
 /// four supervisors raced on the same PID file.
-pub async fn watcher_status(config_path: &str) -> Vec<WatcherStatus> {
-    let entries = parse_watchers_config(config_path);
+pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) -> Vec<WatcherStatus> {
+    let entries = load_entries(config_path, extra_config_path);
 
     // Fan out: for each enabled watcher, spawn BOTH a poller-pid lookup and
     // a supervisor-pid lookup. Disabled watchers get `None` placeholders so
@@ -231,8 +250,8 @@ pub async fn watcher_status(config_path: &str) -> Vec<WatcherStatus> {
 /// Run a watcher by name. Looks up the entry, rejects if disabled or no
 /// start_cmd, then execs the start_cmd and waits for it to complete.
 /// Returns the exit code of the child process.
-pub async fn watcher_run(config_path: &str, name: &str) -> Result<i32, String> {
-    let entries = parse_watchers_config(config_path);
+pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, name: &str) -> Result<i32, String> {
+    let entries = load_entries(config_path, extra_config_path);
     let entry = entries
         .iter()
         .find(|e| e.name == name)
@@ -436,8 +455,8 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
 // ---------------------------------------------------------------------------
 
 /// Kill all enabled watcher processes and clean PID files.
-pub async fn watcher_restart(config_path: &str) -> String {
-    let entries = parse_watchers_config(config_path);
+pub async fn watcher_restart(config_path: &str, extra_config_path: Option<&str>) -> String {
+    let entries = load_entries(config_path, extra_config_path);
     let mut total = 0u32;
     let mut messages = Vec::new();
 
@@ -481,8 +500,8 @@ pub async fn watcher_restart(config_path: &str) -> String {
 // --- CLI command handlers ---
 
 /// `claude-watch watcher list [--json]`
-pub fn cmd_list(config_path: &str, json: bool) {
-    let entries = watcher_list(config_path);
+pub fn cmd_list(config_path: &str, extra_config_path: Option<&str>, json: bool) {
+    let entries = watcher_list(config_path, extra_config_path);
 
     if json {
         let items: Vec<serde_json::Value> = entries
@@ -514,8 +533,8 @@ pub fn cmd_list(config_path: &str, json: bool) {
 /// `DUPLICATE` the full status output is printed (same format as the default
 /// case) so the caller can see what's wrong. Designed for the PostToolUse
 /// hook that surfaces watcher health on every tool call.
-pub async fn cmd_status(config_path: &str, json: bool, unhealthy_only: bool) {
-    let statuses = watcher_status(config_path).await;
+pub async fn cmd_status(config_path: &str, extra_config_path: Option<&str>, json: bool, unhealthy_only: bool) {
+    let statuses = watcher_status(config_path, extra_config_path).await;
 
     if unhealthy_only && !any_unhealthy(&statuses) {
         // Stay silent when everything is healthy. JSON mode gets the same
@@ -539,8 +558,8 @@ pub fn any_unhealthy(statuses: &[WatcherStatus]) -> bool {
 }
 
 /// `claude-watch watcher run <name>`
-pub async fn cmd_run(config_path: &str, name: &str) -> i32 {
-    match watcher_run(config_path, name).await {
+pub async fn cmd_run(config_path: &str, extra_config_path: Option<&str>, name: &str) -> i32 {
+    match watcher_run(config_path, extra_config_path, name).await {
         Ok(code) => code,
         Err(msg) => {
             eprintln!("Error: {}", msg);
@@ -564,8 +583,8 @@ pub async fn cmd_toggle(config_path: &str, name: &str, enable: bool) -> i32 {
 }
 
 /// `claude-watch watcher restart`
-pub async fn cmd_restart(config_path: &str) {
-    let output = watcher_restart(config_path).await;
+pub async fn cmd_restart(config_path: &str, extra_config_path: Option<&str>) {
+    let output = watcher_restart(config_path, extra_config_path).await;
     println!("{}", output);
 }
 

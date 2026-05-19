@@ -218,6 +218,12 @@ fn default_thinking_backoff_multiplier() -> u64 {
 pub struct WatcherMonitorConfig {
     pub enabled: bool,
     pub watchers_config: String,
+    /// Optional supplementary watchers.conf path. Entries from this file are
+    /// merged with the primary `watchers_config`. Intended for operator-local
+    /// watchers (bind-mounted into the container) that aren't baked into the
+    /// image. Missing file is silently ignored.
+    #[serde(default)]
+    pub watchers_config_extra: Option<String>,
     pub expected_watchmen: u32,
     /// Consecutive missing checks before injecting a restart prompt (default: 6 = ~60s)
     #[serde(default = "default_watcher_inject_threshold")]

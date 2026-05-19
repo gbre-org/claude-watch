@@ -87,4 +87,5 @@ export WATCH_DIR="$CLAUDE_EVENT_QUEUE"
 export WATCH_PATTERN='*.json'
 export WATCH_CALLBACK="$CALLBACK"
 
-exec "$DIR_WATCH_LIB"
+"$DIR_WATCH_LIB" &
+wait $!
