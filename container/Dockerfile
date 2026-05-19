@@ -684,6 +684,9 @@ RUN chmod +x /usr/local/bin/audit-hooks
 COPY container/bin/cwsr /usr/local/bin/cwsr
 RUN chmod +x /usr/local/bin/cwsr
 
+COPY container/bin/mcp-reconnect /usr/local/bin/mcp-reconnect
+RUN chmod +x /usr/local/bin/mcp-reconnect
+
 # xclip — cross-host clipboard image-paste shim.
 #
 # The bundled `claude` binary's TUI image-paste code path shells out to
