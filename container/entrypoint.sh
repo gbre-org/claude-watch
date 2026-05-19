@@ -176,6 +176,7 @@ CLAUDE_SHIM_SETTINGS_PATH=""
 # would re-add the unwrapped ones); obligations-only wants additive
 # (host hooks load via user tier, shim only adds the obligations gates).
 CLAUDE_SHIM_FILTER_USER=""
+export CLAUDE_SHIM_FILTER_USER
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
     /usr/local/bin/generate-hooks-shim-settings \
