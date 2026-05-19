@@ -345,6 +345,18 @@ services:
       # 1000, which lives at /tmp/tmux-1000/default inside the
       # container.
       - "claude-tmux-socket:/tmp/tmux-1000"
+      # claude-watch state dir — holds active-agents.json (published
+      # every minute by the in-container cron) and any other daemon
+      # state. Shared read-only with queue-minisite via the named
+      # volume below so the minisite's live-log modal can resolve the
+      # JSONL transcript path for each running agent.
+      #
+      # Override with CW_STATE_PATH=/absolute/host/path to swap the
+      # named volume for a host bind-mount (useful when the host has
+      # claude-watch installed natively and you want the minisite to
+      # read the same file). Set the env var in .env or export before
+      # running docker compose up.
+      - "${CW_STATE_PATH:-claude-watch-state}:/var/lib/claude-watch"
     # working_dir flip: when CLAUDE_HOST_PROJECT_DIR is set, override the
     # image WORKDIR (/workspace) with the host path so the in-container
     # claude lands at the project-memory-matching cwd. Empty / unset
@@ -384,6 +396,16 @@ services:
       # for users who have a pingme shim wired in via override.
       PINGME_SESSION_TASK: "1"
       CLAUDE_EVENT_SESSION_TASK: "1"
+      # Agent-liveness state — written every minute by the in-container
+      # claude-watch active-agents cron. Shared from claude-container via
+      # the claude-watch-state named volume (or CW_STATE_PATH bind-mount).
+      # Required for the live-log modal to locate the running agent's JSONL
+      # transcript and for the "alive" badge on running items.
+      AGENT_STATE_JSON: /agents-state/active-agents.json
+      # Persistent archive dir for completed-agent transcripts. session-task
+      # copies the JSONL here at queue-done / queue-abandon time; the minisite
+      # reads it back for the "View log" button on done / abandoned items.
+      QUEUE_LOG_ARCHIVE_DIR: /queue-home/.config/session/queue-logs
     volumes:
       # session-task queue.json — rw because the Stop button mutates it
       # via session-task (atomic tmp+rename + flock).
@@ -394,6 +416,11 @@ services:
       # Per-session agent JSONL transcripts — the SSE live-log endpoint
       # tails these.
       - "${HOME}/.claude/projects:/agents-jsonl:ro"
+      # claude-watch state dir — shared with claude-container via the named
+      # volume so this container can read active-agents.json (owner liveness
+      # + JSONL path per running queue item). The volume reference matches
+      # the claude-container mount above; both containers see the same bytes.
+      - "${CW_STATE_PATH:-claude-watch-state}:/agents-state:ro"
       # Host obligations.json — rw because the Force-start button
       # registers a hard-gate row that the host main loop reads.
       - "${HOME}/.config/claude:/queue-home/.config/claude:rw"
@@ -537,3 +564,16 @@ volumes:
   # the same tmux session that `docker compose exec claude-container
   # tmux attach` would land you in.
   claude-tmux-socket:
+  # claude-watch state dir — shared between claude-container (writer)
+  # and queue-minisite (reader). Holds active-agents.json (the per-minute
+  # JSON state file published by the in-container claude-watch cron) and
+  # any other daemon state that needs to survive container recreate.
+  #
+  # Only declared — and only used — when CW_STATE_PATH is unset. When
+  # CW_STATE_PATH=/absolute/host/path is set (e.g. pointing at a
+  # native claude-watch state dir on Linux), Compose treats the env var
+  # as an absolute path and creates a host bind-mount instead; this
+  # named volume is left declared but unused.
+  #
+  # Nuke: docker volume rm <project>_claude-watch-state
+  claude-watch-state:

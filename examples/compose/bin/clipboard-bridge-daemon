@@ -123,18 +123,15 @@ snapshot_clipboard_png() {
     # Use the canonical Apple-Script idiom + write to stdout via shell.
     local tmp
     tmp="$(mktemp -t clipboard-bridge-XXXXXX)"
-    if osascript -e 'on error
-                          return 1
-                      end
-                      try
-                          set the_png to (the clipboard as «class PNGf»)
-                          set out_file to (POSIX file "'"$tmp"'") as alias
-                          set fh to open for access out_file with write permission
-                          write the_png to fh
-                          close access fh
-                      on error errMsg
-                          return 1
-                      end' >/dev/null 2>&1; then
+    if osascript -e '
+try
+    set the_png to (the clipboard as «class PNGf»)
+    set f to open for access (POSIX file "'"$tmp"'") with write permission
+    write the_png to f
+    close access f
+on error errMsg
+    error number -128
+end try' >/dev/null 2>&1; then
         if [[ -s "$tmp" ]]; then
             cat "$tmp"
             rm -f "$tmp"

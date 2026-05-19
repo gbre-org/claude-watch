@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Tests for queue-minisite agent-state wiring in examples/compose.
+
+Background: the queue-minisite live-log modal resolves running agents via
+`AGENT_STATE_JSON` (pointing at `active-agents.json`) and streams their JSONL
+transcripts via `AGENTS_JSONL_ROOT`. For the live-log to work in the
+examples/compose stack, three things must be true:
+
+  1. `claude-container` mounts the `claude-watch-state` named volume at
+     `/var/lib/claude-watch` so the in-container cron can write
+     `active-agents.json`.
+  2. `queue-minisite` mounts the SAME volume (read-only) at `/agents-state`
+     so the Flask app can read `active-agents.json`.
+  3. `queue-minisite` has `AGENT_STATE_JSON=/agents-state/active-agents.json`
+     in its environment, and `QUEUE_LOG_ARCHIVE_DIR` for archive viewing.
+
+Without (1)+(2)+(3), clicking a running item in the queue UI opens the log
+modal but the stream stays silent — the app can't find the agent's JSONL path.
+
+This test verifies the FILE-LEVEL wiring (compose YAML only). It does NOT
+spin up a container; runtime assertion (volume gets created and shared) is
+exercised by a live `docker compose up` run.
+
+Run:  ./queue-minisite-agent-state-wiring.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+EXAMPLES_COMPOSE_DIR = HERE.parent.parent
+COMPOSE = EXAMPLES_COMPOSE_DIR / "docker-compose.yml"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+expect(COMPOSE.is_file(), f"docker-compose.yml missing at {COMPOSE}")
+
+if COMPOSE.is_file():
+    text = COMPOSE.read_text(encoding="utf-8")
+
+    # -----------------------------------------------------------------------
+    # 1. claude-container mounts the state volume at /var/lib/claude-watch.
+    #    The canonical compose-interpolation form is:
+    #       ${CW_STATE_PATH:-claude-watch-state}:/var/lib/claude-watch
+    # -----------------------------------------------------------------------
+    expect(
+        re.search(
+            r"\$\{CW_STATE_PATH:-claude-watch-state\}:/var/lib/claude-watch",
+            text,
+        )
+        is not None,
+        "claude-container must mount ${CW_STATE_PATH:-claude-watch-state} "
+        "at /var/lib/claude-watch. Without this the in-container "
+        "claude-watch cron has nowhere to write active-agents.json.",
+    )
+
+    # -----------------------------------------------------------------------
+    # 2. queue-minisite mounts the state volume (read-only) at /agents-state.
+    #    Same interpolation pattern, different container-side mount point.
+    # -----------------------------------------------------------------------
+    expect(
+        re.search(
+            r"\$\{CW_STATE_PATH:-claude-watch-state\}:/agents-state:ro",
+            text,
+        )
+        is not None,
+        "queue-minisite must mount ${CW_STATE_PATH:-claude-watch-state} "
+        "at /agents-state:ro. Without this the Flask app can't read "
+        "active-agents.json to resolve the running agent's JSONL path.",
+    )
+
+    # -----------------------------------------------------------------------
+    # 3a. queue-minisite environment has AGENT_STATE_JSON set.
+    # -----------------------------------------------------------------------
+    expect(
+        "AGENT_STATE_JSON: /agents-state/active-agents.json" in text,
+        "queue-minisite environment must set "
+        "AGENT_STATE_JSON=/agents-state/active-agents.json. Without this "
+        "the app uses the default /agents-state/active-agents.json path "
+        "but the env var must be explicit for clarity.",
+    )
+
+    # -----------------------------------------------------------------------
+    # 3b. queue-minisite environment has QUEUE_LOG_ARCHIVE_DIR set.
+    # -----------------------------------------------------------------------
+    expect(
+        "QUEUE_LOG_ARCHIVE_DIR: /queue-home/.config/session/queue-logs" in text,
+        "queue-minisite environment must set QUEUE_LOG_ARCHIVE_DIR so the "
+        "'View log' button works on done / abandoned items (the archive "
+        "path is inside the ~/.config/session mount which is already rw).",
+    )
+
+    # -----------------------------------------------------------------------
+    # 4. Top-level volumes: block declares claude-watch-state named volume.
+    #    Without this declaration the default CW_STATE_PATH-unset path
+    #    references an undeclared volume name and docker compose errors.
+    # -----------------------------------------------------------------------
+    volumes_section = re.search(
+        r"\nvolumes:\s*\n(?P<body>(?:^[ \t#].*\n|^\s*\n)+)",
+        text,
+        re.MULTILINE,
+    )
+    expect(
+        volumes_section is not None,
+        "docker-compose.yml must have a top-level `volumes:` section.",
+    )
+    if volumes_section is not None:
+        body = volumes_section.group("body")
+        expect(
+            re.search(r"^\s+claude-watch-state:\s*$", body, re.MULTILINE)
+            is not None,
+            "docker-compose.yml top-level `volumes:` must declare "
+            "`claude-watch-state`. Without this docker compose errors "
+            "when CW_STATE_PATH is unset (the named-volume reference is "
+            "undefined).",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Report.
+# ---------------------------------------------------------------------------
+if failures:
+    print(f"FAIL ({len(failures)} failure(s)):", file=sys.stderr)
+    for msg in failures:
+        print(f"  - {msg}", file=sys.stderr)
+    sys.exit(1)
+
+print("OK")
