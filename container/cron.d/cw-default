@@ -36,3 +36,12 @@
 # (or stderr inside the container — cron's -L 15 flag routes stderr to
 # the supervisor log).
 * * * * *   hndrewaall /usr/local/bin/claude-watch metrics > /tmp/claude-watch-cron-metrics.log 2>&1
+
+# Stale-ready queue-item watchdog. Every 5 minutes, scan
+# `session-task queue ready --json` for pending items that have been
+# ready past the threshold (default 6 minutes) and emit ONE aggregated
+# `queue-stale-ready` claude-event per qualifying tick. Single-emit per
+# queue id (ledger at /var/lib/claude-watch/stale-ready-state.json), so
+# a long-stuck item only triggers once until it leaves the queue.
+# Silent exit when nothing qualifies — no console spam.
+*/5 * * * *  hndrewaall /usr/local/bin/claude-watch stale-ready-check > /tmp/claude-watch-cron-stale-ready.log 2>&1

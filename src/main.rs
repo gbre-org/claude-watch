@@ -35,6 +35,7 @@ mod proc_util;
 mod reminders;
 mod respawn;
 mod session_event;
+mod stale_ready;
 mod state;
 mod status;
 mod task_filters;
@@ -137,6 +138,33 @@ enum Commands {
     },
     /// Write Prometheus textfile metrics from claude-watch state
     Metrics,
+    /// Emit a `queue-stale-ready` claude-event when one or more
+    /// `session-task` queue items have been ready+pending past a
+    /// threshold (default 6 minutes). Single-emit per queue id; aggregates
+    /// multiple qualifying items into one event per tick.
+    ///
+    /// Designed for cron (every 5 minutes). Reads queue state via the
+    /// `session-task` CLI; persists the per-qid emit ledger at
+    /// `<state-dir>/stale-ready-state.json`. Default state dir is
+    /// `/var/lib/claude-watch` to align with the in-container
+    /// `active-agents.json` writer; override with --state-dir or the
+    /// `CLAUDE_WATCH_STATE_DIR` env var.
+    #[command(name = "stale-ready-check")]
+    StaleReadyCheck {
+        /// Stale-ready threshold in minutes. Items must be pending +
+        /// ready for at least this long to qualify.
+        #[arg(long, default_value_t = stale_ready::DEFAULT_THRESHOLD_MIN)]
+        threshold_min: u64,
+        /// Directory holding the per-emitter state file
+        /// (`stale-ready-state.json`). Falls back to
+        /// `CLAUDE_WATCH_STATE_DIR` env var, then `/var/lib/claude-watch`.
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<String>,
+        /// Print the event JSON to stdout WITHOUT emitting a file or
+        /// updating the state ledger. For inspection / testing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Fire a hybrid-model hook reminder (invoked by Claude Code hooks).
     ///
     /// Writes a marker to `~/.cache/claude-watch/reminders/<type>.json` so
@@ -1313,6 +1341,20 @@ async fn main() {
         }
         Some(Commands::Metrics) => {
             let code = metrics::cmd_metrics();
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::StaleReadyCheck {
+            threshold_min,
+            state_dir,
+            dry_run,
+        }) => {
+            let code = stale_ready::cmd_stale_ready_check(
+                threshold_min,
+                state_dir.as_deref(),
+                dry_run,
+            );
             if code != 0 {
                 std::process::exit(code);
             }

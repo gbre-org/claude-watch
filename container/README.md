@@ -265,8 +265,9 @@ The image bakes default cron entries at `/etc/cron.d/cw-default` that every clau
 
 - **active-agents writer** (every minute): runs `claude-watch active-agents --json --write-state /var/lib/claude-watch/active-agents.json`. Consumers: queue frontends, work-queue-exporter, queue-check loops.
 - **metrics emit** (every minute): runs `claude-watch metrics`. Prom-style textfile output for scrapers.
+- **stale-ready-check** (every 5 minutes): runs `claude-watch stale-ready-check`. Scans `session-task queue ready --json` for `pending` items that have been ready past a threshold (default 6 minutes) and emits ONE aggregated `queue-stale-ready` claude-event per tick when any items qualify. Single-emit per queue id is tracked in a ledger at `/var/lib/claude-watch/stale-ready-state.json`, so a long-stuck item only triggers the event once until it leaves the queue. Silent exit when nothing qualifies — the long-tail "still stuck" case is intentionally left to external alerting (Prometheus `WorkQueueStuck` / `WorkQueueBacklog` rules). Requires the `session-task` CLI on `PATH` (bind-mounted from `~/repos/claude-watch/tools/session-task/` in the example compose stack); when missing, the command silently exits 0 so containers without `session-task` aren't penalised.
 
-Both run as the `hndrewaall` user (uid 1000) — cron itself runs as root and `setuid()`s into the user named in each `/etc/cron.d/` entry.
+All three run as the `hndrewaall` user (uid 1000) — cron itself runs as root and `setuid()`s into the user named in each `/etc/cron.d/` entry.
 
 ### Operator-specific cron entries (`/etc/cron.d/private/`)
 
