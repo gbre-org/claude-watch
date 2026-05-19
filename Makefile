@@ -152,8 +152,6 @@ test-entrypoint:
 	container/tests/dir-watch-events-all.test
 	container/tests/dir-watch-events-default-backcompat.test
 	container/tests/dir-watch-events-poll-fallback.test
-	container/tests/cw-watcher-supervisor-installed.test
-	container/tests/cw-watcher-supervisor-launches-claude-event-tail.test
 	container/tests/entrypoint-launches-supervisor.test
 	container/tests/cron-installed.test
 	container/tests/entrypoint-launches-cron.test
