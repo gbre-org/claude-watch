@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Hard-fail spawn-gate tests for session-task queue.
+"""Spawn-gate tests for session-task queue.
 
-Covers the 2026-04-17 refinements:
+Covers the 2026-04-17 refinements and the 2026-05-19 soft-serialize
+update:
 
   * `queue add` with non-conflicting scope succeeds.
-  * `queue add` with scope overlapping a running item HARD-FAILS
-    (non-zero exit, ALL CAPS "DO NOT SPAWN" stderr, nothing enqueued).
-  * `queue add --force-enqueue` bypasses the hard-fail but leaves the
-    item in a BLOCKED state (spawn_instruction + spawn-check reflect it).
+  * `queue add` with scope overlapping a running item now SOFT-SERIALIZES
+    (exit 0, item enqueued, ready_now=false, serialized_after records
+    the running peer, informational stderr banner). Previous "HARD-FAIL
+    + REFUSED" behavior replaced 2026-05-19 per Andrew DM.
+  * `queue add --force-enqueue` is now a no-op flag (preserved for
+    back-compat); identical outcome to the default path.
   * `queue spawn-check` on a ready pending item exits 0.
   * `queue spawn-check` on a blocked pending item exits 2 with ALL CAPS
     "DO NOT SPAWN" stderr.
@@ -104,11 +107,22 @@ def test_add_nonconflicting():
 
 
 # ---------------------------------------------------------------------------
-# 2. Conflicting add -> HARD-FAIL
+# 2. Conflicting add -> SOFT-SERIALIZE (enqueued, blocked for spawn)
 # ---------------------------------------------------------------------------
 
 
-def test_add_conflict_hard_fails():
+def test_add_conflict_soft_serializes():
+    """Default path: add with overlapping running scope enqueues + blocks spawn.
+
+    Replaces the prior `test_add_conflict_hard_fails`. Andrew flagged the
+    hard-fail wording as misleading 2026-05-19 -- enqueuing behind active
+    scope is normal serialization. The new contract:
+      * exit 0
+      * item IS in the queue
+      * ready_now=false, spawn_instruction starts with "BLOCKED:"
+      * serialized_after records the running peer
+      * stderr banner is informational (no "REFUSED"/"DO NOT SPAWN ANY")
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
 
@@ -120,24 +134,39 @@ def test_add_conflict_hard_fails():
 
         # Overlapping scope while first is running.
         r2 = _add(env, "conflict", ["repo:foo"])
-        assert r2.returncode != 0, (
-            f"expected hard-fail, got rc={r2.returncode}\n"
+        assert r2.returncode == 0, (
+            f"expected soft-serialize (exit 0), got rc={r2.returncode}\n"
             f"stdout: {r2.stdout}\nstderr: {r2.stderr}"
         )
-        # Must include ALL CAPS "DO NOT SPAWN" phrasing.
-        assert "DO NOT SPAWN" in r2.stderr, r2.stderr
-        assert "QUEUE ADD REFUSED" in r2.stderr, r2.stderr
-        # Must include the conflicting id.
+        d2 = json.loads(r2.stdout)
+        assert d2["ready_now"] is False, d2
+        assert d2["spawn_instruction"].startswith("BLOCKED:"), d2
+        assert d1["id"] in d2["serialized_after"], d2
+
+        # Informational banner -- no "REFUSED" panic wording.
+        assert "REFUSED" not in r2.stderr, r2.stderr
+        assert "DO NOT SPAWN ANY AGENT" not in r2.stderr, r2.stderr
+        # But should still tell the main loop to wait.
+        assert "DO NOT spawn" in r2.stderr or "do not spawn" in r2.stderr.lower(), r2.stderr
+        # Running peer id surfaced.
         assert d1["id"] in r2.stderr, r2.stderr
 
-        # And the queue must NOT contain the failed item.
+        # And the queue MUST contain the soft-serialized item.
         r_list = _run(env, "queue", "list", "--all", "--json", check=True)
         items = json.loads(r_list.stdout)
         descs = [it.get("description") for it in items]
-        assert "conflict" not in descs, descs
+        assert "conflict" in descs, descs
+
+        # spawn-check on the soft-serialized item must still fail (exit 2).
+        rc = _spawn_check(env, d2["id"])
+        assert rc.returncode == 2, (
+            f"expected exit 2, got {rc.returncode}\nstderr: {rc.stderr}"
+        )
+        assert "DO NOT SPAWN" in rc.stderr
 
 
-def test_add_conflict_force_enqueue_succeeds_but_blocked():
+def test_add_conflict_force_enqueue_is_back_compat_noop():
+    """--force-enqueue is now a no-op (back-compat). Outcome identical to default."""
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
 
@@ -145,12 +174,13 @@ def test_add_conflict_force_enqueue_succeeds_but_blocked():
         d1 = json.loads(r1.stdout)
         _register(env, d1["id"], "--json")
 
-        # --force-enqueue: succeeds, but should be BLOCKED for spawn.
+        # --force-enqueue: same outcome as the default soft-serialize path.
         r2 = _add(env, "queued-followup", ["repo:foo"], "--force-enqueue")
         assert r2.returncode == 0, r2.stderr
         d2 = json.loads(r2.stdout)
         assert d2["ready_now"] is False
         assert d2["spawn_instruction"].startswith("BLOCKED:"), d2
+        assert d1["id"] in d2["serialized_after"], d2
         # spawn-check on the blocked item must fail with exit 2.
         rc = _spawn_check(env, d2["id"])
         assert rc.returncode == 2, (
@@ -266,8 +296,8 @@ def test_register_double_fails():
 def _all_tests():
     return [
         test_add_nonconflicting,
-        test_add_conflict_hard_fails,
-        test_add_conflict_force_enqueue_succeeds_but_blocked,
+        test_add_conflict_soft_serializes,
+        test_add_conflict_force_enqueue_is_back_compat_noop,
         test_spawn_check_ready_exits_zero,
         test_spawn_check_blocked_exits_two_all_caps,
         test_spawn_check_not_found_exits_two,

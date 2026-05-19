@@ -82,14 +82,19 @@ def test_repo_overlaps_path_in_same_repo():
         rr = _register(env, d1["id"], "--json")
         assert rr.returncode == 0, rr.stderr
 
-        # A path: claim INSIDE the running repo must HARD-FAIL conflict.
+        # A path: claim INSIDE the running repo must DETECT the conflict.
+        # As of 2026-05-19 the default soft-serializes (exit 0, ready=false,
+        # serialized_after records the running peer) instead of hard-failing.
         r2 = _add(env, "narrow", ["path:dockergom/monitoring"])
-        assert r2.returncode == 3, (
-            f"expected exit 3 (conflict with repo:dockergom), "
+        assert r2.returncode == 0, (
+            f"expected exit 0 (soft-serialize behind repo:dockergom), "
             f"got rc={r2.returncode}\n"
             f"  stdout: {r2.stdout}\n"
             f"  stderr: {r2.stderr}"
         )
+        d2 = json.loads(r2.stdout)
+        assert d2["ready_now"] is False, d2
+        assert d1["id"] in d2["serialized_after"], d2
 
 
 def test_path_overlaps_repo_when_path_added_first():
@@ -104,14 +109,18 @@ def test_path_overlaps_repo_when_path_added_first():
         rr = _register(env, d1["id"], "--json")
         assert rr.returncode == 0, rr.stderr
 
-        # Whole-repo claim must conflict with the running narrow path.
+        # Whole-repo claim must conflict with the running narrow path
+        # (soft-serialize: exit 0, ready=false, serialized_after set).
         r2 = _add(env, "broad", ["repo:dockergom"])
-        assert r2.returncode == 3, (
-            f"expected exit 3 (conflict with path:dockergom/...), "
+        assert r2.returncode == 0, (
+            f"expected exit 0 (soft-serialize behind path:dockergom/...), "
             f"got rc={r2.returncode}\n"
             f"  stdout: {r2.stdout}\n"
             f"  stderr: {r2.stderr}"
         )
+        d2 = json.loads(r2.stdout)
+        assert d2["ready_now"] is False, d2
+        assert d1["id"] in d2["serialized_after"], d2
 
 
 # ---------------------------------------------------------------------------
@@ -159,13 +168,17 @@ def test_prefix_path_tokens_overlap():
         rr = _register(env, d1["id"], "--json")
         assert rr.returncode == 0, rr.stderr
 
-        # Deeper path under the shallow claim must conflict.
+        # Deeper path under the shallow claim must conflict (soft-serialize).
         r2 = _add(env, "deep", ["path:dockergom/monitoring/ecowitt"])
-        assert r2.returncode == 3, (
-            f"expected prefix overlap, got rc={r2.returncode}\n"
+        assert r2.returncode == 0, (
+            f"expected exit 0 (soft-serialize on prefix overlap), "
+            f"got rc={r2.returncode}\n"
             f"  stdout: {r2.stdout}\n"
             f"  stderr: {r2.stderr}"
         )
+        d2 = json.loads(r2.stdout)
+        assert d2["ready_now"] is False, d2
+        assert d1["id"] in d2["serialized_after"], d2
 
 
 def test_prefix_path_tokens_overlap_other_direction():
@@ -180,11 +193,15 @@ def test_prefix_path_tokens_overlap_other_direction():
         assert rr.returncode == 0, rr.stderr
 
         r2 = _add(env, "shallow", ["path:dockergom/monitoring"])
-        assert r2.returncode == 3, (
-            f"expected prefix overlap, got rc={r2.returncode}\n"
+        assert r2.returncode == 0, (
+            f"expected exit 0 (soft-serialize on reverse prefix overlap), "
+            f"got rc={r2.returncode}\n"
             f"  stdout: {r2.stdout}\n"
             f"  stderr: {r2.stderr}"
         )
+        d2 = json.loads(r2.stdout)
+        assert d2["ready_now"] is False, d2
+        assert d1["id"] in d2["serialized_after"], d2
 
 
 # ---------------------------------------------------------------------------
@@ -231,14 +248,19 @@ def test_mixed_path_workload_overlaps_on_workload():
         rr = _register(env, d1["id"], "--json")
         assert rr.returncode == 0, rr.stderr
 
-        # Disjoint path siblings but shared workload -- must still conflict.
+        # Disjoint path siblings but shared workload -- must still conflict
+        # (soft-serialize behind the running peer that holds workload:foo).
         r2 = _add(env, "second",
                   ["path:dockergom/queue-minisite", "workload:foo"])
-        assert r2.returncode == 3, (
-            f"expected workload to dominate, got rc={r2.returncode}\n"
+        assert r2.returncode == 0, (
+            f"expected exit 0 (soft-serialize, workload dominates), "
+            f"got rc={r2.returncode}\n"
             f"  stdout: {r2.stdout}\n"
             f"  stderr: {r2.stderr}"
         )
+        d2 = json.loads(r2.stdout)
+        assert d2["ready_now"] is False, d2
+        assert d1["id"] in d2["serialized_after"], d2
 
 
 # ---------------------------------------------------------------------------

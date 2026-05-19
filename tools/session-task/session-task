@@ -2264,14 +2264,21 @@ def cmd_queue_add(args):
         )
 
     # ------------------------------------------------------------------
-    # HARD-FAIL spawn-gate: if any currently-running item has overlapping
-    # scope, refuse to even enqueue the item. Andrew 2026-04-17:
-    #   "make sure it's not just a warning, but a loud failure with all
-    #    caps and explicit instructions not to run"
-    # This is intentional: adding without running-conflict check lets the
-    # main loop queue up scope-overlapping work and then race to spawn it
-    # before the running item finishes. Hard-fail on add forces the caller
-    # to handle the conflict consciously (wait, or use --force-enqueue).
+    # Soft-serialize on running scope conflict: if any currently-running
+    # item has overlapping scope, the new item is STILL enqueued — but
+    # marked not-ready and recorded with the running peer(s) in
+    # serialized_after, so the main loop will not spawn an agent for it
+    # until the running peer finishes.
+    #
+    # History: Andrew 2026-04-17 asked for a "loud failure with all caps
+    # and explicit instructions not to run" on add-time scope overlap.
+    # That landed as a hard-fail (exit 3, "QUEUE ADD REFUSED" banner).
+    # 2026-05-19 Andrew flagged the banner as misleading: enqueuing
+    # behind active scope is normal serialization, not a refusal — the
+    # only behavior we need to gate is the SPAWN, which the existing
+    # ready_now=false + spawn-check exit-2 machinery already covers.
+    # The banner now states the enqueue succeeded and tells the main
+    # loop to wait for the running peer before spawning.
     # ------------------------------------------------------------------
     fh, data = _queue_open_locked("rw")
     try:
@@ -2338,13 +2345,10 @@ def cmd_queue_add(args):
         ]
 
         running_conflicts = _running_scope_conflicts(items, scope)
-
-        if running_conflicts and not args.force_enqueue:
-            # Release lock before exiting so concurrent callers aren't blocked.
-            fcntl.flock(fh, fcntl.LOCK_UN)
-            fh.close()
-            _print_add_conflict_banner(scope, running_conflicts)
-            sys.exit(3)
+        # Note: --force-enqueue is preserved as a no-op for back-compat
+        # with callers that still pass it. The default path now also
+        # enqueues, so the flag no longer changes behavior; it remains
+        # accepted (and documented) to avoid breaking legacy scripts.
 
         overlapping = _group_ids_overlapping(items, scope)
 
@@ -2442,8 +2446,9 @@ def cmd_queue_add(args):
         else:
             spawn_instruction = "BLOCKED: do not spawn (no head visible)"
 
-    # Print result. running_conflicts is only populated via --force-enqueue
-    # now, since without it we would have already exited above.
+    # Print result. running_conflicts is populated whenever the new scope
+    # overlapped a running peer; it no longer implies any error condition
+    # (the item was enqueued and is correctly serialized behind the peer).
     running_conflict_info = [
         {"id": c["id"], "group_id": c.get("group_id"), "scope": c.get("scope", [])}
         for c in running_conflicts
@@ -2471,18 +2476,12 @@ def cmd_queue_add(args):
         if lock_blockers:
             print(f"lock_blockers: {lock_blockers}")
         print(f"spawn_instruction: {spawn_instruction}")
-        if running_conflicts:
-            # Only reachable via --force-enqueue. Still scream.
-            print("", file=sys.stderr)
-            print("!" * 70, file=sys.stderr)
-            print("!! FORCE-ENQUEUED OVER RUNNING SCOPE CONFLICT. DO NOT SPAWN THIS AGENT.",
-                  file=sys.stderr)
-            for c in running_conflicts:
-                print(f"!!   running {c['id']} (group {c.get('group_id')}): "
-                      f"{','.join(c.get('scope', []))}", file=sys.stderr)
-            print("!! RUN THE CONFLICTING WORK FIRST OR WAIT FOR IT TO FINISH.",
-                  file=sys.stderr)
-            print("!" * 70, file=sys.stderr)
+
+    # Soft-serialize banner: emit to stderr regardless of --json mode so
+    # JSON callers still get the informational note about why this item
+    # is queued behind a running peer. Stays out of the stdout JSON.
+    if running_conflicts:
+        _print_add_conflict_banner(new_id, scope, running_conflicts)
 
     # NOTE: queue-added claude-event emit removed 2026-04-27 (Andrew DM:
     # "Remove queue added event, too noisy"). queue add is task creation,
@@ -2492,40 +2491,49 @@ def cmd_queue_add(args):
     # remain in their respective code paths.
 
 
-def _print_add_conflict_banner(new_scope, running_conflicts):
-    """Scream-worthy ALL CAPS stderr banner for queue-add hard-fail.
+def _print_add_conflict_banner(new_id, new_scope, running_conflicts):
+    """Informational stderr banner for queue-add soft-serialize.
 
-    Used when a queue add attempts to enqueue scope that overlaps a
-    currently-running item. The caller is expected to read this banner,
-    abort the spawn attempt, and either (a) wait for the running item to
-    finish, or (b) surface the conflict to a human.
+    Emitted when a queue add carries scope that overlaps a currently-
+    running peer. The new item HAS been enqueued (this is not a refusal)
+    and is recorded as serialized behind the running peer; the main loop
+    must simply wait to spawn an agent for it until the peer finishes.
+
+    History: prior versions hard-failed this path with an ALL CAPS
+    "QUEUE ADD REFUSED" banner + exit 3, and pointed callers at
+    --force-enqueue as an escape hatch. Andrew flagged the wording as
+    misleading (2026-05-19): enqueuing behind active scope is normal
+    serialization. The spawn-gating already lives in ready_now=false +
+    spawn-check exit 2; the loud "refused" framing was overkill.
     """
     print("", file=sys.stderr)
-    bar = "!" * 72
+    bar = "-" * 72
     print(bar, file=sys.stderr)
-    print("!! QUEUE ADD REFUSED: SCOPE CONFLICT WITH RUNNING ITEM(S).",
-          file=sys.stderr)
-    print("!! DO NOT SPAWN ANY AGENT FOR THIS WORK.", file=sys.stderr)
-    print("!! RUN THE CONFLICTING WORK FIRST OR WAIT FOR IT TO FINISH.",
-          file=sys.stderr)
-    print("!!", file=sys.stderr)
-    print(f"!! NEW SCOPE: {','.join(new_scope)}", file=sys.stderr)
-    print("!! CONFLICTING RUNNING ITEM(S):", file=sys.stderr)
+    print(
+        f"queued (serialized): {new_id} enqueued behind running peer(s) "
+        f"with overlapping scope.",
+        file=sys.stderr,
+    )
+    print(
+        "main loop: DO NOT spawn an agent for this item yet. It will be "
+        "promoted to ready",
+        file=sys.stderr,
+    )
+    print(
+        "when the running peer(s) reach done/abandoned. Use "
+        "`session-task queue spawn-check`",
+        file=sys.stderr,
+    )
+    print("or re-check `ready_now` before spawning.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f"  new scope: {','.join(new_scope)}", file=sys.stderr)
+    print("  running peer(s):", file=sys.stderr)
     for c in running_conflicts:
         print(
-            f"!!   - {c['id']} (group {c.get('group_id')}): "
+            f"    - {c['id']} (group {c.get('group_id')}): "
             f"{','.join(c.get('scope', []))}",
             file=sys.stderr,
         )
-    print("!!", file=sys.stderr)
-    print("!! IF YOU ABSOLUTELY MUST ENQUEUE OVER THIS CONFLICT (RARE):",
-          file=sys.stderr)
-    print("!!   session-task queue add ... --force-enqueue",
-          file=sys.stderr)
-    print("!! BUT YOU STILL MUST NOT SPAWN AN AGENT FOR IT UNTIL THE",
-          file=sys.stderr)
-    print("!! RUNNING ITEM(S) ABOVE REACH A DONE/ABANDONED STATE.",
-          file=sys.stderr)
     print(bar, file=sys.stderr)
 
 
@@ -5002,11 +5010,11 @@ def build_parser():
         "--force-enqueue",
         action="store_true",
         help=(
-            "Bypass the hard-fail scope-conflict check and enqueue anyway. "
-            "The new item is still blocked behind the running item(s) for "
-            "spawn purposes (register/spawn-check will refuse), but it will "
-            "be recorded in the queue. Use ONLY when intentionally queueing "
-            "follow-up work that must serialize after running work."
+            "DEPRECATED no-op (accepted for back-compat). Previously bypassed "
+            "the hard-fail scope-conflict check; as of 2026-05-19 the default "
+            "behavior already enqueues items that overlap a running peer "
+            "(soft-serialize -- ready_now=false until the peer finishes). "
+            "The flag is retained so legacy callers don't break."
         ),
     )
 
