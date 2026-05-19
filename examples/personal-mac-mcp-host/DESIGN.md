@@ -1,8 +1,10 @@
 # personal-mac-mcp-host — DESIGN
 
-> **Status:** design-only. No implementation in this PR. Maintainer review +
-> approval first, then a follow-up PR adds the actual plist, wrapper script,
-> `.env.example`, and README.
+> **Status:** implementation landed in this PR — `personal-mcp-host.sh`,
+> `.env.example`, `.gitignore`, `launchd/org.gbre.personal-mcp.host.plist`,
+> `launchd/README.md`, `README.md`, and embedded test suites under `tests/`.
+> See [`README.md`](README.md) for operator setup; this file is the
+> architectural record (why reverse-SSH, alternatives considered).
 
 ## Goal
 
@@ -489,63 +491,83 @@ launchctl bootstrap gui/$(id -u) \
 launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
 ```
 
-## Open questions / requests for maintainer review
+## Design decisions resolved in this PR
 
-1. **Reuse vs. duplicate `mcp-host-bash`?** The current sketch has
-   `personal-mcp-host.sh` exec the existing `mcp-host-bash` launcher
-   from `examples/compose/bin/`. That couples this directory to the
-   compose example tree. Acceptable, or should this directory be
-   fully self-contained (copy `mcp-host-bash` into here, or factor it
-   out to a shared `examples/bin/`)?
+The questions surfaced in the original design doc are answered below,
+with pointers to where the choice landed in the shipped code.
 
-2. **`launchctl bootout` vs. soft kill switch?** The operator's "only
-   as needed" use case could be served by either (a) `bootstrap` +
-   `kickstart` / `bootout` (what the sketch shows), or (b) bootstrap
-   once at install + a soft kill switch like
-   `MCP_PERSONAL_DISABLED=1` (`mcp-host-bash` ships this pattern).
-   The `bootout` path is more explicit; the soft-kill path is faster.
-   Preference?
+1. **Reuse vs. duplicate `mcp-host-bash`** — **Reuse**.
+   `personal-mcp-host.sh` exec's `../compose/bin/mcp-host-bash`
+   (configurable via `MCP_HOST_BASH_BIN` for operators whose launcher
+   lives elsewhere). Avoids duplicating the cw-profile / allow-list /
+   bearer-shim surface; operators who've already set up the compose
+   stack are pre-configured for this directory.
 
-3. **Bearer token storage.** The sketch puts `MCP_HOST_BASH_BEARER` in
-   the `.gitignore`d `.env`. The compose example uses the macOS
-   Keychain via `load-bearer-from-keychain`. Should this directory
-   adopt the same Keychain pattern? Trade-off: more setup steps for
-   the operator, but the secret never sits in a plaintext file. My
-   recommendation: phase 1 = `.env` plaintext (simpler), phase 2 =
-   optional Keychain hop.
+2. **`launchctl bootout` vs. soft kill switch** — **Both supported**.
+   `RunAtLoad=false` in the plist means the unit registers without
+   firing; operators run `launchctl kickstart` to start a session and
+   `launchctl bootout` to stop. For "leave the unit registered but
+   don't actually run the bridge", `PERSONAL_MCP_DISABLED=1` in
+   `.env` makes the wrapper exit 0 immediately on every spawn.
+   Documented side-by-side in `launchd/README.md` §5.
 
-4. **Should this ship a `tunnel.sh` separate from `personal-mcp-host.sh`?**
-   The sketch combines them. Splitting would let advanced operators
-   run the MCP server and tunnel independently (e.g. only the tunnel
-   for a different host MCP server). Probably YAGNI for v1, but
-   flagging.
+3. **Bearer token storage** — **`.env` plaintext (phase 1)**. The
+   shipped code reads `MCP_HOST_BASH_BEARER` from the sibling `.env`
+   and exports it for `mcp-host-bash` (which already implements the
+   shim). The Keychain hop modelled on `load-bearer-from-keychain` is
+   deliberately out of scope for this PR — left as future work; a
+   later PR can drop in a Keychain wrapper without changing the
+   wrapper's contract (it reads the env var regardless of how it got
+   there).
 
-5. **Host key pinning.** The sketch uses
-   `StrictHostKeyChecking=accept-new`, which pins the remote's host
-   key on first connect. Should the README also show how to
-   pre-populate `known_hosts` (e.g. `ssh-keyscan -H $REMOTE_HOST >>
-   ~/.ssh/known_hosts`) so a MITM at first-connect is also defeated?
-   Lean towards yes.
+4. **`tunnel.sh` separate from `personal-mcp-host.sh`** — **No**.
+   Single combined wrapper (YAGNI; the design doc anticipated this).
+   Splitting buys nothing for v1; future-work bullet below.
 
-6. **Tunneled `mcp-host-bash` allow-list defaults.** The compose
-   example defaults to `CW_PROFILE=corp-dev` (the read-y floor).
-   For a *personal* MacBook the operator is more likely to want
-   `corp-dev-trusted` so they can also write files / run scheduling
-   tools. Default in `.env.example` should be `corp-dev` (conservative
-   floor, easy to widen) — but document the trade-off prominently.
+5. **Host key pinning** — **`StrictHostKeyChecking=accept-new` plus
+   documented `ssh-keyscan` recipe**. The wrapper ships
+   `accept-new` as the floor (pin on first connect). The main README
+   "Pre-populating `known_hosts`" section walks operators through the
+   `ssh-keyscan -H $REMOTE_HOST` pre-population path for those who
+   want to defeat first-connect MITM too.
 
-7. **`ALLOWED_DIR`?** `mcp-host-bash` fences `run_command` to
-   `ALLOWED_DIR=$HOME` by default. For a MacBook remote-access use
-   case, is that the right floor, or should `.env.example` show how
-   to narrow it (e.g. `$HOME/personal-mcp-scratch`)? Defer to v1
-   simplicity: default to `$HOME`, document narrower options.
+6. **`CW_PROFILE` default** — **`corp-dev` (conservative)**.
+   `.env.example` ships `CW_PROFILE="corp-dev"` with an inline note
+   that operators with broader needs (file mutation, scheduling,
+   outbound bytes) can flip to `corp-dev-trusted`. Conservative floor,
+   easy to widen.
 
-8. **Implementation PR sequence.** Proposed:
-   - This PR: design only (DESIGN.md), no executable code.
-   - PR 2: ship `personal-mcp-host.sh` + `.env.example` + `.gitignore`,
-     no plist yet. Operator can verify the wrapper interactively.
-   - PR 3: ship the launchd plist + README + `launchd/README.md`.
-   - PR 4 (optional): Keychain hop, if we decide on it.
+7. **`ALLOWED_DIR` default** — **`$HOME` (inherits from
+   `mcp-host-bash`)**. `.env.example` includes a commented-out
+   `ALLOWED_DIR` line with the narrow-blast-radius
+   (`$HOME/personal-mcp-scratch`) suggestion for operators who want
+   it; the default leaves `mcp-host-bash`'s `$HOME` floor in place.
 
-Approval on this DESIGN.md + sign-off on the open questions above
-unblocks PR 2.
+8. **Implementation PR sequence** — **collapsed into this PR**.
+   Wrapper + `.env.example` + `.gitignore` + plist + READMEs +
+   embedded test suites all land together. Tests run on Linux CI
+   without needing macOS (`--print-cmd` debug hook for the wrapper,
+   `plistlib` for the plist); real macOS verification is the
+   maintainer's local check before merging.
+
+## Future work
+
+- **macOS Keychain bearer hop.** A `load-bearer-from-keychain`-style
+  wrapper for `personal-mcp-host.sh` would let operators keep the
+  bearer out of `.env` entirely. Shape: a small `bin/` script that
+  fetches the bearer via `security find-generic-password -w`,
+  exports it, then exec's `personal-mcp-host.sh`. The compose-stack
+  Keychain wrapper at `../compose/bin/load-bearer-from-keychain` is
+  the model. Out of scope for this PR.
+
+- **Split `tunnel.sh` from `personal-mcp-host.sh`.** Would let
+  advanced operators run only the tunnel (pointing at a different
+  host-side MCP server) or only the MCP server (without remote
+  access). Deferred — single use case for v1.
+
+- **Per-session ephemeral REMOTE_PORT.** Today the operator picks a
+  fixed `REMOTE_PORT` in `.env`. An ephemeral-port mode would have
+  `personal-mcp-host.sh` ask sshd for `0` (let sshd pick), then emit
+  the resolved port (e.g. via `claude-event`) for the remote-side
+  Claude to pick up. Lower collision risk on shared remotes; more
+  client-config plumbing. Deferred.

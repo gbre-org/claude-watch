@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -213,6 +213,25 @@ test-launchd-plist:
 # special-char round-trip, custom service-name. 12 cases, <1s.
 test-load-bearer-from-keychain:
 	examples/compose/bin/tests/load-bearer-from-keychain.test
+
+# Tests for examples/personal-mac-mcp-host/personal-mcp-host.sh — the
+# wrapper that spawns mcp-host-bash + the reverse SSH tunnel for the
+# on-demand remote-access pattern. Uses --print-cmd to verify argv
+# construction without invoking ssh / mcp-host-bash. Covers env-file
+# loading, required-key enforcement, default ssh hardening options,
+# PERSONAL_MCP_SSH_EXTRA passthrough, soft kill switch. 17 cases, <1s.
+test-personal-mcp-host:
+	examples/personal-mac-mcp-host/tests/personal-mcp-host.test
+
+# Tests for examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.host.plist
+# — the macOS LaunchAgent template for on-demand bring-up of
+# personal-mcp-host.sh. Structural validation only (plistlib + plutil
+# when available); does NOT invoke launchctl. Covers
+# RunAtLoad=false enforcement (this is the on-demand pattern, NOT
+# auto-start), Label / paths / EnvironmentVariables shape, README
+# walkthrough coverage. 22 cases, <1s.
+test-personal-mcp-host-plist:
+	examples/personal-mac-mcp-host/tests/launchd-plist.test
 
 # Release build
 build:
