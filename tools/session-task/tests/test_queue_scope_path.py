@@ -55,6 +55,13 @@ def _add(env, desc, scope_args, *extra):
     for s in scope_args:
         cmd.extend(["--scope", s])
     cmd.extend(extra)
+    # Auto-pass --force-enqueue when any scope token is `workload:<label>`
+    # so the cmd_queue_add hard-fail (refuses manual workload-scope adds)
+    # doesn't trip these scope-overlap tests, which legitimately need to
+    # exercise workload tokens. The workload runner itself passes the
+    # same flag on its auto-add path.
+    if any(s.startswith("workload:") for s in scope_args) and "--force-enqueue" not in cmd:
+        cmd.append("--force-enqueue")
     return _run(env, *cmd)
 
 

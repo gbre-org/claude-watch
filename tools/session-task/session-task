@@ -2241,6 +2241,86 @@ def cmd_queue_add(args):
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Hard-fail: manual queueing of a `workload:<label>` scope.
+    #
+    # The `workload run <label>` runner auto-creates a queue item with
+    # scope `["workload:<label>"]` itself (see workload.rs
+    # `auto_create_and_register_queue_item`). When a caller ALSO queues
+    # a `workload:<label>` item manually before invoking `workload run`,
+    # the labels can drift (workload:promote-ready-oa-pitt vs
+    # workload:promote-oa-pitt) and two parallel queue rows end up
+    # tracking the same tmux pane. Andrew flagged the double-row on
+    # the queue minisite 2026-05-19 (sig_ts 1779225355734):
+    # "can you update tooling so it's hard if not impossible to do
+    # the manual queueing when you shouldnt".
+    #
+    # Refuse with exit 3 + ALL CAPS stderr banner (mirrors the existing
+    # SPAWN-CHECK FAILED + REGISTER REFUSED bands). Bypass:
+    #   * `--force-enqueue` flag — the workload runner itself already
+    #     passes this on its auto-add call, so the runner path is
+    #     unaffected; legacy CLI users invoking `queue add` manually
+    #     for a workload: scope must pass it deliberately.
+    #   * `QUEUE_GATE_BYPASS=1` env var — same emergency-bypass shape
+    #     as the pre-agent-queue-gate hook.
+    # ------------------------------------------------------------------
+    workload_scopes = [t for t in scope if t.startswith("workload:")]
+    if workload_scopes:
+        force_bypass = bool(getattr(args, "force_enqueue", False))
+        env_bypass = (
+            os.environ.get("QUEUE_GATE_BYPASS", "").strip() not in ("", "0")
+        )
+        if not (force_bypass or env_bypass):
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(
+                "!! QUEUE ADD REFUSED: MANUAL `workload:` SCOPE NOT ALLOWED.",
+                file=sys.stderr,
+            )
+            print(
+                "!! DO NOT MANUALLY QUEUE WORKLOAD SCOPES.",
+                file=sys.stderr,
+            )
+            print(
+                "!! USE `workload run <label> -- <cmd>` WHICH AUTO-CREATES",
+                file=sys.stderr,
+            )
+            print(
+                "!! THE QUEUE ITEM WITH THE CORRECT SCOPE + REGISTERS IT.",
+                file=sys.stderr,
+            )
+            print("!!", file=sys.stderr)
+            print(
+                "!! Manual `workload:<label>` adds drift from the label",
+                file=sys.stderr,
+            )
+            print(
+                "!! the workload runner ACTUALLY uses, producing two",
+                file=sys.stderr,
+            )
+            print(
+                "!! parallel queue rows tracking one tmux pane.",
+                file=sys.stderr,
+            )
+            print("!!", file=sys.stderr)
+            print(
+                f"!! OFFENDING TOKEN(S): {','.join(workload_scopes)}",
+                file=sys.stderr,
+            )
+            print("!!", file=sys.stderr)
+            print(
+                "!! Emergency bypass (audited): `--force-enqueue` flag,",
+                file=sys.stderr,
+            )
+            print(
+                "!! or set `QUEUE_GATE_BYPASS=1` in the environment.",
+                file=sys.stderr,
+            )
+            print(bar, file=sys.stderr)
+            sys.exit(3)
+
     context = None
     if args.context:
         try:
@@ -5010,11 +5090,14 @@ def build_parser():
         "--force-enqueue",
         action="store_true",
         help=(
-            "DEPRECATED no-op (accepted for back-compat). Previously bypassed "
-            "the hard-fail scope-conflict check; as of 2026-05-19 the default "
-            "behavior already enqueues items that overlap a running peer "
-            "(soft-serialize -- ready_now=false until the peer finishes). "
-            "The flag is retained so legacy callers don't break."
+            "Bypass the hard-fail `workload:<label>` manual-queueing refusal "
+            "(audited). The `workload run` runner passes this flag on its "
+            "auto-add path so workload-driven queueing keeps working. Manual "
+            "`queue add --scope workload:<label>` calls otherwise exit 3 -- "
+            "use `workload run <label>` instead so the queue scope matches "
+            "the tmux pane label. Also accepted (no-op) for back-compat with "
+            "callers that still pass it from the pre-2026-05-19 era when it "
+            "bypassed an add-time scope-conflict hard-fail (now soft-serialize)."
         ),
     )
 

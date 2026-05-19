@@ -44,10 +44,20 @@ session-task queue done q-2026-05-01-XXXX
 `session-task queue spawn-check <id>` is a read-only re-check (exit 0 = clear, exit 2 = blocked
 or not found).
 
-**Note on `--force-enqueue`**: deprecated no-op (preserved for back-compat). Pre-2026-05-19
-the default `queue add` hard-failed (exit 3) on scope overlap with a running peer, and
-`--force-enqueue` was needed to enqueue anyway. The default now soft-serializes, so the
-flag is identical to omitting it.
+**Note on `--force-enqueue`**: dual purpose as of 2026-05-19 (rev 2):
+
+  * **Bypass for the workload-scope hard-fail**. `queue add` REFUSES (exit 3,
+    `QUEUE ADD REFUSED` banner) when any `--scope` token starts with `workload:`,
+    because `workload run <label>` already auto-creates its own queue item with
+    the matching scope. Manual `queue add --scope workload:<label>` calls
+    produced two parallel queue rows tracking one tmux pane (label drift, e.g.
+    `workload:promote-ready-foo` vs the runner's `workload:promote-foo`).
+    `--force-enqueue` bypasses the refusal (the workload runner itself passes
+    this on its auto-add path). `QUEUE_GATE_BYPASS=1` env var also bypasses.
+  * **No-op for legacy non-workload calls**. Pre-2026-05-19 the default
+    `queue add` hard-failed (exit 3) on scope overlap with a running peer, and
+    `--force-enqueue` was needed to enqueue anyway. That default now
+    soft-serializes, so the flag is a no-op for non-workload scopes.
 
 ## Files
 

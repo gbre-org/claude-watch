@@ -76,6 +76,14 @@ def _add(env, desc, scopes, *extra):
     for s in scopes:
         args.extend(["--scope", s])
     args.extend(extra)
+    # The hard-fail in cmd_queue_add refuses manual queueing of any
+    # `workload:<label>` scope (see queue add docstring). These archive
+    # tests legitimately need such items (they're exercising the
+    # workload-bound archive helper), so we pass --force-enqueue
+    # automatically to bypass the refusal — same shape the workload
+    # runner uses on its auto-add path.
+    if any(s.startswith("workload:") for s in scopes) and "--force-enqueue" not in args:
+        args.append("--force-enqueue")
     r = _run(env, *args)
     return json.loads(r.stdout)
 

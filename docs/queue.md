@@ -72,9 +72,14 @@ session-task queue migrate                # one-shot v1→v2 migration
 Before the main loop fires ANY `Agent` tool call:
 
 1. `session-task queue add "..." --scope <s> --summary "~10 word headline"` —
-   get the queue item id. **Exit 3 = HARD REFUSED** (scope overlaps a
-   currently-RUNNING item); DO NOT spawn. `--force-enqueue` enqueues as
-   `BLOCKED` and `register`/`spawn-check` will still refuse.
+   get the queue item id. Scope overlap with a running peer SOFT-SERIALIZES
+   (exit 0, `ready_now=false`, `serialized_after` records the running peer).
+   **Exit 3 = HARD REFUSED** is reserved for `--scope workload:<label>` —
+   the `workload run <label>` runner auto-creates its own queue item with
+   that scope, so manual `workload:` queueing produces double queue rows
+   tracking one tmux pane. Use `workload run <label>` instead. Bypass:
+   `--force-enqueue` flag (the runner itself passes this) or
+   `QUEUE_GATE_BYPASS=1` env var.
 2. Read `ready_now` and `spawn_instruction` from the returned JSON.
 3. If `ready_now=true`: `session-task queue register <id>` (or
    `pop --id <id>`) to atomically mark it running.
