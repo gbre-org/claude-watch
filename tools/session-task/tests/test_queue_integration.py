@@ -196,24 +196,35 @@ def test_register_advances_group_head_on_done():
         assert shown["status"] == "running"
 
 
-def test_register_refuses_running_scope_conflict():
-    """If A is RUNNING and B has overlapping scope, queue add hard-fails."""
+def test_add_soft_serializes_on_running_scope_conflict():
+    """If A is RUNNING and B has overlapping scope, queue add soft-serializes.
+
+    Before 2026-05-19 this hard-failed (exit 3, "QUEUE ADD REFUSED"). Andrew
+    flagged the wording as misleading: enqueuing behind active scope is
+    normal serialization. New contract: exit 0, item enqueued,
+    ready_now=false, serialized_after records the running peer.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         a = _add(env, "first", ["repo:hard"], "--summary", "first")
         _run(env, "queue", "register", a["id"], check=True)
 
-        # Second add with overlapping scope must hard-fail (exit 3).
+        # Second add with overlapping scope soft-serializes (exit 0).
         cmd = [sys.executable, str(SESSION_TASK), "queue", "add",
                "second", "--scope", "repo:hard", "--summary", "blocked",
                "--json"]
         r = subprocess.run(cmd, capture_output=True, text=True, env=env,
                            timeout=15)
-        assert r.returncode == 3, (
-            f"expected exit 3 (hard conflict), got {r.returncode}\n"
+        assert r.returncode == 0, (
+            f"expected exit 0 (soft-serialize), got {r.returncode}\n"
             f"stderr={r.stderr!r}"
         )
-        assert "QUEUE ADD REFUSED" in r.stderr
+        d = json.loads(r.stdout)
+        assert d["ready_now"] is False, d
+        assert a["id"] in d["serialized_after"], d
+        assert d["spawn_instruction"].startswith("BLOCKED:"), d
+        # No "REFUSED" panic wording, but still tell main loop to wait.
+        assert "REFUSED" not in r.stderr, r.stderr
 
 
 def test_queue_list_outputs_pending_and_running():

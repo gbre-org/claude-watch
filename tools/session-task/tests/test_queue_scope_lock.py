@@ -429,7 +429,8 @@ def test_mixed_scope_task_and_regular_blocks_independently():
         _run(env, "queue", "register", x["id"], check=True)
 
         # B has both repo:shared (conflicts with X) AND task:q-A.
-        # Adding under conflict requires --force-enqueue.
+        # As of 2026-05-19 the default soft-serializes; --force-enqueue
+        # is a no-op preserved for back-compat.
         r_b = _add(env, "double-blocked", ["repo:shared", f"task:{a['id']}"],
                    "--force-enqueue")
         b = json.loads(r_b.stdout)

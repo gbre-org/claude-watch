@@ -150,22 +150,26 @@ def test_comma_split_conflict_detection_works():
         rr = _register(env, d1["id"], "--json")
         assert rr.returncode == 0, rr.stderr
 
-        # Second, with a comma-joined scope that includes repo:foo. This
-        # MUST hard-fail (exit 3) -- pre-fix, the stored scope would be
-        # ["repo:foo,resource:bar"] which doesn't exact-match ["repo:foo"]
-        # and the conflict check silently misses.
+        # Second, with a comma-joined scope that includes repo:foo. The
+        # pre-fix bug stored scope as ["repo:foo,resource:bar"] (single
+        # token) and the conflict check silently missed it. After the fix
+        # the scope is comma-split, so this DOES detect the conflict --
+        # which (as of 2026-05-19) soft-serializes rather than hard-fails.
+        # Exit 0, item enqueued, ready_now=false, serialized_after points
+        # at the running peer.
         r2 = _add(env, "second", ["repo:foo,resource:bar"])
-        assert r2.returncode == 3, (
-            f"expected exit 3 (HARD-FAIL conflict), got {r2.returncode}\n"
+        assert r2.returncode == 0, (
+            f"expected exit 0 (soft-serialize), got {r2.returncode}\n"
             f"  stdout: {r2.stdout}\n"
             f"  stderr: {r2.stderr}"
         )
-        # And nothing should have been enqueued.
+        d2 = json.loads(r2.stdout)
+        assert d2["ready_now"] is False, d2
+        assert d1["id"] in d2["serialized_after"], d2
+        # Both items are in the queue.
         ls = _run(env, "queue", "list", "--json", check=True)
         items = json.loads(ls.stdout)
-        # Only the first item exists.
-        assert len(items) == 1, items
-        assert items[0]["id"] == d1["id"]
+        assert len(items) == 2, items
 
 
 # ---------------------------------------------------------------------------

@@ -25,10 +25,14 @@ Three layers of task coordination:
 Before invoking `Agent`:
 
 ```bash
-# 1. Add to the queue. Hard-fails (exit 3) if scope conflicts with a running item.
+# 1. Add to the queue. Always succeeds; if scope conflicts with a running peer
+#    the new item is soft-serialized behind it (ready_now=false,
+#    serialized_after records the peer) and the caller is told to wait.
 session-task queue add "do the thing" --scope repo:foo --summary "~10 word"
 
-# 2. If add returned ready_now=true, atomically claim it as running.
+# 2. If add returned ready_now=true, atomically claim it as running. If
+#    ready_now=false, do NOT spawn an agent yet -- the main loop will pick
+#    it up when the running peer finishes.
 session-task queue register q-2026-05-01-XXXX
 
 # 3. Spawn the Agent with `Queue item: q-2026-05-01-XXXX` in the prompt.
@@ -39,6 +43,11 @@ session-task queue done q-2026-05-01-XXXX
 
 `session-task queue spawn-check <id>` is a read-only re-check (exit 0 = clear, exit 2 = blocked
 or not found).
+
+**Note on `--force-enqueue`**: deprecated no-op (preserved for back-compat). Pre-2026-05-19
+the default `queue add` hard-failed (exit 3) on scope overlap with a running peer, and
+`--force-enqueue` was needed to enqueue anyway. The default now soft-serializes, so the
+flag is identical to omitting it.
 
 ## Files
 

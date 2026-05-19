@@ -235,7 +235,11 @@ def test_unwedge_refused_on_pending():
 
 
 def test_wedged_item_still_owns_scope():
-    """A wedged item blocks a peer item with overlapping scope from spawning."""
+    """A wedged item blocks a peer item with overlapping scope from spawning.
+
+    Pre-2026-05-19 this hard-failed (exit 3). Now soft-serializes: peer is
+    enqueued, ready_now=false, serialized_after points at the wedged owner.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         a = _add(env, "first", ["repo:scope-share"], "--summary", "a")
@@ -244,15 +248,17 @@ def test_wedged_item_still_owns_scope():
         _run(env, "queue", "wedge", a_id, "--reason", "context_limit",
              "--silent", expect_exit=0)
 
-        # Adding a peer with the same scope must hard-fail (running scope
-        # conflict) since wedged items still own their scope.
+        # Adding a peer with the same scope soft-serializes (exit 0,
+        # blocked for spawn) since wedged items still own their scope.
         r = _run(env, "queue", "add", "second", "--scope", "repo:scope-share",
                  "--summary", "b", "--json")
-        # `queue add` exit 3 = HARD REFUSED (scope overlaps RUNNING/wedged).
-        assert r.returncode == 3, (
-            f"expected exit 3 (scope conflict with wedged peer), got "
+        assert r.returncode == 0, (
+            f"expected exit 0 (soft-serialize behind wedged peer), got "
             f"{r.returncode}: stderr={r.stderr!r}"
         )
+        d = json.loads(r.stdout)
+        assert d["ready_now"] is False, d
+        assert a_id in d["serialized_after"], d
 
 
 def test_wedged_item_blocks_spawn_check_of_pending_peer():

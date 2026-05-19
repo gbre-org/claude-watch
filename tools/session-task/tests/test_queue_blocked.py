@@ -264,7 +264,11 @@ def test_unblock_refused_on_wedged():
 
 
 def test_blocked_item_still_owns_scope():
-    """A blocked item blocks a peer item with overlapping scope from spawning."""
+    """A blocked item blocks a peer item with overlapping scope from spawning.
+
+    Pre-2026-05-19 this hard-failed (exit 3). Now soft-serializes: peer is
+    enqueued, ready_now=false, serialized_after points at the blocked owner.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         a = _add(env, "first", ["repo:bscope-share"], "--summary", "a")
@@ -273,14 +277,18 @@ def test_blocked_item_still_owns_scope():
         _run(env, "queue", "block", a_id, "--reason", "ext blocker",
              "--silent", expect_exit=0)
 
-        # Adding a peer with the same scope must hard-fail (running-scope
-        # conflict) since blocked items still own their scope.
+        # Adding a peer with the same scope soft-serializes since blocked
+        # items still own their scope (the blocked owner stays in
+        # serialized_after; ready_now=false).
         r = _run(env, "queue", "add", "second", "--scope",
                  "repo:bscope-share", "--summary", "b", "--json")
-        assert r.returncode == 3, (
-            f"expected exit 3 (scope conflict with blocked peer), got "
+        assert r.returncode == 0, (
+            f"expected exit 0 (soft-serialize behind blocked peer), got "
             f"{r.returncode}: stderr={r.stderr!r}"
         )
+        d = json.loads(r.stdout)
+        assert d["ready_now"] is False, d
+        assert a_id in d["serialized_after"], d
 
 
 def test_blocked_item_blocks_spawn_check_of_pending_peer():
