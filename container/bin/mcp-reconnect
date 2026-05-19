@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# mcp-reconnect — reconnect stale MCP sessions by injecting /mcp into
+# the Claude Code tmux pane.
+#
+# Usage:
+#   mcp-reconnect [--pane <pane>] [--verify] [--timeout <secs>]
+
+set -euo pipefail
+
+PANE="${CLAUDE_WATCH_PANE:-claude-container:0.0}"
+VERIFY=0
+TIMEOUT=5
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --pane)
+            [ "$#" -lt 2 ] && { printf 'mcp-reconnect: --pane requires an argument\n' >&2; exit 2; }
+            PANE="$2"; shift 2 ;;
+        --verify)
+            VERIFY=1; shift ;;
+        --timeout)
+            [ "$#" -lt 2 ] && { printf 'mcp-reconnect: --timeout requires an argument\n' >&2; exit 2; }
+            TIMEOUT="$2"; shift 2 ;;
+        --help|-h)
+            printf 'Usage: mcp-reconnect [--pane <pane>] [--verify] [--timeout <secs>]\n'
+            exit 0 ;;
+        *)
+            printf 'mcp-reconnect: unknown argument %q\n' "$1" >&2; exit 2 ;;
+    esac
+done
+
+# Verify tmux session exists
+SESSION="${PANE%%:*}"
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    printf 'mcp-reconnect: tmux session %q not found\n' "$SESSION" >&2
+    exit 1
+fi
+
+# Send /mcp to the pane
+printf '[mcp-reconnect] sending /mcp to pane %s\n' "$PANE" >&2
+tmux send-keys -t "$PANE" '/mcp' Enter
+
+# Wait for reconnection
+sleep "$TIMEOUT"
+
+# Optionally verify
+if [ "$VERIFY" = "1" ]; then
+    printf '[mcp-reconnect] verifying...\n' >&2
+    if claude mcp list 2>/dev/null | grep -q "Connected"; then
+        printf '[mcp-reconnect] MCP connected.\n' >&2
+    else
+        printf '[mcp-reconnect] warning: no Connected MCP servers found.\n' >&2
+        exit 1
+    fi
+fi
+
+printf '[mcp-reconnect] done.\n' >&2

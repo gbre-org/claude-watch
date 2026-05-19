@@ -2995,7 +2995,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 
     // --- Individual watcher health monitoring ---
     if config.watcher_monitor.enabled {
-        let entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
+        let mut entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
+        if let Some(ref extra) = config.watcher_monitor.watchers_config_extra {
+            entries.extend(status::parse_watchers_config(extra));
+        }
         let mut any_critical_missing = false;
         let mut missing_names: Vec<String> = Vec::new();
         // Pull config values into locals once to avoid borrow-checker

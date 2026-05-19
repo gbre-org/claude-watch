@@ -30,6 +30,16 @@
 
 set -uo pipefail
 
+# Force line-buffered stdout so output is delivered immediately when run as a
+# background task (Claude Code's run_in_background captures via pipe, which
+# causes Python and even bash printf to block-buffer). We re-exec under stdbuf
+# if available and stdout is not a tty.
+if [[ ! -t 1 ]] && command -v stdbuf >/dev/null 2>&1 && [[ -z "${_CEW_STDBUF_WRAPPED:-}" ]]; then
+    export _CEW_STDBUF_WRAPPED=1
+    exec stdbuf -oL "$0" "$@"
+fi
+export PYTHONUNBUFFERED=1
+
 QUEUE_DIR="${CLAUDE_EVENT_QUEUE:-${CRON_EVENT_QUEUE:-$HOME/claude-events}}"
 LOG_DIR="${CLAUDE_EVENT_LOG_DIR:-$HOME/.config/claude-events}"
 LOG_FILE="$LOG_DIR/consumed.jsonl"
@@ -143,7 +153,7 @@ maybe_rotate_log() {
 process_event() {
     local f="$1"
     local log="$2"
-    python3 - "$f" "$log" <<'PYEOF'
+    python3 -u - "$f" "$log" <<'PYEOF'
 import json, os, sys
 src, log = sys.argv[1], sys.argv[2]
 try:

@@ -725,9 +725,10 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
     // each is bounded by its own pgrep/tmux/systemctl call. Total wall
     // clock stays close to the slowest single call instead of summing.
     let watcher_cfg = watcher::config_path();
+    let watcher_cfg_extra = watcher::config_path_extra();
     let (agents, watchers, daemon_active) = tokio::join!(
         tokio::task::spawn_blocking(active_agents::collect),
-        watcher::watcher_status(&watcher_cfg),
+        watcher::watcher_status(&watcher_cfg, watcher_cfg_extra.as_deref()),
         check_daemon_active(),
     );
     let agents = agents.unwrap_or(active_agents::ActiveAgents {
@@ -1087,23 +1088,25 @@ async fn run_task(action: TaskAction) -> i32 {
 
 async fn run_watcher(action: WatcherAction) {
     let cfg = watcher::config_path();
+    let extra = watcher::config_path_extra();
+    let extra_ref = extra.as_deref();
     let exit_code = match action {
-        WatcherAction::Run { name } => watcher::cmd_run(&cfg, &name).await,
+        WatcherAction::Run { name } => watcher::cmd_run(&cfg, extra_ref, &name).await,
         WatcherAction::List { json } => {
-            watcher::cmd_list(&cfg, json);
+            watcher::cmd_list(&cfg, extra_ref, json);
             0
         }
         WatcherAction::Status {
             json,
             unhealthy_only,
         } => {
-            watcher::cmd_status(&cfg, json, unhealthy_only).await;
+            watcher::cmd_status(&cfg, extra_ref, json, unhealthy_only).await;
             0
         }
         WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, &name, true).await,
         WatcherAction::Disable { name } => watcher::cmd_toggle(&cfg, &name, false).await,
         WatcherAction::Restart => {
-            watcher::cmd_restart(&cfg).await;
+            watcher::cmd_restart(&cfg, extra_ref).await;
             0
         }
     };

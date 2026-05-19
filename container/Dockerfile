@@ -749,21 +749,6 @@ RUN chmod +x /usr/local/bin/trust-workspace
 COPY container/bin/audit-hooks.py /usr/local/bin/audit-hooks
 RUN chmod +x /usr/local/bin/audit-hooks
 
-# cw-watcher-supervisor — container-level watcher supervisor. Reads
-# /etc/claude-code/watchers/*.toml, launches each watcher's launcher
-# script, and respawns on exit per restart_policy. Wired into
-# entrypoint.sh so watchers survive the container's full lifetime
-# rather than dying with whichever Claude Code session happened to
-# launch them. See container/bin/cw-watcher-supervisor for the full
-# policy (backoff, crash-loop guard, signal handling) and the
-# embedded `--test` mode (run via
-# `python3 container/bin/cw-watcher-supervisor --test`).
-#
-# The /claude-container:start-watchers skill is now an informational
-# probe — the supervisor is the real launcher.
-COPY container/bin/cw-watcher-supervisor /usr/local/bin/cw-watcher-supervisor
-RUN chmod +x /usr/local/bin/cw-watcher-supervisor
-
 # cwsr — in-container self-restart for the claude CLI. Upgrades
 # @anthropic-ai/claude-code via npm-global and uses `tmux respawn-pane
 # -k` to roll the inner claude process WITHOUT requiring a host-side
@@ -774,6 +759,9 @@ RUN chmod +x /usr/local/bin/cw-watcher-supervisor
 # named-volume claude versions/ dir all survive.
 COPY container/bin/cwsr /usr/local/bin/cwsr
 RUN chmod +x /usr/local/bin/cwsr
+
+COPY container/bin/mcp-reconnect /usr/local/bin/mcp-reconnect
+RUN chmod +x /usr/local/bin/mcp-reconnect
 
 # xclip — cross-host clipboard image-paste shim.
 #
@@ -840,6 +828,13 @@ RUN chmod +x /usr/local/bin/xclip
 # same bytes.
 COPY container/bin/self-clear /usr/local/bin/self-clear
 RUN chmod +x /usr/local/bin/self-clear
+
+# claude-event-watch — the canonical block-print-exit event watcher.
+# Session runs this as a `run_in_background` task; it blocks on inotifywait,
+# prints pending events, and exits. Baked so it's on PATH without depending
+# on the ~/repos bind-mount.
+COPY tools/watchers/claude-event-watch /usr/local/bin/claude-event-watch
+RUN chmod +x /usr/local/bin/claude-event-watch
 
 # Baked skills / agents / watchers — three top-level dirs in the repo
 # (container/skills/, container/agents/, container/watchers/) that ship

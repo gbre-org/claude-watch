@@ -1,78 +1,87 @@
 # container/watchers/
 
-Watcher source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each watcher is a long-running background process the in-container session can launch via the `/start-watchers` skill (defined in [`container/skills/start-watchers.md`](../skills/start-watchers.md)).
+Watcher source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each watcher is a background task the in-container session launches via the `/start-watchers` skill (defined in [`container/skills/start-watchers.md`](../skills/start-watchers.md)).
 
-> **Authoring a new watcher?** Read [`docs/adding-watchers.md`](../../docs/adding-watchers.md) — covers the fire-and-exit lifecycle contract, the metadata schema below, and a fully-worked Jenkins-build-failure example.
+> **Authoring a new watcher?** Read [`docs/adding-watchers.md`](../../docs/adding-watchers.md) — covers the block-print-exit lifecycle contract, the metadata schema below, and a fully-worked example.
 
-## Current state
+## Architecture: block-print-exit
 
-One concrete watcher ships today: `claude-event-tail` (see "Currently shipping" below). It uses the generic `lib/dir-watch.sh` primitive — future watchers that just need "fire a callback per new file in a directory" should plug in the same way (don't reimplement inotify / poll / state).
+Watchers are **session-scoped `run_in_background` Bash tasks**. They are NOT long-lived daemons managed by a supervisor. The lifecycle:
 
-The dir + README + skill exist so:
+1. The session starts the watcher via `Bash(command="claude-event-watch", run_in_background=true)`.
+2. The watcher **blocks** (typically on `inotifywait`) until its trigger condition fires.
+3. The watcher **prints** its output (one-liner per event) to stdout.
+4. The watcher **exits** (prints a restart banner, then terminates).
+5. Claude Code delivers the stdout back to the session as a task-completion notification.
+6. The session **immediately restarts** the watcher before processing the events.
 
-- The convention is documented (avoids ad-hoc one-offs).
-- The Dockerfile wiring (`COPY container/watchers/` and `COPY container/watchers/lib/`) is in place — adding a new watcher requires only dropping files in this dir and rebuilding.
-- The session-start surface in `/etc/claude-code/CLAUDE.md` references `/start-watchers` consistently.
+This "block-print-exit" contract is fundamental. A watcher that runs forever in a loop cannot deliver results to the session — Claude Code only surfaces `run_in_background` output when the task completes (exits). The reference implementation is `tools/watchers/claude-event-watch`.
+
+## Session lifecycle
+
+- **Watchers must be started on every session start** (including `/clear`, resume, context compaction). They do not survive across sessions.
+- **The `/claude-container:start-watchers` skill starts all watchers.** It is step 7 of the session-start checklist.
+- **On watcher exit-with-output**: restart immediately, then process the events.
+- **On resume after compaction**: all prior background tasks are lost. Re-run `/claude-container:start-watchers`.
 
 ## What goes here
 
 Each watcher is a pair of files:
 
-- `<name>.sh` — executable launcher script. MUST run in foreground forever (exit only on terminal failure, never daemonize). Standard output / error go to the log path from the metadata.
-- `<name>.toml` — metadata file with the on-disk schema:
+- `<name>.sh` — executable launcher script. MUST follow the block-print-exit contract (block until trigger, print results, exit). Do NOT loop forever.
+- `<name>.toml` — metadata file:
 
   ```toml
-  name = "queue-event-tail"
-  description = "Tails ~/.claude-events/ for in-container handlers"
-  launcher = "/etc/claude-code/watchers/queue-event-tail.sh"
-  restart_policy = "on-failure"  # or "always" / "never"
-  log_path = "/tmp/claude-container-watchers/queue-event-tail.log"
+  name = "claude-event-watch"
+  description = "Blocks until a claude-event arrives, prints pending events, exits"
+  launcher = "/etc/claude-code/watchers/claude-event-watch.sh"
+  restart_policy = "session"  # restarted by the session on each exit
+  log_path = "/tmp/claude-container-watchers/claude-event-watch.log"
   ```
 
-  All keys are required. `launcher` is canonically the absolute baked path (`/etc/claude-code/watchers/<name>.sh`); the `/start-watchers` skill resolves it as-is.
+  All keys are required. `launcher` is the absolute baked path (`/etc/claude-code/watchers/<name>.sh`); the `/start-watchers` skill resolves it as-is.
 
 ## How they get baked in
 
 The Dockerfile copies this directory into the image at:
 
-- `/etc/claude-code/watchers/` — the path the supervisor + the `/claude-container:start-watchers` skill probe via `ls /etc/claude-code/watchers/*.toml`.
+- `/etc/claude-code/watchers/` — the path the `/claude-container:start-watchers` skill probes via `ls /etc/claude-code/watchers/*.toml`.
 
-(Watchers do NOT land in `/etc/claude-code/plugin/` — they're not slash commands or agents, just launcher scripts the container-level supervisor runs as long-lived child processes.)
+## How they get launched
 
-## How they get launched at container start
+The session runs `/claude-container:start-watchers` at session start (step 7 of the checklist). The skill:
 
-`entrypoint.sh` spawns `/usr/local/bin/cw-watcher-supervisor` (a Python supervisor baked into the image) before tmux launches. The supervisor:
+1. Lists `*.toml` files under `/etc/claude-code/watchers/`.
+2. For each watcher, launches the `launcher` script via `Bash(command="...", run_in_background=true)`.
+3. Reports which watchers were started.
 
-1. Reads every `*.toml` under `/etc/claude-code/watchers/` (or `$CW_WATCHERS_DIR`).
-2. Spawns each watcher's launcher script with stdout/stderr appended to its `log_path`.
-3. Re-spawns on exit per `restart_policy` (`always` / `on-failure` / `never`).
-4. Backoff: exponential 1s → 2s → 4s ... capped at 30s. Resets after a child runs for >= 60s.
-5. Crash-loop protection: more than 5 restarts in a 60s window marks the watcher "stuck"; the supervisor stops respawning it until restart.
-6. Forwards SIGTERM/SIGINT to every child on shutdown.
-
-Result: watchers survive the entire container lifetime — they aren't bound to any one Claude Code session.
-
-The in-session `/claude-container:start-watchers` skill is now an **informational probe** that reports which watchers exist + whether the supervisor's launcher processes are alive. It does NOT double-launch watchers when the supervisor is already running.
-
-Operators who want to opt out of supervision (e.g. validation harnesses) set `CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0` in the container env; in that case the skill falls back to its legacy `run_in_background: true` shape (session-scoped watchers).
+On watcher exit (task completion notification from Claude Code), the session must immediately re-run the watcher. The skill handles killing stale instances before starting fresh ones.
 
 ## How to add a new watcher
 
-1. Drop `container/watchers/<name>.sh` (executable; foreground-running) and `container/watchers/<name>.toml` (metadata) in this dir.
+1. Drop `container/watchers/<name>.sh` (executable; block-print-exit) and `container/watchers/<name>.toml` (metadata) in this dir.
 2. Update this README's "Currently shipping" section (below) so the catalogue stays accurate.
 3. Rebuild the image (`make compose-build` or `docker compose build claude-container`).
 4. `docker compose up -d --force-recreate claude-container` and re-run `/start-watchers` to pick up the new entry.
 
+## The block-print-exit contract
+
+Every watcher MUST:
+
+1. **Block** — wait for its trigger (inotifywait, sleep, network listen, etc.). Do not busy-poll.
+2. **Print** — emit results to stdout in a compact format the session can parse in one glance.
+3. **Exit** — terminate cleanly (exit 0). Print a restart banner so the session knows to re-invoke.
+
+A watcher that loops forever **breaks the delivery model**. Claude Code only surfaces `run_in_background` output on task exit. A forever-loop watcher accumulates output that never reaches the session.
+
 ## Test conventions
 
 - Tests live in [`container/tests/`](../tests/). The baseline [`container/tests/baked-dirs.test`](../tests/baked-dirs.test) asserts this README exists at the baked path; extend it as concrete watchers land (per-watcher: `.sh` is executable, `.toml` parses, metadata fields are present).
-- The `/start-watchers` skill itself is exercised by [`container/tests/skill-restart-discovery.test`](../tests/skill-restart-discovery.test), which also covers `start-watchers.md` discoverability through `--plugin-dir`.
+- The `/start-watchers` skill itself is exercised by [`container/tests/skill-restart-discovery.test`](../tests/skill-restart-discovery.test).
 
-## Why "no watchers by default" is the deliberate design
+## Why watchers are session-scoped (not supervised)
 
-The container is a **code-writing sandbox**, not the host's automation hub. Host-side watchers (Signal DM tail, claude-event tail, torrent watch, podcast watch, etc.) belong on the host, run by the operator's host Claude Code session, with host-side credentials and host-side state. Bringing them into the container would (a) duplicate state, (b) require credential bind-mounts that widen the blast radius, and (c) muddle the container-vs-host boundary the baked CLAUDE.md works hard to keep crisp.
-
-When concrete container-scoped watcher use-cases emerge (e.g. an in-container queue-event tail that surfaces queue items posted by host-side cron jobs into the in-container session, or an MCP-bridge health pinger), they'll land here as proper baked entries.
+The container is a **code-writing sandbox**, not the host's automation hub. Background tasks in Claude Code are inherently session-scoped — they exist in the context of a running conversation. A watcher that outlives its session has no one to deliver results to. The block-print-exit model keeps watchers tightly coupled to the session that consumes their output.
 
 ## Reusable primitives
 
@@ -113,17 +122,22 @@ Optional env:
 - `WATCH_STATE_FILE` — override the state-file path (default `/tmp/dir-watch-<sha1 of WATCH_DIR>.state`). Lines are tab-separated `<filename>\t<mtime>\t<inode>`. The poll fallback diffs against this snapshot to detect created / modified / deleted. The legacy "filenames only" format is auto-migrated on startup with no spurious fires.
 - `WATCH_DISABLE_INOTIFY` — set to any non-empty value to force the poll fallback even when `inotifywait` is on PATH (tests only).
 
-The primitive prints `dir-watch: fire <action> <basename>` to stdout per fire, plus whatever the callback itself emits. It runs foreground forever — the supervisor (`/start-watchers`) keeps the process alive per the watcher's `restart_policy`.
+The primitive prints `dir-watch: fire <action> <basename>` to stdout per fire, plus whatever the callback itself emits.
+
+**Note:** `lib/dir-watch.sh` uses a forever-loop internally and is designed for use by watcher scripts that wrap it with their own exit logic. Standalone watchers (like `claude-event-watch`) implement the block-print-exit contract directly without using this lib.
 
 ## Currently shipping
 
-### `claude-event-tail`
+### `claude-event-watch`
 
-Tails `~/claude-events/*.json` and surfaces each event to the in-container session via stdout. One-liner shape: `EVENT[<source>/<tag>] <first-60-chars-of-message…>` (mirrors the host's `claude-event-watch`). Compact JSON for each event is also appended to `~/.config/claude-events/consumed.jsonl` for later inspection.
+The canonical event-bus watcher. Blocks on `inotifywait` until a `.json` event file appears in `~/claude-events/` (or `$CLAUDE_EVENT_QUEUE`), debounces (default 30s), prints all pending events as one-liners (`EVENT[<source>/<tag>] <message>`), deletes processed files, and exits.
 
-- Launcher: `/etc/claude-code/watchers/claude-event-tail.sh`
-- Metadata: `/etc/claude-code/watchers/claude-event-tail.toml`
-- Restart policy: `always`
-- Log path: `/tmp/claude-container-watchers/claude-event-tail.log`
+- Reference implementation: `tools/watchers/claude-event-watch`
+- Baked launcher: `/etc/claude-code/watchers/claude-event-watch.sh`
+- Metadata: `/etc/claude-code/watchers/claude-event-watch.toml`
+- Restart policy: `session` (restarted by the session on each exit)
+- Log path: `/tmp/claude-container-watchers/claude-event-watch.log`
 
-Implementation: thin wrapper that exports `WATCH_DIR=~/claude-events WATCH_PATTERN='*.json' WATCH_CALLBACK=<read-json-print-oneliner-delete>` and execs `lib/dir-watch.sh`.
+### `claude-event-tail.sh` (DEPRECATED)
+
+The old forever-loop pattern. **Do not use.** A forever-loop watcher cannot deliver results to the session because Claude Code only surfaces `run_in_background` output on task exit. This file is scheduled for removal. Use `claude-event-watch` instead.
