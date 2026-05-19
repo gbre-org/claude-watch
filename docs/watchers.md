@@ -54,6 +54,78 @@ Within a single watcher domain (e.g. event surfacing) keep ONE watcher
 running, not multiple. Duplicates race for inotify events and silently
 drop deliveries.
 
+## Watcher vs. cron — pick the right tool
+
+**Default to cron.** A watcher is a long-lived supervised process; a cron
+job is a single-shot script with no persistent footprint. Every watcher you
+add costs supervisor overhead, restart cycles, DOWN-state alerts, and mental
+load to track. Prefer the simpler primitive unless the criteria below
+genuinely require a watcher.
+
+### When cron is the right choice
+
+- **Reactivity requirement is loose.** Cron's minimum resolution is one
+  minute. For most health checks, promotion scans, index ticks, and
+  periodic event emitters, one-minute granularity is more than sufficient.
+- **Script is stateless or diffs against a tiny state file.** A script that
+  runs, compares current state to a saved cursor, emits events for any delta,
+  and exits cleanly is easy to reason about and safe to restart at any time.
+- **Failure alerting is built in.** Wrap cron jobs with `event-cron-wrapper`
+  to automatically emit a `cron-failure` claude-event on non-zero exit. No
+  extra supervision logic needed.
+- **Representative examples**: `cron-promote-candidates`, `tv-check`,
+  `index-tick`, `cron-security-check-daily`, `cron-queue-check` — all
+  periodic, stateless, fine at one-minute or coarser resolution.
+
+### When you need a watcher instead
+
+A dedicated watcher is justified when BOTH of these are true:
+
+1. **Sub-minute reactivity is required** — you need to react within seconds
+   of an external state change, AND
+2. **No kernel event mechanism fits** — inotify, systemd path units, and
+   similar facilities are not applicable for the event source.
+
+If the event source exposes a kernel mechanism (filesystem changes, socket
+events, etc.) prefer that over polling at any granularity.
+
+### Alternatives to a new watcher process
+
+Even when sub-minute reactivity is genuinely needed, reach for these before
+spawning a new supervised watcher:
+
+- **Kernel event facilities** (`inotifywait`, `fswatch`, systemd path units,
+  eBPF) — react to filesystem or socket events with zero polling. The
+  canonical `claude-event-watch` watcher is built on `inotifywait` for
+  exactly this reason.
+- **Extend an existing daemon** — `claude-watch` itself emits claude-events
+  for queue state changes, watcher-down alerts, stale-ready detections, and
+  more. If the event you need fits inside claude-watch's monitor loop,
+  extend it rather than spawning a peer process.
+- **Cron + internal poll loop** — a cron job that runs at the top of every
+  minute and internally sleeps-and-polls for up to 59 seconds achieves
+  sub-minute resolution without a new supervised process. Appropriate for
+  cases where a few extra seconds of latency are tolerable and the event
+  source has no kernel mechanism.
+
+### Watchers are a tax, not a feature
+
+Each watcher you add:
+
+- Consumes a Claude Code background-task handle slot.
+- Generates restart noise on every resume, `/clear`, and compaction.
+- Triggers DOWN-state alerts when it crashes unexpectedly.
+- Requires mental load to track across sessions.
+
+Start with cron + state-diff. Convert to a watcher only when you have
+empirical evidence that cron's one-minute resolution is insufficient and
+none of the above alternatives apply.
+
+**Concrete example:** `subtorrent-watch` was originally a long-running
+watcher polling Transmission RPC every few seconds. It was replaced with a
+`*/5` cron job: same event coverage, zero supervisor overhead, no DOWN-state
+alerts, restarts trivially on resume.
+
 ## Watcher restart on resume
 
 - **On every resume** — boot, `/clear`, restart, compaction — **kill and

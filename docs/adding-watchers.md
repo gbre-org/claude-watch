@@ -9,6 +9,10 @@ walkthrough: what a watcher IS on disk, what its lifecycle contract
 looks like, and how to drop a new one into either the host-side or
 container-side surface.
 
+> **Before you start:** confirm you actually need a watcher. See
+> [`docs/watchers.md` § Watcher vs. cron](watchers.md#watcher-vs-cron--pick-the-right-tool).
+> Cron is almost always simpler and should be the default.
+
 ## What a watcher is
 
 A watcher is a **short-lived background process** that surfaces a single
