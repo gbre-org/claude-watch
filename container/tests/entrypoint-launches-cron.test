@@ -1,43 +1,30 @@
 #!/usr/bin/env python3
-"""File-level test that entrypoint.sh launches the cron daemon at
-container boot.
+"""File-level test that the in-container cron daemon is wired into
+process-compose's service set.
 
 The Dockerfile installs cron + grants the sudoers carve-out (see
-cron-installed.test) so the uid-1000 entrypoint can start the daemon
-as root via `sudo -n /usr/sbin/cron`. Without the entrypoint-side
-launch the daemon never starts, /etc/cron.d/ entries silently never
-fire, and operators wondering "why isn't my bind-mounted cron job
-running" have no obvious failure mode to debug. This test pins the
-wiring in source so a refactor that drops the launch line fails CI
-here instead of at runtime.
+cron-installed.test) so the uid-1000 supervisor can start the daemon
+as root via `sudo -n /usr/sbin/cron`. With the migration to
+process-compose as PID 1, the cron daemon launch lives in
+process-compose.yml (the declarative service config), not in
+entrypoint.sh. The entrypoint only exports the env-var passthrough
+that disables the process when operators opt out via
+CLAUDE_CONTAINER_CRON=0.
 
 Asserts:
 
-  1. entrypoint.sh contains a CLAUDE_CONTAINER_CRON env check that
-     gates the launch (default ON so a stock container starts cron
-     by default, opt-out via CLAUDE_CONTAINER_CRON=0 for stripped-
-     down harnesses).
-  2. The gate defaults to ON (`:-1`, not `:-0`). A future refactor
-     that flips the default would silently kill scheduled jobs for
-     every existing operator.
-  3. entrypoint.sh invokes /usr/sbin/cron via `sudo -n` (passwordless
-     because the entrypoint is non-interactive; the sudoers carve-out
-     in the Dockerfile provides the NOPASSWD grant).
-  4. cron is launched in the background with setsid (detached PG so
-     the subsequent `exec tmux attach-session` doesn't block on it).
-  5. cron is invoked with `-f` (foreground; otherwise its built-in
-     daemonize fork would lose the PID we need for the cleanup trap)
-     and `-L 15` (LOG_INFO+LOG_NOTICE+LOG_WARNING — routes scheduling
-     decisions to stderr so the log file actually captures them
-     without requiring an in-container syslogd).
-  6. The cron daemon's log path lives at /tmp/claude-container-cron.log
-     (matches the per-watcher log_path convention; uid-1000-writable
-     under /tmp/).
-  7. The launch captures the cron PID into CLAUDE_CRON_PID so the
-     cleanup trap can signal it on docker stop.
-  8. The cleanup() function references CLAUDE_CRON_PID and uses
-     `sudo -n kill` to signal it (the daemon runs as root; uid 1000
-     can't signal root without CAP_KILL).
+  1. process-compose.yml declares a `crond` process.
+  2. The process invokes /usr/sbin/cron via `sudo -n` (passwordless
+     via the Dockerfile's sudoers carve-out).
+  3. cron is invoked with `-f` (foreground; otherwise process-compose
+     would lose track of the daemonized child) and `-L 15`
+     (LOG_INFO+LOG_NOTICE+LOG_WARNING — routes scheduling decisions
+     to stderr where process-compose's log_location captures them).
+  4. The process declares `restart: on_failure` so a daemon crash
+     triggers a restart.
+  5. entrypoint.sh maps the legacy CLAUDE_CONTAINER_CRON=0 opt-out
+     to the process-compose-style *_DISABLED env var, so operators
+     with existing .env files don't see a behaviour change.
 
 Run:  ./entrypoint-launches-cron.test
 """
@@ -52,6 +39,7 @@ HERE = Path(__file__).resolve().parent
 CONTAINER_DIR = HERE.parent
 
 ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+PC_CONFIG = CONTAINER_DIR / "process-compose.yml"
 
 
 failures: list[str] = []
@@ -62,124 +50,92 @@ def expect(cond: bool, msg: str) -> None:
         failures.append(msg)
 
 
+# ---------------------------------------------------------------------------
+# 1-4. process-compose.yml declares the cron daemon process.
+# ---------------------------------------------------------------------------
+expect(PC_CONFIG.is_file(), f"process-compose.yml missing at {PC_CONFIG}")
+if PC_CONFIG.is_file():
+    pc_text = PC_CONFIG.read_text(encoding="utf-8")
+
+    # 1. Service block exists.
+    pat = re.compile(r"(?m)^  crond:\s*$")
+    expect(
+        pat.search(pc_text) is not None,
+        "process-compose.yml must declare a `crond` process. Without "
+        "it the cron daemon never starts inside the container, "
+        "/etc/cron.d/ entries silently never fire, and operators "
+        "wondering 'why isn't my baked cron job running' have no "
+        "obvious failure mode to debug.",
+    )
+
+    # Extract the crond block body for further checks.
+    crond_block = re.search(
+        r"(?ms)^  crond:\s*$(.+?)(?=^  \w|^\Z)",
+        pc_text,
+    )
+    if crond_block:
+        body = crond_block.group(1)
+
+        # 2. Invokes /usr/sbin/cron via sudo -n.
+        expect(
+            re.search(r"sudo\s+-n\s+/usr/sbin/cron\b", body) is not None,
+            "process-compose.yml: crond must invoke /usr/sbin/cron "
+            "via `sudo -n` — the supervisor process runs as uid 1000 "
+            "but the cron daemon must run as root to setuid() into "
+            "the user named in each crontab line. The `-n` flag fails "
+            "fast instead of prompting for a password (the Dockerfile "
+            "ships a NOPASSWD sudoers carve-out for this path).",
+        )
+
+        # 3. cron flags: -f (foreground) + -L 15 (log level).
+        expect(
+            re.search(r"/usr/sbin/cron\s+-f\b", body) is not None,
+            "process-compose.yml: crond must invoke cron with `-f` "
+            "(foreground) so cron does NOT self-daemonize. "
+            "process-compose tracks process lifetime via the spawned "
+            "PID; if cron forks and detaches, process-compose loses "
+            "the child and can't restart on failure.",
+        )
+        expect(
+            re.search(r"/usr/sbin/cron[^\n]*\s-L\s+15\b", body) is not None,
+            "process-compose.yml: crond must invoke cron with `-L 15` "
+            "(LOG_INFO+LOG_NOTICE+LOG_WARNING). Without it cron logs "
+            "scheduling decisions only to syslog, which the container "
+            "doesn't run; process-compose's log_location captures "
+            "stderr, so without -L the logs are blank and debugging a "
+            "broken cron job becomes guesswork.",
+        )
+
+        # 4. Restart policy.
+        expect(
+            re.search(r"restart:\s*on_failure", body) is not None,
+            "process-compose.yml: crond must declare `restart: on_failure` "
+            "so a cron daemon crash triggers a restart instead of "
+            "leaving the container with a dead scheduler.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. entrypoint.sh maps legacy opt-out env var → process-compose disabled var.
+# ---------------------------------------------------------------------------
 expect(ENTRYPOINT.is_file(), f"entrypoint.sh missing at {ENTRYPOINT}")
 if ENTRYPOINT.is_file():
     text = ENTRYPOINT.read_text(encoding="utf-8")
 
-    # 1. Env-gated launch.
     expect(
         "CLAUDE_CONTAINER_CRON" in text,
-        "entrypoint.sh: missing CLAUDE_CONTAINER_CRON env gate. The "
-        "cron daemon launch must be opt-out (default ON) via this "
-        "env var so validation harnesses can disable it with "
-        "CLAUDE_CONTAINER_CRON=0 in .env.",
-    )
-
-    # 2. Default ON.
-    expect(
-        re.search(r"CLAUDE_CONTAINER_CRON:-1", text) is not None,
-        "entrypoint.sh: CLAUDE_CONTAINER_CRON must default to ON "
-        "(`${CLAUDE_CONTAINER_CRON:-1}`). Default OFF would silently "
-        "kill scheduled jobs for every existing operator who relies "
-        "on /etc/cron.d/-bind-mounted recurring jobs.",
-    )
-
-    # 3. `sudo -n /usr/sbin/cron` invocation.
-    expect(
-        re.search(r"sudo\s+-n\s+/usr/sbin/cron\b", text) is not None,
-        "entrypoint.sh: must invoke /usr/sbin/cron via `sudo -n` "
-        "(passwordless via the Dockerfile's sudoers carve-out). The "
-        "`-n` flag fails fast instead of prompting for a password "
-        "(the entrypoint is non-interactive — a password prompt "
-        "would hang the container boot).",
-    )
-
-    # 4. Background launch (setsid + & or nohup). We anchor on the
-    #    `setsid sudo cron` token, then look for a `&\n` on its own
-    #    (immediately after `</dev/null `) to confirm the command
-    #    actually ends with a backgrounding ampersand. The middle
-    #    `[\s\S]*?` is non-greedy so it doesn't eat past the real
-    #    end-of-command; `2>&1` inside the redirect is fine because
-    #    we're not trying to match its `&`.
-    cron_launch_re = re.search(
-        r"setsid\s+sudo\s+-n\s+/usr/sbin/cron[\s\S]*?</dev/null\s*&",
-        text,
+        "entrypoint.sh: must reference CLAUDE_CONTAINER_CRON (the "
+        "legacy opt-out env var) so the post-process-compose "
+        "entrypoint preserves the old contract.",
     )
     expect(
-        cron_launch_re is not None,
-        "entrypoint.sh: cron must be launched in the background with "
-        "setsid (detached PG so the entrypoint's subsequent `exec "
-        "tmux attach-session` doesn't block). Expected shape: "
-        "`nohup setsid sudo -n /usr/sbin/cron -f -L 15 >>/log 2>&1 "
-        "</dev/null &`.",
+        "CLAUDE_CONTAINER_CRON_DISABLED" in text,
+        "entrypoint.sh: must export CLAUDE_CONTAINER_CRON_DISABLED "
+        "when the legacy opt-out env var is set to 0. "
+        "process-compose.yml's `disabled:` field reads the *_DISABLED "
+        "variant; mapping at the entrypoint preserves backwards "
+        "compatibility with operator .env files.",
     )
-
-    # 5. cron flags: -f (foreground) and -L 15 (log level).
-    expect(
-        re.search(r"/usr/sbin/cron\s+-f\b", text) is not None,
-        "entrypoint.sh: cron must be invoked with `-f` (foreground) "
-        "so cron does NOT self-daemonize and fork — otherwise the "
-        "PID captured into CLAUDE_CRON_PID would point at the parent "
-        "wrapper, not the actual daemon, and the cleanup trap "
-        "couldn't signal it correctly.",
-    )
-    expect(
-        re.search(r"/usr/sbin/cron[^\n]*\s-L\s+15\b", text) is not None,
-        "entrypoint.sh: cron must be invoked with `-L 15` "
-        "(LOG_INFO+LOG_NOTICE+LOG_WARNING). Without it cron logs "
-        "scheduling decisions only to syslog, which the container "
-        "doesn't run; the log file would be empty and debugging a "
-        "broken cron job becomes guesswork.",
-    )
-
-    # 6. Log path.
-    expect(
-        "/tmp/claude-container-cron.log" in text,
-        "entrypoint.sh: cron log path should land at "
-        "/tmp/claude-container-cron.log — matches the per-watcher "
-        "/tmp/claude-container-watchers/*.log convention (uid-1000-"
-        "writable under /tmp/, captured-able by `docker compose "
-        "exec <c> cat /tmp/claude-container-cron.log`).",
-    )
-
-    # 7. PID capture.
-    expect(
-        "CLAUDE_CRON_PID" in text,
-        "entrypoint.sh: must capture cron's PID into CLAUDE_CRON_PID "
-        "(mirrors CLAUDE_WATCH_DAEMON_PID / CW_WATCHER_SUPERVISOR_PID "
-        "patterns) so the cleanup trap can signal it on docker stop.",
-    )
-
-    # 8. Cleanup trap signals via sudo (cron runs as root).
-    cleanup_match = re.search(
-        r"cleanup\(\)\s*\{(.+?)^\}",
-        text,
-        re.MULTILINE | re.DOTALL,
-    )
-    expect(
-        cleanup_match is not None,
-        "entrypoint.sh: cleanup() function missing or not parseable",
-    )
-    if cleanup_match:
-        body = cleanup_match.group(1)
-        expect(
-            "CLAUDE_CRON_PID" in body,
-            "entrypoint.sh: cleanup() must reference CLAUDE_CRON_PID "
-            "so the cron daemon drains in-flight scheduled jobs on "
-            "docker stop instead of getting SIGKILLed cold.",
-        )
-        expect(
-            re.search(
-                r"sudo\s+-n\s+kill\s+\"?\$\{?CLAUDE_CRON_PID",
-                body,
-            )
-            is not None,
-            "entrypoint.sh: cleanup() must signal cron via `sudo -n "
-            "kill` — the cron daemon runs as root and uid 1000 can't "
-            "signal root processes without CAP_KILL. Without the sudo "
-            "wrapper the kill silently fails and cron sticks around "
-            "as a zombie.",
-        )
 
 
 if failures:

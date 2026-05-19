@@ -69,6 +69,19 @@ services:
       # the host path when set (compose treats absolute paths as bind
       # mounts) or to the named-volume literal when unset.
       - ${CW_STATE_PATH:-claude-watch-state}:/var/lib/claude-watch
+      # Operator-specific cron entries (PR-watch loops, custom event
+      # emitters, anything referencing host paths). Default cron
+      # entries baked into the image at /etc/cron.d/cw-default fire
+      # regardless; this slot is for the per-host additions.
+      #
+      # Files inside the bind-mounted dir must be root:root mode 0644
+      # (cron's standard requirement for /etc/cron.d/ entries). Each
+      # file follows the standard `m h dom mon dow user command`
+      # format. Files inside the private dir are picked up by cron's
+      # recursive read of /etc/cron.d/.
+      #
+      # Uncomment + set the host path to enable:
+      # - "/host/path/to/private-cron.d/:/etc/cron.d/private/:ro"
     environment:
       # Explicit passthrough of the Claude Code SSE port set by VSCode.
       - CLAUDE_CODE_SSE_PORT

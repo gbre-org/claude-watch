@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# cw-claude-watch-launch — wrapper that execs the in-container
+# claude-watch daemon with the right env. Invoked by process-compose
+# as the `claude-watch` process (see /etc/claude-code/process-compose.yml).
+#
+# Why a wrapper instead of declaring `command: claude-watch` in
+# process-compose.yml directly: the daemon needs CLAUDE_WATCH_CONTAINER_MODE=1
+# set so its find_claude_pid() walks the npm-global install path
+# (/home/hndrewaall/.npm-global/lib/node_modules/...) instead of only
+# the ~/.local/share/claude/versions/ path. Without this the daemon
+# silently no-ops auto-respawn / agent-tracking on a fresh container
+# (before the in-container claude self-update lands a versions/<ver>/
+# entry in the named volume).
+#
+# Also pipes log output to /tmp/claude-watch.log + jsonl files so
+# operators can inspect via `docker compose exec <c> tail -f
+# /tmp/claude-watch.jsonl` — same shape as the pre-process-compose
+# entrypoint backgrounding.
+
+set -euo pipefail
+
+export CLAUDE_WATCH_CONTAINER_MODE=1
+
+# Make sure the log files exist + are uid-1000 writable. Belt-and-
+# suspenders against downstream image overrides.
+: > /tmp/claude-watch.jsonl 2>/dev/null || true
+: > /tmp/claude-watch.log 2>/dev/null || true
+
+# Stream stderr through tee so the supervisor's log_location captures
+# the trace output AND it lands in the legacy /tmp/claude-watch.log
+# file. JSONL is written by the daemon directly (config.toml's
+# log_file points at /tmp/claude-watch.jsonl).
+exec claude-watch 2>&1 | tee -a /tmp/claude-watch.log

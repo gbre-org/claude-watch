@@ -1,0 +1,38 @@
+# claude-watch default cron entries.
+#
+# Baked into the image at /etc/cron.d/cw-default. These entries run
+# inside every container deployment by default — they don't reference
+# host-specific paths, host-specific tools, or operator-specific
+# state. Anything operator-specific (PR-watch loops, custom event
+# emitters, etc.) belongs in /etc/cron.d/private, which is reserved
+# for operator bind-mounts (see container/compose.yml).
+#
+# Why bake these specifically: every claude-watch deployment wants
+# active-agents.json (the queue-minisite and friends consume it) and
+# the metrics emit (work-queue-exporter scrapes the Prom-style
+# textfile). Without these baked, every host needed separate cron
+# setup — painful on macOS Docker Desktop especially (LaunchAgents,
+# Full Disk Access prompts).
+#
+# Format: m h dom mon dow user command
+#   - user MUST be `hndrewaall` (uid 1000); the cron daemon runs as
+#     root but setuid's into the user named in each crontab line.
+#   - claude-watch is on PATH for uid 1000 (image-baked
+#     /usr/local/bin/claude-watch).
+#   - State file path /var/lib/claude-watch/active-agents.json
+#     matches the in-container path that's backed by the
+#     `claude-watch-state` named volume (or the CW_STATE_PATH host
+#     bind-mount, when set) — same path either way.
+#   - stderr from claude-watch goes to /tmp/claude-watch-cron-*.log
+#     so operators can inspect failures via
+#     `docker compose exec <c> cat /tmp/claude-watch-cron-*.log`.
+
+# Publish active-agents JSON state file (queue_id + alive per subagent)
+# every minute. Consumers: work-queue-exporter (Prom has_live_owner
+# gauge), queue-minisite (owner-status column), cron-queue-check.
+* * * * *   hndrewaall /usr/local/bin/claude-watch active-agents --json --write-state /var/lib/claude-watch/active-agents.json > /dev/null 2>>/tmp/claude-watch-cron-active-agents.log
+
+# Emit Prometheus-style metrics every minute. logger writes to syslog
+# (or stderr inside the container — cron's -L 15 flag routes stderr to
+# the supervisor log).
+* * * * *   hndrewaall /usr/local/bin/claude-watch metrics > /tmp/claude-watch-cron-metrics.log 2>&1

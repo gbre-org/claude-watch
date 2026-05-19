@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""File-level test that entrypoint.sh launches cw-watcher-supervisor.
+"""File-level test that the in-container watcher supervisor is wired
+into process-compose's service set.
 
 Without the entrypoint-side launch the supervisor never runs inside
 the container — watchers fall back to session-scoped lifetimes (the
-pre-supervisor behaviour). This test pins the wiring in source so a
-refactor that drops the launch line fails CI here instead of
-surfacing as "no watchers respawning" at runtime.
+pre-supervisor behaviour). With the migration to process-compose as
+PID 1, the supervisor's launch lives in process-compose.yml (the
+declarative service config), not in entrypoint.sh. The entrypoint
+only exports the env-var passthrough that disables the process when
+operators opt out via CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0.
 
 Asserts:
-  1. entrypoint.sh contains a CLAUDE_CONTAINER_WATCHER_SUPERVISOR env
-     check that gates the launch (default ON so a stock container
-     supervises by default).
-  2. entrypoint.sh invokes /usr/local/bin/cw-watcher-supervisor in
-     the background (detached: `&` + setsid or nohup pattern) so the
-     subsequent `exec tmux attach-session` doesn't block on it.
-  3. The supervisor's log path lives under /tmp/claude-container-watchers/
-     (matches the per-watcher log_path convention in the .toml files).
-  4. The cleanup trap signals CW_WATCHER_SUPERVISOR_PID so docker stop
-     drains the supervisor's children before SIGKILL.
+  1. process-compose.yml declares a `cw-watcher-supervisor` process.
+  2. The supervisor process invokes /usr/local/bin/cw-watcher-supervisor
+     (the baked path).
+  3. The supervisor process declares `restart: on_failure` so a
+     crash triggers a restart.
+  4. entrypoint.sh maps the legacy CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0
+     opt-out to the process-compose-style *_DISABLED env var, so
+     operators with existing .env files don't see a behaviour change.
 
 Run:  ./entrypoint-launches-supervisor.test
 """
@@ -32,6 +33,7 @@ HERE = Path(__file__).resolve().parent
 CONTAINER_DIR = HERE.parent
 
 ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+PC_CONFIG = CONTAINER_DIR / "process-compose.yml"
 
 
 failures: list[str] = []
@@ -42,109 +44,70 @@ def expect(cond: bool, msg: str) -> None:
         failures.append(msg)
 
 
+# ---------------------------------------------------------------------------
+# 1-3. process-compose.yml declares the supervisor process.
+# ---------------------------------------------------------------------------
+expect(PC_CONFIG.is_file(), f"process-compose.yml missing at {PC_CONFIG}")
+if PC_CONFIG.is_file():
+    pc_text = PC_CONFIG.read_text(encoding="utf-8")
+
+    # 1. Service block exists.
+    pat = re.compile(r"(?m)^  cw-watcher-supervisor:\s*$")
+    expect(
+        pat.search(pc_text) is not None,
+        "process-compose.yml must declare a `cw-watcher-supervisor` "
+        "process. Without it the supervisor never runs inside the "
+        "container and watchers fall back to session-scoped lifetimes.",
+    )
+
+    # 2. Invokes the baked supervisor binary. Find the block body and
+    # check the `command:` line within it.
+    sup_block = re.search(
+        r"(?ms)^  cw-watcher-supervisor:\s*$(.+?)(?=^  \w|^\Z)",
+        pc_text,
+    )
+    if sup_block:
+        body = sup_block.group(1)
+        expect(
+            "/usr/local/bin/cw-watcher-supervisor" in body,
+            "process-compose.yml: cw-watcher-supervisor must invoke "
+            "/usr/local/bin/cw-watcher-supervisor (the path the "
+            "Dockerfile bakes the supervisor at). Without this the "
+            "supervisor never starts.",
+        )
+        expect(
+            re.search(r"restart:\s*on_failure", body) is not None,
+            "process-compose.yml: cw-watcher-supervisor must declare "
+            "`restart: on_failure` so a supervisor crash triggers a "
+            "restart instead of a half-dead container.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4. entrypoint.sh maps legacy opt-out env var → process-compose disabled var.
+# ---------------------------------------------------------------------------
 expect(ENTRYPOINT.is_file(), f"entrypoint.sh missing at {ENTRYPOINT}")
 if ENTRYPOINT.is_file():
     text = ENTRYPOINT.read_text(encoding="utf-8")
 
-    # 1. Env-gated launch (default ON).
+    # The mapping `CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0` →
+    # `export CLAUDE_CONTAINER_WATCHER_SUPERVISOR_DISABLED=true` must
+    # be present so operators with existing .env files don't see a
+    # behaviour change post-migration.
     expect(
         "CLAUDE_CONTAINER_WATCHER_SUPERVISOR" in text,
-        "entrypoint.sh: missing CLAUDE_CONTAINER_WATCHER_SUPERVISOR "
-        "env gate. The supervisor launch must be opt-out (default ON) "
-        "via this env var so validation harnesses can disable it with "
-        "CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0 in .env.",
-    )
-
-    # The gate must default to ON (`:-1`, not `:-0`). A future
-    # refactor that flips the default would silently kill watcher
-    # supervision for every existing operator.
-    default_on = re.search(
-        r"CLAUDE_CONTAINER_WATCHER_SUPERVISOR:-1",
-        text,
+        "entrypoint.sh: must reference CLAUDE_CONTAINER_WATCHER_SUPERVISOR "
+        "(the legacy opt-out env var) so the post-process-compose "
+        "entrypoint preserves the old contract.",
     )
     expect(
-        default_on is not None,
-        "entrypoint.sh: CLAUDE_CONTAINER_WATCHER_SUPERVISOR must "
-        "default to ON (`${CLAUDE_CONTAINER_WATCHER_SUPERVISOR:-1}`). "
-        "Default OFF (`:-0`) would silently break the supervisor for "
-        "every existing operator.",
+        "CLAUDE_CONTAINER_WATCHER_SUPERVISOR_DISABLED" in text,
+        "entrypoint.sh: must export CLAUDE_CONTAINER_WATCHER_SUPERVISOR_DISABLED "
+        "when the legacy opt-out env var is set to 0. "
+        "process-compose.yml's `disabled:` field reads the *_DISABLED "
+        "variant; mapping at the entrypoint preserves backwards "
+        "compatibility with operator .env files.",
     )
-
-    # 2. The launch line invokes the baked supervisor path in the
-    # background (the entrypoint's subsequent `exec tmux attach-session`
-    # must not block on it).
-    expect(
-        "/usr/local/bin/cw-watcher-supervisor" in text,
-        "entrypoint.sh: must invoke /usr/local/bin/cw-watcher-supervisor "
-        "(the path the Dockerfile bakes the supervisor at). Without "
-        "this line the supervisor never starts and watchers fall back "
-        "to session-scoped lifetimes.",
-    )
-
-    # Look for a `&` after the supervisor invocation OR a setsid+nohup
-    # idiom (the entrypoint uses both nohup AND setsid for the
-    # claude-watch daemon — mirror that here so we don't quietly
-    # accept a foreground invocation that'd block the entrypoint).
-    sup_launch_block = re.search(
-        r"(?s)nohup\s+setsid\s+/usr/local/bin/cw-watcher-supervisor[^&]*&",
-        text,
-    )
-    # Accept the slightly looser shape `setsid cw-watcher-supervisor &`
-    # too (some operators may simplify); the load-bearing bit is
-    # `&` after the supervisor invocation.
-    sup_launch_loose = re.search(
-        r"(?s)setsid[^&\n]*cw-watcher-supervisor[^&\n]*[\\\s]*"
-        r"[^&\n]*&",
-        text,
-    )
-    expect(
-        sup_launch_block is not None or sup_launch_loose is not None,
-        "entrypoint.sh: cw-watcher-supervisor must be launched in the "
-        "background with setsid (so it's detached from the entrypoint's "
-        "PG and survives the subsequent `exec tmux attach-session`). "
-        "Expected shape: `nohup setsid /usr/local/bin/cw-watcher-supervisor "
-        ">>/path/log 2>&1 </dev/null &` (mirrors the claude-watch "
-        "daemon spawn).",
-    )
-
-    # 3. Log path under /tmp/claude-container-watchers/.
-    expect(
-        "/tmp/claude-container-watchers/supervisor.log" in text,
-        "entrypoint.sh: supervisor log should land at "
-        "/tmp/claude-container-watchers/supervisor.log (matches the "
-        "per-watcher log_path convention; uid-1000-writable under "
-        "/tmp/).",
-    )
-
-    # 4. PID capture + cleanup-trap signal.
-    expect(
-        "CW_WATCHER_SUPERVISOR_PID" in text,
-        "entrypoint.sh: must capture the supervisor's PID into "
-        "CW_WATCHER_SUPERVISOR_PID (mirrors the CLAUDE_WATCH_DAEMON_PID "
-        "pattern) so the cleanup trap can signal it on docker stop.",
-    )
-
-    # The cleanup function must reference the PID variable. Match
-    # within the cleanup() body — easiest shape is `kill "$CW_WATCHER_SUPERVISOR_PID"`.
-    cleanup_match = re.search(
-        r"cleanup\(\)\s*\{(.+?)^\}",
-        text,
-        re.MULTILINE | re.DOTALL,
-    )
-    expect(
-        cleanup_match is not None,
-        "entrypoint.sh: cleanup() function missing or not parseable",
-    )
-    if cleanup_match:
-        body = cleanup_match.group(1)
-        expect(
-            "CW_WATCHER_SUPERVISOR_PID" in body,
-            "entrypoint.sh: cleanup() must signal "
-            "CW_WATCHER_SUPERVISOR_PID so the supervisor drains its "
-            "launcher children on docker stop instead of getting "
-            "SIGKILLed cold (children would leak as orphans for tini "
-            "to reap).",
-        )
 
 
 if failures:

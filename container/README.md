@@ -216,31 +216,72 @@ artifacts.
 
 **Signal handling**: the wrapper traps `SIGTERM`/`SIGINT` on the host and forwards them via `docker kill --signal=...` to a per-PID container name (`claude-tmux-$$`), so `Ctrl-C` from the host cleanly tears down the in-container tmux session.
 
-## PID 1 supervisor (tini)
+## PID 1 supervisor (process-compose)
 
-The image installs [`tini`](https://github.com/krallin/tini) from the Debian
-`bookworm` apt repo and runs it as PID 1. The Dockerfile `ENTRYPOINT` is:
+The image runs [`process-compose`](https://github.com/F1bonacc1/process-compose) as PID 1. The Dockerfile `ENTRYPOINT` is:
 
 ```
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/claude-tmux-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/claude-tmux-entrypoint"]
 ```
 
-Why tini, not bash-as-PID-1:
+The entrypoint script does setup (PATH wiring, hooks-shim generation, trust-workspace pre-seeding) then `exec`s `/usr/local/bin/process-compose up --config /etc/claude-code/process-compose.yml --tui=false --no-server`. From there, process-compose is PID 1 of the container.
 
-- **Zombie reap**: `entrypoint.sh` spawns the in-container `claude-watch` daemon via `nohup setsid claude-watch ... &` so it survives the entrypoint's subsequent `exec tmux attach-session`. Anything that daemon (or any MCP subprocess, host-bash bridge call, etc.) leaves orphaned re-parents to PID 1. Without a real init, those orphans accumulate as `<defunct>` entries in `ps` and never get reaped. tini handles `SIGCHLD` and reaps them.
-- **Signal forwarding**: bash's default signal handling around `exec tmux attach-session` is fragile — `docker stop` sends SIGTERM to PID 1, and a bash-as-PID-1 in an `exec` chain can race against tmux for the signal. tini delivers signals to its child cleanly, so the entrypoint's `trap cleanup TERM INT` actually fires.
-- **Exit status propagation**: tini exits with its child's status (or `128 + signal` on signalled exit), so `docker stop --time=N` returns the expected exit code instead of whatever bash decides under exec.
+`process-compose` supervises the in-container service set declared in `/etc/claude-code/process-compose.yml`:
 
-The entrypoint script keeps its existing `trap cleanup TERM INT` block (tini forwards the signal into the script's process, the trap runs, the cleanup kills the tmux session + the daemon PID before exit).
+| Process | Role | Restart policy |
+|---------|------|----------------|
+| `setup-tmux-session` | Oneshot — creates the in-container tmux session in detached mode. | `restart: no` |
+| `tmux-attach` | Interactive foreground process — attaches stdin/stdout/stderr to the tmux session. | `restart: no` |
+| `claude-watch` | Long-running daemon — observes the in-container claude pane via tmux capture-pane. | `restart: on_failure` |
+| `crond` | Long-running daemon — runs `/etc/cron.d/cw-default` + any operator entries in `/etc/cron.d/private/`. | `restart: on_failure` |
+| `cw-watcher-supervisor` | Long-running supervisor — respawns the operator-baked watchers (claude-event-tail etc.). | `restart: on_failure` |
 
-### Future-tier supervision
+Why process-compose (escalation past the prior tini threshold):
 
-tini is a single-process supervisor — it doesn't restart its child, doesn't model service dependencies, and doesn't ship per-service health checks. That's the right tier for today: the container has two long-running children that the entrypoint manages directly (the tmux session's claude pane, plus the headless `claude-watch` daemon). When the container grows past two services — metrics exporters, an in-container queue tail, a host-bash bridge proxy, anything that wants declared dependencies and restart-on-failure — tini stops being enough. The next tier is a real supervisor. Two candidates worth evaluating at that point:
+- **Restart on failure**: a daemon crash (claude-watch panic, crond SIGSEGV) triggers a restart automatically instead of leaving a half-dead container.
+- **`depends_on` ordering**: `claude-watch` waits for `setup-tmux-session` to complete before starting — so it never observes a missing tmux session at boot.
+- **Zombie reap + signal forwarding**: process-compose forwards SIGTERM/SIGINT to its supervised processes on `docker stop`, and reaps zombies the same way tini did.
+- **Centralized logging**: each process's stdout/stderr is captured and labeled with the process name; debugging "which daemon died" is a single `docker compose exec <c> cat /tmp/claude-container-*.log` away.
 
-- **[process-compose](https://github.com/F1bonacc1/process-compose)** — single static Go binary with a docker-compose-style YAML schema (`depends_on`, health checks, restart policies, log streaming, a TUI for live process state). Mental model matches the existing `compose.yml` so an operator already comfortable with compose finds it immediately legible. Younger ecosystem than s6.
-- **[s6-overlay](https://github.com/just-containers/s6-overlay)** — the docker-community standard (LinuxServer.io et al). Mature, well-documented `/etc/cont-init.d` + `/etc/services.d` model with a learning curve that's steeper than process-compose but pays off in flexibility.
+### Disabling individual services
 
-Default lean: **process-compose** when we add the third long-running service, with **s6-overlay** as the maturity fallback if process-compose hits a gap. Don't migrate preemptively — tini is sufficient until the service count grows.
+Each long-running process honors a per-service env-var opt-out. `entrypoint.sh` maps the legacy `CLAUDE_CONTAINER_*` flags to the process-compose-style `*_DISABLED` variant so existing operator `.env` files keep working without churn:
+
+| Env var | Effect |
+|---------|--------|
+| `CLAUDE_CONTAINER_DAEMON=0` | Disables the `claude-watch` process. |
+| `CLAUDE_CONTAINER_CRON=0` | Disables the `crond` process. |
+| `CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0` | Disables the `cw-watcher-supervisor` process. |
+
+Disabling a process makes process-compose skip it entirely (`disabled: true` in the rendered config). The interactive `tmux-attach` process always runs — it's what holds the container open from docker's perspective.
+
+### Why not s6-overlay
+
+[s6-overlay](https://github.com/just-containers/s6-overlay) is the docker-community standard supervisor (LinuxServer.io et al). It's strictly more flexible than process-compose (richer `/etc/cont-init.d` + `/etc/services.d` model) but has a steeper learning curve. process-compose's `depends_on` + `restart:` + YAML shape maps 1:1 onto the outer `docker-compose.yml` that operators already use — we picked it for the lower onboarding cost. If process-compose hits a gap in the future, s6-overlay is the documented fallback.
+
+## In-container cron (`/etc/cron.d/`)
+
+The image bakes default cron entries at `/etc/cron.d/cw-default` that every claude-watch deployment needs:
+
+- **active-agents writer** (every minute): runs `claude-watch active-agents --json --write-state /var/lib/claude-watch/active-agents.json`. Consumers: queue frontends, work-queue-exporter, queue-check loops.
+- **metrics emit** (every minute): runs `claude-watch metrics`. Prom-style textfile output for scrapers.
+
+Both run as the `hndrewaall` user (uid 1000) — cron itself runs as root and `setuid()`s into the user named in each `/etc/cron.d/` entry.
+
+### Operator-specific cron entries (`/etc/cron.d/private/`)
+
+Host-specific recurring jobs (PR-watch loops, custom event emitters, anything referencing operator paths) belong in `/etc/cron.d/private/` — a directory reserved for operator bind-mounts. The path exists in the image (mode 0755, root:root) so a bind-mount over it works without docker auto-creating a fresh root-owned dir with wrong perms.
+
+Operator wiring in `docker-compose.override.yml`:
+
+```yaml
+services:
+  claude-container:
+    volumes:
+      - "/path/to/host/private-cron.d/:/etc/cron.d/private/:ro"
+```
+
+The bind-mounted directory's files must be `root:root` mode `0644` (cron's standard `/etc/cron.d/` requirement). Each file follows the standard `m h dom mon dow user command` format.
 
 ## Host-only CLIs
 

@@ -139,7 +139,9 @@ test-entrypoint:
 	container/tests/agent-comms-baked.test
 	container/tests/compose-mount-modes.test
 	container/tests/state-volume-default.test
-	container/tests/tini-pid1.test
+	container/tests/process-compose-pid1.test
+	container/tests/cron-default-baked.test
+	container/tests/in-container-daemon.test
 	container/tests/iproute2-installed.test
 	container/tests/code-cli-installed.test
 	container/tests/dir-watch-script-installed.test

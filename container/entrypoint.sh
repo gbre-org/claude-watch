@@ -303,168 +303,39 @@ if [ -x /usr/local/bin/trust-workspace ]; then
 fi
 
 cleanup() {
-    # Killing the tmux session terminates both panes' child processes
-    # (pane 0's claude, pane 1's claude-watch daemon) via SIGHUP from the
-    # tmux server. This is the right shape for SIGTERM/SIGINT delivered to
-    # PID 1 (this script) from `docker stop` / wrapper signal forwarding.
+    # Best-effort cleanup before the script exits. process-compose (as
+    # PID 1) handles the real signal-forwarding + child-reaping
+    # contract — it sends SIGTERM to every supervised process on
+    # SIGTERM, then SIGKILL after a grace period. The trap here covers
+    # the narrow case where this entrypoint script is run OUTSIDE
+    # process-compose (debug shell, validation harness) and we want a
+    # clean tmux teardown.
     if tmux has-session -t "$SESSION" 2>/dev/null; then
         tmux kill-session -t "$SESSION" || true
-    fi
-    # When CLAUDE_CONTAINER_DAEMON spawned the headless claude-watch
-    # daemon, it lives outside the tmux session (background child of
-    # entrypoint, detached via setsid). Send it SIGTERM so it
-    # journals a clean daemon_stop event and saves state before docker
-    # SIGKILLs the whole container PID namespace.
-    if [ -n "${CLAUDE_WATCH_DAEMON_PID:-}" ]; then
-        kill "${CLAUDE_WATCH_DAEMON_PID}" 2>/dev/null || true
-    fi
-    # Same shape for the cw-watcher-supervisor: detached via setsid,
-    # tini at PID 1 reaps zombies but won't propagate SIGTERM into our
-    # detached process group on its own. Send the signal explicitly so
-    # the supervisor's own SIGTERM handler fires (drains its launcher
-    # children, then exits cleanly).
-    if [ -n "${CW_WATCHER_SUPERVISOR_PID:-}" ]; then
-        kill "${CW_WATCHER_SUPERVISOR_PID}" 2>/dev/null || true
-    fi
-    # Same shape for the cron daemon: detached via setsid + sudo, so
-    # tini won't reach it via process-group signalling. cron honors
-    # SIGTERM by exiting cleanly (it drains in-flight scheduled jobs
-    # then exits). The kill uses `sudo` to send the signal because
-    # the daemon runs as root (uid 1000 can't signal root processes
-    # without CAP_KILL). Best-effort: a failed kill (cron already
-    # dead, sudoers carve-out somehow gone) is silently dropped so
-    # cleanup doesn't block container shutdown.
-    if [ -n "${CLAUDE_CRON_PID:-}" ]; then
-        sudo -n kill "${CLAUDE_CRON_PID}" 2>/dev/null || true
     fi
     exit 0
 }
 trap cleanup TERM INT
 
-# Debug / one-shot exec path. Skips tmux entirely — `claude-tmux bash`,
-# `claude-tmux bash -c "..."`, and any other argv-passed command path
-# bypasses both panes. Important for the Phase 0e validation pattern
-# (non-interactive `claude --print` via `claude-tmux bash -c "..."`).
+# Debug / one-shot exec path. Skips tmux + process-compose entirely —
+# `claude-tmux bash`, `claude-tmux bash -c "..."`, and any other
+# argv-passed command path bypasses both. Important for the Phase 0e
+# validation pattern (non-interactive `claude --print` via
+# `claude-tmux bash -c "..."`).
 if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
 
-# CLAUDE_CONTAINER_WATCHER_SUPERVISOR — container-level watcher
-# supervisor (default ON).
-#
-# When != "0", spawn /usr/local/bin/cw-watcher-supervisor as a
-# background child of PID 1 (this entrypoint script). The supervisor
-# reads /etc/claude-code/watchers/*.toml and launches each watcher's
-# launcher script with respawn-on-exit semantics per restart_policy.
-#
-# Why container-level: the previous shape ran watchers only inside an
-# active Claude Code session via the /claude-container:start-watchers
-# skill, so they died when the session exited or restarted. Container-
-# level supervision lets watchers (claude-event-tail today, future
-# additions tomorrow) survive the full container lifetime. tini at PID
-# 1 reaps any zombies the supervisor's child processes leak.
-#
-# Logs land at /tmp/claude-container-watchers/supervisor.log — operator
-# inspects via `docker compose exec <c> cat /tmp/claude-container-watchers/supervisor.log`.
-# Each watcher's own stdout/stderr goes to the log_path declared in its
-# .toml (already a path under /tmp/claude-container-watchers/).
-#
-# Set CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0 in .env to disable (useful
-# for validation harnesses that don't want supervised background
-# watchers).
-if [ "${CLAUDE_CONTAINER_WATCHER_SUPERVISOR:-1}" != "0" ] \
-        && [ -x /usr/local/bin/cw-watcher-supervisor ]; then
-    mkdir -p /tmp/claude-container-watchers 2>/dev/null || true
-    : > /tmp/claude-container-watchers/supervisor.log 2>/dev/null || true
-    # nohup + setsid + & so the supervisor survives entrypoint's
-    # subsequent exec into `tmux attach-session`. tini (PID 1) reaps
-    # zombie grandchildren the supervisor and its launcher children
-    # accumulate.
-    nohup setsid /usr/local/bin/cw-watcher-supervisor \
-        >>/tmp/claude-container-watchers/supervisor.log 2>&1 </dev/null &
-    CW_WATCHER_SUPERVISOR_PID=$!
-    echo "[entrypoint] spawned cw-watcher-supervisor (pid $CW_WATCHER_SUPERVISOR_PID, log /tmp/claude-container-watchers/supervisor.log)" >&2
-fi
+# Pre-create the log dirs used by the process-compose-supervised
+# services. Each process writes to a uid-1000-writable path under /tmp/
+# so operators can `docker compose exec <c> tail -f /tmp/...` to
+# inspect. Belt-and-suspenders against downstream image overrides.
+mkdir -p /tmp/claude-container-watchers 2>/dev/null || true
+: > /tmp/claude-container-watchers/supervisor.log 2>/dev/null || true
+: > /tmp/claude-watch.jsonl 2>/dev/null || true
+: > /tmp/claude-watch.log 2>/dev/null || true
+: > /tmp/claude-container-cron.log 2>/dev/null || true
 
-# CLAUDE_CONTAINER_CRON — in-container cron daemon (default ON).
-#
-# When != "0", start the Debian vixie-cron daemon as root via the
-# sudoers carve-out (see Dockerfile `hndrewaall-cron` sudoers entry).
-# The daemon reads /etc/cron.d/, /etc/crontab, and per-user crontabs
-# from /var/spool/cron/crontabs/ and dispatches scheduled jobs. The
-# image bakes NO /etc/cron.d/ entries by default — the daemon starts
-# with an empty schedule, ready to pick up operator-supplied jobs
-# bind-mounted into /etc/cron.d/ via docker-compose.override.yml or
-# baked into a downstream image.
-#
-# Operator wiring (private downstream / override):
-#
-#   services:
-#     claude-container:
-#       volumes:
-#         - "/path/to/host/cron.d/:/etc/cron.d/:ro"
-#
-# cron jobs that emit claude-event JSON (via the in-container
-# `claude-event` CLI, which honors CLAUDE_EVENT_QUEUE) feed the
-# in-container claude-event-tail watcher with zero cross-process IPC
-# — daemon, spool, and watcher all live in the same container.
-#
-# Set CLAUDE_CONTAINER_CRON=0 in .env to skip the daemon launch
-# (validation harnesses, stripped-down containers, etc.). cron's
-# absence is a silent no-op for everything else in the stack.
-#
-# Logs land at /tmp/claude-container-cron.log — operator inspects via
-# `docker compose exec <c> cat /tmp/claude-container-cron.log`. cron
-# itself prints scheduling decisions + child stderr to syslog; the
-# `-L 15` flag enables LOG_INFO+LOG_NOTICE+LOG_WARNING and routes
-# them to stdout/stderr (capture-able by the tee below) instead of
-# requiring an in-container syslogd.
-if [ "${CLAUDE_CONTAINER_CRON:-1}" != "0" ] \
-        && command -v sudo >/dev/null 2>&1 \
-        && [ -x /usr/sbin/cron ]; then
-    : > /tmp/claude-container-cron.log 2>/dev/null || true
-    # `-f` keeps cron in the foreground (we want our own background
-    # via &, not cron's built-in self-daemonize fork which would lose
-    # the PID we need for the cleanup trap). `-L 15` routes scheduling
-    # logs to stderr so the log file captures them.
-    nohup setsid sudo -n /usr/sbin/cron -f -L 15 \
-        >>/tmp/claude-container-cron.log 2>&1 </dev/null &
-    CLAUDE_CRON_PID=$!
-    echo "[entrypoint] spawned cron daemon (pid $CLAUDE_CRON_PID, log /tmp/claude-container-cron.log)" >&2
-fi
-
-# Build the tmux session. Start detached so we can configure panes before
-# attaching, then attach at the end (blocks until session ends).
-#
-# Pane 0 uses `exec claude` (Phase 1.5 fix #2, q-2026-05-11-d7c0): bash replaces
-# itself with the claude binary, so tmux's `#{pane_current_command}` reports
-# `claude` rather than `bash`. claude-watch's status command uses
-# `pane_current_command == "claude"` as its primary pane-discovery filter
-# (claude-watch/src/status.rs); the prior wrapper `claude; echo ...; read`
-# kept bash as PID 1 of the pane, so the filter never matched and pane
-# discovery silently no-op'd. Trade-off: the pane now closes immediately when
-# claude exits (no "press Enter to close pane" UX). Acceptable for Phase 1.5;
-# Phase 2+ can revisit if users need post-exit inspection. See Phase 1f §8
-# "Bug #2" in the project doc.
-# Build the claude invocation. When the rewritten settings file exists
-# (CLAUDE_CONTAINER_REWRITE_HOOKS=1 path above), drop the user tier from
-# the settings cascade with `--setting-sources project,local` AND load
-# the rewritten shim file via `--settings`. That combo REPLACES the
-# bind-mounted host ~/.claude/settings.json's hooks (which would still
-# hit "Exec format error" against cross-arch binaries) with the
-# exec-hook-wrapped copy — without mutating the host file. Otherwise
-# launch claude bare to preserve the existing default.
-#
-# CLAUDE_AUTO_CONTINUE — when non-empty, append `--continue "$value"` so
-# the in-container claude auto-resumes the operator's prior conversation
-# at the project-key's cwd (typically CLAUDE_HOST_PROJECT_DIR) and seeds
-# the resume with the value as the initial prompt. This matches a host
-# alias of the shape:
-#     cd ~/repos && exec claude --continue "resume"
-# Default unset = bare claude (no auto-resume; existing behaviour).
-# Recommended value: "resume" (matches the host-side alias most operators
-# already use). Set CLAUDE_AUTO_CONTINUE=resume in .env to opt in.
-#
 # CLAUDE_CMD-block contract for new appenders: keep every conditional
 # `if [...]; then ... fi` immediately back-to-back (no comments between
 # blocks; blank lines also break the consecutive-if regex used by
@@ -474,19 +345,12 @@ fi
 # regex in the test file matches greedily through the final `fi\n`
 # only as long as `if`s are consecutive.
 #
-# Existing blocks:
-#   1. CLAUDE_SHIM_SETTINGS_PATH set => add --setting-sources +
-#      --settings (filters user tier, loads exec-hook-wrapped shim).
-#   2. /etc/claude-code/plugin/.claude-plugin exists => add
-#      --plugin-dir for the baked container skills + agents (plugin
-#      namespace `claude-container`; skills invoked as
-#      /claude-container:<name>, agents as subagent_type
-#      claude-container:<name>). The dir always exists in container
-#      images built from this Dockerfile; the existence check is a
-#      defensive no-op for older images.
-#   3. CLAUDE_AUTO_CONTINUE non-empty => add --continue '<value>',
-#      single-quoted so multi-word values survive the tmux-command-
-#      string shell parse as one argv element.
+# The CLAUDE_CMD construction is now consumed by
+# /usr/local/bin/cw-tmux-bootstrap (which process-compose runs as the
+# setup-tmux-session oneshot — see /etc/claude-code/process-compose.yml).
+# The conditional blocks remain here so the test parser still has a
+# canonical source to inspect; bootstrap re-runs the same logic against
+# the same env vars at session-creation time.
 CLAUDE_CMD="exec claude"
 if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
     CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
@@ -504,106 +368,52 @@ if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
     _auto_continue_quoted="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
     CLAUDE_CMD="$CLAUDE_CMD --continue $_auto_continue_quoted"
 fi
+export CLAUDE_CMD
 
-tmux new-session -d -s "$SESSION" -x 200 -y 50 \
-    "$CLAUDE_CMD"
-
-# Allow terminal passthrough so VS Code image paste (OSC sequences) reaches
-# Claude Code through tmux. Without this, tmux 3.3+ strips passthrough
-# sequences and screenshot paste silently fails.
-tmux set -g allow-passthrough on
-
-# Advertise 24-bit truecolor to tmux + the shell. Without this, tmux
-# caps output at 256 colors even when the outer terminal (VS Code,
-# iTerm2, etc) supports truecolor, because tmux's COLORTERM detection
-# never gets a value and the `RGB` capability flag is missing from the
-# default terminal-overrides. Manifested as a "lower bit depth" visual
-# difference between VS Code's terminal and ttyd, even on the same
-# tmux session, because xterm.js renders only what tmux advertises.
-tmux set -g terminal-overrides ',xterm-256color:RGB,tmux-256color:RGB'
-tmux set-environment -g COLORTERM truecolor
-
-# Optional sidebar: when CLAUDE_CONTAINER_SIDEBAR=1, split off a 25%-wide
-# right pane running the in-container claude-watch daemon. Bare
-# `claude-watch` with no subcommand runs the daemon (same invocation as
-# the host's systemd unit). If the binary fails to start (config parse
-# error, missing tmux server, etc.) we surface stderr inline AND keep the
-# pane open with a shell prompt so the failure is visible on
-# `tmux attach` instead of leaving a closed pane and an empty session.
+# Propagate the per-service opt-out env vars into process-compose's
+# environment. process-compose interpolates ${VAR:-default} in its
+# config (see /etc/claude-code/process-compose.yml `disabled:` keys),
+# so flipping these flags here disables individual supervised
+# processes without modifying the baked config.
 #
-# Default-off because the sidebar renders as a too-narrow strip in
-# typical browser terminals (the ttyd web console), and the dashboard
-# docs already say claude-only is the default single-pane shape.
-if [ "${CLAUDE_CONTAINER_SIDEBAR:-0}" = "1" ]; then
-    tmux split-window -h -t "$SESSION:0" -p 25 \
-        "echo '[pane 1] starting claude-watch (config=$CLAUDE_WATCH_CONFIG)'; \
-         claude-watch 2>&1 || { ec=\$?; \
-            echo; echo '[pane 1] claude-watch exited with code '\$ec; \
-            echo '[pane 1] dropping to shell so you can inspect; exit to close'; \
-            exec bash; }"
+# Legacy env-var aliases — historical entrypoint code used
+# CLAUDE_CONTAINER_DAEMON=0 / CLAUDE_CONTAINER_CRON=0 /
+# CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0 to skip a daemon spawn.
+# process-compose.yml uses the *_DISABLED suffix (yes-is-disabled
+# semantics). The mapping below preserves the old contract.
+if [ "${CLAUDE_CONTAINER_DAEMON:-1}" = "0" ]; then
+    export CLAUDE_CONTAINER_DAEMON_DISABLED=true
+fi
+if [ "${CLAUDE_CONTAINER_CRON:-1}" = "0" ]; then
+    export CLAUDE_CONTAINER_CRON_DISABLED=true
+fi
+if [ "${CLAUDE_CONTAINER_WATCHER_SUPERVISOR:-1}" = "0" ]; then
+    export CLAUDE_CONTAINER_WATCHER_SUPERVISOR_DISABLED=true
 fi
 
-# CLAUDE_CONTAINER_DAEMON — headless claude-watch daemon (default ON).
+# Hand off to process-compose. From here forward process-compose is
+# the supervisor — it spawns:
+#   1. cw-tmux-bootstrap (oneshot — creates tmux session detached)
+#   2. tmux-attach (foreground TTY — what the operator interacts with)
+#   3. claude-watch daemon (long-running, restart on failure)
+#   4. crond (long-running, restart on failure)
+#   5. cw-watcher-supervisor (long-running, restart on failure)
 #
-# When CLAUDE_CONTAINER_DAEMON != "0", spawn the in-container
-# `claude-watch` daemon as a background child of PID 1 (this entrypoint
-# script). stdout/stderr go to /tmp/claude-watch.jsonl + .log so the
-# operator can inspect via `docker exec <c> cat /tmp/claude-watch.jsonl`
-# (or `tail -f`). Heartbeat / pane scrape / token monitoring runs
-# automatically.
+# Flags:
+#   --config <path>    — service declarations.
+#   --tui=false        — no curses UI; logs go to stdout/stderr where
+#                        docker captures them.
+#   --no-server        — disable the HTTP/gRPC API server (we don't
+#                        use the management API; saves a port + a
+#                        background goroutine).
+#   --keep-tui=false   — redundant with --tui=false on newer versions
+#                        but kept for forward-compat.
 #
-# This is the fix recommended by claude-watch-container-diagnostic.md
-# (q-e1c1, 2026-05-14): the host-side claude-watch.service is tmux-bound
-# to the HOST tmux server and cannot reach the container's tmux server
-# at all. Without an in-container daemon, every claude-watch feature
-# (activity detection, fresh-/clear detection, resume injection,
-# self-clear, prolonged-thinking interrupt, auto-respawn) silently
-# no-ops for the cw container. Spawning the daemon inside makes those
-# features actually fire against the in-container pane.
-#
-# Why default-on: the cw container is Andrew's daily-driver Claude Code
-# instance (DM 2026-05-14 04:43 ET). Operators who don't want the
-# daemon (e.g. running the container as a one-shot validation harness
-# under `claude-tmux bash -c "..."`) set CLAUDE_CONTAINER_DAEMON=0 in
-# .env / docker-compose.override.yml.
-#
-# Why headless (no tmux pane): the sidebar pane renders as a too-narrow
-# strip in ttyd (q-2026-05-12-2e6c) — the visual is broken at typical
-# browser-terminal widths. Headless avoids that entirely; inspection
-# happens via the JSONL log.
-#
-# Why CLAUDE_WATCH_CONTAINER_MODE=1: claude-watch's find_claude_pid()
-# walks /proc/<pid>/exe looking for symlinks under
-# ${HOME}/.local/share/claude/versions/. Inside the container the npm-
-# global-installed claude exe lives at
-# /home/hndrewaall/.npm-global/lib/node_modules/@anthropic-ai/claude-code/
-# bin/claude.exe (autoupdate-v2: prefix moved from /usr/lib to
-# $HOME/.npm-global so `claude update` writes succeed as uid 1000),
-# which does NOT match the versions/ prefix until a self-update lands
-# a versions/<ver>/ entry into the named volume. Setting
-# CLAUDE_WATCH_CONTAINER_MODE=1 enables the npm-global fallback in
-# find_claude_pid_with_paths() — see CONTAINER_CLAUDE_EXE_PREFIX in
-# src/agent.rs for the literal path — so auto-respawn / agent-tracking
-# work on a fresh container (before any self-update fires).
-if [ "${CLAUDE_CONTAINER_DAEMON:-1}" != "0" ]; then
-    export CLAUDE_WATCH_CONTAINER_MODE=1
-    # Make sure the JSONL log file path is uid-1000 writable. The config
-    # already points at /tmp/claude-watch.jsonl which is writable, but
-    # belt-and-suspenders for downstream image overrides.
-    : > /tmp/claude-watch.jsonl 2>/dev/null || true
-    : > /tmp/claude-watch.log 2>/dev/null || true
-    # nohup + setsid + & so the daemon survives entrypoint's subsequent
-    # exec into tmux attach. Redirecting stderr to the .log file (config
-    # legacy_log_file) keeps tracing's stderr-formatted lines colocated
-    # with the JSONL events for post-hoc debugging.
-    nohup setsid claude-watch \
-        >>/tmp/claude-watch.log 2>&1 </dev/null &
-    CLAUDE_WATCH_DAEMON_PID=$!
-    echo "[entrypoint] spawned in-container claude-watch daemon (pid $CLAUDE_WATCH_DAEMON_PID, log /tmp/claude-watch.log, jsonl /tmp/claude-watch.jsonl)" >&2
-fi
-
-# Focus the main claude pane.
-tmux select-pane -t "$SESSION:0.0"
-
-# Attach. Blocks until the session exits.
-exec tmux attach-session -t "$SESSION"
+# `exec` replaces this script's process with process-compose so
+# signals delivered to PID 1 reach process-compose directly. The
+# `cleanup` trap above continues to fire if we're invoked OUTSIDE
+# process-compose (debug path).
+exec /usr/local/bin/process-compose up \
+    --config /etc/claude-code/process-compose.yml \
+    --tui=false \
+    --no-server
