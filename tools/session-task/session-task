@@ -32,6 +32,9 @@ Usage:
     session-task queue ready [--json]
     session-task queue done <id>
     session-task queue abandon <id> [--reason TEXT]
+    session-task queue resurrect <old-id> [--reason TEXT] [--summary TEXT]
+                                          [--keep-old] [--from-transcript PATH]
+                                          [--created-by WHO] [--json]
     session-task queue pop [--id ID]
     session-task queue register <id> [--pid N]   # claim item for spawn (gated)
     session-task queue heartbeat <id> [--pid N]  # refresh liveness on running item
@@ -1614,6 +1617,99 @@ def _find_agent_jsonl(agent_id):
     return best[1] if best else None
 
 
+def _find_transcripts_for_queue_marker(queue_id, *, freshness_secs=24 * 60 * 60):
+    """Locate JSONL transcripts whose contents reference ``Queue item: <queue_id>``.
+
+    Walks the same two-level layouts as ``_find_agent_jsonl``:
+
+        <CLAUDE_AGENTS_JSONL_ROOT>/<session-uuid>/subagents/agent-<id>.jsonl
+        <CLAUDE_AGENTS_JSONL_ROOT>/<host-token>/<session-uuid>/subagents/agent-<id>.jsonl
+
+    Mirrors the multi-dir resolver approach used by claude-watch's Rust
+    ``find_active_subagents_dirs`` (src/active_agents.rs): when the parent
+    Claude process crashes + resumes, surviving subagents write
+    continuation frames into a fresh session-uuid dir under a new project
+    slug. The original `Queue item: q-XXXX` marker lives ONLY in the
+    pre-restart transcript; the continuation file's first frame is a
+    `tool_result` (exit-code reply from the dead parent). Resurrect needs
+    the ORIGINAL spawn prompt, not the degraded continuation, so we walk
+    every recent subagents dir and grep for the marker.
+
+    Returns a list of ``Path`` objects whose contents contain the literal
+    marker, sorted by mtime ASCENDING (oldest first). The oldest is the
+    original spawn; later mtimes are post-restart continuations. Callers
+    that want the original prompt should consume `[0]`.
+
+    ``freshness_secs`` caps how far back to scan (default 24h, matching
+    ``DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS`` in src/active_agents.rs).
+    A file is included iff its mtime is within the window OR the queue id
+    is rare enough that operator override should still surface it; in
+    practice we apply the window because stale transcripts on the gomorrah
+    deploy easily exceed 100MB+ and grepping all history is wasteful.
+    """
+    if not isinstance(queue_id, str) or not queue_id:
+        return []
+    if not re.match(r"^q-[a-z0-9-]{4,64}$", queue_id):
+        return []
+    root = CLAUDE_AGENTS_JSONL_ROOT
+    if not root.is_dir():
+        return []
+    needle = f"Queue item: {queue_id}"
+    now = datetime.now(timezone.utc).timestamp()
+    hits = []  # (mtime, path)
+    # Same two-level walk as _find_agent_jsonl.
+    candidate_roots = [root]
+    try:
+        for child in root.iterdir():
+            if child.is_dir():
+                candidate_roots.append(child)
+    except OSError:
+        return []
+    seen = set()
+    for d in candidate_roots:
+        try:
+            sessions = list(d.iterdir())
+        except OSError:
+            continue
+        for sess in sessions:
+            sub = sess / "subagents"
+            if not sub.is_dir():
+                continue
+            try:
+                files = list(sub.iterdir())
+            except OSError:
+                continue
+            for f in files:
+                if not f.name.startswith("agent-") or not f.name.endswith(".jsonl"):
+                    continue
+                if f in seen:
+                    continue
+                seen.add(f)
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                age = now - st.st_mtime
+                if age > freshness_secs:
+                    continue
+                # Substring scan: faster than json-parse-every-line. The
+                # marker is short and unique enough that false positives
+                # in raw JSONL content are vanishingly unlikely.
+                try:
+                    with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            if needle in line:
+                                hits.append((st.st_mtime, f))
+                                break
+                except OSError:
+                    continue
+    # Oldest first. The pre-restart transcript carries the marker; any
+    # later continuation re-citing the marker in a follow-up user message
+    # would still sort behind it.
+    hits.sort(key=lambda t: t[0])
+    return [p for _, p in hits]
+
+
 def _archive_agent_transcript(item, *, reason="done"):
     """Best-effort archive of the spawning subagent's JSONL transcript.
 
@@ -3014,6 +3110,492 @@ def cmd_queue_abandon(args):
     )
 
     print(f"abandoned: {args.id}")
+
+
+# ---------------------------------------------------------------------------
+# Resurrect (recover a queue item whose owning agent died mid-flight).
+# ---------------------------------------------------------------------------
+#
+# After Claude Code crashes + restarts, in-flight agents die but their
+# queue items remain `running` (orphaned). PR #255 made claude-watch
+# correctly report `queue_id: null` for those ghost agents in
+# active-agents.json. The operator still has to manually reconstruct the
+# original spawn prompt and re-add the queue item.
+#
+# `queue resurrect <old-id>` automates that:
+#   * read the old item, refuse unless status is running/wedged
+#   * find the original agent transcript via `Queue item:` marker grep
+#     across all recently-active subagents/ dirs (post-restart there may
+#     be multiple session UUID dirs — prefer the OLDEST mtime, which is
+#     the pre-restart original spawn; later mtimes are post-restart
+#     continuations whose first user frame is a degraded `tool_result`
+#     reply rather than the spawn prompt).
+#   * extract the first user message text from the JSONL
+#   * create a NEW queue item with scope/summary/depends_on/priority
+#     copied + description prefixed with
+#       ## RESURRECTED FROM <old-id> at <timestamp>
+#   * abandon the old item (default; opt out with --keep-old)
+#   * stamp resurrect provenance fields on the new item so audit-trail
+#     consumers can see the resurrection lineage.
+#
+# Does NOT auto-register or auto-spawn. The caller is responsible for the
+# usual register-and-spawn flow on the new id (same as `queue add`).
+
+
+def cmd_queue_resurrect(args):
+    """Recover an orphaned running/wedged item by spawning a new queue id.
+
+    See module docstring above for the full design rationale.
+    """
+    # ------------------------------------------------------------------
+    # Step 1: read the old item under the queue lock + validate status.
+    # ------------------------------------------------------------------
+    fh, data = _queue_open_locked("r")
+    items_snapshot = list(data["items"])
+    _queue_unlock_readonly(fh)
+
+    old = next((it for it in items_snapshot if it.get("id") == args.id), None)
+    if old is None:
+        print(f"ERROR: queue item {args.id!r} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    status = old.get("status")
+    # Spec: refuse unless status in running/wedged. Done/abandoned/blocked/
+    # pending items should NOT be resurrected — `queue add` is the right
+    # tool for a re-run from scratch, and a blocked item still owns its
+    # scope so the operator must unblock first.
+    if status not in ("running", "wedged"):
+        print(
+            f"ERROR: resurrect refused: {args.id} status={status!r} "
+            f"(must be running or wedged).",
+            file=sys.stderr,
+        )
+        print(
+            f"  hint: use `session-task queue add` to re-run a "
+            f"done/abandoned/pending item from scratch.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Step 2: resolve the transcript path. Operator override beats the
+    # marker-grep search, so a stale-marker / corrupted-transcript case
+    # has an escape hatch.
+    # ------------------------------------------------------------------
+    src_path = None
+    src_source = None  # for diagnostic output
+    if args.from_transcript:
+        candidate = Path(args.from_transcript).expanduser()
+        if not candidate.is_file():
+            print(
+                f"ERROR: --from-transcript path does not exist or is not a "
+                f"file: {candidate}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        src_path = candidate
+        src_source = "override"
+    else:
+        hits = _find_transcripts_for_queue_marker(args.id)
+        if not hits:
+            print(
+                f"ERROR: no transcript found containing the marker "
+                f"`Queue item: {args.id}` under {CLAUDE_AGENTS_JSONL_ROOT} "
+                f"(searched freshness-window 24h).",
+                file=sys.stderr,
+            )
+            print(
+                f"  hint: pass --from-transcript /path/to/agent-XXXX.jsonl "
+                f"to override the auto-search, or use `session-task queue "
+                f"add` to recreate the item from scratch.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Oldest first; the pre-restart transcript has the spawn prompt.
+        src_path = hits[0]
+        src_source = (
+            f"oldest of {len(hits)} marker matches" if len(hits) > 1 else "marker match"
+        )
+
+    # ------------------------------------------------------------------
+    # Step 3: extract the prompt. We want the FIRST user message that
+    # contains the `Queue item:` marker — post-restart continuation
+    # transcripts have a degraded first frame (tool_result for the dead
+    # parent), so plain "first user message" can yield the wrong text.
+    # Fall back to the bare first user message if no marker-bearing one
+    # exists (i.e. the operator overrode --from-transcript to a file
+    # without the marker).
+    # ------------------------------------------------------------------
+    extracted = _read_first_user_prompt_with_marker(src_path, args.id)
+    if extracted is None or not extracted.get("text"):
+        # Last-ditch fallback: plain first user message. Useful when the
+        # operator points --from-transcript at a hand-written prompt or a
+        # transcript predating the queue-marker convention.
+        extracted = _read_first_user_prompt_from_jsonl(src_path)
+    if extracted is None or not extracted.get("text"):
+        print(
+            f"ERROR: could not extract a usable user prompt from "
+            f"{src_path}. The file may be empty, corrupted, or contain "
+            f"only assistant frames.",
+            file=sys.stderr,
+        )
+        print(
+            f"  hint: pass --from-transcript /path/to/known-good.jsonl "
+            f"to override, or use `session-task queue add` to type the "
+            f"prompt by hand.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    original_prompt = extracted["text"]
+
+    # ------------------------------------------------------------------
+    # Step 4: build the new description. The resurrected prompt becomes
+    # the new item's `description` (the field the main loop hands to the
+    # Agent tool at spawn time), prefixed with the resurrect-provenance
+    # header so the spawned agent immediately understands the context.
+    # The header includes the new queue id placeholder filled in below
+    # AFTER we know it; for now just stash the body and assemble after.
+    # ------------------------------------------------------------------
+    ts_iso = _fmt_ts()
+    resurrect_reason = (args.reason or "").strip() or "orphaned-after-restart"
+
+    # ------------------------------------------------------------------
+    # Step 5: under the queue lock, abandon the old item (default) and
+    # create the new item. Same atomic-RMW discipline as `queue add` +
+    # `queue abandon`. Single lock-acquire so an external observer never
+    # sees a state where the old is abandoned but the new doesn't exist
+    # (or vice versa).
+    # ------------------------------------------------------------------
+    summary = (
+        (args.summary or "").strip()
+        or (old.get("summary") or "").strip()
+        or DEFAULT_SUMMARY
+    )
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        # Re-fetch under lock: status may have changed since the snapshot.
+        old_live = next((it for it in items if it.get("id") == args.id), None)
+        if old_live is None:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                f"ERROR: queue item {args.id!r} disappeared between read "
+                f"and write. Retry.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if old_live.get("status") not in ("running", "wedged"):
+            cur = old_live.get("status")
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                f"ERROR: queue item {args.id} status changed to {cur!r} "
+                f"after the initial read. Re-run resurrect if you still "
+                f"want to recover it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Copy fields from the old item. Scope is carried verbatim — the
+        # resurrected agent runs on the same serialization slot as the
+        # dead one. Group_id is allocated fresh by reusing the existing
+        # add-flow group-merge logic so any overlapping groups merge in.
+        scope = list(old_live.get("scope", []))
+        priority = int(old_live.get("priority", 5))
+
+        # Carry depends_on forward as task: scope tokens (the canonical
+        # storage as of 2026-05-08). They're already in scope, but we
+        # surface the list explicitly in the resurrect output so the
+        # operator can see what dep edges are inherited.
+        carried_deps = [
+            _task_token_target(t) for t in scope if _is_task_token(t)
+        ]
+        carried_deps = [d for d in carried_deps if d]
+
+        # Validate deps still exist (one of them might have been pruned
+        # in the meantime). Unknown deps would otherwise stall the new
+        # item indefinitely on a phantom edge.
+        existing_ids_now = {it.get("id") for it in items}
+        unknown_deps = [d for d in carried_deps if d not in existing_ids_now]
+        if unknown_deps:
+            print(
+                f"warning: inherited deps reference unknown queue id(s): "
+                f"{','.join(unknown_deps)}. Stripping from scope.",
+                file=sys.stderr,
+            )
+            scope = [
+                t for t in scope
+                if not (_is_task_token(t) and _task_token_target(t) in unknown_deps)
+            ]
+            carried_deps = [d for d in carried_deps if d not in unknown_deps]
+
+        # Group allocation — same logic as cmd_queue_add. Resurrected
+        # items inherit the original's scope and naturally land in the
+        # same group, which is the desired behavior (the dead agent's
+        # serialization slot stays serialized).
+        overlapping = _group_ids_overlapping(items, scope)
+        if len(overlapping) == 0:
+            group_id = _new_group_id()
+        elif len(overlapping) == 1:
+            group_id = overlapping[0]
+        else:
+            group_id = _new_group_id()
+            for it in items:
+                if it.get("group_id") in overlapping:
+                    it["group_id"] = group_id
+
+        # New id with collision guard.
+        new_id = _new_id()
+        while new_id in existing_ids_now:
+            new_id = _new_id()
+
+        # Assemble the resurrected description. The header includes both
+        # the old id (provenance) and the new id (so an agent reading
+        # this transcript later can re-cite its own Queue item).
+        header = (
+            f"## RESURRECTED FROM {args.id} at {ts_iso}\n"
+            f"## new queue id: {new_id}\n"
+            f"## reason: {resurrect_reason}\n"
+            f"## source transcript: {src_path} ({src_source})\n"
+            f"\n"
+        )
+        new_description = header + original_prompt
+
+        new_item = {
+            "id": new_id,
+            "description": new_description,
+            "summary": summary,
+            "scope": scope,
+            "group_id": group_id,
+            "group_head": False,
+            "status": "pending",
+            "priority": priority,
+            "created_at": ts_iso,
+            "created_by": (args.created_by or "resurrect").strip() or "resurrect",
+            # Resurrection provenance — not consumed by the queue model
+            # itself but surfaces in `queue show` for audit.
+            "resurrected_from": args.id,
+            "resurrected_at": ts_iso,
+            "resurrected_reason": resurrect_reason,
+            "resurrect_source_transcript": str(src_path),
+            "resurrect_truncated": bool(extracted.get("truncated", False)),
+        }
+        # Carry context forward if the old item had any (e.g. auto-resume
+        # opt-outs). Operator can re-override after the fact via context-
+        # bearing tools.
+        if isinstance(old_live.get("context"), dict):
+            new_item["context"] = dict(old_live["context"])
+
+        items.append(new_item)
+
+        # Abandon the old item unless --keep-old. We do this in-process
+        # rather than calling cmd_queue_abandon to avoid re-acquiring the
+        # lock and to keep the audit / pingme emit consistent with the
+        # resurrect lifecycle.
+        old_abandoned = False
+        if not args.keep_old:
+            old_live["status"] = "abandoned"
+            old_live["abandoned_at"] = ts_iso
+            old_live["abandon_reason"] = (
+                f"resurrected as {new_id}: {resurrect_reason}"
+            )
+            old_live["group_head"] = False
+            old_live["resurrected_as"] = new_id
+            # Archive the dead agent's transcript so the operator can
+            # still inspect what the failed agent did. Best-effort — the
+            # helper silently no-ops if it can't find a record.
+            archive_path = _archive_for_item(old_live, reason="abandon")
+            if archive_path:
+                old_live["log_archive_path"] = archive_path
+            old_abandoned = True
+
+        _recompute_group_heads(items)
+
+        # Compute ready_now / serialized_after for the NEW item using
+        # the same machinery as cmd_queue_add so the caller knows whether
+        # to register-and-spawn immediately or wait.
+        locked_scopes = data.get("locked_scopes") or {}
+        ready_now = _item_is_ready(items, new_item, locked_scopes=locked_scopes)
+        lock_blockers = _locked_tokens_blocking_item(new_item, locked_scopes)
+        group_members_sorted = sorted(
+            [
+                it for it in _group_members(items, group_id)
+                if it.get("status") == "pending"
+            ],
+            key=_sort_key,
+        )
+        position = next(
+            (i + 1 for i, it in enumerate(group_members_sorted) if it["id"] == new_id),
+            -1,
+        )
+        serialized_after = [
+            it["id"] for it in group_members_sorted
+            if it["id"] != new_id and _sort_key(it) < _sort_key(new_item)
+        ]
+        running_in_group = [
+            it["id"] for it in _group_members(items, group_id)
+            if it.get("status") in RUNNING_STATUSES
+        ]
+        serialized_after = running_in_group + serialized_after
+
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+    # ------------------------------------------------------------------
+    # Step 6: audit log + lifecycle notifications. Best-effort — we
+    # never block the resurrect on a notify failure.
+    # ------------------------------------------------------------------
+    log_completed(
+        f"[queue {new_id} resurrected from {args.id}] {summary}",
+        extra={
+            "source": "queue",
+            "event": "resurrect",
+            "id": new_id,
+            "from_id": args.id,
+            "old_abandoned": old_abandoned,
+            "reason": resurrect_reason,
+            "source_transcript": str(src_path),
+        },
+    )
+
+    if old_abandoned:
+        # Mirror cmd_queue_abandon's claude-event so downstream consumers
+        # (work-queue-exporter, queue-minisite) see a normal transition.
+        _claude_event_notify(
+            tag="queue-abandoned",
+            message=(
+                f"queue abandoned: {args.id} (resurrected as {new_id})"
+            ),
+            data={
+                "queue_id": args.id,
+                "group_id": old.get("group_id"),
+                "scope": old.get("scope", []),
+                "summary": _item_summary(old),
+                "reason": f"resurrected as {new_id}",
+                "resurrected_as": new_id,
+                "created_by": old.get("created_by", ""),
+            },
+            priority="low",
+            silent=getattr(args, "silent", False),
+        )
+
+    # Build spawn_instruction the same way cmd_queue_add does.
+    if ready_now:
+        spawn_instruction = (
+            f"READY: register-and-spawn (session-task queue register {new_id})"
+        )
+    else:
+        parts = []
+        if lock_blockers:
+            parts.append("locks: " + ",".join(lock_blockers))
+        if serialized_after:
+            parts.append("queue: " + ",".join(serialized_after))
+        if parts:
+            spawn_instruction = (
+                "BLOCKED: do not spawn, wait for " + " | ".join(parts)
+            )
+        else:
+            spawn_instruction = "BLOCKED: do not spawn (no head visible)"
+
+    if args.json:
+        print(json.dumps({
+            "id": new_id,
+            "resurrected_from": args.id,
+            "old_abandoned": old_abandoned,
+            "group_id": group_id,
+            "position": position,
+            "ready_now": ready_now,
+            "serialized_after": serialized_after,
+            "lock_blockers": lock_blockers,
+            "scope": scope,
+            "summary": summary,
+            "priority": priority,
+            "depends_on": carried_deps,
+            "source_transcript": str(src_path),
+            "source": src_source,
+            "truncated": bool(extracted.get("truncated", False)),
+            "spawn_instruction": spawn_instruction,
+        }, indent=2))
+    else:
+        print(f"resurrected: {new_id} (from {args.id})")
+        print(f"  source : {src_path} ({src_source})")
+        print(f"  summary: {summary}")
+        print(f"  scope  : {','.join(scope)}")
+        print(f"  group  : {group_id}, position={position}, ready_now="
+              f"{'true' if ready_now else 'false'}")
+        if old_abandoned:
+            print(f"  old    : {args.id} abandoned")
+        else:
+            print(f"  old    : {args.id} kept ({status})")
+        if carried_deps:
+            print(f"  deps   : {','.join(carried_deps)}")
+        if lock_blockers:
+            print(f"  lock_blockers: {','.join(lock_blockers)}")
+        print(f"  next   : {spawn_instruction}")
+
+
+def _read_first_user_prompt_with_marker(jsonl_path, queue_id, *, max_chars=20_000):
+    """Pull the first user message containing ``Queue item: <queue_id>``.
+
+    Mirrors ``_read_first_user_prompt_from_jsonl`` but additionally
+    requires the marker. Post-restart continuation transcripts have a
+    degraded first frame (a tool_result reply or an Exit-code 137 user
+    message) that doesn't re-cite the queue id — taking that as "the
+    prompt" would resurrect with the wrong text. Returns the same shape
+    as the bare helper (``{"text": ..., "truncated": bool}``) or None if
+    no marker-bearing user message is found.
+    """
+    if jsonl_path is None:
+        return None
+    needle = f"Queue item: {queue_id}"
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                text = None
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    pieces = []
+                    for blk in content:
+                        if isinstance(blk, dict) and blk.get("type") == "text":
+                            t = blk.get("text")
+                            if isinstance(t, str):
+                                pieces.append(t)
+                    if pieces:
+                        text = "\n".join(pieces)
+                if text is None:
+                    continue
+                if needle not in text:
+                    continue
+                truncated = False
+                if len(text) > max_chars:
+                    text = text[:max_chars]
+                    truncated = True
+                return {"text": text, "truncated": truncated}
+    except OSError:
+        return None
+    return None
 
 
 def cmd_queue_pop(args):
@@ -5266,6 +5848,59 @@ def build_parser():
         help="Suppress the pingme lifecycle notification for this operation.",
     )
 
+    q_resurrect = qsub.add_parser(
+        "resurrect",
+        help=(
+            "Recover an orphaned running/wedged item by extracting its "
+            "original spawn prompt from the dead agent's JSONL transcript "
+            "and creating a NEW queue item with the same scope/summary/"
+            "priority/depends_on. Abandons the old item (default; "
+            "--keep-old opts out). Does NOT auto-register or auto-spawn."
+        ),
+    )
+    q_resurrect.add_argument("id", help="Queue id of the running/wedged item to resurrect.")
+    q_resurrect.add_argument(
+        "--reason",
+        help=(
+            "Optional one-line audit reason (defaults to "
+            "'orphaned-after-restart'). Appears in the abandon_reason of "
+            "the old item + the new item's resurrected_reason field."
+        ),
+    )
+    q_resurrect.add_argument(
+        "--summary",
+        help=(
+            "Override the new item's --summary. Defaults to the old "
+            "item's summary."
+        ),
+    )
+    q_resurrect.add_argument(
+        "--keep-old",
+        action="store_true",
+        help=(
+            "Do NOT abandon the old item. Use ONLY when the old item "
+            "still owns scope you want preserved (e.g. for post-mortem "
+            "inspection while the new one runs side-by-side — this WILL "
+            "block the new item on the old's scope serialization)."
+        ),
+    )
+    q_resurrect.add_argument(
+        "--from-transcript",
+        metavar="PATH",
+        help=(
+            "Override the auto-search for the source transcript. Useful "
+            "when the `Queue item:` marker grep yields no results (e.g. "
+            "the transcript was moved or compressed) or when the operator "
+            "wants to point at a hand-edited prompt file."
+        ),
+    )
+    q_resurrect.add_argument("--created-by", help="Override created_by on the new item (default: 'resurrect').")
+    q_resurrect.add_argument("--json", action="store_true")
+    q_resurrect.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the claude-event lifecycle emit for the old-item abandon.",
+    )
+
     q_pop = qsub.add_parser("pop", help="Atomically take next ready item")
     q_pop.add_argument("--id")
 
@@ -5610,6 +6245,7 @@ def main():
             "ready": cmd_queue_ready,
             "done": cmd_queue_done,
             "abandon": cmd_queue_abandon,
+            "resurrect": cmd_queue_resurrect,
             "pop": cmd_queue_pop,
             "register": cmd_queue_register,
             "heartbeat": cmd_queue_heartbeat,
