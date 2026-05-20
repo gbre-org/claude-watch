@@ -412,6 +412,19 @@ def main() -> int:
         print(json.dumps(_allow()))
         return 0
 
+    # Short-circuit: subagents are exempt from the dispatcher gate.
+    # The gate exists to force the MAIN LOOP to delegate work to agents.
+    # Once inside a subagent, the agent IS the delegated worker -- blocking
+    # its tool calls defeats the purpose. Detection: Claude Code's hook
+    # contract includes `agent_id` in the payload ONLY when the tool call
+    # originates from a subagent; main-loop calls have no `agent_id` (or
+    # empty string). Same signal used by the obligations gate.
+    raw_agent_id = payload.get("agent_id", "")
+    agent_id = raw_agent_id.strip() if isinstance(raw_agent_id, str) else ""
+    if agent_id:
+        print(json.dumps(_allow()))
+        return 0
+
     tool_input = payload.get("tool_input", {})
     if not isinstance(tool_input, dict):
         tool_input = {}
