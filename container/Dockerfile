@@ -721,6 +721,14 @@ RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/agent-msg \
             /usr/local/bin/agent-tail
 
+# eval-no-grep-watcher-output — obligations evaluator script that DENIES
+# Bash commands which pipe task/watcher output files through grep/sed/awk/
+# head/tail. Ensures the main loop reads ALL events unfiltered. Seeded as
+# a default obligation row by obligations-init (evaluator predicate,
+# decision_mode=exit_code, stdin_field=tool_input.command).
+COPY container/bin/eval-no-grep-watcher-output /usr/local/bin/eval-no-grep-watcher-output
+RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output
+
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
 # "Quick safety check" trust dialog. Invoked by entrypoint.sh before tmux

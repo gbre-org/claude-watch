@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# eval-no-grep-watcher-output — obligations evaluator that DENIES Bash
+# commands which read task/watcher output files through a filter.
+#
+# The operator wants ALL events read without filtering. This evaluator
+# detects commands that pipe task output (the background-task .output
+# files at /tmp/claude-*/tasks/*.output) through grep, sed, awk, head,
+# or tail, and denies them. Plain `cat` of the output file (no pipe) is
+# allowed.
+#
+# Protocol (obligations evaluator predicate, decision_mode=exit_code):
+#   - stdin: the Bash command text (via stdin_field: "tool_input.command")
+#   - exit 0: ALLOW
+#   - exit 1: DENY
+#   - stderr: diagnostic shown in the deny banner
+#
+# Patterns DENIED:
+#   - cat /tmp/claude-*/tasks/*.output | grep ...
+#   - grep "..." /tmp/claude-*/tasks/*.output
+#   - Any pipe (|) after a command that reads a task output file
+#   - sed/awk/head/tail operating on task output files
+#
+# Patterns ALLOWED:
+#   - cat /tmp/claude-*/tasks/*.output  (plain read, no pipe)
+#   - grep/sed/awk on non-task-output files
+#   - Any command that doesn't touch task output files
+
+set -euo pipefail
+
+# Read the command from stdin
+CMD="$(cat)"
+
+# If empty, allow (defensive)
+if [ -z "$CMD" ]; then
+    exit 0
+fi
+
+# Pattern for task output file paths. The background-task output files
+# live at /tmp/claude-<session>/tasks/<id>.output (or similar globs).
+# We match liberally: anything that looks like a task output path.
+TASK_OUTPUT_PATTERN='/tmp/claude[^|;]*tasks/[^|;]*\.output'
+
+# Check if the command references a task output file at all
+if ! echo "$CMD" | grep -qE "$TASK_OUTPUT_PATTERN"; then
+    # Command doesn't touch task output files — allow
+    exit 0
+fi
+
+# The command references a task output file. Now check whether it
+# filters the output through grep/sed/awk/head/tail.
+
+# Pattern 1: pipe after reading a task output file
+# e.g. "cat /tmp/claude-.../tasks/123.output | grep ..."
+if echo "$CMD" | grep -qE "${TASK_OUTPUT_PATTERN}[^|]*\|"; then
+    echo "DENIED: Do not filter watcher/task output. Read the full output without piping through grep/sed/awk/head/tail." >&2
+    exit 1
+fi
+
+# Pattern 2: grep/sed/awk/head/tail with a task output file as argument
+# e.g. "grep 'EVENT' /tmp/claude-.../tasks/123.output"
+if echo "$CMD" | grep -qE "^\s*(grep|egrep|fgrep|sed|awk|head|tail)\b.*${TASK_OUTPUT_PATTERN}"; then
+    echo "DENIED: Do not filter watcher/task output. Use 'cat' to read the full output without filtering." >&2
+    exit 1
+fi
+
+# Pattern 3: filter command with the path anywhere in the arguments
+# (handles cases like "grep -f patterns /tmp/claude-.../tasks/x.output")
+if echo "$CMD" | grep -qE "(grep|egrep|fgrep|sed|awk|head|tail)\b[^|;]*${TASK_OUTPUT_PATTERN}"; then
+    echo "DENIED: Do not filter watcher/task output. Use 'cat' to read the full output without filtering." >&2
+    exit 1
+fi
+
+# No filtering detected — allow
+exit 0

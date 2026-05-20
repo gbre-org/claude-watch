@@ -19,6 +19,15 @@ Currently seeded rows:
     ``~/.config/claude/agent-queue-bindings.json`` on every successful
     async-launched spawn.
 
+  - ``no_grep_watcher_output`` — prevents the main loop from filtering
+    watcher/task output through grep/sed/awk/head/tail. Uses the
+    ``evaluator`` predicate with an external script
+    (``/usr/local/bin/eval-no-grep-watcher-output``) that inspects Bash
+    commands on stdin. Commands that read task output files
+    (``/tmp/claude-*/tasks/*.output``) through a pipe or pass them as
+    args to a filter tool are DENIED. Plain ``cat`` of the file (no
+    pipe) is ALLOWED. Ensures the operator sees ALL events unfiltered.
+
 The script is best-effort: any failure (missing CLI, broken state file,
 permission error) is logged to stderr but exits 0 so the entrypoint
 keeps going. The whole obligations system is default-open on internal
@@ -41,6 +50,7 @@ import sys
 # run; existing rows with the OLD tag stay until their TTL expires
 # (or until an operator runs `obligations satisfy <id>` against them).
 SUBAGENT_QID_RUNNING_TAG = "[default-seed] subagent_queue_item_running"
+NO_GREP_WATCHER_OUTPUT_TAG = "[default-seed] no_grep_watcher_output"
 
 # Exempts that must always pass even when the gate is firing. These are
 # the recovery surface a subagent uses to either re-register a queue
@@ -178,6 +188,69 @@ def seed_subagent_queue_item_running(cli: str, *, dry_run: bool = False,
     return 0
 
 
+def seed_no_grep_watcher_output(cli: str, *, dry_run: bool = False,
+                                   force: bool = False,
+                                   verbose: bool = False) -> int:
+    """Add the no_grep_watcher_output obligation. Uses the evaluator
+    predicate to deny Bash commands that filter task/watcher output files
+    through grep/sed/awk/head/tail. Returns 0 on success."""
+    if not force and _row_already_present(cli, NO_GREP_WATCHER_OUTPUT_TAG):
+        if verbose:
+            print("no_grep_watcher_output: already seeded -- skipping",
+                  file=sys.stderr)
+        return 0
+
+    # The evaluator script receives the Bash command on stdin and
+    # exits 0 (allow) or 1 (deny). Only scoped to the main loop
+    # (subagents reading their own task output is fine; the main loop
+    # should read ALL output unfiltered).
+    predicate_params = {
+        "cmd": "/usr/local/bin/eval-no-grep-watcher-output",
+        "timeout_ms": 5000,
+        "stdin_field": "tool_input.command",
+        "decision_mode": "exit_code",
+    }
+
+    cmd = [
+        cli, "add",
+        "--tool-pattern", "Bash",
+        "--predicate", "evaluator",
+        "--params", json.dumps(predicate_params),
+        "--ttl", "0",  # non-expiring
+        "--enforcement", "gate",
+        "--deny-msg", NO_GREP_WATCHER_OUTPUT_TAG,
+        "--created-by", "obligations-init",
+        "--json",
+    ]
+
+    if dry_run:
+        print("DRY-RUN: " + " ".join(cmd))
+        return 0
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print("obligations-init: obligations add failed "
+              f"rc={proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        return 1
+    if verbose:
+        try:
+            row = json.loads(proc.stdout)
+            print(f"no_grep_watcher_output: seeded "
+                  f"id={row.get('id', '?')}", file=sys.stderr)
+        except (json.JSONDecodeError, ValueError):
+            print(f"no_grep_watcher_output: seeded "
+                  f"(rc={proc.returncode})", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="obligations-init",
@@ -212,7 +285,13 @@ def main() -> int:
     rc = seed_subagent_queue_item_running(
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
-    return rc
+
+    rc2 = seed_no_grep_watcher_output(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+
+    # Return first non-zero exit code (if any)
+    return rc or rc2
 
 
 if __name__ == "__main__":
