@@ -77,7 +77,8 @@ Metrics:
         agent's transcript" and tuning the alive threshold.
   - worktask_queue_item_ready_age_seconds{id,summary} gauge (seconds since
         `created_at` for items that are pending AND group_head=true AND
-        NOT scope-locked. Drives WorkQueueReadyStuck.)
+        NOT scope-locked AND have no `dep_blockers`. Drives
+        WorkQueueReadyStuck.)
   - worktask_queue_item_locked_age_seconds{id,summary,lock_scope} gauge
         (seconds since `created_at` for items that are pending AND
         group_head=true AND whose scope intersects locked_scopes. These
@@ -203,8 +204,10 @@ g_ready_age = Gauge(
     "worktask_queue_item_ready_age_seconds",
     (
         "Seconds since `created_at` for queue items that are pending AND "
-        "group_head=true AND NOT scope-locked (i.e. genuinely waiting for "
-        "the main loop to spawn). Drives the WorkQueueReadyStuck alert."
+        "group_head=true AND NOT scope-locked AND have empty `dep_blockers` "
+        "(i.e. genuinely waiting for the main loop to spawn). Drives the "
+        "WorkQueueReadyStuck alert. Items waiting on an upstream depends_on "
+        "task are intentionally serialized, not stuck, and are omitted."
     ),
     ["id", "summary"],
     registry=REG,
@@ -453,10 +456,15 @@ def collect():
                     ).set(age)
 
         # Ready-stuck / locked-age gauges.
-        # A pending group-head may be intentionally held by a scope lock.
-        # Lock-blocked items go to g_locked_age (NOT g_ready_age) so they
-        # don't trigger the WorkQueueReadyStuck alert.
-        if status == "pending" and it.get("group_head"):
+        # A pending group-head may be intentionally held by a scope lock
+        # OR waiting on an upstream depends_on task (dep_blockers non-empty).
+        # Both kinds of items are intentionally blocked, not stuck — they
+        # MUST NOT drive the WorkQueueReadyStuck alert. Scope-locked items
+        # go to g_locked_age (visible but silent). dep_blockers-blocked
+        # items are simply omitted from both gauges; they are already
+        # observable via the `dep_blockers` field in queue.json and the
+        # upstream item's own running/pending state.
+        if status == "pending" and it.get("group_head") and not it.get("dep_blockers"):
             created_ts = _parse_ts(it.get("created_at"))
             if created_ts:
                 age = max(0.0, (now - created_ts).total_seconds())
