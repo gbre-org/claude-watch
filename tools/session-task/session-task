@@ -1268,11 +1268,29 @@ def _claude_event_notify(tag, message, data, priority="low", silent=False):
         * ``silent=True`` (from ``--silent`` on the CLI) skips the call.
         * ``CLAUDE_EVENT_SESSION_TASK=0`` env var skips all emits
           (useful for batch scripts / test harnesses).
+        * ``SESSION_TASK_SUPPRESS_SELF_EVENTS=1`` env var skips
+          self-initiated transitions (``queue-running``, ``queue-done``)
+          while preserving unexpected ones (``queue-abandoned``,
+          ``queue-stale-ready``, ``force-start``, etc.). Intended for the
+          in-session main loop which already knows about transitions it
+          triggered via ``register`` / ``done``.
         * ``claude-event`` not on PATH -> silent no-op (not an error).
     """
     if silent:
         return None
     if os.environ.get("CLAUDE_EVENT_SESSION_TASK") == "0":
+        return None
+    # Suppress self-initiated transitions when the calling session sets the
+    # env var. The session itself just called `register` or `done` — it
+    # already knows. External callers (cron, other sessions) don't set this
+    # var and still get full events. Only queue-running and queue-done are
+    # suppressed; unexpected transitions (abandoned, stale-ready, force-start,
+    # wedged, blocked, etc.) always emit.
+    _SELF_SUPPRESSIBLE_TAGS = ("queue-running", "queue-done")
+    if (
+        os.environ.get("SESSION_TASK_SUPPRESS_SELF_EVENTS") == "1"
+        and tag in _SELF_SUPPRESSIBLE_TAGS
+    ):
         return None
     emitter = shutil.which("claude-event")
     if not emitter:

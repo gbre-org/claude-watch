@@ -96,6 +96,19 @@ case ":${PATH}:" in
 esac
 unset _local_bin
 
+# Symlink user utility scripts from the bind-mounted repos/config/ into
+# ~/.local/bin (already on PATH above) so they're discoverable by tools
+# that use shutil.which() — notably session-task's _pingme_notify().
+# The repos/ tree is bind-mounted read-only; the symlink lives on the
+# ephemeral overlay but is recreated every container start by this block.
+_user_bin="${HOME:-/home/hndrewaall}/.local/bin"
+for _script in "${HOME:-/home/hndrewaall}/repos/config/pingme"; do
+    if [ -x "$_script" ] && [ ! -e "${_user_bin}/$(basename "$_script")" ]; then
+        ln -sf "$_script" "${_user_bin}/$(basename "$_script")" 2>/dev/null || true
+    fi
+done
+unset _user_bin _script
+
 # CLAUDE_CONTAINER_REWRITE_HOOKS — opt-in entrypoint-side hook wrapper.
 #
 # When the host is non-Linux (typical: a Mac laptop bind-mounting
