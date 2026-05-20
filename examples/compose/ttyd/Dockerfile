@@ -81,7 +81,8 @@ COPY --from=frontend-builder /build/ttyd/html/dist/inline.html /tmp/index.upstre
 RUN set -eux; \
     python3 /tmp/inject-autodark.py /tmp/index.upstream.html /tmp/index.patched.html; \
     grep -q 'prefers-color-scheme' /tmp/index.patched.html; \
-    grep -q 'autodark-injected' /tmp/index.patched.html
+    grep -q 'autodark-injected' /tmp/index.patched.html; \
+    grep -q 'paste-intercept-injected' /tmp/index.patched.html
 
 # -------------------------------------------------------------------
 # Runtime stage.

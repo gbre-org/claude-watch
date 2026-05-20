@@ -197,6 +197,66 @@ JS = f"""<script id="autodark-injected">
 </script>
 """
 
+# JS: intercept Cmd+V (Mac) / Ctrl+V (non-Mac) and send the raw Ctrl+V
+# byte (\x16) to the terminal instead of triggering the browser's native
+# paste. Claude Code uses Ctrl+V as its `chat:imagePaste` keybinding; in
+# a browser-based terminal (ttyd), the browser intercepts Cmd+V/Ctrl+V
+# for clipboard paste before xterm.js ever sees the keystroke. This
+# handler bridges that gap so the raw byte reaches the terminal app.
+#
+# Users who want text paste can use Ctrl+Shift+V (ttyd's default text-
+# paste keybinding), right-click context menu, or the browser's Edit >
+# Paste menu. The trade-off is intentional: image paste into Claude Code
+# is the primary use case for this terminal.
+PASTE_INTERCEPT_JS = """<script id="paste-intercept-injected">
+(function() {
+    'use strict';
+
+    // Send a raw byte string to the terminal via ttyd's xterm.js instance.
+    // ttyd wires term.onData -> ws.send('0' + data), so triggering the
+    // terminal's data event sends the byte over the WebSocket to the PTY.
+    function sendToTerminal(data) {
+        var t = window.term;
+        if (!t) return false;
+        // xterm.js v5: _core.coreService.triggerDataEvent fires onData.
+        // This is the same path xterm.js uses internally when processing
+        // keyboard input.
+        try {
+            if (t._core && t._core.coreService &&
+                typeof t._core.coreService.triggerDataEvent === 'function') {
+                t._core.coreService.triggerDataEvent(data);
+                return true;
+            }
+        } catch (e) { /* fall through */ }
+        // Fallback: older xterm.js v5 builds expose _onData on _core.
+        try {
+            if (t._core && t._core._onData &&
+                typeof t._core._onData.fire === 'function') {
+                t._core._onData.fire(data);
+                return true;
+            }
+        } catch (e) { /* fall through */ }
+        return false;
+    }
+
+    var isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+
+    document.addEventListener('keydown', function(e) {
+        // Cmd+V on Mac, Ctrl+V on non-Mac (without Shift -- Ctrl+Shift+V
+        // is the standard ttyd text-paste keybinding and must pass through).
+        var isPaste = isMac
+            ? (e.metaKey && !e.ctrlKey && !e.shiftKey && e.key === 'v')
+            : (e.ctrlKey && !e.metaKey && !e.shiftKey && e.key === 'v');
+        if (isPaste) {
+            e.preventDefault();
+            e.stopPropagation();
+            sendToTerminal('\\x16');
+        }
+    }, true);  // useCapture=true to fire before xterm.js's own handler
+})();
+</script>
+"""
+
 
 def inject(html: str) -> str:
     """Inject CSS + JS into the <head> of ttyd's bundled HTML.
@@ -214,7 +274,7 @@ def inject(html: str) -> str:
         raise SystemExit(
             "inject-autodark.py: '</head>' marker not found in input HTML"
         )
-    injected = CSS + JS + marker
+    injected = CSS + JS + PASTE_INTERCEPT_JS + marker
     # Replace only the FIRST occurrence (xterm.js's inline JS may
     # mention the string '</head>' inside a quoted literal further
     # down).
@@ -238,7 +298,8 @@ def main() -> int:
         f"(input was {len(html)} bytes)\n"
     )
     # Sanity-check: our marker classes are present in the output.
-    for needle in ("autodark-injected", "prefers-color-scheme"):
+    for needle in ("autodark-injected", "prefers-color-scheme",
+                   "paste-intercept-injected"):
         if needle not in patched:
             sys.stderr.write(
                 f"inject-autodark.py: missing '{needle}' in output — abort\n"
