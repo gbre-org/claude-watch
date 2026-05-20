@@ -1,0 +1,36 @@
+[Unit]
+Description=claude-watch example: periodic index refresh
+# Documentation reference, not a hard requirement.
+Documentation=https://github.com/hndrewaall/claude-watch
+
+[Service]
+Type=oneshot
+
+# Customise these two for your own recurring job.
+#
+# WHATEVER_REPO_DIR - directory to cd into before running. Default: $HOME.
+# INDEX_CMD         - the actual command to run. Default: a harmless echo so
+#                     a fresh checkout doesn't fail. Replace with e.g.
+#                     `vsearch index /path/to/notes` or any other indexer.
+Environment=WHATEVER_REPO_DIR=%h
+Environment=INDEX_CMD=echo "[claude-watch-index-refresh] tick at $(date -Is) (replace INDEX_CMD with your real command)"
+
+WorkingDirectory=%h
+
+# `sh -lc` so the user's login PATH (including ~/.local/bin, ~/bin, etc.) is
+# picked up and INDEX_CMD can reference shell builtins / aliases / pipelines.
+ExecStart=/bin/sh -lc 'cd "$WHATEVER_REPO_DIR" && eval "$INDEX_CMD"'
+
+# Send stdout/stderr to the journal under this unit's identifier.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-watch-index-refresh
+
+# Don't restart on failure — the timer will fire again on its own schedule.
+Restart=no
+
+[Install]
+# A oneshot service started by a timer doesn't need an Install target, but
+# this stanza lets `systemctl --user enable claude-watch-index-refresh.service`
+# work for ad-hoc one-shot triggering.
+WantedBy=default.target
