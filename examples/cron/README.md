@@ -11,7 +11,23 @@ event notifications on the schedules you define.
 | ----------------------- | --------------------------------------------------------- |
 | `example.crontab`       | Three cron rows demonstrating the canonical patterns      |
 | `disk-space-check.sh`   | Working check-script example used by row 2 of the crontab |
+| `private-example/`      | Container-cron example for `/etc/cron.d/private` mount    |
 | `README.md`             | This file                                                 |
+
+## Host cron vs. container cron
+
+If you're running claude-watch in the **container** (from
+`container/compose.yml`), see `private-example/` instead — the canonical
+install surface for recurring tasks inside the container is the
+`/etc/cron.d/private` bind-mount, and `private-example/` covers
+end-to-end install + verify for that path.
+
+If you're running claude-watch **directly on the host** (no container),
+read on — this directory's `example.crontab` is for you.
+
+The two are complementary: a deployment can have host cron AND a
+container with private cron entries, and they fire independently into
+their respective event rings.
 
 ## What it demonstrates
 
