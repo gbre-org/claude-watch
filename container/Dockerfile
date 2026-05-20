@@ -1,8 +1,9 @@
 # claude-container — Phase 1b image
 #
 # Multi-stage build:
-#   Stage 1 ("claude-watch-builder"): rust:1-bookworm. Clones the public
-#     claude-watch source, pins to a known-good commit, runs cargo build
+#   Stage 1 ("claude-watch-builder"): rust:1-bookworm. COPYs the
+#     claude-watch source from the build context (the repo root the
+#     wrapper invokes `docker build` with) and runs cargo build
 #     --release. Output: /build/target/release/claude-watch.
 #   Stage 2 (final): debian:bookworm-slim, same as Phase 0b. Copies the
 #     built binary from stage 1 into /usr/local/bin/claude-watch.
@@ -10,24 +11,37 @@
 # Builder + final share the bookworm libc to avoid glibc-mismatch on copy
 # (see project doc §5 Phase 1 decision 4 / failure-mode list).
 #
-# Pinned claude-watch revision: ccd1599bb9d05ebe36703488a22ba62b321ff6f2
-# (origin/main as of 2026-05-11; bump deliberately in future phases).
+# Build-context shape: the claude-tmux / `docker compose build` invocations
+# pass the repo root as the context (compose.yml + examples/compose/
+# docker-compose.yml both use `context: ../..` / `context: ..` against
+# this Dockerfile). The COPY line below absorbs whatever HEAD the
+# operator's local working tree is on — the `make compose-build` /
+# `claude-tmux build` flow is responsible for doing a `git pull --rebase`
+# beforehand if the operator wants origin/main rather than a local
+# branch. No hand-drafted SHA bump PR is required when main moves; the
+# Dockerfile's Cargo layer invalidates naturally on Cargo.lock / src/
+# changes.
+#
+# Reproducibility: a `GIT_SHA` build-arg is plumbed through to a LABEL on
+# the final image. The build wrapper / Makefile target passes
+# `--build-arg GIT_SHA=$(git rev-parse HEAD)` so `docker inspect IMAGE
+# --format '{{ index .Config.Labels "claude_watch_sha" }}'` reports which
+# revision was baked. Default empty so a bare `docker build .` (no
+# wrapper) still works.
 
 # --- Stage 1: build claude-watch from source -------------------------------
 FROM rust:1-bookworm AS claude-watch-builder
 
-ARG CLAUDE_WATCH_REPO=https://github.com/hndrewaall/claude-watch.git
-ARG CLAUDE_WATCH_REF=c240920a661278b05dd152030026cfe65d550ee3
-
 WORKDIR /build
 
-# Shallow-clone for build speed, then check out the pinned commit. The
-# fetch-depth=1 + explicit fetch-by-sha pattern works against GitHub's
-# git protocol v2 (uploadpack.allowReachableSHA1InWant defaults on).
-RUN git init . \
-    && git remote add origin "${CLAUDE_WATCH_REPO}" \
-    && git fetch --depth 1 origin "${CLAUDE_WATCH_REF}" \
-    && git checkout FETCH_HEAD
+# COPY the working tree from the build context (the repo root). The
+# .dockerignore at the repo root prunes target/, __pycache__/, .git/,
+# editor swap files, etc. — only the source files Cargo + the rest of
+# the multi-stage build actually need land in this layer. The layer is
+# invalidated when any non-ignored file changes, which matches "I want
+# to rebuild whenever I edit Rust source" without requiring a
+# hand-drafted SHA arg per build.
+COPY . /build
 
 # claude-watch's Cargo.toml has `profile.release = { strip = true, lto = true }`,
 # so the resulting binary is already stripped + LTO-optimised.
@@ -36,6 +50,15 @@ RUN cargo build --release \
 
 # --- Stage 2: runtime image ------------------------------------------------
 FROM debian:bookworm-slim
+
+# Reproducibility tag — the build wrapper / Makefile target passes
+# --build-arg GIT_SHA=$(git rev-parse HEAD) so `docker inspect IMAGE
+# --format '{{ index .Config.Labels "claude_watch_sha" }}'` reports the
+# exact local revision baked into this image. Default empty so a bare
+# `docker build .` (no wrapper, no SHA passed) still produces a working
+# image — the LABEL just reads as an empty string in that case.
+ARG GIT_SHA=
+LABEL claude_watch_sha="${GIT_SHA}"
 
 # Non-interactive apt and consistent locale for a tmux-driven UI.
 ENV DEBIAN_FRONTEND=noninteractive \

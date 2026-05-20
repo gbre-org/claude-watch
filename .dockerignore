@@ -1,0 +1,59 @@
+# .dockerignore — pruning the build context for container/Dockerfile.
+#
+# The container/Dockerfile builds claude-watch from local working-tree
+# sources via a top-level `COPY . /build` in its claude-watch-builder
+# stage (replacing the prior git-clone-and-pin pattern). The build
+# context is the repo root, so without this file Docker would ship
+# every byte under the repo to the daemon — including the Rust
+# `target/` tree (hundreds of MB of incremental build artifacts),
+# Python venvs, OS-side caches, and worktree scratch dirs. That makes
+# `docker build` painfully slow even when nothing has changed, and
+# invalidates the COPY layer on every cargo run.
+#
+# Anything baked into the image via a specific COPY (container/*,
+# tools/hooks/*, tools/obligations/*, tools/agent-msg/*, tools/agent-tail/*,
+# tools/claude-watch-ack/*, tools/claude-watch-dispatch/*, tools/watchers/*,
+# tools/session-task/*) MUST remain visible — those COPY lines reference
+# explicit paths and the Dockerfile would fail if the path were excluded.
+# The exclusions below target build artifacts and tooling caches that
+# the image never consumes.
+
+# Rust build output — by far the largest single source of bloat.
+target/
+
+# Python tooling caches.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor / OS junk.
+*.swp
+*.swo
+.DS_Store
+
+# Local node tooling, virtual envs.
+node_modules/
+.venv/
+venv/
+
+# Coverage / profiling output.
+coverage/
+*.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Operator-specific compose override (mirrors .gitignore — keep it
+# out of the image even when it's untracked locally).
+examples/compose/docker-compose.override.yml
+
+# In-tree git metadata — Cargo builds don't need it, and shipping the
+# full .git/ to the daemon is wasteful (each pack file is megabytes).
+.git/
+
+# Worktree scratch space — the agent-driven workflow puts a fresh
+# worktree per agent under this prefix on the host. It's never inside
+# the repo on disk, but defence-in-depth is cheap.
+/tmp/claude-watch-worktrees/
