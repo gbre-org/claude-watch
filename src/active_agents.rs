@@ -32,7 +32,8 @@
 //! hold in the first iteration of #53.
 
 use serde::Serialize;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::agent::{
@@ -40,8 +41,21 @@ use crate::agent::{
 };
 use crate::workload::{load_state, WorkloadState};
 
-/// Find the most-recently-modified `subagents/` directory under
+/// Default freshness window for `find_active_subagents_dirs`. Any
+/// `subagents/` directory whose newest file mtime is within this many
+/// seconds of "now" is considered active and is included in the merge.
+///
+/// 24h covers the realistic worst case: a long-running agent that
+/// outlived ONE parent restart will have a pre-restart transcript dir
+/// (with the queue marker) plus a post-restart continuation dir under
+/// a new session UUID; both stay within the window.
+pub const DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS: u64 = 24 * 60 * 60;
+
+/// Find ALL recently-active `subagents/` directories under
 /// `~/.claude/projects/<project-slug>/<session-uuid>/subagents/`.
+///
+/// Returns every dir whose newest contained file mtime is within
+/// `freshness_secs` of `now`. Sorted newest-first.
 ///
 /// We walk the projects tree directly rather than going through
 /// `find_session_dir` (which keys off `/tmp/claude-<uid>/<slug>/<uuid>/tasks/`
@@ -49,14 +63,44 @@ use crate::workload::{load_state, WorkloadState};
 /// path-join-by-session-id was broken on real installs and silently
 /// returned nothing).
 ///
-/// "Most recent" = directory with the most-recently-modified file
-/// inside (typically an agent-*.jsonl or .meta.json). Stable across
-/// new sessions; immune to project-slug renames.
-pub fn find_active_subagents_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let projects = std::path::PathBuf::from(home).join(".claude/projects");
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    let project_dirs = std::fs::read_dir(&projects).ok()?;
+/// Why a list and not the single newest dir: when the main-loop parent
+/// process crashes (e.g. OOM/SIGKILL) or self-clears and gets resumed,
+/// any subagents that survive write continuation JSONL frames into a
+/// new session UUID directory. Those continuation frames start with a
+/// `tool_result` (the exit-code reply from the dead parent) and DO NOT
+/// re-include the `Queue item: q-XXXX` spawn marker. The marker is
+/// still present in the PRE-restart transcript under the OLD session
+/// UUID dir. If we only inspect the single most-recent dir we silently
+/// drop the marker for the affected agents. Merging across all recent
+/// dirs (with a preference for records that DO have a queue id) lets
+/// the resolver recover the original marker.
+pub fn find_active_subagents_dirs(
+    now: SystemTime,
+    freshness_secs: u64,
+) -> Vec<PathBuf> {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+    find_active_subagents_dirs_in(
+        &PathBuf::from(home).join(".claude/projects"),
+        now,
+        freshness_secs,
+    )
+}
+
+/// Same as `find_active_subagents_dirs` but with a caller-supplied
+/// projects-root path. Tests use this to point at a tempdir.
+pub fn find_active_subagents_dirs_in(
+    projects: &Path,
+    now: SystemTime,
+    freshness_secs: u64,
+) -> Vec<PathBuf> {
+    let mut hits: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let project_dirs = match std::fs::read_dir(projects) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
     for project_entry in project_dirs.flatten() {
         let session_dirs = match std::fs::read_dir(project_entry.path()) {
             Ok(d) => d,
@@ -88,13 +132,24 @@ pub fn find_active_subagents_dir() -> Option<std::path::PathBuf> {
                     }
                 }
             }
-            best = match best {
-                Some((t, _)) if t >= newest => best,
-                _ => Some((newest, subagents)),
+            // Apply the freshness window. Future-dated mtimes (clock
+            // skew) always pass. Negative durations from
+            // `duration_since` indicate the file is NEWER than `now`,
+            // which we treat as "definitely fresh".
+            let within_window = match now.duration_since(newest) {
+                Ok(d) => d.as_secs() <= freshness_secs,
+                Err(_) => true,
             };
+            if within_window {
+                hits.push((newest, subagents));
+            }
         }
     }
-    best.map(|(_, p)| p)
+    // Newest-first ordering. Callers that care about precedence (e.g.
+    // tie-breaking equal-quality records on recency) consume the list
+    // front-to-back.
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Default JSONL-mtime "alive" window. An agent transcript that hasn't
@@ -291,6 +346,75 @@ pub fn collect_agent_records(
     out
 }
 
+/// Collect agent records across MULTIPLE `subagents/` directories and
+/// merge by agent id.
+///
+/// Merge policy (per agent id):
+///
+///  1. Prefer the record whose `queue_id` is `Some(_)` over one whose
+///     `queue_id` is `None`. This is the whole point of the merge: a
+///     post-restart continuation JSONL drops the spawn marker, but the
+///     pre-restart transcript still has it.
+///  2. Among records that BOTH have a queue id (or both have none),
+///     prefer `alive=true` over `alive=false`.
+///  3. Final tie-break: prefer the more-recent JSONL mtime (i.e. the
+///     smaller `jsonl_age_seconds`). `None` ages sort last.
+///
+/// `dirs` is consumed front-to-back; the iteration order doesn't
+/// affect the result because the merge is symmetric on the comparison
+/// fields. Returned records are sorted by agent_id for stable diff,
+/// matching `collect_agent_records`.
+pub fn collect_agent_records_merged(
+    dirs: &[PathBuf],
+    now: SystemTime,
+    max_age_secs: u64,
+) -> Vec<AgentRecord> {
+    let mut by_id: HashMap<String, AgentRecord> = HashMap::new();
+    for dir in dirs {
+        for record in collect_agent_records(dir, now, max_age_secs) {
+            match by_id.get(&record.agent_id) {
+                None => {
+                    by_id.insert(record.agent_id.clone(), record);
+                }
+                Some(existing) => {
+                    if should_replace(existing, &record) {
+                        by_id.insert(record.agent_id.clone(), record);
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<AgentRecord> = by_id.into_values().collect();
+    out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    out
+}
+
+/// Pure: decide whether `candidate` should replace `existing` per the
+/// merge policy documented on `collect_agent_records_merged`.
+fn should_replace(existing: &AgentRecord, candidate: &AgentRecord) -> bool {
+    // Rule 1: non-null queue_id wins.
+    match (existing.queue_id.is_some(), candidate.queue_id.is_some()) {
+        (false, true) => return true,
+        (true, false) => return false,
+        _ => {}
+    }
+    // Rule 2: alive wins.
+    match (existing.alive, candidate.alive) {
+        (false, true) => return true,
+        (true, false) => return false,
+        _ => {}
+    }
+    // Rule 3: smaller jsonl_age_seconds (more recent) wins. None ages
+    // sort last (i.e. an unreadable-mtime record never wins this
+    // tiebreaker against a known one).
+    match (existing.jsonl_age_seconds, candidate.jsonl_age_seconds) {
+        (Some(_), None) => false,
+        (None, Some(_)) => true,
+        (Some(a), Some(b)) => b < a,
+        (None, None) => false,
+    }
+}
+
 /// Production helper: ask tmux whether a pane id is alive.
 ///
 /// Mirrors the private `pane_alive` in `workload.rs` — duplicating here
@@ -330,9 +454,12 @@ pub fn collect_with_max_age(max_age_secs: u64) -> ActiveAgents {
         None => Vec::new(),
     };
     let workloads = running_workload_labels(&load_state(), pane_alive);
-    let agents = match find_active_subagents_dir() {
-        Some(dir) => collect_agent_records(&dir, SystemTime::now(), max_age_secs),
-        None => Vec::new(),
+    let now = SystemTime::now();
+    let dirs = find_active_subagents_dirs(now, DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS);
+    let agents = if dirs.is_empty() {
+        Vec::new()
+    } else {
+        collect_agent_records_merged(&dirs, now, max_age_secs)
     };
     ActiveAgents {
         subagents,
@@ -782,5 +909,283 @@ mod tests {
         let path = dir.path().join("nested").join("deep").join("state.json");
         atomic_write(&path, "hi\n").unwrap();
         assert!(path.exists());
+    }
+
+    // --- multi-dir merge: post-restart marker recovery ---
+
+    /// Build a fake projects tree at `root` with two `subagents/`
+    /// directories under different session UUIDs of the same project
+    /// slug. Returns (older_dir, newer_dir).
+    fn build_two_session_dirs(root: &Path) -> (PathBuf, PathBuf) {
+        let project = root.join("-home-fake-project");
+        let session_old = project.join("11111111-1111-1111-1111-111111111111");
+        let session_new = project.join("22222222-2222-2222-2222-222222222222");
+        let older = session_old.join("subagents");
+        let newer = session_new.join("subagents");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::create_dir_all(&newer).unwrap();
+        (older, newer)
+    }
+
+    /// Write a JSONL whose first line carries a `Queue item:` marker.
+    fn write_marker_jsonl(path: &Path, qid: &str) {
+        let body = format!(
+            "{{\"message\":{{\"content\":\"Queue item: {}\\n\\nDo the thing\"}}}}\n",
+            qid
+        );
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// Write a JSONL simulating a post-restart continuation transcript:
+    /// the first frame is a `tool_result` reporting the prior parent's
+    /// exit, with no spawn marker anywhere.
+    fn write_continuation_jsonl(path: &Path) {
+        let body = "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"Exit code 137\"}]}}\n";
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// Set the mtime of `path` to `secs` seconds before `SystemTime::now()`.
+    fn backdate(path: &Path, secs: u64) {
+        let mt = SystemTime::now() - Duration::from_secs(secs);
+        let ft = filetime::FileTime::from_system_time(mt);
+        filetime::set_file_mtime(path, ft).unwrap();
+    }
+
+    #[test]
+    fn merge_prefers_record_with_queue_id_over_one_without() {
+        // The bug: agent survived a parent restart. The OLD session dir
+        // has a JSONL with the spawn marker; the NEW session dir has a
+        // continuation JSONL with no marker. The merged result must
+        // surface the marker, NOT the post-restart None.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+
+        let id = "abc123";
+        let older_jsonl = older.join(format!("agent-{}.jsonl", id));
+        let newer_jsonl = newer.join(format!("agent-{}.jsonl", id));
+
+        write_marker_jsonl(&older_jsonl, "q-test-001");
+        write_continuation_jsonl(&newer_jsonl);
+
+        // Backdate the older transcript so it's clearly the elder.
+        // Leave the newer one at "now" so it sorts first in the dirs
+        // list. The merge must still prefer the older one's queue id.
+        backdate(&older_jsonl, 600);
+
+        let dirs = vec![newer.clone(), older.clone()];
+        let records = collect_agent_records_merged(&dirs, SystemTime::now(), 120);
+
+        assert_eq!(records.len(), 1, "{:?}", records);
+        let r = &records[0];
+        assert_eq!(r.agent_id, id);
+        assert_eq!(
+            r.queue_id.as_deref(),
+            Some("q-test-001"),
+            "marker from older dir must survive merge",
+        );
+    }
+
+    #[test]
+    fn merge_returns_none_when_no_dir_has_marker() {
+        // Sanity: the merge does not fabricate a queue id. An agent
+        // whose only transcript is a continuation frame (no marker
+        // anywhere) ends up with queue_id=None.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+
+        let id = "lonely1";
+        // Only present in the NEW session dir, no marker.
+        write_continuation_jsonl(&newer.join(format!("agent-{}.jsonl", id)));
+
+        let dirs = vec![newer.clone(), older.clone()];
+        let records = collect_agent_records_merged(&dirs, SystemTime::now(), 120);
+
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.agent_id, id);
+        assert!(
+            r.queue_id.is_none(),
+            "merge must not fabricate a queue id",
+        );
+    }
+
+    #[test]
+    fn merge_dedupes_and_sorts_by_agent_id() {
+        // Two distinct agents appearing across two dirs — each should
+        // appear once in the output, sorted lexicographically.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+
+        write_marker_jsonl(&older.join("agent-zzz.jsonl"), "q-z");
+        write_marker_jsonl(&newer.join("agent-aaa.jsonl"), "q-a");
+        // Same agent in both dirs (older has marker, newer doesn't).
+        write_marker_jsonl(&older.join("agent-mmm.jsonl"), "q-m");
+        write_continuation_jsonl(&newer.join("agent-mmm.jsonl"));
+
+        let dirs = vec![newer, older];
+        let records = collect_agent_records_merged(&dirs, SystemTime::now(), 120);
+        let ids: Vec<&str> = records.iter().map(|r| r.agent_id.as_str()).collect();
+        assert_eq!(ids, vec!["aaa", "mmm", "zzz"]);
+        assert_eq!(
+            records[1].queue_id.as_deref(),
+            Some("q-m"),
+            "marker must propagate through merge for shared agent_id",
+        );
+    }
+
+    #[test]
+    fn merge_breaks_alive_tie_by_freshest_mtime() {
+        // Both records have queue ids (so rule 1 ties) and both are
+        // alive within the window (so rule 2 ties). The fresher mtime
+        // should win.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+
+        let id = "tied";
+        let older_jsonl = older.join(format!("agent-{}.jsonl", id));
+        let newer_jsonl = newer.join(format!("agent-{}.jsonl", id));
+        write_marker_jsonl(&older_jsonl, "q-old");
+        write_marker_jsonl(&newer_jsonl, "q-new");
+        // Backdate older but keep within max_age so both stay alive.
+        backdate(&older_jsonl, 30);
+
+        let dirs = vec![older.clone(), newer.clone()];
+        let records = collect_agent_records_merged(&dirs, SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].queue_id.as_deref(),
+            Some("q-new"),
+            "freshest record wins when queue_id + alive tie",
+        );
+    }
+
+    #[test]
+    fn merge_prefers_alive_record_over_stale_when_queue_ids_tie() {
+        // Both have queue ids; one is alive, the other is stale. The
+        // alive one wins regardless of the (un)freshness comparison.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+
+        let id = "mixed";
+        let older_jsonl = older.join(format!("agent-{}.jsonl", id));
+        let newer_jsonl = newer.join(format!("agent-{}.jsonl", id));
+        write_marker_jsonl(&older_jsonl, "q-stale-but-marker");
+        write_marker_jsonl(&newer_jsonl, "q-alive");
+        // Push older clearly past the max_age window.
+        backdate(&older_jsonl, 600);
+
+        let dirs = vec![older.clone(), newer.clone()];
+        let records = collect_agent_records_merged(&dirs, SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].queue_id.as_deref(), Some("q-alive"));
+        assert!(records[0].alive);
+    }
+
+    // --- find_active_subagents_dirs_in: freshness window + ordering ---
+
+    #[test]
+    fn find_dirs_returns_only_dirs_within_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+        // Put one fresh file in each so they both pass the
+        // "directory has content" test. Then backdate older WAY past
+        // the freshness window.
+        write_continuation_jsonl(&older.join("agent-a.jsonl"));
+        write_continuation_jsonl(&newer.join("agent-b.jsonl"));
+        backdate(&older.join("agent-a.jsonl"), 48 * 60 * 60);
+        // The dir mtime is what find_active_subagents_dirs_in actually
+        // compares — make sure that's also stale.
+        backdate(&older, 48 * 60 * 60);
+
+        let dirs = find_active_subagents_dirs_in(
+            tmp.path(),
+            SystemTime::now(),
+            24 * 60 * 60,
+        );
+        // Only the newer dir should appear.
+        assert_eq!(dirs.len(), 1, "{:?}", dirs);
+        assert_eq!(dirs[0], newer);
+    }
+
+    #[test]
+    fn find_dirs_returns_all_when_all_fresh() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+        write_continuation_jsonl(&older.join("agent-a.jsonl"));
+        write_continuation_jsonl(&newer.join("agent-b.jsonl"));
+        // Both within the window.
+        let dirs = find_active_subagents_dirs_in(
+            tmp.path(),
+            SystemTime::now(),
+            24 * 60 * 60,
+        );
+        assert_eq!(dirs.len(), 2);
+        // Sorted newest-first: `newer` was written second, so its
+        // newest-file mtime should be greater than `older`'s. (We rely
+        // on the test runner not stalling between writes — if both
+        // mtimes happen to be equal at filesystem resolution, the
+        // ordering is unspecified but the SET equality below still
+        // holds.)
+        let set: std::collections::HashSet<&PathBuf> = dirs.iter().collect();
+        assert!(set.contains(&older));
+        assert!(set.contains(&newer));
+    }
+
+    #[test]
+    fn find_dirs_missing_projects_root_is_empty() {
+        let dirs = find_active_subagents_dirs_in(
+            Path::new("/nonexistent/projects/root"),
+            SystemTime::now(),
+            DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS,
+        );
+        assert!(dirs.is_empty());
+    }
+
+    // --- should_replace ---
+
+    fn rec(id: &str, qid: Option<&str>, alive: bool, age: Option<u64>) -> AgentRecord {
+        AgentRecord {
+            agent_id: id.to_string(),
+            queue_id: qid.map(|s| s.to_string()),
+            alive,
+            jsonl_age_seconds: age,
+        }
+    }
+
+    #[test]
+    fn should_replace_prefers_some_queue_id() {
+        let existing = rec("x", None, true, Some(1));
+        let candidate = rec("x", Some("q-1"), false, Some(999));
+        assert!(should_replace(&existing, &candidate));
+    }
+
+    #[test]
+    fn should_replace_keeps_some_queue_id() {
+        let existing = rec("x", Some("q-1"), false, Some(999));
+        let candidate = rec("x", None, true, Some(1));
+        assert!(!should_replace(&existing, &candidate));
+    }
+
+    #[test]
+    fn should_replace_prefers_alive_when_qid_ties() {
+        let existing = rec("x", Some("q-1"), false, Some(1));
+        let candidate = rec("x", Some("q-1"), true, Some(999));
+        assert!(should_replace(&existing, &candidate));
+    }
+
+    #[test]
+    fn should_replace_prefers_fresher_when_qid_and_alive_tie() {
+        let existing = rec("x", Some("q-1"), true, Some(50));
+        let candidate = rec("x", Some("q-1"), true, Some(10));
+        assert!(should_replace(&existing, &candidate));
+        // And NOT the other way around.
+        assert!(!should_replace(&candidate, &existing));
+    }
+
+    #[test]
+    fn should_replace_does_not_replace_on_equal_fields() {
+        let existing = rec("x", Some("q-1"), true, Some(10));
+        let candidate = rec("x", Some("q-1"), true, Some(10));
+        assert!(!should_replace(&existing, &candidate));
     }
 }
