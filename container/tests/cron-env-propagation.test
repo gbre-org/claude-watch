@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""File-level test that the entrypoint propagates CLAUDE_EVENT_QUEUE
+(and HOME + PATH) into /etc/cron.d/00-env so cron jobs inherit the
+correct event spool path.
+
+Background: cron runs jobs in a clean environment — it does NOT inherit
+the container's exported env vars. Without explicit env-var propagation,
+cron jobs calling `claude-event` write events to the default
+$HOME/claude-events instead of the bind-mounted host spool at
+$CLAUDE_EVENT_QUEUE. The fix: the entrypoint generates
+/etc/cron.d/00-env at boot with the container's CLAUDE_EVENT_QUEUE,
+HOME, and PATH. Cron reads /etc/cron.d/ files in sorted order, so
+"00-env" sorts first and its env-var lines apply to all subsequent
+entries (cw-default, private/).
+
+Asserts:
+
+  1. entrypoint.sh writes /etc/cron.d/00-env when CLAUDE_EVENT_QUEUE
+     is set, using `sudo -n tee`.
+  2. The generated file includes CLAUDE_EVENT_QUEUE, HOME, and PATH.
+  3. The file is chmod'd to 0644 (cron requirement).
+  4. The write is conditional on CLAUDE_EVENT_QUEUE being non-empty
+     (no-op when unset).
+  5. Dockerfile grants passwordless sudo for `tee /etc/cron.d/00-env`
+     so the uid-1000 entrypoint can write the root-owned file.
+  6. Dockerfile grants passwordless sudo for `chmod 0644 /etc/cron.d/00-env`.
+
+Run:  ./cron-env-propagation.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# 1-4. entrypoint.sh generates /etc/cron.d/00-env.
+# ---------------------------------------------------------------------------
+expect(ENTRYPOINT.is_file(), f"entrypoint.sh missing at {ENTRYPOINT}")
+if ENTRYPOINT.is_file():
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+
+    # 1. Uses sudo tee to write /etc/cron.d/00-env.
+    expect(
+        re.search(r"sudo\s+-n\s+tee\s+/etc/cron\.d/00-env", text)
+        is not None,
+        "entrypoint.sh: must write /etc/cron.d/00-env via "
+        "`sudo -n tee /etc/cron.d/00-env`. The file must be root-owned "
+        "(cron rejects non-root-owned /etc/cron.d/ files) so the "
+        "uid-1000 entrypoint needs sudo.",
+    )
+
+    # 2. Propagates CLAUDE_EVENT_QUEUE, HOME, and PATH.
+    expect(
+        "CLAUDE_EVENT_QUEUE=" in text
+        and re.search(
+            r'CLAUDE_EVENT_QUEUE=\$\{?CLAUDE_EVENT_QUEUE', text
+        )
+        is not None,
+        "entrypoint.sh: /etc/cron.d/00-env must include "
+        "CLAUDE_EVENT_QUEUE — the whole point is to tell cron jobs "
+        "where the event spool lives.",
+    )
+    expect(
+        re.search(r'"HOME=', text) is not None,
+        "entrypoint.sh: /etc/cron.d/00-env must include HOME — cron "
+        "jobs need HOME to resolve default paths in claude-event and "
+        "other CLIs.",
+    )
+    expect(
+        re.search(r'"PATH=', text) is not None,
+        "entrypoint.sh: /etc/cron.d/00-env must include PATH — cron "
+        "jobs need the container's full PATH to find claude-event, "
+        "session-task, and other tools.",
+    )
+
+    # 3. chmod 0644 after write.
+    expect(
+        re.search(r"sudo\s+-n\s+chmod\s+0644\s+/etc/cron\.d/00-env", text)
+        is not None,
+        "entrypoint.sh: must chmod /etc/cron.d/00-env to 0644 after "
+        "writing. cron refuses to process files with incorrect "
+        "permissions.",
+    )
+
+    # 4. Conditional on CLAUDE_EVENT_QUEUE being set.
+    expect(
+        re.search(
+            r'if\s+\[\s+-n\s+"\$\{CLAUDE_EVENT_QUEUE:-\}"\s+\]',
+            text,
+        )
+        is not None,
+        "entrypoint.sh: /etc/cron.d/00-env generation must be "
+        "conditional on CLAUDE_EVENT_QUEUE being non-empty. When "
+        "unset (no host spool bridged), writing an empty "
+        "CLAUDE_EVENT_QUEUE= line would override the default "
+        "fallback in claude-event.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5-6. Dockerfile grants sudo for tee + chmod on /etc/cron.d/00-env.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.is_file():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    # 5. sudo for tee /etc/cron.d/00-env.
+    expect(
+        "NOPASSWD: /usr/bin/tee /etc/cron.d/00-env" in text,
+        "Dockerfile: must grant passwordless sudo for "
+        "`/usr/bin/tee /etc/cron.d/00-env` in the sudoers carve-out. "
+        "Without this the entrypoint's `sudo -n tee` fails with "
+        "'sorry, a password is required' and /etc/cron.d/00-env never "
+        "gets written.",
+    )
+
+    # 6. sudo for chmod 0644 /etc/cron.d/00-env.
+    expect(
+        "NOPASSWD: /bin/chmod 0644 /etc/cron.d/00-env" in text,
+        "Dockerfile: must grant passwordless sudo for "
+        "`/bin/chmod 0644 /etc/cron.d/00-env` in the sudoers "
+        "carve-out. Without this the entrypoint can write the file "
+        "but can't ensure the mode is correct (cron rejects "
+        "non-0644 files in /etc/cron.d/).",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+if failures:
+    print("FAIL cron-env-propagation.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS cron-env-propagation.test")
+sys.exit(0)
