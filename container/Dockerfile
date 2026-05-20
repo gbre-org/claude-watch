@@ -729,6 +729,22 @@ RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
 COPY container/bin/eval-no-grep-watcher-output /usr/local/bin/eval-no-grep-watcher-output
 RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output
 
+# eval-event-must-act — obligations evaluator that DENIES Bash tool calls
+# while actionable events remain un-acked in pending-actions.json. When
+# claude-event-watch delivers actionable events (CI failure/success,
+# slack-unread, workbot-prompt, queue-stale-ready), they are recorded as
+# pending. The main loop must call `event-ack` for each before Bash tool
+# calls go through again. Default-open on missing/corrupt state.
+COPY container/bin/eval-event-must-act /usr/local/bin/eval-event-must-act
+RUN chmod +x /usr/local/bin/eval-event-must-act
+
+# event-ack — CLI to mark actionable events as acted-on. Manages
+# ~/.config/claude-events/pending-actions.json. Subcommands: --add (record
+# a pending event), --list (show pending), --clear (escape hatch), or
+# positional key + --action (ack a specific event after handling it).
+COPY container/bin/event-ack /usr/local/bin/event-ack
+RUN chmod +x /usr/local/bin/event-ack
+
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
 # "Quick safety check" trust dialog. Invoked by entrypoint.sh before tmux

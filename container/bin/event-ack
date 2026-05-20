@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# event-ack — mark an actionable event as acted-on.
+#
+# When claude-event-watch delivers actionable events, they are recorded in
+# ~/.config/claude-events/pending-actions.json. The main loop must call
+# `event-ack` for each one after queuing/performing the action. The
+# eval-event-must-act evaluator blocks Bash tool calls while un-acked
+# actionable events remain.
+#
+# Usage:
+#   event-ack "<event-key>" --action "<what you did>"
+#   event-ack --list                # show pending events
+#   event-ack --add "<event-key>"   # manually add (used by watcher restart logic)
+#   event-ack --clear               # clear all pending (escape hatch)
+#
+# Event key format: "tag:summary" e.g. "pr-status-change:CI failure:ACME_ORG#1629"
+# The key is freeform — it just needs to match what was added.
+#
+# State file: ~/.config/claude-events/pending-actions.json
+# Format: {"pending": [{"key": "...", "added_at": "...", "source_event": "..."}]}
+#
+# Default-open: missing/corrupt state file = no pending actions = ALLOW.
+
+set -euo pipefail
+
+STATE_DIR="${CLAUDE_EVENT_STATE_DIR:-${HOME}/.config/claude-events}"
+STATE_FILE="${STATE_DIR}/pending-actions.json"
+
+# Ensure state dir exists
+mkdir -p "$STATE_DIR"
+
+# Initialize state file if missing or corrupt
+_init_state() {
+    if [ ! -f "$STATE_FILE" ] || ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$STATE_FILE" 2>/dev/null; then
+        echo '{"pending":[]}' > "$STATE_FILE"
+    fi
+}
+
+_usage() {
+    cat <<'EOF'
+Usage:
+  event-ack "<event-key>" --action "<description>"   Mark event as acted-on
+  event-ack --add "<event-key>" [--source "<src>"]   Add a pending event
+  event-ack --list                                   List pending events
+  event-ack --clear                                  Clear all pending events
+  event-ack --help                                   Show this help
+EOF
+}
+
+case "${1:-}" in
+    --help|-h)
+        _usage
+        exit 0
+        ;;
+    --list)
+        _init_state
+        python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+pending = data.get('pending', [])
+if not pending:
+    print('No pending actionable events.')
+    sys.exit(0)
+print(f'{len(pending)} pending actionable event(s):')
+for item in pending:
+    print(f'  - {item[\"key\"]}  (added: {item.get(\"added_at\", \"?\")})')
+" "$STATE_FILE"
+        exit 0
+        ;;
+    --add)
+        shift
+        KEY="${1:?event-ack --add requires an event key}"
+        SOURCE=""
+        shift
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --source) SOURCE="$2"; shift 2 ;;
+                *) echo "Unknown option: $1" >&2; exit 1 ;;
+            esac
+        done
+        _init_state
+        python3 -c "
+import json, sys
+from datetime import datetime, timezone
+
+state_file = sys.argv[1]
+key = sys.argv[2]
+source = sys.argv[3] if len(sys.argv) > 3 else ''
+
+with open(state_file) as f:
+    data = json.load(f)
+
+pending = data.get('pending', [])
+# Don't add duplicates
+if not any(item['key'] == key for item in pending):
+    entry = {
+        'key': key,
+        'added_at': datetime.now(timezone.utc).isoformat(),
+    }
+    if source:
+        entry['source_event'] = source
+    pending.append(entry)
+    data['pending'] = pending
+    with open(state_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f'Added: {key}')
+else:
+    print(f'Already pending: {key}')
+" "$STATE_FILE" "$KEY" "$SOURCE"
+        exit 0
+        ;;
+    --clear)
+        _init_state
+        echo '{"pending":[]}' > "$STATE_FILE"
+        echo "Cleared all pending actionable events."
+        exit 0
+        ;;
+    "")
+        _usage
+        exit 1
+        ;;
+    *)
+        # Default: ack an event
+        KEY="$1"
+        shift
+        ACTION=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --action) ACTION="$2"; shift 2 ;;
+                *) echo "Unknown option: $1" >&2; exit 1 ;;
+            esac
+        done
+        if [ -z "$ACTION" ]; then
+            echo "error: --action is required when acking an event" >&2
+            echo "Usage: event-ack \"<event-key>\" --action \"<what you did>\"" >&2
+            exit 1
+        fi
+        _init_state
+        python3 -c "
+import json, sys
+from datetime import datetime, timezone
+
+state_file = sys.argv[1]
+key = sys.argv[2]
+action = sys.argv[3]
+
+with open(state_file) as f:
+    data = json.load(f)
+
+pending = data.get('pending', [])
+original_count = len(pending)
+pending = [item for item in pending if item['key'] != key]
+
+if len(pending) == original_count:
+    print(f'Warning: \"{key}\" was not in pending list (already acked or never added)')
+    sys.exit(0)
+
+data['pending'] = pending
+with open(state_file, 'w') as f:
+    json.dump(data, f, indent=2)
+
+remaining = len(pending)
+print(f'Acked: {key} (action: {action})')
+if remaining > 0:
+    print(f'{remaining} event(s) still pending action.')
+else:
+    print('All actionable events handled.')
+" "$STATE_FILE" "$KEY" "$ACTION"
+        exit 0
+        ;;
+esac

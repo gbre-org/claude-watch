@@ -963,6 +963,74 @@ and limits:
   like a typical host install. claude-watch's in-container config pins to
   this session name.
 
+## Event response protocol — actionable events require ack
+
+When `claude-event-watch` delivers events, some require action and some
+are purely informational. The `event_must_act` obligation (seeded by
+`obligations-init`) **blocks Bash tool calls** while actionable events
+remain un-acked — ensuring the main loop triages every important event
+before moving on to unrelated work.
+
+### Actionable event tags (require `event-ack`)
+
+These events demand a response — investigating a failure, reading a
+message, dispatching a prompt, etc.:
+
+| Tag | Condition | Example action |
+| --- | --- | --- |
+| `pr-status-change` | message contains "CI failure" or "CI success" | Queue investigation / merge check |
+| `slack-unread` | any | Read + respond if needed |
+| `workbot-prompt` | any | Dispatch prompt agent |
+| `queue-stale-ready` | any | Spawn or abandon stale queue item |
+
+### Non-actionable tags (informational, no obligation)
+
+These are context for the next loop pass — no ack needed:
+
+- `pr-status-change` with "new push", "CI pending", "mergeable"
+- `queue-running`, `queue-done`, `queue-abandoned`
+- `worklog-update`
+- `claude-watch-alert` (handled by the separate alert gate)
+
+### Workflow
+
+1. **Watcher fires** — `claude-event-watch` prints `EVENT[source/tag] message`
+   lines and exits.
+2. **Restart watcher immediately** (before processing).
+3. **For each actionable event**, call `event-ack --add "<tag>:<summary>"`
+   to register it as pending. (This step is manual in v1 — the main loop
+   must classify events using the table above.)
+4. **Handle each pending event** — queue an agent, act directly, or dismiss
+   with reason.
+5. **Ack each event** after handling:
+   ```sh
+   event-ack "pr-status-change:CI failure:ACME_ORG#1629" --action "queued investigation"
+   event-ack "slack-unread:dm-from-alice" --action "read + replied"
+   event-ack "workbot-prompt:summarize-pr" --action "dispatched agent"
+   ```
+6. Once all pending events are acked, Bash tool calls flow normally again.
+
+### CLI reference
+
+```sh
+event-ack "<key>" --action "<description>"   # Ack (remove from pending)
+event-ack --add "<key>" [--source "<src>"]   # Add a pending event
+event-ack --list                             # Show what's pending
+event-ack --clear                            # Clear all (escape hatch)
+```
+
+### Gate behavior
+
+- **Default-open**: missing state file, corrupt JSON, empty list, python
+  unavailable — all ALLOW.
+- **Exempt commands**: `event-ack`, `session-task queue`, `obligations`,
+  `claude-watch-ack`, `claude-watch-dispatch`, `agent-msg`, `agent-tail`
+  always pass through even when the gate is firing.
+- **Scope**: main loop only. Subagents are not gated (they work on
+  delegated tasks, not event triage).
+- **Override**: `obligations override "reason" --duration <N>` bypasses
+  all gates including this one.
+
 ## Host-side scheduled tasks (via `host-bash`)
 
 The container has no built-in cron / launchd / systemd — it's a

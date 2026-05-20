@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# eval-event-must-act — obligations evaluator that DENIES Bash tool calls
+# while actionable events remain un-acked.
+#
+# When claude-event-watch delivers events tagged as actionable (see the
+# ACTIONABLE_TAGS list below), they get recorded in pending-actions.json.
+# This evaluator checks that file: if non-empty, DENY with a message
+# listing what needs action. The main loop must call `event-ack` for each
+# pending event (after queuing/performing the action) before Bash tool
+# calls will go through again.
+#
+# Protocol (obligations evaluator predicate, decision_mode=exit_code):
+#   - stdin: the Bash command text (via stdin_field: "tool_input.command")
+#   - exit 0: ALLOW
+#   - exit 1: DENY (pending actions exist)
+#   - stderr: diagnostic shown in the deny banner
+#
+# Default-open posture:
+#   - Missing state file: ALLOW (nothing pending)
+#   - Corrupt/unreadable state file: ALLOW (defensive)
+#   - Empty pending list: ALLOW
+#   - Python not available: ALLOW
+#
+# Exempt commands (always allowed regardless of pending state):
+#   - event-ack (the tool to resolve the gate)
+#   - session-task queue (dispatch surface)
+#   - obligations (inspection/override surface)
+#   - claude-watch-ack / claude-watch-dispatch (alert surface)
+#   - agent-msg (inbox surface)
+
+set -euo pipefail
+
+STATE_DIR="${CLAUDE_EVENT_STATE_DIR:-${HOME}/.config/claude-events}"
+STATE_FILE="${STATE_DIR}/pending-actions.json"
+
+# Read the command from stdin
+CMD="$(cat)"
+
+# If empty command, allow (defensive)
+if [ -z "$CMD" ]; then
+    exit 0
+fi
+
+# Exempt commands — these must always pass so the operator can resolve
+# the gate or perform essential dispatch operations.
+if echo "$CMD" | grep -qE '^\s*(event-ack|session-task\s+queue|obligations\s|claude-watch-ack|claude-watch-dispatch|agent-msg\s|agent-tail)\b'; then
+    exit 0
+fi
+
+# If state file doesn't exist, nothing is pending — allow
+if [ ! -f "$STATE_FILE" ]; then
+    exit 0
+fi
+
+# Check pending actions via python (handles JSON safely)
+# Default-open: any error in the python block => exit 0 (allow)
+python3 -c "
+import json, sys
+
+state_file = sys.argv[1]
+
+try:
+    with open(state_file) as f:
+        data = json.load(f)
+except (json.JSONDecodeError, OSError, ValueError):
+    # Corrupt or unreadable — default-open
+    sys.exit(0)
+
+pending = data.get('pending', [])
+if not isinstance(pending, list) or len(pending) == 0:
+    sys.exit(0)
+
+# Pending actions exist — DENY
+lines = []
+lines.append(f'EVENT-MUST-ACT: {len(pending)} actionable event(s) require action before continuing.')
+lines.append('')
+lines.append('Pending events:')
+for item in pending:
+    key = item.get('key', '?')
+    lines.append(f'  - {key}')
+lines.append('')
+lines.append('For each event, either:')
+lines.append('  1. Queue an agent to handle it, then: event-ack \"<key>\" --action \"queued agent\"')
+lines.append('  2. Act on it directly, then: event-ack \"<key>\" --action \"<what you did>\"')
+lines.append('  3. Dismiss if no action needed: event-ack \"<key>\" --action \"dismissed: <reason>\"')
+lines.append('')
+lines.append('Or clear all: event-ack --clear')
+
+print('\n'.join(lines), file=sys.stderr)
+sys.exit(1)
+" "$STATE_FILE" 2>&1 || {
+    # If python itself fails (not installed, crash, etc.), default-open
+    exit 0
+}
