@@ -32,6 +32,17 @@
 #          a second after load),
 #        - listens for matchMedia change events so live OS theme flips
 #          propagate without a page reload.
+#   4. Injects a keydown handler (PASTE_INTERCEPT_JS) that maps the
+#      browser-native Cmd+V / Ctrl+V to a raw \x16 byte sent into the
+#      xterm.js terminal — Claude Code's chat:imagePaste keybinding.
+#   5. Injects a floating "Paste image" button (PASTE_IMAGE_BUTTON_JS)
+#      that calls navigator.clipboard.read(), POSTs the resulting PNG
+#      blob to the clipboard-upload sidecar at /clipboard-upload, and
+#      on a 200 response fires \x16 to trigger chat:imagePaste. The
+#      sidecar (separate service, see examples/compose/clipboard-upload/)
+#      atomically writes the PNG to a named volume that the
+#      claude-container's xclip shim reads. This is the browser-only
+#      complement to workbot's Mac-side clipboard-bridge daemon.
 #
 # Output is written in place: index.html is overwritten.
 
@@ -257,6 +268,231 @@ PASTE_INTERCEPT_JS = """<script id="paste-intercept-injected">
 </script>
 """
 
+# Floating "Paste image" button + click handler. Reads an image from
+# the browser clipboard via the async Clipboard API, uploads it as raw
+# PNG bytes to the clipboard-upload sidecar (sibling service that
+# atomically writes /host-clipboard/clipboard.png on a named volume
+# shared with the claude-container), and then triggers the same raw
+# Ctrl+V byte (\x16) that the keydown intercept above uses so Claude
+# Code's `chat:imagePaste` action fires inside the terminal.
+#
+# Phase A (paste-event handler that intercepts Cmd+V/Ctrl+V image data
+# directly) is intentionally deferred to a follow-up. This button is
+# the lowest-friction primitive: user clicks once, grants the
+# permission prompt once per origin, and from then on the click acts
+# as an explicit "send my clipboard image to Claude" action.
+#
+# Why a button at all (when the keydown intercept already exists):
+#   1. The keydown intercept fires the *byte* \x16 but does NOT upload
+#      anything — it relies on the claude-container being able to read
+#      a real image from /host-clipboard/clipboard.png that some
+#      separate channel put there (e.g. workbot's Mac-local
+#      clipboard-bridge writing the file via AppleScript). For
+#      browser-only operators (no Mac bridge running), the file is
+#      stale or absent, and Claude Code's xclip shim reads the wrong
+#      bytes.
+#   2. navigator.clipboard.read() requires a user gesture in every
+#      major browser. Wiring it to a global keydown listener would
+#      either prompt-spam on every Ctrl+V or silently fail; a
+#      dedicated button is the cleanest UX.
+#
+# Wire shape (matches the clipboard-upload sidecar from the companion
+# PR): POST /clipboard-upload with Content-Type: image/png and the raw
+# PNG bytes as the body. 200 = stored on the named volume, anything
+# else = surface to the toast.
+PASTE_IMAGE_BUTTON_JS = """<style id="paste-image-button-injected-style">
+#cw-paste-image-btn {
+    position: fixed;
+    bottom: 16px;
+    right: 16px;
+    z-index: 9999;
+    padding: 8px 14px;
+    font: 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: rgba(38, 139, 210, 0.85); /* Solarized blue */
+    color: #fdf6e3;
+    border: 1px solid rgba(7, 54, 66, 0.4);
+    border-radius: 6px;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+    opacity: 0.55;
+    transition: opacity 0.15s ease;
+    user-select: none;
+}
+#cw-paste-image-btn:hover, #cw-paste-image-btn:focus {
+    opacity: 1.0;
+    outline: none;
+}
+#cw-paste-image-btn:active {
+    transform: translateY(1px);
+}
+#cw-paste-image-btn[disabled] {
+    cursor: progress;
+    opacity: 0.4;
+}
+#cw-paste-image-toast {
+    position: fixed;
+    bottom: 60px;
+    right: 16px;
+    z-index: 9999;
+    padding: 8px 12px;
+    font: 12px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: rgba(7, 54, 66, 0.92);
+    color: #eee8d5;
+    border-radius: 4px;
+    max-width: 320px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    pointer-events: none;
+}
+#cw-paste-image-toast.visible { opacity: 1; }
+#cw-paste-image-toast.error { background: rgba(220, 50, 47, 0.92); }
+</style>
+<script id="paste-image-button-injected">
+(function() {
+    'use strict';
+
+    var UPLOAD_URL = '/clipboard-upload';
+    var TOAST_MS = 2800;
+
+    function ensureToast() {
+        var t = document.getElementById('cw-paste-image-toast');
+        if (t) return t;
+        t = document.createElement('div');
+        t.id = 'cw-paste-image-toast';
+        document.body.appendChild(t);
+        return t;
+    }
+
+    var toastTimer = null;
+    function showToast(msg, isError) {
+        var t = ensureToast();
+        t.textContent = msg;
+        t.classList.toggle('error', !!isError);
+        t.classList.add('visible');
+        if (toastTimer) { clearTimeout(toastTimer); }
+        toastTimer = setTimeout(function() {
+            t.classList.remove('visible');
+        }, TOAST_MS);
+    }
+
+    // Mirrors PASTE_INTERCEPT_JS's sendToTerminal — kept inline so the
+    // two scripts don't share globals (each injection block is its own
+    // IIFE). xterm.js v5 path first, v4 / older-v5 fallback after.
+    function sendToTerminal(data) {
+        var t = window.term;
+        if (!t) return false;
+        try {
+            if (t._core && t._core.coreService &&
+                typeof t._core.coreService.triggerDataEvent === 'function') {
+                t._core.coreService.triggerDataEvent(data);
+                return true;
+            }
+        } catch (e) { /* fall through */ }
+        try {
+            if (t._core && t._core._onData &&
+                typeof t._core._onData.fire === 'function') {
+                t._core._onData.fire(data);
+                return true;
+            }
+        } catch (e) { /* fall through */ }
+        return false;
+    }
+
+    function uploadBlob(blob) {
+        return fetch(UPLOAD_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'image/png' },
+            body: blob,
+        });
+    }
+
+    async function readClipboardImage() {
+        if (!navigator.clipboard || !navigator.clipboard.read) {
+            throw new Error('Clipboard API unavailable (needs HTTPS or localhost)');
+        }
+        var items = await navigator.clipboard.read();
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            for (var j = 0; j < item.types.length; j++) {
+                var type = item.types[j];
+                if (type.indexOf('image/') === 0) {
+                    var blob = await item.getType(type);
+                    // Normalize to image/png since the sidecar validates
+                    // PNG magic bytes. If the clipboard has a non-PNG
+                    // image (e.g. image/jpeg from a screenshot tool),
+                    // the upload will fail with 415 and the toast will
+                    // surface that — fine for v1; transcoding to PNG in
+                    // the browser is a Phase A concern.
+                    return { blob: blob, type: type };
+                }
+            }
+        }
+        return null;
+    }
+
+    async function onPasteClick(ev) {
+        if (ev) { ev.preventDefault(); }
+        var btn = document.getElementById('cw-paste-image-btn');
+        if (btn) { btn.setAttribute('disabled', 'disabled'); }
+        try {
+            var found = await readClipboardImage();
+            if (!found) {
+                showToast('No image in clipboard', true);
+                return;
+            }
+            var resp = await uploadBlob(found.blob);
+            if (!resp.ok) {
+                var detail = '';
+                try {
+                    var body = await resp.json();
+                    if (body && body.error) { detail = ': ' + body.error; }
+                } catch (e) { /* non-JSON body, fall through */ }
+                showToast('Upload failed: ' + resp.status + detail, true);
+                return;
+            }
+            // Sidecar wrote /host-clipboard/clipboard.png atomically.
+            // Now fire Ctrl-V so Claude Code's chat:imagePaste action
+            // runs xclip inside the container, which reads the file
+            // the sidecar just wrote and base64-encodes it into the
+            // current prompt.
+            var sent = sendToTerminal('\\x16');
+            if (!sent) {
+                showToast('Uploaded, but terminal not ready', true);
+                return;
+            }
+            showToast('Image pasted');
+        } catch (err) {
+            // NotAllowedError = permission denied / no user gesture.
+            // DataError = clipboard contained something we can't read.
+            // Network errors land here too (fetch rejects).
+            var msg = (err && err.message) ? err.message : String(err);
+            showToast('Error: ' + msg, true);
+        } finally {
+            if (btn) { btn.removeAttribute('disabled'); }
+        }
+    }
+
+    function mountButton() {
+        if (document.getElementById('cw-paste-image-btn')) return;
+        var btn = document.createElement('button');
+        btn.id = 'cw-paste-image-btn';
+        btn.type = 'button';
+        btn.title = 'Read an image from the browser clipboard and send it to Claude Code';
+        btn.textContent = 'Paste image';
+        btn.addEventListener('click', onPasteClick);
+        document.body.appendChild(btn);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', mountButton);
+    } else {
+        mountButton();
+    }
+})();
+</script>
+"""
+
 
 def inject(html: str) -> str:
     """Inject CSS + JS into the <head> of ttyd's bundled HTML.
@@ -274,7 +510,7 @@ def inject(html: str) -> str:
         raise SystemExit(
             "inject-autodark.py: '</head>' marker not found in input HTML"
         )
-    injected = CSS + JS + PASTE_INTERCEPT_JS + marker
+    injected = CSS + JS + PASTE_INTERCEPT_JS + PASTE_IMAGE_BUTTON_JS + marker
     # Replace only the FIRST occurrence (xterm.js's inline JS may
     # mention the string '</head>' inside a quoted literal further
     # down).
@@ -299,7 +535,9 @@ def main() -> int:
     )
     # Sanity-check: our marker classes are present in the output.
     for needle in ("autodark-injected", "prefers-color-scheme",
-                   "paste-intercept-injected"):
+                   "paste-intercept-injected",
+                   "paste-image-button-injected",
+                   "cw-paste-image-btn"):
         if needle not in patched:
             sys.stderr.write(
                 f"inject-autodark.py: missing '{needle}' in output — abort\n"

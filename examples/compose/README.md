@@ -369,6 +369,47 @@ If you don't want the autodark behavior, drop the `-I /usr/local/share/ttyd/inde
 line from `ttyd.command` in `docker-compose.yml`. ttyd will then serve
 its upstream bundled HTML unchanged.
 
+### Image paste from the browser clipboard
+
+Claude Code's `chat:imagePaste` action expects to read a PNG from the host
+clipboard via `xclip`, which doesn't work out of the box when the agent
+runs inside a container and is being driven from a browser tab: the
+container has no access to the operator's clipboard, and the browser's
+own paste keystroke is intercepted before xterm.js sees it.
+
+The patched `index.html` ships two complementary primitives that close
+that gap:
+
+1. **Cmd+V / Ctrl+V keydown intercept** (always on). The browser's
+   default paste handler is suppressed and the raw `\x16` byte is sent
+   into the terminal instead, so the keystroke reaches Claude Code as a
+   `chat:imagePaste` event. On its own this only helps if some other
+   channel has already populated `/host-clipboard/clipboard.png` on the
+   shared named volume (e.g. the Mac-side `clipboard-bridge` daemon
+   under [`launchd/`](launchd/) running on the operator's laptop).
+2. **Floating "Paste image" button** in the lower-right corner. On
+   click, it calls `navigator.clipboard.read()`, finds the first
+   `image/*` `ClipboardItem`, and `POST`s the resulting blob as raw
+   PNG to the sibling `clipboard-upload` sidecar (see
+   [`clipboard-upload/`](clipboard-upload/)). The sidecar atomically
+   writes the file to `/host-clipboard/clipboard.png` on the volume
+   shared with `claude-container`, and the button then fires the same
+   `\x16` byte so the in-container `xclip` shim picks up the new file.
+   Toast notifications surface success / permission errors / sidecar
+   errors inline.
+
+The button is the browser-only equivalent of the Mac-side clipboard
+bridge — useful on Linux desktops, Chromebooks, tablets, and any
+deployment where running a host-side daemon is impractical. The
+sidecar is optional: if you don't deploy it, the button surfaces an
+error toast and the keydown intercept keeps working for users who do
+have a host-side bridge populating the clipboard file.
+
+`navigator.clipboard.read()` requires a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts)
+(HTTPS or `localhost`) and a user gesture. Plain `http://` to a remote
+host will not work — front the ttyd port with a TLS-terminating
+reverse proxy in that case.
+
 ### Security note
 
 The published port `7681` is unauthenticated by design for local-only
