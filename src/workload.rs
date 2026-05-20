@@ -623,6 +623,89 @@ fn auto_create_and_register_queue_item(
     }
 }
 
+/// Inject the `workload:<label>` scope token onto a caller-supplied
+/// queue item via `session-task queue update-scope`.
+///
+/// Motivation: when the main loop registers a queue item with a
+/// non-workload scope (e.g. `resource:promote-4-shows`) and THEN
+/// invokes `workload run LABEL -- CMD --queue-id <qid>`, the queue
+/// item has no `workload:<label>` token. The work-queue-exporter uses
+/// that token to locate the runtime heartbeat file under
+/// `/run/claude/workloads/<label>.heartbeat`; without it,
+/// `worktask_queue_progress_age_seconds` never gets emitted and the
+/// `WorkQueueStuck` / `WorkQueueStuckSoft` alerts false-fire after 1h
+/// on healthy long-running workloads.
+///
+/// This helper is the systemic fix: the workload runner KNOWS its
+/// label and its qid at startup, so it can append the token itself.
+/// q-2026-05-20-13b9 (scope `resource:promote-4-shows-then-reseed`
+/// bound to workload `promote-3-shows`) was the trigger — the
+/// progress_age series was never emitted, both stuck alerts false-fired.
+///
+/// Auto-created queue items already include the `workload:<label>`
+/// scope by construction (see `auto_create_and_register_queue_item`),
+/// so this helper only runs on the caller-supplied `--queue-id` path.
+/// It is idempotent — re-running `workload run LABEL` with the same
+/// qid is a no-op on the queue side (the token is added at most once).
+///
+/// Fail-soft: any CLI / timeout / non-zero exit logs a warning but
+/// does NOT block the workload from starting. The exporter false-fire
+/// is a monitoring degradation, not a correctness failure — better
+/// to keep the workload running.
+///
+/// Bounded with a 10s timeout (same as the auto-create + register
+/// path) so a wedged session-task can't stall workload startup.
+fn inject_workload_scope_token(label: &str, qid: &str) {
+    let cli = match find_session_task_cli() {
+        Some(c) => c,
+        None => {
+            tracing::warn!(
+                label = %label,
+                qid = %qid,
+                "session-task CLI not found; skipping workload scope-token injection \
+                 (worktask_queue_progress_age_seconds will not be emitted)"
+            );
+            return;
+        }
+    };
+    let token = format!("workload:{label}");
+    let args = vec![
+        "queue".to_string(),
+        "update-scope".to_string(),
+        qid.to_string(),
+        token.clone(),
+    ];
+    match run_session_task_with_timeout(&cli, &args, 10) {
+        Ok(out) if out.status.success() => {
+            tracing::debug!(
+                label = %label,
+                qid = %qid,
+                token = %token,
+                "injected workload scope token onto queue item"
+            );
+        }
+        Ok(out) => {
+            tracing::warn!(
+                label = %label,
+                qid = %qid,
+                token = %token,
+                rc = ?out.status.code(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "queue update-scope failed; workload continues without scope-token injection"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                label = %label,
+                qid = %qid,
+                token = %token,
+                error = %e,
+                "queue update-scope errored; workload continues without scope-token injection"
+            );
+        }
+    }
+}
+
 /// Run `session-task` with a wall-clock timeout. Returns the full
 /// `Output` (status + stdout + stderr). On timeout the child is killed
 /// and we return ErrorKind::TimedOut.
@@ -1130,6 +1213,7 @@ pub fn cmd_run(
     //   2. --no-queue opts out entirely (no auto-create).
     //   3. WORKLOAD_QUEUE_AUTO_CREATE=0 env opts out (test escape hatch).
     //   4. Otherwise: auto-create + register a queue row, bind qid.
+    let caller_supplied_qid = queue_id.is_some();
     let mut effective_queue_id: Option<String> = queue_id.map(str::to_string);
     let auto_create_disabled = std::env::var("WORKLOAD_QUEUE_AUTO_CREATE")
         .ok()
@@ -1151,6 +1235,33 @@ pub fn cmd_run(
                     "warning: workload queue auto-register failed (running without queue row): {e}"
                 );
             }
+        }
+    }
+
+    // When the caller supplied --queue-id (i.e. the queue item already
+    // existed BEFORE this workload was launched, typically with a
+    // non-workload scope like `resource:...`), inject `workload:<label>`
+    // onto that item's scope. The work-queue-exporter reads this token
+    // to locate the heartbeat file at `/run/claude/workloads/<label>.heartbeat`
+    // and emit `worktask_queue_progress_age_seconds`. Without it the
+    // exporter never finds the heartbeat → no progress_age series →
+    // `WorkQueueStuck` + `WorkQueueStuckSoft` false-fire after 1h on
+    // healthy long-running workloads (q-2026-05-20-13b9 trigger).
+    //
+    // Skipped on the auto-create path because that path's scope
+    // already includes the token by construction.
+    //
+    // Skipped on the test escape hatch (`WORKLOAD_QUEUE_AUTO_CREATE=0`)
+    // when the caller also supplied a qid — both opt-outs should
+    // collapse into "don't touch session-task" behaviour for the unit-
+    // test harness.
+    let inject_disabled = std::env::var("WORKLOAD_QUEUE_AUTO_CREATE")
+        .ok()
+        .as_deref()
+        == Some("0");
+    if caller_supplied_qid && !inject_disabled {
+        if let Some(ref qid) = effective_queue_id {
+            inject_workload_scope_token(label, qid);
         }
     }
 
@@ -2504,6 +2615,200 @@ mod tests {
 
         let qid = result.expect("register failure should be soft (Ok-soft)");
         assert_eq!(qid, "q-soft-fail");
+    }
+
+    // ---------------------------------------------------------------
+    // inject_workload_scope_token tests (q-2026-05-20-7482).
+    //
+    // The exporter at exporters/work-queue-exporter/work_queue_exporter.py
+    // (~line 299) finds the heartbeat file via a `workload:<label>`
+    // scope token on the queue item. When the queue item was created
+    // BEFORE the workload started (the common main-loop pattern:
+    // queue.add → queue.register → workload.run --queue-id), the
+    // scope is whatever the main loop chose (typically `resource:` or
+    // a repo: scope) and has no workload: token. `inject_workload_scope_token`
+    // is the systemic fix — the workload runner knows label+qid at
+    // startup and appends the token itself.
+    // ---------------------------------------------------------------
+
+    /// Build a recording session-task stub that:
+    ///   * appends argv to `recording` (one block per call, separator `=== invocation ===`)
+    ///   * exits 0 on every invocation
+    fn write_inject_recording_stub(
+        tmp: &std::path::Path,
+        recording: &std::path::Path,
+    ) -> PathBuf {
+        let stub_path = tmp.join("session-task-inject-stub");
+        let stub = format!(
+            "#!/bin/bash\n\
+             {{\n\
+               printf '=== invocation ===\\n'\n\
+               printf '%s\\n' \"$@\"\n\
+             }} >> {rec}\n\
+             exit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+        stub_path
+    }
+
+    #[test]
+    fn inject_workload_scope_token_calls_update_scope() {
+        // Happy path: caller supplies qid → helper invokes
+        // `session-task queue update-scope <qid> workload:<label>`.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = write_inject_recording_stub(tmp.path(), &recording);
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        inject_workload_scope_token("promote-3-shows", "q-2026-05-20-13b9");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+
+        assert!(recording.exists(), "stub should have been invoked");
+        let recorded = std::fs::read_to_string(&recording).expect("read");
+        assert!(
+            recorded.contains("queue\nupdate-scope\nq-2026-05-20-13b9"),
+            "expected `queue update-scope <qid>` invocation: {recorded}"
+        );
+        assert!(
+            recorded.contains("workload:promote-3-shows"),
+            "must pass workload:<label> token: {recorded}"
+        );
+    }
+
+    #[test]
+    fn inject_workload_scope_token_is_fail_soft_on_missing_cli() {
+        // CLI not on PATH → helper logs a warning and RETURNS (does
+        // not panic). The workload must keep running even when the
+        // queue layer is unreachable.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_path = std::env::var("PATH").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::remove_var("SESSION_TASK_CLI");
+            std::env::set_var("PATH", tmp.path()); // empty
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        // Should not panic, should not stall.
+        inject_workload_scope_token("missing-cli", "q-x");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn inject_workload_scope_token_is_fail_soft_on_nonzero_exit() {
+        // session-task update-scope exits non-zero (e.g. item not
+        // found) → helper logs a warning and RETURNS. Workload
+        // startup must not block on queue-layer errors.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let stub_path = tmp.path().join("inject-fail-stub");
+        let stub = "#!/bin/bash\nprintf 'simulated failure\\n' >&2\nexit 1\n";
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        // Should not panic, should return after the stub's exit 1.
+        inject_workload_scope_token("fail-stub", "q-fail");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+    }
+
+    #[test]
+    fn inject_workload_scope_token_is_idempotent() {
+        // Two consecutive calls with the same qid+label must both
+        // invoke `queue update-scope`; the subcommand itself is
+        // idempotent (tested separately in session-task pytest
+        // suite). The point of this test is that the Rust helper
+        // doesn't dedupe or short-circuit on a re-run (re-running
+        // `workload run LABEL --queue-id X` is the operator's
+        // signal that they want the token to exist; we delegate
+        // idempotency to update-scope rather than caching state
+        // here).
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = write_inject_recording_stub(tmp.path(), &recording);
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        inject_workload_scope_token("idem", "q-idem");
+        inject_workload_scope_token("idem", "q-idem");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+
+        let recorded = std::fs::read_to_string(&recording).expect("read");
+        let invocations = recorded.matches("=== invocation ===").count();
+        assert_eq!(
+            invocations, 2,
+            "both calls must invoke session-task (delegated idempotency): {recorded}"
+        );
+        // Both invocations should target the same qid + token.
+        let qid_count = recorded.matches("q-idem").count();
+        assert_eq!(
+            qid_count, 2,
+            "qid must appear in both invocations: {recorded}"
+        );
+        let token_count = recorded.matches("workload:idem").count();
+        assert_eq!(
+            token_count, 2,
+            "token must appear in both invocations: {recorded}"
+        );
     }
 
     #[test]

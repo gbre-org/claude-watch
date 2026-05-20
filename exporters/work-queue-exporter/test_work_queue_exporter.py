@@ -437,6 +437,98 @@ def run_scenarios():
     ra10 = find_any_sample(mod, "worktask_queue_item_ready_age_seconds", "q-s10")
     check("S10 ready_age emitted normally", ra10 is not None and ra10 >= 60, f"got {ra10!r}")
 
+    # ---- Scenario 10b: dep_blockers non-empty -> ready_age absent.
+    # An item with `dep_blockers` is intentionally waiting on an upstream
+    # depends_on task. It MUST NOT drive WorkQueueReadyStuck — that's a
+    # false-positive on healthy serialized work. Mirror of S8 (locked
+    # scope) but using the dep_blockers signal instead.
+    print("\nScenario 10b: pending item with dep_blockers -> ready_age absent")
+    blocked_item = make_pending_item(
+        "q-s10b-blocked", "waiting on upstream", age_seconds=1800,
+    )
+    blocked_item["dep_blockers"] = ["q-s10b-upstream"]
+    upstream_item = make_running_item("q-s10b-upstream", "upstream running")
+    write_queue(qjson, [blocked_item, upstream_item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    ra_blocked = find_any_sample(
+        mod, "worktask_queue_item_ready_age_seconds", "q-s10b-blocked",
+    )
+    check(
+        "S10b ready_age absent for dep_blockers-blocked item",
+        ra_blocked is None,
+        f"expected None, got {ra_blocked!r}",
+    )
+    # And dep_blockers items should NOT leak into locked_age either —
+    # they have no `lock_scope`, just an upstream dependency.
+    la_blocked = find_any_sample(
+        mod, "worktask_queue_item_locked_age_seconds", "q-s10b-blocked",
+    )
+    check(
+        "S10b locked_age absent for dep_blockers-blocked item",
+        la_blocked is None,
+        f"expected None, got {la_blocked!r}",
+    )
+
+    # ---- Scenario 10c: empty dep_blockers list -> ready_age emitted.
+    # Symmetric backwards-compat: an explicit empty list (the normal case
+    # from session-task queue's JSON output) must still emit ready_age.
+    print("\nScenario 10c: pending item with empty dep_blockers list -> ready_age emitted")
+    ready_item = make_pending_item(
+        "q-s10c-ready", "no deps", age_seconds=120,
+    )
+    ready_item["dep_blockers"] = []
+    write_queue(qjson, [ready_item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    ra_ready = find_any_sample(
+        mod, "worktask_queue_item_ready_age_seconds", "q-s10c-ready",
+    )
+    check(
+        "S10c ready_age emitted with empty dep_blockers",
+        ra_ready is not None and ra_ready >= 120,
+        f"got {ra_ready!r}",
+    )
+
+    # ---- Scenario 10d: locked AND dep_blockers -> neither gauge emits.
+    # The lock-scope short-circuit currently emits locked_age. With the
+    # dep_blockers guard added upstream of the lock check, the item is
+    # filtered out before we even classify it as locked. This is
+    # consistent with "dep_blockers means: don't surface ready/locked
+    # signals for this item at all".
+    print("\nScenario 10d: pending item with BOTH dep_blockers AND scope lock -> neither emitted")
+    lock_ts = datetime.now(timezone.utc).isoformat()
+    double_blocked = make_pending_item(
+        "q-s10d", "double blocked", age_seconds=2000,
+    )
+    double_blocked["scope"] = ["new-aqi-meter"]
+    double_blocked["dep_blockers"] = ["q-some-upstream"]
+    locked_dbl = {
+        "new-aqi-meter": {"reason": "hw install", "locked_at": lock_ts},
+    }
+    write_queue(qjson, [double_blocked], locked_scopes=locked_dbl)
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    ra_dbl = find_any_sample(
+        mod, "worktask_queue_item_ready_age_seconds", "q-s10d",
+    )
+    check(
+        "S10d ready_age absent (dep_blockers wins)",
+        ra_dbl is None,
+        f"got {ra_dbl!r}",
+    )
+    la_dbl = find_any_sample(
+        mod, "worktask_queue_item_locked_age_seconds", "q-s10d",
+    )
+    check(
+        "S10d locked_age absent (dep_blockers short-circuits)",
+        la_dbl is None,
+        f"got {la_dbl!r}",
+    )
+
     # ---- Scenario 11: blocked item -- has_live_owner labelled status="blocked"
     # so the WorkQueueOrphaned alert (which filters status="running") does
     # NOT fire on it. By design a blocked item has no live agent.
