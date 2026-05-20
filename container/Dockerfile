@@ -17,7 +17,7 @@
 FROM rust:1-bookworm AS claude-watch-builder
 
 ARG CLAUDE_WATCH_REPO=https://github.com/hndrewaall/claude-watch.git
-ARG CLAUDE_WATCH_REF=ccd1599bb9d05ebe36703488a22ba62b321ff6f2
+ARG CLAUDE_WATCH_REF=c240920a661278b05dd152030026cfe65d550ee3
 
 WORKDIR /build
 

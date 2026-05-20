@@ -307,6 +307,28 @@ The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
 if it's not on PATH, the operator hasn't wired the bind-mount and you
 should flag that before spawning agents at all.
 
+### Verify agent success before marking done
+
+**Never call `session-task queue done <id>` until you have received the
+agent's task-notification AND verified the agent reported success.** The
+main loop receives many `<task-notification>` messages (from watchers,
+other background tasks, etc.) — only the one carrying the agent's
+`task-id` signals that agent's completion. Specifically:
+
+- Wait for the `<task-notification>` whose `task-id` matches the agent
+  you spawned (not any other background task).
+- Verify `<status>completed</status>` in that notification (not
+  `failed`, not `cancelled`).
+- Only THEN call `session-task queue done <id>`.
+- If the agent failed or you cannot confirm success, call
+  `session-task queue abandon <id> --reason "agent failed: <reason>"`
+  instead.
+
+Marking a queue item `done` prematurely (before agent completion or
+on a misidentified notification) releases the scope lock and allows
+conflicting work to start — which races against the still-running
+agent or silently drops failed work on the floor.
+
 ### Queue IMMEDIATELY — never defer
 
 **Queue items the moment you intend to do the work.** Never say "I'll
