@@ -4309,6 +4309,120 @@ def cmd_queue_unblock(args):
         )
 
 
+def cmd_queue_update_scope(args):
+    """Add (or remove) scope tokens on an existing queue item, idempotently.
+
+    Primary motivation: `workload run LABEL -- CMD` needs to inject the
+    `workload:LABEL` scope token onto the queue item that the caller has
+    pre-registered (and whose qid was passed via `--queue-id`). Without
+    that token, the work-queue-exporter has no way to map the queue
+    item to its heartbeat file under `/run/claude/workloads/`, so
+    `worktask_queue_progress_age_seconds` never gets emitted and the
+    `WorkQueueStuck` / `WorkQueueStuckSoft` alerts false-fire on healthy
+    long-running workloads (q-2026-05-20-13b9 was the trigger — a
+    `resource:` scoped queue item bound to a workload via --queue-id
+    never gained its `workload:` token).
+
+    Semantics:
+      * Tokens are passed as positional args; multiple tokens add/remove
+        in one atomic write.
+      * Default mode = add. `--remove` removes the listed tokens.
+      * Add is idempotent: tokens already on the item are silently
+        skipped (no duplicate, no error).
+      * Remove is idempotent: tokens not on the item are silently
+        skipped (no error).
+      * The item's existing scope is preserved — this is a delta op,
+        not a replace.
+      * No `workload:` HARD-DENY check (unlike `queue add`). The whole
+        point of this subcommand is the inverse — to LET the workload
+        runner inject its own scope token onto a pre-registered item.
+
+    Exit codes:
+      * 0 — write succeeded (or no-op because all tokens were already
+        present / already absent).
+      * 1 — item not found, or no tokens supplied.
+
+    See feedback note on q-2026-05-20-7482 for the systemic context.
+    """
+    raw_tokens = list(args.tokens or [])
+    # Allow comma-joined forms for symmetry with `queue add --scope a,b`.
+    expanded = []
+    seen = set()
+    for raw in raw_tokens:
+        for piece in raw.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if piece in seen:
+                continue
+            seen.add(piece)
+            expanded.append(piece)
+    if not expanded:
+        print("ERROR: at least one token required", file=sys.stderr)
+        sys.exit(1)
+    try:
+        tokens = [_normalize_token(t) for t in expanded]
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        existing = list(target.get("scope") or [])
+        existing_set = set(existing)
+        added = []
+        removed = []
+        if args.remove:
+            new_scope = [t for t in existing if t not in set(tokens)]
+            removed = [t for t in tokens if t in existing_set]
+        else:
+            new_scope = list(existing)
+            for t in tokens:
+                if t in existing_set:
+                    continue
+                new_scope.append(t)
+                existing_set.add(t)
+                added.append(t)
+        if new_scope != existing:
+            target["scope"] = new_scope
+            target["scope_updated_at"] = _fmt_ts()
+            _queue_write_and_unlock(fh, data)
+        else:
+            # No-op: release the lock without rewriting the file.
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    if args.json:
+        print(json.dumps({
+            "id": args.id,
+            "scope": new_scope,
+            "added": added,
+            "removed": removed,
+        }, indent=2))
+        return
+    if args.remove:
+        if removed:
+            print(f"removed from {args.id}: {','.join(removed)}")
+        else:
+            print(f"no-op: tokens not present on {args.id}")
+    else:
+        if added:
+            print(f"added to {args.id}: {','.join(added)}")
+        else:
+            print(f"no-op: tokens already present on {args.id}")
+
+
 def cmd_queue_set_summary(args):
     """Add / replace the one-line summary on an existing queue item.
 
@@ -5329,6 +5443,33 @@ def build_parser():
     q_setsum.add_argument("id")
     q_setsum.add_argument("summary", help="New summary text (~10 words)")
 
+    q_updscope = qsub.add_parser(
+        "update-scope",
+        help=(
+            "Add (default) or remove (--remove) scope tokens on an existing "
+            "item. Idempotent. Primary use: `workload run` injecting the "
+            "`workload:<label>` token onto a pre-registered queue item so "
+            "the work-queue-exporter can locate its heartbeat file."
+        ),
+    )
+    q_updscope.add_argument("id")
+    q_updscope.add_argument(
+        "tokens",
+        nargs="+",
+        help=(
+            "Scope token(s) to add. Comma-joined forms accepted "
+            "(`workload:foo,resource:bar`). Tokens already on the item are "
+            "silently skipped (no duplicate). With --remove, tokens are "
+            "removed instead; tokens not present are silently skipped."
+        ),
+    )
+    q_updscope.add_argument(
+        "--remove",
+        action="store_true",
+        help="Remove the listed tokens instead of adding.",
+    )
+    q_updscope.add_argument("--json", action="store_true")
+
     q_depend = qsub.add_parser(
         "depend",
         help=(
@@ -5462,6 +5603,7 @@ def main():
             "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,
             "set-summary": cmd_queue_set_summary,
+            "update-scope": cmd_queue_update_scope,
             "depend": cmd_queue_depend,
             "prune": cmd_queue_prune,
             "banner": cmd_queue_banner,
