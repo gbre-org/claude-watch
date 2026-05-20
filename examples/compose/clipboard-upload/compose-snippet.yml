@@ -1,0 +1,68 @@
+# Drop-in docker-compose snippet that wires the clipboard-upload sidecar
+# alongside the ttyd + claude-container services in examples/compose/.
+#
+# This file is reference-only — it shows the two pieces an operator
+# needs to add to a real docker-compose.yml:
+#
+#   1. The `clipboard-upload` service definition (the block below
+#      whose key is exactly `clipboard-upload:`).
+#   2. The `host-clipboard:` named-volume declaration at the bottom,
+#      and the matching `host-clipboard:/host-clipboard` mount line
+#      added to the sibling claude-container service (commented in
+#      the .yml of the parent compose file — see README "Wiring").
+#
+# Merge by hand into examples/compose/docker-compose.yml, OR include
+# this file via `docker compose -f docker-compose.yml -f
+# clipboard-upload/compose-snippet.yml up`.
+
+services:
+  # ---------------------------------------------------------------------
+  # clipboard-upload — sideband endpoint for browser-paste → clipboard
+  # file. Listens on 9701 inside the container, default published only
+  # on localhost so an operator deploying via a reverse proxy can do
+  # auth + TLS in front. The browser frontend (q-2026-05-20-5f6e) POSTs
+  # to /clipboard-upload; this service materializes the PNG on the
+  # shared `host-clipboard` named volume, which the sibling
+  # claude-container's xclip shim reads via xclip -selection clipboard
+  # -t image/png -o.
+  # ---------------------------------------------------------------------
+  clipboard-upload:
+    build:
+      context: ./clipboard-upload
+      dockerfile: Dockerfile
+    image: claude-clipboard-upload:dev
+    # Only published on the loopback by default. Production: drop the
+    # `127.0.0.1:` prefix only if your reverse proxy is on the same
+    # docker network (or terminate auth ahead of this service).
+    ports:
+      - "127.0.0.1:9701:9701"
+    environment:
+      # In-container destination path. The xclip shim on the
+      # claude-container side reads from the same mount point, so the
+      # value here only matters for the file NAME under
+      # /host-clipboard/. Default matches the shim contract.
+      CLIPBOARD_DEST_PATH: /host-clipboard/clipboard.png
+      LOG_LEVEL: INFO
+    volumes:
+      # Shared volume with the sibling claude-container. Both services
+      # mount it at the same path; the sidecar writes, the
+      # claude-container's xclip shim reads.
+      - "host-clipboard:/host-clipboard"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Reminder: the sibling claude-container service ALSO needs the
+  # host-clipboard volume mounted. In the parent docker-compose.yml,
+  # add to claude-container's volumes:
+  #
+  #     - "host-clipboard:/host-clipboard"
+  #
+  # The claude-container's xclip shim (installed via the
+  # claude-container Dockerfile) is the consumer.
+  # ---------------------------------------------------------------------
+
+volumes:
+  # Named volume — Docker manages its filesystem lifetime. Use a bind
+  # mount instead if you need to inspect the file from the host shell
+  # (e.g. `./host-clipboard:/host-clipboard`).
+  host-clipboard:
