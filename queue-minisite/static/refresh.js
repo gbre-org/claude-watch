@@ -173,6 +173,65 @@
     );
   }
 
+  function renderBlockedItem(it) {
+    // Markup MUST mirror the BLOCKED block in templates/index.html.
+    //
+    // BLOCKED items are status=blocked — the owning agent moved itself
+    // there via `session-task queue block <id> --reason ...`. The reason
+    // is operator-set free text; it is NOT a depends_on edge. Do NOT cull
+    // these by referenced-blocker state (e.g. "blocker q-XYZ is done so
+    // hide this") — the operator set the block and only the operator
+    // (via `session-task queue unblock`) clears it. The server-side
+    // shaping in app.py already emits exactly the items with
+    // ``status == "blocked"``; this renderer just mirrors the markup.
+    //
+    // Prior bug (q-2026-05-20-db66): this renderer + section did not
+    // exist, so the SPA's first refresh tick built a queue-root WITHOUT
+    // #section-blocked and morphdom discarded the server-rendered
+    // blocked section. Visible symptom: "BLOCKED 1" on first paint,
+    // then disappears ~5s later.
+    let head = '';
+    head += '<span class="badge state-blocked" title="parked on an external blocker; no live agent expected">blocked</span>';
+    if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
+    head += `<span class="id">${esc(it.id)}</span>`;
+    head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+
+    const blockedIso = it.blocked_at_iso || '';
+    let ageBlock = `<span ${blockedIso ? `data-local-time-iso="${attr(blockedIso)}" data-local-time-title-only` : ''} title="${attr(blockedIso)}">blocked ${esc(it.age)}</span>`;
+    if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
+
+    let scope = '';
+    if (it.scope && it.scope.length) {
+      scope = '<div class="scope">' +
+        it.scope.map((s) => `<span class="chip">${esc(s)}</span>`).join('') +
+        '</div>';
+    }
+
+    let reasonHtml = '';
+    if (it.block_reason) {
+      reasonHtml = `<p class="description"><strong>blocker:</strong> ${esc(it.block_reason)}</p>`;
+    }
+
+    let prompt = '';
+    if (it.description) {
+      prompt = '<details class="prompt-toggle">' +
+        `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
+        `<pre class="prompt-body">${esc(it.description)}</pre>` +
+        '</details>';
+    }
+
+    return (
+      `<article id="queue-${attr(it.id)}" class="item state-blocked" data-queue-id="${attr(it.id)}" data-queue-status="blocked" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}">` +
+      `<header class="item-head">${head}</header>` +
+      `<p class="summary">${esc(it.summary)}</p>` +
+      reasonHtml +
+      `<div class="age">${ageBlock}</div>` +
+      scope +
+      prompt +
+      '</article>'
+    );
+  }
+
   function renderPendingItem(it) {
     // Markup MUST mirror the pending block in templates/index.html. Any
     // drift will cause morphdom to flap on every tick (server's first
@@ -316,6 +375,28 @@
     );
   }
 
+  function renderBlockedSection(state) {
+    // The Jinja template wraps the entire BLOCKED section in
+    // `{% if blocked %}` — i.e. when the queue has zero blocked items,
+    // there is NO #section-blocked element at all. Mirror that here:
+    // if the SPA renders an empty #section-blocked while the server
+    // omits it, morphdom would diff the two trees and re-create the
+    // wrapper on every tick (and worse, never let the server's
+    // omit-when-empty state stick after a refresh). Return an empty
+    // string when there's nothing to render — morphdom will then
+    // simply delete the wrapper if it was present before, which is
+    // what we want.
+    const totals = state.totals || {};
+    const items = state.blocked || [];
+    if (!items.length) return '';
+    return (
+      `<section id="section-blocked">` +
+      `<h2 class="section-title">Blocked <span class="section-count">${esc(totals.blocked ?? items.length)}</span></h2>` +
+      items.map(renderBlockedItem).join('') +
+      '</section>'
+    );
+  }
+
   function renderPendingSection(state) {
     const totals = state.totals || {};
     const items = state.pending || [];
@@ -368,9 +449,15 @@
     // Build a detached <main> with the four sections in order. The merge
     // target is the live <main id="queue-root"> so we wrap in the same
     // tag + id.
+    // Section order MUST match templates/index.html:
+    //   RUNNING → BLOCKED → PENDING → DONE → ABANDONED.
+    // The previous version (q-2026-05-20-db66) omitted BLOCKED entirely,
+    // so the first refresh tick after page load discarded the server-
+    // rendered #section-blocked: "BLOCKED 1" → vanishes after ~5s.
     const html =
       `<main id="queue-root">` +
       renderRunningSection(state) +
+      renderBlockedSection(state) +
       renderPendingSection(state) +
       renderDoneSection(state) +
       renderAbandonedSection(state) +
