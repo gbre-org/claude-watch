@@ -1,0 +1,93 @@
+# Example /etc/cron.d/private entry for a claude-watch CONTAINER deployment.
+#
+# This file is the canonical example for "I want a recurring task to fire
+# inside my claude-watch container". The container image (built from
+# container/Dockerfile) ships its own cron daemon with /etc/cron.d/private
+# reserved as an operator bind-mount slot. See container/compose.yml for
+# the volume entry; see container/cron.d/cw-default for the baked-in
+# defaults this file SUPPLEMENTS (it does not replace them — both fire).
+#
+# ----------------------------------------------------------------------
+# Installation
+# ----------------------------------------------------------------------
+#
+# 1. Copy this file to a host path you want to bind-mount in. The
+#    in-container path /etc/cron.d/private is a directory, so the host
+#    counterpart is also a directory, and the file inside it can have
+#    any name:
+#
+#        sudo mkdir -p /etc/claude-watch/private-cron.d
+#        sudo cp examples/cron/private-example/private-example.crontab \
+#                /etc/claude-watch/private-cron.d/index-refresh
+#        sudo chown root:root /etc/claude-watch/private-cron.d/index-refresh
+#        sudo chmod 644       /etc/claude-watch/private-cron.d/index-refresh
+#
+#    Files inside /etc/cron.d/ (including subdirectories) MUST be owned
+#    by root and not be symlinks — cron refuses to load anything else
+#    with "WRONG FILE OWNER" and skips it silently.
+#
+# 2. Uncomment the corresponding bind-mount line in container/compose.yml:
+#
+#        - "/etc/claude-watch/private-cron.d/:/etc/cron.d/private/:ro"
+#
+#    Adjust the host path to match step 1.
+#
+# 3. Recreate the container so it picks up the new volume:
+#
+#        docker compose up -d --force-recreate claude-watch
+#
+# 4. Verify cron sees the file (the supervisor log should show one line
+#    per cron entry on reload):
+#
+#        docker compose exec claude-watch cat /var/log/cron.log
+#
+# ----------------------------------------------------------------------
+# Format
+# ----------------------------------------------------------------------
+#
+# Standard /etc/cron.d/ format: `m h dom mon dow user command`. The
+# `user` column is REQUIRED for /etc/cron.d/ entries (unlike a
+# `crontab -e` user-crontab, which omits it).
+#
+# Inside the cw container, the user MUST be `hndrewaall` — that's the
+# uid-1000 account the image bakes for claude-watch, and the one
+# /var/lib/claude-watch/ is owned by. Running as root inside the
+# container bypasses every permission boundary the image sets up.
+#
+# claude-watch itself is on PATH at /usr/local/bin/claude-watch
+# (image-baked). Spell out the absolute path in cron rows; cron's
+# default PATH is the minimal /usr/bin:/bin, so anything not under
+# those needs the full path OR an explicit PATH= line at the top of
+# the file. Following the cw-default convention, this example uses
+# absolute paths.
+#
+# stderr capture follows the same convention as
+# container/cron.d/cw-default: redirect to /tmp/claude-watch-cron-*.log
+# so operators can inspect failures via:
+#
+#     docker compose exec claude-watch cat /tmp/claude-watch-cron-index-refresh.log
+#
+# ----------------------------------------------------------------------
+# Customise
+# ----------------------------------------------------------------------
+#
+# Replace the INDEX_CMD placeholder with the actual command you want
+# fired. The shape below — `claude-event "..." --tag <tag> --source cron
+# --data <k=v>` — is the canonical "I refreshed something; here's the
+# state" emission; consumers can route on the tag via
+# tools/claude-event/routing.
+#
+# If your command is a script that lives on the host, bind-mount the
+# script into the container too (e.g. via a second compose volume entry
+# at /usr/local/bin/my-script), and have the cron row exec the
+# in-container path.
+
+# ----------------------------------------------------------------------
+# Pattern — periodic index refresh (every 6 hours)
+# ----------------------------------------------------------------------
+# Reference shape: re-fire a long-running index/cache rebuild on a fixed
+# cadence, then drop a claude-event so the attached session knows the
+# refresh completed (or failed). 6h is a reasonable default for an
+# index refresh — long enough that consecutive runs don't overlap, short
+# enough that a cache going stale gets noticed the same day.
+0 */6 * * * hndrewaall /usr/local/bin/claude-event "index refresh tick" --tag index-refresh --source cron --data cadence=6h > /tmp/claude-watch-cron-index-refresh.log 2>&1
