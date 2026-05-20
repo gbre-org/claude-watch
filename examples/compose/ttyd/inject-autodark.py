@@ -43,6 +43,18 @@
 #      atomically writes the PNG to a named volume that the
 #      claude-container's xclip shim reads. This is the browser-only
 #      complement to workbot's Mac-side clipboard-bridge daemon.
+#   6. Injects a document-level `paste` event listener
+#      (PASTE_EVENT_HANDLER_JS) that intercepts Cmd+V / Ctrl+V image
+#      data DIRECTLY from the ClipboardEvent — no button click needed.
+#      The browser fires `paste` synchronously with the keystroke (which
+#      counts as a user gesture for clipboardData purposes — the
+#      navigator.clipboard.read() permission prompt only applies to the
+#      ASYNC API). If clipboardData.items contains image/*: upload the
+#      blob to /clipboard-upload, fire \x16, toast. If only text items:
+#      do NOT preventDefault — let the existing keydown intercept (or
+#      the browser's native text-paste path) handle it. The floating
+#      "Paste image" button (step 5) stays in place as an explicit
+#      fallback for permission-quirky browser states.
 #
 # Output is written in place: index.html is overwritten.
 
@@ -305,10 +317,11 @@ PASTE_INTERCEPT_JS = """<script id="paste-intercept-injected">
 # Code's `chat:imagePaste` action fires inside the terminal.
 #
 # Phase A (paste-event handler that intercepts Cmd+V/Ctrl+V image data
-# directly) is intentionally deferred to a follow-up. This button is
-# the lowest-friction primitive: user clicks once, grants the
-# permission prompt once per origin, and from then on the click acts
-# as an explicit "send my clipboard image to Claude" action.
+# directly) lives in PASTE_EVENT_HANDLER_JS below. This button stays
+# as an explicit fallback: some browser/permission states (e.g. a
+# previously-denied clipboard permission, or browsers that don't
+# expose images via the synchronous paste event for security reasons)
+# need an explicit user gesture, and the button always works.
 #
 # Why a button at all (when the keydown intercept already exists):
 #   1. The keydown intercept fires the *byte* \x16 but does NOT upload
@@ -521,6 +534,205 @@ PASTE_IMAGE_BUTTON_JS = """<style id="paste-image-button-injected-style">
 </script>
 """
 
+# Phase A — document-level `paste` event handler. The browser fires a
+# `paste` event SYNCHRONOUSLY when the user hits Cmd+V / Ctrl+V (and on
+# the OS-level Edit > Paste menu item). That event carries a
+# `clipboardData` object that is readable WITHOUT triggering the async
+# Clipboard API permission prompt — `e.clipboardData.items` is gated
+# only by the user-gesture requirement, which the keystroke itself
+# satisfies. This is the "no button click required" path.
+#
+# Coexistence:
+#   - PASTE_INTERCEPT_JS (keydown, useCapture=true) sends \x16 for ALL
+#     Cmd+V / Ctrl+V keystrokes. The paste-event listener below ALSO
+#     fires for those same keystrokes (the browser dispatches both
+#     `keydown` AND `paste` for Cmd+V); we only call preventDefault on
+#     the paste event when we actually found an image, so for text-only
+#     paste the existing flow (keydown -> \x16 OR native text paste)
+#     wins unmolested.
+#   - For images we DO preventDefault on the paste event AND fire \x16
+#     ourselves after upload, so the terminal sees exactly ONE \x16:
+#     the one we fire after the sidecar acks the upload. The keydown
+#     intercept also fires \x16, which would arrive BEFORE the upload
+#     finishes — that's a pre-existing race the button has too. The
+#     xclip shim reads whatever PNG bytes are at /host-clipboard at
+#     the moment Claude Code's chat:imagePaste action runs; the worst
+#     case is the user pastes twice in quick succession and the second
+#     paste reads the first paste's bytes. Acceptable for v1; a future
+#     refinement could suppress the keydown \x16 when an image was
+#     detected, but the keydown intercept can't peek at clipboardData
+#     (it's a different event).
+#   - The button (PASTE_IMAGE_BUTTON_JS) stays. Some scenarios where it
+#     is the only working path:
+#       * User wants to paste an image that isn't currently in the
+#         clipboard from a keystroke (e.g. they screenshotted, switched
+#         to the terminal, want to send without a fresh Cmd+V).
+#       * Browser denies clipboardData.items for security policy
+#         reasons (rare but documented for some enterprise locked-down
+#         Chromium profiles).
+#       * Firefox-on-Linux historically exposed images via the paste
+#         event inconsistently; the button works regardless.
+PASTE_EVENT_HANDLER_JS = """<script id="paste-event-handler-injected">
+(function() {
+    'use strict';
+
+    var UPLOAD_URL = '/clipboard-upload';
+    var TOAST_MS = 2800;
+
+    // Reuse the toast surface mounted by PASTE_IMAGE_BUTTON_JS. If the
+    // button's IIFE hasn't run yet (race on initial load), create the
+    // toast element ourselves; the button's ensureToast() will find it
+    // by id on its first call.
+    function ensureToast() {
+        var t = document.getElementById('cw-paste-image-toast');
+        if (t) return t;
+        t = document.createElement('div');
+        t.id = 'cw-paste-image-toast';
+        if (document.body) {
+            document.body.appendChild(t);
+        }
+        return t;
+    }
+
+    var toastTimer = null;
+    function showToast(msg, isError) {
+        var t = ensureToast();
+        if (!t) return;
+        t.textContent = msg;
+        t.classList.toggle('error', !!isError);
+        t.classList.add('visible');
+        if (toastTimer) { clearTimeout(toastTimer); }
+        toastTimer = setTimeout(function() {
+            t.classList.remove('visible');
+        }, TOAST_MS);
+    }
+
+    // Mirrors PASTE_INTERCEPT_JS / PASTE_IMAGE_BUTTON_JS — each
+    // injected block is its own IIFE so the helper is duplicated. The
+    // duplication is intentional (small, no shared globals across
+    // blocks, easier to reason about each block in isolation).
+    function sendToTerminal(data) {
+        var t = window.term;
+        if (!t) return false;
+        try {
+            if (t._core && t._core.coreService &&
+                typeof t._core.coreService.triggerDataEvent === 'function') {
+                t._core.coreService.triggerDataEvent(data);
+                return true;
+            }
+        } catch (e) { /* fall through */ }
+        try {
+            if (t._core && t._core._onData &&
+                typeof t._core._onData.fire === 'function') {
+                t._core._onData.fire(data);
+                return true;
+            }
+        } catch (e) { /* fall through */ }
+        return false;
+    }
+
+    function uploadBlob(blob) {
+        return fetch(UPLOAD_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'image/png' },
+            body: blob,
+        });
+    }
+
+    // Pull the first image/* item out of the ClipboardEvent. Returns
+    // a File/Blob via DataTransferItem.getAsFile(), or null if there's
+    // no image in the event. DataTransferItemList iteration is by
+    // index — `.items` is array-like but NOT an Array, no forEach.
+    function findImageItem(items) {
+        if (!items) return null;
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            // item.kind is 'file' for binary blobs (images, files);
+            // 'string' for text. Skip strings — text-only paste must
+            // fall through to the existing path.
+            if (item.kind === 'file' && typeof item.type === 'string' &&
+                item.type.indexOf('image/') === 0) {
+                var blob = item.getAsFile();
+                if (blob) return blob;
+            }
+        }
+        return null;
+    }
+
+    // Returns true iff the event contains a text item we should let
+    // through. Used purely for diagnostics — we never preventDefault
+    // for text-only events, so this is informational.
+    function hasTextItem(items) {
+        if (!items) return false;
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            if (item.kind === 'string') return true;
+        }
+        return false;
+    }
+
+    var inFlight = false;
+
+    async function onPaste(e) {
+        // clipboardData may be null in synthetic events; bail safely.
+        var cd = e.clipboardData || window.clipboardData;
+        if (!cd) return;
+
+        var blob = findImageItem(cd.items);
+        if (!blob) {
+            // No image -> do NOT preventDefault. Text paste flows
+            // through the existing keydown intercept (which fires
+            // \\x16 for Cmd+V / Ctrl+V) or, if focus is outside the
+            // terminal, the browser's native paste behaviour.
+            return;
+        }
+
+        // Image found. Take ownership of the event so the browser
+        // doesn't ALSO try to handle it (e.g. paste-into-input on a
+        // focused form element on the page).
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (inFlight) {
+            showToast('Paste already in progress', true);
+            return;
+        }
+        inFlight = true;
+
+        try {
+            var resp = await uploadBlob(blob);
+            if (!resp.ok) {
+                var detail = '';
+                try {
+                    var body = await resp.json();
+                    if (body && body.error) { detail = ': ' + body.error; }
+                } catch (err) { /* non-JSON body */ }
+                showToast('Upload failed: ' + resp.status + detail, true);
+                return;
+            }
+            var sent = sendToTerminal('\\x16');
+            if (!sent) {
+                showToast('Uploaded, but terminal not ready', true);
+                return;
+            }
+            showToast('Image pasted');
+        } catch (err) {
+            var msg = (err && err.message) ? err.message : String(err);
+            showToast('Error: ' + msg, true);
+        } finally {
+            inFlight = false;
+        }
+    }
+
+    // useCapture=true so we run BEFORE any other paste listener on the
+    // page (xterm.js attaches its own paste handler for the textarea
+    // overlay it uses for IME / clipboard input; we want first dibs on
+    // image data).
+    document.addEventListener('paste', onPaste, true);
+})();
+</script>
+"""
+
 
 def inject(html: str) -> str:
     """Inject CSS + JS into the <head> of ttyd's bundled HTML.
@@ -538,7 +750,10 @@ def inject(html: str) -> str:
         raise SystemExit(
             "inject-autodark.py: '</head>' marker not found in input HTML"
         )
-    injected = CSS + JS + PASTE_INTERCEPT_JS + PASTE_IMAGE_BUTTON_JS + marker
+    injected = (
+        CSS + JS + PASTE_INTERCEPT_JS + PASTE_IMAGE_BUTTON_JS
+        + PASTE_EVENT_HANDLER_JS + marker
+    )
     # Replace only the FIRST occurrence (xterm.js's inline JS may
     # mention the string '</head>' inside a quoted literal further
     # down).
@@ -565,7 +780,8 @@ def main() -> int:
     for needle in ("autodark-injected", "prefers-color-scheme",
                    "paste-intercept-injected",
                    "paste-image-button-injected",
-                   "cw-paste-image-btn"):
+                   "cw-paste-image-btn",
+                   "paste-event-handler-injected"):
         if needle not in patched:
             sys.stderr.write(
                 f"inject-autodark.py: missing '{needle}' in output — abort\n"

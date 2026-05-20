@@ -84,7 +84,8 @@ RUN set -eux; \
     grep -q 'autodark-injected' /tmp/index.patched.html; \
     grep -q 'paste-intercept-injected' /tmp/index.patched.html; \
     grep -q 'paste-image-button-injected' /tmp/index.patched.html; \
-    grep -q 'cw-paste-image-btn' /tmp/index.patched.html
+    grep -q 'cw-paste-image-btn' /tmp/index.patched.html; \
+    grep -q 'paste-event-handler-injected' /tmp/index.patched.html
 
 # -------------------------------------------------------------------
 # Runtime stage.
