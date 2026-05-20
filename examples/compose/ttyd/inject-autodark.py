@@ -252,18 +252,46 @@ PASTE_INTERCEPT_JS = """<script id="paste-intercept-injected">
 
     var isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 
+    // --- Strategy 1: keydown capture ---
+    // Works reliably for Ctrl+V on all platforms. For Cmd+V on Mac,
+    // some browsers (Safari especially) swallow the keydown before our
+    // listener fires, so we also need Strategy 2 below.
+    // We check both e.key and e.code: when metaKey is held, some
+    // browsers report e.key as 'v', others as 'V', and some don't
+    // fire the event at all. e.code ('KeyV') is layout-independent
+    // and more reliable with modifier keys.
     document.addEventListener('keydown', function(e) {
+        var keyIsV = (e.key === 'v' || e.key === 'V' || e.code === 'KeyV');
         // Cmd+V on Mac, Ctrl+V on non-Mac (without Shift -- Ctrl+Shift+V
         // is the standard ttyd text-paste keybinding and must pass through).
         var isPaste = isMac
-            ? (e.metaKey && !e.ctrlKey && !e.shiftKey && e.key === 'v')
-            : (e.ctrlKey && !e.metaKey && !e.shiftKey && e.key === 'v');
+            ? (e.metaKey && !e.ctrlKey && !e.shiftKey && keyIsV)
+            : (e.ctrlKey && !e.metaKey && !e.shiftKey && keyIsV);
         if (isPaste) {
             e.preventDefault();
             e.stopPropagation();
             sendToTerminal('\\x16');
         }
     }, true);  // useCapture=true to fire before xterm.js's own handler
+
+    // --- Strategy 2: paste event capture ---
+    // On macOS, Cmd+V often triggers the browser's native paste pipeline
+    // at a priority ABOVE keydown (especially in Safari and Chrome 120+).
+    // The keydown event either never fires or fires with the default
+    // already committed. The 'paste' event, however, ALWAYS fires when
+    // the browser processes a paste — regardless of how it was triggered
+    // (Cmd+V, Edit menu, context menu). By intercepting it, we catch
+    // the Cmd+V case that Strategy 1 misses.
+    //
+    // We preventDefault() to suppress the browser's native paste (which
+    // would insert clipboard text into a focused contenteditable or
+    // input, not useful in a terminal), and send the raw Ctrl+V byte
+    // to the PTY so Claude Code's imagePaste handler activates.
+    document.addEventListener('paste', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        sendToTerminal('\\x16');
+    }, true);  // useCapture=true
 })();
 </script>
 """
