@@ -383,6 +383,147 @@ refresh.mergeQueueRoot(stateE);
 assert('T14: input inside data-no-morph subtree retains value',
   $('#fake-modal-input') && $('#fake-modal-input').value === 'user typed text');
 
+// === TEST 15: BLOCKED section regression (q-2026-05-20-db66) ===
+// Bug: refresh.js' buildQueueDOM() only emitted running/pending/done/
+// abandoned sections — there was no renderBlockedSection. The Jinja
+// template renders BLOCKED server-side, but the first SPA tick (5s
+// after page load) would morphdom-merge a new queue-root that omitted
+// #section-blocked entirely, and the server's blocked items would
+// disappear.
+//
+// Critical sub-case: blocked items can have a free-text block_reason
+// that references other queue ids ("Waiting on q-13b9 to complete").
+// Those references are FYI for the operator only — they are NOT
+// depends_on edges. The blocked item must remain visible regardless
+// of whether the referenced ids are done. The renderer doesn't even
+// parse block_reason; it just shows the row whenever status=blocked.
+const stateF = JSON.parse(JSON.stringify(stateE));
+stateF.blocked = [
+  {
+    id: 'q-99ad',
+    summary: 'Reseed 3 shows from Raiden after promotes',
+    description: '',
+    scope: ['repo:media-tools'],
+    group_head: true,
+    status: 'blocked',
+    priority: 3,
+    created_by: 'andrew',
+    block_reason: 'Waiting on q-13b9 promote-3-shows workload to complete. depends_on relation is what should normally hold this back, but the obligation predicate ignores depends_on. Re-enter running via unblock when q-13b9 done.',
+    depends_on: [],
+    blocked_at_iso: '2026-05-20T18:30:00Z',
+    age: '15m ago',
+    is_starting: false,
+  },
+];
+stateF.totals.blocked = 1;
+refresh.mergeQueueRoot(stateF);
+const blockedSection = $('#section-blocked');
+assert('T15a: #section-blocked rendered when blocked items present',
+  !!blockedSection);
+const q99ad = $('article[data-queue-id="q-99ad"]');
+assert('T15b: blocked item q-99ad article rendered',
+  !!q99ad);
+assert('T15c: blocked item has state-blocked class',
+  q99ad && q99ad.classList.contains('state-blocked'));
+assert('T15d: blocked item has data-queue-status="blocked"',
+  q99ad && q99ad.getAttribute('data-queue-status') === 'blocked');
+const blockedBadge = q99ad && q99ad.querySelector('.badge.state-blocked');
+assert('T15e: blocked item has blocked badge',
+  !!blockedBadge && blockedBadge.textContent.trim() === 'blocked');
+const reasonP = q99ad && q99ad.querySelector('p.description');
+assert('T15f: block_reason surfaced as description paragraph',
+  !!reasonP && reasonP.textContent.includes('Waiting on q-13b9'));
+assert('T15g: blocked section count badge shows 1',
+  blockedSection && blockedSection.querySelector('.section-count').textContent.trim() === '1');
+// Section ordering: running → blocked → pending → done → abandoned.
+// Verify #section-blocked comes after #section-running and before
+// #section-pending in document order.
+const queueRoot = $('#queue-root');
+const sectionIds = Array.from(queueRoot.children)
+  .filter((el) => el.tagName === 'SECTION')
+  .map((el) => el.id);
+assert('T15h: section order is running → blocked → pending → done → abandoned',
+  JSON.stringify(sectionIds) === JSON.stringify([
+    'section-running', 'section-blocked', 'section-pending', 'section-done', 'section-abandoned',
+  ]),
+  `got ${JSON.stringify(sectionIds)}`);
+
+// === TEST 16: blocked item survives ticks even when referenced
+// blocker id is done (operator-set block, not depends_on-derived). ===
+//
+// q-13b9 (referenced in q-99ad's block_reason free text) is in
+// done_recent — exactly the q-2026-05-20-db66 bug scenario. The
+// renderer must NOT cull q-99ad on this basis: only status=blocked
+// drives section membership.
+const stateG = JSON.parse(JSON.stringify(stateF));
+stateG.done_recent = [
+  {
+    id: 'q-13b9',
+    summary: 'promote-3-shows workload',
+    description: '',
+    has_archive: true,
+    completed_at_iso: '2026-05-20T18:25:00Z',
+    age: '20m ago',
+    created_by: 'andrew',
+  },
+];
+stateG.totals.done = 1;
+refresh.mergeQueueRoot(stateG);
+assert('T16a: q-99ad still rendered after referenced blocker q-13b9 transitions to done',
+  !!$('article[data-queue-id="q-99ad"]'));
+assert('T16b: #section-blocked still present after referenced blocker done',
+  !!$('#section-blocked'));
+// And q-13b9 IS in done.
+assert('T16c: q-13b9 appears in #section-done',
+  !!$('#section-done article[data-queue-id="q-13b9"]'));
+
+// === TEST 17: empty blocked array removes #section-blocked ===
+// When the operator unblocks q-99ad (blocked → running/pending),
+// the next tick has blocked=[] and the section wrapper should
+// disappear (matches the Jinja `{% if blocked %}` gate).
+const stateH = JSON.parse(JSON.stringify(stateG));
+stateH.blocked = [];
+stateH.totals.blocked = 0;
+refresh.mergeQueueRoot(stateH);
+assert('T17a: #section-blocked removed when blocked array empties',
+  !$('#section-blocked'));
+assert('T17b: q-99ad article gone when blocked empties',
+  !$('article[data-queue-id="q-99ad"]'));
+
+// === TEST 18: blocked section appears on first SPA tick when server
+// rendered without it (initial-paint had zero blocked, then one
+// arrived). This mirrors the natural flow: page loads with no blocked
+// items, operator runs `session-task queue block`, the next 5s tick
+// must materialize #section-blocked. ===
+//
+// Build a fresh dom that matches the initial page (no blocked
+// section), then tick with one blocked item.
+const stateI = JSON.parse(JSON.stringify(stateE));
+stateI.blocked = [
+  {
+    id: 'q-zzzz',
+    summary: 'newly blocked',
+    description: '',
+    scope: [],
+    group_head: false,
+    status: 'blocked',
+    priority: 5,
+    created_by: '',
+    block_reason: 'waiting on andrew greenlight',
+    depends_on: [],
+    blocked_at_iso: '2026-05-20T18:35:00Z',
+    age: '1m ago',
+    is_starting: false,
+  },
+];
+stateI.totals.blocked = 1;
+// First, ensure #section-blocked is gone (from T17 we already removed it).
+refresh.mergeQueueRoot(stateI);
+assert('T18a: #section-blocked materializes on tick when blocked item appears',
+  !!$('#section-blocked'));
+assert('T18b: q-zzzz rendered',
+  !!$('article[data-queue-id="q-zzzz"]'));
+
 console.log('---');
 if (failures) {
   console.error(`FAILED: ${failures} assertion(s)`);

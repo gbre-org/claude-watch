@@ -398,7 +398,8 @@ if [ "${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}" = "1" ]; then
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
 fi
 if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
-    _auto_continue_quoted="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
+    _auto_continue_val="${CLAUDE_AUTO_CONTINUE_PROMPT:-The claude-container process was just (re)created. Run your session-start checklist, start event watchers, then check session-task for pending work.}"
+    _auto_continue_quoted="'${_auto_continue_val//\'/\'\\\'\'}'"
     CLAUDE_CMD="$CLAUDE_CMD --continue $_auto_continue_quoted"
 fi
 export CLAUDE_CMD

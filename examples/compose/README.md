@@ -377,38 +377,65 @@ runs inside a container and is being driven from a browser tab: the
 container has no access to the operator's clipboard, and the browser's
 own paste keystroke is intercepted before xterm.js sees it.
 
-The patched `index.html` ships two complementary primitives that close
-that gap:
+The patched `index.html` makes Cmd+V / Ctrl+V work for both images
+AND text in a single keybinding:
 
-1. **Cmd+V / Ctrl+V keydown intercept** (always on). The browser's
-   default paste handler is suppressed and the raw `\x16` byte is sent
-   into the terminal instead, so the keystroke reaches Claude Code as a
-   `chat:imagePaste` event. On its own this only helps if some other
-   channel has already populated `/host-clipboard/clipboard.png` on the
-   shared named volume (e.g. the Mac-side `clipboard-bridge` daemon
-   under [`launchd/`](launchd/) running on the operator's laptop).
-2. **Floating "Paste image" button** in the lower-right corner. On
-   click, it calls `navigator.clipboard.read()`, finds the first
-   `image/*` `ClipboardItem`, and `POST`s the resulting blob as raw
-   PNG to the sibling `clipboard-upload` sidecar (see
-   [`clipboard-upload/`](clipboard-upload/)). The sidecar atomically
-   writes the file to `/host-clipboard/clipboard.png` on the volume
-   shared with `claude-container`, and the button then fires the same
-   `\x16` byte so the in-container `xclip` shim picks up the new file.
-   Toast notifications surface success / permission errors / sidecar
-   errors inline.
+1. **Keydown suppression**. A capture-phase `keydown` handler runs
+   before xterm.js's own listener and stops the Cmd+V / Ctrl+V
+   keystroke from propagating; it does NOT call `preventDefault`, so
+   the browser still fires its `paste` event (Safari and Chrome 120+
+   silently swallow the paste event if `keydown` is preventDefaulted).
+2. **`paste` event handler** (capture phase). Synchronously sniffs
+   `event.clipboardData.types`:
+   - If ANY `image/*` MIME is advertised (PNG, JPEG, WebP, GIF, …),
+     `preventDefault()` + `stopImmediatePropagation()` immediately,
+     then async-read the image via `navigator.clipboard.read()` (paste
+     keystroke is a valid user gesture for the async Clipboard API,
+     no permission prompt). The blob is `POST`ed as raw PNG to the
+     sibling `clipboard-upload` sidecar (see
+     [`clipboard-upload/`](clipboard-upload/)); the sidecar atomically
+     writes `/host-clipboard/clipboard.png` on the volume shared with
+     `claude-container`, and the handler then fires the raw `\x16`
+     byte (Claude Code's `chat:imagePaste` keybinding) so the
+     in-container `xclip` shim picks up the new file. A Solarized
+     toast surfaces success / upload errors / permission errors.
+   - If NO image MIME is present, the handler returns immediately
+     WITHOUT calling `preventDefault`. xterm.js's native paste flow
+     then runs and streams the text into the PTY exactly as it would
+     for any other terminal. Cmd+Shift+V / Ctrl+Shift+V (xterm.js's
+     Clipboard-addon text-paste binding) is now redundant for plain
+     text but kept available as a fallback.
 
-The button is the browser-only equivalent of the Mac-side clipboard
-bridge — useful on Linux desktops, Chromebooks, tablets, and any
-deployment where running a host-side daemon is impractical. The
-sidecar is optional: if you don't deploy it, the button surfaces an
-error toast and the keydown intercept keeps working for users who do
-have a host-side bridge populating the clipboard file.
+The sync `.types` check is fast and reliable across Chrome / Safari /
+Firefox; the unreliable bit is the SYNC retrieval of image bytes via
+`e.clipboardData.items[i].getAsFile()` (in particular for macOS
+Cmd+Shift+4 screenshots, where browsers occasionally surface an empty
+items list even though `.types` advertises `image/png`). The handler
+uses `.types` for the sync decision and `navigator.clipboard.read()`
+for the async byte retrieval.
+
+The async-image / native-text design replaces an earlier two-pronged
+approach (a synchronous keydown that fired `\x16` immediately + a
+floating "Paste image" button). The synchronous keydown raced against
+the async upload — the in-container `xclip` could read stale bytes
+before the new PNG landed on the shared volume — and the button was
+redundant once the paste-event path worked. The button was removed in
+2026-05; the Cmd+V keybinding is now the sole entry point for both
+text and image paste. The `chat:imagePaste` byte (`\x16`) is fired
+exactly once per image paste, AFTER the upload has completed,
+eliminating the race.
 
 `navigator.clipboard.read()` requires a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts)
-(HTTPS or `localhost`) and a user gesture. Plain `http://` to a remote
-host will not work — front the ttyd port with a TLS-terminating
-reverse proxy in that case.
+(HTTPS or `localhost`) and a user gesture (the paste keystroke
+qualifies). Plain `http://` to a remote host will not work — front
+the ttyd port with a TLS-terminating reverse proxy in that case.
+
+The Mac-side `clipboard-bridge` daemon under [`launchd/`](launchd/)
+is an orthogonal channel that writes `/host-clipboard/clipboard.png`
+via AppleScript on the operator's laptop. It's useful when the
+operator is driving the agent from a non-browser context (e.g. a
+shell SSH into the container, or a tmux client outside the browser),
+where the browser-side Clipboard API never sees the paste at all.
 
 ### Security note
 

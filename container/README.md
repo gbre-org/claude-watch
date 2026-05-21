@@ -28,29 +28,50 @@ Override the image tag via `CLAUDE_CONTAINER_IMAGE` (default: `claude-container:
 
 ## Build
 
+From the repo root:
+
 ```
-docker build -t claude-container:dev -f container/Dockerfile container/
+make container-build
 ```
 
-Or `cd container && docker build -t claude-container:dev .` if you prefer.
+(or equivalently `docker build --build-arg GIT_SHA=$(git rev-parse HEAD) -t claude-container:dev -f container/Dockerfile .`).
 
 The Dockerfile is a multi-stage build:
 
-- **Stage 1 (`claude-watch-builder`)**: `rust:1-bookworm` clones
-  [`hndrewaall/claude-watch`](https://github.com/hndrewaall/claude-watch)
-  at a pinned commit (build-arg `CLAUDE_WATCH_REF`) and runs
+- **Stage 1 (`claude-watch-builder`)**: `rust:1-bookworm` `COPY`s the
+  working tree from the build context (the repo root) and runs
   `cargo build --release`. Output: `/build/target/release/claude-watch`,
-  stripped + LTO-optimised via the upstream `Cargo.toml`'s
-  `[profile.release]`.
+  stripped + LTO-optimised via the `Cargo.toml`'s `[profile.release]`.
+  The `.dockerignore` at the repo root prunes `target/`, `__pycache__/`,
+  `.git/`, editor swap files, etc. so only the source files Cargo
+  actually needs land in the build context.
 - **Stage 2 (final)**: `debian:bookworm-slim` copies just
   `/usr/local/bin/claude-watch` from stage 1. Builder and runtime share the
   bookworm libc, so the binary runs without glibc-mismatch surprises.
 
-To pin to a different upstream revision:
+The build context is the repo root (not `container/`) because the
+Dockerfile `COPY`s from sibling `tools/hooks/`, `tools/obligations/`,
+etc. — and the claude-watch-builder stage now `COPY`s the whole working
+tree to compile the daemon. The previous hand-drafted SHA bump-PR
+dance (every time `main` moved a contributor had to open a "bump
+`CLAUDE_WATCH_REF`" PR against this Dockerfile) is gone: a normal
+`git pull --rebase` before `make container-build` picks up the latest
+sources naturally.
+
+### Reproducibility / which revision is in the image
+
+The `GIT_SHA` build-arg is plumbed through to a `LABEL
+claude_watch_sha=...` on the final image. The `make container-build`
+and `make compose-build` targets both pass `--build-arg
+GIT_SHA=$(git rev-parse HEAD)` automatically, so:
 
 ```
-docker build --build-arg CLAUDE_WATCH_REF=<sha-or-tag> -t claude-container:dev container/
+docker inspect claude-container:dev --format '{{ index .Config.Labels "claude_watch_sha" }}'
 ```
+
+…reports which working-tree HEAD was baked. A bare `docker build .` (no
+`--build-arg`) still works — the LABEL just reads as empty in that
+case.
 
 The `entrypoint.sh` creates a single-pane tmux session by default (claude
 only). Set `CLAUDE_CONTAINER_SIDEBAR=1` to enable the optional 2-pane

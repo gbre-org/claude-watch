@@ -231,8 +231,13 @@ def test_auto_continue_empty_no_flag() -> None:
 
 
 def test_auto_continue_single_word() -> None:
-    """CLAUDE_AUTO_CONTINUE=resume → exec claude --continue 'resume'."""
-    env = {"PATH": "/usr/bin:/bin", "CLAUDE_AUTO_CONTINUE": "resume"}
+    """CLAUDE_AUTO_CONTINUE=1 + CLAUDE_AUTO_CONTINUE_PROMPT=resume →
+    exec claude --continue 'resume'."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_AUTO_CONTINUE": "1",
+        "CLAUDE_AUTO_CONTINUE_PROMPT": "resume",
+    }
     cmd = run_block(BLOCK, env)
     expect(cmd == "exec claude --continue 'resume'",
            f"auto-continue 'resume': expected exec claude --continue 'resume', "
@@ -247,7 +252,8 @@ def test_auto_continue_with_shim() -> None:
         "PATH": "/usr/bin:/bin",
         "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/foo.json",
         "CLAUDE_SHIM_FILTER_USER": "1",
-        "CLAUDE_AUTO_CONTINUE": "resume",
+        "CLAUDE_AUTO_CONTINUE": "1",
+        "CLAUDE_AUTO_CONTINUE_PROMPT": "resume",
     }
     cmd = run_block(BLOCK, env)
     expect("--setting-sources project,local" in cmd,
@@ -263,12 +269,13 @@ def test_auto_continue_with_shim() -> None:
 
 
 def test_auto_continue_multiword_quoted() -> None:
-    """CLAUDE_AUTO_CONTINUE='hello world' → value survives as a single
-    quoted argv element so tmux's command-string shell parse doesn't
-    split it."""
+    """CLAUDE_AUTO_CONTINUE_PROMPT='hello world' → value survives as a
+    single quoted argv element so tmux's command-string shell parse
+    doesn't split it."""
     env = {
         "PATH": "/usr/bin:/bin",
-        "CLAUDE_AUTO_CONTINUE": "hello world",
+        "CLAUDE_AUTO_CONTINUE": "1",
+        "CLAUDE_AUTO_CONTINUE_PROMPT": "hello world",
     }
     cmd = run_block(BLOCK, env)
     expect("--continue 'hello world'" in cmd,
@@ -282,7 +289,8 @@ def test_auto_continue_value_with_single_quote() -> None:
     balanced under shell parsing."""
     env = {
         "PATH": "/usr/bin:/bin",
-        "CLAUDE_AUTO_CONTINUE": "it's me",
+        "CLAUDE_AUTO_CONTINUE": "1",
+        "CLAUDE_AUTO_CONTINUE_PROMPT": "it's me",
     }
     cmd = run_block(BLOCK, env)
     # The value 'it's me' becomes 'it'\''s me' inside single quotes.
@@ -300,6 +308,18 @@ def test_auto_continue_value_with_single_quote() -> None:
     expect("it's me" in result.stdout,
            f"auto-continue roundtrip: shell should parse value back as "
            f"\"it's me\", got stdout {result.stdout!r}")
+
+
+def test_auto_continue_default_prompt() -> None:
+    """CLAUDE_AUTO_CONTINUE=1 without CLAUDE_AUTO_CONTINUE_PROMPT →
+    uses the built-in default session-start instruction."""
+    env = {"PATH": "/usr/bin:/bin", "CLAUDE_AUTO_CONTINUE": "1"}
+    cmd = run_block(BLOCK, env)
+    expect("--continue" in cmd,
+           f"auto-continue default: --continue should appear, got {cmd!r}")
+    expect("session-start checklist" in cmd,
+           f"auto-continue default: should contain default prompt text, "
+           f"got {cmd!r}")
 
 
 def test_plugin_dir_absent_no_flag() -> None:
@@ -385,6 +405,7 @@ TESTS = [
     test_auto_continue_with_shim,
     test_auto_continue_multiword_quoted,
     test_auto_continue_value_with_single_quote,
+    test_auto_continue_default_prompt,
 ]
 
 for t in TESTS:

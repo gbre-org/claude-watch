@@ -142,6 +142,9 @@ jobs:
       - name: Run personal-mcp-host launchd plist tests
         run: make test-personal-mcp-host-plist
 
+      - name: Run ttyd paste-handler tests
+        run: make test-ttyd-paste-handler
+
       - name: Install uv (for session-task tests)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
