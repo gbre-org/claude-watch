@@ -544,6 +544,63 @@ def test_status_cli_is_exempt_even_at_threshold():
         h.cleanup()
 
 
+def test_subagent_always_allowed():
+    """Subagents must NEVER be gated by the dispatcher. The gate exists
+    to force the main loop to delegate; once delegated, the subagent IS
+    the worker and must be free to chain tool calls."""
+    h = Harness()
+    try:
+        # Push main-loop counter above threshold
+        for _ in range(4):
+            h.run_hook(NON_EXEMPT_BASH)
+        # Confirm main loop is now denied
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "subagent precondition: main loop denied",
+              f"out={out}")
+        # Same call WITH agent_id -> must allow
+        for i in range(10):
+            rc, out, _ = h.run_hook({
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hello"},
+                "agent_id": f"agent-abc-{i}",
+            })
+            check(_is_allow(out),
+                  f"subagent call #{i + 1}: allow despite threshold",
+                  f"out={out}")
+        # Counter should NOT have been incremented by subagent calls
+        check(h.read_state().get("count") == 3,
+              "subagent calls don't increment counter",
+              f"state={h.read_state()}")
+    finally:
+        h.cleanup()
+
+
+def test_subagent_empty_agent_id_still_gates():
+    """An empty agent_id means main loop -- gate should still apply."""
+    h = Harness()
+    try:
+        for _ in range(3):
+            h.run_hook(NON_EXEMPT_BASH)
+        # Call with empty agent_id -- should still deny
+        rc, out, _ = h.run_hook({
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+            "agent_id": "",
+        })
+        check(_is_deny(out), "empty agent_id: still gates (main loop)",
+              f"out={out}")
+        # Call with whitespace-only agent_id -- should still deny
+        rc, out, _ = h.run_hook({
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+            "agent_id": "   ",
+        })
+        check(_is_deny(out), "whitespace agent_id: still gates (main loop)",
+              f"out={out}")
+    finally:
+        h.cleanup()
+
+
 def main() -> int:
     tests = [
         test_empty_state_allows,
@@ -567,6 +624,8 @@ def main() -> int:
         test_counter_does_not_ratchet_during_deny,
         test_watcher_ctl_run_exempt_during_recovery_storm,
         test_status_cli_is_exempt_even_at_threshold,
+        test_subagent_always_allowed,
+        test_subagent_empty_agent_id_still_gates,
     ]
     for t in tests:
         print(f"\n== {t.__name__} ==")

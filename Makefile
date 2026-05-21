@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -327,8 +327,31 @@ bootstrap:
 # Build the compose stack images (skip the sibling eichi build context
 # if eichi isn't cloned next door — `docker compose build` will surface
 # the missing-context error if so).
+#
+# GIT_SHA build-arg flows to container/Dockerfile's `LABEL
+# claude_watch_sha=...` so `docker inspect claude-container:dev --format
+# '{{ index .Config.Labels "claude_watch_sha" }}'` reports which local
+# revision was baked. `git rev-parse HEAD` is the working-tree HEAD;
+# operators who want origin/main should `git pull --rebase` before
+# invoking this target (the Dockerfile no longer pins a remote SHA — it
+# COPYs the local working tree).
 compose-build:
-	@cd examples/compose && docker compose build
+	@cd examples/compose && \
+	  GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
+	  docker compose build \
+	    --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"
+
+# Build just the claude-container image directly (no compose). Same
+# GIT_SHA plumbing as compose-build. Context is the repo root because the
+# Dockerfile COPYs from sibling tools/ + container/ trees, and the
+# claude-watch-builder stage COPYs the whole working tree to compile the
+# Rust daemon.
+container-build:
+	docker build \
+	  --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
+	  -t claude-container:dev \
+	  -f container/Dockerfile \
+	  .
 
 # Bring the integrated compose stack up in the foreground.
 compose-up:
