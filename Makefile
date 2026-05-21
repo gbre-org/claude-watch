@@ -136,6 +136,7 @@ test-entrypoint:
 	container/tests/queue-gate-wired.test
 	container/tests/claude-watch-alert-gate-wired.test
 	container/tests/dispatch-gate-wired.test
+	container/tests/event-must-act-wired.test
 	container/tests/agent-comms-baked.test
 	container/tests/compose-mount-modes.test
 	container/tests/state-volume-default.test

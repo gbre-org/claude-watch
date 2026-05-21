@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""event-classify — classify a claude-event source+tag into a tier.
+
+Tier model (4 tiers; this CLI only owns 3 — Signal is intentionally
+NOT classified here, see "Signal exclusion" below):
+
+  - ``ambient``    Info-only context. UserPromptSubmit hook injects
+                   into the NEXT prompt's context. Non-blocking.
+                   No obligation, no gate, no tool-call deferral.
+
+  - ``actionable`` Demands an active response (queue an agent, ack a
+                   DM-equivalent, dispatch a fix). Recorded in
+                   ``~/.config/claude-events/pending-actions.json``;
+                   the ``event_must_act`` obligation evaluator counts
+                   consecutive non-exempt Bash tool calls while
+                   pending. After N consecutive missed calls (default
+                   3) the gate fires and DENIES.
+
+  - ``excluded``   This refactor explicitly does NOT touch this
+                   class. Currently only Signal (``signal/*``) is on
+                   the excluded list: Signal-DM acks stay on the
+                   existing per-thread obligation gate, NOT migrated
+                   to the new shared event-must-act infrastructure.
+                   Andrew (sig_ts 2026-05-21): "for now keep signal
+                   distinct even if it fits conceptually. too mission
+                   critical to risk on new shared infra".
+
+The classification map is DATA (the ``CLASSIFICATIONS`` table below),
+not hardcoded. New event sources are added by appending to the table.
+
+Source/tag schema is documented in
+``tools/claude-event/claude-event``'s ``VALID_SOURCES`` (``cron``,
+``alertmanager``, ``queue``, ``torrent``, ``security``, ``manual``,
+``claude-watch``).
+
+Usage:
+
+  event-classify --source <src> --tag <tag> [--message <text>]
+                 [--json] [--default <tier>]
+
+  Exit 0 with the tier name on stdout (``ambient`` / ``actionable``
+  / ``excluded`` / ``unknown``). When ``--json`` is set, emit a JSON
+  object with the source / tag / tier / reason fields instead.
+
+  ``--default`` picks the tier when no rule matches (default
+  ``ambient`` — safest "do not block" stance).
+
+Self-tests: ``event-classify --self-test``. Embedded suite covers
+every entry in ``CLASSIFICATIONS`` plus a "no match -> default"
+case, an excluded-takes-precedence-over-ambient case, and the
+message-substring conditional rule (``pr-status-change`` is
+actionable iff the message contains "CI failure"/"CI success",
+ambient otherwise).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from typing import Callable
+
+# --- Tier vocabulary ------------------------------------------------------
+
+AMBIENT = "ambient"
+ACTIONABLE = "actionable"
+EXCLUDED = "excluded"
+UNKNOWN = "unknown"
+VALID_TIERS = {AMBIENT, ACTIONABLE, EXCLUDED, UNKNOWN}
+
+
+# --- Classification table (DATA) ------------------------------------------
+#
+# Each entry: (source_pattern, tag_pattern, predicate, tier, reason).
+#
+#   source_pattern: exact string or "*" (any source)
+#   tag_pattern:    exact string, "*" (any tag), or "<prefix>*" prefix
+#   predicate:      None or a callable(message: str) -> bool. When set,
+#                   the rule matches only if the predicate returns True
+#                   for the message. Used for message-conditional rules
+#                   like pr-status-change (actionable iff "CI failure"/
+#                   "CI success" in message; ambient otherwise).
+#   tier:           "ambient" / "actionable" / "excluded"
+#   reason:         human-readable docstring; surfaced in --json output.
+#
+# Order matters: first match wins. Excluded rules go FIRST so Signal
+# can never accidentally match an ambient/actionable rule.
+#
+# --- ADD A NEW EVENT SOURCE BY APPENDING TO THIS TABLE --------------------
+
+def _contains_any(*needles: str) -> Callable[[str], bool]:
+    def _pred(msg: str) -> bool:
+        m = msg or ""
+        return any(n in m for n in needles)
+    return _pred
+
+
+CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] = [
+    # --- EXCLUDED (NOT TOUCHED BY THIS REFACTOR) --------------------------
+    #
+    # Signal is intentionally NOT migrated. Per Andrew 2026-05-21:
+    # "for now keep signal distinct even if it fits conceptually.
+    # too mission critical to risk on new shared infra". Signal-DM
+    # acks stay on the existing per-thread obligation (signal-wait-*
+    # watcher + signal-send ack-gate). DO NOT add signal-* rules to
+    # the actionable bucket below.
+    ("manual", "signal-dm-inbound", None, EXCLUDED,
+        "Signal stays on its own per-thread ack-gate; not migrated."),
+    ("manual", "signal-group-inbound", None, EXCLUDED,
+        "Signal stays on its own per-thread ack-gate; not migrated."),
+    ("*", "signal-*", None, EXCLUDED,
+        "Any signal-tagged event is owned by the Signal ack-gate."),
+
+    # --- ACTIONABLE -------------------------------------------------------
+    #
+    # Events that DEMAND a response (spawn agent, DM requester, ack).
+    # Each one should add a pending-actions row + count toward the
+    # N-tool-call gate.
+
+    # Torrent completion -> needs torrent-process agent spawn.
+    ("torrent", "torrent-completed", None, ACTIONABLE,
+        "Torrent finished; needs torrent-process agent spawn."),
+
+    # Manual request-fulfilled -> needs requester DM.
+    ("manual", "request-fulfilled", None, ACTIONABLE,
+        "Embiguity request fulfilled; needs requester DM."),
+
+    # Queue items whose owning agent died on transient API errors.
+    ("queue", "queue-api-dead", None, ACTIONABLE,
+        "Queue agent died on transient API 5xx; needs respawn or DM."),
+
+    # claude-watch alerts are conditionally actionable: fatal alerts
+    # (context-warning / crashed-auto-restart) need an immediate
+    # response; transient warnings (test-pane / cannot-interrupt) are
+    # ambient.
+    ("claude-watch", "claude-watch-alert",
+        _contains_any("CONTEXT", "crashed", "auto-restart", "main pane"),
+        ACTIONABLE,
+        "Fatal claude-watch alert (context/crash/main pane); needs "
+        "immediate action."),
+
+    # pr-status-change is conditionally actionable (CI failure / CI
+    # success demand attention; "new push" / "CI pending" / "mergeable"
+    # are routine context).
+    ("*", "pr-status-change",
+        _contains_any("CI failure", "CI success"),
+        ACTIONABLE,
+        "PR status change with CI outcome; needs investigation/merge."),
+
+    # workbot-prompt -> needs dispatch (legacy v1 actionable tag).
+    ("*", "workbot-prompt", None, ACTIONABLE,
+        "Workbot prompt waiting; needs dispatch."),
+
+    # queue-stale-ready -> needs spawn/abandon decision.
+    ("queue", "queue-stale-ready", None, ACTIONABLE,
+        "Queue item ready but stale; needs spawn/abandon decision."),
+
+    # slack-unread (legacy v1 tag, kept for back-compat).
+    ("*", "slack-unread", None, ACTIONABLE,
+        "Slack DM unread; needs read+reply."),
+
+    # --- AMBIENT ----------------------------------------------------------
+    #
+    # Info-only: surface in next UserPromptSubmit context, no gate.
+
+    # Alertmanager firing/resolved -- LLM may decide to act, but the
+    # alert itself is just context (Andrew gets push, this is for
+    # situational awareness).
+    ("alertmanager", "alert-firing", None, AMBIENT,
+        "Alert firing; Andrew already gets push, context for LLM."),
+    ("alertmanager", "alert-resolved", None, AMBIENT,
+        "Alert resolved; context for LLM."),
+    ("alertmanager", "*", None, AMBIENT,
+        "Any alertmanager event is context-only (Andrew gets push)."),
+
+    # Routine cron events (tv-check, queue-stale-ready uses queue
+    # source instead, unmatched-torrents, security-check).
+    ("cron", "tv-check", None, AMBIENT,
+        "Routine TV inventory cron; context only."),
+    ("cron", "unmatched-torrents", None, AMBIENT,
+        "Routine unmatched-torrents cron; context only."),
+    ("cron", "security-check", None, AMBIENT,
+        "Routine security cron; context only."),
+    ("cron", "*", None, AMBIENT,
+        "Routine cron tick; context only."),
+
+    # claude-watch non-fatal alerts (test-pane warnings, transient
+    # cannot-interrupt notices).
+    ("claude-watch", "claude-watch-alert", None, AMBIENT,
+        "Non-fatal claude-watch alert (test-pane / transient); context."),
+    ("claude-watch", "*", None, AMBIENT,
+        "Any non-alert claude-watch event is context-only."),
+
+    # Queue routine transitions (running/done/abandoned).
+    ("queue", "queue-running", None, AMBIENT,
+        "Queue item started; context only."),
+    ("queue", "queue-done", None, AMBIENT,
+        "Queue item done; context only."),
+    ("queue", "queue-abandoned", None, AMBIENT,
+        "Queue item abandoned; context only."),
+
+    # Routine PR status changes: "new push", "CI pending", "mergeable".
+    # The conditional ACTIONABLE rule above catches CI failure/success;
+    # this catches everything else.
+    ("*", "pr-status-change", None, AMBIENT,
+        "Routine PR status (push/pending/mergeable); context only."),
+
+    # Workload routine.
+    ("*", "workload-done", None, AMBIENT,
+        "Workload finished; context only."),
+
+    # Watcher routine events.
+    ("*", "memory-remind", None, AMBIENT,
+        "Memory-remind watcher tick; context only."),
+    ("*", "watcher-cleanup", None, AMBIENT,
+        "Watcher cleanup tick; context only."),
+]
+
+
+# --- Matching engine ------------------------------------------------------
+
+def _match_pattern(pattern: str, value: str) -> bool:
+    """Match value against a simple pattern: exact, '*' (any),
+    or '<prefix>*' (prefix). Case-sensitive on both sides."""
+    if pattern == "*":
+        return True
+    if pattern.endswith("*"):
+        return value.startswith(pattern[:-1])
+    return pattern == value
+
+
+def classify(source: str, tag: str, message: str = "",
+             default_tier: str = AMBIENT) -> dict:
+    """Return a dict with keys 'tier' and 'reason'. First matching
+    rule wins; falls back to ``default_tier`` if no rule matches."""
+    src = source or ""
+    tg = tag or ""
+    msg = message or ""
+    for src_pat, tag_pat, pred, tier, reason in CLASSIFICATIONS:
+        if not _match_pattern(src_pat, src):
+            continue
+        if not _match_pattern(tag_pat, tg):
+            continue
+        if pred is not None and not pred(msg):
+            continue
+        return {"tier": tier, "reason": reason,
+                "matched": f"{src_pat}/{tag_pat}"}
+    return {"tier": default_tier, "reason": "no rule matched (default)",
+            "matched": None}
+
+
+# --- CLI ------------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="event-classify",
+        description="Classify a claude-event source+tag into a tier "
+                    "(ambient / actionable / excluded).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--source", help="Event source (e.g. 'cron', 'manual').")
+    p.add_argument("--tag", help="Event tag (e.g. 'torrent-completed').")
+    p.add_argument("--message", default="",
+                   help="Event message body (used by message-conditional "
+                        "rules like pr-status-change).")
+    p.add_argument("--default", default=AMBIENT, choices=sorted(VALID_TIERS),
+                   help="Tier to return when no rule matches "
+                        f"(default: {AMBIENT}).")
+    p.add_argument("--json", action="store_true",
+                   help="Emit JSON instead of a bare tier name.")
+    p.add_argument("--list-rules", action="store_true",
+                   help="Print every rule in the classification table "
+                        "and exit.")
+    p.add_argument("--self-test", action="store_true",
+                   help="Run the embedded test suite and exit.")
+    args = p.parse_args()
+
+    if args.self_test:
+        return _self_test()
+
+    if args.list_rules:
+        for src_pat, tag_pat, pred, tier, reason in CLASSIFICATIONS:
+            cond = f" (conditional)" if pred else ""
+            print(f"{src_pat:>16} / {tag_pat:<24}  -> {tier:<10} {reason}{cond}")
+        return 0
+
+    if not args.source or not args.tag:
+        p.error("--source and --tag are required (or use --self-test "
+                "/ --list-rules)")
+        return 2
+
+    result = classify(args.source, args.tag, args.message,
+                      default_tier=args.default)
+    if args.json:
+        out = {"source": args.source, "tag": args.tag,
+               "message": args.message, **result}
+        print(json.dumps(out))
+    else:
+        print(result["tier"])
+    return 0
+
+
+# --- Embedded self-test ---------------------------------------------------
+
+def _self_test() -> int:
+    cases = [
+        # Excluded (signal): exact + wildcard
+        (("manual", "signal-dm-inbound", ""), EXCLUDED),
+        (("manual", "signal-group-inbound", ""), EXCLUDED),
+        (("manual", "signal-foo", ""), EXCLUDED),  # signal-* wildcard
+        (("cron", "signal-anything", ""), EXCLUDED),  # signal-* across sources
+
+        # Actionable: simple tags
+        (("torrent", "torrent-completed", ""), ACTIONABLE),
+        (("manual", "request-fulfilled", ""), ACTIONABLE),
+        (("queue", "queue-api-dead", ""), ACTIONABLE),
+        (("manual", "workbot-prompt", ""), ACTIONABLE),
+        (("queue", "queue-stale-ready", ""), ACTIONABLE),
+        (("manual", "slack-unread", ""), ACTIONABLE),
+
+        # claude-watch-alert: conditional. Fatal -> actionable.
+        (("claude-watch", "claude-watch-alert", "CONTEXT CRITICALLY LOW"),
+            ACTIONABLE),
+        (("claude-watch", "claude-watch-alert", "main pane crashed"),
+            ACTIONABLE),
+        (("claude-watch", "claude-watch-alert", "auto-restart fired"),
+            ACTIONABLE),
+        # Non-fatal -> ambient
+        (("claude-watch", "claude-watch-alert", "test-pane warning"), AMBIENT),
+        (("claude-watch", "claude-watch-alert", "cannot-interrupt notice"),
+            AMBIENT),
+
+        # pr-status-change: conditional
+        (("manual", "pr-status-change", "CI failure on PR #1234"),
+            ACTIONABLE),
+        (("manual", "pr-status-change", "CI success on PR #1234"),
+            ACTIONABLE),
+        (("manual", "pr-status-change", "new push to branch"), AMBIENT),
+        (("manual", "pr-status-change", "CI pending"), AMBIENT),
+        (("manual", "pr-status-change", "mergeable"), AMBIENT),
+
+        # Ambient: alertmanager
+        (("alertmanager", "alert-firing", ""), AMBIENT),
+        (("alertmanager", "alert-resolved", ""), AMBIENT),
+        (("alertmanager", "random-tag", ""), AMBIENT),  # alertmanager/* wildcard
+
+        # Ambient: cron
+        (("cron", "tv-check", ""), AMBIENT),
+        (("cron", "unmatched-torrents", ""), AMBIENT),
+        (("cron", "anything-else", ""), AMBIENT),  # cron/* wildcard
+
+        # Ambient: queue routine
+        (("queue", "queue-running", ""), AMBIENT),
+        (("queue", "queue-done", ""), AMBIENT),
+        (("queue", "queue-abandoned", ""), AMBIENT),
+
+        # Ambient: workload + watcher
+        (("manual", "workload-done", ""), AMBIENT),
+        (("manual", "memory-remind", ""), AMBIENT),
+        (("manual", "watcher-cleanup", ""), AMBIENT),
+
+        # Unknown -> default (ambient)
+        (("manual", "totally-novel-tag", ""), AMBIENT),
+    ]
+    failures = []
+    for (src, tag, msg), expected in cases:
+        actual = classify(src, tag, msg)["tier"]
+        if actual != expected:
+            failures.append(f"  {src}/{tag} (msg={msg!r}): "
+                            f"expected={expected} actual={actual}")
+
+    # Excluded-takes-precedence test: a signal-tagged event under a
+    # source that ALSO has an ambient/actionable wildcard must still
+    # come back excluded.
+    res = classify("alertmanager", "signal-something", "")
+    if res["tier"] != EXCLUDED:
+        failures.append(f"  alertmanager/signal-something: expected="
+                        f"{EXCLUDED} actual={res['tier']} -- excluded "
+                        f"rule must run BEFORE alertmanager/* wildcard")
+
+    # --default flag honored when no rule matches.
+    res2 = classify("torrent", "unknown-tag", default_tier=ACTIONABLE)
+    if res2["tier"] != ACTIONABLE:
+        failures.append(f"  default-tier override: expected="
+                        f"{ACTIONABLE} actual={res2['tier']}")
+
+    if failures:
+        print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
+        for f in failures:
+            print(f, file=sys.stderr)
+        return 1
+    print(f"OK: {len(cases) + 2} cases pass.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -963,6 +963,161 @@ and limits:
   like a typical host install. claude-watch's in-container config pins to
   this session name.
 
+## Event response protocol — four-tier model
+
+When `claude-event-watch` delivers events, the container classifies each
+event into one of four tiers based on its `source` and `tag`. The tiers
+escalate from "purely informational" to "blocking" and exist so the LLM
+sees the right level of pressure for each event class.
+
+### Tier 1 — Ambient (info-only, context-inject only)
+
+Routine, non-actionable events: alerts that Andrew already gets push for,
+cron ticks, routine queue transitions (running/done/abandoned), workload-
+done, non-fatal claude-watch alerts, routine PR status (push/pending/
+mergeable), etc.
+
+  - Routed by `event-ack ingest` into `ambient-context.json`.
+  - Surfaced by the `user-prompt-ambient-inject-hook` (UserPromptSubmit)
+    on the NEXT user prompt as additional context.
+  - **Non-blocking**. No gate. The LLM sees them, can act if anything
+    stands out, otherwise just absorbs context.
+
+### Tier 2 — Actionable (pending list + N-call gate)
+
+Events that demand a response within a reasonable window: torrent-
+completed (needs agent spawn), manual/request-fulfilled (needs requester
+DM), queue/queue-api-dead (needs respawn decision), fatal claude-watch
+alerts (CONTEXT CRITICALLY LOW, main pane crashed), PR CI failure /
+success, workbot-prompt, queue-stale-ready, slack-unread.
+
+  - Routed by `event-ack ingest` into `pending-actions.json`.
+  - The `event_must_act` obligation evaluator counts CONSECUTIVE non-
+    exempt Bash tool calls while pending. **Default N=3**: under
+    threshold = ALLOW + bump counter; threshold reached = DENY.
+    Override via `$EVENT_MUST_ACT_N`.
+  - **Each `event-ack` transaction resets the counter to 0**, so the
+    LLM gets a fresh N-call grace window after every ack.
+  - The gate does NOT fire immediately on every actionable event — only
+    after the LLM has missed N consecutive opportunities to triage. This
+    is the q-2026-05-21-856d refinement (Andrew: "only TRULY actionable
+    events go into pending, and the gate escalates after N missed calls
+    rather than firing immediately").
+
+### Tier 3 — Signal (distinct, NOT migrated)
+
+Signal-DM inbound and signal-group inbound stay on their existing
+per-thread obligation path. The `signal-wait-*` watcher records inbound
+DMs, and the per-thread `signal-send` ack-gate blocks outbound until the
+inbound is acked via `signal-ack`.
+
+  - Routed by `event-ack ingest` as `excluded` (no-op).
+  - **NOT migrated to the new shared event-must-act infrastructure.**
+    Andrew (2026-05-21): "for now keep signal distinct even if it fits
+    conceptually. too mission critical to risk on new shared infra".
+  - Long-term: a separate later PR may migrate Signal once the new
+    infra is proven.
+
+### Tier 4 — Unknown (defaults to ambient)
+
+Any event whose source/tag pair doesn't match a rule in the
+`event-classify` table falls through to the default tier (ambient).
+Conservative posture — unknown events become context, never block.
+
+### Event classification table
+
+The mapping is DATA, in `event-classify`'s `CLASSIFICATIONS` table.
+Inspect with:
+
+```sh
+event-classify --list-rules
+event-classify --source <src> --tag <tag> [--message <text>] --json
+```
+
+Adding a new event source = appending a row to the table. No code
+change in the gate logic itself.
+
+### Workflow
+
+1. **Watcher fires** — `claude-event-watch` prints `EVENT[source/tag]
+   message` lines and exits.
+2. **Restart watcher immediately** (before processing).
+3. **For each event line**, call `event-ack ingest --source <src>
+   --tag <tag> --message "<msg>"`. The classifier routes it to the
+   right queue automatically.
+4. **For actionable events**, queue an agent / act directly / dismiss,
+   then ack with `event-ack ack "<key>" --action "<what you did>"`.
+   Each ack resets the N-counter.
+5. **Ambient events** require no action — they'll appear in the next
+   prompt's context automatically via the UserPromptSubmit hook.
+
+### CLI reference
+
+```sh
+# Route an event through the classifier + into the correct queue.
+event-ack ingest --source <src> --tag <tag> --message "<msg>"
+
+# Pending-actions surface (actionable tier).
+event-ack add "<key>" [--source "<src>"]   # Manual add (rare)
+event-ack ack "<key>" --action "<text>"    # Ack -> resets N-counter
+event-ack list                             # Show pending + counter
+event-ack clear                            # Clear all (escape hatch)
+
+# Counter knobs (rarely-used).
+event-ack reset-counter
+
+# Hook-internal (drains ambient queue for UserPrompt inject).
+event-ack drain-ambient
+
+# Classifier introspection.
+event-classify --source <s> --tag <t> [--message <m>] [--json]
+event-classify --list-rules
+```
+
+### Gate behavior (Tier 2 actionable)
+
+- **Default-open**: missing state file, corrupt JSON, empty list,
+  python unavailable — all ALLOW.
+- **N-counter**: tracks CONSECUTIVE missed non-exempt Bash calls while
+  pending. Reset on any `event-ack` mutation. Threshold default 3;
+  configurable via `$EVENT_MUST_ACT_N`.
+- **Exempt commands** (never increment counter, never blocked):
+  `event-ack`, `event-classify`, `session-task queue`, `obligations`,
+  `claude-watch-ack`, `claude-watch-dispatch`, `agent-msg`,
+  `agent-tail`, `signal-history`, `signal-ack`, `signal-mark-read`.
+- **Concurrency**: every state read-modify-write goes through `flock(2)`
+  on a sidecar lockfile (`.lock` next to the state file). Two parallel
+  `event-ack` invocations cannot race.
+- **Scope**: main loop only (the existing obligation row scopes via
+  `is_main_loop`). Subagents are not gated.
+- **Override**: `obligations override "reason" --duration <N>` bypasses
+  this gate (and every other) for the documented escape-hatch window.
+
+### Signal-distinct guarantee (audit-trail)
+
+This refactor explicitly does NOT touch any Signal code path. Verify
+via grep:
+
+```sh
+grep -rE "signal[-_]" container/bin/eval-event-must-act \
+                       container/bin/event-ack \
+                       container/bin/event-classify \
+                       container/bin/user-prompt-ambient-inject-hook
+```
+
+The matches you SHOULD see:
+
+  - `event-classify` carries `signal-*` exclusion rules so any signal-
+    tagged event is classified as `excluded` (no-op).
+  - `eval-event-must-act` exempts `signal-history`, `signal-ack`,
+    `signal-mark-read` so its gate never blocks Signal investigation
+    when an unrelated actionable event is pending.
+  - `signal-send` is NOT exempted by THIS gate (it has its own
+    per-thread ack-gate elsewhere).
+
+No code in this refactor calls into `signal-send`, modifies
+`signal-wait-*`, or mutates the per-thread Signal obligation rows.
+
 ## Host-side scheduled tasks (via `host-bash`)
 
 The container has no built-in cron / launchd / systemd — it's a

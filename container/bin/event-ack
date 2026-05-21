@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""event-ack — manage the four-tier claude-event response surface.
+
+This CLI is the unified entry point for the **new** event-must-act
+infrastructure (refined per Andrew 2026-05-21 — see the PR
+description for the design notes). It owns three pieces of state:
+
+  - ``pending-actions.json``  — actionable events waiting on a
+    response. The companion ``eval-event-must-act`` evaluator reads
+    this file; when non-empty AND the missed-tool-call counter has
+    reached the threshold, it DENIES Bash tool calls.
+
+  - ``tool-call-counter.json`` — N-tool-call escalation counter.
+    Default threshold N=3 (configurable via ``$EVENT_MUST_ACT_N``).
+    Incremented by the evaluator on every non-exempt Bash tool call
+    that runs while pending actions exist; reset to 0 on any
+    ``event-ack`` call (so a SINGLE actionable event doesn't fire
+    the gate immediately — the LLM gets N grace tool calls to
+    spawn an agent / ack / dismiss).
+
+  - ``ambient-context.json``  — info-only events queued for the
+    next UserPromptSubmit context inject. The companion hook
+    ``user-prompt-ambient-inject-hook`` drains this file on every
+    user prompt and emits the contents as additional context (no
+    blocking, no gate).
+
+Subcommands:
+
+  event-ack ingest --source <src> --tag <tag> --message <msg>
+                                  Classify the event (via
+                                  ``event-classify``) and route to the
+                                  correct queue (pending or ambient).
+                                  Signal-tagged events are NO-OP
+                                  (intentionally excluded).
+
+  event-ack add "<key>" [--source "<src>"]
+                                  Manually add an actionable pending
+                                  entry. Equivalent to v1's --add.
+
+  event-ack ack "<key>" --action "<text>"
+                                  Mark actionable as handled. Removes
+                                  from pending-actions, resets the
+                                  N-counter to 0.
+
+  event-ack list                  Show pending + counter state.
+
+  event-ack clear                 Clear pending (escape hatch). Counter
+                                  is also reset.
+
+  event-ack drain-ambient         (Hook-internal) Pop the queued
+                                  ambient events and print them as a
+                                  user-prompt context block. Used by
+                                  user-prompt-ambient-inject-hook.
+
+  event-ack reset-counter         Reset the N-counter to 0 without
+                                  changing pending state.
+
+  event-ack --self-test           Run the embedded test suite.
+
+Signal-distinct guarantee
+-------------------------
+
+This CLI NEVER routes signal-tagged events to either pending-actions
+or ambient-context. Signal-DM ack-gating stays on the existing
+per-thread obligation (``signal-wait-*`` watcher + ``signal-send``
+ack-gate). Andrew (sig_ts 2026-05-21): "for now keep signal distinct
+even if it fits conceptually. too mission critical to risk on new
+shared infra".
+
+State files
+-----------
+
+  - $CLAUDE_EVENT_STATE_DIR/pending-actions.json
+  - $CLAUDE_EVENT_STATE_DIR/tool-call-counter.json
+  - $CLAUDE_EVENT_STATE_DIR/ambient-context.json
+
+Default: ``~/.config/claude-events/``.
+
+Concurrency: every read-modify-write goes through ``flock(2)`` on a
+sidecar lockfile (``<state-file>.lock``). The lock is held for the
+entire transaction so two parallel ``event-ack`` invocations cannot
+race (q-2026-05-21-856d refinement: file locking was missing in v1).
+
+Default-open: missing / corrupt state files are treated as empty
+(no pending, counter=0). The evaluator inherits the same posture.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+# --- Paths / config -------------------------------------------------------
+
+DEFAULT_STATE_DIR = Path(os.environ.get(
+    "CLAUDE_EVENT_STATE_DIR",
+    os.path.expanduser("~/.config/claude-events"),
+))
+
+PENDING_FILE = "pending-actions.json"
+COUNTER_FILE = "tool-call-counter.json"
+AMBIENT_FILE = "ambient-context.json"
+
+DEFAULT_N = int(os.environ.get("EVENT_MUST_ACT_N", "3"))
+
+
+def _state_path(state_dir: Path, name: str) -> Path:
+    return state_dir / name
+
+
+def _lock_path(state_file: Path) -> Path:
+    return state_file.with_suffix(state_file.suffix + ".lock")
+
+
+# --- Locked read-modify-write helper --------------------------------------
+
+@contextmanager
+def _locked(state_dir: Path, filename: str):
+    """Yield (path, current_dict) under an flock on the sidecar lockfile.
+    On exit (no exception), atomically write back via temp+rename. On
+    exception, the file is left untouched and the lock released."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = _state_path(state_dir, filename)
+    lock = _lock_path(path)
+    # Open (or create) the lock file. We hold an exclusive lock for the
+    # whole transaction.
+    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        # Read current state (default-open on missing/corrupt).
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if not isinstance(data, dict):
+                    data = {}
+            except (json.JSONDecodeError, ValueError, OSError):
+                data = {}
+        else:
+            data = {}
+
+        # Hand the caller a dict it can mutate. Wrap in a sentinel so we
+        # know whether the caller wants us to write back.
+        proxy = {"data": data, "write": False}
+        yield proxy
+
+        if proxy["write"]:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(proxy["data"], indent=2,
+                                       sort_keys=True))
+            os.replace(tmp, path)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# --- Core operations ------------------------------------------------------
+
+def add_pending(state_dir: Path, key: str, source: str = "",
+                reset_counter: bool = True) -> dict:
+    """Add an entry to pending-actions.json. Reset the N-counter so
+    a newly-arrived actionable event doesn't immediately tip a gate
+    that was about to fire from a previous burst (each actionable
+    event gets a fresh N-call grace window)."""
+    added = False
+    with _locked(state_dir, PENDING_FILE) as p:
+        pending = p["data"].setdefault("pending", [])
+        if not any(item.get("key") == key for item in pending):
+            entry = {"key": key, "added_at": _now()}
+            if source:
+                entry["source_event"] = source
+            pending.append(entry)
+            p["write"] = True
+            added = True
+
+    if reset_counter:
+        # Reset on transition from non-pending -> pending OR on add of a
+        # new key; the simpler invariant "any ack-or-add resets" matches
+        # operator mental model (each new event gets a fresh grace).
+        _set_counter(state_dir, 0)
+    return {"added": added, "key": key}
+
+
+def ack_pending(state_dir: Path, key: str, action: str) -> dict:
+    """Remove an entry from pending-actions.json. Reset the N-counter."""
+    removed = False
+    remaining = 0
+    with _locked(state_dir, PENDING_FILE) as p:
+        pending = p["data"].setdefault("pending", [])
+        original = len(pending)
+        new_pending = [it for it in pending if it.get("key") != key]
+        if len(new_pending) != original:
+            removed = True
+        p["data"]["pending"] = new_pending
+        p["write"] = True
+        remaining = len(new_pending)
+
+    # Reset counter on any ack (whether the key was present or not -- the
+    # idempotent ack should still relax the gate).
+    _set_counter(state_dir, 0)
+    return {"removed": removed, "key": key, "action": action,
+            "remaining": remaining}
+
+
+def list_state(state_dir: Path) -> dict:
+    """Snapshot pending + counter for inspection."""
+    pending = []
+    with _locked(state_dir, PENDING_FILE) as p:
+        pending = list(p["data"].get("pending", []))
+    counter = _get_counter(state_dir)
+    ambient_count = 0
+    with _locked(state_dir, AMBIENT_FILE) as a:
+        ambient_count = len(a["data"].get("events", []))
+    return {"pending": pending, "counter": counter,
+            "ambient_queued": ambient_count, "threshold": DEFAULT_N}
+
+
+def clear_pending(state_dir: Path) -> dict:
+    """Clear all pending entries. Reset counter."""
+    n = 0
+    with _locked(state_dir, PENDING_FILE) as p:
+        n = len(p["data"].get("pending", []))
+        p["data"]["pending"] = []
+        p["write"] = True
+    _set_counter(state_dir, 0)
+    return {"cleared": n}
+
+
+# --- N-counter ------------------------------------------------------------
+
+def _get_counter(state_dir: Path) -> int:
+    with _locked(state_dir, COUNTER_FILE) as c:
+        v = c["data"].get("count", 0)
+        return v if isinstance(v, int) and v >= 0 else 0
+
+
+def _set_counter(state_dir: Path, value: int) -> None:
+    with _locked(state_dir, COUNTER_FILE) as c:
+        c["data"]["count"] = max(0, int(value))
+        c["data"]["updated_at"] = _now()
+        c["write"] = True
+
+
+def bump_counter(state_dir: Path, by: int = 1) -> int:
+    """Atomic increment. Returns the new value."""
+    with _locked(state_dir, COUNTER_FILE) as c:
+        cur = c["data"].get("count", 0)
+        if not (isinstance(cur, int) and cur >= 0):
+            cur = 0
+        new = cur + by
+        c["data"]["count"] = new
+        c["data"]["updated_at"] = _now()
+        c["write"] = True
+        return new
+
+
+def reset_counter(state_dir: Path) -> int:
+    _set_counter(state_dir, 0)
+    return 0
+
+
+# --- Ambient queue --------------------------------------------------------
+
+def queue_ambient(state_dir: Path, source: str, tag: str,
+                  message: str, reason: str = "") -> dict:
+    """Append an ambient event to the inject queue. No counter touch."""
+    with _locked(state_dir, AMBIENT_FILE) as a:
+        events = a["data"].setdefault("events", [])
+        events.append({
+            "source": source, "tag": tag, "message": message,
+            "reason": reason, "queued_at": _now(),
+        })
+        a["write"] = True
+        return {"queued": True, "depth": len(events)}
+
+
+def drain_ambient(state_dir: Path) -> list[dict]:
+    """Pop and return all queued ambient events."""
+    with _locked(state_dir, AMBIENT_FILE) as a:
+        events = list(a["data"].get("events", []))
+        a["data"]["events"] = []
+        a["write"] = True
+        return events
+
+
+# --- Ingest (classify + route) --------------------------------------------
+
+def _classify(source: str, tag: str, message: str) -> dict:
+    """Shell out to event-classify, with a Python-side fallback if the
+    CLI is missing (tests / stripped containers). Both paths return
+    {'tier': str, 'reason': str}."""
+    cli = shutil.which("event-classify")
+    if cli is None:
+        # Sibling lookup (when running from source tree).
+        here = Path(__file__).resolve().parent
+        sibling = here / "event-classify"
+        if sibling.exists():
+            cli = str(sibling)
+    if cli is None:
+        # Last-ditch: import the module in-process. Since event-classify
+        # is a script (not a package), use exec on its source.
+        return _classify_inline(source, tag, message)
+    try:
+        proc = subprocess.run(
+            [cli, "--source", source, "--tag", tag,
+             "--message", message, "--json"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError,
+            json.JSONDecodeError, ValueError):
+        pass
+    return _classify_inline(source, tag, message)
+
+
+def _classify_inline(source: str, tag: str, message: str) -> dict:
+    """Fallback path: load event-classify's CLASSIFICATIONS table by
+    exec'ing the file in a private namespace, then call classify()."""
+    here = Path(__file__).resolve().parent
+    sibling = here / "event-classify"
+    if not sibling.exists():
+        return {"tier": "ambient",
+                "reason": "fallback: event-classify missing"}
+    try:
+        ns: dict = {"__name__": "__inline__"}
+        exec(sibling.read_text(), ns)
+        return ns["classify"](source, tag, message)
+    except Exception as exc:  # noqa: BLE001
+        return {"tier": "ambient",
+                "reason": f"fallback-error: {exc}"}
+
+
+def ingest(state_dir: Path, source: str, tag: str,
+           message: str) -> dict:
+    """Classify event and route to pending or ambient. Excluded
+    events are no-op (Signal stays on its own gate)."""
+    cls = _classify(source, tag, message)
+    tier = cls.get("tier", "ambient")
+    if tier == "excluded":
+        return {"routed": "excluded", "tier": tier,
+                "reason": cls.get("reason", "")}
+    if tier == "actionable":
+        key = f"{tag}:{(message or '')[:80]}"
+        add_pending(state_dir, key,
+                    source=f"{source}/{tag}", reset_counter=True)
+        return {"routed": "pending", "tier": tier, "key": key,
+                "reason": cls.get("reason", "")}
+    # ambient (or unknown -> defaults to ambient)
+    queue_ambient(state_dir, source, tag, message,
+                  reason=cls.get("reason", ""))
+    return {"routed": "ambient", "tier": tier,
+            "reason": cls.get("reason", "")}
+
+
+# --- CLI ------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="event-ack",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR),
+                   help=f"State directory (default: {DEFAULT_STATE_DIR}).")
+    p.add_argument("--self-test", action="store_true",
+                   help="Run the embedded test suite and exit.")
+
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("ingest", help="Classify + route an event.")
+    sp.add_argument("--source", required=True)
+    sp.add_argument("--tag", required=True)
+    sp.add_argument("--message", default="")
+
+    sp = sub.add_parser("add", help="Add a pending actionable entry.")
+    sp.add_argument("key")
+    sp.add_argument("--source", default="")
+
+    sp = sub.add_parser("ack", help="Ack (remove) a pending entry.")
+    sp.add_argument("key")
+    sp.add_argument("--action", required=True)
+
+    sub.add_parser("list", help="Show pending + counter state.")
+    sub.add_parser("clear", help="Clear all pending entries.")
+    sub.add_parser("drain-ambient",
+                   help="(Hook-internal) Pop queued ambient events.")
+    sub.add_parser("reset-counter", help="Reset N-counter to 0.")
+    bp = sub.add_parser("bump-counter",
+                        help="(Evaluator-internal) Increment N-counter.")
+    bp.add_argument("--by", type=int, default=1)
+
+    return p
+
+
+def _legacy_dispatch(args: list[str]) -> int | None:
+    """v1 compatibility: ``event-ack --add KEY`` / ``--list`` /
+    ``--clear`` / ``<key> --action ...`` still work. Returns the
+    exit code, or None if the args don't look legacy."""
+    if not args:
+        return None
+    first = args[0]
+    if first == "--add":
+        if len(args) < 2:
+            print("error: --add requires a key", file=sys.stderr)
+            return 1
+        key = args[1]
+        source = ""
+        i = 2
+        while i < len(args):
+            if args[i] == "--source" and i + 1 < len(args):
+                source = args[i + 1]
+                i += 2
+            else:
+                i += 1
+        res = add_pending(DEFAULT_STATE_DIR, key, source=source)
+        if res["added"]:
+            print(f"Added: {key}")
+        else:
+            print(f"Already pending: {key}")
+        return 0
+    if first == "--list":
+        snap = list_state(DEFAULT_STATE_DIR)
+        if not snap["pending"]:
+            print("No pending actionable events.")
+        else:
+            print(f"{len(snap['pending'])} pending actionable event(s):")
+            for item in snap["pending"]:
+                print(f"  - {item['key']}  (added: "
+                      f"{item.get('added_at', '?')})")
+        print(f"Tool-call counter: {snap['counter']} / "
+              f"{snap['threshold']}")
+        print(f"Ambient queued:    {snap['ambient_queued']}")
+        return 0
+    if first == "--clear":
+        res = clear_pending(DEFAULT_STATE_DIR)
+        print(f"Cleared {res['cleared']} pending event(s).")
+        return 0
+    # Legacy "event-ack <key> --action <text>" (positional + flag).
+    if (not first.startswith("--") and len(args) >= 3
+            and "--action" in args):
+        key = first
+        action = ""
+        for i in range(1, len(args)):
+            if args[i] == "--action" and i + 1 < len(args):
+                action = args[i + 1]
+                break
+        if not action:
+            print("error: --action requires a value", file=sys.stderr)
+            return 1
+        res = ack_pending(DEFAULT_STATE_DIR, key, action)
+        if res["removed"]:
+            print(f"Acked: {key} (action: {action})")
+        else:
+            print(f"Warning: \"{key}\" was not in pending list "
+                  f"(already acked or never added)")
+        if res["remaining"] > 0:
+            print(f"{res['remaining']} event(s) still pending action.")
+        else:
+            print("All actionable events handled.")
+        return 0
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "--self-test":
+        return _self_test()
+
+    # v1 compat: handle bare --add / --list / --clear / "<key> --action".
+    legacy = _legacy_dispatch(argv)
+    if legacy is not None:
+        return legacy
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    state_dir = Path(args.state_dir)
+
+    if args.self_test:
+        return _self_test()
+
+    if args.cmd == "ingest":
+        res = ingest(state_dir, args.source, args.tag, args.message)
+        print(json.dumps(res))
+        return 0
+
+    if args.cmd == "add":
+        res = add_pending(state_dir, args.key, source=args.source)
+        print(f"Added: {args.key}" if res["added"]
+              else f"Already pending: {args.key}")
+        return 0
+
+    if args.cmd == "ack":
+        res = ack_pending(state_dir, args.key, args.action)
+        if res["removed"]:
+            print(f"Acked: {args.key} (action: {args.action})")
+        else:
+            print(f"Warning: \"{args.key}\" was not pending "
+                  f"(idempotent no-op)")
+        return 0
+
+    if args.cmd == "list":
+        snap = list_state(state_dir)
+        print(json.dumps(snap, indent=2))
+        return 0
+
+    if args.cmd == "clear":
+        res = clear_pending(state_dir)
+        print(f"Cleared {res['cleared']} pending event(s).")
+        return 0
+
+    if args.cmd == "drain-ambient":
+        events = drain_ambient(state_dir)
+        if not events:
+            return 0
+        # Emit a compact context block for the user-prompt hook to
+        # surface. Plain text is fine -- Claude Code injects it
+        # verbatim into the next prompt's context.
+        lines = ["[AMBIENT EVENTS — informational context, no action "
+                 "required unless something stands out]"]
+        for e in events:
+            src = e.get("source", "?")
+            tg = e.get("tag", "?")
+            msg = (e.get("message") or "").strip()
+            if msg:
+                lines.append(f"  - [{src}/{tg}] {msg}")
+            else:
+                lines.append(f"  - [{src}/{tg}]")
+        print("\n".join(lines))
+        return 0
+
+    if args.cmd == "reset-counter":
+        reset_counter(state_dir)
+        print("Counter reset to 0.")
+        return 0
+
+    if args.cmd == "bump-counter":
+        new = bump_counter(state_dir, by=args.by)
+        print(str(new))
+        return 0
+
+    parser.print_help()
+    return 1
+
+
+# --- Embedded self-test ---------------------------------------------------
+
+def _self_test() -> int:
+    import tempfile
+    failures: list[str] = []
+
+    def fail(msg: str) -> None:
+        failures.append(msg)
+
+    with tempfile.TemporaryDirectory() as td:
+        sd = Path(td)
+
+        # 1. List on empty state: no pending, counter=0, ambient=0.
+        snap = list_state(sd)
+        if snap["pending"] or snap["counter"] != 0 or snap["ambient_queued"] != 0:
+            fail(f"empty state: {snap}")
+
+        # 2. Add pending -> appears in list.
+        add_pending(sd, "torrent-completed:foo")
+        snap = list_state(sd)
+        if len(snap["pending"]) != 1 or snap["counter"] != 0:
+            fail(f"after add: {snap}")
+
+        # 3. Idempotent add (same key).
+        add_pending(sd, "torrent-completed:foo")
+        snap = list_state(sd)
+        if len(snap["pending"]) != 1:
+            fail(f"idempotent add duplicated: {snap}")
+
+        # 4. Bump counter while pending.
+        n1 = bump_counter(sd)
+        n2 = bump_counter(sd)
+        if (n1, n2) != (1, 2):
+            fail(f"counter bump: got ({n1}, {n2}) expected (1, 2)")
+
+        # 5. Ack resets counter.
+        ack_pending(sd, "torrent-completed:foo", "queued agent")
+        snap = list_state(sd)
+        if snap["pending"] or snap["counter"] != 0:
+            fail(f"after ack: {snap}")
+
+        # 6. Ack of non-existent key is idempotent (no error).
+        res = ack_pending(sd, "nonexistent", "test")
+        if res["removed"]:
+            fail(f"non-existent ack should not flip removed=True: {res}")
+
+        # 7. Adding a SECOND pending key while counter is high resets to 0
+        #    (each event gets a fresh grace window).
+        add_pending(sd, "k1")
+        bump_counter(sd, by=2)  # counter -> 2
+        add_pending(sd, "k2")  # should reset
+        if _get_counter(sd) != 0:
+            fail(f"add should reset counter; got {_get_counter(sd)}")
+        clear_pending(sd)
+
+        # 8. Clear removes everything + resets counter.
+        add_pending(sd, "a")
+        add_pending(sd, "b")
+        bump_counter(sd, by=5)
+        res = clear_pending(sd)
+        snap = list_state(sd)
+        if res["cleared"] != 2 or snap["pending"] or snap["counter"] != 0:
+            fail(f"clear: {res} / {snap}")
+
+        # 9. Ingest routes ambient correctly.
+        ingest(sd, "alertmanager", "alert-firing", "FooAlert firing")
+        snap = list_state(sd)
+        if snap["ambient_queued"] != 1 or snap["pending"]:
+            fail(f"ambient ingest: {snap}")
+
+        # 10. Ingest routes actionable correctly.
+        ingest(sd, "torrent", "torrent-completed", "Movie X done")
+        snap = list_state(sd)
+        if not snap["pending"] or len(snap["pending"]) != 1:
+            fail(f"actionable ingest: {snap}")
+
+        # 11. Ingest routes excluded (signal) to nothing.
+        ingest(sd, "manual", "signal-dm-inbound", "from alice")
+        snap = list_state(sd)
+        # pending count still 1 (the prior torrent), ambient still 1.
+        if len(snap["pending"]) != 1 or snap["ambient_queued"] != 1:
+            fail(f"signal exclusion leaked: {snap}")
+
+        # 12. Drain ambient -> empties queue + returns events.
+        events = drain_ambient(sd)
+        snap = list_state(sd)
+        if not events or snap["ambient_queued"] != 0:
+            fail(f"drain ambient: events={len(events)} snap={snap}")
+
+        # 13. Reset counter directly.
+        bump_counter(sd, by=3)
+        reset_counter(sd)
+        if _get_counter(sd) != 0:
+            fail(f"reset_counter didn't zero: {_get_counter(sd)}")
+
+        # 14. Corrupt state file -> default-open (treated as empty).
+        clear_pending(sd)
+        (sd / PENDING_FILE).write_text("{not valid json")
+        snap = list_state(sd)
+        if snap["pending"]:
+            fail(f"corrupt state should be empty: {snap}")
+
+        # 15. Concurrent add+ack stress: 50 add+ack cycles in sequence
+        #     under the lock should never lose a row.
+        for i in range(50):
+            add_pending(sd, f"stress-{i}")
+            ack_pending(sd, f"stress-{i}", "test")
+        snap = list_state(sd)
+        if snap["pending"] or snap["counter"] != 0:
+            fail(f"stress cycle leaked state: {snap}")
+
+        # 16. Concurrent processes hold the lock (real fork test).
+        # Two child processes that both increment counter 20 times each
+        # should land at exactly 40, never less, regardless of interleave.
+        reset_counter(sd)
+        pids = []
+        for _ in range(2):
+            pid = os.fork()
+            if pid == 0:
+                # child
+                for _ in range(20):
+                    bump_counter(sd)
+                os._exit(0)
+            pids.append(pid)
+        for pid in pids:
+            os.waitpid(pid, 0)
+        final = _get_counter(sd)
+        if final != 40:
+            fail(f"concurrent bump: expected 40, got {final}")
+
+    if failures:
+        print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
+        for f in failures:
+            print(f"  {f}", file=sys.stderr)
+        return 1
+    print("OK: 16 cases pass.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # Common in shell pipelines (e.g. `event-ack list | head`).
+        sys.exit(0)
