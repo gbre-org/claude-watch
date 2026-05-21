@@ -129,6 +129,17 @@ KNOWN_BUILTINS = {
     # referenced from settings.json or hook payloads.
     "agent-msg",
     "agent-tail",
+    # Four-tier event model (q-2026-05-21-856d). event-classify is the
+    # data-driven source->tier classifier; event-ack manages the
+    # actionable + ambient queues (with file locking on every
+    # transaction); eval-event-must-act is the obligations evaluator
+    # that DENIES Bash after N consecutive missed tool calls;
+    # user-prompt-ambient-inject-hook drains the ambient queue into
+    # the next UserPromptSubmit context.
+    "event-classify",
+    "event-ack",
+    "eval-event-must-act",
+    "user-prompt-ambient-inject-hook",
 }
 
 

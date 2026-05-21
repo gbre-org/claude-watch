@@ -752,21 +752,50 @@ RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
 COPY container/bin/eval-no-grep-watcher-output /usr/local/bin/eval-no-grep-watcher-output
 RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output
 
-# eval-event-must-act — obligations evaluator that DENIES Bash tool calls
-# while actionable events remain un-acked in pending-actions.json. When
-# claude-event-watch delivers actionable events (CI failure/success,
-# slack-unread, workbot-prompt, queue-stale-ready), they are recorded as
-# pending. The main loop must call `event-ack` for each before Bash tool
-# calls go through again. Default-open on missing/corrupt state.
+# eval-event-must-act — obligations evaluator (q-2026-05-21-856d
+# refinement) that escalates over N consecutive non-exempt Bash tool
+# calls while actionable events remain un-acked in pending-actions.json.
+# Default N=3 (override via $EVENT_MUST_ACT_N); under-threshold calls
+# ALLOW + bump the counter, threshold-reached calls DENY. Each event-ack
+# transaction resets the counter to 0 so the LLM gets a fresh N-call
+# grace window after every ack. Default-open on missing/corrupt state.
+# Signal-tagged events are filtered upstream by event-ack ingest and
+# never feed into pending-actions.json; the Signal-DM ack-gate lives
+# on a separate obligation row (signal-wait-* watcher + signal-send
+# ack-gate path, NOT migrated to this gate per Andrew 2026-05-21).
 COPY container/bin/eval-event-must-act /usr/local/bin/eval-event-must-act
 RUN chmod +x /usr/local/bin/eval-event-must-act
 
-# event-ack — CLI to mark actionable events as acted-on. Manages
-# ~/.config/claude-events/pending-actions.json. Subcommands: --add (record
-# a pending event), --list (show pending), --clear (escape hatch), or
-# positional key + --action (ack a specific event after handling it).
+# event-ack — CLI to manage the four-tier claude-event response surface.
+# Manages ~/.config/claude-events/{pending-actions,tool-call-counter,
+# ambient-context}.json with flock-protected transactions. Subcommands:
+#   - ingest: classify (via event-classify) + route to pending/ambient
+#   - add/ack/list/clear: legacy pending-actions surface (v1-compat)
+#   - drain-ambient (hook-internal): pop ambient queue for UserPrompt inject
+#   - reset-counter/bump-counter: N-counter knobs
+# Signal-tagged events are excluded by classification (the Signal-DM
+# ack-gate stays on its existing per-thread obligation path).
 COPY container/bin/event-ack /usr/local/bin/event-ack
 RUN chmod +x /usr/local/bin/event-ack
+
+# event-classify — data-driven source/tag -> tier classifier (ambient
+# / actionable / excluded). Owns the CLASSIFICATIONS table that maps
+# every known event source to its tier; new sources are added by
+# appending to the table. Used by event-ack ingest + by the main loop
+# (event-classify --source X --tag Y) when manually triaging events.
+COPY container/bin/event-classify /usr/local/bin/event-classify
+RUN chmod +x /usr/local/bin/event-classify
+
+# user-prompt-ambient-inject-hook — UserPromptSubmit hook that drains
+# the ambient event queue on every prompt and emits the queued events
+# as additional context for the LLM's next turn. Non-blocking, no
+# gate. Companion to the actionable tier (event_must_act obligation,
+# seeded by obligations-init). Together they implement the four-tier
+# event model -- ambient (this hook), actionable (must-act gate),
+# signal-distinct (NOT touched by this refactor; stays on signal-wait-
+# watcher + signal-send ack-gate), unknown (defaults to ambient).
+COPY container/bin/user-prompt-ambient-inject-hook /usr/local/bin/user-prompt-ambient-inject-hook
+RUN chmod +x /usr/local/bin/user-prompt-ambient-inject-hook
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch

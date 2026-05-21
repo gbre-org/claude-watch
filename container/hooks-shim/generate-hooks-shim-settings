@@ -175,6 +175,15 @@ OBLIGATIONS_HOOKS: list[tuple[str, str, str]] = [
     # itself filters on the `[CLAUDE-WATCH]` substring and is a silent
     # no-op for ordinary prompts.
     ("UserPromptSubmit", "*", "/usr/local/bin/user-prompt-claude-watch-alert-record-hook"),
+    # Ambient event inject -- drains queued ambient (info-only) claude-
+    # events from ~/.config/claude-events/ambient-context.json on every
+    # user prompt and emits them as additional context for the LLM's
+    # next turn. Non-blocking, no gate. Companion to the actionable
+    # tier handled by `event_must_act` (seeded by obligations-init as
+    # an evaluator predicate) -- together they form the four-tier
+    # event model (ambient / actionable / signal-distinct / unknown).
+    # Silent no-op when the ambient queue is empty.
+    ("UserPromptSubmit", "*", "/usr/local/bin/user-prompt-ambient-inject-hook"),
     # Dispatcher gate -- counts consecutive non-exempt non-Agent tool
     # calls; DENIES the (N+1)th once the threshold is crossed (default
     # 3). The companion `claude-watch-dispatch` CLI inspects state +

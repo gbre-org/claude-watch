@@ -1,94 +1,411 @@
-#!/usr/bin/env bash
-# eval-event-must-act — obligations evaluator that DENIES Bash tool calls
-# while actionable events remain un-acked.
-#
-# When claude-event-watch delivers events tagged as actionable (see the
-# ACTIONABLE_TAGS list below), they get recorded in pending-actions.json.
-# This evaluator checks that file: if non-empty, DENY with a message
-# listing what needs action. The main loop must call `event-ack` for each
-# pending event (after queuing/performing the action) before Bash tool
-# calls will go through again.
-#
-# Protocol (obligations evaluator predicate, decision_mode=exit_code):
-#   - stdin: the Bash command text (via stdin_field: "tool_input.command")
-#   - exit 0: ALLOW
-#   - exit 1: DENY (pending actions exist)
-#   - stderr: diagnostic shown in the deny banner
-#
-# Default-open posture:
-#   - Missing state file: ALLOW (nothing pending)
-#   - Corrupt/unreadable state file: ALLOW (defensive)
-#   - Empty pending list: ALLOW
-#   - Python not available: ALLOW
-#
-# Exempt commands (always allowed regardless of pending state):
-#   - event-ack (the tool to resolve the gate)
-#   - session-task queue (dispatch surface)
-#   - obligations (inspection/override surface)
-#   - claude-watch-ack / claude-watch-dispatch (alert surface)
-#   - agent-msg (inbox surface)
+#!/usr/bin/env python3
+"""eval-event-must-act — N-tool-call-escalating obligations evaluator.
 
-set -euo pipefail
+This is the new (refined) event-must-act gate (q-2026-05-21-856d).
+Differences vs the v1 shape:
 
-STATE_DIR="${CLAUDE_EVENT_STATE_DIR:-${HOME}/.config/claude-events}"
-STATE_FILE="${STATE_DIR}/pending-actions.json"
+  - **N-tool-call escalation**: a single actionable event does NOT
+    fire the gate immediately. The evaluator bumps an atomic counter
+    on every non-exempt Bash call that runs while pending actions
+    exist; it only DENIES once the counter reaches the threshold N
+    (default 3, override via ``$EVENT_MUST_ACT_N``).
 
-# Read the command from stdin
-CMD="$(cat)"
+  - **Reset on ack**: ``event-ack`` (any subcommand that mutates
+    pending) resets the counter to 0, so the LLM always gets a
+    fresh N-call window after each ack.
 
-# If empty command, allow (defensive)
-if [ -z "$CMD" ]; then
-    exit 0
-fi
+  - **Signal-distinct**: this gate does NOT touch Signal flows. Only
+    sources/tags classified as ``actionable`` by ``event-classify``
+    feed into pending-actions.json; signal-tagged events are filtered
+    upstream by ``event-ack ingest``.
 
-# Exempt commands — these must always pass so the operator can resolve
-# the gate or perform essential dispatch operations.
-if echo "$CMD" | grep -qE '^\s*(event-ack|session-task\s+queue|obligations\s|claude-watch-ack|claude-watch-dispatch|agent-msg\s|agent-tail)\b'; then
-    exit 0
-fi
+Protocol (obligations ``evaluator`` predicate, ``decision_mode``
+``exit_code``):
 
-# If state file doesn't exist, nothing is pending — allow
-if [ ! -f "$STATE_FILE" ]; then
-    exit 0
-fi
+  - stdin:     bash command body (via ``stdin_field: "tool_input.command"``)
+  - exit 0:    ALLOW (no pending, OR counter still under threshold)
+  - exit 1:    DENY (pending non-empty AND counter >= threshold)
+  - stderr:    deny banner (surfaced by the obligations cascade)
 
-# Check pending actions via python (handles JSON safely)
-# Default-open: any error in the python block => exit 0 (allow)
-python3 -c "
-import json, sys
+Default-open posture:
 
-state_file = sys.argv[1]
+  - missing state files          -> ALLOW (treated as empty)
+  - corrupt JSON                 -> ALLOW (defensive)
+  - python OSError / unexpected  -> ALLOW (fail-safe)
 
+Exempt commands (never count toward the N-counter, never denied):
+
+  - ``event-ack``, ``event-classify``  (the gate-resolution surface)
+  - ``session-task queue``             (queue dispatch)
+  - ``obligations``                    (inspection / override)
+  - ``claude-watch-ack`` / ``claude-watch-dispatch``  (alert surface)
+  - ``agent-msg`` / ``agent-tail``     (subagent IPC surface)
+  - ``signal-history`` / ``signal-ack`` / ``signal-mark-read``
+    (so the LLM can investigate Signal state without being blocked
+    by an unrelated actionable event; Signal-DM ack-gating lives on
+    a separate obligation row, NOT this one)
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import json
+import os
+import re
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+
+# --- Paths / config -------------------------------------------------------
+
+STATE_DIR = Path(os.environ.get(
+    "CLAUDE_EVENT_STATE_DIR",
+    os.path.expanduser("~/.config/claude-events"),
+))
+PENDING_FILE = STATE_DIR / "pending-actions.json"
+COUNTER_FILE = STATE_DIR / "tool-call-counter.json"
+
+DEFAULT_N = 3
 try:
-    with open(state_file) as f:
-        data = json.load(f)
-except (json.JSONDecodeError, OSError, ValueError):
-    # Corrupt or unreadable — default-open
-    sys.exit(0)
+    THRESHOLD = max(1, int(os.environ.get("EVENT_MUST_ACT_N", DEFAULT_N)))
+except ValueError:
+    THRESHOLD = DEFAULT_N
 
-pending = data.get('pending', [])
-if not isinstance(pending, list) or len(pending) == 0:
-    sys.exit(0)
+# Exempt-command regex. Each pattern matches the START of the command
+# (after optional leading whitespace) so we recognize bare invocations
+# and don't try to parse arbitrary shell.
+_EXEMPT_PATTERNS = [
+    r"event-ack(\s|$)",
+    r"event-classify(\s|$)",
+    r"session-task\s+queue(\s|$)",
+    r"obligations(\s|$)",
+    r"claude-watch-ack(\s|$)",
+    r"claude-watch-dispatch(\s|$)",
+    r"agent-msg(\s|$)",
+    r"agent-tail(\s|$)",
+    # Signal investigation surface (Signal-DM ack-gate lives on a
+    # separate row -- we don't want THIS gate to also block Signal
+    # introspection if it happens to fire at the same time).
+    r"signal-history(\s|$)",
+    r"signal-ack(\s|$)",
+    r"signal-mark-read(\s|$)",
+]
+_EXEMPT_RE = re.compile(
+    r"^\s*(" + "|".join(_EXEMPT_PATTERNS) + r")",
+)
 
-# Pending actions exist — DENY
-lines = []
-lines.append(f'EVENT-MUST-ACT: {len(pending)} actionable event(s) require action before continuing.')
-lines.append('')
-lines.append('Pending events:')
-for item in pending:
-    key = item.get('key', '?')
-    lines.append(f'  - {key}')
-lines.append('')
-lines.append('For each event, either:')
-lines.append('  1. Queue an agent to handle it, then: event-ack \"<key>\" --action \"queued agent\"')
-lines.append('  2. Act on it directly, then: event-ack \"<key>\" --action \"<what you did>\"')
-lines.append('  3. Dismiss if no action needed: event-ack \"<key>\" --action \"dismissed: <reason>\"')
-lines.append('')
-lines.append('Or clear all: event-ack --clear')
 
-print('\n'.join(lines), file=sys.stderr)
-sys.exit(1)
-" "$STATE_FILE" 2>&1 || {
-    # If python itself fails (not installed, crash, etc.), default-open
-    exit 0
-}
+def _is_exempt(cmd: str) -> bool:
+    return bool(_EXEMPT_RE.match(cmd))
+
+
+# --- Locked counter helpers (same shape as event-ack) ---------------------
+
+@contextmanager
+def _locked(path: Path):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = path.with_suffix(path.suffix + ".lock")
+    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if not isinstance(data, dict):
+                    data = {}
+            except (json.JSONDecodeError, ValueError, OSError):
+                data = {}
+        else:
+            data = {}
+        proxy = {"data": data, "write": False}
+        yield proxy
+        if proxy["write"]:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(proxy["data"], indent=2,
+                                       sort_keys=True))
+            os.replace(tmp, path)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _pending_count() -> int:
+    if not PENDING_FILE.exists():
+        return 0
+    try:
+        data = json.loads(PENDING_FILE.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    pending = data.get("pending", [])
+    if not isinstance(pending, list):
+        return 0
+    return len(pending)
+
+
+def _pending_keys() -> list[str]:
+    if not PENDING_FILE.exists():
+        return []
+    try:
+        data = json.loads(PENDING_FILE.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    pending = data.get("pending", [])
+    if not isinstance(pending, list):
+        return []
+    keys = []
+    for it in pending:
+        if isinstance(it, dict) and "key" in it:
+            keys.append(str(it["key"]))
+    return keys
+
+
+def _bump_counter() -> int:
+    with _locked(COUNTER_FILE) as c:
+        cur = c["data"].get("count", 0)
+        if not (isinstance(cur, int) and cur >= 0):
+            cur = 0
+        new = cur + 1
+        c["data"]["count"] = new
+        c["write"] = True
+        return new
+
+
+def _get_counter() -> int:
+    if not COUNTER_FILE.exists():
+        return 0
+    try:
+        data = json.loads(COUNTER_FILE.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    v = data.get("count", 0)
+    return v if isinstance(v, int) and v >= 0 else 0
+
+
+# --- Main evaluation ------------------------------------------------------
+
+def _emit_deny(pending: list[str], counter: int) -> None:
+    """Write the deny banner to stderr (surfaced by the obligations
+    cascade)."""
+    lines = [
+        f"EVENT-MUST-ACT: {len(pending)} actionable event(s) un-acked "
+        f"AND {counter} consecutive non-exempt tool call(s) executed "
+        f"(threshold N={THRESHOLD}).",
+        "",
+        "Pending events:",
+    ]
+    for k in pending:
+        lines.append(f"  - {k}")
+    lines.extend([
+        "",
+        "For each event, either:",
+        "  1. Queue an agent to handle it, then: event-ack ack "
+        "\"<key>\" --action \"queued agent\"",
+        "  2. Act on it directly, then: event-ack ack \"<key>\" "
+        "--action \"<what you did>\"",
+        "  3. Dismiss if no action needed: event-ack ack \"<key>\" "
+        "--action \"dismissed: <reason>\"",
+        "",
+        "Or clear all: event-ack clear",
+    ])
+    print("\n".join(lines), file=sys.stderr)
+
+
+def evaluate(cmd: str) -> int:
+    """Return 0 (allow) or 1 (deny)."""
+    if not cmd or not cmd.strip():
+        return 0
+
+    if _is_exempt(cmd):
+        return 0
+
+    pending = _pending_keys()
+    if not pending:
+        return 0
+
+    # Pending exists. Bump the counter; deny iff threshold reached.
+    new_count = _bump_counter()
+    if new_count < THRESHOLD:
+        # Under threshold: ALLOW but the counter has ticked. Surface a
+        # heads-up via stderr so the LLM sees the warning in the next
+        # tool-result feedback. (Obligations cascade only surfaces
+        # stderr on deny; this is best-effort context for the operator
+        # tailing logs.)
+        print(
+            f"event-must-act: {len(pending)} pending, "
+            f"counter={new_count}/{THRESHOLD} -- gate will fire on "
+            f"next non-exempt call if not acked.",
+            file=sys.stderr,
+        )
+        return 0
+
+    _emit_deny(pending, new_count)
+    return 1
+
+
+# --- Self-test ------------------------------------------------------------
+
+def _self_test() -> int:
+    """Embedded test suite. Each case sets up a fresh tmpdir state."""
+    import tempfile
+    failures: list[str] = []
+
+    def _setup_state(td: Path, pending: list[str] | None = None,
+                     counter: int | None = None) -> None:
+        global PENDING_FILE, COUNTER_FILE, STATE_DIR
+        STATE_DIR = td
+        PENDING_FILE = td / "pending-actions.json"
+        COUNTER_FILE = td / "tool-call-counter.json"
+        if pending is not None:
+            PENDING_FILE.write_text(json.dumps({
+                "pending": [{"key": k, "added_at": "now"}
+                            for k in pending],
+            }))
+        if counter is not None:
+            COUNTER_FILE.write_text(json.dumps({"count": counter}))
+
+    def fail(msg: str) -> None:
+        failures.append(msg)
+
+    import tempfile as _tf
+    # Case 1: no pending -> ALLOW.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td))
+        if evaluate("rm -rf /tmp/foo") != 0:
+            fail("no-pending should allow")
+
+    # Case 2: exempt command -> ALLOW even with pending + over threshold.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=["k1"], counter=99)
+        if evaluate("event-ack ack k1 --action done") != 0:
+            fail("exempt event-ack should allow even at high counter")
+        if evaluate("session-task queue list") != 0:
+            fail("exempt session-task queue should allow")
+        if evaluate("obligations list") != 0:
+            fail("exempt obligations should allow")
+
+    # Case 3: pending + counter < N -> ALLOW + bump.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=["k1"], counter=0)
+        # threshold default N=3 -> first 2 calls allowed, 3rd denies.
+        global THRESHOLD
+        THRESHOLD = 3
+        if evaluate("ls") != 0:
+            fail("call 1 should ALLOW (counter 1/3)")
+        if evaluate("ls") != 0:
+            fail("call 2 should ALLOW (counter 2/3)")
+        # Third call hits threshold.
+        if evaluate("ls") != 1:
+            fail("call 3 should DENY (counter 3/3 = threshold)")
+        if _get_counter() != 3:
+            fail(f"counter should be 3, got {_get_counter()}")
+
+    # Case 4: ack resets counter (verified by feeding a fresh setup that
+    # mimics a post-ack state: pending=[] + counter is irrelevant; the
+    # gate is short-circuited at no-pending check).
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=[], counter=10)
+        if evaluate("ls") != 0:
+            fail("post-ack (no pending) should ALLOW even at high counter")
+
+    # Case 5: empty command -> ALLOW.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=["k1"], counter=5)
+        if evaluate("") != 0:
+            fail("empty command should ALLOW")
+        if evaluate("   ") != 0:
+            fail("whitespace command should ALLOW")
+
+    # Case 6: corrupt state -> default-open (ALLOW).
+    with _tf.TemporaryDirectory() as td:
+        sd = Path(td)
+        STATE_DIR = sd
+        PENDING_FILE = sd / "pending-actions.json"
+        COUNTER_FILE = sd / "tool-call-counter.json"
+        PENDING_FILE.write_text("{not valid json")
+        if evaluate("rm -rf /tmp/foo") != 0:
+            fail("corrupt pending file should ALLOW (default-open)")
+
+    # Case 7: signal-* commands should be exempt.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=["k1"], counter=99)
+        if evaluate("signal-history --dm andrew -n 5") != 0:
+            fail("signal-history must be exempt")
+        if evaluate("signal-ack --dm andrew 12345") != 0:
+            fail("signal-ack must be exempt")
+        if evaluate("signal-mark-read /home/foo/x.png") != 0:
+            fail("signal-mark-read must be exempt")
+        # Important: signal-send is NOT exempt by THIS gate -- it has its
+        # own ack-gate. So the new gate should treat it like any other
+        # non-exempt command (deny when over threshold).
+        if evaluate("signal-send --dm andrew 'hello'") != 1:
+            fail("signal-send is NOT exempt from event-must-act; "
+                 "should deny at threshold")
+
+    # Case 8: configurable N via env var. Set threshold=1 -> first
+    # non-exempt call denies immediately.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=["k1"], counter=0)
+        THRESHOLD = 1
+        if evaluate("ls") != 1:
+            fail("threshold=1 should DENY on first call")
+        THRESHOLD = 3  # restore
+
+    # Case 9: threshold=5 -> 4 allows then 5 denies.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=["k1"], counter=0)
+        THRESHOLD = 5
+        for i in range(4):
+            if evaluate("ls") != 0:
+                fail(f"threshold=5: call {i + 1} should ALLOW")
+        if evaluate("ls") != 1:
+            fail("threshold=5: call 5 should DENY")
+        THRESHOLD = 3  # restore
+
+    # Case 10: pending file with non-list 'pending' value -> default-open.
+    with _tf.TemporaryDirectory() as td:
+        sd = Path(td)
+        STATE_DIR = sd
+        PENDING_FILE = sd / "pending-actions.json"
+        COUNTER_FILE = sd / "tool-call-counter.json"
+        PENDING_FILE.write_text(json.dumps({"pending": "not-a-list"}))
+        if evaluate("rm -rf /tmp/foo") != 0:
+            fail("malformed pending should ALLOW (default-open)")
+
+    if failures:
+        print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
+        for f in failures:
+            print(f"  {f}", file=sys.stderr)
+        return 1
+    print("OK: 10 cases pass.")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        return _self_test()
+
+    cmd = sys.stdin.read()
+    try:
+        return evaluate(cmd)
+    except Exception:  # noqa: BLE001 -- default-open on unexpected
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

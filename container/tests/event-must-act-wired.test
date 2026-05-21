@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""Tests for the four-tier event-must-act infrastructure
+(q-2026-05-21-856d refinement).
+
+Asserts:
+
+  1. Each new container/bin/ script exists, is executable, has the
+     expected shebang.
+  2. Each script's --self-test (or equivalent) passes inline.
+  3. The Dockerfile bakes each new script with a COPY + chmod +x.
+  4. baked-CLAUDE.md documents the four-tier model + the Signal-
+     distinct guarantee.
+  5. obligations-init still seeds the event_must_act row (no
+     regression vs v1).
+  6. generate-hooks-shim-settings injects the
+     user-prompt-ambient-inject-hook into UserPromptSubmit.
+  7. audit-hooks KNOWN_BUILTINS includes the new tool names.
+  8. End-to-end: a synthetic ingest of one actionable event +
+     N-1 non-exempt calls = no DENY; the N-th call DENIES; ack
+     resets, next call allows.
+  9. End-to-end: ingest of one ambient event = pending stays empty,
+     ambient queue grows, drain-ambient empties it + emits the
+     expected text shape.
+ 10. End-to-end: ingest of a signal-tagged event = no-op (no row in
+     either queue).
+ 11. Signal-distinct grep audit: the four new scripts contain
+     `signal-` references ONLY as exclusion rules / exemption
+     entries; none call `signal-send`, modify signal-wait-*, or
+     touch per-thread Signal obligation rows.
+
+Run:  ./event-must-act-wired.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+BAKED_CLAUDE_MD = CONTAINER_DIR / "baked-CLAUDE.md"
+AUDIT_HOOKS = CONTAINER_DIR / "bin" / "audit-hooks.py"
+GENERATOR = CONTAINER_DIR / "hooks-shim" / "generate-hooks-shim-settings"
+OBLIGATIONS_INIT = REPO_ROOT / "tools" / "obligations" / "obligations-init"
+
+NEW_SCRIPTS = {
+    "event-ack": CONTAINER_DIR / "bin" / "event-ack",
+    "event-classify": CONTAINER_DIR / "bin" / "event-classify",
+    "eval-event-must-act": CONTAINER_DIR / "bin" / "eval-event-must-act",
+    "user-prompt-ambient-inject-hook":
+        CONTAINER_DIR / "bin" / "user-prompt-ambient-inject-hook",
+}
+
+BAKED_PATHS = {name: f"/usr/local/bin/{name}" for name in NEW_SCRIPTS}
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        print(f"  FAIL {msg}")
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------- 1, 2
+
+def test_scripts_exist_and_executable() -> None:
+    for name, path in NEW_SCRIPTS.items():
+        expect(path.is_file(), f"missing script: {path}")
+        expect(os.access(path, os.X_OK), f"not executable: {path}")
+        # Read first line to confirm shebang
+        first = path.read_text().splitlines()[0]
+        expect(first.startswith("#!"),
+               f"{name}: missing shebang (got {first!r})")
+        expect("python3" in first,
+               f"{name}: expected python3 shebang (got {first!r})")
+
+
+def test_self_tests_pass() -> None:
+    # Run each script's --self-test in an isolated subprocess.
+    for name in ("event-ack", "event-classify", "eval-event-must-act"):
+        path = NEW_SCRIPTS[name]
+        proc = subprocess.run(
+            [sys.executable, str(path), "--self-test"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        expect(proc.returncode == 0,
+               f"{name} --self-test failed (rc={proc.returncode})\n"
+               f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+
+
+# ---------------------------------------------------------------- 3
+
+def test_dockerfile_bakes_scripts() -> None:
+    df = DOCKERFILE.read_text()
+    for name, baked in BAKED_PATHS.items():
+        copy_line = f"COPY container/bin/{name} {baked}"
+        expect(copy_line in df, f"Dockerfile missing: {copy_line!r}")
+        expect(baked in df,
+               f"Dockerfile missing reference to {baked}")
+
+
+# ---------------------------------------------------------------- 4
+
+def test_baked_claude_md_documents_four_tier() -> None:
+    md = BAKED_CLAUDE_MD.read_text()
+    expect("four-tier" in md.lower(),
+           "baked-CLAUDE.md must document 'four-tier' model")
+    expect("Ambient" in md and "Actionable" in md,
+           "baked-CLAUDE.md must name the Ambient + Actionable tiers")
+    expect("Signal" in md and "distinct" in md.lower(),
+           "baked-CLAUDE.md must call out Signal-distinct guarantee")
+    expect("EVENT_MUST_ACT_N" in md,
+           "baked-CLAUDE.md must document the $EVENT_MUST_ACT_N knob")
+    expect("event-classify" in md,
+           "baked-CLAUDE.md must mention event-classify")
+    expect("event-ack ingest" in md,
+           "baked-CLAUDE.md must document `event-ack ingest`")
+
+
+# ---------------------------------------------------------------- 5
+
+def test_obligations_init_seeds_event_must_act() -> None:
+    text = OBLIGATIONS_INIT.read_text()
+    expect("event_must_act" in text,
+           "obligations-init must still seed event_must_act")
+    expect("seed_event_must_act" in text,
+           "obligations-init must define seed_event_must_act()")
+    expect("/usr/local/bin/eval-event-must-act" in text,
+           "obligations-init must point at the baked eval script")
+
+
+# ---------------------------------------------------------------- 6
+
+def test_generator_injects_ambient_hook() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        in_path = Path(td) / "settings.json"
+        in_path.write_text("{}", encoding="utf-8")
+        out_path = Path(td) / "rewritten.json"
+        env = dict(os.environ)
+        for v in ("CLAUDE_SHIM_PATTERNS", "CLAUDE_CONTAINER_OBLIGATIONS",
+                  "CLAUDE_SHIM_OBLIGATIONS_ONLY", "CLAUDE_SHIM_INPUT",
+                  "CLAUDE_SHIM_OUTPUT"):
+            env.pop(v, None)
+        proc = subprocess.run(
+            [sys.executable, str(GENERATOR),
+             "--input", str(in_path),
+             "--output", str(out_path),
+             "--quiet",
+             "--inject-obligations", "1",
+             "--obligations-only"],
+            capture_output=True, text=True, timeout=10, env=env, check=False,
+        )
+        expect(proc.returncode == 0,
+               f"generator rc={proc.returncode}\nstderr:\n{proc.stderr}")
+        data = json.loads(out_path.read_text())
+        ups = (data.get("hooks") or {}).get("UserPromptSubmit") or []
+        commands: list[str] = []
+        for block in ups:
+            if not isinstance(block, dict):
+                continue
+            for h in (block.get("hooks") or []):
+                if isinstance(h, dict) and isinstance(h.get("command"), str):
+                    commands.append(h["command"])
+        expect(BAKED_PATHS["user-prompt-ambient-inject-hook"] in commands,
+               f"UserPromptSubmit must include ambient-inject hook; "
+               f"got: {commands}")
+
+
+# ---------------------------------------------------------------- 7
+
+def test_audit_hooks_knows_new_names() -> None:
+    src = AUDIT_HOOKS.read_text()
+    for name in NEW_SCRIPTS:
+        expect(f'"{name}"' in src,
+               f"audit-hooks KNOWN_BUILTINS missing {name!r}")
+
+
+# ---------------------------------------------------------------- 8
+
+def test_e2e_actionable_n_counter() -> None:
+    """End-to-end: ingest one actionable event, see that the gate
+    allows N-1 non-exempt calls before DENYing on the N-th. Ack resets
+    the counter."""
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td)
+        env = dict(os.environ)
+        env["CLAUDE_EVENT_STATE_DIR"] = str(state)
+        env["EVENT_MUST_ACT_N"] = "3"
+
+        # Ingest a real actionable event (torrent-completed).
+        proc = subprocess.run(
+            [sys.executable, str(NEW_SCRIPTS["event-ack"]),
+             "ingest",
+             "--source", "torrent",
+             "--tag", "torrent-completed",
+             "--message", "Foo bar movie done"],
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        expect(proc.returncode == 0,
+               f"ingest rc={proc.returncode}\n{proc.stderr}")
+        res = json.loads(proc.stdout.strip())
+        expect(res["routed"] == "pending",
+               f"actionable should route to pending; got {res}")
+
+        # Run the evaluator N times via stdin, check decisions.
+        def run_eval(cmd: str) -> int:
+            p = subprocess.run(
+                [sys.executable, str(NEW_SCRIPTS["eval-event-must-act"])],
+                input=cmd, capture_output=True, text=True,
+                env=env, timeout=10, check=False,
+            )
+            return p.returncode
+
+        rc1 = run_eval("ls /tmp")
+        rc2 = run_eval("ls /tmp")
+        rc3 = run_eval("ls /tmp")
+        expect((rc1, rc2) == (0, 0),
+               f"calls 1+2 should allow under N=3; got ({rc1}, {rc2})")
+        expect(rc3 == 1,
+               f"call 3 should DENY at threshold N=3; got rc={rc3}")
+
+        # Ack the event -> counter resets.
+        # Reconstruct the key the ingest used:
+        snap = subprocess.run(
+            [sys.executable, str(NEW_SCRIPTS["event-ack"]), "list"],
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        list_payload = json.loads(snap.stdout)
+        keys = [it["key"] for it in list_payload["pending"]]
+        expect(len(keys) == 1, f"expected 1 pending after ingest; got {keys}")
+        if keys:
+            ack = subprocess.run(
+                [sys.executable, str(NEW_SCRIPTS["event-ack"]), "ack",
+                 keys[0], "--action", "queued test agent"],
+                capture_output=True, text=True, env=env, timeout=10, check=False,
+            )
+            expect(ack.returncode == 0,
+                   f"ack rc={ack.returncode}\n{ack.stderr}")
+
+        # Next call should ALLOW (no pending).
+        rc_after = run_eval("ls /tmp")
+        expect(rc_after == 0,
+               f"post-ack call should ALLOW; got rc={rc_after}")
+
+
+# ---------------------------------------------------------------- 9
+
+def test_e2e_ambient_routes_no_gate() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td)
+        env = dict(os.environ)
+        env["CLAUDE_EVENT_STATE_DIR"] = str(state)
+        env["EVENT_MUST_ACT_N"] = "3"
+
+        # Ingest an ambient event (alertmanager).
+        proc = subprocess.run(
+            [sys.executable, str(NEW_SCRIPTS["event-ack"]),
+             "ingest",
+             "--source", "alertmanager",
+             "--tag", "alert-firing",
+             "--message", "DiskSpaceLow firing"],
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        expect(proc.returncode == 0,
+               f"ingest rc={proc.returncode}\n{proc.stderr}")
+        res = json.loads(proc.stdout.strip())
+        expect(res["routed"] == "ambient",
+               f"alertmanager should route to ambient; got {res}")
+
+        # Pending should be empty -> evaluator allows.
+        p = subprocess.run(
+            [sys.executable, str(NEW_SCRIPTS["eval-event-must-act"])],
+            input="rm -rf /tmp/foo", capture_output=True, text=True,
+            env=env, timeout=10, check=False,
+        )
+        expect(p.returncode == 0,
+               f"evaluator should ALLOW with only ambient queued; "
+               f"got rc={p.returncode}")
+
+        # Drain ambient -> emits text + empties queue.
+        d = subprocess.run(
+            [sys.executable, str(NEW_SCRIPTS["event-ack"]),
+             "drain-ambient"],
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        expect(d.returncode == 0,
+               f"drain-ambient rc={d.returncode}\n{d.stderr}")
+        expect("alert-firing" in d.stdout and "DiskSpaceLow" in d.stdout,
+               f"drain must surface the ambient event; got:\n{d.stdout}")
+        expect("AMBIENT EVENTS" in d.stdout,
+               f"drain output must carry the AMBIENT EVENTS marker; "
+               f"got:\n{d.stdout}")
+
+        # Second drain returns empty (queue was emptied).
+        d2 = subprocess.run(
+            [sys.executable, str(NEW_SCRIPTS["event-ack"]),
+             "drain-ambient"],
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        expect(d2.returncode == 0 and d2.stdout.strip() == "",
+               f"second drain should be empty; got rc={d2.returncode} "
+               f"stdout={d2.stdout!r}")
+
+
+# ---------------------------------------------------------------- 10
+
+def test_e2e_signal_excluded_noop() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td)
+        env = dict(os.environ)
+        env["CLAUDE_EVENT_STATE_DIR"] = str(state)
+
+        # Ingest a signal-tagged event -> excluded (no-op).
+        proc = subprocess.run(
+            [sys.executable, str(NEW_SCRIPTS["event-ack"]),
+             "ingest",
+             "--source", "manual",
+             "--tag", "signal-dm-inbound",
+             "--message", "from alice"],
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        expect(proc.returncode == 0,
+               f"ingest rc={proc.returncode}\n{proc.stderr}")
+        res = json.loads(proc.stdout.strip())
+        expect(res["routed"] == "excluded",
+               f"signal-* should route to excluded; got {res}")
+
+        # Pending + ambient should both be empty.
+        snap = subprocess.run(
+            [sys.executable, str(NEW_SCRIPTS["event-ack"]), "list"],
+            capture_output=True, text=True, env=env, timeout=10, check=False,
+        )
+        st = json.loads(snap.stdout)
+        expect(not st["pending"],
+               f"signal exclusion leaked into pending: {st}")
+        expect(st["ambient_queued"] == 0,
+               f"signal exclusion leaked into ambient: {st}")
+
+
+# ---------------------------------------------------------------- 11
+
+def test_signal_distinct_grep_audit() -> None:
+    """The four new scripts must reference `signal-` only as exclusion
+    rules / exemption entries / documentation -- they must NOT make any
+    *call* to `signal-send`, `signal-wait-*`, `signal-cli`, or
+    `signal-api`.
+
+    Allowed signal references (greppable):
+      - `signal-history` / `signal-ack` / `signal-mark-read` in the
+        exempt-pattern list (so the event-must-act gate doesn't
+        blackhole Signal investigation when an unrelated actionable
+        event is pending).
+      - `signal-*` / `signal-dm-inbound` / `signal-group-inbound` in
+        the event-classify exclusion table.
+      - Docstring / comment mentions of "Signal" / "signal-".
+
+    Forbidden (call sites):
+      - `subprocess.run(["signal-send", ...])` / `Popen(["signal-send"...`
+      - `os.system("signal-send ...")` / `os.popen("signal-send ...")`
+      - `shutil.which("signal-send")`
+      - Any subprocess invocation of signal-wait-* / signal-cli /
+        signal-api.
+
+    Strategy: scan the AST for string LITERALS used as a subprocess
+    argv head that match a forbidden command. A reference inside a
+    comment or a non-call-context string (e.g. an exempt-pattern
+    regex source) is fine.
+    """
+    import ast
+
+    FORBIDDEN_CMDS = {
+        "signal-send",
+        # signal-wait- prefix is matched via startswith below.
+        "signal-cli",
+        "signal-api",
+        "signal-wait",  # signal-wait-dm, signal-wait-group, etc.
+    }
+
+    class CallScanner(ast.NodeVisitor):
+        def __init__(self):
+            self.violations: list[str] = []
+
+        def _check_argv_head(self, head: str, lineno: int, ctx: str) -> None:
+            for forbidden in FORBIDDEN_CMDS:
+                if head == forbidden or head.startswith(forbidden + "-"):
+                    self.violations.append(
+                        f"line {lineno}: {ctx} calls `{head}`")
+
+        def visit_Call(self, node: ast.Call) -> None:
+            # subprocess.run / .Popen / .check_output / etc. take argv
+            # as the first positional arg. We look for argv[0] being
+            # a string constant matching a forbidden command.
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if attr in ("run", "Popen", "call", "check_call",
+                            "check_output", "system", "popen"):
+                    if node.args:
+                        first = node.args[0]
+                        # argv list literal
+                        if isinstance(first, ast.List) and first.elts:
+                            head = first.elts[0]
+                            if (isinstance(head, ast.Constant)
+                                    and isinstance(head.value, str)):
+                                self._check_argv_head(
+                                    head.value, node.lineno,
+                                    f"{attr}([...])")
+                        # bare string literal (os.system("..."))
+                        elif isinstance(first, ast.Constant) and isinstance(
+                                first.value, str):
+                            head = first.value.split()[0] if first.value.split() else ""
+                            self._check_argv_head(
+                                head, node.lineno, f"{attr}(\"...\")")
+            # shutil.which("signal-send") etc.
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "which":
+                if node.args and isinstance(node.args[0], ast.Constant) and \
+                        isinstance(node.args[0].value, str):
+                    self._check_argv_head(node.args[0].value, node.lineno,
+                                          "shutil.which()")
+            self.generic_visit(node)
+
+    for name, path in NEW_SCRIPTS.items():
+        src = path.read_text()
+        try:
+            tree = ast.parse(src, filename=str(path))
+        except SyntaxError as e:
+            expect(False, f"{name}: failed to parse for AST audit: {e}")
+            continue
+        scanner = CallScanner()
+        scanner.visit(tree)
+        for v in scanner.violations:
+            expect(False, f"{name}: forbidden signal call site -- {v}")
+
+
+# --------------------------------------------------------------------
+
+def main() -> int:
+    tests = [
+        test_scripts_exist_and_executable,
+        test_self_tests_pass,
+        test_dockerfile_bakes_scripts,
+        test_baked_claude_md_documents_four_tier,
+        test_obligations_init_seeds_event_must_act,
+        test_generator_injects_ambient_hook,
+        test_audit_hooks_knows_new_names,
+        test_e2e_actionable_n_counter,
+        test_e2e_ambient_routes_no_gate,
+        test_e2e_signal_excluded_noop,
+        test_signal_distinct_grep_audit,
+    ]
+    for t in tests:
+        print(f"== {t.__name__} ==")
+        t()
+    if failures:
+        print(f"\nFAIL event-must-act-wired.test "
+              f"({len(failures)} assertion(s) failed)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"\nPASS event-must-act-wired.test "
+          f"({len(tests)} test functions, all assertions passed)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

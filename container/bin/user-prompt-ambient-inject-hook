@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""UserPromptSubmit hook -- inject ambient claude-events into next prompt.
+
+This is the **ambient** (info-only) tier of the four-tier event model
+introduced in q-2026-05-21-856d. Events classified as ``ambient`` by
+``event-classify`` are queued by ``event-ack ingest`` into
+``ambient-context.json`` instead of going onto the actionable
+pending-actions list. This hook drains the queue at UserPromptSubmit
+time and prints the queued events as additional context.
+
+Claude Code's UserPromptSubmit hook contract treats stdout as
+**additional context** appended to the next user prompt. No deny,
+no block, no gate -- the LLM just sees the ambient events as
+context on its next turn.
+
+Default-open posture:
+  - Missing ``event-ack`` CLI -> silent no-op.
+  - Drain subprocess error -> silent no-op + log.
+  - Empty ambient queue -> no output (no context added).
+
+Wiring (generated into the container settings.json by
+generate-hooks-shim-settings)::
+
+    {
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "matcher": "*",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/usr/local/bin/user-prompt-ambient-inject-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+Signal-distinct guarantee
+-------------------------
+
+Signal-tagged events are filtered upstream in ``event-ack ingest``
+(they hit the ``excluded`` classification and are no-op'd). They
+never reach the ambient queue, so this hook never surfaces a Signal
+message as context. Signal-DM inbound stays on the
+``signal-wait-*`` watcher + per-thread ack-gate path.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+ERR_LOG_PATH = ERR_LOG_DIR / "ambient-inject-hook-errors.log"
+
+
+def _log(payload: dict) -> None:
+    try:
+        ERR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        rec = {"ts": ts, "pid": os.getpid(), **payload}
+        with ERR_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        try:
+            ERR_LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _resolve_event_ack() -> str | None:
+    cli = shutil.which("event-ack")
+    if cli:
+        return cli
+    # When this hook is run from the source tree (not yet installed).
+    here = Path(__file__).resolve().parent
+    sibling = here / "event-ack"
+    if sibling.exists():
+        return str(sibling)
+    return None
+
+
+def _drain() -> str:
+    cli = _resolve_event_ack()
+    if cli is None:
+        _log({"kind": "cli-missing"})
+        return ""
+    try:
+        proc = subprocess.run(
+            [cli, "drain-ambient"],
+            capture_output=True, text=True, timeout=4, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        _log({"kind": "drain-exception", "exc": str(e)})
+        return ""
+    if proc.returncode != 0:
+        _log({"kind": "drain-nonzero", "rc": proc.returncode,
+              "stderr": (proc.stderr or "")[:512]})
+        return ""
+    return proc.stdout or ""
+
+
+def main() -> int:
+    # Read the UserPromptSubmit payload (we don't actually need any field
+    # from it; we drain unconditionally). Best-effort parse so a broken
+    # payload doesn't blackhole context injection.
+    try:
+        json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    text = _drain().strip()
+    if text:
+        # Print to stdout -- Claude Code appends this to the prompt
+        # context. Wrap in a clear marker so the LLM knows the
+        # provenance (ambient events, no action required).
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _log({"kind": "uncaught", "exc": str(exc)})
+        except Exception:
+            pass
+        sys.exit(0)
