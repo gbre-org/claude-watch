@@ -242,6 +242,14 @@ Tier choice in practice:
   spawn an Agent that does the wait, not the main loop. The main
   loop should never sit in a polling sleep loop.
 
+**One concern per agent.** Each agent handles ONE task — never batch
+unrelated work into a single agent prompt. If you have 3 independent
+things to do, queue 3 items and spawn 3 agents. Batching unrelated work
+means: a failure on task 2 loses task 3, the queue audit trail is
+useless, and parallelizable work gets serialized. The signal you're
+batching wrong: your agent prompt has numbered sections for unrelated
+concerns. Split them.
+
 If you're in the main loop and find yourself about to chain
 `Read` → `Edit` → `Edit` → `Bash` → `Bash`, **stop and queue an
 Agent for the whole sequence instead.** The PreToolUse queue-gate
