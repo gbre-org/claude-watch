@@ -689,6 +689,176 @@ def test_handshake_three_post_sequence_with_session_id() -> None:
                 )
 
 
+def test_run_script_handled_locally_not_forwarded() -> None:
+    """run_script is handled by the shim itself (script fed on the
+    interpreter's STDIN, never tokenized) and NOT forwarded to mcp-proxy.
+
+    Exercises the three payloads cli-mcp-server's shlex tokenizer chokes on
+    (perl qw(...) + ;, a multi-line heredoc, nested quotes), plus:
+      - run_script injected into tools/list alongside run_command
+      - run_command still forwards upstream unchanged
+      - an interpreter NOT on ALLOWED_COMMANDS is refused
+    """
+    reset_upstream()
+    with fake_upstream() as upstream_port:
+        # Upstream advertises ONLY run_command in tools/list — the shim must
+        # add run_script on the way back. Any other forwarded request just
+        # gets a marker so we can prove it actually reached upstream.
+        FakeUpstreamHandler.response_headers = [("Content-Type", "application/json")]
+        FakeUpstreamHandler.response_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "tools": [
+                        {"name": "run_command", "description": "d", "inputSchema": {}}
+                    ]
+                },
+            }
+        ).encode()
+        env = {
+            # Only these interpreters are allowed; 'ruby' is deliberately
+            # absent so we can assert the allow-list refusal.
+            "ALLOWED_COMMANDS": "perl,bash,python3",
+            "ALLOWED_DIR": os.environ.get("HOME", "/tmp"),
+            "COMMAND_TIMEOUT": "30",
+        }
+        with running_shim(upstream_port, bearer="s", extra_env=env) as (port, _):
+            url = f"http://127.0.0.1:{port}/mcp"
+            hdrs = {"Content-Type": "application/json", "Authorization": "Bearer s"}
+
+            def call(obj: dict) -> dict:
+                status, _h, body = post(url, body=json.dumps(obj).encode(), headers=hdrs)
+                expect(status == 200, f"run_script call: expected 200, got {status}")
+                return json.loads(body)
+
+            def text(res: dict) -> str:
+                return res["result"]["content"][0]["text"]
+
+            # tools/list: run_script injected next to run_command.
+            listing = call({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            names = [t["name"] for t in listing["result"]["tools"]]
+            expect("run_command" in names, f"tools/list should keep run_command, got {names}")
+            expect("run_script" in names, f"tools/list should inject run_script, got {names}")
+
+            # The tools/list request DID reach upstream (we don't intercept it).
+            # Payload 1: perl qw(...) + ; — the canonical failing case.
+            r = call(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_script",
+                        "arguments": {
+                            "interpreter": "perl",
+                            "script": 'my @x = qw(a b c); print "$_\n" for @x;',
+                        },
+                    },
+                }
+            )
+            expect(not r["result"]["isError"], f"perl: should succeed, got {r}")
+            expect("a\nb\nc" in text(r), f"perl: expected a/b/c output, got {text(r)!r}")
+
+            # Payload 2: multi-line bash heredoc.
+            heredoc = "cat <<'EOF'\nline one\nline two\nEOF\necho done"
+            r = call(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_script",
+                        "arguments": {"interpreter": "bash", "script": heredoc},
+                    },
+                }
+            )
+            expect(not r["result"]["isError"], f"heredoc: should succeed, got {r}")
+            expect(
+                "line one" in text(r) and "done" in text(r),
+                f"heredoc: expected heredoc body, got {text(r)!r}",
+            )
+
+            # Payload 3: nested quotes.
+            nested = '''print("he said 'hi' and \\"bye\\"")'''
+            r = call(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_script",
+                        "arguments": {"interpreter": "python3", "script": nested},
+                    },
+                }
+            )
+            expect(not r["result"]["isError"], f"nested: should succeed, got {r}")
+            expect(
+                "he said 'hi' and \"bye\"" in text(r),
+                f"nested: expected nested-quote output, got {text(r)!r}",
+            )
+
+            # Allow-list refusal: 'ruby' not in ALLOWED_COMMANDS.
+            r = call(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "run_script",
+                        "arguments": {"interpreter": "ruby", "script": "puts 1"},
+                    },
+                }
+            )
+            expect(r["result"]["isError"], f"refusal: should be isError, got {r}")
+            expect(
+                "allow-list" in text(r),
+                f"refusal: should explain allow-list, got {text(r)!r}",
+            )
+
+            # None of the run_script calls should have been forwarded upstream.
+            # The only forwarded request is the tools/list. (Each run_script
+            # tools/call is handled entirely in the shim.)
+            forwarded_methods = []
+            for req in FakeUpstreamHandler.requests:
+                try:
+                    forwarded_methods.append(json.loads(req["body"]).get("method"))
+                except Exception:
+                    forwarded_methods.append(None)
+            expect(
+                "tools/call" not in forwarded_methods,
+                f"run_script must NOT forward tools/call upstream, "
+                f"forwarded methods: {forwarded_methods}",
+            )
+
+            # run_command STILL forwards unchanged — the shim only intercepts
+            # run_script. Upstream returns its marker body for it.
+            FakeUpstreamHandler.response_body = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "result": {"content": [{"type": "text", "text": "FROM-UPSTREAM"}]},
+                }
+            ).encode()
+            before = len(FakeUpstreamHandler.requests)
+            r = call(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {"name": "run_command", "arguments": {"command": "echo hi"}},
+                }
+            )
+            expect(
+                len(FakeUpstreamHandler.requests) == before + 1,
+                "run_command should forward exactly one request upstream",
+            )
+            expect(
+                "FROM-UPSTREAM" in text(r),
+                f"run_command should relay upstream body, got {text(r)!r}",
+            )
+
+
 def test_upstream_unreachable_returns_502() -> None:
     """If mcp-proxy is dead, the shim returns 502 (Bad Gateway) — not
     200 or 401. The bridge's fall-back code path already handles 502
@@ -735,6 +905,7 @@ TESTS = [
     test_sse_response_body_passes_through,
     test_request_body_passed_through_verbatim,
     test_handshake_three_post_sequence_with_session_id,
+    test_run_script_handled_locally_not_forwarded,
     test_upstream_unreachable_returns_502,
 ]
 
