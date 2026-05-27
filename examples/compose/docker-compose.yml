@@ -453,7 +453,9 @@ services:
     user: "1000:1000"
     environment:
       EICHI_DB: /home/hndrewaall/.local/share/eichi/index.db
-      EICHI_PYTHON: /home/hndrewaall/repos/eichi/.venv/bin/python
+      # EICHI_PYTHON deliberately unset — app.py defaults to the
+      # container's own sys.executable. The host venv contains macOS
+      # Mach-O binaries that cannot exec in the Linux container.
     volumes:
       # Host eichi repo at the matching path so the venv's editable .pth
       # (absolute /home/hndrewaall/repos/eichi/src) resolves inside.
