@@ -242,6 +242,14 @@ Tier choice in practice:
   spawn an Agent that does the wait, not the main loop. The main
   loop should never sit in a polling sleep loop.
 
+**One concern per agent.** Each agent handles ONE task — never batch
+unrelated work into a single agent prompt. If you have 3 independent
+things to do, queue 3 items and spawn 3 agents. Batching unrelated work
+means: a failure on task 2 loses task 3, the queue audit trail is
+useless, and parallelizable work gets serialized. The signal you're
+batching wrong: your agent prompt has numbered sections for unrelated
+concerns. Split them.
+
 If you're in the main loop and find yourself about to chain
 `Read` → `Edit` → `Edit` → `Bash` → `Bash`, **stop and queue an
 Agent for the whole sequence instead.** The PreToolUse queue-gate
@@ -970,6 +978,60 @@ and limits:
   need to restart a host daemon, edit host cron, or touch a host service,
   ask the operator on their host session; the container is a code-writing
   sandbox, not a host-administration tool.
+
+## Semantic search — query eichi before grepping
+
+The container has access to [eichi](https://github.com/hndrewaall/eichi),
+a local sqlite-vec + sentence-transformers semantic search index. Use it
+as the **default first lookup** for open-ended recall questions ("where
+is X", "what did we decide about Y", "find the conversation where Z").
+
+Decision tree:
+
+1. **Concept-level question** (fuzzy, semantic) -> query eichi first.
+2. **Exact-string question** (function name, error code, config key) ->
+   `grep -r` or code search.
+3. **Structured data** (metrics, timestamps, statuses) -> domain-specific
+   tool (Prometheus, DB query, etc.).
+
+If eichi returns no results or all `[distant]` scores, THEN fall back to
+grep — not before.
+
+### How to invoke
+
+**From inside the container** (web API — the CLI venv is host-only):
+
+```sh
+curl -s "http://eichi-search:8000/api/search?q=alerting+tiers&k=5" | jq .
+```
+
+Query params: `q` (required), `k` (top-K, default 20), `source`
+(filter tag), `added_since` (duration: `1d`, `7d`, `30d`), `retrieval`
+(`hybrid`|`vector`|`bm25`).
+
+**From the host** (via `host-bash`, if the CLI venv is bootstrapped):
+
+```sh
+# host-bash run_command:
+eichi query "alerting tier design decisions" -k 5
+eichi query "docker networking" --added-since 7d
+eichi query "PR feedback" --sort added -k 10
+```
+
+### Interpreting results
+
+Each result includes a score with a human-readable label: `[strong]` >
+`[moderate]` > `[weak]` > `[distant]`. Treat `[distant]` as noise
+unless the query is highly specialized. Results also carry a source tag
+(`[file]`, `[obsidian]`, etc.) and a timestamp (last modified or added).
+
+### When to re-index
+
+The operator maintains the index via `eichi index <path>` on the host
+(delta-only, idempotent). If `eichi stats` shows `last indexed at` is
+stale relative to recent corpus activity, flag it to the operator —
+re-indexing is a host-side operation (the container reads the index
+read-only via the bind-mounted DB at `~/.local/share/eichi/index.db`).
 
 ## Quick reference for common in-container surprises
 
