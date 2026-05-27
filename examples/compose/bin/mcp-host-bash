@@ -774,6 +774,15 @@ EOF
             ;;
     esac
 
+    # The shim handles the run_script MCP tool locally (script body fed on
+    # the interpreter's STDIN, never tokenized — unlike cli-mcp-server's
+    # run_command). Export the SAME policy fences cli-mcp-server enforces so
+    # run_script and run_command stay in lockstep: the interpreter is
+    # resolved against ALLOWED_COMMANDS, runs with cwd=ALLOWED_DIR, and is
+    # capped by COMMAND_TIMEOUT.
+    ALLOWED_COMMANDS="$ALLOWED_COMMANDS" \
+    ALLOWED_DIR="$ALLOWED_DIR" \
+    COMMAND_TIMEOUT="$COMMAND_TIMEOUT" \
     "${shim_argv[@]}" 2> >(tee -a "$MCP_HOST_BASH_LOG" >&2) &
     shim_pid=$!
     # Poll-wait on BOTH children. If EITHER dies, take the other down

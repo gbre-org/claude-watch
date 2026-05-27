@@ -39,6 +39,29 @@ the shim copies response headers (including `mcp-session-id`), body,
 and status code verbatim. Both JSON and text/event-stream content
 types pass through.
 
+run_script TOOL (locally handled)
+
+The shim also adds a `run_script` MCP tool alongside cli-mcp-server's
+`run_command`. `run_command` shlex-tokenizes its command string, so it
+rejects complex inline quoting (perl `qw(...)` + `;`, nested quotes,
+multi-line heredocs) even with `ALLOWED_COMMANDS=all` +
+`ALLOW_SHELL_OPERATORS=true`. `run_script(interpreter, script)` takes the
+script as a structured JSON string and feeds it to the interpreter on
+STDIN — the body never traverses a shell or tokenizer at any layer.
+
+The shim handles `run_script` itself (it does NOT forward those
+tools/call requests to mcp-proxy) and injects the tool def into
+`tools/list` responses on the way back. It reuses the SAME policy fences
+cli-mcp-server enforces for `run_command`: the interpreter is resolved
+against ALLOWED_COMMANDS, runs with cwd = ALLOWED_DIR, and is capped by
+COMMAND_TIMEOUT (the launcher exports these into the shim's env). Every
+other tool, including `run_command`, is untouched and forwards normally.
+
+Because `run_script` lives in the shim, it is available ONLY in
+bearer-auth mode (MCP_HOST_BASH_BEARER set, shim in the request path).
+When the bearer is unset the launcher binds mcp-proxy directly with no
+shim, and only cli-mcp-server's `run_command` is exposed — unchanged.
+
 USAGE
 
   mcp-proxy-auth-shim \\
@@ -101,14 +124,34 @@ import argparse
 import hmac
 import http.client
 import http.server
+import json
 import os
+import shutil
 import socketserver
+import subprocess
 import sys
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 BEARER_ENV = "MCP_HOST_BASH_BEARER"
 DEBUG_ENV = "MCP_PROXY_AUTH_SHIM_DEBUG"
+
+# Env vars that scope the locally-handled `run_script` tool. These are the
+# SAME knobs cli-mcp-server enforces for `run_command` — the launcher
+# (mcp-host-bash) resolves them once and exports them into BOTH the
+# mcp-proxy --env pairs (for cli-mcp-server / run_command) AND this shim's
+# own environment (for run_script). Reusing the identical fences keeps the
+# two tools' policy in lockstep.
+#   ALLOWED_COMMANDS — comma-separated allow-list of interpreter basenames.
+#       "all" disables the name gate (matches cli-mcp-server semantics).
+#       Unset/empty => run_script refuses every interpreter (fail-closed).
+#   ALLOWED_DIR      — cwd for the spawned interpreter (default: $HOME).
+#   COMMAND_TIMEOUT  — per-script wall-clock cap in seconds (default: 30).
+ALLOWED_COMMANDS_ENV = "ALLOWED_COMMANDS"
+ALLOWED_DIR_ENV = "ALLOWED_DIR"
+COMMAND_TIMEOUT_ENV = "COMMAND_TIMEOUT"
+
+RUN_SCRIPT_TOOL_NAME = "run_script"
 
 # Headers we never want to forward verbatim across the proxy boundary.
 # - `Authorization` is the secret itself; strip on forward (the shim is
@@ -193,6 +236,173 @@ def extract_bearer(header_value: Optional[str]) -> Optional[str]:
     return token
 
 
+# ---------------------------------------------------------------------------
+# run_script — locally-handled MCP tool
+#
+# `cli-mcp-server`'s `run_command` shlex-tokenizes the command string before
+# exec, so it chokes on complex inline quoting (perl `qw(...)`, `;`, nested
+# quotes, multi-line heredocs) even with ALLOWED_COMMANDS=all +
+# ALLOW_SHELL_OPERATORS=true. `run_script` takes the script as a structured
+# JSON string and feeds it to the interpreter on STDIN — the script body
+# never traverses a shell or tokenizer at any layer.
+#
+# This is the ONLY tool the shim handles locally; every other JSON-RPC
+# method (incl. run_command) forwards to mcp-proxy unchanged. The shim also
+# injects the run_script definition into the tools/list response so callers
+# discover it alongside run_command.
+# ---------------------------------------------------------------------------
+
+RUN_SCRIPT_TOOL_DEF = {
+    "name": RUN_SCRIPT_TOOL_NAME,
+    "description": (
+        "Run a script with a chosen interpreter, feeding the script body on "
+        "STDIN. Unlike run_command, the script is NEVER shell-parsed or "
+        "tokenized — pass multi-line bodies, nested quotes, heredocs, perl "
+        "qw(...), semicolons, etc. verbatim. The interpreter is resolved "
+        "against the same allow-list as run_command; the script runs with "
+        "cwd = ALLOWED_DIR and the same per-command timeout."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "interpreter": {
+                "type": "string",
+                "description": (
+                    "Interpreter basename to exec (e.g. 'bash', 'perl', "
+                    "'python3'). Must be on the allow-list."
+                ),
+            },
+            "script": {
+                "type": "string",
+                "description": (
+                    "Script body, fed to the interpreter on STDIN verbatim. "
+                    "No escaping or encoding required."
+                ),
+            },
+        },
+        "required": ["interpreter", "script"],
+    },
+}
+
+
+def _allowed_commands() -> Optional[set[str]]:
+    """Parse ALLOWED_COMMANDS into a set of basenames, or None for the
+    'all' wildcard. Empty/unset => empty set (fail-closed: nothing allowed)."""
+    raw = os.environ.get(ALLOWED_COMMANDS_ENV, "").strip()
+    if raw.lower() == "all":
+        return None  # wildcard — no name gate
+    return {c.strip() for c in raw.split(",") if c.strip()}
+
+
+def _command_timeout() -> int:
+    raw = os.environ.get(COMMAND_TIMEOUT_ENV, "").strip()
+    try:
+        val = int(raw)
+        return val if val > 0 else 30
+    except ValueError:
+        return 30
+
+
+def _allowed_dir() -> str:
+    return os.environ.get(ALLOWED_DIR_ENV, "").strip() or os.environ.get(
+        "HOME", os.getcwd()
+    )
+
+
+def _tool_result(text: str, is_error: bool = False) -> dict:
+    """Build a standard MCP tool-result content block."""
+    return {
+        "content": [{"type": "text", "text": text}],
+        "isError": is_error,
+    }
+
+
+def run_script(interpreter: str, script: str) -> dict:
+    """Execute `interpreter` with `script` on STDIN. Returns an MCP
+    tool-result dict. Reuses the same fences cli-mcp-server enforces for
+    run_command: ALLOWED_COMMANDS name gate, ALLOWED_DIR cwd, COMMAND_TIMEOUT
+    wall-clock cap. The script body is never tokenized or shell-parsed."""
+    if not isinstance(interpreter, str) or not interpreter.strip():
+        return _tool_result("run_script: 'interpreter' is required", is_error=True)
+    if not isinstance(script, str):
+        return _tool_result("run_script: 'script' must be a string", is_error=True)
+
+    interpreter = interpreter.strip()
+
+    # Reject anything that looks like a path or argv — the allow-list is
+    # by basename, mirroring cli-mcp-server's per-binary gate.
+    if os.path.basename(interpreter) != interpreter or "/" in interpreter:
+        return _tool_result(
+            f"run_script: interpreter must be a bare basename, got {interpreter!r}",
+            is_error=True,
+        )
+
+    allowed = _allowed_commands()
+    if allowed is not None and interpreter not in allowed:
+        return _tool_result(
+            f"run_script: interpreter {interpreter!r} is not in the allow-list "
+            f"(ALLOWED_COMMANDS). Refused.",
+            is_error=True,
+        )
+
+    resolved = shutil.which(interpreter)
+    if not resolved:
+        return _tool_result(
+            f"run_script: interpreter {interpreter!r} not found on PATH",
+            is_error=True,
+        )
+
+    timeout = _command_timeout()
+    cwd = _allowed_dir()
+
+    try:
+        proc = subprocess.run(
+            [resolved],
+            input=script,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return _tool_result(
+            f"run_script: {interpreter} timed out after {timeout}s",
+            is_error=True,
+        )
+    except OSError as e:
+        return _tool_result(
+            f"run_script: failed to exec {interpreter}: {type(e).__name__}: {e}",
+            is_error=True,
+        )
+
+    out = (
+        f"exit_code: {proc.returncode}\n"
+        f"--- stdout ---\n{proc.stdout}\n"
+        f"--- stderr ---\n{proc.stderr}"
+    )
+    return _tool_result(out, is_error=(proc.returncode != 0))
+
+
+def inject_run_script_into_tools_list(payload: Any) -> Any:
+    """Given a parsed JSON-RPC response object, if it's a tools/list result,
+    append the run_script tool def (idempotent). Returns the (possibly
+    mutated) object; returns it unchanged if the shape doesn't match."""
+    if not isinstance(payload, dict):
+        return payload
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return payload
+    tools = result.get("tools")
+    if not isinstance(tools, list):
+        return payload
+    if any(
+        isinstance(t, dict) and t.get("name") == RUN_SCRIPT_TOOL_NAME for t in tools
+    ):
+        return payload  # already present — don't duplicate
+    tools.append(RUN_SCRIPT_TOOL_DEF)
+    return payload
+
+
 class AuthShimHandler(http.server.BaseHTTPRequestHandler):
     """Per-request handler. Reads the bearer + upstream config from
     class attributes set at server boot.
@@ -248,14 +458,86 @@ class AuthShimHandler(http.server.BaseHTTPRequestHandler):
             return False
         return True
 
-    def _forward(self) -> None:
-        """Forward the verified request upstream + relay the response."""
-        # Read the request body (if any). Content-Length is the
-        # only body-framing shape mcp-proxy clients use today
-        # (urllib's POST writes Content-Length, not Transfer-Encoding:
-        # chunked), so we don't need streaming support.
+    def _read_body(self) -> bytes:
+        """Read the request body (if any). Content-Length is the only
+        body-framing shape mcp-proxy clients use today (urllib's POST writes
+        Content-Length, not Transfer-Encoding: chunked), so we don't need
+        streaming support. Body is read exactly once per request."""
         content_length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(content_length) if content_length > 0 else b""
+        return self.rfile.read(content_length) if content_length > 0 else b""
+
+    def _send_json(self, status: int, obj: Any) -> None:
+        """Serialize `obj` as JSON and send it as the HTTP response. Used
+        for shim-handled (non-forwarded) responses like run_script results."""
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _try_handle_run_script(self, body: bytes) -> bool:
+        """If `body` is a JSON-RPC tools/call for run_script, handle it
+        locally and reply — returning True. Otherwise return False so the
+        caller forwards the request to mcp-proxy unchanged.
+
+        Parse failures / non-matching shapes return False (forward as-is);
+        we only intercept the exact run_script call shape."""
+        if not body:
+            return False
+        try:
+            req = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        if not isinstance(req, dict) or req.get("method") != "tools/call":
+            return False
+        params = req.get("params")
+        if not isinstance(params, dict) or params.get("name") != RUN_SCRIPT_TOOL_NAME:
+            return False
+
+        args = params.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
+        result = run_script(args.get("interpreter", ""), args.get("script", ""))
+
+        _emit(
+            f"run_script: interpreter={args.get('interpreter')!r} "
+            f"(isError={result.get('isError')})"
+        )
+        self._send_json(
+            200,
+            {"jsonrpc": "2.0", "id": req.get("id"), "result": result},
+        )
+        return True
+
+    def _maybe_inject_run_script(self, resp_body: bytes, content_type: str) -> bytes:
+        """If `resp_body` is a JSON tools/list result, inject the run_script
+        tool def so callers discover it alongside run_command. Returns the
+        (possibly rewritten) body. Non-JSON / non-tools-list bodies (incl.
+        SSE) pass through unchanged — run_command's discovery path is JSON
+        in the mcp-proxy stateless transport, which is what the bridge uses."""
+        if "application/json" not in content_type.lower():
+            return resp_body
+        try:
+            payload = json.loads(resp_body)
+        except (ValueError, UnicodeDecodeError):
+            return resp_body
+        injected = inject_run_script_into_tools_list(payload)
+        if injected is payload and not (
+            isinstance(payload, dict)
+            and isinstance(payload.get("result"), dict)
+            and isinstance(payload["result"].get("tools"), list)
+        ):
+            return resp_body
+        return json.dumps(injected).encode("utf-8")
+
+    def _forward(self, body: bytes) -> None:
+        """Forward the verified request upstream + relay the response.
+
+        `body` is read once by the caller (so run_script interception can
+        peek at it first) and handed in here.
+        """
+        content_length = len(body)
 
         # Build the forward request: strip the Authorization header so
         # mcp-proxy never sees the secret, plus hop-by-hop headers per
@@ -300,6 +582,13 @@ class AuthShimHandler(http.server.BaseHTTPRequestHandler):
                 pass
             return
 
+        # Inject the run_script tool def into a tools/list response so
+        # callers discover it alongside run_command. No-op for every other
+        # response shape (incl. non-tools-list JSON and SSE bodies).
+        content_type = resp.getheader("Content-Type", "") or ""
+        if resp.status == 200:
+            resp_body = self._maybe_inject_run_script(resp_body, content_type)
+
         # Relay response. send_response writes status + the HTTP/1.1
         # Server header; we then append the upstream headers (sans
         # hop-by-hop / re-computed framing). Body framing is
@@ -323,7 +612,12 @@ class AuthShimHandler(http.server.BaseHTTPRequestHandler):
     def _dispatch(self) -> None:
         if not self._check_auth():
             return
-        self._forward()
+        # Read the body once. run_script calls are handled locally (never
+        # forwarded to mcp-proxy / cli-mcp-server); everything else forwards.
+        body = self._read_body()
+        if self._try_handle_run_script(body):
+            return
+        self._forward(body)
 
     # mcp-proxy speaks JSON-RPC over POST; in practice that's the only
     # verb the bridge uses. We also accept GET / OPTIONS / etc. for
