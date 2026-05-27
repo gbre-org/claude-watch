@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -231,6 +231,16 @@ test-personal-mcp-host:
 # walkthrough coverage. 22 cases, <1s.
 test-personal-mcp-host-plist:
 	examples/personal-mac-mcp-host/tests/launchd-plist.test
+
+# Tests for examples/personal-mac-mcp-host/install.sh — the one-command
+# LaunchAgent installer that auto-resolves REPO / HOME, substitutes the
+# /PATH/TO/REPO and /PATH/TO/HOME placeholders, and copies the chosen
+# plist into ~/Library/LaunchAgents/. Runs in --print-cmd / temp-HOME
+# dry-run style; asserts the rendered plist has NO surviving /PATH/TO/
+# placeholders and points at the resolved repo / home. Idempotency +
+# missing-tunnel-plist guard covered. No launchctl. 21 checks, <1s.
+test-personal-mcp-install:
+	examples/personal-mac-mcp-host/tests/install.test
 
 # Tests for examples/compose/ttyd/inject-autodark.py PASTE_EVENT_HANDLER_JS
 # — the browser-side paste handler injected into ttyd's bundled

@@ -72,39 +72,60 @@ the trust model.
   recommended `authorized_keys` line restricting the key to
   port-forward-only.
 
-## 1. Copy the plist into `~/Library/LaunchAgents/`
+## 1. Install the plist (one command)
 
-`launchd` only loads files directly under `~/Library/LaunchAgents/` —
-no symlinks, no files outside that tree. So `cp`, not `ln -s`:
+Use the bundled installer — it auto-resolves your checkout path and home
+directory, substitutes the `/PATH/TO/REPO` / `/PATH/TO/HOME`
+placeholders, copies the plist into `~/Library/LaunchAgents/`, and
+pre-creates `~/Library/Logs/`. No manual `cp` + editor dance:
 
 ```sh
-cp examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.host.plist \
-   ~/Library/LaunchAgents/
+cd examples/personal-mac-mcp-host
+./install.sh --bundled
 ```
 
-The filename must match the plist's `Label` key
-(`org.gbre.personal-mcp.host`) — `launchd` keys off the filename for
-`bootstrap` / `bootout` / `print` / `kickstart`.
-
-## 2. Edit absolute paths
-
-`launchd` does NOT expand `~` or `${HOME}` in plist values — it uses
-literal paths. Open the copy in your editor:
+That prints the resolved paths and the `launchctl bootstrap` command to
+run next (step 2). Pass `--bootstrap` to also bootstrap immediately:
 
 ```sh
+./install.sh --bundled --bootstrap
+```
+
+Other flags:
+
+- `--tunnel-only` — install `org.gbre.personal-mcp.tunnel.plist` instead
+  of the bundled wrapper unit (only if that template exists in this
+  checkout).
+- `--print-cmd` — dry run: print the resolved paths + the rendered plist
+  + the bootstrap command, write nothing.
+- `--help` — full flag reference.
+
+The installer is idempotent — re-run it any time (e.g. after moving your
+checkout) and it overwrites the installed plist with freshly-resolved
+paths.
+
+### What it does under the hood (manual fallback)
+
+If you'd rather do it by hand, the installer is equivalent to:
+
+```sh
+# 1. Copy. launchd only loads files directly under
+#    ~/Library/LaunchAgents/ — no symlinks. The filename must match the
+#    plist's Label (org.gbre.personal-mcp.host); launchd keys bootstrap /
+#    bootout / print / kickstart off it.
+cp launchd/org.gbre.personal-mcp.host.plist ~/Library/LaunchAgents/
+
+# 2. Edit absolute paths. launchd does NOT expand ~ or ${HOME} in plist
+#    values — literal paths only.
 $EDITOR ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
-```
+#    Search/replace:
+#      /PATH/TO/REPO → absolute path to your claude-watch checkout
+#                      (e.g. /Users/yourname/code/claude-watch)
+#      /PATH/TO/HOME → your home directory (e.g. /Users/yourname;
+#                      `echo $HOME` if unsure)
 
-Search/replace:
-
-- `/PATH/TO/REPO` → absolute path to your local `claude-watch` checkout
-  (e.g. `/Users/yourname/code/claude-watch`).
-- `/PATH/TO/HOME` → your home directory (e.g. `/Users/yourname`).
-  Run `echo $HOME` if unsure.
-
-Pre-create the log directory once:
-
-```sh
+# 3. Pre-create the log directory once (launchd makes the log files but
+#    not the parent).
 mkdir -p ~/Library/Logs
 ```
 
@@ -116,7 +137,7 @@ sources on every start. To change one, edit
 `examples/personal-mac-mcp-host/.env` and `kickstart` the unit again
 — no re-bootstrap needed.
 
-## 3. Bootstrap the LaunchAgent (one-time, registers but does NOT start)
+## 2. Bootstrap the LaunchAgent (one-time, registers but does NOT start)
 
 ```sh
 launchctl bootstrap gui/$(id -u) \
@@ -136,7 +157,7 @@ launchctl print gui/$(id -u)/org.gbre.personal-mcp.host
 
 Look for `state = not running` and `last exit code = (never exited)`.
 
-## 4. Per-session: bring up the bridge
+## 3. Per-session: bring up the bridge
 
 When you want to grant your remote Claude access to this Mac:
 
@@ -173,7 +194,7 @@ Tail the wrapper's logs live:
 tail -F ~/Library/Logs/personal-mcp-host.err.log
 ```
 
-## 5. Per-session: tear the bridge down
+## 4. Per-session: tear the bridge down
 
 Two options.
 
@@ -201,7 +222,7 @@ A plain `launchctl kill TERM` does **not** stop the unit — `KeepAlive`
 respawns it within `ThrottleInterval`. Use `bootout` or the soft kill
 switch.
 
-## 6. Pick up plist changes
+## 5. Pick up plist changes
 
 `launchd` snapshots the plist contents at `bootstrap` time. Editing
 the plist after that does NOT take effect until you re-bootstrap:
@@ -216,7 +237,7 @@ launchctl bootstrap gui/$(id -u) \
 (re)start, so a fresh `launchctl kickstart` (or letting `KeepAlive`
 respawn after a `kill TERM`) is enough.
 
-## 7. Logs
+## 6. Logs
 
 The wrapper writes to two places by default:
 
@@ -229,7 +250,7 @@ The wrapper writes to two places by default:
 
 `tail -F <path>` either to follow live.
 
-## 8. Permanently uninstall
+## 7. Permanently uninstall
 
 ```sh
 launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
@@ -277,12 +298,11 @@ with these substitutions:
   `~/Library/Logs/personal-mcp-tunnel.err.log`.
 
 ```sh
-# One-time install:
-cp examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.tunnel.plist \
-   ~/Library/LaunchAgents/
-$EDITOR ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
-# (replace /PATH/TO/REPO and /PATH/TO/HOME)
-mkdir -p ~/Library/Logs
+# One-time install — install.sh auto-substitutes /PATH/TO/REPO and
+# /PATH/TO/HOME and creates ~/Library/Logs (--bootstrap to also bootstrap
+# now; --print-cmd for a dry run):
+cd examples/personal-mac-mcp-host
+./install.sh --tunnel-only
 
 launchctl bootstrap gui/$(id -u) \
     ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
@@ -294,6 +314,11 @@ launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.tunnel
 # Revoke remote access: stop the tunnel. MCP server keeps running.
 launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.tunnel
 ```
+
+(Prefer to do it by hand? Same manual `cp` + editor + `mkdir -p
+~/Library/Logs` steps as the bundled unit's
+[under-the-hood fallback](#what-it-does-under-the-hood-manual-fallback),
+substituting `org.gbre.personal-mcp.tunnel.plist`.)
 
 Because the wrapper skips the `mcp-host-bash` launch + listener probe
 in this mode, the only failure surface is the SSH tunnel itself —

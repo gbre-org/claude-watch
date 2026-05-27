@@ -52,13 +52,15 @@ examples/personal-mac-mcp-host/
 ├── .env.example                              # committed; placeholder values
 ├── .gitignore                                # excludes .env
 ├── personal-mcp-host.sh                      # wrapper: mcp-host-bash + ssh tunnel (or tunnel-only)
+├── install.sh                                # one-command LaunchAgent installer (path substitution)
 ├── launchd/
 │   ├── org.gbre.personal-mcp.host.plist      # bundled LaunchAgent (mcp-host-bash + tunnel, RunAtLoad=false)
 │   ├── org.gbre.personal-mcp.tunnel.plist    # tunnel-only LaunchAgent (tunnel only, RunAtLoad=false)
 │   └── README.md                             # launchctl install walkthrough
 └── tests/
     ├── personal-mcp-host.test                # bash wrapper argv tests
-    └── launchd-plist.test                    # plist structural tests
+    ├── launchd-plist.test                    # plist structural tests
+    └── install.test                          # install.sh path-substitution tests
 ```
 
 ## Topology
@@ -271,7 +273,9 @@ cd examples/personal-mac-mcp-host
 ### Recommended split — always-on MCP + on-demand tunnel-only LaunchAgent
 
 Run the MCP server full-time via the compose-stack LaunchAgent and
-grant remote access on-demand with the **tunnel-only** unit:
+grant remote access on-demand with the **tunnel-only** unit. The
+bundled `install.sh` auto-substitutes the `/PATH/TO/REPO` /
+`/PATH/TO/HOME` placeholders — no manual editing:
 
 ```sh
 # (1) MCP always-on locally — see ../compose/launchd/README.md:
@@ -279,10 +283,9 @@ grant remote access on-demand with the **tunnel-only** unit:
 #     (RunAtLoad=true). mcp-host-bash now listens at every login.
 
 # (2) Tunnel-only unit, granting remote access on-demand.
-#     One-time install:
-cp launchd/org.gbre.personal-mcp.tunnel.plist ~/Library/LaunchAgents/
-$EDITOR ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
-# (replace /PATH/TO/REPO and /PATH/TO/HOME)
+#     One-time install (auto-substitutes paths; --bootstrap to also
+#     bootstrap now):
+./install.sh --tunnel-only
 
 launchctl bootstrap gui/$(id -u) \
     ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
@@ -300,18 +303,19 @@ See [`launchd/README.md`](launchd/README.md) for the full walkthrough.
 ### Bundled (LaunchAgent, RunAtLoad=false)
 
 Simpler alternative: one unit owns both `mcp-host-bash` and the
-tunnel. Walks through copying the plist, replacing `/PATH/TO/REPO` /
-`/PATH/TO/HOME`, bootstrapping the unit (registers but does not fire),
-and the per-session `kickstart` / `bootout` cycle. See
-[`launchd/README.md`](launchd/README.md).
+tunnel. The bundled `install.sh` resolves your checkout path + home
+directory, substitutes the `/PATH/TO/REPO` / `/PATH/TO/HOME`
+placeholders, and copies the plist into `~/Library/LaunchAgents/` — no
+manual editing. See [`launchd/README.md`](launchd/README.md) for the
+full walkthrough (bootstrap, per-session `kickstart` / `bootout`, the
+soft kill switch).
 
 In short:
 
 ```sh
-# One-time install:
-cp launchd/org.gbre.personal-mcp.host.plist ~/Library/LaunchAgents/
-$EDITOR ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
-# (replace /PATH/TO/REPO and /PATH/TO/HOME)
+# One-time install (auto-substitutes paths; --bootstrap to also bootstrap now):
+./install.sh --bundled
+# (re-runnable / idempotent; --print-cmd for a dry run; --help for flags)
 
 launchctl bootstrap gui/$(id -u) \
     ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
@@ -328,6 +332,10 @@ echo 'PERSONAL_MCP_DISABLED="1"' >> .env
 launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
 # (wrapper exits 0 immediately; KeepAlive idles)
 ```
+
+Prefer to do it by hand? The "what it does under the hood" subsection of
+[`launchd/README.md`](launchd/README.md) keeps the manual
+`cp` + editor + `mkdir -p ~/Library/Logs` steps as a fallback.
 
 ## Failure modes
 
@@ -348,20 +356,25 @@ For LaunchAgent-specific failures, see
 
 ## Tests
 
-Two embedded test scripts run on Linux CI:
+Three embedded test scripts run on Linux CI:
 
 ```sh
 make test-personal-mcp-host          # bash wrapper argv tests
 make test-personal-mcp-host-plist    # plist structural tests
+make test-personal-mcp-install       # install.sh path-substitution tests
 ```
 
 The first uses `personal-mcp-host.sh --print-cmd`, which builds the
 planned `ssh` argv but prints it one-per-line instead of executing —
 no `mcp-host-bash` / `ssh` invocation needed. The second parses the
 plist via Python's stdlib `plistlib` and verifies the labels / paths
-/ KeepAlive / RunAtLoad shapes.
+/ KeepAlive / RunAtLoad shapes. The third runs `install.sh` in
+`--print-cmd` / temp-`HOME` dry-run style and asserts the rendered
+plist has NO surviving `/PATH/TO/` placeholders and points at the
+resolved repo / home, for both the bundled and tunnel-only units
+(plus idempotency + the missing-tunnel-plist guard).
 
-Neither requires macOS; both run unchanged in GitHub Actions Linux
+None require macOS; all run unchanged in GitHub Actions Linux
 runners.
 
 Real macOS verification (LaunchAgent bootstrap + actual SSH tunnel)
