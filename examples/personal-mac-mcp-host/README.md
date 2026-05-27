@@ -167,7 +167,8 @@ reason. See the comments in `.env.example` for the full surface.
 | `MCP_HOST_BASH_BEARER` | empty | Defense-in-depth. The SSH tunnel encrypts the wire, but anyone else on the remote's loopback can also dial `localhost:$REMOTE_PORT` — the bearer is the layer that bounds access to callers with the secret. Generate with `head -c 32 /dev/urandom \| base64`. |
 | `CW_PROFILE` | `corp-dev` | Conservative read-y floor. Widen to `corp-dev-trusted` only if your remote-side Claude needs to mutate files / fire webhooks / manage containers on the Mac. |
 | `ALLOWED_DIR` | `$HOME` (in `mcp-host-bash`) | Narrow to e.g. `$HOME/personal-mcp-scratch` if you want to limit the blast radius. |
-| `PERSONAL_MCP_TUNNEL_ONLY` | unset | Set to `1` (equivalent to passing `--tunnel-only`) to run the wrapper in tunnel-only mode: open ONLY the reverse SSH tunnel and skip launching `mcp-host-bash` + the listener probe. Use when `mcp-host-bash` is already running locally (the recommended split — the always-on compose-stack LaunchAgent owns the server). |
+| `PERSONAL_MCP_TUNNEL_ONLY` | unset | Set to `1` (equivalent to passing `--tunnel-only`) to run the wrapper in tunnel-only mode: open ONLY the reverse SSH tunnel and skip the status gate, the `mcp-host-bash` launch + listener probe, and the log tail. Use when `mcp-host-bash` is already running locally (the recommended split — the always-on compose-stack LaunchAgent owns the server) and you want the unattended/launchd shape. |
+| `MCP_HOST_BASH_LOG` | `~/.local/state/claude-container/mcp-host-bash.log` | The live log the default + `--enable` modes `tail -F` after the tunnel comes up. Kept in lockstep with `mcp-host-bash`'s own default so the follow tracks the real JSON-RPC + `run_command` traffic. Override if your launcher logs elsewhere. |
 
 ### Remote-side MCP client config (operator's private notes)
 
@@ -250,8 +251,19 @@ If `$REMOTE_HOST` runs sshd on a non-default port, use
 
 ```sh
 cd examples/personal-mac-mcp-host
-./personal-mcp-host.sh                 # bundled: mcp-host-bash + tunnel
-# OR, tunnel-only (mcp-host-bash already running locally):
+
+# Default: status-gate, then tunnel + tail the live log.
+#   - If the host MCP service ISN'T up, this prints an error + a
+#     ready-to-copy `--enable` rerun command and exits non-zero.
+#   - If it IS up, it opens the reverse tunnel and tails the MCP host
+#     log so you watch traffic live. Ctrl-C tears the tunnel down.
+./personal-mcp-host.sh
+
+# Bring the host MCP service up AND open the tunnel + tail in one shot:
+./personal-mcp-host.sh --enable
+
+# Tunnel-only (mcp-host-bash already running locally; no gate/tail —
+# the unattended/launchd shape):
 ./personal-mcp-host.sh --tunnel-only
 # Bridge stays up until Ctrl-C, the tunnel breaks, or you reboot.
 ```

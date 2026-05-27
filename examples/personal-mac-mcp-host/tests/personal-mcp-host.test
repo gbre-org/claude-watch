@@ -23,9 +23,15 @@ Coverage:
     --print-cmd emits ONLY the SSH: block, NOT the MCP_HOST_BASH_BIN:
     launch block, and the ssh argv is otherwise unchanged.
   - Bad flag exits 2.
-  - --help exits 0 with the usage block.
+  - --help exits 0 with the usage block + documents --enable.
   - PERSONAL_MCP_DISABLED=1 (without --print-cmd) exits 0 immediately.
   - PERSONAL_MCP_ENV_FILE override is honored.
+  - Default status gate, RED: nothing listening on MCP_LOCAL_PORT →
+    error + ready-to-copy --enable rerun command + exit 3.
+  - Default status gate, GREEN: a listener on MCP_LOCAL_PORT → detects
+    the service is up, proceeds to start the reverse tunnel (fake ssh
+    stand-in), then SIGTERM actively tears the tunnel down.
+  - --enable --print-cmd emits the MCP_HOST_BASH_BIN: launch block.
 
 Run:  ./personal-mcp-host.test
 """
@@ -33,9 +39,11 @@ Run:  ./personal-mcp-host.test
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -548,6 +556,177 @@ def test_gitignore_excludes_env() -> None:
         )
 
 
+def _free_port() -> int:
+    """Grab a port the OS hands us, then release it so the script (or our
+    stand-in listener) can bind it."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _make_fake_ssh(dirpath: Path) -> Path:
+    """Write a fake `ssh` that just sleeps, so the GREEN path can spawn a
+    'tunnel' without a real remote. Returns the bin dir to prepend to
+    PATH."""
+    bindir = dirpath / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    ssh = bindir / "ssh"
+    ssh.write_text("#!/usr/bin/env bash\nexec sleep 600\n")
+    ssh.chmod(0o755)
+    return bindir
+
+
+def test_enable_flag_in_help() -> None:
+    """--help documents the new --enable flag + the default status-gate
+    behavior."""
+    lines, _, _, rc = run_script(["--help"])
+    expect(rc == 0, f"--help: rc should be 0, got {rc}")
+    body = "\n".join(lines)
+    expect("--enable" in body, "--help should document the --enable flag")
+    expect(
+        "status-gate" in body or "status gate" in body.lower(),
+        "--help should describe the default status-gate behavior",
+    )
+
+
+def test_default_red_path_service_down_exits_three() -> None:
+    """Default mode with NOTHING listening on MCP_LOCAL_PORT → RED:
+    prints the service-not-running error, prints a ready-to-copy
+    --enable rerun command, and exits non-zero (3)."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        key_path = Path(td) / "fake-key"
+        key_path.write_text("")
+        port = _free_port()
+        write_env(env_path, mcp_local_port=str(port), ssh_key_path=str(key_path))
+        # No flags → default mode. Nothing is bound on `port`.
+        _, stdout, stderr, rc = run_script([], env_file=env_path, expect_rc=None)
+        out = stdout + stderr
+        expect(rc == 3, f"RED path: rc should be 3, got {rc}\n{out}")
+        expect(
+            "NOT running" in out or "not running" in out,
+            f"RED path: should say the host MCP service is not running; got {out!r}",
+        )
+        expect(
+            "--enable" in out,
+            f"RED path: should print a --enable rerun command; got {out!r}",
+        )
+        expect(
+            str(SCRIPT) in out or SCRIPT.name in out,
+            f"RED path: rerun command should reference this script; got {out!r}",
+        )
+
+
+def test_default_green_path_detects_service_up() -> None:
+    """Default mode with a listener bound on MCP_LOCAL_PORT → GREEN:
+    detects the service is up and proceeds toward tunnel setup (spawns
+    the fake ssh stand-in). We assert it got PAST the status gate by
+    looking for the 'service is UP' line, then SIGTERM it and confirm
+    the tunnel teardown runs."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        env_path = tdp / ".env"
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        port = _free_port()
+        write_env(env_path, mcp_local_port=str(port), ssh_key_path=str(key_path))
+        bindir = _make_fake_ssh(tdp)
+
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen(1)
+        proc = None
+        try:
+            env = {
+                "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": os.environ.get("HOME", "/tmp"),
+                "PERSONAL_MCP_ENV_FILE": str(env_path),
+                "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+            }
+            proc = subprocess.Popen(
+                [str(SCRIPT)],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            # Wait for the gate + tunnel-start lines to appear.
+            deadline = time.time() + 8
+            seen = ""
+            got_gate = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    seen += proc.stdout.read()
+                    break
+                # Non-blocking-ish drain via short reads.
+                line = proc.stdout.readline()
+                if line:
+                    seen += line
+                    if "service is UP" in line:
+                        got_gate = True
+                    if "reverse SSH tunnel started" in line:
+                        break
+            expect(
+                got_gate,
+                f"GREEN path: should report service is UP and pass the gate; "
+                f"got:\n{seen}",
+            )
+            expect(
+                "reverse SSH tunnel started" in seen,
+                f"GREEN path: should proceed to start the reverse tunnel; "
+                f"got:\n{seen}",
+            )
+            # Now tear it down via SIGTERM and confirm the teardown path runs.
+            proc.terminate()
+            try:
+                rest = proc.communicate(timeout=8)[0]
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rest = proc.communicate()[0]
+            combined = seen + (rest or "")
+            expect(
+                "tearing down reverse SSH tunnel" in combined,
+                f"GREEN path: SIGTERM should trigger active tunnel teardown; "
+                f"got:\n{combined}",
+            )
+            expect(
+                "reverse SSH tunnel torn down" in combined,
+                f"GREEN path: teardown should confirm the tunnel is gone; "
+                f"got:\n{combined}",
+            )
+        finally:
+            listener.close()
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            # Reap any orphaned fake-ssh sleep children.
+            subprocess.run(["pkill", "-f", "sleep 600"], check=False)
+
+
+def test_enable_print_cmd_emits_mcp_block() -> None:
+    """--enable --print-cmd emits the MCP_HOST_BASH_BIN: launch block
+    (the --enable path brings the server up), plus the SSH: block."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        lines, _, _, _ = run_script(
+            ["--enable", "--print-cmd"], env_file=env_path
+        )
+        blocks = parse_blocks(lines)
+        expect(
+            "MCP_HOST_BASH_BIN" in blocks,
+            f"--enable --print-cmd: should emit MCP_HOST_BASH_BIN: block; "
+            f"got {sorted(blocks)}",
+        )
+        expect(
+            "SSH" in blocks,
+            f"--enable --print-cmd: should emit SSH: block; got {sorted(blocks)}",
+        )
+
+
 def test_script_uses_ssh_minus_capital_R_not_lowercase() -> None:
     """Regression guard: confirm the wrapper uses `-R` (reverse
     forward), not `-L` (local forward). A typo here would send the
@@ -589,6 +768,10 @@ tests = [
     test_tunnel_only_env_var_omits_mcp_block,
     test_tunnel_only_ssh_argv_intact,
     test_disabled_kill_switch_exits_zero,
+    test_enable_flag_in_help,
+    test_default_red_path_service_down_exits_three,
+    test_default_green_path_detects_service_up,
+    test_enable_print_cmd_emits_mcp_block,
     test_env_example_exists_and_has_required_keys,
     test_gitignore_excludes_env,
     test_script_uses_ssh_minus_capital_R_not_lowercase,
