@@ -142,6 +142,9 @@ jobs:
       - name: Run personal-mcp-host launchd plist tests
         run: make test-personal-mcp-host-plist
 
+      - name: Run personal-mcp-host install.sh tests
+        run: make test-personal-mcp-install
+
       - name: Run ttyd paste-handler tests
         run: make test-ttyd-paste-handler
 

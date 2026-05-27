@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Tests for examples/personal-mac-mcp-host/install.sh — the one-command
+# LaunchAgent installer that substitutes /PATH/TO/REPO and /PATH/TO/HOME
+# and copies the chosen plist into ~/Library/LaunchAgents/.
+#
+# Coverage (no launchctl invocation — Linux CI has no launchd):
+#   - --help exits 0 and prints usage.
+#   - no unit selected -> exit 2.
+#   - --bundled --print-cmd resolves REPO/HOME/dest and the previewed
+#     plist has NO surviving /PATH/TO/ placeholders, writes nothing.
+#   - a real --bundled install into a temp HOME produces a plist with
+#     no /PATH/TO/ placeholders, pointing at the resolved repo + home,
+#     mode 0644, with ~/Library/Logs created.
+#   - re-running is idempotent (overwrites cleanly, no temp residue).
+#   - --tunnel-only with no tunnel plist present -> exit 2 with a
+#     helpful message (forward-compat guard).
+#   - conflicting --bundled --tunnel-only -> exit 2.
+#
+# Run:  ./install.test
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+INSTALL="$HERE/../install.sh"
+SRC_PLIST="$HERE/../launchd/org.gbre.personal-mcp.host.plist"
+
+failures=0
+pass() { printf 'PASS  %s\n' "$1"; }
+fail() { printf 'FAIL  %s\n' "$1"; failures=$((failures + 1)); }
+
+expect_eq() {
+    # name expected actual
+    if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (expected $2, got $3)"; fi
+}
+
+if [ ! -x "$INSTALL" ]; then
+    echo "FAIL: install.sh not found / not executable at $INSTALL" >&2
+    exit 2
+fi
+if [ ! -f "$SRC_PLIST" ]; then
+    echo "FAIL: bundled plist not found at $SRC_PLIST" >&2
+    exit 2
+fi
+
+# --- --help exits 0 -------------------------------------------------------
+rc=0
+help_out="$("$INSTALL" --help 2>&1)" || rc=$?
+expect_eq "help exits 0" 0 "$rc"
+case "$help_out" in
+    *"one-command LaunchAgent installer"*) pass "help prints usage banner" ;;
+    *) fail "help prints usage banner" ;;
+esac
+
+# --- no unit -> exit 2 ----------------------------------------------------
+rc=0
+"$INSTALL" >/dev/null 2>&1 || rc=$?
+expect_eq "no unit selected exits 2" 2 "$rc"
+
+# --- conflicting units -> exit 2 ------------------------------------------
+rc=0
+"$INSTALL" --bundled --tunnel-only >/dev/null 2>&1 || rc=$?
+expect_eq "conflicting --bundled --tunnel-only exits 2" 2 "$rc"
+
+# --- --tunnel-only --------------------------------------------------------
+# When the tunnel plist exists (current checkout), a --tunnel-only install
+# must substitute placeholders into THAT plist. When absent (forward-compat
+# / tarball without it), the installer must exit 2 with a helpful message.
+if [ -f "$HERE/../launchd/org.gbre.personal-mcp.tunnel.plist" ]; then
+    TUNHOME="$(mktemp -d)"
+    rc=0
+    "$INSTALL" --tunnel-only --home "$TUNHOME" --repo "/tmp/fake-repo-tun" >/dev/null 2>&1 || rc=$?
+    expect_eq "real --tunnel-only install exits 0" 0 "$rc"
+    TUNDEST="$TUNHOME/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist"
+    if [ -f "$TUNDEST" ]; then pass "installed tunnel plist exists"; else fail "installed tunnel plist exists"; fi
+    if [ -f "$TUNDEST" ]; then
+        if grep -q '/PATH/TO/' "$TUNDEST"; then
+            fail "installed tunnel plist has no /PATH/TO/ placeholders"
+        else
+            pass "installed tunnel plist has no /PATH/TO/ placeholders"
+        fi
+        if grep -q "/tmp/fake-repo-tun/" "$TUNDEST"; then
+            pass "installed tunnel plist uses resolved repo"
+        else
+            fail "installed tunnel plist uses resolved repo"
+        fi
+    fi
+    rm -rf "$TUNHOME"
+else
+    rc=0
+    tout="$("$INSTALL" --tunnel-only --print-cmd 2>&1)" || rc=$?
+    expect_eq "--tunnel-only with no tunnel plist exits 2" 2 "$rc"
+    case "$tout" in
+        *"tunnel-only plist not found"*) pass "missing tunnel plist message is helpful" ;;
+        *) fail "missing tunnel plist message is helpful" ;;
+    esac
+fi
+
+# --- --print-cmd dry run --------------------------------------------------
+TMPHOME="$(mktemp -d)"
+trap 'rm -rf "$TMPHOME"' EXIT
+
+rc=0
+preview="$("$INSTALL" --bundled --print-cmd --home "$TMPHOME" --repo "/tmp/fake-repo-xyz" 2>&1)" || rc=$?
+expect_eq "--print-cmd exits 0" 0 "$rc"
+
+# The previewed plist body must have NO /PATH/TO/ placeholders. We slice
+# the body between the BEGIN/END markers so we only inspect the rendered
+# plist, not the resolved-path summary lines above it.
+plist_body="$(printf '%s\n' "$preview" | sed -n '/--- BEGIN PLIST ---/,/--- END PLIST ---/p')"
+if printf '%s' "$plist_body" | grep -q '/PATH/TO/'; then
+    fail "--print-cmd preview has no /PATH/TO/ placeholders"
+else
+    pass "--print-cmd preview has no /PATH/TO/ placeholders"
+fi
+case "$plist_body" in
+    *"/tmp/fake-repo-xyz/examples/personal-mac-mcp-host/personal-mcp-host.sh"*)
+        pass "--print-cmd preview points ProgramArguments at resolved repo" ;;
+    *) fail "--print-cmd preview points ProgramArguments at resolved repo" ;;
+esac
+case "$plist_body" in
+    *"$TMPHOME/Library/Logs/personal-mcp-host.err.log"*)
+        pass "--print-cmd preview points log path at resolved home" ;;
+    *) fail "--print-cmd preview points log path at resolved home" ;;
+esac
+
+# --print-cmd must NOT have written anything.
+if [ -e "$TMPHOME/Library/LaunchAgents/org.gbre.personal-mcp.host.plist" ]; then
+    fail "--print-cmd wrote nothing"
+else
+    pass "--print-cmd wrote nothing"
+fi
+
+# --- real install ---------------------------------------------------------
+rc=0
+"$INSTALL" --bundled --home "$TMPHOME" --repo "/tmp/fake-repo-xyz" >/dev/null 2>&1 || rc=$?
+expect_eq "real --bundled install exits 0" 0 "$rc"
+
+DEST="$TMPHOME/Library/LaunchAgents/org.gbre.personal-mcp.host.plist"
+if [ -f "$DEST" ]; then pass "installed plist exists"; else fail "installed plist exists"; fi
+
+if [ -f "$DEST" ]; then
+    if grep -q '/PATH/TO/' "$DEST"; then
+        fail "installed plist has no /PATH/TO/ placeholders"
+    else
+        pass "installed plist has no /PATH/TO/ placeholders"
+    fi
+    if grep -q "/tmp/fake-repo-xyz/examples/personal-mac-mcp-host/personal-mcp-host.sh" "$DEST"; then
+        pass "installed plist ProgramArguments uses resolved repo"
+    else
+        fail "installed plist ProgramArguments uses resolved repo"
+    fi
+    if grep -q "$TMPHOME/Library/Logs/personal-mcp-host.err.log" "$DEST"; then
+        pass "installed plist log path uses resolved home"
+    else
+        fail "installed plist log path uses resolved home"
+    fi
+    mode="$(stat -c '%a' "$DEST" 2>/dev/null || stat -f '%Lp' "$DEST")"
+    expect_eq "installed plist mode 0644" "644" "$mode"
+fi
+
+if [ -d "$TMPHOME/Library/Logs" ]; then pass "~/Library/Logs created"; else fail "~/Library/Logs created"; fi
+
+# --- idempotent re-run ----------------------------------------------------
+rc=0
+"$INSTALL" --bundled --home "$TMPHOME" --repo "/tmp/fake-repo-2" >/dev/null 2>&1 || rc=$?
+expect_eq "re-run exits 0" 0 "$rc"
+if grep -q "/tmp/fake-repo-2/" "$DEST"; then
+    pass "re-run overwrites with fresh repo path"
+else
+    fail "re-run overwrites with fresh repo path"
+fi
+# No temp residue (atomic mv via mktemp .XXXXXX).
+residue="$(find "$TMPHOME/Library/LaunchAgents" -name 'org.gbre.personal-mcp.host.plist.*' 2>/dev/null | wc -l | tr -d ' ')"
+expect_eq "no temp-file residue after re-run" "0" "$residue"
+
+# --- summary --------------------------------------------------------------
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "All install.test checks passed."
+    exit 0
+else
+    echo "FAILED: $failures check(s)."
+    exit 1
+fi
