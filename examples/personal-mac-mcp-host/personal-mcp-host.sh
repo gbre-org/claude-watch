@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# personal-mcp-host.sh — boot the MCP server AND/OR the reverse SSH tunnel.
+# personal-mcp-host.sh — gate on the local MCP service, open the reverse
+# SSH tunnel, and tail the live logs.
 #
 # What this does
 #
@@ -26,24 +27,56 @@
 #      pipe. No inbound TCP port on the MacBook, no relay server, no
 #      NAT punch-through.
 #
-# Two operating modes
+# Operating modes
 #
-#   Bundled (default): start BOTH pieces. The wrapper owns the MCP
-#   server's lifecycle and the tunnel's. Simplest shape for operators
-#   who only want one unit to manage.
+#   Default (no flags) — STATUS-GATED tunnel + log tail. The wrapper
+#   first checks whether the host MCP service (mcp-proxy /
+#   cli-mcp-server, the thing listening on 127.0.0.1:$MCP_LOCAL_PORT) is
+#   actually up by attempting a TCP connect to the port:
 #
-#   Tunnel-only (--tunnel-only / PERSONAL_MCP_TUNNEL_ONLY=1): start ONLY
-#   the reverse SSH tunnel. Assumes mcp-host-bash is ALREADY listening
-#   on 127.0.0.1:$MCP_LOCAL_PORT — typically because it runs always-on
-#   under the compose-stack LaunchAgent
-#   (examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist,
-#   RunAtLoad=true). The recommended split: MCP host always up locally
-#   at boot, remote access granted on-demand by starting the tunnel
-#   only. In this mode the wrapper does NOT launch mcp-host-bash and
-#   does NOT run the listener probe (the MCP server's lifecycle is not
-#   ours to manage).
+#     - RED (service NOT up): print a clear error explaining the host
+#       service isn't running, print a ready-to-copy command that
+#       re-runs THIS script with --enable (which brings the service up
+#       for you), and exit non-zero. The wrapper does NOT start the MCP
+#       server in this mode — the default path assumes you keep the
+#       server always-on (e.g. the compose-stack LaunchAgent) and only
+#       want the tunnel on-demand.
 #
-# Lifecycle (bundled, default)
+#     - GREEN (service up): open the reverse SSH tunnel and then tail
+#       the live MCP host log (default
+#       ~/.local/state/claude-container/mcp-host-bash.log) so the
+#       operator sees JSON-RPC + run_command traffic as it happens.
+#       Ctrl-C tears the tunnel down.
+#
+#   --enable — bring the host service up, THEN take the green path.
+#   Performs the bundled-style mcp-host-bash launch + listener probe
+#   (so the port is guaranteed LISTEN), then opens the tunnel and tails
+#   the log. This is the "I haven't got the always-on LaunchAgent; start
+#   everything from this one invocation" path. The printed RED-path
+#   rerun command points here.
+#
+#   --tunnel-only (/ PERSONAL_MCP_TUNNEL_ONLY=1) — start ONLY the
+#   reverse SSH tunnel, no status gate, no log tail. Assumes
+#   mcp-host-bash is ALREADY listening on 127.0.0.1:$MCP_LOCAL_PORT —
+#   typically because it runs always-on under the compose-stack
+#   LaunchAgent (RunAtLoad=true). Holds the tunnel in the foreground;
+#   when it dies, launchd's KeepAlive can respawn it. In this mode the
+#   wrapper does NOT launch mcp-host-bash and does NOT run the listener
+#   probe (the MCP server's lifecycle is not ours to manage). This is
+#   the unattended/launchd shape.
+#
+# Lifecycle (default — status-gated tunnel + tail)
+#
+#   1. Source sibling .env file. Refuse to start if missing.
+#   2. TCP-connect probe 127.0.0.1:$MCP_LOCAL_PORT.
+#      - Not accepting connections → print error + the --enable rerun
+#        command, exit non-zero.
+#   3. Service up → start ssh -N -R ... in the background; capture pid.
+#   4. Tail the live MCP host log in the foreground. SIGTERM / SIGINT
+#      trap actively tears the tunnel down (kill the ssh pid, verify
+#      it's gone), then exits.
+#
+# Lifecycle (--enable — bring up the service, then tunnel + tail)
 #
 #   1. Source sibling .env file. Refuse to start if missing.
 #   2. Resolve mcp-host-bash binary path. Refuse if not executable.
@@ -53,24 +86,25 @@
 #      probe pattern as mcp-host-bash's wait_for_listener). Fail-fast
 #      if the launcher exits before binding.
 #   5. Start ssh -N -R ... in the background; capture pid.
-#   6. Poll-wait on both children. If either dies, take the other
-#      down and exit non-zero so launchd's KeepAlive can respawn the
-#      whole thing.
-#   7. SIGTERM / SIGINT trap: forward to both children, then exit.
+#   6. Tail the live MCP host log in the foreground. SIGTERM / SIGINT
+#      trap tears BOTH children down (ssh tunnel first, verify it's
+#      gone, then the mcp-host-bash child), then exits.
 #
-# Lifecycle (tunnel-only)
+# Lifecycle (--tunnel-only)
 #
 #   1. Source sibling .env file. Refuse to start if missing.
 #   2. Skip the mcp-host-bash resolve + launch + listener probe
-#      entirely.
-#   3. Start ssh -N -R ... in the foreground (exec); when it dies,
+#      entirely. No status gate, no log tail.
+#   3. Start ssh -N -R ... in the background and hold it; when it dies,
 #      launchd's KeepAlive can respawn the tunnel.
-#   4. SIGTERM / SIGINT trap: forward to the ssh child, then exit.
+#   4. SIGTERM / SIGINT trap: actively tear the ssh child down (verify
+#      it's gone), then exit.
 #
 # Usage
 #
-#   personal-mcp-host.sh                  # bundled: foreground (Ctrl-C to stop)
-#   personal-mcp-host.sh --tunnel-only    # tunnel only (MCP already up locally)
+#   personal-mcp-host.sh                  # default: status-gate, then tunnel + tail
+#   personal-mcp-host.sh --enable         # bring the MCP service up, then tunnel + tail
+#   personal-mcp-host.sh --tunnel-only    # tunnel only (MCP already up locally; no gate/tail)
 #   personal-mcp-host.sh --print-cmd      # print planned argv + exit 0
 #   personal-mcp-host.sh --help           # this help
 #
@@ -95,13 +129,20 @@
 #                              (read-y floor). Set `corp-dev-trusted` to widen.
 #   ALLOWED_DIR                fence run_command to this dir. Default: $HOME.
 #   ALLOW_SHELL_OPERATORS      let run_command chain pipes / &&. Default false.
+#   MCP_HOST_BASH_LOG          override the live log path the default / --enable
+#                              modes tail after the tunnel comes up. Default:
+#                              ~/.local/state/claude-container/mcp-host-bash.log
+#                              (the same path mcp-host-bash writes to). Kept in
+#                              sync with the launcher so `tail -F` follows the
+#                              real traffic.
 #   PERSONAL_MCP_TUNNEL_ONLY   set to 1 (or pass --tunnel-only) to start ONLY
-#                              the reverse SSH tunnel, skipping the
-#                              mcp-host-bash launch + listener probe. Use when
-#                              mcp-host-bash is already running locally (e.g.
-#                              the always-on compose-stack LaunchAgent). The
-#                              --tunnel-only flag and this env var are
-#                              equivalent; either enables the mode.
+#                              the reverse SSH tunnel, skipping the status gate,
+#                              the mcp-host-bash launch + listener probe, and
+#                              the log tail. Use when mcp-host-bash is already
+#                              running locally (e.g. the always-on compose-stack
+#                              LaunchAgent) and you want the unattended/launchd
+#                              shape. The --tunnel-only flag and this env var
+#                              are equivalent; either enables the mode.
 #   PERSONAL_MCP_DISABLED      soft kill switch — script exits 0 immediately.
 #                              Pair with launchd's KeepAlive to leave the unit
 #                              registered without actually running mcp-host-bash
@@ -116,6 +157,8 @@
 #   1   missing mcp-host-bash binary, or child died before binding, or
 #       child died during steady-state and we tore the other one down.
 #   2   bad flag / missing .env / missing required key in .env
+#   3   default mode: host MCP service is not up (RED). The error names
+#       the --enable rerun command that brings it up.
 
 set -euo pipefail
 
@@ -134,6 +177,10 @@ TUNNEL_ONLY=0
 if [ "${PERSONAL_MCP_TUNNEL_ONLY:-0}" = "1" ]; then
     TUNNEL_ONLY=1
 fi
+# --enable: bring the host MCP service up before opening the tunnel.
+# Without it the default mode only GATES on the service being up (RED
+# path errors out if it isn't).
+ENABLE=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --help|-h)
@@ -141,11 +188,20 @@ while [ "$#" -gt 0 ]; do
             exit 0
             ;;
         --tunnel-only)
-            # Start ONLY the reverse SSH tunnel; skip the mcp-host-bash
-            # launch + listener probe. For when mcp-host-bash is already
-            # running locally (e.g. the always-on compose-stack
-            # LaunchAgent). Equivalent to PERSONAL_MCP_TUNNEL_ONLY=1.
+            # Start ONLY the reverse SSH tunnel; skip the status gate,
+            # the mcp-host-bash launch + listener probe, and the log
+            # tail. For when mcp-host-bash is already running locally
+            # (e.g. the always-on compose-stack LaunchAgent).
+            # Equivalent to PERSONAL_MCP_TUNNEL_ONLY=1.
             TUNNEL_ONLY=1
+            shift
+            ;;
+        --enable)
+            # Bring the host MCP service up (start mcp-host-bash + wait
+            # for it to bind), then continue into the green path (open
+            # the tunnel + tail the log). This is the rerun command the
+            # default mode's RED-path error tells the operator to run.
+            ENABLE=1
             shift
             ;;
         --print-cmd)
@@ -209,6 +265,11 @@ fi
 
 # Resolve mcp-host-bash. Default: sibling repo path relative to this script.
 MCP_HOST_BASH_BIN="${MCP_HOST_BASH_BIN:-${script_dir}/../compose/bin/mcp-host-bash}"
+
+# Resolve the live log path tailed by the default / --enable green
+# paths. Keep this in lockstep with mcp-host-bash's own default so the
+# tail follows the real JSON-RPC + run_command traffic.
+MCP_HOST_BASH_LOG="${MCP_HOST_BASH_LOG:-${HOME}/.local/state/claude-container/mcp-host-bash.log}"
 
 # Export config the mcp-host-bash child reads from its env. The launcher
 # itself sources ~/.config/claude-container/mcp-host-bash.env too —
@@ -302,12 +363,12 @@ fi
 # -----------------------------------------------------------------------------
 # Pre-flight: the mcp-host-bash launcher must be executable.
 #
-# Skipped in tunnel-only mode — the wrapper does not launch the MCP
-# server there (it is assumed already up locally), so the launcher
-# binary need not even be present.
+# Only required for --enable, the one mode that launches the MCP server.
+# The default (status-gate) mode and --tunnel-only assume the server is
+# already up locally, so the launcher binary need not even be present.
 # -----------------------------------------------------------------------------
 
-if [ "$TUNNEL_ONLY" = "0" ] && [ ! -x "$MCP_HOST_BASH_BIN" ]; then
+if [ "$ENABLE" = "1" ] && [ ! -x "$MCP_HOST_BASH_BIN" ]; then
     cat >&2 <<EOF
 personal-mcp-host: mcp-host-bash not found / not executable: $MCP_HOST_BASH_BIN
 
@@ -342,24 +403,78 @@ fi
 
 mcp_pid=""
 ssh_pid=""
+tail_pid=""
 cleanup_exit_code=0
 shutting_down=0
+cleanup_ran=0
+
+# Actively tear down a single child: SIGTERM, give it a moment, then
+# SIGKILL if it's still alive, and confirm it's actually gone. Echoes a
+# warning (does not abort cleanup) if the pid survives a SIGKILL — that
+# only happens for unkillable/zombie states the operator must chase
+# manually. Returns 0 if the pid is gone afterward, 1 otherwise.
+teardown_pid() {
+    local label=$1 pid=$2
+    [ -n "$pid" ] || return 0
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    # Poll for graceful exit before escalating to SIGKILL.
+    local i
+    for i in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 0.1
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "personal-mcp-host: WARNING: $label (pid $pid) survived teardown" >&2
+        return 1
+    fi
+    return 0
+}
 
 cleanup() {
-    # Take down ssh first — that's the network-facing piece. If the
-    # remote is mid-handshake we don't want to leave a half-open
-    # tunnel while mcp-host-bash flushes its log.
-    for pid in "$ssh_pid" "$mcp_pid"; do
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill -TERM "$pid" 2>/dev/null || true
+    # Re-entrancy guard: a SIGTERM during the SIGINT-triggered teardown
+    # must not restart the sequence.
+    if [ "$cleanup_ran" = "1" ]; then
+        return
+    fi
+    cleanup_ran=1
+
+    # Stop the log tail first so its output doesn't race the teardown
+    # banner. It's a local follower, not part of the bridge.
+    if [ -n "$tail_pid" ] && kill -0 "$tail_pid" 2>/dev/null; then
+        kill -TERM "$tail_pid" 2>/dev/null || true
+    fi
+
+    # Actively tear down the reverse tunnel — that's the network-facing
+    # piece. Do NOT merely exit and leave a half-open forward dangling;
+    # kill the ssh process and verify it's gone.
+    if [ -n "$ssh_pid" ]; then
+        echo "personal-mcp-host: tearing down reverse SSH tunnel (pid $ssh_pid)" >&2
+        if teardown_pid "ssh tunnel" "$ssh_pid"; then
+            echo "personal-mcp-host: reverse SSH tunnel torn down" >&2
+        else
+            # Couldn't confirm the tunnel died — surface a non-zero exit
+            # so launchd / the operator notices.
+            [ "$cleanup_exit_code" = "0" ] && cleanup_exit_code=1
         fi
-    done
-    sleep 0.5
-    for pid in "$ssh_pid" "$mcp_pid"; do
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill -KILL "$pid" 2>/dev/null || true
-        fi
-    done
+    fi
+
+    # Then the mcp-host-bash child, if WE launched it (--enable). In the
+    # default + tunnel-only modes mcp_pid is empty (the server's
+    # lifecycle is not ours), so this is a no-op there.
+    if [ -n "$mcp_pid" ]; then
+        echo "personal-mcp-host: stopping mcp-host-bash (pid $mcp_pid)" >&2
+        teardown_pid "mcp-host-bash" "$mcp_pid" || {
+            [ "$cleanup_exit_code" = "0" ] && cleanup_exit_code=1
+        }
+    fi
+
     exit "$cleanup_exit_code"
 }
 trap 'shutting_down=1; cleanup' TERM INT
@@ -411,14 +526,74 @@ except OSError:
 }
 
 # -----------------------------------------------------------------------------
+# Service status probe — a single TCP connect to the MCP port, no child
+# pid involved. Used by the default mode's status gate to decide RED vs
+# GREEN. Returns 0 if something is accepting connections on
+# host:port, 1 otherwise.
+# -----------------------------------------------------------------------------
+
+service_is_up() {
+    local host=$1 port=$2
+    python3 -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(0.5)
+try:
+    s.connect(('$host', $port))
+    s.close()
+except OSError:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# Open the reverse SSH tunnel in the background, then follow the live
+# MCP host log in the foreground. The tail is what keeps us in the
+# foreground; the SIGINT/SIGTERM trap tears the tunnel (and any
+# --enable mcp-host-bash child) down. If the tunnel dies on its own,
+# stop tailing and exit non-zero so launchd's KeepAlive respawns the
+# whole unit.
+# -----------------------------------------------------------------------------
+
+run_tunnel_and_tail() {
+    "${ssh_argv[@]}" &
+    ssh_pid=$!
+    echo "personal-mcp-host: reverse SSH tunnel started (pid $ssh_pid)" >&2
+
+    # Make sure there's a file to follow even on first run — tail -F
+    # tolerates a missing file but emits a noisy warning; pre-create the
+    # directory + file so the follow is clean from the start.
+    mkdir -p "$(dirname "$MCP_HOST_BASH_LOG")" 2>/dev/null || true
+    [ -f "$MCP_HOST_BASH_LOG" ] || : >"$MCP_HOST_BASH_LOG" 2>/dev/null || true
+
+    echo "personal-mcp-host: following $MCP_HOST_BASH_LOG (Ctrl-C to stop)" >&2
+    # -F (follow + retry on rotate/recreate) so log rotation doesn't
+    # silently end the follow.
+    tail -n 50 -F "$MCP_HOST_BASH_LOG" &
+    tail_pid=$!
+
+    # Steady-state: hold while the tunnel lives. If the tunnel dies,
+    # stop tailing and tear down (cleanup verifies the ssh pid is gone).
+    while kill -0 "$ssh_pid" 2>/dev/null; do
+        sleep 1
+    done
+
+    echo "personal-mcp-host: reverse SSH tunnel exited; shutting down" >&2
+    cleanup_exit_code=1
+    cleanup
+}
+
+# -----------------------------------------------------------------------------
 # Banner
 # -----------------------------------------------------------------------------
 
 {
     if [ "$TUNNEL_ONLY" = "1" ]; then
         echo "personal-mcp-host: starting (tunnel-only)"
+    elif [ "$ENABLE" = "1" ]; then
+        echo "personal-mcp-host: starting (--enable: bring service up, then tunnel + tail)"
     else
-        echo "personal-mcp-host: starting"
+        echo "personal-mcp-host: starting (default: status-gate, then tunnel + tail)"
     fi
     echo "  MCP_LOCAL_PORT:        $MCP_LOCAL_PORT"
     echo "  REMOTE:                ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
@@ -433,10 +608,13 @@ except OSError:
         echo "                         defense-in-depth."
     fi
     echo "  CW_PROFILE:            ${CW_PROFILE:-<unset; mcp-host-bash default applies>}"
-    if [ "$TUNNEL_ONLY" = "1" ]; then
-        echo "  launcher:              <tunnel-only; mcp-host-bash assumed already running>"
-    else
+    if [ "$ENABLE" = "1" ]; then
         echo "  launcher:              $MCP_HOST_BASH_BIN"
+    else
+        echo "  launcher:              <not managed here; mcp-host-bash assumed already running>"
+    fi
+    if [ "$TUNNEL_ONLY" = "0" ]; then
+        echo "  live log:              $MCP_HOST_BASH_LOG"
     fi
     if [ -n "${PERSONAL_MCP_SSH_EXTRA:-}" ]; then
         echo "  SSH extras:            $PERSONAL_MCP_SSH_EXTRA"
@@ -447,11 +625,12 @@ except OSError:
 } >&2
 
 # -----------------------------------------------------------------------------
-# Tunnel-only: skip the mcp-host-bash launch + listener probe entirely.
-# Just open the reverse SSH tunnel and hold it. mcp-host-bash is assumed
-# already listening on 127.0.0.1:$MCP_LOCAL_PORT (e.g. the always-on
-# compose-stack LaunchAgent). If the tunnel dies, exit non-zero so
-# launchd's KeepAlive respawns it.
+# Tunnel-only: skip the status gate, the mcp-host-bash launch + listener
+# probe, and the log tail entirely. Just open the reverse SSH tunnel and
+# hold it. mcp-host-bash is assumed already listening on
+# 127.0.0.1:$MCP_LOCAL_PORT (e.g. the always-on compose-stack
+# LaunchAgent). If the tunnel dies, exit non-zero so launchd's KeepAlive
+# respawns it.
 # -----------------------------------------------------------------------------
 
 if [ "$TUNNEL_ONLY" = "1" ]; then
@@ -465,21 +644,26 @@ if [ "$TUNNEL_ONLY" = "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Start mcp-host-bash
+# --enable: bring the host MCP service up, then fall through to the
+# green path (open the tunnel + tail the log).
+#
+# Launch mcp-host-bash and wait for it to bind the loopback port before
+# opening the tunnel, so we never expose a tunnel to a server that isn't
+# listening yet.
 # -----------------------------------------------------------------------------
 
-"$MCP_HOST_BASH_BIN" --port "$MCP_LOCAL_PORT" &
-mcp_pid=$!
+if [ "$ENABLE" = "1" ]; then
+    "$MCP_HOST_BASH_BIN" --port "$MCP_LOCAL_PORT" &
+    mcp_pid=$!
 
-# Wait for the loopback port to bind before opening the tunnel.
-probe_rc=0
-wait_for_listener 127.0.0.1 "$MCP_LOCAL_PORT" 15 || probe_rc=$?
-case "$probe_rc" in
-    0)
-        echo "personal-mcp-host: mcp-host-bash listening on 127.0.0.1:$MCP_LOCAL_PORT" >&2
-        ;;
-    2)
-        cat >&2 <<EOF
+    probe_rc=0
+    wait_for_listener 127.0.0.1 "$MCP_LOCAL_PORT" 15 || probe_rc=$?
+    case "$probe_rc" in
+        0)
+            echo "personal-mcp-host: mcp-host-bash listening on 127.0.0.1:$MCP_LOCAL_PORT" >&2
+            ;;
+        2)
+            cat >&2 <<EOF
 personal-mcp-host: FATAL: mcp-host-bash exited before binding 127.0.0.1:$MCP_LOCAL_PORT.
        Common causes:
          - install-host-deps was never run (mcp-proxy / cli-mcp-server
@@ -490,39 +674,64 @@ personal-mcp-host: FATAL: mcp-host-bash exited before binding 127.0.0.1:$MCP_LOC
            ~/.config/claude-container/mcp-host-bash.env
        Check the launcher's stderr above for the underlying error.
 EOF
-        cleanup_exit_code=1
-        cleanup
-        ;;
-    3)
-        exit 1
-        ;;
-    *)
-        cat >&2 <<EOF
+            cleanup_exit_code=1
+            cleanup
+            ;;
+        3)
+            exit 1
+            ;;
+        *)
+            cat >&2 <<EOF
 personal-mcp-host: FATAL: mcp-host-bash did not bind 127.0.0.1:$MCP_LOCAL_PORT
        within 15s. The process is still running but has not opened the
        listen socket. Check
-       ~/.local/state/claude-container/mcp-host-bash.log for upstream
-       stderr.
+       $MCP_HOST_BASH_LOG for upstream stderr.
 EOF
-        cleanup_exit_code=1
-        cleanup
-        ;;
-esac
+            cleanup_exit_code=1
+            cleanup
+            ;;
+    esac
+
+    # Service is up (we just brought it up). Open the tunnel + tail.
+    run_tunnel_and_tail
+fi
 
 # -----------------------------------------------------------------------------
-# Start the reverse SSH tunnel
+# Default mode: STATUS GATE.
+#
+# Probe the host MCP service (the thing listening on
+# 127.0.0.1:$MCP_LOCAL_PORT). We do NOT launch it here — the default
+# path assumes the operator keeps the server always-on and only wants
+# the tunnel on-demand.
+#
+#   RED  (not accepting connections): print a clear error, print the
+#        ready-to-copy --enable rerun command that brings the service
+#        up, and exit non-zero (3).
+#   GREEN (up): open the tunnel + tail the log.
 # -----------------------------------------------------------------------------
 
-"${ssh_argv[@]}" &
-ssh_pid=$!
+if service_is_up 127.0.0.1 "$MCP_LOCAL_PORT"; then
+    echo "personal-mcp-host: host MCP service is UP on 127.0.0.1:$MCP_LOCAL_PORT" >&2
+    run_tunnel_and_tail
+fi
 
-# Steady-state: poll both children. If EITHER dies, tear the other
-# down so we never leak half a bridge to launchd's KeepAlive respawn
-# loop. (`wait -n` is bash 4.3+; macOS ships bash 3.2 by default. The
-# poll keeps us portable.)
-while kill -0 "$mcp_pid" 2>/dev/null && kill -0 "$ssh_pid" 2>/dev/null; do
-    sleep 1
-done
+# RED path. Build the rerun command, quoting the script path so a path
+# with spaces still copy-pastes cleanly.
+rerun_cmd=$(printf '%q --enable' "$0")
+cat >&2 <<EOF
+personal-mcp-host: host MCP service is NOT running.
 
-cleanup_exit_code=1
-cleanup
+       Nothing is accepting connections on 127.0.0.1:$MCP_LOCAL_PORT, so
+       there is no MCP server for the reverse tunnel to forward to. The
+       default mode does NOT start the server — it assumes you keep it
+       always-on (e.g. the compose-stack LaunchAgent) and only opens the
+       tunnel on-demand.
+
+       To bring the host MCP service up AND open the tunnel in one shot,
+       re-run this script with --enable:
+
+           $rerun_cmd
+
+       (Or start mcp-host-bash some other way, then re-run with no flags.)
+EOF
+exit 3
