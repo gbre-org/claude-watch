@@ -19,6 +19,9 @@ Coverage:
   - SSH argv reflects the values from .env (REMOTE_USER@REMOTE_HOST,
     REMOTE_PORT:127.0.0.1:MCP_LOCAL_PORT, -i SSH_KEY_PATH).
   - PERSONAL_MCP_SSH_EXTRA gets appended to the ssh argv.
+  - Tunnel-only mode (--tunnel-only / PERSONAL_MCP_TUNNEL_ONLY=1):
+    --print-cmd emits ONLY the SSH: block, NOT the MCP_HOST_BASH_BIN:
+    launch block, and the ssh argv is otherwise unchanged.
   - Bad flag exits 2.
   - --help exits 0 with the usage block.
   - PERSONAL_MCP_DISABLED=1 (without --print-cmd) exits 0 immediately.
@@ -400,6 +403,89 @@ def test_personal_mcp_ssh_extra_appended() -> None:
         )
 
 
+def test_tunnel_only_flag_omits_mcp_block() -> None:
+    """--tunnel-only --print-cmd emits ONLY the SSH: block — no
+    MCP_HOST_BASH_BIN: block — because the wrapper does not launch
+    mcp-host-bash in tunnel-only mode."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        lines, _, _, _ = run_script(
+            ["--tunnel-only", "--print-cmd"], env_file=env_path
+        )
+        blocks = parse_blocks(lines)
+        expect(
+            "SSH" in blocks,
+            f"--tunnel-only --print-cmd: should still emit SSH: block; "
+            f"got blocks {sorted(blocks)}",
+        )
+        expect(
+            "MCP_HOST_BASH_BIN" not in blocks,
+            f"--tunnel-only --print-cmd: MUST NOT emit MCP_HOST_BASH_BIN: "
+            f"block (wrapper does not launch mcp-host-bash in this mode); "
+            f"got blocks {sorted(blocks)}",
+        )
+
+
+def test_tunnel_only_env_var_omits_mcp_block() -> None:
+    """PERSONAL_MCP_TUNNEL_ONLY=1 is equivalent to --tunnel-only: the
+    --print-cmd output has no MCP_HOST_BASH_BIN: block."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(env_path)
+        lines, _, _, _ = run_script(
+            ["--print-cmd"],
+            env={"PERSONAL_MCP_TUNNEL_ONLY": "1"},
+            env_file=env_path,
+        )
+        blocks = parse_blocks(lines)
+        expect(
+            "MCP_HOST_BASH_BIN" not in blocks,
+            f"PERSONAL_MCP_TUNNEL_ONLY=1: MUST NOT emit MCP_HOST_BASH_BIN: "
+            f"block; got blocks {sorted(blocks)}",
+        )
+        expect(
+            "SSH" in blocks,
+            f"PERSONAL_MCP_TUNNEL_ONLY=1: should still emit SSH: block; "
+            f"got blocks {sorted(blocks)}",
+        )
+
+
+def test_tunnel_only_ssh_argv_intact() -> None:
+    """Tunnel-only mode does NOT change the ssh argv — same hardening
+    options, reverse-forward shape, and remote target as bundled
+    mode."""
+    with tempfile.TemporaryDirectory() as td:
+        env_path = Path(td) / ".env"
+        write_env(
+            env_path,
+            remote_user="bob",
+            remote_host="bastion.example.com",
+            remote_port="20001",
+            mcp_local_port="20002",
+        )
+        lines, _, _, _ = run_script(
+            ["--tunnel-only", "--print-cmd"], env_file=env_path
+        )
+        ssh = parse_blocks(lines).get("SSH", [])
+        expect(ssh and ssh[0] == "ssh", f"ssh argv should start with ssh; got {ssh[:3]}")
+        expect("-N" in ssh, f"ssh argv should include -N; got {ssh}")
+        expect(
+            "20001:127.0.0.1:20002" in ssh,
+            f"ssh argv should carry the reverse-forward spec; got {ssh}",
+        )
+        for option in (
+            "ExitOnForwardFailure=yes",
+            "BatchMode=yes",
+            "StrictHostKeyChecking=accept-new",
+        ):
+            expect(option in ssh, f"ssh argv should include {option!r}; got {ssh}")
+        expect(
+            ssh and ssh[-1] == "bob@bastion.example.com",
+            f"ssh argv last token should be the remote target; got {ssh[-1:] }",
+        )
+
+
 def test_disabled_kill_switch_exits_zero() -> None:
     """PERSONAL_MCP_DISABLED=1 (no --print-cmd) → exit 0 immediately
     with stderr message."""
@@ -499,6 +585,9 @@ tests = [
     test_ssh_block_has_key_path,
     test_ssh_block_ends_with_remote_target,
     test_personal_mcp_ssh_extra_appended,
+    test_tunnel_only_flag_omits_mcp_block,
+    test_tunnel_only_env_var_omits_mcp_block,
+    test_tunnel_only_ssh_argv_intact,
     test_disabled_kill_switch_exits_zero,
     test_env_example_exists_and_has_required_keys,
     test_gitignore_excludes_env,

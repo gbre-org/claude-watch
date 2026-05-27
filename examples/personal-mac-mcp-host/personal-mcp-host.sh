@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# personal-mcp-host.sh — boot the MCP server AND the reverse SSH tunnel.
+# personal-mcp-host.sh — boot the MCP server AND/OR the reverse SSH tunnel.
 #
 # What this does
 #
@@ -26,7 +26,24 @@
 #      pipe. No inbound TCP port on the MacBook, no relay server, no
 #      NAT punch-through.
 #
-# Lifecycle
+# Two operating modes
+#
+#   Bundled (default): start BOTH pieces. The wrapper owns the MCP
+#   server's lifecycle and the tunnel's. Simplest shape for operators
+#   who only want one unit to manage.
+#
+#   Tunnel-only (--tunnel-only / PERSONAL_MCP_TUNNEL_ONLY=1): start ONLY
+#   the reverse SSH tunnel. Assumes mcp-host-bash is ALREADY listening
+#   on 127.0.0.1:$MCP_LOCAL_PORT — typically because it runs always-on
+#   under the compose-stack LaunchAgent
+#   (examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist,
+#   RunAtLoad=true). The recommended split: MCP host always up locally
+#   at boot, remote access granted on-demand by starting the tunnel
+#   only. In this mode the wrapper does NOT launch mcp-host-bash and
+#   does NOT run the listener probe (the MCP server's lifecycle is not
+#   ours to manage).
+#
+# Lifecycle (bundled, default)
 #
 #   1. Source sibling .env file. Refuse to start if missing.
 #   2. Resolve mcp-host-bash binary path. Refuse if not executable.
@@ -41,10 +58,20 @@
 #      whole thing.
 #   7. SIGTERM / SIGINT trap: forward to both children, then exit.
 #
+# Lifecycle (tunnel-only)
+#
+#   1. Source sibling .env file. Refuse to start if missing.
+#   2. Skip the mcp-host-bash resolve + launch + listener probe
+#      entirely.
+#   3. Start ssh -N -R ... in the foreground (exec); when it dies,
+#      launchd's KeepAlive can respawn the tunnel.
+#   4. SIGTERM / SIGINT trap: forward to the ssh child, then exit.
+#
 # Usage
 #
-#   personal-mcp-host.sh                  # foreground (Ctrl-C to stop)
-#   personal-mcp-host.sh --print-cmd      # print planned ssh argv + exit 0
+#   personal-mcp-host.sh                  # bundled: foreground (Ctrl-C to stop)
+#   personal-mcp-host.sh --tunnel-only    # tunnel only (MCP already up locally)
+#   personal-mcp-host.sh --print-cmd      # print planned argv + exit 0
 #   personal-mcp-host.sh --help           # this help
 #
 # Env vars consumed from sibling .env (required)
@@ -68,6 +95,13 @@
 #                              (read-y floor). Set `corp-dev-trusted` to widen.
 #   ALLOWED_DIR                fence run_command to this dir. Default: $HOME.
 #   ALLOW_SHELL_OPERATORS      let run_command chain pipes / &&. Default false.
+#   PERSONAL_MCP_TUNNEL_ONLY   set to 1 (or pass --tunnel-only) to start ONLY
+#                              the reverse SSH tunnel, skipping the
+#                              mcp-host-bash launch + listener probe. Use when
+#                              mcp-host-bash is already running locally (e.g.
+#                              the always-on compose-stack LaunchAgent). The
+#                              --tunnel-only flag and this env var are
+#                              equivalent; either enables the mode.
 #   PERSONAL_MCP_DISABLED      soft kill switch — script exits 0 immediately.
 #                              Pair with launchd's KeepAlive to leave the unit
 #                              registered without actually running mcp-host-bash
@@ -94,18 +128,34 @@ usage() {
 }
 
 PRINT_CMD=0
+# Tunnel-only mode: seed from the env var so PERSONAL_MCP_TUNNEL_ONLY=1
+# and --tunnel-only are equivalent. The flag (if passed) wins.
+TUNNEL_ONLY=0
+if [ "${PERSONAL_MCP_TUNNEL_ONLY:-0}" = "1" ]; then
+    TUNNEL_ONLY=1
+fi
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --help|-h)
             usage
             exit 0
             ;;
+        --tunnel-only)
+            # Start ONLY the reverse SSH tunnel; skip the mcp-host-bash
+            # launch + listener probe. For when mcp-host-bash is already
+            # running locally (e.g. the always-on compose-stack
+            # LaunchAgent). Equivalent to PERSONAL_MCP_TUNNEL_ONLY=1.
+            TUNNEL_ONLY=1
+            shift
+            ;;
         --print-cmd)
             # Test-only: build the planned ssh argv but print it
             # (one-per-line) instead of executing. Also skips the
             # mcp-host-bash launch + listener probe so the test runs
             # on hosts that don't have mcp-proxy / cli-mcp-server
-            # installed.
+            # installed. In tunnel-only mode the MCP_HOST_BASH_BIN:
+            # block is omitted (the wrapper does not manage the MCP
+            # server's lifecycle).
             PRINT_CMD=1
             shift
             ;;
@@ -228,14 +278,22 @@ fi
 ssh_argv+=( "${REMOTE_USER}@${REMOTE_HOST}" )
 
 if [ "$PRINT_CMD" = "1" ]; then
-    # Print mode: argv one-per-line for the test suite. Two blocks:
+    # Print mode: argv one-per-line for the test suite.
+    #
+    # Bundled (default): two blocks —
     #   MCP_HOST_BASH_BIN:  the resolved launcher path + --port arg
     #   SSH:                the ssh tunnel argv
-    echo "MCP_HOST_BASH_BIN:"
-    echo "$MCP_HOST_BASH_BIN"
-    echo "--port"
-    echo "$MCP_LOCAL_PORT"
-    echo
+    #
+    # Tunnel-only: ONLY the SSH: block. The wrapper does not launch
+    # mcp-host-bash in this mode, so emitting an MCP_HOST_BASH_BIN:
+    # block would misrepresent what runs.
+    if [ "$TUNNEL_ONLY" = "0" ]; then
+        echo "MCP_HOST_BASH_BIN:"
+        echo "$MCP_HOST_BASH_BIN"
+        echo "--port"
+        echo "$MCP_LOCAL_PORT"
+        echo
+    fi
     echo "SSH:"
     printf '%s\n' "${ssh_argv[@]}"
     exit 0
@@ -243,9 +301,13 @@ fi
 
 # -----------------------------------------------------------------------------
 # Pre-flight: the mcp-host-bash launcher must be executable.
+#
+# Skipped in tunnel-only mode — the wrapper does not launch the MCP
+# server there (it is assumed already up locally), so the launcher
+# binary need not even be present.
 # -----------------------------------------------------------------------------
 
-if [ ! -x "$MCP_HOST_BASH_BIN" ]; then
+if [ "$TUNNEL_ONLY" = "0" ] && [ ! -x "$MCP_HOST_BASH_BIN" ]; then
     cat >&2 <<EOF
 personal-mcp-host: mcp-host-bash not found / not executable: $MCP_HOST_BASH_BIN
 
@@ -353,7 +415,11 @@ except OSError:
 # -----------------------------------------------------------------------------
 
 {
-    echo "personal-mcp-host: starting"
+    if [ "$TUNNEL_ONLY" = "1" ]; then
+        echo "personal-mcp-host: starting (tunnel-only)"
+    else
+        echo "personal-mcp-host: starting"
+    fi
     echo "  MCP_LOCAL_PORT:        $MCP_LOCAL_PORT"
     echo "  REMOTE:                ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
     echo "  SSH_KEY_PATH:          $SSH_KEY_PATH"
@@ -367,7 +433,11 @@ except OSError:
         echo "                         defense-in-depth."
     fi
     echo "  CW_PROFILE:            ${CW_PROFILE:-<unset; mcp-host-bash default applies>}"
-    echo "  launcher:              $MCP_HOST_BASH_BIN"
+    if [ "$TUNNEL_ONLY" = "1" ]; then
+        echo "  launcher:              <tunnel-only; mcp-host-bash assumed already running>"
+    else
+        echo "  launcher:              $MCP_HOST_BASH_BIN"
+    fi
     if [ -n "${PERSONAL_MCP_SSH_EXTRA:-}" ]; then
         echo "  SSH extras:            $PERSONAL_MCP_SSH_EXTRA"
     fi
@@ -375,6 +445,24 @@ except OSError:
     echo "Ctrl-C to stop."
     echo
 } >&2
+
+# -----------------------------------------------------------------------------
+# Tunnel-only: skip the mcp-host-bash launch + listener probe entirely.
+# Just open the reverse SSH tunnel and hold it. mcp-host-bash is assumed
+# already listening on 127.0.0.1:$MCP_LOCAL_PORT (e.g. the always-on
+# compose-stack LaunchAgent). If the tunnel dies, exit non-zero so
+# launchd's KeepAlive respawns it.
+# -----------------------------------------------------------------------------
+
+if [ "$TUNNEL_ONLY" = "1" ]; then
+    "${ssh_argv[@]}" &
+    ssh_pid=$!
+    while kill -0 "$ssh_pid" 2>/dev/null; do
+        sleep 1
+    done
+    cleanup_exit_code=1
+    cleanup
+fi
 
 # -----------------------------------------------------------------------------
 # Start mcp-host-bash

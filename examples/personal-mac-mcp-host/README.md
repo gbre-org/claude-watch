@@ -13,6 +13,36 @@ punch-through.
 See [`DESIGN.md`](DESIGN.md) for the architectural rationale (why
 reverse-SSH and not a fixed port / a relay).
 
+## Two ways to run it
+
+`personal-mcp-host.sh` supports two modes, and there are two
+corresponding LaunchAgent templates:
+
+- **Recommended split — MCP always-on locally, remote access
+  on-demand.** Run the MCP server (`mcp-host-bash`) all the time on the
+  Mac via the compose-stack LaunchAgent
+  [`../compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist`](../compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist)
+  (`RunAtLoad=true`), so the server is up at every login. Then grant
+  remote access only when you want it by starting the **tunnel-only**
+  unit (`org.gbre.personal-mcp.tunnel.plist`, `RunAtLoad=false`), which
+  runs the wrapper in tunnel-only mode (`--tunnel-only` /
+  `PERSONAL_MCP_TUNNEL_ONLY=1`): it opens ONLY the reverse SSH tunnel
+  and assumes `mcp-host-bash` is already listening locally. "Grant
+  access" = start the tunnel; "revoke" = stop it. The MCP server keeps
+  running either way.
+
+- **Bundled (simpler alternative) — one unit owns both.** Run
+  `personal-mcp-host.sh` with no flag (or the bundled
+  `org.gbre.personal-mcp.host.plist`, `RunAtLoad=false`). The wrapper
+  spawns `mcp-host-bash` AND the tunnel together, and tears both down
+  on stop. Fewer moving parts if you don't want the MCP server resident
+  full-time.
+
+The split is recommended because the MCP server's lifecycle is
+decoupled from the (more sensitive) remote-access window: the tunnel —
+the only network-facing piece — stays down until you explicitly bring
+it up, while the local server is always ready.
+
 ## Pieces
 
 ```
@@ -21,9 +51,10 @@ examples/personal-mac-mcp-host/
 ├── README.md                                 # you are here
 ├── .env.example                              # committed; placeholder values
 ├── .gitignore                                # excludes .env
-├── personal-mcp-host.sh                      # wrapper: spawns mcp-host-bash + ssh tunnel
+├── personal-mcp-host.sh                      # wrapper: mcp-host-bash + ssh tunnel (or tunnel-only)
 ├── launchd/
-│   ├── org.gbre.personal-mcp.host.plist      # LaunchAgent template (RunAtLoad=false)
+│   ├── org.gbre.personal-mcp.host.plist      # bundled LaunchAgent (mcp-host-bash + tunnel, RunAtLoad=false)
+│   ├── org.gbre.personal-mcp.tunnel.plist    # tunnel-only LaunchAgent (tunnel only, RunAtLoad=false)
 │   └── README.md                             # launchctl install walkthrough
 └── tests/
     ├── personal-mcp-host.test                # bash wrapper argv tests
@@ -136,6 +167,7 @@ reason. See the comments in `.env.example` for the full surface.
 | `MCP_HOST_BASH_BEARER` | empty | Defense-in-depth. The SSH tunnel encrypts the wire, but anyone else on the remote's loopback can also dial `localhost:$REMOTE_PORT` — the bearer is the layer that bounds access to callers with the secret. Generate with `head -c 32 /dev/urandom \| base64`. |
 | `CW_PROFILE` | `corp-dev` | Conservative read-y floor. Widen to `corp-dev-trusted` only if your remote-side Claude needs to mutate files / fire webhooks / manage containers on the Mac. |
 | `ALLOWED_DIR` | `$HOME` (in `mcp-host-bash`) | Narrow to e.g. `$HOME/personal-mcp-scratch` if you want to limit the blast radius. |
+| `PERSONAL_MCP_TUNNEL_ONLY` | unset | Set to `1` (equivalent to passing `--tunnel-only`) to run the wrapper in tunnel-only mode: open ONLY the reverse SSH tunnel and skip launching `mcp-host-bash` + the listener probe. Use when `mcp-host-bash` is already running locally (the recommended split — the always-on compose-stack LaunchAgent owns the server). |
 
 ### Remote-side MCP client config (operator's private notes)
 
@@ -218,13 +250,45 @@ If `$REMOTE_HOST` runs sshd on a non-default port, use
 
 ```sh
 cd examples/personal-mac-mcp-host
-./personal-mcp-host.sh
+./personal-mcp-host.sh                 # bundled: mcp-host-bash + tunnel
+# OR, tunnel-only (mcp-host-bash already running locally):
+./personal-mcp-host.sh --tunnel-only
 # Bridge stays up until Ctrl-C, the tunnel breaks, or you reboot.
 ```
 
-### On-demand (LaunchAgent, RunAtLoad=false)
+### Recommended split — always-on MCP + on-demand tunnel-only LaunchAgent
 
-Walks through copying the plist, replacing `/PATH/TO/REPO` /
+Run the MCP server full-time via the compose-stack LaunchAgent and
+grant remote access on-demand with the **tunnel-only** unit:
+
+```sh
+# (1) MCP always-on locally — see ../compose/launchd/README.md:
+#     install + bootstrap org.gbre.claude-watch.mcp-host-bash.plist
+#     (RunAtLoad=true). mcp-host-bash now listens at every login.
+
+# (2) Tunnel-only unit, granting remote access on-demand.
+#     One-time install:
+cp launchd/org.gbre.personal-mcp.tunnel.plist ~/Library/LaunchAgents/
+$EDITOR ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
+# (replace /PATH/TO/REPO and /PATH/TO/HOME)
+
+launchctl bootstrap gui/$(id -u) \
+    ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
+# Registers the unit. Doesn't fire it (RunAtLoad=false).
+
+# Grant remote access: start the tunnel (MCP server already up).
+launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.tunnel
+
+# Revoke remote access: stop the tunnel. MCP server keeps running.
+launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.tunnel
+```
+
+See [`launchd/README.md`](launchd/README.md) for the full walkthrough.
+
+### Bundled (LaunchAgent, RunAtLoad=false)
+
+Simpler alternative: one unit owns both `mcp-host-bash` and the
+tunnel. Walks through copying the plist, replacing `/PATH/TO/REPO` /
 `/PATH/TO/HOME`, bootstrapping the unit (registers but does not fire),
 and the per-session `kickstart` / `bootout` cycle. See
 [`launchd/README.md`](launchd/README.md).
@@ -241,7 +305,7 @@ launchctl bootstrap gui/$(id -u) \
     ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
 # Registers the unit. Doesn't fire it (RunAtLoad=false).
 
-# Per-session: start
+# Per-session: start (brings up mcp-host-bash AND the tunnel)
 launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
 
 # Per-session: stop

@@ -1,17 +1,35 @@
-# On-demand macOS LaunchAgent for `personal-mcp-host.sh`
+# On-demand macOS LaunchAgents for `personal-mcp-host.sh`
 
-This directory ships a macOS LaunchAgent template that wires
+This directory ships **two** macOS LaunchAgent templates that wire
 [`personal-mcp-host.sh`](../personal-mcp-host.sh) into `launchd` for
-the **on-demand** remote-access pattern: the unit is registered once,
-but does NOT start at login. The operator brings the bridge up for a
-session with `launchctl kickstart` and tears it down with
-`launchctl bootout` when they're done.
+the **on-demand** remote-access pattern. Both are registered once but
+do NOT start at login (`RunAtLoad=false`); the operator brings the
+bridge up for a session with `launchctl kickstart` and tears it down
+with `launchctl bootout` when they're done.
 
-If you want a persistent host-side MCP bridge that auto-starts at
-login (the "the in-container Claude on the same Mac uses it all the
-time" shape), use the
-[compose-stack LaunchAgent](../../compose/launchd/) instead. This
-directory is the cross-machine shape.
+| Template | Mode | What it starts |
+|---|---|---|
+| `org.gbre.personal-mcp.tunnel.plist` | tunnel-only (`--tunnel-only`) | ONLY the reverse SSH tunnel. Assumes `mcp-host-bash` is already running locally. **Recommended.** |
+| `org.gbre.personal-mcp.host.plist` | bundled (no flag) | `mcp-host-bash` AND the tunnel together. Simpler alternative. |
+
+**Recommended split — MCP always-on locally, remote access on-demand.**
+Run `mcp-host-bash` full-time via the
+[compose-stack LaunchAgent](../../compose/launchd/)
+(`org.gbre.claude-watch.mcp-host-bash.plist`, `RunAtLoad=true`) so the
+MCP server is up at every login, then use the **tunnel-only** unit here
+to grant/revoke remote access on demand without touching the server's
+lifecycle. The tunnel — the only network-facing piece — stays down
+until you explicitly bring it up.
+
+The **bundled** unit (`org.gbre.personal-mcp.host.plist`) is the
+simpler alternative when you'd rather have one unit own both pieces and
+don't want the MCP server resident full-time.
+
+Steps 1–8 below walk the **bundled** unit end to end; the
+[tunnel-only unit](#tunnel-only-unit) section calls out the (small)
+differences. Everything else — bootstrap / kickstart / bootout /
+logs / troubleshooting — is identical between the two; substitute the
+Label `org.gbre.personal-mcp.tunnel` for `org.gbre.personal-mcp.host`.
 
 ## LaunchAgent vs LaunchDaemon
 
@@ -233,6 +251,56 @@ hardening section, you may want to remove its
 rm -f ~/.ssh/id_personal_mcp_tunnel ~/.ssh/id_personal_mcp_tunnel.pub
 ssh $REMOTE_USER@$REMOTE_HOST   # then edit ~/.ssh/authorized_keys
 ```
+
+## Tunnel-only unit
+
+The `org.gbre.personal-mcp.tunnel.plist` template is the recommended
+shape: the MCP server (`mcp-host-bash`) runs always-on locally under
+the [compose-stack LaunchAgent](../../compose/launchd/)
+(`org.gbre.claude-watch.mcp-host-bash.plist`, `RunAtLoad=true`), and
+this unit opens ONLY the reverse SSH tunnel on demand. It invokes the
+wrapper with `--tunnel-only`, so it does NOT launch `mcp-host-bash` and
+does NOT run the listener probe.
+
+The install / lifecycle is identical to the bundled unit (steps 1–8),
+with these substitutions:
+
+- **Prereq:** `mcp-host-bash` must already be listening on
+  `127.0.0.1:$MCP_LOCAL_PORT` — bring up the compose-stack LaunchAgent
+  first (see [`../../compose/launchd/README.md`](../../compose/launchd/README.md)).
+  Confirm with `lsof -nP -iTCP:$MCP_LOCAL_PORT -sTCP:LISTEN`.
+- **Plist + Label:** copy `org.gbre.personal-mcp.tunnel.plist`; its
+  Label is `org.gbre.personal-mcp.tunnel`. Use that Label in every
+  `launchctl` command below.
+- **Logs:** distinct paths so the two units can run side by side —
+  `~/Library/Logs/personal-mcp-tunnel.out.log` and
+  `~/Library/Logs/personal-mcp-tunnel.err.log`.
+
+```sh
+# One-time install:
+cp examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.tunnel.plist \
+   ~/Library/LaunchAgents/
+$EDITOR ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
+# (replace /PATH/TO/REPO and /PATH/TO/HOME)
+mkdir -p ~/Library/Logs
+
+launchctl bootstrap gui/$(id -u) \
+    ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
+# Registers the unit. Doesn't fire it (RunAtLoad=false).
+
+# Grant remote access: start the tunnel (MCP server already up).
+launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.tunnel
+
+# Revoke remote access: stop the tunnel. MCP server keeps running.
+launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.tunnel
+```
+
+Because the wrapper skips the `mcp-host-bash` launch + listener probe
+in this mode, the only failure surface is the SSH tunnel itself —
+"Wrapper exits with 'mcp-host-bash …'" troubleshooting below does not
+apply to the tunnel-only unit. If the tunnel can't dial through to a
+working MCP server, double-check the compose-stack LaunchAgent is
+actually listening on `$MCP_LOCAL_PORT`.
 
 ## Troubleshooting
 

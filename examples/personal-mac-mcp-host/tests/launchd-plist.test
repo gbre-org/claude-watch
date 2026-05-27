@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Tests for examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.host.plist
-— the macOS LaunchAgent template for on-demand bring-up of
-personal-mcp-host.sh (reverse-tunnelled MCP host bridge).
+"""Tests for the examples/personal-mac-mcp-host/launchd/ LaunchAgent
+templates — the macOS units that bring up personal-mcp-host.sh for the
+on-demand reverse-tunnelled MCP host bridge.
 
-Coverage:
+Two templates are validated with the SAME structural checks:
+
+  - org.gbre.personal-mcp.host.plist    — bundled: launches both
+    mcp-host-bash AND the reverse SSH tunnel.
+  - org.gbre.personal-mcp.tunnel.plist  — tunnel-only: launches ONLY
+    the reverse SSH tunnel (mcp-host-bash assumed already running
+    locally, e.g. the always-on compose-stack LaunchAgent). Invokes
+    the wrapper with `--tunnel-only`.
+
+Coverage (run against BOTH plists):
   - File-level structural validation only (no `launchctl` invocation).
   - Plist parses cleanly via Python's stdlib `plistlib`.
   - When `plutil` is available (macOS hosts), lint via that too.
@@ -14,11 +23,14 @@ Coverage:
     `launchctl kickstart` to start a session).
   - `KeepAlive=true` (while running, respawn on exit).
   - `EnvironmentVariables` has a `PATH` entry that includes
-    `.local/bin` (where install-host-deps drops the mcp-host-bash
-    deps).
+    `.local/bin`.
   - `WorkingDirectory`, `StandardOutPath`, `StandardErrorPath`,
     `ThrottleInterval`, `ProcessType` all present + sane.
-  - README walkthrough hits the major operator steps.
+
+Plus tunnel-only specific checks:
+  - The tunnel plist passes `--tunnel-only` in ProgramArguments.
+  - README walkthrough hits the major operator steps + references both
+    Labels.
 
 Run:  ./launchd-plist.test
 """
@@ -32,18 +44,20 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PLIST = (
-    HERE.parent
-    / "launchd"
-    / "org.gbre.personal-mcp.host.plist"
-)
-LAUNCHD_README = HERE.parent / "launchd" / "README.md"
+LAUNCHD_DIR = HERE.parent / "launchd"
+PLIST = LAUNCHD_DIR / "org.gbre.personal-mcp.host.plist"
+TUNNEL_PLIST = LAUNCHD_DIR / "org.gbre.personal-mcp.tunnel.plist"
+LAUNCHD_README = LAUNCHD_DIR / "README.md"
 MAIN_README = HERE.parent / "README.md"
 WRAPPER = HERE.parent / "personal-mcp-host.sh"
 
-if not PLIST.exists():
-    print(f"FAIL: cannot locate launchd plist at {PLIST}", file=sys.stderr)
-    sys.exit(2)
+# All plists subject to the shared structural checks.
+ALL_PLISTS = [PLIST, TUNNEL_PLIST]
+
+for _p in ALL_PLISTS:
+    if not _p.exists():
+        print(f"FAIL: cannot locate launchd plist at {_p}", file=sys.stderr)
+        sys.exit(2)
 
 
 failures: list[str] = []
@@ -54,16 +68,25 @@ def expect(cond: bool, msg: str) -> None:
         failures.append(msg)
 
 
-with open(PLIST, "rb") as fp:
-    PARSED = plistlib.load(fp)
+def load(path: Path) -> dict:
+    with open(path, "rb") as fp:
+        return plistlib.load(fp)
+
+
+# Default parsed plist (the bundled one) for the back-compat single-plist
+# tests that still reference PARSED directly.
+PARSED = load(PLIST)
 
 
 def test_plistlib_parses() -> None:
-    """plistlib accepted the file."""
-    expect(
-        isinstance(PARSED, dict),
-        f"plistlib should return a dict at the top level; got {type(PARSED)}",
-    )
+    """plistlib accepted every template file."""
+    for p in ALL_PLISTS:
+        parsed = load(p)
+        expect(
+            isinstance(parsed, dict),
+            f"{p.name}: plistlib should return a dict at the top level; "
+            f"got {type(parsed)}",
+        )
 
 
 def test_plutil_lint_when_available() -> None:
@@ -73,29 +96,33 @@ def test_plutil_lint_when_available() -> None:
     plutil = shutil.which("plutil")
     if not plutil:
         return
-    result = subprocess.run(
-        [plutil, "-lint", str(PLIST)],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    expect(
-        result.returncode == 0,
-        f"plutil -lint should accept the plist; rc={result.returncode}\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}",
-    )
+    for p in ALL_PLISTS:
+        result = subprocess.run(
+            [plutil, "-lint", str(p)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        expect(
+            result.returncode == 0,
+            f"{p.name}: plutil -lint should accept the plist; "
+            f"rc={result.returncode}\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}",
+        )
 
 
 def test_label_matches_filename() -> None:
     """launchd keys bootstrap / bootout / print / kickstart off the
     filename minus `.plist`. The plist's `Label` MUST match."""
-    expected_label = PLIST.stem  # "org.gbre.personal-mcp.host"
-    actual = PARSED.get("Label")
-    expect(
-        actual == expected_label,
-        f"Label should match plist filename stem; "
-        f"expected {expected_label!r}, got {actual!r}",
-    )
+    for p in ALL_PLISTS:
+        parsed = load(p)
+        expected_label = p.stem  # e.g. "org.gbre.personal-mcp.host"
+        actual = parsed.get("Label")
+        expect(
+            actual == expected_label,
+            f"{p.name}: Label should match plist filename stem; "
+            f"expected {expected_label!r}, got {actual!r}",
+        )
 
 
 def test_label_uses_org_gbre_namespace() -> None:
@@ -103,12 +130,13 @@ def test_label_uses_org_gbre_namespace() -> None:
     Labels live under the `org.gbre.*` namespace (NOT `com.anthropic.*`,
     which implies vendor ownership). Guards against a regression that
     renames the unit under the wrong namespace."""
-    label = PARSED.get("Label", "")
-    expect(
-        isinstance(label, str) and label.startswith("org.gbre."),
-        f"Label must use the org.gbre.* reverse-DNS namespace "
-        f"(operator-owned); got {label!r}",
-    )
+    for p in ALL_PLISTS:
+        label = load(p).get("Label", "")
+        expect(
+            isinstance(label, str) and label.startswith("org.gbre."),
+            f"{p.name}: Label must use the org.gbre.* reverse-DNS namespace "
+            f"(operator-owned); got {label!r}",
+        )
 
 
 def test_keep_alive_true() -> None:
@@ -116,11 +144,12 @@ def test_keep_alive_true() -> None:
     on exit. Combined with RunAtLoad=false, that means `kickstart`
     starts it + tunnel-death respawns it, but `bootout` stops it for
     good."""
-    keep_alive = PARSED.get("KeepAlive")
-    expect(
-        keep_alive is True,
-        f"KeepAlive should be the boolean true; got {keep_alive!r}",
-    )
+    for p in ALL_PLISTS:
+        keep_alive = load(p).get("KeepAlive")
+        expect(
+            keep_alive is True,
+            f"{p.name}: KeepAlive should be the boolean true; got {keep_alive!r}",
+        )
 
 
 def test_run_at_load_false() -> None:
@@ -129,123 +158,138 @@ def test_run_at_load_false() -> None:
     `launchctl kickstart` to start a session. Without this, every
     login would auto-open the remote-access tunnel, which inverts
     the "only run as needed" intent."""
-    run_at_load = PARSED.get("RunAtLoad")
-    expect(
-        run_at_load is False,
-        f"RunAtLoad should be the boolean false (on-demand bring-up); "
-        f"got {run_at_load!r}",
-    )
+    for p in ALL_PLISTS:
+        run_at_load = load(p).get("RunAtLoad")
+        expect(
+            run_at_load is False,
+            f"{p.name}: RunAtLoad should be the boolean false (on-demand "
+            f"bring-up); got {run_at_load!r}",
+        )
 
 
 def test_program_arguments_present() -> None:
     """ProgramArguments[0] is the binary launchd exec's. Non-empty
     list of strings."""
-    pa = PARSED.get("ProgramArguments")
-    expect(
-        isinstance(pa, list) and len(pa) >= 1,
-        f"ProgramArguments must be a non-empty list; got {pa!r}",
-    )
-    if isinstance(pa, list) and pa:
+    for p in ALL_PLISTS:
+        pa = load(p).get("ProgramArguments")
         expect(
-            all(isinstance(x, str) for x in pa),
-            f"ProgramArguments entries must all be strings; got {pa!r}",
+            isinstance(pa, list) and len(pa) >= 1,
+            f"{p.name}: ProgramArguments must be a non-empty list; got {pa!r}",
         )
+        if isinstance(pa, list) and pa:
+            expect(
+                all(isinstance(x, str) for x in pa),
+                f"{p.name}: ProgramArguments entries must all be strings; "
+                f"got {pa!r}",
+            )
 
 
 def test_program_arguments_first_is_absolute() -> None:
     """ProgramArguments[0] must be an absolute path. launchd does NOT
     do PATH lookup or `~` expansion."""
-    pa = PARSED.get("ProgramArguments")
-    if not (isinstance(pa, list) and pa):
-        return
-    first = pa[0]
-    expect(
-        first.startswith("/"),
-        f"ProgramArguments[0] must be an absolute path; got {first!r}",
-    )
+    for p in ALL_PLISTS:
+        pa = load(p).get("ProgramArguments")
+        if not (isinstance(pa, list) and pa):
+            continue
+        first = pa[0]
+        expect(
+            first.startswith("/"),
+            f"{p.name}: ProgramArguments[0] must be an absolute path; "
+            f"got {first!r}",
+        )
 
 
 def test_program_arguments_first_points_at_wrapper() -> None:
     """ProgramArguments[0] must point at personal-mcp-host.sh. Guards
     against typo / refactor renaming the wrapper without updating the
     template."""
-    pa = PARSED.get("ProgramArguments")
-    if not (isinstance(pa, list) and pa):
-        return
-    first = pa[0]
-    expect(
-        first.endswith("/personal-mcp-host.sh"),
-        f"ProgramArguments[0] should end with `/personal-mcp-host.sh`; "
-        f"got {first!r}",
-    )
+    for p in ALL_PLISTS:
+        pa = load(p).get("ProgramArguments")
+        if not (isinstance(pa, list) and pa):
+            continue
+        first = pa[0]
+        expect(
+            first.endswith("/personal-mcp-host.sh"),
+            f"{p.name}: ProgramArguments[0] should end with "
+            f"`/personal-mcp-host.sh`; got {first!r}",
+        )
 
 
 def test_environment_variables_dict() -> None:
     """EnvironmentVariables exists and is a dict."""
-    ev = PARSED.get("EnvironmentVariables")
-    expect(
-        isinstance(ev, dict),
-        f"EnvironmentVariables must be a dict; got {ev!r}",
-    )
+    for p in ALL_PLISTS:
+        ev = load(p).get("EnvironmentVariables")
+        expect(
+            isinstance(ev, dict),
+            f"{p.name}: EnvironmentVariables must be a dict; got {ev!r}",
+        )
 
 
 def test_environment_variables_has_path() -> None:
-    """Launchd's default PATH does not include ~/.local/bin (where
-    install-host-deps drops mcp-proxy / cli-mcp-server). The plist
-    MUST declare a PATH entry that adds it."""
-    ev = PARSED.get("EnvironmentVariables") or {}
-    path = ev.get("PATH")
-    expect(
-        isinstance(path, str) and path.strip() != "",
-        f"EnvironmentVariables.PATH must be a non-empty string; got {path!r}",
-    )
-    if isinstance(path, str):
+    """Launchd's default PATH does not include ~/.local/bin. The plist
+    MUST declare a PATH entry that adds it (both templates carry it for
+    parity / so `ssh` resolves)."""
+    for p in ALL_PLISTS:
+        ev = load(p).get("EnvironmentVariables") or {}
+        path = ev.get("PATH")
         expect(
-            ".local/bin" in path,
-            f"EnvironmentVariables.PATH should include `.local/bin` so "
-            f"the install-host-deps shims resolve; got {path!r}",
+            isinstance(path, str) and path.strip() != "",
+            f"{p.name}: EnvironmentVariables.PATH must be a non-empty string; "
+            f"got {path!r}",
         )
+        if isinstance(path, str):
+            expect(
+                ".local/bin" in path,
+                f"{p.name}: EnvironmentVariables.PATH should include "
+                f"`.local/bin`; got {path!r}",
+            )
 
 
 def test_working_directory_present() -> None:
     """WorkingDirectory is set so the wrapper finds its sibling .env
     via the default `${script_dir}/.env` resolution."""
-    wd = PARSED.get("WorkingDirectory")
-    expect(
-        isinstance(wd, str) and wd.startswith("/"),
-        f"WorkingDirectory must be an absolute path; got {wd!r}",
-    )
+    for p in ALL_PLISTS:
+        wd = load(p).get("WorkingDirectory")
+        expect(
+            isinstance(wd, str) and wd.startswith("/"),
+            f"{p.name}: WorkingDirectory must be an absolute path; got {wd!r}",
+        )
 
 
 def test_log_paths_present_and_absolute() -> None:
     """StandardOutPath / StandardErrorPath capture wrapper stdout /
     stderr. Both must be absolute paths."""
-    for key in ("StandardOutPath", "StandardErrorPath"):
-        val = PARSED.get(key)
-        expect(
-            isinstance(val, str) and val.startswith("/"),
-            f"{key} must be an absolute path; got {val!r}",
-        )
+    for p in ALL_PLISTS:
+        parsed = load(p)
+        for key in ("StandardOutPath", "StandardErrorPath"):
+            val = parsed.get(key)
+            expect(
+                isinstance(val, str) and val.startswith("/"),
+                f"{p.name}: {key} must be an absolute path; got {val!r}",
+            )
 
 
 def test_throttle_interval_reasonable() -> None:
     """ThrottleInterval bounds the KeepAlive respawn cadence. Must
     be a positive integer."""
-    ti = PARSED.get("ThrottleInterval")
-    expect(
-        isinstance(ti, int) and ti >= 1,
-        f"ThrottleInterval must be a positive integer (>=1s); got {ti!r}",
-    )
+    for p in ALL_PLISTS:
+        ti = load(p).get("ThrottleInterval")
+        expect(
+            isinstance(ti, int) and ti >= 1,
+            f"{p.name}: ThrottleInterval must be a positive integer (>=1s); "
+            f"got {ti!r}",
+        )
 
 
 def test_process_type_present() -> None:
     """ProcessType controls launchd's scheduling class. Interactive is
     the right default for a low-latency synchronous bridge."""
-    pt = PARSED.get("ProcessType")
-    expect(
-        isinstance(pt, str) and pt != "",
-        f"ProcessType must be a non-empty string; got {pt!r}",
-    )
+    for p in ALL_PLISTS:
+        pt = load(p).get("ProcessType")
+        expect(
+            isinstance(pt, str) and pt != "",
+            f"{p.name}: ProcessType must be a non-empty string; got {pt!r}",
+        )
 
 
 def test_no_disallowed_top_level_keys() -> None:
@@ -263,13 +307,46 @@ def test_no_disallowed_top_level_keys() -> None:
         "StandardErrorPath",
         "ProcessType",
     }
-    actual = set(PARSED.keys())
-    extras = actual - allowed
+    for p in ALL_PLISTS:
+        actual = set(load(p).keys())
+        extras = actual - allowed
+        expect(
+            not extras,
+            f"{p.name}: Unexpected top-level keys (likely typos / accidental "
+            f"adds — update the allowed set if intentional): {sorted(extras)}",
+        )
+
+
+def test_tunnel_plist_passes_tunnel_only_flag() -> None:
+    """The tunnel-only template MUST invoke the wrapper with
+    `--tunnel-only` (otherwise it would launch mcp-host-bash too,
+    defeating the always-on-MCP + on-demand-tunnel split). The bundled
+    template MUST NOT pass it."""
+    tunnel_pa = load(TUNNEL_PLIST).get("ProgramArguments") or []
     expect(
-        not extras,
-        f"Unexpected top-level keys in plist (likely typos / accidental "
-        f"adds — update the allowed set if intentional): {sorted(extras)}",
+        "--tunnel-only" in tunnel_pa,
+        f"{TUNNEL_PLIST.name}: ProgramArguments must include `--tunnel-only`; "
+        f"got {tunnel_pa!r}",
     )
+    host_pa = load(PLIST).get("ProgramArguments") or []
+    expect(
+        "--tunnel-only" not in host_pa,
+        f"{PLIST.name}: bundled template must NOT pass `--tunnel-only` "
+        f"(it owns both pieces); got {host_pa!r}",
+    )
+
+
+def test_tunnel_plist_distinct_log_paths() -> None:
+    """The two units run side by side; their log paths must differ so
+    they don't clobber each other."""
+    host = load(PLIST)
+    tunnel = load(TUNNEL_PLIST)
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        expect(
+            host.get(key) != tunnel.get(key),
+            f"{key} must differ between the bundled and tunnel-only units; "
+            f"both are {host.get(key)!r}",
+        )
 
 
 def test_wrapper_exists_and_executable() -> None:

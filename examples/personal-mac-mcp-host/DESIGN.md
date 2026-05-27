@@ -1,10 +1,12 @@
 # personal-mac-mcp-host — DESIGN
 
-> **Status:** implementation landed in this PR — `personal-mcp-host.sh`,
-> `.env.example`, `.gitignore`, `launchd/org.gbre.personal-mcp.host.plist`,
-> `launchd/README.md`, `README.md`, and embedded test suites under `tests/`.
-> See [`README.md`](README.md) for operator setup; this file is the
-> architectural record (why reverse-SSH, alternatives considered).
+> **Status:** implemented — `personal-mcp-host.sh`, `.env.example`,
+> `.gitignore`, `launchd/org.gbre.personal-mcp.host.plist` (bundled),
+> `launchd/org.gbre.personal-mcp.tunnel.plist` (tunnel-only),
+> `launchd/README.md`, `README.md`, and embedded test suites under
+> `tests/`. See [`README.md`](README.md) for operator setup; this file
+> is the architectural record (why reverse-SSH, alternatives
+> considered, why the always-on-MCP + on-demand-tunnel split).
 
 ## Goal
 
@@ -51,6 +53,46 @@ The new case adds a **cross-machine** hop. Two ways to bridge that:
 Option C also matches the operator's "only run as needed" requirement —
 the MacBook controls the tunnel lifecycle (`launchctl load` to open it,
 `launchctl unload` to tear it down).
+
+## Two operating modes: bundled vs. the recommended split
+
+The wrapper supports two shapes, with one LaunchAgent template each:
+
+- **Bundled** (`org.gbre.personal-mcp.host.plist`, wrapper invoked with
+  no flag). One unit owns BOTH `mcp-host-bash` and the reverse SSH
+  tunnel. Kickstart it → both come up; bootout → both go down. Fewest
+  moving parts.
+
+- **Recommended split — MCP always-on locally, remote access
+  on-demand** (`org.gbre.personal-mcp.tunnel.plist`, wrapper invoked
+  with `--tunnel-only` / `PERSONAL_MCP_TUNNEL_ONLY=1`). The MCP server
+  runs full-time via the existing compose-stack LaunchAgent
+  [`../compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist`](../compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist)
+  (`RunAtLoad=true`), listening on `127.0.0.1:$MCP_LOCAL_PORT` at every
+  login. This tunnel-only unit then opens ONLY the reverse SSH tunnel
+  when the operator wants to grant access. In tunnel-only mode the
+  wrapper does NOT launch `mcp-host-bash` and does NOT run the listener
+  probe — the server's lifecycle is not its to manage.
+
+Why the split is the recommended shape:
+
+- **Decouples the sensitive piece.** The tunnel is the only
+  network-facing component — the thing that exposes the Mac's MCP
+  server to a remote host. Keeping it on its own unit means "grant
+  remote access" = start the tunnel and "revoke" = stop it, a single
+  crisp on/off with no effect on the always-ready local server.
+- **No cold-start latency on grant.** The MCP server (and its
+  `mcp-proxy` / `cli-mcp-server` / auth-shim bring-up + listener-bind
+  wait) is already warm; granting access is just the SSH dial, not a
+  full server boot.
+- **Reuses the existing always-on LaunchAgent.** Operators who already
+  run the compose-stack `mcp-host-bash` LaunchAgent for the local
+  Docker-Desktop loopback case get cross-machine access by adding only
+  the tunnel-only unit — no second copy of the server.
+
+The bundled unit stays as the simpler alternative for operators who do
+not want the MCP server resident full-time and would rather one unit
+own the whole lifecycle.
 
 ## Topology
 
