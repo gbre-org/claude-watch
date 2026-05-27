@@ -766,6 +766,24 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output
 COPY container/bin/eval-event-must-act /usr/local/bin/eval-event-must-act
 RUN chmod +x /usr/local/bin/eval-event-must-act
 
+# eval-agent-ack-pending — obligations evaluator that blocks Bash tool
+# calls while completed agents await acknowledgment by the main loop.
+# When a subagent delivers a task-notification, the main loop must
+# register it (agent-ack register <queue-id>), process the output, call
+# session-task queue done/abandon, then clear it (agent-ack done <queue-id>).
+# Default N=2 (override via $AGENT_ACK_N): denies after N consecutive
+# non-exempt calls while pending-ack entries exist. Default-open on
+# missing/corrupt state.
+COPY container/bin/eval-agent-ack-pending /usr/local/bin/eval-agent-ack-pending
+RUN chmod +x /usr/local/bin/eval-agent-ack-pending
+
+# agent-ack — CLI to manage the agent completion acknowledgment state.
+# Subcommands: register, done, list, clear, status. Manages the state
+# file at ~/.config/claude/agent-ack-pending.json used by the
+# eval-agent-ack-pending evaluator.
+COPY container/bin/agent-ack /usr/local/bin/agent-ack
+RUN chmod +x /usr/local/bin/agent-ack
+
 # event-ack — CLI to manage the four-tier claude-event response surface.
 # Manages ~/.config/claude-events/{pending-actions,tool-call-counter,
 # ambient-context}.json with flock-protected transactions. Subcommands:

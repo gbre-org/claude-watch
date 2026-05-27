@@ -329,6 +329,35 @@ on a misidentified notification) releases the scope lock and allows
 conflicting work to start — which races against the still-running
 agent or silently drops failed work on the floor.
 
+### Agent completion ack obligation (enforced)
+
+The `agent_ack_pending` obligation **enforces** the verify-before-done
+rule above. When a task-notification arrives for a completed agent,
+the main loop MUST follow this protocol:
+
+1. `agent-ack register <queue-id> [--agent-id <id>]` — register that
+   you received a task-notification for this queue item.
+2. Read the agent's output. Verify success or failure.
+3. `session-task queue done <queue-id>` (success) or
+   `session-task queue abandon <queue-id> --reason "..."` (failure).
+4. `agent-ack done <queue-id>` — clear the pending-ack entry.
+
+**The evaluator fires after 2 consecutive non-exempt Bash calls**
+(configurable via `$AGENT_ACK_N`) while pending-ack entries exist.
+This means you have a very short window to process the completion
+before the gate blocks you. The intent is that agent completions are
+high-priority: process them before moving on to other work.
+
+Quick reference:
+
+```sh
+agent-ack register <queue-id> [--agent-id <id>]  # step 1
+agent-ack done <queue-id>                         # step 4
+agent-ack list [--json]                           # inspect state
+agent-ack status                                  # one-line summary
+agent-ack clear                                   # escape hatch
+```
+
 ### Queue IMMEDIATELY — never defer
 
 **Queue items the moment you intend to do the work.** Never say "I'll

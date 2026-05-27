@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""eval-agent-ack-pending — obligations evaluator for agent completion ack.
+
+Enforces that the main loop acknowledges completed agents within N
+consecutive tool calls. When a subagent delivers a task-notification
+(completes), the main loop MUST:
+
+  1. Read the agent's output (verify success/failure)
+  2. Call ``session-task queue done <id>`` or ``abandon <id>``
+
+Until that happens, the completion is "pending ack." This evaluator
+blocks the main loop after N consecutive non-exempt tool calls while
+pending-ack entries exist.
+
+State file: ``~/.config/claude/agent-ack-pending.json``
+
+Shape::
+
+    {
+      "pending": [
+        {
+          "queue_id": "q-2026-05-27-XXXX",
+          "agent_id": "agent-abc123",
+          "registered_at": "2026-05-27T10:00:00Z",
+          "registered_at_epoch": 1716800000
+        }
+      ],
+      "counter": 0
+    }
+
+Entries are added by the main loop calling::
+
+    agent-ack register <queue-id> [--agent-id <id>]
+
+Entries are cleared by::
+
+    agent-ack done <queue-id>
+
+(which the main loop calls after ``session-task queue done <id>``).
+
+Protocol (obligations ``evaluator`` predicate, ``decision_mode``
+``exit_code``):
+
+  - stdin:     bash command body (via ``stdin_field: "tool_input.command"``)
+  - exit 0:    ALLOW (no pending acks, OR counter still under threshold)
+  - exit 1:    DENY (pending non-empty AND counter >= threshold)
+  - stderr:    deny banner (surfaced by the obligations cascade)
+
+Default-open posture:
+
+  - missing state file            -> ALLOW
+  - corrupt JSON                  -> ALLOW
+  - python OSError / unexpected   -> ALLOW
+
+Exempt commands (never count, never denied):
+
+  - ``agent-ack``                 (the resolution surface)
+  - ``session-task queue``        (queue dispatch -- includes ``done``)
+  - ``obligations``               (inspection / override)
+  - ``agent-msg`` / ``agent-tail`` (subagent IPC)
+  - ``event-ack`` / ``event-classify`` (event triage)
+  - ``claude-watch-ack`` / ``claude-watch-dispatch`` (alert surface)
+  - ``signal-history`` / ``signal-ack`` / ``signal-mark-read``
+
+Configurable threshold: ``$AGENT_ACK_N`` (default 2). A low default
+because agent completions are high-priority — the main loop should
+handle them almost immediately.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+
+# --- Paths / config -------------------------------------------------------
+
+STATE_DIR = Path(os.environ.get(
+    "CLAUDE_AGENT_ACK_STATE_DIR",
+    os.path.expanduser("~/.config/claude"),
+))
+STATE_FILE = STATE_DIR / "agent-ack-pending.json"
+
+DEFAULT_N = 2
+try:
+    THRESHOLD = max(1, int(os.environ.get("AGENT_ACK_N", DEFAULT_N)))
+except ValueError:
+    THRESHOLD = DEFAULT_N
+
+# Exempt-command regex. Same philosophy as eval-event-must-act.
+_EXEMPT_PATTERNS = [
+    r"agent-ack(\s|$)",
+    r"session-task\s+queue(\s|$)",
+    r"obligations(\s|$)",
+    r"agent-msg(\s|$)",
+    r"agent-tail(\s|$)",
+    r"event-ack(\s|$)",
+    r"event-classify(\s|$)",
+    r"claude-watch-ack(\s|$)",
+    r"claude-watch-dispatch(\s|$)",
+    r"signal-history(\s|$)",
+    r"signal-ack(\s|$)",
+    r"signal-mark-read(\s|$)",
+]
+_EXEMPT_RE = re.compile(
+    r"^\s*(" + "|".join(_EXEMPT_PATTERNS) + r")",
+)
+
+
+def _is_exempt(cmd: str) -> bool:
+    return bool(_EXEMPT_RE.match(cmd))
+
+
+# --- Locked state helpers -------------------------------------------------
+
+@contextmanager
+def _locked(path: Path):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = path.with_suffix(path.suffix + ".lock")
+    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if not isinstance(data, dict):
+                    data = {}
+            except (json.JSONDecodeError, ValueError, OSError):
+                data = {}
+        else:
+            data = {}
+        proxy = {"data": data, "write": False}
+        yield proxy
+        if proxy["write"]:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(proxy["data"], indent=2,
+                                       sort_keys=True))
+            os.replace(tmp, path)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _get_pending() -> list[dict]:
+    if not STATE_FILE.exists():
+        return []
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    pending = data.get("pending", [])
+    if not isinstance(pending, list):
+        return []
+    return [p for p in pending if isinstance(p, dict) and "queue_id" in p]
+
+
+def _get_counter() -> int:
+    if not STATE_FILE.exists():
+        return 0
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    v = data.get("counter", 0)
+    return v if isinstance(v, int) and v >= 0 else 0
+
+
+def _bump_counter() -> int:
+    with _locked(STATE_FILE) as c:
+        cur = c["data"].get("counter", 0)
+        if not (isinstance(cur, int) and cur >= 0):
+            cur = 0
+        new = cur + 1
+        c["data"]["counter"] = new
+        c["write"] = True
+        return new
+
+
+# --- Main evaluation ------------------------------------------------------
+
+def _emit_deny(pending: list[dict], counter: int) -> None:
+    """Write the deny banner to stderr."""
+    lines = [
+        f"AGENT-ACK-PENDING: {len(pending)} completed agent(s) awaiting "
+        f"acknowledgment AND {counter} consecutive non-exempt tool call(s) "
+        f"executed (threshold N={THRESHOLD}).",
+        "",
+        "Pending agent completions:",
+    ]
+    for p in pending:
+        qid = p.get("queue_id", "?")
+        aid = p.get("agent_id", "unknown")
+        lines.append(f"  - queue_id={qid}  agent_id={aid}")
+    lines.extend([
+        "",
+        "For each completed agent, you MUST:",
+        "  1. Read the agent's output (verify success/failure)",
+        "  2. Call: session-task queue done <queue-id>",
+        "     (or: session-task queue abandon <queue-id> --reason \"...\")",
+        "  3. Then: agent-ack done <queue-id>",
+        "",
+        "This clears the pending-ack entry and allows normal work to resume.",
+    ])
+    print("\n".join(lines), file=sys.stderr)
+
+
+def evaluate(cmd: str) -> int:
+    """Return 0 (allow) or 1 (deny)."""
+    if not cmd or not cmd.strip():
+        return 0
+
+    if _is_exempt(cmd):
+        return 0
+
+    pending = _get_pending()
+    if not pending:
+        return 0
+
+    # Pending exists. Bump the counter; deny iff threshold reached.
+    new_count = _bump_counter()
+    if new_count < THRESHOLD:
+        print(
+            f"agent-ack-pending: {len(pending)} pending, "
+            f"counter={new_count}/{THRESHOLD} -- gate will fire on "
+            f"next non-exempt call if not acked.",
+            file=sys.stderr,
+        )
+        return 0
+
+    _emit_deny(pending, new_count)
+    return 1
+
+
+# --- Self-test ------------------------------------------------------------
+
+def _self_test() -> int:
+    """Embedded test suite."""
+    import tempfile
+    failures: list[str] = []
+
+    def _setup_state(td: Path, pending: list[dict] | None = None,
+                     counter: int | None = None) -> None:
+        global STATE_FILE, STATE_DIR
+        STATE_DIR = td
+        STATE_FILE = td / "agent-ack-pending.json"
+        state = {}
+        if pending is not None:
+            state["pending"] = pending
+        if counter is not None:
+            state["counter"] = counter
+        if state:
+            STATE_FILE.write_text(json.dumps(state))
+
+    def fail(msg: str) -> None:
+        failures.append(msg)
+
+    import tempfile as _tf
+    global THRESHOLD
+
+    # Case 1: no state file -> ALLOW
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td))
+        if evaluate("ls") != 0:
+            fail("no state file should allow")
+
+    # Case 2: empty pending -> ALLOW
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=[], counter=99)
+        if evaluate("ls") != 0:
+            fail("empty pending should allow")
+
+    # Case 3: exempt commands -> ALLOW even with pending + over threshold
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td),
+                     pending=[{"queue_id": "q-1", "agent_id": "a-1"}],
+                     counter=99)
+        if evaluate("agent-ack done q-1") != 0:
+            fail("exempt agent-ack should allow")
+        if evaluate("session-task queue done q-1") != 0:
+            fail("exempt session-task queue should allow")
+        if evaluate("obligations list") != 0:
+            fail("exempt obligations should allow")
+        if evaluate("agent-msg inbox agent-123") != 0:
+            fail("exempt agent-msg should allow")
+
+    # Case 4: pending + counter < N -> ALLOW + bump
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td),
+                     pending=[{"queue_id": "q-1", "agent_id": "a-1"}],
+                     counter=0)
+        THRESHOLD = 2
+        if evaluate("ls") != 0:
+            fail("call 1 should ALLOW (counter 1/2)")
+        if evaluate("ls") != 1:
+            fail("call 2 should DENY (counter 2/2 = threshold)")
+
+    # Case 5: threshold=1 -> immediate deny
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td),
+                     pending=[{"queue_id": "q-1", "agent_id": "a-1"}],
+                     counter=0)
+        THRESHOLD = 1
+        if evaluate("ls") != 1:
+            fail("threshold=1 should DENY on first non-exempt call")
+
+    # Case 6: empty/whitespace command -> ALLOW
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td),
+                     pending=[{"queue_id": "q-1", "agent_id": "a-1"}],
+                     counter=99)
+        if evaluate("") != 0:
+            fail("empty command should ALLOW")
+        if evaluate("   ") != 0:
+            fail("whitespace command should ALLOW")
+
+    # Case 7: corrupt state file -> default-open (ALLOW)
+    with _tf.TemporaryDirectory() as td:
+        sd = Path(td)
+        STATE_DIR = sd
+        STATE_FILE = sd / "agent-ack-pending.json"
+        STATE_FILE.write_text("{not valid json at all")
+        if evaluate("rm -rf /tmp/foo") != 0:
+            fail("corrupt state should ALLOW (default-open)")
+
+    # Case 8: multiple pending entries
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td),
+                     pending=[
+                         {"queue_id": "q-1", "agent_id": "a-1"},
+                         {"queue_id": "q-2", "agent_id": "a-2"},
+                     ],
+                     counter=0)
+        THRESHOLD = 2
+        if evaluate("ls") != 0:
+            fail("multiple pending, call 1 should ALLOW")
+        if evaluate("ls") != 1:
+            fail("multiple pending, call 2 should DENY")
+
+    THRESHOLD = DEFAULT_N  # restore
+
+    if failures:
+        print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
+        for f in failures:
+            print(f"  {f}", file=sys.stderr)
+        return 1
+    print("OK: 8 cases pass.")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        return _self_test()
+
+    cmd = sys.stdin.read()
+    try:
+        return evaluate(cmd)
+    except Exception:  # noqa: BLE001 -- default-open on unexpected
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

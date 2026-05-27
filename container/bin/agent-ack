@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""agent-ack — manage the agent completion acknowledgment state.
+
+CLI for the agent-ack-pending obligation. The main loop uses this to
+register completed agents (after receiving a task-notification) and to
+clear them (after calling ``session-task queue done``).
+
+Usage:
+    agent-ack register <queue-id> [--agent-id <id>]
+        Register that a task-notification was received for <queue-id>.
+        The main loop MUST then process the agent's output and call
+        ``session-task queue done <queue-id>`` before calling
+        ``agent-ack done <queue-id>``.
+
+    agent-ack done <queue-id>
+        Clear the pending-ack entry for <queue-id>. Resets the
+        N-counter to 0.
+
+    agent-ack list [--json]
+        Show all pending-ack entries.
+
+    agent-ack clear
+        Clear all pending entries + reset counter (escape hatch).
+
+    agent-ack status
+        One-line summary: pending count + counter value.
+
+State file: ``~/.config/claude/agent-ack-pending.json``
+
+Shape::
+
+    {
+      "pending": [
+        {
+          "queue_id": "q-2026-05-27-XXXX",
+          "agent_id": "agent-abc123",
+          "registered_at": "2026-05-27T10:00:00+00:00",
+          "registered_at_epoch": 1716800000
+        }
+      ],
+      "counter": 0
+    }
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import fcntl
+import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get(
+    "CLAUDE_AGENT_ACK_STATE_DIR",
+    os.path.expanduser("~/.config/claude"),
+))
+STATE_FILE = STATE_DIR / "agent-ack-pending.json"
+
+
+@contextmanager
+def _locked(path: Path, mode: str = "rw"):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = path.with_suffix(path.suffix + ".lock")
+    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if not isinstance(data, dict):
+                    data = {"pending": [], "counter": 0}
+            except (json.JSONDecodeError, ValueError, OSError):
+                data = {"pending": [], "counter": 0}
+        else:
+            data = {"pending": [], "counter": 0}
+        yield data
+        if mode == "rw":
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+            os.replace(tmp, path)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    """Register a completed agent awaiting ack."""
+    now = time.time()
+    now_iso = _dt.datetime.fromtimestamp(
+        now, tz=_dt.timezone.utc
+    ).isoformat()
+
+    with _locked(STATE_FILE) as data:
+        pending = data.get("pending", [])
+        if not isinstance(pending, list):
+            pending = []
+
+        # Don't double-register the same queue_id.
+        existing = [p for p in pending
+                    if isinstance(p, dict) and p.get("queue_id") == args.queue_id]
+        if existing:
+            print(f"already registered: {args.queue_id}")
+            return 0
+
+        entry = {
+            "queue_id": args.queue_id,
+            "agent_id": args.agent_id or "unknown",
+            "registered_at": now_iso,
+            "registered_at_epoch": int(now),
+        }
+        pending.append(entry)
+        data["pending"] = pending
+        # Reset counter on new registration so the LLM gets a fresh
+        # N-call window to process it.
+        data["counter"] = 0
+
+    print(f"registered: {args.queue_id}")
+    return 0
+
+
+def cmd_done(args: argparse.Namespace) -> int:
+    """Clear a pending-ack entry."""
+    with _locked(STATE_FILE) as data:
+        pending = data.get("pending", [])
+        if not isinstance(pending, list):
+            pending = []
+
+        before = len(pending)
+        pending = [p for p in pending
+                   if not (isinstance(p, dict) and p.get("queue_id") == args.queue_id)]
+        data["pending"] = pending
+        # Reset counter on each ack.
+        data["counter"] = 0
+
+        if len(pending) == before:
+            print(f"not found: {args.queue_id}", file=sys.stderr)
+            return 1
+
+    print(f"acked: {args.queue_id}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """Show all pending-ack entries."""
+    with _locked(STATE_FILE, mode="ro") as data:
+        pending = data.get("pending", [])
+        counter = data.get("counter", 0)
+
+    if not isinstance(pending, list):
+        pending = []
+
+    if getattr(args, "json_output", False):
+        print(json.dumps({"pending": pending, "counter": counter}, indent=2))
+        return 0
+
+    if not pending:
+        print("No pending agent acks.")
+        return 0
+
+    print(f"Pending agent acks ({len(pending)}, counter={counter}):")
+    for p in pending:
+        if isinstance(p, dict):
+            qid = p.get("queue_id", "?")
+            aid = p.get("agent_id", "?")
+            ts = p.get("registered_at", "?")
+            print(f"  {qid}  agent={aid}  since={ts}")
+    return 0
+
+
+def cmd_clear(args: argparse.Namespace) -> int:
+    """Clear all pending entries + reset counter."""
+    with _locked(STATE_FILE) as data:
+        data["pending"] = []
+        data["counter"] = 0
+    print("cleared all pending agent acks.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """One-line status summary."""
+    with _locked(STATE_FILE, mode="ro") as data:
+        pending = data.get("pending", [])
+        counter = data.get("counter", 0)
+
+    if not isinstance(pending, list):
+        pending = []
+
+    n = len(pending)
+    if n == 0:
+        print("agent-ack: no pending completions.")
+    else:
+        qids = ", ".join(p.get("queue_id", "?") for p in pending
+                         if isinstance(p, dict))
+        print(f"agent-ack: {n} pending [{qids}], counter={counter}")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="agent-ack",
+        description="Manage agent completion acknowledgment state.",
+    )
+    sub = p.add_subparsers(dest="command")
+
+    # register
+    reg = sub.add_parser("register",
+                         help="Register a completed agent awaiting ack")
+    reg.add_argument("queue_id", help="Queue item ID (q-YYYY-MM-DD-XXXX)")
+    reg.add_argument("--agent-id", default="",
+                     help="Agent ID from the task-notification")
+
+    # done
+    d = sub.add_parser("done", help="Clear a pending-ack entry")
+    d.add_argument("queue_id", help="Queue item ID to clear")
+
+    # list
+    ls = sub.add_parser("list", help="Show all pending-ack entries")
+    ls.add_argument("--json", dest="json_output", action="store_true")
+
+    # clear
+    sub.add_parser("clear", help="Clear all pending entries (escape hatch)")
+
+    # status
+    sub.add_parser("status", help="One-line status summary")
+
+    args = p.parse_args()
+    if not args.command:
+        p.print_help()
+        return 1
+
+    handlers = {
+        "register": cmd_register,
+        "done": cmd_done,
+        "list": cmd_list,
+        "clear": cmd_clear,
+        "status": cmd_status,
+    }
+    return handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001
+        print(f"agent-ack: error: {exc}", file=sys.stderr)
+        sys.exit(1)
