@@ -727,6 +727,230 @@ def test_enable_print_cmd_emits_mcp_block() -> None:
         )
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pgid(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def _make_fake_mcp_host(dirpath: Path, port: int, pidfile: Path) -> Path:
+    """Write a fake `mcp-host-bash` stand-in that binds `port`, records
+    its own pid to `pidfile`, and sleeps forever. Stands in for the real
+    launcher so the --enable path runs on a host without mcp-proxy /
+    cli-mcp-server installed. Returns its absolute path."""
+    bindir = dirpath / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    host = bindir / "mcp-host-bash"
+    host.write_text(
+        "#!/usr/bin/env python3\n"
+        "import socket, time, os, sys\n"
+        "s = socket.socket()\n"
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        f"s.bind(('127.0.0.1', {port}))\n"
+        "s.listen(5)\n"
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "sys.stderr.write('fake-mcp-host-bash: listening\\n')\n"
+        "sys.stderr.flush()\n"
+        "while True:\n"
+        "    time.sleep(1)\n"
+    )
+    host.chmod(0o755)
+    return host
+
+
+def test_enable_ctrlc_leaves_host_service_running() -> None:
+    """REGRESSION (the bug this fix targets): in --enable mode, a real
+    Ctrl-C (SIGINT delivered to the wrapper's foreground process group
+    via a PTY) must tear down ONLY the reverse SSH tunnel + the log
+    tail, and LEAVE the host MCP service running. The service must be
+    started detached (its own session / process group) so the
+    terminal-delivered SIGINT never reaches it and the wrapper's exit
+    doesn't take it down.
+
+    Asserts:
+      - before: the host service pid is alive AND in a DIFFERENT process
+        group than the wrapper (proof it was detached).
+      - after Ctrl-C: host service STILL alive; ssh tunnel pid GONE;
+        tail pid GONE; wrapper exited.
+    """
+    import pty
+    import select
+
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        port = _free_port()
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        env_path = tdp / ".env"
+        write_env(env_path, mcp_local_port=str(port), ssh_key_path=str(key_path))
+
+        host_pidfile = tdp / "host.pid"
+        fake_host = _make_fake_mcp_host(tdp, port, host_pidfile)
+
+        # Fake ssh stand-in that records its pid then sleeps.
+        bindir = fake_host.parent
+        ssh = bindir / "ssh"
+        ssh_pidfile = tdp / "ssh.pid"
+        ssh.write_text(
+            "#!/usr/bin/env bash\n"
+            f'echo $$ > "{ssh_pidfile}"\n'
+            "exec sleep 600\n"
+        )
+        ssh.chmod(0o755)
+
+        env = {
+            "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PERSONAL_MCP_ENV_FILE": str(env_path),
+            "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+            "MCP_HOST_BASH_BIN": str(fake_host),
+        }
+
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            [str(SCRIPT), "--enable"],
+            env=env,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            preexec_fn=os.setsid,
+            close_fds=True,
+        )
+        os.close(slave)
+
+        buf = b""
+        host_pid = None
+        ssh_pid = None
+        try:
+            # Wait until the tunnel + tail are up.
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                r, _, _ = select.select([master], [], [], 0.5)
+                if r:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                if b"reverse SSH tunnel started" in buf and b"following" in buf:
+                    break
+            time.sleep(1.0)  # let pids settle
+
+            expect(
+                host_pidfile.exists(),
+                f"--enable: fake host service should have recorded its pid; "
+                f"output:\n{buf.decode(errors='replace')}",
+            )
+            expect(
+                ssh_pidfile.exists(),
+                f"--enable: fake ssh should have recorded its pid; "
+                f"output:\n{buf.decode(errors='replace')}",
+            )
+            if host_pidfile.exists():
+                host_pid = int(host_pidfile.read_text().strip())
+            if ssh_pidfile.exists():
+                ssh_pid = int(ssh_pidfile.read_text().strip())
+
+            # BEFORE: service alive + detached into its own process group.
+            if host_pid is not None:
+                expect(
+                    _pid_alive(host_pid),
+                    "--enable: host service should be alive before Ctrl-C",
+                )
+                expect(
+                    _pgid(host_pid) != _pgid(proc.pid),
+                    f"--enable: host service (pid {host_pid}, pgid "
+                    f"{_pgid(host_pid)}) MUST be in a DIFFERENT process group "
+                    f"than the wrapper (pid {proc.pid}, pgid {_pgid(proc.pid)}) "
+                    f"— it must be started detached so a terminal Ctrl-C "
+                    f"doesn't reach it",
+                )
+            if ssh_pid is not None:
+                expect(_pid_alive(ssh_pid), "--enable: ssh tunnel should be alive before Ctrl-C")
+
+            # Send a REAL Ctrl-C: the ^C byte makes the PTY deliver SIGINT
+            # to the foreground process group, exactly like an operator
+            # pressing Ctrl-C in their terminal.
+            os.write(master, b"\x03")
+
+            try:
+                proc.wait(timeout=12)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), 9)
+                proc.wait(timeout=5)
+                failures.append("--enable: wrapper did not exit after Ctrl-C")
+
+            # Drain remaining output.
+            time.sleep(0.6)
+            while True:
+                r, _, _ = select.select([master], [], [], 0.4)
+                if not r:
+                    break
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+
+            out = buf.decode(errors="replace")
+
+            # AFTER: service survives; tunnel + tail gone.
+            if host_pid is not None:
+                expect(
+                    _pid_alive(host_pid),
+                    f"--enable: host MCP service (pid {host_pid}) MUST STILL "
+                    f"BE RUNNING after Ctrl-C — cleanup tears down only the "
+                    f"tunnel + tail, never the service.\nOutput:\n{out}",
+                )
+            if ssh_pid is not None:
+                expect(
+                    not _pid_alive(ssh_pid),
+                    f"--enable: ssh tunnel (pid {ssh_pid}) should be torn down "
+                    f"by Ctrl-C.\nOutput:\n{out}",
+                )
+            expect(
+                "reverse SSH tunnel torn down" in out,
+                f"--enable: teardown should confirm the tunnel is gone; got:\n{out}",
+            )
+            expect(
+                "leaving host MCP service running" in out,
+                f"--enable: cleanup should announce it left the service "
+                f"running; got:\n{out}",
+            )
+        finally:
+            # Reap the surviving service + any strays we spawned.
+            for pid in (host_pid, ssh_pid):
+                if pid is not None and _pid_alive(pid):
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        pass
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), 9)
+                except OSError:
+                    pass
+                proc.wait(timeout=5)
+            try:
+                os.close(master)
+            except OSError:
+                pass
+            subprocess.run(["pkill", "-f", "sleep 600"], check=False)
+
+
 def test_script_uses_ssh_minus_capital_R_not_lowercase() -> None:
     """Regression guard: confirm the wrapper uses `-R` (reverse
     forward), not `-L` (local forward). A typo here would send the
@@ -772,6 +996,7 @@ tests = [
     test_default_red_path_service_down_exits_three,
     test_default_green_path_detects_service_up,
     test_enable_print_cmd_emits_mcp_block,
+    test_enable_ctrlc_leaves_host_service_running,
     test_env_example_exists_and_has_required_keys,
     test_gitignore_excludes_env,
     test_script_uses_ssh_minus_capital_R_not_lowercase,

@@ -31,12 +31,17 @@ corresponding LaunchAgent templates:
   access" = start the tunnel; "revoke" = stop it. The MCP server keeps
   running either way.
 
-- **Bundled (simpler alternative) — one unit owns both.** Run
-  `personal-mcp-host.sh` with no flag (or the bundled
+- **Bundled (simpler alternative) — one command brings up both.** Run
+  `personal-mcp-host.sh --enable` (or the bundled
   `org.gbre.personal-mcp.host.plist`, `RunAtLoad=false`). The wrapper
-  spawns `mcp-host-bash` AND the tunnel together, and tears both down
-  on stop. Fewer moving parts if you don't want the MCP server resident
-  full-time.
+  brings `mcp-host-bash` up AND opens the tunnel from one invocation.
+  The MCP service is started **detached** (its own session) so it
+  PERSISTS: a Ctrl-C / stop tears down only the tunnel + log tail and
+  leaves the service running. Re-run the default (no-flag) path and it
+  detects the still-listening service and just reconnects the tunnel.
+  Fewer moving parts if you don't want to manage the MCP server's
+  LaunchAgent separately, while keeping the tunnel as the only thing
+  you open and close on demand.
 
 The split is recommended because the MCP server's lifecycle is
 decoupled from the (more sensitive) remote-access window: the tunnel —
@@ -261,7 +266,10 @@ cd examples/personal-mac-mcp-host
 #     log so you watch traffic live. Ctrl-C tears the tunnel down.
 ./personal-mcp-host.sh
 
-# Bring the host MCP service up AND open the tunnel + tail in one shot:
+# Bring the host MCP service up AND open the tunnel + tail in one shot.
+# The service is started detached, so Ctrl-C tears down ONLY the tunnel
+# + tail and leaves the MCP service running; re-run the default path to
+# reconnect the tunnel to the still-running service.
 ./personal-mcp-host.sh --enable
 
 # Tunnel-only (mcp-host-bash already running locally; no gate/tail —

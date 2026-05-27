@@ -53,7 +53,11 @@
 #   (so the port is guaranteed LISTEN), then opens the tunnel and tails
 #   the log. This is the "I haven't got the always-on LaunchAgent; start
 #   everything from this one invocation" path. The printed RED-path
-#   rerun command points here.
+#   rerun command points here. The host service is started DETACHED in
+#   its own session so it OUTLIVES this wrapper: when you Ctrl-C (or
+#   launchd SIGTERMs) the wrapper, only the tunnel + log tail are torn
+#   down — the MCP service keeps running. Re-running the default (GREEN)
+#   path then finds it still listening and just reconnects the tunnel.
 #
 #   --tunnel-only (/ PERSONAL_MCP_TUNNEL_ONLY=1) — start ONLY the
 #   reverse SSH tunnel, no status gate, no log tail. Assumes
@@ -87,8 +91,9 @@
 #      if the launcher exits before binding.
 #   5. Start ssh -N -R ... in the background; capture pid.
 #   6. Tail the live MCP host log in the foreground. SIGTERM / SIGINT
-#      trap tears BOTH children down (ssh tunnel first, verify it's
-#      gone, then the mcp-host-bash child), then exits.
+#      trap tears down ONLY the tunnel (verify it's gone) + the log
+#      tail, then exits. The detached mcp-host-bash service is left
+#      RUNNING — the wrapper's exit does not stop it.
 #
 # Lifecycle (--tunnel-only)
 #
@@ -465,14 +470,18 @@ cleanup() {
         fi
     fi
 
-    # Then the mcp-host-bash child, if WE launched it (--enable). In the
-    # default + tunnel-only modes mcp_pid is empty (the server's
-    # lifecycle is not ours), so this is a no-op there.
+    # We deliberately DO NOT tear down the host MCP service here, even
+    # when --enable started it. The tunnel is the ephemeral "grant remote
+    # access for now" piece; the MCP service is persistent. Ctrl-C / a
+    # launchd SIGTERM is the operator saying "close the tunnel", NOT
+    # "shut the server down". The --enable path starts mcp-host-bash
+    # DETACHED in its own session (see start_detached) precisely so it
+    # survives this wrapper's exit — re-running the default (GREEN) path
+    # then detects the still-listening service and just reconnects the
+    # tunnel. To stop the service itself, the operator stops it directly
+    # (Ctrl-C its own foreground, or MCP_HOST_BASH_DISABLED / launchd).
     if [ -n "$mcp_pid" ]; then
-        echo "personal-mcp-host: stopping mcp-host-bash (pid $mcp_pid)" >&2
-        teardown_pid "mcp-host-bash" "$mcp_pid" || {
-            [ "$cleanup_exit_code" = "0" ] && cleanup_exit_code=1
-        }
+        echo "personal-mcp-host: leaving host MCP service running (pid $mcp_pid) — only the tunnel was torn down" >&2
     fi
 
     exit "$cleanup_exit_code"
@@ -644,16 +653,50 @@ if [ "$TUNNEL_ONLY" = "1" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# start_detached — launch a command in its OWN session (new session ⇒ new
+# process group), so it is NOT in this wrapper's process group and is
+# therefore NOT hit by a terminal-delivered Ctrl-C (SIGINT goes to the
+# foreground process group) nor by this wrapper's own exit. The detached
+# child must outlive us: that's the whole point of --enable starting a
+# persistent service while the wrapper only manages the ephemeral tunnel.
+#
+# Portability: `setsid` is the clean primitive but is NOT present in the
+# macOS base system. Perl ships on macOS (and Linux) and exposes
+# POSIX::setsid(), so we fall back to a tiny perl wrapper. Either form
+# backgrounded with `&` yields a capturable `$!` whose PID lives in a
+# fresh session — verified the liveness probe (`kill -0 $mcp_pid`) still
+# works because the PID we capture IS the exec'd service, not an
+# intermediate that exits.
+#
+# Echoes nothing; the caller captures the pid via `$!` right after.
+# -----------------------------------------------------------------------------
+
+if command -v setsid >/dev/null 2>&1; then
+    start_detached() { setsid "$@"; }
+elif command -v perl >/dev/null 2>&1; then
+    start_detached() { perl -e 'use POSIX qw(setsid); setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!";' -- "$@"; }
+else
+    # Last-resort fallback: no setsid, no perl. `nohup` detaches from the
+    # controlling terminal's SIGHUP but does NOT move the child into a new
+    # process group, so a terminal Ctrl-C (SIGINT to the foreground pgrp)
+    # could still reach it. We accept that on the rare host with neither
+    # setsid nor perl; cleanup() still never signals mcp_pid itself.
+    start_detached() { nohup "$@"; }
+fi
+
+# -----------------------------------------------------------------------------
 # --enable: bring the host MCP service up, then fall through to the
 # green path (open the tunnel + tail the log).
 #
-# Launch mcp-host-bash and wait for it to bind the loopback port before
+# Launch mcp-host-bash DETACHED (its own session/process-group, see
+# start_detached) and wait for it to bind the loopback port before
 # opening the tunnel, so we never expose a tunnel to a server that isn't
-# listening yet.
+# listening yet. Detaching it means a Ctrl-C / SIGTERM to this wrapper
+# tears down ONLY the tunnel + tail — the service keeps running.
 # -----------------------------------------------------------------------------
 
 if [ "$ENABLE" = "1" ]; then
-    "$MCP_HOST_BASH_BIN" --port "$MCP_LOCAL_PORT" &
+    start_detached "$MCP_HOST_BASH_BIN" --port "$MCP_LOCAL_PORT" </dev/null &
     mcp_pid=$!
 
     probe_rc=0
