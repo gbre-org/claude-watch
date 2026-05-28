@@ -58,50 +58,8 @@ VALID_SOURCES = {
 }
 
 
-def main() -> int:
-    # Detect legacy invocation (via cron-event shim/symlink) and warn.
-    invoked_as = os.path.basename(sys.argv[0])
-    if invoked_as == "cron-event":
-        print(
-            "cron-event: DEPRECATED — please use `claude-event` instead. "
-            "The old name is kept as a shim for backward compat.",
-            file=sys.stderr,
-        )
-
-    ap = argparse.ArgumentParser(
-        description="Emit an event to the Claude event queue for the main loop to handle.",
-    )
-    ap.add_argument("message", help="Event message (arbitrary text)")
-    ap.add_argument("--tag", default="generic", help="Short tag/category (default: generic)")
-    ap.add_argument(
-        "--priority",
-        default="normal",
-        choices=["low", "normal", "high", "urgent"],
-        help="Priority hint for Claude (default: normal)",
-    )
-    ap.add_argument(
-        "--data",
-        action="append",
-        default=[],
-        metavar="KEY=VAL",
-        help="Extra structured data (repeatable)",
-    )
-    ap.add_argument(
-        "--source",
-        default=None,
-        help=(
-            "Originating source type "
-            "(cron|alertmanager|queue|torrent|security|claude-watch|manual). "
-            "Defaults to 'cron' for backward compat."
-        ),
-    )
-    ap.add_argument(
-        "--source-name",
-        default=os.environ.get("CLAUDE_EVENT_SOURCE_NAME", os.environ.get("CRON_EVENT_SOURCE", "")),
-        help="Originating job/script name (defaults to $CLAUDE_EVENT_SOURCE_NAME)",
-    )
-    args = ap.parse_args()
-
+def cmd_emit(args: argparse.Namespace) -> int:
+    """Emit an event into the queue."""
     # Source defaults + validation
     source = args.source or "cron"
     if source not in VALID_SOURCES:
@@ -159,6 +117,128 @@ def main() -> int:
 
     print(str(final_path))
     return 0
+
+
+def cmd_ls(_args: argparse.Namespace) -> int:
+    """List pending events in the queue."""
+    if not QUEUE_DIR.is_dir():
+        print("0 pending events.")
+        return 0
+
+    events: list[tuple[float, str, str, str]] = []  # (timestamp, source, tag, message)
+    for p in QUEUE_DIR.iterdir():
+        if not p.name.endswith(".json") or p.name.startswith("."):
+            continue
+        try:
+            with open(p) as f:
+                ev = json.load(f)
+            events.append((
+                ev.get("timestamp", 0.0),
+                ev.get("source", "unknown"),
+                ev.get("tag", "unknown"),
+                ev.get("message", ""),
+            ))
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    if not events:
+        print("0 pending events.")
+        return 0
+
+    events.sort(key=lambda e: e[0])
+    now = time.time()
+    for ts, source, tag, message in events:
+        age = int(now - ts)
+        print(f"EVENT[{source}/{tag}] {message} (age: {age}s)")
+    print(f"\n{len(events)} pending event(s).")
+    return 0
+
+
+def cmd_count(_args: argparse.Namespace) -> int:
+    """Print the number of pending events in the queue."""
+    if not QUEUE_DIR.is_dir():
+        print("0")
+        return 0
+
+    count = sum(
+        1
+        for p in QUEUE_DIR.iterdir()
+        if p.name.endswith(".json") and not p.name.startswith(".")
+    )
+    print(str(count))
+    return 0
+
+
+def main() -> int:
+    # Detect legacy invocation (via cron-event shim/symlink) and warn.
+    invoked_as = os.path.basename(sys.argv[0])
+    if invoked_as == "cron-event":
+        print(
+            "cron-event: DEPRECATED — please use `claude-event` instead. "
+            "The old name is kept as a shim for backward compat.",
+            file=sys.stderr,
+        )
+
+    ap = argparse.ArgumentParser(
+        description="Emit events to (or inspect) the Claude event queue.",
+    )
+    sub = ap.add_subparsers(dest="subcommand")
+
+    # --- emit (also the default when no subcommand given) ---
+    emit_p = sub.add_parser("emit", help="Emit an event into the queue")
+    emit_p.add_argument("message", help="Event message (arbitrary text)")
+    emit_p.add_argument("--tag", default="generic", help="Short tag/category (default: generic)")
+    emit_p.add_argument(
+        "--priority",
+        default="normal",
+        choices=["low", "normal", "high", "urgent"],
+        help="Priority hint for Claude (default: normal)",
+    )
+    emit_p.add_argument(
+        "--data",
+        action="append",
+        default=[],
+        metavar="KEY=VAL",
+        help="Extra structured data (repeatable)",
+    )
+    emit_p.add_argument(
+        "--source",
+        default=None,
+        help=(
+            "Originating source type "
+            "(cron|alertmanager|queue|torrent|security|claude-watch|manual). "
+            "Defaults to 'cron' for backward compat."
+        ),
+    )
+    emit_p.add_argument(
+        "--source-name",
+        default=os.environ.get("CLAUDE_EVENT_SOURCE_NAME", os.environ.get("CRON_EVENT_SOURCE", "")),
+        help="Originating job/script name (defaults to $CLAUDE_EVENT_SOURCE_NAME)",
+    )
+
+    # --- ls ---
+    sub.add_parser("ls", help="List pending events in the queue")
+
+    # --- count ---
+    sub.add_parser("count", help="Print number of pending events (for scripts)")
+
+    # Backward compat: if the first positional arg is not a known subcommand,
+    # treat the entire argv as an implicit "emit" invocation.
+    known_subcommands = {"emit", "ls", "count"}
+    if len(sys.argv) > 1 and sys.argv[1] not in known_subcommands and not sys.argv[1].startswith("-"):
+        sys.argv.insert(1, "emit")
+
+    args = ap.parse_args()
+
+    if args.subcommand == "ls":
+        return cmd_ls(args)
+    elif args.subcommand == "count":
+        return cmd_count(args)
+    elif args.subcommand == "emit":
+        return cmd_emit(args)
+    else:
+        ap.print_help()
+        return 0
 
 
 if __name__ == "__main__":
