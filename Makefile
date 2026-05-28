@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -372,6 +372,12 @@ compose-up:
 # claude-container-versions).
 compose-down:
 	@cd examples/compose && docker compose down
+
+# Force-recreate the claude-container service (picks up new image / config).
+# stop_grace_period in compose already sets the 5s timeout so -t 5 is
+# belt-and-suspenders.
+redeploy:
+	@cd examples/compose && docker compose up -d --force-recreate -t 5 claude-container
 
 # Clean build artifacts
 clean:
