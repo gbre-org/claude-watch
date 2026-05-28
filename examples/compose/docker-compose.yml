@@ -54,6 +54,7 @@ services:
       context: ../..
       dockerfile: container/Dockerfile
     image: claude-container:dev
+    stop_grace_period: 5s
     depends_on:
       tmux-socket-init:
         condition: service_completed_successfully

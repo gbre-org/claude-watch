@@ -742,15 +742,11 @@ uid 1000 against a writable global path, no sudo needed.
 
 ## Container redeploy
 
-To redeploy the container (after pulling new code, merging PRs, etc.),
-run via host-bash as ONE inline command:
+To redeploy: `make redeploy` from the repo root (via host-bash).
+Equivalent: `cd examples/compose && docker compose up -d --force-recreate -t 5 claude-container`
 
-    cd ~/repos/claude-watch/examples/compose && docker compose down claude-container && docker compose up -d claude-container
-
-**NEVER use `--force-recreate`** — it gets stuck and requires manual
-intervention. Always `down` then `up`.
-
-**NEVER write a script for this.** It's one inline command via host-bash.
+The `stop_grace_period: 5s` in docker-compose.yml ensures the old
+container is killed quickly even without the explicit `-t 5` flag.
 
 This kills the current session. The next session starts with the new
 image and picks up via the resume prompt.
