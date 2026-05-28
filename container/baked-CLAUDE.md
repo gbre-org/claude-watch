@@ -740,6 +740,21 @@ The package name (`@anthropic-ai/claude-code`) and install command
 host is Linux, macOS, or Windows. The in-container npm itself runs as
 uid 1000 against a writable global path, no sudo needed.
 
+## Container redeploy
+
+To redeploy the container (after pulling new code, merging PRs, etc.),
+run via host-bash as ONE inline command:
+
+    cd ~/repos/claude-watch/examples/compose && docker compose down claude-container && docker compose up -d claude-container
+
+**NEVER use `--force-recreate`** — it gets stuck and requires manual
+intervention. Always `down` then `up`.
+
+**NEVER write a script for this.** It's one inline command via host-bash.
+
+This kills the current session. The next session starts with the new
+image and picks up via the resume prompt.
+
 ## What is bind-mounted from the host
 
 The
