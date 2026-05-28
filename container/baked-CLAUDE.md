@@ -350,11 +350,39 @@ the main loop MUST follow this protocol:
    `session-task queue abandon <queue-id> --reason "..."` (failure).
 4. `agent-ack done <queue-id>` — clear the pending-ack entry.
 
-**The evaluator fires after 2 consecutive non-exempt Bash calls**
-(configurable via `$AGENT_ACK_N`) while pending-ack entries exist.
-This means you have a very short window to process the completion
-before the gate blocks you. The intent is that agent completions are
-high-priority: process them before moving on to other work.
+**The evaluator IMMEDIATELY blocks ANY non-exempt Bash call** while
+pending-ack entries exist (`$AGENT_ACK_N` defaults to 0 — no grace
+window). This means: the VERY FIRST tool call you attempt after an
+agent completes will be DENIED unless you have already called
+`agent-ack register`. Agent completions are the highest-priority
+work the main loop can do — nothing else proceeds until they are
+processed.
+
+**Why N=0 (no grace window)?** Claude Code does not fire a PostToolUse
+hook on agent completion — completions arrive as system messages
+(task-notifications). There is no automated hook to populate
+`agent-ack-pending.json`. The main loop MUST call `agent-ack register`
+as its first action upon receiving a task-notification. With N=0,
+forgetting to register means the gate fires on the very next call,
+making the omission immediately visible rather than silently letting
+2 calls slip through.
+
+**Concrete sequence when you receive a task-notification:**
+
+```sh
+# 1. IMMEDIATELY register (before any other tool call)
+agent-ack register q-2026-05-28-XXXX --agent-id agent-abc123
+
+# 2. Read agent output, verify success/failure
+#    (this is exempt — agent-ack commands pass through the gate)
+
+# 3. Close the queue item
+session-task queue done q-2026-05-28-XXXX
+# OR: session-task queue abandon q-2026-05-28-XXXX --reason "..."
+
+# 4. Clear the pending-ack entry — gate stops firing
+agent-ack done q-2026-05-28-XXXX
+```
 
 Quick reference:
 
