@@ -72,6 +72,9 @@ thinking_backoff_multiplier = 3
 # every time the watcher is blocking on inotifywait in a background task.
 # The correct restart mechanism is the watcher's own restart banner in
 # its task output, not the daemon's tmux-inject path.
+# Dead-watcher detection is handled by cw-watcher-health-check (cron,
+# */2 min) which checks for stale unconsumed events and injects a
+# [CLAUDE-WATCH] alert via tmux send-keys if any accumulate >2min.
 enabled = false
 # Baked in-container watcher list. Format documented in the file.
 # Currently registers: claude-event-tail (the in-container

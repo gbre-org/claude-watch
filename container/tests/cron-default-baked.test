@@ -145,6 +145,36 @@ if CRON_DEFAULT.is_file():
             f"got {metrics_line!r}",
         )
 
+    # Watcher health check entry.
+    watcher_health_line = next(
+        (line for line in schedule_lines if "cw-watcher-health-check" in line),
+        None,
+    )
+    expect(
+        watcher_health_line is not None,
+        "cron.d/cw-default must include a `cw-watcher-health-check` "
+        "entry. Without it a dead event watcher goes undetected — "
+        "events accumulate unconsumed and the session never gets "
+        "alerted.",
+    )
+    if watcher_health_line is not None:
+        expect(
+            watcher_health_line.startswith("*/2 * * * *"),
+            f"watcher health check entry must run every 2 minutes "
+            f"(`*/2 * * * *`); got {watcher_health_line!r}",
+        )
+        expect(
+            "hndrewaall" in watcher_health_line,
+            f"watcher health check entry must run as the hndrewaall "
+            f"user; got {watcher_health_line!r}",
+        )
+        expect(
+            "/usr/local/bin/cw-watcher-health-check" in watcher_health_line,
+            f"watcher health check entry must reference the baked "
+            f"/usr/local/bin/cw-watcher-health-check script; "
+            f"got {watcher_health_line!r}",
+        )
+
 
 # ---------------------------------------------------------------------------
 # 4-5. Dockerfile bakes the file + creates the private slot.
@@ -193,6 +223,24 @@ if DOCKERFILE.is_file():
         "docker auto-creates it root-owned 0755 on first bind-mount. "
         "Same auto-creation gotcha as /home/hndrewaall/.config got hit "
         "by.",
+    )
+
+    # 6. cw-watcher-health-check baked.
+    expect(
+        re.search(
+            r"COPY\s+container/bin/cw-watcher-health-check\s+"
+            r"/usr/local/bin/cw-watcher-health-check",
+            df,
+        )
+        is not None,
+        "Dockerfile must COPY container/bin/cw-watcher-health-check "
+        "to /usr/local/bin/cw-watcher-health-check. Without this the "
+        "watcher health check cron entry has no script to run.",
+    )
+    expect(
+        re.search(r"chmod\s+\+x\s+/usr/local/bin/cw-watcher-health-check", df)
+        is not None,
+        "Dockerfile must chmod +x /usr/local/bin/cw-watcher-health-check.",
     )
 
 

@@ -925,6 +925,14 @@ RUN chmod +x /usr/local/bin/xclip
 COPY container/bin/self-clear /usr/local/bin/self-clear
 RUN chmod +x /usr/local/bin/self-clear
 
+# cw-watcher-health-check — cron-driven dead-watcher detector.
+# Checks for unconsumed events in the queue dir older than 2 min;
+# if any exist, injects a [CLAUDE-WATCH] alert into the tmux pane
+# via send-keys (bypasses the event system, which is broken if
+# events are accumulating). Fired by the */2 cron entry in cw-default.
+COPY container/bin/cw-watcher-health-check /usr/local/bin/cw-watcher-health-check
+RUN chmod +x /usr/local/bin/cw-watcher-health-check
+
 # claude-event-watch — the canonical block-print-exit event watcher.
 # Session runs this as a `run_in_background` task; it blocks on inotifywait,
 # prints pending events, and exits. Baked so it's on PATH without depending

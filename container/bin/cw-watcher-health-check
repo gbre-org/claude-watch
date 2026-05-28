@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# cw-watcher-health-check — detect dead event watcher via stale queue.
+#
+# The in-container event watcher (claude-event-watch / claude-event-tail)
+# runs as a `run_in_background` task inside the Claude Code session.
+# When the container is recreated or the session clears, the watcher
+# dies and nobody restarts it. This script detects that condition by
+# checking for unconsumed events that have accumulated past a threshold.
+#
+# If stale events exist, the watcher is dead (or stuck). We inject a
+# [CLAUDE-WATCH] alert directly into the tmux pane via send-keys,
+# bypassing the event system entirely (which is the whole point — if
+# events are accumulating, the event consumption path is broken).
+#
+# Intended to run via cron every 2 minutes:
+#   */2 * * * * hndrewaall /usr/local/bin/cw-watcher-health-check
+#
+# Environment:
+#   CLAUDE_EVENT_QUEUE  — event spool directory (default ~/claude-events)
+#   CW_WATCHER_HEALTH_STALE_MIN — age threshold in minutes (default 2)
+#   CW_WATCHER_HEALTH_PANE — tmux pane target (default claude-container:0.0)
+
+set -euo pipefail
+
+QUEUE="${CLAUDE_EVENT_QUEUE:-$HOME/claude-events}"
+STALE_MIN="${CW_WATCHER_HEALTH_STALE_MIN:-2}"
+PANE="${CW_WATCHER_HEALTH_PANE:-claude-container:0.0}"
+
+# If the queue directory doesn't exist, nothing to check.
+if [ ! -d "$QUEUE" ]; then
+    exit 0
+fi
+
+# Count .json files older than the threshold.
+STALE=$(find "$QUEUE" -name '*.json' -mmin +"$STALE_MIN" 2>/dev/null | wc -l)
+
+if [ "$STALE" -gt 0 ]; then
+    # Inject directly into the tmux pane. This bypasses the event
+    # system (which is broken if we got here) and uses the same
+    # [CLAUDE-WATCH] prefix that the daemon uses for its alerts,
+    # triggering the "STOP EVERYTHING" protocol in the session.
+    tmux send-keys -t "$PANE" \
+        "[CLAUDE-WATCH] WATCHER DOWN: $STALE event(s) unconsumed >${STALE_MIN}min. Restart event watcher via /claude-container:start-watchers" \
+        Enter
+fi

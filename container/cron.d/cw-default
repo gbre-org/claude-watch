@@ -45,3 +45,11 @@
 # a long-stuck item only triggers once until it leaves the queue.
 # Silent exit when nothing qualifies — no console spam.
 */5 * * * *  hndrewaall /usr/local/bin/claude-watch stale-ready-check > /tmp/claude-watch-cron-stale-ready.log 2>&1
+
+# Event-watcher health check. Every 2 minutes, look for .json event
+# files in the queue dir that have been sitting unconsumed for >2 min.
+# If any exist, the event watcher is dead (container recreate, session
+# clear, etc). Injects a [CLAUDE-WATCH] alert directly into the tmux
+# pane via send-keys — bypasses the event system entirely (which is the
+# whole point: if events are accumulating, the event path is broken).
+*/2 * * * *  hndrewaall /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log
