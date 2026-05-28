@@ -62,9 +62,10 @@ Exempt commands (never count, never denied):
   - ``claude-watch-ack`` / ``claude-watch-dispatch`` (alert surface)
   - ``signal-history`` / ``signal-ack`` / ``signal-mark-read``
 
-Configurable threshold: ``$AGENT_ACK_N`` (default 2). A low default
-because agent completions are high-priority — the main loop should
-handle them almost immediately.
+Configurable threshold: ``$AGENT_ACK_N`` (default 0). With N=0, ANY
+non-exempt Bash call while pending-ack entries exist is immediately
+denied. Agent completions are the highest-priority work the main loop
+can do — they must be processed before anything else.
 """
 
 from __future__ import annotations
@@ -85,9 +86,9 @@ STATE_DIR = Path(os.environ.get(
 ))
 STATE_FILE = STATE_DIR / "agent-ack-pending.json"
 
-DEFAULT_N = 2
+DEFAULT_N = 0
 try:
-    THRESHOLD = max(1, int(os.environ.get("AGENT_ACK_N", DEFAULT_N)))
+    THRESHOLD = max(0, int(os.environ.get("AGENT_ACK_N", DEFAULT_N)))
 except ValueError:
     THRESHOLD = DEFAULT_N
 
@@ -230,7 +231,12 @@ def evaluate(cmd: str) -> int:
     if not pending:
         return 0
 
-    # Pending exists. Bump the counter; deny iff threshold reached.
+    # Pending exists. With N=0 (default), deny immediately — no grace
+    # window. With N>0, bump counter and deny when threshold reached.
+    if THRESHOLD <= 0:
+        _emit_deny(pending, 0)
+        return 1
+
     new_count = _bump_counter()
     if new_count < THRESHOLD:
         print(
@@ -308,7 +314,16 @@ def _self_test() -> int:
         if evaluate("ls") != 1:
             fail("call 2 should DENY (counter 2/2 = threshold)")
 
-    # Case 5: threshold=1 -> immediate deny
+    # Case 5: threshold=0 -> immediate deny (default behavior)
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td),
+                     pending=[{"queue_id": "q-1", "agent_id": "a-1"}],
+                     counter=0)
+        THRESHOLD = 0
+        if evaluate("ls") != 1:
+            fail("threshold=0 should DENY immediately on first non-exempt call")
+
+    # Case 5b: threshold=1 -> also immediate deny (bumps to 1, hits threshold)
     with _tf.TemporaryDirectory() as td:
         _setup_state(Path(td),
                      pending=[{"queue_id": "q-1", "agent_id": "a-1"}],
@@ -357,7 +372,7 @@ def _self_test() -> int:
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("OK: 8 cases pass.")
+    print("OK: 9 cases pass.")
     return 0
 
 
