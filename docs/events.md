@@ -171,3 +171,15 @@ ring-buffer log (compact JSON).
 make test-claude-event     # 11 cases (emit + tail round-trip)
 make test-watchers         # claude-event-watch fast-path smoke test
 ```
+
+## Enforcing that events get read
+
+The `claude-event` bus moves events into the main loop's context, but
+nothing on the bus itself ensures the LLM actually triages them. The
+companion enforcement layer is `event_must_act` — an obligation-gate
+that classifies events into four tiers (ambient / actionable / Signal /
+unknown), routes them to the right queue, and DENIES Bash tool calls
+after the main loop misses N consecutive opportunities to act on an
+actionable event. See [event-must-act.md](event-must-act.md) for the
+tier model, the `event-classify` + `event-ack` CLIs, and the
+container-baked deploy + smoke-test path.
