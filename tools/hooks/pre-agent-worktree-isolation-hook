@@ -177,8 +177,11 @@ def _load_opted_in_repos(
     """Read opted-in repos from the config files.
 
     Each non-blank, non-``#`` line: ``repo_key|prompt_regex|upstream_path``.
-    The upstream_path is consumed by the worktree-create-hook companion and
-    is ignored here. Malformed lines are skipped (best-effort).
+    The ``prompt_regex`` field is allowed to contain ``|`` (regex
+    alternation), so we peel ``upstream_path`` off the END (rpartition) and
+    then split ``repo_key`` off the front of what remains. The
+    ``upstream_path`` is consumed by the worktree-create-hook companion and
+    ignored here. Malformed lines are skipped (best-effort).
 
     Returns a list of ``(repo_key, compiled_regex)`` pairs. Empty list if no
     config files exist or all entries are malformed -- in that case the hook
@@ -196,11 +199,18 @@ def _load_opted_in_repos(
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split("|", 2)
-            if len(parts) < 2:
+            # Peel upstream_path off the end; then split repo_key off the
+            # front. The middle (regex) may itself contain ``|``.
+            left, sep_up, _upstream = line.rpartition("|")
+            if not sep_up:
+                # Only zero or one `|` -> at least two fields missing.
                 continue
-            repo_key = parts[0].strip()
-            regex_src = parts[1].strip()
+            repo_key, sep_key, regex_src = left.partition("|")
+            if not sep_key:
+                # No `|` between repo_key and regex.
+                continue
+            repo_key = repo_key.strip()
+            regex_src = regex_src.strip()
             if not repo_key or not regex_src:
                 continue
             try:
@@ -694,6 +704,24 @@ def _run_tests() -> int:  # noqa: C901
         _check(
             "CFG4. two config files merged in order",
             [k for k, _ in loaded] == ["repo-a", "repo-b"],
+            f"loaded={loaded}",
+        )
+
+    # Regex containing `|` (alternation) -- the parser must NOT swallow
+    # alternations into the upstream_path field.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        cfg = td / "repos.txt"
+        cfg.write_text(
+            "claude-watch|(?:~/repos/claude-watch\\b|/home/[^/\\s]+/repos/claude-watch\\b)|/home/u/repos/claude-watch\n"
+        )
+        loaded = _load_opted_in_repos([cfg])
+        _check(
+            "CFG5. regex with `|` alternation parsed (no field-split bug)",
+            len(loaded) == 1
+            and loaded[0][0] == "claude-watch"
+            and loaded[0][1].search("/home/foo/repos/claude-watch") is not None
+            and loaded[0][1].search("~/repos/claude-watch") is not None,
             f"loaded={loaded}",
         )
 
