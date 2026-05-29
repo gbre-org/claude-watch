@@ -276,3 +276,20 @@ make test-hooks            # 70+ cases covering every predicate,
                            # overrides, and the watcher-ctl cardinal-rule
                            # gate. Runs against an isolated $HOME tmpdir.
 ```
+
+## Event-reading enforcement (`event_must_act`)
+
+The obligations gate documented above is generic — it enforces
+arbitrary predicates against arbitrary tool calls. The `event_must_act`
+obligation is one concrete instance of that gate, wired specifically to
+the `claude-event` bus to enforce that the main loop triages actionable
+events instead of letting them pile up unread. It's seeded by
+`tools/obligations/obligations-init`, evaluated by
+`container/bin/eval-event-must-act`, and acked via
+`container/bin/event-ack`. See [event-must-act.md](event-must-act.md)
+for the four-tier classification model, the CLI surface, the
+N-tool-call escalation semantics, and the container deploy + smoke-test
+path. The behaviour is baked into the container image, so workbot and
+any other container-driven Claude Code deployment picks it up on the
+next `make container-build && make compose-up` cycle without per-host
+configuration.
