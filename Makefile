@@ -47,6 +47,9 @@ test-hooks:
 	tools/hooks/tests/pre-tool-claude-watch-alert-gate-hook.test
 	tools/hooks/tests/user-prompt-claude-watch-alert-record-hook.test
 	tools/hooks/tests/pre-tool-dispatch-gate-hook.test
+	tools/hooks/pre-agent-background-required-hook --test
+	tools/hooks/pre-agent-worktree-isolation-hook --test
+	tools/hooks/worktree-create-hook --test
 	tools/claude-watch-ack/tests/claude-watch-ack.test
 	tools/claude-watch-dispatch/tests/claude-watch-dispatch.test
 
@@ -272,6 +275,9 @@ deploy: build
 #   - pre-tool-obligations-gate-hook        : PreToolUse hook (* matcher)
 #   - post-tool-obligations-update-hook     : PostToolUse hook (* matcher)
 #   - post-tool-mark-attachment-read-hook   : PostToolUse hook (Read matcher)
+#   - pre-agent-background-required-hook    : PreToolUse hook (Agent matcher)
+#   - pre-agent-worktree-isolation-hook     : PreToolUse hook (Agent matcher)
+#   - worktree-create-hook                  : WorktreeCreate/Remove hook
 #
 # Install policy:
 #   - The claude-watch Rust daemon is a build artifact, so it's a real
@@ -294,6 +300,9 @@ install: build
 	@ln -sfn $(abspath tools/hooks/pre-tool-obligations-gate-hook) $(BIN_DIR)/pre-tool-obligations-gate-hook
 	@ln -sfn $(abspath tools/hooks/post-tool-obligations-update-hook) $(BIN_DIR)/post-tool-obligations-update-hook
 	@ln -sfn $(abspath tools/hooks/post-tool-mark-attachment-read-hook) $(BIN_DIR)/post-tool-mark-attachment-read-hook
+	@ln -sfn $(abspath tools/hooks/pre-agent-background-required-hook) $(BIN_DIR)/pre-agent-background-required-hook
+	@ln -sfn $(abspath tools/hooks/pre-agent-worktree-isolation-hook) $(BIN_DIR)/pre-agent-worktree-isolation-hook
+	@ln -sfn $(abspath tools/hooks/worktree-create-hook) $(BIN_DIR)/worktree-create-hook
 	@ln -sfn $(abspath tools/agent-msg/agent-msg) $(BIN_DIR)/agent-msg
 	@ln -sfn $(abspath tools/agent-tail/agent-tail) $(BIN_DIR)/agent-tail
 	@ln -sfn $(abspath tools/claude-event/claude-event) $(BIN_DIR)/claude-event
@@ -308,6 +317,9 @@ install: build
 	@echo "  - pre-tool-obligations-gate-hook (symlink -> tools/hooks/)"
 	@echo "  - post-tool-obligations-update-hook (symlink -> tools/hooks/)"
 	@echo "  - post-tool-mark-attachment-read-hook (symlink -> tools/hooks/)"
+	@echo "  - pre-agent-background-required-hook (symlink -> tools/hooks/)"
+	@echo "  - pre-agent-worktree-isolation-hook (symlink -> tools/hooks/)"
+	@echo "  - worktree-create-hook      (symlink -> tools/hooks/)"
 	@echo "  - agent-msg                 (symlink -> tools/agent-msg/)"
 	@echo "  - agent-tail                (symlink -> tools/agent-tail/)"
 	@echo "  - claude-event              (symlink -> tools/claude-event/)"

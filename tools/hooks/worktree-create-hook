@@ -1,0 +1,779 @@
+#!/usr/bin/env python3
+r"""WorktreeCreate / WorktreeRemove hook -- opt-in-per-repo worktree allocation.
+
+When the Claude Code main session's cwd is not a git repo, the harness can't
+allocate an agent worktree on its own ("Cannot create agent worktree: not in
+a git repository and no WorktreeCreate hooks are configured"). This hook
+fills that gap, but only for an explicit opt-in list read from config files.
+
+Modes
+-----
+This script doubles as both the ``WorktreeCreate`` and ``WorktreeRemove``
+hook. The harness invokes the same binary; behaviour is selected by
+``hook_event_name`` on stdin (or, as a fallback, the ``WORKTREE_HOOK_MODE``
+env var / ``--remove`` flag for embedded tests).
+
+Opt-in config
+-------------
+Opted-in repos are read from these config files (in order, all merged):
+
+    /etc/claude-code/worktree-isolation-repos.txt        (system-wide)
+    ~/.config/claude-watch/worktree-isolation-repos.txt  (user)
+
+Each non-blank, non-comment (``#``) line is a pipe-separated record:
+
+    repo_key|prompt_regex|upstream_path
+
+  - ``repo_key`` -- short label, used in /tmp/<repo_key>-worktrees/ and audit log
+  - ``prompt_regex`` -- case-insensitive regex matched against the Agent prompt
+  - ``upstream_path`` -- absolute path to the upstream working tree (the
+    ``git worktree add`` target).
+
+KEEP IN SYNC with pre-agent-worktree-isolation-hook (same file format,
+same loader semantics).
+
+Sample config (place at /etc/claude-code/worktree-isolation-repos.txt)::
+
+    # repo_key | prompt_regex | upstream_path
+    claude-watch|(?:~/repos/claude-watch\b|/home/[^/\s]+/repos/claude-watch\b|\brepos/claude-watch\b|\bhndrewaall/claude-watch\b|\bgithub\.com/hndrewaall/claude-watch\b)|/home/USER/repos/claude-watch
+
+Contract (Claude Code harness, verified 2026-05-19)
+---------------------------------------------------
+- stdin: JSON containing at minimum ``hook_event_name`` and (for the create
+  path) some session context. Real-world payloads include keys like
+  ``name``, ``cwd``, ``session_id`` and the Agent ``tool_input`` (we read
+  ``prompt`` if present); for ``WorktreeRemove`` a ``worktree_path`` field
+  identifies the directory to clean up.
+- stdout for ``WorktreeCreate``: a single line containing the absolute path
+  of the newly-created worktree, OR empty stdout to pass through to the
+  harness's default behaviour (i.e. "not opted in, you handle it").
+- stdout for ``WorktreeRemove``: ignored by the harness; we just clean up
+  and exit 0.
+- Exit 0 always. Non-zero on ``WorktreeCreate`` would abort the spawn, which
+  is too aggressive for a hook bug -- default-OPEN (empty stdout = pass-through)
+  preserves the existing "not in a git repo" error rather than masking it.
+
+Audit log: best-effort newline-delimited JSON to
+``~/.config/claude/worktree-create.log`` (0600).
+
+Embedded tests: ``worktree-create-hook --test``.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+# Config file locations -- shared with pre-agent-worktree-isolation-hook.
+CONFIG_FILES = [
+    Path("/etc/claude-code/worktree-isolation-repos.txt"),
+    Path(os.path.expanduser("~/.config/claude-watch/worktree-isolation-repos.txt")),
+]
+
+LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+LOG_PATH = LOG_DIR / "worktree-create.log"
+
+# Tool names whose prompts we inspect for opt-in matches.
+AGENT_TOOL_NAMES = {"Agent", "Task"}
+
+# Worktree path layout: /tmp/<repo_key>-worktrees/agent-<UUID>
+WORKTREE_BASE_TMPL = "/tmp/{repo_key}-worktrees"
+
+# Prompt cache populated by pre-agent-worktree-isolation-hook on PreToolUse.
+CACHE_DIR = Path(os.path.expanduser("~/.cache/claude"))
+CACHE_TTL_SECONDS = 30
+CACHE_FILENAME_TMPL = "last-agent-prompt-{session_id}.txt"
+
+
+def _log(record: dict) -> None:
+    """Best-effort JSON-line audit log."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            **record,
+        }
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+        try:
+            LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _load_opted_in_repos(
+    config_files: list[Path] = CONFIG_FILES,
+) -> list[tuple[str, re.Pattern[str], Path]]:
+    """Read opted-in repos from the config files.
+
+    Same file format / semantics as pre-agent-worktree-isolation-hook.
+    Lines with a missing or malformed upstream_path are skipped (since this
+    hook actually needs the path to allocate the worktree).
+    """
+    out: list[tuple[str, re.Pattern[str], Path]] = []
+    for path in config_files:
+        try:
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|", 2)
+            if len(parts) < 3:
+                continue
+            repo_key = parts[0].strip()
+            regex_src = parts[1].strip()
+            upstream_str = parts[2].strip()
+            if not repo_key or not regex_src or not upstream_str:
+                continue
+            try:
+                pat = re.compile(regex_src, re.IGNORECASE)
+            except re.error:
+                continue
+            try:
+                upstream = Path(os.path.expanduser(upstream_str))
+            except (OSError, ValueError):
+                continue
+            out.append((repo_key, pat, upstream))
+    return out
+
+
+def _find_opted_in(
+    prompt: str,
+    opted_in: list[tuple[str, re.Pattern[str], Path]],
+) -> tuple[str, Path] | None:
+    """Return (repo_key, upstream_path) for the first match, else None."""
+    if not prompt:
+        return None
+    for repo_key, pattern, upstream in opted_in:
+        if pattern.search(prompt):
+            return (repo_key, upstream)
+    return None
+
+
+def _find_opted_in_by_path(
+    worktree_path: str,
+    opted_in: list[tuple[str, re.Pattern[str], Path]],
+) -> tuple[str, Path] | None:
+    """Match a worktree path back to its (repo_key, upstream) for removal."""
+    if not worktree_path:
+        return None
+    try:
+        norm = os.path.realpath(worktree_path)
+    except (OSError, ValueError):
+        norm = worktree_path
+    for repo_key, _pattern, upstream in opted_in:
+        base = WORKTREE_BASE_TMPL.format(repo_key=repo_key)
+        if worktree_path.startswith(base + "/") or norm.startswith(base + "/"):
+            return (repo_key, upstream)
+    return None
+
+
+def _cache_path_for_session(session_id: str) -> Path:
+    """Per-session prompt-cache file path. Same sanitization as the writer."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id) or "_"
+    safe = safe[:128]
+    return CACHE_DIR / CACHE_FILENAME_TMPL.format(session_id=safe)
+
+
+def _read_prompt_cache(session_id: str | None, ttl: int = CACHE_TTL_SECONDS) -> str:
+    if not session_id:
+        return ""
+    try:
+        cache_file = _cache_path_for_session(session_id)
+        if not cache_file.is_file():
+            return ""
+        import time
+        age = time.time() - cache_file.stat().st_mtime
+        if age > ttl:
+            return ""
+        return cache_file.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
+
+
+def _prune_stale_cache(cache_dir: Path = CACHE_DIR, ttl: int = 60) -> None:
+    try:
+        if not cache_dir.is_dir():
+            return
+        import time
+        now = time.time()
+        for f in cache_dir.glob("last-agent-prompt-*.txt"):
+            try:
+                if now - f.stat().st_mtime > ttl:
+                    f.unlink()
+            except OSError:
+                pass
+    except (OSError, ValueError):
+        pass
+
+
+def _extract_prompt(payload: dict) -> str:
+    """Best-effort extraction of the Agent prompt from a hook payload.
+
+    Order:
+      1. Cache file written by pre-agent-worktree-isolation-hook keyed by
+         session_id. TTL: 30s.
+      2. Legacy inlined tool_input.prompt / payload.prompt.
+      3. Transcript-scan fallback.
+    """
+    if not isinstance(payload, dict):
+        return ""
+
+    session_id = payload.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        cached = _read_prompt_cache(session_id)
+        if cached:
+            _prune_stale_cache()
+            return cached
+
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        p = tool_input.get("prompt")
+        if isinstance(p, str) and p:
+            return p
+    p = payload.get("prompt")
+    if isinstance(p, str) and p:
+        return p
+
+    transcript = payload.get("transcript_path")
+    if isinstance(transcript, str) and transcript:
+        try:
+            p = _scan_transcript_for_latest_agent_prompt(Path(transcript))
+            if p:
+                return p
+        except (OSError, ValueError):
+            pass
+    try:
+        return _scan_latest_project_transcript()
+    except (OSError, ValueError):
+        return ""
+
+
+def _scan_latest_project_transcript() -> str:
+    projects = Path(os.path.expanduser("~/.claude/projects"))
+    if not projects.is_dir():
+        return ""
+    latest: tuple[float, Path] | None = None
+    for jsonl in projects.rglob("*.jsonl"):
+        try:
+            mtime = jsonl.stat().st_mtime
+        except OSError:
+            continue
+        if latest is None or mtime > latest[0]:
+            latest = (mtime, jsonl)
+    if latest is None:
+        return ""
+    return _scan_transcript_for_latest_agent_prompt(latest[1])
+
+
+def _scan_transcript_for_latest_agent_prompt(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_use":
+                continue
+            name = block.get("name")
+            if name not in AGENT_TOOL_NAMES:
+                continue
+            inp = block.get("input")
+            if not isinstance(inp, dict):
+                continue
+            p = inp.get("prompt")
+            if isinstance(p, str) and p:
+                return p
+    return ""
+
+
+def _extract_worktree_path(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("worktree_path", "worktreePath", "path"):
+        val = payload.get(key)
+        if isinstance(val, str) and val:
+            return val
+    for nest_key in ("tool_input", "hookSpecificOutput", "hook_input"):
+        nest = payload.get(nest_key)
+        if isinstance(nest, dict):
+            for key in ("worktree_path", "worktreePath", "path"):
+                val = nest.get(key)
+                if isinstance(val, str) and val:
+                    return val
+    return ""
+
+
+def _detect_mode(payload: dict) -> str:
+    if isinstance(payload, dict):
+        ev = payload.get("hook_event_name") or payload.get("hookEventName")
+        if isinstance(ev, str):
+            ev_low = ev.strip().lower()
+            if "remove" in ev_low:
+                return "remove"
+            if "create" in ev_low:
+                return "create"
+    env_mode = os.environ.get("WORKTREE_HOOK_MODE", "").strip().lower()
+    if env_mode in ("create", "remove"):
+        return env_mode
+    if isinstance(payload, dict):
+        tn = payload.get("tool_name")
+        if isinstance(tn, str) and tn in AGENT_TOOL_NAMES:
+            return "create"
+    return "unknown"
+
+
+def handle_create(
+    payload: dict,
+    *,
+    runner=subprocess.run,
+    opted_in: list[tuple[str, re.Pattern[str], Path]] | None = None,
+) -> str:
+    """Decide + (maybe) allocate a worktree. Returns the stdout payload."""
+    if opted_in is None:
+        opted_in = _load_opted_in_repos()
+    prompt = _extract_prompt(payload)
+    match = _find_opted_in(prompt, opted_in)
+    if match is None:
+        _log({
+            "event": "create",
+            "decision": "passthrough",
+            "reason": "no opted-in repo in prompt",
+            "debug_prompt_len": len(prompt),
+        })
+        return ""
+
+    repo_key, upstream = match
+    if not upstream.exists():
+        _log({
+            "event": "create",
+            "decision": "passthrough",
+            "reason": f"upstream path does not exist: {upstream}",
+            "repo_key": repo_key,
+        })
+        return ""
+
+    base = Path(WORKTREE_BASE_TMPL.format(repo_key=repo_key))
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log({"event": "create", "decision": "passthrough", "reason": f"mkdir failed: {exc}"})
+        return ""
+
+    wt_id = uuid.uuid4().hex[:12]
+    wt_path = base / f"agent-{wt_id}"
+    branch = f"worktree-{wt_id}"
+
+    # Resolve base ref: prefer origin/main; fall back to main, then HEAD.
+    base_ref = "origin/main"
+    try:
+        probe = runner(
+            ["git", "-C", str(upstream), "rev-parse", "--verify", "--quiet", base_ref],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if probe.returncode != 0:
+            base_ref = "main"
+            probe = runner(
+                ["git", "-C", str(upstream), "rev-parse", "--verify", "--quiet", base_ref],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if probe.returncode != 0:
+                base_ref = "HEAD"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log({"event": "create", "decision": "passthrough", "reason": f"rev-parse failed: {exc}"})
+        return ""
+
+    cmd = [
+        "git", "-C", str(upstream), "worktree", "add",
+        "-b", branch, str(wt_path), base_ref,
+    ]
+    try:
+        proc = runner(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log({"event": "create", "decision": "passthrough", "reason": f"worktree add raised: {exc}"})
+        return ""
+
+    if proc.returncode != 0:
+        _log({
+            "event": "create",
+            "decision": "passthrough",
+            "reason": "git worktree add returned non-zero",
+            "repo_key": repo_key,
+            "stderr": (proc.stderr or "")[:500],
+            "stdout": (proc.stdout or "")[:500],
+        })
+        return ""
+
+    _log({
+        "event": "create",
+        "decision": "allocated",
+        "repo_key": repo_key,
+        "upstream": str(upstream),
+        "worktree_path": str(wt_path),
+        "branch": branch,
+        "base_ref": base_ref,
+    })
+    return str(wt_path)
+
+
+def handle_remove(
+    payload: dict,
+    *,
+    runner=subprocess.run,
+    opted_in: list[tuple[str, re.Pattern[str], Path]] | None = None,
+) -> None:
+    """Tear down a worktree we previously created. No stdout output expected."""
+    if opted_in is None:
+        opted_in = _load_opted_in_repos()
+    wt_path = _extract_worktree_path(payload)
+    match = _find_opted_in_by_path(wt_path, opted_in)
+    if match is None:
+        _log({"event": "remove", "decision": "ignored", "reason": "not our worktree", "path": wt_path})
+        return
+
+    repo_key, upstream = match
+    cmd = ["git", "-C", str(upstream), "worktree", "remove", "--force", wt_path]
+    try:
+        proc = runner(cmd, capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log({"event": "remove", "decision": "best-effort-failed", "reason": str(exc), "path": wt_path})
+        proc = None
+
+    try:
+        if os.path.isdir(wt_path):
+            shutil.rmtree(wt_path, ignore_errors=True)
+    except OSError:
+        pass
+
+    _log({
+        "event": "remove",
+        "decision": "cleaned" if proc and proc.returncode == 0 else "best-effort",
+        "repo_key": repo_key,
+        "path": wt_path,
+        "git_rc": (proc.returncode if proc else None),
+        "git_stderr": ((proc.stderr or "")[:500] if proc else None),
+    })
+
+
+def main() -> int:
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, ValueError):
+        _log({"event": "parse_error", "raw_preview": raw[:200]})
+        return 0
+
+    mode = _detect_mode(payload)
+    try:
+        if mode == "remove":
+            handle_remove(payload)
+            return 0
+        if mode == "create":
+            out = handle_create(payload)
+            if out:
+                sys.stdout.write(out + "\n")
+            return 0
+        _log({"event": "unknown_mode", "payload_keys": list(payload.keys()) if isinstance(payload, dict) else None})
+        return 0
+    except Exception as exc:  # noqa: BLE001 -- default-open
+        _log({"event": "uncaught", "error": str(exc), "mode": mode})
+        try:
+            sys.stderr.write(f"worktree-create-hook: uncaught error: {exc}\n")
+        except OSError:
+            pass
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Embedded test suite
+# ---------------------------------------------------------------------------
+
+# Canonical opted-in fixture for tests (independent of config files on disk).
+_TEST_CW_PATTERN = re.compile(
+    r"(?:"
+    r"~/repos/claude-watch\b"
+    r"|/home/[^/\s]+/repos/claude-watch\b"
+    r"|\brepos/claude-watch\b"
+    r"|\bhndrewaall/claude-watch\b"
+    r"|\bgithub\.com/hndrewaall/claude-watch\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _run_tests() -> int:  # noqa: C901
+    import tempfile
+
+    results: list[bool] = []
+
+    def _check(name: str, cond: bool, detail: str = "") -> None:
+        if cond:
+            print(f"  PASS  {name}")
+            results.append(True)
+        else:
+            print(f"  FAIL  {name}  {detail}")
+            results.append(False)
+
+    print("=== Unit tests ===")
+
+    fixture = [("claude-watch", _TEST_CW_PATTERN, Path("/nonexistent/cw"))]
+
+    m = _find_opted_in("Work in ~/repos/claude-watch and rebase.", fixture)
+    _check("1. _find_opted_in cw prompt matches", m is not None and m[0] == "claude-watch", f"m={m}")
+
+    m = _find_opted_in("Just look at ~/repos/media-tools, no cw.", fixture)
+    _check("2. _find_opted_in non-cw passthrough", m is None, f"m={m}")
+
+    m = _find_opted_in("Open PR github.com/hndrewaall/claude-watch/pulls/123", fixture)
+    _check("3. github.com URL matches", m is not None and m[0] == "claude-watch", f"m={m}")
+
+    p = _extract_prompt({"tool_name": "Agent", "tool_input": {"prompt": "hello"}})
+    _check("4. prompt extracted from tool_input", p == "hello", f"p={p!r}")
+
+    mode = _detect_mode({"hook_event_name": "WorktreeCreate"})
+    _check("5. detect_mode WorktreeCreate", mode == "create", f"mode={mode}")
+    mode = _detect_mode({"hook_event_name": "WorktreeRemove"})
+    _check("6. detect_mode WorktreeRemove", mode == "remove", f"mode={mode}")
+
+    wt = _extract_worktree_path({"worktree_path": "/tmp/cw-worktrees/agent-x"})
+    _check("7. extract worktree_path top-level", wt == "/tmp/cw-worktrees/agent-x", f"wt={wt}")
+    wt = _extract_worktree_path({"tool_input": {"worktreePath": "/tmp/cw-worktrees/agent-y"}})
+    _check("8. extract worktreePath nested", wt == "/tmp/cw-worktrees/agent-y", f"wt={wt}")
+
+    m = _find_opted_in_by_path("/tmp/claude-watch-worktrees/agent-deadbeef", fixture)
+    _check("9. find_by_path matches our cw base", m is not None and m[0] == "claude-watch", f"m={m}")
+
+    m = _find_opted_in_by_path("/home/u/repos/foo/bar", fixture)
+    _check("10. find_by_path rejects foreign", m is None, f"m={m}")
+
+    out = handle_create(
+        {"tool_name": "Agent", "tool_input": {"prompt": "Just media-tools."}},
+        opted_in=fixture,
+    )
+    _check("11. handle_create non-opted-in -> empty passthrough", out == "", f"out={out!r}")
+
+    print("=== Config-file loader tests ===")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        cfg = td / "repos.txt"
+        cfg.write_text(
+            "# comment\n"
+            "\n"
+            "claude-watch|\\bclaude-watch\\b|/home/u/repos/claude-watch\n"
+        )
+        loaded = _load_opted_in_repos([cfg])
+        _check("CFG1. one entry parsed", len(loaded) == 1 and loaded[0][0] == "claude-watch", f"loaded={loaded}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        cfg = td / "repos.txt"
+        cfg.write_text(
+            "no-upstream|\\bfoo\\b\n"  # only 2 fields -> skipped
+            "claude-watch|\\bcw\\b|/home/u/repos/claude-watch\n"
+            "bad|[unclosed-regex|/y\n"
+            "  | no-key | path\n"
+        )
+        loaded = _load_opted_in_repos([cfg])
+        _check(
+            "CFG2. malformed lines skipped, valid line kept",
+            len(loaded) == 1 and loaded[0][0] == "claude-watch",
+            f"loaded={loaded}",
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        loaded = _load_opted_in_repos([td / "doesnt-exist.txt"])
+        _check("CFG3. missing config file -> empty list", loaded == [], f"loaded={loaded}")
+
+    print("=== Integration tests (real git repo) ===")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_repo = Path(tmp) / "fake-cw"
+        tmp_repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_repo), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(tmp_repo), "config", "user.name", "test"],
+            check=True,
+        )
+        (tmp_repo / "README.md").write_text("hi\n")
+        subprocess.run(["git", "-C", str(tmp_repo), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_repo), "commit", "-q", "-m", "init"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(tmp_repo), "update-ref", "refs/remotes/origin/main", "main"],
+            check=True,
+        )
+
+        test_opted_in = [
+            ("claude-watch-test", re.compile(r"FAKE_CW_MARKER", re.IGNORECASE), tmp_repo)
+        ]
+
+        try:
+            out = handle_create(
+                {"tool_name": "Agent", "tool_input": {"prompt": "Reference: FAKE_CW_MARKER for this test."}},
+                opted_in=test_opted_in,
+            )
+            ok = bool(out) and Path(out).exists() and Path(out).is_dir()
+            _check("12. handle_create allocates a real worktree", ok, f"out={out!r}")
+
+            if ok:
+                lst = subprocess.run(
+                    ["git", "-C", str(tmp_repo), "worktree", "list", "--porcelain"],
+                    capture_output=True, text=True, check=False,
+                )
+                listed = out in lst.stdout
+                _check("13. git worktree list registers it", listed, f"stdout={lst.stdout!r}")
+            else:
+                _check("13. git worktree list registers it", False, "skipped")
+
+            if ok:
+                handle_remove(
+                    {"hook_event_name": "WorktreeRemove", "worktree_path": out},
+                    opted_in=test_opted_in,
+                )
+                still = Path(out).exists()
+                lst = subprocess.run(
+                    ["git", "-C", str(tmp_repo), "worktree", "list", "--porcelain"],
+                    capture_output=True, text=True, check=False,
+                )
+                listed = out in lst.stdout
+                _check("14. handle_remove drops the dir", not still, f"still_exists={still}")
+                _check("15. handle_remove drops from git worktree list", not listed, f"stdout={lst.stdout!r}")
+            else:
+                _check("14. handle_remove drops the dir", False, "skipped")
+                _check("15. handle_remove drops from git worktree list", False, "skipped")
+
+            try:
+                handle_remove(
+                    {"hook_event_name": "WorktreeRemove", "worktree_path": "/tmp/not-ours/foo"},
+                    opted_in=test_opted_in,
+                )
+                _check("16. handle_remove ignores foreign path", True)
+            except Exception as exc:  # noqa: BLE001
+                _check("16. handle_remove ignores foreign path", False, f"raised: {exc}")
+
+        finally:
+            try:
+                leftover = Path(WORKTREE_BASE_TMPL.format(repo_key="claude-watch-test"))
+                if leftover.exists():
+                    shutil.rmtree(leftover, ignore_errors=True)
+            except OSError:
+                pass
+
+    print("=== Subprocess smoke tests ===")
+    script = Path(__file__).resolve()
+
+    proc = subprocess.run(
+        [str(script)],
+        input=json.dumps({
+            "hook_event_name": "WorktreeCreate",
+            "tool_name": "Agent",
+            "tool_input": {"prompt": "Just media-tools work."},
+        }),
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    _check(
+        "17. subprocess non-cw create -> empty stdout passthrough",
+        proc.returncode == 0 and proc.stdout.strip() == "",
+        f"rc={proc.returncode} stdout={proc.stdout!r}",
+    )
+
+    proc = subprocess.run(
+        [str(script)],
+        input="not json {{{",
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    _check(
+        "18. subprocess malformed stdin -> default-open exit 0",
+        proc.returncode == 0 and proc.stdout.strip() == "",
+        f"rc={proc.returncode} stdout={proc.stdout!r}",
+    )
+
+    proc = subprocess.run(
+        [str(script)],
+        input=json.dumps({
+            "hook_event_name": "WorktreeRemove",
+            "worktree_path": "/tmp/some-random-dir/agent-x",
+        }),
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    _check(
+        "19. subprocess WorktreeRemove foreign -> exit 0 no stdout",
+        proc.returncode == 0 and proc.stdout.strip() == "",
+        f"rc={proc.returncode} stdout={proc.stdout!r}",
+    )
+
+    proc = subprocess.run(
+        [str(script)],
+        input="",
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    _check(
+        "20. subprocess empty stdin -> default-open",
+        proc.returncode == 0 and proc.stdout.strip() == "",
+        f"rc={proc.returncode} stdout={proc.stdout!r}",
+    )
+
+    total = len(results)
+    passed = sum(1 for r in results if r)
+    print()
+    print(f"RESULT: {passed}/{total} passed")
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        sys.exit(_run_tests())
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 -- last-ditch default-open
+        try:
+            sys.stderr.write(f"worktree-create-hook: unexpected error: {exc}\n")
+        except OSError:
+            pass
+        sys.exit(0)
