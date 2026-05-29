@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+r"""PreToolUse hook for the Agent tool -- enforce worktree isolation for opted-in repos.
+
+Parallel agents touching the same checkout can collide on sibling branches
+(e.g. one agent force-pushes another's branch during a rebase race because
+both share a single working tree). The architectural fix is
+``isolation: "worktree"`` on every Agent spawn that touches an opted-in
+shared repo. This hook enforces that, opt-in per repo (no blanket enforcement).
+
+Opt-in config
+-------------
+Opted-in repos are read from these config files (in order, all merged):
+
+    /etc/claude-code/worktree-isolation-repos.txt        (system-wide)
+    ~/.config/claude-watch/worktree-isolation-repos.txt  (user)
+
+Each non-blank, non-comment (``#``) line is a pipe-separated record:
+
+    repo_key|prompt_regex|upstream_path
+
+  - ``repo_key`` -- short label used in /tmp/<repo_key>-worktrees/ and audit log
+  - ``prompt_regex`` -- case-insensitive regex matched against the Agent prompt
+  - ``upstream_path`` -- absolute path to the working tree (the
+    ``git worktree add`` source). Read by worktree-create-hook; this hook
+    ignores it.
+
+If no config file is present (or contains zero parsed entries) the hook is a
+no-op and allows all Agent spawns. This makes the hook safe to install on
+hosts that don't have any shared-repo collision risk.
+
+Sample config (place at /etc/claude-code/worktree-isolation-repos.txt)::
+
+    # repo_key | prompt_regex | upstream_path
+    claude-watch|(?:~/repos/claude-watch\b|/home/[^/\s]+/repos/claude-watch\b|\brepos/claude-watch\b|\bhndrewaall/claude-watch\b|\bgithub\.com/hndrewaall/claude-watch\b)|/home/USER/repos/claude-watch
+
+Decision protocol (matches the other PreToolUse hooks in this directory):
+- Exit 0 with empty JSON ``{}`` -> allow silently.
+- Exit 0 with ``hookSpecificOutput.permissionDecision == "deny"`` + a banner
+  -> block the tool.
+- Default-OPEN on any internal error -- a hook bug must never blackhole the
+  Agent tool.
+
+Wiring (in ``~/.claude/settings.json``)::
+
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Agent",
+            "hooks": [
+              {
+                "type": "command",
+                "command": ".../pre-agent-worktree-isolation-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+Emergency bypass: set ``WORKTREE_ISOLATION_BYPASS=1`` in env. Bypass events
+are best-effort audit-logged to ``~/.config/claude/worktree-isolation-bypass.log``.
+
+Per-prompt opt-out marker
+-------------------------
+If the Agent prompt contains the literal string ``WORKTREE_ISOLATION_NOT_REQUIRED:``
+(uppercase, anywhere in the prompt), the regex match is skipped and the spawn
+is allowed without ``isolation: "worktree"``. This exists for meta /
+investigation prompts that mention an opted-in repo for diagnostic context but
+don't actually do work in that repo's worktree.
+
+The text following the colon (up to a newline or 200 chars) is treated as the
+human reason and audit-logged. Use a short one-line reason::
+
+    WORKTREE_ISOLATION_NOT_REQUIRED: meta investigation, no worktree work
+
+Marker bypass events are audit-logged to
+``~/.config/claude/worktree-isolation-bypass.log`` with ``mode:"marker"``.
+
+Prompt cache
+------------
+This hook ALSO writes the Agent prompt to a per-session cache file
+(``~/.cache/claude/last-agent-prompt-<session_id>.txt``, 0600) so the
+companion ``worktree-create-hook`` can read the prompt -- the harness does
+NOT inline the prompt in the ``WorktreeCreate`` payload, and PreToolUse on
+Agent fires BEFORE WorktreeCreate per the harness contract.
+
+Embedded tests: run ``pre-agent-worktree-isolation-hook --test``.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# Tool names we gate on. ``Agent`` is the modern name; ``Task`` is the legacy
+# alias -- keeping both matches the queue-gate hook for symmetry.
+AGENT_TOOL_NAMES = {"Agent", "Task"}
+
+# Config file locations -- system-wide first, then user. Both merged.
+CONFIG_FILES = [
+    Path("/etc/claude-code/worktree-isolation-repos.txt"),
+    Path(os.path.expanduser("~/.config/claude-watch/worktree-isolation-repos.txt")),
+]
+
+BYPASS_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+BYPASS_LOG_PATH = BYPASS_LOG_DIR / "worktree-isolation-bypass.log"
+
+# Prompt cache. Written here on every PreToolUse-on-Agent invocation; read by
+# the WorktreeCreate hook. Keyed by session_id so concurrent agents in
+# different sessions can't stomp each other. Files older than
+# ``CACHE_TTL_SECONDS`` are pruned on next access.
+CACHE_DIR = Path(os.path.expanduser("~/.cache/claude"))
+CACHE_TTL_SECONDS = 60
+
+# Per-prompt opt-out marker. The string is unique enough that it's unlikely to
+# appear in a normal prompt by accident; the trailing colon is part of the
+# marker so a bare mention does not trigger the bypass.
+MARKER = "WORKTREE_ISOLATION_NOT_REQUIRED:"
+MARKER_REASON_MAX = 200
+
+
+def _allow() -> dict:
+    """Empty dict -> no decision override -> tool proceeds."""
+    return {}
+
+
+def _deny(reason: str, banner: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": banner,
+    }
+
+
+def _banner(repo_key: str, specific_reason: str, opted_in_keys: list[str]) -> str:
+    return (
+        "!! BLOCKED: Agent spawn on opted-in shared repo without worktree isolation\n"
+        "!!\n"
+        f"!! Repo: {repo_key}\n"
+        "!!\n"
+        "!! Parallel agents on the same working tree can collide during rebase /\n"
+        "!! force-push. The architectural fix: every Agent spawn that touches an\n"
+        "!! opted-in repo MUST pass isolation=\"worktree\" so Claude Code allocates\n"
+        "!! a private git worktree for that agent.\n"
+        "!!\n"
+        "!! Fix: re-spawn the Agent tool call with isolation: \"worktree\"\n"
+        "!!\n"
+        f"!! What was wrong: {specific_reason}\n"
+        "!!\n"
+        f"!! Opted-in repos: {', '.join(opted_in_keys) or '(none)'}\n"
+        "!!\n"
+        "!! If the prompt only MENTIONS an opted-in repo for diagnostic context\n"
+        "!! and the agent will NOT touch its worktree, add this line to the\n"
+        "!! prompt to skip the regex match (audited):\n"
+        "!!\n"
+        "!!   WORKTREE_ISOLATION_NOT_REQUIRED: <one-line reason>\n"
+        "!!\n"
+        "!! Hook source: pre-agent-worktree-isolation-hook\n"
+        "!! Emergency bypass: set WORKTREE_ISOLATION_BYPASS=1 env var (audited)\n"
+        "!! Config: /etc/claude-code/worktree-isolation-repos.txt\n"
+        "!!         ~/.config/claude-watch/worktree-isolation-repos.txt"
+    )
+
+
+def _load_opted_in_repos(
+    config_files: list[Path] = CONFIG_FILES,
+) -> list[tuple[str, re.Pattern[str]]]:
+    """Read opted-in repos from the config files.
+
+    Each non-blank, non-``#`` line: ``repo_key|prompt_regex|upstream_path``.
+    The upstream_path is consumed by the worktree-create-hook companion and
+    is ignored here. Malformed lines are skipped (best-effort).
+
+    Returns a list of ``(repo_key, compiled_regex)`` pairs. Empty list if no
+    config files exist or all entries are malformed -- in that case the hook
+    is effectively a no-op.
+    """
+    out: list[tuple[str, re.Pattern[str]]] = []
+    for path in config_files:
+        try:
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|", 2)
+            if len(parts) < 2:
+                continue
+            repo_key = parts[0].strip()
+            regex_src = parts[1].strip()
+            if not repo_key or not regex_src:
+                continue
+            try:
+                pat = re.compile(regex_src, re.IGNORECASE)
+            except re.error:
+                continue
+            out.append((repo_key, pat))
+    return out
+
+
+def _log_bypass(
+    tool_name: str,
+    prompt_preview: str,
+    matched_repo: str,
+    mode: str = "env",
+    marker_reason: str | None = None,
+    session_id: str | None = None,
+    agent_name: str | None = None,
+) -> None:
+    """Audit log for bypass events. Best-effort; swallow errors."""
+    try:
+        BYPASS_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        record: dict = {
+            "ts": ts,
+            "mode": mode,
+            "tool_name": tool_name,
+            "matched_repo": matched_repo,
+            "prompt_preview": prompt_preview[:200],
+            "pid": os.getpid(),
+        }
+        if marker_reason is not None:
+            record["marker_reason"] = marker_reason
+        if session_id is not None:
+            record["session_id"] = session_id
+        if agent_name is not None:
+            record["agent_name"] = agent_name
+        with BYPASS_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+        try:
+            BYPASS_LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _extract_marker_reason(prompt: str) -> str | None:
+    if not prompt or MARKER not in prompt:
+        return None
+    idx = prompt.find(MARKER)
+    tail = prompt[idx + len(MARKER):]
+    nl = tail.find("\n")
+    reason = tail[:nl] if nl >= 0 else tail
+    return reason.strip()[:MARKER_REASON_MAX]
+
+
+def _find_opted_in_repo(
+    prompt: str, opted_in: list[tuple[str, re.Pattern[str]]]
+) -> str | None:
+    if not prompt:
+        return None
+    for repo_key, pattern in opted_in:
+        if pattern.search(prompt):
+            return repo_key
+    return None
+
+
+def _cache_path_for_session(session_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id) or "_"
+    safe = safe[:128]
+    return CACHE_DIR / f"last-agent-prompt-{safe}.txt"
+
+
+def _prune_stale_cache(cache_dir: Path = CACHE_DIR, ttl: int = CACHE_TTL_SECONDS) -> None:
+    try:
+        if not cache_dir.is_dir():
+            return
+        import time
+        now = time.time()
+        for f in cache_dir.glob("last-agent-prompt-*.txt"):
+            try:
+                if now - f.stat().st_mtime > ttl:
+                    f.unlink()
+            except OSError:
+                pass
+    except (OSError, ValueError):
+        pass
+
+
+def _write_prompt_cache(session_id: str | None, prompt: str) -> None:
+    """Atomically write the Agent prompt to the session cache file."""
+    if not session_id or not prompt:
+        return
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            CACHE_DIR.chmod(0o700)
+        except OSError:
+            pass
+        target = _cache_path_for_session(session_id)
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".last-agent-prompt-",
+            suffix=".tmp",
+            dir=str(CACHE_DIR),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(prompt)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, target)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return
+        _prune_stale_cache()
+    except (OSError, ValueError):
+        pass
+
+
+def _isolation_value(tool_input: dict) -> str:
+    for key in ("isolation", "isolation_mode", "isolationMode"):
+        val = tool_input.get(key)
+        if isinstance(val, str):
+            return val
+    return ""
+
+
+def _evaluate(
+    payload: dict,
+    opted_in: list[tuple[str, re.Pattern[str]]] | None = None,
+) -> dict:
+    """Pure function: payload dict -> decision dict. Used by tests."""
+    if opted_in is None:
+        opted_in = _load_opted_in_repos()
+
+    if not isinstance(payload, dict):
+        return _allow()
+
+    tool_name = payload.get("tool_name", "")
+    if tool_name not in AGENT_TOOL_NAMES:
+        return _allow()
+
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    prompt = tool_input.get("prompt", "")
+    if not isinstance(prompt, str):
+        prompt = ""
+
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str):
+        session_id = None
+    agent_name = tool_input.get("subagent_type") or tool_input.get("agent_name")
+    if not isinstance(agent_name, str):
+        agent_name = None
+
+    # Cache the prompt for the WorktreeCreate hook to read.
+    _write_prompt_cache(session_id, prompt)
+
+    # No opted-in repos configured -> no-op.
+    if not opted_in:
+        return _allow()
+
+    # Emergency bypass (env var).
+    if os.environ.get("WORKTREE_ISOLATION_BYPASS", "").strip() not in ("", "0"):
+        matched = _find_opted_in_repo(prompt, opted_in) or "(no-match)"
+        _log_bypass(
+            tool_name,
+            prompt,
+            matched,
+            mode="env",
+            session_id=session_id,
+            agent_name=agent_name,
+        )
+        return _allow()
+
+    # Per-prompt opt-out marker. Skips the regex match entirely. Audited.
+    marker_reason = _extract_marker_reason(prompt)
+    if marker_reason is not None:
+        matched = _find_opted_in_repo(prompt, opted_in) or "(no-match)"
+        _log_bypass(
+            tool_name,
+            prompt,
+            matched,
+            mode="marker",
+            marker_reason=marker_reason,
+            session_id=session_id,
+            agent_name=agent_name,
+        )
+        return _allow()
+
+    matched_repo = _find_opted_in_repo(prompt, opted_in)
+    if matched_repo is None:
+        return _allow()
+
+    isolation = _isolation_value(tool_input).strip().lower()
+    if isolation == "worktree":
+        return _allow()
+
+    if not isolation:
+        reason = (
+            f"prompt references opted-in repo {matched_repo!r} but "
+            "isolation field is missing"
+        )
+    else:
+        reason = (
+            f"prompt references opted-in repo {matched_repo!r} but "
+            f"isolation is {isolation!r}, expected 'worktree'"
+        )
+    return _deny(reason, _banner(matched_repo, reason, [k for k, _ in opted_in]))
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        # Malformed / empty stdin: default-open.
+        print(json.dumps(_allow()))
+        return 0
+
+    decision = _evaluate(payload)
+    print(json.dumps(decision))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Embedded test suite (run via ``--test``)
+# ---------------------------------------------------------------------------
+
+# A canonical opted-in fixture used in most tests. We pass this explicitly so
+# tests don't depend on whatever config files happen to be present on the
+# host where the test runs.
+_TEST_CW_PATTERN = re.compile(
+    r"(?:"
+    r"~/repos/claude-watch\b"
+    r"|/home/[^/\s]+/repos/claude-watch\b"
+    r"|\brepos/claude-watch\b"
+    r"|\bhndrewaall/claude-watch\b"
+    r"|\bgithub\.com/hndrewaall/claude-watch\b"
+    r")",
+    re.IGNORECASE,
+)
+_TEST_OPTED_IN: list[tuple[str, re.Pattern[str]]] = [("claude-watch", _TEST_CW_PATTERN)]
+
+
+def _run_tests() -> int:  # noqa: C901
+    results: list[bool] = []
+
+    def _check(name: str, cond: bool, detail: str = "") -> None:
+        if cond:
+            print(f"  PASS  {name}")
+            results.append(True)
+        else:
+            print(f"  FAIL  {name}  {detail}")
+            results.append(False)
+
+    def _is_deny(out: dict) -> bool:
+        hso = out.get("hookSpecificOutput") or {}
+        return hso.get("permissionDecision") == "deny"
+
+    def _is_allow(out: dict) -> bool:
+        return not _is_deny(out)
+
+    print("=== Core tests (with test opted-in fixture) ===")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": "Work in ~/repos/claude-watch on a feature branch.\n\nQueue item: q-xxxx",
+            "isolation": "worktree",
+        },
+    }, _TEST_OPTED_IN)
+    _check("1. cw + isolation=worktree allows", _is_allow(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "Work in ~/repos/claude-watch on a feature branch."},
+    }, _TEST_OPTED_IN)
+    _check("2. cw + no isolation denies", _is_deny(out), f"out={out}")
+    if _is_deny(out):
+        banner = out.get("systemMessage", "")
+        _check(
+            "2a. deny banner mentions claude-watch + worktree",
+            "claude-watch" in banner and "worktree" in banner.lower(),
+            f"banner={banner!r}",
+        )
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": "Edit ~/repos/claude-watch/Cargo.toml.",
+            "isolation": "none",
+        },
+    }, _TEST_OPTED_IN)
+    _check("3. cw + wrong isolation denies", _is_deny(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "Work in ~/repos/some-other-repo and bump a tag."},
+    }, _TEST_OPTED_IN)
+    _check("4. non-opted-in repo + no isolation allows", _is_allow(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "Investigate a general request and return findings."},
+    }, _TEST_OPTED_IN)
+    _check("5. no shared-repo ref allows", _is_allow(out), f"out={out}")
+
+    out = _evaluate({"tool_name": "Bash", "tool_input": {"command": "ls"}}, _TEST_OPTED_IN)
+    _check("6. non-Agent tool allows", _is_allow(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": "Reference: the PR for hndrewaall/claude-watch #229 was merged.",
+        },
+    }, _TEST_OPTED_IN)
+    _check("7. mention-in-comment denies (accepted FP)", _is_deny(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "Investigate cw queue behavior generally; no checkout work."},
+    }, _TEST_OPTED_IN)
+    _check("8. bare 'cw' alone allows (no path match)", _is_allow(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": "Work in ~/repos/claude-watch.",
+            "isolationMode": "worktree",
+        },
+    }, _TEST_OPTED_IN)
+    _check("9. isolationMode camelCase recognized", _is_allow(out), f"out={out}")
+
+    print("=== Auxiliary tests ===")
+    os.environ["WORKTREE_ISOLATION_BYPASS"] = "1"
+    try:
+        out = _evaluate({
+            "tool_name": "Agent",
+            "tool_input": {"prompt": "Work in ~/repos/claude-watch."},
+        }, _TEST_OPTED_IN)
+        _check("10. WORKTREE_ISOLATION_BYPASS=1 bypasses", _is_allow(out), f"out={out}")
+    finally:
+        del os.environ["WORKTREE_ISOLATION_BYPASS"]
+
+    out = _evaluate("not a dict", _TEST_OPTED_IN)  # type: ignore[arg-type]
+    _check("11. non-dict payload allows", _is_allow(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Task",
+        "tool_input": {"prompt": "Work in ~/repos/claude-watch."},
+    }, _TEST_OPTED_IN)
+    _check("12. Task (legacy) also gated", _is_deny(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "Open a PR at https://github.com/hndrewaall/claude-watch/pulls"},
+    }, _TEST_OPTED_IN)
+    _check("13. github.com/hndrewaall/claude-watch URL matches", _is_deny(out), f"out={out}")
+
+    # No opted-in -> hook is no-op even for what would otherwise be denied.
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "Work in ~/repos/claude-watch."},
+    }, [])
+    _check("14. empty opted-in list -> no-op allow", _is_allow(out), f"out={out}")
+
+    print("=== Per-prompt opt-out marker tests ===")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                "Investigate WorktreeCreate hook bug.\n"
+                "Context: cw is the only opted-in repo, see ~/repos/claude-watch/.\n"
+                "WORKTREE_ISOLATION_NOT_REQUIRED: meta investigation, no worktree work\n"
+            ),
+        },
+    }, _TEST_OPTED_IN)
+    _check("M1. marker + cw regex + no isolation allows", _is_allow(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                "Investigate a general bug.\n"
+                "WORKTREE_ISOLATION_NOT_REQUIRED: no shared-repo involvement\n"
+            ),
+        },
+    }, _TEST_OPTED_IN)
+    _check("M2. marker + no regex match allows", _is_allow(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "Work in ~/repos/claude-watch on a feature branch."},
+    }, _TEST_OPTED_IN)
+    _check("M3. no marker + cw regex + no isolation still denies", _is_deny(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                "Work in ~/repos/claude-watch.\n"
+                "worktree_isolation_not_required: lowercased\n"
+            ),
+        },
+    }, _TEST_OPTED_IN)
+    _check("M4. lowercased marker does NOT bypass", _is_deny(out), f"out={out}")
+
+    out = _evaluate({
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                "Work in ~/repos/claude-watch.\n"
+                "Mentions the WORKTREE_ISOLATION_NOT_REQUIRED marker but lacks colon.\n"
+            ),
+        },
+    }, _TEST_OPTED_IN)
+    _check("M5. marker without trailing colon does NOT bypass", _is_deny(out), f"out={out}")
+
+    _check(
+        "M6a. extract reason returns trimmed text up to newline",
+        _extract_marker_reason(
+            "blah\nWORKTREE_ISOLATION_NOT_REQUIRED:  diagnostic only  \nmore text"
+        ) == "diagnostic only",
+    )
+    _check(
+        "M6b. extract reason returns None when marker absent",
+        _extract_marker_reason("plain prompt with no marker") is None,
+    )
+    _check(
+        "M6c. extract reason returns empty string when marker has no tail",
+        _extract_marker_reason("WORKTREE_ISOLATION_NOT_REQUIRED:") == "",
+    )
+
+    print("=== Config-file loader tests ===")
+
+    import tempfile
+
+    # Empty config dir -> empty list.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        loaded = _load_opted_in_repos([td / "doesnt-exist.txt"])
+        _check("CFG1. missing config file -> empty list", loaded == [], f"loaded={loaded}")
+
+    # Simple valid config.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        cfg = td / "repos.txt"
+        cfg.write_text(
+            "# comment\n"
+            "\n"
+            "claude-watch|~/repos/claude-watch\\b|/home/u/repos/claude-watch\n"
+        )
+        loaded = _load_opted_in_repos([cfg])
+        _check("CFG2. one entry parsed", len(loaded) == 1 and loaded[0][0] == "claude-watch", f"loaded={loaded}")
+
+    # Malformed lines skipped.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        cfg = td / "repos.txt"
+        cfg.write_text(
+            "junk-line-no-pipe\n"
+            "  | no key | path\n"
+            "claude-watch|\\bclaude-watch\\b|/x\n"
+            "bad|[unclosed-regex|/y\n"
+        )
+        loaded = _load_opted_in_repos([cfg])
+        _check(
+            "CFG3. malformed lines skipped, valid line kept",
+            len(loaded) == 1 and loaded[0][0] == "claude-watch",
+            f"loaded={loaded}",
+        )
+
+    # Two config files merged.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        a = td / "a.txt"
+        a.write_text("repo-a|\\brepo-a\\b|/a\n")
+        b = td / "b.txt"
+        b.write_text("repo-b|\\brepo-b\\b|/b\n")
+        loaded = _load_opted_in_repos([a, b])
+        _check(
+            "CFG4. two config files merged in order",
+            [k for k, _ in loaded] == ["repo-a", "repo-b"],
+            f"loaded={loaded}",
+        )
+
+    print("=== Prompt cache tests ===")
+
+    import time
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        global CACHE_DIR
+        orig_cache_dir = CACHE_DIR
+        try:
+            CACHE_DIR = Path(tmpdir)
+            _evaluate({
+                "tool_name": "Agent",
+                "session_id": "cache-sess-1",
+                "tool_input": {
+                    "prompt": "hello world from prompt cache test",
+                    "isolation": "worktree",
+                },
+            }, _TEST_OPTED_IN)
+            cache_file = _cache_path_for_session("cache-sess-1")
+            _check("C1a. cache file written", cache_file.is_file(), f"path={cache_file}")
+            if cache_file.is_file():
+                content = cache_file.read_text(encoding="utf-8")
+                _check(
+                    "C1b. cache file contents match prompt",
+                    content == "hello world from prompt cache test",
+                )
+                mode = cache_file.stat().st_mode & 0o777
+                _check("C1c. cache file mode is 0600", mode == 0o600, f"mode={oct(mode)}")
+        finally:
+            CACHE_DIR = orig_cache_dir
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orig_cache_dir = CACHE_DIR
+        try:
+            CACHE_DIR = Path(tmpdir)
+            _evaluate({
+                "tool_name": "Agent",
+                "tool_input": {"prompt": "no session id here", "isolation": "worktree"},
+            }, _TEST_OPTED_IN)
+            cache_files = list(Path(tmpdir).glob("last-agent-prompt-*.txt"))
+            _check(
+                "C2. no session_id -> no cache file",
+                len(cache_files) == 0,
+                f"files={cache_files}",
+            )
+        finally:
+            CACHE_DIR = orig_cache_dir
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orig_cache_dir = CACHE_DIR
+        try:
+            CACHE_DIR = Path(tmpdir)
+            _evaluate({
+                "tool_name": "Agent",
+                "session_id": "weird/../id with spaces",
+                "tool_input": {"prompt": "weird-id test", "isolation": "worktree"},
+            }, _TEST_OPTED_IN)
+            files = list(Path(tmpdir).glob("last-agent-prompt-*.txt"))
+            _check(
+                "C3a. funky session_id still produces one cache file",
+                len(files) == 1,
+                f"files={files}",
+            )
+            if files:
+                _check(
+                    "C3b. cache filename sanitized (no traversal)",
+                    files[0].parent.resolve() == Path(tmpdir).resolve(),
+                )
+        finally:
+            CACHE_DIR = orig_cache_dir
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        td = Path(tmpdir)
+        stale = td / "last-agent-prompt-old.txt"
+        stale.write_text("old\n")
+        fresh = td / "last-agent-prompt-new.txt"
+        fresh.write_text("new\n")
+        old_ts = time.time() - 200
+        os.utime(stale, (old_ts, old_ts))
+        _prune_stale_cache(cache_dir=td, ttl=60)
+        _check("C4a. stale cache file pruned", not stale.exists())
+        _check("C4b. fresh cache file kept", fresh.exists())
+
+    # Subprocess smoke test.
+    import subprocess
+    script_path = Path(__file__).resolve()
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "no opted-in match -> always allow"},
+    }
+    proc = subprocess.run(
+        [str(script_path)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        out = {"__raw__": proc.stdout}
+    _check(
+        "SUB1. subprocess smoke: no match -> allow",
+        proc.returncode == 0 and _is_allow(out),
+        f"rc={proc.returncode} stdout={proc.stdout!r}",
+    )
+
+    proc = subprocess.run(
+        [str(script_path)],
+        input="not json {{{",
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        out = {"__raw__": proc.stdout}
+    _check(
+        "SUB2. subprocess smoke: malformed stdin defaults open",
+        proc.returncode == 0 and _is_allow(out),
+        f"rc={proc.returncode} stdout={proc.stdout!r}",
+    )
+
+    total = len(results)
+    passed = sum(1 for r in results if r)
+    print()
+    print(f"RESULT: {passed}/{total} passed")
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        sys.exit(_run_tests())
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001  -- last-ditch default-open
+        try:
+            sys.stderr.write(
+                f"pre-agent-worktree-isolation-hook: unexpected error: {exc}\n"
+            )
+        except OSError:
+            pass
+        print("{}")
+        sys.exit(0)

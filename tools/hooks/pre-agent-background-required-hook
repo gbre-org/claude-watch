@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""PreToolUse hook for the Agent tool -- require run_in_background: true.
+
+The Claude Code harness runs the ``Agent`` tool FOREGROUND (synchronous,
+blocking the whole main loop until the sub-agent finishes) unless the spawn
+explicitly passes ``run_in_background: true``. A foreground agent defeats the
+"main loop is a dispatcher, not a worker" model -- the loop can't service
+watchers, queue events, or anything else while it blocks. This hook makes
+background-spawning a hard invariant: any ``Agent`` call whose
+``tool_input.run_in_background`` is not ``true`` is DENIED with a banner
+telling the operator to re-spawn with ``run_in_background: true``.
+
+Decision protocol (matches the other PreToolUse hooks in this directory):
+- Exit 0 with empty JSON ``{}`` -> allow silently.
+- Exit 0 with ``hookSpecificOutput.permissionDecision == "deny"`` + a banner
+  -> block the tool.
+- Default-OPEN on any internal error -- a hook bug must never blackhole the
+  Agent tool.
+
+Wiring (in ``~/.claude/settings.json``)::
+
+    {"hooks": {"PreToolUse": [{"matcher": "Agent", "hooks": [
+        {"type": "command",
+         "command": ".../pre-agent-background-required-hook",
+         "timeout": 5}]}]}}
+
+Emergency bypass: set ``AGENT_FOREGROUND_OK=1`` in env (audited, best-effort).
+
+Per-prompt opt-out marker: if the Agent prompt contains the literal string
+``FOREGROUND_AGENT_OK:`` (uppercase, anywhere), the check is skipped and the
+foreground spawn is allowed. The trailing text (to newline / 200 chars) is the
+audited reason. Use only for a genuinely-must-block-the-loop case.
+
+Embedded tests: run ``pre-agent-background-required-hook --test``.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import sys
+from pathlib import Path
+
+AGENT_TOOL_NAMES = {"Agent", "Task"}
+
+BYPASS_ENV = "AGENT_FOREGROUND_OK"
+MARKER = "FOREGROUND_AGENT_OK:"
+MARKER_REASON_MAX = 200
+
+BYPASS_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+BYPASS_LOG_PATH = BYPASS_LOG_DIR / "agent-foreground-bypass.log"
+
+
+def _allow() -> dict:
+    return {}
+
+
+def _deny(reason: str, banner: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": banner,
+    }
+
+
+def _banner() -> str:
+    return (
+        "!! BLOCKED: Agent spawn without run_in_background: true\n"
+        "!!\n"
+        "!! The Agent tool runs FOREGROUND by default -- it blocks the entire\n"
+        "!! main loop until the sub-agent finishes. The main loop is a\n"
+        "!! dispatcher, not a worker: it must stay free to service watchers,\n"
+        "!! queue events, and context-warnings while agents run.\n"
+        "!!\n"
+        "!! Fix: re-spawn the Agent tool call with\n"
+        "!!     run_in_background: true\n"
+        "!! You'll be notified when the agent completes.\n"
+        "!!\n"
+        "!! Genuinely need a blocking foreground agent? Add this line to the\n"
+        "!! prompt (audited):\n"
+        "!!     FOREGROUND_AGENT_OK: <one-line reason>\n"
+        "!! or set AGENT_FOREGROUND_OK=1 in env (audited).\n"
+        "!!\n"
+        "!! Hook source: pre-agent-background-required-hook"
+    )
+
+
+def _truthy_background(val) -> bool:
+    """True only for an explicit affirmative run_in_background value.
+
+    The harness passes a real bool when the param is set; be lenient about
+    string-encoded truthy values too, but treat absent / false / empty as
+    foreground.
+    """
+    if val is True:
+        return True
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes")
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return val != 0
+    return False
+
+
+def _extract_marker_reason(prompt: str):
+    if not prompt or MARKER not in prompt:
+        return None
+    tail = prompt[prompt.find(MARKER) + len(MARKER):]
+    nl = tail.find("\n")
+    reason = tail if nl < 0 else tail[:nl]
+    return reason.strip()[:MARKER_REASON_MAX]
+
+
+def _log_bypass(mode: str, reason: str, prompt_preview: str, session_id=None) -> None:
+    try:
+        BYPASS_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "mode": mode,
+            "reason": reason,
+            "prompt_preview": (prompt_preview or "")[:200],
+            "session_id": session_id,
+            "pid": os.getpid(),
+        }
+        with BYPASS_LOG_PATH.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        try:
+            BYPASS_LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except Exception:
+        pass
+
+
+def _evaluate(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return _allow()
+
+    if payload.get("tool_name", "") not in AGENT_TOOL_NAMES:
+        return _allow()
+
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    prompt = tool_input.get("prompt", "")
+    if not isinstance(prompt, str):
+        prompt = ""
+    session_id = payload.get("session_id")
+
+    # Already background -> allow.
+    if _truthy_background(tool_input.get("run_in_background")):
+        return _allow()
+
+    # Env bypass (audited).
+    if os.environ.get(BYPASS_ENV) == "1":
+        _log_bypass("env", os.environ.get(BYPASS_ENV, ""), prompt, session_id)
+        return _allow()
+
+    # Per-prompt marker bypass (audited).
+    marker_reason = _extract_marker_reason(prompt)
+    if marker_reason is not None:
+        _log_bypass("marker", marker_reason, prompt, session_id)
+        return _allow()
+
+    return _deny(
+        "Agent spawned foreground (run_in_background not true) -- blocks the main loop.",
+        _banner(),
+    )
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        # Default-OPEN: a parse failure must not blackhole the Agent tool.
+        print(json.dumps(_allow()))
+        return 0
+    try:
+        decision = _evaluate(payload)
+    except Exception:
+        decision = _allow()
+    print(json.dumps(decision))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Embedded tests: pre-agent-background-required-hook --test
+# --------------------------------------------------------------------------
+def _run_tests() -> int:
+    fails = 0
+
+    def check(name, cond):
+        nonlocal fails
+        if not cond:
+            fails += 1
+            print(f"FAIL: {name}")
+        else:
+            print(f"ok: {name}")
+
+    def is_deny(d):
+        return d.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+
+    check("non-agent allowed", _evaluate({"tool_name": "Bash", "tool_input": {}}) == {})
+    check("agent fg denied", is_deny(_evaluate(
+        {"tool_name": "Agent", "tool_input": {"prompt": "do x", "subagent_type": "general-purpose"}})))
+    check("agent rib=false denied", is_deny(_evaluate(
+        {"tool_name": "Agent", "tool_input": {"run_in_background": False}})))
+    check("agent rib=true allowed", _evaluate(
+        {"tool_name": "Agent", "tool_input": {"run_in_background": True}}) == {})
+    check("agent rib='true' allowed", _evaluate(
+        {"tool_name": "Agent", "tool_input": {"run_in_background": "true"}}) == {})
+    check("task fg denied", is_deny(_evaluate(
+        {"tool_name": "Task", "tool_input": {}})))
+    check("marker bypass allowed", _evaluate(
+        {"tool_name": "Agent", "tool_input": {"prompt": "FOREGROUND_AGENT_OK: ci-wait shim"}}) == {})
+    os.environ[BYPASS_ENV] = "1"
+    try:
+        check("env bypass allowed", _evaluate(
+            {"tool_name": "Agent", "tool_input": {"prompt": "x"}}) == {})
+    finally:
+        del os.environ[BYPASS_ENV]
+    check("malformed allowed", _evaluate("not a dict") == {})
+
+    print(f"\n{'PASS' if fails == 0 else 'FAIL'}: {fails} failure(s)")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        sys.exit(_run_tests())
+    sys.exit(main())
