@@ -1271,29 +1271,11 @@ def _claude_event_notify(tag, message, data, priority="low", silent=False):
         * ``silent=True`` (from ``--silent`` on the CLI) skips the call.
         * ``CLAUDE_EVENT_SESSION_TASK=0`` env var skips all emits
           (useful for batch scripts / test harnesses).
-        * ``SESSION_TASK_SUPPRESS_SELF_EVENTS=1`` env var skips
-          self-initiated transitions (``queue-running``, ``queue-done``)
-          while preserving unexpected ones (``queue-abandoned``,
-          ``queue-stale-ready``, ``force-start``, etc.). Intended for the
-          in-session main loop which already knows about transitions it
-          triggered via ``register`` / ``done``.
         * ``claude-event`` not on PATH -> silent no-op (not an error).
     """
     if silent:
         return None
     if os.environ.get("CLAUDE_EVENT_SESSION_TASK") == "0":
-        return None
-    # Suppress self-initiated transitions when the calling session sets the
-    # env var. The session itself just called `register` or `done` — it
-    # already knows. External callers (cron, other sessions) don't set this
-    # var and still get full events. Only queue-running and queue-done are
-    # suppressed; unexpected transitions (abandoned, stale-ready, force-start,
-    # wedged, blocked, etc.) always emit.
-    _SELF_SUPPRESSIBLE_TAGS = ("queue-running", "queue-done")
-    if (
-        os.environ.get("SESSION_TASK_SUPPRESS_SELF_EVENTS") == "1"
-        and tag in _SELF_SUPPRESSIBLE_TAGS
-    ):
         return None
     emitter = shutil.which("claude-event")
     if not emitter:
@@ -2681,8 +2663,9 @@ def cmd_queue_add(args):
     # "Remove queue added event, too noisy"). queue add is task creation,
     # not a state transition. The main loop already holds the return value
     # from queue add — surfacing it again as an event was double-handling.
-    # State-transition emits (queue-running, queue-done, queue-abandoned)
-    # remain in their respective code paths.
+    # State-transition emits (queue-done, queue-abandoned) remain in their
+    # respective code paths. queue-running removed from register (noise —
+    # the caller just triggered it); force-start still emits queue-running.
 
 
 def _print_add_conflict_banner(new_id, new_scope, running_conflicts):
@@ -4019,22 +4002,6 @@ def cmd_queue_register(args):
             f"| priority: {registered.get('priority', 5)}"
         ),
         priority="normal",
-        silent=getattr(args, "silent", False),
-    )
-
-    # Claude-event lifecycle emit: queue-running. Informational — lets the
-    # main loop see transitions without having to poll queue.json.
-    _claude_event_notify(
-        tag="queue-running",
-        message=f"queue running: {registered['id']} ({_item_summary(registered)})",
-        data={
-            "queue_id": registered["id"],
-            "group_id": registered.get("group_id"),
-            "scope": registered.get("scope", []),
-            "summary": _item_summary(registered),
-            "created_by": registered.get("created_by", ""),
-        },
-        priority="low",
         silent=getattr(args, "silent", False),
     )
 

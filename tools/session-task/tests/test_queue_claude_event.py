@@ -6,7 +6,8 @@ was intentionally dropped 2026-04-27 -- ``queue add`` is task creation,
 not a state transition, and the main loop already holds the return
 value, so the event was double-handling and noisy):
 
-  * `queue register <id>` emits a ``queue-running`` claude-event.
+  * `queue register <id>` does NOT emit a claude-event (noise -- the
+    caller just triggered it; removed 2026-05-29).
   * `queue done <id>` emits a ``queue-done`` claude-event with an
     ``elapsed_sec`` data field populated from ``started_at``.
   * `queue abandon <id> [--reason R]` emits a ``queue-abandoned``
@@ -205,11 +206,18 @@ def test_add_does_not_emit_claude_event():
 
 
 # ---------------------------------------------------------------------------
-# 2. queue register emits queue-running
+# 2. queue register does NOT emit queue-running (removed 2026-05-29)
 # ---------------------------------------------------------------------------
 
 
-def test_register_emits_queue_running_event():
+def test_register_does_not_emit_queue_running_event():
+    """``queue register`` no longer emits a claude-event.
+
+    The ``queue-running`` emit from register was noise -- the caller
+    (main loop) just triggered the transition and already knows.
+    Removed 2026-05-29. force-start still emits queue-running via its
+    own code path.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         bin_dir = Path(tmp) / "bin"
         ev_log = Path(tmp) / "claude-event.log"
@@ -220,22 +228,14 @@ def test_register_emits_queue_running_event():
         r1 = _add(env, "reg-test", ["repo:ce-reg"], "--summary",
                   "reg test summary")
         d1 = json.loads(r1.stdout)
-        # queue add no longer emits an event (queue-added removed
-        # 2026-04-27). The shim log should still be empty here.
         assert _read_shim_log(ev_log) == []
 
         _run(env, "queue", "register", d1["id"], "--json", check=True)
 
         calls = _read_shim_log(ev_log)
-        # one total: register
-        assert len(calls) == 1, calls
-        parsed = _parse_claude_event_argv(calls[0])
-        assert parsed["source"] == "queue"
-        assert parsed["tag"] == "queue-running"
-        assert parsed["priority"] == "low"
-        assert d1["id"] in parsed["message"]
-        assert parsed["data"]["queue_id"] == d1["id"]
-        assert parsed["data"]["group_id"] == d1["group_id"]
+        assert calls == [], (
+            f"queue register should NOT emit a claude-event; got {calls}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -258,9 +258,9 @@ def test_done_emits_queue_done_event_with_elapsed_sec():
         _run(env, "queue", "done", d1["id"], check=True)
 
         calls = _read_shim_log(ev_log)
-        # register + done (queue add does not emit since 2026-04-27)
-        assert len(calls) == 2, calls
-        parsed = _parse_claude_event_argv(calls[1])
+        # done only (register no longer emits since 2026-05-29)
+        assert len(calls) == 1, calls
+        parsed = _parse_claude_event_argv(calls[0])
         assert parsed["source"] == "queue"
         assert parsed["tag"] == "queue-done"
         assert parsed["data"]["queue_id"] == d1["id"]
@@ -290,9 +290,9 @@ def test_abandon_emits_queue_abandoned_event():
              "agent crashed in testing", check=True)
 
         calls = _read_shim_log(ev_log)
-        # register + abandon (queue add does not emit since 2026-04-27)
-        assert len(calls) == 2, calls
-        parsed = _parse_claude_event_argv(calls[1])
+        # abandon only (register no longer emits since 2026-05-29)
+        assert len(calls) == 1, calls
+        parsed = _parse_claude_event_argv(calls[0])
         assert parsed["source"] == "queue"
         assert parsed["tag"] == "queue-abandoned"
         assert parsed["data"]["queue_id"] == d1["id"]
@@ -329,11 +329,11 @@ def test_failing_claude_event_does_not_block_queue_op():
         assert rd.returncode == 0, rd.stderr
 
         # The shim still recorded every invocation despite exit 17.
-        # queue add does not emit a claude-event since 2026-04-27, so
-        # only register + done land in the shim log.
+        # Only done lands in the shim log (register no longer emits
+        # since 2026-05-29, queue add since 2026-04-27).
         calls = _read_shim_log(ev_log)
         tags = [_parse_claude_event_argv(c)["tag"] for c in calls]
-        assert tags == ["queue-running", "queue-done"], tags
+        assert tags == ["queue-done"], tags
 
 
 # ---------------------------------------------------------------------------
@@ -422,13 +422,13 @@ def test_abandon_is_idempotent_on_already_abandoned():
             "abandon_reason must NOT be overwritten by repeat abandon"
         )
 
-        # claude-event log: register + first abandon only. The repeat
-        # abandon must not emit a duplicate `queue-abandoned`.
+        # claude-event log: first abandon only. The repeat abandon must
+        # not emit a duplicate `queue-abandoned`. Register no longer emits.
         calls = _read_shim_log(ev_log)
         tags = [
             _parse_claude_event_argv(c).get("tag") for c in calls
         ]
-        assert tags == ["queue-running", "queue-abandoned"], (
+        assert tags == ["queue-abandoned"], (
             f"expected exactly one queue-abandoned emit, got tags={tags}"
         )
 
@@ -469,7 +469,7 @@ def test_abandon_is_idempotent_after_done():
         tags = [
             _parse_claude_event_argv(c).get("tag") for c in calls
         ]
-        assert tags == ["queue-running", "queue-done"], (
+        assert tags == ["queue-done"], (
             f"abandon-on-done should not emit; tags={tags}"
         )
 
@@ -482,7 +482,7 @@ def test_abandon_is_idempotent_after_done():
 def _all_tests():
     return [
         test_add_does_not_emit_claude_event,
-        test_register_emits_queue_running_event,
+        test_register_does_not_emit_queue_running_event,
         test_done_emits_queue_done_event_with_elapsed_sec,
         test_abandon_emits_queue_abandoned_event,
         test_failing_claude_event_does_not_block_queue_op,
