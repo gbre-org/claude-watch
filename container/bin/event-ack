@@ -411,6 +411,12 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+_SUBCOMMANDS = frozenset({
+    "ack", "add", "ingest", "list", "clear",
+    "drain-ambient", "reset-counter", "bump-counter",
+})
+
+
 def _legacy_dispatch(args: list[str]) -> int | None:
     """v1 compatibility: ``event-ack --add KEY`` / ``--list`` /
     ``--clear`` / ``<key> --action ...`` still work. Returns the
@@ -418,6 +424,10 @@ def _legacy_dispatch(args: list[str]) -> int | None:
     if not args:
         return None
     first = args[0]
+    # If the first positional matches a real subcommand name, bail out
+    # and let the argparse dispatcher handle it properly.
+    if first in _SUBCOMMANDS:
+        return None
     if first == "--add":
         if len(args) < 2:
             print("error: --add requires a key", file=sys.stderr)
@@ -692,12 +702,30 @@ def _self_test() -> int:
         if final != 40:
             fail(f"concurrent bump: expected 40, got {final}")
 
+        # 17. Legacy dispatch does NOT intercept subcommand names.
+        #     "event-ack ack <key> --action <text>" must return None from
+        #     _legacy_dispatch so argparse handles it.
+        add_pending(sd, "sub-test-key")
+        legacy_result = _legacy_dispatch(
+            ["ack", "sub-test-key", "--action", "via argparse"])
+        if legacy_result is not None:
+            fail(f"_legacy_dispatch intercepted 'ack' subcommand: "
+                 f"returned {legacy_result}")
+        # Verify argparse path works (via main()).
+        rc = main(["--state-dir", str(sd), "ack", "sub-test-key",
+                   "--action", "via argparse"])
+        if rc != 0:
+            fail(f"argparse ack returned rc={rc}")
+        snap = list_state(sd)
+        if any(e["key"] == "sub-test-key" for e in snap["pending"]):
+            fail(f"sub-test-key still pending after argparse ack: {snap}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("OK: 16 cases pass.")
+    print("OK: 17 cases pass.")
     return 0
 
 
