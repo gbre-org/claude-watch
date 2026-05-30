@@ -369,6 +369,17 @@ if [ -n "${CLAUDE_EVENT_QUEUE:-}" ]; then
     && sudo -n chmod 0644 /etc/cron.d/00-env 2>/dev/null || true
 fi
 
+# Copy bind-mounted private cron entries to a root-owned location.
+# /etc/cron.d/private/ is bind-mounted from the host with uid 1000 ownership,
+# but cron requires root:root 0644. We copy (not symlink) so ownership is correct.
+if [ -d /etc/cron.d/private ] && ls /etc/cron.d/private/* >/dev/null 2>&1; then
+    for f in /etc/cron.d/private/*; do
+        dest="/etc/cron.d/private-$(basename "$f")"
+        sudo -n tee "$dest" < "$f" > /dev/null 2>&1
+        sudo -n chmod 0644 "$dest" 2>/dev/null
+    done
+fi
+
 # CLAUDE_CMD-block contract for new appenders: keep every conditional
 # `if [...]; then ... fi` immediately back-to-back (no comments between
 # blocks; blank lines also break the consecutive-if regex used by

@@ -116,11 +116,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # every spawn site for re-entrancy as the wrong uid. The narrow
 # sudo-for-cron carve-out is the minimum-change shape that lets
 # cron start without disturbing any existing uid-1000 invariant.
-RUN printf '%s\n%s\n%s\n%s\n' \
+RUN printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/sbin/cron' \
         'hndrewaall ALL=(root) NOPASSWD: /bin/kill' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/bin/tee /etc/cron.d/00-env' \
         'hndrewaall ALL=(root) NOPASSWD: /bin/chmod 0644 /etc/cron.d/00-env' \
+        'hndrewaall ALL=(root) NOPASSWD: /usr/bin/tee /etc/cron.d/private-*' \
+        'hndrewaall ALL=(root) NOPASSWD: /bin/chmod 0644 /etc/cron.d/private-*' \
         > /etc/sudoers.d/hndrewaall-cron \
     && chmod 0440 /etc/sudoers.d/hndrewaall-cron
 
