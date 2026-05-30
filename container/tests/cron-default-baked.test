@@ -159,9 +159,9 @@ if CRON_DEFAULT.is_file():
     )
     if watcher_health_line is not None:
         expect(
-            watcher_health_line.startswith("*/2 * * * *"),
-            f"watcher health check entry must run every 2 minutes "
-            f"(`*/2 * * * *`); got {watcher_health_line!r}",
+            watcher_health_line.startswith("* * * * *"),
+            f"watcher health check entry must run every minute "
+            f"(`* * * * *`); got {watcher_health_line!r}",
         )
         expect(
             "hndrewaall" in watcher_health_line,
