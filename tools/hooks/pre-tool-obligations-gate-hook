@@ -68,6 +68,31 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Shell-structure parser (dependency-free) used to make the hardcoded
+# watcher-ctl-bare gate AST-aware: a `watcher-ctl run` mention inside a
+# quoted argument / heredoc body must NOT trip the gate, while a real
+# compound/background `watcher-ctl run` invocation still must. Imported
+# best-effort from the sibling obligations/ dir (installed layout) or the
+# in-repo tree (uninstalled). On any import failure we fall back to the
+# previous regex-only behavior (fail-closed).
+_shell_ast = None
+try:
+    _here = Path(__file__).resolve().parent
+    # Candidate dirs that may hold shell_ast.py:
+    #   - sibling tools/obligations/ (uninstalled in-repo layout, and the
+    #     host `make install` symlink layout which resolves back to it)
+    #   - the hook's own directory (the baked-container layout, where
+    #     obligations + the hooks + shell_ast.py all live flat in
+    #     /usr/local/bin/)
+    for _cand in (_here.parent / "obligations", _here):
+        _cand = _cand.resolve()
+        if (_cand / "shell_ast.py").exists():
+            sys.path.insert(0, str(_cand))
+            break
+    import shell_ast as _shell_ast  # type: ignore  # noqa: E402
+except Exception:  # noqa: BLE001 -- any failure => regex fallback
+    _shell_ast = None
+
 ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 ERR_LOG_PATH = ERR_LOG_DIR / "obligations-hook-errors.log"
 BYPASS_LOG_PATH = ERR_LOG_DIR / "obligations-bypass.log"
@@ -185,6 +210,13 @@ def _build_bypass_missing_reason_banner() -> str:
 # We deliberately implement this in the hook script itself (NOT as a stored
 # obligation row) because it's an architectural axiom that must be enforced
 # regardless of obligation-state corruption.
+#
+# Matching is AST-aware (see `_watcher_ctl_violation`): the gate fires only
+# when `watcher-ctl run` is an ACTUAL command head with a real top-level
+# compound/background/pipe operator -- NOT when that text merely appears
+# inside a quoted argument or heredoc body (e.g. a Signal DM body or a
+# `session-task queue add` description that *describes* the forbidden form).
+# Parse failure fails closed to the legacy regex check below.
 # ---------------------------------------------------------------------------
 
 # Allowed forms:
@@ -207,15 +239,13 @@ _WATCHER_BARE_RE = re.compile(
 _WATCHER_PRESENT_RE = re.compile(r"\bwatcher-ctl\s+run\b")
 
 
-def _watcher_ctl_violation(cmd: str) -> str | None:
-    """If `cmd` violates the bare-watcher-ctl-run rule, return a deny reason.
+def _watcher_ctl_violation_stringmatch(cmd: str) -> str | None:
+    """Legacy regex-only violation check (the fail-closed fallback).
 
     Returns None when the command does not invoke `watcher-ctl run` at all,
     OR when it invokes it in the bare allowed form. Returns a short
     human-readable reason string when the command is a violation.
     """
-    if not isinstance(cmd, str) or not cmd:
-        return None
     if not _WATCHER_PRESENT_RE.search(cmd):
         return None
     # `watcher-ctl run` is present. Now check whether the WHOLE command is
@@ -232,6 +262,74 @@ def _watcher_ctl_violation(cmd: str) -> str | None:
     elif ";" in cmd:
         op = "command separator `;`"
     elif "|" in cmd:
+        op = "pipe `|`"
+    elif "$(" in cmd or "`" in cmd:
+        op = "subshell (`$(...)` or backticks)"
+    else:
+        op = "non-bare invocation"
+    return op
+
+
+def _watcher_ctl_violation(cmd: str) -> str | None:
+    """If `cmd` violates the bare-watcher-ctl-run rule, return a deny reason.
+
+    AST-aware: the gate fires only when `watcher-ctl run` is an ACTUAL
+    command head (not text inside a quoted argument or heredoc body) AND
+    the command carries a real top-level compound/background/pipe operator
+    (or a subshell construct in the name token). A `watcher-ctl run ...`
+    string that merely appears inside a quoted argument -- e.g. a Signal DM
+    body or a `session-task queue add` description that *describes* the
+    forbidden form -- no longer false-positive-denies.
+
+    On parse failure, or if the structural helper is unavailable, we FAIL
+    CLOSED to the legacy regex check (`_watcher_ctl_violation_stringmatch`)
+    so a real violation hidden behind a malformed construct still trips.
+
+    Returns None when there is no violation; a short human-readable reason
+    string otherwise.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return None
+
+    if _shell_ast is None:
+        return _watcher_ctl_violation_stringmatch(cmd)
+
+    try:
+        parsed = _shell_ast.parse(cmd)
+    except _shell_ast.ShellParseError:
+        # Unparseable -> fail closed to the regex check, but only flag a
+        # violation if the legacy check ALSO sees `watcher-ctl run` present.
+        return _watcher_ctl_violation_stringmatch(cmd)
+    except Exception:  # noqa: BLE001 -- helper bug => fail closed
+        return _watcher_ctl_violation_stringmatch(cmd)
+
+    # Is `watcher-ctl run` an actual command head of any top-level segment?
+    runs_watcher = any(
+        _shell_ast._head_matches(seg, "watcher-ctl run")
+        for seg in parsed.segments
+    )
+    if not runs_watcher:
+        # `watcher-ctl run` is not actually invoked. If the raw text mentions
+        # it only inside quoted/heredoc data, that's a legitimate non-match.
+        return None
+
+    # `watcher-ctl run` IS invoked. The only allowed shape is a single bare
+    # command (no top-level operator) whose name token is a safe identifier
+    # (no subshell / metacharacters). Reuse the strict bare-form regex for
+    # the name-token safety check; use the AST for the operator check.
+    if not parsed.has_top_level_operator() and _WATCHER_BARE_RE.match(cmd):
+        return None
+
+    # It's a violation. Pinpoint the operator for a useful message, reading
+    # the actual top-level operators from the parse (not a substring scan).
+    ops = {seg.op_after for seg in parsed.segments if seg.op_after}
+    if "&" in ops:
+        op = "trailing `&` (shell background)"
+    elif "&&" in ops or "||" in ops:
+        op = "compound (`&&` / `||`)"
+    elif ";" in ops:
+        op = "command separator `;` / subshell"
+    elif "|" in ops:
         op = "pipe `|`"
     elif "$(" in cmd or "`" in cmd:
         op = "subshell (`$(...)` or backticks)"

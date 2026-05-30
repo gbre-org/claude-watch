@@ -88,7 +88,13 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         satisfied when session-task queue item id has the given status
   - no_pipe_pattern: {regex}
         BAN-style predicate: for Bash commands, satisfied when regex does
-        NOT match the command string. (Always satisfied for non-Bash tools.)
+        NOT match the command. Matching is AST-aware -- the regex is
+        applied to a structure-only rendering (quoted-string and heredoc
+        bodies flattened, real top-level pipes/operators preserved), so a
+        forbidden pipe pattern that only appears inside a string argument
+        or heredoc body does not false-positive-deny. Parse failure falls
+        back (fail-closed) to matching the raw command string. (Always
+        satisfied for non-Bash tools.)
   - marker_file_present: {path, negate?}
         alias of file_exists for "you owe X" trackers
   - process_alive: {pid_file}
@@ -344,6 +350,18 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Shell-structure parser (dependency-free, stdlib-only) used to make the
+# no_pipe_pattern predicate AST-aware: it matches the regex against a
+# structure-only rendering of the command (quoted/heredoc data flattened),
+# so a forbidden pipe pattern that merely appears inside a string argument
+# no longer false-positive-denies. Imported best-effort: if the module is
+# missing for any reason, the predicate falls back to raw string-match.
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import shell_ast as _shell_ast  # noqa: E402
+except Exception:  # noqa: BLE001 -- any import failure => fall back to regex
+    _shell_ast = None
 
 OBLIGATIONS_FILE = Path.home() / ".config" / "claude" / "obligations.json"
 
@@ -1385,9 +1403,35 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
             patt = re.compile(regex)
         except re.error as e:
             return (True, f"invalid regex (default-open): {e}")
+        # AST-aware matching: apply the regex against a STRUCTURE-ONLY
+        # rendering of the command (quoted-string and heredoc-body contents
+        # flattened, but REAL top-level pipes / operators preserved). This
+        # means a forbidden pipe pattern that merely appears inside a string
+        # argument or heredoc body no longer false-positive-denies, while a
+        # real top-level pipe still trips the gate. On parse failure we FAIL
+        # CLOSED back to matching the raw string (better a false-positive
+        # deny on an unparseable command than a missed real violation).
+        structural = None
+        if _shell_ast is not None:
+            try:
+                structural = _shell_ast.structure_string(cmd)
+            except _shell_ast.ShellParseError:
+                structural = None  # fall back to raw string-match below
+            except Exception:  # noqa: BLE001 -- never let a helper bug gate
+                structural = None
+        if structural is not None:
+            if patt.search(structural):
+                return (False,
+                        f"command matches forbidden pattern /{regex}/ "
+                        "(structural match)")
+            return (True,
+                    f"command does not match /{regex}/ (structural match)")
+        # Fallback: raw string-match (parse failed or helper unavailable).
         if patt.search(cmd):
-            return (False, f"command matches forbidden pattern /{regex}/")
-        return (True, f"command does not match /{regex}/")
+            return (False,
+                    f"command matches forbidden pattern /{regex}/ "
+                    "(raw string fallback)")
+        return (True, f"command does not match /{regex}/ (raw string fallback)")
 
     if kind == "process_alive":
         pid_file = params.get("pid_file")

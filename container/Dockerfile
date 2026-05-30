@@ -720,6 +720,16 @@ COPY tools/claude-watch-dispatch/claude-watch-dispatch /usr/local/bin/claude-wat
 #     enumerates active subagent transcripts and `--follow` for live
 #     streaming.
 COPY tools/obligations/obligations /usr/local/bin/obligations
+# shell_ast.py -- dependency-free shell-structure parser imported by both
+# the obligations CLI (no_pipe_pattern predicate) and the
+# pre-tool-obligations-gate-hook (watcher-ctl bare gate) to make pattern
+# matching AST-aware: a forbidden pipe/operator that appears inside a
+# quoted argument or heredoc body no longer false-positive-denies. Both
+# importers fall back to the previous raw string-match if this module is
+# absent, so baking it alongside obligations keeps the AST behavior in the
+# container. Placed flat in /usr/local/bin/ so `obligations` (same dir)
+# and the hook (own-dir import candidate) both resolve it.
+COPY tools/obligations/shell_ast.py /usr/local/bin/shell_ast.py
 # obligations-init -- idempotent seed for the default-bundled obligations
 # rows. Invoked from the container entrypoint after the obligations CLI
 # is available on PATH. Currently seeds the

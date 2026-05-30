@@ -29,6 +29,24 @@
 //! No integration with the hook hot-path yet — the public surface here is
 //! just `evaluate(...)` plus the predicate enum.
 //!
+//! ## Hot-path status (update)
+//!
+//! The PreToolUse hot-path is the Python obligations CLI + the Python
+//! `pre-tool-obligations-gate-hook` (invoked per tool call). Those cannot
+//! import this Rust `tree-sitter-bash` evaluator without a per-call
+//! subprocess exec + a deployed binary dependency — exactly the overhead
+//! the spike's "Parser choice" section rejected for the Go option. So the
+//! hot-path gate fix ships as a dependency-free, stdlib-only Python parser
+//! (`tools/obligations/shell_ast.py`) that implements the SAME structural
+//! semantics this spike validated: match REAL pipeline / command-head /
+//! top-level-operator nodes, never operator text that is quoted-string or
+//! heredoc-body DATA. The Python parser powers the AST-aware
+//! `no_pipe_pattern` predicate and the hardcoded watcher-ctl-bare gate,
+//! with a fail-closed fallback to the previous raw string-match on any
+//! parse error. This Rust module remains the in-process reference /
+//! bench harness (`tests/bench_ast_predicate.rs`) for a future
+//! Rust-native hook hot-path.
+//!
 //! ## Parser choice
 //!
 //! Considered:

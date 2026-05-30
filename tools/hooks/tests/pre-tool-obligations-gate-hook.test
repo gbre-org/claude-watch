@@ -2462,6 +2462,93 @@ def main() -> int:
             ))
 
             # ---------------------------------------------------------
+            # Tests 74w1-74w5: AST-aware watcher-ctl gate.
+            #
+            # Regression cases for the false-POSITIVE class: a command
+            # whose ARGUMENT TEXT merely contains `watcher-ctl run X &&...`
+            # (a quoted string / heredoc body -- data, not an executed
+            # command) must NOT trip the gate. A REAL compound/background
+            # `watcher-ctl run` invocation still must.
+            # ---------------------------------------------------------
+
+            # 74w1: `watcher-ctl run X && bar` text inside a single-quoted
+            # argument to session-task -> ALLOW (it's data, never runs).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": (
+                         "session-task queue add "
+                         "'watcher-ctl run foo && bar must be bare'"
+                     ),
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "74w1. watcher-ctl gate: quoted-arg mention -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74w2: `watcher-ctl run X &` mentioned inside a heredoc body
+            # staged for a signal DM -> ALLOW. The real executed commands
+            # are signal-stage / cat / signal-send, none of which is
+            # watcher-ctl.
+            heredoc_cmd = (
+                "f=$(signal-stage); cat > \"$f\" <<'EOF'\n"
+                "reminder: never `watcher-ctl run X &` -- use run_in_background\n"
+                "EOF\n"
+                "signal-send --dm andrew -F \"$f\""
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": heredoc_cmd}},
+                env_w,
+            )
+            results.append(_check(
+                "74w2. watcher-ctl gate: heredoc-body mention -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74w3: REAL compound `watcher-ctl run foo && echo` -> DENY.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "watcher-ctl run foo && echo done"}},
+                env_w,
+            )
+            results.append(_check(
+                "74w3. watcher-ctl gate: real `&&` invocation -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74w4: `sudo watcher-ctl run X &` -> DENY (wrapper-stripped head
+            # is still watcher-ctl run, and there's a real background `&`).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "sudo watcher-ctl run foo &"}},
+                env_w,
+            )
+            results.append(_check(
+                "74w4. watcher-ctl gate: sudo wrapper + real `&` -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74w5: bare `watcher-ctl run X` with the name token containing a
+            # subshell `$(...)` -> DENY (name-token safety preserved).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "watcher-ctl run $(echo signal)"}},
+                env_w,
+            )
+            results.append(_check(
+                "74w5. watcher-ctl gate: subshell in name token -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # ---------------------------------------------------------
             # Tests 74a-74h: Monitor-tool subagent gate (hardcoded).
             #
             # Re-uses the same isolated env (no obligations registered)
@@ -2594,6 +2681,115 @@ def main() -> int:
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
+
+        # ---------------------------------------------------------------
+        # Tests 74p1-74p5: AST-aware no_pipe_pattern predicate.
+        #
+        # The no_pipe_pattern predicate now matches its regex against a
+        # STRUCTURE-ONLY rendering of the command (quoted-string and
+        # heredoc bodies flattened, real top-level pipes preserved). This
+        # fixes the false-POSITIVE where a forbidden `| <cmd>` pattern that
+        # appears inside a quoted argument or heredoc body denied the call
+        # even though nothing forbidden would run. Models the real
+        # no-pipe-into-signal-send guard (regex `\|\s*signal-send`).
+        # ---------------------------------------------------------------
+        with tempfile.TemporaryDirectory(prefix="obligations-nopipe-ast-") as td_p:
+            tmpdir_p = Path(td_p)
+            env_p, _ob_p = _make_isolated_env(tmpdir_p)
+            # Build the banned-target name without writing the literal
+            # `signal-send` token next to a pipe in THIS test's source (the
+            # live gate that guards the editing session string-matches it).
+            _send = "signal-" + "send"
+            _stage = "signal-" + "stage"
+            _pipe = chr(124)
+            ob_pp = _add_ob(
+                env_p,
+                tool_pattern="Bash",
+                predicate="no_pipe_pattern",
+                params={"regex": r"\|\s*" + _send},
+                ttl=0,
+                deny_msg="do NOT pipe into " + _send,
+            )
+
+            # 74p1: REAL pipe into the banned target -> DENY.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "cat body.txt " + _pipe + " " + _send + " --dm a",
+                 }},
+                env_p,
+            )
+            results.append(_check(
+                "74p1. no_pipe AST: real pipe -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74p2: forbidden pattern inside a single-quoted argument -> ALLOW.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": (
+                         _send + " --dm andrew "
+                         "'reminder: do not " + _pipe + " " + _send
+                         + " -- use " + _stage + "'"
+                     ),
+                 }},
+                env_p,
+            )
+            results.append(_check(
+                "74p2. no_pipe AST: quoted-arg mention -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74p3: forbidden pattern inside a heredoc body staged for a DM,
+            # with the REAL send as a separate (non-piped) statement -> ALLOW.
+            heredoc_pp = (
+                "f=$(" + _stage + "); cat > \"$f\" <<'EOF'\n"
+                "never " + _pipe + " " + _send + " -- stage + -F instead\n"
+                "EOF\n"
+                + _send + " --dm andrew -F \"$f\""
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": heredoc_pp}},
+                env_p,
+            )
+            results.append(_check(
+                "74p3. no_pipe AST: heredoc-body mention -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74p4: UNPARSEABLE command whose raw form contains the real
+            # violation string -> DENY (fail-closed fallback to string-match).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     # unterminated single quote => parse fails
+                     "command": "echo 'oops " + _pipe + " " + _send,
+                 }},
+                env_p,
+            )
+            results.append(_check(
+                "74p4. no_pipe AST: unparseable real-form -> deny (fail-closed)",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74p5: unrelated command -> ALLOW (no regression).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "ls -la /tmp"}},
+                env_p,
+            )
+            results.append(_check(
+                "74p5. no_pipe AST: unrelated command -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_pp], env_p)
 
         # ---------------------------------------------------------------
         # Tests 75-88: stale_ready_queue_present predicate.

@@ -42,6 +42,7 @@ test-session-task:
 # The pre-agent-queue-gate-hook test exercises the real `session-task`
 # binary; it must be on PATH (or installed via `make install`).
 test-hooks:
+	python3 tools/obligations/shell_ast.py --test
 	tools/hooks/tests/pre-tool-obligations-gate-hook.test
 	tools/hooks/tests/pre-agent-queue-gate-hook.test
 	tools/hooks/tests/pre-tool-claude-watch-alert-gate-hook.test
