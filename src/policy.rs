@@ -3026,7 +3026,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // dead memory-remind whose pidfile still points at PID N
             // (now reaped) is reported as DOWN rather than masked by a
             // coincidental pgrep hit.
-            let recorded_pid = read_watcher_pid(crate::watcher::PID_DIR, &entry.name);
+            let recorded_pid = read_watcher_pid(&crate::watcher::pid_dir(), &entry.name);
             let down = watcher_is_down(count, entry.min_count, recorded_pid, is_pid_alive);
             let orphaned = down && count >= entry.min_count;
             let health = state

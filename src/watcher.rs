@@ -12,8 +12,18 @@ use std::os::unix::process::ExitStatusExt;
 /// Default config path for watchers.
 const DEFAULT_CONFIG: &str = ".config/watchmen/watchers.conf";
 
-/// PID file directory for watcher liveness tracking.
+/// Default PID file directory for watcher liveness tracking.
 pub const PID_DIR: &str = "/var/run/claude";
+
+/// Resolve the PID directory. Respects `$CLAUDE_WATCH_PID_DIR` so tests (and
+/// any sandboxed environment without write access to `/var/run/claude`) can
+/// redirect the watcher PID files. Falls back to [`PID_DIR`] when unset/empty.
+pub fn pid_dir() -> String {
+    match std::env::var("CLAUDE_WATCH_PID_DIR") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => PID_DIR.to_string(),
+    }
+}
 
 /// Resolve the watchers.conf path (respects $WATCHERS_CONFIG for testing).
 pub fn config_path() -> String {
@@ -247,9 +257,152 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
     results
 }
 
+/// Read a watcher PID file and return the recorded PID, if the file exists and
+/// contains a parseable integer. Whitespace is trimmed. `None` on missing /
+/// unreadable / non-numeric content.
+fn read_pid_file(pid_file: &str) -> Option<u32> {
+    let content = std::fs::read_to_string(pid_file).ok()?;
+    content.trim().parse::<u32>().ok()
+}
+
+/// Check whether a PID is currently alive via a `kill(pid, 0)` signal probe.
+///
+/// Signal 0 performs no delivery but still runs the kernel's
+/// permission/existence checks, so `Ok(())` means the process exists (and we
+/// may signal it), while `ESRCH` means it's gone. `EPERM` means it exists but
+/// we don't own it — still "alive" for our purposes. We treat any other error
+/// (or success) conservatively as "alive" only on success/EPERM.
+fn pid_is_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // PID 0 is special-cased by kill(2): it targets the caller's entire
+    // process group, which always "succeeds". It is never a real watcher PID,
+    // so treat it as not-alive to avoid a false positive in the guard.
+    if pid == 0 {
+        return false;
+    }
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(Errno::EPERM) => true, // exists, just not ours
+        Err(_) => false,           // ESRCH (gone) or anything else
+    }
+}
+
+/// Read `/proc/PID/cmdline` (NUL-separated argv) into a space-joined string.
+/// Returns `None` if the process is gone or the file is unreadable.
+fn pid_cmdline(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/cmdline", pid);
+    let data = std::fs::read(&path).ok()?;
+    let s = String::from_utf8_lossy(&data)
+        .replace('\0', " ")
+        .trim()
+        .to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Identity check: does the live process `pid` actually look like *this*
+/// watcher, rather than a recycled PID that the kernel handed to an unrelated
+/// process after the watcher died?
+///
+/// We compare the process's `/proc/PID/cmdline` against the watcher's
+/// configured `start_cmd`. A recycled PID running some other program won't
+/// share the watcher's argv, so the guard won't wrongly suppress a real
+/// restart. The match is intentionally lenient (substring on the first
+/// `start_cmd` token, i.e. the watcher binary/script name) because the live
+/// process's argv may differ from the literal `start_cmd` — the start command
+/// frequently `exec`s a child or wraps the poller (e.g. `uv run X`, or a
+/// script that re-execs itself). Requiring the binary token to appear is
+/// enough to reject an obviously-unrelated recycled PID while tolerating these
+/// wrapper transforms.
+///
+/// `None` from `pid_cmdline` (process gone, or kernel-thread with empty
+/// cmdline) → not a match.
+fn pid_matches_watcher(pid: u32, start_cmd: &str) -> bool {
+    let token = match start_cmd.split_whitespace().next() {
+        Some(t) if !t.is_empty() => t,
+        _ => return false,
+    };
+    // Use the basename of the first token so an absolute path in start_cmd
+    // (e.g. `/usr/local/bin/claude-event-watch`) still matches a cmdline that
+    // records the bare name, and vice-versa.
+    let token_base = token.rsplit('/').next().unwrap_or(token);
+    match pid_cmdline(pid) {
+        Some(cmdline) => cmdline.contains(token) || cmdline.contains(token_base),
+        None => false,
+    }
+}
+
+/// Pure decision: given what the guard observed, should `watcher_run` no-op
+/// (a live instance already holds the slot) instead of starting a second one?
+///
+/// Inputs (all already probed by the caller — kept pure so it's unit-testable
+/// without touching `/proc` or `pgrep`):
+/// - `recorded_pid_alive`: the PID file named a process that is alive AND whose
+///   cmdline identity matches this watcher (recycled-PID case already filtered
+///   out by the caller — a dead/stale/mismatched PID file passes `false`).
+/// - `live_poller_count`: number of live processes matching the watcher's
+///   `pattern` (the same signal `watcher-status` counts). A value `>= 1` means
+///   a poller is already up even if the PID file is stale/missing (e.g. the
+///   running instance was started out-of-band).
+///
+/// Returns `true` (skip / no-op, exit 0 idempotently) when either signal shows
+/// a live instance; `false` (proceed to start) otherwise. This covers:
+/// - fresh start, no PID file, no poller → start.
+/// - stale PID file (process dead), no poller → start.
+/// - PID file points at a live matching instance → skip.
+/// - PID file stale/missing but a poller is already running → skip.
+pub fn run_guard_should_skip(recorded_pid_alive: bool, live_poller_count: u32) -> bool {
+    recorded_pid_alive || live_poller_count >= 1
+}
+
+/// Atomically claim the PID file via `O_CREAT | O_EXCL`, writing `pid`.
+///
+/// Returns:
+/// - `Ok(true)` — we won the race and the file now records our PID.
+/// - `Ok(false)` — the file already existed (someone else holds the slot); the
+///   caller should treat this as "lost the race" and no-op.
+/// - `Err(_)` — an unexpected I/O error (not `AlreadyExists`).
+///
+/// This closes the two-near-simultaneous-`run` race: even if both invocations
+/// pass the pre-flight liveness check before either has spawned, only one can
+/// create the lock file with `O_EXCL`; the loser backs off. The caller must
+/// have already removed a *stale* PID file (dead/mismatched) before calling
+/// this, so a genuine restart isn't permanently blocked by a leftover file.
+fn try_claim_pid_file(pid_file: &str, pid: u32) -> std::io::Result<bool> {
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_CREAT | O_EXCL
+        .open(pid_file)
+    {
+        Ok(mut f) => {
+            f.write_all(pid.to_string().as_bytes())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Run a watcher by name. Looks up the entry, rejects if disabled or no
 /// start_cmd, then execs the start_cmd and waits for it to complete.
 /// Returns the exit code of the child process.
+///
+/// **Idempotency / PID-guard:** before starting, the function checks whether a
+/// live instance already holds the watcher's slot — either via the PID file
+/// (PID alive *and* cmdline identity matches this watcher, to reject recycled
+/// PIDs) or via the live-poller count (`pgrep` on the watcher's pattern, the
+/// same signal `watcher-status` uses). If so it prints a clear message and
+/// exits 0 (success — so the main loop's restart cadence doesn't treat the
+/// no-op as an error) WITHOUT spawning a second instance. A stale PID file
+/// (process dead, or recycled to an unrelated PID) is cleared and the watcher
+/// starts normally. The PID file is claimed atomically (`O_EXCL`) so two
+/// near-simultaneous `run` invocations can't both win.
 pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, name: &str) -> Result<i32, String> {
     let entries = load_entries(config_path, extra_config_path);
     let entry = entries
@@ -267,11 +420,55 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
         .ok_or_else(|| format!("no start command configured for '{}'", name))?;
 
     // Create PID directory if needed
-    let _ = std::fs::create_dir_all(PID_DIR);
+    let pid_dir = pid_dir();
+    let _ = std::fs::create_dir_all(&pid_dir);
 
-    // Print history on restart (PID file exists from previous run)
-    let pid_file = format!("{}/{}.pid", PID_DIR, name);
-    if std::path::Path::new(&pid_file).exists() {
+    let pid_file = format!("{}/{}.pid", pid_dir, name);
+    let pid_file_exists = std::path::Path::new(&pid_file).exists();
+
+    // --- PID-guard (idempotency) -------------------------------------------
+    // Determine whether a live instance already holds this watcher's slot.
+    //
+    // Two independent signals:
+    //   1. PID file: alive AND cmdline identity matches this watcher. A
+    //      recycled PID running something unrelated does NOT count (so we
+    //      don't wrongly suppress a real restart). A stale PID file (process
+    //      dead, or recycled to a non-matching process) is removed below so
+    //      the atomic O_EXCL claim can succeed.
+    //   2. Live poller count: `pgrep` on the watcher's pattern — the same
+    //      signal `watcher-status` uses. Catches an instance started
+    //      out-of-band whose PID isn't (or no longer is) in the file.
+    let recorded_pid = read_pid_file(&pid_file);
+    let recorded_pid_alive = match recorded_pid {
+        Some(pid) => pid_is_alive(pid) && pid_matches_watcher(pid, start_cmd),
+        None => false,
+    };
+    let live_poller_count = process_pids(&entry.pattern).await.len() as u32;
+
+    if run_guard_should_skip(recorded_pid_alive, live_poller_count) {
+        let where_ = if recorded_pid_alive {
+            format!("pid {}", recorded_pid.unwrap())
+        } else {
+            format!(
+                "{} live poller(s) matching '{}'",
+                live_poller_count, entry.pattern
+            )
+        };
+        println!(
+            "{} already running ({}); not starting a second instance",
+            name, where_
+        );
+        return Ok(0);
+    }
+
+    // No live instance. If a PID file lingers it is stale (dead/recycled PID)
+    // — remove it so the atomic O_EXCL claim below can succeed.
+    if recorded_pid.is_some() {
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    // Print history on restart (PID file existed from a previous run).
+    if pid_file_exists {
         // Fire the watcher's optional on_restart_cmd handler so its
         // recent state lands in the task output. Operators wire whatever
         // history-dumping command makes sense for their integration via
@@ -291,15 +488,42 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
         return Err(format!("empty start command for '{}'", name));
     }
 
+    // Atomically claim the PID slot BEFORE spawning, with our own PID as a
+    // placeholder. If another `run` invocation raced us here and already
+    // created the file, back off and no-op (idempotent success) — this closes
+    // the window where both invocations pass the liveness check above before
+    // either has spawned. We rewrite the file with the child PID once spawned.
+    match try_claim_pid_file(&pid_file, std::process::id()) {
+        Ok(true) => {}
+        Ok(false) => {
+            println!(
+                "{} launch already in progress (PID file held by a concurrent run); \
+                 not starting a second instance",
+                name
+            );
+            return Ok(0);
+        }
+        Err(e) => {
+            // Couldn't create the lock file for an unexpected reason. Fall
+            // back to a best-effort start rather than wedging the watcher.
+            eprintln!("warning: could not claim PID file for '{}': {}", name, e);
+        }
+    }
+
     // Spawn child process
     let mut child = tokio::process::Command::new(args[0])
         .args(&args[1..])
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn()
-        .map_err(|e| format!("failed to start '{}': {}", start_cmd, e))?;
+        .map_err(|e| {
+            // Spawn failed — release the slot we claimed so a retry isn't
+            // blocked by our orphaned lock file.
+            let _ = std::fs::remove_file(&pid_file);
+            format!("failed to start '{}': {}", start_cmd, e)
+        })?;
 
-    // Write PID file
+    // Record the real child PID (overwrite the placeholder claim).
     let pid = child.id().unwrap_or(0);
     let _ = std::fs::write(&pid_file, pid.to_string());
 
@@ -476,7 +700,7 @@ pub async fn watcher_restart(config_path: &str, extra_config_path: Option<&str>)
     }
 
     // Clean PID files
-    if let Ok(dir) = std::fs::read_dir(PID_DIR) {
+    if let Ok(dir) = std::fs::read_dir(pid_dir()) {
         for entry in dir.flatten() {
             if entry.path().extension().is_some_and(|ext| ext == "pid") {
                 let _ = std::fs::remove_file(entry.path());
@@ -1343,5 +1567,324 @@ mod tests {
         // If both are somehow present, prefer the explicit exit code.
         assert_eq!(super::exit_code_from_status(Some(0), Some(15)), 0);
         assert_eq!(super::exit_code_from_status(Some(7), Some(15)), 7);
+    }
+
+    // --- PID-guard tests ---------------------------------------------------
+
+    #[test]
+    fn test_run_guard_skip_when_recorded_pid_alive() {
+        // A live, identity-matched PID file → skip (no second instance),
+        // regardless of poller count.
+        assert!(run_guard_should_skip(true, 0));
+        assert!(run_guard_should_skip(true, 1));
+    }
+
+    #[test]
+    fn test_run_guard_skip_when_poller_already_running() {
+        // PID file stale/missing (recorded_pid_alive=false) but a live poller
+        // is already matched by pgrep → still skip.
+        assert!(run_guard_should_skip(false, 1));
+        assert!(run_guard_should_skip(false, 3));
+    }
+
+    #[test]
+    fn test_run_guard_start_when_nothing_alive() {
+        // No live PID, no poller → proceed (fresh start OR stale PID file).
+        assert!(!run_guard_should_skip(false, 0));
+    }
+
+    #[test]
+    fn test_read_pid_file_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("w.pid");
+        std::fs::write(&p, "  4242\n").unwrap();
+        assert_eq!(read_pid_file(p.to_str().unwrap()), Some(4242));
+    }
+
+    #[test]
+    fn test_read_pid_file_missing_or_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.pid");
+        assert_eq!(read_pid_file(missing.to_str().unwrap()), None);
+
+        let garbage = dir.path().join("bad.pid");
+        std::fs::write(&garbage, "not-a-pid").unwrap();
+        assert_eq!(read_pid_file(garbage.to_str().unwrap()), None);
+
+        let empty = dir.path().join("empty.pid");
+        std::fs::write(&empty, "").unwrap();
+        assert_eq!(read_pid_file(empty.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn test_pid_is_alive_self_true() {
+        // The test process itself is, definitionally, alive.
+        assert!(pid_is_alive(std::process::id()));
+    }
+
+    #[test]
+    fn test_pid_is_alive_bogus_false() {
+        // PID 0 is not a real process; a very high PID is essentially
+        // guaranteed not to exist on a normal system. Either way → not alive.
+        assert!(!pid_is_alive(0));
+        assert!(!pid_is_alive(u32::MAX - 1));
+    }
+
+    #[test]
+    fn test_pid_matches_watcher_self() {
+        // Our own cmdline contains the test binary path. Use the actual first
+        // argv token as the start_cmd so the identity check matches.
+        let argv0 = std::env::args().next().unwrap_or_default();
+        assert!(
+            pid_matches_watcher(std::process::id(), &argv0),
+            "self cmdline should match its own argv0"
+        );
+    }
+
+    #[test]
+    fn test_pid_matches_watcher_mismatch_rejects_recycled_pid() {
+        // A start_cmd for some unrelated binary must NOT match our process's
+        // cmdline — this is the recycled-PID guard.
+        assert!(!pid_matches_watcher(
+            std::process::id(),
+            "definitely-not-a-real-watcher-binary-xyz"
+        ));
+    }
+
+    #[test]
+    fn test_pid_matches_watcher_dead_pid_is_false() {
+        // No cmdline for a dead PID → not a match (can't claim identity).
+        assert!(!pid_matches_watcher(u32::MAX - 1, "anything"));
+    }
+
+    #[test]
+    fn test_pid_matches_watcher_empty_start_cmd_is_false() {
+        assert!(!pid_matches_watcher(std::process::id(), ""));
+        assert!(!pid_matches_watcher(std::process::id(), "   "));
+    }
+
+    #[test]
+    fn test_try_claim_pid_file_first_wins_second_loses() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("claim.pid");
+        let path = p.to_str().unwrap();
+
+        // First claim creates the file and wins.
+        assert_eq!(try_claim_pid_file(path, 111).unwrap(), true);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "111");
+
+        // Second claim on the existing file loses (no overwrite, no error).
+        assert_eq!(try_claim_pid_file(path, 222).unwrap(), false);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "111");
+    }
+
+    #[test]
+    fn test_try_claim_pid_file_after_removal_succeeds() {
+        // Mirrors the stale-PID-file recovery path: remove the stale file,
+        // then the claim must succeed for a genuine restart.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("stale.pid");
+        let path = p.to_str().unwrap();
+
+        std::fs::write(&p, "999").unwrap(); // stale leftover
+        std::fs::remove_file(&p).unwrap(); // caller clears it
+        assert_eq!(try_claim_pid_file(path, 333).unwrap(), true);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "333");
+    }
+
+    // --- PID-guard end-to-end (`watcher_run`) tests ------------------------
+    //
+    // These set process-global env vars (CLAUDE_WATCH_PID_DIR, WATCHERS_CONFIG)
+    // so they must not run concurrently with each other. A shared mutex
+    // serializes them. Each test points the PID dir + config at a unique
+    // tempdir so they don't collide with the live system or each other.
+
+    use std::sync::Mutex;
+    static RUN_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that sets the watcher env vars on construction and restores
+    /// the prior values on drop, holding the serialization lock for its
+    /// lifetime.
+    struct RunEnv<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+        prev_pid_dir: Option<String>,
+        prev_cfg: Option<String>,
+        prev_cfg_extra: Option<String>,
+    }
+    impl<'a> RunEnv<'a> {
+        fn new(pid_dir: &str, cfg: &str) -> Self {
+            let lock = RUN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_pid_dir = std::env::var("CLAUDE_WATCH_PID_DIR").ok();
+            let prev_cfg = std::env::var("WATCHERS_CONFIG").ok();
+            let prev_cfg_extra = std::env::var("WATCHERS_CONFIG_EXTRA").ok();
+            std::env::set_var("CLAUDE_WATCH_PID_DIR", pid_dir);
+            std::env::set_var("WATCHERS_CONFIG", cfg);
+            std::env::remove_var("WATCHERS_CONFIG_EXTRA");
+            RunEnv {
+                _lock: lock,
+                prev_pid_dir,
+                prev_cfg,
+                prev_cfg_extra,
+            }
+        }
+    }
+    impl<'a> Drop for RunEnv<'a> {
+        fn drop(&mut self) {
+            restore("CLAUDE_WATCH_PID_DIR", &self.prev_pid_dir);
+            restore("WATCHERS_CONFIG", &self.prev_cfg);
+            restore("WATCHERS_CONFIG_EXTRA", &self.prev_cfg_extra);
+        }
+    }
+    fn restore(key: &str, prev: &Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// `watcher_run` for a watcher with a stale PID file (recorded PID dead)
+    /// and no live poller → must start normally (spawn the start_cmd).
+    #[tokio::test]
+    async fn test_watcher_run_stale_pid_file_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+
+        // A unique sentinel as the pattern so pgrep only matches our poller.
+        // We materialize a tiny executable script *named* with the sentinel,
+        // so the marker lives in argv[0] (matchable by `pgrep -f`) without
+        // needing whitespace in the (whitespace-split) start_cmd.
+        let sentinel = format!("cw-runtest-stale-{}", unique_token("w"));
+        let script = make_poller_script(dir.path(), &sentinel, "0.3");
+        std::fs::write(&cfg, format!("runtest|{}|1|true|{}\n", sentinel, script)).unwrap();
+
+        // Plant a stale PID file pointing at a definitely-dead PID.
+        let pid_file = pid_dir.join("runtest.pid");
+        std::fs::write(&pid_file, (u32::MAX - 1).to_string()).unwrap();
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+
+        let code = watcher_run(&config_path(), config_path_extra().as_deref(), "runtest")
+            .await
+            .expect("run should succeed");
+        // The sleep exits 0; a no-op guard would also return 0, so to prove we
+        // actually STARTED we check the PID file was rewritten to a live (now
+        // exited) child PID that is NOT the stale sentinel.
+        assert_eq!(code, 0);
+        let recorded = std::fs::read_to_string(&pid_file).unwrap();
+        assert_ne!(
+            recorded.trim(),
+            (u32::MAX - 1).to_string(),
+            "stale PID file should have been overwritten by a real start"
+        );
+    }
+
+    /// `watcher_run` for a watcher with no PID file and no poller → starts.
+    #[tokio::test]
+    async fn test_watcher_run_no_pid_file_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        let sentinel = format!("cw-runtest-fresh-{}", unique_token("w"));
+        let script = make_poller_script(dir.path(), &sentinel, "0.3");
+        std::fs::write(&cfg, format!("runtest|{}|1|true|{}\n", sentinel, script)).unwrap();
+
+        let pid_file = pid_dir.join("runtest.pid");
+        assert!(!pid_file.exists());
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        let code = watcher_run(&config_path(), config_path_extra().as_deref(), "runtest")
+            .await
+            .expect("run should succeed");
+        assert_eq!(code, 0);
+        // A real start wrote a PID file with the child PID.
+        assert!(pid_file.exists(), "a real start should write the PID file");
+    }
+
+    /// Two sequential `watcher_run` invocations for the same watcher while the
+    /// first instance is still alive → the second must NO-OP (PID-guard),
+    /// returning 0 without starting a second poller.
+    #[tokio::test]
+    async fn test_watcher_run_second_invocation_noops_while_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        let sentinel = format!("cw-runtest-dup-{}", unique_token("w"));
+        // Long-lived poller so it's still alive when we fire the second run.
+        let script = make_poller_script(dir.path(), &sentinel, "30");
+        std::fs::write(&cfg, format!("runtest|{}|1|true|{}\n", sentinel, script)).unwrap();
+        let pid_file = pid_dir.join("runtest.pid");
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+
+        // Spawn the first instance directly (don't await — it sleeps 30s) so
+        // it's alive for the guard check. We run the SAME script watcher_run
+        // would, then write the PID file as watcher_run does.
+        let mut first = tokio::process::Command::new(&script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn first poller");
+        let first_pid = first.id().expect("first pid");
+        std::fs::write(&pid_file, first_pid.to_string()).unwrap();
+
+        // Now fire watcher_run — it should observe the live poller (pgrep on
+        // the sentinel pattern) and/or the live PID file and NO-OP.
+        let code = watcher_run(&config_path(), config_path_extra().as_deref(), "runtest")
+            .await
+            .expect("guarded run should return Ok");
+        assert_eq!(code, 0, "guarded no-op must exit 0 (idempotent)");
+
+        // The PID file must still point at the FIRST instance — proof no
+        // second instance was started and recorded.
+        let recorded = std::fs::read_to_string(&pid_file).unwrap();
+        assert_eq!(
+            recorded.trim(),
+            first_pid.to_string(),
+            "second run must not have replaced the live instance's PID file"
+        );
+
+        // Exactly one live poller for the sentinel.
+        let pollers = process_pids(&sentinel).await;
+        assert_eq!(
+            pollers.len(),
+            1,
+            "only the first instance should be alive, got pids {:?}",
+            pollers
+        );
+
+        // Cleanup.
+        let _ = first.start_kill();
+        let _ = first.wait().await;
+    }
+
+    fn unique_token(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "{}-{}-{}",
+            prefix,
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+
+    /// Materialize an executable shell script whose *filename* embeds
+    /// `sentinel`, so the running process's argv[0] carries the sentinel and is
+    /// matchable by `pgrep -f -- <sentinel>`. The script sleeps for `secs`
+    /// (NOT via `exec`, so the sentinel-bearing argv[0] survives for the
+    /// lifetime of the poller). Returns the absolute path (used directly as the
+    /// watcher's `start_cmd`, no whitespace).
+    fn make_poller_script(dir: &std::path::Path, sentinel: &str, secs: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(sentinel);
+        std::fs::write(&path, format!("#!/bin/sh\nsleep {}\n", secs)).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().into_owned()
     }
 }
