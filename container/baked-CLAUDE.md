@@ -771,10 +771,16 @@ uid 1000 against a writable global path, no sudo needed.
 ## Container redeploy
 
 To redeploy: `make redeploy` from the repo root (via host-bash).
-Equivalent: `cd examples/compose && docker compose up -d --force-recreate -t 5 claude-container`
+Equivalent: `cd examples/compose && docker compose up -d --force-recreate claude-container`
 
-The `stop_grace_period: 5s` in docker-compose.yml ensures the old
-container is killed quickly even without the explicit `-t 5` flag.
+`docker-compose.yml` sets `stop_grace_period: 15s`, sized to fit
+process-compose's own graceful shutdown (each supervised process pins
+`shutdown.timeout: 3` in `container/process-compose.yml`). Do NOT pass
+a short `-t`/timeout that's shorter than that total: it SIGKILLs PID 1
+(process-compose) mid-teardown and orphans the cron / claude-watch
+grandchildren, which keep the shared named volumes + tmux socket pinned
+and wedge the in-place recreate — the same failure the old
+`down`-then-`up` dance worked around.
 
 This kills the current session. The next session starts with the new
 image and picks up via the resume prompt.
