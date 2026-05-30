@@ -281,6 +281,32 @@ pub struct WatcherMonitorConfig {
     /// through to the tmux-inject path. Default: "claude-event-watch".
     #[serde(default = "default_watcher_event_consumer_name")]
     pub event_consumer_watcher_name: String,
+    /// Grace window (seconds) for the `watcher-status --unhealthy-only`
+    /// health predicate (the one the obligations gate consults on every
+    /// tool call). A watcher that has been DOWN for FEWER than this many
+    /// seconds is NOT reported as unhealthy by `--unhealthy-only`, so the
+    /// `watchers_healthy` obligation does not trip.
+    ///
+    /// Rationale: the one-shot waiters (`signal-wait-dm`, `signal-wait-group`,
+    /// `claude-event-watch`) legitimately print-and-exit for a brief instant
+    /// every time they surface an event; the main loop restarts them
+    /// immediately afterward. During that instant a naive instantaneous
+    /// health check reads DOWN and trips the gate. With a constant event
+    /// stream the gate would be DOWN almost continuously, cancelling whole
+    /// batches of unrelated tool calls. Only a SUSTAINED outage (DOWN longer
+    /// than this window) is a real failure worth gating on.
+    ///
+    /// The DOWN-since timestamp is tracked in the daemon state file
+    /// (`general.state_file`) and is per-watcher; a watcher returning to
+    /// health (DOWN -> ok) resets its timer so a later brief blip gets a
+    /// fresh grace window. DUPLICATE is NOT graced — duplicate
+    /// pollers/supervisors are a persistent state-cleanliness bug, not a
+    /// transient print-and-exit, so they surface immediately.
+    ///
+    /// Default: 30 seconds. Set to 0 to disable the grace window entirely
+    /// (every instantaneous DOWN trips the gate, the pre-grace behaviour).
+    #[serde(default = "default_watcher_health_grace_secs")]
+    pub health_grace_secs: u64,
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -317,6 +343,10 @@ fn default_watcher_event_command() -> String {
 
 fn default_watcher_event_consumer_name() -> String {
     "claude-event-watch".to_string()
+}
+
+fn default_watcher_health_grace_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1187,6 +1217,8 @@ cooldown = 300
             config.watcher_monitor.event_consumer_watcher_name,
             "claude-event-watch"
         );
+        // Health-grace default (no health_grace_secs key in SAMPLE_CONFIG).
+        assert_eq!(config.watcher_monitor.health_grace_secs, 30);
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
         assert!(config.task_watch.enabled);
