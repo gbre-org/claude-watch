@@ -387,10 +387,14 @@ compose-down:
 	@cd examples/compose && docker compose down
 
 # Force-recreate the claude-container service (picks up new image / config).
-# stop_grace_period in compose already sets the 5s timeout so -t 5 is
-# belt-and-suspenders.
+# Let docker-compose.yml's `stop_grace_period: 15s` govern the stop wait —
+# it's sized to fit process-compose's own graceful shutdown (per-process
+# shutdown.timeout 3s each). Do NOT pass a short `-t` here: a stop timeout
+# shorter than process-compose's total shutdown SIGKILLs PID 1 mid-teardown
+# and orphans cron / claude-watch grandchildren that pin the shared volumes
+# + tmux socket, which is what wedged the in-place recreate.
 redeploy:
-	@cd examples/compose && docker compose up -d --force-recreate -t 5 claude-container
+	@cd examples/compose && docker compose up -d --force-recreate claude-container
 
 # Clean build artifacts
 clean:

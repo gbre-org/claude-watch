@@ -26,8 +26,31 @@ export CLAUDE_WATCH_CONTAINER_MODE=1
 : > /tmp/claude-watch.jsonl 2>/dev/null || true
 : > /tmp/claude-watch.log 2>/dev/null || true
 
-# Stream stderr through tee so the supervisor's log_location captures
-# the trace output AND it lands in the legacy /tmp/claude-watch.log
-# file. JSONL is written by the daemon directly (config.toml's
-# log_file points at /tmp/claude-watch.jsonl).
-exec claude-watch 2>&1 | tee -a /tmp/claude-watch.log
+# Stream stderr to BOTH the supervisor log (which process-compose
+# captures from this process's stdout) AND the legacy
+# /tmp/claude-watch.log file. JSONL is written by the daemon directly
+# (config.toml's log_file points at /tmp/claude-watch.jsonl).
+#
+# CRITICAL — do NOT use `exec claude-watch ... | tee ...`.
+# A pipeline runs each stage in its own subshell, so the `exec` only
+# replaces the LEFT subshell, NOT this wrapper. The process
+# process-compose actually launches and signals then stays a `bash`
+# running the pipeline, with claude-watch and tee as its children.
+# On `docker stop` / `up --force-recreate`, process-compose sends
+# SIGTERM to that bash; bash running a foreground pipeline does not
+# forward the signal to claude-watch, and `tee` blocks on its pipe
+# read until the write end closes — so neither child dies on SIGTERM.
+# process-compose then waits out its per-process shutdown timeout
+# before SIGKILL, and any grandchild that outlives PID 1's SIGKILL
+# keeps the shared named volumes / tmux socket pinned, which is what
+# wedges a recreate-in-place (`down` tears the whole project + its
+# netns down, so it doesn't hit this).
+#
+# Fix: redirect this shell's own stdout/stderr through a process
+# substitution into tee (so logs still tee), then `exec claude-watch`
+# so the daemon BECOMES this process. process-compose now signals
+# claude-watch directly; SIGTERM reaches the daemon, it exits, and
+# process-compose completes shutdown cleanly inside docker's grace
+# window.
+exec > >(tee -a /tmp/claude-watch.log) 2>&1
+exec claude-watch

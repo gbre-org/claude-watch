@@ -47,6 +47,42 @@ version: "0.5"
 # Default log_location is unused — each process opts into a custom
 # log_location below. process-compose writes startup chatter to stderr
 # of the supervisor itself, which docker captures.
+#
+# ---------------------------------------------------------------------
+# Shutdown timing — why every long-running process pins an explicit
+# `shutdown.timeout`.
+#
+# On `docker stop` / `docker compose up -d --force-recreate`, docker
+# sends SIGTERM to PID 1 (process-compose) and waits the service's
+# `stop_grace_period` before escalating to SIGKILL. process-compose
+# then runs ITS OWN graceful shutdown: it signals each supervised
+# process and waits up to that process's `shutdown.timeout` (upstream
+# DEFAULT = 10s) before SIGKILLing it.
+#
+# That default is LONGER than docker's grace period, and two of our
+# processes don't die on a plain SIGTERM:
+#   - crond runs as `sudo -n /usr/sbin/cron`; sudo does not forward
+#     SIGTERM to its child, so the cron daemon ignores it.
+#   - any process whose launcher leaves a blocked reader (e.g. a tee
+#     on a pipe) alive.
+# With the 10s-per-process default, process-compose is still mid-wait
+# when docker's grace elapses and SIGKILLs process-compose. Killing
+# PID 1 without it having reaped its children can leave grandchildren
+# (cron, claude-watch) holding the shared named volumes + tmux socket,
+# which is exactly what wedges a recreate-IN-PLACE. A full
+# `docker compose down` tears the whole project + its netns down, so
+# it papers over the leak — which is why down+up "works" but
+# force-recreate hangs.
+#
+# Fix: pin each long-running process's `shutdown.timeout` to 3s so
+# process-compose escalates to SIGKILL fast and finishes its whole
+# shutdown well inside docker's `stop_grace_period` (raised to 15s in
+# docker-compose.yml as headroom). SIGKILL can't be ignored, so even
+# the sudo-wrapped cron and any stuck reader die promptly. claude-watch
+# itself is now `exec`'d directly by its launcher (see
+# container/bin/cw-claude-watch-launch) so its SIGTERM path works too;
+# the timeout is the backstop.
+# ---------------------------------------------------------------------
 
 processes:
   setup-tmux-session:
@@ -83,6 +119,14 @@ processes:
       restart: on_failure
       backoff_seconds: 5
       max_restarts: 0  # 0 == unlimited
+    # SIGTERM (default) then SIGKILL after 3s. The launcher `exec`s
+    # claude-watch directly so this process IS the daemon; SIGTERM
+    # reaches it. The short timeout is the backstop against a wedged
+    # daemon so process-compose finishes shutdown inside docker's
+    # grace period.
+    shutdown:
+      signal: 15
+      timeout: 3
     disabled: ${CLAUDE_CONTAINER_DAEMON_DISABLED:-false}
 
   crond:
@@ -95,6 +139,14 @@ processes:
       restart: on_failure
       backoff_seconds: 5
       max_restarts: 0
+    # sudo does NOT forward SIGTERM to the cron child, so a plain
+    # SIGTERM is ignored and the daemon lingers. Cap the wait at 3s
+    # so process-compose escalates to SIGKILL (which sudo cannot
+    # swallow) quickly, killing the process group inside docker's
+    # grace period instead of leaking an orphaned root cron.
+    shutdown:
+      signal: 15
+      timeout: 3
     disabled: ${CLAUDE_CONTAINER_CRON_DISABLED:-false}
 
   cw-watcher-supervisor:
@@ -104,4 +156,10 @@ processes:
       restart: on_failure
       backoff_seconds: 5
       max_restarts: 0
+    # The supervisor spawns watcher children; bound its shutdown so a
+    # slow watcher teardown can't hold process-compose past docker's
+    # grace period.
+    shutdown:
+      signal: 15
+      timeout: 3
     disabled: ${CLAUDE_CONTAINER_WATCHER_SUPERVISOR_DISABLED:-false}

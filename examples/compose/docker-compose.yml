@@ -54,7 +54,19 @@ services:
       context: ../..
       dockerfile: container/Dockerfile
     image: claude-container:dev
-    stop_grace_period: 5s
+    # Give PID 1 (process-compose) room to run its own graceful
+    # shutdown before docker SIGKILLs it. process-compose signals each
+    # supervised process and waits up to that process's
+    # `shutdown.timeout` (pinned to 3s each in
+    # container/process-compose.yml) before escalating to SIGKILL.
+    # Worst case is the processes torn down sequentially, so 15s is
+    # comfortable headroom. A grace period SHORTER than
+    # process-compose's total shutdown (the prior 5s) let docker
+    # SIGKILL PID 1 mid-teardown, orphaning cron / claude-watch
+    # grandchildren that kept the shared named volumes + tmux socket
+    # pinned — which is what wedged `up --force-recreate` (a full
+    # `down` tears the netns down so it papered over the leak).
+    stop_grace_period: 15s
     depends_on:
       tmux-socket-init:
         condition: service_completed_successfully
