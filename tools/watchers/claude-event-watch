@@ -8,16 +8,32 @@
 #        $CRON_EVENT_QUEUE also honored for backward compat)
 #
 # Behavior:
-#   - If events already pending, print them immediately and exit.
-#   - Otherwise, block on inotifywait for create/moved_to.
-#   - Debounce / cooloff: after the FIRST event arrives, sleep N seconds
-#     (default 30) to BATCH any additional events that land during the
-#     window. This prevents the main loop from cycling rapidly through
-#     event bursts (e.g. torrent-completed flood from 45 grabbed torrents
-#     finishing roughly together). Configure via:
-#       --debounce SECONDS         (CLI flag, takes precedence)
-#       $EVENT_WATCH_DEBOUNCE_SECONDS  (env var)
-#     Set to 0 to disable (pre-debounce behavior — short 2s settle only).
+#   - Block on inotifywait for create/moved_to (or, if events are already
+#     pending at startup, skip straight to the debounce collect loop).
+#   - Debounce / coalesce: once at least one event is pending we enter an
+#     ADAPTIVE quiet-period collect loop. We poll the queue every
+#     $EVENT_WATCH_QUIET_SECONDS (default 3); each time the pending count
+#     GROWS we reset the quiet timer; once the count holds steady for one
+#     full quiet interval (a "quiet period") we drain EVERYTHING in one
+#     batch and exit. A hard cap of $EVENT_WATCH_DEBOUNCE_SECONDS (default
+#     30) bounds the total wait so a slow drip of events can't stall the
+#     surface indefinitely. This batches staggered bursts (e.g. a
+#     torrent-completed flood, or four unrelated events landing within a
+#     few seconds) into a SINGLE .output so the main loop's mandatory
+#     read-act-restart cycle fires once per window, not once per event.
+#
+#     CRITICAL: the collect loop only ever WAITS and COUNTS. It never acks,
+#     consumes, hides, or reorders an event. Draining happens exactly once,
+#     at the end, over whatever is on disk — so an event that arrives during
+#     the window is surfaced in this batch, and one that lands a microsecond
+#     after the final drain is still on disk for the next watcher run. No
+#     event can be dropped by the debounce.
+#
+#     Both knobs are user-configurable (CLI flag wins over env var):
+#       --debounce SECONDS  /  $EVENT_WATCH_DEBOUNCE_SECONDS   (max window)
+#       --quiet SECONDS     /  $EVENT_WATCH_QUIET_SECONDS       (quiet period)
+#     Set --debounce 0 to disable batching entirely (surface immediately,
+#     pre-debounce behavior).
 #   - Print each event as a single one-liner: EVENT[<source>/<tag>] <msg…>
 #     then delete the queue file. Full event JSON (compact, one line) is
 #     appended to the consumed-event ring buffer log at
@@ -46,27 +62,46 @@ LOG_FILE="$LOG_DIR/consumed.jsonl"
 LOG_MAX_LINES="${CLAUDE_EVENT_LOG_MAX_LINES:-10000}"
 LOG_KEEP_ROTATIONS=3
 
-# Debounce/cooloff window (seconds). After the first event fires we sleep this
-# long, letting any additional events accumulate, then drain everything in one
-# shot. Default 30s; override via --debounce flag or env var. Setting 0
-# disables the cooloff (falls back to a short 2s settle).
+# Debounce window (seconds) — HARD CAP on the total collect wait. Once an
+# event is pending we run an adaptive quiet-period collect loop (see below);
+# this value bounds how long that loop can run regardless of continued
+# arrivals. Default 30s; override via --debounce flag or env var. Setting 0
+# disables batching entirely (surface immediately — pre-debounce behavior).
 DEBOUNCE_SECONDS="${EVENT_WATCH_DEBOUNCE_SECONDS:-30}"
+
+# Quiet-period (seconds) — the settle interval for the adaptive collect loop.
+# We poll the queue every QUIET_SECONDS; each time the pending count grows we
+# reset the timer, and we drain once the count holds steady for one full
+# quiet interval (or the DEBOUNCE_SECONDS cap is hit). Default 3s — small
+# enough that a single lone event surfaces promptly, large enough to coalesce
+# a staggered burst. Override via --quiet flag or $EVENT_WATCH_QUIET_SECONDS.
+QUIET_SECONDS="${EVENT_WATCH_QUIET_SECONDS:-3}"
 
 usage() {
     cat <<EOF
-Usage: claude-event-watch [--debounce SECONDS] [-h|--help]
+Usage: claude-event-watch [--debounce SECONDS] [--quiet SECONDS] [-h|--help]
 
 Block until a new claude-event arrives in \$CLAUDE_EVENT_QUEUE
-(default ~/claude-events/), print all pending events as one-liners,
-then exit.
+(default ~/claude-events/), batch any events that land in a short
+adaptive window, print them all as one-liners, then exit.
 
 Options:
-  --debounce SECONDS  Cooloff window after first event (default: 30).
-                      During this window additional events are batched
-                      into the same emit. Set to 0 to disable (uses a
-                      short 2s settle only). Also configurable via
-                      \$EVENT_WATCH_DEBOUNCE_SECONDS.
+  --debounce SECONDS  Hard cap on the collect window (default: 30). Bounds
+                      how long the adaptive quiet-period loop may run.
+                      Set to 0 to disable batching (surface immediately).
+                      Also configurable via \$EVENT_WATCH_DEBOUNCE_SECONDS.
+  --quiet SECONDS     Quiet-period / settle interval for the adaptive
+                      collect loop (default: 3). The queue is polled every
+                      SECONDS; each new event resets the timer, and the
+                      batch is drained once the pending count holds steady
+                      for one full quiet interval (or --debounce is hit).
+                      Also configurable via \$EVENT_WATCH_QUIET_SECONDS.
   -h, --help          Show this help.
+
+The collect loop never drops, hides, acks, or reorders an event — it only
+waits and counts, then drains the queue once at the end. Events arriving
+during the window are batched; events landing after the final drain remain
+on disk for the next run.
 
 Output: one line per event, shape:
   EVENT[<source>/<tag>] <first-60-chars-of-message>…
@@ -92,6 +127,18 @@ while [[ $# -gt 0 ]]; do
             DEBOUNCE_SECONDS="${1#--debounce=}"
             shift
             ;;
+        --quiet)
+            if [[ $# -lt 2 ]]; then
+                echo "claude-event-watch: --quiet requires a value" >&2
+                exit 2
+            fi
+            QUIET_SECONDS="$2"
+            shift 2
+            ;;
+        --quiet=*)
+            QUIET_SECONDS="${1#--quiet=}"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -107,6 +154,13 @@ done
 # Validate DEBOUNCE_SECONDS is a non-negative integer.
 if ! [[ "$DEBOUNCE_SECONDS" =~ ^[0-9]+$ ]]; then
     echo "claude-event-watch: DEBOUNCE_SECONDS must be a non-negative integer (got: $DEBOUNCE_SECONDS)" >&2
+    exit 2
+fi
+
+# Validate QUIET_SECONDS is a positive integer (must be >= 1 — it's the poll
+# interval for the collect loop; 0 would busy-spin).
+if ! [[ "$QUIET_SECONDS" =~ ^[0-9]+$ ]] || (( QUIET_SECONDS < 1 )); then
+    echo "claude-event-watch: QUIET_SECONDS must be a positive integer (got: $QUIET_SECONDS)" >&2
     exit 2
 fi
 
@@ -185,6 +239,56 @@ finally:
 PYEOF
 }
 
+# Count the number of pending event files currently in the queue. Used by the
+# adaptive collect loop to decide when the burst has settled. Cheap: a single
+# find piped to a count. Does NOT consume or modify anything.
+count_pending() {
+    find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]'
+}
+
+# Adaptive quiet-period collect loop. Precondition: at least one event is
+# already pending. We poll every QUIET_SECONDS; each time the pending count
+# GROWS we reset the quiet timer (more of the burst is still landing). Once
+# the count holds steady across one full quiet interval — or the
+# DEBOUNCE_SECONDS hard cap is reached — we return so the caller drains.
+#
+# This loop NEVER touches the queue files: it only sleeps and counts. All
+# draining/acking happens after it returns, exactly once, over whatever is on
+# disk at that moment. An event landing during the loop is therefore batched;
+# one landing after the post-loop drain stays on disk for the next run. No
+# event can be lost or hidden here.
+collect_burst() {
+    # DEBOUNCE_SECONDS == 0 means batching disabled: surface immediately.
+    if (( DEBOUNCE_SECONDS == 0 )); then
+        return 0
+    fi
+
+    local waited=0
+    local last_count
+    last_count="$(count_pending)"
+
+    while (( waited < DEBOUNCE_SECONDS )); do
+        # Sleep up to QUIET_SECONDS, but never overshoot the hard cap.
+        local remaining=$(( DEBOUNCE_SECONDS - waited ))
+        local nap=$(( QUIET_SECONDS < remaining ? QUIET_SECONDS : remaining ))
+        sleep "$nap"
+        waited=$(( waited + nap ))
+
+        local now_count
+        now_count="$(count_pending)"
+        if (( now_count > last_count )); then
+            # Burst still growing — reset the quiet timer by continuing to
+            # loop (we've consumed `nap` toward the hard cap, which is the
+            # safety bound; the quiet period restarts implicitly because the
+            # count changed this interval).
+            last_count="$now_count"
+            continue
+        fi
+        # Count held steady for a full quiet interval → burst settled.
+        break
+    done
+}
+
 print_pending() {
     local any=0
     maybe_rotate_log
@@ -197,11 +301,15 @@ print_pending() {
     return $any
 }
 
-# Fast path: drain anything already pending. Note: no debounce here — if events
-# are already queued when the watcher starts up we surface them immediately.
-# The cooloff only applies AFTER the watcher has been blocking on inotify
-# (i.e. it's a fresh burst, not backlog).
+# Fast path: events already pending at startup (backlog landed during the
+# main loop's read-act-restart gap). We STILL run the adaptive collect loop
+# here — this is the key fix for the "once per event" cycle. Backlog events
+# are exactly the burst that the main loop would otherwise be forced through
+# one at a time. The collect loop coalesces any siblings still landing, then
+# drains the whole batch in one .output. (DEBOUNCE_SECONDS=0 short-circuits
+# collect_burst, preserving immediate-surface behavior.)
 if find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+    collect_burst
     print_pending || true
     print_restart_banner
     exit 0
@@ -215,18 +323,12 @@ fi
 
 inotifywait -q -e create -e moved_to --include '\.json$' "$QUEUE_DIR" >/dev/null 2>&1
 
-# Cooloff window: after the first event fires we sleep DEBOUNCE_SECONDS
-# (default 30) to let any related events from the same burst accumulate,
-# then drain everything in one batch. This is the primary lever that keeps
-# the main loop from cycling rapidly through event floods.
-#
-# When DEBOUNCE_SECONDS=0 we fall back to the old 2s settle (just enough
-# for batched cron emissions to all land before we read the directory).
-if (( DEBOUNCE_SECONDS > 0 )); then
-    sleep "$DEBOUNCE_SECONDS"
-else
-    sleep 2
-fi
+# A fresh event just fired. Run the adaptive collect loop to batch any
+# related events from the same burst, then drain everything in one shot.
+# collect_burst polls the queue and waits out a quiet period (capped at
+# DEBOUNCE_SECONDS); it never consumes events, so the drain below sees the
+# full batch.
+collect_burst
 
 print_pending || true
 print_restart_banner

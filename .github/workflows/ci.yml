@@ -148,6 +148,12 @@ jobs:
       - name: Run ttyd paste-handler tests
         run: make test-ttyd-paste-handler
 
+      - name: Install inotify-tools (for claude-event-watch tests)
+        run: sudo apt-get update && sudo apt-get install -y inotify-tools
+
+      - name: Run watcher tests (self-clear + claude-event-watch debounce)
+        run: make test-watchers
+
       - name: Install uv (for session-task tests)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
 

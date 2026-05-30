@@ -25,15 +25,35 @@ the `claude-watch` Rust binary (multicall symlinks — see
 ## `claude-event-watch`
 
 ```
-claude-event-watch [--debounce SECONDS]
+claude-event-watch [--debounce SECONDS] [--quiet SECONDS]
 ```
 
-- Fast path: drain anything already pending (no debounce).
-- Slow path: `inotifywait -e create -e moved_to --include '\.json$'`,
-  then sleep `$DEBOUNCE_SECONDS` (default 30) to batch any related events,
-  then drain.
+- Once at least one event is pending (whether already queued at startup or
+  freshly arrived via `inotifywait -e create -e moved_to --include
+  '\.json$'`), the watcher runs an **adaptive quiet-period collect loop**:
+  it polls the queue every `--quiet` seconds (default 3); each time the
+  pending count grows it keeps waiting, and it drains once the count holds
+  steady for a full quiet interval — or the `--debounce` hard cap
+  (default 30) is reached. This coalesces a staggered burst (e.g. four
+  unrelated events landing within a few seconds, or a torrent-completed
+  flood) into a **single** surfaced `.output`, so the main loop's
+  mandatory read-act-restart cycle fires once per window instead of once
+  per event. This now applies to the fast path (backlog already pending at
+  startup) too — backlog is exactly the burst the main loop would
+  otherwise be forced through one event at a time.
+- The collect loop only ever waits and counts — it never acks, consumes,
+  hides, or reorders an event. The single drain at the end covers whatever
+  is on disk; an event that lands after that drain stays on disk for the
+  next run, so no event is lost.
+- `--debounce 0` disables batching (surface immediately — pre-debounce
+  behavior).
 - Output shape: `EVENT[<source>/<tag>] <first-60-chars-of-message>…`
 - Restart banner: `WATCHER EXITED. RESTART NOW: watcher-ctl run claude-event-watch`
+
+Per-host configuration goes in the `start_cmd` field of the watcher's
+`watchers.conf` entry (what `watcher-ctl run claude-event-watch` expands
+to), e.g. `claude-event-watch --debounce 10 --quiet 3`, or via the env
+vars below.
 
 Environment:
 
@@ -41,7 +61,8 @@ Environment:
 - `$CLAUDE_EVENT_LOG_DIR` — log dir (default `~/.config/claude-events/`)
 - `$CLAUDE_EVENT_LOG_MAX_LINES` — ring-buffer rotation threshold
   (default 10000)
-- `$EVENT_WATCH_DEBOUNCE_SECONDS` — equivalent of `--debounce`
+- `$EVENT_WATCH_DEBOUNCE_SECONDS` — equivalent of `--debounce` (hard cap)
+- `$EVENT_WATCH_QUIET_SECONDS` — equivalent of `--quiet` (quiet period)
 
 ## `self-clear`
 
