@@ -85,7 +85,10 @@ enabled = true
 # Seconds of continuous foreground activity before warning.
 # Raised 180 -> 300 on 2026-04-21: the shorter value was firing on legitimate
 # long agent-return reads. 300s still catches real stuck states.
-threshold_seconds = 300
+# Raised 300 -> 480 on 2026-05-30 (Andrew): prolonged-thinking alerts were
+# self-feeding the watcher treadmill (every 5min thinking = a claude-event =
+# claude-event-watch wake/exit = DOWN window = gate trip). 8min cuts the spam.
+threshold_seconds = 480
 # Check interval for foreground state (seconds) — independent of general.check_interval
 check_interval = 3
 # Interrupt when blocking/prolonged thinking detected (false = log-only mode)
