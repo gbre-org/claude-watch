@@ -111,6 +111,13 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         the unhealthy-watchers report verbatim, so an inform-mode obligation
         using this predicate gives the main loop a concise "X is DOWN"
         banner after every tool call.
+        NOTE: `watcher-status --unhealthy-only` applies a HEALTH GRACE
+        WINDOW (claude-watch `[watcher_monitor].health_grace_secs`, default
+        30s): a watcher DOWN for less than the grace is NOT reported, so the
+        one-shot waiters' brief print-and-exit gap between events does not
+        trip this gate. Only a SUSTAINED outage surfaces. DUPLICATE is never
+        graced. This predicate inherits that behaviour transparently — no
+        change here.
   - no_pending_watcher_outputs: {exempt_command_patterns?}
         satisfied iff there are no captured-but-unread watcher outputs.
         Reads sidecars from /tmp/claude-watcher-output-pending/ -- each one

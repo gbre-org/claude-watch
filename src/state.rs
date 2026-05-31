@@ -68,6 +68,20 @@ pub struct State {
     pub wedged_clear_count: u32,
     // Watcher health
     pub watcher_health: HashMap<String, WatcherState>,
+    /// Per-watcher RFC3339 timestamp of when the watcher was FIRST observed
+    /// `DOWN` by `watcher-status --unhealthy-only` (the health predicate the
+    /// obligations gate consults). Used to implement the health grace window
+    /// (`watcher_monitor.health_grace_secs`): a watcher DOWN for less than the
+    /// grace is suppressed from the unhealthy report so the one-shot waiters'
+    /// brief print-and-exit gap doesn't trip the gate. An entry is set when a
+    /// watcher transitions ok/DUPLICATE -> DOWN and CLEARED when it returns to
+    /// non-DOWN, so each fresh outage gets its own grace window. Persisted
+    /// across `watcher-status` invocations (which are one-shot CLI calls) via
+    /// the state file. NOT cleared on daemon load — a stale value is harmless
+    /// (it only widens the elapsed-down measurement, which fails safe toward
+    /// surfacing a genuinely-stuck watcher).
+    #[serde(default)]
+    pub watcher_down_since: HashMap<String, String>,
     #[serde(default)]
     pub last_watcher_inject: Option<String>,
     /// Count of watcher inject events (for metrics)
@@ -392,6 +406,33 @@ mod tests {
         assert!(restored.last_status.is_some());
         assert_eq!(restored.watcher_health.len(), 1);
         assert!(restored.watcher_health.contains_key("alerts-watcher"));
+    }
+
+    #[test]
+    fn test_watcher_down_since_roundtrip_and_default() {
+        // The health-grace DOWN-since map must round-trip through save/load
+        // AND default to empty on a state file written before the field
+        // existed (serde default).
+        let path = "/tmp/claude-watch-test-down-since.json";
+        let mut state = State::default();
+        state
+            .watcher_down_since
+            .insert("signal-wait-dm".to_string(), "2026-05-30T17:00:00Z".to_string());
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert_eq!(
+            loaded.watcher_down_since.get("signal-wait-dm").map(String::as_str),
+            Some("2026-05-30T17:00:00Z")
+        );
+        let _ = std::fs::remove_file(path);
+
+        // Old state file (no field) -> empty map, not an error.
+        let path2 = "/tmp/claude-watch-test-down-since-default.json";
+        std::fs::write(path2, "{}").unwrap();
+        let loaded2 = load_state(path2);
+        assert!(loaded2.watcher_down_since.is_empty());
+        let _ = std::fs::remove_file(path2);
     }
 
     #[test]
