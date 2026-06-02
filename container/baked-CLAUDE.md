@@ -1008,6 +1008,63 @@ Claude Code logs each hook invocation. exec-hook writes its
 path. Tail `/tmp/exec-hook-skipped` inside the container for the list of
 skipped binaries (one line per target).
 
+## Semantic search — eichi
+
+The container has access to `eichi`, a local-first semantic search CLI
+backed by sqlite-vec + sentence-transformers. Use it as the **default
+first step** when you need to find prior context, decisions, notes, or
+conversations — query eichi before falling back to grep or asking the
+operator.
+
+### When to search
+
+- "Where did we decide X?" / "What was the context around Y?"
+- Looking for a file, note, or conversation fragment by concept (not
+  exact string).
+- Answering questions about prior work, past decisions, or existing
+  documentation.
+
+### How to invoke (from inside the container)
+
+The eichi CLI runs on the **host** (it needs the host venv + index DB).
+Use `host-bash` to run queries:
+
+```sh
+# Semantic search (default hybrid vec+BM25 retrieval):
+host-bash: eichi query "how did we decide on the alerting tiers" -k 5
+
+# With filters:
+host-bash: eichi query "docker compose networking" --added-since 7d
+host-bash: eichi query "PR review feedback" --sort added -k 10
+
+# Check what's indexed:
+host-bash: eichi stats
+host-bash: eichi ls
+```
+
+If `host-bash` is unavailable, the eichi web UI runs at
+`http://localhost:8001/` (the `eichi-search` container in the compose
+stack) — use `curl` against `/api/search?q=<query>&k=<n>` as a
+fallback.
+
+### When to re-index
+
+If `eichi stats` shows the last-indexed timestamp is old relative to
+recent activity, or if important new corpus has been added to the
+standard indexing paths, prompt the operator: "eichi index looks stale
+(last indexed N days ago) — want me to re-index?" Re-indexing is
+idempotent and delta-only, so it's safe to run frequently.
+
+### Search-first, grep-second
+
+- **Semantic query** (`eichi query`): for concept-level lookup, fuzzy
+  recall, "what was the conversation about X."
+- **Literal grep** (`grep -r`): for exact strings, function names,
+  error messages, config keys — things that need character-exact match.
+
+Default to eichi for open-ended "find" questions. Fall back to grep
+when you know the exact string you're looking for.
+
 ## Workflow boundaries
 
 This Claude Code session runs inside an isolated container. Its strengths
