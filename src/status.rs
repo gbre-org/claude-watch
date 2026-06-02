@@ -542,10 +542,33 @@ pub async fn check_watchmen_count() -> u32 {
     out.parse().unwrap_or(0)
 }
 
+/// Count processes matching `pattern` via `pgrep -fc`.
+///
+/// Retained as a public primitive (parallel to [`check_watchmen_count`]).
+/// The watcher-health monitor now prefers [`check_process_pids`] so it can
+/// probe each matched PID for genuine liveness rather than trusting a raw
+/// count (which includes zombies).
+#[allow(dead_code)]
 pub async fn check_process_count(pattern: &str) -> u32 {
     // Use "--" to prevent pgrep from interpreting patterns starting with "--" as options
     let (out, _) = run_cmd_any(&["pgrep", "-fc", "--", pattern], 5).await;
     out.parse().unwrap_or(0)
+}
+
+/// Return the PIDs of processes matching `pattern` via `pgrep -f`.
+///
+/// Unlike [`check_process_count`] (which only returns a count), this exposes
+/// the individual PIDs so the caller can probe each for genuine liveness
+/// (rejecting zombies / `<defunct>` entries that `pgrep` still counts because
+/// they linger in the process table until reaped). The watcher-health monitor
+/// uses this to decide "is the watcher actually alive" off the SAME process
+/// set that `pgrep -fc` counts — rather than off a separately-recorded PID
+/// file that drifts out of sync after a daemon/watcher restart.
+pub async fn check_process_pids(pattern: &str) -> Vec<u32> {
+    let (out, _) = run_cmd_any(&["pgrep", "-f", "--", pattern], 5).await;
+    out.lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
 }
 
 /// Parse watchers config file. Format:

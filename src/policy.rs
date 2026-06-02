@@ -1059,12 +1059,50 @@ fn is_pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a PID is genuinely alive — i.e. exists AND is not a zombie
+/// (`<defunct>`). `pgrep` still lists zombies because they linger in the
+/// process table until reaped, so a plain `kill -0` probe (or a raw `pgrep`
+/// count) would treat a defunct watcher as "running". We read `/proc/PID/stat`
+/// and reject state `Z` so a watcher whose process has died-but-not-yet-reaped
+/// is correctly seen as not-alive.
+///
+/// Falls back to the signal-0 probe when `/proc/PID/stat` is unreadable (e.g.
+/// a non-Linux test host) so behaviour degrades to "exists?" rather than
+/// always-false.
+fn is_pid_genuinely_alive(pid: u32) -> bool {
+    let path = format!("/proc/{}/stat", pid);
+    match std::fs::read_to_string(&path) {
+        Ok(stat) => {
+            // /proc/PID/stat: `pid (comm) STATE ...`. comm can contain spaces
+            // and parens, so find the LAST ')' and take the next token.
+            if let Some(close) = stat.rfind(')') {
+                let rest = stat[close + 1..].trim_start();
+                let state = rest.split_whitespace().next().unwrap_or("");
+                // 'Z' = zombie/defunct, 'X'/'x' = dead. Anything else is a
+                // live, reapable-or-running process.
+                return state != "Z" && state != "X" && state != "x";
+            }
+            // Malformed stat — fall back to existence probe.
+            is_pid_alive(pid)
+        }
+        // No /proc entry (already reaped) or non-Linux host: fall back to the
+        // signal probe.
+        Err(_) => is_pid_alive(pid),
+    }
+}
+
 /// Read a watcher PID file and return the recorded PID, if the file exists
 /// and contains a parseable integer. Whitespace is trimmed.
 ///
 /// Returns:
 /// - `Some(pid)` if the file exists and parses cleanly.
 /// - `None` if the file is missing, unreadable, or contains non-numeric data.
+///
+/// NOTE: as of the BUG-A fix the watcher-health monitor no longer consults the
+/// recorded PID file to decide liveness (it drifted out of sync after restarts
+/// and caused false "WATCHER DOWN" reports). This helper is retained for
+/// diagnostics / potential future use and remains unit-tested.
+#[allow(dead_code)]
 fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
     let path = format!("{}/{}.pid", pid_dir, name);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -1072,40 +1110,45 @@ fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
 }
 
 /// Decide whether a watcher should be considered DOWN, given:
-/// - the live process count (from `pgrep -fc`)
+/// - the PIDs of processes matching the watcher's pattern (from `pgrep -f`)
 /// - the configured `min_count`
-/// - the recorded PID file (if any)
-/// - a process-liveness probe (typically `is_pid_alive`)
+/// - a genuine-liveness probe (typically [`is_pid_genuinely_alive`], which
+///   rejects zombies)
 ///
-/// Returns `true` when the watcher is missing/orphaned.
+/// Returns `true` when fewer than `min_count` of the matched processes are
+/// genuinely alive.
 ///
-/// The orphan-detection branch is the bug-2 fix: if a PID file exists and its
-/// recorded PID is dead, the watcher is DOWN even when `pgrep -fc` happens to
-/// match some other process by accident (e.g. a stale shell whose argv still
-/// contains the watcher's name pattern, or a self-matching wrapper). This
-/// matches the legacy `watchmen` shell-script's `kill -0` cross-check that
-/// was lost when watchmen was rewritten in Rust.
+/// ## Why this no longer consults a recorded PID file (BUG A fix)
 ///
-/// Watchers without a PID file fall through to the existing pgrep-only logic
-/// (preserves backward compat for watchers we don't explicitly track).
+/// The previous implementation cross-checked a SEPARATELY-recorded PID
+/// (`/var/run/claude/<name>.pid`) and declared the watcher DOWN whenever that
+/// recorded PID was dead — *even when `pgrep` found the watcher genuinely
+/// running under a different PID*. That recorded PID is written by
+/// `watcher-ctl run` at spawn time, so it drifts out of sync with reality on
+/// every restart path that doesn't go through `watcher-ctl run` (a daemon
+/// `make deploy` / `systemctl restart`, a watchmen-supervisor respawn, or a
+/// wrapper that re-execs the poller under a fresh PID). The result was a
+/// persistent FALSE "WATCHER(S) DOWN" for a watcher that watchmen
+/// (`watcher-status`, which is pgrep-only) AND `ps` both saw as healthy.
+///
+/// The original intent of the cross-check — don't let a coincidental `pgrep`
+/// match (a stale shell whose argv contains the pattern, or a `<defunct>`
+/// zombie still in the process table) mask a genuinely-dead watcher — is
+/// preserved here WITHOUT the drifting recorded PID: we probe each matched
+/// PID directly via the genuine-liveness predicate (which rejects zombies),
+/// and require at least `min_count` of them to be truly alive. This reads
+/// liveness off the SAME process set `pgrep` matched, so the monitor and
+/// watchmen can never disagree about a process that is actually running.
 pub fn watcher_is_down(
-    pgrep_count: u32,
+    matched_pids: &[u32],
     min_count: u32,
-    recorded_pid: Option<u32>,
-    pid_alive: impl Fn(u32) -> bool,
+    pid_genuinely_alive: impl Fn(u32) -> bool,
 ) -> bool {
-    // Standard pgrep-only check first.
-    if pgrep_count < min_count {
-        return true;
-    }
-    // Orphan-detection: pgrep saw a match, but the PID Claude actually
-    // started has died. The match is a false positive — count as DOWN.
-    if let Some(pid) = recorded_pid {
-        if !pid_alive(pid) {
-            return true;
-        }
-    }
-    false
+    let alive = matched_pids
+        .iter()
+        .filter(|&&pid| pid_genuinely_alive(pid))
+        .count() as u32;
+    alive < min_count
 }
 
 /// Spawn `self-clear` immediately (no grace period). Used for the
@@ -3030,17 +3073,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             if !entry.enabled {
                 continue;
             }
-            let count = status::check_process_count(&entry.pattern).await;
-            // Orphan-PID cross-check (bug-2 fix): pgrep can match the wrong
-            // process if a stale shell or self-matching wrapper happens to
-            // contain the watcher's name pattern in its argv. The legacy
-            // `watchmen` shell-script handled this with a `kill -0` probe of
-            // the recorded PID; we restore that behaviour here so that a
-            // dead memory-remind whose pidfile still points at PID N
-            // (now reaped) is reported as DOWN rather than masked by a
-            // coincidental pgrep hit.
-            let recorded_pid = read_watcher_pid(&crate::watcher::pid_dir(), &entry.name);
-            let down = watcher_is_down(count, entry.min_count, recorded_pid, is_pid_alive);
+            // Read the actual matched PIDs (not just a count) so we can probe
+            // each for genuine liveness. This is the SAME process set that
+            // `pgrep -fc` / watcher-status counts — so the monitor's liveness
+            // verdict is derived from reality, not from a separately-recorded
+            // PID file that drifts out of sync after a restart (BUG A).
+            let matched_pids = status::check_process_pids(&entry.pattern).await;
+            let count = matched_pids.len() as u32;
+            // Zombie guard (preserves the original orphan-detection intent):
+            // a `<defunct>` watcher process lingers in the table and would be
+            // counted by a raw pgrep, so we require at least `min_count` of the
+            // matched PIDs to be GENUINELY alive (non-zombie). We do NOT consult
+            // /var/run/claude/<name>.pid anymore — see `watcher_is_down` docs.
+            let down = watcher_is_down(&matched_pids, entry.min_count, is_pid_genuinely_alive);
+            // "orphaned" now means: pgrep matched >= min_count processes, but
+            // fewer than min_count are genuinely alive (the rest are zombies /
+            // coincidental matches). Surfaced in the log for diagnostics.
             let orphaned = down && count >= entry.min_count;
             let health = state
                 .watcher_health
@@ -3659,63 +3707,81 @@ mod tests {
 
     // --- watcher_is_down tests ---
     //
-    // Regression suite for bug 2: the legacy `watchmen` shell-script did a
-    // `kill -0` cross-check on the recorded PID file so a pgrep false-match
-    // (stale wrapper, self-matching shell, etc.) didn't mask a dead watcher.
-    // The Rust rewrite dropped that check; these tests pin down the
-    // restored behaviour. Most importantly: pgrep_count >= min_count but
-    // recorded_pid is dead -> DOWN (orphan-detected).
+    // BUG A regression suite. The monitor decides liveness off the SAME
+    // process set `pgrep` matched (probing each PID for genuine, non-zombie
+    // liveness) — NOT off a separately-recorded PID file that drifts out of
+    // sync after a restart. A watcher that `pgrep` finds genuinely alive must
+    // NEVER be reported DOWN, even when its `/var/run/claude/<name>.pid` file
+    // is stale (points at a now-reaped PID from before a `make deploy` /
+    // watcher respawn). The zombie guard preserves the original orphan-
+    // detection intent: a `<defunct>` match does not count as alive.
 
     #[test]
-    fn test_watcher_is_down_count_below_min() {
-        // No PID file, count = 0 < min_count = 1 -> DOWN.
-        assert!(watcher_is_down(0, 1, None, |_| true));
+    fn test_watcher_is_down_no_matches() {
+        // No matching processes at all -> DOWN.
+        assert!(watcher_is_down(&[], 1, |_| true));
     }
 
     #[test]
-    fn test_watcher_is_down_count_meets_min_no_pidfile() {
-        // No PID file -> fall back to pgrep-only logic. Count meets min ->
-        // not DOWN. Preserves backward-compat for watchers we don't track.
-        assert!(!watcher_is_down(1, 1, None, |_| panic!("should not probe")));
-        assert!(!watcher_is_down(3, 1, None, |_| panic!("should not probe")));
+    fn test_watcher_is_down_alive_match_meets_min() {
+        // One genuinely-alive match, min_count 1 -> NOT down.
+        assert!(!watcher_is_down(&[42], 1, |pid| pid == 42));
+        // Several alive matches, min_count 1 -> NOT down.
+        assert!(!watcher_is_down(&[42, 43, 44], 1, |_| true));
     }
 
     #[test]
-    fn test_watcher_is_down_pidfile_alive() {
-        // Count meets min AND recorded PID is alive -> not DOWN.
-        assert!(!watcher_is_down(1, 1, Some(42), |pid| pid == 42));
+    fn test_watcher_is_down_zombie_only_match() {
+        // The orphan/zombie case (original bug-2 intent, preserved): pgrep
+        // matched a PID but it is a zombie / dead -> the alive-count is 0 ->
+        // DOWN. This is the only way a matched-but-not-running watcher is
+        // flagged now; no recorded PID file is consulted.
+        assert!(watcher_is_down(&[42], 1, |_| false));
+        // Multiple matches, all zombies -> still DOWN.
+        assert!(watcher_is_down(&[42, 43, 44], 1, |_| false));
     }
 
     #[test]
-    fn test_watcher_is_down_pidfile_dead_orphan() {
-        // The bug-2 fix: count meets min via pgrep BUT recorded PID is dead.
-        // Used to be reported as ok; now reported as DOWN (orphan).
-        assert!(watcher_is_down(1, 1, Some(42), |_| false));
+    fn test_watcher_is_down_mixed_alive_and_zombie() {
+        // 3 pgrep matches but only 1 genuinely alive. min_count 1 -> NOT down
+        // (the live one satisfies the requirement). The zombies are ignored.
+        let alive_pid = 100u32;
+        assert!(!watcher_is_down(&[100, 200, 300], 1, move |pid| pid
+            == alive_pid));
+        // Same set but min_count 2 -> DOWN (only 1 of the 2 required is alive).
+        assert!(watcher_is_down(&[100, 200, 300], 2, move |pid| pid
+            == alive_pid));
     }
 
+    /// BUG A: stale-PID-file-after-restart must NOT cause a false DOWN.
+    ///
+    /// Before the fix, the monitor read a recorded PID from
+    /// `/var/run/claude/<name>.pid`, found it dead (the watcher had been
+    /// respawned under a fresh PID by `make deploy` / watchmen), and reported
+    /// the watcher DOWN — while `pgrep` (and `watcher-status`, and `ps`) all
+    /// saw it genuinely running. Now the monitor probes the matched PIDs
+    /// directly, so the genuinely-running watcher is NEVER reported DOWN
+    /// regardless of any stale recorded PID.
     #[test]
-    fn test_watcher_is_down_pidfile_dead_with_higher_count() {
-        // Even when pgrep shows multiple matches (e.g. transient self-match),
-        // a dead recorded PID is the canonical signal — DOWN.
-        assert!(watcher_is_down(5, 1, Some(42), |_| false));
-    }
-
-    #[test]
-    fn test_watcher_is_down_count_below_min_with_pidfile() {
-        // Count below min AND PID dead -> DOWN regardless.
-        assert!(watcher_is_down(0, 1, Some(42), |_| false));
-        // Count below min but PID alive -> still DOWN (count is canonical
-        // signal that the watcher isn't running with min_count instances).
-        assert!(watcher_is_down(0, 1, Some(42), |pid| pid == 42));
+    fn test_watcher_is_down_false_down_after_restart_regression() {
+        // watchmen/pgrep sees the watcher genuinely running under PID 5000
+        // (the post-restart PID). An old PID file might still name PID 42
+        // (now reaped) — but that file is no longer consulted, so it cannot
+        // poison the verdict. Monitor must agree with watchmen: NOT down.
+        let live_pid = 5000u32;
+        assert!(
+            !watcher_is_down(&[live_pid], 1, move |pid| pid == live_pid),
+            "a watcher that pgrep finds genuinely alive must NEVER be \
+             reported DOWN, even with a stale recorded PID file"
+        );
     }
 
     #[test]
     fn test_watcher_is_down_min_count_zero() {
-        // Edge case: min_count = 0 means always meets count requirement.
-        // Without a PID file, never DOWN.
-        assert!(!watcher_is_down(0, 0, None, |_| panic!("no probe")));
-        // With a PID file and dead PID, DOWN by orphan detection.
-        assert!(watcher_is_down(0, 0, Some(42), |_| false));
+        // Edge case: min_count = 0 -> never DOWN, even with no matches.
+        assert!(!watcher_is_down(&[], 0, |_| panic!("no probe needed")));
+        // With matches present, still not DOWN.
+        assert!(!watcher_is_down(&[42], 0, |_| true));
     }
 
     // --- read_watcher_pid tests ---

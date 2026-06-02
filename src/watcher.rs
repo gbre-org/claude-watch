@@ -389,6 +389,73 @@ fn try_claim_pid_file(pid_file: &str, pid: u32) -> std::io::Result<bool> {
     }
 }
 
+/// RAII exclusive lock over a watcher's spawn slot, backed by `flock(2)` on a
+/// dedicated `<name>.lock` file.
+///
+/// ## Why a `flock` lock and not just the O_EXCL PID file (BUG B fix)
+///
+/// The PID file alone is a fragile mutex:
+///   * It is **overwritten** with the child's PID after spawn (and some
+///     watcher scripts, e.g. `memory-remind`, write it themselves as a
+///     belt-and-suspenders), so its existence stops meaning "a launch is in
+///     progress" the instant the child is up — reopening the window for a
+///     second `watcher-ctl run` to slip through.
+///   * If `watcher-ctl run` is `SIGKILL`ed, the O_EXCL file **lingers** as a
+///     stale lock that the next legitimate run has to detect-and-remove,
+///     which itself is a TOCTOU (remove → another run O_EXCL-creates in the
+///     gap).
+///
+/// `flock` fixes both: the lock lives on a SEPARATE file that nothing
+/// overwrites, it is held by the running `watcher_run` process for the entire
+/// child lifetime, and the kernel **auto-releases it when the holding process
+/// dies** (clean or crash) — so there is no stale-lock to garbage-collect and
+/// no remove-then-recreate gap. A non-blocking `LOCK_EX | LOCK_NB` acquire
+/// means a concurrent run (or a supervisor/daemon-driven respawn that also
+/// goes through `watcher_run`) that arrives while the slot is held gets
+/// `EWOULDBLOCK` and backs off instead of spawning a duplicate poller.
+struct WatcherLock {
+    // Held for the lock's lifetime; the kernel releases the flock when this
+    // fd is closed (on drop or process exit). We never read/write it.
+    _file: std::fs::File,
+}
+
+impl WatcherLock {
+    /// Try to acquire the exclusive spawn lock for `name` under `pid_dir`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(lock))` — we hold the lock; caller may spawn. Lock is
+    ///   released when the returned guard is dropped (or the process exits).
+    /// - `Ok(None)`       — another live `watcher_run` already holds it; the
+    ///   caller must NOT spawn (idempotent skip).
+    /// - `Err(_)`         — could not open the lock file (e.g. the lock dir is
+    ///   unwritable). The caller decides how to degrade.
+    fn try_acquire(pid_dir: &str, name: &str) -> std::io::Result<Option<WatcherLock>> {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = format!("{}/{}.lock", pid_dir, name);
+        // Open (create if absent) the lock file. We deliberately do NOT
+        // O_EXCL here — the lock FILE persisting across runs is fine and
+        // desired; mutual exclusion comes from the advisory flock on it, not
+        // from the file's existence.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        // Non-blocking exclusive advisory lock.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            Ok(Some(WatcherLock { _file: file }))
+        } else {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                // EWOULDBLOCK / EAGAIN: someone else holds the lock.
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
+                _ => Err(err),
+            }
+        }
+    }
+}
+
 /// Run a watcher by name. Looks up the entry, rejects if disabled or no
 /// start_cmd, then execs the start_cmd and waits for it to complete.
 /// Returns the exit code of the child process.
@@ -425,6 +492,41 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
 
     let pid_file = format!("{}/{}.pid", pid_dir, name);
     let pid_file_exists = std::path::Path::new(&pid_file).exists();
+
+    // --- Spawn-slot lock (BUG B fix) ---------------------------------------
+    // Acquire an exclusive `flock` over `<name>.lock` for the WHOLE duration
+    // of this run. This is the atomic, crash-safe mutex that guarantees only
+    // ONE poller can be spawned at a time, no matter how many concurrent
+    // `watcher-ctl run <name>` invocations (or supervisor/daemon-driven
+    // respawns that route through here) race. Unlike the PID file, the lock
+    // file is never overwritten and is auto-released by the kernel when this
+    // process exits — so there is no stale-lock cleanup and no remove-then-
+    // recreate TOCTOU. We bind it to `_slot_lock` (NOT `_`) so it lives until
+    // `watcher_run` returns; `let _ = ...` would drop it immediately.
+    let _slot_lock = match WatcherLock::try_acquire(&pid_dir, name) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            // Another live run holds the slot. Idempotent skip (success so the
+            // main loop's restart cadence doesn't treat this as an error).
+            println!(
+                "{} launch already in progress (spawn lock held by a concurrent run); \
+                 not starting a second instance",
+                name
+            );
+            return Ok(0);
+        }
+        Err(e) => {
+            // Could not even open the lock file (e.g. unwritable lock dir).
+            // Degrade to the PID-file/pgrep guards below rather than wedging
+            // the watcher entirely — but warn loudly so the broken lock dir
+            // gets noticed.
+            eprintln!(
+                "warning: could not acquire spawn lock for '{}': {} — falling back to PID-file guard",
+                name, e
+            );
+            None
+        }
+    };
 
     // --- PID-guard (idempotency) -------------------------------------------
     // Determine whether a live instance already holds this watcher's slot.
@@ -1690,6 +1792,87 @@ mod tests {
         std::fs::remove_file(&p).unwrap(); // caller clears it
         assert_eq!(try_claim_pid_file(path, 333).unwrap(), true);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "333");
+    }
+
+    // --- WatcherLock (BUG B) tests -----------------------------------------
+    //
+    // The flock-backed spawn lock is the atomic mutex that guarantees only one
+    // poller survives concurrent `watcher-ctl run <name>` invocations (or any
+    // supervisor/daemon-driven respawn routed through `watcher_run`). These
+    // pin the contract: a second acquire while the first is held must fail
+    // (so the caller skips its spawn), and the slot must free up once the
+    // holder is dropped (so a genuine later restart isn't permanently blocked).
+
+    #[test]
+    fn test_watcher_lock_excludes_concurrent_holder() {
+        // BUG B regression: while one run holds the spawn lock, a second
+        // concurrent acquire on the SAME watcher name must return None (lost
+        // the race → must NOT spawn a duplicate poller). Modelling the
+        // window where both invocations passed the pre-flight pgrep guard
+        // (saw 0 live pollers) before either spawned.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().to_str().unwrap();
+
+        let first = WatcherLock::try_acquire(pid_dir, "memory-remind")
+            .expect("first acquire should not error")
+            .expect("first acquire should win the lock");
+
+        // Second acquire while `first` is still held → None (back off).
+        let second = WatcherLock::try_acquire(pid_dir, "memory-remind")
+            .expect("second acquire should not error");
+        assert!(
+            second.is_none(),
+            "a second concurrent acquire must NOT obtain the lock — \
+             exactly one poller may be spawned"
+        );
+
+        // Keep `first` alive across the assertion.
+        drop(first);
+    }
+
+    #[test]
+    fn test_watcher_lock_released_on_drop_allows_reacquire() {
+        // After the holder drops (run finished / watcher exited), the slot is
+        // free again — a genuine later restart must be able to claim it.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().to_str().unwrap();
+
+        {
+            let _first = WatcherLock::try_acquire(pid_dir, "claude-event-watch")
+                .unwrap()
+                .expect("first acquire wins");
+            // While held, a concurrent acquire fails.
+            assert!(WatcherLock::try_acquire(pid_dir, "claude-event-watch")
+                .unwrap()
+                .is_none());
+        } // _first dropped here → kernel releases the flock.
+
+        // Now the slot is free; re-acquire must succeed.
+        let reacquired = WatcherLock::try_acquire(pid_dir, "claude-event-watch")
+            .unwrap();
+        assert!(
+            reacquired.is_some(),
+            "after the holder drops, the spawn lock must be re-acquirable so a \
+             real restart isn't permanently blocked"
+        );
+    }
+
+    #[test]
+    fn test_watcher_lock_distinct_names_dont_collide() {
+        // Two DIFFERENT watchers must lock independently — holding one must
+        // not block spawning another.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().to_str().unwrap();
+
+        let _a = WatcherLock::try_acquire(pid_dir, "watcher-a")
+            .unwrap()
+            .expect("watcher-a lock");
+        let b = WatcherLock::try_acquire(pid_dir, "watcher-b").unwrap();
+        assert!(
+            b.is_some(),
+            "distinct watcher names use distinct lock files and must not \
+             contend with each other"
+        );
     }
 
     // --- PID-guard end-to-end (`watcher_run`) tests ------------------------
