@@ -81,9 +81,9 @@ if DOCKERFILE.is_file():
 
     # 3. sudoers carve-out for cron.
     expect(
-        "hndrewaall ALL=(root) NOPASSWD: /usr/sbin/cron" in text,
+        "hndrewaall ALL=(root) NOPASSWD: CRON_NOFORK" in text,
         "Dockerfile: must add a sudoers entry granting hndrewaall "
-        "passwordless sudo for /usr/sbin/cron only. The narrow "
+        "passwordless sudo for CRON_NOFORK (the alias). The narrow "
         "carve-out lets the uid-1000 entrypoint start the cron "
         "daemon without broadening sudo access to other binaries.",
     )
