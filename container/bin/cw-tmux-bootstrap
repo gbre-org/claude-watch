@@ -29,25 +29,11 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exit 0
 fi
 
-# Build the claude invocation. Mirrors the logic in
-# claude-tmux-entrypoint (see comments there for the full rationale of
-# each conditional block).
-CLAUDE_CMD="exec claude"
-if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
-    CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
-fi
-if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -z "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
-    CLAUDE_CMD="exec claude --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
-fi
-if [ -d /etc/claude-code/plugin/.claude-plugin ]; then
-    CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /etc/claude-code/plugin"
-fi
-if [ "${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}" = "1" ]; then
-    CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
-fi
-if [ -n "${CLAUDE_AUTO_CONTINUE:-}" ]; then
-    _auto_continue_quoted="'${CLAUDE_AUTO_CONTINUE//\'/\'\\\'\'}'"
-    CLAUDE_CMD="$CLAUDE_CMD --continue $_auto_continue_quoted"
+# CLAUDE_CMD is built and exported by the entrypoint before process-compose
+# starts. Use it directly.
+if [ -z "${CLAUDE_CMD:-}" ]; then
+    echo "[cw-tmux-bootstrap] CLAUDE_CMD not set — entrypoint did not export it" >&2
+    exit 1
 fi
 
 tmux new-session -d -s "$SESSION" -x 200 -y 50 \

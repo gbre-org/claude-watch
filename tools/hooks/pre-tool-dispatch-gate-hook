@@ -158,6 +158,7 @@ _BAKED_BASH_EXEMPT_PATTERNS = [
     # told the loop to run.
     r"^watcher-ctl\s+run(?:\s|$)",
     r"^/usr/local/bin/watcher-ctl\s+run(?:\s|$)",
+    r"^/etc/claude-code/watchers/",
 ]
 
 # Tool names that bypass tracking + denial regardless of args. Agent is
