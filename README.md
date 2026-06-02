@@ -269,9 +269,12 @@ make install-hooks       # install the git pre-commit hook (warnings + tests)
 
 ### Pre-commit hook
 
-`make install-hooks` symlinks
-[`scripts/git-hooks/pre-commit`](scripts/git-hooks/pre-commit) into
-`.git/hooks/pre-commit`. The hook runs two gates before each commit:
+`make install-hooks` sets `core.hooksPath` to the tracked
+[`scripts/git-hooks/`](scripts/git-hooks/) dir (local to this repo, not
+`--global`). Because the path is relative and git config lives in the
+shared common dir, the gate applies to every worktree of this repo —
+including fresh `git worktree add` checkouts — without re-running the
+target. The hook runs two gates before each commit:
 
 1. **Warning-free release build** — `RUSTFLAGS="-D warnings" cargo build --release --tests`. Any rustc warning (dead code, unused imports, etc.) blocks the commit.
 2. **Unit + fixture tests** via `cargo nextest run -E 'not binary(~e2e_)'` (~0.5s in parallel).

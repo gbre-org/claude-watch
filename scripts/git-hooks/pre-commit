@@ -8,9 +8,9 @@
 #   2. Unit + fixture test suite via cargo-nextest. ~0.1s in parallel.
 #      Skips e2e tests (which do real sleeps and add ~10s+).
 #
-# Install via `make install-hooks` (which symlinks this file into
-# .git/hooks/pre-commit). Bypass for RED-phase TDD commits with
-# `git commit --no-verify`.
+# Install via `make install-hooks` (which points core.hooksPath at this
+# dir, so every worktree of the repo runs it). Bypass for RED-phase TDD
+# commits with `git commit --no-verify`.
 #
 # Exits non-zero on any warning or test failure, blocking the commit.
 

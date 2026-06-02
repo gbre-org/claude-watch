@@ -123,7 +123,7 @@ Tests run fully parallel by default. Configuration:
 
 ## Pre-commit Hook
 
-Run `make install-hooks` to install the pre-commit hook. It symlinks `scripts/git-hooks/pre-commit` into `.git/hooks/` and runs two gates per commit:
+Run `make install-hooks` to install the pre-commit hook. It sets `core.hooksPath` to the tracked `scripts/git-hooks/` dir (local to this repo, relative path — so it applies to every worktree, including fresh `git worktree add` checkouts, not just the main checkout). The hook runs two gates per commit:
 
 1. **Warning-free release build** — `RUSTFLAGS="-D warnings" cargo build --release --tests`. Any rustc warning (dead code, unused imports, etc.) blocks the commit. Mirrors the CI `Warning-Free Build` job.
 2. **Unit + fixture tests** via `cargo nextest run -E 'not binary(~e2e_)'` (~0.5s in parallel, skips e2e tests that do real sleeps).

@@ -106,6 +106,9 @@ jobs:
       - name: Check baked-doc markdown links (no broken links)
         run: make test-doc-links
 
+      - name: Run install-hooks (core.hooksPath + worktree) tests
+        run: make test-install-hooks
+
       - name: Run claude-tmux env passthrough + fail-loud warning tests
         run: make test-claude-tmux-env
 

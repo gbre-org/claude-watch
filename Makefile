@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-doc-links test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -124,6 +124,12 @@ test-hooks-shim:
 test-doc-links:
 	python3 scripts/check-doc-links.py --self-test
 	python3 scripts/check-doc-links.py --all
+
+# Test the install-hooks target: asserts it sets a relative, repo-local
+# core.hooksPath (not --global, no .git/hooks symlink) and that a fresh
+# git worktree resolves + fires the pre-commit hook from its own checkout.
+test-install-hooks:
+	scripts/git-hooks/tests/install-hooks.test
 
 # Run the entrypoint CLAUDE_CMD construction tests. Extracts the
 # CLAUDE_CMD-building shell block from container/entrypoint.sh by regex
@@ -340,13 +346,20 @@ install: build
 	@echo "  - self-clear                (symlink -> tools/watchers/)"
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
-# Symlinks scripts/git-hooks/pre-commit into .git/hooks so script edits
-# take effect without re-running this target. Removes any previous file
-# at .git/hooks/pre-commit (including older inline-generated versions).
+# Points core.hooksPath at the tracked scripts/git-hooks/ dir instead of
+# symlinking into .git/hooks/. Two reasons this is the correct form:
+#   1. The setting is RELATIVE, so it resolves against each worktree's own
+#      top-level — every worktree runs its own checked-out hooks.
+#   2. git config lives in the shared common dir, so this auto-applies to
+#      every existing AND future worktree of this repo. A symlink into
+#      .git/hooks/ does NOT: linked worktrees have a private gitdir and
+#      never consult the main repo's .git/hooks, so a fresh worktree
+#      silently ran with no pre-commit gate.
+# Scoped to THIS repo (local .git/config), NOT --global — other repos are
+# untouched. Idempotent: re-running just re-asserts the same value.
 install-hooks:
-	@rm -f .git/hooks/pre-commit
-	@ln -s ../../scripts/git-hooks/pre-commit .git/hooks/pre-commit
-	@echo "Pre-commit hook installed (symlink -> scripts/git-hooks/pre-commit)."
+	@git config core.hooksPath scripts/git-hooks
+	@echo "Pre-commit hook installed (core.hooksPath -> scripts/git-hooks; applies to all worktrees)."
 
 # --- examples/compose targets -----------------------------------------
 # Convenience wrappers around the integrated docker-compose example at
