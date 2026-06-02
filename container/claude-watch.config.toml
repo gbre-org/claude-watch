@@ -12,8 +12,6 @@
 #     pane 1 — this one — is the sidecar reading pane 0).
 #   - All file paths live under /tmp/ or /home/hndrewaall/, never /var/log/
 #     or /var/run/ (no root-owned host dirs in the container).
-#   - watcher_monitor disabled (Phase 1 has no watchers inside the container;
-#     Phase 2 will move them in).
 #   - auto_update / reauth / hybrid hooks disabled (host integrations).
 #   - task_watch disabled (no in-container `tasks` session yet).
 # Phase 1e (q-2026-05-11-8a96).
@@ -67,19 +65,16 @@ interrupt_message = "The foreground command was backgrounded by claude-watch bec
 thinking_backoff_multiplier = 3
 
 [watcher_monitor]
-# Disabled — block-print-exit watchers (claude-event-watch) are DOWN
-# between fires by design. The pgrep-based monitor fires false alerts
-# every time the watcher is blocking on inotifywait in a background task.
-# The correct restart mechanism is the watcher's own restart banner in
-# its task output, not the daemon's tmux-inject path.
-# Dead-watcher detection is handled by cw-watcher-health-check (cron,
-# */2 min) which checks for stale unconsumed events and injects a
-# [CLAUDE-WATCH] alert via tmux send-keys if any accumulate >2min.
-enabled = false
+# The in-container watcher (claude-event-tail) sits in inotifywait as a
+# long-lived process, so pgrep reliably detects it. If the supervisor
+# fails to restart it, the daemon fires a [CLAUDE-WATCH] alert and the
+# main loop re-runs it via watcher-ctl. The cw-watcher-health-check
+# cron (stale-event detection) remains as an additional safety net.
+enabled = true
 # Baked in-container watcher list. Format documented in the file.
 # Currently registers: claude-event-tail (the in-container
 # equivalent of host claude-event-watch).
-watchers_config = "/etc/claude-code/watchmen/watchers.conf"
+watchers_config = "/etc/claude-code/watchers/watchers.conf"
 watchers_config_extra = "/home/hndrewaall/.config/claude-container/watchers/watchers.conf"
 # Used only for the legacy host-side `bin/watchmen` daemon count.
 # Zero in container -- no host-side watchmen daemon runs here.
