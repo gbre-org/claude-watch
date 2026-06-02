@@ -374,7 +374,7 @@ a "use these fds" or "connect to this socket" option. The SDK supports
 several transports (`stdio | http | sse-ide | ws-ide`) but those are
 agent-as-MCP-client transports for connecting to MCP servers, NOT for
 hosting the user-input channel of the agent itself — see
-`docs/sse-protocol.md` for the full protocol surface. The
+[`sse-protocol.md`](sse-protocol.md) for the full protocol surface. The
 `claudeCode.claudeProcessWrapper` setting lets the operator override the
 executable path, but not the transport.
 

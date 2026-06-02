@@ -10,8 +10,8 @@ looks like, and how to drop a new one into either the host-side or
 container-side surface.
 
 > **Before you start:** confirm you actually need a watcher. See
-> [`docs/watchers.md` § Watcher vs. cron](watchers.md#watcher-vs-cron--pick-the-right-tool).
-> Cron is almost always simpler and should be the default.
+> [`docs/watchers.md` § Watcher vs. producer (cron)](watchers.md#watcher-vs-producer-cron--pick-the-right-tool).
+> A cron producer is almost always simpler and should be the default.
 
 ## What a watcher is
 

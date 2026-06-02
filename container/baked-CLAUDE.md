@@ -180,12 +180,15 @@ If the operator gives you a job that genuinely needs a host-side
 watcher / notifier, run it on the host instead (via the operator's host
 Claude Code session) or bridge the watch event over `host-bash`.
 
-> **Watcher vs. cron decision:** before adding a new watcher, confirm
-> a watcher is actually needed. Cron is almost always simpler: it has
-> no persistent footprint, no restart cycles, and no DOWN-state alerts.
-> A dedicated watcher is justified only when sub-minute reactivity is
-> required AND no kernel event mechanism (inotify, systemd path units)
-> fits. See [`docs/watchers.md` § Watcher vs. cron](https://github.com/hndrewaall/claude-watch/blob/main/docs/watchers.md#watcher-vs-cron--pick-the-right-tool)
+> **Watcher vs. producer (cron) decision:** before adding a new *watcher*
+> (a one-shot, main-loop-supervised tool that blocks-prints-exits), confirm
+> one is actually needed. A *cron producer* — a script that emits a
+> claude-event and exits, surfaced by the existing `claude-event-watch`
+> watcher — is almost always simpler: no persistent supervised slot, no
+> restart cycles, no DOWN-state alerts. A dedicated watcher is justified only
+> when sub-minute reactivity is required AND no kernel event mechanism
+> (inotify, systemd path units) fits. See
+> [`docs/watchers.md` § Watcher vs. producer (cron)](https://github.com/hndrewaall/claude-watch/blob/main/docs/watchers.md#watcher-vs-producer-cron--pick-the-right-tool)
 > for the full decision framework, alternatives (kernel events, extending
 > claude-watch, cron + internal poll loop), and a concrete example.
 
@@ -1101,10 +1104,29 @@ read-only via the bind-mounted DB at `~/.local/share/eichi/index.db`).
 
 ## Event response protocol — four-tier model
 
-When `claude-event-watch` delivers events, the container classifies each
-event into one of four tiers based on its `source` and `tag`. The tiers
-escalate from "purely informational" to "blocking" and exist so the LLM
-sees the right level of pressure for each event class.
+> **Read first — the conceptual model:** the
+> [event hierarchy concept doc](https://github.com/hndrewaall/claude-watch/blob/main/docs/concepts/event-hierarchy.md)
+> is the entry point that explains how **events vs. obligations vs.
+> interruptions** differ as signaling mechanisms. (It lives under `docs/`,
+> which is NOT baked into this image — read it at the GitHub URL above, not a
+> local path.) The four tiers below are a *different, orthogonal* axis: they
+> are the container's **event-classification** routing (how each individual
+> `claude-event` is triaged), not the event→obligation→interruption *force
+> ladder*. The concept doc's terminology applies here verbatim:
+>
+> - A **watcher** is the one-shot tool the main loop runs (`claude-event-watch`,
+>   `signal-wait-*`) — it **blocks, prints events to stdout, and exits**;
+>   the loop reads that stdout and respawns a fresh instance. It is the
+>   signal-*delivery* mechanism, not a long-lived poller.
+> - An **event producer** (a cron job, alertmanager, the queue) is what
+>   *emits* a `claude-event` onto the bus for the `claude-event-watch` watcher
+>   to surface. Cron ticks below are producer output — cron jobs are **not**
+>   watchers.
+
+When `claude-event-watch` (the watcher) delivers events, the container
+classifies each event into one of four tiers based on its `source` and `tag`.
+The tiers escalate from "purely informational" to "blocking" and exist so the
+LLM sees the right level of pressure for each event class.
 
 ### Tier 1 — Ambient (info-only, context-inject only)
 
@@ -1356,9 +1378,10 @@ isn't; the host scheduler is).
 ## Where to learn more
 
 - [Top-level claude-watch README](https://github.com/hndrewaall/claude-watch/blob/main/README.md)
+- [docs/concepts/event-hierarchy.md](https://github.com/hndrewaall/claude-watch/blob/main/docs/concepts/event-hierarchy.md) — the conceptual entry point: how **events vs. obligations vs. interruptions** differ, and the precise **watcher** (one-shot main-loop tool) vs. **event producer** (cron / alertmanager / queue) terminology used throughout these docs
 - [container/ README](https://github.com/hndrewaall/claude-watch/blob/main/container/README.md) — full Dockerfile / entrypoint / blast-radius reference
 - [examples/compose/ README](https://github.com/hndrewaall/claude-watch/blob/main/examples/compose/README.md) — fresh-laptop developer stack walkthrough
-- [docs/watchers.md](https://github.com/hndrewaall/claude-watch/blob/main/docs/watchers.md) — operator-side hygiene rules for background tasks and watchers, including the **watcher-vs-cron decision framework** (when cron suffices, when a watcher is justified, and alternatives)
+- [docs/watchers.md](https://github.com/hndrewaall/claude-watch/blob/main/docs/watchers.md) — operator-side hygiene rules for watchers, including the **watcher-vs-producer (cron) decision framework** (when a cron producer suffices, when a dedicated watcher is justified, and alternatives)
 - [docs/adding-watchers.md](https://github.com/hndrewaall/claude-watch/blob/main/docs/adding-watchers.md) — authoring walkthrough for new watchers (fire-and-exit contract, host- and container-side layouts, worked Jenkins example)
 - [Claude Code memory docs](https://code.claude.com/docs/en/memory) — canonical CLAUDE.md hierarchy reference
 - [Claude Code hooks docs](https://code.claude.com/docs/en/hooks) — full hook event list + exit-code semantics

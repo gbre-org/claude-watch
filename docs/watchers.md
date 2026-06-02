@@ -1,9 +1,16 @@
 # Background tasks + watcher hygiene
 
-Watchers and other long-lived background tasks are the canonical way to
-surface external state changes to a Claude Code main loop. They MUST be
-spawned, supervised, and restarted following the rules below — drift
-silently turns watchers into orphans that fire into the void.
+Watchers are the canonical way to surface external state changes to a Claude
+Code main loop. A **watcher** here is the precise thing: a *one-shot tool the
+main loop invokes* (`watcher-ctl run <name>`) that blocks until its event
+fires, prints it to stdout, and **exits** — the supervisor respawns a fresh
+instance for the next burst (see [`adding-watchers.md`](adding-watchers.md) for
+the lifecycle contract). It is *not* a long-lived poll loop, and it is distinct
+from an **event producer** (a cron job, alertmanager, the queue) that merely
+*emits* a claude-event onto the bus for the `claude-event-watch` watcher to
+surface — producers are not watchers. Watchers MUST be spawned, supervised, and
+restarted following the rules below — drift silently turns them into orphans
+that fire into the void.
 
 > **Writing a new watcher?** See [`adding-watchers.md`](adding-watchers.md)
 > for the authoring walkthrough — the on-disk file layout, the
@@ -54,13 +61,21 @@ Within a single watcher domain (e.g. event surfacing) keep ONE watcher
 running, not multiple. Duplicates race for inotify events and silently
 drop deliveries.
 
-## Watcher vs. cron — pick the right tool
+## Watcher vs. producer (cron) — pick the right tool
 
-**Default to cron.** A watcher is a long-lived supervised process; a cron
-job is a single-shot script with no persistent footprint. Every watcher you
-add costs supervisor overhead, restart cycles, DOWN-state alerts, and mental
-load to track. Prefer the simpler primitive unless the criteria below
-genuinely require a watcher.
+This is a choice between the two roles in the terminology above: a **watcher**
+(a supervised, main-loop-owned tool that blocks-prints-exits and gets respawned
+each burst) versus an **event producer** (most often a cron job — a single-shot
+script that emits a claude-event and exits, surfaced by the *one*
+`claude-event-watch` watcher).
+
+**Default to a cron producer.** Each watcher you stand up — even though every
+single invocation is short-lived — costs a *supervised slot*: supervisor
+overhead, restart cycles on every resume / `/clear` / compaction, DOWN-state
+alerts, and mental load to track. A cron producer has none of that persistent
+footprint; it just emits onto the bus that the existing watcher already
+surfaces. Prefer the producer unless the criteria below genuinely require a
+dedicated watcher.
 
 ### When cron is the right choice
 

@@ -412,7 +412,7 @@ on-disk schema, the bake target, and the add-a-new-entry walkthrough.
 | --- | --- | --- | --- |
 | [`container/skills/`](skills/) | `/etc/claude-code/skills/` (canonical) + `/etc/claude-code/plugin/commands/` (plugin loader) | One `<name>.md` per slash command | `--plugin-dir /etc/claude-code/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`); skills callable as `/claude-container:<name>` |
 | [`container/agents/`](agents/) | `/etc/claude-code/agents/` (canonical) + `/etc/claude-code/plugin/agents/` (plugin loader) | One `<name>.md` per custom agent (frontmatter + body) | Same `--plugin-dir`; agents spawned with `subagent_type="claude-container:<name>"` |
-| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per long-running watcher | Auto-launched at container start by `cw-watcher-supervisor` (entrypoint-spawned, respawn-on-exit per `restart_policy`). The `/claude-container:start-watchers` skill is an informational probe. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
+| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per watcher (a one-shot, fire-and-exit tool — blocks, prints events, exits) | Auto-launched at container start by `cw-watcher-supervisor` (entrypoint-spawned, respawn-on-exit per `restart_policy`). The `/claude-container:start-watchers` skill is an informational probe. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
 
 The plugin namespace `claude-container` is set by
 [`container/plugin/.claude-plugin/plugin.json`](plugin/.claude-plugin/plugin.json),
@@ -488,3 +488,9 @@ docker compose -f container/compose.yml up -d
 `compose.yml` uses `${CW_STATE_PATH:-claude-watch-state}` in the volume reference: when the env var is set, compose treats it as an absolute path and creates a bind mount; when unset, compose treats it as a volume name and uses the declared `claude-watch-state` named volume. No alternate compose file is required.
 
 **Host-path ownership**: when overriding to a bind mount, the host directory must be uid-1000 writable so the in-container cron entries can write `active-agents.json`. The image's pre-created `/var/lib/claude-watch` ownership only propagates into the default named-volume path; a host bind-mount is whatever ownership the host filesystem has. The `chown 1000:1000` above is the canonical fix when the in-container user is uid 1000 (the typical case for hosts where the invoking user is also uid 1000).
+
+## Related docs
+
+- [`docs/tips-faq.md`](../docs/tips-faq.md) — operational tips and common issues for claude-container users (e.g. image paste from a VS Code terminal into the container).
+- [`docs/two-channel-design.md`](../docs/two-channel-design.md) — the session/observation two-channel split that the container's tmux+daemon shape implements.
+- [`docs/adding-watchers.md`](../docs/adding-watchers.md) — authoring a container-side watcher (the fire-and-exit lifecycle contract).

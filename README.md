@@ -56,13 +56,22 @@ tier ESCALATES if the lower one is insufficient: an **event** is informational
 satisfied, and an **interruption** CANCELS in-flight generation and forces the
 main loop to handle the underlying issue immediately.
 
+> For the **conceptual** treatment — how events, obligations, and
+> interruptions *differ* (not just how they escalate), where a *watcher* (the
+> one-shot `claude-event-watch`-style tool) fits as the immediate notifier
+> versus an *event producer* (cron / alertmanager / queue) that feeds it (and
+> why the watcher count stays near one), and why a harness-injected tool
+> rejection is NOT an interruption — see
+> [`docs/concepts/event-hierarchy.md`](docs/concepts/event-hierarchy.md). It is
+> the entry point that ties the otherwise-scattered per-subsystem docs together.
+
 ```mermaid
 flowchart LR
     EXT["external alerting<br/>(Prometheus / Alertmanager / etc)"]:::ext
     subgraph EV["events (informational)"]
         direction TB
-        W[watchers] --> E[claude-event CLI]
-        E --> EW[claude-event-watch]
+        W["producers<br/>(cron / alertmanager / queue)"] --> E[claude-event CLI]
+        E --> EW["claude-event-watch<br/>(the watcher)"]
         EW --> UPS[UserPromptSubmit context]
     end
     subgraph OB["obligations (blocking)"]
@@ -86,7 +95,7 @@ flowchart LR
 
 | Tier | Mechanism | Implementation surface | Use case |
 |------|-----------|------------------------|----------|
-| **events** (mild) | watchers | `claude-event` CLI emits JSON into `~/claude-events/`; `claude-event-watch` surfaces an `EVENT[source/tag]` one-liner in the next `UserPromptSubmit` context | Routine signaling — cron ticks, queue state changes, non-blocking alerts, completed-torrent notifications, scheduled reminders |
+| **events** (mild) | producers + a watcher | A *producer* (cron / alertmanager / queue) emits JSON into `~/claude-events/` via the `claude-event` CLI; the `claude-event-watch` *watcher* (a one-shot, fire-and-exit tool) surfaces an `EVENT[source/tag]` one-liner in the next `UserPromptSubmit` context | Routine signaling — cron ticks, queue state changes, non-blocking alerts, completed-torrent notifications, scheduled reminders |
 | **obligations** (blocking) | hooks (PreToolUse / PostToolUse) | `settings.json` hooks invoke the `obligations` CLI; predicates DENY a tool call when invariants are unmet; the agent must `obligations satisfy` or `obligations override` before retrying | Invariants and guardrails — must-ack inbox before sending, must-read captured watcher output before restarting, no-private-leakage gates, queue-spawn ordering, ack-gate enforcement |
 | **interruptions** (forced) | tmux `send-keys` | The `claude-watch` Rust daemon injects directly into the main-loop tmux pane when urgency demands mid-generation intervention (context approaching limit, dead watchers, prolonged thinking >300s, zombie session) | Forced, can't-wait-for-turn-boundary intervention — situations where letting the current generation finish would make recovery harder or impossible |
 
@@ -228,7 +237,7 @@ fresh deployments self-contained.
 | `obligations` | [`tools/obligations/`](tools/obligations/) | Generic "must do X before Y" gate; bounded predicate vocabulary. The `event_must_act` instance is the event-reading enforcement layer — see [`docs/event-must-act.md`](docs/event-must-act.md). |
 | Hook scripts | [`tools/hooks/`](tools/hooks/) | PreToolUse / PostToolUse hooks that wire the queue + obligations gate into Claude Code's hook contract. See [`docs/hooks.md`](docs/hooks.md). |
 | `agent-msg` | [`tools/agent-msg/`](tools/agent-msg/) | Async-messaging CLI for delivering inbox messages to running subagents via the obligations gate. See [`docs/agent-msg.md`](docs/agent-msg.md). |
-| `claude-event` + `claude-event-tail` | [`tools/claude-event/`](tools/claude-event/) | Source-agnostic JSON event bus (emitter + ring-buffer reader). See [`docs/events.md`](docs/events.md). |
+| `claude-event` + `claude-event-tail` | [`tools/claude-event/`](tools/claude-event/) | Source-agnostic JSON event bus (emitter + ring-buffer reader). See [`docs/events.md`](docs/events.md), and [`docs/concepts/event-hierarchy.md`](docs/concepts/event-hierarchy.md) for how events relate to obligations and interruptions. |
 | `claude-event-watch` + `self-clear` | [`tools/watchers/`](tools/watchers/) | Watcher script (inotify-blocking event surfacer) and the `/clear` + resume-prompt injector. See [`docs/watchers.md`](docs/watchers.md) for operator hygiene and [`docs/adding-watchers.md`](docs/adding-watchers.md) for authoring a custom watcher. |
 | `queue-minisite` | [`queue-minisite/`](queue-minisite/) | Mobile-friendly Flask UI for the `session-task` work queue. Renders running/pending/blocked items with Stop / Abandon / Force-start buttons. Designed to sit behind an upstream auth proxy. See [`queue-minisite/README.md`](queue-minisite/README.md). |
 | `container` | [`container/`](container/) | Containerized deployment of Claude Code + the `claude-watch` daemon + tmux as a single Docker image, plus a host-side `claude-tmux` wrapper with bind mounts, env passthrough, POSIX signal handling, and TTY. Lets the same Claude Code environment run identically on Linux servers and macOS work laptops. See [`container/README.md`](container/README.md). |

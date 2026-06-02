@@ -7,8 +7,11 @@ Rust daemon that monitors Claude Code health via tmux pane capture. Detects acti
 claude-watch and its sibling tools form a **three-tier alerting hierarchy**.
 Each tier escalates the intervention level over the one below it. The README
 has a visual diagram and tier table — see
-[`README.md` § Alerting hierarchy](README.md#alerting-hierarchy). The short
-form:
+[`README.md` § Alerting hierarchy](README.md#alerting-hierarchy). For the
+conceptual distinction between the three (and the crucial "a harness-injected
+tool rejection is NOT an interruption" point), see
+[`docs/concepts/event-hierarchy.md`](docs/concepts/event-hierarchy.md). The
+short form:
 
 ```
 events  <  obligations  <  interruptions
