@@ -144,7 +144,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the legacy NOPASSWD grant for any other invocation.
 RUN printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         'Cmnd_Alias CRON_NOFORK = /usr/sbin/cron -f -L 15' \
-        'Defaults!CRON_NOFORK !pam_session, !pam_setcred' \
+        'Defaults!CRON_NOFORK !pam_session, !pam_setcred, !use_pty' \
         'hndrewaall ALL=(root) NOPASSWD: CRON_NOFORK' \
         'hndrewaall ALL=(root) NOPASSWD: /bin/kill' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/bin/tee /etc/cron.d/00-env' \

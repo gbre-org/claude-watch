@@ -134,12 +134,12 @@ if DOCKERFILE.is_file():
     )
     expect(
         re.search(
-            r"Defaults!CRON_NOFORK\s+!pam_session,\s*!pam_setcred",
+            r"Defaults!CRON_NOFORK\s+!pam_session,\s*!pam_setcred,\s*!use_pty",
             text,
         )
         is not None,
         "Dockerfile: must add `Defaults!CRON_NOFORK !pam_session, "
-        "!pam_setcred` so the sudoers plugin defines no close "
+        "!pam_setcred, !use_pty` so the sudoers plugin defines no close "
         "function and sudo execs cron directly instead of forking "
         "it. This is what lets the cron daemon die cleanly on "
         "container stop (no orphaned root cron pinning the netns + "
