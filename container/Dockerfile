@@ -522,6 +522,38 @@ RUN ln -s /usr/local/bin/claude-watch /usr/local/bin/watcher-ctl
 # baked one wholesale.
 COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md
 
+# Bake the docs the managed CLAUDE.md links to, alongside it, so its
+# cross-references resolve to LOCAL paths in-container instead of raw-GitHub
+# URLs. baked-CLAUDE.md lands at /etc/claude-code/CLAUDE.md and now uses plain
+# RELATIVE links (docs/..., README.md, container/README.md,
+# examples/compose/...). For those to resolve, each target must sit at
+# /etc/claude-code/<repo-relative-path>. We mirror the repo layout under
+# /etc/claude-code/ for exactly the subtrees baked-CLAUDE.md reaches into:
+#
+#   docs/                          -> the concept + per-subsystem docs
+#                                     (event-hierarchy, watchers, adding-watchers, …)
+#   README.md                      -> top-level README (Alerting hierarchy)
+#   container/README.md            -> blast-radius / entrypoint reference
+#   container/hooks-shim/exec-hook -> the exec-hook shim baked-CLAUDE.md cites
+#   container/{skills,agents,watchers}
+#                                  -> the baked slash-command / agent / watcher dirs
+#   examples/compose/{README.md,docker-compose.yml,bin}
+#                                  -> the fresh-laptop developer stack
+#
+# scripts/check-doc-links.py (run in CI) guarantees every relative link in
+# baked-CLAUDE.md resolves to a path that exists in the repo, so this COPY set
+# stays in sync with the doc's links: a new link to an un-baked path fails CI.
+COPY docs/ /etc/claude-code/docs/
+COPY README.md /etc/claude-code/README.md
+COPY container/README.md /etc/claude-code/container/README.md
+COPY container/hooks-shim/exec-hook /etc/claude-code/container/hooks-shim/exec-hook
+COPY container/skills/ /etc/claude-code/container/skills/
+COPY container/agents/ /etc/claude-code/container/agents/
+COPY container/watchers/ /etc/claude-code/container/watchers/
+COPY examples/compose/README.md /etc/claude-code/examples/compose/README.md
+COPY examples/compose/docker-compose.yml /etc/claude-code/examples/compose/docker-compose.yml
+COPY examples/compose/bin/ /etc/claude-code/examples/compose/bin/
+
 # Bake CLAUDE_WATCH_CONFIG into the image-level env (Phase 1.5 fix #3,
 # q-2026-05-11-d7c0). entrypoint.sh exports it for its own children (pane 0/1
 # under tmux), but `docker exec <container> claude-watch ...` spawns a fresh

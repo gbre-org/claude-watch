@@ -103,6 +103,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check baked-doc markdown links (no broken links)
+        run: make test-doc-links
+
       - name: Run claude-tmux env passthrough + fail-loud warning tests
         run: make test-claude-tmux-env
 

@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-doc-links test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -114,6 +114,16 @@ test-hooks-shim:
 	container/hooks-shim/tests/exec-hook-bridge.test
 	container/hooks-shim/tests/generate-hooks-shim-settings.test
 	container/hooks-shim/tests/generate-project-mcp-json.test
+
+# No-broken-links gate for the docs baked into the container image. Runs the
+# checker's embedded self-tests, then verifies every relative markdown link in
+# container/baked-CLAUDE.md (and repo-wide) resolves to a path that exists in
+# the repo. baked-CLAUDE.md now links to its sibling docs by RELATIVE path
+# (they are COPYed into /etc/claude-code/ alongside it), so a link to an
+# un-baked path is a real in-container 404 — this gate catches it at CI time.
+test-doc-links:
+	python3 scripts/check-doc-links.py --self-test
+	python3 scripts/check-doc-links.py --all
 
 # Run the entrypoint CLAUDE_CMD construction tests. Extracts the
 # CLAUDE_CMD-building shell block from container/entrypoint.sh by regex
