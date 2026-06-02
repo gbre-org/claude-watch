@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Tests for the in-container watcher_monitor alert layer being ENABLED.
+
+Background: The watcher_monitor was originally disabled (PR #200 hotfix)
+because the old block-print-exit watchers were undetectable between fires
+-- pgrep found nothing, the alert fired, recovery spawned, the watcher
+exited, and the alert re-fired in a loop.
+
+The current watcher (claude-event-tail) sits in inotifywait as a
+long-lived process. pgrep reliably detects it, so the watcher_monitor
+alert layer works correctly and should be enabled. If the supervisor
+fails to restart the watcher, the daemon fires a [CLAUDE-WATCH] alert
+and the main loop re-runs it via watcher-ctl.
+
+This test verifies:
+
+  1. claude-watch.config.toml [watcher_monitor].enabled is true.
+  2. watchers_config points at the baked in-container path.
+  3. event_consumer_watcher_name is "claude-event-tail".
+  4. container/watchers.conf still exists and declares claude-event-tail.
+  5. Dockerfile artifacts (COPY, symlink, ENV) remain in place.
+
+Run:  ./watcher-monitor-enabled.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+
+WATCHERS_CONF = CONTAINER_DIR / "watchers.conf"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+CONFIG_TOML = CONTAINER_DIR / "claude-watch.config.toml"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def parse_watchers_conf(text: str) -> list[dict]:
+    """Mirror src/status.rs::parse_watchers_config_str -- pipe-separated,
+    skip blank + # lines, fields: name|pattern|min_count|enabled|start_cmd.
+    """
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        out.append({
+            "name": parts[0],
+            "pattern": parts[1],
+            "min_count": int(parts[2]) if len(parts) > 2 and parts[2] else 1,
+            "enabled": (parts[3].strip().lower() == "true") if len(parts) > 3 else True,
+            "start_cmd": parts[4].strip() if len(parts) > 4 else "",
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 1. claude-watch.config.toml [watcher_monitor].enabled is true.
+# ---------------------------------------------------------------------------
+expect(CONFIG_TOML.exists(), f"claude-watch.config.toml missing at {CONFIG_TOML}")
+section_body = ""
+if CONFIG_TOML.exists():
+    cfg = CONFIG_TOML.read_text(encoding="utf-8")
+
+    section = re.search(r'^\[watcher_monitor\]', cfg, re.MULTILINE)
+    expect(
+        section is not None,
+        "claude-watch.config.toml missing the `[watcher_monitor]` section header",
+    )
+
+    if section is not None:
+        m = re.search(
+            r'^\[watcher_monitor\]\s*\n(.*?)(?=^\[|\Z)',
+            cfg,
+            re.MULTILINE | re.DOTALL,
+        )
+        if m:
+            section_body = m.group(1)
+
+    # The watcher_monitor must be enabled: claude-event-tail is a
+    # long-lived inotifywait process, pgrep-detectable, so the alert
+    # layer works correctly.
+    enabled_true = re.search(
+        r'^\s*enabled\s*=\s*true\b',
+        section_body,
+        re.MULTILINE,
+    )
+    expect(
+        enabled_true is not None,
+        "claude-watch.config.toml [watcher_monitor].enabled must be "
+        "true -- claude-event-tail is a long-lived process (sits in "
+        "inotifywait), so pgrep reliably detects it and the alert "
+        "layer works correctly",
+    )
+    # Defensive: no stray `enabled = false` anywhere in the section.
+    enabled_false = re.search(
+        r'^\s*enabled\s*=\s*false\b',
+        section_body,
+        re.MULTILINE,
+    )
+    expect(
+        enabled_false is None,
+        "claude-watch.config.toml [watcher_monitor] contains a stray "
+        "`enabled = false` line -- the monitor must be enabled",
+    )
+
+    # 2. watchers_config points at the baked in-container path.
+    expect(
+        re.search(
+            r'^\s*watchers_config\s*=\s*"/etc/claude-code/watchers/watchers\.conf"',
+            section_body,
+            re.MULTILINE,
+        )
+        is not None,
+        "claude-watch.config.toml [watcher_monitor].watchers_config "
+        "must point at /etc/claude-code/watchers/watchers.conf",
+    )
+
+    # 3. event_consumer_watcher_name is "claude-event-tail".
+    expect(
+        re.search(
+            r'^\s*event_consumer_watcher_name\s*=\s*"claude-event-tail"',
+            section_body,
+            re.MULTILINE,
+        )
+        is not None,
+        "claude-watch.config.toml [watcher_monitor]."
+        "event_consumer_watcher_name must be \"claude-event-tail\"",
+    )
+
+# ---------------------------------------------------------------------------
+# 4. container/watchers.conf still exists and declares claude-event-tail.
+# ---------------------------------------------------------------------------
+expect(WATCHERS_CONF.exists(), f"container/watchers.conf missing at {WATCHERS_CONF}")
+if WATCHERS_CONF.exists():
+    text = WATCHERS_CONF.read_text(encoding="utf-8")
+    entries = parse_watchers_conf(text)
+    names = [e["name"] for e in entries]
+    expect(
+        "claude-event-tail" in names,
+        f"container/watchers.conf must include `claude-event-tail` -- "
+        f"got names: {names}",
+    )
+
+# ---------------------------------------------------------------------------
+# 5. Dockerfile artifacts that other surfaces depend on remain in place.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    expect(
+        re.search(
+            r'^\s*COPY\s+container/watchers\.conf\s+'
+            r'/etc/claude-code/watchmen/watchers\.conf\s*$',
+            df,
+            re.MULTILINE,
+        )
+        is not None,
+        "Dockerfile must still bake "
+        "`COPY container/watchers.conf /etc/claude-code/watchmen/watchers.conf` "
+        "-- the watcher-ctl CLI surface (multicall alias) reads it",
+    )
+    expect(
+        re.search(
+            r'^\s*RUN\s+ln\s+-s\s+/usr/local/bin/claude-watch\s+'
+            r'/usr/local/bin/watcher-ctl\s*$',
+            df,
+            re.MULTILINE,
+        )
+        is not None,
+        "Dockerfile must still symlink watcher-ctl -> claude-watch -- "
+        "the symlink is independent of the alert layer; other code "
+        "paths invoke `watcher-ctl`",
+    )
+    expect(
+        re.search(
+            r'^\s*ENV\s+WATCHERS_CONFIG=/etc/claude-code/watchmen/watchers\.conf\s*$',
+            df,
+            re.MULTILINE,
+        )
+        is not None,
+        "Dockerfile must still bake "
+        "`ENV WATCHERS_CONFIG=/etc/claude-code/watchmen/watchers.conf` "
+        "-- the watcher-ctl CLI honors this env override",
+    )
+
+if failures:
+    print("FAIL watcher-monitor-enabled.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS watcher-monitor-enabled.test")
+sys.exit(0)

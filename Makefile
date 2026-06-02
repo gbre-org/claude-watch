@@ -178,7 +178,7 @@ test-entrypoint:
 	container/tests/entrypoint-launches-cron.test
 	container/tests/redeploy-self-recreate.test
 	container/tests/claude-event-queue-wired.test
-	container/tests/watcher-monitor-disabled.test
+	container/tests/watcher-monitor-enabled.test
 	container/tests/claude-bin-symlink-uid.test
 	container/tests/npm-install-as-uid-1000.test
 	container/tests/xclip-shim.test
