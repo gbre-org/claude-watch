@@ -2429,12 +2429,25 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             {
                 // Claude Code is running (idle prompt visible) but tokens=0 — this is
                 // a fresh session launched externally (e.g. dashboard --fresh), not by
-                // claude-watch. Inject "resume" to kick-start the checklist.
+                // claude-watch. Inject a checklist kick-start prompt.
+                //
+                // The injected text is worded to remove the ambiguity Andrew
+                // flagged (2026-06-02): bare "resume" read to the main loop
+                // as a possible "restart" request, so it could not tell
+                // whether it had ALREADY been (re)started/cleared (and should
+                // just continue) vs was being asked to restart. The session
+                // here is already fresh at the idle prompt, so the prompt
+                // says so explicitly and points at the resume checklist
+                // without any "restart" verb.
                 info!(
                     dead_checks,
-                    "fresh external session detected — injecting resume"
+                    "fresh external session detected — injecting checklist kick-start"
                 );
-                inject_dispatch::inject_to_agent(&effective_pane, "resume").await;
+                inject_dispatch::inject_to_agent(
+                    &effective_pane,
+                    "You are a fresh session (already started/cleared) — do NOT restart or clear again. Run your session-start / resume checklist now to recover state and pick up pending work.",
+                )
+                .await;
                 state.fresh_session_injected = true;
                 state.was_alive_since_inject = false;
                 state.last_fresh_inject = Some(Local::now().to_rfc3339());

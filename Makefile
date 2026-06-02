@@ -396,15 +396,31 @@ compose-up:
 compose-down:
 	@cd examples/compose && docker compose down
 
-# Force-recreate the claude-container service (picks up new image / config).
-# Let docker-compose.yml's `stop_grace_period: 15s` govern the stop wait —
-# it's sized to fit process-compose's own graceful shutdown (per-process
-# shutdown.timeout 3s each). Do NOT pass a short `-t` here: a stop timeout
-# shorter than process-compose's total shutdown SIGKILLs PID 1 mid-teardown
-# and orphans cron / claude-watch grandchildren that pin the shared volumes
-# + tmux socket, which is what wedged the in-place recreate.
+# Redeploy the claude-container service (picks up new image / config).
+#
+# We teardown-then-up the single service rather than `up -d
+# --force-recreate` it in place. `--force-recreate` stops the old
+# container but keeps the project + its netns alive, so any process that
+# outlives PID 1's shutdown keeps the shared named volumes / tmux socket
+# pinned and the recreate wedges. The chief offender is crond: it runs as
+# `sudo -n /usr/sbin/cron` (see container/process-compose.yml), and when
+# process-compose escalates to SIGKILL it kills the `sudo` wrapper, not
+# the root-owned cron child it forked — so a root cron survives and pins
+# the netns. That's why a full `docker compose down` recovers (it tears
+# the whole project + netns down) while in-place force-recreate sticks.
+#
+# `rm -sf <svc>` (stop + force + no-prompt) gives us the same clean-slate
+# teardown as `down` but scoped to just claude-container, leaving the
+# sibling services (queue-minisite, eichi-search, ttyd) running. Named
+# volumes survive (we don't pass -v), so claude state / versions / the
+# tmux socket dir persist across the redeploy. `up -d` then brings a
+# fresh, responsive container. Idempotent: `rm -sf` is a no-op if the
+# container is already gone, and the depends_on chain re-runs the
+# tmux-socket-init oneshot on the way up.
 redeploy:
-	@cd examples/compose && docker compose up -d --force-recreate claude-container
+	@cd examples/compose && \
+	  docker compose rm -sf claude-container && \
+	  docker compose up -d claude-container
 
 # Clean build artifacts
 clean:

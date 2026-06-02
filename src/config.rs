@@ -487,10 +487,20 @@ fn default_update_resume_prompt() -> String {
     // design), then (5) resume normal dispatch. Single line so
     // tmux-inject's vim-mode dd/i pipeline handles it atomically.
     //
+    // 2026-06-02: leads with an explicit "You have ALREADY been
+    // restarted — do NOT restart again" preamble. The bare word
+    // "resume" / "post-restart recovery" read ambiguously to the main
+    // loop: it could not tell whether claude-watch was telling it a
+    // restart had ALREADY happened (continue) or ASKING it to restart
+    // (act). The injection only ever fires AFTER the restart completes,
+    // so the preamble states that unambiguously. Note `session-resume
+    // restart` is a CLI command name (the recovery entry point), not an
+    // instruction to perform another restart.
+    //
     // 2026-05-15: q-6477 PR #203 sat green-and-unmerged for ~30 min
     // post-restart until WorkQueueOrphaned fired; this prompt makes
     // that recovery deterministic instead of alert-driven.
-    "post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id>` (reason: agent orphaned across restart). Then resume normal dispatch.".to_string()
+    "You have ALREADY been restarted — this message was injected by claude-watch AFTER the restart completed, so do NOT restart again. Begin post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id>` (reason: agent orphaned across restart). Then resume normal dispatch.".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1427,6 +1437,19 @@ cooldown = 300
         // deterministic. If you're tempted to revert to "resume", read
         // memory/feedback_post-restart-orphan-recovery.md first.
         let prompt = default_update_resume_prompt();
+        // Anti-ambiguity guard (2026-06-02): the prompt must state
+        // explicitly that the restart has ALREADY happened and the loop
+        // must NOT restart again. The bare "resume" / "post-restart
+        // recovery" wording confused the main loop about whether it was
+        // being told a restart completed vs asked to restart.
+        assert!(
+            prompt.contains("ALREADY been restarted"),
+            "must state the restart already happened (anti-ambiguity)"
+        );
+        assert!(
+            prompt.contains("do NOT restart again"),
+            "must tell the loop not to restart again (anti-ambiguity)"
+        );
         assert!(
             prompt.contains("session-resume restart"),
             "must invoke session-resume restart"
