@@ -116,7 +116,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # every spawn site for re-entrancy as the wrong uid. The narrow
 # sudo-for-cron carve-out is the minimum-change shape that lets
 # cron start without disturbing any existing uid-1000 invariant.
-RUN printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+# CRON_NOFORK tag + the `Defaults!CRON_NOFORK !pam_session, !pam_setcred`
+# line are the crux of clean container teardown (and therefore of
+# self-redeploy). By DEFAULT, Debian's sudo links the sudoers policy
+# plugin against PAM with pam_session + pam_setcred enabled. Per sudo(8)
+# "Process model": the sudoers plugin defines a close function whenever
+# pam_session or pam_setcred is enabled, and "if the policy plugin does
+# not define a close function, sudo will execute the command directly
+# instead of calling fork(2) first." So with the defaults, `sudo -n
+# /usr/sbin/cron -f` does NOT exec cron — it FORKS it and stays alive as
+# a monitor. process-compose then tracks the `sudo` wrapper PID, not the
+# root cron child. On `docker stop` / `up --force-recreate`,
+# process-compose SIGKILLs the sudo wrapper, which cannot forward
+# SIGKILL, so the forked ROOT cron survives, pins the container netns +
+# the shared tmux-socket named volume, and the freshly-recreated
+# container wedges (a full `docker compose down` papered over the leak by
+# tearing the whole project + netns down).
+#
+# Disabling pam_session + pam_setcred for the tagged cron command means
+# the sudoers plugin defines NO close function, so sudo `execve()`s cron
+# DIRECTLY — the process process-compose launches and signals IS the
+# cron daemon. SIGTERM/SIGKILL reach cron with no orphaned wrapper, so
+# nothing survives to pin the netns/socket and force-recreate is clean.
+#
+# `Defaults!"/usr/sbin/cron -f -L 15"` scopes the override to the exact
+# argv the supervisor uses; the bare `/usr/sbin/cron` Cmnd_Alias keeps
+# the legacy NOPASSWD grant for any other invocation.
+RUN printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        'Cmnd_Alias CRON_NOFORK = /usr/sbin/cron -f -L 15' \
+        'Defaults!CRON_NOFORK !pam_session, !pam_setcred' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/sbin/cron' \
         'hndrewaall ALL=(root) NOPASSWD: /bin/kill' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/bin/tee /etc/cron.d/00-env' \
@@ -124,7 +152,8 @@ RUN printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/bin/tee /etc/cron.d/private-*' \
         'hndrewaall ALL=(root) NOPASSWD: /bin/chmod 0644 /etc/cron.d/private-*' \
         > /etc/sudoers.d/hndrewaall-cron \
-    && chmod 0440 /etc/sudoers.d/hndrewaall-cron
+    && chmod 0440 /etc/sudoers.d/hndrewaall-cron \
+    && visudo -cf /etc/sudoers.d/hndrewaall-cron
 
 # cron — Debian's vixie-cron daemon for in-container recurring jobs.
 #

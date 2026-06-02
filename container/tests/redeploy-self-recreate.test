@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""File-level test that the Makefile `redeploy` target is a SINGLE
+`docker compose up -d --force-recreate claude-container` so it works
+when issued FROM INSIDE the container (self-redeploy).
+
+Why this matters — the workbot's container must be able to redeploy
+ITSELF: run `make redeploy` from inside, have the container recreate,
+and a fresh claude session come back up and resume. For that to work
+the redeploy MUST be one host-daemon operation. When the in-container
+docker CLI issues `up -d --force-recreate`, it hands ONE create+start
+request to the HOST docker daemon, which carries it to completion even
+after the issuing container (and the shell running `make redeploy`) is
+torn down. The daemon owns the operation — no backgrounding, no nohup,
+no disown needed.
+
+The previously-shipped `docker compose rm -sf claude-container &&
+docker compose up -d claude-container` split BREAKS self-redeploy: when
+run from inside the container, the FIRST command destroys the very
+container running the make recipe, so the shell dies and the
+`&& up -d` never runs — the container goes down and never comes back.
+
+This test locks in the single-force-recreate invariant so a future
+refactor can't silently reintroduce a teardown-then-up split (or a
+nohup / disown / `&` detach hack), all of which break self-redeploy.
+
+Asserts (against the Makefile `redeploy:` recipe body):
+
+  1. The recipe runs `up -d --force-recreate` (the single atomic
+     host-daemon recreate).
+  2. The recipe does NOT contain a `rm -sf` / `rm -fs` teardown (the
+     split-command form that dies with the issuing container).
+  3. The recipe does NOT contain a `docker compose down` (whole-
+     project teardown — kills sibling services AND can't be the first
+     half of a self-redeploy for the same reason as rm -sf).
+  4. The recipe contains NO detach hacks: nohup, disown, setsid, or a
+     trailing `&` backgrounding the compose call (HARD CONSTRAINT —
+     the daemon owns the recreate, so no backgrounding is needed and
+     any detach hack dies with the issuing container's shell anyway).
+  5. The recipe targets the `claude-container` service by name (so it
+     doesn't recreate sibling services).
+
+Run:  ./redeploy-self-recreate.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+MAKEFILE = REPO_ROOT / "Makefile"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def extract_recipe(makefile_text: str, target: str) -> str:
+    """Return the recipe body (tab-indented lines) for `target:`.
+
+    A make recipe is the block of TAB-indented lines immediately
+    following a `target:` line, up to the first non-tab,
+    non-blank line. Comments (#...) above the target are not part of
+    the recipe, so we deliberately start collecting only AFTER the
+    `target:` line and only keep tab-led command lines.
+    """
+    lines = makefile_text.splitlines()
+    body: list[str] = []
+    in_target = False
+    for line in lines:
+        if re.match(rf"^{re.escape(target)}:", line):
+            in_target = True
+            continue
+        if in_target:
+            if line.startswith("\t"):
+                body.append(line.lstrip("\t"))
+            elif line.strip() == "":
+                # Blank line ends the recipe.
+                break
+            else:
+                # First non-tab, non-blank line ends the recipe.
+                break
+    return "\n".join(body)
+
+
+expect(MAKEFILE.is_file(), f"Makefile missing at {MAKEFILE}")
+if MAKEFILE.is_file():
+    text = MAKEFILE.read_text(encoding="utf-8")
+    recipe = extract_recipe(text, "redeploy")
+
+    expect(
+        recipe.strip() != "",
+        "Makefile: a `redeploy` target must exist with a non-empty "
+        "recipe.",
+    )
+
+    # 1. single force-recreate.
+    expect(
+        re.search(r"up\s+-d\s+--force-recreate", recipe) is not None
+        or re.search(r"up\s+--force-recreate\s+-d", recipe) is not None,
+        "Makefile redeploy: must run `docker compose up -d "
+        "--force-recreate claude-container` — a SINGLE host-daemon "
+        "recreate that completes even after the issuing (in-container) "
+        "shell is torn down. This is the crux of self-redeploy.",
+    )
+
+    # 2. no rm -sf split.
+    expect(
+        re.search(r"\brm\s+-(sf|fs)\b", recipe) is None,
+        "Makefile redeploy: must NOT use `docker compose rm -sf` — the "
+        "teardown-then-up split breaks self-redeploy because the first "
+        "command destroys the container running the make recipe, so "
+        "the `&& up -d` never executes and the container never comes "
+        "back. Use a single `up -d --force-recreate` instead.",
+    )
+
+    # 3. no `down`.
+    expect(
+        re.search(r"compose\s+down\b", recipe) is None,
+        "Makefile redeploy: must NOT run `docker compose down` — it "
+        "tears down sibling services AND, like rm -sf, can't be the "
+        "first half of a self-redeploy (it kills the issuing "
+        "container so any following command never runs).",
+    )
+
+    # 4. no detach hacks.
+    for bad in ("nohup", "disown", "setsid"):
+        expect(
+            bad not in recipe,
+            f"Makefile redeploy: must NOT use `{bad}` — HARD "
+            "CONSTRAINT. The host docker daemon owns the recreate, so "
+            "no backgrounding/detach is needed; any detach hack dies "
+            "with the issuing container's shell anyway.",
+        )
+    # A trailing `&` that backgrounds the compose call. Match a `&`
+    # that is NOT part of `&&`. We strip `&&` first then look for a
+    # lone `&`.
+    recipe_no_andand = recipe.replace("&&", "")
+    expect(
+        "&" not in recipe_no_andand,
+        "Makefile redeploy: must NOT background the compose call with "
+        "a trailing `&` — the daemon completes the recreate "
+        "synchronously from the CLI's perspective; backgrounding it "
+        "from inside the container detaches it into a shell that the "
+        "recreate itself is about to kill.",
+    )
+
+    # 5. targets the claude-container service by name.
+    expect(
+        "claude-container" in recipe,
+        "Makefile redeploy: must name the `claude-container` service "
+        "so it recreates only that service and leaves siblings "
+        "(queue-minisite, eichi-search, ttyd) running.",
+    )
+
+
+if failures:
+    print("FAIL redeploy-self-recreate.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS redeploy-self-recreate.test")
+sys.exit(0)

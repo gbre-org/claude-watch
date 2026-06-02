@@ -170,6 +170,7 @@ test-entrypoint:
 	container/tests/entrypoint-launches-supervisor.test
 	container/tests/cron-installed.test
 	container/tests/entrypoint-launches-cron.test
+	container/tests/redeploy-self-recreate.test
 	container/tests/claude-event-queue-wired.test
 	container/tests/watcher-monitor-disabled.test
 	container/tests/claude-bin-symlink-uid.test
@@ -398,29 +399,39 @@ compose-down:
 
 # Redeploy the claude-container service (picks up new image / config).
 #
-# We teardown-then-up the single service rather than `up -d
-# --force-recreate` it in place. `--force-recreate` stops the old
-# container but keeps the project + its netns alive, so any process that
-# outlives PID 1's shutdown keeps the shared named volumes / tmux socket
-# pinned and the recreate wedges. The chief offender is crond: it runs as
-# `sudo -n /usr/sbin/cron` (see container/process-compose.yml), and when
-# process-compose escalates to SIGKILL it kills the `sudo` wrapper, not
-# the root-owned cron child it forked — so a root cron survives and pins
-# the netns. That's why a full `docker compose down` recovers (it tears
-# the whole project + netns down) while in-place force-recreate sticks.
+# A SINGLE `docker compose up -d --force-recreate claude-container`.
+# This is deliberately one host-daemon operation so the target works
+# when issued FROM INSIDE the container (self-redeploy): the in-
+# container docker CLI hands the recreate request to the HOST docker
+# daemon, which performs the stop-old + start-new host-side and
+# COMPLETES it even after the issuing container (and the shell that ran
+# `make redeploy`) is torn down. The daemon owns the operation — no
+# backgrounding, no nohup, no disown, no second `&& up -d` that would
+# die with the issuing container.
 #
-# `rm -sf <svc>` (stop + force + no-prompt) gives us the same clean-slate
-# teardown as `down` but scoped to just claude-container, leaving the
-# sibling services (queue-minisite, eichi-search, ttyd) running. Named
-# volumes survive (we don't pass -v), so claude state / versions / the
-# tmux socket dir persist across the redeploy. `up -d` then brings a
-# fresh, responsive container. Idempotent: `rm -sf` is a no-op if the
-# container is already gone, and the depends_on chain re-runs the
-# tmux-socket-init oneshot on the way up.
+# Why a single command and NOT a `rm -sf && up -d` split: when run from
+# inside the container, the FIRST command (`rm -sf` / `down`) destroys
+# the very container running the make recipe, so the shell dies and the
+# `&& up -d` never executes — the container goes down and never comes
+# back. `up -d --force-recreate` is atomic from the CLI's perspective:
+# it issues ONE create+start request that the daemon carries to
+# completion independently of the caller's lifetime.
+#
+# Why force-recreate no longer wedges (the bug #292 worked around):
+# in-place recreate only ever stuck because a grandchild outlived PID
+# 1's shutdown and pinned the netns + shared tmux-socket volume. The
+# chief offender was crond — `sudo -n /usr/sbin/cron` FORKED a root
+# cron that survived SIGKILL of the sudo wrapper. That is now fixed at
+# the source: the Dockerfile sudoers carve-out disables pam_session +
+# pam_setcred for the cron argv so sudo `execve()`s cron directly (no
+# orphan), and cw-claude-watch-launch `exec`s claude-watch. With clean
+# teardown, the old container fully releases the netns + named volumes
+# before the fresh one starts, so `--force-recreate` succeeds every
+# time. Named volumes survive (no -v), so claude state / versions / the
+# tmux socket dir persist across the redeploy.
 redeploy:
 	@cd examples/compose && \
-	  docker compose rm -sf claude-container && \
-	  docker compose up -d claude-container
+	  docker compose up -d --force-recreate claude-container
 
 # Clean build artifacts
 clean:

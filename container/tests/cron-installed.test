@@ -23,6 +23,16 @@ Asserts:
      on docker stop.
   5. The sudoers file is created with mode 0440 (sudoers refuses to
      read world-readable files; 0440 is the canonical convention).
+  6. The sudoers file disables pam_session + pam_setcred for the cron
+     argv (CRON_NOFORK alias) so sudo `execve()`s cron directly instead
+     of forking it. This is the crux of clean container teardown: with
+     the PAM defaults sudo forks the cron child and process-compose
+     only tracks the sudo wrapper, so on SIGKILL the orphaned root cron
+     survives and pins the netns + shared tmux-socket volume, wedging
+     `up --force-recreate` (and therefore in-container self-redeploy).
+  7. The Dockerfile validates the sudoers file with `visudo -cf` at
+     build time so a malformed carve-out fails the build instead of
+     silently disabling sudo at runtime.
 
 Run:  ./cron-installed.test
 """
@@ -107,6 +117,48 @@ if DOCKERFILE.is_file():
         "Dockerfile: sudoers file must be chmod 0440 — sudoers "
         "refuses to read world-readable files, and 0440 is the "
         "canonical convention.",
+    )
+
+    # 6. no-fork carve-out: CRON_NOFORK alias + the pam_session /
+    #    pam_setcred disable. WITHOUT this, Debian's PAM-linked sudo
+    #    defines a sudoers close function and FORKS cron, leaving an
+    #    orphaned root cron that pins the netns on SIGKILL and wedges
+    #    force-recreate. With pam_session + pam_setcred disabled the
+    #    plugin has no close function, so sudo execs cron directly.
+    expect(
+        "Cmnd_Alias CRON_NOFORK = /usr/sbin/cron -f -L 15" in text,
+        "Dockerfile: must define a `Cmnd_Alias CRON_NOFORK = "
+        "/usr/sbin/cron -f -L 15` matching the EXACT argv "
+        "process-compose.yml uses for the crond process. The alias "
+        "scopes the no-fork override to that one invocation.",
+    )
+    expect(
+        re.search(
+            r"Defaults!CRON_NOFORK\s+!pam_session,\s*!pam_setcred",
+            text,
+        )
+        is not None,
+        "Dockerfile: must add `Defaults!CRON_NOFORK !pam_session, "
+        "!pam_setcred` so the sudoers plugin defines no close "
+        "function and sudo execs cron directly instead of forking "
+        "it. This is what lets the cron daemon die cleanly on "
+        "container stop (no orphaned root cron pinning the netns + "
+        "tmux-socket volume), which is what makes `up "
+        "--force-recreate` (and in-container self-redeploy) work.",
+    )
+
+    # 7. build-time sudoers validation.
+    expect(
+        re.search(
+            r"visudo\s+-cf\s+/etc/sudoers\.d/hndrewaall-cron",
+            text,
+        )
+        is not None,
+        "Dockerfile: must `visudo -cf /etc/sudoers.d/hndrewaall-cron` "
+        "after writing the file so a malformed carve-out fails the "
+        "image build instead of silently disabling sudo at runtime "
+        "(a parse error in /etc/sudoers.d/ makes ALL sudo invocations "
+        "fail, which would break the cron launch at boot).",
     )
 
 

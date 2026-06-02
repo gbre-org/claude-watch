@@ -59,29 +59,36 @@ version: "0.5"
 # process and waits up to that process's `shutdown.timeout` (upstream
 # DEFAULT = 10s) before SIGKILLing it.
 #
-# That default is LONGER than docker's grace period, and two of our
-# processes don't die on a plain SIGTERM:
-#   - crond runs as `sudo -n /usr/sbin/cron`; sudo does not forward
-#     SIGTERM to its child, so the cron daemon ignores it.
+# That default is LONGER than docker's grace period. Historically two
+# of our processes also didn't die on a plain SIGTERM, which made the
+# leak worse:
+#   - crond ran as `sudo -n /usr/sbin/cron`; with PAM defaults sudo
+#     FORKS the cron child (it defines a sudoers close function) and
+#     stays alive as a monitor, so process-compose tracked the sudo
+#     wrapper and SIGKILL left the forked ROOT cron orphaned. FIXED:
+#     the Dockerfile sudoers carve-out disables pam_session +
+#     pam_setcred for the cron argv so sudo now `execve()`s cron
+#     directly (the supervised process IS the daemon). See the crond
+#     block below.
 #   - any process whose launcher leaves a blocked reader (e.g. a tee
-#     on a pipe) alive.
-# With the 10s-per-process default, process-compose is still mid-wait
-# when docker's grace elapses and SIGKILLs process-compose. Killing
-# PID 1 without it having reaped its children can leave grandchildren
-# (cron, claude-watch) holding the shared named volumes + tmux socket,
-# which is exactly what wedges a recreate-IN-PLACE. A full
-# `docker compose down` tears the whole project + its netns down, so
-# it papers over the leak — which is why down+up "works" but
-# force-recreate hangs.
+#     on a pipe) alive. FIXED: cw-claude-watch-launch `exec`s the
+#     daemon instead of running it behind a pipeline.
+# With the 10s-per-process default, process-compose was still mid-wait
+# when docker's grace elapsed and SIGKILLed process-compose. Killing
+# PID 1 without it having reaped its children left grandchildren (cron,
+# claude-watch) holding the shared named volumes + tmux socket — which
+# is exactly what wedged a recreate-IN-PLACE. A full `docker compose
+# down` tears the whole project + its netns down, so it papered over
+# the leak — which is why down+up "worked" but force-recreate hung.
 #
-# Fix: pin each long-running process's `shutdown.timeout` to 3s so
-# process-compose escalates to SIGKILL fast and finishes its whole
-# shutdown well inside docker's `stop_grace_period` (raised to 15s in
-# docker-compose.yml as headroom). SIGKILL can't be ignored, so even
-# the sudo-wrapped cron and any stuck reader die promptly. claude-watch
-# itself is now `exec`'d directly by its launcher (see
-# container/bin/cw-claude-watch-launch) so its SIGTERM path works too;
-# the timeout is the backstop.
+# Defense in depth: (1) sudo execs cron + the launcher execs
+# claude-watch, so SIGTERM reaches both daemons with no orphaned
+# wrapper; (2) each long-running process pins `shutdown.timeout: 3s`
+# so process-compose escalates to SIGKILL fast and finishes its whole
+# shutdown well inside docker's `stop_grace_period` (15s in
+# docker-compose.yml as headroom). SIGKILL can't be ignored, so even a
+# wedged daemon dies promptly. The timeout is the backstop; the
+# exec-not-fork fixes are the primary cure.
 # ---------------------------------------------------------------------
 
 processes:
@@ -134,16 +141,32 @@ processes:
     # `-f` keeps cron in the foreground; `-L 15` routes scheduling
     # logs (LOG_INFO+LOG_NOTICE+LOG_WARNING) to stderr so the
     # supervisor's per-process log captures them.
+    #
+    # CRITICAL — clean teardown depends on sudo EXECing cron, not
+    # forking it. By default Debian's sudo (PAM, pam_session +
+    # pam_setcred on) defines a sudoers close function, so it FORKS
+    # the cron child and stays alive as a monitor; process-compose
+    # would then track the `sudo` wrapper, and on SIGKILL the forked
+    # ROOT cron would survive and pin the container netns + shared
+    # tmux-socket volume — wedging `up --force-recreate` (and hence
+    # in-container self-redeploy). The Dockerfile's sudoers carve-out
+    # disables pam_session + pam_setcred for this exact argv
+    # (`Defaults!CRON_NOFORK !pam_session, !pam_setcred`, where
+    # CRON_NOFORK = `/usr/sbin/cron -f -L 15`), so sudo `execve()`s
+    # cron directly. The process process-compose launches and signals
+    # IS the cron daemon — no orphan, so SIGTERM (then the 3s-timeout
+    # SIGKILL backstop) tears it down cleanly inside docker's grace
+    # period. The exact argv here MUST match the CRON_NOFORK alias in
+    # container/Dockerfile or sudo falls back to its forking default.
     command: sudo -n /usr/sbin/cron -f -L 15
     availability:
       restart: on_failure
       backoff_seconds: 5
       max_restarts: 0
-    # sudo does NOT forward SIGTERM to the cron child, so a plain
-    # SIGTERM is ignored and the daemon lingers. Cap the wait at 3s
-    # so process-compose escalates to SIGKILL (which sudo cannot
-    # swallow) quickly, killing the process group inside docker's
-    # grace period instead of leaking an orphaned root cron.
+    # SIGTERM first; because sudo now execs cron directly this reaches
+    # the daemon. The 3s timeout is the backstop: process-compose
+    # escalates to SIGKILL fast so its whole shutdown completes inside
+    # docker's stop_grace_period instead of leaking an orphan.
     shutdown:
       signal: 15
       timeout: 3
