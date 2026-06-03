@@ -9,7 +9,7 @@ also skips the docker probe so the test runs in CI without docker access.
 
 Coverage:
   - Default invocation: `docker compose --project-directory <dir> exec -it
-    claude-container tmux -u new-session -A -s claude-container`.
+    claude-container tmux -u attach-session -t claude-container`.
   - CW_SERVICE override: changes the compose service name.
   - CW_SESSION override: changes the tmux session name.
   - CW_COMPOSE_DIR override: changes the --project-directory value.
@@ -92,7 +92,7 @@ def expect(cond: bool, msg: str) -> None:
 
 def test_print_cmd_default_invocation() -> None:
     """Default: docker compose --project-directory <compose> exec -it
-    claude-container tmux -u new-session -A -s claude-container."""
+    claude-container tmux -u attach-session -t claude-container."""
     lines, _, _, _ = run_cw(["--print-cmd"])
     # Find the trailing exec invocation by looking for 'exec' + service.
     joined = " ".join(lines)
@@ -116,15 +116,15 @@ def test_print_cmd_default_invocation() -> None:
            f"default: service name should be claude-container, got {lines}")
     expect("tmux" in lines,
            f"default: argv should run tmux, got {lines}")
-    expect("new-session" in lines,
-           f"default: argv should run new-session, got {lines}")
-    expect("-A" in lines,
-           f"default: argv should include -A (attach-or-create), got {lines}")
-    # Session name appears AFTER `-s`.
-    s_idx = lines.index("-s")
-    expect(lines[s_idx + 1] == "claude-container",
-           f"default: -s session name should be claude-container, "
-           f"got {lines[s_idx + 1]!r}")
+    expect("attach-session" in lines,
+           f"default: argv should run attach-session, got {lines}")
+    expect("-A" not in lines,
+           f"default: argv should NOT include -A (no attach-or-create), got {lines}")
+    # Session name appears AFTER `-t`.
+    t_idx = lines.index("-t")
+    expect(lines[t_idx + 1] == "claude-container",
+           f"default: -t session name should be claude-container, "
+           f"got {lines[t_idx + 1]!r}")
     # -u flag for UTF-8.
     expect("-u" in lines,
            f"default: tmux argv should include -u, got {lines}")
@@ -142,12 +142,12 @@ def test_print_cmd_service_override() -> None:
 
 
 def test_print_cmd_session_override() -> None:
-    """CW_SESSION=foo => `tmux -u new-session -A -s foo`."""
+    """CW_SESSION=foo => `tmux -u attach-session -t foo`."""
     lines, _, _, _ = run_cw(["--print-cmd"], env={"CW_SESSION": "my-sess"})
-    s_idx = lines.index("-s")
-    expect(lines[s_idx + 1] == "my-sess",
-           f"session-override: -s value should be my-sess, "
-           f"got {lines[s_idx + 1]!r}")
+    t_idx = lines.index("-t")
+    expect(lines[t_idx + 1] == "my-sess",
+           f"session-override: -t value should be my-sess, "
+           f"got {lines[t_idx + 1]!r}")
 
 
 def test_print_cmd_compose_dir_override() -> None:

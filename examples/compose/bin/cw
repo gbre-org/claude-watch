@@ -64,9 +64,10 @@ Usage:
 Reconnect behavior:
   When the inner `docker compose exec` exits non-zero (container was
   recreated, daemon hiccup, etc.), cw sleeps 1s and retries — `tmux
-  new-session -A` re-creates the in-container session on the new
-  container, so the operator sees a fresh attach. Clean detach
-  (Ctrl-b d → rc=0) exits 0 without retry. If exec fails more than
+  attach-session` will fail (non-zero) until the container's
+  cw-tmux-bootstrap oneshot creates the real session, so cw can never
+  accidentally race-create a bare session. Clean detach (Ctrl-b d →
+  rc=0) exits 0 without retry. If exec fails more than
   CW_RECONNECT_MAX_ATTEMPTS (30) times within CW_RECONNECT_WINDOW_SECS
   (60), cw bails with exit 1 — most likely the docker daemon is down.
 
@@ -208,10 +209,13 @@ if [ "$UP_FIRST" = "1" ] && [ "$PRINT_CMD" = "0" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Attach. Uses `tmux new-session -A` so it ATTACHES if the session exists
-# and CREATES it (running an interactive shell) if not — matches the same
-# resilient pattern the ttyd service uses. The container entrypoint creates
-# the session at startup, so under normal operation we always attach.
+# Attach. Uses `tmux attach-session -t` which ONLY attaches to an existing
+# session — it fails (non-zero) if the session doesn't exist yet. This
+# prevents a race where cw's reconnect loop wins against cw-tmux-bootstrap:
+# `new-session -A` would CREATE a bare session (default shell) if the named
+# session didn't exist, causing the real bootstrap to skip. With
+# `attach-session`, the reconnect loop simply retries until the bootstrap
+# creates the real session.
 #
 # -t / -i flags: tmux needs a real TTY. We pass them through unconditionally
 # because the operator-facing use case is "from a vscode terminal" — that
@@ -223,7 +227,7 @@ attach_argv=(
     "${DOCKER_CMD[@]}" compose
     --project-directory "$CW_COMPOSE_DIR"
     exec -it "$SERVICE"
-    tmux -u new-session -A -s "$SESSION"
+    tmux -u attach-session -t "$SESSION"
 )
 
 if [ "$PRINT_CMD" = "1" ]; then
@@ -247,15 +251,16 @@ if [ -n "${CW_DOCKER_EXEC:-}" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Reconnect loop. The inner attach (docker compose exec → tmux new-session
-# -A) either:
+# Reconnect loop. The inner attach (docker compose exec → tmux
+# attach-session) either:
 #
 #   - exits 0 on a clean Ctrl-b d detach. We exit 0 too.
 #   - exits non-zero when the container is recreated, daemon stutters,
-#     or some other transient hiccup. We sleep 1s and retry. The new
-#     container's daemon-side exec will eventually succeed, `tmux -A`
-#     re-creates the in-container session, and the operator sees a fresh
-#     attach without needing to re-invoke cw.
+#     the session doesn't exist yet (bootstrap still running), or some
+#     other transient hiccup. We sleep 1s and retry. Once the new
+#     container's cw-tmux-bootstrap creates the session, the next
+#     attach-session succeeds and the operator sees a fresh attach
+#     without needing to re-invoke cw.
 #
 # `--no-reconnect` short-circuits to the old single-shot behavior: any
 # exit (zero or not) terminates cw immediately.
