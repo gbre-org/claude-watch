@@ -5160,6 +5160,269 @@ def main() -> int:
             ))
             _run([str(CLI), "satisfy", ob_141], env_eval)
 
+        # ===========================================================
+        # Tests 200-209: scoped infra override (PR: gate-override
+        # decoupling, incident 2026-06-03). A POLICY mandatory ob (e.g.
+        # the AskUserQuestion ban, a marker_file_present row) must NOT
+        # globally refuse an `override --scope infra`, and that infra
+        # override must NOT bypass the policy mandatory ob -- it only
+        # clears infrastructure-wedge obligations (watchers_healthy /
+        # no_pending_watcher_outputs / process_alive / ...).
+        # ===========================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-infra-") as td_i:
+            tmpdir_i = Path(td_i)
+            env_i, ob_path_i = _make_isolated_env(tmpdir_i)
+
+            def _add_marker_mandatory_ob():
+                """Register a POLICY mandatory ob shaped like the
+                AskUserQuestion ban: an explicit --mandatory
+                marker_file_present row that denies when the marker is
+                ABSENT (negate=true => satisfied only when present)."""
+                proc = _run([
+                    str(CLI), "add",
+                    "--tool-pattern", "*",
+                    "--predicate", "marker_file_present",
+                    "--params", json.dumps({
+                        "path": str(tmpdir_i / "askuserquestion-allowed"),
+                    }),
+                    "--ttl", "0",
+                    "--deny-msg", "AskUserQuestion banned (policy)",
+                    "--mandatory",
+                    "--created-by", "test",
+                    "--json",
+                ], env_i)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"marker add failed: {proc.stderr}")
+                return json.loads(proc.stdout)["id"]
+
+            def _add_watchers_healthy_ob():
+                """An infra-class watchers_healthy gate ob (no CLI on PATH
+                => default-open, so we instead use no_pending_watcher_
+                outputs which we can make fail deterministically). We use a
+                file_exists-free infra predicate: process_alive on a dead
+                PID, which deterministically DENIES and is infra-class."""
+                deadpid = tmpdir_i / "deadpid"
+                # PID 2^31-1 is effectively never alive in CI.
+                deadpid.write_text("2147483600")
+                return _add_ob(
+                    env_i,
+                    tool_pattern="Bash",
+                    predicate="process_alive",
+                    params={"pid_file": str(deadpid)},
+                    ttl=300,
+                    deny_msg="infra watcher process dead",
+                )
+
+            # --- 200: with a POLICY mandatory ob active, `override
+            #          --scope all` is REFUSED (legacy behavior) ---
+            mand_ob = _add_marker_mandatory_ob()
+            ov_all = _run([
+                str(CLI), "override", "all-scope attempt",
+                "--duration", "60", "--scope", "all", "--created-by", "test",
+            ], env_i)
+            results.append(_check(
+                "200. policy mandatory ob present -> override --scope all "
+                "refused (exit 4)",
+                ov_all.returncode == 4 and "MANDATORY" in ov_all.stderr,
+                f"rc={ov_all.returncode} stderr={ov_all.stderr!r}",
+            ))
+
+            # --- 201: refusal message points operator at --scope infra ---
+            results.append(_check(
+                "201. all-scope refusal suggests --scope infra when blockers "
+                "are policy-only",
+                "--scope infra" in ov_all.stderr,
+                f"stderr={ov_all.stderr!r}",
+            ))
+
+            # --- 202: with the SAME policy mandatory ob active, `override
+            #          --scope infra` SUCCEEDS (decoupling) ---
+            ov_infra = _run([
+                str(CLI), "override", "infra wedge clear",
+                "--duration", "60", "--scope", "infra", "--created-by", "test",
+                "--json",
+            ], env_i)
+            ov_infra_id = ""
+            if ov_infra.returncode == 0:
+                try:
+                    ov_infra_id = json.loads(ov_infra.stdout).get("id", "")
+                except json.JSONDecodeError:
+                    pass
+            results.append(_check(
+                "202. policy mandatory ob present -> override --scope infra "
+                "SUCCEEDS",
+                ov_infra.returncode == 0 and ov_infra_id.startswith("ov-"),
+                f"rc={ov_infra.returncode} stdout={ov_infra.stdout[:200]!r} "
+                f"stderr={ov_infra.stderr[:200]!r}",
+            ))
+
+            # --- 203: the infra override persists scope=infra in state ---
+            scope_persisted = None
+            state_i = json.loads(ob_path_i.read_text())
+            for ov in state_i.get("overrides", []):
+                if ov.get("id") == ov_infra_id:
+                    scope_persisted = ov.get("scope")
+                    break
+            results.append(_check(
+                "203. infra override persists scope=infra in state",
+                scope_persisted == "infra",
+                f"scope_persisted={scope_persisted!r}",
+            ))
+
+            # --- 204: with the infra override active, the POLICY mandatory
+            #          ob is STILL ENFORCED (marker absent => deny) ---
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_i,
+            )
+            results.append(_check(
+                "204. infra override does NOT bypass the policy mandatory ob "
+                "(still denied)",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # --- 205: add an infra-class (process_alive, dead PID) ob and
+            #          confirm the infra override DOES bypass it ---
+            # First satisfy the policy ob's marker so it stops denying, so
+            # we can observe the infra ob's bypass in isolation.
+            (tmpdir_i / "askuserquestion-allowed").write_text("x")
+            infra_ob = _add_watchers_healthy_ob()
+            # Sanity: WITHOUT considering the override, the infra ob denies.
+            # (Cancel override, check deny, re-add override.)
+            _run([str(CLI), "satisfy", ov_infra_id], env_i)
+            rc_base, out_base, _ = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_i,
+            )
+            ov_infra2 = _run([
+                str(CLI), "override", "infra wedge clear 2",
+                "--duration", "60", "--scope", "infra", "--created-by", "test",
+                "--json",
+            ], env_i)
+            ov_infra2_id = (json.loads(ov_infra2.stdout).get("id", "")
+                            if ov_infra2.returncode == 0 else "")
+            rc_ov, out_ov, _ = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_i,
+            )
+            results.append(_check(
+                "205. infra override bypasses an infra-class ob "
+                "(deny baseline -> allow with override)",
+                (_is_deny(out_base) and rc_ov == 0 and _is_allow(out_ov)),
+                f"base_deny={_is_deny(out_base)} rc_ov={rc_ov} "
+                f"out_ov={out_ov}",
+            ))
+
+            # --- 206: an infra override does NOT bypass a NON-infra
+            #          (policy) gate-mode ob (e.g. a file_exists row) ---
+            policy_gate_ob = _add_ob(
+                env_i,
+                tool_pattern="Bash",
+                predicate="file_exists",
+                params={"path": str(tmpdir_i / "never-exists-206")},
+                ttl=300,
+                deny_msg="non-infra policy gate",
+            )
+            rc_206, out_206, _ = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_i,
+            )
+            results.append(_check(
+                "206. infra override does NOT bypass a non-infra gate-mode ob",
+                rc_206 == 0 and _is_deny(out_206),
+                f"rc={rc_206} out={out_206}",
+            ))
+            _run([str(CLI), "satisfy", policy_gate_ob], env_i)
+            _run([str(CLI), "satisfy", infra_ob], env_i)
+            if ov_infra2_id:
+                _run([str(CLI), "satisfy", ov_infra2_id], env_i)
+
+            # --- 207: an INFRA-class MANDATORY ob DOES refuse an infra
+            #          override (the narrow case that should still veto) ---
+            deadpid2 = tmpdir_i / "deadpid2"
+            deadpid2.write_text("2147483601")
+            proc_im = _run([
+                str(CLI), "add",
+                "--tool-pattern", "Bash",
+                "--predicate", "process_alive",
+                "--params", json.dumps({"pid_file": str(deadpid2)}),
+                "--ttl", "300",
+                "--deny-msg", "infra mandatory",
+                "--mandatory",
+                "--created-by", "test",
+                "--json",
+            ], env_i)
+            infra_mand_id = (json.loads(proc_im.stdout)["id"]
+                             if proc_im.returncode == 0 else None)
+            ov_207 = _run([
+                str(CLI), "override", "should be refused",
+                "--duration", "60", "--scope", "infra", "--created-by", "test",
+            ], env_i)
+            results.append(_check(
+                "207. infra-class MANDATORY ob refuses an --scope infra "
+                "override (exit 4)",
+                ov_207.returncode == 4 and "MANDATORY" in ov_207.stderr,
+                f"rc={ov_207.returncode} stderr={ov_207.stderr!r}",
+            ))
+            if infra_mand_id:
+                _run([str(CLI), "satisfy", infra_mand_id], env_i)
+            # And clean up the policy mandatory marker ob.
+            if mand_ob:
+                _run([str(CLI), "satisfy", mand_ob], env_i)
+
+            # --- 208: invalid --scope rejected with exit 2 ---
+            ov_bad = _run([
+                str(CLI), "override", "bad scope",
+                "--duration", "60", "--scope", "bogus", "--created-by", "test",
+            ], env_i)
+            results.append(_check(
+                "208. invalid --scope rejected (argparse exit 2)",
+                ov_bad.returncode == 2,
+                f"rc={ov_bad.returncode} stderr={ov_bad.stderr!r}",
+            ))
+
+            # --- 209: legacy override record (no scope field) is treated
+            #          as scope=all and still bypasses everything ---
+            # Write an override directly into state with no scope key.
+            legacy_state = json.loads(ob_path_i.read_text())
+            import time as _t
+            legacy_state.setdefault("overrides", []).append({
+                "id": "ov-legacy-209",
+                "reason": "legacy no-scope",
+                "duration_secs": 60,
+                "expires_at": _t.time() + 60,
+                "created_at": _t.time(),
+                "created_by": "test",
+            })
+            # Add an arbitrary non-infra gate ob it must bypass.
+            legacy_state.setdefault("obligations", []).append({
+                "id": "ob-legacy-209",
+                "tool_pattern": "Bash",
+                "exempt_patterns": [],
+                "predicate": {"kind": "file_exists",
+                              "params": {"path": "/never-exists-209"}},
+                "enforcement": "gate",
+                "ttl_secs": 300,
+                "expires_at": _t.time() + 300,
+                "created_at": _t.time(),
+                "created_by": "test",
+                "satisfied_by": None,
+                "deny_message": "legacy bypass target",
+                "mandatory": False,
+            })
+            ob_path_i.write_text(json.dumps(legacy_state))
+            rc_209, out_209, _ = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_i,
+            )
+            results.append(_check(
+                "209. legacy scopeless override -> treated as scope=all "
+                "(bypasses non-infra ob)",
+                rc_209 == 0 and _is_allow(out_209),
+                f"rc={rc_209} out={out_209}",
+            ))
+
     total = len(results)
     passed = sum(1 for r in results if r)
     print()
