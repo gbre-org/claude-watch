@@ -37,6 +37,12 @@ pub struct Config {
     /// so existing configs work without edits. See `StuckDetectionConfig`.
     #[serde(default)]
     pub stuck_detection: StuckDetectionConfig,
+    /// Native in-tree emission of `queue-stuck` / `queue-orphaned`
+    /// claude-events from the `queue-check` subcommand. Default OFF — the
+    /// capability ships in every build but stays silent unless explicitly
+    /// enabled. See `QueueCheckConfig`.
+    #[serde(default)]
+    pub queue_check: QueueCheckConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -769,6 +775,45 @@ fn default_workload_heartbeat_dir() -> String {
 
 fn default_workload_heartbeat_max_age_secs() -> u64 {
     60
+}
+
+/// Config for the `claude-watch queue-check` subcommand — the in-tree
+/// equivalent of the out-of-tree Prometheus `WorkQueueStuckSoft` /
+/// `WorkQueueOrphaned` alert rules. The subcommand always RUNS detection
+/// (so `--dry-run` / `--force-emit` work everywhere); this gate only
+/// controls whether it writes claude-event files in normal cron mode.
+#[derive(Debug, Deserialize, Clone)]
+pub struct QueueCheckConfig {
+    /// Emit `queue-stuck` / `queue-orphaned` claude-events when the
+    /// `queue-check` subcommand detects a stuck or orphaned queue item.
+    /// **Default: false** — ships in every build but off locally unless
+    /// explicitly enabled. `--force-emit` overrides this for one-shot
+    /// testing; `--dry-run` prints without emitting regardless.
+    #[serde(default = "default_queue_check_emit_events")]
+    pub emit_events: bool,
+    /// Heartbeat-staleness threshold (minutes) for the `stuck` condition:
+    /// a `running` item whose `last_heartbeat_at` is older than this is
+    /// flagged stuck. Default 15 (mirrors the deployed StuckSoft
+    /// `for:15m`). The `--stale-heartbeat-min` CLI flag overrides per-run.
+    #[serde(default = "default_queue_check_stale_heartbeat_min")]
+    pub stale_heartbeat_min: u64,
+}
+
+impl Default for QueueCheckConfig {
+    fn default() -> Self {
+        Self {
+            emit_events: default_queue_check_emit_events(),
+            stale_heartbeat_min: default_queue_check_stale_heartbeat_min(),
+        }
+    }
+}
+
+fn default_queue_check_emit_events() -> bool {
+    false
+}
+
+fn default_queue_check_stale_heartbeat_min() -> u64 {
+    15
 }
 
 /// Load config from well-known paths or CLAUDE_WATCH_CONFIG env var.

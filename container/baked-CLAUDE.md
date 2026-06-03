@@ -260,6 +260,41 @@ hook (next section) enforces "Agent spawns require a queue item"
 — this section enforces the upstream policy that the spawn should
 happen in the first place.
 
+### Long blocking jobs → `workload run`, wait with `workload babysit`
+
+For long-running SYSTEM jobs (media-promote, rsync, ffmpeg, a remux,
+a big scan) the right tier is a **workload**, not an inline command and
+not an Agent that blocks: `workload run <label> -- <cmd>` launches the
+job in a detached tmux pane that survives `/clear` and emits a
+`workload-done` event when it finishes. The runner auto-creates its own
+queue item (`--scope workload:<label>`).
+
+When you need to WAIT for that workload to finish, **block in-process
+with `workload babysit` — never tight-poll with repeated `workload list`
+/ `workload log` calls across separate LLM turns** (that burns thousands
+of tokens per turn for zero progress; it's the exact failure mode babysit
+fixes):
+
+```
+workload babysit <label> --qid q-XXXX [--heartbeat 60] [--max-block 540] [--poll 15]
+```
+
+- Blocks **in-process** waiting for `<label>` — zero LLM turns while it
+  waits.
+- Pats the bound queue item's heartbeat every `--heartbeat` seconds
+  (default 60) so `last_heartbeat_at` stays fresh (never mistaken for
+  orphaned/stuck).
+- **Returns 0** on `done (exit N)` (the workload's own rc is also
+  propagated as the process exit code).
+- **Returns 75** (EX_TEMPFAIL) at `--max-block` seconds (default 540,
+  under the Bash 600 s cap) if still running, printing
+  `still-running ... — rerun to keep waiting`.
+
+**Pattern**: call `workload babysit`; on **exit 75 re-invoke it** to keep
+waiting. Each re-invocation is the only LLM-turn cost of the whole wait
+(≈ once per `--max-block`), versus a fresh turn per poll. Exit 1 = no such
+label; exit 2 = bad `--qid`.
+
 ## Queue protocol — every Agent tool call
 
 Before firing **any** `Agent` tool call, you MUST first add a queue

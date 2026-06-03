@@ -32,6 +32,7 @@ mod logging;
 mod metrics;
 mod policy;
 mod proc_util;
+mod queue_check;
 mod reminders;
 mod respawn;
 mod session_event;
@@ -162,6 +163,43 @@ enum Commands {
         state_dir: Option<String>,
         /// Print the event JSON to stdout WITHOUT emitting a file or
         /// updating the state ledger. For inspection / testing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Emit `queue-stuck` / `queue-orphaned` claude-events when one or
+    /// more `session-task` queue items are STUCK (wedged, or a running
+    /// item whose heartbeat is stale) or ORPHANED (a running item whose
+    /// explicitly-claimed owning PID is no longer alive).
+    ///
+    /// This is the IN-TREE equivalent of the out-of-tree Prometheus
+    /// `WorkQueueStuckSoft` / `WorkQueueOrphaned` alert rules, so stuck/
+    /// orphan detection no longer depends on an external Prometheus +
+    /// alertmanager. Designed for cron (every few minutes). Single-emit
+    /// per (qid, condition); persists the dedup ledger at
+    /// `<state-dir>/queue-check-state.json`.
+    ///
+    /// **Emission is gated behind `[queue_check] emit_events` in
+    /// config.toml, default FALSE** — the capability ships in every build
+    /// but stays silent unless explicitly enabled. `--force-emit`
+    /// overrides the config for one-shot testing; `--dry-run` prints the
+    /// event JSON without emitting or touching the ledger.
+    #[command(name = "queue-check")]
+    QueueCheck {
+        /// Heartbeat-staleness threshold (minutes) for the `stuck`
+        /// condition. Overrides `[queue_check] stale_heartbeat_min`.
+        #[arg(long)]
+        stale_heartbeat_min: Option<u64>,
+        /// Directory holding the per-emitter state file
+        /// (`queue-check-state.json`). Falls back to
+        /// `CLAUDE_WATCH_STATE_DIR` env var, then `/var/lib/claude-watch`.
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<String>,
+        /// Emit events regardless of the `[queue_check] emit_events`
+        /// config toggle. For one-shot testing / manual runs.
+        #[arg(long)]
+        force_emit: bool,
+        /// Print the event JSON to stdout WITHOUT emitting a file or
+        /// updating the dedup ledger. For inspection / testing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1397,6 +1435,31 @@ async fn main() {
             let code = stale_ready::cmd_stale_ready_check(
                 threshold_min,
                 state_dir.as_deref(),
+                dry_run,
+            );
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::QueueCheck {
+            stale_heartbeat_min,
+            state_dir,
+            force_emit,
+            dry_run,
+        }) => {
+            // Resolve the stale-heartbeat threshold: explicit CLI flag wins,
+            // else the `[queue_check] stale_heartbeat_min` config value,
+            // else the built-in default. config load is best-effort (the
+            // subcommand must still run on a host without a config file).
+            let stale_min = stale_heartbeat_min.unwrap_or_else(|| {
+                config::try_load_config()
+                    .map(|c| c.queue_check.stale_heartbeat_min)
+                    .unwrap_or(queue_check::DEFAULT_STALE_HEARTBEAT_MIN)
+            });
+            let code = queue_check::cmd_queue_check(
+                stale_min,
+                state_dir.as_deref(),
+                force_emit,
                 dry_run,
             );
             if code != 0 {

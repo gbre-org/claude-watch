@@ -110,6 +110,35 @@ Emergency bypass: `QUEUE_GATE_BYPASS=1` env var (audited to
   `"READY: register-and-spawn (...)"` or `"BLOCKED: do not spawn, wait
   for ..."` — read it, don't guess.
 
+### Waiting on a long workload — use `workload babysit`, not tight-poll
+
+When an agent or the main loop has kicked off a long `workload run <label>`
+(media-promote, rsync, ffmpeg, a remux) and needs to wait for it to finish,
+**block in-process with `workload babysit` — do NOT loop `workload list` /
+`workload log` across separate LLM turns.** Repeated polling burns thousands
+of tokens per turn for no progress; that's exactly the failure mode babysit
+exists to fix.
+
+```
+workload babysit <label> --qid q-XXXX [--heartbeat 60] [--max-block 540] [--poll 15]
+```
+
+- Blocks **in-process** waiting for `<label>` to finish — zero LLM turns
+  while it waits.
+- Pats the bound queue item's heartbeat (`session-task queue heartbeat
+  <qid>`) every `--heartbeat` seconds (default 60) so `last_heartbeat_at`
+  stays fresh and the item is never mistaken for orphaned/stuck.
+- **Returns 0** once the workload reaches `done (exit N)` (the workload's
+  own exit code is also propagated as the process exit code).
+- **Returns 75** (EX_TEMPFAIL) at `--max-block` seconds (default 540, kept
+  under the Bash 600 s cap) if the workload is still running, printing
+  `still-running ... — rerun to keep waiting`.
+
+**Intended pattern**: call `workload babysit`, and on **exit 75 re-invoke it**
+to keep waiting. Each re-invocation is the only LLM-turn cost of the whole
+wait (≈ once per `--max-block`), versus a fresh turn per poll. Exit 1 = no
+such label; exit 2 = malformed `--qid` (must look like `q-XXXX`).
+
 ## Schema (v2)
 
 ```json

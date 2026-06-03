@@ -46,6 +46,18 @@
 # Silent exit when nothing qualifies — no console spam.
 */5 * * * *  hndrewaall /usr/local/bin/claude-watch stale-ready-check > /tmp/claude-watch-cron-stale-ready.log 2>&1
 
+# Stuck / orphaned queue-item watchdog. Every 5 minutes, scan
+# `session-task queue list --all --json` for ORPHANED items (running with a
+# dead owning PID) and STUCK items (wedged, or running with a stale
+# heartbeat) and emit `queue-orphaned` / `queue-stuck` claude-events. This
+# is the IN-TREE equivalent of the out-of-tree Prometheus WorkQueueOrphaned
+# / WorkQueueStuckSoft alert rules. Single-emit per (qid, condition); ledger
+# at /var/lib/claude-watch/queue-check-state.json. EMISSION IS GATED behind
+# `[queue_check] emit_events` in config.toml (DEFAULT FALSE) — this entry
+# runs the detector every tick but stays silent until the toggle is flipped
+# on (detection-only runs just log "emit_events is OFF" and exit 0).
+*/5 * * * *  hndrewaall /usr/local/bin/claude-watch queue-check > /tmp/claude-watch-cron-queue-check.log 2>&1
+
 # Event-watcher health check. Every minute, look for .json event
 # files in the queue dir that have been sitting unconsumed for >2 min.
 # If any exist, the event watcher is dead (container recreate, session

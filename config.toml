@@ -286,6 +286,30 @@ enabled = true
 workload_heartbeat_dir = "/run/claude/workloads"
 workload_heartbeat_max_age_secs = 60
 
+[queue_check]
+# Native in-tree emission of stuck / orphaned queue-item claude-events.
+#
+# The `claude-watch queue-check` subcommand (run from cron) inspects the
+# session-task queue and detects:
+#   * ORPHANED — a `running` item whose explicitly-claimed owning PID is no
+#     longer alive (pid=null items are trusted-alive and never flagged).
+#   * STUCK    — a `wedged` item, OR a `running` item whose
+#     `last_heartbeat_at` is older than `stale_heartbeat_min`.
+# On detection it emits a `queue-orphaned` / `queue-stuck` claude-event
+# (single-emit per qid+condition). This is the IN-TREE equivalent of the
+# out-of-tree Prometheus `WorkQueueOrphaned` / `WorkQueueStuckSoft` alert
+# rules, so stuck/orphan detection no longer depends on external Prometheus.
+#
+# emit_events is DEFAULT FALSE: the capability ships in every build but
+# stays silent unless explicitly enabled here. Detection still runs (so
+# `queue-check --dry-run` / `--force-emit` work regardless); this toggle
+# only controls whether normal cron runs write event files.
+emit_events = false
+# Heartbeat-staleness threshold (minutes) for the STUCK condition. Default
+# 15 mirrors the deployed WorkQueueStuckSoft `for:15m` window. The
+# `--stale-heartbeat-min` CLI flag overrides this per-run.
+stale_heartbeat_min = 15
+
 [hybrid]
 # Hybrid hooks + daemon-fallback tuning.
 #
