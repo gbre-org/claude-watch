@@ -93,12 +93,32 @@ Three flavors (in order of precedence at gate-evaluation time):
      (e.g. the per-watcher recovery for THIS predicate) must always be
      allowed."
   3. Per-call audited overrides — `obligations override <reason>
-     --duration <60|5m|1h>` registers a short-TTL override that bypasses
-     ALL gate-mode obligations. Audited to
-     `~/.config/claude/obligations-bypass.log`, fires a Pushover via
-     `pingme`, AND emits a loud `claude-event` (tag `obligations-bypass`,
-     source `claude-watch`) so the bypass surfaces to the main loop on
-     the next UserPromptSubmit. 24h cap.
+     --duration <60|5m|1h> [--scope all|infra]` registers a short-TTL
+     override. Audited to `~/.config/claude/obligations-bypass.log`, fires
+     a Pushover via `pingme`, AND emits a loud `claude-event` (tag
+     `obligations-bypass`, source `claude-watch`) so the bypass surfaces
+     to the main loop on the next UserPromptSubmit. 24h cap.
+
+     Override `--scope` (decouples the infra escape hatch from policy):
+       - `all` (default): bypasses EVERY gate-mode obligation. Refused
+         (exit 4) while ANY mandatory obligation is active — including a
+         policy mandatory one (e.g. the AskUserQuestion ban, a
+         `marker_file_present` row).
+       - `infra`: bypasses ONLY infrastructure-wedge obligations —
+         predicate trees composed entirely of `INFRA_PREDICATE_KINDS`
+         (`watchers_healthy`, `no_pending_watcher_outputs`,
+         `process_alive`, `process_in_pgrep`, `agent_inbox_empty`). It is
+         NOT refused by an unrelated POLICY mandatory obligation, and it
+         does NOT bypass that policy obligation — only the health wedge.
+         It IS still refused by an *infra-class* mandatory obligation.
+
+     Why two scopes (incident 2026-06-03): a single non-critical reminder
+     watcher going DOWN wedged `watchers_healthy`, blocking every tool.
+     `obligations override` was then refused outright because the
+     AskUserQuestion ban (a policy mandatory `marker_file_present` row)
+     was active — coupling two unrelated obligations and leaving no
+     in-band escape. `--scope infra` clears the health wedge without
+     touching, or being blocked by, the policy obligation.
 
 Env-var emergency bypass: `OBLIGATIONS_BYPASS=1` plus a non-empty
 `OBLIGATIONS_BYPASS_REASON=<text>`. Both must be set; the hook DENIES with

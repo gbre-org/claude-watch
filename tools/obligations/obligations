@@ -38,6 +38,7 @@ State: ``~/.config/claude/obligations.json`` (0600), schema:
         {
           "id": "ov-YYYY-MM-DD-NNNN",
           "reason": "human-readable why",
+          "scope": "all" | "infra",   # default "all" (legacy records: all)
           "expires_at": <unix_ts>,
           "created_at": <unix_ts>,
           "created_by": "main-loop"
@@ -55,11 +56,17 @@ Two flavors of "do not block this":
    the regular ``tool_pattern`` syntax.
 
 2. **Per-call audited overrides** (the escape hatch). A short-TTL record in
-   the ``overrides`` array bypasses ALL gate-mode obligations for the
-   duration. Created via ``obligations override <reason> --duration <s>``,
+   the ``overrides`` array bypasses gate-mode obligations WITHIN ITS SCOPE
+   for the duration. Created via
+   ``obligations override <reason> --duration <s> [--scope all|infra]``,
    audited to ``~/.config/claude/obligations-bypass.log``, surfaced in
-   ``obligations list``, and self-clears via TTL. Use when you need a
-   targeted bypass without permanent harness env-var pollution.
+   ``obligations list``, and self-clears via TTL. ``--scope all`` (default)
+   bypasses every gate-mode ob and is refused while ANY mandatory ob is
+   active. ``--scope infra`` bypasses only infrastructure-wedge obligations
+   (``INFRA_PREDICATE_KINDS``: watcher / process / inbox health) and is NOT
+   refused by — nor does it bypass — an unrelated POLICY mandatory
+   obligation (e.g. the AskUserQuestion ban). Use the infra scope to clear
+   a health wedge without permanent harness env-var pollution.
 
 Predicates COMPOSE via the meta-predicate ``all_of`` (and trivially via the
 unary ``is_main_loop`` predicate). To express "must be main loop AND <X>",
@@ -504,6 +511,33 @@ AUTO_MANDATORY_PREDICATE_KINDS = {
     "stale_ready_queue_present",
 }
 
+# Infrastructure-wedge predicate kinds. These are the *health* predicates
+# whose failure means "a watcher / process / inbox is in a bad state" --
+# they gate every tool the moment they go red, and the standard recovery
+# (restart a watcher, drain an inbox) can itself be blocked when an
+# UNRELATED policy obligation is also active.
+#
+# A ``--scope infra`` override (see ``cmd_override``) targets ONLY
+# obligations whose predicate tree is composed entirely of these kinds.
+# This lets an operator clear an infrastructure wedge (e.g. a one-shot
+# reminder watcher stuck DOWN dragging down ``watchers_healthy``) WITHOUT
+# being globally refused just because a policy mandatory obligation (e.g.
+# the AskUserQuestion ban, a ``marker_file_present`` row) happens to be
+# present -- and crucially WITHOUT bypassing that policy obligation.
+#
+# Rationale (incident 2026-06-03): a single non-critical reminder watcher
+# going DOWN wedged the entire gate, and ``obligations override`` was
+# refused outright because ``ob-2026-05-20-960d`` (AskUserQuestion ban,
+# a policy mandatory marker_file_present row) was active. The two were
+# completely unrelated; coupling them left no in-band escape.
+INFRA_PREDICATE_KINDS = {
+    "watchers_healthy",
+    "no_pending_watcher_outputs",
+    "process_alive",
+    "process_in_pgrep",
+    "agent_inbox_empty",
+}
+
 # Default location of the session-task queue file. Override via the
 # ``queue_path`` predicate param (mostly for tests).
 DEFAULT_QUEUE_PATH = Path.home() / ".config" / "session" / "queue.json"
@@ -522,6 +556,12 @@ DEFAULT_AGENT_QUEUE_BINDINGS_PATH = (
 )
 
 VALID_ENFORCEMENT_MODES = {"gate", "inform"}
+
+# Override scopes. ``all`` is the legacy blanket bypass (refused while any
+# mandatory ob is active). ``infra`` is the decoupled scope that clears
+# only infrastructure-wedge obligations (INFRA_PREDICATE_KINDS) and is not
+# refused by an unrelated POLICY mandatory obligation.
+VALID_OVERRIDE_SCOPES = {"all", "infra"}
 
 # Hard cap on how long the watchers_healthy predicate may shell out for. Even
 # with --unhealthy-only this normally finishes in <100ms; this is a defensive
@@ -821,9 +861,14 @@ def _prune_expired(data, now=None):
 def _active_override(data, now=None):
     """Return the first non-expired override (dict) or None.
 
-    Used by `_check_core` to bypass ALL gate-mode obligations when an
+    Used by `_check_core` to bypass gate-mode obligations when an
     operator-issued override is in effect. The override is *not* mutated --
     callers may inspect/audit it.
+
+    NOTE: an override may carry ``scope`` (``"all"`` legacy / ``"infra"``).
+    Callers must consult ``_override_bypasses_obligation`` to decide
+    whether a *specific* obligation is bypassed; the mere presence of an
+    override no longer implies a blanket bypass.
     """
     if now is None:
         now = _now()
@@ -837,6 +882,41 @@ def _active_override(data, now=None):
         if exp > now:
             return ov
     return None
+
+
+def _override_scope(ov):
+    """Return the scope of an override record, defaulting to ``"all"`` for
+    legacy records written before the ``scope`` field existed."""
+    if not isinstance(ov, dict):
+        return "all"
+    scope = ov.get("scope")
+    return scope if scope in VALID_OVERRIDE_SCOPES else "all"
+
+
+def _override_bypasses_obligation(ov, ob):
+    """Return True if active override ``ov`` bypasses obligation ``ob``.
+
+    - ``scope="all"``: bypasses every gate-mode obligation (legacy
+      behavior). It is only ever created when NO mandatory row is active
+      (``cmd_override`` enforces this), so it can never bypass a mandatory
+      ob in practice -- but we still refuse to bypass mandatory rows here
+      defensively.
+    - ``scope="infra"``: bypasses ONLY infra-class obligations, and never
+      a mandatory one. A policy obligation (incl. the AskUserQuestion ban)
+      is left fully in force.
+    """
+    if _is_obligation_mandatory(ob):
+        # Overrides never bypass mandatory obligations. (For all-scope this
+        # is belt-and-suspenders; cmd_override already refuses when one is
+        # active. For infra-scope it's the load-bearing guarantee that the
+        # policy mandatory ob stays enforced.)
+        return False
+    scope = _override_scope(ov)
+    if scope == "all":
+        return True
+    if scope == "infra":
+        return _is_obligation_infra(ob)
+    return False
 
 
 def _predicate_kinds_in_tree(pred):
@@ -884,11 +964,48 @@ def _is_obligation_mandatory(ob):
     return bool(kinds & AUTO_MANDATORY_PREDICATE_KINDS)
 
 
-def _active_mandatory_obligations(data, now=None):
-    """Return the list of non-expired mandatory obligations.
+def _is_obligation_infra(ob):
+    """Return True if the obligation row is an INFRASTRUCTURE-wedge row.
 
-    Used by ``cmd_override`` to refuse the override when any active row
-    is mandatory. Expired rows are skipped (they would not gate anyway).
+    An obligation is infra when its predicate tree is composed ENTIRELY of
+    ``INFRA_PREDICATE_KINDS`` (ignoring the structural ``all_of`` /
+    ``is_main_loop`` scope-guard wrappers, which carry no health semantics
+    of their own). A row mixing an infra health predicate with any
+    non-infra, non-structural predicate is NOT treated as infra -- a
+    scoped infra override must never clear something it doesn't fully
+    understand.
+    """
+    if not isinstance(ob, dict):
+        return False
+    pred = ob.get("predicate") or {}
+    kinds = _predicate_kinds_in_tree(pred)
+    if not kinds:
+        return False
+    # ``all_of`` is a structural combinator and ``is_main_loop`` is a
+    # context scope-guard; neither is a health signal, so they don't
+    # disqualify an otherwise-infra row.
+    structural = {"all_of", "is_main_loop"}
+    meaningful = kinds - structural
+    if not meaningful:
+        # Pure structural wrapper with no leaf -- not an infra health row.
+        return False
+    return meaningful <= INFRA_PREDICATE_KINDS
+
+
+def _active_mandatory_obligations(data, now=None, scope="all"):
+    """Return the list of non-expired mandatory obligations that BLOCK an
+    override of the given ``scope``.
+
+    ``scope="all"`` (default, legacy behavior): every active mandatory row
+    blocks -- an all-scope override bypasses everything, so any mandatory
+    row must veto it.
+
+    ``scope="infra"``: only mandatory rows that are THEMSELVES infra-class
+    block. A policy mandatory obligation (e.g. the AskUserQuestion ban, a
+    ``marker_file_present`` row) does NOT veto an infra-scoped override,
+    because that override will not bypass it. This is the decoupling fix:
+    an unrelated policy mandatory ob can no longer wedge the infra escape
+    hatch.
     """
     if now is None:
         now = _now()
@@ -896,8 +1013,14 @@ def _active_mandatory_obligations(data, now=None):
     for ob in data.get("obligations", []) or []:
         if _is_expired(ob, now):
             continue
-        if _is_obligation_mandatory(ob):
-            out.append(ob)
+        if not _is_obligation_mandatory(ob):
+            continue
+        if scope == "infra" and not _is_obligation_infra(ob):
+            # Non-infra (policy) mandatory rows are out of an infra
+            # override's scope -- they neither block it nor are bypassed
+            # by it.
+            continue
+        out.append(ob)
     return out
 
 
@@ -2336,12 +2459,14 @@ def cmd_list(args):
         }, indent=2))
         return 0
     if overrides:
-        print("ACTIVE OVERRIDES (bypass all gate-mode obligations):")
+        print("ACTIVE OVERRIDES (scoped gate-mode bypass):")
         for ov in overrides:
             exp = ov.get("expires_at")
             when = (f"expires in {int(exp - now)}s"
                     if exp and exp > now else "EXPIRED")
-            print(f"  {ov.get('id')} [{when}] by {ov.get('created_by','?')}")
+            scope = _override_scope(ov)
+            print(f"  {ov.get('id')} [{when}] scope={scope} "
+                  f"by {ov.get('created_by','?')}")
             print(f"    reason: {ov.get('reason','(no reason)')}")
         print()
     if not items:
@@ -2449,18 +2574,31 @@ def cmd_override(args):
               file=sys.stderr)
         return 2
 
+    scope = getattr(args, "scope", "all") or "all"
+    if scope not in VALID_OVERRIDE_SCOPES:
+        print(
+            f"ERROR: --scope must be one of {sorted(VALID_OVERRIDE_SCOPES)}",
+            file=sys.stderr,
+        )
+        return 2
+
     now = _now()
     fh, data = _open_locked()
     try:
         _prune_expired(data, now)
 
-        # Mandatory-obligation refusal: if ANY active obligation is
-        # mandatory (explicit --mandatory at add time OR predicate kind
-        # in AUTO_MANDATORY_PREDICATE_KINDS), refuse to register the
-        # override. The operator must dispatch / abandon the underlying
-        # work (or `obligations satisfy <id>` with proof) instead.
-        # Exit 4 distinguishes this from generic CLI errors (exit 2).
-        mandatory_rows = _active_mandatory_obligations(data, now)
+        # Mandatory-obligation refusal, SCOPED. An ``all``-scope override
+        # bypasses every gate-mode ob, so ANY active mandatory row vetoes
+        # it. An ``infra``-scope override bypasses only infra-class obs and
+        # never a mandatory one, so only an *infra-class* mandatory row
+        # vetoes it -- a POLICY mandatory ob (e.g. the AskUserQuestion ban,
+        # a marker_file_present row) is out of scope and does NOT block.
+        # This is the decoupling fix (incident 2026-06-03): a single
+        # reminder watcher wedging `watchers_healthy` can be cleared with
+        # `obligations override "<reason>" --scope infra` even while a
+        # policy mandatory ob is active, and the policy ob stays enforced.
+        # Exit 4 distinguishes mandatory refusal from generic CLI errors.
+        mandatory_rows = _active_mandatory_obligations(data, now, scope=scope)
         if mandatory_rows:
             _write_unlock(fh, data)
             ids = ", ".join(ob.get("id", "?") for ob in mandatory_rows)
@@ -2468,14 +2606,27 @@ def cmd_override(args):
                 k for ob in mandatory_rows
                 for k in _predicate_kinds_in_tree(ob.get("predicate") or {})
             })
+            extra = ""
+            if scope == "all":
+                # Point the operator at the narrower escape hatch when the
+                # blocking rows are all policy (non-infra) -- an infra
+                # override would not be vetoed by them.
+                if not any(_is_obligation_infra(ob) for ob in mandatory_rows):
+                    extra = (
+                        " If you only need to clear an infrastructure wedge "
+                        "(watcher / process / inbox health), use "
+                        "`obligations override \"<reason>\" --scope infra` -- "
+                        "policy mandatory obligations do not block an "
+                        "infra-scoped override."
+                    )
             print(
                 "ERROR: refusing to register override -- "
-                f"{len(mandatory_rows)} active MANDATORY obligation(s) cannot "
-                f"be bypassed: {ids} (predicate kinds: {', '.join(kinds)}). "
-                "Dispatch or abandon the underlying work instead "
-                "(`session-task queue done|abandon <id>`), or run "
+                f"{len(mandatory_rows)} active MANDATORY obligation(s) in "
+                f"scope '{scope}' cannot be bypassed: {ids} (predicate kinds: "
+                f"{', '.join(kinds)}). Dispatch or abandon the underlying work "
+                "instead (`session-task queue done|abandon <id>`), or run "
                 "`obligations satisfy <ob-id>` if the obligation is genuinely "
-                "resolved.",
+                f"resolved.{extra}",
                 file=sys.stderr,
             )
             return 4
@@ -2487,6 +2638,7 @@ def cmd_override(args):
         ov = {
             "id": ov_id,
             "reason": reason,
+            "scope": scope,
             "duration_secs": duration,
             "expires_at": now + duration,
             "created_at": now,
@@ -2502,6 +2654,7 @@ def cmd_override(args):
         "kind": "override-created",
         "override_id": ov_id,
         "reason": reason,
+        "scope": scope,
         "duration_secs": duration,
         "created_by": args.created_by,
     })
@@ -2518,10 +2671,17 @@ def cmd_override(args):
     else:
         print(f"Override active: {ov_id}")
         print(f"  reason:     {reason}")
+        print(f"  scope:      {scope}")
         print(f"  duration:   {duration}s (expires in {duration}s)")
         print(f"  created_by: {args.created_by}")
         print()
-        print("All gate-mode obligations are bypassed for the duration.")
+        if scope == "infra":
+            print("Infrastructure-wedge obligations (watcher / process / "
+                  "inbox health) are bypassed for the duration.")
+            print("Policy obligations (e.g. the AskUserQuestion ban) remain "
+                  "in force.")
+        else:
+            print("All gate-mode obligations are bypassed for the duration.")
         print(f"Cancel early: obligations satisfy {ov_id}")
     return 0
 
@@ -2616,20 +2776,16 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
     data = _read_only()
     now = _now()
 
-    # Per-call audited override: if any non-expired override exists, ALL
-    # gate-mode obligations are bypassed. The override is logged at create
-    # time; we re-audit each bypassed call for forensic completeness.
+    # Per-call audited override: a non-expired override bypasses the
+    # gate-mode obligations WITHIN ITS SCOPE. An ``all``-scope override
+    # bypasses every gate-mode ob (legacy); an ``infra``-scope override
+    # bypasses only infra-class obs and never a (policy) mandatory ob. We
+    # therefore can't short-circuit here -- we fall through to the
+    # per-obligation loop below, which consults
+    # ``_override_bypasses_obligation`` for each row. The override is
+    # logged at create time; we re-audit each call that actually bypasses
+    # at least one ob for forensic completeness.
     active_ov = _active_override(data, now)
-    if active_ov:
-        _audit_override({
-            "kind": "override-applied",
-            "override_id": active_ov.get("id"),
-            "reason": active_ov.get("reason"),
-            "tool_name": tool_name,
-            "command_string_preview": (command_string or "")[:200],
-            "agent_id": agent_id or "",
-        })
-        return (True, [])
 
     # Universal recovery exempts: the framework-level deadlock-prevention
     # floor. Tools matching UNIVERSAL_RECOVERY_EXEMPT_PATTERNS are allowed
@@ -2646,6 +2802,7 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
         return (True, [])
 
     blocking = []
+    override_applied = False
     for ob in data.get("obligations", []):
         if _is_expired(ob, now):
             continue
@@ -2664,6 +2821,13 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
         )
         if exempt_hit:
             continue
+        # Scoped audited override: if an override is active AND its scope
+        # covers this obligation, bypass it. ``all``-scope bypasses every
+        # gate-mode ob; ``infra``-scope bypasses only infra-class obs and
+        # never a (policy) mandatory ob. Mandatory obs are never bypassed.
+        if active_ov is not None and _override_bypasses_obligation(active_ov, ob):
+            override_applied = True
+            continue
         pred = ob.get("predicate", {}) or {}
         ok, why = _eval_predicate(pred, tool_name, command_string,
                                    agent_id=agent_id)
@@ -2674,6 +2838,19 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
                 "predicate": pred,
                 "why": why,
             })
+    # Re-audit the override on any call where it actually bypassed at least
+    # one obligation (forensic completeness; the create event is logged
+    # separately at override time).
+    if override_applied and active_ov is not None:
+        _audit_override({
+            "kind": "override-applied",
+            "override_id": active_ov.get("id"),
+            "scope": _override_scope(active_ov),
+            "reason": active_ov.get("reason"),
+            "tool_name": tool_name,
+            "command_string_preview": (command_string or "")[:200],
+            "agent_id": agent_id or "",
+        })
     return (len(blocking) == 0, blocking)
 
 
@@ -2957,6 +3134,15 @@ def build_parser():
     p_ov.add_argument("--duration", required=True,
                       help="how long to bypass: 60, 5m, 1h, 30m, 1d, etc. "
                            "Hard cap 24h.")
+    p_ov.add_argument("--scope", default="all",
+                      choices=sorted(VALID_OVERRIDE_SCOPES),
+                      help="override scope. 'all' (default): bypass every "
+                           "gate-mode obligation -- refused while ANY "
+                           "mandatory obligation is active. 'infra': bypass "
+                           "only infrastructure-wedge obligations (watcher / "
+                           "process / inbox health) -- NOT refused by an "
+                           "unrelated POLICY mandatory obligation (e.g. the "
+                           "AskUserQuestion ban) and does NOT bypass it.")
     p_ov.add_argument("--created-by", default="main-loop",
                       help="audit string (e.g. 'main-loop', 'andrew')")
     p_ov.add_argument("--json", action="store_true")
