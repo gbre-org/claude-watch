@@ -18,6 +18,26 @@ use std::path::{Path, PathBuf};
 
 const PROM_FILE: &str = "/var/lib/node-exporter/textfile/claude_watch.prom";
 
+/// Live-process snapshot collected at metrics-emission time.
+///
+/// Mirrors the four counts in `claude-watch status`'s "Claude Code" section:
+/// active agents, running tasks (workloads), live + enabled watcher counts,
+/// and open bashes. Singletons — there's only one Claude Code on this host.
+/// Kept as a plain struct so `build_metrics` stays a pure function (no I/O).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LiveCounts {
+    /// Live subagent PIDs (children of the Claude PID, watchers/own-cmds excluded).
+    pub active_agents: u32,
+    /// Currently-running workload labels (tmux pane alive in `tasks` session).
+    pub running_tasks: u32,
+    /// Number of enabled watchers that are healthy (`status == "ok"`).
+    pub live_watchers: u32,
+    /// Number of enabled watchers (config rows with `enabled=true`).
+    pub enabled_watchers: u32,
+    /// Open-bash count parsed from Claude Code's status bar.
+    pub open_bashes: u32,
+}
+
 fn default_state_file() -> PathBuf {
     if let Ok(s) = std::env::var("CLAUDE_WATCH_STATE") {
         return PathBuf::from(s);
@@ -50,7 +70,12 @@ fn num(v: &Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn build_metrics(state: &Value, current_version: &str, latest_version: &str) -> Vec<String> {
+fn build_metrics(
+    state: &Value,
+    current_version: &str,
+    latest_version: &str,
+    live: &LiveCounts,
+) -> Vec<String> {
     let last_check = state
         .get("last_check")
         .and_then(|v| v.as_str())
@@ -292,6 +317,31 @@ fn build_metrics(state: &Value, current_version: &str, latest_version: &str) -> 
             "claude_watch_reminder_to_action_latency_seconds_count{{type=\"update\"}} {}",
             reminder_to_update_count
         ),
+        "".to_string(),
+        // Claude Code live-process counts — the four numbers exposed by
+        // `claude-watch status`'s top section. Singleton gauges (no
+        // session_id label) because there's only one Claude Code on this
+        // host. Names use the `claude_code_*` prefix to make ownership
+        // unambiguous (Claude Code itself, not claude-watch).
+        "# HELP claude_code_active_agents Number of live Claude Code subagent processes".to_string(),
+        "# TYPE claude_code_active_agents gauge".to_string(),
+        format!("claude_code_active_agents {}", live.active_agents),
+        "".to_string(),
+        "# HELP claude_code_running_tasks Number of currently-running workloads (tmux tasks session)".to_string(),
+        "# TYPE claude_code_running_tasks gauge".to_string(),
+        format!("claude_code_running_tasks {}", live.running_tasks),
+        "".to_string(),
+        "# HELP claude_code_live_watchers Number of enabled watchers currently healthy".to_string(),
+        "# TYPE claude_code_live_watchers gauge".to_string(),
+        format!("claude_code_live_watchers {}", live.live_watchers),
+        "".to_string(),
+        "# HELP claude_code_enabled_watchers Number of watchers enabled in watchers.conf".to_string(),
+        "# TYPE claude_code_enabled_watchers gauge".to_string(),
+        format!("claude_code_enabled_watchers {}", live.enabled_watchers),
+        "".to_string(),
+        "# HELP claude_code_open_bashes Number of open background-bash slots in Claude Code".to_string(),
+        "# TYPE claude_code_open_bashes gauge".to_string(),
+        format!("claude_code_open_bashes {}", live.open_bashes),
     ]
 }
 
@@ -349,8 +399,53 @@ fn fetch_version_info() -> (String, String) {
     (current, latest)
 }
 
+/// Collect the live-process counts that mirror `claude-watch status`'s
+/// "Claude Code" section. Best-effort: any sub-collection failure degrades
+/// to zero rather than failing the whole metrics emission. The textfile
+/// collector cron job runs every minute; one transiently-broken count
+/// shouldn't take down the whole exporter.
+async fn collect_live_counts() -> LiveCounts {
+    use crate::active_agents;
+    use crate::status::get_claude_status;
+    use crate::watcher;
+
+    // Fan out the three independent collections in parallel — same pattern
+    // as `run_status` in main.rs. Total wall-clock stays near the slowest
+    // single call (typically watcher_status's pgrep round-trips).
+    let watcher_cfg = watcher::config_path();
+    let watcher_cfg_extra = watcher::config_path_extra();
+    let (agents, watchers, claude_status) = tokio::join!(
+        tokio::task::spawn_blocking(active_agents::collect),
+        watcher::watcher_status(&watcher_cfg, watcher_cfg_extra.as_deref()),
+        get_claude_status(),
+    );
+
+    let agents = agents.unwrap_or(active_agents::ActiveAgents {
+        subagents: Vec::new(),
+        workloads: Vec::new(),
+        agents: Vec::new(),
+    });
+
+    let live_watchers = watchers.iter().filter(|w| w.status == "ok").count() as u32;
+    let enabled_watchers = watchers.iter().filter(|w| w.enabled).count() as u32;
+
+    // open_bashes: prefer a fresh status-bar parse. If that fails (no pane
+    // visible, parser miss, etc.), fall back to 0 — the existing
+    // `claude_bash_count` gauge already surfaces last_known_bashes from
+    // state.json for trend continuity.
+    let open_bashes = claude_status.map(|cs| cs.bashes as u32).unwrap_or(0);
+
+    LiveCounts {
+        active_agents: agents.subagents.len() as u32,
+        running_tasks: agents.workloads.len() as u32,
+        live_watchers,
+        enabled_watchers,
+        open_bashes,
+    }
+}
+
 /// CLI entry point: `claude-watch metrics`.
-pub fn cmd_metrics() -> i32 {
+pub async fn cmd_metrics() -> i32 {
     let state_path = default_state_file();
     let prom_path = PathBuf::from(PROM_FILE);
 
@@ -372,7 +467,8 @@ pub fn cmd_metrics() -> i32 {
     };
 
     let (cur, latest) = fetch_version_info();
-    let lines = build_metrics(&state, &cur, &latest);
+    let live = collect_live_counts().await;
+    let lines = build_metrics(&state, &cur, &latest, &live);
     if let Err(e) = write_prom(&lines, &prom_path) {
         eprintln!("Error writing prom file: {e}");
         return 1;
@@ -404,7 +500,7 @@ mod tests {
     #[test]
     fn build_metrics_minimal() {
         let state = json!({});
-        let lines = build_metrics(&state, "1.2.3", "1.2.4");
+        let lines = build_metrics(&state, "1.2.3", "1.2.4", &LiveCounts::default());
         // Key lines present
         assert!(lines.iter().any(|l| l == "claude_watch_up 1"));
         assert!(lines.iter().any(|l| l == "claude_context_tokens 0"));
@@ -424,7 +520,7 @@ mod tests {
             "last_known_tokens": 42,
             "alert_count": 3,
         });
-        let lines = build_metrics(&state, "x", "y");
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
         assert!(lines.iter().any(|l| l == "claude_watchers_total 2"));
         assert!(lines.iter().any(|l| l == "claude_watchers_missing 1"));
         assert!(lines.iter().any(|l| l == "claude_context_tokens 42"));
@@ -460,7 +556,7 @@ mod tests {
             "reminder_to_clear_latency_secs_sum": 123.5,
             "reminder_to_clear_latency_count": 3,
         });
-        let lines = build_metrics(&state, "x", "y");
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
         let joined = lines.join("\n");
         assert!(joined.contains(
             "claude_watch_fallback_injections_total{type=\"clear\"} 4"
@@ -492,7 +588,7 @@ mod tests {
             "fresh_clear_resume_inject_interrupts_total": 6,
             "restart_claude_interrupts_total": 8,
         });
-        let lines = build_metrics(&state, "x", "y");
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
         let joined = lines.join("\n");
 
         // # TYPE claude_interrupts_total counter (NOT gauge)
@@ -533,7 +629,7 @@ mod tests {
     fn build_metrics_per_interrupt_defaults_to_zero() {
         // Missing fields default to 0 (new counters, state file predates them).
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y");
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
         let joined = lines.join("\n");
         assert!(
             joined.contains("claude_interrupts_total{kind=\"prolonged_thinking\"} 0"),
@@ -553,7 +649,7 @@ mod tests {
         // reads from the shared dir), but we can at least verify all
         // three label types are present in the output.
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y");
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
         let joined = lines.join("\n");
         for label in ["context_high", "version_update", "pre_compact"] {
             assert!(
@@ -566,5 +662,48 @@ mod tests {
                 joined
             );
         }
+    }
+
+    #[test]
+    fn build_metrics_live_counts_zero_default() {
+        // LiveCounts::default() means all five gauges emit 0.
+        let state = json!({});
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
+        let joined = lines.join("\n");
+        for name in [
+            "claude_code_active_agents",
+            "claude_code_running_tasks",
+            "claude_code_live_watchers",
+            "claude_code_enabled_watchers",
+            "claude_code_open_bashes",
+        ] {
+            let needle = format!("{} 0", name);
+            assert!(
+                joined.lines().any(|l| l == needle),
+                "missing zero-default {:?} in:\n{}",
+                needle,
+                joined
+            );
+        }
+    }
+
+    #[test]
+    fn build_metrics_live_counts_populated() {
+        // Non-zero LiveCounts values render correctly.
+        let state = json!({});
+        let live = LiveCounts {
+            active_agents: 2,
+            running_tasks: 1,
+            live_watchers: 3,
+            enabled_watchers: 3,
+            open_bashes: 4,
+        };
+        let lines = build_metrics(&state, "x", "y", &live);
+        let joined = lines.join("\n");
+        assert!(joined.contains("claude_code_active_agents 2"), "{joined}");
+        assert!(joined.contains("claude_code_running_tasks 1"), "{joined}");
+        assert!(joined.contains("claude_code_live_watchers 3"), "{joined}");
+        assert!(joined.contains("claude_code_enabled_watchers 3"), "{joined}");
+        assert!(joined.contains("claude_code_open_bashes 4"), "{joined}");
     }
 }

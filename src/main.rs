@@ -1422,7 +1422,7 @@ async fn main() {
             }
         }
         Some(Commands::Metrics) => {
-            let code = metrics::cmd_metrics();
+            let code = metrics::cmd_metrics().await;
             if code != 0 {
                 std::process::exit(code);
             }
