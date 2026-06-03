@@ -24,6 +24,13 @@ set -euo pipefail
 
 SESSION="claude-container"
 
+# Remove stale tmux socket from a prior container incarnation. The socket
+# lives on a named volume that survives force-recreate; without this, a
+# stale socket would make has-session return 0 and we'd skip creation,
+# leaving the operator with a dead pane. Safe here because this oneshot
+# runs exactly once at container start (before anything else touches tmux).
+rm -f /tmp/tmux-1000/default
+
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "[cw-tmux-bootstrap] session $SESSION already exists; skipping create" >&2
     exit 0
