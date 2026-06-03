@@ -254,6 +254,43 @@ enum WorkloadAction {
         #[arg(long = "force-i-acknowledge-events-are-better")]
         force_i_acknowledge_events_are_better: bool,
     },
+    /// Block IN-PROCESS until a workload finishes, refreshing the bound
+    /// queue item's heartbeat on a timer — then return.
+    ///
+    /// Purpose: let an agent (or the main loop) wait on a long workload
+    /// WITHOUT either (a) tight-polling via separate `workload
+    /// list`/`log` calls — each a fresh LLM turn that burns thousands of
+    /// tokens — or (b) blocking in one long bash call that never
+    /// refreshes the queue heartbeat (so WorkQueueStuckSoft /
+    /// WorkQueueOrphaned eventually fire).
+    ///
+    /// `babysit` waits in-process (no LLM turns) and pats the queue
+    /// heartbeat (`session-task queue heartbeat <qid>`) every
+    /// `--heartbeat` seconds. It returns exit 0 the moment the workload
+    /// reaches `done (exit N)`, or exit 75 (EX_TEMPFAIL) after
+    /// `--max-block` seconds with the workload still running — the
+    /// caller then re-invokes babysit to keep waiting. `--max-block`
+    /// defaults to 540s, comfortably under the Bash tool's 600s hard
+    /// cap, so a single babysit call never gets killed mid-wait.
+    Babysit {
+        /// Workload label to wait on
+        label: String,
+        /// Queue id (`q-XXXX`) whose heartbeat to refresh on the timer.
+        #[arg(long = "qid")]
+        qid: String,
+        /// Seconds between `session-task queue heartbeat` refreshes
+        /// (default 60). The deployed alert thresholds give this ample
+        /// margin — see the babysit doc comment in `workload.rs`.
+        #[arg(long = "heartbeat", default_value_t = 60)]
+        heartbeat: u64,
+        /// Seconds to block before returning exit 75 so the caller can
+        /// re-invoke (default 540, under the 600s Bash-tool cap).
+        #[arg(long = "max-block", default_value_t = 540)]
+        max_block: u64,
+        /// Seconds between in-process completion polls (default 15).
+        #[arg(long = "poll", default_value_t = 15)]
+        poll: u64,
+    },
     /// Show/tail workload output
     Log {
         /// Workload label
@@ -1163,6 +1200,13 @@ fn run_workload(action: WorkloadAction) -> i32 {
             lines,
             force_i_acknowledge_events_are_better,
         } => workload::cmd_wait(&label, lines, force_i_acknowledge_events_are_better),
+        WorkloadAction::Babysit {
+            label,
+            qid,
+            heartbeat,
+            max_block,
+            poll,
+        } => workload::cmd_babysit(&label, &qid, heartbeat, max_block, poll),
         WorkloadAction::Log {
             label,
             follow,

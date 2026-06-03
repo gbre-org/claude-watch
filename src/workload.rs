@@ -1513,6 +1513,296 @@ pub fn cmd_wait(label: &str, lines: usize, force_acknowledged: bool) -> i32 {
     }
 }
 
+/// Exit code returned by `workload babysit` when `--max-block` seconds
+/// elapse with the workload still running. EX_TEMPFAIL (75) from
+/// `sysexits.h` — a "transient failure, retry" signal. The caller
+/// re-invokes babysit to keep waiting; this is the ONLY LLM-turn cost
+/// of the whole wait (≈ once per `--max-block`). Deliberately distinct
+/// from the workload's own exit code (propagated as-is on completion)
+/// and from the error exits (1, 2) so the caller can tell "rerun me"
+/// apart from "the workload finished" and "something is wrong."
+const BABYSIT_TEMPFAIL_EXIT: i32 = 75;
+
+/// Outcome of one `babysit` blocking window. Separated from the I/O
+/// (clock, tmux, session-task) so the loop logic is unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BabysitOutcome {
+    /// Workload reached `done (exit N)`; carries the workload's rc.
+    Done(i32),
+    /// `--max-block` elapsed with the workload still running; carries
+    /// the elapsed wall-clock seconds for the operator-facing message.
+    StillRunning(u64),
+}
+
+/// Pure-ish core of `workload babysit`, factored out of `cmd_babysit`
+/// so it can be unit-tested without real tmux panes, real sleeps, or a
+/// real `session-task` CLI.
+///
+/// Closures injected by the caller:
+///   * `is_done`   — returns `Some(rc)` once the workload has completed
+///     (in prod: `exit_file` exists → parse it / fall back to pane-dead),
+///     else `None`.
+///   * `heartbeat` — fires the queue heartbeat side effect (in prod:
+///     `session-task queue heartbeat <qid>`). Return value is ignored —
+///     heartbeat is best-effort.
+///   * `now`       — monotonic seconds since loop start (tests inject a
+///     deterministic fake clock; prod uses a real `Instant`).
+///   * `sleep`     — advances the clock by `poll` seconds (tests
+///     fast-forward the fake clock; prod actually sleeps).
+///
+/// Contract:
+///   * Polls `is_done` every `poll` seconds. First `Some(rc)` → return
+///     `Done(rc)` immediately.
+///   * Fires `heartbeat` whenever the next `heartbeat`-second boundary
+///     has been crossed (and once up-front at t=0 so a freshly-started
+///     babysit immediately refreshes liveness).
+///   * If `now()` reaches `max_block` with no completion → return
+///     `StillRunning(elapsed)`.
+///
+/// `poll` is clamped to ≥1 so a degenerate `--poll 0` can't spin.
+fn babysit_loop<D, H, N, S>(
+    heartbeat_secs: u64,
+    max_block_secs: u64,
+    poll_secs: u64,
+    mut is_done: D,
+    mut heartbeat: H,
+    mut now: N,
+    mut sleep: S,
+) -> BabysitOutcome
+where
+    D: FnMut() -> Option<i32>,
+    H: FnMut(),
+    N: FnMut() -> u64,
+    S: FnMut(u64),
+{
+    let poll = poll_secs.max(1);
+    // Up-front heartbeat: a freshly-started babysit refreshes liveness
+    // immediately so a queue item that was registered a while ago (e.g.
+    // before a long auto-create + spawn path) doesn't carry a stale
+    // last_heartbeat_at into the first poll window.
+    heartbeat();
+    let mut next_heartbeat = now().saturating_add(heartbeat_secs.max(1));
+
+    loop {
+        // Check completion FIRST so a workload that finished during the
+        // last sleep is reported on this iteration without one more nap.
+        if let Some(rc) = is_done() {
+            return BabysitOutcome::Done(rc);
+        }
+        let elapsed = now();
+        if elapsed >= max_block_secs {
+            return BabysitOutcome::StillRunning(elapsed);
+        }
+        if elapsed >= next_heartbeat {
+            heartbeat();
+            // Schedule the next boundary relative to the one we just
+            // crossed (not to `elapsed`) so heartbeats stay on a fixed
+            // cadence even if a poll tick lands late.
+            next_heartbeat = next_heartbeat.saturating_add(heartbeat_secs.max(1));
+        }
+        sleep(poll);
+    }
+}
+
+/// Detect workload completion for `babysit`. Returns `Some(rc)` once the
+/// workload has finished:
+///   * `<label>.exit` exists → parse the rc (fall back to 1 if the file
+///     is present but unparseable — a finished-but-garbled marker still
+///     means "done").
+///   * else if the tmux pane has died WITHOUT an exit file → treat as a
+///     crash with rc 1 (mirrors `cmd_wait`'s pane-died handling).
+///   * else `None` (still running).
+fn babysit_is_done(label: &str, pane_id: &str) -> Option<i32> {
+    let exit_path = exit_file(label);
+    if exit_path.exists() {
+        return Some(read_exit_code(label).unwrap_or(1));
+    }
+    if !pane_alive(pane_id) {
+        // Pane gone but no exit file — the wrapper died before writing
+        // its marker. Report a crash so the caller stops waiting.
+        return Some(1);
+    }
+    None
+}
+
+/// Fire `session-task queue heartbeat <qid>` (best-effort). Mirrors the
+/// existing queue-transition shell-outs: bounded 10s timeout, honours
+/// the `SESSION_TASK_CLI` override (tests point it at a stub), fail-soft
+/// on any error (the heartbeat is liveness hygiene, not correctness —
+/// the workload keeps running regardless). `pid` is intentionally NOT
+/// passed: `session-task queue heartbeat` defaults to leaving `pid`
+/// untouched, which is exactly right for a workload-bound item whose
+/// liveness signal is its tmux pane, not a single OS PID.
+fn babysit_heartbeat(qid: &str, label: &str) {
+    let cli = match find_session_task_cli() {
+        Some(c) => c,
+        None => {
+            tracing::warn!(
+                qid = %qid,
+                label = %label,
+                "babysit: session-task CLI not found; skipping queue heartbeat"
+            );
+            return;
+        }
+    };
+    let args = vec![
+        "queue".to_string(),
+        "heartbeat".to_string(),
+        qid.to_string(),
+    ];
+    match run_session_task_with_timeout(&cli, &args, 10) {
+        Ok(out) if out.status.success() => {
+            tracing::debug!(qid = %qid, label = %label, "babysit: queue heartbeat refreshed");
+        }
+        Ok(out) => {
+            tracing::warn!(
+                qid = %qid,
+                label = %label,
+                rc = ?out.status.code(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "babysit: queue heartbeat exited non-zero (continuing)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                qid = %qid,
+                label = %label,
+                error = %e,
+                "babysit: queue heartbeat errored (continuing)"
+            );
+        }
+    }
+}
+
+/// CLI: `workload babysit <label> --qid <q-XXXX> [--heartbeat 60]
+///       [--max-block 540] [--poll 15]`
+///
+/// In-process wait on a long workload that ALSO pats the bound queue
+/// item's heartbeat, designed to be re-invoked by the caller on a
+/// `--max-block` cadence rather than polled per-LLM-turn.
+///
+/// ## Why a single in-process wait + periodic heartbeat
+///
+/// Two failure modes this replaces (Andrew flagged 2026-06-03):
+///   * **Tight-poll**: an agent loops `workload list` / `workload log`
+///     across separate tool calls, each a fresh LLM turn burning
+///     thousands of tokens. babysit collapses the whole wait into ONE
+///     in-process loop — zero LLM turns until it returns.
+///   * **One long blind block**: an agent blocks in a single multi-
+///     minute bash call that never refreshes the queue heartbeat.
+///     babysit pats `session-task queue heartbeat <qid>` every
+///     `--heartbeat` seconds so the queue item's `last_heartbeat_at`
+///     stays fresh.
+///
+/// ## Return contract
+///   * **exit 0** + `babysit: done label=<L> workload_exit=<N>` when the
+///     workload reaches `done (exit N)`. The workload's own rc is ALSO
+///     propagated as the process exit code (clamped to 0..=255 — process
+///     exit codes are a byte; a kill marker like -15 would otherwise wrap
+///     to 241, so we map any negative/oversized rc to 1 while still
+///     printing the true value in the status line for the caller to read).
+///   * **exit 75** (EX_TEMPFAIL) + `babysit: still-running label=<L>
+///     elapsed=<S>s — rerun to keep waiting` when `--max-block` elapses
+///     with the workload still running. The caller re-invokes babysit.
+///   * **exit 1** + stderr for an unknown label (matches the rest of the
+///     `workload` CLI's "No workload 'X'" convention).
+///   * **exit 2** + stderr for a malformed `--qid` (must look like
+///     `q-...`). Distinct from 1 so the caller can tell "bad arg" from
+///     "no such workload", and distinct from 75 so a config typo never
+///     masquerades as "rerun me."
+///
+/// ## Heartbeat default has margin against the deployed alert rules
+///
+/// Investigated 2026-06-03. The relevant Prometheus rules and what they
+/// key on (so the 60s default is demonstrably safe):
+///   * `WorkQueueStuck` / `WorkQueueStuckSoft` key on
+///     `worktask_queue_item_progress_age_seconds`, which is the mtime of
+///     the workload's RUNTIME heartbeat file
+///     (`/run/claude/workloads/<label>.heartbeat`). That file is petted
+///     by the workload wrapper's OWN progress-driven sidecar whenever the
+///     wrapped command's output grows — babysit does not touch it and
+///     does not need to. StuckSoft needs progress >15m stale `for:15m`;
+///     a live, output-producing workload never trips it.
+///   * `WorkQueueOrphaned` keys on `worktask_queue_item_has_live_owner`
+///     (the exporter joining queue.json against claude-watch
+///     active-agents) and on `cron-queue-check`'s orphan pass. BOTH treat
+///     a live workload pane as proof-of-life: the exporter stays silent
+///     on workload-bound items that have no agent record, and
+///     cron-queue-check clears all orphan suspicion whenever ANY workload
+///     is alive. So a running workload already silences Orphaned —
+///     babysit's heartbeat is not load-bearing for that alert.
+///
+///   The `session-task queue heartbeat` refresh updates
+///   `last_heartbeat_at`. That field is NOT currently consumed by the
+///   deployed exporter or cron-queue-check — but refreshing it is cheap,
+///   correct hygiene (it IS the documented liveness field for pid=None
+///   items), keeps the field meaningful for the queue CLI / dashboard,
+///   and future-proofs babysit if a heartbeat-staleness alert is added.
+///   60s sits an order of magnitude under every `for:` window above, so
+///   no tightening is warranted.
+pub fn cmd_babysit(
+    label: &str,
+    qid: &str,
+    heartbeat_secs: u64,
+    max_block_secs: u64,
+    poll_secs: u64,
+) -> i32 {
+    // Validate the qid shape up front (exit 2 — distinct from the
+    // unknown-label exit 1). We only sanity-check the `q-` prefix rather
+    // than the full date-suffix grammar; session-task is the authority
+    // on whether the id actually exists, and the heartbeat is fail-soft
+    // anyway — this guard just catches obvious arg-order mistakes (e.g.
+    // passing the label where the qid belongs).
+    if !qid.starts_with("q-") {
+        eprintln!("babysit: --qid must look like 'q-XXXX' (got {qid:?})");
+        return 2;
+    }
+
+    let state = load_state();
+    let info = match state.get(label) {
+        Some(i) => i.clone(),
+        None => {
+            eprintln!("No workload '{label}'");
+            return 1;
+        }
+    };
+
+    let start = std::time::Instant::now();
+    let pane_id = info.pane_id.clone();
+    let outcome = babysit_loop(
+        heartbeat_secs,
+        max_block_secs,
+        poll_secs,
+        || babysit_is_done(label, &pane_id),
+        || babysit_heartbeat(qid, label),
+        || start.elapsed().as_secs(),
+        |secs| std::thread::sleep(Duration::from_secs(secs)),
+    );
+
+    match outcome {
+        BabysitOutcome::Done(rc) => {
+            println!("babysit: done label={label} workload_exit={rc}");
+            // Process exit codes are a single byte (0..=255). Propagate
+            // the workload's rc directly when it fits the success/normal
+            // range; map negative (kill markers like -15) or oversized
+            // values to 1 so they don't silently wrap (e.g. -15 -> 241)
+            // and get misread as a transient/other condition. The TRUE
+            // value is always in the status line above for the caller.
+            if (0..=255).contains(&rc) {
+                rc
+            } else {
+                1
+            }
+        }
+        BabysitOutcome::StillRunning(elapsed) => {
+            println!(
+                "babysit: still-running label={label} elapsed={elapsed}s — rerun to keep waiting"
+            );
+            BABYSIT_TEMPFAIL_EXIT
+        }
+    }
+}
+
 /// CLI: `workload log <label>`
 pub fn cmd_log(label: &str, lines: usize, follow: bool) -> i32 {
     let state = load_state();
@@ -1870,6 +2160,172 @@ mod tests {
             rc, 1,
             "opt-in `workload wait` should reach state lookup and exit 1 \
              for missing label, got {rc}"
+        );
+    }
+
+    // ----- workload babysit -----
+
+    /// Drive `babysit_loop` with a fake clock that advances by `poll`
+    /// each `sleep`, a completion closure that flips to `Some(rc)` once
+    /// the clock reaches `done_at`, and a heartbeat counter. Returns the
+    /// outcome plus the recorded heartbeat timestamps.
+    fn run_babysit_sim(
+        heartbeat_secs: u64,
+        max_block_secs: u64,
+        poll_secs: u64,
+        done_at: Option<u64>,
+        done_rc: i32,
+    ) -> (BabysitOutcome, Vec<u64>) {
+        use std::cell::Cell;
+        let clock = Cell::new(0u64);
+        let heartbeats: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+
+        let outcome = babysit_loop(
+            heartbeat_secs,
+            max_block_secs,
+            poll_secs,
+            || match done_at {
+                Some(t) if clock.get() >= t => Some(done_rc),
+                _ => None,
+            },
+            || heartbeats.borrow_mut().push(clock.get()),
+            || clock.get(),
+            |secs| clock.set(clock.get() + secs),
+        );
+        (outcome, heartbeats.into_inner())
+    }
+
+    #[test]
+    fn babysit_loop_returns_done_with_workload_rc() {
+        // Workload finishes at t=30s; babysit must report Done(rc) and
+        // stop (not run to max_block).
+        let (outcome, _hb) = run_babysit_sim(60, 540, 15, Some(30), 0);
+        assert_eq!(outcome, BabysitOutcome::Done(0));
+    }
+
+    #[test]
+    fn babysit_loop_propagates_nonzero_workload_rc() {
+        let (outcome, _hb) = run_babysit_sim(60, 540, 15, Some(45), 7);
+        assert_eq!(outcome, BabysitOutcome::Done(7));
+    }
+
+    #[test]
+    fn babysit_loop_times_out_to_still_running() {
+        // Workload never finishes (done_at=None). After max_block the
+        // loop must return StillRunning with elapsed >= max_block.
+        let (outcome, _hb) = run_babysit_sim(60, 540, 15, None, 0);
+        match outcome {
+            BabysitOutcome::StillRunning(elapsed) => {
+                assert!(
+                    elapsed >= 540,
+                    "elapsed should be >= max_block, got {elapsed}"
+                );
+            }
+            other => panic!("expected StillRunning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn babysit_loop_fires_heartbeats_on_cadence() {
+        // 540s window, 60s heartbeat, 15s poll, never-finishing workload.
+        // Expect an up-front heartbeat at t=0 plus one per 60s boundary
+        // crossed before max_block: t=0,60,120,...,480 (t=540 hits the
+        // max_block return before the heartbeat check). That's the
+        // up-front pat + 8 boundary pats = 9 total.
+        let (_outcome, hb) = run_babysit_sim(60, 540, 15, None, 0);
+        assert_eq!(
+            hb.first().copied(),
+            Some(0),
+            "must heartbeat up-front at t=0"
+        );
+        assert_eq!(
+            hb.len(),
+            9,
+            "expected up-front + 8 boundary heartbeats, got {hb:?}"
+        );
+        // Every heartbeat after the first lands on a 60s multiple.
+        for ts in &hb[1..] {
+            assert_eq!(ts % 60, 0, "heartbeat {ts} not on a 60s boundary: {hb:?}");
+        }
+    }
+
+    #[test]
+    fn babysit_loop_heartbeats_at_least_once_even_on_fast_completion() {
+        // Workload done almost immediately — the up-front heartbeat must
+        // still fire so a long-registered queue item gets refreshed.
+        let (outcome, hb) = run_babysit_sim(60, 540, 15, Some(0), 0);
+        assert_eq!(outcome, BabysitOutcome::Done(0));
+        assert_eq!(hb, vec![0], "up-front heartbeat must fire before completion check");
+    }
+
+    #[test]
+    fn babysit_loop_clamps_zero_poll() {
+        // A degenerate --poll 0 must not spin forever: clamp to 1s so
+        // the clock advances and max_block is eventually reached.
+        let (outcome, _hb) = run_babysit_sim(60, 5, 0, None, 0);
+        assert!(matches!(outcome, BabysitOutcome::StillRunning(_)));
+    }
+
+    #[test]
+    fn cmd_babysit_rejects_bad_qid() {
+        // A --qid that doesn't look like q-XXXX exits 2 (distinct from
+        // the unknown-label exit 1) before any state lookup.
+        let rc = cmd_babysit("any-label", "not-a-qid", 60, 540, 15);
+        assert_eq!(rc, 2, "malformed qid must exit 2, got {rc}");
+    }
+
+    #[test]
+    fn cmd_babysit_unknown_label_exits_1() {
+        // Valid-looking qid but no such workload → exit 1, matching the
+        // rest of the workload CLI's missing-label convention.
+        let rc = cmd_babysit(
+            "definitely-not-a-real-workload-xyz",
+            "q-2026-06-03-test",
+            60,
+            540,
+            15,
+        );
+        assert_eq!(rc, 1, "unknown label must exit 1, got {rc}");
+    }
+
+    #[test]
+    fn babysit_heartbeat_invokes_session_task_queue_heartbeat() {
+        // Stub session-task as a recording bash script and verify
+        // babysit_heartbeat shells out with `queue heartbeat <qid>`.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        babysit_heartbeat("q-2026-06-03-hb", "hb-label");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+
+        assert!(recording.exists(), "stub session-task should have been invoked");
+        let recorded = std::fs::read_to_string(&recording).expect("read recording");
+        assert!(
+            recorded.contains("queue\nheartbeat\nq-2026-06-03-hb"),
+            "expected `queue heartbeat <qid>` invocation in {recorded}"
         );
     }
 
