@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""
+eval-queue-ready-unspawned — obligation evaluator that blocks the main loop
+when ready-but-unspawned queue items exist.
+
+If `session-task queue list --json` shows any item with status=pending and
+ready_now=true, this evaluator DENIES (exit 1). The main loop must spawn
+the ready items before doing other work.
+
+Exempt commands (never denied): same set as eval-event-must-act (session-task,
+obligations, claude-watch-ack, etc.) plus Agent (spawning IS the fix).
+
+Decision mode: exit_code (allow on 0, deny on 1).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+_EXEMPT_PATTERNS = [
+    r"session-task(\s|$)",
+    r"obligations(\s|$)",
+    r"claude-watch-ack(\s|$)",
+    r"claude-watch-dispatch(\s|$)",
+    r"agent-msg(\s|$)",
+    r"agent-tail(\s|$)",
+    r"agent-ack(\s|$)",
+    r"event-ack(\s|$)",
+    r"event-classify(\s|$)",
+    r"signal-history(\s|$)",
+    r"signal-ack(\s|$)",
+    r"signal-mark-read(\s|$)",
+    r"/etc/claude-code/watchers/",
+    r"pingme(\s|$)",
+]
+
+_EXEMPT_RE = re.compile(
+    r"^\s*(" + "|".join(_EXEMPT_PATTERNS) + r")",
+)
+
+
+def _is_exempt(cmd: str) -> bool:
+    return bool(_EXEMPT_RE.match(cmd))
+
+
+def main() -> int:
+    cmd = sys.stdin.read().strip()
+
+    if _is_exempt(cmd):
+        return 0
+
+    try:
+        result = subprocess.run(
+            ["session-task", "queue", "list", "--json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return 0  # default-open on error
+
+        items = json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return 0  # default-open
+
+    ready_unspawned = [
+        i for i in items
+        if i.get("status") == "pending" and i.get("ready_now") is True
+    ]
+
+    if not ready_unspawned:
+        return 0
+
+    summaries = "; ".join(i.get("summary", i.get("id", "?"))[:40] for i in ready_unspawned[:3])
+    print(
+        f"DENIED: {len(ready_unspawned)} ready queue item(s) unspawned: {summaries}. "
+        f"Spawn them (session-task queue register + Agent) before doing other work.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

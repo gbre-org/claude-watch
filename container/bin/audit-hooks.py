@@ -139,6 +139,7 @@ KNOWN_BUILTINS = {
     "event-classify",
     "event-ack",
     "eval-event-must-act",
+    "eval-queue-ready-unspawned",
     "user-prompt-ambient-inject-hook",
 }
 
