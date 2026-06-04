@@ -228,6 +228,16 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_ack_timestamp() -> None:
+    """Write current epoch to last-ack-timestamp for cooldown tracking."""
+    import time
+    ts_path = STATE_DIR / "last-ack-timestamp"
+    try:
+        ts_path.write_text(str(time.time()))
+    except OSError:
+        pass
+
+
 def cmd_ack(args: argparse.Namespace) -> int:
     state = _load_state()
     alerts = state.get("alerts") or []
@@ -235,6 +245,7 @@ def cmd_ack(args: argparse.Namespace) -> int:
         cleared = len(alerts)
         state["alerts"] = []
         _save_state(state)
+        _write_ack_timestamp()
         print(f"ack'd {cleared} alert(s)")
         return 0
     if not args.alert_id:
@@ -246,6 +257,7 @@ def cmd_ack(args: argparse.Namespace) -> int:
         return 1
     state["alerts"] = new_alerts
     _save_state(state)
+    _write_ack_timestamp()
     print(f"ack'd {args.alert_id}")
     return 0
 
