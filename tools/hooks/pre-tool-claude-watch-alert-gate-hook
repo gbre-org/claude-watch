@@ -290,6 +290,62 @@ def _build_reason(alerts: list[dict]) -> str:
 
 
 # -----------------------------------------------------------------------------
+# Override + cooldown checks
+# -----------------------------------------------------------------------------
+
+OBLIGATIONS_PATH = Path(os.path.expanduser("~/.config/claude/obligations.json"))
+ACK_COOLDOWN_SECS = int(os.environ.get("CLAUDE_WATCH_ALERT_ACK_COOLDOWN", "30"))
+
+
+def _has_active_override() -> bool:
+    """Return True if any obligations override is currently active."""
+    if not OBLIGATIONS_PATH.exists():
+        return False
+    try:
+        with OBLIGATIONS_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    overrides = data.get("overrides")
+    if not isinstance(overrides, list) or not overrides:
+        return False
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for ov in overrides:
+        if not isinstance(ov, dict):
+            continue
+        expires_at = ov.get("expires_at")
+        if not expires_at:
+            continue
+        try:
+            exp = datetime.datetime.fromisoformat(expires_at)
+            if now < exp:
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
+
+def _within_ack_cooldown(alerts: list[dict]) -> bool:
+    """Return True if the most recent alert was acked within COOLDOWN_SECS.
+    This prevents re-fire spam when the monitor writes alerts faster than
+    the operator can act."""
+    if ACK_COOLDOWN_SECS <= 0:
+        return False
+    ack_log = STATE_DIR / "last-ack-timestamp"
+    if not ack_log.exists():
+        return False
+    try:
+        ts = float(ack_log.read_text().strip())
+        import time
+        return (time.time() - ts) < ACK_COOLDOWN_SECS
+    except (OSError, ValueError):
+        return False
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
@@ -326,8 +382,21 @@ def main() -> int:
         print(json.dumps(_allow()))
         return 0
 
+    # Respect active obligations overrides — if the operator has explicitly
+    # bypassed all gates, the alert gate should not block either.
+    if _has_active_override():
+        print(json.dumps(_allow()))
+        return 0
+
     alerts = _read_pending_alerts()
     if not alerts:
+        print(json.dumps(_allow()))
+        return 0
+
+    # Cooldown: if the most recent ack was within COOLDOWN_SECS, allow.
+    # This prevents rapid re-fire when the watcher_monitor writes a new
+    # alert faster than the operator can act on it.
+    if _within_ack_cooldown(alerts):
         print(json.dumps(_allow()))
         return 0
 
