@@ -70,11 +70,30 @@ fn num(v: &Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Epoch seconds (float, with sub-second precision) of the mtime of the host
+/// main-loop heartbeat file. Returns `None` if the file is missing or its
+/// mtime can't be read — the caller then omits the gauge entirely (matching
+/// how an absent optional series is handled: no stale value is exported).
+///
+/// This is the file the main loop `touch`es on each `heartbeat-tick`. It is
+/// the canonical liveness signal: if the main loop wedges and stops touching
+/// the file, its mtime freezes and the gauge's age climbs without bound —
+/// unlike `claude_heartbeat_timestamp_seconds`, which tracks the *daemon's*
+/// own ~60s check cycle (`state.last_check`) and stays fresh even when the
+/// main loop is dead.
+fn heartbeat_file_mtime_secs(path: &Path) -> Option<f64> {
+    let meta = fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(dur.as_secs_f64())
+}
+
 fn build_metrics(
     state: &Value,
     current_version: &str,
     latest_version: &str,
     live: &LiveCounts,
+    mainloop_heartbeat_mtime: Option<f64>,
 ) -> Vec<String> {
     let last_check = state
         .get("last_check")
@@ -153,7 +172,7 @@ fn build_metrics(
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
-    vec![
+    let mut lines = vec![
         "# HELP claude_watch_up Whether claude-watch state file is readable".to_string(),
         "# TYPE claude_watch_up gauge".to_string(),
         "claude_watch_up 1".to_string(),
@@ -342,7 +361,29 @@ fn build_metrics(
         "# HELP claude_code_open_bashes Number of open background-bash slots in Claude Code".to_string(),
         "# TYPE claude_code_open_bashes gauge".to_string(),
         format!("claude_code_open_bashes {}", live.open_bashes),
-    ]
+    ];
+
+    // Main-loop heartbeat FILE mtime — the true liveness signal. The main
+    // loop touches the host heartbeat file on each `heartbeat-tick`; this
+    // gauge exports that file's mtime so a wedged main loop (which stops
+    // touching the file) shows a climbing age. Distinct from
+    // `claude_heartbeat_timestamp_seconds`, which tracks the daemon's own
+    // check cycle and stays fresh regardless of main-loop liveness. Omitted
+    // entirely when the file is absent so no stale value is exported.
+    if let Some(mtime) = mainloop_heartbeat_mtime {
+        lines.push("".to_string());
+        lines.push(
+            "# HELP claude_mainloop_heartbeat_timestamp_seconds Epoch (mtime) of the host main-loop heartbeat file, touched by the main loop on each heartbeat-tick"
+                .to_string(),
+        );
+        lines.push("# TYPE claude_mainloop_heartbeat_timestamp_seconds gauge".to_string());
+        lines.push(format!(
+            "claude_mainloop_heartbeat_timestamp_seconds {:.3}",
+            mtime
+        ));
+    }
+
+    lines
 }
 
 /// Build the multi-line `claude_watch_reminder_fires_total{type=...}`
@@ -476,7 +517,17 @@ pub async fn cmd_metrics() -> i32 {
 
     let (cur, latest) = fetch_version_info();
     let live = collect_live_counts().await;
-    let lines = build_metrics(&state, &cur, &latest, &live);
+
+    // Resolve the host main-loop heartbeat file path from config (the
+    // canonical `[claude].heartbeat_file` field). If config can't be loaded,
+    // fall back to the documented default path so the gauge still works on a
+    // normally-provisioned host. The gauge is omitted if the file is absent.
+    let heartbeat_path = crate::config::try_load_config()
+        .map(|c| c.claude.heartbeat_file)
+        .unwrap_or_else(|_| "/run/claude/heartbeat".to_string());
+    let mainloop_heartbeat_mtime = heartbeat_file_mtime_secs(Path::new(&heartbeat_path));
+
+    let lines = build_metrics(&state, &cur, &latest, &live, mainloop_heartbeat_mtime);
     if let Err(e) = write_prom(&lines, &prom_path) {
         eprintln!("Error writing prom file: {e}");
         return 1;
@@ -508,7 +559,7 @@ mod tests {
     #[test]
     fn build_metrics_minimal() {
         let state = json!({});
-        let lines = build_metrics(&state, "1.2.3", "1.2.4", &LiveCounts::default());
+        let lines = build_metrics(&state, "1.2.3", "1.2.4", &LiveCounts::default(), None);
         // Key lines present
         assert!(lines.iter().any(|l| l == "claude_watch_up 1"));
         assert!(lines.iter().any(|l| l == "claude_context_tokens 0"));
@@ -528,7 +579,7 @@ mod tests {
             "last_known_tokens": 42,
             "alert_count": 3,
         });
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
         assert!(lines.iter().any(|l| l == "claude_watchers_total 2"));
         assert!(lines.iter().any(|l| l == "claude_watchers_missing 1"));
         assert!(lines.iter().any(|l| l == "claude_context_tokens 42"));
@@ -539,6 +590,66 @@ mod tests {
     fn down_metrics_format() {
         let lines = down_metrics();
         assert!(lines.iter().any(|l| l == "claude_watch_up 0"));
+    }
+
+    #[test]
+    fn heartbeat_file_mtime_present_for_fresh_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hb = dir.path().join("heartbeat");
+        std::fs::write(&hb, b"").unwrap();
+        let mtime = heartbeat_file_mtime_secs(&hb).expect("fresh file should yield an mtime");
+        // Within a generous window of "now" — file was just written.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(
+            (now - mtime).abs() < 60.0,
+            "mtime {mtime} should be near now {now}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_file_mtime_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(heartbeat_file_mtime_secs(&missing).is_none());
+    }
+
+    #[test]
+    fn build_metrics_includes_mainloop_heartbeat_when_present() {
+        let state = json!({});
+        // A fixed, recognizable epoch (2026-01-01T00:00:00Z = 1767225600).
+        let lines = build_metrics(
+            &state,
+            "x",
+            "y",
+            &LiveCounts::default(),
+            Some(1_767_225_600.0),
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l == "claude_mainloop_heartbeat_timestamp_seconds 1767225600.000"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "# TYPE claude_mainloop_heartbeat_timestamp_seconds gauge"));
+        // The daemon-check gauge must remain present and untouched.
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("claude_heartbeat_timestamp_seconds ")));
+    }
+
+    #[test]
+    fn build_metrics_omits_mainloop_heartbeat_when_absent() {
+        let state = json!({});
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains("claude_mainloop_heartbeat_timestamp_seconds")));
+        // Daemon-check gauge still present.
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("claude_heartbeat_timestamp_seconds ")));
     }
 
     #[test]
@@ -564,7 +675,7 @@ mod tests {
             "reminder_to_clear_latency_secs_sum": 123.5,
             "reminder_to_clear_latency_count": 3,
         });
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
         let joined = lines.join("\n");
         assert!(joined.contains(
             "claude_watch_fallback_injections_total{type=\"clear\"} 4"
@@ -596,7 +707,7 @@ mod tests {
             "fresh_clear_resume_inject_interrupts_total": 6,
             "restart_claude_interrupts_total": 8,
         });
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
         let joined = lines.join("\n");
 
         // # TYPE claude_interrupts_total counter (NOT gauge)
@@ -637,7 +748,7 @@ mod tests {
     fn build_metrics_per_interrupt_defaults_to_zero() {
         // Missing fields default to 0 (new counters, state file predates them).
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
         let joined = lines.join("\n");
         assert!(
             joined.contains("claude_interrupts_total{kind=\"prolonged_thinking\"} 0"),
@@ -657,7 +768,7 @@ mod tests {
         // reads from the shared dir), but we can at least verify all
         // three label types are present in the output.
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
         let joined = lines.join("\n");
         for label in ["context_high", "version_update", "pre_compact"] {
             assert!(
@@ -676,7 +787,7 @@ mod tests {
     fn build_metrics_live_counts_zero_default() {
         // LiveCounts::default() means all five gauges emit 0.
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default());
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
         let joined = lines.join("\n");
         for name in [
             "claude_code_active_agents",
@@ -706,7 +817,7 @@ mod tests {
             enabled_watchers: 3,
             open_bashes: 4,
         };
-        let lines = build_metrics(&state, "x", "y", &live);
+        let lines = build_metrics(&state, "x", "y", &live, None);
         let joined = lines.join("\n");
         assert!(joined.contains("claude_code_active_agents 2"), "{joined}");
         assert!(joined.contains("claude_code_running_tasks 1"), "{joined}");
