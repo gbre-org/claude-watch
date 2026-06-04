@@ -3,7 +3,7 @@
 end-to-end (mirror bind-mount + in-container CLAUDE_EVENT_QUEUE env
 passthrough).
 
-Background: the in-container claude-event-tail watcher reads JSON
+Background: the in-container claude-event-watch watcher reads JSON
 events from `$CLAUDE_EVENT_QUEUE` (or `$HOME/claude-events` as a
 fallback). The compose stack uses a same-path-on-both-sides mirror
 bind-mount of the operator's host spool — when the operator sets
@@ -74,7 +74,7 @@ if COMPOSE.is_file():
         "docker-compose.yml: claude-container `environment:` block "
         "must forward CLAUDE_EVENT_QUEUE from "
         "${CLAUDE_HOST_EVENTS_DIR:-}. Without the passthrough, the "
-        "in-container claude-event-tail keeps reading from the "
+        "in-container claude-event-watch keeps reading from the "
         "container-default $HOME/claude-events (= /home/hndrewaall/"
         "claude-events) instead of the operator's mirrored spool — "
         "the bind-mount lands events at a path the watcher never "

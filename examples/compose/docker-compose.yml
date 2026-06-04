@@ -176,7 +176,7 @@ services:
       # --dangerously-skip-permissions to the claude argv when set.
       CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS: ${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}
       # CLAUDE_EVENT_QUEUE — in-container override for where the
-      # claude-event-tail watcher looks for event JSON files (and
+      # claude-event-watch watcher looks for event JSON files (and
       # where the in-container claude-event CLI writes to). Wired to
       # the same operator-supplied path as the bind-mount source/dest
       # below, so the host writer and the in-container reader hit the
@@ -272,10 +272,10 @@ services:
       # in the same workflow.
       - "${CLAUDE_HOST_BIN_DIR:-${HOME}/bin}:/home/hndrewaall/bin:rw"
       # claude-event spool — rw. Host cron / alertmanager / queue
-      # producers write here; the in-container claude-event-tail reads
+      # producers write here; the in-container claude-event-watch reads
       # + consumes them. Same-path-on-both-sides mirror so the spool
       # resolves to the SAME absolute path inside and out — the
-      # in-container claude-event-tail picks the path up via the
+      # in-container claude-event-watch picks the path up via the
       # CLAUDE_EVENT_QUEUE env var (set in the environment: block
       # above from the same CLAUDE_HOST_EVENTS_DIR value), so the host
       # writer and container reader hit the same directory regardless

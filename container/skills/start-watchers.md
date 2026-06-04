@@ -2,7 +2,7 @@ Report on the in-container background watchers documented under `/etc/claude-cod
 
 ## Current state — watchers are container-supervised
 
-The container ships **one** long-running watcher today: `claude-event-tail`, which surfaces JSON event drops in `~/claude-events/` to the in-container session via stdout. It uses the generic re-arming `lib/dir-watch.sh` primitive — future watchers that just need "fire callback per new file" should plug in via the same primitive rather than reimplementing inotify / poll / state.
+The container ships **one** fire-and-exit watcher today: `claude-event-watch`, which blocks until a JSON event arrives in `~/claude-events/`, prints all pending events as one-liners, and exits. The main loop gets notified on each exit (batch delivery) and restarts it immediately.
 
 **Lifecycle change**: previously this skill launched watchers via Claude Code's `Bash` tool with `run_in_background: true`, so watchers died when the session ended and the next session had to re-run the skill. The new shape: `cw-watcher-supervisor` (baked at `/usr/local/bin/cw-watcher-supervisor`, launched by `entrypoint.sh` before tmux) reads each watcher's `.toml` and respawns the launcher on exit per `restart_policy`. Watchers survive the entire container lifetime, not just one session.
 

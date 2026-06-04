@@ -340,7 +340,7 @@ if events_entry is not None:
     raw, mode = events_entry
     expect(
         mode in ("rw", "default"),
-        f"CLAUDE_HOST_EVENTS_DIR mount must be RW (claude-event-tail "
+        f"CLAUDE_HOST_EVENTS_DIR mount must be RW (claude-event-watch "
         f"consumes events by reading + deleting the JSON files); got mode={mode!r}",
     )
     # Mirror pattern: source == destination so the same absolute path

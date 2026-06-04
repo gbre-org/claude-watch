@@ -83,49 +83,6 @@ A watcher that loops forever **breaks the delivery model**. Claude Code only sur
 
 The container is a **code-writing sandbox**, not the host's automation hub. Background tasks in Claude Code are inherently session-scoped — they exist in the context of a running conversation. A watcher that outlives its session has no one to deliver results to. The block-print-exit model keeps watchers tightly coupled to the session that consumes their output.
 
-## Reusable primitives
-
-### `lib/dir-watch.sh`
-
-Generic re-arming directory watcher. Drop a wrapper script that exports three env vars and `exec`s into this primitive — it handles inotify monitor mode, ls-mtime poll fallback, the "already seen" state file, and the never-exit re-arm loop.
-
-```bash
-#!/bin/bash
-export WATCH_DIR="$HOME/my-events"
-export WATCH_PATTERN='*.json'
-# $1 = full path, $2 = action ("created" / "modified" / "deleted").
-export WATCH_CALLBACK='echo "got $2 for $1"'
-export WATCH_EVENTS='all'                # opt into the full lifecycle
-exec /etc/claude-code/watchers/lib/dir-watch.sh
-```
-
-Required env:
-
-- `WATCH_DIR` — absolute path to the directory to monitor.
-- `WATCH_PATTERN` — bash glob (NOT regex), matched against the basename (e.g. `*.json`, `v[0-9]*.md`, `*`).
-- `WATCH_CALLBACK` — shell snippet invoked once per matching event. Positional args inside the callback:
-  - `$1` — the file's full path.
-  - `$2` — the action label (one of `created` / `modified` / `deleted`).
-
-  Callbacks that only consume `$1` continue to work unchanged — the `$2` slot is additive.
-
-Optional env:
-
-- `WATCH_EVENTS` — space-separated list of lifecycle events to fire on. Default: `created` (matches the pre-events behaviour — only new files fire). Allowed values:
-  - `created` — new file appeared (inotify `CREATE` / `MOVED_TO`; poll: filename not in prior snapshot).
-  - `modified` — existing file's content changed (inotify `CLOSE_WRITE`; poll: same filename + newer mtime). Only fires for files that previously fired `created`.
-  - `deleted` — file removed or renamed out of the dir (inotify `DELETE` / `MOVED_FROM`; poll: filename gone from glob).
-  - `moved-in` — alias for `created` (rename into the watched dir).
-  - `moved-out` — alias for `deleted` (rename out of the watched dir).
-  - `all` — shorthand for `created modified deleted`.
-- `POLL_INTERVAL_SECS` — fallback poll interval when `inotifywait` is missing (default 3s).
-- `WATCH_STATE_FILE` — override the state-file path (default `/tmp/dir-watch-<sha1 of WATCH_DIR>.state`). Lines are tab-separated `<filename>\t<mtime>\t<inode>`. The poll fallback diffs against this snapshot to detect created / modified / deleted. The legacy "filenames only" format is auto-migrated on startup with no spurious fires.
-- `WATCH_DISABLE_INOTIFY` — set to any non-empty value to force the poll fallback even when `inotifywait` is on PATH (tests only).
-
-The primitive prints `dir-watch: fire <action> <basename>` to stdout per fire, plus whatever the callback itself emits.
-
-**Note:** `lib/dir-watch.sh` uses a forever-loop internally and is designed for use by watcher scripts that wrap it with their own exit logic. Standalone watchers (like `claude-event-watch`) implement the block-print-exit contract directly without using this lib.
-
 ## Currently shipping
 
 ### `claude-event-watch`
@@ -137,7 +94,3 @@ The canonical event-bus watcher. Blocks on `inotifywait` until a `.json` event f
 - Metadata: `/etc/claude-code/watchers/claude-event-watch.toml`
 - Restart policy: `session` (restarted by the session on each exit)
 - Log path: `/tmp/claude-container-watchers/claude-event-watch.log`
-
-### `claude-event-tail.sh` (DEPRECATED)
-
-The old forever-loop pattern. **Do not use.** A forever-loop watcher cannot deliver results to the session because Claude Code only surfaces `run_in_background` output on task exit. This file is scheduled for removal. Use `claude-event-watch` instead.

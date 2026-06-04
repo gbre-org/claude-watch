@@ -255,7 +255,7 @@ The entrypoint script does setup (PATH wiring, hooks-shim generation, trust-work
 | `tmux-attach` | Interactive foreground process — attaches stdin/stdout/stderr to the tmux session. | `restart: no` |
 | `claude-watch` | Long-running daemon — observes the in-container claude pane via tmux capture-pane. | `restart: on_failure` |
 | `crond` | Long-running daemon — runs `/etc/cron.d/cw-default` + any operator entries in `/etc/cron.d/private/`. | `restart: on_failure` |
-| `cw-watcher-supervisor` | Long-running supervisor — respawns the operator-baked watchers (claude-event-tail etc.). | `restart: on_failure` |
+| `cw-watcher-supervisor` | Long-running supervisor — respawns the operator-baked watchers (claude-event-watch etc.). | `restart: on_failure` |
 
 Why process-compose (escalation past the prior tini threshold):
 
@@ -430,12 +430,11 @@ plugin loader treats the baked dir as a real plugin.
 - Agents: none yet — the dir is a stub for future agent ports (Explore,
   general-purpose, note-writer, etc. — see
   [`container/agents/README.md`](agents/README.md) for the plan).
-- Watchers: [`claude-event-tail`](watchers/claude-event-tail.sh)
-  (surfaces `~/claude-events/*.json` drops to the in-container
-  session). Supervised by `cw-watcher-supervisor`, which entrypoint.sh
-  spawns at container start; watchers respawn-on-exit per their
-  `restart_policy` and survive the full container lifetime
-  independent of any Claude Code session inside.
+- Watchers: [`claude-event-watch`](watchers/claude-event-watch.sh)
+  (blocks until a `~/claude-events/*.json` event arrives, prints
+  pending events, and exits — fire-and-exit contract). Supervised by
+  `cw-watcher-supervisor`, which entrypoint.sh spawns at container
+  start; watchers respawn-on-exit per their `restart_policy`.
 
 To add a new skill / agent / watcher: drop the file in the appropriate
 `container/<dir>/`, add a test under `container/tests/baked-dirs.test`
