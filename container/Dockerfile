@@ -857,6 +857,13 @@ RUN chmod +x /usr/local/bin/eval-event-must-act
 COPY container/bin/eval-agent-ack-pending /usr/local/bin/eval-agent-ack-pending
 RUN chmod +x /usr/local/bin/eval-agent-ack-pending
 
+# eval-queue-ready-unspawned — obligations evaluator that blocks Bash tool
+# calls when session-task queue has items with status=pending and
+# ready_now=true. Forces the main loop to spawn agents for ready work
+# before doing anything else. Default-open on errors.
+COPY container/bin/eval-queue-ready-unspawned /usr/local/bin/eval-queue-ready-unspawned
+RUN chmod +x /usr/local/bin/eval-queue-ready-unspawned
+
 # agent-ack — CLI to manage the agent completion acknowledgment state.
 # Subcommands: register, done, list, clear, status. Manages the state
 # file at ~/.config/claude/agent-ack-pending.json used by the
