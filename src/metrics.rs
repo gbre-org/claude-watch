@@ -436,7 +436,15 @@ async fn collect_live_counts() -> LiveCounts {
     let open_bashes = claude_status.map(|cs| cs.bashes as u32).unwrap_or(0);
 
     LiveCounts {
-        active_agents: agents.subagents.len() as u32,
+        // Count live agents from the JSONL-transcript alive flag, NOT from
+        // `subagents` (child PIDs). Subagents share the parent Claude Code
+        // PID — they're in-process event loops, not child processes — so the
+        // child-PID set actually enumerates non-watcher child PROCESSES (MCP
+        // servers like the chrome-devtools stdio server, transient bash), not
+        // agents, inflating the gauge by a near-constant offset. Transcript
+        // mtime (within the 120s max-age window) is the canonical agent
+        // liveness signal.
+        active_agents: agents.agents.iter().filter(|a| a.alive).count() as u32,
         running_tasks: agents.workloads.len() as u32,
         live_watchers,
         enabled_watchers,
