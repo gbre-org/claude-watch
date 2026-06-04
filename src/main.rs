@@ -22,6 +22,7 @@
 mod active_agents;
 mod agent;
 mod alert;
+mod cadence;
 mod cmd;
 mod config;
 mod event_bus;
@@ -1008,6 +1009,17 @@ async fn run_daemon() {
     );
     let mut last_full_check = std::time::Instant::now() - general_interval; // run immediately
 
+    // Cadence emitter: the daemon sources the `heartbeat-tick` (60s) and
+    // `memory-reminder` (15min) claude-events, replacing the out-of-tree
+    // self-rescheduling reminder background task. NOTE: this only EMITS the
+    // events; it deliberately does NOT touch the host heartbeat file — that
+    // remains the main loop's job so a wedged loop still goes stale and
+    // trips wedge detection. See `crate::cadence`.
+    let mut cadence_tracker = cadence::CadenceTracker::with_intervals(
+        Duration::from_secs(current_config.cadence.heartbeat_tick_interval_secs),
+        Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
+    );
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -1021,6 +1033,12 @@ async fn run_daemon() {
             // Refresh the post-escape settle delay in case the operator
             // tuned it via config.toml + SIGHUP.
             tmux::set_post_escape_settle_ms(current_config.tmux.post_escape_settle_ms);
+            // Re-arm the cadence tracker in case the operator tuned the
+            // intervals via config.toml + SIGHUP.
+            cadence_tracker = cadence::CadenceTracker::with_intervals(
+                Duration::from_secs(current_config.cadence.heartbeat_tick_interval_secs),
+                Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
+            );
             write_jsonl_log(
                 &current_config.general.log_file,
                 "config_reload",
@@ -1029,6 +1047,41 @@ async fn run_daemon() {
         }
 
         let now = std::time::Instant::now();
+
+        // Emit daemon-sourced cadence events (heartbeat-tick / memory-reminder)
+        // on their monotonic intervals. Best-effort; never blocks the loop.
+        if current_config.cadence.enabled {
+            let due = cadence_tracker.due(now);
+            if !due.is_empty() {
+                tracing::debug!(
+                    heartbeat_tick = due.heartbeat_tick,
+                    memory_reminder = due.memory_reminder,
+                    "emitting cadence event(s)"
+                );
+            }
+            if due.heartbeat_tick {
+                event_bus::emit_cadence(&event_bus::CadenceEvent {
+                    tag: cadence::HEARTBEAT_TICK_TAG,
+                    source: cadence::CADENCE_SOURCE,
+                    message: "heartbeat tick",
+                    priority: "low",
+                    data: serde_json::json!({
+                        "interval_secs": current_config.cadence.heartbeat_tick_interval_secs,
+                    }),
+                });
+            }
+            if due.memory_reminder {
+                event_bus::emit_cadence(&event_bus::CadenceEvent {
+                    tag: cadence::MEMORY_REMINDER_TAG,
+                    source: cadence::CADENCE_SOURCE,
+                    message: cadence::MEMORY_REMINDER_CHECKLIST,
+                    priority: "high",
+                    data: serde_json::json!({
+                        "interval_secs": current_config.cadence.memory_reminder_interval_secs,
+                    }),
+                });
+            }
+        }
 
         // Full check cycle at general.check_interval
         if now.duration_since(last_full_check) >= general_interval {

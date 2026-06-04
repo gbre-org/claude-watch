@@ -43,6 +43,10 @@ pub struct Config {
     /// enabled. See `QueueCheckConfig`.
     #[serde(default)]
     pub queue_check: QueueCheckConfig,
+    /// Daemon-emitted cadence events (`heartbeat-tick` / `memory-reminder`).
+    /// Default ON with 60s / 900s intervals. See `CadenceConfig`.
+    #[serde(default)]
+    pub cadence: CadenceConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -814,6 +818,49 @@ fn default_queue_check_emit_events() -> bool {
 
 fn default_queue_check_stale_heartbeat_min() -> u64 {
     15
+}
+
+/// Config for the daemon's cadence events. The daemon emits two periodic
+/// claude-events on its own monotonic clock: `heartbeat-tick` (a wake
+/// signal) and `memory-reminder` (the action checklist). This replaces the
+/// out-of-tree self-rescheduling reminder background task. The daemon
+/// NEVER writes the host heartbeat *file* — that stays the main loop's job
+/// so wedge detection still works (see `crate::cadence`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct CadenceConfig {
+    /// Emit the cadence events. Default true — the whole point of the
+    /// feature. Set false to silence (e.g. during the staged cutover, or
+    /// on a host that sources these another way).
+    #[serde(default = "default_cadence_enabled")]
+    pub enabled: bool,
+    /// Seconds between `heartbeat-tick` events. Default 60.
+    #[serde(default = "default_heartbeat_tick_interval_secs")]
+    pub heartbeat_tick_interval_secs: u64,
+    /// Seconds between `memory-reminder` events. Default 900 (15min).
+    #[serde(default = "default_memory_reminder_interval_secs")]
+    pub memory_reminder_interval_secs: u64,
+}
+
+impl Default for CadenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cadence_enabled(),
+            heartbeat_tick_interval_secs: default_heartbeat_tick_interval_secs(),
+            memory_reminder_interval_secs: default_memory_reminder_interval_secs(),
+        }
+    }
+}
+
+fn default_cadence_enabled() -> bool {
+    true
+}
+
+fn default_heartbeat_tick_interval_secs() -> u64 {
+    crate::cadence::HEARTBEAT_TICK_INTERVAL_SECS
+}
+
+fn default_memory_reminder_interval_secs() -> u64 {
+    crate::cadence::MEMORY_REMINDER_INTERVAL_SECS
 }
 
 /// Load config from well-known paths or CLAUDE_WATCH_CONFIG env var.
