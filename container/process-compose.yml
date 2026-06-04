@@ -39,7 +39,7 @@
 #                       additions.
 #   cw-watcher-supervisor (long-running) reads
 #                       /etc/claude-code/watchers/*.toml and respawns
-#                       the operator-baked watchers (claude-event-tail
+#                       the operator-baked watchers (claude-event-watch
 #                       et al) with per-watcher restart policies.
 
 version: "0.5"
@@ -173,7 +173,7 @@ processes:
     disabled: ${CLAUDE_CONTAINER_CRON_DISABLED:-false}
 
   cw-watcher-supervisor:
-    description: Watcher launcher supervisor — respawns claude-event-tail et al.
+    description: Watcher launcher supervisor — respawns claude-event-watch et al.
     command: /usr/local/bin/cw-watcher-supervisor
     availability:
       restart: on_failure

@@ -65,25 +65,23 @@ interrupt_message = "The foreground command was backgrounded by claude-watch bec
 thinking_backoff_multiplier = 3
 
 [watcher_monitor]
-# The in-container watcher (claude-event-tail) sits in inotifywait as a
-# long-lived process, so pgrep reliably detects it. If the supervisor
-# fails to restart it, the daemon fires a [CLAUDE-WATCH] alert and the
-# main loop re-runs it via watcher-ctl. The cw-watcher-health-check
-# cron (stale-event detection) remains as an additional safety net.
+# The in-container watcher (claude-event-watch) follows the fire-and-exit
+# contract: blocks on inotifywait, prints pending events, and exits. The
+# cw-watcher-supervisor respawns it on each exit. If the supervisor fails
+# to restart it, the daemon fires a [CLAUDE-WATCH] alert and the main
+# loop re-runs it via watcher-ctl. The cw-watcher-health-check cron
+# (stale-event detection) remains as an additional safety net.
 enabled = true
 # Baked in-container watcher list. Format documented in the file.
-# Currently registers: claude-event-tail (the in-container
-# equivalent of host claude-event-watch).
+# Currently registers: claude-event-watch (fire-and-exit event watcher).
 watchers_config = "/etc/claude-code/watchmen/watchers.conf"
 watchers_config_extra = "/home/hndrewaall/.config/claude-container/watchers/watchers.conf"
 # Used only for the legacy host-side `bin/watchmen` daemon count.
 # Zero in container -- no host-side watchmen daemon runs here.
 expected_watchmen = 0
 # Match the in-container watcher's name so the consumer-self-feedback
-# guard in policy.rs fires when claude-event-tail itself is down.
-# (Host default is "claude-event-watch"; container ships
-# claude-event-tail instead.)
-event_consumer_watcher_name = "claude-event-tail"
+# guard in policy.rs fires when claude-event-watch itself is down.
+event_consumer_watcher_name = "claude-event-watch"
 
 [context_monitor]
 enabled = true

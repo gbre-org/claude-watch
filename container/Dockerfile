@@ -186,7 +186,7 @@ RUN printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
 #
 # Entries that drop claude-event JSON into the spool (via the
 # in-container `claude-event` CLI, which honors CLAUDE_EVENT_QUEUE)
-# flow to the in-container claude-event-tail watcher automatically —
+# flow to the in-container claude-event-watch watcher automatically —
 # the cron daemon, the spool dir, and the watcher all live in the
 # same container so no cross-process IPC is needed.
 
@@ -608,7 +608,7 @@ ENV CLAUDE_WATCH_CONFIG=/etc/claude-watch/config.toml
 # [watcher_monitor].watchers_config TOML key handles the daemon's own
 # read path; this env var covers the CLI path the main loop invokes when
 # the WATCHER(S) DOWN alert prompt tells it to run `watcher-ctl run
-# claude-event-tail`. src/watcher.rs config_path() honors WATCHERS_CONFIG.
+# claude-event-watch`. src/watcher.rs config_path() honors WATCHERS_CONFIG.
 ENV WATCHERS_CONFIG=/etc/claude-code/watchmen/watchers.conf
 
 # /etc/profile.d/claude-tools.sh — discoverability for bind-mounted CLIs.
@@ -1075,8 +1075,7 @@ COPY container/watchers/ /etc/claude-code/watchers/
 # the explicit chmod here. Mirrors the same defence-in-depth pattern
 # every other baked-script COPY uses (exec-hook, cwsr, self-clear,
 # etc.).
-RUN chmod +x /etc/claude-code/watchers/lib/dir-watch.sh \
-            /etc/claude-code/watchers/claude-event-tail.sh
+RUN chmod +x /etc/claude-code/watchers/claude-event-watch.sh
 COPY container/plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude-plugin/plugin.json
 
 # process-compose service config + helper launchers. The supervisor

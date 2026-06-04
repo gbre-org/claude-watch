@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # cw-watcher-health-check — detect dead event watcher via stale queue.
 #
-# The in-container event watcher (claude-event-watch / claude-event-tail)
-# runs as a `run_in_background` task inside the Claude Code session.
+# The in-container event watcher (claude-event-watch) runs as a
+# `run_in_background` task inside the Claude Code session.
 # When the container is recreated or the session clears, the watcher
 # dies and nobody restarts it. This script detects that condition by
 # checking for unconsumed events that have accumulated past a threshold.

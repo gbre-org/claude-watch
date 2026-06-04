@@ -1,5 +1,0 @@
-name = "claude-event-tail"
-description = "Tails ~/claude-events/*.json and surfaces each event to the in-container session"
-launcher = "/etc/claude-code/watchers/claude-event-tail.sh"
-restart_policy = "always"
-log_path = "/tmp/claude-container-watchers/claude-event-tail.log"

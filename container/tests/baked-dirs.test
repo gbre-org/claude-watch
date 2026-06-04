@@ -19,12 +19,9 @@ the convention holds at commit-time:
      today.
   5. container/agents/ ships only its README.md (stub for future agent
      ports; see the dir's README "Future plan" section).
-  6. container/watchers/ ships its README.md, the generic re-arming
-     `lib/dir-watch.sh` primitive, and the first concrete consumer
-     (`claude-event-tail.{sh,toml}`). Future watcher integrations plug
-     in via the same primitive; per-watcher coverage lives in dedicated
-     `dir-watch-*.test` / `claude-event-tail-*.test` files in
-     container/tests/.
+  6. container/watchers/ ships its README.md and the fire-and-exit
+     event watcher (`claude-event-watch.{sh,toml}`). Per-watcher
+     coverage lives in dedicated test files in container/tests/.
   7. container/plugin/.claude-plugin/plugin.json exists with name
      `claude-container`. This sets the plugin namespace; baked skills
      land as /claude-container:<name>.
@@ -173,12 +170,10 @@ expect(
     f"agent ports), got: {agent_files}",
 )
 
-# 6. watchers/ ships README.md + claude-event-tail.{sh,toml} +
-#    lib/dir-watch.sh. We assert the README is present and the
-#    claude-event-tail pair lives at the top level; per-file shape
-#    (executable, parseable toml, contract assertions) is covered by
-#    dedicated dir-watch-*.test / claude-event-tail-*.test files so
-#    this test stays focused on dir-level convention.
+# 6. watchers/ ships README.md + claude-event-watch.{sh,toml}.
+#    Per-file shape (executable, parseable toml, contract assertions)
+#    is covered by dedicated test files so this test stays focused on
+#    dir-level convention.
 watcher_files = sorted(p.name for p in WATCHERS_DIR.iterdir() if p.is_file())
 expect(
     "README.md" in watcher_files,
@@ -186,24 +181,15 @@ expect(
     f"on-disk schema. Got: {watcher_files}",
 )
 expect(
-    "claude-event-tail.sh" in watcher_files,
-    f"container/watchers/claude-event-tail.sh missing — required as the "
-    f"first concrete consumer of lib/dir-watch.sh. Got: {watcher_files}",
+    "claude-event-watch.sh" in watcher_files,
+    f"container/watchers/claude-event-watch.sh missing — the fire-and-exit "
+    f"event watcher launcher. Got: {watcher_files}",
 )
 expect(
-    "claude-event-tail.toml" in watcher_files,
-    f"container/watchers/claude-event-tail.toml missing — required metadata "
+    "claude-event-watch.toml" in watcher_files,
+    f"container/watchers/claude-event-watch.toml missing — required metadata "
     f"for the /start-watchers skill to discover the watcher. Got: "
     f"{watcher_files}",
-)
-# lib/dir-watch.sh — the generic primitive lives in the lib/ subdir
-# so the .toml-walking enumeration in /start-watchers naturally skips
-# it (it's a helper, not a watcher to launch directly).
-dir_watch_lib = WATCHERS_DIR / "lib" / "dir-watch.sh"
-expect(
-    dir_watch_lib.is_file(),
-    f"container/watchers/lib/dir-watch.sh missing — the generic re-arming "
-    f"directory-watcher primitive. claude-event-tail.sh execs into it.",
 )
 
 # 7. plugin.json present, name=claude-container.
