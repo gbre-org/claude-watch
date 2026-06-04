@@ -295,6 +295,13 @@ RUN mkdir -p /var/lib/claude-watch \
     && chown 1000:1000 /var/lib/claude-watch \
     && chmod 0755 /var/lib/claude-watch
 
+# Pre-create /var/run/claude/workload-state owned by uid 1000 so
+# `workload run` can write state files without needing root or
+# runtime mkdir. Same pattern as /var/lib/claude-watch above.
+RUN mkdir -p /var/run/claude/workload-state \
+    && chown 1000:1000 /var/run/claude /var/run/claude/workload-state \
+    && chmod 0755 /var/run/claude /var/run/claude/workload-state
+
 # Pre-create ~/.config/ owned by uid 1000 so features that write
 # persistent state to a subdirectory of ~/.config/ (claude-event-watch
 # consumed.jsonl, claude-watch-ack pending-alerts.json, future state
