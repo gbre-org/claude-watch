@@ -337,7 +337,7 @@ version_fallback_secs = 900
 # background task that the main loop otherwise had to keep restarting.
 #
 # Two events are emitted on the daemon's monotonic clock:
-#   * heartbeat-tick  — every heartbeat_tick_interval_secs (60s). A light
+#   * heartbeat-tick  — every heartbeat_tick_interval_secs (300s = 5min). A light
 #                       wake signal so the main loop has a recurring event
 #                       to react to even while idle.
 #   * memory-reminder — every memory_reminder_interval_secs (900s = 15min),
@@ -349,5 +349,5 @@ version_fallback_secs = 900
 # wedged loop's heartbeat goes stale and the existing stale-detection
 # fires. If the daemon wrote the file directly it would mask a dead loop.
 enabled = true
-heartbeat_tick_interval_secs = 60
+heartbeat_tick_interval_secs = 300
 memory_reminder_interval_secs = 900

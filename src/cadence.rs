@@ -8,7 +8,7 @@
 //! restart churn: the daemon ticks on its own monotonic clock and emits two
 //! claude-events.
 //!
-//! 1. `heartbeat-tick` — every [`HEARTBEAT_TICK_INTERVAL_SECS`] (60s). A
+//! 1. `heartbeat-tick` — every [`HEARTBEAT_TICK_INTERVAL_SECS`] (300s, 5 min). A
 //!    lightweight wake signal. It exists so the main loop has a recurring
 //!    event to react to even while idle (a hook cannot fire on an idle
 //!    loop; an event surfaced in the next `UserPromptSubmit` wakes it).
@@ -37,8 +37,8 @@
 
 use std::time::{Duration, Instant};
 
-/// Interval between `heartbeat-tick` events. 60 seconds.
-pub const HEARTBEAT_TICK_INTERVAL_SECS: u64 = 60;
+/// Interval between `heartbeat-tick` events. 300 seconds (5 min).
+pub const HEARTBEAT_TICK_INTERVAL_SECS: u64 = 300;
 
 /// Interval between `memory-reminder` events. 15 minutes.
 pub const MEMORY_REMINDER_INTERVAL_SECS: u64 = 900;
@@ -106,7 +106,7 @@ pub struct CadenceTracker {
 }
 
 impl CadenceTracker {
-    /// Construct with the default intervals (60s / 15min).
+    /// Construct with the default intervals (5min / 15min).
     pub fn new() -> Self {
         Self::with_intervals(
             Duration::from_secs(HEARTBEAT_TICK_INTERVAL_SECS),
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn constants_match_design() {
-        assert_eq!(HEARTBEAT_TICK_INTERVAL_SECS, 60);
+        assert_eq!(HEARTBEAT_TICK_INTERVAL_SECS, 300);
         assert_eq!(MEMORY_REMINDER_INTERVAL_SECS, 900);
         assert_eq!(HEARTBEAT_TICK_TAG, "heartbeat-tick");
         assert_eq!(MEMORY_REMINDER_TAG, "memory-reminder");
