@@ -4,6 +4,7 @@
 
 pub mod active_agents;
 pub mod agent;
+pub mod cadence;
 pub mod cmd;
 pub mod config;
 pub mod event_bus;

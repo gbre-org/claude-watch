@@ -329,3 +329,25 @@ context_fallback_secs = 300
 # `claude update`. Default 15 minutes — Claude often needs a few turns to
 # hit a stopping point before restarting.
 version_fallback_secs = 900
+
+[cadence]
+# Daemon-emitted cadence claude-events. The daemon is already a
+# long-running monitor loop, so it is the natural source for periodic
+# "cadence" signals — replacing a separate self-rescheduling reminder
+# background task that the main loop otherwise had to keep restarting.
+#
+# Two events are emitted on the daemon's monotonic clock:
+#   * heartbeat-tick  — every heartbeat_tick_interval_secs (60s). A light
+#                       wake signal so the main loop has a recurring event
+#                       to react to even while idle.
+#   * memory-reminder — every memory_reminder_interval_secs (900s = 15min),
+#                       carrying the action checklist (update logs, commit
+#                       + push repos, etc.).
+#
+# IMPORTANT: the daemon emits these EVENTS only — it deliberately does NOT
+# write any host heartbeat *file*. That stays the main loop's job so a
+# wedged loop's heartbeat goes stale and the existing stale-detection
+# fires. If the daemon wrote the file directly it would mask a dead loop.
+enabled = true
+heartbeat_tick_interval_secs = 60
+memory_reminder_interval_secs = 900

@@ -201,6 +201,109 @@ pub fn emit(alert: &ClaudeWatchAlert<'_>) {
     );
 }
 
+/// A generic daemon-emitted cadence event (`heartbeat-tick`,
+/// `memory-reminder`). Unlike [`ClaudeWatchAlert`], these carry no
+/// alert/stuck semantics — they are plain periodic signals the daemon
+/// produces on its monotonic clock (see [`crate::cadence`]). The body
+/// matches the same JSON shape the Python `claude-event` helper writes so
+/// `claude-event-watch` dispatches purely on `tag`.
+#[derive(Debug, Clone)]
+pub struct CadenceEvent<'a> {
+    /// Event tag (also the dispatch key). E.g. `heartbeat-tick`.
+    pub tag: &'a str,
+    /// `source` / `source_name` fields. `claude-watch` for these.
+    pub source: &'a str,
+    /// Human-readable message — for `heartbeat-tick` a short string, for
+    /// `memory-reminder` the full action checklist.
+    pub message: &'a str,
+    /// Priority field (`low|normal|high|urgent`).
+    pub priority: &'a str,
+    /// Extra `data` fields merged into the event. Pass
+    /// `serde_json::json!({})` for none.
+    pub data: serde_json::Value,
+}
+
+/// Build the JSON body for a cadence event. Public for testability;
+/// production callers use [`emit_cadence`].
+pub fn build_cadence_json(ev: &CadenceEvent<'_>) -> serde_json::Value {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let now_iso = chrono::Local::now().to_rfc3339();
+    let hostname = hostname_string();
+    let user = std::env::var("USER").unwrap_or_default();
+    let pid = std::process::id();
+
+    serde_json::json!({
+        "timestamp": now,
+        "timestamp_iso": now_iso,
+        "hostname": hostname,
+        "source": ev.source,
+        "source_name": ev.source,
+        "tag": ev.tag,
+        "priority": ev.priority,
+        "message": ev.message,
+        "data": ev.data,
+        "pid": pid,
+        "user": user,
+    })
+}
+
+/// Emit a cadence event JSON file into the queue dir. Default-open: any
+/// I/O failure is logged at warn level and swallowed (a missed cadence
+/// tick is harmless — the next interval re-fires).
+pub fn emit_cadence(ev: &CadenceEvent<'_>) {
+    let dir = queue_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %e, dir = %dir.display(),
+            "cadence emit: failed to create queue dir, skipping");
+        return;
+    }
+
+    let event = build_cadence_json(ev);
+    let body = match serde_json::to_string_pretty(&event) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "cadence emit: failed to serialize event");
+            return;
+        }
+    };
+
+    let ts_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Sanitize the tag for the filename (matches the Python helper's
+    // <ts_ns>_<safe_tag>.json convention).
+    let safe_tag: String = ev
+        .tag
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let final_name = format!("{}_{}.json", ts_ns, safe_tag);
+    let final_path = dir.join(&final_name);
+    let tmp_path = dir.join(format!(".{}.tmp", final_name));
+
+    if let Err(e) = std::fs::write(&tmp_path, body.as_bytes()) {
+        tracing::warn!(error = %e, path = %tmp_path.display(),
+            "cadence emit: failed to write tmp file");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+        tracing::warn!(error = %e, src = %tmp_path.display(), dst = %final_path.display(),
+            "cadence emit: failed to rename tmp into place");
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+
+    tracing::info!(
+        path = %final_path.display(),
+        tag = %ev.tag,
+        "cadence event emitted"
+    );
+}
+
 /// One workload-done event. Emitted exactly once per workload run when
 /// the underlying tmux-pane wrapper script finishes (or `workload kill`
 /// terminates it). Surfaced to the main loop via `claude-event-watch`
@@ -641,5 +744,71 @@ mod tests {
         assert_eq!(parsed["data"]["label"], "translate-book");
         assert_eq!(parsed["data"]["exit_code"], 0);
         assert_eq!(parsed["data"]["killed"], false);
+    }
+
+    #[test]
+    fn build_cadence_json_has_required_fields() {
+        let ev = CadenceEvent {
+            tag: "heartbeat-tick",
+            source: "claude-watch",
+            message: "heartbeat tick",
+            priority: "low",
+            data: serde_json::json!({"interval_secs": 60}),
+        };
+        let v = build_cadence_json(&ev);
+        assert_eq!(v["tag"], "heartbeat-tick");
+        assert_eq!(v["source"], "claude-watch");
+        assert_eq!(v["source_name"], "claude-watch");
+        assert_eq!(v["priority"], "low");
+        assert_eq!(v["message"], "heartbeat tick");
+        assert_eq!(v["data"]["interval_secs"], 60);
+        assert!(v["timestamp"].is_number());
+        assert!(v["timestamp_iso"].is_string());
+        assert!(v["pid"].is_number());
+    }
+
+    #[test]
+    fn emit_cadence_writes_file_with_sanitized_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        // SAFETY: cadence tests in this module don't concurrently mutate
+        // this var beyond the single set/restore window per test.
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+        }
+
+        let ev = CadenceEvent {
+            tag: "memory-reminder",
+            source: "claude-watch",
+            message: "=== MEMORY REMINDER ===",
+            priority: "high",
+            data: serde_json::json!({"interval_secs": 900}),
+        };
+        emit_cadence(&ev);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("_memory-reminder.json")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one cadence event file");
+
+        let content = std::fs::read_to_string(entries[0].path()).expect("read event");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("event is valid JSON");
+        assert_eq!(parsed["tag"], "memory-reminder");
+        assert_eq!(parsed["priority"], "high");
+        assert_eq!(parsed["data"]["interval_secs"], 900);
     }
 }
