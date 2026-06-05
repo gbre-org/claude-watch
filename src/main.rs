@@ -1048,38 +1048,40 @@ async fn run_daemon() {
 
         let now = std::time::Instant::now();
 
-        // Emit daemon-sourced cadence events (heartbeat-tick / memory-reminder)
-        // on their monotonic intervals. Best-effort; never blocks the loop.
+        // Cadence signals (heartbeat-tick / memory-reminder).
+        //
+        // These must NOT write JSON files to the event queue — doing so triggers
+        // an infinite watcher restart loop (event file -> watcher fires -> exits
+        // -> monitor restarts watcher -> new event file -> ...).
+        //
+        // heartbeat-tick: no-op beyond logging. Its original purpose (waking an
+        // idle main loop) is superseded by the daemon's own check cycle. The
+        // daemon deliberately does NOT touch the host heartbeat file (that stays
+        // the main loop's job for wedge detection).
+        //
+        // memory-reminder: tmux-inject the checklist directly into the pane so
+        // the main loop sees it as a user-typed prompt. This is the same delivery
+        // mechanism used by other daemon interventions (nudge, resume, etc.).
         if current_config.cadence.enabled {
             let due = cadence_tracker.due(now);
             if !due.is_empty() {
                 tracing::debug!(
                     heartbeat_tick = due.heartbeat_tick,
                     memory_reminder = due.memory_reminder,
-                    "emitting cadence event(s)"
+                    "cadence signal(s) due"
                 );
             }
             if due.heartbeat_tick {
-                event_bus::emit_cadence(&event_bus::CadenceEvent {
-                    tag: cadence::HEARTBEAT_TICK_TAG,
-                    source: cadence::CADENCE_SOURCE,
-                    message: "heartbeat tick",
-                    priority: "low",
-                    data: serde_json::json!({
-                        "interval_secs": current_config.cadence.heartbeat_tick_interval_secs,
-                    }),
-                });
+                tracing::info!("heartbeat-tick cadence (no event file)");
             }
             if due.memory_reminder {
-                event_bus::emit_cadence(&event_bus::CadenceEvent {
-                    tag: cadence::MEMORY_REMINDER_TAG,
-                    source: cadence::CADENCE_SOURCE,
-                    message: cadence::MEMORY_REMINDER_CHECKLIST,
-                    priority: "high",
-                    data: serde_json::json!({
-                        "interval_secs": current_config.cadence.memory_reminder_interval_secs,
-                    }),
-                });
+                let pane = state.last_known_pane.clone();
+                if pane.is_empty() {
+                    tracing::warn!("memory-reminder due but no known pane — skipping inject");
+                } else {
+                    tracing::info!(pane = %pane, "memory-reminder: injecting checklist via tmux");
+                    tmux::inject_text(&pane, cadence::MEMORY_REMINDER_CHECKLIST).await;
+                }
             }
         }
 
