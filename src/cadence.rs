@@ -1,20 +1,29 @@
-//! Daemon-emitted cadence events: `heartbeat-tick` and `memory-reminder`.
+//! Daemon-emitted cadence signals: `heartbeat-tick` and `memory-reminder`.
 //!
 //! The claude-watch daemon is already a long-running monitor loop — the
 //! natural place to source periodic "cadence" signals for the main loop.
 //! Previously these were produced by a separate self-rescheduling
 //! background task that the main loop had to keep restarting every cycle
 //! (a treadmill). Moving the *cadence source* into the daemon removes that
-//! restart churn: the daemon ticks on its own monotonic clock and emits two
-//! claude-events.
+//! restart churn: the daemon ticks on its own monotonic clock.
 //!
-//! 1. `heartbeat-tick` — every [`HEARTBEAT_TICK_INTERVAL_SECS`] (300s, 5 min). A
-//!    lightweight wake signal. It exists so the main loop has a recurring
-//!    event to react to even while idle (a hook cannot fire on an idle
-//!    loop; an event surfaced in the next `UserPromptSubmit` wakes it).
+//! 1. `heartbeat-tick` — every [`HEARTBEAT_TICK_INTERVAL_SECS`] (300s, 5 min).
+//!    A lightweight cadence signal. Logged only — no file I/O. The daemon's
+//!    own check cycle handles monitoring; no event file needed.
 //!
 //! 2. `memory-reminder` — every [`MEMORY_REMINDER_INTERVAL_SECS`] (15min),
 //!    carrying the action checklist text ([`MEMORY_REMINDER_CHECKLIST`]).
+//!    Delivered via tmux-inject into the main loop pane (same mechanism as
+//!    other daemon interventions).
+//!
+//! ## Why cadence signals must NOT write to the event queue
+//!
+//! Writing JSON files to `~/claude-events/` triggers an infinite watcher
+//! restart loop: the `claude-event-watch` watcher fires on the new file,
+//! drains it, exits; the watcher-monitor sees it down and restarts it;
+//! by then a new cadence file has landed; repeat forever. Cadence signals
+//! are delivered out-of-band (tmux-inject for memory-reminder, no-op for
+//! heartbeat-tick) to break this cycle.
 //!
 //! ## Why the daemon must NOT write the heartbeat file itself
 //!
@@ -22,10 +31,7 @@
 //! it: a wedged loop stops writing, the file goes stale, and the daemon's
 //! existing stale-detection fires a nudge. If the daemon wrote that file
 //! directly it would stay fresh even while the loop is dead, defeating
-//! wedge detection. So this module ONLY emits the `heartbeat-tick`
-//! *event*; touching the heartbeat file remains the main loop's job, done
-//! when it handles that event. This module never touches any heartbeat
-//! file.
+//! wedge detection. This module never touches any heartbeat file.
 //!
 //! ## Cadence decision is pure
 //!
@@ -33,7 +39,7 @@
 //! each timer and decides, given "now", whether each timer is due. It is a
 //! pure value type (no I/O), so the interval logic is unit-tested directly.
 //! The daemon owns one `CadenceTracker`, calls [`CadenceTracker::due`] each
-//! loop pass, and emits whichever events are due.
+//! loop pass, and acts on whichever signals are due.
 
 use std::time::{Duration, Instant};
 
