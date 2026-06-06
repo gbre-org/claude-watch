@@ -8,22 +8,35 @@
 //! restart churn: the daemon ticks on its own monotonic clock.
 //!
 //! 1. `heartbeat-tick` — every [`HEARTBEAT_TICK_INTERVAL_SECS`] (300s, 5 min).
-//!    A lightweight cadence signal. Logged only — no file I/O. The daemon's
-//!    own check cycle handles monitoring; no event file needed.
+//!    Written to the event queue (`~/claude-events/`) so the main loop is
+//!    reminded — via the next `UserPromptSubmit` — to touch the host
+//!    heartbeat file. That file is the wedge-detector; if the loop never
+//!    gets a recurring prompt to refresh it while idle, it goes stale at the
+//!    ~10-min threshold and the daemon fires a spurious "heartbeat stale"
+//!    alert. So heartbeat-tick *must* reach the loop, and the event queue is
+//!    the delivery path.
 //!
 //! 2. `memory-reminder` — every [`MEMORY_REMINDER_INTERVAL_SECS`] (15min),
 //!    carrying the action checklist text ([`MEMORY_REMINDER_CHECKLIST`]).
 //!    Delivered via tmux-inject into the main loop pane (same mechanism as
-//!    other daemon interventions).
+//!    other daemon interventions), NOT the event queue.
 //!
-//! ## Why cadence signals must NOT write to the event queue
+//! ## Delivery choice: event queue vs. tmux-inject
 //!
-//! Writing JSON files to `~/claude-events/` triggers an infinite watcher
-//! restart loop: the `claude-event-watch` watcher fires on the new file,
-//! drains it, exits; the watcher-monitor sees it down and restarts it;
-//! by then a new cadence file has landed; repeat forever. Cadence signals
-//! are delivered out-of-band (tmux-inject for memory-reminder, no-op for
-//! heartbeat-tick) to break this cycle.
+//! Writing JSON files to `~/claude-events/` can, under load, contribute to a
+//! watcher-restart treadmill: `claude-event-watch` fires on a new file,
+//! drains it, exits; the watcher-monitor restarts it; if another event has
+//! already landed, repeat. That treadmill is driven by event *bursts* during
+//! active threads — not by a single steady periodic signal. A lone
+//! heartbeat-tick every 5 minutes is well within the debounce window and is
+//! an acceptable cost for the thing it buys: a reliable idle-loop reminder to
+//! refresh the heartbeat. `memory-reminder` carries a large checklist and
+//! wants to land as a user-typed prompt, so it is tmux-injected instead.
+//!
+//! (Historical note: an earlier change routed *both* cadence signals away
+//! from the event queue to fight the treadmill, which silently dropped the
+//! heartbeat-tick reminder and re-introduced the stale-heartbeat alerts.
+//! Only memory-reminder needed to leave the queue.)
 //!
 //! ## Why the daemon must NOT write the heartbeat file itself
 //!

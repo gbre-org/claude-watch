@@ -811,4 +811,64 @@ mod tests {
         assert_eq!(parsed["priority"], "high");
         assert_eq!(parsed["data"]["interval_secs"], 900);
     }
+
+    /// Regression guard: heartbeat-tick must reach the event queue.
+    ///
+    /// An earlier change made the daemon's heartbeat-tick a no-op (logged
+    /// only, never delivered), so the main loop stopped getting its 5-min
+    /// reminder to touch the host heartbeat file → the heartbeat went stale
+    /// and the daemon fired spurious "heartbeat stale" alerts. This test
+    /// builds the heartbeat-tick cadence event exactly as `run_daemon` does
+    /// (using the `cadence` constants) and asserts an event file lands in the
+    /// queue with the right tag/source/priority.
+    #[test]
+    fn emit_cadence_heartbeat_tick_writes_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        // SAFETY: nextest runs each test in its own process; the single
+        // set/restore window per test keeps this env mutation isolated.
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+        }
+
+        // Mirror the production call site in `main::run_daemon`.
+        let ev = CadenceEvent {
+            tag: crate::cadence::HEARTBEAT_TICK_TAG,
+            source: crate::cadence::CADENCE_SOURCE,
+            message: "heartbeat tick",
+            priority: "low",
+            data: serde_json::json!({"interval_secs": 300}),
+        };
+        emit_cadence(&ev);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("_heartbeat-tick.json")
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "heartbeat-tick must produce exactly one event-queue file"
+        );
+
+        let content = std::fs::read_to_string(entries[0].path()).expect("read event");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("event is valid JSON");
+        assert_eq!(parsed["tag"], "heartbeat-tick");
+        assert_eq!(parsed["source"], "claude-watch");
+        assert_eq!(parsed["priority"], "low");
+        assert_eq!(parsed["data"]["interval_secs"], 300);
+    }
 }

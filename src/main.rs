@@ -1009,12 +1009,14 @@ async fn run_daemon() {
     );
     let mut last_full_check = std::time::Instant::now() - general_interval; // run immediately
 
-    // Cadence emitter: the daemon sources the `heartbeat-tick` (60s) and
-    // `memory-reminder` (15min) claude-events, replacing the out-of-tree
-    // self-rescheduling reminder background task. NOTE: this only EMITS the
-    // events; it deliberately does NOT touch the host heartbeat file — that
-    // remains the main loop's job so a wedged loop still goes stale and
-    // trips wedge detection. See `crate::cadence`.
+    // Cadence emitter: the daemon sources the `heartbeat-tick` (5min) and
+    // `memory-reminder` (15min) cadence signals, replacing the out-of-tree
+    // self-rescheduling reminder background task. heartbeat-tick is delivered
+    // via the event queue (reminds the main loop to touch the heartbeat file);
+    // memory-reminder is tmux-injected. NOTE: the daemon deliberately does NOT
+    // touch the host heartbeat file itself — that remains the main loop's job
+    // so a wedged loop still goes stale and trips wedge detection. See
+    // `crate::cadence`.
     let mut cadence_tracker = cadence::CadenceTracker::with_intervals(
         Duration::from_secs(current_config.cadence.heartbeat_tick_interval_secs),
         Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
@@ -1050,18 +1052,21 @@ async fn run_daemon() {
 
         // Cadence signals (heartbeat-tick / memory-reminder).
         //
-        // These must NOT write JSON files to the event queue — doing so triggers
-        // an infinite watcher restart loop (event file -> watcher fires -> exits
-        // -> monitor restarts watcher -> new event file -> ...).
-        //
-        // heartbeat-tick: no-op beyond logging. Its original purpose (waking an
-        // idle main loop) is superseded by the daemon's own check cycle. The
-        // daemon deliberately does NOT touch the host heartbeat file (that stays
-        // the main loop's job for wedge detection).
+        // heartbeat-tick: writes a single low-priority claude-event into the
+        // event queue every 5 min. This is the reminder that prompts the main
+        // loop to touch the host heartbeat file (its wedge-detector). Without a
+        // delivered event the main loop has nothing to react to while idle, the
+        // heartbeat goes stale at the 10-min threshold, and the daemon fires a
+        // spurious "heartbeat stale" alert. A lone 5-min single-event cadence is
+        // an acceptable cost: the watcher-restart treadmill is driven by event
+        // *bursts* during active threads, not by one steady periodic event.
+        // The daemon still does NOT touch the host heartbeat file itself — that
+        // remains the main loop's job so a wedged loop is detectable.
         //
         // memory-reminder: tmux-inject the checklist directly into the pane so
         // the main loop sees it as a user-typed prompt. This is the same delivery
-        // mechanism used by other daemon interventions (nudge, resume, etc.).
+        // mechanism used by other daemon interventions (nudge, resume, etc.) and
+        // intentionally bypasses the event queue.
         if current_config.cadence.enabled {
             let due = cadence_tracker.due(now);
             if !due.is_empty() {
@@ -1072,14 +1077,29 @@ async fn run_daemon() {
                 );
             }
             if due.heartbeat_tick {
-                tracing::info!("heartbeat-tick cadence (no event file)");
+                event_bus::emit_cadence(&event_bus::CadenceEvent {
+                    tag: cadence::HEARTBEAT_TICK_TAG,
+                    source: cadence::CADENCE_SOURCE,
+                    message: "heartbeat tick",
+                    priority: "low",
+                    data: serde_json::json!({
+                        "interval_secs": current_config.cadence.heartbeat_tick_interval_secs,
+                    }),
+                });
             }
             if due.memory_reminder {
                 let pane = state.last_known_pane.clone();
                 if pane.is_empty() {
-                    tracing::warn!("memory-reminder due but no known pane — skipping inject");
+                    tracing::warn!(
+                        tag = cadence::MEMORY_REMINDER_TAG,
+                        "memory-reminder due but no known pane — skipping inject"
+                    );
                 } else {
-                    tracing::info!(pane = %pane, "memory-reminder: injecting checklist via tmux");
+                    tracing::info!(
+                        tag = cadence::MEMORY_REMINDER_TAG,
+                        pane = %pane,
+                        "memory-reminder: injecting checklist via tmux"
+                    );
                     tmux::inject_text(&pane, cadence::MEMORY_REMINDER_CHECKLIST).await;
                 }
             }
