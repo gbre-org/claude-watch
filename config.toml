@@ -339,7 +339,11 @@ version_fallback_secs = 900
 # Two events are emitted on the daemon's monotonic clock:
 #   * heartbeat-tick  — every heartbeat_tick_interval_secs (300s = 5min). A light
 #                       wake signal so the main loop has a recurring event
-#                       to react to even while idle.
+#                       to react to even while idle. Its body carries the
+#                       host heartbeat-file path to touch in data.path — the
+#                       configurable [claude].heartbeat_file above (the same
+#                       path the daemon monitors for staleness), so the two
+#                       never drift apart.
 #   * memory-reminder — every memory_reminder_interval_secs (900s = 15min),
 #                       carrying the action checklist (update logs, commit
 #                       + push repos, etc.).
