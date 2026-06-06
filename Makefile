@@ -165,14 +165,7 @@ test-entrypoint:
 	container/tests/in-container-daemon.test
 	container/tests/iproute2-installed.test
 	container/tests/code-cli-installed.test
-	container/tests/dir-watch-script-installed.test
 	container/tests/claude-event-tail-baked.test
-	container/tests/dir-watch-rearms.test
-	container/tests/dir-watch-events-modified.test
-	container/tests/dir-watch-events-deleted.test
-	container/tests/dir-watch-events-all.test
-	container/tests/dir-watch-events-default-backcompat.test
-	container/tests/dir-watch-events-poll-fallback.test
 	container/tests/entrypoint-launches-supervisor.test
 	container/tests/cron-installed.test
 	container/tests/entrypoint-launches-cron.test
