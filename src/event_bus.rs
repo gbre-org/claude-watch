@@ -250,6 +250,22 @@ pub fn build_cadence_json(ev: &CadenceEvent<'_>) -> serde_json::Value {
     })
 }
 
+/// Build the `data` body for a `heartbeat-tick` cadence event.
+///
+/// Carries the configured host heartbeat-file `path` — the file the main
+/// loop is reminded to touch on each tick — plus the emit `interval_secs`.
+/// The path is sourced from the daemon's existing `[claude].heartbeat_file`
+/// config, which is the SAME path the daemon monitors for staleness, so the
+/// "touch this file" instruction and the "this file went stale" detector can
+/// never drift to different paths. Kept as a named builder so the daemon
+/// call site and the unit tests agree on the body shape.
+pub fn heartbeat_tick_data(heartbeat_path: &str, interval_secs: u64) -> serde_json::Value {
+    serde_json::json!({
+        "path": heartbeat_path,
+        "interval_secs": interval_secs,
+    })
+}
+
 /// Emit a cadence event JSON file into the queue dir. Default-open: any
 /// I/O failure is logged at warn level and swallowed (a missed cadence
 /// tick is harmless — the next interval re-fires).
@@ -831,13 +847,16 @@ mod tests {
             std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
         }
 
-        // Mirror the production call site in `main::run_daemon`.
+        // Mirror the production call site in `main::run_daemon`, including a
+        // NON-default configured heartbeat path so we prove the configured
+        // value flows into the event body (not a hardcoded constant).
+        let configured_path = "/custom/run/claude/heartbeat";
         let ev = CadenceEvent {
             tag: crate::cadence::HEARTBEAT_TICK_TAG,
             source: crate::cadence::CADENCE_SOURCE,
             message: "heartbeat tick",
             priority: "low",
-            data: serde_json::json!({"interval_secs": 300}),
+            data: heartbeat_tick_data(configured_path, 300),
         };
         emit_cadence(&ev);
 
@@ -870,5 +889,22 @@ mod tests {
         assert_eq!(parsed["source"], "claude-watch");
         assert_eq!(parsed["priority"], "low");
         assert_eq!(parsed["data"]["interval_secs"], 300);
+        // The configured heartbeat-file path must be carried in the body and
+        // must reflect the configured (non-default) value.
+        assert_eq!(parsed["data"]["path"], configured_path);
+    }
+
+    #[test]
+    fn heartbeat_tick_data_carries_configured_path() {
+        // Default-shaped path.
+        let data = heartbeat_tick_data("/var/run/claude/heartbeat", 300);
+        assert_eq!(data["path"], "/var/run/claude/heartbeat");
+        assert_eq!(data["interval_secs"], 300);
+
+        // A user-configured override must surface verbatim in the body — the
+        // path is NOT hardcoded.
+        let data = heartbeat_tick_data("/tmp/claude-heartbeat", 60);
+        assert_eq!(data["path"], "/tmp/claude-heartbeat");
+        assert_eq!(data["interval_secs"], 60);
     }
 }

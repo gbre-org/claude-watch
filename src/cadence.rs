@@ -10,7 +10,9 @@
 //! 1. `heartbeat-tick` — every [`HEARTBEAT_TICK_INTERVAL_SECS`] (300s, 5 min).
 //!    Written to the event queue (`~/claude-events/`) so the main loop is
 //!    reminded — via the next `UserPromptSubmit` — to touch the host
-//!    heartbeat file. That file is the wedge-detector; if the loop never
+//!    heartbeat file. The event body carries that file's path (`data.path`,
+//!    the configurable `[claude].heartbeat_file`), so the loop is told
+//!    exactly which file to touch. That file is the wedge-detector; if the loop never
 //!    gets a recurring prompt to refresh it while idle, it goes stale at the
 //!    ~10-min threshold and the daemon fires a spurious "heartbeat stale"
 //!    alert. So heartbeat-tick *must* reach the loop, and the event queue is

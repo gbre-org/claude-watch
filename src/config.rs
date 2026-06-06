@@ -95,6 +95,13 @@ pub struct TmuxConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClaudeConfig {
     pub max_context_tokens: u64,
+    /// Host heartbeat file the MAIN LOOP touches as its wedge-detector
+    /// proof-of-life. The daemon monitors this path for staleness (and
+    /// exports its mtime as a metric) but NEVER writes it. This same path is
+    /// carried in the `data.path` field of each `heartbeat-tick` cadence
+    /// event so the main loop is told exactly which file to touch — keeping
+    /// the "touch" target and the staleness-monitor target on one
+    /// user-configurable path.
     pub heartbeat_file: String,
     pub relaunch_script: String,
 }

@@ -1077,14 +1077,20 @@ async fn run_daemon() {
                 );
             }
             if due.heartbeat_tick {
+                // Body carries the configured host heartbeat-file path so the
+                // main loop knows WHICH file to touch. It is the canonical
+                // `[claude].heartbeat_file` path — the same one the daemon
+                // monitors for staleness — so the reminder and the detector
+                // stay pinned to one user-configurable path.
                 event_bus::emit_cadence(&event_bus::CadenceEvent {
                     tag: cadence::HEARTBEAT_TICK_TAG,
                     source: cadence::CADENCE_SOURCE,
                     message: "heartbeat tick",
                     priority: "low",
-                    data: serde_json::json!({
-                        "interval_secs": current_config.cadence.heartbeat_tick_interval_secs,
-                    }),
+                    data: event_bus::heartbeat_tick_data(
+                        &current_config.claude.heartbeat_file,
+                        current_config.cadence.heartbeat_tick_interval_secs,
+                    ),
                 });
             }
             if due.memory_reminder {
