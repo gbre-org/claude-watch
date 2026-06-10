@@ -26,12 +26,12 @@ the convention holds at commit-time:
      `claude-container`. This sets the plugin namespace; baked skills
      land as /claude-container:<name>.
   8. Dockerfile COPY lines wire the source dirs into the right targets:
-       - skills/   -> /etc/claude-code/skills/
-                   -> /etc/claude-code/plugin/commands/   (loader path)
-       - agents/   -> /etc/claude-code/agents/
-                   -> /etc/claude-code/plugin/agents/      (loader path)
-       - watchers/ -> /etc/claude-code/watchers/           (no loader path)
-       - plugin.json -> /etc/claude-code/plugin/.claude-plugin/plugin.json
+       - skills/   -> /opt/claude-container/skills/
+                   -> /opt/claude-container/plugin/commands/   (loader path)
+       - agents/   -> /opt/claude-container/agents/
+                   -> /opt/claude-container/plugin/agents/      (loader path)
+       - watchers/ -> /opt/claude-container/watchers/           (no loader path)
+       - plugin.json -> /opt/claude-container/plugin/.claude-plugin/plugin.json
   9. baked-CLAUDE.md session-start checklist references the new dirs so
      a fresh in-container session discovers them on every start.
 
@@ -79,8 +79,8 @@ for d in (SKILLS_DIR, AGENTS_DIR, WATCHERS_DIR):
         )
         # Each README must explain bake target + add-a-new-entry shape.
         expect(
-            "/etc/claude-code/" in text,
-            f"{readme} should reference the /etc/claude-code/ bake path so "
+            "/opt/claude-container/" in text,
+            f"{readme} should reference the /opt/claude-container/ bake path so "
             f"operators know where the files actually land in the image",
         )
 
@@ -143,8 +143,8 @@ if start_watchers.is_file():
     text = start_watchers.read_text(encoding="utf-8")
     expect(len(text) > 200, f"{start_watchers} suspiciously short (<200 chars)")
     expect(
-        "/etc/claude-code/watchers" in text,
-        f"{start_watchers} should reference /etc/claude-code/watchers/ — "
+        "/opt/claude-container/watchers" in text,
+        f"{start_watchers} should reference /opt/claude-container/watchers/ — "
         f"the path it probes via `ls`",
     )
     # Honest "no watchers today" framing — the skill must NOT lie about
@@ -222,13 +222,13 @@ if DOCKERFILE.is_file():
         # the source paths are prefixed with `container/`. The regex
         # below tolerates either prefix to keep the test stable across
         # the build-context migration.
-        ("skills/", "/etc/claude-code/skills/"),
-        ("skills/", "/etc/claude-code/plugin/commands/"),
-        ("agents/", "/etc/claude-code/agents/"),
-        ("agents/", "/etc/claude-code/plugin/agents/"),
-        ("watchers/", "/etc/claude-code/watchers/"),
+        ("skills/", "/opt/claude-container/skills/"),
+        ("skills/", "/opt/claude-container/plugin/commands/"),
+        ("agents/", "/opt/claude-container/agents/"),
+        ("agents/", "/opt/claude-container/plugin/agents/"),
+        ("watchers/", "/opt/claude-container/watchers/"),
         ("plugin/.claude-plugin/plugin.json",
-         "/etc/claude-code/plugin/.claude-plugin/plugin.json"),
+         "/opt/claude-container/plugin/.claude-plugin/plugin.json"),
     ]
     for src, dst in required_copy_lines:
         # Tolerate any whitespace; require both src and dst on the same
@@ -251,19 +251,19 @@ if BAKED.is_file():
     # The checklist should mention all three dirs by name so a fresh
     # session knows to enumerate them.
     expect(
-        "/etc/claude-code/skills" in text,
-        "baked-CLAUDE.md should reference /etc/claude-code/skills/ in the "
+        "/opt/claude-container/skills" in text,
+        "baked-CLAUDE.md should reference /opt/claude-container/skills/ in the "
         "session-start checklist so the agent enumerates baked skills on "
         "every fresh session",
     )
     expect(
-        "/etc/claude-code/agents" in text,
-        "baked-CLAUDE.md should reference /etc/claude-code/agents/ in the "
+        "/opt/claude-container/agents" in text,
+        "baked-CLAUDE.md should reference /opt/claude-container/agents/ in the "
         "session-start checklist",
     )
     expect(
-        "/etc/claude-code/watchers" in text,
-        "baked-CLAUDE.md should reference /etc/claude-code/watchers/ in "
+        "/opt/claude-container/watchers" in text,
+        "baked-CLAUDE.md should reference /opt/claude-container/watchers/ in "
         "the session-start checklist",
     )
     expect(

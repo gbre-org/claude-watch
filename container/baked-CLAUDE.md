@@ -1,7 +1,7 @@
 # claude-container — runtime environment
 
 This file is the **managed-policy CLAUDE.md** baked into the
-[claude-container](container)
+[claude-container](/opt/claude-container/container)
 image at `/etc/claude-code/CLAUDE.md`. Claude Code loads it at session start,
 before any user-level (`~/.claude/CLAUDE.md`) or project-level
 (`<cwd>/CLAUDE.md`) instructions. It exists so every session inside the
@@ -132,17 +132,17 @@ all that's needed.
    glance what you have to work with. Keep it concise — one or two
    sentences.
 6. **List baked skills + agents + watchers**: `ls
-   /etc/claude-code/skills/ /etc/claude-code/agents/
-   /etc/claude-code/watchers/`. Skills land at
+   /opt/claude-container/skills/ /opt/claude-container/agents/
+   /opt/claude-container/watchers/`. Skills land at
    `/claude-container:<name>` (e.g. `/claude-container:restart`,
    `/claude-container:start-watchers`); agents are spawned with
    `Agent(subagent_type="claude-container:<name>", ...)`; watchers are
    shell scripts the agent launches via the `Bash` tool with
    `run_in_background: true`. The full convention + how-to-add lives in
    the per-dir READMEs at the repo's
-   [`container/skills/`](container/skills),
-   [`container/agents/`](container/agents),
-   [`container/watchers/`](container/watchers).
+   [`container/skills/`](/opt/claude-container/container/skills),
+   [`container/agents/`](/opt/claude-container/container/agents),
+   [`container/watchers/`](/opt/claude-container/container/watchers).
 7. **Start event watchers via `/claude-container:start-watchers`**.
    Watchers are **session-scoped `run_in_background` Bash tasks** that
    must be (re)started on every session start, `/clear`, resume, or
@@ -188,7 +188,7 @@ Claude Code session) or bridge the watch event over `host-bash`.
 > restart cycles, no DOWN-state alerts. A dedicated watcher is justified only
 > when sub-minute reactivity is required AND no kernel event mechanism
 > (inotify, systemd path units) fits. See
-> [`docs/watchers.md` § Watcher vs. producer (cron)](docs/watchers.md#watcher-vs-producer-cron--pick-the-right-tool)
+> [`docs/watchers.md` § Watcher vs. producer (cron)](/opt/claude-container/docs/watchers.md#watcher-vs-producer-cron--pick-the-right-tool)
 > for the full decision framework, alternatives (kernel events, extending
 > claude-watch, cron + internal poll loop), and a concrete example.
 
@@ -890,7 +890,7 @@ docker daemon is fine; the point is no MANUAL host step and no nohup):
 ## What is bind-mounted from the host
 
 The
-[example compose stack](examples/compose/docker-compose.yml)
+[example compose stack](/opt/claude-container/examples/compose/docker-compose.yml)
 documents the standard mount surface. Defaults (operator can override
 each via `CLAUDE_HOST_*` env vars):
 
@@ -900,7 +900,7 @@ each via `CLAUDE_HOST_*` env vars):
 | `/home/hndrewaall/.claude.json` | `${HOME}/.claude.json` | rw | top-level Claude Code config (MCP server registry, project allow-lists) |
 | `/home/hndrewaall/repos/` | `${HOME}/repos/` | ro | host repo trees (read-only so the container can't scribble on working trees) |
 | `/home/hndrewaall/bin/` | `${HOME}/bin/` | ro | operator-curated launcher scripts |
-| `/etc/claude-code/` | host managed-settings dir if `CLAUDE_HOST_MANAGED_SETTINGS_DIR` set | ro | host MDM / enterprise policy |
+| `/mnt/host-managed-claude-config/` | host managed-settings dir if `CLAUDE_HOST_MANAGED_SETTINGS_DIR` set | ro | host MDM / enterprise policy; its `managed-settings.json` surfaces at `/etc/claude-code/managed-settings.json` via an image-baked symlink |
 | `${CLAUDE_HOST_PROJECT_DIR}` | same path on host | rw | project cwd (so the project-memory key matches the host's) |
 | `${CLAUDE_HOST_HOOKS_DIR}` | same path on host | ro | corp telemetry hook scripts referenced by `~/.claude/settings.json` |
 
@@ -1017,7 +1017,7 @@ each `command` wrapped in `exec-hook`. Run `/mcp` to see what loaded.
   cross-arch binary. The host adapter is the operator's responsibility
   (`mcp-proxy`, `mcphost`, etc.); the container only rewrites the
   in-container `.mcp.json`. Full surface in
-  [container/README.md](container/README.md#blast-radius).
+  [container/README.md](/opt/claude-container/container/README.md#blast-radius).
 - **`host-bash`** — generic "run a safe command on the host" MCP server,
   shipped as an off-the-shelf
   [`cli-mcp-server`](https://github.com/MladenSU/cli-mcp-server) +
@@ -1032,7 +1032,7 @@ each `command` wrapped in `exec-hook`. Run `/mcp` to see what loaded.
   host-side work from inside the container. If it's not available
   (`/mcp` doesn't list it), the operator hasn't wired up the host-side
   launcher. See
-  [examples/compose/bin/mcp-host-bash](examples/compose/bin).
+  [examples/compose/bin/mcp-host-bash](/opt/claude-container/examples/compose/bin).
 
   **Boundary discipline**: host-bash is a *window* to the host, not
   the host. When you report what you did, frame it as "I ran X on the
@@ -1049,7 +1049,7 @@ the host's `~/.claude.json` has none defined.
 
 ## Hooks
 
-The container ships [`exec-hook`](container/hooks-shim/exec-hook),
+The container ships [`exec-hook`](/opt/claude-container/container/hooks-shim/exec-hook),
 a safe-exec wrapper for `settings.json` hook commands whose target
 binary may not be Linux-native. It inspects magic bytes, exec's ELF /
 shebang-script targets transparently, and silently no-ops on Mach-O /
@@ -1261,7 +1261,7 @@ read-only via the bind-mounted DB at `~/.local/share/eichi/index.db`).
 ## Event response protocol — four-tier model
 
 > **Read first — the conceptual model:** the
-> [event hierarchy concept doc](docs/concepts/event-hierarchy.md)
+> [event hierarchy concept doc](/opt/claude-container/docs/concepts/event-hierarchy.md)
 > is the entry point that explains how **events vs. obligations vs.
 > interruptions** differ as signaling mechanisms. (The `docs/` tree is baked
 > into this image alongside this file, so the link above resolves to a local
@@ -1534,11 +1534,11 @@ isn't; the host scheduler is).
 
 ## Where to learn more
 
-- [Top-level claude-watch README](README.md)
-- [docs/concepts/event-hierarchy.md](docs/concepts/event-hierarchy.md) — the conceptual entry point: how **events vs. obligations vs. interruptions** differ, and the precise **watcher** (one-shot main-loop tool) vs. **event producer** (cron / alertmanager / queue) terminology used throughout these docs
-- [container/ README](container/README.md) — full Dockerfile / entrypoint / blast-radius reference
-- [examples/compose/ README](examples/compose/README.md) — fresh-laptop developer stack walkthrough
-- [docs/watchers.md](docs/watchers.md) — operator-side hygiene rules for watchers, including the **watcher-vs-producer (cron) decision framework** (when a cron producer suffices, when a dedicated watcher is justified, and alternatives)
-- [docs/adding-watchers.md](docs/adding-watchers.md) — authoring walkthrough for new watchers (fire-and-exit contract, host- and container-side layouts, worked Jenkins example)
+- [Top-level claude-watch README](/opt/claude-container/README.md)
+- [docs/concepts/event-hierarchy.md](/opt/claude-container/docs/concepts/event-hierarchy.md) — the conceptual entry point: how **events vs. obligations vs. interruptions** differ, and the precise **watcher** (one-shot main-loop tool) vs. **event producer** (cron / alertmanager / queue) terminology used throughout these docs
+- [container/ README](/opt/claude-container/container/README.md) — full Dockerfile / entrypoint / blast-radius reference
+- [examples/compose/ README](/opt/claude-container/examples/compose/README.md) — fresh-laptop developer stack walkthrough
+- [docs/watchers.md](/opt/claude-container/docs/watchers.md) — operator-side hygiene rules for watchers, including the **watcher-vs-producer (cron) decision framework** (when a cron producer suffices, when a dedicated watcher is justified, and alternatives)
+- [docs/adding-watchers.md](/opt/claude-container/docs/adding-watchers.md) — authoring walkthrough for new watchers (fire-and-exit contract, host- and container-side layouts, worked Jenkins example)
 - [Claude Code memory docs](https://code.claude.com/docs/en/memory) — canonical CLAUDE.md hierarchy reference
 - [Claude Code hooks docs](https://code.claude.com/docs/en/hooks) — full hook event list + exit-code semantics

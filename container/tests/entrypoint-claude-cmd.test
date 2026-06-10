@@ -323,7 +323,7 @@ def test_auto_continue_default_prompt() -> None:
 
 
 def test_plugin_dir_absent_no_flag() -> None:
-    """When /etc/claude-code/plugin/.claude-plugin does NOT exist, the
+    """When /opt/claude-container/plugin/.claude-plugin does NOT exist, the
     --plugin-dir flag must not appear (defensive no-op for older images
     pre-dating the baked container plugin)."""
     env = {"PATH": "/usr/bin:/bin"}
@@ -335,11 +335,11 @@ def test_plugin_dir_absent_no_flag() -> None:
 
 
 def test_plugin_dir_present_appends_flag() -> None:
-    """When /etc/claude-code/plugin/.claude-plugin exists, --plugin-dir
-    /etc/claude-code/plugin is appended unconditionally — the baked
+    """When /opt/claude-container/plugin/.claude-plugin exists, --plugin-dir
+    /opt/claude-container/plugin is appended unconditionally — the baked
     container plugin (skills + agents) loads at session start.
 
-    We can't create /etc/claude-code/plugin without root, but the test
+    We can't create /opt/claude-container/plugin without root, but the test
     can still verify the conditional fires by re-extracting the block
     with the dir literal substituted to an existing tmpdir, then
     re-running."""
@@ -349,10 +349,10 @@ def test_plugin_dir_present_appends_flag() -> None:
         # Substitute the hard-coded path in the extracted block. The block
         # references the path twice (once in the test, once in the assignment).
         patched_block = BLOCK.replace(
-            "/etc/claude-code/plugin/.claude-plugin",
+            "/opt/claude-container/plugin/.claude-plugin",
             str(plug / ".claude-plugin"),
         ).replace(
-            "/etc/claude-code/plugin", str(plug)
+            "/opt/claude-container/plugin", str(plug)
         )
         env = {"PATH": "/usr/bin:/bin"}
         cmd = run_block(patched_block, env)

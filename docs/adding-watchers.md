@@ -43,7 +43,7 @@ There are two physical homes for a watcher in this repo:
 | Surface | Location | Wired via | Read |
 |---------|----------|-----------|------|
 | **Host-side** | `tools/watchers/<name>` + `~/.config/watchmen/watchers.conf` | `watcher-ctl run <name>` (supervisor in `src/watcher.rs`) | [Host-side authoring](#host-side-authoring) |
-| **Container-side** | `container/watchers/<name>.sh` + `container/watchers/<name>.toml` | `/start-watchers` skill (probes `/etc/claude-code/watchers/*.toml`) | [Container-side authoring](#container-side-authoring) |
+| **Container-side** | `container/watchers/<name>.sh` + `container/watchers/<name>.toml` | `/start-watchers` skill (probes `/opt/claude-container/watchers/*.toml`) | [Container-side authoring](#container-side-authoring) |
 
 The lifecycle contract (fire → exit → main loop respawns) is the SAME
 on both surfaces. The difference is purely how the supervisor finds and
@@ -289,7 +289,7 @@ template.
 ## Container-side authoring
 
 Container watchers live under `container/watchers/` and are baked into
-the image at `/etc/claude-code/watchers/`. They're discovered by the
+the image at `/opt/claude-container/watchers/`. They're discovered by the
 `/start-watchers` skill (`container/skills/start-watchers.md`), which
 parses each `.toml` file and launches the paired `.sh` via the
 `Bash` tool with `run_in_background: true`.
@@ -308,7 +308,7 @@ container/watchers/<name>.toml    # metadata (parsed by /start-watchers)
 ```toml
 name = "queue-event-tail"
 description = "Tails ~/.claude-events/ for in-container handlers"
-launcher = "/etc/claude-code/watchers/queue-event-tail.sh"
+launcher = "/opt/claude-container/watchers/queue-event-tail.sh"
 restart_policy = "on-failure"   # or "always" / "never"
 log_path = "/tmp/claude-container-watchers/queue-event-tail.log"
 ```
@@ -318,7 +318,7 @@ All keys are REQUIRED.
 - `name` — identifier surfaced by `/start-watchers`.
 - `description` — one-line description.
 - `launcher` — absolute baked path. Convention is
-  `/etc/claude-code/watchers/<name>.sh` (mirrors the `name` field).
+  `/opt/claude-container/watchers/<name>.sh` (mirrors the `name` field).
 - `restart_policy` — `always` / `on-failure` / `never`. The skill
   consults this when the launcher exits.
 - `log_path` — where `/start-watchers` writes the launcher's stdout
@@ -329,7 +329,7 @@ All keys are REQUIRED.
 1. Container session start. Baked CLAUDE.md instruction
    ([line 94](../container/baked-CLAUDE.md)) tells the agent to invoke
    `/claude-container:start-watchers`.
-2. Skill runs `ls /etc/claude-code/watchers/*.toml`.
+2. Skill runs `ls /opt/claude-container/watchers/*.toml`.
 3. For each `.toml`, the skill parses metadata, then runs the
    `launcher` via `Bash` with `run_in_background: true`, capturing the
    `bash_id`.
@@ -466,7 +466,7 @@ done
 ```toml
 name = "jenkins-build-failure"
 description = "Surface newly-failed Jenkins builds from $JENKINS_URL"
-launcher = "/etc/claude-code/watchers/jenkins-build-failure.sh"
+launcher = "/opt/claude-container/watchers/jenkins-build-failure.sh"
 restart_policy = "on-failure"
 log_path = "/tmp/claude-container-watchers/jenkins-build-failure.log"
 ```

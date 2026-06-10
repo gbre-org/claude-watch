@@ -391,7 +391,7 @@ fi
 #
 # The CLAUDE_CMD construction is now consumed by
 # /usr/local/bin/cw-tmux-bootstrap (which process-compose runs as the
-# setup-tmux-session oneshot — see /etc/claude-code/process-compose.yml).
+# setup-tmux-session oneshot — see /opt/claude-container/process-compose.yml).
 # The conditional blocks remain here so the test parser still has a
 # canonical source to inspect; bootstrap re-runs the same logic against
 # the same env vars at session-creation time.
@@ -402,8 +402,8 @@ fi
 if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -z "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
     CLAUDE_CMD="exec claude --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
 fi
-if [ -d /etc/claude-code/plugin/.claude-plugin ]; then
-    CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /etc/claude-code/plugin"
+if [ -d /opt/claude-container/plugin/.claude-plugin ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --plugin-dir /opt/claude-container/plugin"
 fi
 if [ "${CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS:-}" = "1" ]; then
     CLAUDE_CMD="$CLAUDE_CMD --dangerously-skip-permissions"
@@ -417,7 +417,7 @@ export CLAUDE_CMD
 
 # Propagate the per-service opt-out env vars into process-compose's
 # environment. process-compose interpolates ${VAR:-default} in its
-# config (see /etc/claude-code/process-compose.yml `disabled:` keys),
+# config (see /opt/claude-container/process-compose.yml `disabled:` keys),
 # so flipping these flags here disables individual supervised
 # processes without modifying the baked config.
 #
@@ -459,6 +459,6 @@ fi
 # `cleanup` trap above continues to fire if we're invoked OUTSIDE
 # process-compose (debug path).
 exec /usr/local/bin/process-compose up \
-    --config /etc/claude-code/process-compose.yml \
+    --config /opt/claude-container/process-compose.yml \
     --tui=false \
     --no-server

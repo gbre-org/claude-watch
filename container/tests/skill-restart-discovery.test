@@ -2,8 +2,8 @@
 """Tests for the in-container baked plugin's slash-command discovery.
 
 The Dockerfile bakes container/skills/<name>.md into
-/etc/claude-code/plugin/commands/<name>.md and entrypoint.sh appends
-`--plugin-dir /etc/claude-code/plugin` to the claude argv. Claude Code's
+/opt/claude-container/plugin/commands/<name>.md and entrypoint.sh appends
+`--plugin-dir /opt/claude-container/plugin` to the claude argv. Claude Code's
 plugin loader walks `<plugin-dir>/commands/` and registers each
 `<name>.md` as a slash command at `/<plugin-name>:<name>`.
 
@@ -23,7 +23,7 @@ no live claude required):
      skill. (Skipped gracefully if `claude` is not on PATH.)
 
 The full integration check (claude inside the running container, with
-the actual baked /etc/claude-code/plugin dir) lives in the v31 workbot
+the actual baked /opt/claude-container/plugin dir) lives in the v31 workbot
 prompt — this test covers what we can verify without docker.
 
 Run:  ./skill-restart-discovery.test

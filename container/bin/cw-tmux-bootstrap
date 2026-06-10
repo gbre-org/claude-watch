@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cw-tmux-bootstrap — creates the in-container tmux session in detached
 # mode. Invoked by process-compose as the `setup-tmux-session` oneshot
-# (see /etc/claude-code/process-compose.yml).
+# (see /opt/claude-container/process-compose.yml).
 #
 # This script extracts the tmux-session-creation logic from
 # /usr/local/bin/claude-tmux-entrypoint so process-compose can run it

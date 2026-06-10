@@ -77,7 +77,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # SIGTERM/SIGINT forwarding to its supervised children, and provides
 # the declarative restart-on-failure / depends_on contract that tini
 # (a single-process supervisor) couldn't. See
-# /etc/claude-code/process-compose.yml for the service declarations
+# /opt/claude-container/process-compose.yml for the service declarations
 # and container/README.md "PID 1 supervisor" for the migration
 # rationale.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -250,7 +250,7 @@ RUN mkdir -p /home/hndrewaall/.local/share/claude /home/hndrewaall/.local/bin \
 # tmux session. tini reaps zombies + forwards signals but doesn't
 # model dependencies, restart on failure, or centralize logs.
 # process-compose declares those service contracts in
-# /etc/claude-code/process-compose.yml and runs them with restart
+# /opt/claude-container/process-compose.yml and runs them with restart
 # policies + depends_on ordering.
 #
 # Static binary release from upstream (single-binary Go); no apt
@@ -513,7 +513,7 @@ COPY container/claude-watch.config.toml /etc/claude-watch/config.toml
 
 # Baked watchers.conf — the daemon's watcher_monitor list. Stacks on top
 # of cw-watcher-supervisor (which is the primary restart layer): the
-# supervisor reads /etc/claude-code/watchers/*.toml and respawns each
+# supervisor reads /opt/claude-container/watchers/*.toml and respawns each
 # watcher per restart_policy. The daemon's watcher_monitor reads this
 # pipe-separated file and fires `[CLAUDE-WATCH] WATCHER(S) DOWN` alerts
 # via tmux-inject if the watcher's pgrep pattern is missing for several
@@ -521,12 +521,12 @@ COPY container/claude-watch.config.toml /etc/claude-watch/config.toml
 # the two layers give us "supervisor restarts in seconds" + "daemon
 # alerts the main loop if supervision has actually failed".
 #
-# Path /etc/claude-code/watchmen/watchers.conf mirrors the host's
+# Path /opt/claude-container/watchmen/watchers.conf mirrors the host's
 # ~/.config/watchmen/watchers.conf convention (the "watchmen" subdir
 # survives from the legacy shell-script supervisor's name). The
 # container's claude-watch.config.toml points watcher_monitor.watchers_config
 # at this exact path.
-COPY container/watchers.conf /etc/claude-code/watchmen/watchers.conf
+COPY container/watchers.conf /opt/claude-container/watchmen/watchers.conf
 
 # watcher-ctl: multicall alias of claude-watch. The daemon's
 # WATCHER(S) DOWN alert prompt injects `watcher-ctl run <name>` into
@@ -548,23 +548,41 @@ RUN ln -s /usr/local/bin/claude-watch /usr/local/bin/watcher-ctl
 # to read more. Source of truth lives at container/baked-CLAUDE.md in the
 # claude-watch repo — rebuild the image to update.
 #
-# IMPORTANT mount interaction: the example compose stack
-# (examples/compose/docker-compose.yml) optionally bind-mounts a host-side
-# managed-settings dir over /etc/claude-code/ when the operator sets
-# CLAUDE_HOST_MANAGED_SETTINGS_DIR. The compose default for that env var is
-# /dev/null (graceful no-op), so an unset operator's session sees the baked
-# CLAUDE.md unshielded. Operators who DO set the override take responsibility
-# for whatever managed-settings dir they point at — their dir replaces the
-# baked one wholesale.
+# /etc/claude-code/ is RESERVED for Claude Code's managed-config tier on
+# Linux. The image keeps exactly two entries there:
+#
+#   CLAUDE.md             — this baked managed-policy memory file.
+#   managed-settings.json — a symlink into the host-managed-settings
+#                           staging mount (see the RUN ln -s below).
+#
+# Everything claude-watch-specific (skills, agents, watchers, plugin,
+# process-compose.yml, doc mirror, watchmen config) is baked under
+# /opt/claude-container/ instead, so a host managed-settings bind-mount
+# can never shadow — or be shadowed by — container runtime files.
+#
+# Mount interaction: the example compose stack
+# (examples/compose/docker-compose.yml) bind-mounts the operator's host
+# managed-settings dir (CLAUDE_HOST_MANAGED_SETTINGS_DIR; Linux default
+# /etc/claude-code, macOS /Library/Application Support/ClaudeCode) read-only
+# at the fixed staging path /mnt/host-managed-claude-config. The symlink
+# below makes the host's managed-settings.json visible at the documented
+# Linux path the in-container claude actually reads, REGARDLESS of where
+# the host OS keeps the file. When the env var is unset the compose mounts
+# /dev/null at the staging path and the symlink dangles — Claude Code
+# treats the managed-settings tier as absent. The host's own managed
+# CLAUDE.md (if any) is intentionally NOT propagated: the baked
+# container-runtime CLAUDE.md owns that slot.
 COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md
+RUN ln -s /mnt/host-managed-claude-config/managed-settings.json \
+        /etc/claude-code/managed-settings.json
 
-# Bake the docs the managed CLAUDE.md links to, alongside it, so its
-# cross-references resolve to LOCAL paths in-container instead of raw-GitHub
-# URLs. baked-CLAUDE.md lands at /etc/claude-code/CLAUDE.md and now uses plain
-# RELATIVE links (docs/..., README.md, container/README.md,
-# examples/compose/...). For those to resolve, each target must sit at
-# /etc/claude-code/<repo-relative-path>. We mirror the repo layout under
-# /etc/claude-code/ for exactly the subtrees baked-CLAUDE.md reaches into:
+# Bake the docs the managed CLAUDE.md links to so its cross-references
+# resolve to LOCAL paths in-container instead of raw-GitHub URLs.
+# baked-CLAUDE.md lands at /etc/claude-code/CLAUDE.md and links to its
+# sibling docs by ABSOLUTE /opt/claude-container/<repo-relative-path>
+# targets (the managed dir itself stays doc-free — see the reservation
+# note above). We mirror the repo layout under /opt/claude-container/
+# for exactly the subtrees baked-CLAUDE.md reaches into:
 #
 #   docs/                          -> the concept + per-subsystem docs
 #                                     (event-hierarchy, watchers, adding-watchers, …)
@@ -576,19 +594,20 @@ COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md
 #   examples/compose/{README.md,docker-compose.yml,bin}
 #                                  -> the fresh-laptop developer stack
 #
-# scripts/check-doc-links.py (run in CI) guarantees every relative link in
-# baked-CLAUDE.md resolves to a path that exists in the repo, so this COPY set
-# stays in sync with the doc's links: a new link to an un-baked path fails CI.
-COPY docs/ /etc/claude-code/docs/
-COPY README.md /etc/claude-code/README.md
-COPY container/README.md /etc/claude-code/container/README.md
-COPY container/hooks-shim/exec-hook /etc/claude-code/container/hooks-shim/exec-hook
-COPY container/skills/ /etc/claude-code/container/skills/
-COPY container/agents/ /etc/claude-code/container/agents/
-COPY container/watchers/ /etc/claude-code/container/watchers/
-COPY examples/compose/README.md /etc/claude-code/examples/compose/README.md
-COPY examples/compose/docker-compose.yml /etc/claude-code/examples/compose/docker-compose.yml
-COPY examples/compose/bin/ /etc/claude-code/examples/compose/bin/
+# scripts/check-doc-links.py (run in CI) maps /opt/claude-container/-prefixed
+# links back to repo-relative paths and guarantees each resolves to a path
+# that exists in the repo, so this COPY set stays in sync with the doc's
+# links: a new link to an un-baked path fails CI.
+COPY docs/ /opt/claude-container/docs/
+COPY README.md /opt/claude-container/README.md
+COPY container/README.md /opt/claude-container/container/README.md
+COPY container/hooks-shim/exec-hook /opt/claude-container/container/hooks-shim/exec-hook
+COPY container/skills/ /opt/claude-container/container/skills/
+COPY container/agents/ /opt/claude-container/container/agents/
+COPY container/watchers/ /opt/claude-container/container/watchers/
+COPY examples/compose/README.md /opt/claude-container/examples/compose/README.md
+COPY examples/compose/docker-compose.yml /opt/claude-container/examples/compose/docker-compose.yml
+COPY examples/compose/bin/ /opt/claude-container/examples/compose/bin/
 
 # Bake CLAUDE_WATCH_CONFIG into the image-level env (Phase 1.5 fix #3,
 # q-2026-05-11-d7c0). entrypoint.sh exports it for its own children (pane 0/1
@@ -609,7 +628,7 @@ ENV CLAUDE_WATCH_CONFIG=/etc/claude-watch/config.toml
 # read path; this env var covers the CLI path the main loop invokes when
 # the WATCHER(S) DOWN alert prompt tells it to run `watcher-ctl run
 # claude-event-watch`. src/watcher.rs config_path() honors WATCHERS_CONFIG.
-ENV WATCHERS_CONFIG=/etc/claude-code/watchmen/watchers.conf
+ENV WATCHERS_CONFIG=/opt/claude-container/watchmen/watchers.conf
 
 # /etc/profile.d/claude-tools.sh — discoverability for bind-mounted CLIs.
 #
@@ -1036,26 +1055,26 @@ RUN chmod +x /usr/local/bin/claude-event-watch
 #
 # Wiring shape:
 #
-#   container/skills/   -> /etc/claude-code/skills/   (canonical bake path,
+#   container/skills/   -> /opt/claude-container/skills/   (canonical bake path,
 #                                                       documented for inspection)
-#                       -> /etc/claude-code/plugin/commands/
+#                       -> /opt/claude-container/plugin/commands/
 #                                                      (where Claude Code's
 #                                                       plugin loader reads
 #                                                       slash commands)
-#   container/agents/   -> /etc/claude-code/agents/   (canonical bake path)
-#                       -> /etc/claude-code/plugin/agents/
+#   container/agents/   -> /opt/claude-container/agents/   (canonical bake path)
+#                       -> /opt/claude-container/plugin/agents/
 #                                                      (plugin loader reads
 #                                                       custom agents here)
-#   container/watchers/ -> /etc/claude-code/watchers/ (probed by the
+#   container/watchers/ -> /opt/claude-container/watchers/ (probed by the
 #                                                       /start-watchers skill;
 #                                                       NOT a plugin loader path)
 #   container/plugin/.claude-plugin/plugin.json
-#                       -> /etc/claude-code/plugin/.claude-plugin/plugin.json
+#                       -> /opt/claude-container/plugin/.claude-plugin/plugin.json
 #                          (manifest the plugin loader requires; sets the
 #                           plugin namespace to `claude-container`, so
 #                           skills land as /claude-container:<name>)
 #
-# entrypoint.sh appends `--plugin-dir /etc/claude-code/plugin` to the
+# entrypoint.sh appends `--plugin-dir /opt/claude-container/plugin` to the
 # claude argv so the plugin loader picks up the baked commands/agents at
 # session start. The two-target COPY (skills -> {skills,plugin/commands};
 # agents -> {agents,plugin/agents}) keeps the canonical paths
@@ -1063,11 +1082,11 @@ RUN chmod +x /usr/local/bin/claude-event-watch
 # operator to think about the plugin layout. Watchers do NOT land in the
 # plugin dir because they aren't slash commands or agents — they're
 # shell scripts the agent runs via the Bash tool with run_in_background.
-COPY container/skills/ /etc/claude-code/skills/
-COPY container/skills/ /etc/claude-code/plugin/commands/
-COPY container/agents/ /etc/claude-code/agents/
-COPY container/agents/ /etc/claude-code/plugin/agents/
-COPY container/watchers/ /etc/claude-code/watchers/
+COPY container/skills/ /opt/claude-container/skills/
+COPY container/skills/ /opt/claude-container/plugin/commands/
+COPY container/agents/ /opt/claude-container/agents/
+COPY container/agents/ /opt/claude-container/plugin/agents/
+COPY container/watchers/ /opt/claude-container/watchers/
 # Defensive chmod +x on the baked watcher scripts. The recursive COPY
 # above preserves source-side perms, but a future refactor that swaps
 # the COPY for a different mechanism (or an upstream tar layer that
@@ -1075,12 +1094,12 @@ COPY container/watchers/ /etc/claude-code/watchers/
 # the explicit chmod here. Mirrors the same defence-in-depth pattern
 # every other baked-script COPY uses (exec-hook, cwsr, self-clear,
 # etc.).
-RUN chmod +x /etc/claude-code/watchers/claude-event-watch.sh
-COPY container/plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude-plugin/plugin.json
+RUN chmod +x /opt/claude-container/watchers/claude-event-watch.sh
+COPY container/plugin/.claude-plugin/plugin.json /opt/claude-container/plugin/.claude-plugin/plugin.json
 
 # process-compose service config + helper launchers. The supervisor
 # runs as PID 1 (see ENTRYPOINT below) and reads
-# /etc/claude-code/process-compose.yml at startup to drive the
+# /opt/claude-container/process-compose.yml at startup to drive the
 # in-container service set: tmux session bootstrap (oneshot), tmux
 # attach (foreground TTY), claude-watch daemon (long-running), crond
 # (long-running), cw-watcher-supervisor (long-running). Each
@@ -1091,7 +1110,7 @@ COPY container/plugin/.claude-plugin/plugin.json /etc/claude-code/plugin/.claude
 # mode (extracted from entrypoint.sh's tmux session-creation logic).
 # cw-claude-watch-launch wraps the claude-watch invocation with the
 # CLAUDE_WATCH_CONTAINER_MODE=1 env + log-file plumbing.
-COPY container/process-compose.yml /etc/claude-code/process-compose.yml
+COPY container/process-compose.yml /opt/claude-container/process-compose.yml
 COPY container/bin/cw-tmux-bootstrap /usr/local/bin/cw-tmux-bootstrap
 COPY container/bin/cw-claude-watch-launch /usr/local/bin/cw-claude-watch-launch
 RUN chmod +x /usr/local/bin/cw-tmux-bootstrap \
@@ -1117,7 +1136,7 @@ WORKDIR /workspace
 # The entrypoint script is the FIRST process under process-compose's
 # supervision — it runs setup (PATH, hooks-shim, trust-workspace,
 # obligations-init) then execs `process-compose up` with the baked
-# /etc/claude-code/process-compose.yml. process-compose then
+# /opt/claude-container/process-compose.yml. process-compose then
 # supervises the tmux session + daemons per the declared restart
 # policies.
 #

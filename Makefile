@@ -119,7 +119,7 @@ test-hooks-shim:
 # checker's embedded self-tests, then verifies every relative markdown link in
 # container/baked-CLAUDE.md (and repo-wide) resolves to a path that exists in
 # the repo. baked-CLAUDE.md now links to its sibling docs by RELATIVE path
-# (they are COPYed into /etc/claude-code/ alongside it), so a link to an
+# (they are COPYed into /opt/claude-container/ alongside it), so a link to an
 # un-baked path is a real in-container 404 — this gate catches it at CI time.
 test-doc-links:
 	python3 scripts/check-doc-links.py --self-test

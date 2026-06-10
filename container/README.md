@@ -245,9 +245,9 @@ The image runs [`process-compose`](https://github.com/F1bonacc1/process-compose)
 ENTRYPOINT ["/usr/local/bin/claude-tmux-entrypoint"]
 ```
 
-The entrypoint script does setup (PATH wiring, hooks-shim generation, trust-workspace pre-seeding) then `exec`s `/usr/local/bin/process-compose up --config /etc/claude-code/process-compose.yml --tui=false --no-server`. From there, process-compose is PID 1 of the container.
+The entrypoint script does setup (PATH wiring, hooks-shim generation, trust-workspace pre-seeding) then `exec`s `/usr/local/bin/process-compose up --config /opt/claude-container/process-compose.yml --tui=false --no-server`. From there, process-compose is PID 1 of the container.
 
-`process-compose` supervises the in-container service set declared in `/etc/claude-code/process-compose.yml`:
+`process-compose` supervises the in-container service set declared in `/opt/claude-container/process-compose.yml`:
 
 | Process | Role | Restart policy |
 |---------|------|----------------|
@@ -326,7 +326,7 @@ The mechanism is a small `/etc/profile.d/claude-tools.sh` fragment baked into th
 
 Operational tooling that the operator runs on the **host** (alerting, monitoring, media post-processing, ingest pipelines, etc.) is intentionally NOT installed in the container. The image is meant to be a generic Claude Code + claude-watch sandbox; host-specific tooling stays on the host where it has the right environment, credentials, and filesystem layout. Layer that in via your own image or a sibling bind-mount when you need it.
 
-The [example compose stack](../examples/compose/) takes that "sibling bind-mount" path further by mounting `~/bin` (read-only) alongside `~/repos`, so host-installed CLI symlinks resolve inside the container. Every host-side source path in that compose file is overridable via a `CLAUDE_HOST_*` env var (defaults work for Linux without further config; macOS or corporate-managed-config operators set `CLAUDE_HOST_MANAGED_SETTINGS_DIR` to opt into a host managed-settings dir — note that doing so REPLACES the image-baked `/etc/claude-code/` including the managed-policy CLAUDE.md the image ships). See [examples/compose/README.md](../examples/compose/README.md) "Host state bind-mounts" + "Host paths on non-default layouts (env-var overrides)" for the full table of mounts the example wires up (claude-events, settings dirs, etc.), the per-tier Claude Code settings hierarchy, and the macOS graceful-no-op behavior for paths that don't exist on the host. Host-specific integration mounts (shell-history DBs, messaging attachment dirs, etc.) live in a local `docker-compose.override.yml`, not the public example.
+The [example compose stack](../examples/compose/) takes that "sibling bind-mount" path further by mounting `~/bin` (read-only) alongside `~/repos`, so host-installed CLI symlinks resolve inside the container. Every host-side source path in that compose file is overridable via a `CLAUDE_HOST_*` env var (defaults work for Linux without further config; macOS or corporate-managed-config operators set `CLAUDE_HOST_MANAGED_SETTINGS_DIR` to opt into a host managed-settings dir — it is staged at `/mnt/host-managed-claude-config` and its `managed-settings.json` surfaces at the Linux managed path via an image-baked symlink, without shadowing the managed-policy CLAUDE.md the image ships). See [examples/compose/README.md](../examples/compose/README.md) "Host state bind-mounts" + "Host paths on non-default layouts (env-var overrides)" for the full table of mounts the example wires up (claude-events, settings dirs, etc.), the per-tier Claude Code settings hierarchy, and the macOS graceful-no-op behavior for paths that don't exist on the host. Host-specific integration mounts (shell-history DBs, messaging attachment dirs, etc.) live in a local `docker-compose.override.yml`, not the public example.
 
 ## VS Code tunnel auth bootstrap (`code` CLI)
 
@@ -393,14 +393,23 @@ These cardinals are non-negotiable; the
 [`baked-claude-md-cardinals.test`](tests/baked-claude-md-cardinals.test)
 asserts both are present and ordered above the runtime-env section.
 
+Inside the image, `/etc/claude-code/` is reserved for the Claude Code
+managed-config tier and holds exactly two entries: the baked `CLAUDE.md`
+and a `managed-settings.json` symlink pointing into the
+`/mnt/host-managed-claude-config` staging mount. All claude-watch-specific
+content (skills, agents, watchers, plugin, process-compose.yml, the doc
+mirror, watchmen config) is baked under `/opt/claude-container/` instead.
+
 The example compose stack's `CLAUDE_HOST_MANAGED_SETTINGS_DIR` env-var
-mount is `/dev/null` by default (graceful no-op) so the baked CLAUDE.md
-stays visible. Operators who have a host managed-settings dir set the env
-var explicitly — doing so replaces the baked `/etc/claude-code/` wholesale,
-which means the host dir must include its own CLAUDE.md if you want the
-container-runtime description to remain in context. The simplest path is
-to symlink or copy `container/baked-CLAUDE.md` into your host
-managed-settings dir alongside whatever else lives there.
+mount is `/dev/null` by default (graceful no-op — the symlink dangles and
+Claude Code sees no managed-settings tier). Operators who have a host
+managed-settings dir (Linux `/etc/claude-code`, macOS
+`/Library/Application Support/ClaudeCode`) set the env var explicitly; the
+dir is mounted read-only at the staging path and its
+`managed-settings.json` surfaces at the documented Linux path
+`/etc/claude-code/managed-settings.json` — the only managed-config path a
+Linux Claude Code process reads. The baked CLAUDE.md always stays visible;
+a host managed CLAUDE.md is intentionally not propagated.
 
 ## Baked skills, agents, watchers
 
@@ -410,14 +419,14 @@ on-disk schema, the bake target, and the add-a-new-entry walkthrough.
 
 | Source dir | Bake target(s) | What it ships | Loader path |
 | --- | --- | --- | --- |
-| [`container/skills/`](skills/) | `/etc/claude-code/skills/` (canonical) + `/etc/claude-code/plugin/commands/` (plugin loader) | One `<name>.md` per slash command | `--plugin-dir /etc/claude-code/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`); skills callable as `/claude-container:<name>` |
-| [`container/agents/`](agents/) | `/etc/claude-code/agents/` (canonical) + `/etc/claude-code/plugin/agents/` (plugin loader) | One `<name>.md` per custom agent (frontmatter + body) | Same `--plugin-dir`; agents spawned with `subagent_type="claude-container:<name>"` |
-| [`container/watchers/`](watchers/) | `/etc/claude-code/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per watcher (a one-shot, fire-and-exit tool — blocks, prints events, exits) | Auto-launched at container start by `cw-watcher-supervisor` (entrypoint-spawned, respawn-on-exit per `restart_policy`). The `/claude-container:start-watchers` skill is an informational probe. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
+| [`container/skills/`](skills/) | `/opt/claude-container/skills/` (canonical) + `/opt/claude-container/plugin/commands/` (plugin loader) | One `<name>.md` per slash command | `--plugin-dir /opt/claude-container/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`); skills callable as `/claude-container:<name>` |
+| [`container/agents/`](agents/) | `/opt/claude-container/agents/` (canonical) + `/opt/claude-container/plugin/agents/` (plugin loader) | One `<name>.md` per custom agent (frontmatter + body) | Same `--plugin-dir`; agents spawned with `subagent_type="claude-container:<name>"` |
+| [`container/watchers/`](watchers/) | `/opt/claude-container/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per watcher (a one-shot, fire-and-exit tool — blocks, prints events, exits) | Auto-launched at container start by `cw-watcher-supervisor` (entrypoint-spawned, respawn-on-exit per `restart_policy`). The `/claude-container:start-watchers` skill is an informational probe. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
 
 The plugin namespace `claude-container` is set by
 [`container/plugin/.claude-plugin/plugin.json`](plugin/.claude-plugin/plugin.json),
 which the Dockerfile copies to
-`/etc/claude-code/plugin/.claude-plugin/plugin.json` so Claude Code's
+`/opt/claude-container/plugin/.claude-plugin/plugin.json` so Claude Code's
 plugin loader treats the baked dir as a real plugin.
 
 **Currently shipping:**

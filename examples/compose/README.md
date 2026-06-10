@@ -76,7 +76,7 @@ behavior or claude-watch monitoring.
 
 | Host path (default) | env-var override | Container path | Mode | Why |
 |---|---|---|---|---|
-| `/dev/null` _(default; managed-settings dir)_ | `CLAUDE_HOST_MANAGED_SETTINGS_DIR` | _(same path as source when set)_ | `ro` | Host managed / enterprise Claude Code settings tier (`managed-settings.json`, etc.). Set to your host's managed-settings dir to opt in — Linux default `/etc/claude-code`, macOS default `/Library/Application Support/ClaudeCode`. Default `/dev/null` is a no-op so the image-baked `/etc/claude-code/CLAUDE.md` (managed-policy CLAUDE.md describing the container runtime) stays visible. Setting the override replaces the baked dir wholesale. |
+| `/dev/null` _(default; managed-settings dir)_ | `CLAUDE_HOST_MANAGED_SETTINGS_DIR` | `/mnt/host-managed-claude-config` | `ro` | Host managed / enterprise Claude Code settings tier (`managed-settings.json`, etc.). Set to your host's managed-settings dir to opt in — Linux default `/etc/claude-code`, macOS default `/Library/Application Support/ClaudeCode`. The image bakes a symlink `/etc/claude-code/managed-settings.json -> /mnt/host-managed-claude-config/managed-settings.json`, so the host's managed settings surface at the documented LINUX managed-config path the in-container `claude` actually reads — regardless of where the host OS keeps them (a macOS-path mirror mount inside a Linux container would be silently ignored). The image-baked `/etc/claude-code/CLAUDE.md` (managed-policy CLAUDE.md describing the container runtime) always stays visible; a host managed CLAUDE.md is intentionally not propagated. Default `/dev/null` leaves the symlink dangling — Claude Code sees no managed-settings tier. |
 | `~/.claude` | `CLAUDE_HOST_CONFIG_DIR` | `/home/hndrewaall/.claude` | `rw` | User-global Claude Code state: session JSONLs, project state, cache, agent definitions (`agents/*.md`). Claude writes here continuously. |
 | `~/.claude.json` | `CLAUDE_HOST_CONFIG_FILE` | `/home/hndrewaall/.claude.json` | `rw` | User-global top-level Claude Code config (MCP servers, model prefs, project allow-list). |
 | `~/repos` | `CLAUDE_HOST_REPOS_DIR` | `/home/hndrewaall/repos` | `rw` | Host repo trees (also carries project-tier Claude Code config in each repo's `.claude/`). Read-write so an operator using the in-container `claude` as a daily-driver editor can edit, commit, and push from inside the container without detouring through `/workspace`. |
@@ -170,10 +170,11 @@ settings to surface; the image ships a baked managed-policy CLAUDE.md
 that describes the in-container runtime when this is unset):
 
 ```ini
-# Point at the macOS managed-settings location. Replaces the baked
-# /etc/claude-code/ in the image (including the managed-policy CLAUDE.md);
-# bring your own CLAUDE.md if you set this and still want the
-# container-runtime description in context.
+# Point at the macOS managed-settings location. The dir is staged at
+# /mnt/host-managed-claude-config inside the container and its
+# managed-settings.json surfaces at /etc/claude-code/managed-settings.json
+# (the Linux path the in-container claude reads) via an image-baked
+# symlink. The baked managed-policy CLAUDE.md stays visible either way.
 CLAUDE_HOST_MANAGED_SETTINGS_DIR=/Library/Application Support/ClaudeCode
 ```
 

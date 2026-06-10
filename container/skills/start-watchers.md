@@ -1,4 +1,4 @@
-Report on the in-container background watchers documented under `/etc/claude-code/watchers/`. As of the cw-watcher-supervisor PR, watchers are **auto-launched by the entrypoint** and supervised for the container's entire lifetime — this skill is now an informational probe, not a launcher.
+Report on the in-container background watchers documented under `/opt/claude-container/watchers/`. As of the cw-watcher-supervisor PR, watchers are **auto-launched by the entrypoint** and supervised for the container's entire lifetime — this skill is now an informational probe, not a launcher.
 
 ## Current state — watchers are container-supervised
 
@@ -18,10 +18,10 @@ This skill exists so the in-container agent has a single canonical place to:
 1. **Probe the baked watcher catalogue**:
 
    ```sh
-   ls -1 /etc/claude-code/watchers/*.toml 2>/dev/null
+   ls -1 /opt/claude-container/watchers/*.toml 2>/dev/null
    ```
 
-   Each `.toml` is one watcher's metadata file (name, description, restart-policy, log-path); each is paired with a launcher script at `/etc/claude-code/watchers/<name>.sh` (or whatever the metadata's `launcher` key references). See `/etc/claude-code/watchers/README.md` for the on-disk schema.
+   Each `.toml` is one watcher's metadata file (name, description, restart-policy, log-path); each is paired with a launcher script at `/opt/claude-container/watchers/<name>.sh` (or whatever the metadata's `launcher` key references). See `/opt/claude-container/watchers/README.md` for the on-disk schema.
 
 2. **Check whether the container-level supervisor is up**:
 
@@ -34,12 +34,12 @@ This skill exists so the in-container agent has a single canonical place to:
    If the supervisor is running (entrypoint default), report `already supervised by cw-watcher-supervisor` and the supervisor PID. Do NOT double-launch watchers via `run_in_background: true` — the supervisor owns them. If the supervisor is not running (operator opted out via `CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0`), fall back to the legacy in-session launch path (see "Legacy fallback" below).
 
 3. **If the listing is empty**: report back to the operator:
-   > "No watchers are baked into this container image. The convention dir at `/etc/claude-code/watchers/` exists for future watcher integrations; no concrete watchers ship today."
+   > "No watchers are baked into this container image. The convention dir at `/opt/claude-container/watchers/` exists for future watcher integrations; no concrete watchers ship today."
 
 4. **If the listing has entries AND the supervisor is up**: report which watchers exist, their `restart_policy`, the path of each watcher's log, and whether the launcher process is currently alive. Example check per watcher:
 
    ```sh
-   pgrep -af '/etc/claude-code/watchers/<name>.sh'
+   pgrep -af '/opt/claude-container/watchers/<name>.sh'
    tail -n 10 /tmp/claude-container-watchers/<name>.log
    ```
 
@@ -52,7 +52,7 @@ When `CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0` AND the listing has entries: for ea
 The supervisor respawns automatically on exit (per `restart_policy`). To roll a watcher manually:
 
 ```sh
-pkill -f '/etc/claude-code/watchers/<name>.sh'
+pkill -f '/opt/claude-container/watchers/<name>.sh'
 ```
 
 The supervisor's poll loop notices the exit within ~0.5s and respawns it (after the configured backoff if the previous run was short-lived).
@@ -64,7 +64,7 @@ To temporarily disable a watcher, edit its `.toml` to set `restart_policy = "nev
 To add a container-baked watcher in a future PR:
 
 1. Drop `<name>.sh` (executable launcher; should run in foreground forever, exit non-zero on failure) and `<name>.toml` (metadata) under [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers) in the claude-watch repo.
-2. The `Dockerfile` `COPY` line for `container/watchers/` already lands them at `/etc/claude-code/watchers/<name>.{sh,toml}` (the supervisor auto-discovers them).
+2. The `Dockerfile` `COPY` line for `container/watchers/` already lands them at `/opt/claude-container/watchers/<name>.{sh,toml}` (the supervisor auto-discovers them).
 3. Update `container/watchers/README.md` to document what the watcher does and what events it produces.
 4. Rebuild the image and `cwsr` (or `docker compose up -d --force-recreate` if entrypoint-time wiring changed).
 
@@ -72,4 +72,4 @@ To add a container-baked watcher in a future PR:
 
 - This skill never starts host-side watchers and never schedules host cron jobs. For host-side scheduled work, see the "Host-side scheduled tasks (via `host-bash`)" section of `/etc/claude-code/CLAUDE.md`.
 - The `container/watchers/README.md` documents the on-disk schema (`name`, `description`, `launcher`, `restart_policy`, `log_path`); change there first, then bump the consumers.
-- Source dir in repo: [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers). Baked path inside the container: `/etc/claude-code/watchers/`.
+- Source dir in repo: [`container/watchers/`](https://github.com/hndrewaall/claude-watch/tree/main/container/watchers). Baked path inside the container: `/opt/claude-container/watchers/`.

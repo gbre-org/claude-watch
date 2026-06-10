@@ -19,12 +19,15 @@ This test asserts:
      path inside the image. Mis-targeting (e.g. `/etc/claude.md` or
      `/usr/local/etc/...`) would silently break the load path — Claude Code
      would walk past the file because it's not at the documented location.
-  4. examples/compose/docker-compose.yml defaults
-     CLAUDE_HOST_MANAGED_SETTINGS_DIR to /dev/null (graceful no-op), NOT to
-     /etc/claude-code. The previous default silently shadowed the baked
-     CLAUDE.md whenever the host had an empty /etc/claude-code (or docker
-     auto-created it on first up); the no-op default keeps the baked file
-     visible until operators explicitly opt in.
+  4. examples/compose/docker-compose.yml mounts the host managed-settings
+     dir (CLAUDE_HOST_MANAGED_SETTINGS_DIR, default /dev/null = graceful
+     no-op) read-only at the FIXED staging path
+     /mnt/host-managed-claude-config — never at the host's own path (a
+     macOS-path mirror inside a Linux container is silently ignored by
+     Claude Code) and never directly over /etc/claude-code (which would
+     shadow the baked CLAUDE.md). The image's
+     /etc/claude-code/managed-settings.json symlink (asserted in 4b)
+     surfaces the staged file at the documented Linux managed-config path.
   5. Public-repo hygiene: baked-CLAUDE.md does NOT reference any private homelab
      path (no /mnt/Raiden, no /home/<known-personal-user>, no ADHPrivate, etc).
      The file ships in a public repo and lands in every container session as
@@ -112,7 +115,7 @@ if BAKED.exists():
         "`audit-hooks` so the agent reports the hook fate summary",
     )
     # 5a.1. Session-start checklist must invoke /claude-container:start-watchers.
-    #       The skill self-discovers /etc/claude-code/watchers/*.toml and
+    #       The skill self-discovers /opt/claude-container/watchers/*.toml and
     #       launches each via Bash run_in_background. Today the dir is
     #       empty (the skill reports "nothing to start"), but invoking it
     #       at every session start means future image builds that DO ship
@@ -128,7 +131,7 @@ if BAKED.exists():
         is not None,
         "baked-CLAUDE.md session-start checklist should invoke "
         "`/claude-container:start-watchers` (the skill that self-"
-        "discovers /etc/claude-code/watchers/*.toml and launches each). "
+        "discovers /opt/claude-container/watchers/*.toml and launches each). "
         "Without an explicit checklist step, future image builds that "
         "ship watcher launchers will sit unstarted on every session.",
     )
@@ -396,40 +399,73 @@ if DOCKERFILE.exists():
         "destination silently breaks the load path",
     )
 
-# 4. Compose default is /dev/null (graceful no-op).
+# 4. Compose mounts the host managed-settings dir at the fixed staging
+#    path (default /dev/null = graceful no-op).
 expect(COMPOSE.exists(), f"compose.yml missing at {COMPOSE}")
 if COMPOSE.exists():
     yml = COMPOSE.read_text(encoding="utf-8")
-    # Look for the managed-settings mount line. The pattern we WANT is the
-    # graceful-no-op shape used by the other optional mounts:
-    #   - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:${...}:ro"
-    # The pattern we want to REJECT is the old default that shadowed the
-    # baked CLAUDE.md:
-    #   - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/etc/claude-code}:..."
+    # The pattern we WANT: host dir (default /dev/null) -> fixed staging
+    # path, read-only:
+    #   - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:/mnt/host-managed-claude-config:ro"
+    # Patterns we REJECT:
+    #   - the old source==destination mirror (mounts a macOS host dir at
+    #     the macOS path inside a LINUX container, where Claude Code
+    #     never reads it — managed settings silently dropped), and
+    #   - any mount targeting /etc/claude-code directly (shadows the
+    #     baked managed-policy CLAUDE.md).
     good = re.search(
         r'\$\{CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null\}\s*:\s*'
-        r'\$\{CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null\}\s*:\s*ro',
+        r'/mnt/host-managed-claude-config\s*:\s*ro',
         yml,
     )
-    bad = re.search(
-        r'\$\{CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/etc/claude-code\}\s*:\s*'
-        r'/etc/claude-code',
+    bad_mirror = re.search(
+        r'\$\{CLAUDE_HOST_MANAGED_SETTINGS_DIR:-[^}]*\}\s*:\s*'
+        r'\$\{CLAUDE_HOST_MANAGED_SETTINGS_DIR',
+        yml,
+    )
+    bad_overlay = re.search(
+        r'CLAUDE_HOST_MANAGED_SETTINGS_DIR[^\n]*:\s*/etc/claude-code',
         yml,
     )
     expect(
         good is not None,
-        "compose.yml managed-settings mount line missing the graceful-no-op "
-        "default shape `${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:"
-        "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:ro` — without it the "
-        "mount shadows the baked /etc/claude-code/CLAUDE.md when the env var "
-        "is unset",
+        "compose.yml managed-settings mount must be "
+        "`${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:"
+        "/mnt/host-managed-claude-config:ro` — the fixed Linux staging "
+        "path the image's /etc/claude-code/managed-settings.json symlink "
+        "points into. /dev/null default keeps it a graceful no-op.",
     )
     expect(
-        bad is None,
-        "compose.yml still uses the old default that mounts an empty host "
-        "/etc/claude-code over the baked one. Switch to the /dev/null "
-        "graceful-no-op default so the baked CLAUDE.md stays visible by "
-        "default.",
+        bad_mirror is None,
+        "compose.yml uses the old source==destination mirror shape for the "
+        "managed-settings mount. Inside a Linux container the macOS host "
+        "path is ignored by Claude Code, so host managed settings (e.g. "
+        "Bedrock provider config) silently never reach the in-container "
+        "claude. Mount at the fixed staging path instead.",
+    )
+    expect(
+        bad_overlay is None,
+        "compose.yml mounts the host managed-settings dir directly over "
+        "/etc/claude-code — that shadows the image-baked managed-policy "
+        "CLAUDE.md. Mount at /mnt/host-managed-claude-config instead; the "
+        "baked symlink surfaces managed-settings.json at the Linux path.",
+    )
+
+# 4b. Dockerfile bakes the managed-settings.json symlink into the managed
+#     dir so the staged host file surfaces at the documented Linux path.
+if DOCKERFILE.is_file():
+    df_text = DOCKERFILE.read_text(encoding="utf-8")
+    expect(
+        re.search(
+            r"ln\s+-s\s+/mnt/host-managed-claude-config/managed-settings\.json\s*"
+            r"(\\\s*)?\n?\s*/etc/claude-code/managed-settings\.json",
+            df_text,
+        )
+        is not None,
+        "Dockerfile missing the `ln -s /mnt/host-managed-claude-config/"
+        "managed-settings.json /etc/claude-code/managed-settings.json` "
+        "symlink — without it the staged host managed settings never "
+        "surface at the Linux managed-config path Claude Code reads.",
     )
 
 

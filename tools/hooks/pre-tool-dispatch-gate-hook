@@ -158,6 +158,11 @@ _BAKED_BASH_EXEMPT_PATTERNS = [
     # told the loop to run.
     r"^watcher-ctl\s+run(?:\s|$)",
     r"^/usr/local/bin/watcher-ctl\s+run(?:\s|$)",
+    # In-container baked watcher launchers. /opt/claude-container/ is
+    # the current bake root; the /etc/claude-code/ entry is kept for
+    # images built before the managed-config-dir cleanup (that dir is
+    # now reserved for Claude Code's managed-settings tier).
+    r"^/opt/claude-container/watchers/",
     r"^/etc/claude-code/watchers/",
 ]
 

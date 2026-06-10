@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cw-claude-watch-launch — wrapper that execs the in-container
 # claude-watch daemon with the right env. Invoked by process-compose
-# as the `claude-watch` process (see /etc/claude-code/process-compose.yml).
+# as the `claude-watch` process (see /opt/claude-container/process-compose.yml).
 #
 # Why a wrapper instead of declaring `command: claude-watch` in
 # process-compose.yml directly: the daemon needs CLAUDE_WATCH_CONTAINER_MODE=1

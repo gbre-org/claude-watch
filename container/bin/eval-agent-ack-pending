@@ -106,7 +106,7 @@ _EXEMPT_PATTERNS = [
     r"signal-history(\s|$)",
     r"signal-ack(\s|$)",
     r"signal-mark-read(\s|$)",
-    r"/etc/claude-code/watchers/",
+    r"/opt/claude-container/watchers/",
 ]
 _EXEMPT_RE = re.compile(
     r"^\s*(" + "|".join(_EXEMPT_PATTERNS) + r")",

@@ -6,12 +6,13 @@ the docs/ tree and the READMEs it cross-links into) and verifies that every
 *relative* link target resolves to an existing path on disk.
 
 Why this exists: container/baked-CLAUDE.md is baked into the container image at
-/etc/claude-code/CLAUDE.md and now references sibling docs by plain RELATIVE
-links (docs/..., README.md, container/README.md, ...) instead of absolute
-raw-GitHub URLs, because the docs are now COPYed into the image alongside it.
-A relative link that points at a path which does not exist in the repo would
-silently 404 in-container, so this check guards against that class of rot. It
-also runs repo-wide (--all) so the cross-doc links in docs/*.md stay honest.
+/etc/claude-code/CLAUDE.md and references sibling docs by ABSOLUTE
+/opt/claude-container/... links (the image mirrors the repo layout under that
+prefix; the managed dir /etc/claude-code/ itself stays doc-free) instead of
+raw-GitHub URLs. A link that points at a path which does not exist in the repo
+would silently 404 in-container, so this check guards against that class of
+rot. It also runs repo-wide (--all) so the cross-doc links in docs/*.md stay
+honest.
 
 Rules:
   * External links (http://, https://, mailto:, etc.) are NOT checked.
@@ -68,13 +69,21 @@ DEFAULT_DOCS = [
 #
 #   container/baked-CLAUDE.md is COPYed to /etc/claude-code/CLAUDE.md, and the
 #   docs it links to (docs/, README.md, container/README.md,
-#   examples/compose/...) are COPYed to /etc/claude-code/<repo-relative-path>.
-#   So /etc/claude-code/ mirrors the REPO ROOT, and its `docs/watchers.md` etc.
-#   links must be checked against the repo root — not against `container/`,
-#   where the source file happens to sit.
+#   examples/compose/...) are COPYed to /opt/claude-container/<repo-relative-path>.
+#   So /opt/claude-container/ mirrors the REPO ROOT. baked-CLAUDE.md links to
+#   the mirror by ABSOLUTE /opt/claude-container/... targets (the managed dir
+#   /etc/claude-code/ holds only managed config, never the doc mirror); those
+#   are validated by stripping CONTAINER_BAKE_PREFIX and checking the
+#   repo-relative remainder. Any remaining relative links in the file resolve
+#   against the repo root per this override.
 LINK_BASE_OVERRIDES = {
     "container/baked-CLAUDE.md": ".",  # resolve relative links against repo root
 }
+
+# In-container absolute prefix that mirrors the repo root (Dockerfile
+# doc-mirror COPY block). Links starting with this prefix are checked
+# against the repo root with the prefix stripped.
+CONTAINER_BAKE_PREFIX = "/opt/claude-container/"
 
 
 def iter_doc_links(text: str):
@@ -129,7 +138,14 @@ def check_file(md_path: Path, repo_root: Path) -> list[str]:
         path_part = normalize_target(target)
         if path_part is None:
             continue
-        if path_part.startswith("/"):
+        if path_part.startswith(CONTAINER_BAKE_PREFIX):
+            # In-container absolute bake path: /opt/claude-container/
+            # mirrors the repo root inside the image (see the Dockerfile
+            # doc-mirror COPY block), so strip the prefix and check the
+            # repo-relative remainder.
+            stripped = path_part[len(CONTAINER_BAKE_PREFIX):]
+            resolved = (repo_root / stripped).resolve()
+        elif path_part.startswith("/"):
             resolved = (repo_root / path_part.lstrip("/")).resolve()
         else:
             resolved = (base_dir / path_part).resolve()
