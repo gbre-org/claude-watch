@@ -39,7 +39,12 @@ relaunch_script = "/tmp/claude-relaunch.sh"
 [dead_process]
 checks_required = 3
 restart_cooldown = 300
-fresh_inject_checks = 5
+# Cycles of confirmed idle+0-tokens before injecting the fresh-session resume
+# prompt. At check_interval=10s this is the inject latency floor. The code
+# default is 5 (~50-60s) to avoid kicking a host session that's only briefly
+# between turns. In the container a recreate is known-fresh, so 2 cycles
+# (~20s) is plenty of confirmation and cuts the post-recreate dead time.
+fresh_inject_checks = 2
 
 [fresh_clear]
 min_tokens = 2000
