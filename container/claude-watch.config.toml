@@ -67,10 +67,11 @@ thinking_backoff_multiplier = 3
 [watcher_monitor]
 # The in-container watcher (claude-event-watch) follows the fire-and-exit
 # contract: blocks on inotifywait, prints pending events, and exits. The
-# cw-watcher-supervisor respawns it on each exit. If the supervisor fails
-# to restart it, the daemon fires a [CLAUDE-WATCH] alert and the main
-# loop re-runs it via watcher-ctl. The cw-watcher-health-check cron
-# (stale-event detection) remains as an additional safety net.
+# session respawns it on each exit (session-scoped run_in_background
+# task). If the session fails to restart it, the daemon fires a
+# [CLAUDE-WATCH] alert and the main loop re-runs it via watcher-ctl.
+# The cw-watcher-health-check cron (stale-event detection) remains as
+# an additional safety net.
 enabled = true
 # Baked in-container watcher list. Format documented in the file.
 # Currently registers: claude-event-watch (fire-and-exit event watcher).

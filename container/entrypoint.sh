@@ -422,18 +422,15 @@ export CLAUDE_CMD
 # processes without modifying the baked config.
 #
 # Legacy env-var aliases — historical entrypoint code used
-# CLAUDE_CONTAINER_DAEMON=0 / CLAUDE_CONTAINER_CRON=0 /
-# CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0 to skip a daemon spawn.
-# process-compose.yml uses the *_DISABLED suffix (yes-is-disabled
-# semantics). The mapping below preserves the old contract.
+# CLAUDE_CONTAINER_DAEMON=0 / CLAUDE_CONTAINER_CRON=0 to skip a daemon
+# spawn. process-compose.yml uses the *_DISABLED suffix
+# (yes-is-disabled semantics). The mapping below preserves the old
+# contract.
 if [ "${CLAUDE_CONTAINER_DAEMON:-1}" = "0" ]; then
     export CLAUDE_CONTAINER_DAEMON_DISABLED=true
 fi
 if [ "${CLAUDE_CONTAINER_CRON:-1}" = "0" ]; then
     export CLAUDE_CONTAINER_CRON_DISABLED=true
-fi
-if [ "${CLAUDE_CONTAINER_WATCHER_SUPERVISOR:-1}" = "0" ]; then
-    export CLAUDE_CONTAINER_WATCHER_SUPERVISOR_DISABLED=true
 fi
 
 # Hand off to process-compose. From here forward process-compose is
@@ -442,7 +439,6 @@ fi
 #   2. tmux-attach (foreground TTY — what the operator interacts with)
 #   3. claude-watch daemon (long-running, restart on failure)
 #   4. crond (long-running, restart on failure)
-#   5. cw-watcher-supervisor (long-running, restart on failure)
 #
 # Flags:
 #   --config <path>    — service declarations.

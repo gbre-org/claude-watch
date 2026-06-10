@@ -245,9 +245,9 @@ RUN mkdir -p /home/hndrewaall/.local/share/claude /home/hndrewaall/.local/bin \
 # process-compose — service supervisor (replaces tini at PID 1).
 #
 # Escalation past the README's "tini sufficient until three services"
-# threshold rule: claude-watch daemon + crond + cw-watcher-supervisor
-# are the three long-running services living alongside the foreground
-# tmux session. tini reaps zombies + forwards signals but doesn't
+# threshold rule: claude-watch daemon + crond are the long-running
+# services living alongside the foreground tmux session. tini reaps
+# zombies + forwards signals but doesn't
 # model dependencies, restart on failure, or centralize logs.
 # process-compose declares those service contracts in
 # /opt/claude-container/process-compose.yml and runs them with restart
@@ -511,15 +511,14 @@ RUN case "$(uname -m)" in \
 # without this file the daemon would FATAL on "no config file found". Phase 1e.
 COPY container/claude-watch.config.toml /etc/claude-watch/config.toml
 
-# Baked watchers.conf — the daemon's watcher_monitor list. Stacks on top
-# of cw-watcher-supervisor (which is the primary restart layer): the
-# supervisor reads /opt/claude-container/watchers/*.toml and respawns each
-# watcher per restart_policy. The daemon's watcher_monitor reads this
-# pipe-separated file and fires `[CLAUDE-WATCH] WATCHER(S) DOWN` alerts
-# via tmux-inject if the watcher's pgrep pattern is missing for several
-# consecutive checks (i.e. the supervisor itself has failed). Together
-# the two layers give us "supervisor restarts in seconds" + "daemon
-# alerts the main loop if supervision has actually failed".
+# Baked watchers.conf — the daemon's watcher_monitor list. Watchers are
+# session-scoped run_in_background tasks (block-print-exit contract):
+# the in-container session launches each watcher and restarts it on
+# exit. The daemon's watcher_monitor reads this pipe-separated file and
+# fires `[CLAUDE-WATCH] WATCHER(S) DOWN` alerts via tmux-inject if the
+# watcher's pgrep pattern is missing for several consecutive checks
+# (i.e. the session failed to restart it). The session restarts in
+# seconds; the daemon alerts the main loop if that has actually failed.
 #
 # Path /opt/claude-container/watchmen/watchers.conf mirrors the host's
 # ~/.config/watchmen/watchers.conf convention (the "watchmen" subdir
@@ -1102,9 +1101,9 @@ COPY container/plugin/.claude-plugin/plugin.json /opt/claude-container/plugin/.c
 # /opt/claude-container/process-compose.yml at startup to drive the
 # in-container service set: tmux session bootstrap (oneshot), tmux
 # attach (foreground TTY), claude-watch daemon (long-running), crond
-# (long-running), cw-watcher-supervisor (long-running). Each
-# long-running process has an `availability: restart: on_failure`
-# policy so a crash triggers a restart instead of a dead container.
+# (long-running). Each long-running process has an
+# `availability: restart: on_failure` policy so a crash triggers a
+# restart instead of a dead container.
 #
 # cw-tmux-bootstrap creates the in-container tmux session in detached
 # mode (extracted from entrypoint.sh's tmux session-creation logic).

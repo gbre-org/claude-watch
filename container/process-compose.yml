@@ -1,11 +1,11 @@
 # claude-container process-compose supervisor config.
 #
 # Escalation past the README's tini-threshold rule: when the container
-# grew to three long-running services (claude-watch daemon + crond +
-# cw-watcher-supervisor, alongside the foreground tmux session), tini
-# stopped being enough — it doesn't model service dependencies, doesn't
-# restart on failure, and doesn't centralize logging. process-compose
-# replaces it as the supervisor.
+# grew to multiple long-running services (claude-watch daemon + crond,
+# alongside the foreground tmux session), tini stopped being enough —
+# it doesn't model service dependencies, doesn't restart on failure,
+# and doesn't centralize logging. process-compose replaces it as the
+# supervisor.
 #
 # Loaded by /usr/local/bin/claude-tmux-entrypoint after the setup phase
 # (PATH wiring, hooks-shim generation, trust-workspace) finishes:
@@ -14,8 +14,8 @@
 #       --tui=false --no-server
 #
 # Each process is declared with an explicit `availability:` block so a
-# crash (claude-watch panic, crond SIGSEGV, watcher-supervisor crash)
-# triggers a restart instead of leaving a half-dead container.
+# crash (claude-watch panic, crond SIGSEGV) triggers a restart instead
+# of leaving a half-dead container.
 #
 # `is_tty: true` on the tmux-attach process tells process-compose to
 # wire stdin/stdout/stderr from PID 1 (process-compose itself) through
@@ -37,10 +37,12 @@
 #                       entries (active-agents writer, metrics emit)
 #                       plus any operator-bind-mounted /etc/cron.d/
 #                       additions.
-#   cw-watcher-supervisor (long-running) reads
-#                       /opt/claude-container/watchers/*.toml and respawns
-#                       the operator-baked watchers (claude-event-watch
-#                       et al) with per-watcher restart policies.
+#
+# NOTE: a `cw-watcher-supervisor` process used to be declared here too.
+# Its binary was deleted when watchers moved to session-scoped
+# run_in_background tasks (block-print-exit contract — see
+# container/watchers/README.md); the service entry would crash-loop on
+# the missing binary, so it was removed.
 
 version: "0.5"
 
@@ -171,18 +173,3 @@ processes:
       signal: 15
       timeout: 3
     disabled: ${CLAUDE_CONTAINER_CRON_DISABLED:-false}
-
-  cw-watcher-supervisor:
-    description: Watcher launcher supervisor — respawns claude-event-watch et al.
-    command: /usr/local/bin/cw-watcher-supervisor
-    availability:
-      restart: on_failure
-      backoff_seconds: 5
-      max_restarts: 0
-    # The supervisor spawns watcher children; bound its shutdown so a
-    # slow watcher teardown can't hold process-compose past docker's
-    # grace period.
-    shutdown:
-      signal: 15
-      timeout: 3
-    disabled: ${CLAUDE_CONTAINER_WATCHER_SUPERVISOR_DISABLED:-false}
