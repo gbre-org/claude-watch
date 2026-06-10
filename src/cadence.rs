@@ -18,7 +18,7 @@
 //!    alert. So heartbeat-tick *must* reach the loop, and the event queue is
 //!    the delivery path.
 //!
-//! 2. `memory-reminder` — every [`MEMORY_REMINDER_INTERVAL_SECS`] (15min),
+//! 2. `memory-reminder` — every [`MEMORY_REMINDER_INTERVAL_SECS`] (30min),
 //!    carrying the action checklist text ([`MEMORY_REMINDER_CHECKLIST`]).
 //!    Delivered via tmux-inject into the main loop pane (same mechanism as
 //!    other daemon interventions), NOT the event queue.
@@ -61,8 +61,8 @@ use std::time::{Duration, Instant};
 /// Interval between `heartbeat-tick` events. 300 seconds (5 min).
 pub const HEARTBEAT_TICK_INTERVAL_SECS: u64 = 300;
 
-/// Interval between `memory-reminder` events. 15 minutes.
-pub const MEMORY_REMINDER_INTERVAL_SECS: u64 = 900;
+/// Interval between `memory-reminder` events. 30 minutes.
+pub const MEMORY_REMINDER_INTERVAL_SECS: u64 = 1800;
 
 /// claude-event tag for the heartbeat tick.
 pub const HEARTBEAT_TICK_TAG: &str = "heartbeat-tick";
@@ -308,9 +308,12 @@ mod tests {
     }
 
     #[test]
-    fn constants_match_design() {
-        assert_eq!(HEARTBEAT_TICK_INTERVAL_SECS, 300);
-        assert_eq!(MEMORY_REMINDER_INTERVAL_SECS, 900);
+    fn tags_match_protocol() {
+        // The tag strings are the wire contract with event-classify /
+        // claude-event-watch, so pin them. The interval *values* are NOT
+        // asserted here — that would just restate the literal in a second
+        // place (a maintenance tax, not a test). The intervals are plain
+        // tunables; their single source of truth is the const above.
         assert_eq!(HEARTBEAT_TICK_TAG, "heartbeat-tick");
         assert_eq!(MEMORY_REMINDER_TAG, "memory-reminder");
     }

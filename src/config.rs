@@ -840,10 +840,14 @@ pub struct CadenceConfig {
     /// on a host that sources these another way).
     #[serde(default = "default_cadence_enabled")]
     pub enabled: bool,
-    /// Seconds between `heartbeat-tick` events. Default 60.
+    /// Seconds between `heartbeat-tick` events. Defaults to
+    /// [`crate::cadence::HEARTBEAT_TICK_INTERVAL_SECS`] (the single source
+    /// of truth for the value).
     #[serde(default = "default_heartbeat_tick_interval_secs")]
     pub heartbeat_tick_interval_secs: u64,
-    /// Seconds between `memory-reminder` events. Default 900 (15min).
+    /// Seconds between `memory-reminder` events. Defaults to
+    /// [`crate::cadence::MEMORY_REMINDER_INTERVAL_SECS`] (the single source
+    /// of truth for the value).
     #[serde(default = "default_memory_reminder_interval_secs")]
     pub memory_reminder_interval_secs: u64,
 }

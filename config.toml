@@ -344,7 +344,7 @@ version_fallback_secs = 900
 #                       configurable [claude].heartbeat_file above (the same
 #                       path the daemon monitors for staleness), so the two
 #                       never drift apart.
-#   * memory-reminder — every memory_reminder_interval_secs (900s = 15min),
+#   * memory-reminder — every memory_reminder_interval_secs (1800s = 30min),
 #                       carrying the action checklist (update logs, commit
 #                       + push repos, etc.).
 #
@@ -353,5 +353,9 @@ version_fallback_secs = 900
 # wedged loop's heartbeat goes stale and the existing stale-detection
 # fires. If the daemon wrote the file directly it would mask a dead loop.
 enabled = true
-heartbeat_tick_interval_secs = 300
-memory_reminder_interval_secs = 900
+# Intervals are omitted on purpose: leaving them unset inherits the code
+# defaults (HEARTBEAT_TICK_INTERVAL_SECS / MEMORY_REMINDER_INTERVAL_SECS in
+# src/cadence.rs), which is the single source of truth. Uncomment to override
+# on a specific host; otherwise a bump to the const is the only change needed.
+#   heartbeat_tick_interval_secs = 300     # default: 5min
+#   memory_reminder_interval_secs = 1800   # default: 30min
