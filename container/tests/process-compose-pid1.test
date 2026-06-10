@@ -11,7 +11,7 @@ process-compose (a single static Go binary with a docker-compose-style
 YAML schema) provides those service contracts.
 
 Wiring: the Dockerfile installs process-compose from upstream releases
-(pinned version), copies a baked /etc/claude-code/process-compose.yml
+(pinned version), copies a baked /opt/claude-container/process-compose.yml
 service config, and sets ENTRYPOINT to the entrypoint script
 (which does setup then `exec`s process-compose). process-compose is
 PID 1 from there forward; it reaps zombies + forwards signals to its
@@ -258,9 +258,9 @@ if ENTRYPOINT.exists():
 
     # Must reference the baked config path.
     expect(
-        "/etc/claude-code/process-compose.yml" in text,
+        "/opt/claude-container/process-compose.yml" in text,
         "entrypoint.sh must reference "
-        "/etc/claude-code/process-compose.yml as the process-compose "
+        "/opt/claude-container/process-compose.yml as the process-compose "
         "--config arg. That's where the Dockerfile bakes the service "
         "declarations.",
     )

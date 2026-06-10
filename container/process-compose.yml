@@ -10,7 +10,7 @@
 # Loaded by /usr/local/bin/claude-tmux-entrypoint after the setup phase
 # (PATH wiring, hooks-shim generation, trust-workspace) finishes:
 #
-#   exec process-compose up --config /etc/claude-code/process-compose.yml \
+#   exec process-compose up --config /opt/claude-container/process-compose.yml \
 #       --tui=false --no-server
 #
 # Each process is declared with an explicit `availability:` block so a
@@ -38,7 +38,7 @@
 #                       plus any operator-bind-mounted /etc/cron.d/
 #                       additions.
 #   cw-watcher-supervisor (long-running) reads
-#                       /etc/claude-code/watchers/*.toml and respawns
+#                       /opt/claude-container/watchers/*.toml and respawns
 #                       the operator-baked watchers (claude-event-watch
 #                       et al) with per-watcher restart policies.
 

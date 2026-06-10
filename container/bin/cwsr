@@ -139,7 +139,7 @@ build_claude_cmd() {
     # commands until the next docker compose recreate. The dir check
     # falls back gracefully on older images that pre-date the plugin
     # bake (no plugin dir => no flag).
-    local plugin_dir="${CWSR_PLUGIN_DIR:-/etc/claude-code/plugin}"
+    local plugin_dir="${CWSR_PLUGIN_DIR:-/opt/claude-container/plugin}"
     if [ -d "$plugin_dir/.claude-plugin" ]; then
         cmd="$cmd --plugin-dir $plugin_dir"
     fi

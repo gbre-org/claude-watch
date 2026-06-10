@@ -1,6 +1,6 @@
 # container/skills/
 
-Slash-command source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each file is one skill that the in-container `claude` process can invoke as `/<plugin>:<name>` (the plugin name is `claude-container`, set by `/etc/claude-code/plugin/.claude-plugin/plugin.json`).
+Slash-command source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each file is one skill that the in-container `claude` process can invoke as `/<plugin>:<name>` (the plugin name is `claude-container`, set by `/opt/claude-container/plugin/.claude-plugin/plugin.json`).
 
 ## What goes here
 
@@ -12,14 +12,14 @@ Slash-command source files baked into the [claude-container](https://github.com/
 
 The Dockerfile copies this directory into the image at two paths:
 
-1. `/etc/claude-code/skills/` — canonical bake path; documented for operators who want to inspect what shipped with their image (e.g. `ls /etc/claude-code/skills/`).
-2. `/etc/claude-code/plugin/commands/` — the path Claude Code's plugin loader actually reads. The Dockerfile populates this dir at build time and the entrypoint launches `claude` with `--plugin-dir /etc/claude-code/plugin`, so every baked skill becomes discoverable as `/claude-container:<name>` in the in-container session.
+1. `/opt/claude-container/skills/` — canonical bake path; documented for operators who want to inspect what shipped with their image (e.g. `ls /opt/claude-container/skills/`).
+2. `/opt/claude-container/plugin/commands/` — the path Claude Code's plugin loader actually reads. The Dockerfile populates this dir at build time and the entrypoint launches `claude` with `--plugin-dir /opt/claude-container/plugin`, so every baked skill becomes discoverable as `/claude-container:<name>` in the in-container session.
 
-The two paths share contents (the Dockerfile copies `container/skills/` into both). Operators reading `/etc/claude-code/skills/` see the same files Claude Code actually loads.
+The two paths share contents (the Dockerfile copies `container/skills/` into both). Operators reading `/opt/claude-container/skills/` see the same files Claude Code actually loads.
 
 ## How a fresh container session discovers them
 
-`entrypoint.sh` adds `--plugin-dir /etc/claude-code/plugin` to the `CLAUDE_CMD` it spawns under tmux. Claude Code's plugin loader walks `commands/` inside the plugin dir and registers each `<name>.md` as a slash command. Inside an interactive session the agent can verify discovery with:
+`entrypoint.sh` adds `--plugin-dir /opt/claude-container/plugin` to the `CLAUDE_CMD` it spawns under tmux. Claude Code's plugin loader walks `commands/` inside the plugin dir and registers each `<name>.md` as a slash command. Inside an interactive session the agent can verify discovery with:
 
 ```
 /claude-container:restart        # invoke the baked /restart skill

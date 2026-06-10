@@ -176,7 +176,7 @@ def test_conflicting_flags_rejected() -> None:
 
 
 def test_plugin_dir_absent_no_flag() -> None:
-    """No /etc/claude-code/plugin/.claude-plugin (default on the test
+    """No /opt/claude-container/plugin/.claude-plugin (default on the test
     host) => no --plugin-dir flag in the rebuilt argv."""
     lines, _, _, _ = run_cwsr(["--print"])
     tmux = [l for l in lines if l.startswith("TMUX:")][0]
@@ -189,7 +189,7 @@ def test_plugin_dir_absent_no_flag() -> None:
 def test_plugin_dir_present_appends_flag() -> None:
     """CWSR_PLUGIN_DIR env override points at an existing plugin dir
     => --plugin-dir <dir> is appended (preserves shape across
-    self-restart in a container where /etc/claude-code/plugin exists)."""
+    self-restart in a container where /opt/claude-container/plugin exists)."""
     import tempfile as tf
     with tf.TemporaryDirectory() as td:
         plug = Path(td) / "plugin"

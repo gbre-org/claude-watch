@@ -33,7 +33,7 @@ DOCKERFILE = CONTAINER_DIR / "Dockerfile"
 
 # Expected baked paths (what the metadata declares + what
 # /start-watchers will probe).
-BAKED_LAUNCHER = "/etc/claude-code/watchers/claude-event-watch.sh"
+BAKED_LAUNCHER = "/opt/claude-container/watchers/claude-event-watch.sh"
 
 
 failures: list[str] = []
@@ -161,7 +161,7 @@ if DOCKERFILE.is_file():
     # Match the chmod across line continuations (`\` newline).
     chmod_pat = re.compile(
         r"chmod\s+\+x\s+(?:[^\n]|\\\n)*"
-        r"/etc/claude-code/watchers/claude-event-watch\.sh",
+        r"/opt/claude-container/watchers/claude-event-watch\.sh",
     )
     expect(
         chmod_pat.search(df) is not None,

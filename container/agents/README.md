@@ -12,12 +12,12 @@ Agent prompt source files baked into the [claude-container](https://github.com/h
 
 The Dockerfile copies this directory into the image at two paths:
 
-1. `/etc/claude-code/agents/` — canonical bake path; documented for operators who want to inspect what shipped.
-2. `/etc/claude-code/plugin/agents/` — the path Claude Code's plugin loader actually reads. The entrypoint launches `claude` with `--plugin-dir /etc/claude-code/plugin`, so every baked agent becomes discoverable as `claude-container:<name>` in the `Agent` tool's `subagent_type` parameter.
+1. `/opt/claude-container/agents/` — canonical bake path; documented for operators who want to inspect what shipped.
+2. `/opt/claude-container/plugin/agents/` — the path Claude Code's plugin loader actually reads. The entrypoint launches `claude` with `--plugin-dir /opt/claude-container/plugin`, so every baked agent becomes discoverable as `claude-container:<name>` in the `Agent` tool's `subagent_type` parameter.
 
 ## How a fresh container session discovers them
 
-Same mechanism as skills: `--plugin-dir /etc/claude-code/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`) tells Claude Code to walk `agents/` inside the plugin dir and register each `<name>.md` as a custom agent. Inside an interactive session the agent can verify discovery by asking "list the agents you can see" — the plugin's agents appear with the `claude-container:` prefix.
+Same mechanism as skills: `--plugin-dir /opt/claude-container/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`) tells Claude Code to walk `agents/` inside the plugin dir and register each `<name>.md` as a custom agent. Inside an interactive session the agent can verify discovery by asking "list the agents you can see" — the plugin's agents appear with the `claude-container:` prefix.
 
 ## How to add a new agent
 

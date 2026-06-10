@@ -1,5 +1,5 @@
 name = "claude-event-watch"
 description = "Blocks until a claude-event arrives in ~/claude-events/, prints pending events, exits"
-launcher = "/etc/claude-code/watchers/claude-event-watch.sh"
+launcher = "/opt/claude-container/watchers/claude-event-watch.sh"
 restart_policy = "session"
 log_path = "/tmp/claude-container-watchers/claude-event-watch.log"

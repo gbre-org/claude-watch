@@ -74,7 +74,7 @@ thinking_backoff_multiplier = 3
 enabled = true
 # Baked in-container watcher list. Format documented in the file.
 # Currently registers: claude-event-watch (fire-and-exit event watcher).
-watchers_config = "/etc/claude-code/watchmen/watchers.conf"
+watchers_config = "/opt/claude-container/watchmen/watchers.conf"
 watchers_config_extra = "/home/hndrewaall/.config/claude-container/watchers/watchers.conf"
 # Used only for the legacy host-side `bin/watchmen` daemon count.
 # Zero in container -- no host-side watchmen daemon runs here.

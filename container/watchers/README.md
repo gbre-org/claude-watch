@@ -34,24 +34,24 @@ Each watcher is a pair of files:
   ```toml
   name = "claude-event-watch"
   description = "Blocks until a claude-event arrives, prints pending events, exits"
-  launcher = "/etc/claude-code/watchers/claude-event-watch.sh"
+  launcher = "/opt/claude-container/watchers/claude-event-watch.sh"
   restart_policy = "session"  # restarted by the session on each exit
   log_path = "/tmp/claude-container-watchers/claude-event-watch.log"
   ```
 
-  All keys are required. `launcher` is the absolute baked path (`/etc/claude-code/watchers/<name>.sh`); the `/start-watchers` skill resolves it as-is.
+  All keys are required. `launcher` is the absolute baked path (`/opt/claude-container/watchers/<name>.sh`); the `/start-watchers` skill resolves it as-is.
 
 ## How they get baked in
 
 The Dockerfile copies this directory into the image at:
 
-- `/etc/claude-code/watchers/` — the path the `/claude-container:start-watchers` skill probes via `ls /etc/claude-code/watchers/*.toml`.
+- `/opt/claude-container/watchers/` — the path the `/claude-container:start-watchers` skill probes via `ls /opt/claude-container/watchers/*.toml`.
 
 ## How they get launched
 
 The session runs `/claude-container:start-watchers` at session start (step 7 of the checklist). The skill:
 
-1. Lists `*.toml` files under `/etc/claude-code/watchers/`.
+1. Lists `*.toml` files under `/opt/claude-container/watchers/`.
 2. For each watcher, launches the `launcher` script via `Bash(command="...", run_in_background=true)`.
 3. Reports which watchers were started.
 
@@ -90,7 +90,7 @@ The container is a **code-writing sandbox**, not the host's automation hub. Back
 The canonical event-bus watcher. Blocks on `inotifywait` until a `.json` event file appears in `~/claude-events/` (or `$CLAUDE_EVENT_QUEUE`), debounces (default 30s), prints all pending events as one-liners (`EVENT[<source>/<tag>] <message>`), deletes processed files, and exits.
 
 - Reference implementation: `tools/watchers/claude-event-watch`
-- Baked launcher: `/etc/claude-code/watchers/claude-event-watch.sh`
-- Metadata: `/etc/claude-code/watchers/claude-event-watch.toml`
+- Baked launcher: `/opt/claude-container/watchers/claude-event-watch.sh`
+- Metadata: `/opt/claude-container/watchers/claude-event-watch.toml`
 - Restart policy: `session` (restarted by the session on each exit)
 - Log path: `/tmp/claude-container-watchers/claude-event-watch.log`
