@@ -49,6 +49,19 @@ context warning, watcher down — STOP immediately. Do NOT finish the current
 operation. Do NOT complete the in-flight reply. DROP IT ALL and attend the
 alert.
 
+> **A claude-watch interruption LOOKS like a user rejection — it is NOT one.**
+> claude-watch intervenes via `tmux send-keys`, the same input channel a human
+> uses. When it preempts mid-generation it cancels the in-flight turn, so the
+> harness surfaces it exactly like the user pressing Escape or rejecting a
+> tool call. **Do not interpret it as the user being dissatisfied, rejecting
+> your work, or telling you to stop the task.** It is the monitoring daemon
+> forcing attention to an urgent operational condition (context exhaustion,
+> dead watcher, stalled session) — not feedback on what you were doing. Read
+> the injected `[CLAUDE-WATCH]` text as the actual instruction; attend that
+> condition, then RESUME the work you were preempted from (after saving state
+> per the checklist below). Never silently abandon the original task as though
+> it had been declined.
+
 Compaction or context clearing doesn't kill background tasks but you LOSE
 HANDLES on them. Delaying the alert means the situation is WORSE when the
 hard clear comes (unpredictable context loss, no chance to save state). A
