@@ -182,3 +182,14 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
           make test-session-task
+
+      - name: Run obligations / hooks tests
+        # These suites were previously local-only, which let a hook
+        # behavior change merge while leaving its test failing on a
+        # clean main checkout (caught only on the next local run).
+        # Needs the companion-CLI symlinks from the step above
+        # (pre-agent-queue-gate-hook.test exercises the real
+        # session-task binary).
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+          make test-hooks

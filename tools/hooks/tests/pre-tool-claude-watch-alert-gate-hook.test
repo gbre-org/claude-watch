@@ -11,12 +11,23 @@ Covers:
   - Single pending alert: ALLOW for `git commit` exempt
   - Single pending alert: ALLOW for Read tool (exempt)
   - Multiple pending alerts: DENY persists after one is ack'd, until last cleared
+    (with the ack cooldown disabled -- see below)
+  - Ack cooldown (added in #314): within CLAUDE_WATCH_ALERT_ACK_COOLDOWN
+    seconds of the most recent ack, ALLOW even with alerts still pending
+  - Obligations override (added in #314): an active (unexpired) override
+    in obligations.json -> ALLOW; an expired one -> still DENY
   - CLAUDE_WATCH_ALERT_BYPASS=1: allow + audit log
   - Malformed JSON on stdin: allow (default-open)
   - Corrupt state file: allow (default-open)
   - DENY response shape: hookSpecificOutput.permissionDecision == "deny"
   - DENY banner includes alert ids + recovery instructions
   - Compound bash (`a && b`): DENY even if first token is exempt
+
+Hermeticity: the harness disables the ack cooldown
+(CLAUDE_WATCH_ALERT_ACK_COOLDOWN=0) and points the obligations-override
+check at the tempdir (CLAUDE_WATCH_ALERT_OBLIGATIONS_PATH), so neither
+the wall clock nor live host override state can flip assertions. The
+cooldown + override behaviors get their own dedicated tests.
 
 Run:  ./pre-tool-claude-watch-alert-gate-hook.test
 """
@@ -43,6 +54,16 @@ class Harness:
         self.env["CLAUDE_WATCH_ALERT_STATE_DIR"] = str(self.state_dir)
         # Point the ack CLI at the same state dir
         # (the ack CLI reads CLAUDE_WATCH_ALERT_STATE_DIR too)
+        # Disable the post-ack cooldown window (default 30s) so the
+        # deny-until-last-alert-cleared assertions are deterministic.
+        # test_ack_cooldown_allows re-enables it explicitly.
+        self.env["CLAUDE_WATCH_ALERT_ACK_COOLDOWN"] = "0"
+        # Point the obligations-override check into the tempdir so a
+        # live `obligations override` on the host can't spuriously
+        # allow the deny cases. test_obligations_override writes its
+        # own file here.
+        self.obligations_path = Path(self.tmpdir.name) / "obligations.json"
+        self.env["CLAUDE_WATCH_ALERT_OBLIGATIONS_PATH"] = str(self.obligations_path)
 
     def cleanup(self) -> None:
         self.tmpdir.cleanup()
@@ -254,7 +275,10 @@ def test_multiple_alerts_persist():
         # Ack the first one via the CLI (this exercises round-trip with the hook)
         subprocess.run([str(ACK_CLI), "ack", a1], env=h.env, check=True,
                        capture_output=True, timeout=10)
-        # Still 1 pending -> still deny
+        # Still 1 pending -> still deny. (The harness sets
+        # CLAUDE_WATCH_ALERT_ACK_COOLDOWN=0; with the default 30s
+        # cooldown the ack above would open an allow window -- that
+        # behavior is pinned separately in test_ack_cooldown_allows.)
         rc, out, err = h.run_hook({"tool_name": "Bash",
                                    "tool_input": {"command": "ls"}})
         check(_is_deny(out), "1-still-pending: deny")
@@ -267,6 +291,69 @@ def test_multiple_alerts_persist():
         rc, out, err = h.run_hook({"tool_name": "Bash",
                                    "tool_input": {"command": "ls"}})
         check(_is_allow(out), "all-ack'd: allow")
+    finally:
+        h.cleanup()
+
+
+def test_ack_cooldown_allows():
+    """#314 behavior: after the most recent ack, the gate ALLOWS for
+    CLAUDE_WATCH_ALERT_ACK_COOLDOWN seconds even with alerts still
+    pending (prevents re-fire spam when the monitor writes alerts
+    faster than the operator can act). Once the cooldown is disabled,
+    the same pending alert denies again."""
+    h = Harness()
+    try:
+        a1 = h.add_alert("[CLAUDE-WATCH] first")
+        h.add_alert("[CLAUDE-WATCH] second")
+        # Ack one; the ack CLI stamps last-ack-timestamp.
+        subprocess.run([str(ACK_CLI), "ack", a1], env=h.env, check=True,
+                       capture_output=True, timeout=10)
+        check((h.state_dir / "last-ack-timestamp").exists(),
+              "cooldown: ack CLI wrote last-ack-timestamp")
+        # With the cooldown active (generous window so the assertion
+        # can't race the wall clock), the remaining pending alert is
+        # allowed through.
+        rc, out, err = h.run_hook(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            extra_env={"CLAUDE_WATCH_ALERT_ACK_COOLDOWN": "300"},
+        )
+        check(_is_allow(out), "cooldown active: allow", f"out={out}")
+        # Cooldown disabled (harness default 0): same state denies.
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(_is_deny(out), "cooldown disabled: deny", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_obligations_override():
+    """#314 behavior: an ACTIVE obligations override (unexpired entry in
+    obligations.json `overrides`) means the operator explicitly bypassed
+    all gates -- the alert gate allows too. An EXPIRED override does not
+    count."""
+    import datetime
+
+    h = Harness()
+    try:
+        h.add_alert()
+
+        def write_override(expires_delta_secs: int) -> None:
+            exp = (datetime.datetime.now(datetime.timezone.utc)
+                   + datetime.timedelta(seconds=expires_delta_secs))
+            h.obligations_path.write_text(json.dumps({
+                "overrides": [{"reason": "test", "expires_at": exp.isoformat()}],
+            }))
+
+        # Active override -> allow.
+        write_override(300)
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(_is_allow(out), "active override: allow", f"out={out}")
+        # Expired override -> still deny.
+        write_override(-300)
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}})
+        check(_is_deny(out), "expired override: deny", f"out={out}")
     finally:
         h.cleanup()
 
@@ -396,6 +483,8 @@ def main() -> int:
         test_alert_allows_read_tool,
         test_alert_denies_other_tools,
         test_multiple_alerts_persist,
+        test_ack_cooldown_allows,
+        test_obligations_override,
         test_bypass_env_var,
         test_malformed_stdin_allows,
         test_corrupt_state_allows,

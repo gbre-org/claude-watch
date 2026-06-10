@@ -166,7 +166,6 @@ test-entrypoint:
 	container/tests/iproute2-installed.test
 	container/tests/code-cli-installed.test
 	container/tests/claude-event-tail-baked.test
-	container/tests/entrypoint-launches-supervisor.test
 	container/tests/cron-installed.test
 	container/tests/entrypoint-launches-cron.test
 	container/tests/redeploy-self-recreate.test

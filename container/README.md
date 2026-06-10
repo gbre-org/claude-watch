@@ -255,7 +255,8 @@ The entrypoint script does setup (PATH wiring, hooks-shim generation, trust-work
 | `tmux-attach` | Interactive foreground process — attaches stdin/stdout/stderr to the tmux session. | `restart: no` |
 | `claude-watch` | Long-running daemon — observes the in-container claude pane via tmux capture-pane. | `restart: on_failure` |
 | `crond` | Long-running daemon — runs `/etc/cron.d/cw-default` + any operator entries in `/etc/cron.d/private/`. | `restart: on_failure` |
-| `cw-watcher-supervisor` | Long-running supervisor — respawns the operator-baked watchers (claude-event-watch etc.). | `restart: on_failure` |
+
+> A `cw-watcher-supervisor` process used to be part of this set. The supervisor binary was removed when watchers moved to session-scoped `run_in_background` tasks (block-print-exit contract — see [`container/watchers/README.md`](watchers/README.md)); the in-container session launches and restarts watchers itself via the `/claude-container:start-watchers` skill.
 
 Why process-compose (escalation past the prior tini threshold):
 
@@ -272,7 +273,6 @@ Each long-running process honors a per-service env-var opt-out. `entrypoint.sh` 
 |---------|--------|
 | `CLAUDE_CONTAINER_DAEMON=0` | Disables the `claude-watch` process. |
 | `CLAUDE_CONTAINER_CRON=0` | Disables the `crond` process. |
-| `CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0` | Disables the `cw-watcher-supervisor` process. |
 
 Disabling a process makes process-compose skip it entirely (`disabled: true` in the rendered config). The interactive `tmux-attach` process always runs — it's what holds the container open from docker's perspective.
 
@@ -421,7 +421,7 @@ on-disk schema, the bake target, and the add-a-new-entry walkthrough.
 | --- | --- | --- | --- |
 | [`container/skills/`](skills/) | `/opt/claude-container/skills/` (canonical) + `/opt/claude-container/plugin/commands/` (plugin loader) | One `<name>.md` per slash command | `--plugin-dir /opt/claude-container/plugin` (added to `CLAUDE_CMD` by `entrypoint.sh`); skills callable as `/claude-container:<name>` |
 | [`container/agents/`](agents/) | `/opt/claude-container/agents/` (canonical) + `/opt/claude-container/plugin/agents/` (plugin loader) | One `<name>.md` per custom agent (frontmatter + body) | Same `--plugin-dir`; agents spawned with `subagent_type="claude-container:<name>"` |
-| [`container/watchers/`](watchers/) | `/opt/claude-container/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per watcher (a one-shot, fire-and-exit tool — blocks, prints events, exits) | Auto-launched at container start by `cw-watcher-supervisor` (entrypoint-spawned, respawn-on-exit per `restart_policy`). The `/claude-container:start-watchers` skill is an informational probe. Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
+| [`container/watchers/`](watchers/) | `/opt/claude-container/watchers/` | One `<name>.sh` launcher + `<name>.toml` metadata per watcher (a one-shot, fire-and-exit tool — blocks, prints events, exits) | Launched by the in-container session via the `/claude-container:start-watchers` skill as session-scoped `run_in_background` tasks; the session restarts each watcher on exit (block-print-exit contract). Authoring guide: [`docs/adding-watchers.md`](../docs/adding-watchers.md) |
 
 The plugin namespace `claude-container` is set by
 [`container/plugin/.claude-plugin/plugin.json`](plugin/.claude-plugin/plugin.json),
@@ -434,16 +434,16 @@ plugin loader treats the baked dir as a real plugin.
 - Skills: [`restart`](skills/restart.md) (mirrors the host's `/restart`
   but invokes the in-container `cwsr` instead of `claude-watch update
   --force`); [`start-watchers`](skills/start-watchers.md)
-  (informational probe — reports which watchers are running under
-  the container-level `cw-watcher-supervisor`).
+  (launches the baked watchers as session-scoped `run_in_background`
+  tasks and documents the restart-on-exit contract).
 - Agents: none yet — the dir is a stub for future agent ports (Explore,
   general-purpose, note-writer, etc. — see
   [`container/agents/README.md`](agents/README.md) for the plan).
 - Watchers: [`claude-event-watch`](watchers/claude-event-watch.sh)
   (blocks until a `~/claude-events/*.json` event arrives, prints
-  pending events, and exits — fire-and-exit contract). Supervised by
-  `cw-watcher-supervisor`, which entrypoint.sh spawns at container
-  start; watchers respawn-on-exit per their `restart_policy`.
+  pending events, and exits — fire-and-exit contract). Launched by the
+  session via `/claude-container:start-watchers`; the session restarts
+  it on each exit.
 
 To add a new skill / agent / watcher: drop the file in the appropriate
 `container/<dir>/`, add a test under `container/tests/baked-dirs.test`
