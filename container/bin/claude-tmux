@@ -119,7 +119,7 @@ Environment overrides:
                            bind-mount at the SAME path inside the container,
                            read-only. Required when ~/.claude/settings.json
                            references a host-only path (e.g. corp telemetry
-                           hook at /Users/<you>/.devbar/bin/telemetry-hook).
+                           hook at /Users/<you>/.local/bin/telemetry-hook).
                            Missing dir = silently skipped.
   CLAUDE_HOST_PROJECT_DIR  Absolute host path to make the in-container cwd.
                            Bind-mounted at the SAME path inside the container
@@ -282,7 +282,7 @@ done < <(env | grep -E '^(CLAUDE|ANTHROPIC)_' | cut -d= -f1 | sort -u || true)
 # -----------------------------------------------------------------------------
 # Corporate-network passthrough: SSL CA bundles + proxy settings.
 #
-# Why: operators on enterprise VPNs (Salesforce, etc.) inject a corp CA into
+# Why: operators on enterprise VPNs inject a corp CA into
 # their host's NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / etc. so HTTPS to corp
 # endpoints validates. Without forwarding, the in-container claude binary
 # trips on "Unable to connect to API: SSL certificate verification failed.
@@ -356,7 +356,7 @@ done
 #
 # When ~/.claude/settings.json (which IS bind-mounted into the container)
 # references hook scripts by absolute host path — e.g. a corporate
-# telemetry hook at /Users/<you>/.devbar/bin/telemetry-hook — the path
+# telemetry hook at /Users/<you>/.local/bin/telemetry-hook — the path
 # doesn't exist inside the container and Claude Code surfaces
 # "SessionStart:startup hook error — /bin/sh: 1: <path>: not found".
 #

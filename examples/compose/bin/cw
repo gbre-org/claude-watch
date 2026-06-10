@@ -205,6 +205,16 @@ fi
 # -----------------------------------------------------------------------------
 
 if [ "$UP_FIRST" = "1" ] && [ "$PRINT_CMD" = "0" ]; then
+    # Host-side init BEFORE `up -d`: bridge the macOS Keychain Claude token
+    # into the dir-mounted ~/.claude/.credentials.json (fail-closed — a
+    # locked keychain / missing login aborts the up so we never start a
+    # logged-out container) and one-time-seed the container-only
+    # ~/.claude.json so it isn't a desync-prone single-file bind mount.
+    # No-op on Linux. Skip if the operator removed/relocated the helper.
+    prep="$CW_COMPOSE_DIR/bin/prepare-host-claude-state"
+    if [ -x "$prep" ]; then
+        "$prep"
+    fi
     "${DOCKER_CMD[@]}" compose --project-directory "$CW_COMPOSE_DIR" up -d
 fi
 

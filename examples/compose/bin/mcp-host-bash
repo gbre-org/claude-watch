@@ -6,7 +6,7 @@
 # What this gives you
 #
 # A second MCP server visible inside the containerised claude (alongside
-# any other bridged servers such as the Salesforce mcp-adaptor) that
+# any other bridged servers such as a corp host-mcp-server) that
 # exposes a single `run_command` tool. The tool executes argv against
 # whitelisted binaries on the **host**, so the container can drive
 # host-only operations (corp git, host-only CLIs, scripts under the
@@ -35,7 +35,7 @@
 #
 #   - mcp-proxy:     PyPI 'mcp-proxy'. Hosts a stdio MCP server over
 #                    HTTP. Same component validated in v24 workbot for
-#                    the mcp-adaptor bridge.
+#                    the host-mcp-server bridge.
 #   - cli-mcp-server: PyPI 'cli-mcp-server'. Generic stdio MCP server
 #                    with an `run_command` tool and an env-var-driven
 #                    allow-list (ALLOWED_COMMANDS / ALLOWED_FLAGS /
@@ -142,8 +142,8 @@
 #
 #   CW_PROFILE=corp-dev (default): the read-y dev-tooling floor — file
 #       inspection, text munging, VCS, language toolchains (node / npm /
-#       python / make / etc.), common corp-dev binaries (envchain / sfdx
-#       / jenkins-builds), and read-only network probes (ping / dig /
+#       python / make / etc.), common corp-dev binaries (envchain /
+#       jenkins-builds), and read-only network probes (ping / dig /
 #       host / nslookup). Excludes anything that writes off-host or
 #       mutates system state.
 #   CW_PROFILE=corp-dev-trusted: adds host-scheduling tooling (cron /
@@ -189,8 +189,8 @@
 #
 #   CLAUDE_MCP_HTTP_BRIDGE=host-bash=http://host.docker.internal:8766/mcp
 #
-# (Combine with the existing mcp-adaptor entry via `:` if you have both:
-#   CLAUDE_MCP_HTTP_BRIDGE=mcp-adaptor=...8765/mcp:host-bash=...8766/mcp )
+# (Combine with the existing host-mcp-server entry via `:` if you have both:
+#   CLAUDE_MCP_HTTP_BRIDGE=host-mcp-server=...8765/mcp:host-bash=...8766/mcp )
 #
 # Inside the container, after `docker compose up -d`:
 #   claude mcp list                # should show host-bash, Connected
@@ -220,9 +220,12 @@ DEFAULT_PORT=8766
 #   - shell discovery: pwd, echo, which, env, printenv, hostname, uname,
 #     date, basename, dirname
 #   - language toolchains: node, npm, yarn, python, python3, pip, make
-#   - corp-dev toolset (Andrew/ACME_ORG surface): envchain, jenkins-builds,
-#     sfdx, force, sf, sfdc
+#   - corp-dev toolset (examples): envchain, jenkins-builds
 #   - read-y network probes: ping, host, dig, nslookup
+#
+# Operators add their own corp-dev CLIs (cloud SDKs, deploy tools, etc.)
+# via an explicit ALLOWED_COMMANDS in ~/.config/claude-container/mcp-host-bash.env,
+# which fully replaces this default (see the precedence note below).
 #
 # Deliberately NOT in the default (escalation requires CW_PROFILE=corp-dev-trusted):
 #   - curl, wget, scp — write files / push bytes off-host
@@ -230,7 +233,7 @@ DEFAULT_PORT=8766
 #   - bash, sh, zsh, fish — arbitrary script exec
 #   - rm, chmod, mv, cp — destructive / privilege-changing
 #   - crontab, launchctl, systemctl, schtasks — host scheduling
-DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,host,dig,nslookup,envchain,jenkins-builds,sfdx,force,sf,sfdc"
+DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,host,dig,nslookup,envchain,jenkins-builds"
 DEFAULT_ALLOWED_FLAGS="all"
 DEFAULT_COMMAND_TIMEOUT=30
 DEFAULT_ALLOW_SHELL_OPERATORS="false"

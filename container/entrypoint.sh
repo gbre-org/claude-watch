@@ -160,7 +160,7 @@ unset _user_bin _script
 # pre-PR-#147 behaviour exactly). Set to a colon-separated list of
 # globs to wrap only matching commands; first whitespace-separated
 # token of each command is matched against each glob (fnmatch.fnmatchcase).
-# Example: CLAUDE_SHIM_PATTERNS='/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*'
+# Example: CLAUDE_SHIM_PATTERNS='/Users/*/.local/bin/*:/Users/*/.local/pkgs/*/bin/*'
 # Both generate-hooks-shim-settings and generate-project-mcp-json honor
 # this env var natively (they each have a `--shim-patterns` flag that
 # defaults to $CLAUDE_SHIM_PATTERNS), so we don't need to plumb the
@@ -267,7 +267,7 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_HOST_PROJECT_DIR" ]; then
         # CLAUDE_MCP_HTTP_BRIDGE — colon-separated `name=url` pairs.
         # Cross-arch MCP servers (e.g. macOS Mach-O like the
-        # Salesforce mcp-adaptor) can't exec inside the Linux
+        # a corp host-mcp-server) can't exec inside the Linux
         # container; exec-hook silent-no-ops them, which surfaces in
         # /mcp as "Failed to reconnect: ENOENT". When the operator
         # runs a host-side HTTP→stdio adapter for those binaries

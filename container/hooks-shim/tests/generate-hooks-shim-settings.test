@@ -136,7 +136,7 @@ def test_single_command_wrapped() -> None:
                     {
                         "matcher": "startup|resume",
                         "hooks": [
-                            {"type": "command", "command": "/Users/me/.devbar/bin/telemetry-hook"},
+                            {"type": "command", "command": "/Users/me/.local/bin/telemetry-hook"},
                         ],
                     },
                 ],
@@ -145,7 +145,7 @@ def test_single_command_wrapped() -> None:
         run_helper(str(inp), str(out))
         result = load_output(out)
         cmd = result["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-        expect(cmd == f"{EXEC_HOOK} /Users/me/.devbar/bin/telemetry-hook",
+        expect(cmd == f"{EXEC_HOOK} /Users/me/.local/bin/telemetry-hook",
                f"single-cmd: wrapper missing, got {cmd!r}")
 
 
@@ -328,14 +328,14 @@ def test_realistic_corp_settings() -> None:
                     {
                         "matcher": "startup|resume",
                         "hooks": [
-                            {"type": "command", "command": "/Users/hallandrew/.devbar/bin/telemetry-hook session-start"},
+                            {"type": "command", "command": "/Users/me/.local/bin/telemetry-hook session-start"},
                         ],
                     },
                 ],
                 "UserPromptSubmit": [
                     {
                         "hooks": [
-                            {"type": "command", "command": "/Users/hallandrew/.devbar/bin/telemetry-hook prompt-submit"},
+                            {"type": "command", "command": "/Users/me/.local/bin/telemetry-hook prompt-submit"},
                         ],
                     },
                 ],
@@ -344,7 +344,7 @@ def test_realistic_corp_settings() -> None:
                         "matcher": "Bash",
                         "hooks": [
                             {"type": "command", "command": "check-no-bg-ampersand"},
-                            {"type": "command", "command": "/Users/hallandrew/.devbar/bin/telemetry-hook pre-tool"},
+                            {"type": "command", "command": "/Users/me/.local/bin/telemetry-hook pre-tool"},
                         ],
                     },
                 ],
@@ -357,7 +357,7 @@ def test_realistic_corp_settings() -> None:
         # shim is transparent on ELF + shebang, so this is safe.
         expect(
             result["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-            == f"{EXEC_HOOK} /Users/hallandrew/.devbar/bin/telemetry-hook session-start",
+            == f"{EXEC_HOOK} /Users/me/.local/bin/telemetry-hook session-start",
             "corp: SessionStart command should be wrapped with args preserved",
         )
         expect(
@@ -377,7 +377,7 @@ def test_mcp_servers_pass_through_unchanged() -> None:
         write_json(inp, {
             "mcpServers": {
                 "telemetry": {
-                    "command": "/Users/me/.devbar/bin/mcp-adaptor",
+                    "command": "/Users/me/.local/bin/host-mcp-server",
                     "args": ["--port", "9999"],
                 },
             },
@@ -390,7 +390,7 @@ def test_mcp_servers_pass_through_unchanged() -> None:
         # mcpServers passes through verbatim — NOT wrapped.
         telem = result["mcpServers"]["telemetry"]
         expect(
-            telem["command"] == "/Users/me/.devbar/bin/mcp-adaptor",
+            telem["command"] == "/Users/me/.local/bin/host-mcp-server",
             f"mcp-passthrough: command should NOT be wrapped here, got {telem['command']!r}",
         )
         expect(
@@ -411,15 +411,15 @@ def test_mcp_servers_pass_through_unchanged() -> None:
 
 
 def _settings_with_three_paths() -> dict:
-    """Common input: one command per "/Users/me/.devbar/bin/X",
-    "/Users/me/.devbar/pkgs/y/bin/X", and "/opt/local/bin/X". Used by
+    """Common input: one command per "/Users/me/.local/bin/X",
+    "/Users/me/.local/pkgs/y/bin/X", and "/opt/local/bin/X". Used by
     several pattern tests."""
     return {
         "hooks": {
             "Stop": [
                 {"hooks": [
-                    {"type": "command", "command": "/Users/me/.devbar/bin/telemetry"},
-                    {"type": "command", "command": "/Users/me/.devbar/pkgs/foo/bin/telemetry"},
+                    {"type": "command", "command": "/Users/me/.local/bin/telemetry"},
+                    {"type": "command", "command": "/Users/me/.local/pkgs/foo/bin/telemetry"},
                     {"type": "command", "command": "/opt/local/bin/native-tool"},
                 ]},
             ],
@@ -464,18 +464,18 @@ def test_pattern_narrow_match_only_wraps_matches() -> None:
         inp = Path(td) / "in.json"
         out = Path(td) / "out.json"
         write_json(inp, _settings_with_three_paths())
-        run_helper(str(inp), str(out), patterns="/Users/*/.devbar/bin/*")
+        run_helper(str(inp), str(out), patterns="/Users/*/.local/bin/*")
         cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
-        # Only the first command matches /Users/*/.devbar/bin/* (the
+        # Only the first command matches /Users/*/.local/bin/* (the
         # /pkgs/ path has more segments and doesn't match this glob;
         # /opt/local doesn't match either).
         expect(
-            cmds[0] == f"{EXEC_HOOK} /Users/me/.devbar/bin/telemetry",
-            f"narrow: /Users/me/.devbar/bin/telemetry should be wrapped, got {cmds[0]!r}",
+            cmds[0] == f"{EXEC_HOOK} /Users/me/.local/bin/telemetry",
+            f"narrow: /Users/me/.local/bin/telemetry should be wrapped, got {cmds[0]!r}",
         )
         expect(
-            cmds[1] == "/Users/me/.devbar/pkgs/foo/bin/telemetry",
-            f"narrow: /pkgs/ path should NOT match /Users/*/.devbar/bin/*, got {cmds[1]!r}",
+            cmds[1] == "/Users/me/.local/pkgs/foo/bin/telemetry",
+            f"narrow: /pkgs/ path should NOT match /Users/*/.local/bin/*, got {cmds[1]!r}",
         )
         expect(
             cmds[2] == "/opt/local/bin/native-tool",
@@ -492,7 +492,7 @@ def test_multiple_patterns_union_match() -> None:
         run_helper(
             str(inp),
             str(out),
-            patterns="/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*",
+            patterns="/Users/*/.local/bin/*:/Users/*/.local/pkgs/*/bin/*",
         )
         cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
         # Both /Users/ paths match (different globs); /opt/local doesn't.
@@ -534,7 +534,7 @@ def test_env_var_supplies_patterns_when_flag_absent() -> None:
         run_helper(
             str(inp),
             str(out),
-            env_patterns="/Users/*/.devbar/bin/*",
+            env_patterns="/Users/*/.local/bin/*",
         )
         cmds = [h["command"] for h in load_output(out)["hooks"]["Stop"][0]["hooks"]]
         expect(
@@ -542,7 +542,7 @@ def test_env_var_supplies_patterns_when_flag_absent() -> None:
             f"env: /Users/.../bin path should be wrapped via env, got {cmds[0]!r}",
         )
         expect(
-            cmds[1] == "/Users/me/.devbar/pkgs/foo/bin/telemetry",
+            cmds[1] == "/Users/me/.local/pkgs/foo/bin/telemetry",
             f"env: /pkgs/ should NOT match, got {cmds[1]!r}",
         )
 
@@ -576,14 +576,14 @@ def test_pattern_matches_command_with_args() -> None:
         write_json(inp, {
             "hooks": {
                 "Stop": [{"hooks": [
-                    {"type": "command", "command": "/Users/me/.devbar/bin/hook --flag value | grep foo"},
+                    {"type": "command", "command": "/Users/me/.local/bin/hook --flag value | grep foo"},
                 ]}],
             },
         })
-        run_helper(str(inp), str(out), patterns="/Users/*/.devbar/bin/*")
+        run_helper(str(inp), str(out), patterns="/Users/*/.local/bin/*")
         cmd = load_output(out)["hooks"]["Stop"][0]["hooks"][0]["command"]
         expect(
-            cmd == f"{EXEC_HOOK} /Users/me/.devbar/bin/hook --flag value | grep foo",
+            cmd == f"{EXEC_HOOK} /Users/me/.local/bin/hook --flag value | grep foo",
             f"args-not-matched: shell args should NOT participate in matching, got {cmd!r}",
         )
 
@@ -697,7 +697,7 @@ def test_obligations_preserves_host_hooks() -> None:
                         "matcher": "startup|resume",
                         "hooks": [
                             {"type": "command",
-                             "command": "/Users/me/.devbar/bin/telemetry"},
+                             "command": "/Users/me/.local/bin/telemetry"},
                         ],
                     },
                 ],
@@ -708,7 +708,7 @@ def test_obligations_preserves_host_hooks() -> None:
         # Host hook still present + wrapped.
         ss = _collect_hook_commands(result, "SessionStart", "startup|resume")
         expect(
-            f"{EXEC_HOOK} /Users/me/.devbar/bin/telemetry" in ss,
+            f"{EXEC_HOOK} /Users/me/.local/bin/telemetry" in ss,
             f"preserve: host SessionStart hook should be wrapped + present, got {ss}",
         )
         # Obligations hooks all present.
@@ -735,7 +735,7 @@ def test_obligations_only_drops_host_hooks() -> None:
                         "matcher": "startup|resume",
                         "hooks": [
                             {"type": "command",
-                             "command": "/Users/me/.devbar/bin/telemetry"},
+                             "command": "/Users/me/.local/bin/telemetry"},
                         ],
                     },
                 ],
@@ -834,6 +834,88 @@ def test_obligations_only_writes_output_with_missing_input() -> None:
 # Run
 # ---------------------------------------------------------------------------
 
+def test_apikeyhelper_dropped_when_path_missing() -> None:
+    """A host-only absolute apiKeyHelper path that doesn't exist in the
+    container is dropped (the macOS host-helper leak case)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "apiKeyHelper": "'/Users/me/.local/bin/get-api-key' auth claude",
+            "env": {"FOO": "bar"},
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/p/x"}]}]},
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect("apiKeyHelper" not in result,
+               f"apikeyhelper: missing-path helper should be dropped, got {result.get('apiKeyHelper')!r}")
+        # Other top-level keys + hook rewrite still happen.
+        expect(result["env"] == {"FOO": "bar"},
+               "apikeyhelper: unrelated keys must survive the drop")
+        expect(result["hooks"]["Stop"][0]["hooks"][0]["command"] == f"{EXEC_HOOK} /p/x",
+               "apikeyhelper: hooks still wrapped alongside the drop")
+
+
+def test_apikeyhelper_dropped_when_macho() -> None:
+    """A present-but-Mach-O apiKeyHelper target is dropped (can't exec on Linux)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        macho = Path(td) / "helper-macho"
+        # Mach-O 64-bit magic 0xFEEDFACF (little-endian on disk: cf fa ed fe).
+        macho.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        macho.chmod(0o755)
+        write_json(inp, {"apiKeyHelper": f"{macho} auth claude"})
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect("apiKeyHelper" not in result,
+               f"apikeyhelper: Mach-O helper should be dropped, got {result.get('apiKeyHelper')!r}")
+
+
+def test_apikeyhelper_kept_when_elf() -> None:
+    """A real ELF helper (Linux host) is preserved verbatim."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        elf = Path(td) / "helper-elf"
+        elf.write_bytes(b"\x7fELF" + b"\x00" * 32)
+        elf.chmod(0o755)
+        cmd = f"{elf} auth claude"
+        write_json(inp, {"apiKeyHelper": cmd})
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(result.get("apiKeyHelper") == cmd,
+               f"apikeyhelper: ELF helper should be kept verbatim, got {result.get('apiKeyHelper')!r}")
+
+
+def test_apikeyhelper_kept_when_shebang() -> None:
+    """A shebang script helper is runnable and preserved."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        script = Path(td) / "helper.sh"
+        script.write_text("#!/bin/sh\necho key\n")
+        script.chmod(0o755)
+        write_json(inp, {"apiKeyHelper": str(script)})
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(result.get("apiKeyHelper") == str(script),
+               f"apikeyhelper: shebang helper should be kept, got {result.get('apiKeyHelper')!r}")
+
+
+def test_apikeyhelper_kept_when_bare_command() -> None:
+    """A bare command name (PATH lookup, no slash) is assumed runtime-
+    resolvable and kept — we only strip absolute-path leaks."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"apiKeyHelper": "get-my-key --json"})
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(result.get("apiKeyHelper") == "get-my-key --json",
+               f"apikeyhelper: bare command should be kept, got {result.get('apiKeyHelper')!r}")
+
+
 TESTS = [
     test_no_hooks_key_passthrough,
     test_empty_hooks_dict_passthrough,
@@ -841,6 +923,11 @@ TESTS = [
     test_already_wrapped_not_double_wrapped,
     test_multi_event_multi_hook_all_wrapped,
     test_other_top_level_keys_preserved,
+    test_apikeyhelper_dropped_when_path_missing,
+    test_apikeyhelper_dropped_when_macho,
+    test_apikeyhelper_kept_when_elf,
+    test_apikeyhelper_kept_when_shebang,
+    test_apikeyhelper_kept_when_bare_command,
     test_malformed_hooks_tree_no_exception,
     test_missing_input_no_output,
     test_unparseable_input_no_output,

@@ -21,8 +21,8 @@ Usage:
     audit-hooks --test             # run embedded test suite
 
 Output (human mode):
-    audit-hooks: SessionStart.startup|resume -> exec-hook /Users/me/.devbar/...
-      target: /Users/me/.devbar/bin/telemetry-hook
+    audit-hooks: SessionStart.startup|resume -> exec-hook /Users/me/.local/...
+      target: /Users/me/.local/bin/telemetry-hook
       magic:  feedfacf (Mach-O 64-bit)
       fate:   silent-no-op (exec-hook intercepts)
 
@@ -439,7 +439,7 @@ def run_tests() -> int:
             "Stop": [
                 {
                     "hooks": [
-                        {"type": "command", "command": "exec-hook /Users/me/.devbar/bin/telemetry"},
+                        {"type": "command", "command": "exec-hook /Users/me/.local/bin/telemetry"},
                     ],
                 },
             ],
@@ -460,7 +460,7 @@ def run_tests() -> int:
         expect(stop.fate in ("missing", "silent-no-op"),
                f"Stop hook fate {stop.fate!r}; want missing (file absent on test host) "
                f"or silent-no-op")
-        expect(stop.wrapped_target == "/Users/me/.devbar/bin/telemetry",
+        expect(stop.wrapped_target == "/Users/me/.local/bin/telemetry",
                f"Stop wrapped_target {stop.wrapped_target!r}")
 
     # Bare reference to a non-ELF target → not-wrapped (the actionable bug)
@@ -470,7 +470,7 @@ def run_tests() -> int:
                 {
                     "matcher": "*",
                     "hooks": [
-                        {"type": "command", "command": "/Users/me/.devbar/bin/missing-bin"},
+                        {"type": "command", "command": "/Users/me/.local/bin/missing-bin"},
                     ],
                 },
             ],

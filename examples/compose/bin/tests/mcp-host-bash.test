@@ -303,7 +303,7 @@ EXPECTED_DEFAULT_ALLOWED = (
     "ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,"
     "wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,"
     "hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,"
-    "host,dig,nslookup,envchain,jenkins-builds,sfdx,force,sf,sfdc"
+    "host,dig,nslookup,envchain,jenkins-builds"
 )
 
 
@@ -333,15 +333,16 @@ def test_cw_profile_corp_dev_equals_default() -> None:
 
 
 def test_default_includes_corp_dev_tooling() -> None:
-    """Default profile must include the SF/ACME_ORG corp-dev tooling
-    Andrew bumped into (envchain, jenkins-builds, sfdx, force, sf, sfdc)
-    plus the standard dev-language toolchains and read-y network probes
-    so the day-to-day workflow doesn't need CW_PROFILE flips."""
+    """Default profile must include the example corp-dev tooling
+    (envchain, jenkins-builds) plus the standard dev-language toolchains
+    and read-y network probes so the day-to-day workflow doesn't need
+    CW_PROFILE flips. Operator-specific CLIs (cloud SDKs, deploy tools)
+    are added via an explicit ALLOWED_COMMANDS override, NOT the default."""
     lines, _, _, _ = run_script(["--print-cmd"])
     idx = lines.index("ALLOWED_COMMANDS")
     cmd_list = [c.strip() for c in lines[idx + 1].split(",")]
-    # Corp-dev binaries (the gap that surfaced 2026-05-14).
-    for needed in ("envchain", "jenkins-builds", "sfdx", "force", "sf", "sfdc"):
+    # Example corp-dev binaries shipped in the default.
+    for needed in ("envchain", "jenkins-builds"):
         expect(
             needed in cmd_list,
             f"default must include corp-dev tool {needed!r}; got {cmd_list}",

@@ -111,7 +111,7 @@ all that's needed.
    continuing (some host-side instructions are unsafe to run in a
    container; some container-side ones are unsafe on the host).
 2. **MCP bridges reachable**: run `claude mcp list`. Expected to see at
-   least `mcp-adaptor` and (if the operator configured it) `host-bash`,
+   least `host-mcp-server` and (if the operator configured it) `host-bash`,
    each with a `Connected` status. If a bridge shows as failed, note it
    for the operator — many corp workflows depend on these.
 3. **Hook fate**: run `audit-hooks` (no args). The summary line reports
@@ -1074,7 +1074,7 @@ so the host file is never mutated.
 
 **Implication for corporate telemetry hooks**: a Mac-host telemetry
 binary referenced from `~/.claude/settings.json` (typical pattern: under
-`~/.devbar/bin/` or similar) by default **does not fire inside the
+`~/.local/bin/` or similar) by default **does not fire inside the
 container**. exec-hook detects the Mach-O and silently no-ops — the
 alternative ("Exec format error" on every hook event) is worse. If your
 team requires telemetry from container sessions, the options are:
@@ -1170,7 +1170,7 @@ This Claude Code session runs inside an isolated container. Its strengths
 and limits:
 
 - **Strong fit**: writing code in `${CLAUDE_HOST_PROJECT_DIR}`, talking
-  to APIs the operator has bridged in (corp gateways via mcp-adaptor,
+  to APIs the operator has bridged in (corp gateways via host-mcp-server,
   off-the-shelf MCP servers, the Anthropic API). All TLS chains terminate
   at the in-container Node / Python; corporate-CA bundles forward
   through `NODE_EXTRA_CA_CERTS` etc. when the operator wires them up.
