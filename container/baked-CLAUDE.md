@@ -1304,7 +1304,19 @@ Events that demand a response within a reasonable window: torrent-
 completed (needs agent spawn), manual/request-fulfilled (needs requester
 DM), queue/queue-api-dead (needs respawn decision), fatal claude-watch
 alerts (CONTEXT CRITICALLY LOW, main pane crashed), PR CI failure /
-success, workbot-prompt, queue-stale-ready, slack-unread.
+success, workbot-prompt, queue-stale-ready, slack-unread,
+**claude-watch/heartbeat-tick**.
+
+> **`heartbeat-tick` — touch the heartbeat file.** Every ~5 min the
+> claude-watch daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat
+> tick [path=<FILE> interval_secs=…]`. When you see it, run **`touch
+> <FILE>`** (the path on the event line, e.g. `touch /tmp/claude-heartbeat`).
+> That file is the daemon's wedge-detector: it watches the file's mtime and,
+> if it goes stale (~10 min), fires a "heartbeat stale" alert and may try to
+> recover a loop it thinks is wedged. The touch MUST come from you acting on
+> the event (it proves the loop is alive) — the daemon deliberately never
+> touches the file itself. This is a one-command self-service action; it does
+> not need an agent spawn or an `event-ack` transaction, just the `touch`.
 
   - Routed by `event-ack ingest` into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-

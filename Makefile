@@ -433,8 +433,20 @@ compose-down:
 # before the fresh one starts, so `--force-recreate` succeeds every
 # time. Named volumes survive (no -v), so claude state / versions / the
 # tmux socket dir persist across the redeploy.
+#
+# Host-side init (prepare-host-claude-state) runs FIRST, mirroring
+# `cw --up`: on macOS it bridges the Keychain Claude token into the
+# dir-mounted ~/.claude/.credentials.json (fail-closed — a locked
+# keychain aborts the redeploy so we never recreate into a logged-out
+# container) and one-time-seeds the container-only ~/.claude.json.
+# It is a clean no-op on Linux and when run from INSIDE the container
+# (no `security` CLI), and it never tears down the running container,
+# so the recipe shell survives to issue the atomic recreate below —
+# the self-redeploy contract is preserved. Guarded by `-x` exactly as
+# cw does, so a removed/relocated helper just skips the step.
 redeploy:
 	@cd examples/compose && \
+	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
 	  docker compose up -d --force-recreate claude-container
 
 # Clean build artifacts

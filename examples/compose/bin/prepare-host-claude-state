@@ -65,6 +65,31 @@ SEED_SOURCE="${CLAUDE_SEED_SOURCE:-$HOME/.claude.json}"
 log()  { printf 'prepare-host-claude-state: %s\n' "$*" >&2; }
 fatal() { log "ERROR: $*"; exit 1; }
 
+# Load the compose .env so operator config (CLAUDE_HOST_PREP_HOOK,
+# CLAUDE_HOST_CONFIG_FILE, ...) is visible here. compose auto-loads .env for
+# its OWN interpolation, but this prep runs as a separate subprocess BEFORE
+# `docker compose up`, so without this it would not see those vars. Existing
+# environment wins over .env (so a caller can still override). Lines are
+# plain KEY=VALUE; we don't execute the file, just export simple assignments.
+PREP_ENV_FILE="${CW_COMPOSE_ENV:-$(cd "$(dirname "$0")/.." && pwd)/.env}"
+if [ -f "$PREP_ENV_FILE" ]; then
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in
+            ''|\#*) continue ;;                  # blank / comment
+            *=*)
+                _k="${_line%%=*}"
+                case "$_k" in
+                    *[!A-Za-z0-9_]*) continue ;; # not a clean var name
+                esac
+                # Only set if not already in the environment (env wins).
+                if [ -z "${!_k+x}" ]; then
+                    export "$_k=${_line#*=}"
+                fi
+                ;;
+        esac
+    done < "$PREP_ENV_FILE"
+fi
+
 # ---------------------------------------------------------------------------
 # macOS-only by design. `security` is the tell: absent => not a Mac (or a
 # stripped-down macOS), so both jobs are no-ops and the Linux bind-mount
@@ -182,6 +207,30 @@ else
         log "config seed: seeded $SEED_TARGET from $SEED_SOURCE (one-time; container owns it hereafter)"
     else
         log "WARNING: config seed from $SEED_SOURCE -> $SEED_TARGET failed — in-container claude will start from empty config (recoverable). Continuing."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# JOB 3 — operator hook (FAIL-CLOSED when present)
+# ---------------------------------------------------------------------------
+# Optional site-specific host-prep that must run before `up -d`, kept OUT of
+# this public repo. Set CLAUDE_HOST_PREP_HOOK to an executable; it runs here
+# with the same env. Typical use: refresh a corp API token into the
+# compose .env, regenerate a sanitized managed-settings.json, etc.
+#
+# Fail-CLOSED: if the hook is set and FAILS, we abort (non-zero) so we never
+# bring the stack up with stale/missing site config — same posture as the
+# auth bridge. Unset or non-executable => silent skip (default, public-safe).
+PREP_HOOK="${CLAUDE_HOST_PREP_HOOK:-}"
+if [ -n "$PREP_HOOK" ]; then
+    if [ -x "$PREP_HOOK" ]; then
+        log "operator hook: running $PREP_HOOK"
+        if ! "$PREP_HOOK"; then
+            fatal "operator hook $PREP_HOOK failed — aborting so we don't start with stale site config. Fix it and retry."
+        fi
+        log "operator hook: $PREP_HOOK completed"
+    else
+        fatal "CLAUDE_HOST_PREP_HOOK=$PREP_HOOK is set but not executable — refusing to silently skip site prep."
     fi
 fi
 

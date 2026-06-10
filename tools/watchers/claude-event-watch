@@ -225,7 +225,28 @@ message = str(ev.get("message", ""))
 message = " ".join(message.split())
 if len(message) > 60:
     message = message[:60] + "…"
-print(f"EVENT[{source}/{tag}] {message}")
+
+# Surface scalar fields from the event's `data` object on the one-liner so
+# the main loop can act WITHOUT re-reading the JSON file. Many events carry
+# the actionable payload there (e.g. heartbeat-tick's `path` = the heartbeat
+# file to touch); without this the loop sees only an opaque message and can't
+# tell what to do. Only flat string/number/bool values are appended (nested
+# objects/arrays stay in the logged JSON); rendered as ` key=value` pairs in
+# sorted order for determinism.
+data = ev.get("data")
+suffix = ""
+if isinstance(data, dict):
+    parts = []
+    for k in sorted(data):
+        v = data[k]
+        if isinstance(v, bool) or isinstance(v, (int, float, str)):
+            sv = " ".join(str(v).split())
+            if len(sv) > 80:
+                sv = sv[:80] + "…"
+            parts.append(f"{k}={sv}")
+    if parts:
+        suffix = " [" + " ".join(parts) + "]"
+print(f"EVENT[{source}/{tag}] {message}{suffix}")
 
 # Compact one-line JSON for the log; ensure_ascii keeps the line PIPE_BUF-safe
 # even with multibyte chars in the message field.
