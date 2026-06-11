@@ -230,6 +230,58 @@ if ! grep -q 'late' <<<"$run2"; then
 fi
 echo "  no-loss: late event persisted and surfaced on next run OK"
 
+# --- TOCTOU gap-event / bounded-block loop test --------------------------
+# Regression for the check-then-block race: the watcher's catch-up scan finds
+# an empty queue, then arms inotifywait. An event landing in the gap before
+# inotifywait's watch is armed would, with an UNBOUNDED block, be invisible to
+# inotifywait (it only fires on events AFTER arming) and sit unconsumed until
+# some LATER unrelated event woke it — long enough for the cron health-check
+# to false-flag "WATCHER DOWN". The fix bounds the block with `inotifywait -t`
+# and loops back to the catch-up scan, so a gap-event is drained within one
+# timeout window.
+#
+# We can't deterministically hit the microsecond arm-gap, but we can assert the
+# equivalent guarantee the bounded loop provides: start the watcher on an EMPTY
+# queue (so it arms inotifywait and blocks), then drop an event. Whether the
+# event is caught by inotifywait's wakeup OR by the next iteration's catch-up
+# scan after a timeout, the bounded loop MUST drain it and exit within a couple
+# of timeout windows. A pre-fix unbounded block that missed the create event
+# would hang here forever (reaped as a FAIL by reap_within).
+GQ="$TMP/gq"; GLOG="$TMP/glog"; GLOCK="$TMP/gap.lock"
+mkdir -p "$GQ" "$GLOG"
+# Short inotify timeout so the catch-up rescan fires quickly even if the create
+# event itself is missed (the gap-event path we're guarding).
+EVENT_WATCH_INOTIFY_TIMEOUT=2 CLAUDE_EVENT_QUEUE="$GQ" \
+    CLAUDE_EVENT_LOG_DIR="$GLOG" CLAUDE_EVENT_WATCH_LOCK="$GLOCK" \
+    "$WATCHER" --debounce 0 >"$TMP/gap.out" 2>&1 &
+GAP=$!
+BG_PIDS+=("$GAP")
+# Let it reach the inotifywait block, then drop an event.
+sleep 1
+write_event "$GQ" "100_gap.json" "gap event"
+# The bounded loop must drain + exit. Allow a generous margin (a few timeout
+# windows) before declaring a hang.
+if ! reap_within "$GAP" 15; then
+    echo "FAIL: watcher did not drain a post-arm event within 15s (TOCTOU loop hung)" >&2
+    cat "$TMP/gap.out" >&2
+    exit 1
+fi
+if ! grep -q '^EVENT\[manual/batch\] gap event' "$TMP/gap.out"; then
+    echo "FAIL: gap event not surfaced by bounded-block loop" >&2
+    cat "$TMP/gap.out" >&2
+    exit 1
+fi
+if ! grep -q 'WATCHER EXITED' "$TMP/gap.out"; then
+    echo "FAIL: gap-event run missing restart banner (fire-and-exit contract)" >&2
+    cat "$TMP/gap.out" >&2
+    exit 1
+fi
+if [[ -n "$(ls "$GQ" 2>/dev/null)" ]]; then
+    echo "FAIL: queue not drained after gap-event surface" >&2
+    exit 1
+fi
+echo "  TOCTOU: post-arm gap event drained + exited within bounded window OK"
+
 # --- flock singleton guard tests -----------------------------------------
 # These verify the watcher self-defends against a duplicate launch racing the
 # same queue. We isolate every instance onto a per-test lockfile via
