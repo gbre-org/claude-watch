@@ -21,7 +21,15 @@ check_interval = 10
 state_file = "/home/hndrewaall/.cache/claude-watch/state.json"
 log_file = "/tmp/claude-watch.jsonl"
 legacy_log_file = "/tmp/claude-watch.log"
-post_interrupt_cooldown_secs = 60
+# Global post-interrupt cooldown (seconds): 5-min outer ceiling on ALL
+# interrupt fires (prolonged-thinking, context-warning, auto-respawn).
+# Raised 60 -> 300 (2026-06-11). Per-type cooldowns stay the inner
+# lower-bound; this is the outer ceiling. User-overridable.
+post_interrupt_cooldown_secs = 300
+# Keep watcher-down EXEMPT from the global ceiling — a down watcher is a
+# hard-liveness escape hatch. Set false to subject watcher-down to the
+# global gate too.
+global_cooldown_exempt_watcher_down = true
 
 [tmux]
 # Pin to the in-container tmux session created by entrypoint.sh.
@@ -63,7 +71,10 @@ resume_prompt = "[CLAUDE-WATCH] (in-container) Daemon detected stuck state."
 
 [foreground_monitor]
 enabled = true
-threshold_seconds = 300
+# Raised 300 -> 480 (2026-06-11) to match the host root config.toml
+# (line ~91, already 480 since 2026-05-30). 300 was clipping legit
+# long agent-spawn composes / agent-return reads as prolonged thinking.
+threshold_seconds = 480
 check_interval = 3
 interrupt_enabled = true
 interrupt_message = "The foreground command was backgrounded by claude-watch because it exceeded the timeout. Use run_in_background for long commands."

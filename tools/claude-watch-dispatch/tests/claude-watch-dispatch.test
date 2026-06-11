@@ -40,6 +40,11 @@ class Harness:
         self.env = os.environ.copy()
         self.env["CLAUDE_WATCH_DISPATCH_STATE_DIR"] = str(self.state_dir)
         self.env["CLAUDE_WATCH_DISPATCH_EXEMPT_PATH"] = str(self.override_path)
+        # Isolate the host-backed threshold config (default
+        # ~/.claude/claude-watch-dispatch.json) so a real host file can't
+        # skew the default-threshold assertions.
+        self.host_config_path = Path(self.tmpdir.name) / "host-dispatch.json"
+        self.env["CLAUDE_WATCH_DISPATCH_CONFIG"] = str(self.host_config_path)
         self.env.pop("CLAUDE_WATCH_DISPATCH_THRESHOLD", None)
         self.env.pop("CLAUDE_WATCH_DISPATCH_ENABLED", None)
         self.env.pop("CLAUDE_WATCH_DISPATCH_BYPASS", None)
@@ -107,7 +112,7 @@ def test_status_json():
                   f"got: {sorted(data.keys())}")
         check(data["count"] == 0, "status --json: fresh count=0",
               f"got: {data['count']}")
-        check(data["threshold"] == 3, "status --json: default threshold=3",
+        check(data["threshold"] == 6, "status --json: default threshold=6",
               f"got: {data['threshold']}")
     finally:
         h.cleanup()

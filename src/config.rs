@@ -63,10 +63,25 @@ pub struct GeneralConfig {
     /// on the newly-started thought. 0 disables the gate.
     #[serde(default = "default_post_interrupt_cooldown_secs")]
     pub post_interrupt_cooldown_secs: u64,
+    /// When true (default), the watcher-down inject path is EXEMPT from
+    /// the global post-interrupt cooldown ceiling. A down watcher is a
+    /// hard-liveness failure (the `*-wait` / `claude-event-watch` family
+    /// is silent), so it must be allowed to fire even when another
+    /// interrupt fired recently. Set false to subject watcher-down to the
+    /// same global ceiling as every other fire path.
+    #[serde(default = "default_global_cooldown_exempt_watcher_down")]
+    pub global_cooldown_exempt_watcher_down: bool,
 }
 
 fn default_post_interrupt_cooldown_secs() -> u64 {
-    60
+    // 5-min global interrupt ceiling (raised 60 -> 300, 2026-06-11). The
+    // outer bound across ALL fire paths; per-type cooldowns are the inner
+    // lower-bound.
+    300
+}
+
+fn default_global_cooldown_exempt_watcher_down() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -887,43 +902,112 @@ pub fn load_config() -> Config {
     }
 }
 
+/// Recursively deep-merge `overlay` on top of `base` as TOML values.
+/// For two tables, keys from `overlay` win per-field, recursing into
+/// nested tables; keys present only in `base` are preserved. For any
+/// non-table value (or a type mismatch), `overlay` replaces `base`
+/// wholesale. This is the field-level layering primitive behind
+/// `try_load_config` — a partial `~/.config/claude-watch/config.toml`
+/// overrides only the fields it sets, falling back to the base layer
+/// (env / `/etc` / cwd) for everything else.
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_tbl), toml::Value::Table(overlay_tbl)) => {
+            for (k, v) in overlay_tbl {
+                match base_tbl.get_mut(&k) {
+                    Some(existing) => merge_toml(existing, v),
+                    None => {
+                        base_tbl.insert(k, v);
+                    }
+                }
+            }
+        }
+        (base_slot, overlay_val) => {
+            *base_slot = overlay_val;
+        }
+    }
+}
+
 /// Non-exiting config loader. Returns an Err with a human-readable
 /// reason if no valid config file is found. The hybrid `hook-fire`
 /// subcommand uses this to fail gracefully — a Claude Code session
 /// must not break just because the host hasn't set up a config file.
+///
+/// LAYERED merge (2026-06-11): instead of strict first-hit-wins, the
+/// loader builds a base layer from the FIRST existing path in
+/// [`$CLAUDE_WATCH_CONFIG`, `./config.toml`] and then overlays the user
+/// config at `~/.config/claude-watch/config.toml` on top, merging
+/// per-field. This makes a bind-mounted `~/.config/claude-watch`
+/// override actually take effect even when the baked image config (set
+/// via `$CLAUDE_WATCH_CONFIG`) always exists and would previously win
+/// outright. Backward compatible: when only one file exists the result
+/// is identical to parsing that single file.
 pub fn try_load_config() -> Result<Config, String> {
-    let config_paths = [
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+    let user_path = format!("{}/.config/claude-watch/config.toml", home);
+
+    // Base layer: first existing of $CLAUDE_WATCH_CONFIG, then ./config.toml.
+    // The user-config path is layered ON TOP of this (per-field override).
+    let base_paths = [
         std::env::var("CLAUDE_WATCH_CONFIG").unwrap_or_default(),
-        format!(
-            "{}/.config/claude-watch/config.toml",
-            std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string())
-        ),
-        "config.toml".to_string(), // fallback: look in current directory
+        "config.toml".to_string(),
     ];
 
-    for path in &config_paths {
+    // Read + ~-expand a path into a parsed toml::Value, or None if absent.
+    let read_layer = |path: &str| -> Option<Result<toml::Value, String>> {
         if path.is_empty() {
-            continue;
+            return None;
         }
-        if let Ok(content) = std::fs::read_to_string(path) {
-            // Expand ~ to $HOME in config values before parsing
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
-            let content = content.replace("~/", &format!("{}/", home));
-            match toml::from_str::<Config>(&content) {
-                Ok(config) => {
-                    tracing::info!(path, "loaded config");
-                    return Ok(config);
-                }
-                Err(e) => {
-                    return Err(format!("Failed to parse config {}: {}", path, e));
-                }
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let expanded = content.replace("~/", &format!("{}/", home));
+                Some(
+                    toml::from_str::<toml::Value>(&expanded)
+                        .map_err(|e| format!("Failed to parse config {}: {}", path, e)),
+                )
             }
+            Err(_) => None,
+        }
+    };
+
+    // Build the base layer (first existing base path wins for the base).
+    let mut merged: Option<toml::Value> = None;
+    let mut loaded_from: Vec<String> = Vec::new();
+    for path in &base_paths {
+        if let Some(res) = read_layer(path) {
+            merged = Some(res?);
+            loaded_from.push(path.clone());
+            break;
         }
     }
-    Err(format!(
-        "no config file found. Tried: {:?}",
-        config_paths
-    ))
+
+    // Overlay the user config on top (per-field override), if present.
+    if let Some(res) = read_layer(&user_path) {
+        let overlay = res?;
+        match merged.as_mut() {
+            Some(base) => merge_toml(base, overlay),
+            None => merged = Some(overlay),
+        }
+        loaded_from.push(user_path.clone());
+    }
+
+    match merged {
+        Some(value) => match value.try_into::<Config>() {
+            Ok(config) => {
+                tracing::info!(paths = ?loaded_from, "loaded config (layered)");
+                Ok(config)
+            }
+            Err(e) => Err(format!(
+                "Failed to build config from layers {:?}: {}",
+                loaded_from, e
+            )),
+        },
+        None => {
+            let mut tried = base_paths.to_vec();
+            tried.push(user_path);
+            Err(format!("no config file found. Tried: {:?}", tried))
+        }
+    }
 }
 
 /// Parse config from a TOML string. Useful for testing.
@@ -1310,8 +1394,9 @@ cooldown = 300
     fn test_parse_valid_config() {
         let config = parse_config(SAMPLE_CONFIG).expect("should parse valid config");
         assert_eq!(config.general.check_interval, 10);
-        // New field: default should be applied when not present in TOML.
-        assert_eq!(config.general.post_interrupt_cooldown_secs, 60);
+        // Default applied when not present in TOML. Bumped 60 -> 300
+        // (2026-06-11): 5-min global interrupt ceiling.
+        assert_eq!(config.general.post_interrupt_cooldown_secs, 300);
         // New field: thinking_backoff_multiplier default is 2 (legacy doubling).
         assert_eq!(config.foreground_monitor.thinking_backoff_multiplier, 2);
         assert_eq!(config.tmux.dashboard_pane, "dashboard:0.0");
@@ -1727,6 +1812,58 @@ max_suppression_window_secs = 1200
     fn test_parse_invalid_config() {
         let result = parse_config("not valid toml [[[");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_post_interrupt_cooldown_default_is_300() {
+        // Default bumped 60 -> 300 (2026-06-11): 5-min global ceiling.
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert_eq!(config.general.post_interrupt_cooldown_secs, 300);
+    }
+
+    #[test]
+    fn test_global_cooldown_exempt_watcher_down_defaults_true() {
+        // Watcher-down stays exempt from the global ceiling by default.
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert!(config.general.global_cooldown_exempt_watcher_down);
+    }
+
+    #[test]
+    fn test_global_cooldown_exempt_watcher_down_override_false() {
+        let cfg_str = SAMPLE_CONFIG.replace(
+            "legacy_log_file = \"/tmp/test.log\"",
+            "legacy_log_file = \"/tmp/test.log\"\nglobal_cooldown_exempt_watcher_down = false",
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert!(!config.general.global_cooldown_exempt_watcher_down);
+    }
+
+    #[test]
+    fn test_merge_toml_overlay_wins_per_field() {
+        // Layered merge: overlay overrides only the fields it sets,
+        // preserving base fields and recursing into nested tables.
+        let mut base: toml::Value = toml::from_str(
+            "[general]\ncheck_interval = 10\npost_interrupt_cooldown_secs = 60\n             [tmux]\ndashboard_session = \"base\"\n",
+        )
+        .unwrap();
+        let overlay: toml::Value = toml::from_str(
+            "[general]\npost_interrupt_cooldown_secs = 999\n",
+        )
+        .unwrap();
+        merge_toml(&mut base, overlay);
+        let general = base.get("general").unwrap();
+        // overridden field wins
+        assert_eq!(
+            general.get("post_interrupt_cooldown_secs").unwrap().as_integer(),
+            Some(999)
+        );
+        // base-only field in the same table is preserved
+        assert_eq!(general.get("check_interval").unwrap().as_integer(), Some(10));
+        // base-only TABLE is preserved
+        assert_eq!(
+            base.get("tmux").unwrap().get("dashboard_session").unwrap().as_str(),
+            Some("base")
+        );
     }
 
     #[test]
