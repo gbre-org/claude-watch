@@ -212,6 +212,20 @@ pub struct ForegroundMonitorConfig {
     /// the original doubling behaviour.
     #[serde(default = "default_thinking_backoff_multiplier")]
     pub thinking_backoff_multiplier: u64,
+    /// Token-progress guard for prolonged-thinking fires. Claude Code
+    /// 2.1.17x keeps the assistant turn open (live thinking widget
+    /// rendered) while background shells are pending, so a pure pane
+    /// scrape sees continuous "Thinking" through idle waits. A genuinely
+    /// stuck/long generation grows the status-bar token count
+    /// continuously; an idle open turn barely moves it. If the token
+    /// delta across a thinking episode is below this floor at fire time,
+    /// the interrupt is suppressed and the episode re-arms (timer +
+    /// token baseline slide forward) so a real stall starting later in
+    /// the same open turn can still fire. 0 disables the guard. When the
+    /// token count is unavailable/unparseable or appears to have reset
+    /// (negative delta), the guard fails open and the fire is allowed.
+    #[serde(default = "default_min_tokens_delta")]
+    pub min_tokens_delta: u64,
 }
 
 fn default_interrupt_enabled() -> bool {
@@ -228,6 +242,10 @@ fn default_max_thinking_backoff() -> u64 {
 
 fn default_thinking_backoff_multiplier() -> u64 {
     2
+}
+
+fn default_min_tokens_delta() -> u64 {
+    2000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1310,6 +1328,8 @@ cooldown = 300
         assert_eq!(config.general.post_interrupt_cooldown_secs, 60);
         // New field: thinking_backoff_multiplier default is 2 (legacy doubling).
         assert_eq!(config.foreground_monitor.thinking_backoff_multiplier, 2);
+        // Token-progress guard default (no min_tokens_delta key in SAMPLE_CONFIG).
+        assert_eq!(config.foreground_monitor.min_tokens_delta, 2000);
         assert_eq!(config.tmux.dashboard_pane, "dashboard:0.0");
         assert_eq!(config.claude.max_context_tokens, 200000);
         assert_eq!(config.dead_process.checks_required, 3);
@@ -1717,6 +1737,73 @@ max_suppression_window_secs = 1200
         let config = parse_config(config_custom).expect("should parse with [suppression] section");
         assert_eq!(config.suppression.max_consecutive_suppressions, 5);
         assert_eq!(config.suppression.max_suppression_window_secs, 1200);
+    }
+
+    #[test]
+    fn test_parse_config_min_tokens_delta_override() {
+        // An explicit min_tokens_delta in [foreground_monitor] must override
+        // the 2000 default; 0 (guard disabled) must round-trip too.
+        let base = |value: u64| {
+            format!(
+                r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[tmux]
+dashboard_pane = "dashboard:0.0"
+dashboard_session = "dashboard"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 480
+check_interval = 3
+min_tokens_delta = {value}
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#
+            )
+        };
+        let config = parse_config(&base(5000)).expect("should parse min_tokens_delta override");
+        assert_eq!(config.foreground_monitor.min_tokens_delta, 5000);
+        let config = parse_config(&base(0)).expect("should parse min_tokens_delta = 0");
+        assert_eq!(config.foreground_monitor.min_tokens_delta, 0);
     }
 
     #[test]
