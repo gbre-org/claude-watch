@@ -807,12 +807,33 @@ def _render_payload() -> dict[str, Any]:
     # "running"/"pending" for visibility.
     starting_count = sum(1 for r in running if r.get("is_starting"))
 
+    # Source filter universe — the distinct ``created_by`` values across
+    # EVERY item in the queue (running + pending + blocked + done +
+    # abandoned), NOT just the items in one visible section. ``created_by``
+    # is the "source" of a queue item: who enqueued it (`main-loop`,
+    # `workload`, or any future producer). The topbar source dropdown is
+    # populated from this so it lists every real producer regardless of
+    # which sections happen to be non-empty right now. Empty / missing
+    # ``created_by`` is dropped (renders as the implicit "all" option).
+    #
+    # Derived from the GLOBAL item list (not a per-section facet): the old
+    # dropdown showed nothing because no global distinct-source query
+    # existed to feed it.
+    sources = sorted(
+        {
+            (it.get("created_by") or "").strip()
+            for it in items
+            if isinstance(it, dict) and (it.get("created_by") or "").strip()
+        }
+    )
+
     return {
         "running": running,
         "blocked": blocked,
         "pending": pending,
         "done_recent": done_recent,
         "abandoned_recent": abandoned_recent,
+        "sources": sources,
         "totals": {
             "running": len(running),
             "blocked": len(blocked),
