@@ -491,6 +491,12 @@ services:
     user: "1000:1000"
     environment:
       EICHI_DB: /home/hndrewaall/.local/share/eichi/index.db
+      # The eichi-search container's $HOME is /home/eichi, but the host
+      # ~/.config/eichi is bind-mounted at /home/hndrewaall/.config/eichi
+      # (UID-1000 user baked into the image). Point sources.py's config
+      # resolver (priority #1) at the explicit bind-mount path so the
+      # source-map / role allowlist actually loads.
+      EICHI_SOURCES_CONFIG: /home/hndrewaall/.config/eichi/sources.toml
       # EICHI_PYTHON deliberately unset — app.py defaults to the
       # container's own sys.executable. The host venv contains macOS
       # Mach-O binaries that cannot exec in the Linux container.
