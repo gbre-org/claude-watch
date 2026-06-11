@@ -159,6 +159,7 @@ jobs:
 
       - name: Run watcher tests (self-clear + claude-event-watch debounce)
         run: make test-watchers
+        timeout-minutes: 5
 
       - name: Install uv (for session-task tests)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh

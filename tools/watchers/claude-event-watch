@@ -56,6 +56,32 @@ if [[ ! -t 1 ]] && command -v stdbuf >/dev/null 2>&1 && [[ -z "${_CEW_STDBUF_WRA
 fi
 export PYTHONUNBUFFERED=1
 
+# --- tty / foreground-misuse guard ---------------------------------------
+# CONTRACT: this watcher must be launched as a run_in_background Bash task by
+# the main loop. In that mode stdout is a captured PIPE (not a tty), so the
+# block-print-exit output is delivered back to the session as a task-
+# completion notification. When stdout IS a tty the watcher is being run
+# interactively — either an operator debugging it by hand (legitimate) or a
+# shell-`&` / nohup misuse (NOT legitimate; the main loop never sees the
+# output). We cannot reliably tell those two cases apart from inside the
+# process: a backgrounded `cmd &` from an interactive shell still inherits
+# the terminal as stdout unless redirected, so `-t 1` does not distinguish
+# shell-`&` from a foreground manual run. Because there is no stronger signal,
+# we WARN loudly rather than hard-fail — a hard exit here would break the
+# legitimate "operator runs it by hand to watch events scroll" debug path.
+# (The flock singleton guard below is the real teeth: it is what actually
+# blocks a duplicate inotifywait from racing the same queue.)
+#
+# NOTE: this check runs AFTER the stdbuf re-exec above. That re-exec only
+# fires when stdout is NOT a tty (`! -t 1`), so by the time we reach here in
+# a piped/background launch we are already in the re-exec'd child whose
+# stdout is still the same non-tty pipe — the warning correctly stays silent.
+# In a tty launch the re-exec is skipped entirely, so we are in the original
+# process and the warning fires once.
+if [[ -t 1 ]]; then
+    echo "claude-event-watch: WARNING — stdout is a tty; this watcher is meant to run as a run_in_background task (block-print-exit). Continuing, but the main loop won't receive this output." >&2
+fi
+
 QUEUE_DIR="${CLAUDE_EVENT_QUEUE:-${CRON_EVENT_QUEUE:-$HOME/claude-events}}"
 LOG_DIR="${CLAUDE_EVENT_LOG_DIR:-$HOME/.config/claude-events}"
 LOG_FILE="$LOG_DIR/consumed.jsonl"
@@ -166,6 +192,58 @@ fi
 
 mkdir -p "$QUEUE_DIR"
 mkdir -p "$LOG_DIR"
+
+# --- flock singleton guard ------------------------------------------------
+# Only ONE claude-event-watch may run at a time: two concurrent instances
+# would each block on inotifywait over the SAME queue dir, and on the next
+# event both would wake, both would drain, and they'd race to consume/delete
+# the same files — duplicating some events on one instance's stdout while the
+# other sees a half-empty queue. The contract is "exactly one watcher, re-
+# invoked by the main loop after each delivery"; this enforces it from inside
+# the watcher itself (one place, unbypassable, self-documenting) rather than
+# relying on an external PreToolUse gate.
+#
+# We use fd-based flock so the lock auto-releases when THIS process dies (no
+# stale-lock file to clean up — a crash/kill frees it immediately). The lock
+# is acquired here, after the stdbuf re-exec above, so it is taken exactly
+# once in the final long-lived process. fd 9 is inherited across the re-exec
+# only if we'd locked before it; we deliberately lock AFTER, so there is no
+# self-conflict.
+#
+# Lockfile path mirrors the self-clear watcher's convention: override via
+# $CLAUDE_EVENT_WATCH_LOCK, else $XDG_RUNTIME_DIR/claude-event-watch.lock,
+# else /tmp/claude-event-watch.lock. The override lets tests isolate so a
+# real running watcher on the host can't make the test see a held lock (and
+# vice-versa).
+LOCKFILE="${CLAUDE_EVENT_WATCH_LOCK:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/claude-event-watch.lock}}"
+LOCKFILE="${LOCKFILE:-/tmp/claude-event-watch.lock}"
+if command -v flock >/dev/null 2>&1; then
+    # Read any existing holder pid FIRST, before we open the fd for write —
+    # opening with `9>` truncates the file, which would otherwise wipe the
+    # holder's pid before we get to read it in the refused branch below.
+    prior_holder="$(cat "$LOCKFILE" 2>/dev/null | tr -d '[:space:]')"
+    exec 9>"$LOCKFILE" || {
+        echo "claude-event-watch: cannot open lockfile $LOCKFILE" >&2
+        exit 1
+    }
+    if ! flock -n 9; then
+        # Lock is held by a live instance — refuse. `prior_holder` was read
+        # before the truncating open above, so it still names the holder (an
+        # empty/stale read is fine; we still refuse with "unknown").
+        echo "claude-event-watch: already running (pid ${prior_holder:-unknown}) — refusing to start a duplicate" >&2
+        exit 3
+    fi
+    # We hold the lock. The truncating open already emptied the file; record
+    # our pid so a refused second instance can name us. The fd stays open for
+    # the lock's lifetime (auto-released on process death — no stale cleanup).
+    printf '%s\n' "$$" >&9
+else
+    # flock unavailable (e.g. macOS without util-linux). Degrade gracefully:
+    # the singleton guarantee is best-effort here, but the watcher still works.
+    # Most deployments (the Linux container) ship flock, so this is the rare
+    # path. We warn once so the gap is visible.
+    echo "claude-event-watch: WARNING — flock not found; singleton guard disabled (duplicate watchers possible)" >&2
+fi
 
 print_restart_banner() {
     echo "===="
