@@ -734,6 +734,7 @@ RUN chmod +x /usr/local/bin/generate-project-mcp-json
 #
 # Hooks installed:
 #   - pre-agent-queue-gate-hook            (PreToolUse Agent matcher)
+#   - pre-agent-background-required-hook   (PreToolUse Agent matcher)
 #   - pre-tool-obligations-gate-hook       (PreToolUse * matcher)
 #   - post-tool-obligations-update-hook    (PostToolUse * matcher)
 #   - post-tool-mark-attachment-read-hook  (PostToolUse Read matcher)
@@ -745,6 +746,7 @@ RUN chmod +x /usr/local/bin/generate-project-mcp-json
 # /usr/local/bin/ ensures the obligations gate fires inside the
 # container regardless of host state.
 COPY tools/hooks/pre-agent-queue-gate-hook /usr/local/bin/pre-agent-queue-gate-hook
+COPY tools/hooks/pre-agent-background-required-hook /usr/local/bin/pre-agent-background-required-hook
 COPY tools/hooks/pre-tool-obligations-gate-hook /usr/local/bin/pre-tool-obligations-gate-hook
 COPY tools/hooks/post-tool-obligations-update-hook /usr/local/bin/post-tool-obligations-update-hook
 COPY tools/hooks/post-tool-mark-attachment-read-hook /usr/local/bin/post-tool-mark-attachment-read-hook
@@ -828,6 +830,7 @@ COPY tools/obligations/obligations-init /usr/local/bin/obligations-init
 COPY tools/agent-msg/agent-msg /usr/local/bin/agent-msg
 COPY tools/agent-tail/agent-tail /usr/local/bin/agent-tail
 RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
+            /usr/local/bin/pre-agent-background-required-hook \
             /usr/local/bin/pre-tool-obligations-gate-hook \
             /usr/local/bin/post-tool-obligations-update-hook \
             /usr/local/bin/post-tool-mark-attachment-read-hook \

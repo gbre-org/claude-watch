@@ -42,6 +42,17 @@ Examples that are OK inline (single tool call):
 The session's job is to DISPATCH work, not perform it. The Task agent
 handles the work; the session orchestrates.
 
+**Agents MUST be backgrounded — never foreground.** Always spawn with
+`run_in_background: true`. A foreground Agent call blocks this loop until the
+subagent finishes, which freezes everything the dispatcher must keep doing
+(babysit the queue, answer agent-chat, refresh the heartbeat, field
+claude-watch alerts) and makes a long subagent look like a wedged loop to the
+daemon. This is enforced: the `pre-agent-background-required-hook` PreToolUse
+gate DENIES any Agent spawn whose `run_in_background` isn't `true`. (Emergency
+override: env `AGENT_FOREGROUND_OK=1`, or put `FOREGROUND_AGENT_OK: <reason>`
+in the Agent prompt for a genuinely-must-block case.) After spawning, track
+the agent via the queue and `agent-msg`/`agent-tail`, not by blocking on it.
+
 ## claude-watch alerts — STOP EVERYTHING — NON-NEGOTIABLE
 
 When claude-watch injects an alert into the tmux pane — prolonged thinking,
