@@ -3,7 +3,7 @@
 
 The companion `pre-tool-dispatch-gate-hook` (PreToolUse) counts every
 non-exempt non-Agent tool call. When the consecutive count exceeds the
-configured threshold (default 3), the hook DENIES the next non-exempt
+configured threshold (default 6), the hook DENIES the next non-exempt
 tool call and tells the operator to spawn an Agent via the queue
 protocol. Spawning an Agent (or running this CLI's `reset`) zeros the
 counter.
@@ -89,7 +89,35 @@ EXEMPT_OVERRIDE_PATH = Path(os.environ.get(
     "/etc/claude-code/dispatch-exempt.txt",
 ))
 
-DEFAULT_THRESHOLD = 3
+# Raised 3 -> 6 (2026-06-11). Mirror of the hook's DEFAULT_THRESHOLD;
+# keep the two in sync (the hook duplicates this value, NOT imports it).
+DEFAULT_THRESHOLD = 6
+
+# Host-backed threshold config — mirror of the hook's HOST_CONFIG_PATH so
+# `status` reports the same effective threshold the hook enforces. ~/.claude
+# is bind-mounted rw from the host, so this survives container recreate
+# (unlike the in-container ~/.config/claude-watch state). JSON: {"threshold": 6}.
+HOST_CONFIG_PATH = Path(os.environ.get(
+    "CLAUDE_WATCH_DISPATCH_CONFIG",
+    os.path.expanduser("~/.claude/claude-watch-dispatch.json"),
+))
+
+
+def _host_config_threshold() -> int | None:
+    """Host-backed default threshold, or None. Default-open on any error."""
+    try:
+        if not HOST_CONFIG_PATH.exists():
+            return None
+        with HOST_CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    val = data.get("threshold")
+    if isinstance(val, int) and val > 0:
+        return val
+    return None
 
 
 # Baked-in exempt set -- read-only inspection commands + the gate's own
@@ -204,7 +232,8 @@ def _save_state(state: dict) -> None:
 
 
 def _effective_threshold(state: dict) -> int:
-    """Per-call threshold: state override wins, then env, then default."""
+    """Per-call threshold: state override wins, then env, then the
+    host-backed config file, then default. Mirrors the hook."""
     if state.get("threshold"):
         return int(state["threshold"])
     env = os.environ.get("CLAUDE_WATCH_DISPATCH_THRESHOLD", "").strip()
@@ -215,6 +244,9 @@ def _effective_threshold(state: dict) -> int:
                 return n
         except ValueError:
             pass
+    host = _host_config_threshold()
+    if host is not None:
+        return host
     return DEFAULT_THRESHOLD
 
 

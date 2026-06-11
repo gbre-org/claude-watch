@@ -87,6 +87,34 @@ pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) ->
         .is_some_and(|e| e < cooldown_secs as f64)
 }
 
+/// Atomic check-and-stamp of the global interrupt gate — the SINGLE
+/// chokepoint every (non-exempt) interrupt fire path consults right
+/// before injecting.
+///
+/// Returns `false` (claim DENIED) if another interrupt fired within the
+/// last `cooldown_secs` seconds — the caller must NOT fire. Otherwise it
+/// STAMPS `state.last_interrupt_at = now` and returns `true` (claim
+/// GRANTED) — the caller may fire. Collapsing the previous split
+/// "check here / stamp later" two-step into one call removes the window
+/// where two fire paths in the same `check_once` pass could both pass an
+/// early check and then both stamp, double-injecting within the cooldown.
+///
+/// A `cooldown_secs` of 0 disables the gate: the claim always succeeds
+/// and the timestamp is still stamped (so other sites observe the fire).
+///
+/// `now` is an RFC3339 timestamp string (the daemon's per-check `now`).
+pub(crate) fn try_claim_global_interrupt(
+    state: &mut State,
+    cooldown_secs: u64,
+    now: &str,
+) -> bool {
+    if interrupt_in_global_cooldown(state, cooldown_secs) {
+        return false;
+    }
+    state.last_interrupt_at = Some(now.to_string());
+    true
+}
+
 /// Pure predicate: should the watcher-down inject path fire now, given
 /// the timestamp of the last watcher-inject and the configured cooldown?
 ///
@@ -829,24 +857,6 @@ async fn check_foreground_inner(
                     config.foreground_monitor.thinking_backoff_multiplier,
                 );
                 if elapsed >= next_threshold as f64 {
-                    // Global post-interrupt cooldown: if ANY interrupt fired
-                    // recently (watcher-down, context-warning, or a prior
-                    // thinking one), suppress this fire. Prevents the
-                    // cascade where e.g. a watcher-down interrupt resets the
-                    // thinking timer and the new thought trips prolonged
-                    // thinking immediately afterward.
-                    if interrupt_in_global_cooldown(
-                        state,
-                        config.general.post_interrupt_cooldown_secs,
-                    ) {
-                        debug!(
-                            elapsed_secs = elapsed,
-                            threshold = next_threshold,
-                            cooldown = config.general.post_interrupt_cooldown_secs,
-                            "prolonged thinking would fire but global post-interrupt cooldown active"
-                        );
-                        return;
-                    }
                     // Workload-heartbeat suppression: an active
                     // `workload run` (stv-promote, big rsync, ffmpeg)
                     // can pin the main loop in a fire-and-forget wait
@@ -859,7 +869,9 @@ async fn check_foreground_inner(
                     // timer is NOT reset here — the next cycle re-
                     // evaluates from the same start so the moment the
                     // workload finishes (heartbeat goes stale) the
-                    // interrupt can fire on the next tick.
+                    // interrupt can fire on the next tick. Checked BEFORE
+                    // the global-gate claim so a workload-suppressed cycle
+                    // does not consume a claim.
                     if workload_heartbeat_suppresses_stuck(config) {
                         debug!(
                             elapsed_secs = elapsed,
@@ -877,6 +889,29 @@ async fn check_foreground_inner(
                                 "dir": &config.stuck_detection.workload_heartbeat_dir,
                                 "max_age_secs": config.stuck_detection.workload_heartbeat_max_age_secs,
                             }),
+                        );
+                        return;
+                    }
+                    // Global interrupt gate (single chokepoint): atomically
+                    // claim-and-stamp. If ANY interrupt fired within the
+                    // cooldown window (watcher-down, context-warning,
+                    // auto-respawn, or a prior thinking one), the claim
+                    // fails and we suppress. Prevents the cascade where e.g.
+                    // a watcher-down interrupt resets the thinking timer and
+                    // the new thought trips prolonged thinking immediately
+                    // afterward. The claim STAMPS last_interrupt_at on
+                    // success, so the later (removed) explicit stamp is no
+                    // longer needed.
+                    if !try_claim_global_interrupt(
+                        state,
+                        config.general.post_interrupt_cooldown_secs,
+                        &now,
+                    ) {
+                        debug!(
+                            elapsed_secs = elapsed,
+                            threshold = next_threshold,
+                            cooldown = config.general.post_interrupt_cooldown_secs,
+                            "prolonged thinking would fire but global post-interrupt cooldown active"
                         );
                         return;
                     }
@@ -915,10 +950,10 @@ async fn check_foreground_inner(
                             ),
                             "thinking interrupt: Escape + inject prompt"
                         );
-                        // Stamp the global interrupt cooldown so other fire
-                        // paths (watcher-down, context-warning) see this
-                        // interrupt and back off.
-                        state.last_interrupt_at = Some(now.clone());
+                        // NOTE: the global interrupt cooldown was already
+                        // STAMPED above by try_claim_global_interrupt — no
+                        // separate stamp here (collapsed into the atomic
+                        // claim, 2026-06-11).
                         state.prolonged_thinking_interrupts_total = state
                             .prolonged_thinking_interrupts_total
                             .saturating_add(1);
@@ -2030,6 +2065,26 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
         return;
     }
 
+    // Global interrupt gate (single chokepoint, 2026-06-11): even though
+    // auto-respawn has its own `should_respawn` cooldown, it now also
+    // consults the shared global ceiling so a respawn does not stack on
+    // top of another interrupt fired moments earlier (and vice versa).
+    // Atomically claim-and-stamp; on failure, skip this fire — the next
+    // check cycle re-evaluates (the hang signals persist within the
+    // window). NOTE: try_claim_global_interrupt stamps last_interrupt_at
+    // on success, so the later explicit stamp is removed.
+    if !try_claim_global_interrupt(
+        state,
+        config.general.post_interrupt_cooldown_secs,
+        now,
+    ) {
+        debug!(
+            cooldown = config.general.post_interrupt_cooldown_secs,
+            "auto-respawn would fire but global post-interrupt cooldown active — deferring"
+        );
+        return;
+    }
+
     // Threshold + cooldown satisfied — fire.
     let active_signals: Vec<String> = state
         .hang_signal_history
@@ -2068,7 +2123,8 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
     state.auto_respawn_count = state.auto_respawn_count.saturating_add(1);
     state.auto_respawn_interrupts_total =
         state.auto_respawn_interrupts_total.saturating_add(1);
-    state.last_interrupt_at = Some(now.to_string());
+    // last_interrupt_at already STAMPED by try_claim_global_interrupt
+    // above (2026-06-11 — collapsed into the atomic claim).
     // Clear the history so the next cycle starts from a clean slate.
     state.hang_signal_history = crate::respawn::HangSignalHistory::default();
     state.pane_content_hash = None;
@@ -2808,17 +2864,6 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             config.hybrid.context_fallback_secs as f64,
                         );
 
-                    // Global post-interrupt cooldown: if a recent interrupt
-                    // (thinking, watcher-down, or a prior context-warning)
-                    // fired, defer this context warning too. The deferred
-                    // self-clear child still runs if the token level stays
-                    // high; the cooldown only gates the tmux interrupt +
-                    // warning message.
-                    let global_cooldown_blocks = interrupt_in_global_cooldown(
-                        state,
-                        config.general.post_interrupt_cooldown_secs,
-                    );
-
                     if api_retrying {
                         debug!(
                             tokens,
@@ -2849,7 +2894,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                                 "grace_secs": config.hybrid.context_fallback_secs,
                             }),
                         );
-                    } else if global_cooldown_blocks {
+                    } else if !try_claim_global_interrupt(
+                        state,
+                        config.general.post_interrupt_cooldown_secs,
+                        &now,
+                    ) {
                         debug!(
                             tokens,
                             pct,
@@ -2908,7 +2957,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 
                         state.context_clear_triggered = true;
                         state.last_context_clear = Some(now.clone());
-                        state.last_interrupt_at = Some(now.clone());
+                        // last_interrupt_at already STAMPED by the atomic
+                        // try_claim_global_interrupt above (2026-06-11).
                         state.fallback_clear_count = state.fallback_clear_count.saturating_add(1);
                         state.context_warning_interrupts_total = state
                             .context_warning_interrupts_total
@@ -3391,6 +3441,45 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // bound the suppression run, not the cooldown clock.
                     crate::state::save_state(&config.general.state_file, state);
                 } else {
+                    // Global interrupt gate (single chokepoint, 2026-06-11):
+                    // watcher-down is EXEMPT by default
+                    // (`general.global_cooldown_exempt_watcher_down = true`)
+                    // because a down watcher is a hard-liveness failure that
+                    // must be allowed to fire even when another interrupt
+                    // fired recently. When the operator flips that bool to
+                    // false, watcher-down is subjected to the same atomic
+                    // global claim as every other fire path: if the claim
+                    // fails we skip the inject this cycle (the per-watcher
+                    // `inject_cooldown` re-fires it once the global window
+                    // clears). The per-type cooldown
+                    // (`watcher_inject_due`) above remains the inner
+                    // lower-bound either way.
+                    // exempt=true (default) -> claim is skipped (true).
+                    // exempt=false -> attempt the atomic claim; false means
+                    // the global ceiling is active and we must skip the
+                    // inject this cycle (fall through to auto-respawn /
+                    // healthcheck / logging — do NOT `return` here).
+                    let global_gate_ok = config.general.global_cooldown_exempt_watcher_down
+                        || try_claim_global_interrupt(
+                            state,
+                            config.general.post_interrupt_cooldown_secs,
+                            &now,
+                        );
+                    if !global_gate_ok {
+                        debug!(
+                            missing = %missing_list,
+                            cooldown = config.general.post_interrupt_cooldown_secs,
+                            "watcher-down inject would fire but global post-interrupt cooldown active (exempt=false) — deferring"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "watcher_inject_global_cooldown_deferred",
+                            serde_json::json!({
+                                "missing": missing_names,
+                                "cooldown_secs": config.general.post_interrupt_cooldown_secs,
+                            }),
+                        );
+                    } else {
                     if let Some(reason) = escalation {
                         warn!(
                             missing = %missing_list,
@@ -3484,6 +3573,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         state.watcher_down_interrupts_total.saturating_add(1);
                     reset_suppression(state);
                     crate::state::save_state(&config.general.state_file, state);
+                    }
                 }
             }
         }
@@ -4329,6 +4419,53 @@ cooldown = 300
         let mut state = State::default();
         state.last_interrupt_at = Some("not a date".to_string());
         assert!(!interrupt_in_global_cooldown(&state, 60));
+    }
+
+    #[test]
+    fn test_try_claim_global_interrupt_grants_when_no_prior() {
+        // No prior interrupt -> claim succeeds and stamps last_interrupt_at.
+        let mut state = State::default();
+        let now = Utc::now().to_rfc3339();
+        assert!(try_claim_global_interrupt(&mut state, 300, &now));
+        assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_try_claim_global_interrupt_denies_within_cooldown() {
+        // A recent interrupt within the window -> claim DENIED and the
+        // existing stamp is NOT overwritten (atomic check-and-stamp).
+        let mut state = State::default();
+        let prior = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        state.last_interrupt_at = Some(prior.clone());
+        let now = Utc::now().to_rfc3339();
+        assert!(!try_claim_global_interrupt(&mut state, 300, &now));
+        assert_eq!(
+            state.last_interrupt_at.as_deref(),
+            Some(prior.as_str()),
+            "denied claim must not move the timestamp"
+        );
+    }
+
+    #[test]
+    fn test_try_claim_global_interrupt_grants_after_window() {
+        // Prior interrupt older than the cooldown -> claim succeeds and
+        // re-stamps to now.
+        let mut state = State::default();
+        let prior = (Utc::now() - chrono::Duration::seconds(400)).to_rfc3339();
+        state.last_interrupt_at = Some(prior);
+        let now = Utc::now().to_rfc3339();
+        assert!(try_claim_global_interrupt(&mut state, 300, &now));
+        assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_try_claim_global_interrupt_zero_cooldown_always_grants() {
+        // cooldown=0 disables the gate: claim always succeeds, still stamps.
+        let mut state = State::default();
+        state.last_interrupt_at = Some(Utc::now().to_rfc3339());
+        let now = Utc::now().to_rfc3339();
+        assert!(try_claim_global_interrupt(&mut state, 0, &now));
+        assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
     }
 
     // --- Fresh session inject loop prevention tests ---

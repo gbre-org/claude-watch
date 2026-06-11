@@ -2,7 +2,7 @@
 """PreToolUse hook -- enforces the dispatcher-cardinal as a hard gate.
 
 This hook tracks consecutive non-exempt non-Agent tool calls. When the
-consecutive count exceeds the threshold (default 3), DENY the next
+consecutive count exceeds the threshold (default 6), DENY the next
 non-exempt tool call with a banner that tells the operator to spawn an
 Agent via the queue-protocol.
 
@@ -55,7 +55,7 @@ which appends in policy order; see OBLIGATIONS_HOOKS in that file.
 Tweakability (Andrew explicit: "some tweakability is important")
 -----------------------------------------------------------------
 
-  - CLAUDE_WATCH_DISPATCH_THRESHOLD     override the default 3
+  - CLAUDE_WATCH_DISPATCH_THRESHOLD     override the default 6
   - CLAUDE_WATCH_DISPATCH_ENABLED=0     disable entirely (allow + no
                                         state tracking)
   - CLAUDE_WATCH_DISPATCH_BYPASS=1      one-shot allow + audit log
@@ -110,7 +110,48 @@ ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 ERR_LOG_PATH = ERR_LOG_DIR / "claude-watch-dispatch-hook-errors.log"
 BYPASS_LOG_PATH = ERR_LOG_DIR / "claude-watch-dispatch-bypass.log"
 
-DEFAULT_THRESHOLD = 3
+# Raised 3 -> 6 (2026-06-11): the dispatcher gate was firing too eagerly
+# on legitimate short multi-step inspections. 6 consecutive non-exempt
+# main-loop calls is a more realistic "you should have delegated" line.
+# Override precedence (highest first): in-container state override
+# (`claude-watch-dispatch set-threshold`) > $CLAUDE_WATCH_DISPATCH_THRESHOLD
+# env > host-backed config file (see HOST_CONFIG_PATH) > this default.
+DEFAULT_THRESHOLD = 6
+
+# Host-backed threshold config. The in-container dispatch STATE lives at
+# ~/.config/claude-watch/dispatch-state.json, which is NOT bind-mounted —
+# so a `set-threshold` override there is LOST on container recreate. To let
+# an operator pin a default that SURVIVES recreate, this hook ALSO reads an
+# optional threshold from a file under ~/.claude/, which IS bind-mounted
+# rw from the host (see container/examples/compose docker-compose.yml).
+# JSON shape: {"threshold": 6}. Missing / malformed -> ignored (default
+# applies). Override the path via $CLAUDE_WATCH_DISPATCH_CONFIG.
+HOST_CONFIG_PATH = Path(os.environ.get(
+    "CLAUDE_WATCH_DISPATCH_CONFIG",
+    os.path.expanduser("~/.claude/claude-watch-dispatch.json"),
+))
+
+
+def _host_config_threshold() -> int | None:
+    """Read a host-backed default threshold, or None if unavailable.
+
+    Default-open: any read / parse error returns None so a corrupt or
+    absent host config can never brick the gate — the baked DEFAULT
+    applies instead.
+    """
+    try:
+        if not HOST_CONFIG_PATH.exists():
+            return None
+        with HOST_CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    val = data.get("threshold")
+    if isinstance(val, int) and val > 0:
+        return val
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +304,9 @@ def _save_state(state: dict) -> None:
 
 
 def _effective_threshold(state: dict) -> int:
-    """State override wins, then env, then default."""
+    """Precedence: in-container state override, then env, then the
+    host-backed config file (survives container recreate), then the
+    baked DEFAULT_THRESHOLD."""
     if state.get("threshold"):
         return int(state["threshold"])
     env = os.environ.get("CLAUDE_WATCH_DISPATCH_THRESHOLD", "").strip()
@@ -274,6 +317,9 @@ def _effective_threshold(state: dict) -> int:
                 return n
         except ValueError:
             pass
+    host = _host_config_threshold()
+    if host is not None:
+        return host
     return DEFAULT_THRESHOLD
 
 
