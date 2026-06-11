@@ -458,11 +458,10 @@ agent-ack clear                                   # escape hatch
 
 ### Queue IMMEDIATELY — never defer
 
-**Queue items the moment you intend to do the work.** Never say "I'll
-queue it once X finishes." If you intend to do something, queue it NOW.
-Use scopes and the blocking mechanism to prevent it from RUNNING until
-the right time — that's what scopes are for. Holding a task in your head
-instead of the queue means it gets lost on compaction/clear.
+**Queue items the moment you intend to do the work.** Never "I'll queue
+it once X finishes" — queue it NOW. Use scopes + the blocking mechanism
+to keep it from RUNNING until the right time. Holding a task in your
+head instead of the queue means it gets lost on compaction/clear.
 
 Wrong:
 ```
@@ -476,6 +475,12 @@ session-task queue add "..." --scope <non-conflicting-scope> --summary "..."
 session-task queue add "..." --scope <same-scope> --force-enqueue
 # (it'll be serialized behind the running item automatically)
 ```
+
+**Restart-tasks are queueable too.** Redeploy / `cwsr` / restart are
+ordinary work — enqueue them via `session-task`, encoding the restart
+dependency with a blocking scope rather than holding it in your head.
+The queue survives restarts (at worst a running agent needs
+resurrecting, which the tooling supports).
 
 ### Continuous subagent queue-discipline enforcement
 
@@ -836,11 +841,11 @@ To redeploy: `make redeploy` from the repo root (via host-bash).
 Equivalent: `cd examples/compose && docker compose up -d --force-recreate claude-container`
 
 `make redeploy` is a SINGLE `docker compose up -d --force-recreate
-claude-container`. That single-command shape is what makes it safe to
-run FROM INSIDE the container (self-redeploy): the in-container docker
-CLI hands ONE create+start request to the HOST docker daemon, which
-carries the stop-old + start-new to completion even after the issuing
-container (and the shell that ran `make redeploy`) is torn down. The
+claude-container`. That single-command shape makes it safe to run FROM
+INSIDE the container (self-redeploy): the in-container docker CLI hands
+ONE create+start request to the HOST docker daemon, which carries
+stop-old + start-new to completion even after the issuing container
+(and the shell that ran `make redeploy`) is torn down. The
 daemon owns the operation — **no nohup, no disown, no `&`
 backgrounding, and NOT a `rm -sf && up -d` split** (the second command
 in a split never runs once the issuing container dies).
@@ -849,31 +854,30 @@ Why force-recreate no longer wedges: in-place recreate only ever stuck
 when a grandchild outlived process-compose's shutdown and pinned the
 container netns + the shared tmux-socket named volume. The chief
 offender was crond — `sudo -n /usr/sbin/cron` FORKED a root cron that
-survived SIGKILL of the sudo wrapper. That is fixed at the source: the
+survived SIGKILL of the sudo wrapper. Fixed at the source: the
 Dockerfile sudoers carve-out disables `pam_session` + `pam_setcred` for
 the cron argv (`Defaults!CRON_NOFORK !pam_session, !pam_setcred`) so
 sudo `execve()`s cron DIRECTLY (the supervised process IS the daemon,
 no orphan), and `cw-claude-watch-launch` `exec`s claude-watch. With
-clean teardown the old container fully releases the netns + named
-volumes before the fresh one starts.
+clean teardown the old container releases the netns + named volumes
+before the fresh one starts.
 
 `docker-compose.yml` sets `stop_grace_period: 15s`, sized to fit
-process-compose's own graceful shutdown (each supervised process pins
+process-compose's graceful shutdown (each supervised process pins
 `shutdown.timeout: 3` in `container/process-compose.yml`). Do NOT pass
-a short `-t`/timeout shorter than that total: it SIGKILLs PID 1
+a `-t`/timeout shorter than that total: it SIGKILLs PID 1
 (process-compose) mid-teardown.
 
 This kills the current session. The next session starts with the new
 image and picks up via the resume prompt (claude-watch's
-resume-injection fires the "you've ALREADY been restarted — continue"
-prompt, and the entrypoint's `CLAUDE_AUTO_CONTINUE` resumes the prior
-conversation).
+resume-injection fires "you've ALREADY been restarted — continue", and
+the entrypoint's `CLAUDE_AUTO_CONTINUE` resumes the prior conversation).
 
 ### Validating self-redeploy (end-to-end, from inside the container)
 
-This is the acceptance test for "the workbot can redeploy itself".
-Run it FROM INSIDE the container session (host-bash to reach the host
-docker daemon is fine; the point is no MANUAL host step and no nohup):
+This is the acceptance test for "the workbot can redeploy itself". Run
+it FROM INSIDE the container session (host-bash to reach the host docker
+daemon is fine; the point is no MANUAL host step and no nohup):
 
 1. Drop a marker the NEW session can read back, then redeploy:
 
@@ -884,7 +888,7 @@ docker daemon is fine; the point is no MANUAL host step and no nohup):
 
 2. The container recreates host-side. The fresh entrypoint boots
    process-compose → tmux → claude, and the resume prompt brings a NEW
-   claude session up automatically (no manual attach).
+   session up automatically (no manual attach).
 
 3. In the NEW session, confirm it came back from the SAME redeploy:
 
@@ -896,7 +900,7 @@ docker daemon is fine; the point is no MANUAL host step and no nohup):
 
    The marker lives under the bind-mounted `~/.cache` / state path so
    it survives the recreate. A readable marker + a fresh container
-   uptime + an active claude session = self-redeploy validated.
+   uptime + an active session = self-redeploy validated.
 
 4. Clean-shutdown spot-check (proves no orphaned cron pins the netns).
    Before/after a `docker stop` of a throwaway container, assert no
@@ -907,8 +911,8 @@ docker daemon is fine; the point is no MANUAL host step and no nohup):
      sh -c 'ps -eo pid,user,comm | grep -E "[c]ron" || echo "no cron"'
    docker stop <container>           # graceful; process-compose tears down
    # After stop the container is gone; a second `up -d --force-recreate`
-   # must succeed with NO "address already in use" / "dataset is busy" /
-   # netns-pinned wedge. If it wedges, an orphan survived teardown.
+   # must succeed with NO "address already in use" / netns-pinned wedge.
+   # If it wedges, an orphan survived teardown.
    ```
 
 ## What is bind-mounted from the host
