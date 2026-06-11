@@ -167,6 +167,15 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "Heartbeat tick; touch the heartbeat file at data.path (path=… on "
         "the event line) to keep the loop's wedge-detector fresh."),
 
+    # memory-reminder -> ambient context-hygiene reminder emitted by the
+    # daemon every 30min (carries the memory checklist in the event message).
+    # Non-urgent: it surfaces on the next UserPromptSubmit, no agent spawn and
+    # no blocking gate. Placed before the claude-watch/* ambient catch-all so
+    # the reason string is specific. (Replaces the legacy */memory-remind
+    # watcher-tick row; the daemon's cadence loop is now the sole producer.)
+    ("claude-watch", "memory-reminder", None, AMBIENT,
+        "Memory-hygiene reminder; context only."),
+
     # slack-unread (legacy v1 tag, kept for back-compat).
     ("*", "slack-unread", None, ACTIONABLE,
         "Slack DM unread; needs read+reply."),
@@ -222,8 +231,6 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "Workload finished; context only."),
 
     # Watcher routine events.
-    ("*", "memory-remind", None, AMBIENT,
-        "Memory-remind watcher tick; context only."),
     ("*", "watcher-cleanup", None, AMBIENT,
         "Watcher cleanup tick; context only."),
 ]
@@ -371,7 +378,7 @@ def _self_test() -> int:
 
         # Ambient: workload + watcher
         (("manual", "workload-done", ""), AMBIENT),
-        (("manual", "memory-remind", ""), AMBIENT),
+        (("claude-watch", "memory-reminder", ""), AMBIENT),
         (("manual", "watcher-cleanup", ""), AMBIENT),
         # claude-watch/* catch-all stays ambient for non-heartbeat tags.
         (("claude-watch", "some-other-tag", ""), AMBIENT),

@@ -1094,20 +1094,23 @@ async fn run_daemon() {
                 });
             }
             if due.memory_reminder {
-                let pane = state.last_known_pane.clone();
-                if pane.is_empty() {
-                    tracing::warn!(
-                        tag = cadence::MEMORY_REMINDER_TAG,
-                        "memory-reminder due but no known pane — skipping inject"
-                    );
-                } else {
-                    tracing::info!(
-                        tag = cadence::MEMORY_REMINDER_TAG,
-                        pane = %pane,
-                        "memory-reminder: injecting checklist via tmux"
-                    );
-                    tmux::inject_text(&pane, cadence::MEMORY_REMINDER_CHECKLIST).await;
-                }
+                // Memory-reminder is non-urgent context hygiene, so it is
+                // delivered as an AMBIENT claude-event on the queue (surfaced
+                // on the next UserPromptSubmit) rather than as a
+                // mid-generation tmux-inject interruption. Mirrors the
+                // heartbeat-tick delivery path above; the checklist body
+                // rides in the event `message`, and event-classify routes
+                // claude-watch/memory-reminder to the ambient tier.
+                event_bus::emit_cadence(&event_bus::CadenceEvent {
+                    tag: cadence::MEMORY_REMINDER_TAG,
+                    source: cadence::CADENCE_SOURCE,
+                    message: cadence::MEMORY_REMINDER_CHECKLIST,
+                    priority: "low",
+                    data: serde_json::json!({
+                        "interval_secs":
+                            current_config.cadence.memory_reminder_interval_secs,
+                    }),
+                });
             }
         }
 
