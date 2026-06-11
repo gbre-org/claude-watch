@@ -12,10 +12,10 @@
 # (before the in-container claude self-update lands a versions/<ver>/
 # entry in the named volume).
 #
-# Also pipes log output to /tmp/claude-watch.log + jsonl files so
-# operators can inspect via `docker compose exec <c> tail -f
-# /tmp/claude-watch.jsonl` — same shape as the pre-process-compose
-# entrypoint backgrounding.
+# Also pipes log output to /var/log/claude-watch/claude-watch.log +
+# jsonl files so operators can inspect via `docker compose exec <c>
+# tail -f /var/log/claude-watch/claude-watch.jsonl` — same shape as the
+# pre-process-compose entrypoint backgrounding.
 
 set -euo pipefail
 
@@ -23,13 +23,14 @@ export CLAUDE_WATCH_CONTAINER_MODE=1
 
 # Make sure the log files exist + are uid-1000 writable. Belt-and-
 # suspenders against downstream image overrides.
-: > /tmp/claude-watch.jsonl 2>/dev/null || true
-: > /tmp/claude-watch.log 2>/dev/null || true
+: > /var/log/claude-watch/claude-watch.jsonl 2>/dev/null || true
+: > /var/log/claude-watch/claude-watch.log 2>/dev/null || true
 
 # Stream stderr to BOTH the supervisor log (which process-compose
 # captures from this process's stdout) AND the legacy
-# /tmp/claude-watch.log file. JSONL is written by the daemon directly
-# (config.toml's log_file points at /tmp/claude-watch.jsonl).
+# /var/log/claude-watch/claude-watch.log file. JSONL is written by the
+# daemon directly (config.toml's log_file points at
+# /var/log/claude-watch/claude-watch.jsonl).
 #
 # CRITICAL — do NOT use `exec claude-watch ... | tee ...`.
 # A pipeline runs each stage in its own subshell, so the `exec` only
@@ -52,5 +53,5 @@ export CLAUDE_WATCH_CONTAINER_MODE=1
 # claude-watch directly; SIGTERM reaches the daemon, it exits, and
 # process-compose completes shutdown cleanly inside docker's grace
 # window.
-exec > >(tee -a /tmp/claude-watch.log) 2>&1
+exec > >(tee -a /var/log/claude-watch/claude-watch.log) 2>&1
 exec claude-watch

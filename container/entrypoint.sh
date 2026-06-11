@@ -35,7 +35,7 @@
 #   sudo docker exec -it <container> tmux attach -t claude-container
 #   sudo docker exec <container> tmux capture-pane -t claude-container:0.1 -p
 # Or peek at the structured log:
-#   sudo docker exec <container> cat /tmp/claude-watch.jsonl
+#   sudo docker exec <container> cat /var/log/claude-watch/claude-watch.jsonl
 
 set -euo pipefail
 
@@ -341,14 +341,15 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # Pre-create the log dirs used by the process-compose-supervised
-# services. Each process writes to a uid-1000-writable path under /tmp/
-# so operators can `docker compose exec <c> tail -f /tmp/...` to
+# services. Logs live under the FHS /var/log/claude-watch/ tree (the
+# Dockerfile pre-creates it uid-1000-owned) so operators can
+# `docker compose exec <c> tail -f /var/log/claude-watch/...` to
 # inspect. Belt-and-suspenders against downstream image overrides.
-mkdir -p /tmp/claude-container-watchers 2>/dev/null || true
-: > /tmp/claude-container-watchers/supervisor.log 2>/dev/null || true
-: > /tmp/claude-watch.jsonl 2>/dev/null || true
-: > /tmp/claude-watch.log 2>/dev/null || true
-: > /tmp/claude-container-cron.log 2>/dev/null || true
+mkdir -p /var/log/claude-watch/watchers /var/run/claude 2>/dev/null || true
+: > /var/log/claude-watch/watchers/supervisor.log 2>/dev/null || true
+: > /var/log/claude-watch/claude-watch.jsonl 2>/dev/null || true
+: > /var/log/claude-watch/claude-watch.log 2>/dev/null || true
+: > /var/log/claude-watch/cron.log 2>/dev/null || true
 
 # Propagate container env vars into /etc/cron.d/00-env so cron jobs
 # (which run in a clean environment) inherit CLAUDE_EVENT_QUEUE, HOME,

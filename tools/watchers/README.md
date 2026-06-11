@@ -81,10 +81,10 @@ Environment defaults (all overridable via flag):
 
 - `$CLAUDE_SELF_CLEAR_LOG` — log path (default
   `$XDG_STATE_HOME/claude-watch/self-clear.log`, falling back to
-  `~/.local/state/claude-watch/self-clear.log`)
+  `/var/log/claude-watch/self-clear.log`)
 - `$CLAUDE_SELF_CLEAR_LOCK` — lock path (default
   `$XDG_RUNTIME_DIR/claude-self-clear.lock`, falling back to
-  `/tmp/claude-self-clear.lock`)
+  `/var/run/claude/claude-self-clear.lock`)
 - `$CLAUDE_SELF_CLEAR_RESUME_PROMPT` — resume-prompt text (default is a
   generic placeholder; override to point at a host-specific
   resume-checklist).

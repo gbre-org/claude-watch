@@ -48,7 +48,7 @@ max_context_tokens = 1000000
 # Heartbeat file written by memory-remind
 heartbeat_file = "/var/run/claude/heartbeat"
 # Relaunch script path (written on restart)
-relaunch_script = "/tmp/claude-relaunch.sh"
+relaunch_script = "/var/run/claude/claude-relaunch.sh"
 
 [dead_process]
 # Consecutive zero-token checks before declaring dead
