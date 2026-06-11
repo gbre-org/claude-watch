@@ -181,6 +181,13 @@ OBLIGATIONS_HOOKS: list[tuple[str, str, str]] = [
     # Block Agent spawns missing a `Queue item: q-XXXX` line. Mirrors the
     # host's PreToolUse "Agent" matcher in ~/.claude/settings.json.
     ("PreToolUse", "Agent", "/usr/local/bin/pre-agent-queue-gate-hook"),
+    # Block FOREGROUND Agent spawns. A foreground subagent blocks this loop
+    # for its whole lifetime — no queue babysit, no agent-chat, no heartbeat
+    # refresh, no alert handling — and looks like a wedge to the daemon.
+    # Denies any Agent call whose run_in_background isn't true. The container
+    # is the dispatcher; foreground agents are forbidden here. (Host may use
+    # them; this table is injected only when CLAUDE_CONTAINER_OBLIGATIONS=1.)
+    ("PreToolUse", "Agent", "/usr/local/bin/pre-agent-background-required-hook"),
     # Generic obligations gate (one row per active obligation, denies any
     # tool call whose tool/command-string matches an unsatisfied row).
     # Mirrors the host's PreToolUse "*" matcher.

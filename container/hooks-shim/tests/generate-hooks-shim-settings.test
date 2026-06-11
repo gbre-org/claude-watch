@@ -660,6 +660,24 @@ def test_obligations_inject_into_empty_settings() -> None:
             )
 
 
+def test_obligations_inject_foreground_gate() -> None:
+    """The container-only foreground-agent gate is injected alongside the
+    queue gate on the PreToolUse/Agent matcher (a second hook in the same
+    bucket — the (event,matcher) dict above can't represent two, so it's
+    asserted separately)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {})
+        run_helper(str(inp), str(out), inject_obligations=True)
+        cmds = _collect_hook_commands(load_output(out), "PreToolUse", "Agent")
+        expect(
+            "/usr/local/bin/pre-agent-background-required-hook" in cmds,
+            f"obligations: PreToolUse.Agent should include the background-required "
+            f"gate, got {cmds}",
+        )
+
+
 def test_obligations_idempotent_no_duplicates() -> None:
     """Running the helper twice does NOT duplicate the injected hooks
     (the same command in the same matcher bucket is detected and
@@ -946,6 +964,7 @@ TESTS = [
     test_pattern_matches_command_with_args,
     test_pattern_preserves_already_wrapped,
     test_obligations_inject_into_empty_settings,
+    test_obligations_inject_foreground_gate,
     test_obligations_idempotent_no_duplicates,
     test_obligations_preserves_host_hooks,
     test_obligations_only_drops_host_hooks,
