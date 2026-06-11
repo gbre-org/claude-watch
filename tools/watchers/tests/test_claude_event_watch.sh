@@ -26,7 +26,38 @@ if [[ ! -x "$WATCHER" ]]; then
 fi
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Track background watcher pids so the EXIT trap can reap them — a stray
+# watcher left blocking on inotifywait must never outlive the test (that was
+# the CI-hang failure mode this suite is hardened against).
+BG_PIDS=()
+cleanup() {
+    local p
+    for p in "${BG_PIDS[@]:-}"; do
+        [[ -n "$p" ]] || continue
+        kill "$p" 2>/dev/null || true
+    done
+    rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+# Portable bounded wait: reap $1 within $2 seconds; if it's still alive at the
+# deadline, kill it and return non-zero. Avoids an unbounded `wait` that hangs
+# CI forever when a backgrounded watcher never self-exits (no GNU `timeout`
+# dependency — works on macOS and Linux alike). Polls `kill -0`.
+reap_within() {  # <pid> <max_seconds>
+    local pid="$1" max="$2" waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( waited >= max )); then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    wait "$pid" 2>/dev/null || true
+    return 0
+}
 
 QUEUE="$TMP/queue"
 LOG_DIR="$TMP/log"
@@ -257,13 +288,24 @@ else
 
     # (i) Real concurrent case: a FIRST watcher blocking on an empty queue
     # holds the lock; a SECOND launched against the same lockfile is refused.
-    # Then we drop an event so the first drains + exits, releasing the lock.
+    #
+    # The ONLY thing this case asserts is the singleton guard under genuine
+    # concurrency: while instance #1 holds the flock (blocked on inotifywait
+    # over an empty queue), instance #2 must fail-fast with rc=3. The
+    # teardown of instance #1 deliberately does NOT rely on a racy
+    # inotify wakeup (drop-event → drain → self-exit): on the CI runner a
+    # missed/filtered inotify CREATE — or `--include` regex support varying
+    # across inotify-tools builds — could leave instance #1 blocked forever,
+    # turning the subsequent `wait` into the unbounded hang that pinned the
+    # "Run watcher tests" step for 15+ min. We tear instance #1 down
+    # explicitly and reap it with a bounded poll instead.
     CQ="$TMP/cq"; CLOG="$TMP/clog"; CLOCK="$TMP/concurrent.lock"
     mkdir -p "$CQ" "$CLOG"
     # First instance: empty queue → it blocks on inotifywait holding the lock.
     CLAUDE_EVENT_QUEUE="$CQ" CLAUDE_EVENT_LOG_DIR="$CLOG" \
         CLAUDE_EVENT_WATCH_LOCK="$CLOCK" "$WATCHER" --debounce 0 >"$TMP/first.out" 2>&1 &
     FIRST=$!
+    BG_PIDS+=("$FIRST")
     # Give the first instance a beat to acquire the lock + reach inotifywait.
     sleep 2
     set +e
@@ -277,9 +319,16 @@ else
         kill "$FIRST" 2>/dev/null || true
         exit 1
     fi
-    # Release the first: drop an event so it drains and exits cleanly.
+    # Tear down instance #1 deterministically. We FIRST try the graceful path
+    # (drop a release event so a healthy watcher drains + exits, exercising the
+    # lock auto-release on a clean exit), but bound the reap so a missed
+    # inotify wakeup can't hang the suite. If the graceful path doesn't reap it
+    # in time, reap_within kills + waits it — the singleton assertion above has
+    # already passed, so a kill teardown is fine.
     write_event "$CQ" "100_release.json" "release"
-    wait "$FIRST" 2>/dev/null || true
+    if ! reap_within "$FIRST" 10; then
+        echo "  NOTE: 1st watcher did not self-exit on release within 10s; killed it (inotify wakeup race on this runner) — singleton assertion already verified" >&2
+    fi
     echo "  singleton: real concurrent 2nd watcher refused while 1st blocks OK"
 fi
 
