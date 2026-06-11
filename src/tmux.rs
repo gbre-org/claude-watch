@@ -561,10 +561,47 @@ pub async fn inject_text(pane: &str, text: &str) {
     send_literal(pane, text).await;
     sleep(Duration::from_millis(500)).await;
 
-    // Step 5: Escape + Enter to submit
-    send_keys(pane, &["Escape"]).await;
-    sleep(Duration::from_millis(300)).await;
-    send_keys(pane, &["Enter"]).await;
+    // Step 5: Tab -> Escape -> Enter to submit.
+    //
+    // ROOT CAUSE of "alert text typed but never submitted" bug
+    // (operator-confirmed via screenshot, 2026-06-11): the old sequence
+    // here was Escape -> Enter, with NO Tab. When Claude Code's
+    // autocomplete / ghost-text overlay is active (which it routinely is
+    // after typing the resume/alert payload in INSERT mode), the FIRST
+    // Escape only DISMISSES the dropdown — it does NOT exit INSERT (the
+    // same overlay-eats-the-first-Escape behavior documented at Step 1,
+    // lines ~463-465). So the pane stays in INSERT mode, and the
+    // following Enter inserts a NEWLINE into the input buffer instead of
+    // submitting. The alert text then sits un-submitted in the INSERT
+    // buffer exactly as the operator observed.
+    //
+    // The proven fix mirrors the battle-tested `container/bin/self-clear`
+    // Python inject path (its "regular text" branch, which has shipped
+    // reliably): Tab FIRST to accept/clear the autocomplete, THEN Escape
+    // to dismiss any ghost text that re-triggers after Tab and reach
+    // NORMAL mode cleanly, THEN Enter to submit from NORMAL mode (Enter
+    // in NORMAL mode always submits the current line). Do NOT drop the
+    // Tab — without it the Escape lands on the live dropdown and the
+    // submit silently fails. The keystroke ORDER is asserted by
+    // `submit_keystroke_sequence_is_tab_escape_enter` so a future edit
+    // can't silently regress back to the bare Escape->Enter sequence.
+    for key in submit_keystroke_sequence() {
+        send_keys(pane, &[key]).await;
+        sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// The ordered keystroke sequence used by `inject_text` Step 5 to submit
+/// the typed payload to a Claude Code (vim-mode) pane.
+///
+/// Kept as a pure function so the submit contract is unit-testable without
+/// shelling out to a live tmux (`send_keys`/`run_cmd` have no mock seam).
+/// MUST start with `Tab` (accept/clear autocomplete) and end with `Enter`
+/// (submit) — see the Step 5 comment in `inject_text` for why the bare
+/// `Escape` -> `Enter` sequence left alert text un-submitted in the INSERT
+/// buffer (operator-confirmed regression, 2026-06-11).
+pub(crate) fn submit_keystroke_sequence() -> &'static [&'static str] {
+    &["Tab", "Escape", "Enter"]
 }
 
 /// Inject a command into a shell prompt.
@@ -1336,6 +1373,40 @@ pub async fn healthcheck_brief() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the "alert text typed but never submitted"
+    /// bug (operator-confirmed via screenshot, 2026-06-11). `inject_text`
+    /// Step 5 MUST send Tab (accept/clear autocomplete) before Escape so
+    /// the trailing Enter submits from NORMAL mode instead of inserting a
+    /// newline into a still-INSERT buffer. The pre-fix sequence was the
+    /// bare `["Escape", "Enter"]`, which left the payload un-submitted
+    /// whenever the autocomplete overlay ate the lone Escape. This pins
+    /// the proven `container/bin/self-clear` "regular text" sequence.
+    #[test]
+    fn submit_keystroke_sequence_is_tab_escape_enter() {
+        let seq = submit_keystroke_sequence();
+        assert_eq!(
+            seq,
+            &["Tab", "Escape", "Enter"],
+            "Step-5 submit sequence regressed; must be Tab->Escape->Enter"
+        );
+        // Explicit invariants the comment leans on, asserted independently
+        // so a partial edit (e.g. dropping just the Tab) fails loudly.
+        assert_eq!(
+            seq.first(),
+            Some(&"Tab"),
+            "must Tab FIRST to clear autocomplete before Escape"
+        );
+        assert_eq!(
+            seq.last(),
+            Some(&"Enter"),
+            "must end on Enter to actually submit"
+        );
+        assert!(
+            seq.contains(&"Escape"),
+            "must Escape to reach NORMAL mode before the submitting Enter"
+        );
+    }
 
     #[test]
     fn test_idle_prompt_detected() {
