@@ -71,6 +71,10 @@
 #   ALLOWED_DIR      — absolute path. The server refuses commands that
 #                      would resolve outside this tree. Default: $HOME.
 #   COMMAND_TIMEOUT  — per-command wall-clock cap, seconds. Default: 30.
+#   MAX_COMMAND_LENGTH — max length (chars) of a single command string
+#                      cli-mcp-server accepts before truncating. Its own
+#                      hardcoded default is 1024; we raise it to 8192 so
+#                      legitimate longer commands are not clipped.
 #   ALLOW_SHELL_OPERATORS — "true"/"false". When false (default), the
 #                      server rejects pipes/redirects/&&/||, so the
 #                      container can't string commands together.
@@ -236,6 +240,12 @@ DEFAULT_PORT=8766
 DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,host,dig,nslookup,envchain,jenkins-builds"
 DEFAULT_ALLOWED_FLAGS="all"
 DEFAULT_COMMAND_TIMEOUT=30
+# Max length (chars) of a single command string cli-mcp-server will
+# accept before truncating. cli-mcp-server's own hardcoded default is
+# 1024 (os.getenv("MAX_COMMAND_LENGTH", "1024")), which truncates many
+# legitimate commands the in-container claude issues. We default to a
+# roomier 8192; operators can narrow or widen via $MCP_HOST_BASH_CONFIG.
+DEFAULT_MAX_COMMAND_LENGTH=8192
 DEFAULT_ALLOW_SHELL_OPERATORS="false"
 
 # Trust profiles — opt-in widened allow-lists for specific operator
@@ -414,6 +424,7 @@ ALLOWED_COMMANDS="${ALLOWED_COMMANDS:-$PROFILE_ALLOWED_COMMANDS}"
 ALLOWED_FLAGS="${ALLOWED_FLAGS:-$DEFAULT_ALLOWED_FLAGS}"
 ALLOWED_DIR="${ALLOWED_DIR:-${HOME}}"
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-$DEFAULT_COMMAND_TIMEOUT}"
+MAX_COMMAND_LENGTH="${MAX_COMMAND_LENGTH:-$DEFAULT_MAX_COMMAND_LENGTH}"
 ALLOW_SHELL_OPERATORS="${ALLOW_SHELL_OPERATORS:-$DEFAULT_ALLOW_SHELL_OPERATORS}"
 
 # -----------------------------------------------------------------------------
@@ -476,6 +487,7 @@ argv=(
     --env ALLOWED_FLAGS "$ALLOWED_FLAGS"
     --env ALLOWED_DIR "$ALLOWED_DIR"
     --env COMMAND_TIMEOUT "$COMMAND_TIMEOUT"
+    --env MAX_COMMAND_LENGTH "$MAX_COMMAND_LENGTH"
     --env ALLOW_SHELL_OPERATORS "$ALLOW_SHELL_OPERATORS"
     --
     cli-mcp-server
@@ -714,6 +726,7 @@ except OSError:
     echo "  ALLOWED_FLAGS:         $ALLOWED_FLAGS"
     echo "  ALLOWED_DIR:           $ALLOWED_DIR"
     echo "  COMMAND_TIMEOUT:       $COMMAND_TIMEOUT"
+    echo "  MAX_COMMAND_LENGTH:    $MAX_COMMAND_LENGTH"
     echo "  ALLOW_SHELL_OPERATORS: $ALLOW_SHELL_OPERATORS"
     echo "  log:                   $MCP_HOST_BASH_LOG"
     echo "  config:                $MCP_HOST_BASH_CONFIG (present: $([ -f "$MCP_HOST_BASH_CONFIG" ] && echo yes || echo no))"

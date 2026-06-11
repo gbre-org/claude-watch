@@ -170,6 +170,10 @@ def test_default_policy_conservative() -> None:
     timeout = find_env_value(lines, "COMMAND_TIMEOUT")
     expect(timeout == "30",
            f"default COMMAND_TIMEOUT should be 30s, got {timeout!r}")
+    max_len = find_env_value(lines, "MAX_COMMAND_LENGTH")
+    expect(max_len == "8192",
+           f"default MAX_COMMAND_LENGTH should be 8192 (raised from "
+           f"cli-mcp-server's 1024 default), got {max_len!r}")
     dir_ = find_env_value(lines, "ALLOWED_DIR")
     expect(dir_ == "/tmp/fake-home-mcp-host-bash",
            f"default ALLOWED_DIR should be $HOME, got {dir_!r}")
@@ -227,6 +231,7 @@ def test_config_file_overrides_defaults() -> None:
             "ALLOWED_COMMANDS=git,gh,make\n"
             "ALLOWED_DIR=/Users/me/work\n"
             "COMMAND_TIMEOUT=60\n"
+            "MAX_COMMAND_LENGTH=4096\n"
             "ALLOW_SHELL_OPERATORS=true\n"
         )
         lines, _, _, _ = run_script(
@@ -242,6 +247,10 @@ def test_config_file_overrides_defaults() -> None:
         timeout = find_env_value(lines, "COMMAND_TIMEOUT")
         expect(timeout == "60",
                f"config override: COMMAND_TIMEOUT should be from file, got {timeout!r}")
+        max_len = find_env_value(lines, "MAX_COMMAND_LENGTH")
+        expect(max_len == "4096",
+               f"config override: MAX_COMMAND_LENGTH should be from file, "
+               f"got {max_len!r}")
         operators = find_env_value(lines, "ALLOW_SHELL_OPERATORS")
         expect(operators == "true",
                f"config override: ALLOW_SHELL_OPERATORS should be from file, "

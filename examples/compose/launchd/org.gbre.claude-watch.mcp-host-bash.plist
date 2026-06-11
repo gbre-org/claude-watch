@@ -126,6 +126,12 @@
         chain commands with pipes / `&&` / redirects. Default `false`.
         Leave the default unless you specifically need it.
 
+      - MAX_COMMAND_LENGTH: max length (chars) of a single command
+        string cli-mcp-server will accept before truncating. Its own
+        hardcoded default is 1024, which clips many legitimate commands
+        the in-container claude issues; the launcher defaults to 8192.
+        Raise / lower here or in the operator config file.
+
       - SSL_CERT_FILE / REQUESTS_CA_BUNDLE: corporate CA bundle for
         operators behind a TLS MITM proxy. mcp-host-bash itself does
         NOT make outbound HTTPS calls (the static install via
@@ -203,6 +209,15 @@
 
         <key>ALLOW_SHELL_OPERATORS</key>
         <string>false</string>
+
+        <!--
+          MAX_COMMAND_LENGTH: max single-command length (chars) before
+          cli-mcp-server truncates. Default 8192 (launcher raises it from
+          cli-mcp-server's 1024 hardcoded default). Omit to inherit the
+          launcher default.
+        -->
+        <key>MAX_COMMAND_LENGTH</key>
+        <string>8192</string>
 
         <key>SSL_CERT_FILE</key>
         <string></string>
