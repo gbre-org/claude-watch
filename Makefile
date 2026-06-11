@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -124,6 +124,18 @@ test-hooks-shim:
 test-doc-links:
 	python3 scripts/check-doc-links.py --self-test
 	python3 scripts/check-doc-links.py --all
+
+# CLAUDE.md size guard. Every CLAUDE.md is loaded into Claude Code's context
+# at session start and stays there all session; /doctor recommends each stay
+# under ~40,000 CHARACTERS. This gate fails when a tracked CLAUDE.md exceeds
+# the generic HARD_LIMIT (40k) — except container/baked-CLAUDE.md, which is
+# intentionally ~76k today and is pinned by a ratchet ceiling in the script's
+# ALLOWLIST so it cannot GROW (the lever that drives it back down). The SAME
+# script runs in scripts/git-hooks/pre-commit; CI is the real enforcement
+# since the local hook is bypassable with `git commit --no-verify`.
+test-claude-md-size:
+	python3 scripts/check-claude-md-size.py --self-test
+	python3 scripts/check-claude-md-size.py
 
 # Test the install-hooks target: asserts it sets a relative, repo-local
 # core.hooksPath (not --global, no .git/hooks symlink) and that a fresh
