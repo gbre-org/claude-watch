@@ -39,7 +39,22 @@ if [ "$STALE" -gt 0 ]; then
     # system (which is broken if we got here) and uses the same
     # [CLAUDE-WATCH] prefix that the daemon uses for its alerts,
     # triggering the "STOP EVERYTHING" protocol in the session.
-    tmux send-keys -t "$PANE" \
-        "[CLAUDE-WATCH] WATCHER DOWN: $STALE event(s) unconsumed >${STALE_MIN}min. Restart event watcher via /claude-container:start-watchers" \
-        Enter
+    #
+    # Submit via the Tab -> Escape -> Enter sequence, NOT a bare trailing
+    # Enter. ROOT CAUSE (same bug PR #337 fixed in src/tmux.rs, and what
+    # container/bin/self-clear's "regular text" branch has always done): when
+    # the claude pane is in vim INSERT mode with an autocomplete/ghost-text
+    # overlay active (routine after typing into the prompt), a bare Enter
+    # inserts a NEWLINE into the input buffer instead of submitting — so the
+    # alert text sits un-submitted and the operator has to hit Enter by hand.
+    # Tab first accepts/clears the autocomplete, Escape dismisses any ghost
+    # text and reaches NORMAL mode, then Enter submits from NORMAL mode (where
+    # Enter always submits the current line). The control keys are sent as
+    # SEPARATE send-keys (key names, not -l literals) so tmux interprets them
+    # as keystrokes rather than typing the literal words.
+    tmux send-keys -t "$PANE" -l \
+        "[CLAUDE-WATCH] WATCHER DOWN: $STALE event(s) unconsumed >${STALE_MIN}min. Restart event watcher via /claude-container:start-watchers"
+    tmux send-keys -t "$PANE" Tab
+    tmux send-keys -t "$PANE" Escape
+    tmux send-keys -t "$PANE" Enter
 fi

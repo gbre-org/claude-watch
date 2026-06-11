@@ -400,34 +400,72 @@ print_pending() {
     return $any
 }
 
-# Fast path: events already pending at startup (backlog landed during the
-# main loop's read-act-restart gap). We STILL run the adaptive collect loop
-# here — this is the key fix for the "once per event" cycle. Backlog events
-# are exactly the burst that the main loop would otherwise be forced through
-# one at a time. The collect loop coalesces any siblings still landing, then
-# drains the whole batch in one .output. (DEBOUNCE_SECONDS=0 short-circuits
-# collect_burst, preserving immediate-surface behavior.)
-if find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null | grep -q .; then
-    collect_burst
-    print_pending || true
-    print_restart_banner
-    exit 0
-fi
-
-# Block until something new shows up
+# Ensure inotifywait is available before entering the wait loop. (Checked once
+# here, up front — the loop below assumes it.)
 if ! command -v inotifywait >/dev/null 2>&1; then
     echo "claude-event-watch: inotifywait not found (install inotify-tools)" >&2
     exit 1
 fi
 
-inotifywait -q -e create -e moved_to --include '\.json$' "$QUEUE_DIR" >/dev/null 2>&1
+# --- catch-up / block loop (TOCTOU-safe) ----------------------------------
+# We alternate between a "catch-up" scan of the queue and a BOUNDED block on
+# inotifywait. The bound is the whole point: it closes a check-then-block race
+# that previously let an event sit unconsumed indefinitely.
+#
+# THE RACE (the bug this loop fixes): the old code did a single catch-up scan,
+# and if it found nothing fell straight through to an UNBOUNDED
+#   inotifywait -e create -e moved_to ...
+# inotifywait only fires on create/moved_to events that occur AFTER its watch
+# is armed. There is an unavoidable gap between the catch-up `find` returning
+# "empty" and inotifywait actually arming its inotify watch. An event .json
+# that lands inside that gap is seen by NEITHER: the find already ran, and
+# inotifywait wasn't watching yet. With an unbounded wait, that gap-event then
+# sat on disk until the NEXT unrelated event happened to wake inotifywait —
+# which could be many minutes (or never). The cron health-check
+# (cw-watcher-health-check) then flags it as "WATCHER DOWN" at the 2-min mark,
+# even though the watcher PROCESS is perfectly alive — it's just blind to the
+# gap-event. That false "down" alert is what fired repeatedly all session.
+#
+# THE FIX: give inotifywait a timeout (-t) and loop back to the catch-up scan.
+#   - rc=0  : an event fired      → loop; catch-up scan drains it → exit 0.
+#   - rc=2  : timeout (no event)  → loop; catch-up scan catches any gap-event
+#             that landed during the arm gap, draining within <= timeout.
+#   - other : real inotifywait error → break and exit nonzero.
+# So a gap-event can sit at most one timeout window (<=30s) instead of forever,
+# and the catch-up scan — not inotifywait's event stream — is the thing that
+# actually drains. External behavior is otherwise unchanged: with no events the
+# loop keeps blocking a timeout-window at a time (same as a plain block); the
+# moment any event is present it drains the WHOLE batch in one .output and
+# EXITS, preserving the fire-and-exit / main-loop-restart contract. The
+# debounce/collect_burst coalescing, flock singleton, and restart banner are
+# all untouched.
+INOTIFY_TIMEOUT="${EVENT_WATCH_INOTIFY_TIMEOUT:-30}"
+while true; do
+    # Catch-up: anything already pending (incl. a backlog that landed during
+    # the main loop's read-act-restart gap, OR a gap-event from a prior
+    # iteration's arm window) → coalesce the burst + drain + exit. We run the
+    # adaptive collect loop here too so backlog siblings still landing are
+    # batched into one .output rather than forcing the main loop through them
+    # one at a time. (DEBOUNCE_SECONDS=0 short-circuits collect_burst,
+    # preserving immediate-surface behavior.)
+    if find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+        collect_burst
+        print_pending || true
+        print_restart_banner
+        exit 0
+    fi
 
-# A fresh event just fired. Run the adaptive collect loop to batch any
-# related events from the same burst, then drain everything in one shot.
-# collect_burst polls the queue and waits out a quiet period (capped at
-# DEBOUNCE_SECONDS); it never consumes events, so the drain below sees the
-# full batch.
-collect_burst
-
-print_pending || true
-print_restart_banner
+    # Block for new events, but with a timeout so the loop re-scans and a
+    # gap-event can never sit unconsumed beyond one window.
+    inotifywait -q -t "$INOTIFY_TIMEOUT" -e create -e moved_to \
+        --include '\.json$' "$QUEUE_DIR" >/dev/null 2>&1
+    rc=$?
+    # rc=0: event fired → loop re-checks catch-up (drains). rc=2: timeout →
+    # loop re-checks catch-up (catches any gap-event). Any other rc is a real
+    # inotifywait error → stop looping and surface it.
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+        echo "claude-event-watch: inotifywait exited with rc=$rc — stopping" >&2
+        print_restart_banner
+        exit 1
+    fi
+done
