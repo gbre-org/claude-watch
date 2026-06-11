@@ -302,6 +302,15 @@ RUN mkdir -p /var/run/claude/workload-state \
     && chown 1000:1000 /var/run/claude /var/run/claude/workload-state \
     && chmod 0755 /var/run/claude /var/run/claude/workload-state
 
+# Pre-create /var/log/claude-watch (+ the watchers/ subdir) owned by
+# uid 1000 so the daemon, the cw-claude-watch-launch wrapper, and the
+# session watchers can write their logs (claude-watch.jsonl/.log,
+# cron.log, watchers/*.log) without needing root or runtime mkdir.
+# Same pattern as /var/lib/claude-watch and /var/run/claude above.
+RUN mkdir -p /var/log/claude-watch/watchers \
+    && chown -R 1000:1000 /var/log/claude-watch \
+    && chmod -R 0755 /var/log/claude-watch
+
 # Pre-create ~/.config/ owned by uid 1000 so features that write
 # persistent state to a subdirectory of ~/.config/ (claude-event-watch
 # consumed.jsonl, claude-watch-ack pending-alerts.json, future state

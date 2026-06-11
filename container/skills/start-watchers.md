@@ -35,7 +35,7 @@ This skill exists so the in-container agent has a single canonical place to:
    - **Already running** (e.g. an earlier launch in this same session): do NOT double-launch — report the existing PID.
    - **Not running**: launch the launcher script as a backgrounded subprocess **only via Claude Code's `run_in_background: true` Bash invocation** — never via shell `&` or `nohup` (matches the host's cardinal watcher rule: watchers can ONLY be started by Claude Code's main loop). Capture the resulting `bash_id` so the watcher can be monitored / killed later.
 
-4. **Report** which watchers were started (or were already alive), their `restart_policy`, and the path of each watcher's log (`/tmp/claude-container-watchers/<name>.log` by convention).
+4. **Report** which watchers were started (or were already alive), their `restart_policy`, and the path of each watcher's log (`/var/log/claude-watch/watchers/<name>.log` by convention).
 
 ## On watcher exit
 

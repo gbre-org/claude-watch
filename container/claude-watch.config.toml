@@ -10,8 +10,11 @@
 #     that entrypoint.sh creates, not the host's "dashboard" session).
 #   - dashboard_pane = "claude-container:0.0" (the claude pane is left/main,
 #     pane 1 — this one — is the sidecar reading pane 0).
-#   - All file paths live under /tmp/ or /home/hndrewaall/, never /var/log/
-#     or /var/run/ (no root-owned host dirs in the container).
+#   - File paths follow the FHS: logs under /var/log/claude-watch/,
+#     runtime (locks, heartbeat, relaunch script) under /var/run/claude/,
+#     persistent state under /var/lib/claude-watch/. All three are
+#     pre-created uid-1000-owned by the Dockerfile so the in-container
+#     daemon (uid 1000) writes them without root or runtime mkdir.
 #   - auto_update / reauth / hybrid hooks disabled (host integrations).
 #   - task_watch disabled (no in-container `tasks` session yet).
 # Phase 1e (q-2026-05-11-8a96).
@@ -19,8 +22,8 @@
 [general]
 check_interval = 5
 state_file = "/home/hndrewaall/.cache/claude-watch/state.json"
-log_file = "/tmp/claude-watch.jsonl"
-legacy_log_file = "/tmp/claude-watch.log"
+log_file = "/var/log/claude-watch/claude-watch.jsonl"
+legacy_log_file = "/var/log/claude-watch/claude-watch.log"
 # Global post-interrupt cooldown (seconds): 5-min outer ceiling on ALL
 # interrupt fires (prolonged-thinking, context-warning, auto-respawn).
 # Raised 60 -> 300 (2026-06-11). Per-type cooldowns stay the inner
@@ -41,8 +44,8 @@ post_escape_settle_ms = 0
 
 [claude]
 max_context_tokens = 1000000
-heartbeat_file = "/tmp/claude-heartbeat"
-relaunch_script = "/tmp/claude-relaunch.sh"
+heartbeat_file = "/var/run/claude/claude-heartbeat"
+relaunch_script = "/var/run/claude/claude-relaunch.sh"
 
 [dead_process]
 checks_required = 3

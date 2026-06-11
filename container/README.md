@@ -147,7 +147,7 @@ Container-specific deltas from a typical host config:
 - `[tmux] dashboard_pane = "claude-container:0.0"` / `dashboard_session =
   "claude-container"` — pinned to the in-container tmux session, not a host
   `dashboard` session.
-- Logs land at `/tmp/claude-watch.jsonl` (uid 1000 writable, ephemeral).
+- Logs land at `/var/log/claude-watch/claude-watch.jsonl` (uid 1000 writable, ephemeral).
 - `watcher_monitor`, `auto_update`, `reauth`, `task_watch`, `hybrid`
   disabled — those depend on host integrations.
 
@@ -157,7 +157,7 @@ To inspect pane 1 from another shell on the host (only meaningful when
 ```
 sudo docker exec -it <container> tmux attach -t claude-container
 sudo docker exec <container> tmux capture-pane -t claude-container:0.1 -p
-sudo docker exec <container> cat /tmp/claude-watch.jsonl
+sudo docker exec <container> cat /var/log/claude-watch/claude-watch.jsonl
 ```
 
 In sidebar mode, if the daemon fails to start (config parse error, etc.)

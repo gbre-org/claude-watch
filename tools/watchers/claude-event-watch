@@ -212,11 +212,11 @@ mkdir -p "$LOG_DIR"
 #
 # Lockfile path mirrors the self-clear watcher's convention: override via
 # $CLAUDE_EVENT_WATCH_LOCK, else $XDG_RUNTIME_DIR/claude-event-watch.lock,
-# else /tmp/claude-event-watch.lock. The override lets tests isolate so a
-# real running watcher on the host can't make the test see a held lock (and
-# vice-versa).
+# else /var/run/claude/claude-event-watch.lock. The override lets tests
+# isolate so a real running watcher on the host can't make the test see a
+# held lock (and vice-versa).
 LOCKFILE="${CLAUDE_EVENT_WATCH_LOCK:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/claude-event-watch.lock}}"
-LOCKFILE="${LOCKFILE:-/tmp/claude-event-watch.lock}"
+LOCKFILE="${LOCKFILE:-/var/run/claude/claude-event-watch.lock}"
 if command -v flock >/dev/null 2>&1; then
     # Read any existing holder pid FIRST, before we open the fd for write —
     # opening with `9>` truncates the file, which would otherwise wipe the

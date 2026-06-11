@@ -17,9 +17,9 @@ Configuration (defaults are portable; override via CLI flag or env var):
 
 Defaults:
   log file:    $XDG_STATE_HOME/claude-watch/self-clear.log
-               (or ~/.local/state/claude-watch/self-clear.log)
+               (or /var/log/claude-watch/self-clear.log fallback)
   lock file:   $XDG_RUNTIME_DIR/claude-self-clear.lock
-               (or /tmp/claude-self-clear.lock fallback)
+               (or /var/run/claude/claude-self-clear.lock fallback)
   resume:      "[SELF-CLEAR-RESUME] Clean context reset completed.
                 Resume the previous task / checklist."
 """
@@ -58,10 +58,10 @@ def _default_log_file() -> str:
     env = os.environ.get("CLAUDE_SELF_CLEAR_LOG", "").strip()
     if env:
         return env
-    state_home = os.environ.get("XDG_STATE_HOME", "").strip() or str(
-        Path.home() / ".local" / "state"
-    )
-    return str(Path(state_home) / "claude-watch" / "self-clear.log")
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    if state_home:
+        return str(Path(state_home) / "claude-watch" / "self-clear.log")
+    return "/var/log/claude-watch/self-clear.log"
 
 
 def _default_lock_file() -> str:
@@ -72,7 +72,7 @@ def _default_lock_file() -> str:
     runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
     if runtime:
         return str(Path(runtime) / "claude-self-clear.lock")
-    return "/tmp/claude-self-clear.lock"
+    return "/var/run/claude/claude-self-clear.lock"
 
 
 def _default_resume_prompt() -> str:

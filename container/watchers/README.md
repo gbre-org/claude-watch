@@ -36,7 +36,7 @@ Each watcher is a pair of files:
   description = "Blocks until a claude-event arrives, prints pending events, exits"
   launcher = "/opt/claude-container/watchers/claude-event-watch.sh"
   restart_policy = "session"  # restarted by the session on each exit
-  log_path = "/tmp/claude-container-watchers/claude-event-watch.log"
+  log_path = "/var/log/claude-watch/watchers/claude-event-watch.log"
   ```
 
   All keys are required. `launcher` is the absolute baked path (`/opt/claude-container/watchers/<name>.sh`); the `/start-watchers` skill resolves it as-is.
@@ -93,4 +93,4 @@ The canonical event-bus watcher. Blocks on `inotifywait` until a `.json` event f
 - Baked launcher: `/opt/claude-container/watchers/claude-event-watch.sh`
 - Metadata: `/opt/claude-container/watchers/claude-event-watch.toml`
 - Restart policy: `session` (restarted by the session on each exit)
-- Log path: `/tmp/claude-container-watchers/claude-event-watch.log`
+- Log path: `/var/log/claude-watch/watchers/claude-event-watch.log`
