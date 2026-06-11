@@ -12,11 +12,11 @@
 //! This module routes the inject to the right channel based on the agent
 //! process's deployment mode (see `proc_util::agent_deployment_mode`):
 //!
-//! | Mode      | Channel                                    |
-//! |-----------|--------------------------------------------|
-//! | Terminal  | `tmux::inject_text` (historical default)    |
-//! | IdePanel  | `inject_probe::inject` (pidfd_getfd)        |
-//! | Unknown   | claude-event escalation (no in-band channel) |
+//! | Mode      | Channel                                       |
+//! |-----------|-----------------------------------------------|
+//! | Terminal  | `tmux::inject_text` (historical default)      |
+//! | IdePanel  | `inject_probe::inject` (pidfd_getfd)          |
+//! | Unknown   | tmux if pane present, else claude-event       |
 //!
 //! ## Limitations
 //!
@@ -34,10 +34,16 @@
 //! to surface the inability to interrupt — and logs a single one-line
 //! warning per agent PID (idempotent across the daemon's lifetime).
 //!
-//! `Unknown` mode (process gone, /proc unreadable) goes directly to
-//! claude-event without trying any in-band channel. The agent may be
-//! transient or dying; surfacing the alert to the main loop is the
-//! safest action.
+//! `Unknown` mode (claude PID not yet resolvable — e.g. the post-boot
+//! window where /proc/PID/exe isn't yet the final claude binary, or
+//! /proc unreadable) defaults to the historical Terminal behavior when
+//! the tmux pane is present: `tmux::inject_text`. A tmux-hosted pane is
+//! always a terminal, and the only reason to suppress tmux-inject is a
+//! positively-detected IDE panel (the distinct `IdePanel` mode), never
+//! `Unknown`. This honors the `proc_util::AgentDeploymentMode::Unknown`
+//! contract ("default to Terminal behavior"). Only when NO pane is
+//! present (empty spec / pane gone) does the dispatcher fall back to
+//! claude-event escalation, since there is then no in-band channel.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -172,6 +178,7 @@ pub async fn dispatch_inject(
     text: &str,
     mode: AgentDeploymentMode,
     agent_pid: Option<u32>,
+    pane_present: bool,
 ) -> InjectBackend {
     match mode {
         AgentDeploymentMode::Terminal => {
@@ -226,12 +233,33 @@ pub async fn dispatch_inject(
             }
         }
         AgentDeploymentMode::Unknown => {
-            info!(
-                pane = %pane,
-                "agent deployment mode unknown; falling back to claude-event escalation (no in-band channel)"
-            );
-            emit_unknown_event(backends, pane);
-            InjectBackend::UnknownEvent
+            // `Unknown` means we couldn't positively resolve the claude
+            // PID (e.g. during the post-boot window where /proc/PID/exe
+            // isn't yet the final claude binary while node bootstraps).
+            // Per the proc_util::AgentDeploymentMode::Unknown contract,
+            // Unknown should default to Terminal behavior — it's strictly
+            // broader than IdePanel, and a tmux-hosted pane is always a
+            // terminal. The only legitimate reason to suppress tmux inject
+            // is a positively-detected IDE panel (pty=false + SSE_PORT),
+            // which is the distinct `IdePanel` mode, never `Unknown`. So
+            // when the pane exists, honor the historical Terminal default
+            // and inject via tmux rather than escalating to a claude-event
+            // that never types the prompt into the pane.
+            if pane_present {
+                info!(
+                    pane = %pane,
+                    "agent deployment mode unknown but pane present; defaulting to tmux inject (Terminal contract)"
+                );
+                backends.tmux_inject(pane, text).await;
+                InjectBackend::Tmux
+            } else {
+                info!(
+                    pane = %pane,
+                    "agent deployment mode unknown and no pane present; falling back to claude-event escalation (no in-band channel)"
+                );
+                emit_unknown_event(backends, pane);
+                InjectBackend::UnknownEvent
+            }
         }
     }
 }
@@ -242,7 +270,14 @@ pub async fn inject_to_agent(pane: &str, text: &str) {
     let backends = RealBackends;
     let agent_pid = resolve_agent_pid_for_pane(pane).await;
     let mode = mode_for(agent_pid);
-    let _ = dispatch_inject(&backends, pane, text, mode, agent_pid).await;
+    // "Pane present" = a non-empty pane spec whose pane_pid tmux can
+    // resolve. This is a weaker, more available signal than the claude
+    // PID (which `resolve_agent_pid_for_pane` walks the tree for and may
+    // miss during the boot window). The Unknown-mode dispatch arm uses it
+    // to decide between the tmux Terminal default and claude-event
+    // escalation. See the `AgentDeploymentMode::Unknown` contract.
+    let pane_present = !pane.is_empty() && crate::tmux::get_pane_pid(pane).await.is_some();
+    let _ = dispatch_inject(&backends, pane, text, mode, agent_pid, pane_present).await;
 }
 
 fn emit_panel_fallback_event(
@@ -405,6 +440,7 @@ mod tests {
             "hello",
             AgentDeploymentMode::Terminal,
             Some(9999),
+            true,
         )
         .await;
         assert_eq!(out, InjectBackend::Tmux);
@@ -427,6 +463,7 @@ mod tests {
             "hello",
             AgentDeploymentMode::IdePanel,
             Some(4321),
+            true,
         )
         .await;
         assert_eq!(out, InjectBackend::Pidfd);
@@ -440,7 +477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_unknown_routes_to_event() {
+    async fn dispatch_unknown_no_pane_routes_to_event() {
         let _g = reset_for_test();
         let b = RecordingBackends::ok_pidfd();
         let out = dispatch_inject(
@@ -449,6 +486,7 @@ mod tests {
             "hello",
             AgentDeploymentMode::Unknown,
             None,
+            false,
         )
         .await;
         assert_eq!(out, InjectBackend::UnknownEvent);
@@ -456,6 +494,35 @@ mod tests {
             b.calls(),
             vec![Call::Event {
                 alert_type: "inject-dispatch-unknown-mode".to_string()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_with_pane_present_routes_to_tmux() {
+        // Load-bearing regression: during the post-boot window the claude
+        // PID isn't yet resolvable, so mode_for() yields Unknown — but the
+        // tmux pane exists. Per the AgentDeploymentMode::Unknown contract
+        // ("default to Terminal behavior"), this MUST tmux-inject the
+        // resume prompt, not escalate to a claude-event that never types
+        // into the pane.
+        let _g = reset_for_test();
+        let b = RecordingBackends::ok_pidfd();
+        let out = dispatch_inject(
+            &b,
+            "claude-container:0.0",
+            "hello",
+            AgentDeploymentMode::Unknown,
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(out, InjectBackend::Tmux);
+        assert_eq!(
+            b.calls(),
+            vec![Call::Tmux {
+                pane: "claude-container:0.0".to_string(),
+                text: "hello".to_string()
             }]
         );
     }
@@ -474,6 +541,7 @@ mod tests {
             "hello",
             AgentDeploymentMode::IdePanel,
             Some(8765),
+            true,
         )
         .await;
         assert_eq!(out, InjectBackend::PidfdFailedEvent);
@@ -510,6 +578,7 @@ mod tests {
             "hello",
             AgentDeploymentMode::IdePanel,
             Some(8765),
+            true,
         )
         .await;
         assert_eq!(out, InjectBackend::PidfdFailedEvent);
@@ -528,6 +597,7 @@ mod tests {
             "hello",
             AgentDeploymentMode::IdePanel,
             None,
+            true,
         )
         .await;
         assert_eq!(out, InjectBackend::UnknownEvent);

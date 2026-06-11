@@ -17,7 +17,7 @@
 # Phase 1e (q-2026-05-11-8a96).
 
 [general]
-check_interval = 10
+check_interval = 5
 state_file = "/home/hndrewaall/.cache/claude-watch/state.json"
 log_file = "/tmp/claude-watch.jsonl"
 legacy_log_file = "/tmp/claude-watch.log"
@@ -48,11 +48,12 @@ relaunch_script = "/tmp/claude-relaunch.sh"
 checks_required = 3
 restart_cooldown = 300
 # Cycles of confirmed idle+0-tokens before injecting the fresh-session resume
-# prompt. At check_interval=10s this is the inject latency floor. The code
+# prompt. At check_interval=5s this is the inject latency floor. The code
 # default is 5 (~50-60s) to avoid kicking a host session that's only briefly
-# between turns. In the container a recreate is known-fresh, so 2 cycles
-# (~20s) is plenty of confirmation and cuts the post-recreate dead time.
-fresh_inject_checks = 2
+# between turns. In the container a recreate is known-fresh, so 1 cycle
+# (~5s) is enough confirmation and cuts the post-recreate dead time. Combined
+# with check_interval=5 above, the first inject attempt lands in <10s.
+fresh_inject_checks = 1
 
 [fresh_clear]
 min_tokens = 2000
