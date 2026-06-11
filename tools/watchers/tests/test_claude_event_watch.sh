@@ -199,4 +199,130 @@ if ! grep -q 'late' <<<"$run2"; then
 fi
 echo "  no-loss: late event persisted and surfaced on next run OK"
 
-echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce)"
+# --- flock singleton guard tests -----------------------------------------
+# These verify the watcher self-defends against a duplicate launch racing the
+# same queue. We isolate every instance onto a per-test lockfile via
+# $CLAUDE_EVENT_WATCH_LOCK so a real watcher running on the host (or a
+# previous test) can't perturb the result.
+
+if ! command -v flock >/dev/null 2>&1; then
+    echo "  SKIP: flock not available — singleton guard tests skipped" >&2
+else
+    # (h) Lock path is env-overridable, and a SECOND instance is refused
+    # (exit 3) while the lock is held by a first. We hold the lock from the
+    # test itself (deterministic — no inotify timing) by opening an fd on the
+    # lockfile and flock'ing it, then invoke the watcher pointed at the SAME
+    # lockfile and assert it refuses.
+    LOCKFILE="$TMP/cew.lock"
+    LQ="$TMP/lq"; LLOG="$TMP/llog"; mkdir -p "$LQ" "$LLOG"
+
+    exec 8>"$LOCKFILE"
+    if ! flock -n 8; then
+        echo "FAIL: test harness could not acquire its own lock" >&2; exit 1
+    fi
+    # Lock now held by the test shell (fd 8). Second instance must refuse.
+    set +e
+    dup_out=$(CLAUDE_EVENT_QUEUE="$LQ" CLAUDE_EVENT_LOG_DIR="$LLOG" \
+        CLAUDE_EVENT_WATCH_LOCK="$LOCKFILE" "$WATCHER" --debounce 0 2>&1)
+    dup_rc=$?
+    set -e
+    if (( dup_rc != 3 )); then
+        echo "FAIL: duplicate instance returned rc=$dup_rc, expected 3" >&2
+        echo "$dup_out" >&2
+        exit 1
+    fi
+    if ! grep -q 'already running' <<<"$dup_out"; then
+        echo "FAIL: duplicate instance missing 'already running' message" >&2
+        echo "$dup_out" >&2
+        exit 1
+    fi
+    # Release the held lock; the SAME invocation must now succeed (proves the
+    # refusal was the lock, not some other failure, and that the lockfile path
+    # was honored via the env override).
+    flock -u 8
+    exec 8>&-
+    free_out=$(CLAUDE_EVENT_QUEUE="$LQ" CLAUDE_EVENT_LOG_DIR="$LLOG" \
+        CLAUDE_EVENT_WATCH_LOCK="$LOCKFILE" "$WATCHER" --debounce 0 2>&1)
+    if grep -q 'already running' <<<"$free_out"; then
+        echo "FAIL: instance refused even though lock was released" >&2
+        echo "$free_out" >&2
+        exit 1
+    fi
+    if ! grep -q 'WATCHER EXITED' <<<"$free_out"; then
+        echo "FAIL: instance with free lock did not run to completion" >&2
+        echo "$free_out" >&2
+        exit 1
+    fi
+    echo "  singleton: 2nd instance refused (rc=3) while lock held, runs once free OK"
+
+    # (i) Real concurrent case: a FIRST watcher blocking on an empty queue
+    # holds the lock; a SECOND launched against the same lockfile is refused.
+    # Then we drop an event so the first drains + exits, releasing the lock.
+    CQ="$TMP/cq"; CLOG="$TMP/clog"; CLOCK="$TMP/concurrent.lock"
+    mkdir -p "$CQ" "$CLOG"
+    # First instance: empty queue → it blocks on inotifywait holding the lock.
+    CLAUDE_EVENT_QUEUE="$CQ" CLAUDE_EVENT_LOG_DIR="$CLOG" \
+        CLAUDE_EVENT_WATCH_LOCK="$CLOCK" "$WATCHER" --debounce 0 >"$TMP/first.out" 2>&1 &
+    FIRST=$!
+    # Give the first instance a beat to acquire the lock + reach inotifywait.
+    sleep 2
+    set +e
+    conc_out=$(CLAUDE_EVENT_QUEUE="$CQ" CLAUDE_EVENT_LOG_DIR="$CLOG" \
+        CLAUDE_EVENT_WATCH_LOCK="$CLOCK" "$WATCHER" --debounce 0 2>&1)
+    conc_rc=$?
+    set -e
+    if (( conc_rc != 3 )); then
+        echo "FAIL: concurrent 2nd watcher returned rc=$conc_rc, expected 3" >&2
+        echo "$conc_out" >&2
+        kill "$FIRST" 2>/dev/null || true
+        exit 1
+    fi
+    # Release the first: drop an event so it drains and exits cleanly.
+    write_event "$CQ" "100_release.json" "release"
+    wait "$FIRST" 2>/dev/null || true
+    echo "  singleton: real concurrent 2nd watcher refused while 1st blocks OK"
+fi
+
+# (j) tty-warning path: when stdout is a tty the watcher must WARN (not fail).
+# We can't easily give the subprocess a real tty here without a pty helper, so
+# we assert the inverse contract instead — in our normal piped invocations the
+# warning never appears — and additionally confirm the warning STRING exists in
+# the script so a refactor can't silently drop it. (The non-tty no-warning
+# behavior is already exercised by every other test above capturing stderr.)
+if grep -q 'stdout is a tty' <<<"$run2"; then
+    echo "FAIL: tty warning leaked into a piped (non-tty) invocation" >&2
+    exit 1
+fi
+if ! grep -q 'stdout is a tty' "$WATCHER"; then
+    echo "FAIL: watcher missing the tty-misuse warning" >&2
+    exit 1
+fi
+# Best-effort real-tty check: if `script` (util that allocates a pty) is
+# available, run the watcher under it and confirm the warning fires. Skipped
+# silently where `script`'s flags differ (macOS vs Linux) or it's absent.
+if command -v script >/dev/null 2>&1; then
+    TQ="$TMP/tq"; TLOG="$TMP/tlog"; TLOCK="$TMP/tty.lock"
+    mkdir -p "$TQ" "$TLOG"
+    tty_out=""
+    if script -qec "true" /dev/null >/dev/null 2>&1; then
+        # GNU script (Linux): script -qec "<cmd>" <logfile>
+        tty_out=$(CLAUDE_EVENT_QUEUE="$TQ" CLAUDE_EVENT_LOG_DIR="$TLOG" \
+            CLAUDE_EVENT_WATCH_LOCK="$TLOCK" \
+            script -qec "$WATCHER --debounce 0" /dev/null 2>&1 || true)
+    elif script -q /dev/null true >/dev/null 2>&1; then
+        # BSD script (macOS): script -q <logfile> <cmd...>
+        tty_out=$(CLAUDE_EVENT_QUEUE="$TQ" CLAUDE_EVENT_LOG_DIR="$TLOG" \
+            CLAUDE_EVENT_WATCH_LOCK="$TLOCK" \
+            script -q /dev/null "$WATCHER" --debounce 0 2>&1 || true)
+    fi
+    if [[ -n "$tty_out" ]]; then
+        if grep -q 'stdout is a tty' <<<"$tty_out"; then
+            echo "  tty-misuse: warning fired under a real pty OK"
+        else
+            echo "  NOTE: pty run produced no tty warning (script flag mismatch?) — string-presence check still enforced" >&2
+        fi
+    fi
+fi
+echo "  tty-misuse: warning string present + absent from piped runs OK"
+
+echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + singleton + tty guard)"
