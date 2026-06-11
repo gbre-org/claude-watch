@@ -415,7 +415,7 @@ pub async fn execute_respawn_with_versions_dir(
     // confuse the post-restart resume-inject path. The fresh dashboard
     // will write its own pane-id file. We do NOT delete the heartbeat
     // file — the new claude+memory-remind chain will refresh it.
-    let _ = std::fs::remove_file("/tmp/claude-relaunch.sh");
+    let _ = std::fs::remove_file("/var/run/claude/claude-relaunch.sh");
 
     // Emit a claude-event so Andrew's notification stream picks up the
     // respawn, and so the dashboard's session log gets a breadcrumb.
