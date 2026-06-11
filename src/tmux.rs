@@ -121,6 +121,121 @@ pub(crate) fn check_lines_for_idle_prompt(pane_output: &str) -> bool {
     false
 }
 
+/// Check if the pane is showing an INTERACTIVE PROMPT that is awaiting a
+/// human selection/confirmation — an `AskUserQuestion` multiple-choice
+/// menu, a tool-permission prompt ("Do you want to proceed?"), or any
+/// arrow-key selection overlay. Captures the pane and runs the pure
+/// `interactive_prompt_visible` detector.
+///
+/// Used to SUPPRESS keystroke injection (resume-prompt inject, fresh-/clear
+/// inject) while such a prompt is on screen. Injecting `send-keys` into a
+/// live selection menu is DESTRUCTIVE — the first injected key (or the
+/// Escape that `tmux::inject_text` leads with) cancels the menu out from
+/// under the operator before they can answer it. See
+/// `interactive_prompt_visible` for the conservative-bias rationale.
+pub async fn is_interactive_prompt(pane: &str) -> bool {
+    if let Some(out) = capture_pane(pane).await {
+        return interactive_prompt_visible(&out);
+    }
+    false
+}
+
+/// Pure function: does the pane show an interactive prompt awaiting a human
+/// pick/confirm? This is the signature claude-watch must treat as
+/// "NOT-idle, do NOT inject keystrokes" even though a `❯` prompt char is
+/// present (every such menu still renders a `❯` selection cursor, which is
+/// exactly why the bare `is_idle` `❯`-scan misclassifies it as idle).
+///
+/// Claude Code renders these interactive prompts as a bordered box whose
+/// footer carries a recognizable hint line, e.g.:
+///
+/// ```text
+///   Do you want to proceed?
+///   ❯ 1. Yes
+///     2. No, and tell Claude what to do differently (esc)
+/// ```
+/// or, for `AskUserQuestion` / selection overlays:
+/// ```text
+///   ❯ 1. Some option
+///     2. Another option
+///   ↑/↓ to select · Enter to confirm · Esc to cancel
+/// ```
+///
+/// ## Detection signatures (any one matches)
+///
+///  1. A tool-permission question line: `Do you want to` / `Would you like to`
+///     / `Do you want to proceed`.
+///  2. A selection-hint footer that implies an active pick: a line containing
+///     "to select" AND ("Enter to" OR "to confirm" OR "to submit" OR
+///     "Esc to cancel" OR "esc)"). The Background-tasks *viewer* overlay also
+///     uses "↑/↓ to select … Enter to view … ←/Esc to close" — that one is a
+///     passive viewer, not a blocking question, but suppressing an inject
+///     while it is open is harmless (it only DELAYS a resume), so we
+///     deliberately match it too rather than risk under-matching a real
+///     question.
+///  3. A `❯`-cursored numbered option row (`❯ 1.` / `❯ 2.` …) — the menu's
+///     highlighted selection. A genuinely-idle prompt has the `❯` alone on
+///     an otherwise-empty input line, never immediately followed by a
+///     numbered option.
+///
+/// ## Conservative bias
+///
+/// This guard is intentionally biased toward returning `true` ("an
+/// interactive prompt is up — suppress"). The two error modes are NOT
+/// symmetric: a FALSE POSITIVE merely DELAYS a resume-inject by one or more
+/// check cycles (fully recoverable — the prompt will clear and the next
+/// cycle injects), whereas a FALSE NEGATIVE lets the daemon `send-keys` into
+/// a live menu and CANCEL the operator's question (the reported bug —
+/// destructive, unrecoverable for that interaction). So when a marker is
+/// ambiguous, prefer to match it.
+pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    // Scan a generous tail — these prompt boxes can be several lines tall
+    // and the footer hint sits at the bottom.
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    for line in &lines[start..] {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+
+        // (1) Permission / confirmation question text.
+        if lower.contains("do you want to")
+            || lower.contains("would you like to")
+            || lower.contains("do you trust")
+        {
+            return true;
+        }
+
+        // (2) A selection-hint footer that implies an active pick.
+        if lower.contains("to select")
+            && (lower.contains("enter to")
+                || lower.contains("to confirm")
+                || lower.contains("to submit")
+                || lower.contains("esc to")
+                || lower.contains("to close")
+                || lower.contains("to view"))
+        {
+            return true;
+        }
+
+        // (3) A `❯`-cursored numbered option row (`❯ 1.`, `❯ 2.`, …).
+        // The cursor char may be followed by spaces then `<digit>.`.
+        if let Some(rest) = trimmed.strip_prefix('\u{276f}') {
+            let rest = rest.trim_start();
+            let mut chars = rest.chars();
+            if let Some(c) = chars.next() {
+                if c.is_ascii_digit() && chars.next() == Some('.') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Check if pane shows exit teardown indicators ("Goodbye!" or "Background command was stopped").
 /// During /exit, Claude Code prints these before the process fully terminates.
 pub async fn is_exit_teardown(pane: &str) -> bool {
@@ -1258,6 +1373,103 @@ mod tests {
         }
         let output = lines.join("\n");
         assert!(check_lines_for_idle_prompt(&output));
+    }
+
+    // -------------------------------------------------------------------
+    // interactive_prompt_visible — regression suite for the 2026-06-11 bug
+    // where the daemon injected a resume prompt into a live AskUserQuestion
+    // menu (the `❯` selection cursor was misread as an idle prompt), the
+    // leading Escape cancelling the operator's question.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn interactive_prompt_permission_confirmation() {
+        // Tool-permission prompt. `❯` cursor is on the highlighted option,
+        // so is_idle would wrongly say idle.
+        let output = "\u{25cf} Bash(rm -rf /tmp/foo)\n\
+                      ─────────────\n\
+                      Do you want to proceed?\n\
+                      \u{276f} 1. Yes\n\
+                        2. No, and tell Claude what to do differently (esc)";
+        assert!(
+            interactive_prompt_visible(output),
+            "permission confirmation must be detected as an interactive prompt"
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_ask_user_question_menu() {
+        // AskUserQuestion multiple-choice menu with a select-hint footer.
+        let output = "Which approach should I take?\n\
+                      \u{276f} 1. Refactor in place\n\
+                        2. Rewrite from scratch\n\
+                        3. Leave as-is\n\
+                      \u{2191}/\u{2193} to select \u{00b7} Enter to confirm \u{00b7} Esc to cancel";
+        assert!(
+            interactive_prompt_visible(output),
+            "AskUserQuestion menu must be detected as an interactive prompt"
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_cursored_numbered_option() {
+        // Even without a recognizable footer/question line, a `❯ <n>.`
+        // cursored option row is a menu signature.
+        let output = "Pick one:\n\u{276f} 1. Option A\n  2. Option B";
+        assert!(interactive_prompt_visible(output));
+    }
+
+    #[test]
+    fn interactive_prompt_do_you_trust_folder() {
+        // Trust-workspace prompt on first launch in a new dir.
+        let output = "Do you trust the files in this folder?\n\
+                      \u{276f} 1. Yes, proceed\n  2. No, exit";
+        assert!(interactive_prompt_visible(output));
+    }
+
+    #[test]
+    fn interactive_prompt_not_fired_on_bare_idle_prompt() {
+        // A genuinely-idle pane: bare `❯` on the input line, status bar
+        // below. Must NOT be flagged as an interactive prompt (otherwise
+        // we'd suppress every resume-inject forever).
+        let output = "\u{25cf} Brewed for 12s\n\
+                      ─────────────\n\
+                      \u{276f}\n\
+                      ─────────────\n\
+                      \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        assert!(
+            !interactive_prompt_visible(output),
+            "bare idle prompt must NOT be flagged as an interactive prompt"
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_not_fired_on_idle_with_typed_text() {
+        // Idle prompt with the operator's draft text after the cursor —
+        // still not a menu (no numbered option directly after ❯, no
+        // select-hint footer, no question text).
+        let output = "\u{276f} some draft text the user is typing\n\
+                      ─────────────\n\
+                      \u{23f5}\u{23f5} bypass permissions on \u{00b7} esc to interrupt";
+        assert!(!interactive_prompt_visible(output));
+    }
+
+    #[test]
+    fn interactive_prompt_fires_on_background_tasks_viewer_overlay() {
+        // The Background-tasks viewer overlay (ctrl+b) is a passive viewer,
+        // not a blocking question — but it carries the "↑/↓ to select …
+        // Enter to view … ←/Esc to close" footer. Per the conservative
+        // bias, suppressing an inject while it's open is harmless (only
+        // delays a resume), so we deliberately match it rather than risk
+        // under-matching a real question with a similar footer.
+        let output = "  Background tasks\n\
+                        4 active shells\n\
+                      \u{276f} watcher-ctl run alerts-watcher (running)\n\
+                      \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
+        assert!(
+            interactive_prompt_visible(output),
+            "select-hint footer overlay must be matched (conservative bias)"
+        );
     }
 
     #[test]

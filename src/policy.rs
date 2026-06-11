@@ -2229,6 +2229,21 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             crate::state::save_state(&config.general.state_file, state);
             return;
         }
+        // Don't inject while an interactive prompt (AskUserQuestion menu,
+        // tool-permission confirmation, selection overlay) is awaiting the
+        // operator. Such a prompt renders a `❯` selection cursor, so the
+        // bare `is_idle` `❯`-scan below would misclassify it as idle and
+        // `send-keys` the resume prompt into the live menu — the leading
+        // Escape cancels the operator's question out from under them
+        // (reported bug, 2026-06-11). Suppressing here only DELAYS the
+        // resume to the next cycle once the prompt clears (recoverable),
+        // whereas injecting is destructive — so we suppress.
+        if tmux::is_interactive_prompt(pane).await {
+            debug!("post-restart: skipping — interactive prompt on screen (awaiting operator)");
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        }
         if tmux::is_idle(pane).await {
             info!("post-restart: injecting resume prompt");
             inject_dispatch::inject_to_agent(
@@ -2601,6 +2616,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // Injecting resume during teardown is useless and confusing.
         if !effective_pane.is_empty() && tmux::is_exit_teardown(&effective_pane).await {
             debug!("fresh /clear check: skipping — exit teardown detected");
+            state.consecutive_fast_detections = 0;
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        }
+
+        // Skip if an interactive prompt (AskUserQuestion menu, tool-
+        // permission confirmation, selection overlay) is awaiting the
+        // operator. Same destructive-inject hazard as the post-restart
+        // path: such a menu renders a `❯` cursor that `is_idle` would
+        // read as idle, and a resume-inject's leading Escape cancels the
+        // operator's question. Suppress (delays the inject — recoverable)
+        // rather than inject (destructive). Reset the fast-detection
+        // counter so detection re-builds once the prompt clears.
+        if !effective_pane.is_empty() && tmux::is_interactive_prompt(&effective_pane).await {
+            debug!("fresh /clear check: skipping — interactive prompt on screen (awaiting operator)");
             state.consecutive_fast_detections = 0;
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
