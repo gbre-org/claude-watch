@@ -20,8 +20,11 @@
 //!
 //! 2. `memory-reminder` — every [`MEMORY_REMINDER_INTERVAL_SECS`] (30min),
 //!    carrying the action checklist text ([`MEMORY_REMINDER_CHECKLIST`]).
-//!    Delivered via tmux-inject into the main loop pane (same mechanism as
-//!    other daemon interventions), NOT the event queue.
+//!    Written to the event queue (`~/claude-events/`) as an AMBIENT
+//!    `claude-watch/memory-reminder` event, surfaced via the next
+//!    `UserPromptSubmit`. Memory hygiene is not urgent enough to justify a
+//!    mid-generation tmux-inject interruption, so it lives at the lowest
+//!    (event) tier of the alerting hierarchy.
 //!
 //! ## Delivery choice: event queue vs. tmux-inject
 //!
@@ -32,13 +35,17 @@
 //! active threads — not by a single steady periodic signal. A lone
 //! heartbeat-tick every 5 minutes is well within the debounce window and is
 //! an acceptable cost for the thing it buys: a reliable idle-loop reminder to
-//! refresh the heartbeat. `memory-reminder` carries a large checklist and
-//! wants to land as a user-typed prompt, so it is tmux-injected instead.
+//! refresh the heartbeat. `memory-reminder` fires far less often (every
+//! 30min) and is likewise well within the debounce window, so it too rides
+//! the event queue — as an *ambient* signal, since memory hygiene is not
+//! urgent enough to warrant a mid-generation tmux-inject interruption.
 //!
-//! (Historical note: an earlier change routed *both* cadence signals away
-//! from the event queue to fight the treadmill, which silently dropped the
-//! heartbeat-tick reminder and re-introduced the stale-heartbeat alerts.
-//! Only memory-reminder needed to leave the queue.)
+//! (Historical note: an even earlier change routed *both* cadence signals
+//! away from the event queue to fight the treadmill, which silently dropped
+//! the heartbeat-tick reminder and re-introduced the stale-heartbeat alerts;
+//! a later change moved memory-reminder back to a tmux-inject. Both now use
+//! the event queue: heartbeat-tick as actionable, memory-reminder as
+//! ambient.)
 //!
 //! ## Why the daemon must NOT write the heartbeat file itself
 //!
