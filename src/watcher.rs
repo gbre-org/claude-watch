@@ -390,7 +390,19 @@ fn try_claim_pid_file(pid_file: &str, pid: u32) -> std::io::Result<bool> {
 }
 
 /// RAII exclusive lock over a watcher's spawn slot, backed by `flock(2)` on a
-/// dedicated `<name>.lock` file.
+/// dedicated `<name>.runlock` file.
+///
+/// ## Why `.runlock`, NOT `.lock` (self-deadlock fix)
+///
+/// The watcher scripts (e.g. `claude-event-watch`) take their OWN `flock`
+/// singleton guard on `<pid_dir>/<name>.lock`. This parent lock therefore
+/// MUST live on a different path — it is held across the child's whole
+/// spawn+wait lifetime, so if it shared `<name>.lock` the spawned child
+/// could never acquire its own guard and would refuse with
+/// `already running (pid unknown)` + exit 3 every time (the parent starving
+/// the child). `.runlock` keeps the two concerns on separate inodes:
+/// `.runlock` serializes concurrent `watcher_run` callers; `.lock` is the
+/// child's own duplicate-poller guard.
 ///
 /// ## Why a `flock` lock and not just the O_EXCL PID file (BUG B fix)
 ///
@@ -431,7 +443,16 @@ impl WatcherLock {
     ///   unwritable). The caller decides how to degrade.
     fn try_acquire(pid_dir: &str, name: &str) -> std::io::Result<Option<WatcherLock>> {
         use std::os::unix::io::AsRawFd;
-        let lock_path = format!("{}/{}.lock", pid_dir, name);
+        // Parent spawn-serialization lock. MUST use a path DISTINCT from
+        // the watcher script's own `<name>.lock` singleton-guard lockfile
+        // (the bash watchers `flock` `<pid_dir>/<name>.lock`). If we locked
+        // the SAME path here and held it across the child's spawn+wait
+        // below, the child could NEVER acquire its own guard -> it would
+        // print "already running (pid unknown)" and exit 3 forever
+        // (self-deadlock: parent starves the child of the child's lock).
+        // `.runlock` serializes concurrent `watcher_run` callers without
+        // colliding with the child's `.lock`.
+        let lock_path = format!("{}/{}.runlock", pid_dir, name);
         // Open (create if absent) the lock file. We deliberately do NOT
         // O_EXCL here — the lock FILE persisting across runs is fine and
         // desired; mutual exclusion comes from the advisory flock on it, not
@@ -1872,6 +1893,62 @@ mod tests {
             b.is_some(),
             "distinct watcher names use distinct lock files and must not \
              contend with each other"
+        );
+    }
+
+    #[test]
+    fn test_watcher_run_lock_uses_runlock_not_child_lock_path() {
+        // SELF-DEADLOCK regression: the parent spawn-serialization lock MUST
+        // live on `<name>.runlock`, NOT the `<name>.lock` path the watcher
+        // *script* (e.g. claude-event-watch) takes its OWN flock singleton
+        // guard on. If the parent held `<name>.lock` across the child's
+        // spawn+wait, the child could never acquire its guard → it would
+        // refuse with "already running (pid unknown)" + exit 3 forever.
+        //
+        // We assert the invariant structurally: while the parent lock is held,
+        // a manual flock on the SAME `<name>.runlock` path is blocked (proves
+        // that IS the parent's path), but a flock on the child's `<name>.lock`
+        // path is FREE (proves the parent is NOT squatting the child's guard).
+        use std::os::unix::io::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().to_str().unwrap();
+        let name = "claude-event-watch";
+
+        let _held = WatcherLock::try_acquire(pid_dir, name)
+            .expect("acquire should not error")
+            .expect("acquire should win");
+
+        // The child's singleton-guard lockfile path must be FREE while the
+        // parent holds its run-lock — otherwise the child self-deadlocks.
+        let child_lock_path = format!("{}/{}.lock", pid_dir, name);
+        let child_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&child_lock_path)
+            .expect("open child lock path");
+        let child_rc =
+            unsafe { libc::flock(child_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(
+            child_rc, 0,
+            "the child's <name>.lock guard path MUST be free while the parent              holds its run-lock (else the spawned watcher self-deadlocks)"
+        );
+
+        // And the parent's actual lock path IS `<name>.runlock` (a manual
+        // non-blocking flock on it must fail — the parent holds it).
+        let run_lock_path = format!("{}/{}.runlock", pid_dir, name);
+        let run_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&run_lock_path)
+            .expect("open runlock path");
+        let run_rc =
+            unsafe { libc::flock(run_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_ne!(
+            run_rc, 0,
+            "the parent's run-lock path must be <name>.runlock and be held              (a concurrent flock on it must fail)"
         );
     }
 
