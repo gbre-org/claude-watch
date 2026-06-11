@@ -269,9 +269,13 @@ else
     fi
     # Release the held lock; the SAME invocation must now succeed (proves the
     # refusal was the lock, not some other failure, and that the lockfile path
-    # was honored via the env override).
+    # was honored via the env override). Preload an event so the now-unblocked
+    # watcher takes the fast-path (drain → banner → exit) instead of arming
+    # inotifywait and blocking forever on an empty queue (that empty-queue +
+    # --debounce 0 block was an unbounded hang in this command substitution).
     flock -u 8
     exec 8>&-
+    write_event "$LQ" "100_free.json" "free run"
     free_out=$(CLAUDE_EVENT_QUEUE="$LQ" CLAUDE_EVENT_LOG_DIR="$LLOG" \
         CLAUDE_EVENT_WATCH_LOCK="$LOCKFILE" "$WATCHER" --debounce 0 2>&1)
     if grep -q 'already running' <<<"$free_out"; then
