@@ -356,6 +356,14 @@ fi
 if command -v script >/dev/null 2>&1; then
     TQ="$TMP/tq"; TLOG="$TMP/tlog"; TLOCK="$TMP/tty.lock"
     mkdir -p "$TQ" "$TLOG"
+    # Preload an event so the watcher takes the fast-path (warn about the tty,
+    # drain, exit) under the pty. WITHOUT a pending event, --debounce 0 on an
+    # empty queue arms inotifywait and blocks FOREVER inside the pty — and
+    # `script` waits for its child, so the command substitution would never
+    # return (this was a CI hang: GNU `script -qec` on the ubuntu runner held
+    # the watcher-test step for minutes; the BSD-script path on macOS happened
+    # to terminate, masking it locally).
+    write_event "$TQ" "100_tty.json" "tty run"
     tty_out=""
     if script -qec "true" /dev/null >/dev/null 2>&1; then
         # GNU script (Linux): script -qec "<cmd>" <logfile>
