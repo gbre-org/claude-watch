@@ -61,39 +61,106 @@ pub(crate) fn thinking_backoff_threshold_with_multiplier(
     threshold.min(max_backoff)
 }
 
-/// Token-progress guard for prolonged-thinking fires (pure predicate).
+/// Per-check decision of the token-progress guard for the prolonged-
+/// thinking timer (pure).
 ///
-/// Returns true when the fire should be SUPPRESSED because the token count
-/// barely moved across the thinking episode — the signature of an idle open
-/// turn (Claude Code keeps the assistant turn open, with the live thinking
-/// widget rendered, while background shells are pending), not a stuck
-/// generation. A real stall/long generation grows tokens continuously.
+/// v2 semantics (2026-06-11, same-day replacement of the at-fire-time
+/// suppression check from PR #341): the guard runs on EVERY ongoing-
+/// thinking check, not just at the fire boundary. Whenever the status-bar
+/// token count has grown by at least `min_tokens_delta` since the episode
+/// baseline, the thinking timer re-arms (`thinking_start` + baseline slide
+/// forward to NOW), so the timer only accumulates over genuinely
+/// growth-free time. A fire therefore means "`threshold_seconds` of
+/// continuous Thinking with token growth below the floor" — a parked or
+/// wedged turn — while any turn that keeps making token progress keeps
+/// sliding the window and never fires.
 ///
-/// Fail-open design — all of these ALLOW the fire (return false):
-/// - `min_tokens_delta == 0` (guard disabled by config)
-/// - `episode_start_tokens` is `None` (token count unavailable at episode
-///   start)
-/// - `current_tokens == 0` (token count unparseable/unavailable now)
-/// - `current_tokens < episode_start_tokens` (negative delta — token
-///   counter reset, e.g. context clear mid-episode; delta is "unknown")
+/// Why the v1 at-fire-time check never engaged in production: the
+/// status-bar count measures CONTEXT tokens, which grow ~3-7k per 480s
+/// window from tool results and injected system reminders even when the
+/// assistant emits almost nothing (measured 2026-06-11: +7439 tokens
+/// across the 10.5 min between two false fires covering 2-3 tiny turns).
+/// So "suppress when episode delta < 2000" was never true — zero
+/// suppressions ever — and, inverted on the other side, a genuinely
+/// growth-free wedge would have been suppressed (and re-armed) at every
+/// backoff boundary forever and never fired.
 ///
-/// Better an occasional false-positive interrupt than a missed real stall.
-pub(crate) fn thinking_fire_suppressed_by_token_progress(
+/// Decisions:
+/// - `Keep`: guard disabled (`min_tokens_delta == 0`), token count
+///   unparseable this cycle (`current_tokens == 0`), or growth below the
+///   floor — leave the timer accumulating.
+/// - `CaptureBaseline`: tokens were unavailable at episode start and are
+///   parseable now — record the baseline late; timer keeps accumulating.
+/// - `Rearm`: growth since baseline reached the floor — slide timer +
+///   baseline forward.
+/// - `RearmCounterReset`: token count went backwards (counter reset, e.g.
+///   context clear or status-bar source flap) — the old baseline is
+///   meaningless; re-baseline and slide the timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThinkingTokenAction {
+    Keep,
+    CaptureBaseline,
+    Rearm,
+    RearmCounterReset,
+}
+
+pub(crate) fn thinking_token_progress_action(
     episode_start_tokens: Option<u64>,
     current_tokens: u64,
     min_tokens_delta: u64,
-) -> bool {
-    if min_tokens_delta == 0 {
-        return false;
+) -> ThinkingTokenAction {
+    if min_tokens_delta == 0 || current_tokens == 0 {
+        return ThinkingTokenAction::Keep;
     }
     let start = match episode_start_tokens {
         Some(s) => s,
-        None => return false,
+        None => return ThinkingTokenAction::CaptureBaseline,
     };
-    if current_tokens == 0 || current_tokens < start {
-        return false;
+    if current_tokens < start {
+        return ThinkingTokenAction::RearmCounterReset;
     }
-    (current_tokens - start) < min_tokens_delta
+    if current_tokens - start >= min_tokens_delta {
+        return ThinkingTokenAction::Rearm;
+    }
+    ThinkingTokenAction::Keep
+}
+
+/// Apply the v2 token-progress decision to the live thinking-timer state.
+///
+/// Mutates `thinking_start` / `episode_start_tokens` exactly as the
+/// production flow requires and returns `Some(reason)` when the timer
+/// re-armed (the caller logs + writes the jsonl record), `None` otherwise.
+/// Late baseline capture happens silently. Split out from
+/// `check_foreground_inner` so the engagement behavior is unit-testable
+/// without tmux.
+pub(crate) fn apply_thinking_token_progress(
+    thinking_start: &mut Option<String>,
+    episode_start_tokens: &mut Option<u64>,
+    current_tokens: u64,
+    min_tokens_delta: u64,
+    now: &str,
+) -> Option<&'static str> {
+    match thinking_token_progress_action(
+        *episode_start_tokens,
+        current_tokens,
+        min_tokens_delta,
+    ) {
+        ThinkingTokenAction::Keep => None,
+        ThinkingTokenAction::CaptureBaseline => {
+            *episode_start_tokens = Some(current_tokens);
+            None
+        }
+        ThinkingTokenAction::Rearm => {
+            *thinking_start = Some(now.to_string());
+            *episode_start_tokens = Some(current_tokens);
+            Some("token_progress_rearm")
+        }
+        ThinkingTokenAction::RearmCounterReset => {
+            *thinking_start = Some(now.to_string());
+            *episode_start_tokens = Some(current_tokens);
+            Some("token_counter_reset")
+        }
+    }
 }
 
 /// Returns true if a previous interrupt fired within the last
@@ -888,8 +955,61 @@ async fn check_foreground_inner(
             // Don't reset thinking_interrupt_count here — it persists across
             // brief non-thinking blips within the same stall episode. It only
             // resets when we see a genuinely active state (below).
-        } else if let Some(ref start) = state.thinking_start {
-            if let Some(elapsed) = elapsed_since(start) {
+        } else {
+            // Token-progress guard (v2): runs on EVERY ongoing-thinking
+            // check. Token growth >= min_tokens_delta since the episode
+            // baseline re-arms the timer (thinking_start + baseline slide
+            // to NOW), so the timer only accumulates over genuinely
+            // growth-free time and a fire means "threshold_seconds of
+            // Thinking without token progress" — a parked/wedged turn.
+            // Ambient context growth (tool results, system reminders)
+            // keeps an idle-but-alive open turn re-arming forever; a
+            // genuinely stuck loop produces no growth and still fires.
+            // Does NOT touch thinking_interrupt_count and emits no
+            // claude-event. See thinking_token_progress_action docs for
+            // why the v1 at-fire-time check never engaged in production.
+            let pre_rearm_baseline = state.thinking_episode_start_tokens;
+            let pre_rearm_elapsed = state
+                .thinking_start
+                .as_ref()
+                .and_then(|s| elapsed_since(s))
+                .unwrap_or(0.0);
+            if let Some(reason) = apply_thinking_token_progress(
+                &mut state.thinking_start,
+                &mut state.thinking_episode_start_tokens,
+                tokens,
+                config.foreground_monitor.min_tokens_delta,
+                &now,
+            ) {
+                let start_tokens = pre_rearm_baseline.unwrap_or(0);
+                info!(
+                    elapsed_secs = pre_rearm_elapsed,
+                    start_tokens,
+                    tokens,
+                    tokens_delta = tokens.saturating_sub(start_tokens),
+                    min_tokens_delta = config.foreground_monitor.min_tokens_delta,
+                    reason,
+                    "prolonged thinking suppressed: token progress — re-arming \
+                     (timer accumulates only over growth-free time)"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "prolonged_thinking_suppressed",
+                    serde_json::json!({
+                        "elapsed_secs": pre_rearm_elapsed,
+                        "reason": reason,
+                        "start_tokens": start_tokens,
+                        "tokens": tokens,
+                        "tokens_delta": tokens.saturating_sub(start_tokens),
+                        "min_tokens_delta": config.foreground_monitor.min_tokens_delta,
+                    }),
+                );
+            }
+            if let Some(elapsed) = state
+                .thinking_start
+                .as_ref()
+                .and_then(|s| elapsed_since(s))
+            {
                 let next_threshold = thinking_backoff_threshold_with_multiplier(
                     config.foreground_monitor.threshold_seconds,
                     config.foreground_monitor.max_thinking_backoff,
@@ -932,53 +1052,6 @@ async fn check_foreground_inner(
                         );
                         return;
                     }
-                    // Token-progress guard: an idle open turn (Claude Code
-                    // keeps the assistant turn open — live thinking widget
-                    // rendered — while background shells are pending) shows
-                    // continuous Thinking with near-zero token growth. A
-                    // genuinely stuck/long generation grows tokens
-                    // continuously. Suppress the fire when the episode's
-                    // token delta is below the configured floor, and re-arm
-                    // (slide the timer + token baseline forward) so a real
-                    // stall starting later in the same open turn is judged
-                    // on fresh token growth and can still fire. Fails open
-                    // when tokens are unavailable or the counter reset
-                    // (negative delta). Does NOT touch
-                    // thinking_interrupt_count and emits no claude-event.
-                    if thinking_fire_suppressed_by_token_progress(
-                        state.thinking_episode_start_tokens,
-                        tokens,
-                        config.foreground_monitor.min_tokens_delta,
-                    ) {
-                        let start_tokens = state.thinking_episode_start_tokens.unwrap_or(0);
-                        info!(
-                            elapsed_secs = elapsed,
-                            threshold = next_threshold,
-                            start_tokens,
-                            tokens,
-                            tokens_delta = tokens.saturating_sub(start_tokens),
-                            min_tokens_delta = config.foreground_monitor.min_tokens_delta,
-                            "prolonged thinking suppressed: token progress below floor (idle open turn) — re-arming"
-                        );
-                        write_jsonl_log(
-                            &config.general.log_file,
-                            "prolonged_thinking_suppressed",
-                            serde_json::json!({
-                                "elapsed_secs": elapsed,
-                                "threshold_secs": next_threshold,
-                                "reason": "token_progress_below_floor",
-                                "start_tokens": start_tokens,
-                                "tokens": tokens,
-                                "tokens_delta": tokens.saturating_sub(start_tokens),
-                                "min_tokens_delta": config.foreground_monitor.min_tokens_delta,
-                            }),
-                        );
-                        // Re-arm: next window measured from NOW with a fresh
-                        // token baseline.
-                        state.thinking_start = Some(now.clone());
-                        state.thinking_episode_start_tokens = (tokens > 0).then_some(tokens);
-                        return;
-                    }
                     // Global interrupt gate (single chokepoint): atomically
                     // claim-and-stamp. If ANY interrupt fired within the
                     // cooldown window (watcher-down, context-warning,
@@ -988,8 +1061,10 @@ async fn check_foreground_inner(
                     // the new thought trips prolonged thinking immediately
                     // afterward. The claim STAMPS last_interrupt_at on
                     // success, so the later (removed) explicit stamp is no
-                    // longer needed. Checked AFTER the token-progress guard
-                    // so a token-suppressed cycle does not consume a claim.
+                    // longer needed. Token-progress re-arms happen BEFORE
+                    // the threshold evaluation, so a re-armed (suppressed)
+                    // cycle never reaches this gate and does not consume a
+                    // claim.
                     if !try_claim_global_interrupt(
                         state,
                         config.general.post_interrupt_cooldown_secs,
@@ -1003,10 +1078,23 @@ async fn check_foreground_inner(
                         );
                         return;
                     }
+                    // Fire-time token observability: ALWAYS log the episode
+                    // baseline, current tokens, and delta — even when the
+                    // fire proceeds — so the token-progress guard's
+                    // production behavior is inspectable from the journal
+                    // and the jsonl alone. `start_tokens = 0` +
+                    // `baseline_recorded = false` means the count was never
+                    // parseable during the episode (legacy fail-open fire).
+                    let start_tokens = state.thinking_episode_start_tokens;
                     warn!(
                         elapsed_secs = elapsed,
                         threshold = next_threshold,
                         interrupt_count = state.thinking_interrupt_count,
+                        start_tokens = start_tokens.unwrap_or(0),
+                        tokens,
+                        tokens_delta = tokens.saturating_sub(start_tokens.unwrap_or(0)),
+                        baseline_recorded = start_tokens.is_some(),
+                        min_tokens_delta = config.foreground_monitor.min_tokens_delta,
                         "prolonged thinking detected — interrupting (backoff)"
                     );
                     write_jsonl_log(
@@ -1016,6 +1104,10 @@ async fn check_foreground_inner(
                             "elapsed_secs": elapsed,
                             "tokens": tokens,
                             "bashes": bashes,
+                            "start_tokens": start_tokens,
+                            "tokens_delta": tokens.saturating_sub(start_tokens.unwrap_or(0)),
+                            "baseline_recorded": start_tokens.is_some(),
+                            "min_tokens_delta": config.foreground_monitor.min_tokens_delta,
                             "interrupt_count": state.thinking_interrupt_count,
                             "next_threshold_secs": next_threshold,
                             "action": if config.foreground_monitor.interrupt_enabled { "interrupt" } else { "log-only" },
@@ -4774,113 +4866,204 @@ cooldown = 300
         assert_eq!(result, 960);
     }
 
-    // --- Token-progress guard tests (2026-06-11) ---
+    // --- Token-progress guard tests (v2, 2026-06-11) ---
 
     #[test]
-    fn test_token_guard_suppresses_idle_open_turn() {
-        // Idle open turn: 480s of "thinking" with only ~1.5k token growth
-        // (below the 2000 floor) — suppress the fire.
-        assert!(thinking_fire_suppressed_by_token_progress(
-            Some(100_000),
-            101_500,
-            2000
-        ));
-        // Zero growth — definitely idle.
-        assert!(thinking_fire_suppressed_by_token_progress(
-            Some(100_000),
-            100_000,
-            2000
-        ));
+    fn test_token_action_keep_below_floor() {
+        // Growth below the floor: keep the timer accumulating (this is the
+        // growth-free time that earns a fire).
+        assert_eq!(
+            thinking_token_progress_action(Some(100_000), 101_500, 2000),
+            ThinkingTokenAction::Keep
+        );
+        // Zero growth — definitely keep.
+        assert_eq!(
+            thinking_token_progress_action(Some(100_000), 100_000, 2000),
+            ThinkingTokenAction::Keep
+        );
     }
 
     #[test]
-    fn test_token_guard_allows_real_generation() {
-        // A real stuck/long generation grows tokens continuously — delta at
-        // or above the floor must fire.
-        assert!(!thinking_fire_suppressed_by_token_progress(
-            Some(100_000),
-            102_000, // delta == floor exactly: progress, allow the fire
-            2000
-        ));
-        assert!(!thinking_fire_suppressed_by_token_progress(
-            Some(100_000),
-            130_000, // big growth
-            2000
-        ));
+    fn test_token_action_rearm_at_floor() {
+        // Growth at/above the floor: re-arm (slide timer + baseline).
+        assert_eq!(
+            thinking_token_progress_action(Some(100_000), 102_000, 2000),
+            ThinkingTokenAction::Rearm
+        );
+        assert_eq!(
+            thinking_token_progress_action(Some(100_000), 130_000, 2000),
+            ThinkingTokenAction::Rearm
+        );
     }
 
     #[test]
-    fn test_token_guard_negative_delta_fails_open() {
-        // Token counter reset mid-episode (e.g. context clear): current <
-        // start means the delta is unknown — fail open, allow the fire.
-        assert!(!thinking_fire_suppressed_by_token_progress(
-            Some(150_000),
-            5_000,
-            2000
-        ));
+    fn test_token_action_counter_reset() {
+        // Token counter went backwards (context clear / status-bar source
+        // flap): old baseline is meaningless — re-baseline + slide.
+        assert_eq!(
+            thinking_token_progress_action(Some(150_000), 5_000, 2000),
+            ThinkingTokenAction::RearmCounterReset
+        );
     }
 
     #[test]
-    fn test_token_guard_missing_baseline_fails_open() {
-        // Tokens were unavailable when the episode started — fail open.
-        assert!(!thinking_fire_suppressed_by_token_progress(None, 100_000, 2000));
-        assert!(!thinking_fire_suppressed_by_token_progress(None, 0, 2000));
+    fn test_token_action_late_baseline_capture() {
+        // Baseline missing (tokens unparseable at episode start), tokens
+        // now available: capture late, don't slide the timer.
+        assert_eq!(
+            thinking_token_progress_action(None, 100_000, 2000),
+            ThinkingTokenAction::CaptureBaseline
+        );
     }
 
     #[test]
-    fn test_token_guard_unparseable_current_tokens_fails_open() {
-        // tokens == 0 means the status-bar count is unparseable/absent now
-        // — fail open, allow the fire (preserves pre-guard behavior).
-        assert!(!thinking_fire_suppressed_by_token_progress(
-            Some(100_000),
-            0,
-            2000
-        ));
+    fn test_token_action_unparseable_or_disabled_keeps() {
+        // tokens == 0 (unparseable now) or floor == 0 (guard disabled):
+        // leave the timer alone — legacy behavior, fail-open at fire time.
+        assert_eq!(
+            thinking_token_progress_action(Some(100_000), 0, 2000),
+            ThinkingTokenAction::Keep
+        );
+        assert_eq!(
+            thinking_token_progress_action(None, 0, 2000),
+            ThinkingTokenAction::Keep
+        );
+        assert_eq!(
+            thinking_token_progress_action(Some(100_000), 100_000, 0),
+            ThinkingTokenAction::Keep
+        );
+        assert_eq!(
+            thinking_token_progress_action(None, 100_000, 0),
+            ThinkingTokenAction::Keep
+        );
     }
 
     #[test]
-    fn test_token_guard_disabled_by_zero_floor() {
-        // min_tokens_delta = 0 disables the guard entirely — never suppress,
-        // even at zero growth.
-        assert!(!thinking_fire_suppressed_by_token_progress(
-            Some(100_000),
-            100_000,
-            0
-        ));
+    fn test_apply_token_progress_rearm_slides_state() {
+        // Rearm mutates BOTH timer and baseline and reports the reason.
+        let mut start = Some("2026-06-11T19:03:26-04:00".to_string());
+        let mut baseline = Some(283_000);
+        let reason = apply_thinking_token_progress(
+            &mut start,
+            &mut baseline,
+            286_368,
+            2000,
+            "2026-06-11T19:08:00-04:00",
+        );
+        assert_eq!(reason, Some("token_progress_rearm"));
+        assert_eq!(start.as_deref(), Some("2026-06-11T19:08:00-04:00"));
+        assert_eq!(baseline, Some(286_368));
     }
 
     #[test]
-    fn test_token_guard_rearm_window_semantics() {
-        // Simulates the re-arm flow: window 1 is an idle open turn
-        // (suppressed, baseline slides to the current count); window 2 sees
-        // a real generation start and grow past the floor from the NEW
-        // baseline — the fire must be allowed even though total growth from
-        // the ORIGINAL baseline would also have allowed it; conversely a
-        // second idle window keeps suppressing.
-        let floor = 2000;
+    fn test_apply_token_progress_counter_reset_slides_state() {
+        let mut start = Some("old".to_string());
+        let mut baseline = Some(150_000);
+        let reason =
+            apply_thinking_token_progress(&mut start, &mut baseline, 5_000, 2000, "new");
+        assert_eq!(reason, Some("token_counter_reset"));
+        assert_eq!(start.as_deref(), Some("new"));
+        assert_eq!(baseline, Some(5_000));
+    }
 
-        // Window 1: 100_000 -> 100_500 (idle) — suppressed.
-        let baseline1 = Some(100_000);
-        let tokens_at_fire1 = 100_500;
-        assert!(thinking_fire_suppressed_by_token_progress(
-            baseline1,
-            tokens_at_fire1,
-            floor
-        ));
+    #[test]
+    fn test_apply_token_progress_late_capture_keeps_timer() {
+        // Production no-baseline path: tokens were 0/unparseable when the
+        // episode started (baseline None). When the count becomes
+        // available, the baseline is captured WITHOUT sliding the timer —
+        // so a wedge that started under a scrape failure still fires on
+        // the original schedule, and subsequent growth is judged against
+        // a real baseline instead of failing open forever.
+        let mut start = Some("episode-start".to_string());
+        let mut baseline: Option<u64> = None;
+        let reason =
+            apply_thinking_token_progress(&mut start, &mut baseline, 280_000, 2000, "now");
+        assert_eq!(reason, None);
+        assert_eq!(start.as_deref(), Some("episode-start"), "timer must not slide");
+        assert_eq!(baseline, Some(280_000));
+    }
 
-        // Re-arm: baseline slides forward to the count at suppression time.
-        let baseline2 = Some(tokens_at_fire1);
+    #[test]
+    fn test_apply_token_progress_keep_touches_nothing() {
+        let mut start = Some("episode-start".to_string());
+        let mut baseline = Some(100_000);
+        // Below-floor growth.
+        assert_eq!(
+            apply_thinking_token_progress(&mut start, &mut baseline, 101_000, 2000, "now"),
+            None
+        );
+        assert_eq!(start.as_deref(), Some("episode-start"));
+        assert_eq!(baseline, Some(100_000));
+        // Unparseable current count.
+        assert_eq!(
+            apply_thinking_token_progress(&mut start, &mut baseline, 0, 2000, "now"),
+            None
+        );
+        assert_eq!(baseline, Some(100_000));
+        // Guard disabled by zero floor: never slides, even on huge growth.
+        assert_eq!(
+            apply_thinking_token_progress(&mut start, &mut baseline, 900_000, 0, "now"),
+            None
+        );
+        assert_eq!(start.as_deref(), Some("episode-start"));
+        assert_eq!(baseline, Some(100_000));
+    }
 
-        // Window 2a: still idle (100_500 -> 101_000) — suppressed again.
-        assert!(thinking_fire_suppressed_by_token_progress(
-            baseline2, 101_000, floor
-        ));
+    #[test]
+    fn test_token_progress_production_replay_2026_06_11() {
+        // Replays the 19:03:26 -> 19:11:29 ET false fire from 2026-06-11:
+        // an idle-but-alive open turn (2-3 tiny main-loop turns) whose
+        // CONTEXT token count drips ~700/min from tool results + system
+        // reminders. Under the v1 at-fire-time check the 480s window
+        // accumulated ~5.6k delta >= the 2000 floor, so the fire was
+        // ALLOWED (the bug). Under v2 the drip re-arms the timer every
+        // ~3 min, so the growth-free clock never reaches 480s and the
+        // fire is suppressed.
+        let floor = 2000u64;
+        let mut start = Some("t0".to_string());
+        let mut baseline = Some(283_000u64);
+        let mut clock_secs = 0u64; // seconds since last re-arm (simulated)
+        let mut fired = false;
+        let mut rearms = 0;
+        // 10s full-cycle cadence, ~120 tokens per cycle (~720/min drip).
+        let mut tokens = 283_000u64;
+        for _cycle in 0..120 {
+            // 20 minutes simulated
+            clock_secs += 10;
+            tokens += 120;
+            if apply_thinking_token_progress(&mut start, &mut baseline, tokens, floor, "tn")
+                .is_some()
+            {
+                rearms += 1;
+                clock_secs = 0; // thinking_start slid to now
+            }
+            if clock_secs >= 480 {
+                fired = true;
+                break;
+            }
+        }
+        assert!(!fired, "ambient context drip must keep re-arming the timer");
+        assert!(rearms >= 4, "expected periodic re-arms, got {rearms}");
 
-        // Window 2b: real stall starts later in the same open turn
-        // (100_500 -> 110_000) — judged on fresh growth, fire allowed.
-        assert!(!thinking_fire_suppressed_by_token_progress(
-            baseline2, 110_000, floor
-        ));
+        // Contrast: a genuinely growth-free wedge (same setup, no drip)
+        // must still fire at the 480s threshold.
+        let mut start = Some("t0".to_string());
+        let mut baseline = Some(283_000u64);
+        let mut clock_secs = 0u64;
+        let mut fired = false;
+        for _cycle in 0..120 {
+            clock_secs += 10;
+            if apply_thinking_token_progress(&mut start, &mut baseline, 283_000, floor, "tn")
+                .is_some()
+            {
+                clock_secs = 0;
+            }
+            if clock_secs >= 480 {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "a growth-free wedge must still fire");
     }
 
     // --- Global post-interrupt cooldown tests (2026-04-21) ---

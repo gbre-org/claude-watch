@@ -227,18 +227,23 @@ pub struct ForegroundMonitorConfig {
     /// the original doubling behaviour.
     #[serde(default = "default_thinking_backoff_multiplier")]
     pub thinking_backoff_multiplier: u64,
-    /// Token-progress guard for prolonged-thinking fires. Claude Code
-    /// 2.1.17x keeps the assistant turn open (live thinking widget
-    /// rendered) while background shells are pending, so a pure pane
-    /// scrape sees continuous "Thinking" through idle waits. A genuinely
-    /// stuck/long generation grows the status-bar token count
-    /// continuously; an idle open turn barely moves it. If the token
-    /// delta across a thinking episode is below this floor at fire time,
-    /// the interrupt is suppressed and the episode re-arms (timer +
-    /// token baseline slide forward) so a real stall starting later in
-    /// the same open turn can still fire. 0 disables the guard. When the
-    /// token count is unavailable/unparseable or appears to have reset
-    /// (negative delta), the guard fails open and the fire is allowed.
+    /// Token-progress guard for prolonged-thinking fires (v2, sliding
+    /// re-arm). Claude Code 2.1.17x keeps the assistant turn open (live
+    /// thinking widget rendered) while background shells are pending, so
+    /// a pure pane scrape sees continuous "Thinking" through idle waits.
+    /// On every ongoing-thinking check, if the status-bar token count has
+    /// grown by at least this floor since the episode baseline, the
+    /// thinking timer re-arms (timer + baseline slide forward to now), so
+    /// the timer only accumulates over genuinely growth-free time and the
+    /// interrupt fires only after `threshold_seconds` of Thinking WITHOUT
+    /// token progress -- a parked or wedged turn. Note the count measures
+    /// CONTEXT tokens: tool results and injected system reminders grow it
+    /// even when the assistant emits nothing, which keeps an idle-but-
+    /// alive open turn re-arming indefinitely (the v1 at-fire-time delta
+    /// check was defeated by exactly that ambient growth). 0 disables the
+    /// guard (legacy pure-timer behavior). When the count is unavailable
+    /// at episode start, the baseline is captured late at the first
+    /// parseable check; if it never parses, the fire fails open.
     #[serde(default = "default_min_tokens_delta")]
     pub min_tokens_delta: u64,
 }

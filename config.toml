@@ -106,18 +106,23 @@ interrupt_message = "The foreground command was backgrounded by claude-watch bec
 # 2700 (capped at max_thinking_backoff). Raised 2 -> 3 on 2026-04-21:
 # if interrupt #1 didn't break the wedge, firing #2 quickly won't either.
 thinking_backoff_multiplier = 3
-# Token-progress guard (2026-06-11): Claude Code 2.1.17x keeps the
-# assistant turn open — live thinking widget rendered — while background
-# shells are pending, so the pane scrape reads continuous "Thinking"
-# through pure idle waits and fires false prolonged-thinking interrupts.
-# A real stall grows the status-bar token count continuously; an idle
-# open turn barely moves it (observed ~4-6k over 480s vs the event
-# handling alone). If the token delta across a thinking episode is below
-# this floor at fire time, the interrupt is suppressed and the episode
-# re-arms (timer + token baseline slide forward) so a real stall that
-# starts later in the same open turn can still fire. 0 disables the
-# guard. Fails open (fire allowed) when the token count is unavailable
-# or appears to have reset mid-episode.
+# Token-progress guard (v2 sliding re-arm, 2026-06-11): Claude Code
+# 2.1.17x keeps the assistant turn open — live thinking widget rendered —
+# while background shells are pending, so the pane scrape reads continuous
+# "Thinking" through pure idle waits and fires false prolonged-thinking
+# interrupts. On every ongoing-thinking check, token growth >= this floor
+# since the episode baseline re-arms the thinking timer (timer + baseline
+# slide forward to now), so the timer only accumulates over genuinely
+# growth-free time and the interrupt fires only after threshold_seconds
+# of Thinking WITHOUT token progress — a parked/wedged turn. The count
+# measures CONTEXT tokens: tool results and injected system reminders
+# grow it (~3-7k per 480s observed) even when the assistant emits almost
+# nothing, which keeps an idle-but-alive open turn re-arming forever —
+# that same ambient growth is what defeated the v1 at-fire-time delta
+# check (delta was always >= the floor, so it never suppressed anything).
+# 0 disables the guard (legacy pure-timer behavior). If the count is
+# unavailable at episode start the baseline is captured late at the first
+# parseable check; if it never parses the fire fails open.
 min_tokens_delta = 2000
 
 [watcher_monitor]
