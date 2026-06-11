@@ -31,6 +31,15 @@ pub struct State {
     /// Count of consecutive thinking interrupts (for exponential backoff)
     #[serde(default)]
     pub thinking_interrupt_count: u32,
+    /// Status-bar token count recorded when the current thinking episode
+    /// started (i.e. when `thinking_start` was set). Used by the
+    /// token-progress guard: at fire time, a token delta below
+    /// `foreground_monitor.min_tokens_delta` marks the episode as an idle
+    /// open turn (background shells keep the turn open) and suppresses the
+    /// interrupt. `None` when the token count was unavailable at episode
+    /// start — the guard then fails open (fire allowed).
+    #[serde(default)]
+    pub thinking_episode_start_tokens: Option<u64>,
     /// Timestamp of the last interrupt fired (across all fire paths:
     /// prolonged-thinking, watcher-down, context-warning). Used as the
     /// global post-interrupt cooldown gate so any one interrupt suppresses
@@ -313,6 +322,7 @@ pub fn load_state(path: &str) -> State {
     state.thinking_start = None;
     state.thinking_alerted = false;
     state.thinking_interrupt_count = 0;
+    state.thinking_episode_start_tokens = None;
     // last_interrupt_at is a short-lived global cooldown gate — daemon
     // downtime makes any persisted value meaningless (either stale or
     // indefinitely-suppressive). Clear on load so the next interrupt is
@@ -526,6 +536,7 @@ mod tests {
         state.prolonged_thinking_interrupts_total = 100;
         state.watcher_down_interrupts_total = 200;
         state.thinking_interrupt_count = 5; // transient (gets cleared on load)
+        state.thinking_episode_start_tokens = Some(123_456); // transient
         state.last_interrupt_at = Some("2026-01-01T00:00:00+00:00".to_string()); // transient
         save_state(path, &state);
 
@@ -535,6 +546,7 @@ mod tests {
         assert_eq!(loaded.watcher_down_interrupts_total, 200);
         // Transient state cleared (guarded by existing behavior in load_state)
         assert_eq!(loaded.thinking_interrupt_count, 0);
+        assert!(loaded.thinking_episode_start_tokens.is_none());
         assert!(loaded.last_interrupt_at.is_none());
         let _ = std::fs::remove_file(path);
     }

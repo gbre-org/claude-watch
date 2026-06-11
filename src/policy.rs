@@ -61,6 +61,41 @@ pub(crate) fn thinking_backoff_threshold_with_multiplier(
     threshold.min(max_backoff)
 }
 
+/// Token-progress guard for prolonged-thinking fires (pure predicate).
+///
+/// Returns true when the fire should be SUPPRESSED because the token count
+/// barely moved across the thinking episode — the signature of an idle open
+/// turn (Claude Code keeps the assistant turn open, with the live thinking
+/// widget rendered, while background shells are pending), not a stuck
+/// generation. A real stall/long generation grows tokens continuously.
+///
+/// Fail-open design — all of these ALLOW the fire (return false):
+/// - `min_tokens_delta == 0` (guard disabled by config)
+/// - `episode_start_tokens` is `None` (token count unavailable at episode
+///   start)
+/// - `current_tokens == 0` (token count unparseable/unavailable now)
+/// - `current_tokens < episode_start_tokens` (negative delta — token
+///   counter reset, e.g. context clear mid-episode; delta is "unknown")
+///
+/// Better an occasional false-positive interrupt than a missed real stall.
+pub(crate) fn thinking_fire_suppressed_by_token_progress(
+    episode_start_tokens: Option<u64>,
+    current_tokens: u64,
+    min_tokens_delta: u64,
+) -> bool {
+    if min_tokens_delta == 0 {
+        return false;
+    }
+    let start = match episode_start_tokens {
+        Some(s) => s,
+        None => return false,
+    };
+    if current_tokens == 0 || current_tokens < start {
+        return false;
+    }
+    (current_tokens - start) < min_tokens_delta
+}
+
 /// Returns true if a previous interrupt fired within the last
 /// `cooldown_secs` seconds. Used to suppress cascading interrupts across
 /// the prolonged-thinking and context-warning fire paths.
@@ -827,6 +862,7 @@ async fn check_foreground_inner(
         debug!("foreground check: api_retry active — suppressing fires this cycle");
         state.thinking_start = None;
         state.thinking_alerted = false;
+        state.thinking_episode_start_tokens = None;
         state.foreground_start = None;
         state.foreground_alerted = false;
         return;
@@ -845,6 +881,10 @@ async fn check_foreground_inner(
         if state.thinking_start.is_none() {
             state.thinking_start = Some(now.clone());
             state.thinking_alerted = false;
+            // Token baseline for the token-progress guard. `tokens == 0`
+            // means the status-bar count was unavailable/unparseable —
+            // record None so the guard fails open at fire time.
+            state.thinking_episode_start_tokens = (tokens > 0).then_some(tokens);
             // Don't reset thinking_interrupt_count here — it persists across
             // brief non-thinking blips within the same stall episode. It only
             // resets when we see a genuinely active state (below).
@@ -892,6 +932,53 @@ async fn check_foreground_inner(
                         );
                         return;
                     }
+                    // Token-progress guard: an idle open turn (Claude Code
+                    // keeps the assistant turn open — live thinking widget
+                    // rendered — while background shells are pending) shows
+                    // continuous Thinking with near-zero token growth. A
+                    // genuinely stuck/long generation grows tokens
+                    // continuously. Suppress the fire when the episode's
+                    // token delta is below the configured floor, and re-arm
+                    // (slide the timer + token baseline forward) so a real
+                    // stall starting later in the same open turn is judged
+                    // on fresh token growth and can still fire. Fails open
+                    // when tokens are unavailable or the counter reset
+                    // (negative delta). Does NOT touch
+                    // thinking_interrupt_count and emits no claude-event.
+                    if thinking_fire_suppressed_by_token_progress(
+                        state.thinking_episode_start_tokens,
+                        tokens,
+                        config.foreground_monitor.min_tokens_delta,
+                    ) {
+                        let start_tokens = state.thinking_episode_start_tokens.unwrap_or(0);
+                        info!(
+                            elapsed_secs = elapsed,
+                            threshold = next_threshold,
+                            start_tokens,
+                            tokens,
+                            tokens_delta = tokens.saturating_sub(start_tokens),
+                            min_tokens_delta = config.foreground_monitor.min_tokens_delta,
+                            "prolonged thinking suppressed: token progress below floor (idle open turn) — re-arming"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "prolonged_thinking_suppressed",
+                            serde_json::json!({
+                                "elapsed_secs": elapsed,
+                                "threshold_secs": next_threshold,
+                                "reason": "token_progress_below_floor",
+                                "start_tokens": start_tokens,
+                                "tokens": tokens,
+                                "tokens_delta": tokens.saturating_sub(start_tokens),
+                                "min_tokens_delta": config.foreground_monitor.min_tokens_delta,
+                            }),
+                        );
+                        // Re-arm: next window measured from NOW with a fresh
+                        // token baseline.
+                        state.thinking_start = Some(now.clone());
+                        state.thinking_episode_start_tokens = (tokens > 0).then_some(tokens);
+                        return;
+                    }
                     // Global interrupt gate (single chokepoint): atomically
                     // claim-and-stamp. If ANY interrupt fired within the
                     // cooldown window (watcher-down, context-warning,
@@ -901,7 +988,8 @@ async fn check_foreground_inner(
                     // the new thought trips prolonged thinking immediately
                     // afterward. The claim STAMPS last_interrupt_at on
                     // success, so the later (removed) explicit stamp is no
-                    // longer needed.
+                    // longer needed. Checked AFTER the token-progress guard
+                    // so a token-suppressed cycle does not consume a claim.
                     if !try_claim_global_interrupt(
                         state,
                         config.general.post_interrupt_cooldown_secs,
@@ -936,8 +1024,11 @@ async fn check_foreground_inner(
                     state.thinking_alerted = true;
                     state.thinking_interrupt_count += 1;
                     // Reset thinking_start so the next backoff interval
-                    // counts from NOW, not from the original start
+                    // counts from NOW, not from the original start. Refresh
+                    // the token baseline alongside it so the token-progress
+                    // guard judges the next backoff window on fresh growth.
                     state.thinking_start = Some(now.clone());
+                    state.thinking_episode_start_tokens = (tokens > 0).then_some(tokens);
 
                     if config.foreground_monitor.interrupt_enabled {
                         info!(
@@ -1012,6 +1103,7 @@ async fn check_foreground_inner(
         state.thinking_start = None;
         state.thinking_alerted = false;
         state.thinking_interrupt_count = 0;
+        state.thinking_episode_start_tokens = None;
     }
 
     // --- Foreground blocking tracking ---
@@ -4680,6 +4772,115 @@ cooldown = 300
         // Huge counts with multiplier>1 must not panic.
         let result = thinking_backoff_threshold_with_multiplier(300, 960, u32::MAX, 3);
         assert_eq!(result, 960);
+    }
+
+    // --- Token-progress guard tests (2026-06-11) ---
+
+    #[test]
+    fn test_token_guard_suppresses_idle_open_turn() {
+        // Idle open turn: 480s of "thinking" with only ~1.5k token growth
+        // (below the 2000 floor) — suppress the fire.
+        assert!(thinking_fire_suppressed_by_token_progress(
+            Some(100_000),
+            101_500,
+            2000
+        ));
+        // Zero growth — definitely idle.
+        assert!(thinking_fire_suppressed_by_token_progress(
+            Some(100_000),
+            100_000,
+            2000
+        ));
+    }
+
+    #[test]
+    fn test_token_guard_allows_real_generation() {
+        // A real stuck/long generation grows tokens continuously — delta at
+        // or above the floor must fire.
+        assert!(!thinking_fire_suppressed_by_token_progress(
+            Some(100_000),
+            102_000, // delta == floor exactly: progress, allow the fire
+            2000
+        ));
+        assert!(!thinking_fire_suppressed_by_token_progress(
+            Some(100_000),
+            130_000, // big growth
+            2000
+        ));
+    }
+
+    #[test]
+    fn test_token_guard_negative_delta_fails_open() {
+        // Token counter reset mid-episode (e.g. context clear): current <
+        // start means the delta is unknown — fail open, allow the fire.
+        assert!(!thinking_fire_suppressed_by_token_progress(
+            Some(150_000),
+            5_000,
+            2000
+        ));
+    }
+
+    #[test]
+    fn test_token_guard_missing_baseline_fails_open() {
+        // Tokens were unavailable when the episode started — fail open.
+        assert!(!thinking_fire_suppressed_by_token_progress(None, 100_000, 2000));
+        assert!(!thinking_fire_suppressed_by_token_progress(None, 0, 2000));
+    }
+
+    #[test]
+    fn test_token_guard_unparseable_current_tokens_fails_open() {
+        // tokens == 0 means the status-bar count is unparseable/absent now
+        // — fail open, allow the fire (preserves pre-guard behavior).
+        assert!(!thinking_fire_suppressed_by_token_progress(
+            Some(100_000),
+            0,
+            2000
+        ));
+    }
+
+    #[test]
+    fn test_token_guard_disabled_by_zero_floor() {
+        // min_tokens_delta = 0 disables the guard entirely — never suppress,
+        // even at zero growth.
+        assert!(!thinking_fire_suppressed_by_token_progress(
+            Some(100_000),
+            100_000,
+            0
+        ));
+    }
+
+    #[test]
+    fn test_token_guard_rearm_window_semantics() {
+        // Simulates the re-arm flow: window 1 is an idle open turn
+        // (suppressed, baseline slides to the current count); window 2 sees
+        // a real generation start and grow past the floor from the NEW
+        // baseline — the fire must be allowed even though total growth from
+        // the ORIGINAL baseline would also have allowed it; conversely a
+        // second idle window keeps suppressing.
+        let floor = 2000;
+
+        // Window 1: 100_000 -> 100_500 (idle) — suppressed.
+        let baseline1 = Some(100_000);
+        let tokens_at_fire1 = 100_500;
+        assert!(thinking_fire_suppressed_by_token_progress(
+            baseline1,
+            tokens_at_fire1,
+            floor
+        ));
+
+        // Re-arm: baseline slides forward to the count at suppression time.
+        let baseline2 = Some(tokens_at_fire1);
+
+        // Window 2a: still idle (100_500 -> 101_000) — suppressed again.
+        assert!(thinking_fire_suppressed_by_token_progress(
+            baseline2, 101_000, floor
+        ));
+
+        // Window 2b: real stall starts later in the same open turn
+        // (100_500 -> 110_000) — judged on fresh growth, fire allowed.
+        assert!(!thinking_fire_suppressed_by_token_progress(
+            baseline2, 110_000, floor
+        ));
     }
 
     // --- Global post-interrupt cooldown tests (2026-04-21) ---
