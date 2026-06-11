@@ -43,6 +43,10 @@ class Harness:
         # Always isolate the override file -- never read /etc by accident.
         self.override_path = Path(self.tmpdir.name) / "dispatch-exempt.txt"
         self.env["CLAUDE_WATCH_DISPATCH_EXEMPT_PATH"] = str(self.override_path)
+        # Isolate the host-backed threshold config so a real host file
+        # (~/.claude/claude-watch-dispatch.json) can't skew the test.
+        self.host_config_path = Path(self.tmpdir.name) / "host-dispatch.json"
+        self.env["CLAUDE_WATCH_DISPATCH_CONFIG"] = str(self.host_config_path)
         if override_patterns is not None:
             self.override_path.write_text(
                 "\n".join(override_patterns) + "\n", encoding="utf-8",
@@ -53,6 +57,11 @@ class Harness:
         self.env.pop("CLAUDE_WATCH_DISPATCH_THRESHOLD", None)
         if threshold is not None:
             self.env["CLAUDE_WATCH_DISPATCH_THRESHOLD"] = str(threshold)
+
+    def write_host_config(self, threshold: int) -> None:
+        self.host_config_path.write_text(
+            json.dumps({"threshold": threshold}) + "\n", encoding="utf-8",
+        )
 
     def cleanup(self) -> None:
         self.tmpdir.cleanup()
@@ -134,7 +143,9 @@ def test_missing_state_allows():
 
 
 def test_threshold_default_3_denies_on_4th():
-    h = Harness()
+    # Pin threshold=3 explicitly (the baked DEFAULT is now 6); this test
+    # exercises the increment/deny mechanics at a known threshold.
+    h = Harness(threshold=3)
     try:
         # 3 ALLOWs, 4th DENY.
         for i in range(1, 4):
@@ -159,7 +170,7 @@ def test_threshold_default_3_denies_on_4th():
 
 
 def test_agent_resets_counter():
-    h = Harness()
+    h = Harness(threshold=3)
     try:
         # 3 non-exempt calls -> count == 3
         for _ in range(3):
@@ -290,7 +301,7 @@ def test_env_threshold_picked_up_immediately():
 
 
 def test_bypass_env_var():
-    h = Harness()
+    h = Harness(threshold=3)
     try:
         # Push above threshold to ensure subsequent calls would deny
         for _ in range(4):
@@ -322,7 +333,7 @@ def test_disabled_env_var():
 
 
 def test_reset_via_cli():
-    h = Harness()
+    h = Harness(threshold=3)
     try:
         for _ in range(3):
             h.run_hook(NON_EXEMPT_BASH)
@@ -359,7 +370,7 @@ def test_set_threshold_via_cli():
 
 def test_override_file_supplements_exempt():
     """Operator can add a custom exempt regex via dispatch-exempt.txt."""
-    h = Harness(override_patterns=[
+    h = Harness(threshold=3, override_patterns=[
         r"^my-custom-tool(?:\s|$)",
         "# this is a comment",
         "",  # blank line
@@ -451,7 +462,7 @@ def test_malformed_stdin_allows():
 
 
 def test_deny_response_shape():
-    h = Harness()
+    h = Harness(threshold=3)
     try:
         for _ in range(3):
             h.run_hook(NON_EXEMPT_BASH)
@@ -475,7 +486,7 @@ def test_counter_does_not_ratchet_during_deny():
     """While denying, the counter should NOT keep increasing (otherwise
     the operator would have to call reset just to lower it). Pinned at
     threshold."""
-    h = Harness()
+    h = Harness(threshold=3)
     try:
         for _ in range(3):
             h.run_hook(NON_EXEMPT_BASH)
@@ -499,7 +510,7 @@ def test_watcher_ctl_run_exempt_during_recovery_storm():
 
     Regression for the workbot block at 22:32 ET 2026-05-15.
     """
-    h = Harness()
+    h = Harness(threshold=3)
     try:
         # Fire 6 consecutive watcher-ctl run recoveries -- well past
         # the default threshold of 3. Each must allow without
@@ -548,9 +559,9 @@ def test_subagent_always_allowed():
     """Subagents must NEVER be gated by the dispatcher. The gate exists
     to force the main loop to delegate; once delegated, the subagent IS
     the worker and must be free to chain tool calls."""
-    h = Harness()
+    h = Harness(threshold=3)
     try:
-        # Push main-loop counter above threshold
+        # Push main-loop counter above threshold (threshold pinned to 3)
         for _ in range(4):
             h.run_hook(NON_EXEMPT_BASH)
         # Confirm main loop is now denied
@@ -577,7 +588,7 @@ def test_subagent_always_allowed():
 
 def test_subagent_empty_agent_id_still_gates():
     """An empty agent_id means main loop -- gate should still apply."""
-    h = Harness()
+    h = Harness(threshold=3)
     try:
         for _ in range(3):
             h.run_hook(NON_EXEMPT_BASH)
@@ -596,6 +607,65 @@ def test_subagent_empty_agent_id_still_gates():
             "agent_id": "   ",
         })
         check(_is_deny(out), "whitespace agent_id: still gates (main loop)",
+              f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_default_threshold_is_6():
+    """With no state override, no env, no host config -> baked DEFAULT
+    is 6: 6 ALLOWs, 7th DENY."""
+    h = Harness()  # no threshold -> falls through to DEFAULT_THRESHOLD
+    try:
+        for i in range(1, 7):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+            check(_is_allow(out), f"default call #{i} (<=6): allow", f"out={out}")
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "default call #7: deny", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_host_config_threshold_applies():
+    """A host-backed config file (~/.claude/claude-watch-dispatch.json,
+    isolated here) sets the threshold when no state/env override exists.
+    Survives container recreate because ~/.claude is bind-mounted."""
+    h = Harness()
+    try:
+        h.write_host_config(2)  # 2 ALLOWs, 3rd DENY
+        for i in range(1, 3):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+            check(_is_allow(out), f"host-config call #{i} (<=2): allow", f"out={out}")
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "host-config call #3: deny", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_env_threshold_beats_host_config():
+    """Env override outranks the host-backed config file."""
+    h = Harness(threshold=4)  # env CLAUDE_WATCH_DISPATCH_THRESHOLD=4
+    try:
+        h.write_host_config(2)  # host says 2, but env=4 wins
+        for i in range(1, 5):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+            check(_is_allow(out), f"env-over-host call #{i} (<=4): allow", f"out={out}")
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "env-over-host call #5: deny", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_malformed_host_config_falls_back_to_default():
+    """A corrupt host config is ignored (default-open) -> DEFAULT (6)."""
+    h = Harness()
+    try:
+        h.host_config_path.write_text("not json{{", encoding="utf-8")
+        for i in range(1, 7):
+            rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+            check(_is_allow(out), f"bad-host-config call #{i} (<=6): allow", f"out={out}")
+        rc, out, _ = h.run_hook(NON_EXEMPT_BASH)
+        check(_is_deny(out), "bad-host-config call #7: deny (default 6 applies)",
               f"out={out}")
     finally:
         h.cleanup()
@@ -626,6 +696,10 @@ def main() -> int:
         test_status_cli_is_exempt_even_at_threshold,
         test_subagent_always_allowed,
         test_subagent_empty_agent_id_still_gates,
+        test_default_threshold_is_6,
+        test_host_config_threshold_applies,
+        test_env_threshold_beats_host_config,
+        test_malformed_host_config_falls_back_to_default,
     ]
     for t in tests:
         print(f"\n== {t.__name__} ==")

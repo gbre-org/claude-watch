@@ -18,7 +18,8 @@ or shell into one — runtime exercise lives in workbot v-prompts.
 Coverage:
   1. process-compose.yml declares a `claude-watch` long-running process
      that invokes the cw-claude-watch-launch wrapper (which exports
-     CLAUDE_WATCH_CONTAINER_MODE=1 + writes to /tmp/claude-watch.log).
+     CLAUDE_WATCH_CONTAINER_MODE=1 + writes to
+     /var/log/claude-watch/claude-watch.log).
   2. The process declares `restart: on_failure` so a daemon crash
      triggers a restart.
   3. Dockerfile bakes container/bin/self-clear at /usr/local/bin/self-clear

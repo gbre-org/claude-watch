@@ -15,8 +15,14 @@ legacy_log_file = "/var/log/claude/claude-watch.log"
 # interrupts for this many seconds. Prevents cascading interrupts where a
 # watcher-down interrupt fires mid-thought, resets the thinking timer, and
 # then prolonged-thinking immediately re-fires on the newly-started thought.
-# 0 disables the gate.
-post_interrupt_cooldown_secs = 60
+# 0 disables the gate. Raised 60 -> 300 (2026-06-11): 5-min global
+# interrupt ceiling. Per-type cooldowns are the inner lower-bound; this
+# is the outer ceiling — a fire needs BOTH its per-type elapsed AND the
+# global claim to succeed. User-overridable.
+post_interrupt_cooldown_secs = 300
+# Keep watcher-down EXEMPT from the global ceiling (a down watcher is a
+# hard-liveness escape hatch). Set false to gate watcher-down too.
+global_cooldown_exempt_watcher_down = true
 
 [tmux]
 # Override: pin Claude Code to a specific tmux pane (e.g. "dashboard:0.2").
@@ -42,7 +48,7 @@ max_context_tokens = 1000000
 # Heartbeat file written by memory-remind
 heartbeat_file = "/var/run/claude/heartbeat"
 # Relaunch script path (written on restart)
-relaunch_script = "/tmp/claude-relaunch.sh"
+relaunch_script = "/var/run/claude/claude-relaunch.sh"
 
 [dead_process]
 # Consecutive zero-token checks before declaring dead
@@ -357,7 +363,7 @@ version_fallback_secs = 900
 #                       configurable [claude].heartbeat_file above (the same
 #                       path the daemon monitors for staleness), so the two
 #                       never drift apart.
-#   * memory-reminder — every memory_reminder_interval_secs (900s = 15min),
+#   * memory-reminder — every memory_reminder_interval_secs (1800s = 30min),
 #                       carrying the action checklist (update logs, commit
 #                       + push repos, etc.).
 #
@@ -366,5 +372,9 @@ version_fallback_secs = 900
 # wedged loop's heartbeat goes stale and the existing stale-detection
 # fires. If the daemon wrote the file directly it would mask a dead loop.
 enabled = true
-heartbeat_tick_interval_secs = 300
-memory_reminder_interval_secs = 900
+# Intervals are omitted on purpose: leaving them unset inherits the code
+# defaults (HEARTBEAT_TICK_INTERVAL_SECS / MEMORY_REMINDER_INTERVAL_SECS in
+# src/cadence.rs), which is the single source of truth. Uncomment to override
+# on a specific host; otherwise a bump to the const is the only change needed.
+#   heartbeat_tick_interval_secs = 300     # default: 5min
+#   memory_reminder_interval_secs = 1800   # default: 30min

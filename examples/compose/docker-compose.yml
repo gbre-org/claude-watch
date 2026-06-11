@@ -80,7 +80,7 @@ services:
       # Forwarded if set on the host (VSCode IDE port).
       CLAUDE_CODE_SSE_PORT: ${CLAUDE_CODE_SSE_PORT:-}
       # Corporate-network passthrough: SSL CA bundles + proxy settings for
-      # operators on enterprise VPNs (Salesforce, etc.) where the host
+      # operators on enterprise VPNs where the host
       # injects a corp CA into NODE_EXTRA_CA_CERTS / SSL_CERT_FILE etc.
       # Without this, the in-container claude binary fails with
       # "Unable to connect to API: SSL certificate verification failed.
@@ -119,7 +119,7 @@ services:
       # rewrite touches. Colon-separated globs; first whitespace-
       # separated token of each command is matched against each glob.
       # Unset / empty (default) = wrap everything (backward compatible).
-      # Example: '/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*'.
+      # Example: '/Users/*/.local/bin/*:/Users/*/.local/pkgs/*/bin/*'.
       # Honored by both generate-hooks-shim-settings (hooks) and
       # generate-project-mcp-json (MCP server commands).
       CLAUDE_SHIM_PATTERNS: ${CLAUDE_SHIM_PATTERNS:-}
@@ -134,7 +134,7 @@ services:
       # binary. Pair with a host-side stdio→HTTP wrapper (mcp-proxy
       # etc.) that owns the actual MCP binary. Unset / empty = no
       # rewriting (default). Example:
-      #   mcp-adaptor=http://host.docker.internal:8765/mcp
+      #   host-mcp-server=http://host.docker.internal:8765/mcp
       CLAUDE_MCP_HTTP_BRIDGE: ${CLAUDE_MCP_HTTP_BRIDGE:-}
       # CLAUDE_HOST_HOOK_BRIDGE — when "1", exec-hook hands every Mach-O
       # / wrong-arch hook off to /usr/local/bin/exec-hook-bridge instead
@@ -261,6 +261,20 @@ services:
       # ~/.claude.json — rw: top-level Claude Code config (MCP server
       # registry, model preferences, project allow-lists). Claude updates
       # this on settings changes.
+      #
+      # macOS WARNING: do NOT point CLAUDE_HOST_CONFIG_FILE at the
+      # operator's live ${HOME}/.claude.json on Docker Desktop for Mac.
+      # This is a SINGLE-FILE bind mount; the host's native Claude Code
+      # rewrites ~/.claude.json via write-tmp-then-rename on every
+      # settings / model / trust change, which replaces the host inode.
+      # The VirtioFS/gRPC-FUSE single-file mount stays pinned to the old,
+      # now-unlinked inode, so the in-container claude reads stale /
+      # truncated content. Point CLAUDE_HOST_CONFIG_FILE at a dedicated
+      # container-only file the host's claude never touches (the
+      # .env.example default is ${HOME}/.config/claude-container/
+      # claude.json); `cw --up` seeds it once from ~/.claude.json via
+      # examples/compose/bin/prepare-host-claude-state. The Linux default
+      # below is safe as-is (Linux file bind mounts don't desync this way).
       - "${CLAUDE_HOST_CONFIG_FILE:-${HOME}/.claude.json}:/home/hndrewaall/.claude.json:rw"
       # ~/repos — rw: host repo trees so in-container scripts under
       # ~/bin (next mount) can resolve their symlink targets. Read-write
@@ -342,7 +356,7 @@ services:
       - "${CLAUDE_HOST_CORP_CA_BUNDLE:-/dev/null}:${CLAUDE_HOST_CORP_CA_BUNDLE:-/dev/null}:ro"
       # Host hook-script dir — ro. When ~/.claude/settings.json references
       # a hook script by ABSOLUTE host path (corp telemetry hooks,
-      # auto-installed via tools like devbar), the path has to resolve
+      # auto-installed via a corporate telemetry tool), the path has to resolve
       # inside the container or Claude Code logs "SessionStart:startup
       # hook error — /bin/sh: 1: <path>: not found" and refuses to fire
       # the hook. Bind-mount the host dir at the SAME path so the
@@ -477,6 +491,12 @@ services:
     user: "1000:1000"
     environment:
       EICHI_DB: /home/hndrewaall/.local/share/eichi/index.db
+      # The eichi-search container's $HOME is /home/eichi, but the host
+      # ~/.config/eichi is bind-mounted at /home/hndrewaall/.config/eichi
+      # (UID-1000 user baked into the image). Point sources.py's config
+      # resolver (priority #1) at the explicit bind-mount path so the
+      # source-map / role allowlist actually loads.
+      EICHI_SOURCES_CONFIG: /home/hndrewaall/.config/eichi/sources.toml
       # EICHI_PYTHON deliberately unset — app.py defaults to the
       # container's own sys.executable. The host venv contains macOS
       # Mach-O binaries that cannot exec in the Linux container.

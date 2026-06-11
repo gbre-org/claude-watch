@@ -146,6 +146,45 @@ main {
 .dot-ok  { background: var(--ok); }
 .dot-err { background: var(--critical); }
 
+/* ------- source filter dropdown (topbar) ------- */
+.source-filter-label {
+  display: inline-flex;
+  align-items: center;
+}
+.source-filter {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--fg-emph);
+  font: inherit;
+  min-height: 28px;
+  cursor: pointer;
+}
+.source-filter:focus-visible {
+  outline: 2px solid var(--running);
+  outline-offset: 1px;
+}
+
+/* Visually-hidden but screen-reader-accessible (no prior .sr-only). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Cards hidden by the source filter. !important so it beats any state-*
+   display rule; the filter is a user-driven view toggle, not item state. */
+.item.filtered-out {
+  display: none !important;
+}
+
 .ts {
   font-variant-numeric: tabular-nums;
   color: var(--fg-mute);

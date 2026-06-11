@@ -172,8 +172,8 @@ def test_top_level_servers_wrapped() -> None:
         inp = Path(td) / ".claude.json"
         write_json(inp, {
             "mcpServers": {
-                "mcp-adaptor": {
-                    "command": "/Users/me/.mcp-adaptor/bin/mcp-adaptor-go-v2.0.5-darwin-arm64",
+                "host-mcp-server": {
+                    "command": "/Users/me/.host-mcp-server/bin/host-mcp-server-bin-v2.0.5-darwin-arm64",
                     "args": ["--stdio"],
                     "env": {"DEBUG": "1"},
                 },
@@ -191,10 +191,10 @@ def test_top_level_servers_wrapped() -> None:
 
         out = load_output(project)
         expect("mcpServers" in out, "top-level: output should have mcpServers key")
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             adaptor["command"]
-            == f"{EXEC_HOOK} /Users/me/.mcp-adaptor/bin/mcp-adaptor-go-v2.0.5-darwin-arm64",
+            == f"{EXEC_HOOK} /Users/me/.host-mcp-server/bin/host-mcp-server-bin-v2.0.5-darwin-arm64",
             f"top-level: adaptor command not wrapped, got {adaptor['command']!r}",
         )
         expect(
@@ -293,7 +293,7 @@ def test_only_project_scoped_servers_picked_up() -> None:
     rather than top-level.
 
     Workbot v26 surfaced this: a bare `claude mcp add host-bash ...`
-    placed the entry under `projects["/Users/hallandrew/repos/claude-config"].mcpServers`
+    placed the entry under `projects["/Users/me/repos/claude-config"].mcpServers`
     not the top-level mcpServers, and an older version of this helper
     only walked the top-level block — so the in-container .mcp.json
     came up empty for host-bash. The fix is to ALSO walk
@@ -457,8 +457,8 @@ def _mcp_with_three_servers() -> dict:
     families, used by multiple pattern tests."""
     return {
         "mcpServers": {
-            "devbar": {"command": "/Users/me/.devbar/bin/mcp-adaptor", "args": ["--stdio"]},
-            "pkgs-tool": {"command": "/Users/me/.devbar/pkgs/foo/bin/mcp-tool"},
+            "corp-tool": {"command": "/Users/me/.local/bin/host-mcp-server", "args": ["--stdio"]},
+            "pkgs-tool": {"command": "/Users/me/.local/pkgs/foo/bin/mcp-tool"},
             "system-tool": {"command": "/opt/homebrew/bin/native-mcp"},
         },
     }
@@ -499,23 +499,23 @@ def test_no_pattern_wraps_every_server() -> None:
 
 
 def test_pattern_narrow_match_only_wraps_matches() -> None:
-    """Narrow pattern: only the devbar/bin path matches; others pass through."""
+    """Narrow pattern: only the corp-tool path matches; others pass through."""
     with tempfile.TemporaryDirectory() as td:
         inp = Path(td) / ".claude.json"
         write_json(inp, _mcp_with_three_servers())
         project = Path(td) / "project"
         project.mkdir()
-        run_helper(str(inp), str(project), patterns="/Users/*/.devbar/bin/*")
+        run_helper(str(inp), str(project), patterns="/Users/*/.local/bin/*")
         out = load_output(project)
         expect(
-            out["mcpServers"]["devbar"]["command"]
-            == f"{EXEC_HOOK} /Users/me/.devbar/bin/mcp-adaptor",
-            f"narrow: devbar/bin should be wrapped, "
-            f"got {out['mcpServers']['devbar']['command']!r}",
+            out["mcpServers"]["corp-tool"]["command"]
+            == f"{EXEC_HOOK} /Users/me/.local/bin/host-mcp-server",
+            f"narrow: corp-tool path should be wrapped, "
+            f"got {out['mcpServers']['corp-tool']['command']!r}",
         )
         expect(
             out["mcpServers"]["pkgs-tool"]["command"]
-            == "/Users/me/.devbar/pkgs/foo/bin/mcp-tool",
+            == "/Users/me/.local/pkgs/foo/bin/mcp-tool",
             f"narrow: pkgs-tool should NOT be wrapped, "
             f"got {out['mcpServers']['pkgs-tool']['command']!r}",
         )
@@ -537,12 +537,12 @@ def test_multiple_patterns_union() -> None:
         run_helper(
             str(inp),
             str(project),
-            patterns="/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*",
+            patterns="/Users/*/.local/bin/*:/Users/*/.local/pkgs/*/bin/*",
         )
         out = load_output(project)
         expect(
-            out["mcpServers"]["devbar"]["command"].startswith(f"{EXEC_HOOK} "),
-            f"union: devbar wrapped, got {out['mcpServers']['devbar']['command']!r}",
+            out["mcpServers"]["corp-tool"]["command"].startswith(f"{EXEC_HOOK} "),
+            f"union: corp-tool wrapped, got {out['mcpServers']['corp-tool']['command']!r}",
         )
         expect(
             out["mcpServers"]["pkgs-tool"]["command"].startswith(f"{EXEC_HOOK} "),
@@ -583,17 +583,17 @@ def test_env_var_supplies_patterns_when_flag_absent() -> None:
         run_helper(
             str(inp),
             str(project),
-            env_patterns="/Users/*/.devbar/bin/*",
+            env_patterns="/Users/*/.local/bin/*",
         )
         out = load_output(project)
         expect(
-            out["mcpServers"]["devbar"]["command"].startswith(f"{EXEC_HOOK} "),
-            f"env: devbar/bin should be wrapped, "
-            f"got {out['mcpServers']['devbar']['command']!r}",
+            out["mcpServers"]["corp-tool"]["command"].startswith(f"{EXEC_HOOK} "),
+            f"env: corp-tool path should be wrapped, "
+            f"got {out['mcpServers']['corp-tool']['command']!r}",
         )
         expect(
             out["mcpServers"]["pkgs-tool"]["command"]
-            == "/Users/me/.devbar/pkgs/foo/bin/mcp-tool",
+            == "/Users/me/.local/pkgs/foo/bin/mcp-tool",
             f"env: pkgs-tool should NOT match, "
             f"got {out['mcpServers']['pkgs-tool']['command']!r}",
         )
@@ -662,11 +662,11 @@ def test_pattern_idempotent() -> None:
         write_json(inp, _mcp_with_three_servers())
         project = Path(td) / "project"
         project.mkdir()
-        run_helper(str(inp), str(project), patterns="/Users/*/.devbar/bin/*")
+        run_helper(str(inp), str(project), patterns="/Users/*/.local/bin/*")
         out_file = project / ".mcp.json"
         mtime1 = out_file.stat().st_mtime_ns
         time.sleep(0.05)
-        run_helper(str(inp), str(project), patterns="/Users/*/.devbar/bin/*")
+        run_helper(str(inp), str(project), patterns="/Users/*/.local/bin/*")
         mtime2 = out_file.stat().st_mtime_ns
         expect(
             mtime1 == mtime2,
@@ -681,15 +681,15 @@ def test_pattern_idempotent() -> None:
 
 
 def _mcp_input_for_bridge() -> dict:
-    """Common input: two MCP servers, mcp-adaptor (the typical
+    """Common input: two MCP servers, host-mcp-server (the typical
     Mach-O cross-arch case) + chrome-devtools (npx-spawned)."""
     return {
         "mcpServers": {
-            "mcp-adaptor": {
-                "command": "/Users/me/.mcp-adaptor/bin/mcp-adaptor-go-darwin-arm64",
+            "host-mcp-server": {
+                "command": "/Users/me/.host-mcp-server/bin/host-mcp-server-bin-darwin-arm64",
                 "args": ["--stdio"],
                 "transport": "stdio",
-                "env": {"GW_PROFILE": "default", "MCP_ADAPTOR_ENV": "prod"},
+                "env": {"GW_PROFILE": "default", "MCP_SERVER_ENV": "prod"},
             },
             "chrome-devtools": {
                 "command": "npx",
@@ -710,17 +710,17 @@ def test_http_bridge_rewrites_matching_server() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
         )
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             adaptor.get("type") == "http",
-            f"http-bridge: mcp-adaptor type should be 'http', got {adaptor.get('type')!r}",
+            f"http-bridge: host-mcp-server type should be 'http', got {adaptor.get('type')!r}",
         )
         expect(
             adaptor.get("url") == "http://host.docker.internal:8765/mcp",
-            f"http-bridge: mcp-adaptor url incorrect, got {adaptor.get('url')!r}",
+            f"http-bridge: host-mcp-server url incorrect, got {adaptor.get('url')!r}",
         )
         for stdio_key in ("command", "args", "transport", "env"):
             expect(
@@ -741,7 +741,7 @@ def test_http_bridge_leaves_other_servers_alone() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
         )
         out = load_output(project)
         cd = out["mcpServers"]["chrome-devtools"]
@@ -768,21 +768,21 @@ def test_http_bridge_multiple_servers_colon_separated() -> None:
             str(inp),
             str(project),
             http_bridge=(
-                "mcp-adaptor=http://host.docker.internal:8765/mcp"
+                "host-mcp-server=http://host.docker.internal:8765/mcp"
                 ":chrome-devtools=http://host.docker.internal:9999/cdp"
             ),
         )
         out = load_output(project)
         expect(
-            out["mcpServers"]["mcp-adaptor"].get("type") == "http",
-            f"multi-bridge: mcp-adaptor rewrite failed, "
-            f"got {out['mcpServers']['mcp-adaptor']!r}",
+            out["mcpServers"]["host-mcp-server"].get("type") == "http",
+            f"multi-bridge: host-mcp-server rewrite failed, "
+            f"got {out['mcpServers']['host-mcp-server']!r}",
         )
         expect(
-            out["mcpServers"]["mcp-adaptor"].get("url")
+            out["mcpServers"]["host-mcp-server"].get("url")
             == "http://host.docker.internal:8765/mcp",
-            f"multi-bridge: mcp-adaptor url wrong, "
-            f"got {out['mcpServers']['mcp-adaptor'].get('url')!r}",
+            f"multi-bridge: host-mcp-server url wrong, "
+            f"got {out['mcpServers']['host-mcp-server'].get('url')!r}",
         )
         expect(
             out["mcpServers"]["chrome-devtools"].get("type") == "http",
@@ -806,15 +806,15 @@ def test_http_bridge_empty_no_rewrite() -> None:
         project.mkdir()
         run_helper(str(inp), str(project), http_bridge="")
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             adaptor.get("command", "").startswith(f"{EXEC_HOOK} "),
-            f"empty-bridge: mcp-adaptor should fall back to stdio + exec-hook, "
+            f"empty-bridge: host-mcp-server should fall back to stdio + exec-hook, "
             f"got command={adaptor.get('command')!r}",
         )
         expect(
             adaptor.get("type") != "http",
-            f"empty-bridge: mcp-adaptor should NOT be rewritten to http, "
+            f"empty-bridge: host-mcp-server should NOT be rewritten to http, "
             f"got type={adaptor.get('type')!r}",
         )
 
@@ -833,7 +833,7 @@ def test_http_bridge_unknown_name_no_rewrite() -> None:
         )
         out = load_output(project)
         # Both servers keep their stdio + exec-hook shape.
-        for name in ("mcp-adaptor", "chrome-devtools"):
+        for name in ("host-mcp-server", "chrome-devtools"):
             entry = out["mcpServers"][name]
             expect(
                 entry.get("type") != "http",
@@ -852,13 +852,13 @@ def test_http_bridge_env_var_supplies_value() -> None:
         run_helper(
             str(inp),
             str(project),
-            env_http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            env_http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
         )
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             adaptor.get("type") == "http",
-            f"env-bridge: mcp-adaptor should be http-rewritten from env var, "
+            f"env-bridge: host-mcp-server should be http-rewritten from env var, "
             f"got type={adaptor.get('type')!r}",
         )
 
@@ -874,19 +874,19 @@ def test_http_bridge_flag_overrides_env_var() -> None:
             str(inp),
             str(project),
             http_bridge="chrome-devtools=http://host.docker.internal:9000/cdp",
-            env_http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            env_http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
         )
         out = load_output(project)
-        # Flag wins: chrome-devtools gets bridged, mcp-adaptor doesn't.
+        # Flag wins: chrome-devtools gets bridged, host-mcp-server doesn't.
         expect(
             out["mcpServers"]["chrome-devtools"].get("type") == "http",
             f"flag-overrides-env: chrome-devtools should be http, "
             f"got {out['mcpServers']['chrome-devtools']!r}",
         )
         expect(
-            out["mcpServers"]["mcp-adaptor"].get("type") != "http",
-            f"flag-overrides-env: mcp-adaptor should NOT be http, "
-            f"got {out['mcpServers']['mcp-adaptor']!r}",
+            out["mcpServers"]["host-mcp-server"].get("type") != "http",
+            f"flag-overrides-env: host-mcp-server should NOT be http, "
+            f"got {out['mcpServers']['host-mcp-server']!r}",
         )
 
 
@@ -897,8 +897,8 @@ def test_http_bridge_preserves_http_specific_keys() -> None:
         inp = Path(td) / ".claude.json"
         write_json(inp, {
             "mcpServers": {
-                "mcp-adaptor": {
-                    "command": "/Users/me/.mcp-adaptor/bin/mcp-adaptor-go-darwin-arm64",
+                "host-mcp-server": {
+                    "command": "/Users/me/.host-mcp-server/bin/host-mcp-server-bin-darwin-arm64",
                     "args": [],
                     "transport": "stdio",
                     "env": {"GW_PROFILE": "default"},
@@ -912,10 +912,10 @@ def test_http_bridge_preserves_http_specific_keys() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
         )
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             adaptor.get("headers") == {"X-Trace": "1"},
             f"preserve-http-keys: headers should survive rewrite, "
@@ -940,16 +940,16 @@ def test_http_bridge_combines_with_pattern_filter() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
             # A pattern that only matches `npx` — chrome-devtools should
-            # still be wrapped; mcp-adaptor is now http and unaffected.
+            # still be wrapped; host-mcp-server is now http and unaffected.
             patterns="npx",
         )
         out = load_output(project)
         expect(
-            out["mcpServers"]["mcp-adaptor"].get("type") == "http",
-            f"bridge+pattern: mcp-adaptor rewrite should win over pattern, "
-            f"got {out['mcpServers']['mcp-adaptor']!r}",
+            out["mcpServers"]["host-mcp-server"].get("type") == "http",
+            f"bridge+pattern: host-mcp-server rewrite should win over pattern, "
+            f"got {out['mcpServers']['host-mcp-server']!r}",
         )
         expect(
             out["mcpServers"]["chrome-devtools"].get("command")
@@ -972,14 +972,14 @@ def test_http_bridge_malformed_pair_ignored() -> None:
             str(project),
             http_bridge=(
                 "nopair"
-                ":mcp-adaptor=http://host.docker.internal:8765/mcp"
+                ":host-mcp-server=http://host.docker.internal:8765/mcp"
             ),
         )
         out = load_output(project)
         expect(
-            out["mcpServers"]["mcp-adaptor"].get("type") == "http",
+            out["mcpServers"]["host-mcp-server"].get("type") == "http",
             f"malformed-pair: valid sibling pair should still apply, "
-            f"got {out['mcpServers']['mcp-adaptor']!r}",
+            f"got {out['mcpServers']['host-mcp-server']!r}",
         )
 
 
@@ -1001,12 +1001,12 @@ def test_bearer_env_set_injects_authorization_header() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
             # Set the default env var that --bearer-env points at.
             bearer_value="dont-care-the-secret-value",
         )
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             isinstance(adaptor.get("headers"), dict),
             f"bearer-set: headers should be a dict, got {adaptor.get('headers')!r}",
@@ -1039,10 +1039,10 @@ def test_bearer_env_unset_no_headers_field() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
         )
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             adaptor.get("type") == "http",
             f"bearer-unset: rewrite still happens, "
@@ -1067,11 +1067,11 @@ def test_bearer_env_empty_no_headers_field() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
             bearer_value="",  # explicit empty
         )
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             "headers" not in adaptor,
             f"bearer-empty: empty env var should NOT inject Authorization, "
@@ -1092,12 +1092,12 @@ def test_bearer_env_disabled_via_empty_flag() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
             bearer_env="",
             bearer_value="dont-care",
         )
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             "headers" not in adaptor,
             f"bearer-disabled: --bearer-env '' should suppress auto-inject "
@@ -1117,12 +1117,12 @@ def test_bearer_env_custom_var_name() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
             bearer_env="MY_CORP_BEARER",
             bearer_value="some-other-secret",
         )
         out = load_output(project)
-        adaptor = out["mcpServers"]["mcp-adaptor"]
+        adaptor = out["mcpServers"]["host-mcp-server"]
         expect(
             adaptor.get("headers", {}).get("Authorization")
             == "Bearer ${MY_CORP_BEARER}",
@@ -1139,8 +1139,8 @@ def test_bearer_env_preserves_existing_headers() -> None:
         inp = Path(td) / ".claude.json"
         write_json(inp, {
             "mcpServers": {
-                "mcp-adaptor": {
-                    "command": "/Users/me/.mcp-adaptor/bin/x",
+                "host-mcp-server": {
+                    "command": "/Users/me/.host-mcp-server/bin/x",
                     "headers": {"X-Trace": "1", "X-Operator": "andrew"},
                 },
             },
@@ -1150,11 +1150,11 @@ def test_bearer_env_preserves_existing_headers() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
             bearer_value="zz",
         )
         out = load_output(project)
-        headers = out["mcpServers"]["mcp-adaptor"].get("headers", {})
+        headers = out["mcpServers"]["host-mcp-server"].get("headers", {})
         expect(
             headers.get("X-Trace") == "1",
             f"bearer-merge: X-Trace should survive, got {headers!r}",
@@ -1179,8 +1179,8 @@ def test_bearer_env_operator_authorization_wins() -> None:
         inp = Path(td) / ".claude.json"
         write_json(inp, {
             "mcpServers": {
-                "mcp-adaptor": {
-                    "command": "/Users/me/.mcp-adaptor/bin/x",
+                "host-mcp-server": {
+                    "command": "/Users/me/.host-mcp-server/bin/x",
                     "headers": {"Authorization": "Bearer hardcoded-by-operator"},
                 },
             },
@@ -1190,11 +1190,11 @@ def test_bearer_env_operator_authorization_wins() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
             bearer_value="zz",
         )
         out = load_output(project)
-        auth = out["mcpServers"]["mcp-adaptor"]["headers"]["Authorization"]
+        auth = out["mcpServers"]["host-mcp-server"]["headers"]["Authorization"]
         expect(
             auth == "Bearer hardcoded-by-operator",
             f"bearer-operator-wins: operator's explicit Authorization "
@@ -1214,8 +1214,8 @@ def test_bearer_env_non_bridged_server_unaffected() -> None:
         run_helper(
             str(inp),
             str(project),
-            # ONLY bridge mcp-adaptor; chrome-devtools stays stdio.
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            # ONLY bridge host-mcp-server; chrome-devtools stays stdio.
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
             bearer_value="zz",
         )
         out = load_output(project)
@@ -1249,7 +1249,7 @@ def test_bearer_env_unset_default_var_no_inject() -> None:
         run_helper(
             str(inp),
             str(project),
-            http_bridge="mcp-adaptor=http://host.docker.internal:8765/mcp",
+            http_bridge="host-mcp-server=http://host.docker.internal:8765/mcp",
         )
         out = load_output(project)
         # No headers added => exact pre-PR shape.

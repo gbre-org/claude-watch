@@ -245,9 +245,9 @@ RUN mkdir -p /home/hndrewaall/.local/share/claude /home/hndrewaall/.local/bin \
 # process-compose — service supervisor (replaces tini at PID 1).
 #
 # Escalation past the README's "tini sufficient until three services"
-# threshold rule: claude-watch daemon + crond + cw-watcher-supervisor
-# are the three long-running services living alongside the foreground
-# tmux session. tini reaps zombies + forwards signals but doesn't
+# threshold rule: claude-watch daemon + crond are the long-running
+# services living alongside the foreground tmux session. tini reaps
+# zombies + forwards signals but doesn't
 # model dependencies, restart on failure, or centralize logs.
 # process-compose declares those service contracts in
 # /opt/claude-container/process-compose.yml and runs them with restart
@@ -301,6 +301,15 @@ RUN mkdir -p /var/lib/claude-watch \
 RUN mkdir -p /var/run/claude/workload-state \
     && chown 1000:1000 /var/run/claude /var/run/claude/workload-state \
     && chmod 0755 /var/run/claude /var/run/claude/workload-state
+
+# Pre-create /var/log/claude-watch (+ the watchers/ subdir) owned by
+# uid 1000 so the daemon, the cw-claude-watch-launch wrapper, and the
+# session watchers can write their logs (claude-watch.jsonl/.log,
+# cron.log, watchers/*.log) without needing root or runtime mkdir.
+# Same pattern as /var/lib/claude-watch and /var/run/claude above.
+RUN mkdir -p /var/log/claude-watch/watchers \
+    && chown -R 1000:1000 /var/log/claude-watch \
+    && chmod -R 0755 /var/log/claude-watch
 
 # Pre-create ~/.config/ owned by uid 1000 so features that write
 # persistent state to a subdirectory of ~/.config/ (claude-event-watch
@@ -511,15 +520,14 @@ RUN case "$(uname -m)" in \
 # without this file the daemon would FATAL on "no config file found". Phase 1e.
 COPY container/claude-watch.config.toml /etc/claude-watch/config.toml
 
-# Baked watchers.conf — the daemon's watcher_monitor list. Stacks on top
-# of cw-watcher-supervisor (which is the primary restart layer): the
-# supervisor reads /opt/claude-container/watchers/*.toml and respawns each
-# watcher per restart_policy. The daemon's watcher_monitor reads this
-# pipe-separated file and fires `[CLAUDE-WATCH] WATCHER(S) DOWN` alerts
-# via tmux-inject if the watcher's pgrep pattern is missing for several
-# consecutive checks (i.e. the supervisor itself has failed). Together
-# the two layers give us "supervisor restarts in seconds" + "daemon
-# alerts the main loop if supervision has actually failed".
+# Baked watchers.conf — the daemon's watcher_monitor list. Watchers are
+# session-scoped run_in_background tasks (block-print-exit contract):
+# the in-container session launches each watcher and restarts it on
+# exit. The daemon's watcher_monitor reads this pipe-separated file and
+# fires `[CLAUDE-WATCH] WATCHER(S) DOWN` alerts via tmux-inject if the
+# watcher's pgrep pattern is missing for several consecutive checks
+# (i.e. the session failed to restart it). The session restarts in
+# seconds; the daemon alerts the main loop if that has actually failed.
 #
 # Path /opt/claude-container/watchmen/watchers.conf mirrors the host's
 # ~/.config/watchmen/watchers.conf convention (the "watchmen" subdir
@@ -735,6 +743,7 @@ RUN chmod +x /usr/local/bin/generate-project-mcp-json
 #
 # Hooks installed:
 #   - pre-agent-queue-gate-hook            (PreToolUse Agent matcher)
+#   - pre-agent-background-required-hook   (PreToolUse Agent matcher)
 #   - pre-tool-obligations-gate-hook       (PreToolUse * matcher)
 #   - post-tool-obligations-update-hook    (PostToolUse * matcher)
 #   - post-tool-mark-attachment-read-hook  (PostToolUse Read matcher)
@@ -746,6 +755,7 @@ RUN chmod +x /usr/local/bin/generate-project-mcp-json
 # /usr/local/bin/ ensures the obligations gate fires inside the
 # container regardless of host state.
 COPY tools/hooks/pre-agent-queue-gate-hook /usr/local/bin/pre-agent-queue-gate-hook
+COPY tools/hooks/pre-agent-background-required-hook /usr/local/bin/pre-agent-background-required-hook
 COPY tools/hooks/pre-tool-obligations-gate-hook /usr/local/bin/pre-tool-obligations-gate-hook
 COPY tools/hooks/post-tool-obligations-update-hook /usr/local/bin/post-tool-obligations-update-hook
 COPY tools/hooks/post-tool-mark-attachment-read-hook /usr/local/bin/post-tool-mark-attachment-read-hook
@@ -829,6 +839,7 @@ COPY tools/obligations/obligations-init /usr/local/bin/obligations-init
 COPY tools/agent-msg/agent-msg /usr/local/bin/agent-msg
 COPY tools/agent-tail/agent-tail /usr/local/bin/agent-tail
 RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
+            /usr/local/bin/pre-agent-background-required-hook \
             /usr/local/bin/pre-tool-obligations-gate-hook \
             /usr/local/bin/post-tool-obligations-update-hook \
             /usr/local/bin/post-tool-mark-attachment-read-hook \
@@ -1102,9 +1113,9 @@ COPY container/plugin/.claude-plugin/plugin.json /opt/claude-container/plugin/.c
 # /opt/claude-container/process-compose.yml at startup to drive the
 # in-container service set: tmux session bootstrap (oneshot), tmux
 # attach (foreground TTY), claude-watch daemon (long-running), crond
-# (long-running), cw-watcher-supervisor (long-running). Each
-# long-running process has an `availability: restart: on_failure`
-# policy so a crash triggers a restart instead of a dead container.
+# (long-running). Each long-running process has an
+# `availability: restart: on_failure` policy so a crash triggers a
+# restart instead of a dead container.
 #
 # cw-tmux-bootstrap creates the in-container tmux session in detached
 # mode (extracted from entrypoint.sh's tmux session-creation logic).

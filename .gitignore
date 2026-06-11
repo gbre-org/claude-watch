@@ -12,3 +12,9 @@ __pycache__/
 # file leaks personal paths (gh token dir, gitconfig, ssh-agent socket,
 # work-private bare-repo paths) and must NOT be committed.
 examples/compose/docker-compose.override.yml
+
+# Operator-specific env for the example compose stack. Holds personal host
+# paths and live secrets (mcp-host-bash bearer, etc.). The committed
+# `.env.example` is the canonical template; the real `.env` must NOT be
+# committed.
+examples/compose/.env

@@ -1,23 +1,34 @@
 #!/bin/sh
 # claude-watch pre-commit hook
 #
-# Runs two gates before allowing a commit:
-#   1. Warning-free release build (RUSTFLAGS="-D warnings"). Catches new
+# Runs three gates before allowing a commit:
+#   1. CLAUDE.md size guard. Every CLAUDE.md is loaded into Claude Code's
+#      context at session start; /doctor recommends each stay under ~40,000
+#      chars. Fails if a tracked CLAUDE.md is over its ceiling. Cheap, so it
+#      runs first (fails fast before the slow cargo build). Mirrors the CI
+#      `make test-claude-md-size` step.
+#   2. Warning-free release build (RUSTFLAGS="-D warnings"). Catches new
 #      dead code, unused imports, etc. on the way in instead of letting
 #      them accumulate.
-#   2. Unit + fixture test suite via cargo-nextest. ~0.1s in parallel.
+#   3. Unit + fixture test suite via cargo-nextest. ~0.1s in parallel.
 #      Skips e2e tests (which do real sleeps and add ~10s+).
 #
 # Install via `make install-hooks` (which points core.hooksPath at this
 # dir, so every worktree of the repo runs it). Bypass for RED-phase TDD
-# commits with `git commit --no-verify`.
+# commits with `git commit --no-verify` — which is exactly why CI re-runs
+# the same gates (a bypassed local hook can't sneak an oversize CLAUDE.md
+# or a warning past CI).
 #
-# Exits non-zero on any warning or test failure, blocking the commit.
+# Exits non-zero on any oversize file, warning, or test failure, blocking
+# the commit.
 
 set -e
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
+
+echo "==> pre-commit: CLAUDE.md size guard"
+python3 scripts/check-claude-md-size.py
 
 echo "==> pre-commit: warning-free release build (RUSTFLAGS=\"-D warnings\")"
 RUSTFLAGS="-D warnings" cargo build --release --tests

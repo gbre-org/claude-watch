@@ -8,7 +8,7 @@ WHY THIS EXISTS
 Operators bind-mount ~/.claude into the container, including
 ~/.claude/settings.json with its `hooks.<event>.[*].hooks[*].command`
 entries. When the host is macOS (or any non-Linux platform), those
-commands often point at host-native binaries — devbar's
+commands often point at host-native binaries — a corp tool's
 telemetry-hook, etc. — that Linux's exec() bounces with "Exec format
 error". Claude Code logs the failure on every hook event; the noise
 buries real diagnostics.
@@ -17,7 +17,7 @@ PR #135 shipped /usr/local/bin/exec-hook, a magic-byte sniffer that
 exec's ELF / shebang transparently and silently no-ops on Mach-O /
 unknown. The shim is opt-in: the operator has to MANUALLY edit each
 hook command in their settings.json to wrap it as
-  "command": "exec-hook /Users/me/.devbar/bin/telemetry-hook"
+  "command": "exec-hook /Users/me/.local/bin/telemetry-hook"
 On a Mac host where settings.json is bind-mounted in, that edit is
 load-bearing on the HOST and surprises the host install.
 
@@ -50,7 +50,7 @@ PATTERN FILTERING (--shim-patterns / CLAUDE_SHIM_PATTERNS)
 
 By default this helper wraps EVERY hook command it finds. Operators
 who only want a NARROW subset wrapped (e.g. just corp telemetry hooks
-under `/Users/*/.devbar/bin/*`) can pass `--shim-patterns` (or set
+under `/Users/*/.local/bin/*`) can pass `--shim-patterns` (or set
 `CLAUDE_SHIM_PATTERNS` in the env) to a colon-separated list of glob
 patterns. When the flag/env is set to a non-empty value, ONLY commands
 whose first token (the binary path) matches at least one pattern are
@@ -111,7 +111,32 @@ INPUT FORMAT
 
 This script rewrites:
   - `hooks.<event>.[*].hooks[*].command`
+  - `apiKeyHelper` (see APIKEYHELPER SANITIZING below)
 All other top-level keys are passed through unchanged.
+
+APIKEYHELPER SANITIZING
+
+`apiKeyHelper` is a top-level settings key: a shell command Claude Code
+runs to obtain an API key. On a macOS host it commonly points at a
+host-native binary (e.g. a corp `…/get-api-key` Mach-O). When
+that host settings.json is bind-mounted into this Linux container, the
+helper path either doesn't exist or is a non-ELF binary, so Claude Code
+runs it on EVERY inference and logs `apiKeyHelper failed: exited 127 …`
+(or `… did not return a value`) each time. The noise is continuous and
+the helper can never actually return a key — a Mach-O binary cannot run
+under Linux exec().
+
+Mirroring the exec-hook magic-byte philosophy: at generation time we
+resolve the helper's target binary (its first shell token) and check
+whether it is runnable in THIS container — present AND ELF (or a
+shebang script). If it is not (missing path, Mach-O, unknown format),
+we DROP the `apiKeyHelper` key from the output with a one-line stderr
+heads-up. Claude Code then falls back to its normal env-based auth
+(`ANTHROPIC_API_KEY`, Bedrock/Vertex env, OAuth creds) — which is what
+container deployments use anyway. A genuinely runnable ELF/shebang
+helper (Linux host) is preserved verbatim. This is unconditional and
+operator-safe: a non-runnable helper is definitionally broken in the
+container, so dropping it only ever removes pure error noise.
 
 OUTPUT FORMAT
 
@@ -156,6 +181,13 @@ OBLIGATIONS_HOOKS: list[tuple[str, str, str]] = [
     # Block Agent spawns missing a `Queue item: q-XXXX` line. Mirrors the
     # host's PreToolUse "Agent" matcher in ~/.claude/settings.json.
     ("PreToolUse", "Agent", "/usr/local/bin/pre-agent-queue-gate-hook"),
+    # Block FOREGROUND Agent spawns. A foreground subagent blocks this loop
+    # for its whole lifetime — no queue babysit, no agent-chat, no heartbeat
+    # refresh, no alert handling — and looks like a wedge to the daemon.
+    # Denies any Agent call whose run_in_background isn't true. The container
+    # is the dispatcher; foreground agents are forbidden here. (Host may use
+    # them; this table is injected only when CLAUDE_CONTAINER_OBLIGATIONS=1.)
+    ("PreToolUse", "Agent", "/usr/local/bin/pre-agent-background-required-hook"),
     # Generic obligations gate (one row per active obligation, denies any
     # tool call whose tool/command-string matches an unsatisfied row).
     # Mirrors the host's PreToolUse "*" matcher.
@@ -313,6 +345,59 @@ def command_matches_patterns(cmd: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(head, p) for p in patterns)
 
 
+def target_runnable_here(path: str) -> bool:
+    """True iff `path` is a binary/script this Linux container can exec().
+
+    Mirrors the magic-byte sniff in container/hooks-shim/exec-hook:
+      - ELF (0x7f 'E' 'L' 'F')       -> runnable
+      - shebang script (0x23 0x21)   -> runnable (the OS handles #!)
+      - Mach-O / unknown / missing   -> NOT runnable
+    A relative path or bare command name (no '/') is assumed to be a
+    PATH lookup we cannot reliably resolve at generation time; we treat
+    it as runnable so we never strip a helper that might resolve at
+    runtime. The strip is aimed squarely at the absolute-host-path leak
+    (e.g. /Applications/CorpTool.app/…/get-api-key) which is the only case that reliably
+    reproduces the failure.
+    """
+    if not path or "/" not in path:
+        return True
+    try:
+        if not os.path.exists(path):
+            return False
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError:
+        return False
+    if magic[:4] == b"\x7fELF":
+        return True
+    if magic[:2] == b"#!":
+        return True
+    return False
+
+
+def sanitize_api_key_helper(settings: dict) -> tuple[dict, str | None]:
+    """Drop `apiKeyHelper` when its target binary is not runnable here.
+
+    Returns (new_settings, dropped_command_or_None). The input is not
+    mutated. When the key is absent or its target IS runnable in this
+    container, the settings are returned unchanged and the second tuple
+    element is None.
+    """
+    helper = settings.get("apiKeyHelper")
+    if not isinstance(helper, str) or not helper.strip():
+        return settings, None
+    target = command_first_token(helper)
+    # apiKeyHelper targets are sometimes single-quoted to survive spaces
+    # in the path (e.g. "'/Applications/My App/bin' auth claude"). Strip
+    # a leading quote so the existence/magic check sees the real path.
+    target = target.strip("'\"")
+    if target_runnable_here(target):
+        return settings, None
+    out = dict(settings)
+    out.pop("apiKeyHelper", None)
+    return out, helper
+
+
 def wrap_command(cmd: str, patterns: list[str] | None = None) -> str:
     """Prefix `cmd` with `exec-hook ` unless already wrapped or filtered
     out by the operator's pattern list.
@@ -420,7 +505,7 @@ def main(argv: list[str]) -> int:
              "= wrap every command (default, backward-compatible). "
              "Falls back to CLAUDE_SHIM_PATTERNS env var if the flag "
              "isn't given. Example: "
-             "'/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*'.",
+             "'/Users/*/.local/bin/*:/Users/*/.local/pkgs/*/bin/*'.",
     )
     p.add_argument(
         "--quiet", "-q",
@@ -501,6 +586,19 @@ def main(argv: list[str]) -> int:
         rewritten = {"hooks": {}}
     else:
         rewritten = rewrite_hooks(settings, patterns)
+        # Drop a cross-arch / missing apiKeyHelper that would 127 on every
+        # inference inside the container (host-native binary leaked in via
+        # the bind-mounted settings.json). Only the rewrite path carries
+        # the host's top-level keys through; obligations-only emits a bare
+        # hooks dict with no apiKeyHelper to begin with.
+        rewritten, dropped_helper = sanitize_api_key_helper(rewritten)
+        if dropped_helper and not args.quiet:
+            print(
+                "generate-hooks-shim-settings: dropped apiKeyHelper "
+                f"(target not runnable in this container): {dropped_helper!r} "
+                "-- falling back to env-based auth",
+                file=sys.stderr,
+            )
     if inject_obligations:
         rewritten = inject_obligations_hooks(rewritten)
 

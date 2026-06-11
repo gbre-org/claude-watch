@@ -106,6 +106,13 @@ jobs:
       - name: Check baked-doc markdown links (no broken links)
         run: make test-doc-links
 
+      - name: Check CLAUDE.md size budget (always-in-context guard)
+        # Fails if a tracked CLAUDE.md exceeds its char ceiling (generic 40k;
+        # container/baked-CLAUDE.md pinned by a ratchet allowlist so it can't
+        # grow). CI is the REAL enforcement — the local pre-commit hook that
+        # runs the same script is bypassable with `git commit --no-verify`.
+        run: make test-claude-md-size
+
       - name: Run install-hooks (core.hooksPath + worktree) tests
         run: make test-install-hooks
 
@@ -159,6 +166,7 @@ jobs:
 
       - name: Run watcher tests (self-clear + claude-event-watch debounce)
         run: make test-watchers
+        timeout-minutes: 5
 
       - name: Install uv (for session-task tests)
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -182,3 +190,14 @@ jobs:
         run: |
           export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
           make test-session-task
+
+      - name: Run obligations / hooks tests
+        # These suites were previously local-only, which let a hook
+        # behavior change merge while leaving its test failing on a
+        # clean main checkout (caught only on the next local run).
+        # Needs the companion-CLI symlinks from the step above
+        # (pre-agent-queue-gate-hook.test exercises the real
+        # session-task binary).
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+          make test-hooks

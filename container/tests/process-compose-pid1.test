@@ -2,9 +2,9 @@
 """Tests for the process-compose PID 1 supervisor wiring (replaces the
 prior tini-pid1.test).
 
-Background — when the container grew to three long-running services
-(claude-watch daemon + crond + cw-watcher-supervisor, alongside the
-foreground tmux session), tini stopped being sufficient. tini reaps
+Background — when the container grew to multiple long-running services
+(claude-watch daemon + crond, alongside the foreground tmux session),
+tini stopped being sufficient. tini reaps
 zombies and forwards signals but doesn't model service dependencies,
 doesn't restart on failure, and doesn't centralize per-process logs.
 process-compose (a single static Go binary with a docker-compose-style
@@ -34,7 +34,10 @@ Coverage:
      (which itself execs process-compose after setup).
   4. container/process-compose.yml exists and declares the canonical
      service set (setup-tmux-session, tmux-attach, claude-watch,
-     crond, cw-watcher-supervisor).
+     crond) — and does NOT declare the retired cw-watcher-supervisor
+     (its binary was deleted when watchers moved to session-scoped
+     run_in_background tasks; a leftover service entry crash-loops on
+     the missing binary).
   5. Long-running services declare `restart: on_failure` so a
      crash triggers a restart instead of a dead container.
   6. entrypoint.sh execs /usr/local/bin/process-compose at the end
@@ -204,7 +207,6 @@ if PC_CONFIG.exists():
         "tmux-attach",
         "claude-watch",
         "crond",
-        "cw-watcher-supervisor",
     ]
     for svc in required_services:
         # Service block headers look like `  <name>:` at indent level 2.
@@ -219,18 +221,32 @@ if PC_CONFIG.exists():
             f"supervisor for that role.",
         )
 
+    # Ghost-service regression guard: cw-watcher-supervisor's binary
+    # was deleted when watchers moved to session-scoped
+    # run_in_background tasks (block-print-exit contract), but its
+    # process-compose service entry lingered and crash-looped on the
+    # missing binary at every container boot. It must never come back
+    # without its binary.
+    expect(
+        re.search(r"(?m)^  cw-watcher-supervisor:\s*$", pc_text) is None,
+        "process-compose.yml must NOT declare a `cw-watcher-supervisor` "
+        "process. The supervisor binary was removed (watchers are "
+        "session-scoped run_in_background tasks now); a service entry "
+        "pointing at the missing binary crash-loops at boot.",
+    )
+
     # 5. Long-running services must declare restart: on_failure.
     # Coarse check: the literal `restart: on_failure` must appear
-    # at least 3 times (once per long-running process: claude-watch,
-    # crond, cw-watcher-supervisor). The oneshot setup-tmux-session
-    # has `restart: no` and the interactive tmux-attach also has
-    # `restart: no` (operator-controlled).
+    # at least 2 times (once per long-running process: claude-watch,
+    # crond). The oneshot setup-tmux-session has `restart: no` and the
+    # interactive tmux-attach also has `restart: no`
+    # (operator-controlled).
     on_failure_count = len(re.findall(r"restart:\s*on_failure", pc_text))
     expect(
-        on_failure_count >= 3,
+        on_failure_count >= 2,
         f"process-compose.yml must declare `restart: on_failure` on "
-        f"each of the 3 long-running supervised processes "
-        f"(claude-watch, crond, cw-watcher-supervisor); found "
+        f"each of the 2 long-running supervised processes "
+        f"(claude-watch, crond); found "
         f"{on_failure_count} occurrence(s). Without restart policies, "
         f"a daemon crash leaves the container in a half-dead state.",
     )

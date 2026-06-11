@@ -45,7 +45,7 @@
 #         {
 #           "matcher": "startup|resume",
 #           "hooks": [
-#             { "type": "command", "command": "exec-hook /Users/me/.devbar/bin/telemetry-hook" }
+#             { "type": "command", "command": "exec-hook /Users/me/.local/bin/telemetry-hook" }
 #           ]
 #         }
 #       ]

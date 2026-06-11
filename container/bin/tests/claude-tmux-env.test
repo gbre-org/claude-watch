@@ -233,7 +233,7 @@ def test_proxy_vars_forwarded_no_mount() -> None:
 
 def test_claude_host_hooks_dir_existing() -> None:
     """CLAUDE_HOST_HOOKS_DIR pointing at a real dir => bind-mount ro."""
-    with tempfile.TemporaryDirectory(prefix="devbar-bin-") as d:
+    with tempfile.TemporaryDirectory(prefix="corphook-bin-") as d:
         argv = run_script({"CLAUDE_HOST_HOOKS_DIR": d})
         expected = f"{d}:{d}:ro"
         expect(expected in find_volume_mounts(argv),
@@ -360,7 +360,7 @@ def test_claude_wildcard_still_forwarded() -> None:
 def test_combined_corp_setup() -> None:
     """End-to-end: corp VPN scenario (CA bundle + proxy + hooks dir)."""
     with tempfile.NamedTemporaryFile(prefix="corp-ca-", suffix=".pem") as f, \
-         tempfile.TemporaryDirectory(prefix="devbar-bin-") as hooks:
+         tempfile.TemporaryDirectory(prefix="corphook-bin-") as hooks:
         ca = f.name
         argv = run_script({
             "NODE_EXTRA_CA_CERTS": ca,
@@ -444,7 +444,7 @@ def test_warning_fires_for_missing_hooks_dir() -> None:
 def test_no_warning_for_valid_paths() -> None:
     """Valid CA file + valid hooks dir => NO warnings."""
     with tempfile.NamedTemporaryFile(prefix="ca-", suffix=".pem") as f, \
-         tempfile.TemporaryDirectory(prefix="devbar-bin-") as hooks:
+         tempfile.TemporaryDirectory(prefix="corphook-bin-") as hooks:
         _, stderr = run_script(
             {
                 "NODE_EXTRA_CA_CERTS": f.name,

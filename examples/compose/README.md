@@ -78,13 +78,13 @@ behavior or claude-watch monitoring.
 |---|---|---|---|---|
 | `/dev/null` _(default; managed-settings dir)_ | `CLAUDE_HOST_MANAGED_SETTINGS_DIR` | `/mnt/host-managed-claude-config` | `ro` | Host managed / enterprise Claude Code settings tier (`managed-settings.json`, etc.). Set to your host's managed-settings dir to opt in — Linux default `/etc/claude-code`, macOS default `/Library/Application Support/ClaudeCode`. The image bakes a symlink `/etc/claude-code/managed-settings.json -> /mnt/host-managed-claude-config/managed-settings.json`, so the host's managed settings surface at the documented LINUX managed-config path the in-container `claude` actually reads — regardless of where the host OS keeps them (a macOS-path mirror mount inside a Linux container would be silently ignored). The image-baked `/etc/claude-code/CLAUDE.md` (managed-policy CLAUDE.md describing the container runtime) always stays visible; a host managed CLAUDE.md is intentionally not propagated. Default `/dev/null` leaves the symlink dangling — Claude Code sees no managed-settings tier. |
 | `~/.claude` | `CLAUDE_HOST_CONFIG_DIR` | `/home/hndrewaall/.claude` | `rw` | User-global Claude Code state: session JSONLs, project state, cache, agent definitions (`agents/*.md`). Claude writes here continuously. |
-| `~/.claude.json` | `CLAUDE_HOST_CONFIG_FILE` | `/home/hndrewaall/.claude.json` | `rw` | User-global top-level Claude Code config (MCP servers, model prefs, project allow-list). |
+| `~/.claude.json` | `CLAUDE_HOST_CONFIG_FILE` | `/home/hndrewaall/.claude.json` | `rw` | User-global top-level Claude Code config (MCP servers, model prefs, project allow-list). **macOS:** do **not** leave this at the default `~/.claude.json` — it's a single-file bind mount, and the host's native Claude rewrites that file's inode on every settings change, so the Docker Desktop VirtioFS/gRPC-FUSE mount desyncs and the in-container `claude` reads stale/truncated content. Set `CLAUDE_HOST_CONFIG_FILE=$HOME/.config/claude-container/claude.json` (a dedicated container-only file); `cw --up` seeds it once from `~/.claude.json` via `bin/prepare-host-claude-state`. Linux file bind mounts don't desync this way, so the default is fine there. |
 | `~/repos` | `CLAUDE_HOST_REPOS_DIR` | `/home/hndrewaall/repos` | `rw` | Host repo trees (also carries project-tier Claude Code config in each repo's `.claude/`). Read-write so an operator using the in-container `claude` as a daily-driver editor can edit, commit, and push from inside the container without detouring through `/workspace`. |
 | `~/bin` | `CLAUDE_HOST_BIN_DIR` | `/home/hndrewaall/bin` | `rw` | Launcher / shim scripts (mostly symlinks into `~/repos/*/bin`). Read-write so the operator can `ln -s` new shims from inside the container without a host shell, symmetric with the `~/repos` mount. |
 | `~/claude-events` | `CLAUDE_HOST_EVENTS_DIR` | `/home/hndrewaall/claude-events` | `rw` | claude-event JSONL spool. Host producers write, in-container `claude-event-watch` consumes. |
 | `~/.config/session` | _(not overridable; shared with queue-minisite)_ | `/home/hndrewaall/.config/session` | `rw` | session-task queue.json (same path the queue-minisite mounts). |
 | `/dev/null` _(default; corp-CA bundle on VPN)_ | `CLAUDE_HOST_CORP_CA_BUNDLE` | _(same path as source)_ | `ro` | Corporate-CA bundle for operators behind a TLS MITM proxy. The forwarded `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` env vars carry an ABSOLUTE host path; this mount makes that path resolve INSIDE the container. Set to the same value as `NODE_EXTRA_CA_CERTS`. Default `/dev/null` is a no-op for non-corp setups. |
-| `/dev/null` _(default; host hook-script dir)_ | `CLAUDE_HOST_HOOKS_DIR` | _(same path as source)_ | `ro` | Host directory of settings.json hook scripts referenced by ABSOLUTE host path (e.g. corp telemetry hooks at `~/.devbar/bin/`). Without this, Claude Code logs `SessionStart:startup hook error — /bin/sh: 1: <path>: not found`. Default `/dev/null` is a no-op for hosts without external hooks. |
+| `/dev/null` _(default; host hook-script dir)_ | `CLAUDE_HOST_HOOKS_DIR` | _(same path as source)_ | `ro` | Host directory of settings.json hook scripts referenced by ABSOLUTE host path (e.g. corp telemetry hooks at `~/.local/bin/`). Without this, Claude Code logs `SessionStart:startup hook error — /bin/sh: 1: <path>: not found`. Default `/dev/null` is a no-op for hosts without external hooks. |
 
 Host-specific integration mounts (shell-history databases, messaging
 attachment dirs, etc.) are intentionally out of scope for this example.
@@ -120,21 +120,21 @@ filesystem.
 
 When `~/.claude/settings.json` (which IS bind-mounted into the
 container) references hook scripts by absolute host path —
-common with corp telemetry tooling like devbar, which auto-installs a
-hook into `~/.devbar/bin/telemetry-hook` and registers it in
+common with corp telemetry corporate telemetry tooling, which auto-installs a
+hook into `~/.local/bin/telemetry-hook` and registers it in
 settings.json — the path doesn't exist inside the bookworm-slim
 container. Claude Code logs
 
 ```
-SessionStart:startup hook error — /bin/sh: 1: /Users/<you>/.devbar/bin/telemetry-hook: not found
-UserPromptSubmit hook error — /bin/sh: 1: /Users/<you>/.devbar/bin/telemetry-hook: not found
+SessionStart:startup hook error — /bin/sh: 1: /Users/<you>/.local/bin/telemetry-hook: not found
+UserPromptSubmit hook error — /bin/sh: 1: /Users/<you>/.local/bin/telemetry-hook: not found
 ```
 
 at every session start / prompt submit. The hook silently fails (Claude
 Code keeps running), but every prompt logs the error.
 
 Fix: set `CLAUDE_HOST_HOOKS_DIR` in `.env` to the host directory holding
-the hook script (e.g. `/Users/<you>/.devbar/bin`). The compose file
+the hook script (e.g. `/Users/<you>/.local/bin`). The compose file
 bind-mounts that dir read-only at the SAME path inside the container so
 the settings.json reference resolves.
 
@@ -289,7 +289,7 @@ Setup (one-time, four steps):
 
    Rebuild + restart the container (`docker compose down && docker compose up -d`). Inside the container, `claude mcp list` should show `host-bash: Connected`.
 
-Security: the launcher applies a `cli-mcp-server` allow-list by default that covers the read-y / observation / standard-dev-tool surface — file inspection (`ls`, `cat`, `head`, `tail`, `grep`, `find`, `file`, `stat`, `diff`, `sort`, `uniq`, `wc`), text munging (`awk`, `sed`, `cut`, `tr`, `xargs`, `base64`, `jq`, `yq`), VCS / forge (`git`, `gh`), shell discovery (`pwd`, `echo`, `which`, `env`, `printenv`, `hostname`, `uname`, `date`, `basename`, `dirname`), language toolchains (`node`, `npm`, `yarn`, `python`, `python3`, `pip`, `make`), corp-dev binaries (`envchain`, `jenkins-builds`, `sfdx`, `force`, `sf`, `sfdc`), and read-y network probes (`ping`, `host`, `dig`, `nslookup`). Plus `ALLOWED_DIR=$HOME`, `COMMAND_TIMEOUT=30`, `ALLOW_SHELL_OPERATORS=false`. Override per-host via `~/.config/claude-container/mcp-host-bash.env` (plain `KEY=VALUE` lines). Audit log at `~/.local/state/claude-container/mcp-host-bash.log`. Soft kill switch: `MCP_HOST_BASH_DISABLED=1` in the launcher's shell env. See the `host-bash` block in [`.env.example`](.env.example) for the full security write-up — `run_command` is a privilege escalation, keep the allow-list tight.
+Security: the launcher applies a `cli-mcp-server` allow-list by default that covers the read-y / observation / standard-dev-tool surface — file inspection (`ls`, `cat`, `head`, `tail`, `grep`, `find`, `file`, `stat`, `diff`, `sort`, `uniq`, `wc`), text munging (`awk`, `sed`, `cut`, `tr`, `xargs`, `base64`, `jq`, `yq`), VCS / forge (`git`, `gh`), shell discovery (`pwd`, `echo`, `which`, `env`, `printenv`, `hostname`, `uname`, `date`, `basename`, `dirname`), language toolchains (`node`, `npm`, `yarn`, `python`, `python3`, `pip`, `make`), corp-dev binaries (`envchain`, `jenkins-builds`), and read-y network probes (`ping`, `host`, `dig`, `nslookup`). Plus `ALLOWED_DIR=$HOME`, `COMMAND_TIMEOUT=30`, `MAX_COMMAND_LENGTH=8192` (raised from cli-mcp-server's 1024 default so longer commands aren't truncated), `ALLOW_SHELL_OPERATORS=false`. Override per-host via `~/.config/claude-container/mcp-host-bash.env` (plain `KEY=VALUE` lines). Audit log at `~/.local/state/claude-container/mcp-host-bash.log`. Soft kill switch: `MCP_HOST_BASH_DISABLED=1` in the launcher's shell env. See the `host-bash` block in [`.env.example`](.env.example) for the full security write-up — `run_command` is a privilege escalation, keep the allow-list tight.
 
 **Trust profile** (`CW_PROFILE`): set `CW_PROFILE=corp-dev-trusted` in the launcher's shell env to opt into a wider allow-list that adds host-scheduling tooling — `crontab` (Linux + macOS), `launchctl` (macOS launchd), `systemctl` (Linux systemd user units), `schtasks` / `powershell` / `pwsh` (Windows Task Scheduler), `sw_vers` / `lsb_release` (extra OS detection), file mutation (`tee`, `mkdir`, `chmod`, `cp`, `mv`, `rm`), outbound bytes (`curl`, `wget`, `scp`), key/cert tooling (`openssl`, `ssh-keygen`), and container management (`docker`, `docker-compose`). Default unset (`corp-dev`) keeps the read-y dev-tooling floor described above. Use the trusted profile when you want the in-container claude to wire periodic claude-event jobs on the host (cron / launchd / systemd timers / Task Scheduler), push artifacts off-host, or recreate the compose stack from inside its own session (`docker compose up -d --force-recreate <svc>`, `docker compose exec <svc> ...`) — see the "Host-side scheduled tasks" section in `container/baked-CLAUDE.md` for the workflow. Note: `docker` / `docker-compose` are trusted-only because the binary covers destructive subcommands (`docker rm`, `docker stop`, `docker kill`) alongside read-y ones (`docker ps`, `docker logs`); cli-mcp-server's allow-list is per-binary, not per-subcommand. Operator's explicit `ALLOWED_COMMANDS` in `~/.config/claude-container/mcp-host-bash.env` always wins over the profile default.
 

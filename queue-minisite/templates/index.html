@@ -41,6 +41,15 @@
       {% if totals.blocked %}<span class="count count-blocked" title="items parked on an external blocker (human greenlight, third-party API, etc.) — NOT alert candidates">{{ totals.blocked }} blocked</span>{% endif %}
       <span class="count count-pending" title="pending items">{{ totals.pending }} pending</span>
       {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
+      <label class="source-filter-label" for="source-filter">
+        <span class="sr-only">Filter by source</span>
+        <select id="source-filter" class="source-filter" aria-label="Filter queue items by source (created_by)" title="Filter items by source (who enqueued them)">
+          <option value="">all sources</option>
+          {% for s in sources %}
+            <option value="{{ s }}">{{ s }}</option>
+          {% endfor %}
+        </select>
+      </label>
       <span class="dot {% if error %}dot-err{% else %}dot-ok{% endif %}" title="{{ 'fetch error' if error else 'live' }}"></span>
       <span
         class="ts"
@@ -114,6 +123,7 @@
           class="item {% if is_starting and not is_workload %}state-starting{% else %}state-running{% endif %} drop-zone log-clickable {% if owner.alive == False and not is_starting and not is_workload %}orphan{% endif %}"
           data-queue-id="{{ it.id }}"
           data-queue-status="running"
+          data-created-by="{{ it.created_by }}"
           data-queue-starting="{{ '1' if (is_starting and not is_workload) else '0' }}"
           data-queue-summary="{{ it.summary }}"
           data-queue-description="{{ it.description }}"
@@ -193,6 +203,7 @@
           class="item state-blocked"
           data-queue-id="{{ it.id }}"
           data-queue-status="blocked"
+          data-created-by="{{ it.created_by }}"
           data-queue-summary="{{ it.summary }}"
           data-queue-description="{{ it.description }}">
           <header class="item-head">
@@ -238,6 +249,7 @@
           draggable="true"
           data-queue-id="{{ it.id }}"
           data-queue-status="pending"
+          data-created-by="{{ it.created_by }}"
           data-queue-summary="{{ it.summary }}"
           title="Drag onto another item to set as dependency">
           <header class="item-head">
@@ -316,6 +328,7 @@
           class="item state-done {% if it.has_archive %}log-clickable{% endif %}"
           data-queue-id="{{ it.id }}"
           data-queue-status="done"
+          data-created-by="{{ it.created_by }}"
           data-queue-summary="{{ it.summary }}"
           data-queue-description="{{ it.description }}"
           {% if it.has_archive %}data-log-mode="archive" tabindex="0" role="button" aria-label="View archived log for {{ it.id }}" title="Click to view archived log."{% endif %}>
@@ -354,6 +367,7 @@
           class="item state-abandoned {% if it.has_archive %}log-clickable{% endif %}"
           data-queue-id="{{ it.id }}"
           data-queue-status="abandoned"
+          data-created-by="{{ it.created_by }}"
           data-queue-summary="{{ it.summary }}"
           data-queue-description="{{ it.description }}"
           {% if it.has_archive %}data-log-mode="archive" tabindex="0" role="button" aria-label="View archived log for {{ it.id }}" title="Click to view archived log."{% endif %}>

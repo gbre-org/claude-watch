@@ -84,8 +84,8 @@ for matching semantics + edge cases.
 HTTP BRIDGE (--http-bridge / CLAUDE_MCP_HTTP_BRIDGE)
 
 When the operator's MCP server is a host-only binary that won't run
-inside the container (e.g. a macOS Mach-O binary like the Salesforce
-mcp-adaptor) the default behaviour — wrap with exec-hook → silent
+inside the container (e.g. a macOS Mach-O binary like a corporate
+host-mcp-server) the default behaviour — wrap with exec-hook → silent
 no-op on Mach-O → "Failed to reconnect: ENOENT" in /mcp — is the
 right safety floor but leaves the server unusable inside the
 container. The escape hatch: have the operator run a tiny HTTP→stdio
@@ -106,7 +106,7 @@ their stdio shape and the exec-hook wrapping kicks in as usual.
 
 Example:
 
-  CLAUDE_MCP_HTTP_BRIDGE='mcp-adaptor=http://host.docker.internal:8765/mcp'
+  CLAUDE_MCP_HTTP_BRIDGE='host-mcp-server=http://host.docker.internal:8765/mcp'
 
 Matching is by exact MCP server name (NOT command path or glob).
 Unknown / unset = no rewriting (default). Empty values for a known
@@ -115,8 +115,8 @@ name are ignored (no rewrite, fall through to stdio + exec-hook).
 NB: Claude Code's `type: "http"` MCP transport is the supported way
 to point at a remote MCP endpoint. The helper does not start the
 host-side adapter — the operator wires that up out of band (launchd
-LaunchAgent, manual `mcp-proxy` invocation, etc.). The Salesforce
-mcp-adaptor binary itself doesn't (today) speak HTTP; pair this knob
+LaunchAgent, manual `mcp-proxy` invocation, etc.). The corporate
+host-mcp-server binary itself doesn't (today) speak HTTP; pair this knob
 with a stdio→HTTP wrapper such as `mcp-proxy`, `mcphost`, or the
 upstream `@modelcontextprotocol/sdk` server-side helpers, or a
 hand-rolled shim. See container/README.md for operator setup notes.
@@ -292,8 +292,8 @@ def parse_http_bridge(raw: str | None) -> dict[str, str]:
     and a URL never contains a `:` outside of `scheme:` (which lives
     after the first `=`), so the outer split is unambiguous.
 
-    Example: 'mcp-adaptor=http://host.docker.internal:8765/mcp:other=http://h:9999/x'
-      → {'mcp-adaptor': 'http://host.docker.internal:8765/mcp',
+    Example: 'host-mcp-server=http://host.docker.internal:8765/mcp:other=http://h:9999/x'
+      → {'host-mcp-server': 'http://host.docker.internal:8765/mcp',
          'other': 'http://h:9999/x'}
     """
     if not raw:
@@ -492,7 +492,7 @@ def main(argv: list[str]) -> int:
              "servers pass through verbatim. Empty / unset = wrap every "
              "server (default, backward-compatible). Falls back to "
              "CLAUDE_SHIM_PATTERNS env var if the flag isn't given. "
-             "Example: '/Users/*/.devbar/bin/*:/Users/*/.mcp-adaptor/bin/*'.",
+             "Example: '/Users/*/.local/bin/*:/Users/*/.host-mcp-server/bin/*'.",
     )
     p.add_argument(
         "--http-bridge",
@@ -505,7 +505,7 @@ def main(argv: list[str]) -> int:
              "adapter for cross-arch MCP binaries (e.g. macOS Mach-O). "
              "Falls back to CLAUDE_MCP_HTTP_BRIDGE env var if the flag "
              "isn't given. Example: "
-             "'mcp-adaptor=http://host.docker.internal:8765/mcp'.",
+             "'host-mcp-server=http://host.docker.internal:8765/mcp'.",
     )
     p.add_argument(
         "--bearer-env",

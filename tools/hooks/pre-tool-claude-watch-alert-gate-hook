@@ -63,6 +63,16 @@ Default-open contract
         `~/.config/claude/claude-watch-alert-hook-errors.log`.
   - `CLAUDE_WATCH_ALERT_BYPASS=1` in env -> allow + log to
         `~/.config/claude/claude-watch-alert-bypass.log`.
+  - Active obligations override (any unexpired entry in
+        `obligations.json` `overrides`) -> allow. The operator
+        explicitly bypassed all gates; the alert gate honors that.
+        Path overridable via `CLAUDE_WATCH_ALERT_OBLIGATIONS_PATH`
+        (tests point it at a tempdir for hermeticity).
+  - Ack cooldown: for `CLAUDE_WATCH_ALERT_ACK_COOLDOWN` seconds
+        (default 30, 0 disables) after the most recent
+        `claude-watch-ack ack`, allow even if alerts are pending --
+        prevents re-fire spam when the monitor writes alerts faster
+        than the operator can act.
 
 A broken hook MUST NEVER blackhole the loop. The state file write path
 (`claude-watch-ack add`) is the choke point; if THAT breaks, the gate
@@ -293,7 +303,13 @@ def _build_reason(alerts: list[dict]) -> str:
 # Override + cooldown checks
 # -----------------------------------------------------------------------------
 
-OBLIGATIONS_PATH = Path(os.path.expanduser("~/.config/claude/obligations.json"))
+# Env-overridable so the test harness can point the override check at a
+# tempdir -- otherwise an active override on the HOST (a live
+# `obligations override`) makes every deny assertion spuriously allow.
+OBLIGATIONS_PATH = Path(os.environ.get(
+    "CLAUDE_WATCH_ALERT_OBLIGATIONS_PATH",
+    os.path.expanduser("~/.config/claude/obligations.json"),
+))
 ACK_COOLDOWN_SECS = int(os.environ.get("CLAUDE_WATCH_ALERT_ACK_COOLDOWN", "30"))
 
 

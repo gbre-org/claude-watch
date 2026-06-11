@@ -166,7 +166,12 @@ def test_e2e_default_threshold() -> None:
         env = os.environ.copy()
         env["CLAUDE_WATCH_DISPATCH_STATE_DIR"] = str(state_dir)
         env["CLAUDE_WATCH_DISPATCH_EXEMPT_PATH"] = str(override_path)
-        env.pop("CLAUDE_WATCH_DISPATCH_THRESHOLD", None)
+        # Isolate the host-backed threshold config (a real host file would
+        # otherwise change the effective threshold) and pin the threshold
+        # to 3 so this mechanics test stays deterministic across the
+        # baked-default bump (3 -> 6, 2026-06-11).
+        env["CLAUDE_WATCH_DISPATCH_CONFIG"] = str(Path(td) / "host-dispatch.json")
+        env["CLAUDE_WATCH_DISPATCH_THRESHOLD"] = "3"
         env.pop("CLAUDE_WATCH_DISPATCH_BYPASS", None)
         env.pop("CLAUDE_WATCH_DISPATCH_ENABLED", None)
 
@@ -215,7 +220,8 @@ def test_e2e_cli_reset_clears_gate() -> None:
         env = os.environ.copy()
         env["CLAUDE_WATCH_DISPATCH_STATE_DIR"] = str(state_dir)
         env["CLAUDE_WATCH_DISPATCH_EXEMPT_PATH"] = str(Path(td) / "exempt.txt")
-        env.pop("CLAUDE_WATCH_DISPATCH_THRESHOLD", None)
+        env["CLAUDE_WATCH_DISPATCH_CONFIG"] = str(Path(td) / "host-dispatch.json")
+        env["CLAUDE_WATCH_DISPATCH_THRESHOLD"] = "3"
 
         def run_hook(payload):
             return subprocess.run(

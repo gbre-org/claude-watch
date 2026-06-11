@@ -155,6 +155,27 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("queue", "queue-stale-ready", None, ACTIONABLE,
         "Queue item ready but stale; needs spawn/abandon decision."),
 
+    # heartbeat-tick -> the main loop MUST touch the heartbeat file named in
+    # the event's `data.path` (surfaced on the EVENT[] one-liner as `path=`).
+    # The file is the daemon's wedge-detector: if the idle loop never
+    # refreshes it, it goes stale at the ~10-min threshold and the daemon
+    # fires a spurious "heartbeat stale" alert. This is a tiny self-service
+    # action (one `touch`), not an agent-spawn — but it IS required, so it's
+    # actionable rather than ambient. Placed before the claude-watch/* ambient
+    # catch-all below.
+    ("claude-watch", "heartbeat-tick", None, ACTIONABLE,
+        "Heartbeat tick; touch the heartbeat file at data.path (path=… on "
+        "the event line) to keep the loop's wedge-detector fresh."),
+
+    # memory-reminder -> ambient context-hygiene reminder emitted by the
+    # daemon every 30min (carries the memory checklist in the event message).
+    # Non-urgent: it surfaces on the next UserPromptSubmit, no agent spawn and
+    # no blocking gate. Placed before the claude-watch/* ambient catch-all so
+    # the reason string is specific. (Replaces the legacy */memory-remind
+    # watcher-tick row; the daemon's cadence loop is now the sole producer.)
+    ("claude-watch", "memory-reminder", None, AMBIENT,
+        "Memory-hygiene reminder; context only."),
+
     # slack-unread (legacy v1 tag, kept for back-compat).
     ("*", "slack-unread", None, ACTIONABLE,
         "Slack DM unread; needs read+reply."),
@@ -210,8 +231,6 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "Workload finished; context only."),
 
     # Watcher routine events.
-    ("*", "memory-remind", None, AMBIENT,
-        "Memory-remind watcher tick; context only."),
     ("*", "watcher-cleanup", None, AMBIENT,
         "Watcher cleanup tick; context only."),
 ]
@@ -317,6 +336,9 @@ def _self_test() -> int:
         (("manual", "workbot-prompt", ""), ACTIONABLE),
         (("queue", "queue-stale-ready", ""), ACTIONABLE),
         (("manual", "slack-unread", ""), ACTIONABLE),
+        # heartbeat-tick is actionable (touch the file), and must win over
+        # the claude-watch/* ambient catch-all below it.
+        (("claude-watch", "heartbeat-tick", "heartbeat tick"), ACTIONABLE),
 
         # claude-watch-alert: conditional. Fatal -> actionable.
         (("claude-watch", "claude-watch-alert", "CONTEXT CRITICALLY LOW"),
@@ -356,8 +378,10 @@ def _self_test() -> int:
 
         # Ambient: workload + watcher
         (("manual", "workload-done", ""), AMBIENT),
-        (("manual", "memory-remind", ""), AMBIENT),
+        (("claude-watch", "memory-reminder", ""), AMBIENT),
         (("manual", "watcher-cleanup", ""), AMBIENT),
+        # claude-watch/* catch-all stays ambient for non-heartbeat tags.
+        (("claude-watch", "some-other-tag", ""), AMBIENT),
 
         # Unknown -> default (ambient)
         (("manual", "totally-novel-tag", ""), AMBIENT),

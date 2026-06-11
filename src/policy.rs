@@ -122,6 +122,34 @@ pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) ->
         .is_some_and(|e| e < cooldown_secs as f64)
 }
 
+/// Atomic check-and-stamp of the global interrupt gate — the SINGLE
+/// chokepoint every (non-exempt) interrupt fire path consults right
+/// before injecting.
+///
+/// Returns `false` (claim DENIED) if another interrupt fired within the
+/// last `cooldown_secs` seconds — the caller must NOT fire. Otherwise it
+/// STAMPS `state.last_interrupt_at = now` and returns `true` (claim
+/// GRANTED) — the caller may fire. Collapsing the previous split
+/// "check here / stamp later" two-step into one call removes the window
+/// where two fire paths in the same `check_once` pass could both pass an
+/// early check and then both stamp, double-injecting within the cooldown.
+///
+/// A `cooldown_secs` of 0 disables the gate: the claim always succeeds
+/// and the timestamp is still stamped (so other sites observe the fire).
+///
+/// `now` is an RFC3339 timestamp string (the daemon's per-check `now`).
+pub(crate) fn try_claim_global_interrupt(
+    state: &mut State,
+    cooldown_secs: u64,
+    now: &str,
+) -> bool {
+    if interrupt_in_global_cooldown(state, cooldown_secs) {
+        return false;
+    }
+    state.last_interrupt_at = Some(now.to_string());
+    true
+}
+
 /// Pure predicate: should the watcher-down inject path fire now, given
 /// the timestamp of the last watcher-inject and the configured cooldown?
 ///
@@ -869,24 +897,6 @@ async fn check_foreground_inner(
                     config.foreground_monitor.thinking_backoff_multiplier,
                 );
                 if elapsed >= next_threshold as f64 {
-                    // Global post-interrupt cooldown: if ANY interrupt fired
-                    // recently (watcher-down, context-warning, or a prior
-                    // thinking one), suppress this fire. Prevents the
-                    // cascade where e.g. a watcher-down interrupt resets the
-                    // thinking timer and the new thought trips prolonged
-                    // thinking immediately afterward.
-                    if interrupt_in_global_cooldown(
-                        state,
-                        config.general.post_interrupt_cooldown_secs,
-                    ) {
-                        debug!(
-                            elapsed_secs = elapsed,
-                            threshold = next_threshold,
-                            cooldown = config.general.post_interrupt_cooldown_secs,
-                            "prolonged thinking would fire but global post-interrupt cooldown active"
-                        );
-                        return;
-                    }
                     // Workload-heartbeat suppression: an active
                     // `workload run` (stv-promote, big rsync, ffmpeg)
                     // can pin the main loop in a fire-and-forget wait
@@ -899,7 +909,9 @@ async fn check_foreground_inner(
                     // timer is NOT reset here — the next cycle re-
                     // evaluates from the same start so the moment the
                     // workload finishes (heartbeat goes stale) the
-                    // interrupt can fire on the next tick.
+                    // interrupt can fire on the next tick. Checked BEFORE
+                    // the global-gate claim so a workload-suppressed cycle
+                    // does not consume a claim.
                     if workload_heartbeat_suppresses_stuck(config) {
                         debug!(
                             elapsed_secs = elapsed,
@@ -967,6 +979,30 @@ async fn check_foreground_inner(
                         state.thinking_episode_start_tokens = (tokens > 0).then_some(tokens);
                         return;
                     }
+                    // Global interrupt gate (single chokepoint): atomically
+                    // claim-and-stamp. If ANY interrupt fired within the
+                    // cooldown window (watcher-down, context-warning,
+                    // auto-respawn, or a prior thinking one), the claim
+                    // fails and we suppress. Prevents the cascade where e.g.
+                    // a watcher-down interrupt resets the thinking timer and
+                    // the new thought trips prolonged thinking immediately
+                    // afterward. The claim STAMPS last_interrupt_at on
+                    // success, so the later (removed) explicit stamp is no
+                    // longer needed. Checked AFTER the token-progress guard
+                    // so a token-suppressed cycle does not consume a claim.
+                    if !try_claim_global_interrupt(
+                        state,
+                        config.general.post_interrupt_cooldown_secs,
+                        &now,
+                    ) {
+                        debug!(
+                            elapsed_secs = elapsed,
+                            threshold = next_threshold,
+                            cooldown = config.general.post_interrupt_cooldown_secs,
+                            "prolonged thinking would fire but global post-interrupt cooldown active"
+                        );
+                        return;
+                    }
                     warn!(
                         elapsed_secs = elapsed,
                         threshold = next_threshold,
@@ -1005,10 +1041,10 @@ async fn check_foreground_inner(
                             ),
                             "thinking interrupt: Escape + inject prompt"
                         );
-                        // Stamp the global interrupt cooldown so other fire
-                        // paths (watcher-down, context-warning) see this
-                        // interrupt and back off.
-                        state.last_interrupt_at = Some(now.clone());
+                        // NOTE: the global interrupt cooldown was already
+                        // STAMPED above by try_claim_global_interrupt — no
+                        // separate stamp here (collapsed into the atomic
+                        // claim, 2026-06-11).
                         state.prolonged_thinking_interrupts_total = state
                             .prolonged_thinking_interrupts_total
                             .saturating_add(1);
@@ -1182,6 +1218,23 @@ fn is_pid_genuinely_alive(pid: u32) -> bool {
     }
 }
 
+/// Read `/proc/<pid>/cmdline` (NUL-separated argv) into a space-joined string.
+/// Returns `None` if the process is gone, the file is unreadable, or the
+/// cmdline is empty (e.g. a kernel thread). Used for watcher identity checks.
+fn read_proc_cmdline(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/cmdline", pid);
+    let data = std::fs::read(&path).ok()?;
+    let s = String::from_utf8_lossy(&data)
+        .replace('\0', " ")
+        .trim()
+        .to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Read a watcher PID file and return the recorded PID, if the file exists
 /// and contains a parseable integer. Whitespace is trimmed.
 ///
@@ -1209,27 +1262,30 @@ fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
 /// Returns `true` when fewer than `min_count` of the matched processes are
 /// genuinely alive.
 ///
-/// ## Why this no longer consults a recorded PID file (BUG A fix)
+/// ## DEPRECATED 2026-06-11 — pgrep liveness defeated by `exec` (this bug)
 ///
-/// The previous implementation cross-checked a SEPARATELY-recorded PID
-/// (`/var/run/claude/<name>.pid`) and declared the watcher DOWN whenever that
-/// recorded PID was dead — *even when `pgrep` found the watcher genuinely
-/// running under a different PID*. That recorded PID is written by
-/// `watcher-ctl run` at spawn time, so it drifts out of sync with reality on
-/// every restart path that doesn't go through `watcher-ctl run` (a daemon
-/// `make deploy` / `systemctl restart`, a watchmen-supervisor respawn, or a
-/// wrapper that re-execs the poller under a fresh PID). The result was a
-/// persistent FALSE "WATCHER(S) DOWN" for a watcher that watchmen
-/// (`watcher-status`, which is pgrep-only) AND `ps` both saw as healthy.
+/// This helper is no longer wired into the watcher-health monitor. It read
+/// liveness off `pgrep -f <pattern>`, where `<pattern>` is the watchers.conf
+/// pattern field — the launcher SCRIPT path (e.g.
+/// `/opt/claude-container/watchers/claude-event-watch.sh`). But that launcher
+/// does `exec /usr/local/bin/claude-event-watch`, which REPLACES the process
+/// image: after the exec the live process's argv is
+/// `/bin/bash /usr/local/bin/claude-event-watch` — the `.sh` path is GONE from
+/// argv. So `pgrep -f` on the `.sh` pattern can NEVER match a healthy watcher,
+/// `matched_pids` is always empty, and `watcher_is_down` returns `true` on
+/// every check → a `WATCHER(S) DOWN` tmux-inject storm (~every 70s) even
+/// though the watcher is alive and well. (The only time the old `pgrep`
+/// matched at all was a coincidental hit on an unrelated diagnostic shell
+/// whose command-string happened to contain the `.sh` path — a false positive,
+/// not the watcher.)
 ///
-/// The original intent of the cross-check — don't let a coincidental `pgrep`
-/// match (a stale shell whose argv contains the pattern, or a `<defunct>`
-/// zombie still in the process table) mask a genuinely-dead watcher — is
-/// preserved here WITHOUT the drifting recorded PID: we probe each matched
-/// PID directly via the genuine-liveness predicate (which rejects zombies),
-/// and require at least `min_count` of them to be truly alive. This reads
-/// liveness off the SAME process set `pgrep` matched, so the monitor and
-/// watchmen can never disagree about a process that is actually running.
+/// The monitor now uses [`pidfile_watcher_is_down`] instead: it reads the PID
+/// the watcher itself records (in its `<name>.lock` flock file, or the
+/// `<name>.pid` file written by `watcher_run`), probes it for liveness, and
+/// verifies cmdline identity — all of which survive the `exec`-to-binary
+/// transform. Kept here (with tests) only for the historical
+/// BUG-A regression suite and any external caller.
+#[allow(dead_code)]
 pub fn watcher_is_down(
     matched_pids: &[u32],
     min_count: u32,
@@ -1240,6 +1296,125 @@ pub fn watcher_is_down(
         .filter(|&&pid| pid_genuinely_alive(pid))
         .count() as u32;
     alive < min_count
+}
+
+/// Resolve the directory that holds watcher PID / lock files.
+///
+/// Mirrors the watcher's own lockfile resolution in
+/// `tools/watchers/claude-event-watch`
+/// (`$XDG_RUNTIME_DIR/<name>.lock` else `/var/run/claude/<name>.lock`) and
+/// `watcher::pid_dir()` (`$CLAUDE_WATCH_PID_DIR` else `/var/run/claude`), so
+/// the daemon reads the SAME file the watcher writes. Precedence:
+///   1. `$CLAUDE_WATCH_PID_DIR` (explicit override; used by tests + the
+///      watcher_run spawn path).
+///   2. `$XDG_RUNTIME_DIR` (matches the watcher's lockfile default).
+///   3. `/var/run/claude` (final fallback — the baked container path).
+pub(crate) fn watcher_pid_dir() -> String {
+    if let Ok(p) = std::env::var("CLAUDE_WATCH_PID_DIR") {
+        if !p.trim().is_empty() {
+            return p;
+        }
+    }
+    if let Ok(p) = std::env::var("XDG_RUNTIME_DIR") {
+        if !p.trim().is_empty() {
+            return p;
+        }
+    }
+    "/var/run/claude".to_string()
+}
+
+/// Read the PID the watcher recorded for itself, from the runtime dir.
+///
+/// A watcher records its live PID in one of two files under [`watcher_pid_dir`]:
+///   * `<name>.lock` — written by the watcher itself (the flock singleton
+///     guard writes `printf '%s\n' "$$" >&9`). This is the authoritative
+///     source in the container, where watchers are spawned by the session as
+///     `run_in_background` tasks (NOT via `watcher_run`), so no `.pid` file
+///     exists.
+///   * `<name>.pid` — written by `watcher::watcher_run` with the child PID when
+///     claude-watch spawns the watcher.
+///
+/// We prefer `<name>.lock` (always present for a live watcher in the container)
+/// and fall back to `<name>.pid`. Returns the first file that parses to a PID,
+/// or `None` if neither exists / parses.
+fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
+    let lock = format!("{}/{}.lock", pid_dir, name);
+    if let Ok(content) = std::fs::read_to_string(&lock) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    read_watcher_pid(pid_dir, name)
+}
+
+/// Does the live process `pid`'s cmdline look like *this* watcher (identity
+/// check to reject a recycled PID the kernel handed to an unrelated process)?
+///
+/// The match is lenient because the watcher's launcher `exec`s a child or
+/// re-execs itself, so the live argv rarely equals the literal `start_cmd`.
+/// Concretely, the start_cmd is the launcher SCRIPT
+/// (`/opt/claude-container/watchers/claude-event-watch.sh`) but the live
+/// process — after `exec /usr/local/bin/claude-event-watch` — has cmdline
+/// `/bin/bash /usr/local/bin/claude-event-watch`. The `.sh` is gone, so a
+/// naive `cmdline.contains(start_cmd)` fails. We therefore reduce the
+/// start_cmd's first token to its basename AND strip a trailing script
+/// extension (`.sh`, `.bash`, `.py`), yielding the stem `claude-event-watch`,
+/// which DOES appear in the exec'd cmdline. This tolerates the exec-to-binary
+/// transform while still rejecting an obviously-unrelated recycled PID (whose
+/// cmdline won't contain the watcher's name stem).
+fn cmdline_matches_watcher(cmdline: &str, start_cmd: &str) -> bool {
+    let token = match start_cmd.split_whitespace().next() {
+        Some(t) if !t.is_empty() => t,
+        _ => return false,
+    };
+    let base = token.rsplit('/').next().unwrap_or(token);
+    // Strip a trailing script extension so a `.sh` launcher that exec's a bare
+    // binary of the same stem still matches.
+    let stem = base
+        .strip_suffix(".sh")
+        .or_else(|| base.strip_suffix(".bash"))
+        .or_else(|| base.strip_suffix(".py"))
+        .unwrap_or(base);
+    if stem.is_empty() {
+        return false;
+    }
+    cmdline.contains(token) || cmdline.contains(base) || cmdline.contains(stem)
+}
+
+/// Pure decision: is the watcher DOWN, given what the daemon observed about its
+/// recorded PID file?
+///
+/// Kept pure (no `/proc`, no `pgrep`, no filesystem) so the DOWN logic is
+/// unit-testable, mirroring the testable style of `watcher::run_guard_should_skip`.
+///
+/// Inputs (all already probed by the caller):
+/// - `recorded_pid`: the PID read from the watcher's `<name>.lock` / `<name>.pid`
+///   file, or `None` if no pidfile exists.
+/// - `pid_alive`: whether that recorded PID is currently alive (`kill(pid, 0)` /
+///   genuine-liveness probe). Meaningless when `recorded_pid` is `None`.
+/// - `cmdline_matches`: whether that PID's `/proc/<pid>/cmdline` matches this
+///   watcher's identity (rejects a recycled PID). Meaningless when
+///   `recorded_pid` is `None` or `!pid_alive`.
+///
+/// A watcher is UP iff its pidfile names a live process whose cmdline matches
+/// the watcher. DOWN in every other case:
+///   * missing pidfile  → DOWN (no recorded instance),
+///   * stale pidfile (recorded PID dead) → DOWN (triggers a legit restart),
+///   * recycled PID (alive but cmdline mismatch) → DOWN.
+///
+/// NOTE: there is intentionally no `pgrep` / process-scan path here — `exec`
+/// replacing the launcher's argv with the exec'd binary's argv defeats any
+/// `pgrep -f <launcher.sh>` match (this bug). Liveness comes ONLY from the
+/// pidfile the watcher itself maintains.
+pub fn pidfile_watcher_is_down(
+    recorded_pid: Option<u32>,
+    pid_alive: bool,
+    cmdline_matches: bool,
+) -> bool {
+    match recorded_pid {
+        Some(_) => !(pid_alive && cmdline_matches),
+        None => true,
+    }
 }
 
 /// Spawn `self-clear` immediately (no grace period). Used for the
@@ -2121,6 +2296,26 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
         return;
     }
 
+    // Global interrupt gate (single chokepoint, 2026-06-11): even though
+    // auto-respawn has its own `should_respawn` cooldown, it now also
+    // consults the shared global ceiling so a respawn does not stack on
+    // top of another interrupt fired moments earlier (and vice versa).
+    // Atomically claim-and-stamp; on failure, skip this fire — the next
+    // check cycle re-evaluates (the hang signals persist within the
+    // window). NOTE: try_claim_global_interrupt stamps last_interrupt_at
+    // on success, so the later explicit stamp is removed.
+    if !try_claim_global_interrupt(
+        state,
+        config.general.post_interrupt_cooldown_secs,
+        now,
+    ) {
+        debug!(
+            cooldown = config.general.post_interrupt_cooldown_secs,
+            "auto-respawn would fire but global post-interrupt cooldown active — deferring"
+        );
+        return;
+    }
+
     // Threshold + cooldown satisfied — fire.
     let active_signals: Vec<String> = state
         .hang_signal_history
@@ -2159,7 +2354,8 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
     state.auto_respawn_count = state.auto_respawn_count.saturating_add(1);
     state.auto_respawn_interrupts_total =
         state.auto_respawn_interrupts_total.saturating_add(1);
-    state.last_interrupt_at = Some(now.to_string());
+    // last_interrupt_at already STAMPED by try_claim_global_interrupt
+    // above (2026-06-11 — collapsed into the atomic claim).
     // Clear the history so the next cycle starts from a clean slate.
     state.hang_signal_history = crate::respawn::HangSignalHistory::default();
     state.pane_content_hash = None;
@@ -2260,6 +2456,21 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // Don't inject during /exit teardown
         if tmux::is_exit_teardown(pane).await {
             debug!("post-restart: skipping — exit teardown detected");
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        }
+        // Don't inject while an interactive prompt (AskUserQuestion menu,
+        // tool-permission confirmation, selection overlay) is awaiting the
+        // operator. Such a prompt renders a `❯` selection cursor, so the
+        // bare `is_idle` `❯`-scan below would misclassify it as idle and
+        // `send-keys` the resume prompt into the live menu — the leading
+        // Escape cancels the operator's question out from under them
+        // (reported bug, 2026-06-11). Suppressing here only DELAYS the
+        // resume to the next cycle once the prompt clears (recoverable),
+        // whereas injecting is destructive — so we suppress.
+        if tmux::is_interactive_prompt(pane).await {
+            debug!("post-restart: skipping — interactive prompt on screen (awaiting operator)");
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
@@ -2642,6 +2853,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             return;
         }
 
+        // Skip if an interactive prompt (AskUserQuestion menu, tool-
+        // permission confirmation, selection overlay) is awaiting the
+        // operator. Same destructive-inject hazard as the post-restart
+        // path: such a menu renders a `❯` cursor that `is_idle` would
+        // read as idle, and a resume-inject's leading Escape cancels the
+        // operator's question. Suppress (delays the inject — recoverable)
+        // rather than inject (destructive). Reset the fast-detection
+        // counter so detection re-builds once the prompt clears.
+        if !effective_pane.is_empty() && tmux::is_interactive_prompt(&effective_pane).await {
+            debug!("fresh /clear check: skipping — interactive prompt on screen (awaiting operator)");
+            state.consecutive_fast_detections = 0;
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        }
+
         if !effective_pane.is_empty() && tmux::is_idle(&effective_pane).await {
             state.consecutive_fast_detections += 1;
             if state.consecutive_fast_detections < config.fresh_clear.detections_required {
@@ -2899,17 +3126,6 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             config.hybrid.context_fallback_secs as f64,
                         );
 
-                    // Global post-interrupt cooldown: if a recent interrupt
-                    // (thinking, watcher-down, or a prior context-warning)
-                    // fired, defer this context warning too. The deferred
-                    // self-clear child still runs if the token level stays
-                    // high; the cooldown only gates the tmux interrupt +
-                    // warning message.
-                    let global_cooldown_blocks = interrupt_in_global_cooldown(
-                        state,
-                        config.general.post_interrupt_cooldown_secs,
-                    );
-
                     if api_retrying {
                         debug!(
                             tokens,
@@ -2940,7 +3156,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                                 "grace_secs": config.hybrid.context_fallback_secs,
                             }),
                         );
-                    } else if global_cooldown_blocks {
+                    } else if !try_claim_global_interrupt(
+                        state,
+                        config.general.post_interrupt_cooldown_secs,
+                        &now,
+                    ) {
                         debug!(
                             tokens,
                             pct,
@@ -2999,7 +3219,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 
                         state.context_clear_triggered = true;
                         state.last_context_clear = Some(now.clone());
-                        state.last_interrupt_at = Some(now.clone());
+                        // last_interrupt_at already STAMPED by the atomic
+                        // try_claim_global_interrupt above (2026-06-11).
                         state.fallback_clear_count = state.fallback_clear_count.saturating_add(1);
                         state.context_warning_interrupts_total = state
                             .context_warning_interrupts_total
@@ -3164,23 +3385,43 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             if !entry.enabled {
                 continue;
             }
-            // Read the actual matched PIDs (not just a count) so we can probe
-            // each for genuine liveness. This is the SAME process set that
-            // `pgrep -fc` / watcher-status counts — so the monitor's liveness
-            // verdict is derived from reality, not from a separately-recorded
-            // PID file that drifts out of sync after a restart (BUG A).
-            let matched_pids = status::check_process_pids(&entry.pattern).await;
-            let count = matched_pids.len() as u32;
-            // Zombie guard (preserves the original orphan-detection intent):
-            // a `<defunct>` watcher process lingers in the table and would be
-            // counted by a raw pgrep, so we require at least `min_count` of the
-            // matched PIDs to be GENUINELY alive (non-zombie). We do NOT consult
-            // /var/run/claude/<name>.pid anymore — see `watcher_is_down` docs.
-            let down = watcher_is_down(&matched_pids, entry.min_count, is_pid_genuinely_alive);
-            // "orphaned" now means: pgrep matched >= min_count processes, but
-            // fewer than min_count are genuinely alive (the rest are zombies /
-            // coincidental matches). Surfaced in the log for diagnostics.
-            let orphaned = down && count >= entry.min_count;
+            // Pidfile-based liveness (2026-06-11 fix). We DELIBERATELY do not
+            // `pgrep` the watcher's pattern: the launcher script
+            // (`<name>.sh`) does `exec /usr/local/bin/<name>`, which replaces
+            // the process argv with the exec'd binary's — so the `.sh` path is
+            // gone from argv and `pgrep -f <.sh path>` can NEVER match a healthy
+            // watcher, producing a false-DOWN inject storm. Instead we read the
+            // PID the watcher itself records (its `<name>.lock` flock file, or
+            // the `<name>.pid` written by `watcher_run`), probe it for genuine
+            // (non-zombie) liveness, and verify cmdline identity (to reject a
+            // recycled PID). All three survive the exec-to-binary transform.
+            let pid_dir = watcher_pid_dir();
+            let recorded_pid = read_watcher_recorded_pid(&pid_dir, &entry.name);
+            let pid_alive = recorded_pid.is_some_and(is_pid_genuinely_alive);
+            let cmdline_matches = match (recorded_pid, pid_alive, entry.start_cmd.as_deref()) {
+                // Live PID + a configured start_cmd → verify identity. A live
+                // PID with no start_cmd to compare against is treated as a
+                // match (we have nothing to reject it with, and the pidfile
+                // naming it is itself evidence).
+                (Some(pid), true, Some(start_cmd)) => match read_proc_cmdline(pid) {
+                    Some(cmdline) => cmdline_matches_watcher(&cmdline, start_cmd),
+                    None => false,
+                },
+                (Some(_), true, None) => true,
+                _ => false,
+            };
+            // The pidfile model is single-instance: a watcher is UP iff its
+            // pidfile names exactly one live matching process (the natural map
+            // of min_count==1). min_count==0 means "never DOWN" — preserve that
+            // edge so a watcher explicitly opted out of liveness checks can't
+            // trip the alert.
+            let down =
+                entry.min_count != 0 && pidfile_watcher_is_down(recorded_pid, pid_alive, cmdline_matches);
+            // "orphaned": a pidfile names a PID that is NOT a genuinely-alive
+            // matching watcher (dead / zombie / recycled). Surfaced for
+            // diagnostics — a stale pidfile is the pidfile-model analogue of
+            // the old zombie-match case.
+            let orphaned = down && recorded_pid.is_some();
             let health = state
                 .watcher_health
                 .entry(entry.name.clone())
@@ -3482,6 +3723,45 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // bound the suppression run, not the cooldown clock.
                     crate::state::save_state(&config.general.state_file, state);
                 } else {
+                    // Global interrupt gate (single chokepoint, 2026-06-11):
+                    // watcher-down is EXEMPT by default
+                    // (`general.global_cooldown_exempt_watcher_down = true`)
+                    // because a down watcher is a hard-liveness failure that
+                    // must be allowed to fire even when another interrupt
+                    // fired recently. When the operator flips that bool to
+                    // false, watcher-down is subjected to the same atomic
+                    // global claim as every other fire path: if the claim
+                    // fails we skip the inject this cycle (the per-watcher
+                    // `inject_cooldown` re-fires it once the global window
+                    // clears). The per-type cooldown
+                    // (`watcher_inject_due`) above remains the inner
+                    // lower-bound either way.
+                    // exempt=true (default) -> claim is skipped (true).
+                    // exempt=false -> attempt the atomic claim; false means
+                    // the global ceiling is active and we must skip the
+                    // inject this cycle (fall through to auto-respawn /
+                    // healthcheck / logging — do NOT `return` here).
+                    let global_gate_ok = config.general.global_cooldown_exempt_watcher_down
+                        || try_claim_global_interrupt(
+                            state,
+                            config.general.post_interrupt_cooldown_secs,
+                            &now,
+                        );
+                    if !global_gate_ok {
+                        debug!(
+                            missing = %missing_list,
+                            cooldown = config.general.post_interrupt_cooldown_secs,
+                            "watcher-down inject would fire but global post-interrupt cooldown active (exempt=false) — deferring"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "watcher_inject_global_cooldown_deferred",
+                            serde_json::json!({
+                                "missing": missing_names,
+                                "cooldown_secs": config.general.post_interrupt_cooldown_secs,
+                            }),
+                        );
+                    } else {
                     if let Some(reason) = escalation {
                         warn!(
                             missing = %missing_list,
@@ -3575,6 +3855,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         state.watcher_down_interrupts_total.saturating_add(1);
                     reset_suppression(state);
                     crate::state::save_state(&config.general.state_file, state);
+                    }
                 }
             }
         }
@@ -3873,6 +4154,121 @@ mod tests {
         assert!(!watcher_is_down(&[], 0, |_| panic!("no probe needed")));
         // With matches present, still not DOWN.
         assert!(!watcher_is_down(&[42], 0, |_| true));
+    }
+
+    // --- pidfile_watcher_is_down tests (2026-06-11 exec-defeats-pgrep fix) ---
+    //
+    // The monitor now decides DOWN purely from the watcher's OWN recorded
+    // pidfile (its `<name>.lock` flock file, or the `<name>.pid` from
+    // watcher_run), NOT from `pgrep` on the launcher `.sh` pattern (which the
+    // launcher's `exec` defeats — the `.sh` path vanishes from argv). A watcher
+    // is UP iff the pidfile names a live process whose cmdline matches.
+
+    #[test]
+    fn test_pidfile_watcher_up_when_live_matching() {
+        // Pidfile names a PID that is alive AND whose cmdline matches → UP.
+        assert!(!pidfile_watcher_is_down(Some(4242), true, true));
+    }
+
+    #[test]
+    fn test_pidfile_watcher_down_when_pidfile_missing() {
+        // No pidfile → DOWN (no recorded instance). The alive/match flags are
+        // meaningless here and must not flip the verdict.
+        assert!(pidfile_watcher_is_down(None, false, false));
+        assert!(pidfile_watcher_is_down(None, true, true));
+    }
+
+    #[test]
+    fn test_pidfile_watcher_down_when_stale_dead_pid() {
+        // Pidfile exists but the recorded PID is dead (stale pidfile) → DOWN.
+        // This correctly triggers a legitimate restart.
+        assert!(pidfile_watcher_is_down(Some(4242), false, false));
+    }
+
+    #[test]
+    fn test_pidfile_watcher_down_when_recycled_pid() {
+        // Recorded PID is alive but its cmdline does NOT match this watcher —
+        // the kernel recycled the PID to an unrelated process → DOWN (do not
+        // wrongly suppress a real restart).
+        assert!(pidfile_watcher_is_down(Some(4242), true, false));
+    }
+
+    // --- cmdline_matches_watcher tests -------------------------------------
+    //
+    // The exec-to-binary transform: the watcher's start_cmd is the launcher
+    // SCRIPT (`.../claude-event-watch.sh`), but the live process — after
+    // `exec /usr/local/bin/claude-event-watch` — has cmdline
+    // `/bin/bash /usr/local/bin/claude-event-watch` (the `.sh` is GONE). The
+    // matcher must tolerate this by stripping the script extension from the
+    // start_cmd basename, while still rejecting an obviously-unrelated PID.
+
+    #[test]
+    fn test_cmdline_matches_exec_transform_sh_to_binary() {
+        // The exact live shape this bug is about.
+        let cmdline = "/bin/bash /usr/local/bin/claude-event-watch";
+        let start_cmd = "/opt/claude-container/watchers/claude-event-watch.sh";
+        assert!(
+            cmdline_matches_watcher(cmdline, start_cmd),
+            "the exec'd binary cmdline (no .sh) must match the .sh launcher \
+             start_cmd via the stripped stem"
+        );
+    }
+
+    #[test]
+    fn test_cmdline_matches_literal_path() {
+        // When the live cmdline DOES contain the full start_cmd (no exec), the
+        // full-token / basename match still works.
+        let cmdline = "/bin/bash /opt/claude-container/watchers/claude-event-watch.sh";
+        let start_cmd = "/opt/claude-container/watchers/claude-event-watch.sh";
+        assert!(cmdline_matches_watcher(cmdline, start_cmd));
+    }
+
+    #[test]
+    fn test_cmdline_matches_rejects_unrelated() {
+        // A recycled PID running something unrelated must NOT match.
+        let cmdline = "/usr/bin/python3 /home/user/some-other-tool.py";
+        let start_cmd = "/opt/claude-container/watchers/claude-event-watch.sh";
+        assert!(!cmdline_matches_watcher(cmdline, start_cmd));
+    }
+
+    #[test]
+    fn test_cmdline_matches_empty_start_cmd_is_false() {
+        assert!(!cmdline_matches_watcher("/bin/bash /usr/local/bin/x", ""));
+        assert!(!cmdline_matches_watcher("/bin/bash /usr/local/bin/x", "   "));
+    }
+
+    // --- read_watcher_recorded_pid: prefers .lock, falls back to .pid -------
+
+    #[test]
+    fn test_read_watcher_recorded_pid_prefers_lock() {
+        // The watcher writes its PID to `<name>.lock` (the flock singleton
+        // guard). With both files present the .lock wins.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("claude-event-watch.lock"), "31956\n").unwrap();
+        std::fs::write(dir.path().join("claude-event-watch.pid"), "12345\n").unwrap();
+        assert_eq!(
+            read_watcher_recorded_pid(d, "claude-event-watch"),
+            Some(31956)
+        );
+    }
+
+    #[test]
+    fn test_read_watcher_recorded_pid_falls_back_to_pid() {
+        // No .lock (e.g. watcher spawned via watcher_run, which writes .pid).
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("w.pid"), "777\n").unwrap();
+        assert_eq!(read_watcher_recorded_pid(d, "w"), Some(777));
+    }
+
+    #[test]
+    fn test_read_watcher_recorded_pid_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_watcher_recorded_pid(dir.path().to_str().unwrap(), "nope"),
+            None
+        );
     }
 
     // --- read_watcher_pid tests ---
@@ -4529,6 +4925,53 @@ cooldown = 300
         let mut state = State::default();
         state.last_interrupt_at = Some("not a date".to_string());
         assert!(!interrupt_in_global_cooldown(&state, 60));
+    }
+
+    #[test]
+    fn test_try_claim_global_interrupt_grants_when_no_prior() {
+        // No prior interrupt -> claim succeeds and stamps last_interrupt_at.
+        let mut state = State::default();
+        let now = Utc::now().to_rfc3339();
+        assert!(try_claim_global_interrupt(&mut state, 300, &now));
+        assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_try_claim_global_interrupt_denies_within_cooldown() {
+        // A recent interrupt within the window -> claim DENIED and the
+        // existing stamp is NOT overwritten (atomic check-and-stamp).
+        let mut state = State::default();
+        let prior = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        state.last_interrupt_at = Some(prior.clone());
+        let now = Utc::now().to_rfc3339();
+        assert!(!try_claim_global_interrupt(&mut state, 300, &now));
+        assert_eq!(
+            state.last_interrupt_at.as_deref(),
+            Some(prior.as_str()),
+            "denied claim must not move the timestamp"
+        );
+    }
+
+    #[test]
+    fn test_try_claim_global_interrupt_grants_after_window() {
+        // Prior interrupt older than the cooldown -> claim succeeds and
+        // re-stamps to now.
+        let mut state = State::default();
+        let prior = (Utc::now() - chrono::Duration::seconds(400)).to_rfc3339();
+        state.last_interrupt_at = Some(prior);
+        let now = Utc::now().to_rfc3339();
+        assert!(try_claim_global_interrupt(&mut state, 300, &now));
+        assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_try_claim_global_interrupt_zero_cooldown_always_grants() {
+        // cooldown=0 disables the gate: claim always succeeds, still stamps.
+        let mut state = State::default();
+        state.last_interrupt_at = Some(Utc::now().to_rfc3339());
+        let now = Utc::now().to_rfc3339();
+        assert!(try_claim_global_interrupt(&mut state, 0, &now));
+        assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
     }
 
     // --- Fresh session inject loop prevention tests ---

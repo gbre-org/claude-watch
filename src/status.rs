@@ -560,10 +560,16 @@ pub async fn check_process_count(pattern: &str) -> u32 {
 /// Unlike [`check_process_count`] (which only returns a count), this exposes
 /// the individual PIDs so the caller can probe each for genuine liveness
 /// (rejecting zombies / `<defunct>` entries that `pgrep` still counts because
-/// they linger in the process table until reaped). The watcher-health monitor
-/// uses this to decide "is the watcher actually alive" off the SAME process
-/// set that `pgrep -fc` counts — rather than off a separately-recorded PID
-/// file that drifts out of sync after a daemon/watcher restart.
+/// they linger in the process table until reaped).
+///
+/// NOTE (2026-06-11): the watcher-health monitor NO LONGER uses this for
+/// liveness. `pgrep -f <pattern>` is defeated when the watcher's launcher
+/// script `exec`s a binary (the `.sh` pattern disappears from argv), causing
+/// false `WATCHER(S) DOWN` alerts. The monitor now reads the watcher's own
+/// pidfile/lockfile instead (see `policy::pidfile_watcher_is_down`). Retained
+/// as a public primitive for any other caller that needs a pattern → PIDs
+/// lookup.
+#[allow(dead_code)]
 pub async fn check_process_pids(pattern: &str) -> Vec<u32> {
     let (out, _) = run_cmd_any(&["pgrep", "-f", "--", pattern], 5).await;
     out.lines()

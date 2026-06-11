@@ -35,7 +35,7 @@
 #   sudo docker exec -it <container> tmux attach -t claude-container
 #   sudo docker exec <container> tmux capture-pane -t claude-container:0.1 -p
 # Or peek at the structured log:
-#   sudo docker exec <container> cat /tmp/claude-watch.jsonl
+#   sudo docker exec <container> cat /var/log/claude-watch/claude-watch.jsonl
 
 set -euo pipefail
 
@@ -160,7 +160,7 @@ unset _user_bin _script
 # pre-PR-#147 behaviour exactly). Set to a colon-separated list of
 # globs to wrap only matching commands; first whitespace-separated
 # token of each command is matched against each glob (fnmatch.fnmatchcase).
-# Example: CLAUDE_SHIM_PATTERNS='/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*'
+# Example: CLAUDE_SHIM_PATTERNS='/Users/*/.local/bin/*:/Users/*/.local/pkgs/*/bin/*'
 # Both generate-hooks-shim-settings and generate-project-mcp-json honor
 # this env var natively (they each have a `--shim-patterns` flag that
 # defaults to $CLAUDE_SHIM_PATTERNS), so we don't need to plumb the
@@ -267,7 +267,7 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_HOST_PROJECT_DIR" ]; then
         # CLAUDE_MCP_HTTP_BRIDGE — colon-separated `name=url` pairs.
         # Cross-arch MCP servers (e.g. macOS Mach-O like the
-        # Salesforce mcp-adaptor) can't exec inside the Linux
+        # a corp host-mcp-server) can't exec inside the Linux
         # container; exec-hook silent-no-ops them, which surfaces in
         # /mcp as "Failed to reconnect: ENOENT". When the operator
         # runs a host-side HTTP→stdio adapter for those binaries
@@ -341,14 +341,15 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # Pre-create the log dirs used by the process-compose-supervised
-# services. Each process writes to a uid-1000-writable path under /tmp/
-# so operators can `docker compose exec <c> tail -f /tmp/...` to
+# services. Logs live under the FHS /var/log/claude-watch/ tree (the
+# Dockerfile pre-creates it uid-1000-owned) so operators can
+# `docker compose exec <c> tail -f /var/log/claude-watch/...` to
 # inspect. Belt-and-suspenders against downstream image overrides.
-mkdir -p /tmp/claude-container-watchers 2>/dev/null || true
-: > /tmp/claude-container-watchers/supervisor.log 2>/dev/null || true
-: > /tmp/claude-watch.jsonl 2>/dev/null || true
-: > /tmp/claude-watch.log 2>/dev/null || true
-: > /tmp/claude-container-cron.log 2>/dev/null || true
+mkdir -p /var/log/claude-watch/watchers /var/run/claude 2>/dev/null || true
+: > /var/log/claude-watch/watchers/supervisor.log 2>/dev/null || true
+: > /var/log/claude-watch/claude-watch.jsonl 2>/dev/null || true
+: > /var/log/claude-watch/claude-watch.log 2>/dev/null || true
+: > /var/log/claude-watch/cron.log 2>/dev/null || true
 
 # Propagate container env vars into /etc/cron.d/00-env so cron jobs
 # (which run in a clean environment) inherit CLAUDE_EVENT_QUEUE, HOME,
@@ -422,18 +423,15 @@ export CLAUDE_CMD
 # processes without modifying the baked config.
 #
 # Legacy env-var aliases — historical entrypoint code used
-# CLAUDE_CONTAINER_DAEMON=0 / CLAUDE_CONTAINER_CRON=0 /
-# CLAUDE_CONTAINER_WATCHER_SUPERVISOR=0 to skip a daemon spawn.
-# process-compose.yml uses the *_DISABLED suffix (yes-is-disabled
-# semantics). The mapping below preserves the old contract.
+# CLAUDE_CONTAINER_DAEMON=0 / CLAUDE_CONTAINER_CRON=0 to skip a daemon
+# spawn. process-compose.yml uses the *_DISABLED suffix
+# (yes-is-disabled semantics). The mapping below preserves the old
+# contract.
 if [ "${CLAUDE_CONTAINER_DAEMON:-1}" = "0" ]; then
     export CLAUDE_CONTAINER_DAEMON_DISABLED=true
 fi
 if [ "${CLAUDE_CONTAINER_CRON:-1}" = "0" ]; then
     export CLAUDE_CONTAINER_CRON_DISABLED=true
-fi
-if [ "${CLAUDE_CONTAINER_WATCHER_SUPERVISOR:-1}" = "0" ]; then
-    export CLAUDE_CONTAINER_WATCHER_SUPERVISOR_DISABLED=true
 fi
 
 # Hand off to process-compose. From here forward process-compose is
@@ -442,7 +440,6 @@ fi
 #   2. tmux-attach (foreground TTY — what the operator interacts with)
 #   3. claude-watch daemon (long-running, restart on failure)
 #   4. crond (long-running, restart on failure)
-#   5. cw-watcher-supervisor (long-running, restart on failure)
 #
 # Flags:
 #   --config <path>    — service declarations.

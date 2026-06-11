@@ -90,12 +90,9 @@ class DefaultsTest(unittest.TestCase):
                 mod.LOG_FILE,
             )
 
-    def test_log_default_home_local_state(self):
+    def test_log_default_var_log_fallback(self):
         mod = _import_self_clear({"XDG_STATE_HOME": None})
-        expected = str(
-            Path.home() / ".local" / "state" / "claude-watch" / "self-clear.log"
-        )
-        self.assertEqual(mod.LOG_FILE, expected)
+        self.assertEqual(mod.LOG_FILE, "/var/log/claude-watch/self-clear.log")
 
     def test_log_env_override_wins(self):
         mod = _import_self_clear({"CLAUDE_SELF_CLEAR_LOG": "/somewhere/explicit.log"})
@@ -106,9 +103,9 @@ class DefaultsTest(unittest.TestCase):
             mod = _import_self_clear({"XDG_RUNTIME_DIR": td})
             self.assertEqual(mod.LOCKFILE, f"{td}/claude-self-clear.lock")
 
-    def test_lock_default_tmp_fallback(self):
+    def test_lock_default_var_run_fallback(self):
         mod = _import_self_clear({"XDG_RUNTIME_DIR": None})
-        self.assertEqual(mod.LOCKFILE, "/tmp/claude-self-clear.lock")
+        self.assertEqual(mod.LOCKFILE, "/var/run/claude/claude-self-clear.lock")
 
     def test_lock_env_override_wins(self):
         mod = _import_self_clear({"CLAUDE_SELF_CLEAR_LOCK": "/run/x.lock"})

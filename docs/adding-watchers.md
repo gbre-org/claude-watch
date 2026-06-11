@@ -310,7 +310,7 @@ name = "queue-event-tail"
 description = "Tails ~/.claude-events/ for in-container handlers"
 launcher = "/opt/claude-container/watchers/queue-event-tail.sh"
 restart_policy = "on-failure"   # or "always" / "never"
-log_path = "/tmp/claude-container-watchers/queue-event-tail.log"
+log_path = "/var/log/claude-watch/watchers/queue-event-tail.log"
 ```
 
 All keys are REQUIRED.
@@ -399,7 +399,7 @@ set -uo pipefail
 JENKINS_URL="${JENKINS_URL:?JENKINS_URL not set}"
 JENKINS_AUTH="${JENKINS_AUTH:-}"   # "user:apitoken" if needed
 STATE_DIR="${JENKINS_STATE_DIR:-/var/lib/claude-watch/jenkins-build-failure}"
-LOG_FILE="${JENKINS_LOG_FILE:-/tmp/claude-container-watchers/jenkins-build-failure.log}"
+LOG_FILE="${JENKINS_LOG_FILE:-/var/log/claude-watch/watchers/jenkins-build-failure.log}"
 CURSOR_FILE="$STATE_DIR/cursor"
 POLL_INTERVAL="${JENKINS_POLL_INTERVAL:-60}"
 
@@ -468,7 +468,7 @@ name = "jenkins-build-failure"
 description = "Surface newly-failed Jenkins builds from $JENKINS_URL"
 launcher = "/opt/claude-container/watchers/jenkins-build-failure.sh"
 restart_policy = "on-failure"
-log_path = "/tmp/claude-container-watchers/jenkins-build-failure.log"
+log_path = "/var/log/claude-watch/watchers/jenkins-build-failure.log"
 ```
 
 ### What the agent sees on a fire

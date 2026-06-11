@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# prepare-host-claude-state — host-side init for the claude-container stack.
+#
+# Run from `cw --up` immediately BEFORE `docker compose up -d`. Two jobs,
+# both shaped around Docker Desktop for macOS quirks. Each job is a no-op
+# (exit 0) on a Linux host where the quirk doesn't apply.
+#
+# ----------------------------------------------------------------------------
+# JOB 1 — AUTH BRIDGE  (macOS: FAIL-CLOSED)
+# ----------------------------------------------------------------------------
+# Claude Code on macOS stores its OAuth token in the login Keychain under
+# the generic-password service "Claude Code-credentials" — NOT in
+# ~/.claude/.credentials.json. The in-container (Linux) claude reads the
+# token from ~/.claude/.credentials.json, which is bind-mounted from the
+# host's ~/.claude dir. On a Mac host that file carries only the mcpOAuth
+# block (host-bash MCP), with no `claudeAiOauth` — so the in-container
+# claude is simply logged out. (~/.claude.json's `oauthAccount` block is
+# account METADATA only: email, org, tier — no token.)
+#
+# This reads the live token out of the Keychain and merges its
+# `claudeAiOauth` object into ~/.claude/.credentials.json, preserving every
+# other key already in that file (mcpOAuth etc.). Idempotent: writes only
+# when the stored token differs from what's already on disk.
+#
+# Fail-closed on macOS: if the Keychain entry exists but can't be read
+# (locked keychain, transient `security` error) OR the blob is malformed,
+# this exits non-zero so `cw --up` aborts rather than starting a stack with
+# stale / missing auth. A clean "not found" (errSecItemNotFound / rc 44) is
+# treated as fatal too — on a Mac host with Claude Code installed, a missing
+# entry means the operator isn't logged in on the host, and silently coming
+# up logged-out is exactly the failure mode we're eliminating.
+#
+# ----------------------------------------------------------------------------
+# JOB 2 — CONFIG SEED  (macOS: FAIL-OPEN)
+# ----------------------------------------------------------------------------
+# ~/.claude.json must NOT be a live single-file bind mount of the operator's
+# real ~/.claude.json on Docker Desktop for Mac. The host's native Claude
+# Code rewrites that file via write-tmp-then-rename on every settings / model
+# / trust change, which REPLACES the host inode. The container's single-file
+# VirtioFS/gRPC-FUSE mount stays pinned to the now-unlinked old inode, so the
+# in-container claude reads stale or truncated content (the "cat shows a
+# truncated file" symptom).
+#
+# Fix: point CLAUDE_HOST_CONFIG_FILE at a DEDICATED container-only file that
+# the host's native Claude never touches (default:
+# ~/.config/claude-container/claude.json). Its inode is stable because only
+# the container writes it, so the desync can't happen. This seeds that file
+# ONCE from the operator's real ~/.claude.json (so the container inherits
+# project trust, MCP registry, model prefs). Idempotent: seeds only when the
+# target is missing — after that the container owns its own copy. Fail-open:
+# a seed failure just means the in-container claude starts from an empty
+# config (trust prompt resurfaces), which is recoverable, so it must never
+# block the stack from coming up.
+
+set -euo pipefail
+
+CLAUDE_CRED_SERVICE="${CLAUDE_CRED_SERVICE:-Claude Code-credentials}"
+HOST_CONFIG_DIR="${CLAUDE_HOST_CONFIG_DIR:-$HOME/.claude}"
+CREDENTIALS_FILE="$HOST_CONFIG_DIR/.credentials.json"
+# The dedicated container-only config file. Defaults match the value the
+# .env.example tells macOS operators to set for CLAUDE_HOST_CONFIG_FILE.
+SEED_TARGET="${CLAUDE_HOST_CONFIG_FILE:-$HOME/.config/claude-container/claude.json}"
+SEED_SOURCE="${CLAUDE_SEED_SOURCE:-$HOME/.claude.json}"
+
+log()  { printf 'prepare-host-claude-state: %s\n' "$*" >&2; }
+fatal() { log "ERROR: $*"; exit 1; }
+
+# Load the compose .env so operator config (CLAUDE_HOST_PREP_HOOK,
+# CLAUDE_HOST_CONFIG_FILE, ...) is visible here. compose auto-loads .env for
+# its OWN interpolation, but this prep runs as a separate subprocess BEFORE
+# `docker compose up`, so without this it would not see those vars. Existing
+# environment wins over .env (so a caller can still override). Lines are
+# plain KEY=VALUE; we don't execute the file, just export simple assignments.
+PREP_ENV_FILE="${CW_COMPOSE_ENV:-$(cd "$(dirname "$0")/.." && pwd)/.env}"
+if [ -f "$PREP_ENV_FILE" ]; then
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in
+            ''|\#*) continue ;;                  # blank / comment
+            *=*)
+                _k="${_line%%=*}"
+                case "$_k" in
+                    *[!A-Za-z0-9_]*) continue ;; # not a clean var name
+                esac
+                # Only set if not already in the environment (env wins).
+                if [ -z "${!_k+x}" ]; then
+                    export "$_k=${_line#*=}"
+                fi
+                ;;
+        esac
+    done < "$PREP_ENV_FILE"
+fi
+
+# ---------------------------------------------------------------------------
+# macOS-only by design. `security` is the tell: absent => not a Mac (or a
+# stripped-down macOS), so both jobs are no-ops and the Linux bind-mount
+# paths handle everything natively.
+# ---------------------------------------------------------------------------
+if ! command -v security >/dev/null 2>&1; then
+    log "no \`security\` CLI (non-macOS host) — skipping Keychain auth bridge + config seed"
+    exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    fatal "python3 not on PATH — required to merge Keychain auth into $CREDENTIALS_FILE"
+fi
+
+# ---------------------------------------------------------------------------
+# JOB 1 — auth bridge (fail-closed)
+# ---------------------------------------------------------------------------
+# `security find-generic-password -w` prints ONLY the password (the JSON
+# blob) to stdout. Capture rc separately so we can distinguish "not found"
+# (44) from other failures, and so `set -e` doesn't abort before we classify.
+set +e
+KC_BLOB="$(security find-generic-password -s "$CLAUDE_CRED_SERVICE" -w 2>/dev/null)"
+KC_RC=$?
+set -e
+
+if [ "$KC_RC" -eq 44 ]; then
+    fatal "Keychain entry '$CLAUDE_CRED_SERVICE' not found — the host is not logged in to Claude Code. Run \`claude\` on the host and sign in, then retry \`cw --up\`."
+elif [ "$KC_RC" -ne 0 ]; then
+    fatal "reading Keychain entry '$CLAUDE_CRED_SERVICE' failed (security rc=$KC_RC) — keychain may be locked. Unlock it and retry \`cw --up\`."
+fi
+
+if [ -z "$KC_BLOB" ]; then
+    fatal "Keychain entry '$CLAUDE_CRED_SERVICE' is empty — refusing to write an empty credential."
+fi
+
+mkdir -p "$HOST_CONFIG_DIR"
+
+# Merge claudeAiOauth from the Keychain blob into .credentials.json,
+# preserving every other top-level key. Idempotent: exits 10 (no change)
+# when the on-disk token already matches, 0 when it wrote an update, and
+# non-zero on any parse/IO error (=> fail-closed via `set -e`).
+set +e
+KC_BLOB="$KC_BLOB" CREDENTIALS_FILE="$CREDENTIALS_FILE" python3 - <<'PY'
+import json, os, sys, tempfile
+
+blob = os.environ["KC_BLOB"]
+path = os.environ["CREDENTIALS_FILE"]
+
+try:
+    kc = json.loads(blob)
+except json.JSONDecodeError as e:
+    print(f"Keychain blob is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(2)
+
+oauth = kc.get("claudeAiOauth")
+if not isinstance(oauth, dict):
+    print("Keychain blob has no `claudeAiOauth` object", file=sys.stderr)
+    sys.exit(3)
+
+# Read existing creds, preserving unrelated keys (mcpOAuth etc.).
+existing = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            existing = json.load(f)
+        if not isinstance(existing, dict):
+            print(f"{path}: top-level is not an object — refusing to clobber", file=sys.stderr)
+            sys.exit(4)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"{path}: unreadable/invalid ({e}) — refusing to clobber", file=sys.stderr)
+        sys.exit(5)
+
+if existing.get("claudeAiOauth") == oauth:
+    sys.exit(10)  # already current — no write
+
+merged = dict(existing)
+merged["claudeAiOauth"] = oauth
+
+# Atomic write into the dir-mounted ~/.claude (a real directory mount on
+# the host — rename works fine here, no single-file-mount EBUSY).
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(prefix=".credentials.json.", dir=d)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    tmp = None
+finally:
+    if tmp is not None:
+        try: os.unlink(tmp)
+        except OSError: pass
+PY
+PY_RC=$?
+set -e
+
+case "$PY_RC" in
+    0)  log "auth bridge: wrote current Claude token from Keychain -> $CREDENTIALS_FILE" ;;
+    10) log "auth bridge: $CREDENTIALS_FILE token already current — no change" ;;
+    *)  fatal "auth bridge: failed to merge Keychain token into $CREDENTIALS_FILE (python rc=$PY_RC)" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# JOB 2 — config seed (fail-open)
+# ---------------------------------------------------------------------------
+if [ -e "$SEED_TARGET" ]; then
+    log "config seed: $SEED_TARGET already exists — container owns it, leaving untouched"
+elif [ ! -f "$SEED_SOURCE" ]; then
+    log "config seed: source $SEED_SOURCE not found — skipping (in-container claude starts from empty config)"
+else
+    if mkdir -p "$(dirname "$SEED_TARGET")" 2>/dev/null \
+        && cp "$SEED_SOURCE" "$SEED_TARGET" 2>/dev/null; then
+        log "config seed: seeded $SEED_TARGET from $SEED_SOURCE (one-time; container owns it hereafter)"
+    else
+        log "WARNING: config seed from $SEED_SOURCE -> $SEED_TARGET failed — in-container claude will start from empty config (recoverable). Continuing."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# JOB 3 — operator hook (FAIL-CLOSED when present)
+# ---------------------------------------------------------------------------
+# Optional site-specific host-prep that must run before `up -d`, kept OUT of
+# this public repo. Set CLAUDE_HOST_PREP_HOOK to an executable; it runs here
+# with the same env. Typical use: refresh a corp API token into the
+# compose .env, regenerate a sanitized managed-settings.json, etc.
+#
+# Fail-CLOSED: if the hook is set and FAILS, we abort (non-zero) so we never
+# bring the stack up with stale/missing site config — same posture as the
+# auth bridge. Unset or non-executable => silent skip (default, public-safe).
+PREP_HOOK="${CLAUDE_HOST_PREP_HOOK:-}"
+if [ -n "$PREP_HOOK" ]; then
+    if [ -x "$PREP_HOOK" ]; then
+        log "operator hook: running $PREP_HOOK"
+        if ! "$PREP_HOOK"; then
+            fatal "operator hook $PREP_HOOK failed — aborting so we don't start with stale site config. Fix it and retry."
+        fi
+        log "operator hook: $PREP_HOOK completed"
+    else
+        fatal "CLAUDE_HOST_PREP_HOOK=$PREP_HOOK is set but not executable — refusing to silently skip site prep."
+    fi
+fi
+
+exit 0
