@@ -67,6 +67,63 @@
   }
 
   // ---------------------------------------------------------------------
+  // Source filter — filters the visible queue cards by their producer
+  // (the queue item's `created_by`: `main-loop`, `workload`, …). The
+  // dropdown is populated from `state.sources`, the GLOBAL distinct
+  // `created_by` set computed server-side over EVERY queue item — NOT a
+  // per-section facet. Before this fix there was no source dropdown at
+  // all (it "showed nothing"); the fix adds one fed by real queue data.
+  //
+  // Filtering is purely client-side (show/hide cards via the `filtered-out`
+  // class) so it composes cleanly with the morphdom refresh: each tick
+  // rebuilds the cards + the dropdown options, then re-applies the active
+  // selection. The selected value survives the merge via onBeforeElUpdated.
+  // ---------------------------------------------------------------------
+  const SOURCE_FILTER_ID = 'source-filter';
+
+  function buildSourceFilterHTML(sources) {
+    const opts = ['<option value="">all sources</option>']
+      .concat((sources || []).map(
+        (s) => `<option value="${attr(s)}">${esc(s)}</option>`
+      ))
+      .join('');
+    return (
+      `<label class="source-filter-label" for="${SOURCE_FILTER_ID}">` +
+      `<span class="sr-only">Filter by source</span>` +
+      `<select id="${SOURCE_FILTER_ID}" class="source-filter" ` +
+        `aria-label="Filter queue items by source (created_by)" ` +
+        `title="Filter items by source (who enqueued them)">${opts}</select>` +
+      `</label>`
+    );
+  }
+
+  function getSourceFilterValue() {
+    const sel = document.getElementById(SOURCE_FILTER_ID);
+    return sel ? (sel.value || '') : '';
+  }
+
+  function applySourceFilter() {
+    const want = getSourceFilterValue();
+    const cards = document.querySelectorAll('#queue-root .item');
+    cards.forEach((card) => {
+      if (!want) {
+        card.classList.remove('filtered-out');
+        return;
+      }
+      const by = card.getAttribute('data-created-by') || '';
+      card.classList.toggle('filtered-out', by !== want);
+    });
+  }
+
+  // Delegated change handler — the <select> is rebuilt every tick, so we
+  // bind on document rather than the (replaceable) element itself.
+  document.addEventListener('change', (e) => {
+    if (e.target && e.target.id === SOURCE_FILTER_ID) {
+      applySourceFilter();
+    }
+  });
+
+  // ---------------------------------------------------------------------
   // Section renderers — mirror templates/index.html block-for-block.
   // Returning HTML strings keeps the diff with the template easy to
   // eyeball. The outer section element gets a stable id (#section-X) so
@@ -163,7 +220,7 @@
     }
 
     return (
-      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr} ${logModeAttr}>` +
+      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr} ${logModeAttr}>` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       `<div class="age">${ageBlock}</div>` +
@@ -221,7 +278,7 @@
     }
 
     return (
-      `<article id="queue-${attr(it.id)}" class="item state-blocked" data-queue-id="${attr(it.id)}" data-queue-status="blocked" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}">` +
+      `<article id="queue-${attr(it.id)}" class="item state-blocked" data-queue-id="${attr(it.id)}" data-queue-status="blocked" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}">` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       reasonHtml +
@@ -296,7 +353,7 @@
     }
 
     return (
-      `<article id="queue-${attr(it.id)}" class="${cardClasses}" draggable="true" data-queue-id="${attr(it.id)}" data-queue-status="pending" data-queue-summary="${attr(it.summary)}" title="Drag onto another item to set as dependency">` +
+      `<article id="queue-${attr(it.id)}" class="${cardClasses}" draggable="true" data-queue-id="${attr(it.id)}" data-queue-status="pending" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" title="Drag onto another item to set as dependency">` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       `<div class="age">${ageBlock}</div>` +
@@ -349,7 +406,7 @@
     }
 
     return (
-      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="${attr(status)}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" ${archiveAttr}>` +
+      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="${attr(status)}" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" ${archiveAttr}>` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       reasonHtml +
@@ -495,6 +552,14 @@
     if (orphanCount) {
       html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
     }
+    // Source filter dropdown. MUST be rendered here too (not just in the
+    // Jinja template): mergeTopbarMeta rebuilds #topbar-meta every tick,
+    // so omitting it would let morphdom discard the server-rendered
+    // <select> on the first tick — the same class of bug as the dropped
+    // BLOCKED section (q-2026-05-20-db66). The selected value is
+    // preserved across the merge by onBeforeElUpdated. Options are
+    // rebuilt from state.sources (the global distinct created_by set).
+    html += buildSourceFilterHTML(state.sources || []);
     html += `<span class="dot ${errorTxt ? 'dot-err' : 'dot-ok'}" title="${errorTxt ? 'fetch error' : 'live'}"></span>`;
     const tsAttrs = fetchedAt
       ? ` data-local-time-iso="${attr(fetchedAt)}" data-local-time-fmt="time" data-local-time-tooltip`
@@ -570,6 +635,16 @@
     // Preserve focused input/textarea state — value + focus.
     if ((fromEl.tagName === 'INPUT' || fromEl.tagName === 'TEXTAREA') &&
         document.activeElement === fromEl) {
+      toEl.value = fromEl.value;
+    }
+
+    // Preserve the source-filter selection across the tick. The dropdown
+    // is rebuilt every refresh (options can change as new producers
+    // enqueue items), but the user's chosen value must persist. Copy the
+    // live value onto the freshly-built <select> BEFORE morphdom diffs
+    // them; if the previously-selected source is no longer an option,
+    // the assignment is a no-op and the select falls back to "all".
+    if (fromEl.tagName === 'SELECT' && fromEl.id === SOURCE_FILTER_ID) {
       toEl.value = fromEl.value;
     }
 
@@ -665,6 +740,11 @@
       mergeQueueRoot(j);
       mergeTopbarMeta(j);
 
+      // Re-apply the active source filter to the freshly-merged cards.
+      // New/changed cards default to visible; this hides any that don't
+      // match the current selection.
+      applySourceFilter();
+
       // Update the cache-age value inside the (skipped) info-dropdown so
       // it stays live without re-rendering the whole subtree.
       const cacheAgeEl = document.querySelector('.cache-age');
@@ -696,6 +776,9 @@
   window.__queueRefresh = {
     buildQueueDOM,
     buildTopbarMetaDOM,
+    buildSourceFilterHTML,
+    applySourceFilter,
+    getSourceFilterValue,
     mergeQueueRoot,
     mergeTopbarMeta,
     onBeforeElUpdated,
