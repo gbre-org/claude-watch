@@ -163,6 +163,67 @@ pub(crate) fn apply_thinking_token_progress(
     }
 }
 
+/// Age in whole seconds of the host heartbeat file's mtime relative to
+/// `now` (pure). Returns `None` when the mtime is unavailable (file
+/// missing/unreadable) or in the FUTURE relative to `now`
+/// (`duration_since` fails on clock skew / corrupt stamp). The
+/// heartbeat-freshness gate FAILS OPEN on `None` — the fire is allowed —
+/// deliberately unlike the workload-heartbeat suppressor (which treats a
+/// future mtime as fresh): a corrupt or skewed host heartbeat must never
+/// mask a real wedge.
+pub(crate) fn heartbeat_age_secs(mtime: Option<SystemTime>, now: SystemTime) -> Option<u64> {
+    now.duration_since(mtime?).ok().map(|d| d.as_secs())
+}
+
+/// Heartbeat-freshness gate for the prolonged-thinking fire path (v3,
+/// 2026-06-11). In deployments where the supervised session touches the
+/// host heartbeat file (`[claude].heartbeat_file`) on a periodic cadence
+/// event, a FRESH mtime at fire time is proof the session is alive and
+/// merely parked in an open turn — the residual v2 false positive, where
+/// an ultra-quiet stretch drips fewer context tokens than
+/// `min_tokens_delta` per backoff window so the token-progress guard
+/// never re-arms. A STALE mtime means a possible real wedge (a wedged
+/// session stops touching the file by design), so the fire proceeds —
+/// and the daemon's separate heartbeat-stale detection escalates that
+/// case independently.
+///
+/// Returns `true` (suppress the fire) iff the gate is enabled
+/// (`heartbeat_fresh_secs > 0`) AND the heartbeat age is known AND
+/// `age < heartbeat_fresh_secs` — in which case it RE-ARMS the thinking
+/// timer exactly like the v2 token-progress re-arm: `thinking_start` and
+/// the token baseline slide forward to `now`, so the timer only resumes
+/// accumulating from this check. Returns `false` (allow the fire,
+/// touch nothing) when the gate is disabled, the heartbeat file is
+/// missing/unreadable, its mtime is in the future (both surface here as
+/// `heartbeat_age_secs == None` — fail-open), or the age is at/over the
+/// threshold. Split out from `check_foreground_inner` so the behavior is
+/// unit-testable without tmux (same pattern as
+/// `apply_thinking_token_progress`).
+pub(crate) fn apply_heartbeat_fresh_rearm(
+    thinking_start: &mut Option<String>,
+    episode_start_tokens: &mut Option<u64>,
+    heartbeat_age_secs: Option<u64>,
+    heartbeat_fresh_secs: u64,
+    current_tokens: u64,
+    now: &str,
+) -> bool {
+    if heartbeat_fresh_secs == 0 {
+        // Gate disabled.
+        return false;
+    }
+    let Some(age) = heartbeat_age_secs else {
+        // Missing/unreadable file or future mtime — fail open.
+        return false;
+    };
+    if age >= heartbeat_fresh_secs {
+        // Stale heartbeat — possible real wedge, allow the fire.
+        return false;
+    }
+    *thinking_start = Some(now.to_string());
+    *episode_start_tokens = (current_tokens > 0).then_some(current_tokens);
+    true
+}
+
 /// Returns true if a previous interrupt fired within the last
 /// `cooldown_secs` seconds. Used to suppress cascading interrupts across
 /// the prolonged-thinking and context-warning fire paths.
@@ -1052,6 +1113,64 @@ async fn check_foreground_inner(
                         );
                         return;
                     }
+                    // Host-heartbeat freshness gate (v3, 2026-06-11): if the
+                    // supervised session touched the host heartbeat file
+                    // (`[claude].heartbeat_file` — the same path the
+                    // heartbeat-stale detector watches) within
+                    // `heartbeat_fresh_secs`, the session is demonstrably
+                    // alive and this is an idle parked-open turn, not a
+                    // wedge — suppress and RE-ARM (slide thinking_start +
+                    // token baseline, same as the v2 token-progress re-arm).
+                    // Stale/missing/unreadable/future-mtime heartbeat allows
+                    // the fire (fail-open); 0 disables the gate. Checked
+                    // BEFORE the global-gate claim so a suppressed cycle
+                    // does not consume a claim. The age is also reused in
+                    // the fire-time observability fields below.
+                    let hb_age_secs = heartbeat_age_secs(
+                        std::fs::metadata(&config.claude.heartbeat_file)
+                            .ok()
+                            .and_then(|m| m.modified().ok()),
+                        SystemTime::now(),
+                    );
+                    let pre_rearm_baseline = state.thinking_episode_start_tokens;
+                    if apply_heartbeat_fresh_rearm(
+                        &mut state.thinking_start,
+                        &mut state.thinking_episode_start_tokens,
+                        hb_age_secs,
+                        config.foreground_monitor.heartbeat_fresh_secs,
+                        tokens,
+                        &now,
+                    ) {
+                        let start_tokens = pre_rearm_baseline.unwrap_or(0);
+                        info!(
+                            elapsed_secs = elapsed,
+                            threshold = next_threshold,
+                            heartbeat_age_secs = hb_age_secs,
+                            heartbeat_fresh_secs = config.foreground_monitor.heartbeat_fresh_secs,
+                            start_tokens,
+                            tokens,
+                            tokens_delta = tokens.saturating_sub(start_tokens),
+                            "prolonged thinking suppressed: host heartbeat fresh — \
+                             session alive, idle parked-open turn; re-arming"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "prolonged_thinking_suppressed",
+                            serde_json::json!({
+                                "elapsed_secs": elapsed,
+                                "threshold_secs": next_threshold,
+                                "reason": "heartbeat_fresh",
+                                "heartbeat_age_secs": hb_age_secs,
+                                "heartbeat_fresh_secs": config.foreground_monitor.heartbeat_fresh_secs,
+                                "heartbeat_file": &config.claude.heartbeat_file,
+                                "start_tokens": start_tokens,
+                                "tokens": tokens,
+                                "tokens_delta": tokens.saturating_sub(start_tokens),
+                                "min_tokens_delta": config.foreground_monitor.min_tokens_delta,
+                            }),
+                        );
+                        return;
+                    }
                     // Global interrupt gate (single chokepoint): atomically
                     // claim-and-stamp. If ANY interrupt fired within the
                     // cooldown window (watcher-down, context-warning,
@@ -1095,6 +1214,7 @@ async fn check_foreground_inner(
                         tokens_delta = tokens.saturating_sub(start_tokens.unwrap_or(0)),
                         baseline_recorded = start_tokens.is_some(),
                         min_tokens_delta = config.foreground_monitor.min_tokens_delta,
+                        heartbeat_age_secs = hb_age_secs,
                         "prolonged thinking detected — interrupting (backoff)"
                     );
                     write_jsonl_log(
@@ -1108,6 +1228,8 @@ async fn check_foreground_inner(
                             "tokens_delta": tokens.saturating_sub(start_tokens.unwrap_or(0)),
                             "baseline_recorded": start_tokens.is_some(),
                             "min_tokens_delta": config.foreground_monitor.min_tokens_delta,
+                            "heartbeat_age_secs": hb_age_secs,
+                            "heartbeat_fresh_secs": config.foreground_monitor.heartbeat_fresh_secs,
                             "interrupt_count": state.thinking_interrupt_count,
                             "next_threshold_secs": next_threshold,
                             "action": if config.foreground_monitor.interrupt_enabled { "interrupt" } else { "log-only" },
@@ -5007,6 +5129,140 @@ cooldown = 300
         );
         assert_eq!(start.as_deref(), Some("episode-start"));
         assert_eq!(baseline, Some(100_000));
+    }
+
+    // --- Heartbeat-freshness gate tests (v3, 2026-06-11) ---
+
+    #[test]
+    fn test_heartbeat_fresh_suppresses_and_rearms() {
+        // Fresh heartbeat (age 120s < 600s threshold): suppress the fire
+        // and slide BOTH the thinking timer and the token baseline —
+        // identical state effect to the v2 token-progress re-arm.
+        let mut start = Some("episode-start".to_string());
+        let mut baseline = Some(283_000u64);
+        let suppressed = apply_heartbeat_fresh_rearm(
+            &mut start,
+            &mut baseline,
+            Some(120),
+            600,
+            290_000,
+            "2026-06-11T21:58:00-04:00",
+        );
+        assert!(suppressed);
+        assert_eq!(start.as_deref(), Some("2026-06-11T21:58:00-04:00"));
+        assert_eq!(baseline, Some(290_000));
+    }
+
+    #[test]
+    fn test_heartbeat_fresh_rearm_unparseable_tokens_clears_baseline() {
+        // Re-arm with tokens unparseable this cycle (0): baseline goes to
+        // None (late capture on a later cycle), matching the fire-path
+        // baseline-refresh semantics.
+        let mut start = Some("episode-start".to_string());
+        let mut baseline = Some(283_000u64);
+        assert!(apply_heartbeat_fresh_rearm(
+            &mut start,
+            &mut baseline,
+            Some(0),
+            600,
+            0,
+            "now"
+        ));
+        assert_eq!(start.as_deref(), Some("now"));
+        assert_eq!(baseline, None);
+    }
+
+    #[test]
+    fn test_heartbeat_stale_allows_fire() {
+        // Stale heartbeat (age >= threshold): possible real wedge — allow
+        // the fire, touch nothing. Boundary (age == threshold) is stale.
+        let mut start = Some("episode-start".to_string());
+        let mut baseline = Some(283_000u64);
+        assert!(!apply_heartbeat_fresh_rearm(
+            &mut start,
+            &mut baseline,
+            Some(900),
+            600,
+            290_000,
+            "now"
+        ));
+        assert!(!apply_heartbeat_fresh_rearm(
+            &mut start,
+            &mut baseline,
+            Some(600),
+            600,
+            290_000,
+            "now"
+        ));
+        assert_eq!(start.as_deref(), Some("episode-start"));
+        assert_eq!(baseline, Some(283_000));
+    }
+
+    #[test]
+    fn test_heartbeat_missing_file_fails_open() {
+        // Missing/unreadable heartbeat file surfaces as age None: the gate
+        // must FAIL OPEN (allow the fire) and touch nothing.
+        assert_eq!(heartbeat_age_secs(None, SystemTime::now()), None);
+        let mut start = Some("episode-start".to_string());
+        let mut baseline = Some(283_000u64);
+        assert!(!apply_heartbeat_fresh_rearm(
+            &mut start,
+            &mut baseline,
+            None,
+            600,
+            290_000,
+            "now"
+        ));
+        assert_eq!(start.as_deref(), Some("episode-start"));
+        assert_eq!(baseline, Some(283_000));
+    }
+
+    #[test]
+    fn test_heartbeat_future_mtime_fails_open() {
+        // mtime in the future relative to now: duration_since fails, age
+        // is None, gate fails open. (Deliberately NOT treated as fresh,
+        // unlike the workload-heartbeat suppressor — a corrupt or skewed
+        // host heartbeat must never mask a real wedge.)
+        let now = SystemTime::now();
+        let future = now + std::time::Duration::from_secs(60);
+        assert_eq!(heartbeat_age_secs(Some(future), now), None);
+        let mut start = Some("episode-start".to_string());
+        let mut baseline = Some(283_000u64);
+        assert!(!apply_heartbeat_fresh_rearm(
+            &mut start,
+            &mut baseline,
+            heartbeat_age_secs(Some(future), now),
+            600,
+            290_000,
+            "now"
+        ));
+        assert_eq!(start.as_deref(), Some("episode-start"));
+    }
+
+    #[test]
+    fn test_heartbeat_gate_zero_disables() {
+        // heartbeat_fresh_secs = 0 disables the gate entirely: even a
+        // just-touched heartbeat (age 0) never suppresses.
+        let mut start = Some("episode-start".to_string());
+        let mut baseline = Some(283_000u64);
+        assert!(!apply_heartbeat_fresh_rearm(
+            &mut start,
+            &mut baseline,
+            Some(0),
+            0,
+            290_000,
+            "now"
+        ));
+        assert_eq!(start.as_deref(), Some("episode-start"));
+        assert_eq!(baseline, Some(283_000));
+    }
+
+    #[test]
+    fn test_heartbeat_age_secs_past_mtime() {
+        // Plain past mtime: age computes in whole seconds.
+        let now = SystemTime::now();
+        let past = now - std::time::Duration::from_secs(123);
+        assert_eq!(heartbeat_age_secs(Some(past), now), Some(123));
     }
 
     #[test]

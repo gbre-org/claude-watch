@@ -246,6 +246,25 @@ pub struct ForegroundMonitorConfig {
     /// parseable check; if it never parses, the fire fails open.
     #[serde(default = "default_min_tokens_delta")]
     pub min_tokens_delta: u64,
+    /// Host-heartbeat freshness gate (v3) for prolonged-thinking fires.
+    /// Complements the token-progress guard above: an ultra-quiet but
+    /// alive session (event-driven loops handling only periodic ticks)
+    /// can grow context tokens SLOWER than `min_tokens_delta` per backoff
+    /// window, so the v2 re-arm never engages and a parked-open idle turn
+    /// still fires. In deployments where the supervised session touches
+    /// the host heartbeat file (`[claude].heartbeat_file`) on a periodic
+    /// cadence (e.g. on each daemon-emitted `heartbeat-tick` event), the
+    /// file's mtime is a direct liveness signal: a wedged session stops
+    /// touching it BY DESIGN, and the daemon's separate heartbeat-stale
+    /// detection already escalates that case. At prolonged-thinking fire
+    /// time, if the heartbeat mtime is younger than this many seconds the
+    /// fire is suppressed and the thinking timer RE-ARMS (timer + token
+    /// baseline slide to now, same as the v2 re-arm); if it is stale the
+    /// fire proceeds. Fail-open: file missing/unreadable or mtime in the
+    /// future allows the fire. 0 disables the gate. Default 600 — two
+    /// 5-minute touch cadences, so one missed touch doesn't mask a wedge.
+    #[serde(default = "default_heartbeat_fresh_secs")]
+    pub heartbeat_fresh_secs: u64,
 }
 
 fn default_interrupt_enabled() -> bool {
@@ -266,6 +285,10 @@ fn default_thinking_backoff_multiplier() -> u64 {
 
 fn default_min_tokens_delta() -> u64 {
     2000
+}
+
+fn default_heartbeat_fresh_secs() -> u64 {
+    600
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1424,6 +1447,9 @@ cooldown = 300
         assert_eq!(config.foreground_monitor.thinking_backoff_multiplier, 2);
         // Token-progress guard default (no min_tokens_delta key in SAMPLE_CONFIG).
         assert_eq!(config.foreground_monitor.min_tokens_delta, 2000);
+        // Heartbeat-freshness gate default (no heartbeat_fresh_secs key in
+        // SAMPLE_CONFIG).
+        assert_eq!(config.foreground_monitor.heartbeat_fresh_secs, 600);
         assert_eq!(config.tmux.dashboard_pane, "dashboard:0.0");
         assert_eq!(config.claude.max_context_tokens, 200000);
         assert_eq!(config.dead_process.checks_required, 3);
@@ -1898,6 +1924,73 @@ cooldown = 300
         assert_eq!(config.foreground_monitor.min_tokens_delta, 5000);
         let config = parse_config(&base(0)).expect("should parse min_tokens_delta = 0");
         assert_eq!(config.foreground_monitor.min_tokens_delta, 0);
+    }
+
+    #[test]
+    fn test_parse_config_heartbeat_fresh_secs_override() {
+        // An explicit heartbeat_fresh_secs in [foreground_monitor] must
+        // override the 600 default; 0 (gate disabled) must round-trip too.
+        let base = |value: u64| {
+            format!(
+                r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[tmux]
+dashboard_pane = "dashboard:0.0"
+dashboard_session = "dashboard"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 480
+check_interval = 3
+heartbeat_fresh_secs = {value}
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#
+            )
+        };
+        let config = parse_config(&base(1200)).expect("should parse heartbeat_fresh_secs override");
+        assert_eq!(config.foreground_monitor.heartbeat_fresh_secs, 1200);
+        let config = parse_config(&base(0)).expect("should parse heartbeat_fresh_secs = 0");
+        assert_eq!(config.foreground_monitor.heartbeat_fresh_secs, 0);
     }
 
     #[test]

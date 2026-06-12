@@ -129,6 +129,24 @@ thinking_backoff_multiplier = 3
 # on a live turn. 500 re-arms on any real turn while a genuinely wedged
 # zero-progress turn still fires.
 min_tokens_delta = 500
+# Host-heartbeat freshness gate (v3, 2026-06-11): complements the
+# token-progress guard above. An ultra-quiet but alive session (an
+# event-driven loop handling only periodic ticks) can grow context tokens
+# SLOWER than min_tokens_delta per backoff window (observed
+# tokens_delta=230 on a false fire), so the v2 re-arm never engages and a
+# parked-open idle turn still fires. In deployments where the supervised
+# session touches the host heartbeat file ([claude].heartbeat_file) on a
+# periodic cadence — e.g. on each daemon-emitted heartbeat-tick event —
+# the file's mtime is a direct liveness signal: a wedged session stops
+# touching it by design, and the daemon's separate heartbeat-stale
+# detection escalates that case independently. At prolonged-thinking fire
+# time, a heartbeat mtime younger than this many seconds suppresses the
+# fire and RE-ARMS the thinking timer (timer + token baseline slide to
+# now, same as the v2 re-arm); a stale mtime lets the fire proceed.
+# Fail-open: missing/unreadable file or future mtime allows the fire.
+# 0 disables the gate. Default 600 = two 5-minute touch cadences, so a
+# single missed touch doesn't mask a real wedge.
+heartbeat_fresh_secs = 600
 
 [watcher_monitor]
 # Enable individual watcher health tracking
