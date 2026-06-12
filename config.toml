@@ -123,7 +123,12 @@ thinking_backoff_multiplier = 3
 # 0 disables the guard (legacy pure-timer behavior). If the count is
 # unavailable at episode start the baseline is captured late at the first
 # parseable check; if it never parses the fire fails open.
-min_tokens_delta = 2000
+# Tuned 2000 -> 500 (2026-06-11 production calibration): very quiet idle
+# periods can drip just under 2k context tokens per 480s window (observed
+# tokens_delta=1857 on a false fire), so 2000 failed to re-arm and fired
+# on a live turn. 500 re-arms on any real turn while a genuinely wedged
+# zero-progress turn still fires.
+min_tokens_delta = 500
 
 [watcher_monitor]
 # Enable individual watcher health tracking
