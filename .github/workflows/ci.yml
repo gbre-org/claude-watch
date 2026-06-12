@@ -137,6 +137,9 @@ jobs:
       - name: Run mcp-host-bash host-shim tests
         run: make test-mcp-host-bash
 
+      - name: Run hostjob detached-runner tests
+        run: make test-hostjob
+
       - name: Run mcp-proxy-auth-shim bearer-auth tests
         run: make test-mcp-proxy-auth-shim
 

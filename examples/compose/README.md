@@ -293,6 +293,64 @@ Security: the launcher applies a `cli-mcp-server` allow-list by default that cov
 
 **Trust profile** (`CW_PROFILE`): set `CW_PROFILE=corp-dev-trusted` in the launcher's shell env to opt into a wider allow-list that adds host-scheduling tooling — `crontab` (Linux + macOS), `launchctl` (macOS launchd), `systemctl` (Linux systemd user units), `schtasks` / `powershell` / `pwsh` (Windows Task Scheduler), `sw_vers` / `lsb_release` (extra OS detection), file mutation (`tee`, `mkdir`, `chmod`, `cp`, `mv`, `rm`), outbound bytes (`curl`, `wget`, `scp`), key/cert tooling (`openssl`, `ssh-keygen`), and container management (`docker`, `docker-compose`). Default unset (`corp-dev`) keeps the read-y dev-tooling floor described above. Use the trusted profile when you want the in-container claude to wire periodic claude-event jobs on the host (cron / launchd / systemd timers / Task Scheduler), push artifacts off-host, or recreate the compose stack from inside its own session (`docker compose up -d --force-recreate <svc>`, `docker compose exec <svc> ...`) — see the "Host-side scheduled tasks" section in `container/baked-CLAUDE.md` for the workflow. Note: `docker` / `docker-compose` are trusted-only because the binary covers destructive subcommands (`docker rm`, `docker stop`, `docker kill`) alongside read-y ones (`docker ps`, `docker logs`); cli-mcp-server's allow-list is per-binary, not per-subcommand. Operator's explicit `ALLOWED_COMMANDS` in `~/.config/claude-container/mcp-host-bash.env` always wins over the profile default.
 
+### `hostjob` — run host commands past the 30s host-bash cap
+
+`mcp-host-bash` enforces a hard `COMMAND_TIMEOUT` (default **30s**, see the
+security note above) on every `run_command`, and its allow-list deliberately
+omits `sleep`, `nohup`, `bash`, and `&`-backgrounding. That's the right floor
+for a host-shell privilege escalator, but it means the in-container `claude`
+cannot directly run a host command that takes longer than the cap — `make
+container-build`, a large `rsync`, a docker build, a long test run all blow
+past 30s and get killed mid-flight.
+
+[`examples/compose/bin/hostjob`](bin/hostjob) is the escape hatch. It launches
+the long command **detached** (a small reaper process, detached via
+`start_new_session`, that survives the launching `run_command` returning),
+streams its output to a per-job log, and records a `status.json` that flips to
+`done rc=N` when the worker exits. The agent then polls or blocks-with-timeout
+for completion across several short `run_command` calls, each of which returns
+well under the 30s cap.
+
+`python3` **is** on the host-bash allow-list (bare `hostjob` is not), so the
+in-container agent invokes it as a `python3` script with an absolute path —
+one clean argv per call, no shell operators (host-bash forbids
+`&&` / `|` / `;` / redirection):
+
+```sh
+# Launch a long command detached:
+python3 <path>/hostjob run --label build -- make container-build
+
+# Block up to ~25s, then exit 75 ("still running") so the caller re-invokes;
+# exits 0 once the job is done:
+python3 <path>/hostjob wait build
+
+# One-shot status + log tail (no blocking):
+python3 <path>/hostjob poll build --tail 60
+
+# Enumerate known jobs:
+python3 <path>/hostjob list
+
+# Remove finished job state (refuses while still running):
+python3 <path>/hostjob clean --label build      # or --all
+```
+
+Typical flow: `run` the command once, then `wait` in a loop — each `wait`
+returns 0 (done) or 75 (still running, re-invoke to keep waiting), mirroring
+the `EX_TEMPFAIL` re-invoke pattern `session-task`'s `workload babysit` uses.
+On `done`, `poll --tail` surfaces the final log output and the worker's exit
+code.
+
+State lives under `~/.cache/hostjob/<label>/` (`log` + `status.json`); the
+script is pure-stdlib Python and stores nothing outside `$HOME`. It is a
+generic primitive — it encodes knowledge of host-bash's own 30s constraint
+and nothing application-specific — which is why it ships here alongside the
+`mcp-host-bash` launcher rather than out-of-tree.
+
+(Complementary, not a replacement: raising `COMMAND_TIMEOUT` lets *everyday*
+commands run a little longer without `hostjob`, but `hostjob` is still the
+right tool for genuinely long-running, fire-and-poll work. See the follow-up
+note in the security section.)
+
 ### Auto-resume the prior conversation (`CLAUDE_AUTO_CONTINUE`)
 
 Set `CLAUDE_AUTO_CONTINUE=resume` in `.env` (commented example near the bottom of `.env.example`) to have the in-container claude launch with `--continue "resume"` instead of bare `claude`. This matches the standard host alias most operators already use:

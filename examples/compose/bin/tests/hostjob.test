@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Tests for examples/compose/bin/hostjob — the detached host-job runner
+built for the host-bash MCP server's 30s command cap.
+
+Exercises the script's real behavior end-to-end against a throwaway
+$HOME (hostjob stores all state under $HOME/.cache/hostjob, so pointing
+HOME at a tempdir fully isolates each run). Every case shells out to the
+actual `hostjob` script with `python3` — the same invocation form
+in-container agents use, since bare `hostjob` is not on the host-bash
+allowlist but `python3` is.
+
+Coverage:
+  - run -> a trivial command (`true`) launches detached, exits 0 fast.
+  - wait -> blocks until the worker is done and reports rc=0.
+  - poll -> one-shot status shows `done rc=0` after completion.
+  - run a failing command (`false`) -> wait reports rc=1.
+  - run captures stdout to the per-job log (`echo hi` -> log tail has hi).
+  - list -> shows the known job(s).
+  - clean --label -> removes a finished job; subsequent poll => no such job.
+  - clean refuses while a job is still running.
+  - run --force overrides an existing RUNNING label.
+  - run with no command => exit 2.
+  - poll/wait/clean on an unknown label => exit 1.
+
+Run:  ./hostjob.test
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "hostjob"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate hostjob at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+# Each test run gets its own HOME so hostjob's ~/.cache/hostjob state is
+# fully isolated and never touches the operator's real state.
+TMP_HOME = tempfile.mkdtemp(prefix="hostjob-test-home-")
+
+
+def run_hostjob(
+    args: list[str],
+    expect_rc: int | None = 0,
+    timeout: int = 30,
+) -> tuple[list[str], str, str, int]:
+    """Run hostjob with the given argv. Returns (stdout_lines, stdout,
+    stderr, returncode). Asserts rc == expect_rc unless expect_rc is None."""
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": TMP_HOME,
+    }
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if expect_rc is not None and result.returncode != expect_rc:
+        raise AssertionError(
+            f"hostjob {args} exited {result.returncode}, expected {expect_rc}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout.splitlines(), result.stdout, result.stderr, result.returncode
+
+
+def wait_done(label: str, timeout: int = 20) -> tuple[str, int]:
+    """Block (re-invoking `wait` on its EX_TEMPFAIL 75) until the job is
+    no longer running. Returns (stdout, final_rc_of_wait)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # `wait` returns 0 once the job is done, 75 if still running.
+        _, out, _, rc = run_hostjob(["wait", label, "--max-block", "5"],
+                                    expect_rc=None)
+        if rc == 0:
+            return out, rc
+        if rc != 75:
+            raise AssertionError(f"wait {label} unexpected rc={rc}\n{out}")
+    raise AssertionError(f"wait {label} did not finish within {timeout}s")
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def test_run_true_then_wait_rc0() -> None:
+    """run `true` -> launches, wait reports done rc=0."""
+    _, out, _, _ = run_hostjob(["run", "--label", "t_true", "--", "true"])
+    expect("launched label=t_true" in out,
+           f"run: expected launch banner, got {out!r}")
+    wout, _ = wait_done("t_true")
+    expect("done rc=0" in wout,
+           f"wait: expected done rc=0, got {wout!r}")
+
+
+def test_poll_shows_done() -> None:
+    """After completion, poll shows done rc=0."""
+    run_hostjob(["run", "--label", "t_poll", "--", "true"])
+    wait_done("t_poll")
+    _, out, _, _ = run_hostjob(["poll", "t_poll"])
+    expect("done rc=0" in out, f"poll: expected done rc=0, got {out!r}")
+
+
+def test_failing_command_rc1() -> None:
+    """run `false` -> wait reports rc=1."""
+    run_hostjob(["run", "--label", "t_false", "--", "false"])
+    wout, _ = wait_done("t_false")
+    expect("done rc=1" in wout, f"wait: expected done rc=1, got {wout!r}")
+
+
+def test_stdout_captured_to_log() -> None:
+    """run `echo hi` -> the per-job log tail contains 'hi'."""
+    run_hostjob(["run", "--label", "t_echo", "--", "echo", "hi"])
+    wait_done("t_echo")
+    _, out, _, _ = run_hostjob(["poll", "t_echo", "--tail", "10"])
+    expect("hi" in out, f"poll: expected log tail to contain 'hi', got {out!r}")
+
+
+def test_list_shows_job() -> None:
+    """list shows a known job after a run."""
+    run_hostjob(["run", "--label", "t_list", "--", "true"])
+    wait_done("t_list")
+    _, out, _, _ = run_hostjob(["list"])
+    expect("t_list" in out, f"list: expected t_list in output, got {out!r}")
+
+
+def test_clean_label_removes_finished() -> None:
+    """clean --label removes a finished job; poll then => exit 1."""
+    run_hostjob(["run", "--label", "t_clean", "--", "true"])
+    wait_done("t_clean")
+    _, out, _, _ = run_hostjob(["clean", "--label", "t_clean"])
+    expect("cleaned t_clean" in out, f"clean: expected cleaned banner, got {out!r}")
+    run_hostjob(["poll", "t_clean"], expect_rc=1)
+
+
+def test_clean_refuses_running() -> None:
+    """clean refuses to remove a job that is still running."""
+    # `sleep 5` keeps the worker alive long enough to assert the refusal.
+    run_hostjob(["run", "--label", "t_run_clean", "--", "sleep", "5"])
+    # Give the reaper a beat to flip status to running.
+    time.sleep(0.5)
+    _, _, err, rc = run_hostjob(["clean", "--label", "t_run_clean"],
+                                expect_rc=1)
+    expect("still RUNNING" in err or "running" in err.lower(),
+           f"clean: expected refusal for running job, got rc={rc} err={err!r}")
+    # Clean up the running job once it finishes so state dir is tidy.
+    wait_done("t_run_clean", timeout=20)
+    run_hostjob(["clean", "--label", "t_run_clean"])
+
+
+def test_force_overrides_running() -> None:
+    """run --force replaces an existing RUNNING label."""
+    run_hostjob(["run", "--label", "t_force", "--", "sleep", "5"])
+    time.sleep(0.5)
+    # Without --force this would exit 1; with --force it relaunches (rc 0).
+    _, out, _, _ = run_hostjob(["run", "--force", "--label", "t_force",
+                                "--", "true"])
+    expect("launched label=t_force" in out,
+           f"run --force: expected relaunch, got {out!r}")
+    wait_done("t_force", timeout=20)
+
+
+def test_run_empty_command_exit2() -> None:
+    """run with no `-- <cmd>` => exit 2."""
+    run_hostjob(["run", "--label", "t_empty"], expect_rc=2)
+
+
+def test_unknown_label_exit1() -> None:
+    """poll/wait/clean on an unknown label => exit 1."""
+    run_hostjob(["poll", "nope_nope"], expect_rc=1)
+    run_hostjob(["wait", "nope_nope"], expect_rc=1)
+    run_hostjob(["clean", "--label", "nope_nope"], expect_rc=1)
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_run_true_then_wait_rc0,
+    test_poll_shows_done,
+    test_failing_command_rc1,
+    test_stdout_captured_to_log,
+    test_list_shows_job,
+    test_clean_label_removes_finished,
+    test_clean_refuses_running,
+    test_force_overrides_running,
+    test_run_empty_command_exit2,
+    test_unknown_label_exit1,
+]
+
+for t in TESTS:
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except AssertionError as e:
+        failures.append(f"{t.__name__}: {e}")
+        print(f"FAIL  {t.__name__}: {e}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")

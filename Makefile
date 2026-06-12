@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -202,6 +202,15 @@ test-cw:
 # without requiring uvx / mcp-proxy / cli-mcp-server. 11 cases, <1s.
 test-mcp-host-bash:
 	examples/compose/bin/tests/mcp-host-bash.test
+
+# Run the hostjob tests (examples/compose/bin/hostjob — the detached
+# host-job runner that lets an in-container agent launch host commands
+# past the 30s host-bash MCP cap, then poll/wait for them). Exercises the
+# real run/wait/poll/list/clean surface against a throwaway $HOME so no
+# operator state is touched. 10 cases, ~3s (a couple of cases sleep).
+test-hostjob:
+	examples/compose/bin/tests/hostjob.test
+
 
 # Tests for examples/compose/bin/mcp-proxy-auth-shim — the bearer-token
 # reverse proxy that fronts mcp-proxy. Spins up an in-process fake

@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""hostjob — run long host commands detached, then poll/wait for them.
+
+WHY THIS EXISTS
+---------------
+The host-bash MCP tool that claude-watch agents use to reach the host has a
+HARD 30-second command timeout, and its allowlist has NO `sleep`, `nohup`,
+`bash`, or `&`-backgrounding. So any host command that runs longer than 30s
+(`make container-build`, big rsyncs, docker builds) cannot be run directly —
+agents used to hand-roll a `subprocess.Popen(start_new_session=True)` detach
+hack plus manual logfile polling every single time. `hostjob` encapsulates
+that pattern once.
+
+`python3` IS on the host-bash allowlist, so invoke this as:
+
+    python3 ~/repos/andrew-sf-tools/hostjob run  --label <l> -- <cmd ...>
+    python3 ~/repos/andrew-sf-tools/hostjob wait  <l>            # block <=25s, re-invoke on exit 75
+    python3 ~/repos/andrew-sf-tools/hostjob poll  <l>            # one-shot status + log tail
+    python3 ~/repos/andrew-sf-tools/hostjob list
+    python3 ~/repos/andrew-sf-tools/hostjob clean --label <l> | --all
+
+Each invocation is ONE clean argv (host-bash forbids &&/|/;/redirection),
+returns well under the 30s cap, and the worker survives the launching call
+ending because it is detached via start_new_session.
+
+Pure stdlib; runs on the host's python3.
+"""
+
+import argparse
+import errno
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+STATE_ROOT = os.path.join(os.path.expanduser("~"), ".cache", "hostjob")
+
+
+# --------------------------------------------------------------------------
+# state helpers
+# --------------------------------------------------------------------------
+def job_dir(label):
+    return os.path.join(STATE_ROOT, label)
+
+
+def log_path(label):
+    return os.path.join(job_dir(label), "log")
+
+
+def status_path(label):
+    return os.path.join(job_dir(label), "status.json")
+
+
+def read_status(label):
+    """Return the status dict, or None if no such job."""
+    try:
+        with open(status_path(label), "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def write_status(label, data):
+    """Atomic write: tmp + rename, so a concurrent poll never sees half a file."""
+    d = job_dir(label)
+    os.makedirs(d, exist_ok=True)
+    tmp = status_path(label) + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, status_path(label))
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        if e.errno == errno.ESRCH:
+            return False
+        if e.errno == errno.EPERM:
+            return True  # exists, not ours — still "alive"
+        return False
+    return True
+
+
+def tail_lines(path, n):
+    """Efficiently read the last n lines of a (possibly huge) file."""
+    if n <= 0:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = 8192
+            data = b""
+            newlines = 0
+            pos = size
+            while pos > 0 and newlines <= n:
+                step = min(block, pos)
+                pos -= step
+                f.seek(pos)
+                chunk = f.read(step)
+                data = chunk + data
+                newlines += chunk.count(b"\n")
+            lines = data.splitlines()[-n:]
+            return b"\n".join(lines).decode("utf-8", "replace")
+    except FileNotFoundError:
+        return ""
+
+
+def elapsed_str(started_at, ended_at=None):
+    if not started_at:
+        return "?"
+    end = ended_at if ended_at else time.time()
+    secs = int(end - started_at)
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm%ds" % (secs // 60, secs % 60)
+    return "%dh%dm" % (secs // 3600, (secs % 3600) // 60)
+
+
+def reconcile(label):
+    """Read status; if marked running but pid is gone and no rc was recorded,
+    mark it crashed. Returns the (possibly updated) status dict or None."""
+    st = read_status(label)
+    if st is None:
+        return None
+    if st.get("status") == "running":
+        # The reaper child writes 'done' when the worker exits. If status is
+        # still 'running' but the worker pid is gone, the reaper died too =>
+        # crashed.
+        wpid = st.get("pid")
+        if wpid and not pid_alive(wpid):
+            st["status"] = "crashed"
+            st["rc"] = st.get("rc")
+            st["ended_at"] = st.get("ended_at") or time.time()
+            write_status(label, st)
+    return st
+
+
+# --------------------------------------------------------------------------
+# run
+# --------------------------------------------------------------------------
+def cmd_run(args):
+    label = args.label
+    cmd = args.cmd
+    if not cmd:
+        sys.stderr.write("hostjob run: empty command (need '-- <cmd> [args...]')\n")
+        return 2
+
+    existing = reconcile(label)
+    if existing and existing.get("status") == "running" and not args.force:
+        sys.stderr.write(
+            "hostjob run: label %r already RUNNING (pid=%s). "
+            "Use --force to override, or pick another label.\n"
+            % (label, existing.get("pid"))
+        )
+        return 1
+
+    d = job_dir(label)
+    os.makedirs(d, exist_ok=True)
+    lp = log_path(label)
+    sp = status_path(label)
+
+    cwd = os.path.abspath(os.path.expanduser(args.cwd)) if args.cwd else None
+
+    # Double-fork-style detach: we spawn a small reaper process (also detached
+    # via start_new_session) that launches the real worker, waits for it, and
+    # writes the final status (done rc=N). This way `status.json` flips to
+    # 'done' with the real rc even though the launching host-bash call has long
+    # since returned. The reaper is the session leader; the worker is its child.
+    reaper_src = _REAPER_TEMPLATE
+
+    # Initial status: running, pid filled in by the reaper once it knows the
+    # worker pid. We seed it so an immediate `poll` after `run` sees 'running'.
+    started = time.time()
+    write_status(
+        label,
+        {
+            "label": label,
+            "cmd": cmd,
+            "cwd": cwd,
+            "status": "running",
+            "rc": None,
+            "pid": None,
+            "reaper_pid": None,
+            "started_at": started,
+            "ended_at": None,
+        },
+    )
+
+    env = dict(os.environ)
+    # Pass everything the reaper needs via argv-free env to keep argv clean.
+    env["HOSTJOB_LABEL"] = label
+    env["HOSTJOB_STATUS"] = sp
+    env["HOSTJOB_LOG"] = lp
+    env["HOSTJOB_CWD"] = cwd or ""
+    env["HOSTJOB_STARTED"] = repr(started)
+    env["HOSTJOB_CMD_JSON"] = json.dumps(cmd)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", reaper_src],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+        close_fds=True,
+    )
+
+    # Record the reaper pid so a poll can detect a fully-dead job.
+    st = read_status(label) or {}
+    st["reaper_pid"] = proc.pid
+    write_status(label, st)
+
+    print("hostjob: launched label=%s reaper_pid=%d" % (label, proc.pid))
+    print("  cmd: %s" % " ".join(cmd))
+    if cwd:
+        print("  cwd: %s" % cwd)
+    print("  log: %s" % lp)
+    print("  poll: python3 %s wait %s" % (os.path.abspath(__file__), label))
+    return 0
+
+
+# The reaper runs detached. It launches the worker, waits, writes final status.
+_REAPER_TEMPLATE = r"""
+import json, os, subprocess, sys, time
+
+label = os.environ["HOSTJOB_LABEL"]
+sp = os.environ["HOSTJOB_STATUS"]
+lp = os.environ["HOSTJOB_LOG"]
+cwd = os.environ.get("HOSTJOB_CWD") or None
+started = float(os.environ["HOSTJOB_STARTED"])
+cmd = json.loads(os.environ["HOSTJOB_CMD_JSON"])
+
+def write_status(data):
+    tmp = sp + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2); f.write("\n")
+    os.replace(tmp, sp)
+
+rc = None
+worker_pid = None
+try:
+    logf = open(lp, "ab", buffering=0)
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=logf, stderr=subprocess.STDOUT, close_fds=True,
+    )
+    worker_pid = proc.pid
+    write_status({
+        "label": label, "cmd": cmd, "cwd": cwd, "status": "running",
+        "rc": None, "pid": worker_pid, "reaper_pid": os.getpid(),
+        "started_at": started, "ended_at": None,
+    })
+    rc = proc.wait()
+    status = "done"
+except Exception as e:
+    rc = 127
+    status = "crashed"
+    try:
+        with open(lp, "ab", buffering=0) as f:
+            f.write(("\n[hostjob reaper error] %r\n" % e).encode())
+    except Exception:
+        pass
+
+write_status({
+    "label": label, "cmd": cmd, "cwd": cwd, "status": status,
+    "rc": rc, "pid": worker_pid, "reaper_pid": os.getpid(),
+    "started_at": started, "ended_at": time.time(),
+})
+"""
+
+
+# --------------------------------------------------------------------------
+# poll
+# --------------------------------------------------------------------------
+def _print_status(label, st, tail_n):
+    state = st.get("status")
+    started = st.get("started_at")
+    ended = st.get("ended_at")
+    el = elapsed_str(started, ended)
+    if state == "running":
+        print("hostjob[%s]: running (elapsed %s, pid=%s)" % (label, el, st.get("pid")))
+    elif state == "done":
+        print("hostjob[%s]: done rc=%s (ran %s)" % (label, st.get("rc"), el))
+    elif state == "crashed":
+        print("hostjob[%s]: CRASHED rc=%s (ran %s) — worker died unexpectedly"
+              % (label, st.get("rc"), el))
+    else:
+        print("hostjob[%s]: %s" % (label, state))
+    print("  cmd: %s" % " ".join(st.get("cmd", [])))
+    print("  log: %s" % log_path(label))
+    if tail_n > 0:
+        body = tail_lines(log_path(label), tail_n)
+        print("  --- last %d log lines ---" % tail_n)
+        if body:
+            for line in body.splitlines():
+                print("  | " + line)
+        else:
+            print("  | (no log output yet)")
+
+
+def cmd_poll(args):
+    st = reconcile(args.label)
+    if st is None:
+        sys.stderr.write("hostjob poll: no such job %r\n" % args.label)
+        return 1
+    _print_status(args.label, st, args.tail)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# wait
+# --------------------------------------------------------------------------
+def cmd_wait(args):
+    label = args.label
+    st = reconcile(label)
+    if st is None:
+        sys.stderr.write("hostjob wait: no such job %r\n" % label)
+        return 1
+
+    deadline = time.time() + args.max_block
+    interval = 1.0
+    while True:
+        st = reconcile(label)
+        if st is None:
+            sys.stderr.write("hostjob wait: job %r vanished\n" % label)
+            return 1
+        if st.get("status") != "running":
+            _print_status(label, st, args.tail)
+            return 0
+        if time.time() >= deadline:
+            _print_status(label, st, args.tail)
+            print("hostjob[%s]: still-running — re-invoke `wait %s` to keep waiting"
+                  % (label, label))
+            return 75  # mirrors `workload babysit` EX_TEMPFAIL
+        time.sleep(min(interval, max(0.05, deadline - time.time())))
+
+
+# --------------------------------------------------------------------------
+# list / clean
+# --------------------------------------------------------------------------
+def cmd_list(args):
+    if not os.path.isdir(STATE_ROOT):
+        print("hostjob: no jobs (state dir %s does not exist)" % STATE_ROOT)
+        return 0
+    labels = sorted(
+        d for d in os.listdir(STATE_ROOT)
+        if os.path.isdir(os.path.join(STATE_ROOT, d))
+    )
+    if not labels:
+        print("hostjob: no jobs")
+        return 0
+    for label in labels:
+        st = reconcile(label)
+        if st is None:
+            continue
+        state = st.get("status")
+        el = elapsed_str(st.get("started_at"), st.get("ended_at"))
+        if state == "done":
+            tag = "done rc=%s" % st.get("rc")
+        elif state == "crashed":
+            tag = "CRASHED rc=%s" % st.get("rc")
+        else:
+            tag = state
+        print("%-24s %-16s %-8s  %s" % (label, tag, el, " ".join(st.get("cmd", []))))
+    return 0
+
+
+def _rmtree(path):
+    for root, dirs, files in os.walk(path, topdown=False):
+        for f in files:
+            try:
+                os.remove(os.path.join(root, f))
+            except OSError:
+                pass
+        for d in dirs:
+            try:
+                os.rmdir(os.path.join(root, d))
+            except OSError:
+                pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
+def cmd_clean(args):
+    if not args.all and not args.label:
+        sys.stderr.write("hostjob clean: need --label <l> or --all\n")
+        return 2
+    if not os.path.isdir(STATE_ROOT):
+        print("hostjob: nothing to clean")
+        return 0
+
+    if args.label:
+        st = reconcile(args.label)
+        if st is None:
+            sys.stderr.write("hostjob clean: no such job %r\n" % args.label)
+            return 1
+        if st.get("status") == "running":
+            sys.stderr.write("hostjob clean: %r is still RUNNING; refusing\n" % args.label)
+            return 1
+        _rmtree(job_dir(args.label))
+        print("hostjob: cleaned %s" % args.label)
+        return 0
+
+    # --all: only finished jobs
+    cleaned = []
+    skipped = []
+    for label in sorted(os.listdir(STATE_ROOT)):
+        d = os.path.join(STATE_ROOT, label)
+        if not os.path.isdir(d):
+            continue
+        st = reconcile(label)
+        if st and st.get("status") == "running":
+            skipped.append(label)
+            continue
+        _rmtree(d)
+        cleaned.append(label)
+    print("hostjob: cleaned %d job(s)%s"
+          % (len(cleaned), (" — skipped running: %s" % ", ".join(skipped)) if skipped else ""))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# argparse
+# --------------------------------------------------------------------------
+def main(argv):
+    p = argparse.ArgumentParser(
+        prog="hostjob",
+        description="Run long host commands detached; poll/wait for them. "
+                    "Built for the 30s host-bash MCP cap.",
+    )
+    sub = p.add_subparsers(dest="subcmd")
+
+    pr = sub.add_parser("run", help="launch a detached host worker")
+    pr.add_argument("--label", required=True)
+    pr.add_argument("--cwd", default=None)
+    pr.add_argument("--force", action="store_true",
+                    help="override an existing RUNNING job with this label")
+    pr.add_argument("cmd", nargs=argparse.REMAINDER,
+                    help="-- <cmd> [args...] (everything after -- is the command)")
+    pr.set_defaults(func=cmd_run)
+
+    pp = sub.add_parser("poll", help="one-shot status + log tail")
+    pp.add_argument("label")
+    pp.add_argument("--tail", type=int, default=40)
+    pp.set_defaults(func=cmd_poll)
+
+    pw = sub.add_parser("wait", help="block <=max-block then exit (75 if still running)")
+    pw.add_argument("label")
+    pw.add_argument("--max-block", type=int, default=25)
+    pw.add_argument("--tail", type=int, default=40)
+    pw.set_defaults(func=cmd_wait)
+
+    pl = sub.add_parser("list", help="show all known jobs")
+    pl.set_defaults(func=cmd_list)
+
+    pc = sub.add_parser("clean", help="remove finished job state")
+    pc.add_argument("--label", default=None)
+    pc.add_argument("--all", action="store_true")
+    pc.set_defaults(func=cmd_clean)
+
+    args = p.parse_args(argv)
+    if not getattr(args, "subcmd", None):
+        p.print_help()
+        return 2
+
+    # Strip a leading '--' that argparse.REMAINDER keeps for `run`.
+    if args.subcmd == "run" and args.cmd and args.cmd[0] == "--":
+        args.cmd = args.cmd[1:]
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
