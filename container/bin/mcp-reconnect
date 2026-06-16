@@ -36,9 +36,17 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     exit 1
 fi
 
-# Send /mcp to the pane
+# Send /mcp to the pane via the centralized inject path. The tmux
+# send-keys / submit choreography lives in ONE place — `claude-watch inject`
+# (src/tmux.rs) — instead of being hand-rolled here. `/mcp` is a slash
+# command, so we pass --slash-command: slash commands submit with a bare
+# Enter from INSERT mode (the Tab→Escape→Enter regular-text sequence does
+# NOT submit a slash command — the documented self-clear `/clear` bug). The
+# old hand-rolled `tmux send-keys '/mcp' Enter` also assumed the pane was
+# already at a clean prompt; the centralized path additionally coerces
+# Escape→NORMAL and clears the input line first.
 printf '[mcp-reconnect] sending /mcp to pane %s\n' "$PANE" >&2
-tmux send-keys -t "$PANE" '/mcp' Enter
+claude-watch inject --pane "$PANE" --submit '/mcp' --slash-command
 
 # Wait for reconnection
 sleep "$TIMEOUT"
