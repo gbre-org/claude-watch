@@ -119,15 +119,20 @@ def capture_pane_text(pane):
         return "(capture error)"
 
 
-def run(cmd):
+def run(cmd, timeout=10):
     """Run a subprocess with timeout. Returns (stdout, returncode).
 
     Never raises — returns ('', -1) on any error. This is critical
     because callers (is_idle, wait_for_idle) loop without try/except,
     and an uncaught exception would silently kill the forked child.
+
+    The default 10s timeout suits the quick tmux capture / claude-watch
+    status calls. The `claude-watch inject` call needs longer (its full
+    Escape→type→submit→verify choreography can run ~11s worst case), so
+    `inject()` passes an explicit larger timeout.
     """
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip(), r.returncode
     except Exception:
         return "", -1
@@ -292,250 +297,58 @@ def interrupt_and_wait(pane, timeout=60, poll_interval=0.5):
     return False
 
 
-def wait_for_condition(pane, check_fn, description, timeout=3, poll=0.2):
-    """Poll tmux pane until check_fn(pane_text) returns True.
-
-    Returns (True, pane_text) on success, (False, last_pane_text) on timeout.
-    """
-    deadline = time.time() + timeout
-    last_text = ""
-    while time.time() < deadline:
-        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
-        last_text = out.strip() if rc == 0 and out else ""
-        if check_fn(last_text):
-            return True, last_text
-        time.sleep(poll)
-    return False, last_text
-
-
-def pane_is_stable(pane, settle=0.3):
-    """Verify pane content is stable (two captures match)."""
-    out1, rc1 = run(["tmux", "capture-pane", "-t", pane, "-p"])
-    time.sleep(settle)
-    out2, rc2 = run(["tmux", "capture-pane", "-t", pane, "-p"])
-    if rc1 != 0 or rc2 != 0:
-        return False
-    return out1 == out2
-
-
-def get_prompt_line_text(pane_text):
-    """Extract text after the ❯ prompt character on the prompt line.
-
-    Returns the text after ❯ (stripped), or None if no prompt found.
-    """
-    for line in reversed(pane_text.split("\n")):
-        if "❯" in line:
-            idx = line.index("❯")
-            return line[idx + 1:].strip()
-    return None
-
-
-def is_insert_mode(pane_text):
-    """Check if Claude Code is in INSERT mode (vim keybindings)."""
-    return "-- INSERT" in pane_text
-
-
 def inject(pane, text, label="inject", slash_command=False):
     """Inject text into Claude Code and submit (vim mode).
 
-    Key constraints:
-    - Ctrl-C: triggers interrupt handler. Never use.
-    - Escape x2+: triggers exit confirmation. Only use ONE.
-    - S: re-triggers autocomplete. Use dd instead.
+    Delegates the actual tmux send-keys / submit choreography to the
+    CENTRALIZED `claude-watch inject` subcommand (src/tmux.rs) so this
+    script no longer carries its own copy of the Escape→NORMAL / dd /
+    `i` INSERT verify-and-retry / type / submit logic. There used to be
+    FOUR drifted copies of that sequence across the codebase (this
+    script, cw-watcher-health-check, mcp-reconnect, and src/tmux.rs);
+    one of them (cw-watcher-health-check) had regressed into typing the
+    alert text WITHOUT submitting it. Centralizing into `claude-watch
+    inject` retires the drift: the Rust path carries the proven keystroke
+    order AND verifies the submission landed (payload cleared from the
+    prompt line), exiting non-zero if it didn't.
 
-    Each step verifies tmux pane state before proceeding, replacing
-    blind sleeps with polled verification. This prevents mistimed
-    keystrokes when Escape doesn't land (autocomplete ghost text, etc.).
+    `claude-watch inject` reproduces BOTH branches this function used to
+    implement:
+      - regular text  -> Tab→Escape→Enter submit (the default).
+      - slash command  -> `--slash-command`: bare Enter from INSERT mode
+        (the Tab+Escape sequence does NOT submit a slash command, because
+        Escape goes INSERT→NORMAL and Enter in NORMAL mode doesn't submit
+        — the 2026-03-01 `/clear`-sent-as-text bug).
 
-    For slash commands (slash_command=True), uses a simpler submission
-    sequence: just Enter after typing. The Tab+Escape sequence used for
-    regular text breaks slash commands because Escape goes INSERT→NORMAL
-    in vim mode, and Enter in NORMAL mode doesn't submit.
+    NOTE: only the per-keystroke type-and-submit step is centralized. The
+    HIGHER-LEVEL self-clear flow that wraps this call — interrupt_and_wait,
+    the /clear retry loop, post-/clear token polling for completion, and
+    feedback-prompt dismissal — stays here in child_main(), unchanged. That
+    flow is /clear-specific orchestration, not a plain submit, so it is NOT
+    something `claude-watch inject` should own.
     """
     log(f"  [{label}] pane before: {capture_pane_text(pane)}")
 
-    # Step 1: Escape — INSERT→NORMAL, dismisses autocomplete
-    # When autocomplete is active, first Escape dismisses the dropdown
-    # but stays in INSERT mode. Need a second Escape to reach NORMAL.
-    # Verify by checking that "-- INSERT" disappears from the pane.
-    for esc_attempt in range(1, 4):
-        run(["tmux", "send-keys", "-t", pane, "Escape"])
-
-        ok, snap = wait_for_condition(
-            pane,
-            lambda t: not is_insert_mode(t) and pane_is_stable(pane),
-            "NORMAL mode after Escape",
-            timeout=2, poll=0.3,
-        )
-        if ok:
-            log(f"  [{label}] Escape: NORMAL mode confirmed (attempt {esc_attempt})")
-            break
-        still_insert = is_insert_mode(snap)
-        log(f"  [{label}] Escape attempt {esc_attempt}: stable={not still_insert}, insert={still_insert}")
-        if not still_insert:
-            break
-    else:
-        log(f"  [{label}] WARNING: still in INSERT mode after 3 Escapes, continuing anyway")
-
-    # Step 2: dd — delete entire line in NORMAL mode
-    # Verify: prompt line has no text after ❯
-    run(["tmux", "send-keys", "-t", pane, "d"])
-    time.sleep(0.1)
-    run(["tmux", "send-keys", "-t", pane, "d"])
-
-    ok, snap = wait_for_condition(
-        pane,
-        lambda t: get_prompt_line_text(t) is not None and get_prompt_line_text(t) == "",
-        "prompt line empty after dd",
-        timeout=2, poll=0.2,
-    )
-    log(f"  [{label}] dd: line_empty={ok}, prompt_text={get_prompt_line_text(snap)!r}")
-    if not ok:
-        # dd may not have landed — retry once
-        log(f"  [{label}] dd retry")
-        run(["tmux", "send-keys", "-t", pane, "d"])
-        time.sleep(0.1)
-        run(["tmux", "send-keys", "-t", pane, "d"])
-        ok2, snap = wait_for_condition(
-            pane,
-            lambda t: get_prompt_line_text(t) is not None and get_prompt_line_text(t) == "",
-            "prompt line empty after dd retry",
-            timeout=2, poll=0.2,
-        )
-        log(f"  [{label}] dd retry: line_empty={ok2}")
-
-    # Step 3: i — enter INSERT mode on empty line
-    # Autocomplete/ghost text can trigger immediately on INSERT entry.
-    # If pane is unstable after 'i', dismiss autocomplete with Escape
-    # and re-enter INSERT. This prevents autocomplete from capturing
-    # the typed text (especially '/' triggering slash-command dropdown).
-    for i_attempt in range(1, 4):
-        run(["tmux", "send-keys", "-t", pane, "i"])
-
-        ok, snap = wait_for_condition(
-            pane,
-            lambda _: pane_is_stable(pane, settle=0.3),
-            "pane stable after i",
-            timeout=2, poll=0.3,
-        )
-        log(f"  [{label}] i attempt {i_attempt}: stable={ok}")
-
-        if ok:
-            break
-
-        # Unstable = autocomplete/ghost text active. Dismiss with Escape
-        # (goes back to NORMAL), wait for settle, then retry 'i'.
-        log(f"  [{label}] dismissing autocomplete (Escape back to NORMAL)")
-        run(["tmux", "send-keys", "-t", pane, "Escape"])
-        wait_for_condition(
-            pane,
-            lambda t: not is_insert_mode(t) and pane_is_stable(pane, settle=0.3),
-            "NORMAL after autocomplete dismiss",
-            timeout=2, poll=0.3,
-        )
-        time.sleep(0.3)  # Extra settle before retrying
-    else:
-        log(f"  [{label}] WARNING: pane still unstable after 3 i attempts, continuing")
-
-    # Step 4: Type the text literally
-    # Verify: the text appears on the prompt line
-    run(["tmux", "send-keys", "-t", pane, "-l", text])
-
-    # For verification, check that at least the first 10 chars appear
-    # (full text may wrap or get truncated by tmux column width)
-    check_prefix = text[:10]
-    ok, snap = wait_for_condition(
-        pane,
-        lambda t: check_prefix in t,
-        f"text '{check_prefix}...' visible",
-        timeout=3, poll=0.3,
-    )
-    log(f"  [{label}] text: visible={ok}")
-    if not ok:
-        log(f"  [{label}] WARNING: typed text not visible in pane, continuing anyway")
-        log(f"  [{label}] pane snapshot: {' | '.join(snap.split(chr(10))[-5:])}")
-
-    # Step 5: Submit
+    cmd = ["claude-watch", "inject", "--pane", pane, "--submit", text]
     if slash_command:
-        # Slash commands: just Enter. We're in INSERT mode after typing,
-        # so Enter submits directly. The autocomplete dropdown showing
-        # command suggestions is harmless — Enter submits the input as
-        # a slash command.
-        #
-        # DO NOT use Tab+Escape here. Escape goes INSERT→NORMAL in vim
-        # mode, and then Enter doesn't submit. This was the bug that
-        # caused /clear to be sent as regular text 3 times in a row
-        # (2026-03-01 session, all 3 attempts failed, tokens increased
-        # instead of dropping).
+        cmd.append("--slash-command")
 
-        # Pre-submit verification: check that the prompt line contains
-        # our text and not something mangled by autocomplete.
-        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
-        if rc == 0 and out:
-            prompt_text = get_prompt_line_text(out.strip())
-            log(f"  [{label}] pre-submit prompt: {prompt_text!r}")
-            if prompt_text and text not in prompt_text:
-                log(f"  [{label}] WARNING: prompt doesn't contain '{text}', "
-                    f"got '{prompt_text}'. Clearing and retyping.")
-                # Clear the garbled input and retype
-                run(["tmux", "send-keys", "-t", pane, "Escape"])
-                time.sleep(0.3)
-                run(["tmux", "send-keys", "-t", pane, "d"])
-                time.sleep(0.1)
-                run(["tmux", "send-keys", "-t", pane, "d"])
-                time.sleep(0.3)
-                run(["tmux", "send-keys", "-t", pane, "i"])
-                time.sleep(0.5)  # Longer settle for retry
-                run(["tmux", "send-keys", "-t", pane, "-l", text])
-                time.sleep(0.3)
-
-        run(["tmux", "send-keys", "-t", pane, "Enter"])
-
-        # Verify: the typed text disappears from the prompt line
-        # (submission clears the input)
-        ok, snap = wait_for_condition(
-            pane,
-            lambda t: check_prefix not in t,
-            "text cleared after Enter",
-            timeout=3, poll=0.3,
-        )
-        log(f"  [{label}] submitted (Enter, slash_command=True): cleared={ok}")
+    # Generous timeout: the full Escape→type→submit→verify choreography can
+    # take ~11s worst case (Escape loop + INSERT retries + 3s verify window),
+    # which would trip run()'s default 10s timeout.
+    out, rc = run(cmd, timeout=30)
+    # rc == 0  -> typed (no-submit, n/a here) OR submission verified.
+    # rc == 3  -> submit keystrokes sent but payload still on the prompt
+    #             line after the verify window (submission likely did not
+    #             land). rc == -1 -> subprocess error/timeout (see run()).
+    if rc == 0:
+        log(f"  [{label}] submitted (claude-watch inject, slash_command={slash_command}): verified")
+    elif rc == 3:
+        log(f"  [{label}] WARNING: claude-watch inject reports submit NOT verified "
+            f"(payload still on prompt line). pane: {capture_pane_text(pane)}")
     else:
-        # Regular text (resume prompt, etc.): Tab to accept autocomplete,
-        # then Escape to dismiss ghost text that re-triggers after Tab,
-        # then Enter to submit.
-        run(["tmux", "send-keys", "-t", pane, "Tab"])
-
-        # Verify Tab landed: pane should stabilize
-        ok, snap = wait_for_condition(
-            pane,
-            lambda _: pane_is_stable(pane),
-            "stable after Tab",
-            timeout=2, poll=0.3,
-        )
-        log(f"  [{label}] Tab: stable={ok}")
-
-        # Escape: dismiss any ghost text / re-triggered autocomplete
-        run(["tmux", "send-keys", "-t", pane, "Escape"])
-
-        ok, snap = wait_for_condition(
-            pane,
-            lambda _: pane_is_stable(pane),
-            "stable after Escape (dismiss ghost)",
-            timeout=2, poll=0.3,
-        )
-        log(f"  [{label}] Escape (dismiss ghost): stable={ok}")
-
-        # Enter: submit from NORMAL mode (always submits current line)
-        run(["tmux", "send-keys", "-t", pane, "Enter"])
-
-        ok, snap = wait_for_condition(
-            pane,
-            lambda t: check_prefix not in t,
-            "text cleared after Enter",
-            timeout=3, poll=0.3,
-        )
-        log(f"  [{label}] submitted (Tab+Escape+Enter): cleared={ok}")
+        log(f"  [{label}] WARNING: claude-watch inject failed (rc={rc}). "
+            f"out={out!r} pane: {capture_pane_text(pane)}")
 
 
 def child_main(pane, args):
