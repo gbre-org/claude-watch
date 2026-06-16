@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# cw-cron-run — flag-file guard / exec-wrapper for baked cron.d entries.
+#
+# WHY THIS EXISTS (2026-06-16 incident):
+#   The baked cron entries in /etc/cron.d/cw-default (root-owned 0644)
+#   cannot be edited or disabled from inside the container without an
+#   interactive `sudo` — which on a macOS host triggers a Touch ID /
+#   fingerprint prompt on EVERY invocation, making it prohibitive to
+#   silence a misbehaving cron job (e.g. the cw-watcher-health-check
+#   entry injecting a [CLAUDE-WATCH] alert into the tmux pane every
+#   minute). There was no lever to disable a single baked entry without
+#   root.
+#
+# THE MECHANISM:
+#   Every cw-default cron command is PREFIXED with this wrapper plus a
+#   stable job-name. On each tick the wrapper checks for a flag file
+#   named after the job under the DISABLE_DIR. If the flag exists, the
+#   wrapper exits 0 WITHOUT running the real command (silent skip — exit
+#   0 so cron logs no failure). Otherwise it `exec`s the real command,
+#   adding no extra process and preserving the command's exit code and
+#   signal behavior.
+#
+#   The flag dir lives under /var/lib/claude-watch, which is
+#   uid-1000-owned (0755) and backed by the `claude-watch-state` named
+#   volume — so toggling a job needs NO sudo, and the disabled state
+#   PERSISTS across container redeploys.
+#
+# OPERATOR INTERFACE:
+#   Use `cw-cron-toggle list|disable <name>|enable <name>` to flip the
+#   flag files. See docs/cron-toggle.md.
+#
+# USAGE (as a cron command prefix):
+#   cw-cron-run <job-name> <command> [args...]
+#
+# ENVIRONMENT:
+#   CW_CRON_DISABLED_DIR — flag dir (default /var/lib/claude-watch/cron-disabled)
+
+set -euo pipefail
+
+DISABLE_DIR="${CW_CRON_DISABLED_DIR:-/var/lib/claude-watch/cron-disabled}"
+
+if [ "$#" -lt 2 ]; then
+    echo "cw-cron-run: usage: cw-cron-run <job-name> <command> [args...]" >&2
+    exit 2
+fi
+
+JOB="$1"
+shift
+
+if [ -e "${DISABLE_DIR}/${JOB}" ]; then
+    # Job disabled via flag file — skip silently. Exit 0 so cron does
+    # not log a failure. A single diagnostic line to stderr only (cron
+    # routes it to the per-job log, not the console).
+    echo "cw-cron-run: job '${JOB}' disabled (flag ${DISABLE_DIR}/${JOB}); skipping" >&2
+    exit 0
+fi
+
+exec "$@"
