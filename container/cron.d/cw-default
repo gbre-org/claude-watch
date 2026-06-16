@@ -26,16 +26,24 @@
 #   - stderr from claude-watch goes to /tmp/claude-watch-cron-*.log
 #     so operators can inspect failures via
 #     `docker compose exec <c> cat /tmp/claude-watch-cron-*.log`.
+#
+# DISABLING AN ENTRY (no sudo): each command below runs through the
+#   `cw-cron-run <job-name> ...` guard. To stop/resume a job without
+#   root, flip its flag file via `cw-cron-toggle disable|enable <name>`
+#   (job-names: active-agents, metrics, stale-ready-check, queue-check,
+#   watcher-health-check). Flags live under the uid-1000-writable,
+#   named-volume-persistent /var/lib/claude-watch/cron-disabled. Takes
+#   effect next tick; persists across redeploys. See docs/cron-toggle.md.
 
 # Publish active-agents JSON state file (queue_id + alive per subagent)
 # every minute. Consumers: work-queue-exporter (Prom has_live_owner
 # gauge), queue-minisite (owner-status column), cron-queue-check.
-* * * * *   hndrewaall /usr/local/bin/claude-watch active-agents --json --write-state /var/lib/claude-watch/active-agents.json > /dev/null 2>>/tmp/claude-watch-cron-active-agents.log
+* * * * *   hndrewaall /usr/local/bin/cw-cron-run active-agents /usr/local/bin/claude-watch active-agents --json --write-state /var/lib/claude-watch/active-agents.json > /dev/null 2>>/tmp/claude-watch-cron-active-agents.log
 
 # Emit Prometheus-style metrics every minute. logger writes to syslog
 # (or stderr inside the container — cron's -L 15 flag routes stderr to
 # the supervisor log).
-* * * * *   hndrewaall /usr/local/bin/claude-watch metrics > /tmp/claude-watch-cron-metrics.log 2>&1
+* * * * *   hndrewaall /usr/local/bin/cw-cron-run metrics /usr/local/bin/claude-watch metrics > /tmp/claude-watch-cron-metrics.log 2>&1
 
 # Stale-ready queue-item watchdog. Every 5 minutes, scan
 # `session-task queue ready --json` for pending items that have been
@@ -44,7 +52,7 @@
 # queue id (ledger at /var/lib/claude-watch/stale-ready-state.json), so
 # a long-stuck item only triggers once until it leaves the queue.
 # Silent exit when nothing qualifies — no console spam.
-*/5 * * * *  hndrewaall /usr/local/bin/claude-watch stale-ready-check > /tmp/claude-watch-cron-stale-ready.log 2>&1
+*/5 * * * *  hndrewaall /usr/local/bin/cw-cron-run stale-ready-check /usr/local/bin/claude-watch stale-ready-check > /tmp/claude-watch-cron-stale-ready.log 2>&1
 
 # Stuck / orphaned queue-item watchdog. Every 5 minutes, scan
 # `session-task queue list --all --json` for ORPHANED items (running with a
@@ -56,7 +64,7 @@
 # `[queue_check] emit_events` in config.toml (DEFAULT FALSE) — this entry
 # runs the detector every tick but stays silent until the toggle is flipped
 # on (detection-only runs just log "emit_events is OFF" and exit 0).
-*/5 * * * *  hndrewaall /usr/local/bin/claude-watch queue-check > /tmp/claude-watch-cron-queue-check.log 2>&1
+*/5 * * * *  hndrewaall /usr/local/bin/cw-cron-run queue-check /usr/local/bin/claude-watch queue-check > /tmp/claude-watch-cron-queue-check.log 2>&1
 
 # Event-watcher health check. Every minute, look for .json event
 # files in the queue dir that have been sitting unconsumed for >2 min.
@@ -64,4 +72,4 @@
 # clear, etc). Injects a [CLAUDE-WATCH] alert directly into the tmux
 # pane via send-keys — bypasses the event system entirely (which is the
 # whole point: if events are accumulating, the event path is broken).
-* * * * *  hndrewaall /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log
+* * * * *  hndrewaall /usr/local/bin/cw-cron-run watcher-health-check /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log

@@ -119,6 +119,9 @@ jobs:
       - name: Run claude-tmux env passthrough + fail-loud warning tests
         run: make test-claude-tmux-env
 
+      - name: Run cron-toggle (cw-cron-run + cw-cron-toggle) tests
+        run: make test-cron-toggle
+
       - name: Run exec-hook shim tests
         run: make test-hooks-shim
 
