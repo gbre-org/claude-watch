@@ -237,6 +237,51 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Type text into a Claude Code (vim-mode) tmux pane and submit it,
+    /// verifying the submission actually landed.
+    ///
+    /// This is the ONE centralized tmux send-keys / submit choreography.
+    /// Shell tooling (cw-watcher-health-check, mcp-reconnect, self-clear)
+    /// MUST shell out to this subcommand instead of hand-rolling
+    /// `tmux send-keys` sequences — drifted copies of that logic (one of
+    /// which injected alert text WITHOUT submitting it) are the bug this
+    /// subcommand exists to retire. The keystroke sequence is the proven
+    /// `src/tmux.rs` path: Escape→NORMAL coercion, dd line-clear, `i`
+    /// INSERT verify-and-retry, literal type, then Tab→Escape→Enter to
+    /// submit (or a bare Enter for `--slash-command`).
+    ///
+    /// Verification: a landed submit CLEARS the payload from the prompt
+    /// line. If the payload is still on the input line after the verify
+    /// window, the submit did NOT land and the command exits non-zero
+    /// (exit 3) so callers can detect a stuck inject. `--no-submit` types
+    /// without submitting and always exits 0.
+    Inject {
+        /// Text to type (and, unless --no-submit, submit).
+        #[arg(long, value_name = "TEXT")]
+        submit: String,
+
+        /// Target tmux pane (e.g. `claude-container:0.0`). Defaults to
+        /// $CW_WATCHER_HEALTH_PANE, then $CLAUDE_WATCH_PANE, then the
+        /// `[tmux] dashboard_pane` config value, then auto-detection via
+        /// the claude-pane scan, then `claude-container:0.0`.
+        #[arg(long, value_name = "PANE")]
+        pane: Option<String>,
+
+        /// Type the text but do NOT submit it (no Tab/Escape/Enter). Always
+        /// exits 0 — there is no submission to verify.
+        #[arg(long)]
+        no_submit: bool,
+
+        /// Submit as a slash command: bare Enter from INSERT mode instead of
+        /// the Tab→Escape→Enter regular-text sequence. Slash commands do NOT
+        /// submit via Escape→NORMAL→Enter (documented self-clear `/clear` bug).
+        #[arg(long)]
+        slash_command: bool,
+
+        /// Emit machine-readable JSON outcome on stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1447,6 +1492,76 @@ fn multicall_rewrite_args() -> Vec<String> {
 }
 
 #[tokio::main]
+/// Resolve the target pane for `claude-watch inject`, in precedence order:
+/// explicit `--pane` flag > $CW_WATCHER_HEALTH_PANE > $CLAUDE_WATCH_PANE >
+/// `[tmux] dashboard_pane` config (when non-empty) > auto-detection via the
+/// claude-pane scan > the `claude-container:0.0` fallback the shell callers
+/// historically defaulted to.
+async fn resolve_inject_pane(flag: Option<&str>) -> String {
+    if let Some(p) = flag {
+        if !p.is_empty() {
+            return p.to_string();
+        }
+    }
+    for var in ["CW_WATCHER_HEALTH_PANE", "CLAUDE_WATCH_PANE"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    if let Ok(cfg) = config::try_load_config() {
+        if !cfg.tmux.dashboard_pane.is_empty() {
+            return cfg.tmux.dashboard_pane.clone();
+        }
+    }
+    if let Some(p) = status::find_claude_pane().await {
+        return p;
+    }
+    "claude-container:0.0".to_string()
+}
+
+/// Handler for `claude-watch inject`. Returns a process exit code:
+///   0 = typed (no-submit) OR submission verified
+///   3 = submit keystrokes sent but the payload was still on the prompt line
+///       after the verify window (submission likely did NOT land)
+async fn run_inject(
+    text: &str,
+    pane_flag: Option<&str>,
+    no_submit: bool,
+    slash_command: bool,
+    json: bool,
+) -> i32 {
+    let pane = resolve_inject_pane(pane_flag).await;
+    let submit = !no_submit;
+    let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command).await;
+
+    let (code, status) = match outcome {
+        tmux::InjectOutcome::Typed => (0, "typed"),
+        tmux::InjectOutcome::Submitted => (0, "submitted"),
+        tmux::InjectOutcome::SubmitUnverified => (3, "submit_unverified"),
+    };
+
+    if json {
+        println!(
+            "{{\"pane\":{},\"status\":\"{}\",\"submitted\":{},\"slash_command\":{}}}",
+            serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
+            status,
+            submit,
+            slash_command
+        );
+    } else if code == 0 {
+        eprintln!("[claude-watch inject] {} on pane {}", status, pane);
+    } else {
+        eprintln!(
+            "[claude-watch inject] WARNING: submit may not have landed (payload still on prompt line) on pane {}",
+            pane
+        );
+    }
+
+    code
+}
+
 async fn main() {
     // Restore default SIGPIPE handling so piping to `head` etc. exits
     // cleanly instead of panicking on println! with a broken pipe.
@@ -1558,6 +1673,18 @@ async fn main() {
         }
         Some(Commands::InjectProbe { pid, text, json }) => {
             let code = inject_probe::cmd_inject_probe(pid, &text, json);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::Inject {
+            submit,
+            pane,
+            no_submit,
+            slash_command,
+            json,
+        }) => {
+            let code = run_inject(&submit, pane.as_deref(), no_submit, slash_command, json).await;
             if code != 0 {
                 std::process::exit(code);
             }
