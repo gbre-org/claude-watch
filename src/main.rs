@@ -1491,7 +1491,6 @@ fn multicall_rewrite_args() -> Vec<String> {
     }
 }
 
-#[tokio::main]
 /// Resolve the target pane for `claude-watch inject`, in precedence order:
 /// explicit `--pane` flag > $CW_WATCHER_HEALTH_PANE > $CLAUDE_WATCH_PANE >
 /// `[tmux] dashboard_pane` config (when non-empty) > auto-detection via the
@@ -1562,6 +1561,7 @@ async fn run_inject(
     code
 }
 
+#[tokio::main]
 async fn main() {
     // Restore default SIGPIPE handling so piping to `head` etc. exits
     // cleanly instead of panicking on println! with a broken pipe.
