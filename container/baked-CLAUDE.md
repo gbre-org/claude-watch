@@ -328,6 +328,16 @@ with the host** — `repo:claude-watch` covers BOTH host- and
 container-side work on that repo. An agent that skips the queue can
 race host-side work, lose edits to a parallel agent, or stomp builds.
 
+**Scope: this governs every `Agent` call the MAIN LOOP dispatches —
+one queue item per main-loop-spawned agent, the queue being the main
+loop's audit trail of work IT dispatched.** It does NOT separately
+enqueue *nested* subagents (agents an agent spawns under itself, or
+sub-work an agent runs internally) — those are not individually
+queue-tracked by the main loop. (The `subagent_queue_item_running`
+predicate below is the related-but-distinct case: it keeps a RUNNING
+subagent's already-bound q-id valid — that q-id is the one the main
+loop enqueued at spawn, not a fresh per-nested-agent item.)
+
 **The `pre-agent-queue-gate-hook` PreToolUse hook IS active inside
 this container** when `CLAUDE_CONTAINER_OBLIGATIONS=1` (the default).
 Baked at `/usr/local/bin/pre-agent-queue-gate-hook` and wired into
