@@ -47,6 +47,11 @@ pub struct Config {
     /// Default ON with 60s / 900s intervals. See `CadenceConfig`.
     #[serde(default)]
     pub cadence: CadenceConfig,
+    /// Detect malformed (non-namespaced) tool-call blocks rendered as plain
+    /// assistant text and inject a short corrective nudge. Default ON with
+    /// conservative defaults. See `MalformedToolCallConfig`.
+    #[serde(default)]
+    pub malformed_tool_call: MalformedToolCallConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -630,6 +635,74 @@ fn default_wedged_cooldown() -> u64 {
 
 fn default_threshold_percent() -> u64 {
     75
+}
+
+/// Detection + corrective-nudge tuning for the malformed-tool-call guardrail.
+///
+/// Incident (2026-06-17): the managed Claude Code session repeatedly emitted
+/// MALFORMED tool calls — a stray literal text prefix followed by raw,
+/// NON-namespaced `<invoke ...>` / `<parameter ...>` tags instead of a
+/// well-formed namespaced tool call. The harness did not execute the call;
+/// it rendered as plain assistant text, so the INTENDED action (almost always
+/// a `watcher-ctl run claude-event-watch`, a `signal-send`, or a heartbeat
+/// `touch`) silently never ran. Sustained, this stranded one-shot watchers
+/// DOWN, drove the heartbeat stale, and produced hours of
+/// failure / heartbeat-stale / watcher-down alert storms.
+///
+/// Recovery here is deliberately the LIGHTEST possible: when the malformed
+/// signature is observed for `consecutive` cycles in a row, claude-watch
+/// tmux-injects a single short corrective sentence telling the loop to re-emit
+/// the LAST action as a well-formed tool call (no stray prefix) and to verify
+/// each watcher actually came up. No /clear, no restart — the model is not
+/// wedged, it just produced unparseable output and needs to retry cleanly.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MalformedToolCallConfig {
+    /// Master switch. Default true (opt-out).
+    #[serde(default = "default_malformed_enabled")]
+    pub enabled: bool,
+    /// Number of consecutive check cycles the malformed signature must be
+    /// observed before injecting the corrective nudge. Conservative default
+    /// of 2 (at a 10s general interval, ~20s of sustained malformation) so a
+    /// single transient render — or a one-off pane that merely quotes the
+    /// tag strings — does not trip it.
+    #[serde(default = "default_malformed_consecutive")]
+    pub consecutive: u32,
+    /// Cooldown in seconds between malformed-tool-call corrective nudges.
+    /// Prevents spamming the pane if the model keeps malforming across the
+    /// next few turns while it recovers. Default 180s (3 min).
+    #[serde(default = "default_malformed_cooldown")]
+    pub cooldown: u64,
+    /// The corrective text injected into the pane. Single-line by design (the
+    /// inject_text vim-mode pipeline expects one literal send_keys -l call).
+    #[serde(default = "default_malformed_nudge")]
+    pub nudge: String,
+}
+
+impl Default for MalformedToolCallConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_malformed_enabled(),
+            consecutive: default_malformed_consecutive(),
+            cooldown: default_malformed_cooldown(),
+            nudge: default_malformed_nudge(),
+        }
+    }
+}
+
+fn default_malformed_enabled() -> bool {
+    true
+}
+
+fn default_malformed_consecutive() -> u32 {
+    2
+}
+
+fn default_malformed_cooldown() -> u64 {
+    180
+}
+
+fn default_malformed_nudge() -> String {
+    "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). Re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is actually up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn.".to_string()
 }
 
 /// Hybrid hooks + daemon-fallback tuning.

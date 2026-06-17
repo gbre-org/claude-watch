@@ -1292,6 +1292,81 @@ pub async fn detect_wedged(pane: &str) -> Option<WedgedReason> {
     check_lines_for_wedged(&out)
 }
 
+/// Pure function: detect whether the pane shows a MALFORMED tool call — the
+/// model emitting raw, NON-namespaced `<invoke ...>` / `<parameter ...>` tags
+/// (optionally preceded by a stray literal text prefix) instead of a
+/// well-formed namespaced tool call.
+///
+/// Background: a correctly-formed tool call is consumed by the harness and
+/// rendered as a tool-use widget (e.g. `● Bash(...)`); the raw `<invoke>` /
+/// `<parameter>` tags NEVER appear as visible assistant text. When the model
+/// malforms the call — emitting a bare `<invoke name="Bash">` without the
+/// required namespace prefix, often with a stray word glued to the front —
+/// the harness does NOT execute it. Instead the malformed block is rendered
+/// as plain assistant TEXT and the INTENDED action (very often a
+/// `watcher-ctl run ...`, a `signal-send`, or a heartbeat `touch`) silently
+/// never runs. Sustained, this strands one-shot watchers DOWN, lets the
+/// heartbeat go stale, and produces hours of failure/heartbeat-stale/
+/// watcher-down alert storms — the 2026-06-17 incident.
+///
+/// Detection signature: a line in the recent pane tail that contains a raw
+/// opening `<invoke` or `<parameter` tag whose tag-name is NOT namespaced
+/// with the expected `antml:` prefix. A well-formed call's tags never reach
+/// the pane as text, so the presence of the raw tag is itself the malformation
+/// signal. We require the opening-tag form (`<invoke`/`<parameter`) so prose
+/// that merely mentions the word "invoke" or "parameter" does not trip it.
+///
+/// To further guard against false positives from chat-history / documentation
+/// that legitimately discusses these tags (including THIS source file being
+/// read into a pane), the caller requires multiple consecutive observations
+/// before acting, and the corrective action is a low-cost text nudge — never
+/// a /clear or any destructive recovery.
+///
+/// Returns `true` on the FIRST malformed-tag match found in the tail.
+pub(crate) fn check_lines_for_malformed_tool_call(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 40 {
+        lines.len() - 40
+    } else {
+        0
+    };
+    let tail = &lines[start..];
+
+    // Match a raw opening `<invoke ...` or `<parameter ...` tag that is NOT
+    // namespaced (i.e. not immediately preceded by `antml:` or any `word:`
+    // prefix). `<invoke ...>` is the correct form and is consumed by the
+    // harness, so it never shows as text — but we still explicitly exclude any
+    // namespaced form to be safe. The negative lookbehind is emulated by
+    // requiring the char before `invoke`/`parameter` to be `<` exactly.
+    //
+    // Examples that MATCH (malformed, rendered as text):
+    //   <invoke name="Bash">
+    //   court<invoke name="Bash">
+    //   <parameter name="command">
+    // Examples that do NOT match:
+    //   <invoke name="Bash">   (namespaced; never reaches pane anyway)
+    //   please invoke the watcher     (prose, no `<` tag)
+    let re = match regex_lite::Regex::new(r"<(invoke|parameter)\b") {
+        Ok(re) => re,
+        Err(_) => return false,
+    };
+
+    // Any matching line is by construction a NON-namespaced raw tag: a
+    // correctly namespaced tag has a namespace prefix between `<` and
+    // `invoke`/`parameter`, which the `<` requirement in the regex excludes.
+    tail.iter().any(|line| re.is_match(line))
+}
+
+/// Capture the pane and check whether the live tail shows a malformed
+/// (non-namespaced) tool-call block rendered as assistant text. Returns true
+/// on detection. See `check_lines_for_malformed_tool_call` for the rationale.
+pub async fn detect_malformed_tool_call(pane: &str) -> bool {
+    if let Some(out) = capture_pane_history(pane, 60).await {
+        return check_lines_for_malformed_tool_call(&out);
+    }
+    false
+}
+
 /// Pure function: detect whether the pane shows Claude Code in an upstream-API
 /// retry-backoff state. When Anthropic returns 5xx (overloaded / 529) or
 /// transient 5xx errors, Claude Code retries with exponential backoff and
@@ -2402,6 +2477,70 @@ API Error: Request rejected (429)\n";
     fn test_wedged_reason_display() {
         assert_eq!(format!("{}", WedgedReason::ContextLimit), "context_limit");
         assert_eq!(format!("{}", WedgedReason::RateLimited), "rate_limited");
+    }
+
+    // --- check_lines_for_malformed_tool_call tests ---
+    //
+    // The raw, non-namespaced tag strings below are inert Rust string
+    // literals — they are NOT tool calls. They reproduce exactly what the
+    // pane shows when the model malforms a call and the harness renders the
+    // block as assistant text.
+
+    #[test]
+    fn test_malformed_bare_invoke_tag() {
+        // The classic signature: a raw non-namespaced `<invoke>` rendered as
+        // text because the harness could not parse it.
+        let output = "\
+some prior output\n\
+<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n\
+</invoke>\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_malformed_with_stray_text_prefix() {
+        // The 2026-06-17 signature: a stray literal word glued to the front
+        // of the opening tag (e.g. `court<invoke ...`).
+        let output = "court<invoke name=\"Bash\">\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_malformed_bare_parameter_tag() {
+        let output = "<parameter name=\"command\">touch /var/run/claude/heartbeat</parameter>\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_prose_mentioning_invoke() {
+        // Prose that merely says "invoke" / "parameter" without the raw `<`
+        // opening tag must NOT trip the detector.
+        let output = "\u{276f} please invoke the watcher and pass the parameter\nTokens: 50000";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_normal_output() {
+        let output = "\u{25cf} Bash(watcher-ctl run claude-event-watch)\nTokens: 50000\nBashes: 1";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_malformed_only_checks_recent_lines() {
+        // A malformed tag far up in scrollback (>40 lines back) should NOT
+        // count — only the live tail is inspected.
+        let mut lines: Vec<String> = vec!["<invoke name=\"Bash\">".to_string()];
+        for _ in 0..100 {
+            lines.push("normal conversation line".to_string());
+        }
+        let output = lines.join("\n");
+        assert!(!check_lines_for_malformed_tool_call(&output));
+    }
+
+    #[test]
+    fn test_malformed_empty_input() {
+        assert!(!check_lines_for_malformed_tool_call(""));
     }
 
     // --- check_lines_for_api_retry tests ---

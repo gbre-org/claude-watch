@@ -75,6 +75,20 @@ pub struct State {
     /// Total wedged-triggered self-clears (for metrics).
     #[serde(default)]
     pub wedged_clear_count: u32,
+    /// Number of consecutive check cycles where the pane has shown a MALFORMED
+    /// tool-call signature (raw non-namespaced `<invoke>` / `<parameter>` tags
+    /// rendered as assistant text). When this reaches
+    /// `malformed_tool_call.consecutive`, claude-watch injects a short
+    /// corrective nudge. Reset to 0 when the signature clears.
+    #[serde(default)]
+    pub malformed_tool_call_consecutive: u32,
+    /// Timestamp (RFC3339) of the last malformed-tool-call corrective nudge
+    /// (cooldown gate).
+    #[serde(default)]
+    pub last_malformed_nudge: Option<String>,
+    /// Cumulative count of malformed-tool-call corrective nudges (for metrics).
+    #[serde(default)]
+    pub malformed_tool_call_nudge_count: u64,
     // Watcher health
     pub watcher_health: HashMap<String, WatcherState>,
     /// Per-watcher RFC3339 timestamp of when the watcher was FIRST observed
