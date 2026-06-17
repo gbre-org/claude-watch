@@ -132,6 +132,13 @@ STOP_TIMEOUT_SECONDS = float(os.environ.get("STOP_TIMEOUT_SECONDS", "10"))
 # Mirrors the canonical format used by session-task. Strict pattern keeps
 # subprocess invocation safe even if upstream gating ever drifts.
 _QUEUE_ID_RE = re.compile(r"^q-[a-z0-9-]{4,64}$")
+# Queue-item marker embedded in an agent's first user message. The
+# main loop seeds every spawn prompt with a ``Queue item: q-XXXX`` line
+# (the queue-gate hook enforces it), so a subagent's transcript carries
+# the q-id of the item it belongs to. We parse it to attribute each
+# subagent to its owning queue item (see ``_list_session_subagents`` +
+# the per-item filter in ``_shape``).
+_QUEUE_MARKER_RE = re.compile(r"Queue item:\s*(q-[a-z0-9-]{4,64})")
 # Reason length cap — the value is stored verbatim in queue.json; no
 # need to allow paragraphs.
 _MAX_REASON_LEN = 500
@@ -682,15 +689,26 @@ def _shape(
         shaped["is_starting"] = bool(owner.get("is_starting"))
         # Nested subagent tree -- for running items with a known owner
         # agent, resolve the owner's parent main-loop session and list
-        # ALL sibling subagents of that session. The dir walk is cheap
-        # (running items are few) and fail-soft. See
-        # _list_session_subagents for the flat-per-session limitation.
+        # its subagents, then keep only the ones belonging to THIS queue
+        # item. ``_list_session_subagents`` returns every subagent in the
+        # owner's session (it can't tell items apart on its own); each
+        # record carries a ``queue_id`` parsed from the spawn-prompt
+        # ``Queue item: q-XXXX`` marker, so we filter here. The dir walk is
+        # cheap (running items are few) and fail-soft.
         subagents: list[dict[str, Any]] = []
         owner_agent_id = owner.get("agent_id") or ""
         if owner_agent_id:
             session_id = _session_id_for_subagent(owner_agent_id)
             if session_id:
                 subagents = _list_session_subagents(session_id)
+        # Filter the session-wide list down to this item's own subagents.
+        # Only apply the strict filter when at least one sibling carries a
+        # parseable q-id marker: if NONE do (older transcripts predating
+        # the marker), fall back to the unfiltered list rather than render
+        # a silently-empty tree.
+        iid = item.get("id", "")
+        if any(s.get("queue_id") for s in subagents):
+            subagents = [s for s in subagents if s.get("queue_id") == iid]
         shaped["subagents"] = subagents
     else:
         shaped["is_starting"] = False
@@ -1808,6 +1826,7 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
     ``agent-*.jsonl`` file::
 
         {"subagent_id": <id>, "label": <short label>,
+         "queue_id": <q-id from the spawn-prompt marker, or "">,
          "age_seconds": <now-mtime>, "age": <humanized>}
 
     Sorted most-recently-active first (mtime desc). Path-traversal guarded.
@@ -1861,11 +1880,19 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for sid, (mtime, path) in best.items():
         age_seconds = max(0.0, now - mtime)
-        label = _first_user_text(path) or sid
+        first_user = _first_user_text(path)
+        label = first_user or sid
+        # Attribute the subagent to its owning queue item by parsing the
+        # ``Queue item: q-XXXX`` marker the main loop seeds into every
+        # spawn prompt (the same first-user text used for the label).
+        # Empty string when the transcript predates / omits the marker;
+        # ``_shape`` only filters when at least one sibling carries one.
+        m = _QUEUE_MARKER_RE.search(first_user)
         out.append(
             {
                 "subagent_id": sid,
                 "label": label,
+                "queue_id": m.group(1) if m else "",
                 "age_seconds": age_seconds,
                 "age": _humanize_age(age_seconds),
             }

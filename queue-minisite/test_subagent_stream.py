@@ -295,6 +295,85 @@ class SubagentTreeTest(unittest.TestCase):
         self.assertIn(owner_id, ids)
         self.assertIn(sibling_id, ids)
 
+    def _seed_marked_subagent(self, jsonl_root, session_uuid, agent_id, qid):
+        """Seed a subagent transcript whose first user message carries the
+        ``Queue item: q-XXXX`` spawn marker (so its record gets a queue_id)."""
+        lines = [
+            {
+                "type": "user",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+                "isSidechain": True,
+                "uuid": "u1",
+                "message": {
+                    "role": "user",
+                    "content": f"Queue item: {qid}\nDo the scoped task.",
+                },
+            },
+        ]
+        return _seed_subagent_jsonl(
+            jsonl_root, session_uuid, agent_id, lines=lines)
+
+    def test_meta_subagents_filtered_to_owning_item(self):
+        """When session siblings carry DIFFERENT ``Queue item:`` markers, a
+        running item must surface ONLY the subagents bound to ITS q-id -- not
+        every subagent in the owner's parent main-loop session.
+        """
+        # Two distinct items, both registered running, sharing one session.
+        item_a = _add(self.env, "scoped item A", ["repo:subagent-filter-a"])
+        qid_a = item_a["id"]
+        _register(self.env, qid_a)
+        item_b = _add(self.env, "scoped item B", ["repo:subagent-filter-b"])
+        qid_b = item_b["id"]
+        _register(self.env, qid_b)
+
+        session_uuid = "e55a85ee-f56a-9b1c-e000-0000000000ee"
+        # Owner of item A; its own subagent carries qid_a's marker.
+        owner_a = "e55a85eef56a9b1ce"
+        # A sibling subagent in the SAME session, bound to item B.
+        sibling_b = "f66b96ffa67b0c2df"
+        # The owner agent for item A.
+        _seed_agent_state(self.agent_state, owner_a, qid_a, alive=True, age=5)
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, owner_a, qid_a)
+        self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, sibling_b, qid_b)
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid_a}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        self.assertIsInstance(subs, list, f"no subagents list: {subs}")
+        ids = {s["subagent_id"] for s in subs}
+        # Only item A's own subagent -- the item-B sibling is filtered out.
+        self.assertEqual(ids, {owner_a},
+                         f"expected only owner_a, got {subs}")
+        self.assertEqual(subs[0].get("queue_id"), qid_a)
+
+    def test_meta_subagents_unfiltered_when_no_markers(self):
+        """Back-compat fallback: when NO sibling carries a ``Queue item:``
+        marker (older transcripts), keep the prior unfiltered behavior rather
+        than render a silently-empty tree.
+        """
+        item = _add(self.env, "no-marker fallback", ["repo:subagent-nomarker"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "a77c97aa-b78c-0d2e-f000-0000000000aa"
+        owner_id = "a77c97aab78c0d2ef"
+        sibling_id = "b88d08bbc89d1e3fa"
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=3)
+        # Default fixtures have first-user text "do the thing" -- no marker.
+        _seed_subagent_jsonl(self.jsonl_root, session_uuid, owner_id)
+        _seed_subagent_jsonl(self.jsonl_root, session_uuid, sibling_id)
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        ids = {s["subagent_id"] for s in r.get_json().get("subagents", [])}
+        # No markers -> fallback keeps both (unfiltered).
+        self.assertEqual(ids, {owner_id, sibling_id},
+                         f"fallback should keep all, got {ids}")
+
     # ---------- GET /api/subagent/<id>/stream ----------
 
     def test_subagent_stream_emits_backfill(self):
