@@ -219,6 +219,32 @@
         '</details>';
     }
 
+    // Nested subagent tree -- mirrors the RUNNING block in
+    // templates/index.html. it.subagents is computed server-side
+    // (app.py _shape) for running items: the owner agent's parent
+    // sessionId -> all agent-*.jsonl siblings under that session's
+    // subagents/ dir. MUST match the server markup so morphdom doesn't
+    // flap, AND must be re-rendered here so the 5s SPA refresh doesn't
+    // wipe the tree the server first painted.
+    const subagents = it.subagents || [];
+    let subtree = '';
+    if (subagents.length) {
+      const nodes = subagents.map((sa) => {
+        const sid = sa.subagent_id || '';
+        return (
+          `<li class="subagent-node subagent-log-clickable" data-subagent-id="${attr(sid)}" data-log-mode="subagent" tabindex="0" role="button" aria-label="View live log for subagent ${attr(sid)}" title="Click to tail this subagent's live log">` +
+          `<code class="subagent-id">${esc(sid.slice(0, 12))}</code>` +
+          `<span class="subagent-label">${esc(sa.label || sid)}</span>` +
+          `<span class="subagent-age">${esc(sa.age || '')}</span>` +
+          '</li>'
+        );
+      }).join('');
+      subtree = '<details class="prompt-toggle subagent-tree">' +
+        `<summary class="prompt-summary">Subagents (${esc(subagents.length)})</summary>` +
+        `<ul class="subagent-list">${nodes}</ul>` +
+        '</details>';
+    }
+
     return (
       `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr} ${logModeAttr}>` +
       `<header class="item-head">${head}</header>` +
@@ -226,6 +252,7 @@
       `<div class="age">${ageBlock}</div>` +
       scope +
       prompt +
+      subtree +
       '</article>'
     );
   }
