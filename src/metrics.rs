@@ -152,6 +152,7 @@ fn build_metrics(
     let context_warning_interrupts = num(state, "context_warning_interrupts_total");
     let watcher_down_interrupts = num(state, "watcher_down_interrupts_total");
     let wedged_clear_interrupts = num(state, "wedged_clear_interrupts_total");
+    let malformed_tool_call_nudges = num(state, "malformed_tool_call_nudge_count");
     let auto_update_interrupts = num(state, "auto_update_interrupts_total");
     let reauth_inject_interrupts = num(state, "reauth_inject_interrupts_total");
     let post_restart_resume_inject_interrupts =
@@ -283,6 +284,10 @@ fn build_metrics(
         format!(
             "claude_interrupts_total{{kind=\"wedged_clear\"}} {}",
             wedged_clear_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"malformed_tool_call_nudge\"}} {}",
+            malformed_tool_call_nudges
         ),
         format!(
             "claude_interrupts_total{{kind=\"auto_update\"}} {}",

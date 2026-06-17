@@ -218,6 +218,34 @@ grace_period = 300
 # Minimum interval between context clear triggers (seconds)
 cooldown = 300
 
+[malformed_tool_call]
+# Detect MALFORMED tool calls — the model emitting raw, NON-namespaced
+# `<invoke ...>` / `<parameter ...>` tags (often with a stray literal text
+# prefix glued to the front) instead of a well-formed namespaced tool call.
+# A correctly-formed call is consumed by the harness and shown only as a
+# tool-use widget; the raw tags never reach the pane as text. So a raw
+# non-namespaced tag visible in the live tail means the harness did NOT run
+# the call — it rendered as plain assistant text and the INTENDED action
+# (commonly `watcher-ctl run claude-event-watch`, a `signal-send`, or a
+# heartbeat `touch`) silently never ran. Sustained, this strands one-shot
+# watchers DOWN, drives the heartbeat stale, and produces hours of
+# failure / heartbeat-stale / watcher-down alert storms (the 2026-06-17
+# incident). Recovery is the lightest possible: a single short corrective
+# tmux-inject — NO /clear, NO restart (the model is not wedged, it just
+# produced unparseable output and must retry cleanly).
+enabled = true
+# Consecutive check cycles the malformed signature must be observed before
+# injecting the nudge (at the 10s general interval, 2 ≈ 20s of sustained
+# malformation). Conservative so a single transient render — or a pane that
+# merely quotes the tag strings — does not trip it.
+consecutive = 2
+# Cooldown between corrective nudges (seconds). Avoids spamming the pane if
+# the model keeps malforming across the next few turns while it recovers.
+cooldown = 180
+# The corrective text injected into the pane. Single-line by design (the
+# inject_text vim-mode pipeline expects one literal send_keys -l call).
+nudge = "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). Re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is actually up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn."
+
 [auto_update]
 # Enable automatic version update checks
 enabled = true

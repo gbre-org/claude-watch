@@ -3795,6 +3795,94 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         }
     }
 
+    // --- Malformed-tool-call detection (non-namespaced invoke/parameter) ---
+    //
+    // The model sometimes emits a MALFORMED tool call: a stray literal text
+    // prefix followed by raw, NON-namespaced `<invoke ...>` / `<parameter ...>`
+    // tags instead of a well-formed namespaced tool call. The harness does NOT
+    // execute it — the block renders as plain assistant TEXT — so the INTENDED
+    // action (very often a `watcher-ctl run claude-event-watch`, a
+    // `signal-send`, or a heartbeat `touch`) silently never runs. Sustained,
+    // this strands one-shot watchers DOWN, lets the heartbeat go stale, and
+    // produces hours of failure / heartbeat-stale / watcher-down alert storms
+    // (the 2026-06-17 incident).
+    //
+    // A well-formed tool call is consumed by the harness and shows only as a
+    // tool-use widget; the raw tags never reach the pane as text. So the mere
+    // presence of a raw non-namespaced `<invoke`/`<parameter` tag in the live
+    // tail IS the malformation signal. Recovery is the lightest possible: a
+    // single short corrective tmux-inject (no /clear, no restart — the model
+    // is not wedged, it just produced unparseable output and must retry).
+    if config.malformed_tool_call.enabled && !effective_pane.is_empty() {
+        let malformed = tmux::detect_malformed_tool_call(&effective_pane).await;
+
+        if malformed {
+            state.malformed_tool_call_consecutive += 1;
+            debug!(
+                consecutive = state.malformed_tool_call_consecutive,
+                threshold = config.malformed_tool_call.consecutive,
+                "malformed tool-call signature detected"
+            );
+
+            if state.malformed_tool_call_consecutive >= config.malformed_tool_call.consecutive {
+                let in_cooldown = state
+                    .last_malformed_nudge
+                    .as_deref()
+                    .and_then(elapsed_since)
+                    .is_some_and(|e| e < config.malformed_tool_call.cooldown as f64);
+
+                if api_retrying {
+                    debug!(
+                        "malformed tool-call detected but api_retry active — suppressing nudge"
+                    );
+                } else if in_cooldown {
+                    debug!("malformed tool-call detected but nudge cooldown active");
+                } else {
+                    warn!(
+                        consecutive = state.malformed_tool_call_consecutive,
+                        "malformed tool-call sustained — injecting corrective nudge"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "malformed_tool_call_nudge",
+                        serde_json::json!({
+                            "consecutive": state.malformed_tool_call_consecutive,
+                            "tokens": tokens,
+                        }),
+                    );
+                    write_legacy_log(
+                        &config.general.legacy_log_file,
+                        &format!(
+                            "malformed tool-call ({} consecutive) — injecting corrective nudge",
+                            state.malformed_tool_call_consecutive,
+                        ),
+                    );
+
+                    tmux::interrupt_and_wait(&effective_pane, 5).await;
+                    inject_dispatch::inject_to_agent(
+                        &effective_pane,
+                        &config.malformed_tool_call.nudge,
+                    )
+                    .await;
+
+                    state.last_malformed_nudge = Some(now.clone());
+                    state.malformed_tool_call_nudge_count =
+                        state.malformed_tool_call_nudge_count.saturating_add(1);
+                    state.last_interrupt_at = Some(now.clone());
+                    // Reset the run so the next nudge requires a fresh
+                    // `consecutive` streak (and is also gated by the cooldown).
+                    state.malformed_tool_call_consecutive = 0;
+                }
+            }
+        } else if state.malformed_tool_call_consecutive > 0 {
+            debug!(
+                prev_consecutive = state.malformed_tool_call_consecutive,
+                "malformed tool-call signature cleared — resetting counter"
+            );
+            state.malformed_tool_call_consecutive = 0;
+        }
+    }
+
     // --- Individual watcher health monitoring ---
     if config.watcher_monitor.enabled {
         let mut entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
