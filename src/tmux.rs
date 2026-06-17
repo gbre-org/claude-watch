@@ -1530,6 +1530,75 @@ fn tag_name_attr_present(tag_body: &str) -> bool {
     }
 }
 
+/// True if the tail contains the high-confidence `court`-prefix malform
+/// signature: a line that is EXACTLY `court` (after trimming surrounding
+/// whitespace), immediately followed within the next few lines by a bare,
+/// non-namespaced `<invoke` opening tag.
+///
+/// This is the confirmed real-world signature (2026-06-17): the malformed
+/// invocation always begins with the bare literal token `court` on its own
+/// line, then non-namespaced `<invoke .../>` / `<parameter .../>` tags the
+/// harness can't parse, so the whole block — `court` included — is rendered
+/// as visible pane text.
+///
+/// We deliberately keep this tight to preserve precision:
+///   * the `court` line must be the WHOLE trimmed line (so the word "court" in
+///     prose, e.g. "the court ruled", does NOT match), and
+///   * the following `<invoke` must be a real opening tag (boundary char after
+///     `<invoke`), bare (non-namespaced — a namespaced tag would be consumed by
+///     the harness and never reach the pane), and
+///   * any region inside a fenced code block (```...```) is skipped, so docs /
+///     chat that quote the signature inside a fence do not trip it.
+const COURT_PREFIX_LOOKAHEAD: usize = 4;
+
+fn detect_court_prefix_signature(tail: &[&str]) -> bool {
+    // Per-line fence state, so we can both skip a `court` line inside a fence
+    // and avoid matching an `<invoke` that lives inside a fence. The fence
+    // marker line itself is treated as "inside" for skip purposes.
+    let fence_state: Vec<bool> = tail
+        .iter()
+        .scan(false, |fence, line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                *fence = !*fence;
+                Some(true)
+            } else {
+                Some(*fence)
+            }
+        })
+        .collect();
+
+    for (i, line) in tail.iter().enumerate() {
+        if fence_state[i] {
+            continue;
+        }
+        if line.trim() != "court" {
+            continue;
+        }
+        // Look ahead a few lines for a bare (non-namespaced) opening `<invoke`.
+        let end = (i + 1 + COURT_PREFIX_LOOKAHEAD).min(tail.len());
+        for (j, look) in tail.iter().enumerate().take(end).skip(i + 1) {
+            if fence_state[j] {
+                continue;
+            }
+            if line_has_bare_open_invoke(look) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True if the line contains at least one bare (non-namespaced) opening
+/// `<invoke` tag. Reuses the same tokenizer the structural detector uses, so a
+/// namespaced `<invoke>` (consumed by the harness, never on the pane) and
+/// non-tag text like `<invokeXYZ` do NOT count.
+fn line_has_bare_open_invoke(line: &str) -> bool {
+    tokenize_malformed_line(line)
+        .iter()
+        .any(|t| matches!(t, MalformedToken::OpenInvoke { .. }))
+}
+
 /// Structural detector. Walks the tail line-by-line, skipping any region inside
 /// a fenced code block (```...```), tokenizes each remaining line, and confirms
 /// a real tool-call *construct*:
@@ -1544,6 +1613,16 @@ fn tag_name_attr_present(tag_body: &str) -> bool {
 /// treated as prose/noise and ignored. This is what cuts the false positives
 /// that a substring grep produced.
 fn detect_malformed_construct(tail: &[&str]) -> bool {
+    // High-confidence fast-path: the real-world 2026-06-17 signature is a pane
+    // line that is EXACTLY the bare literal token `court` (after trimming
+    // whitespace), immediately followed within the next few lines by a bare
+    // (non-namespaced) `<invoke` opening tag. The harness can't parse the
+    // malformed block, so it renders the whole thing — the leading `court`
+    // included — as visible pane text. This is a definite malform.
+    if detect_court_prefix_signature(tail) {
+        return true;
+    }
+
     let mut in_fence = false;
     let mut tokens: Vec<MalformedToken> = Vec::new();
     for line in tail {
@@ -2941,6 +3020,79 @@ some quoted code\n\
     #[test]
     fn test_malformed_empty_input() {
         assert!(!check_lines_for_malformed_tool_call(""));
+    }
+
+    // --- court-prefix fast-path signature tests ---
+
+    #[test]
+    fn test_malformed_court_prefix_signature() {
+        // The confirmed 2026-06-17 real-world signature: a bare `court` line
+        // immediately followed by a non-namespaced `<invoke ...>`.
+        let output = "\
+court\n\
+<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n\
+</invoke>\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_malformed_court_prefix_with_whitespace() {
+        // Leading/trailing whitespace around the bare `court` token still matches.
+        let output = "  court  \n<invoke name=\"Read\">\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_malformed_court_prefix_lookahead_gap() {
+        // The `<invoke` may land a few lines after `court` (still within the
+        // small look-ahead window).
+        let output = "court\n\n\n<invoke name=\"Bash\">\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_court_in_prose() {
+        // The word "court" embedded in prose is NOT the bare-line signature,
+        // and there is no bare invoke tag to corroborate.
+        let output = "the court ruled in favor of the plaintiff today\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_court_prose_with_namespaced_call() {
+        // "court" in prose followed by a PROPERLY namespaced call (which never
+        // reaches the pane as text anyway) must not fire the fast-path.
+        let output = "the court adjourned\n<invoke name=\"Bash\">\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_court_prefix_inside_code_fence() {
+        // The whole signature quoted inside a fenced code block (docs / chat)
+        // must NOT fire.
+        let output = "\
+Example of the bad pattern:\n\
+```\n\
+court\n\
+<invoke name=\"Bash\">\n\
+<parameter name=\"command\">ls</parameter>\n\
+</invoke>\n\
+```\n\
+end of example\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_court_far_from_invoke() {
+        // A bare `court` line with NO bare invoke within the look-ahead window
+        // is not the signature (and nothing else corroborates a construct).
+        let mut lines = vec!["court".to_string()];
+        for _ in 0..10 {
+            lines.push("just a normal line".to_string());
+        }
+        let output = lines.join("\n");
+        assert!(!check_lines_for_malformed_tool_call(&output));
     }
 
     // --- check_lines_for_api_retry tests ---
