@@ -1188,6 +1188,36 @@ def _has_dep_cycle(items, root_id):
     return False
 
 
+def _reaches(items, src_id, dst_id):
+    """Return True if src_id transitively depends on dst_id.
+
+    Plain forward-reachability DFS over the dep graph (the same edges
+    ``_iter_dep_ids`` exposes). Used by ``cmd_queue_depend`` to name the
+    offending dep when a cycle-creating edit is refused: an added edge
+    ``item -> d`` closes a loop iff ``d`` already reaches ``item``.
+    O(N) over the queue, same budget as ``_has_dep_cycle``.
+    """
+    if src_id == dst_id:
+        return True
+    by_id = {it.get("id"): it for it in items if it.get("id")}
+    seen = set()
+    stack = [src_id]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        node_item = by_id.get(node)
+        if node_item is None:
+            continue
+        for child in _iter_dep_ids(node_item):
+            if child == dst_id:
+                return True
+            if child not in seen:
+                stack.append(child)
+    return False
+
+
 def _gc_groups(items):
     """Remove any reference to groups that have no pending/running members.
 
@@ -5042,12 +5072,44 @@ def cmd_queue_depend(args):
     Architecture (per Andrew's perf brief): WRITE is just a set
     add/remove on the dragged item. NO transitive-closure cache, NO
     cascade work. Cycles are detected lazily on READ via
-    ``_has_dep_cycle``.
+    ``_has_dep_cycle`` AND prevented at write time (see below).
 
     --add / --remove accept comma-separated id lists. --clear wipes ALL
-    task: scope tokens (regular scope tokens are preserved). Done/
-    abandoned items can't acquire new deps (the deps would be moot — the
-    item is already terminal).
+    task: scope tokens (regular scope tokens are preserved).
+
+    Safe-edit semantics (the "don't silently re-gate live/terminal work"
+    rules — 2026-06-17):
+
+      * Cycle prevention. Before committing, the new edge set is applied
+        speculatively and ``_has_dep_cycle`` is run on the dragged item.
+        If the edit would introduce a NEW cycle (one not already present
+        before the edit), the write is REFUSED (exit 3) and nothing is
+        persisted. This is stricter than the old "detect lazily on read,
+        warn after the fact" posture: an operator asking for a cyclic
+        edge almost always made a mistake, and silently accepting it
+        wedges ready_now=false forever. (A pre-existing cycle reachable
+        only through OTHER items is not the edit's fault, so removes /
+        clears that don't ADD an edge are never blocked by this guard —
+        they're how you BREAK a cycle.)
+
+      * done / abandoned items refuse ALL edits (exit 1). The item is
+        terminal; re-gating it is meaningless and editing its dep set
+        only corrupts the audit trail.
+
+      * running / wedged / blocked items: ADDS are refused by default
+        (exit 1) and require --force. Rationale: a running item is
+        already past the ready_now gate — an agent is actively working
+        it. Silently bolting on a new unmet dep does NOT pause that
+        agent (status stays running; ready_now is only consulted at
+        spawn time for PENDING items), so the edge would be a lie:
+        "depends on X" while the work it gates already ran. Refusing by
+        default surfaces the mistake. --force lets an operator who
+        really means it (e.g. correcting a mis-modeled graph mid-flight)
+        record the edge anyway. REMOVES / --clear on these states are
+        always allowed (loosening a gate is always safe).
+
+      * pending items: any edit is allowed (adds re-gate ready_now as
+        intended; this is the normal case the verbs exist for).
     """
     add_raw = list(getattr(args, "add", None) or [])
     remove_raw = list(getattr(args, "remove", None) or [])
@@ -5091,11 +5153,33 @@ def cmd_queue_depend(args):
             fh.close()
             print(f"not found: {args.id}", file=sys.stderr)
             sys.exit(1)
-        if target.get("status") not in ACTIVE_STATUSES:
+        status = target.get("status")
+        force = bool(getattr(args, "force", False))
+        if status not in ACTIVE_STATUSES:
+            # done / abandoned: terminal. Editing the dep set is moot and
+            # only muddies the audit trail. Refuse outright.
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             print(
-                f"ERROR: cannot edit deps on {target.get('status')} item",
+                f"ERROR: cannot edit deps on {status} item (terminal state)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if status != "pending" and to_add and not force:
+            # running / wedged / blocked: ADDING a dep cannot actually
+            # re-gate the item (ready_now is only consulted for pending
+            # items at spawn time), so a new "depends on X" edge on an
+            # already-running item is a lie about state. Refuse the ADD
+            # unless --force. Removes / clears are still allowed below
+            # (loosening a gate is always safe).
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                f"ERROR: cannot --add deps on {status} item without --force "
+                f"(adding a dep does not pause an already-running item; "
+                f"the edge would misrepresent state). Removes/--clear are "
+                f"allowed; pass --force only if you really mean to record "
+                f"the edge on a live item.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -5134,6 +5218,37 @@ def cmd_queue_depend(args):
             if a not in after_deps:
                 after_deps.append(a)
 
+        # Cycle PREVENTION (2026-06-17): refuse an edit that would
+        # introduce a NEW cycle. We compute the cycle state both before
+        # and after the speculative edit so we only blame edits that
+        # actually create a cycle — a pre-existing cycle reachable only
+        # via OTHER items must not block a remove/clear meant to break it.
+        cycle_before = _has_dep_cycle(items, args.id)
+        spec_scope = non_task_scope + [f"task:{d}" for d in after_deps]
+        saved_scope = target.get("scope")
+        target["scope"] = spec_scope
+        try:
+            cycle_after = _has_dep_cycle(items, args.id)
+        finally:
+            target["scope"] = saved_scope
+        if cycle_after and not cycle_before:
+            # The edit created the cycle. Identify which added dep(s)
+            # close a loop back to this item so the message is actionable.
+            offenders = [
+                d for d in to_add
+                if d in after_deps and _reaches(items, d, args.id)
+            ]
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                "ERROR: refusing dep edit — it would create a dependency "
+                "cycle"
+                + (f" via {','.join(offenders)}" if offenders else "")
+                + f" (item {args.id} would transitively depend on itself).",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+
         # Rewrite scope: regular tokens first (preserves user ordering),
         # then task: tokens in dep order. Drop the legacy field if a
         # migration left it lingering.
@@ -5155,22 +5270,35 @@ def cmd_queue_depend(args):
     locked_scopes2 = data2.get("locked_scopes") or {}
     _queue_unlock_readonly(fh2)
     fresh = next((it for it in items2 if it["id"] == args.id), None)
+    fresh_deps = list(_iter_dep_ids(fresh)) if fresh else list(after_deps)
     ready = _item_is_ready(items2, fresh, locked_scopes=locked_scopes2) if fresh else False
     cycle = (
         _has_dep_cycle(items2, args.id)
-        if (fresh and list(_iter_dep_ids(fresh)))
+        if (fresh and fresh_deps)
         else False
     )
+    # Compute `unmet` (a.k.a. dep_blockers) the same way `queue show` does
+    # so the dep-edit output mirrors the rest of the CLI's contract: a dep
+    # is "unmet" unless its target exists AND is `done`.
+    by_id2 = {x.get("id"): x for x in items2 if x.get("id")}
+    unmet = [
+        d for d in fresh_deps
+        if (by_id2.get(d) is None) or (by_id2[d].get("status") != "done")
+    ]
 
     if getattr(args, "json", False):
         print(json.dumps(
             {
                 "id": args.id,
-                "depends_on": after_deps,
+                "depends_on": fresh_deps,
                 "added": to_add,
                 "removed": to_remove,
                 "cleared": do_clear,
                 "ready_now": ready,
+                "unmet": unmet,
+                # `dep_blockers` is the field name `queue add` / `queue show`
+                # use; alias it so consumers reading either name work.
+                "dep_blockers": unmet,
                 "dep_cycle": cycle,
             },
             indent=2,
@@ -5178,11 +5306,17 @@ def cmd_queue_depend(args):
     else:
         print(f"deps updated: {args.id}")
         print(f"  before : {before}")
-        print(f"  after  : {after_deps}")
+        print(f"  after  : {fresh_deps}")
+        print(f"  unmet  : {unmet}")
+        print(f"  ready_now: {'true' if ready else 'false'}")
         if cycle:
+            # Should be unreachable for edits this verb makes (cycle
+            # creation is now refused at write time), but a PRE-EXISTING
+            # cycle reachable via other items can still surface here.
             print(
-                "  WARNING: dependency cycle reachable from this item; "
-                "ready_now will stay false until the cycle is broken.",
+                "  WARNING: a dependency cycle is reachable from this item "
+                "(pre-existing — not created by this edit); ready_now will "
+                "stay false until the cycle is broken.",
                 file=sys.stderr,
             )
 
@@ -6097,7 +6231,9 @@ def build_parser():
             "Stored (since 2026-05-08) as `task:<id>` scope tokens; "
             "ready_now flips True only when every dep is in 'done' state. "
             "Cross-group deps allowed. --clear strips only task: tokens "
-            "(regular scope is preserved)."
+            "(regular scope is preserved). Cycle-creating edits are "
+            "REFUSED; ADDs on a running/wedged/blocked item require "
+            "--force; done/abandoned items refuse all edits."
         ),
     )
     q_depend.add_argument("id")
@@ -6123,6 +6259,17 @@ def build_parser():
         "--clear",
         action="store_true",
         help="Remove ALL deps from this item (applied before --add).",
+    )
+    q_depend.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Allow --add on a running/wedged/blocked item. By default an "
+            "ADD on a non-pending item is refused (a new dep cannot pause "
+            "already-running work, so the edge would misrepresent state). "
+            "Removes / --clear never need --force. done/abandoned items "
+            "refuse all edits regardless of --force."
+        ),
     )
     q_depend.add_argument("--json", action="store_true")
 
