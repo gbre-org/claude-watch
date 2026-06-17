@@ -698,8 +698,72 @@ def run_scenarios():
     pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s17")
     check("S17 progress_age absent for blocked item", pa is None, f"got {pa!r}")
 
+    # ---- Scenario 17b: running hostjob item w/ fresh heartbeat ->
+    # progress_age emitted (reuses the generic gauge with the hostjob
+    # label in the workload_label dimension). hostjob heartbeat layout is
+    # a per-label DIR: <HOSTJOB_HEARTBEAT_DIR>/<label>/heartbeat.
+    print("\nScenario 17b: hostjob item w/ fresh heartbeat -> progress_age emitted (small)")
+    hj_hb_dir = tempfile.mkdtemp(prefix="wqe-hjhb-")
+    os.makedirs(os.path.join(hj_hb_dir, "stv-host-promote"))
+    hj_fresh = os.path.join(hj_hb_dir, "stv-host-promote", "heartbeat")
+    with open(hj_fresh, "w") as f:
+        f.write("progress\n")
+    hj_env = dict(env)
+    hj_env["HOSTJOB_HEARTBEAT_DIR"] = hj_hb_dir
+    item = make_running_item("q-s17b", "stv host promote hostjob")
+    item["scope"] = ["hostjob:stv-host-promote", "repo:media-tools"]
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(hj_env)
+    mod.collect()
+    pa = find_sample(
+        mod, "worktask_queue_item_progress_age_seconds",
+        {"id": "q-s17b", "workload_label": "stv-host-promote"},
+    )
+    check(
+        "S17b hostjob progress_age emitted",
+        pa is not None and 0.0 <= pa < 30.0,
+        f"expected fresh value < 30s, got {pa!r}",
+    )
+
+    # ---- Scenario 17c: running hostjob item w/ STALE heartbeat ->
+    # progress_age large (WorkQueueStuck should fire on this too).
+    print("\nScenario 17c: hostjob item w/ stale heartbeat -> progress_age large")
+    os.makedirs(os.path.join(hj_hb_dir, "stuck-hostjob"))
+    hj_stale = os.path.join(hj_hb_dir, "stuck-hostjob", "heartbeat")
+    with open(hj_stale, "w") as f:
+        f.write("stale\n")
+    hj_two_hr_ago = time.time() - 7200
+    os.utime(hj_stale, (hj_two_hr_ago, hj_two_hr_ago))
+    item = make_running_item("q-s17c", "stuck hostjob")
+    item["scope"] = ["hostjob:stuck-hostjob"]
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(hj_env)
+    mod.collect()
+    pa = find_sample(
+        mod, "worktask_queue_item_progress_age_seconds",
+        {"id": "q-s17c", "workload_label": "stuck-hostjob"},
+    )
+    check(
+        "S17c hostjob progress_age reflects stale mtime",
+        pa is not None and pa >= 7000,
+        f"expected >= 7000s, got {pa!r}",
+    )
+
+    # ---- Scenario 17d: hostjob item w/ NO heartbeat dir -> absent.
+    print("\nScenario 17d: hostjob item w/ missing heartbeat -> progress_age absent")
+    item = make_running_item("q-s17d", "hostjob no heartbeat")
+    item["scope"] = ["hostjob:never-started-hj"]
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(hj_env)
+    mod.collect()
+    pa = find_any_sample(mod, "worktask_queue_item_progress_age_seconds", "q-s17d")
+    check("S17d hostjob progress_age absent", pa is None, f"got {pa!r}")
+
     # ---- Scenario 18: helper edge cases.
-    print("\nScenario 18: _workload_label_from_scope edge cases")
+    print("\nScenario 18: _workload_label_from_scope + _hostjob_label_from_scope edge cases")
     mod = load_exporter(env)
     check("S18 None scope -> None",
           mod._workload_label_from_scope(None) is None, "got non-None")
@@ -713,6 +777,17 @@ def run_scenarios():
           mod._workload_label_from_scope(["repo:x", "workload:y"]) == "y", "wrong label")
     check("S18 empty label -> None",
           mod._workload_label_from_scope(["workload:"]) is None, "got non-None")
+    # hostjob helper parallels the workload helper.
+    check("S18 hj None scope -> None",
+          mod._hostjob_label_from_scope(None) is None, "got non-None")
+    check("S18 hj non-hostjob scope -> None",
+          mod._hostjob_label_from_scope(["repo:foo"]) is None, "got non-None")
+    check("S18 hj hostjob scope -> label",
+          mod._hostjob_label_from_scope(["hostjob:abc"]) == "abc", "wrong label")
+    check("S18 hj mixed scope -> label",
+          mod._hostjob_label_from_scope(["repo:x", "hostjob:y"]) == "y", "wrong label")
+    check("S18 hj empty label -> None",
+          mod._hostjob_label_from_scope(["hostjob:"]) is None, "got non-None")
 
     print()
     if failures:

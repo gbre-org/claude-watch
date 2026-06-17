@@ -143,6 +143,17 @@ WORKLOAD_HEARTBEAT_DIR = os.environ.get(
     "WORKLOAD_HEARTBEAT_DIR", "/workload-heartbeats"
 )
 WORKLOAD_SCOPE_PREFIX = "workload:"
+# Directory holding per-hostjob progress heartbeat files written by the
+# `hostjob` runner (andrew-sf-tools). UNLIKE workload's flat
+# `<label>.heartbeat`, hostjob nests the heartbeat inside a per-label
+# dir: `<HOSTJOB_HEARTBEAT_DIR>/<label>/heartbeat`. The runner touches it
+# on progress; we stat its mtime to compute the same
+# `worktask_queue_item_progress_age_seconds` gauge. Host path is
+# ~/.cache/hostjob/; container bind-mounts it at /hostjob-heartbeats:ro.
+HOSTJOB_HEARTBEAT_DIR = os.environ.get(
+    "HOSTJOB_HEARTBEAT_DIR", "/hostjob-heartbeats"
+)
+HOSTJOB_SCOPE_PREFIX = "hostjob:"
 
 REG = CollectorRegistry()
 
@@ -233,7 +244,12 @@ g_progress_age = Gauge(
         "`workload:<label>` token. The heartbeat is progress-driven "
         "(claude-watch PR #209): the wrapper sidecar re-touches the "
         "file only when the wrapped command's .output file grows, so "
-        "a hung command yields a stale heartbeat. WorkQueueStuck joins "
+        "a hung command yields a stale heartbeat. The same gauge is "
+        "also emitted for `hostjob:<label>` items (the andrew-sf-tools "
+        "hostjob runner touches HOSTJOB_HEARTBEAT_DIR/<label>/heartbeat); "
+        "the `workload_label` dimension carries the hostjob label in that "
+        "case (the metric/join key is `id`, so the label is informational). "
+        "WorkQueueStuck joins "
         "this gauge against worktask_queue_items_running_elapsed_seconds "
         "to require BOTH long runtime AND stale progress before firing, "
         "eliminating false-positives on healthy long-running tasks. "
@@ -307,6 +323,24 @@ def _workload_label_from_scope(scope):
     for token in scope:
         if isinstance(token, str) and token.startswith(WORKLOAD_SCOPE_PREFIX):
             label = token[len(WORKLOAD_SCOPE_PREFIX):]
+            if label:
+                return label
+    return None
+
+
+def _hostjob_label_from_scope(scope):
+    """Return the hostjob label from a `hostjob:<label>` scope token, or
+    None if `scope` doesn't include one.
+
+    Parallel to `_workload_label_from_scope`. The andrew-sf-tools hostjob
+    runner builds the scope token as `hostjob:<label>`. Returns the first
+    match defensively.
+    """
+    if not scope:
+        return None
+    for token in scope:
+        if isinstance(token, str) and token.startswith(HOSTJOB_SCOPE_PREFIX):
+            label = token[len(HOSTJOB_SCOPE_PREFIX):]
             if label:
                 return label
     return None
@@ -438,6 +472,32 @@ def collect():
                         # Stay silent rather than emit a misleading
                         # "infinite age" series; WorkQueueStuck's
                         # `unless` clause handles the absence.
+                        pass
+
+                # Hostjob progress heartbeat — parallels the workload block
+                # above. The hostjob runner (andrew-sf-tools) touches
+                # HOSTJOB_HEARTBEAT_DIR/<label>/heartbeat (per-label DIR,
+                # not a flat file). Reuse the same generic
+                # worktask_queue_item_progress_age_seconds gauge so
+                # WorkQueueStuck (which joins on `id`) covers hostjob items
+                # for free; the hostjob label rides in the workload_label
+                # dimension (informational — the join key is `id`).
+                hostjob_label = _hostjob_label_from_scope(it.get("scope"))
+                if hostjob_label:
+                    hj_hb_path = os.path.join(
+                        HOSTJOB_HEARTBEAT_DIR, hostjob_label, "heartbeat"
+                    )
+                    try:
+                        hj_mtime = os.stat(hj_hb_path).st_mtime
+                        hj_progress_age = max(0.0, time.time() - hj_mtime)
+                        g_progress_age.labels(
+                            id=iid, summary=summary,
+                            workload_label=hostjob_label,
+                        ).set(hj_progress_age)
+                    except OSError:
+                        # Heartbeat missing -- hostjob in startup, exited
+                        # but not yet flipped, or no progress heartbeat
+                        # emitted. Fail-soft (same posture as workload).
                         pass
 
             # Look up agent by queue_id. Emit has_live_owner ONLY when we

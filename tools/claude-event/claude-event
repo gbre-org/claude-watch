@@ -55,6 +55,7 @@ VALID_SOURCES = {
     "security",
     "manual",
     "claude-watch",
+    "hostjob",
 }
 
 
