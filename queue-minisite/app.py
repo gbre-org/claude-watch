@@ -701,11 +701,16 @@ def _shape(
             session_id = _session_id_for_subagent(owner_agent_id)
             if session_id:
                 subagents = _list_session_subagents(session_id)
-        # Filter the session-wide list down to this item's own subagents.
-        # Only apply the strict filter when at least one sibling carries a
-        # parseable q-id marker: if NONE do (older transcripts predating
-        # the marker), fall back to the unfiltered list rather than render
-        # a silently-empty tree.
+        # Filter the session-wide forest down to this item's own subtree(s).
+        # ``_list_session_subagents`` returns a NESTED forest of ROOT nodes
+        # (tier-1 children of the main-loop session); each root keeps its full
+        # ``children`` subtree (the agents IT spawned, recursively). We filter
+        # at the ROOT level by the ``Queue item: q-XXXX`` marker so a root that
+        # belongs to THIS item carries its entire descendant tree along with
+        # it. Only apply the strict filter when at least one root carries a
+        # parseable q-id marker: if NONE do (older transcripts predating the
+        # marker), fall back to the unfiltered forest rather than render a
+        # silently-empty tree.
         iid = item.get("id", "")
         if any(s.get("queue_id") for s in subagents):
             subagents = [s for s in subagents if s.get("queue_id") == iid]
@@ -1729,17 +1734,33 @@ def _find_parent_session_jsonl(session_id: str) -> Path | None:
 # the OWNER agent via claude-watch's active-agents map (queue_id -> agent_id);
 # that owner agent IS a subagent under some session's ``subagents/`` dir.
 #
-# To surface the FULL set of sibling subagents for that main-loop session we:
+# FILE LAYOUT vs LINEAGE (the corrected truth -- a prior version of this
+# comment wrongly claimed deeper edges were unreconstructible):
+#
+#   * The on-disk FILE layout IS flat per-session: every subagent transcript
+#     -- regardless of spawn depth -- sits as a sibling ``agent-<id>.jsonl``
+#     under the SAME session's ``subagents/`` dir, and every record's
+#     top-level ``sessionId`` is the MAIN-LOOP session (even for depth-2+).
+#   * BUT the parent->child LINEAGE edges live INSIDE the records. When agent
+#     A spawns agent B via the Agent/Task tool, A's transcript records a
+#     ``type:"user"`` record whose ``toolUseResult`` dict carries
+#     ``{"agentId": "<B's id>", "description": ..., "status":
+#     "async_launched"/"isAsync": true}``. So the edge ``A -> B`` is
+#     recoverable by scanning A's own transcript for ``toolUseResult.agentId``.
+#
+# Therefore the tree IS multi-level. We:
 #   1. resolve the owner agent's transcript via _find_agent_jsonl,
 #   2. read its first record to recover the parent ``sessionId``,
-#   3. enumerate EVERY ``agent-*.jsonl`` in that same ``subagents/`` dir.
-#
-# LIMITATION (documented honestly): the on-disk layout is FLAT per-session --
-# subagents spawned BY a subagent are not nested on disk; they sit as siblings
-# under the same session dir. So the tree we render groups subagents by their
-# PARENT MAIN-LOOP SESSION, not by which specific agent spawned each one.
-# There is no on-disk signal to reconstruct deeper parent->child edges, so we
-# don't pretend to.
+#   3. enumerate EVERY ``agent-*.jsonl`` under that session's ``subagents/``
+#      dir to discover the universe of agents + metadata,
+#   4. parse ``toolUseResult.agentId`` edges out of the parent SESSION
+#      transcript (-> tier-1 direct children of the session) AND out of each
+#      subagent transcript (-> the children that subagent itself spawned),
+#   5. nest the agents into a forest using those edges (arbitrary depth),
+#      cycle-guarded and fail-soft.
+# Verified live: a real session carried a depth-2 edge
+# (a79306d715d92f54e -> a04808bfd2cd8efb3), so multi-level is real, not
+# theoretical.
 
 # Session UUIDs are dashed alphanum (same guard _find_parent_session_jsonl
 # uses). Path-traversal guard for the directory walk below.
@@ -1816,21 +1837,81 @@ def _first_user_text(path: Path) -> str:
     return ""
 
 
+def _parse_spawn_edges(path: Path) -> list[str]:
+    """Return the agent ids THIS transcript spawned, in first-seen order.
+
+    When an agent spawns a child via the Agent/Task tool, its transcript
+    records a ``type:"user"`` record whose ``toolUseResult`` dict carries the
+    child's ``agentId`` (alongside ``description`` / ``status:async_launched``
+    / ``isAsync``). Scanning a transcript for those ``toolUseResult.agentId``
+    values yields the DIRECT children spawned BY the owner of ``path``.
+
+    Used for BOTH the parent SESSION transcript (-> tier-1 children of the
+    session) and each subagent transcript (-> the children that subagent
+    spawned). Reads the whole file (transcripts can be large but spawn
+    records may appear anywhere). De-duplicates while preserving order.
+    Fail-soft: returns [] on any read / parse error.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                tur = rec.get("toolUseResult")
+                if not isinstance(tur, dict):
+                    continue
+                child = tur.get("agentId")
+                if (
+                    isinstance(child, str)
+                    and _SUBAGENT_ID_RE.match(child)
+                    and child not in seen
+                ):
+                    seen.add(child)
+                    out.append(child)
+    except OSError:
+        return []
+    return out
+
+
 def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
-    """Enumerate the subagents of a main-loop session.
+    """Build the MULTI-LEVEL subagent forest for a main-loop session.
 
     Given a parent ``session_id``, locate that session's ``subagents/`` dir
     under AGENTS_JSONL_ROOT (handling BOTH mount shapes exactly like
     ``_find_agent_jsonl``: ``<root>/<session>/subagents/`` first, then
-    ``<root>/<project-slug>/<session>/subagents/``) and return one record per
-    ``agent-*.jsonl`` file::
+    ``<root>/<project-slug>/<session>/subagents/``).
 
-        {"subagent_id": <id>, "label": <short label>,
-         "queue_id": <q-id from the spawn-prompt marker, or "">,
-         "age_seconds": <now-mtime>, "age": <humanized>}
+    The on-disk FILE layout is flat (every subagent transcript is a sibling
+    under one ``subagents/`` dir, regardless of spawn depth), but the
+    parent->child LINEAGE lives INSIDE the records as ``toolUseResult.agentId``
+    spawn edges (see ``_parse_spawn_edges`` + the module comment above). We:
 
-    Sorted most-recently-active first (mtime desc). Path-traversal guarded.
-    Fail-soft: returns [] on any error / bad session id.
+      1. enumerate every ``agent-*.jsonl`` (dedup by id, newest mtime) and
+         build a metadata node per agent::
+
+             {"subagent_id": <id>, "label": <short label>,
+              "queue_id": <q-id from the spawn-prompt marker, or "">,
+              "age_seconds": <now-mtime>, "age": <humanized>,
+              "children": [<same shape, recursively>]}
+
+      2. parse spawn edges out of EACH subagent transcript (child agents that
+         subagent itself spawned) AND out of the parent SESSION transcript
+         (tier-1 direct children of the session),
+      3. nest the nodes into a forest: a node is a ROOT iff the session
+         transcript names it directly OR nothing else claims it as a child.
+
+    Cycle-guarded (an agent can never become its own ancestor) and fail-soft:
+    returns [] on any error / bad session id. Each tier is sorted
+    most-recently-active first (mtime asc on age_seconds).
     """
     if not _SESSION_ID_RE.match(session_id):
         return []
@@ -1877,7 +1958,13 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
             if prev is None or mtime > prev[0]:
                 best[sid] = (mtime, entry)
 
-    out: list[dict[str, Any]] = []
+    if not best:
+        return []
+
+    # Per-agent metadata node (children filled in during the nesting walk).
+    nodes: dict[str, dict[str, Any]] = {}
+    # owner_id -> [direct child ids] discovered from each transcript's edges.
+    child_edges: dict[str, list[str]] = {}
     for sid, (mtime, path) in best.items():
         age_seconds = max(0.0, now - mtime)
         first_user = _first_user_text(path)
@@ -1886,19 +1973,75 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
         # ``Queue item: q-XXXX`` marker the main loop seeds into every
         # spawn prompt (the same first-user text used for the label).
         # Empty string when the transcript predates / omits the marker;
-        # ``_shape`` only filters when at least one sibling carries one.
+        # ``_shape`` only filters when at least one ROOT carries one.
         m = _QUEUE_MARKER_RE.search(first_user)
-        out.append(
-            {
-                "subagent_id": sid,
-                "label": label,
-                "queue_id": m.group(1) if m else "",
-                "age_seconds": age_seconds,
-                "age": _humanize_age(age_seconds),
-            }
-        )
-    out.sort(key=lambda r: r["age_seconds"])  # most-recently-active first
-    return out
+        nodes[sid] = {
+            "subagent_id": sid,
+            "label": label,
+            "queue_id": m.group(1) if m else "",
+            "age_seconds": age_seconds,
+            "age": _humanize_age(age_seconds),
+            "children": [],
+        }
+        # Edges spawned BY this subagent (deeper tiers). Only keep edges that
+        # point at agents we actually enumerated (defensive vs partial state).
+        child_edges[sid] = _parse_spawn_edges(path)
+
+    # Tier-1 edges: agents the parent SESSION transcript spawned directly.
+    session_path = _find_parent_session_jsonl(session_id)
+    session_children = (
+        _parse_spawn_edges(session_path) if session_path is not None else []
+    )
+
+    # An agent is a child of someone iff some OTHER agent's edge names it.
+    claimed: set[str] = set()
+    for owner, kids in child_edges.items():
+        for kid in kids:
+            if kid in nodes and kid != owner:
+                claimed.add(kid)
+
+    def _build(sid: str, ancestors: frozenset[str]) -> dict[str, Any] | None:
+        """Materialize the subtree rooted at ``sid``. Cycle-guarded via
+        ``ancestors``; returns None if ``sid`` is unknown / already on the
+        path back to the root."""
+        if sid not in nodes or sid in ancestors:
+            return None
+        node = dict(nodes[sid])  # shallow copy so shared metadata stays clean
+        node["children"] = []
+        next_anc = ancestors | {sid}
+        seen_kids: set[str] = set()
+        for kid in child_edges.get(sid, []):
+            if kid in seen_kids:
+                continue
+            seen_kids.add(kid)
+            built = _build(kid, next_anc)
+            if built is not None:
+                node["children"].append(built)
+        node["children"].sort(key=lambda r: r["age_seconds"])
+        return node
+
+    # ROOTS: agents the session named directly (preferred ordering), plus any
+    # enumerated agent that nothing claimed as a child (covers transcripts
+    # whose session-level spawn record was rotated away). De-dup, preserve
+    # session order first.
+    root_ids: list[str] = []
+    root_seen: set[str] = set()
+    for sid in session_children:
+        if sid in nodes and sid not in root_seen:
+            root_seen.add(sid)
+            root_ids.append(sid)
+    for sid in best:
+        if sid not in claimed and sid not in root_seen:
+            root_seen.add(sid)
+            root_ids.append(sid)
+
+    forest: list[dict[str, Any]] = []
+    for sid in root_ids:
+        built = _build(sid, frozenset())
+        if built is not None:
+            forest.append(built)
+    forest.sort(key=lambda r: r["age_seconds"])  # most-recently-active first
+    return forest
 
 
 def _format_sse(data: dict[str, Any]) -> bytes:

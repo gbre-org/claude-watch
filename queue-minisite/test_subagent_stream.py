@@ -374,6 +374,116 @@ class SubagentTreeTest(unittest.TestCase):
         self.assertEqual(ids, {owner_id, sibling_id},
                          f"fallback should keep all, got {ids}")
 
+    def _seed_session_jsonl(self, jsonl_root, session_uuid, child_ids,
+                            *, project_slug=None):
+        """Write the parent SESSION transcript with toolUseResult.agentId
+        spawn edges naming each id in ``child_ids`` as a tier-1 child."""
+        if project_slug:
+            base = jsonl_root / project_slug
+        else:
+            base = jsonl_root
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{session_uuid}.jsonl"
+        lines = []
+        for cid in child_ids:
+            lines.append({
+                "type": "user",
+                "sessionId": session_uuid,
+                "uuid": f"u-{cid}",
+                "toolUseResult": {
+                    "agentId": cid,
+                    "description": f"spawn {cid}",
+                    "status": "async_launched",
+                    "isAsync": True,
+                },
+                "message": {"role": "user", "content": "(tool result)"},
+            })
+        body = "\n".join(json.dumps(r) for r in lines) + "\n"
+        path.write_text(body)
+        return path
+
+    def _seed_subagent_with_spawn(self, jsonl_root, session_uuid, agent_id,
+                                  child_ids):
+        """Seed a subagent transcript that itself spawns ``child_ids`` (its
+        records carry toolUseResult.agentId edges -> deeper tiers)."""
+        lines = [
+            {
+                "type": "user",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+                "isSidechain": True,
+                "uuid": "u1",
+                "message": {"role": "user", "content": f"parent {agent_id}"},
+            },
+        ]
+        for cid in child_ids:
+            lines.append({
+                "type": "user",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+                "uuid": f"u-{cid}",
+                "toolUseResult": {
+                    "agentId": cid,
+                    "description": f"spawn {cid}",
+                    "status": "async_launched",
+                    "isAsync": True,
+                },
+                "message": {"role": "user", "content": "(tool result)"},
+            })
+        return _seed_subagent_jsonl(
+            jsonl_root, session_uuid, agent_id, lines=lines)
+
+    def test_list_session_subagents_builds_multilevel_tree(self):
+        """A depth-2 spawn chain (session -> A -> B) must nest: the session's
+        tier-1 child A carries B as a `children` entry — proving the tree is
+        reconstructed from toolUseResult.agentId edges, not flat-per-session.
+        """
+        session_uuid = "ab11cd22-ef33-ab44-cd55-0000000000ff"
+        root_id = "a79306d715d92f54e"   # the real-world depth-2 parent
+        child_id = "a04808bfd2cd8efb3"  # the real-world depth-2 child
+        # Session names A directly; A's transcript spawns B; B is a leaf.
+        self._seed_session_jsonl(self.jsonl_root, session_uuid, [root_id])
+        self._seed_subagent_with_spawn(
+            self.jsonl_root, session_uuid, root_id, [child_id])
+        _seed_subagent_jsonl(self.jsonl_root, session_uuid, child_id)
+        self.appmod._cache.fetched_at = 0.0
+
+        forest = self.appmod._list_session_subagents(session_uuid)
+        ids = {n["subagent_id"] for n in forest}
+        # Only A is a ROOT; B is nested under A (not a top-level sibling).
+        self.assertEqual(ids, {root_id},
+                         f"B should be nested, not a root: {forest}")
+        root = forest[0]
+        self.assertIn("children", root)
+        kids = {c["subagent_id"] for c in root["children"]}
+        self.assertEqual(kids, {child_id},
+                         f"expected B nested under A: {root}")
+        # The leaf carries an (empty) children list of the same shape.
+        leaf = root["children"][0]
+        self.assertEqual(leaf["children"], [])
+
+    def test_list_session_subagents_cycle_guarded(self):
+        """A self/mutual spawn cycle (A -> B -> A) must not infinite-loop: the
+        builder drops the edge that would revisit an ancestor.
+        """
+        session_uuid = "cd33ef44-ab55-cd66-ef77-0000000000aa"
+        a_id = "aaa1111122223333a"
+        b_id = "bbb4444455556666b"
+        self._seed_session_jsonl(self.jsonl_root, session_uuid, [a_id])
+        self._seed_subagent_with_spawn(
+            self.jsonl_root, session_uuid, a_id, [b_id])
+        # B spawns A back -> cycle.
+        self._seed_subagent_with_spawn(
+            self.jsonl_root, session_uuid, b_id, [a_id])
+        self.appmod._cache.fetched_at = 0.0
+
+        forest = self.appmod._list_session_subagents(session_uuid)
+        self.assertEqual({n["subagent_id"] for n in forest}, {a_id})
+        b = forest[0]["children"][0]
+        self.assertEqual(b["subagent_id"], b_id)
+        # The B -> A back-edge is dropped (A is an ancestor), so B is a leaf.
+        self.assertEqual(b["children"], [])
+
     # ---------- GET /api/subagent/<id>/stream ----------
 
     def test_subagent_stream_emits_backfill(self):

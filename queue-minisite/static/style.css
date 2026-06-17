@@ -1605,3 +1605,35 @@ body.modal-open { overflow: hidden; }
   color: var(--fg-muted, #93a1a1);
   font-size: 0.72rem;
 }
+
+/* ------- nested levels (agent -> agent -> ...) -------
+ *
+ * Each non-leaf node is followed by a sibling `li.subagent-children` whose
+ * <details class="subagent-tree subagent-subtree"> holds that agent's own
+ * spawned children (the recursive subagent_node macro / renderSubagentNode).
+ * The wrapper <li> is structural only — it must NOT pick up .subagent-node's
+ * clickable chrome (it has no node id), so reset it. The nested .subagent-list
+ * already supplies the indent + left-border "trunk" at every level, so depth
+ * reads as progressive indentation: each level adds another trunk + margin. */
+.subagent-children {
+  display: block;
+  padding: 0;
+  margin: 0;
+  cursor: default;
+}
+
+/* A nested subtree sits flush under its parent node, slightly tightened so the
+ * caret/summary reads as "children of the node directly above" rather than a
+ * sibling of the parent card's top-level tree. */
+.subagent-subtree {
+  margin-top: 2px;
+  margin-left: 0.2em;
+}
+
+/* The nested summary is a touch quieter than the top-level "Subagents (N)"
+ * root so the eye walks DOWN the tiers; still bold enough to read as a
+ * disclosure label. */
+.subagent-subtree > .prompt-summary {
+  font-weight: 500;
+  font-size: 0.74rem;
+}

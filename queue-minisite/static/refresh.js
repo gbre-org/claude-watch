@@ -137,6 +137,40 @@
   }, true);
 
   // ---------------------------------------------------------------------
+  // Recursive subagent-tree node renderer. Mirrors the Jinja
+  // subagent_node() macro in templates/index.html byte-for-byte
+  // (structure / attrs / classes / `open` defaults) so the morphdom merge
+  // doesn't flap. Renders one node <li>, then — when the node spawned
+  // children (sa.children, reconstructed server-side from
+  // toolUseResult.agentId spawn edges) — a NESTED <details open> holding the
+  // children, recursing to arbitrary depth. Every level is DEFAULT-EXPANDED;
+  // each nested <details> keys its localStorage persistence on the AGENT ID.
+  // ---------------------------------------------------------------------
+  function renderSubagentNode(sa) {
+    const sid = sa.subagent_id || '';
+    let html = (
+      `<li class="subagent-node subagent-log-clickable" data-subagent-id="${attr(sid)}" data-log-mode="subagent" tabindex="0" role="button" aria-label="View live log for subagent ${attr(sid)}" title="Click to tail this subagent's live log">` +
+      `<code class="subagent-id">${esc(sid.slice(0, 12))}</code>` +
+      `<span class="subagent-label">${esc(sa.label || sid)}</span>` +
+      `<span class="subagent-age">${esc(sa.age || '')}</span>` +
+      '</li>'
+    );
+    const children = sa.children || [];
+    if (children.length) {
+      const childNodes = children.map(renderSubagentNode).join('');
+      html += (
+        '<li class="subagent-children">' +
+        `<details class="prompt-toggle subagent-tree subagent-subtree" open data-tree-key="${attr(sid)}">` +
+        `<summary class="prompt-summary">Subagents (${esc(children.length)})</summary>` +
+        `<ul class="subagent-list">${childNodes}</ul>` +
+        '</details>' +
+        '</li>'
+      );
+    }
+    return html;
+  }
+
+  // ---------------------------------------------------------------------
   // Source filter — filters the visible queue cards by their producer
   // (the queue item's `created_by`: `main-loop`, `workload`, …). The
   // dropdown is populated from `state.sources`, the GLOBAL distinct
@@ -292,29 +326,23 @@
     // Nested subagent tree -- mirrors the RUNNING block in
     // templates/index.html. it.subagents is computed server-side
     // (app.py _shape) for running items: the owner agent's parent
-    // sessionId -> all agent-*.jsonl siblings under that session's
-    // subagents/ dir. MUST match the server markup so morphdom doesn't
-    // flap, AND must be re-rendered here so the 5s SPA refresh doesn't
-    // wipe the tree the server first painted.
+    // sessionId -> a NESTED forest of agent nodes, each with a `children`
+    // list reconstructed from toolUseResult.agentId spawn edges. The tree
+    // nests to arbitrary depth (agent -> agent -> ...). MUST match the
+    // server macro (subagent_node) so morphdom doesn't flap, AND must be
+    // re-rendered here so the 5s SPA refresh doesn't wipe the tree the
+    // server first painted.
     const subagents = it.subagents || [];
     let subtree = '';
     if (subagents.length) {
-      const nodes = subagents.map((sa) => {
-        const sid = sa.subagent_id || '';
-        return (
-          `<li class="subagent-node subagent-log-clickable" data-subagent-id="${attr(sid)}" data-log-mode="subagent" tabindex="0" role="button" aria-label="View live log for subagent ${attr(sid)}" title="Click to tail this subagent's live log">` +
-          `<code class="subagent-id">${esc(sid.slice(0, 12))}</code>` +
-          `<span class="subagent-label">${esc(sa.label || sid)}</span>` +
-          `<span class="subagent-age">${esc(sa.age || '')}</span>` +
-          '</li>'
-        );
-      }).join('');
+      const nodes = subagents.map(renderSubagentNode).join('');
       // DEFAULT-EXPANDED (`open`) + collapsible — mirrors templates/index.html
-      // byte-for-byte so morphdom doesn't flap. `data-tree-key` (the queue id)
-      // is the localStorage persistence key (see applySubtreeState + the
-      // toggle listener below). DEPTH CEILING (honest): one level only —
-      // running item -> its owning session's subagents; deeper agent->agent
-      // nesting is NOT reconstructible from disk (flat-per-session transcript).
+      // so morphdom doesn't flap. `data-tree-key` (the queue id) is the
+      // localStorage persistence key for the TOP-LEVEL tree; each nested
+      // subtree keys on its own agent id (see renderSubagentNode +
+      // applySubtreeState + the toggle listener below). MULTI-LEVEL: deeper
+      // agent->agent nesting IS reconstructed from the transcript spawn edges
+      // (file layout is flat per session, but the edges live in the records).
       subtree = `<details class="prompt-toggle subagent-tree" open data-tree-key="${attr(it.id)}">` +
         `<summary class="prompt-summary">Subagents (${esc(subagents.length)})</summary>` +
         `<ul class="subagent-list">${nodes}</ul>` +

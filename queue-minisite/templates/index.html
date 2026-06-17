@@ -26,6 +26,42 @@
   <script src="{{ url_for('static', filename='vendor/morphdom-2.7.4.min.js') }}"></script>
 </head>
 <body>
+  {#- ---------- recursive subagent-tree node macro ----------
+      Renders ONE subagent node (a clickable <li>) and, when the node spawned
+      children (sa.children, reconstructed server-side from
+      toolUseResult.agentId spawn edges — see app.py _list_session_subagents),
+      a NESTED <details class="subagent-tree" open> holding the children,
+      recursing to arbitrary depth. Every level is DEFAULT-EXPANDED (`open`)
+      and independently collapsible; each nested <details> carries its own
+      data-tree-key (the agent id) so localStorage persists collapse state
+      per node (refresh.js applySubtreeState + toggle listener). Mirrored
+      byte-for-byte (structure/attrs/classes/open defaults) in
+      static/refresh.js renderSubagentNode() so the morphdom refresh doesn't
+      flap. -#}
+  {% macro subagent_node(sa) -%}
+    <li
+      class="subagent-node subagent-log-clickable"
+      data-subagent-id="{{ sa.subagent_id }}"
+      data-log-mode="subagent"
+      tabindex="0"
+      role="button"
+      aria-label="View live log for subagent {{ sa.subagent_id }}"
+      title="Click to tail this subagent's live log">
+      <code class="subagent-id">{{ sa.subagent_id[:12] }}</code>
+      <span class="subagent-label">{{ sa.label }}</span>
+      <span class="subagent-age">{{ sa.age }}</span>
+    </li>
+    {% if sa.children %}
+      <li class="subagent-children">
+        <details class="prompt-toggle subagent-tree subagent-subtree" open data-tree-key="{{ sa.subagent_id }}">
+          <summary class="prompt-summary">Subagents ({{ sa.children|length }})</summary>
+          <ul class="subagent-list">
+            {% for child in sa.children %}{{ subagent_node(child) }}{% endfor %}
+          </ul>
+        </details>
+      </li>
+    {% endif %}
+  {%- endmacro %}
   <header class="topbar">
     <div class="title">
       {% if site_logo_url %}
@@ -182,43 +218,36 @@
             </details>
           {% endif %}
           {# ---------- NESTED SUBAGENT TREE ----------
-             Expandable list of the child subagents of this running item's
-             owner main-loop session. it.subagents is computed server-side in
-             app.py _shape() (running items only): the owner agent's parent
-             sessionId -> every agent-*.jsonl sibling under that session's
-             subagents/ dir. Each node is clickable to open the SAME live-log
-             modal pointed at /api/subagent/<id>/stream (live-log.js dispatches
-             on data-log-mode="subagent"). Mirrored in static/refresh.js so the
-             5s SPA refresh re-renders the tree (otherwise it would be wiped).
-             NOTE (flat-per-session): the on-disk layout groups subagents by
-             SESSION, not by which specific agent spawned each one.
-             DEPTH CEILING (honest): this tree is exactly ONE level deep —
-             running queue item -> its owning session's subagents. Deeper
-             agent->agent spawn nesting is NOT reconstructible from disk (the
-             transcript layout is flat per session, see app.py), so we do not
-             fabricate it. The tree is DEFAULT-EXPANDED (`open`) and collapsible
-             via the native <details>/<summary> disclosure; per-card collapse
-             state is persisted in localStorage keyed by `data-tree-key` (the
-             queue id) — see static/refresh.js (toggle listener +
-             applySubtreeState). Default is EXPANDED when no stored value. #}
+             MULTI-LEVEL tree of the child subagents of this running item.
+             it.subagents is computed server-side in app.py _shape() (running
+             items only): the owner agent's parent sessionId -> a NESTED forest
+             of agent nodes, with parent->child edges reconstructed from each
+             transcript's toolUseResult.agentId spawn records (see
+             _list_session_subagents). Each node carries a `children` list of
+             the same shape, so the tree nests to ARBITRARY DEPTH (agent ->
+             agent -> agent ...). The FILE layout on disk is flat per session,
+             but the spawn EDGES live inside the records, so the tree is real,
+             not fabricated.
+
+             Each node is clickable to open the SAME live-log modal pointed at
+             /api/subagent/<id>/stream (live-log.js dispatches on
+             data-log-mode="subagent"). Rendered via the recursive
+             subagent_node() macro (defined at the top of <body>) and mirrored
+             in static/refresh.js renderSubagentNode() so the 5s SPA refresh
+             re-renders the tree without flapping.
+
+             Every level is DEFAULT-EXPANDED (`open`) and independently
+             collapsible via the native <details>/<summary> disclosure;
+             collapse state is persisted in localStorage keyed by
+             `data-tree-key` — the QUEUE ID for the top-level tree, the AGENT
+             ID for each nested subtree — see static/refresh.js (toggle
+             listener + applySubtreeState). Default is EXPANDED when no stored
+             value / storage error. #}
           {% if it.subagents %}
             <details class="prompt-toggle subagent-tree" open data-tree-key="{{ it.id }}">
               <summary class="prompt-summary">Subagents ({{ it.subagents|length }})</summary>
               <ul class="subagent-list">
-                {% for sa in it.subagents %}
-                  <li
-                    class="subagent-node subagent-log-clickable"
-                    data-subagent-id="{{ sa.subagent_id }}"
-                    data-log-mode="subagent"
-                    tabindex="0"
-                    role="button"
-                    aria-label="View live log for subagent {{ sa.subagent_id }}"
-                    title="Click to tail this subagent's live log">
-                    <code class="subagent-id">{{ sa.subagent_id[:12] }}</code>
-                    <span class="subagent-label">{{ sa.label }}</span>
-                    <span class="subagent-age">{{ sa.age }}</span>
-                  </li>
-                {% endfor %}
+                {% for sa in it.subagents %}{{ subagent_node(sa) }}{% endfor %}
               </ul>
             </details>
           {% endif %}
