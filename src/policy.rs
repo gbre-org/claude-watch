@@ -350,6 +350,43 @@ pub(crate) fn dead_process_restart_suppressed(
     suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
 }
 
+/// Pure gate: should the fresh-external-session checklist kick-start inject
+/// FIRE this cycle? Mirrors the decision made at the fire site (the
+/// dead-process block's `else if`) so the conditions — including the
+/// interactive-prompt suppression — are unit-testable without mocking tmux.
+///
+/// The inject fires iff ALL hold:
+///   * `dead_checks >= fresh_inject_checks` — enough consecutive
+///     tokens==0 / bashes==0 observations to be confident the session is
+///     genuinely a fresh idle one (not a momentary between-turns reading).
+///   * `!already_injected` — we haven't already kick-started this session.
+///   * `is_idle` — the Claude prompt (`❯`) is visible.
+///   * `!interactive_prompt` — there is NO `AskUserQuestion` / tool-permission
+///     / selection menu on screen awaiting the operator.
+///
+/// The last clause is the fix for the reported bug: a legitimately pending
+/// interactive question idles the loop with tokens==0 and renders a `❯`
+/// cursor, so `is_idle` reads true and the loop lands in the dead-process
+/// block. Without this clause the kick-start inject `send-keys` (leading
+/// Escape) would CANCEL the operator's question. A pending question is a
+/// recognized, legitimate idle state — the #356 ask_question_monitor uses
+/// the same `is_interactive_prompt` signal to detect it — so it must EXEMPT
+/// the loop from the wedge/restart inject for the question's lifetime.
+/// Suppressing is recoverable (a later cycle injects once the prompt
+/// clears); injecting into a live menu is not.
+pub(crate) fn fresh_inject_due(
+    dead_checks: u32,
+    fresh_inject_checks: u32,
+    already_injected: bool,
+    is_idle: bool,
+    interactive_prompt: bool,
+) -> bool {
+    dead_checks >= fresh_inject_checks
+        && !already_injected
+        && is_idle
+        && !interactive_prompt
+}
+
 /// Pure predicate: is at least one workload heartbeat fresh?
 ///
 /// Scans `dir` for files (any name) and returns `true` if any has an
@@ -3128,10 +3165,24 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     state.alert_count = 0;
                     reset_suppression(state);
                 }
-            } else if dead_checks >= config.dead_process.fresh_inject_checks
-                && !state.fresh_session_injected
-                && tmux::is_idle(&effective_pane).await
-            {
+            } else if {
+                // Evaluate the pane reads ONCE into locals, then defer the
+                // FIRE/SUPPRESS decision to the pure `fresh_inject_due` gate
+                // (unit-tested, so the interactive-prompt suppression is
+                // locked). `is_interactive_prompt` is only consulted when
+                // `is_idle` already holds, to avoid a second pane capture on
+                // the common not-idle path.
+                let idle = tmux::is_idle(&effective_pane).await;
+                let interactive =
+                    idle && tmux::is_interactive_prompt(&effective_pane).await;
+                fresh_inject_due(
+                    dead_checks,
+                    config.dead_process.fresh_inject_checks,
+                    state.fresh_session_injected,
+                    idle,
+                    interactive,
+                )
+            } {
                 // Claude Code is running (idle prompt visible) but tokens=0 — this is
                 // a fresh session launched externally (e.g. dashboard --fresh), not by
                 // claude-watch. Inject a checklist kick-start prompt.
@@ -3144,6 +3195,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // here is already fresh at the idle prompt, so the prompt
                 // says so explicitly and points at the resume checklist
                 // without any "restart" verb.
+                //
+                // SUPPRESSION (interactive prompt): the `fresh_inject_due`
+                // gate above also requires `!interactive_prompt`. A legitimately
+                // pending `AskUserQuestion` / tool-permission / selection menu
+                // idles the loop with tokens==0 (no generation) and renders a
+                // `❯` selection cursor, so it lands in THIS dead-process block
+                // and reads as `is_idle` — without the guard the fresh-/resume-
+                // checklist inject below would `send-keys` (leading Escape)
+                // into the live menu and CANCEL the operator's question before
+                // they can answer it. This mirrors the identical guard on the
+                // fresh-/clear path below; the #356 ask_question_monitor
+                // already uses `is_interactive_prompt` as its detection signal,
+                // so a pending question is a recognized, legitimate idle state
+                // that must NOT be preempted by a wedge/restart inject. A FALSE
+                // POSITIVE here only DELAYS the kick-start by a cycle
+                // (recoverable); a FALSE NEGATIVE destroys a live question.
                 info!(
                     dead_checks,
                     "fresh external session detected — injecting checklist kick-start"
@@ -7331,6 +7398,57 @@ pane_unchanged_secs = 600
         assert!(suppressed_on, "master switch on must let fresh hb suppress");
     }
 
+
+    // --- fresh-external-session inject gate (interactive-prompt suppression) ---
+
+    #[test]
+    fn test_fresh_inject_due_fires_when_idle_and_no_interactive_prompt() {
+        // The canonical fresh-idle case: enough dead checks, not yet
+        // injected, idle prompt visible, NO interactive menu → inject.
+        assert!(fresh_inject_due(
+            /* dead_checks */ 3,
+            /* fresh_inject_checks */ 3,
+            /* already_injected */ false,
+            /* is_idle */ true,
+            /* interactive_prompt */ false,
+        ));
+    }
+
+    #[test]
+    fn test_fresh_inject_due_suppressed_when_interactive_prompt_pending() {
+        // THE BUG FIX: a legitimately pending AskUserQuestion idles the loop
+        // (tokens==0) and renders a `❯` cursor, so `is_idle` is true and we
+        // are deep in the dead-process block — but an interactive prompt is
+        // up. The inject MUST be suppressed so its leading-Escape send-keys
+        // does not cancel the operator's question. Every other condition is
+        // satisfied; only the interactive-prompt clause must hold the gate.
+        assert!(
+            !fresh_inject_due(
+                /* dead_checks */ 10,
+                /* fresh_inject_checks */ 3,
+                /* already_injected */ false,
+                /* is_idle */ true,
+                /* interactive_prompt */ true,
+            ),
+            "a pending interactive question must suppress the fresh-inject"
+        );
+    }
+
+    #[test]
+    fn test_fresh_inject_due_requires_idle() {
+        // Not at the idle prompt (e.g. still rendering) → never inject,
+        // regardless of the interactive flag.
+        assert!(!fresh_inject_due(5, 3, false, false, false));
+        assert!(!fresh_inject_due(5, 3, false, false, true));
+    }
+
+    #[test]
+    fn test_fresh_inject_due_requires_threshold_and_not_already_injected() {
+        // Under the dead-check threshold → no inject yet.
+        assert!(!fresh_inject_due(2, 3, false, true, false));
+        // Already injected this session → don't re-inject.
+        assert!(!fresh_inject_due(5, 3, true, true, false));
+    }
 
     // --- AskUserQuestion stale-monitor timer lifecycle (Phase 1) ---
 
