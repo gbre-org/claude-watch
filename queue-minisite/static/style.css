@@ -1541,9 +1541,23 @@ body.modal-open { overflow: hidden; }
   margin-top: 8px;
 }
 
+/* The tree's <summary> reuses .prompt-toggle .prompt-summary, so it already
+ * gets the rotating ▸ caret disclosure affordance (rotates 90deg when the
+ * <details> is [open]). DEFAULT-EXPANDED: the markup emits `open`, so on
+ * first load the caret points down and the node list is visible. We bump the
+ * summary's emphasis a touch so it reads as a labelled tree root rather than
+ * just another muted toggle. */
+.subagent-tree > .prompt-summary {
+  color: var(--fg);
+  font-weight: 600;
+}
+
 .subagent-list {
   list-style: none;
-  margin: 6px 0 0;
+  /* Indent the child list under the caret so the tree visibly nests beneath
+   * its summary; the left border is the tree's "trunk". One level deep only
+   * (running item -> its session's subagents) — see refresh.js / index.html. */
+  margin: 6px 0 0 0.55em;
   padding-left: 12px;
   border-left: 2px solid var(--line);
   display: flex;
