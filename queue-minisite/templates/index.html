@@ -191,9 +191,18 @@
              on data-log-mode="subagent"). Mirrored in static/refresh.js so the
              5s SPA refresh re-renders the tree (otherwise it would be wiped).
              NOTE (flat-per-session): the on-disk layout groups subagents by
-             SESSION, not by which specific agent spawned each one. #}
+             SESSION, not by which specific agent spawned each one.
+             DEPTH CEILING (honest): this tree is exactly ONE level deep —
+             running queue item -> its owning session's subagents. Deeper
+             agent->agent spawn nesting is NOT reconstructible from disk (the
+             transcript layout is flat per session, see app.py), so we do not
+             fabricate it. The tree is DEFAULT-EXPANDED (`open`) and collapsible
+             via the native <details>/<summary> disclosure; per-card collapse
+             state is persisted in localStorage keyed by `data-tree-key` (the
+             queue id) — see static/refresh.js (toggle listener +
+             applySubtreeState). Default is EXPANDED when no stored value. #}
           {% if it.subagents %}
-            <details class="prompt-toggle subagent-tree">
+            <details class="prompt-toggle subagent-tree" open data-tree-key="{{ it.id }}">
               <summary class="prompt-summary">Subagents ({{ it.subagents|length }})</summary>
               <ul class="subagent-list">
                 {% for sa in it.subagents %}

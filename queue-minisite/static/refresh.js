@@ -67,6 +67,76 @@
   }
 
   // ---------------------------------------------------------------------
+  // Subagent-tree collapse persistence.
+  //
+  // The nested subagent tree (one .subagent-tree <details> per running card,
+  // keyed by `data-tree-key` = the queue id) renders DEFAULT-EXPANDED on
+  // first load. The operator can collapse/expand any card's tree; we persist
+  // that per-card choice in localStorage under `subtree:<queueId>` ("1"=open,
+  // "0"=closed). The DEFAULT (no stored value, e.g. first ever load) is OPEN.
+  //
+  // Why this can't ride the generic <details> preserve-open path in
+  // onBeforeElUpdated: that path only re-applies `open` when the LIVE element
+  // is open. Because our server + renderer both emit `open` by default, a
+  // user-COLLAPSED tree would be slammed back open on the next 5s tick. So
+  // we read localStorage explicitly for .subagent-tree nodes during the merge
+  // (applySubtreeStateToEl) and re-apply it after the first server paint
+  // (applySubtreeState). Everything is dependency-free + fails safe to OPEN.
+  // ---------------------------------------------------------------------
+  const SUBTREE_KEY_PREFIX = 'subtree:';
+
+  function readSubtreeStored(key) {
+    if (!key) return null;
+    try {
+      return window.localStorage.getItem(SUBTREE_KEY_PREFIX + key);
+    } catch (_) {
+      return null; // private mode / disabled storage -> default open
+    }
+  }
+
+  function writeSubtreeStored(key, isOpen) {
+    if (!key) return;
+    try {
+      window.localStorage.setItem(SUBTREE_KEY_PREFIX + key, isOpen ? '1' : '0');
+    } catch (_) { /* storage unavailable -> just don't persist */ }
+  }
+
+  // Apply the stored collapse state to a single .subagent-tree element.
+  // Default (no stored value) = OPEN (expanded). Returns nothing.
+  function applySubtreeStateToEl(el) {
+    if (!el || !el.getAttribute) return;
+    const key = el.getAttribute('data-tree-key');
+    if (!key) return;
+    const stored = readSubtreeStored(key);
+    if (stored === '0') {
+      el.removeAttribute('open');
+    } else {
+      // stored === '1' OR null (first load) -> expanded
+      el.setAttribute('open', '');
+    }
+  }
+
+  // Re-apply stored state to every subagent tree currently in the DOM. Run
+  // once after the server's first paint and again after each merge tick.
+  function applySubtreeState() {
+    const trees = document.querySelectorAll('.subagent-tree[data-tree-key]');
+    for (let i = 0; i < trees.length; i += 1) {
+      applySubtreeStateToEl(trees[i]);
+    }
+  }
+
+  // Persist on toggle. One delegated capturing listener catches the native
+  // <details> `toggle` event from any .subagent-tree and records its new
+  // open/closed state keyed by queue id.
+  document.addEventListener('toggle', (ev) => {
+    const t = ev.target;
+    if (!t || !t.classList || !t.classList.contains('subagent-tree')) return;
+    const key = t.getAttribute && t.getAttribute('data-tree-key');
+    if (!key) return;
+    writeSubtreeStored(key, !!t.open);
+  }, true);
+
+  // ---------------------------------------------------------------------
   // Source filter — filters the visible queue cards by their producer
   // (the queue item's `created_by`: `main-loop`, `workload`, …). The
   // dropdown is populated from `state.sources`, the GLOBAL distinct
@@ -239,7 +309,13 @@
           '</li>'
         );
       }).join('');
-      subtree = '<details class="prompt-toggle subagent-tree">' +
+      // DEFAULT-EXPANDED (`open`) + collapsible — mirrors templates/index.html
+      // byte-for-byte so morphdom doesn't flap. `data-tree-key` (the queue id)
+      // is the localStorage persistence key (see applySubtreeState + the
+      // toggle listener below). DEPTH CEILING (honest): one level only —
+      // running item -> its owning session's subagents; deeper agent->agent
+      // nesting is NOT reconstructible from disk (flat-per-session transcript).
+      subtree = `<details class="prompt-toggle subagent-tree" open data-tree-key="${attr(it.id)}">` +
         `<summary class="prompt-summary">Subagents (${esc(subagents.length)})</summary>` +
         `<ul class="subagent-list">${nodes}</ul>` +
         '</details>';
@@ -651,11 +727,23 @@
   function onBeforeElUpdated(fromEl, toEl) {
     if (shouldSkipElement(fromEl)) return false;
 
-    // Preserve <details> expansion: if the live element is open, mirror
-    // it onto the new element BEFORE morphdom diffs them. Otherwise the
-    // server's `closed` state would slam the user-opened panel shut on
-    // every tick.
-    if (fromEl.tagName === 'DETAILS' && fromEl.open) {
+    // Preserve <details> expansion across the tick.
+    //
+    // Subagent trees (.subagent-tree, keyed by data-tree-key) have their own
+    // persistence: the canonical open/closed state lives in localStorage and
+    // defaults to OPEN. Apply that to the freshly-built node so a user's
+    // COLLAPSE survives — the generic "preserve if live open" rule below
+    // can't express a collapse because both server + renderer emit `open` by
+    // default (the new node is always open, so the tree would re-expand on
+    // every tick). applySubtreeStateToEl reads localStorage and sets/clears
+    // `open` accordingly (default open when unset).
+    if (fromEl.classList && fromEl.classList.contains('subagent-tree')) {
+      applySubtreeStateToEl(toEl);
+    } else if (fromEl.tagName === 'DETAILS' && fromEl.open) {
+      // Generic disclosures (Prompt blocks, etc.): if the live element is
+      // open, mirror it onto the new element BEFORE morphdom diffs them.
+      // Otherwise the server's `closed` state would slam the user-opened
+      // panel shut on every tick.
       toEl.setAttribute('open', '');
     }
 
@@ -772,6 +860,11 @@
       // match the current selection.
       applySourceFilter();
 
+      // Re-apply persisted subagent-tree collapse state (default expanded).
+      // onBeforeElUpdated already handles UPDATED nodes; this also covers any
+      // newly-ADDED card whose tree morphdom inserted this tick.
+      applySubtreeState();
+
       // Update the cache-age value inside the (skipped) info-dropdown so
       // it stays live without re-rendering the whole subtree.
       const cacheAgeEl = document.querySelector('.cache-age');
@@ -789,6 +882,11 @@
       // Network blip — try again next tick.
     }
   }
+
+  // Apply persisted subagent-tree collapse state to the server's first
+  // paint (which always emits `open`). A previously-collapsed card is
+  // restored to collapsed; everything else stays expanded (the default).
+  applySubtreeState();
 
   // Don't fire the first tick immediately on load — the server-rendered
   // first paint is already correct. Schedule the recurring tick.
@@ -809,5 +907,7 @@
     mergeQueueRoot,
     mergeTopbarMeta,
     onBeforeElUpdated,
+    applySubtreeState,
+    applySubtreeStateToEl,
   };
 })();
