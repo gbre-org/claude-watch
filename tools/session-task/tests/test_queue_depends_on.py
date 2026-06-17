@@ -160,33 +160,70 @@ def test_depend_add_remove_clear():
 
 
 # ---------------------------------------------------------------------------
-# 4. cycle detection: A->B->A both stuck
+# 4. cycle PREVENTION: the edit that would close a loop is refused (2026-06-17)
 # ---------------------------------------------------------------------------
-def test_dep_cycle_detected_on_read():
+def test_dep_cycle_refused_at_write_time():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         a = _add(env, "a", ["repo:a"])
         b = _add(env, "b", ["repo:b"])
 
-        # b -> a
+        # b -> a (fine; acyclic)
         _run(env, "queue", "depend", b["id"], "--add", a["id"], check=True)
-        # a -> b (creates cycle)
-        _run(env, "queue", "depend", a["id"], "--add", b["id"], check=True)
+        # a -> b would create a cycle a->b->a — REFUSED, nothing persisted.
+        r = _run(env, "queue", "depend", a["id"], "--add", b["id"])
+        assert r.returncode != 0
+        assert "cycle" in r.stderr.lower()
+        # The offending dep is named in the diagnostic.
+        assert b["id"] in r.stderr
 
+        # The refused edge was NOT written: a has no deps, graph acyclic,
+        # both items still make progress (a is ready, b waits on a).
         a_show = _show(env, a["id"])
         b_show = _show(env, b["id"])
-        assert a_show["dep_cycle"] is True
-        assert b_show["dep_cycle"] is True
-        assert a_show["ready_now"] is False
+        assert a_show.get("depends_on") in (None, [])
+        assert a_show["dep_cycle"] is False
+        assert b_show["dep_cycle"] is False
+        assert a_show["ready_now"] is True
+        assert b_show["depends_on"] == [a["id"]]
         assert b_show["ready_now"] is False
 
-        # Breaking the cycle restores forward progress (a no longer
-        # depends on b -> a is ready -> can finish -> b unblocks).
-        _run(env, "queue", "depend", a["id"], "--remove", b["id"],
-             check=True)
-        a_show = _show(env, a["id"])
-        assert a_show["dep_cycle"] is False
-        assert a_show["ready_now"] is True
+
+def test_transitive_dep_cycle_refused():
+    # a->b, b->c already exist; adding c->a closes a 3-node loop -> refused.
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+        c = _add(env, "c", ["repo:c"])
+
+        _run(env, "queue", "depend", a["id"], "--add", b["id"], check=True)
+        _run(env, "queue", "depend", b["id"], "--add", c["id"], check=True)
+        r = _run(env, "queue", "depend", c["id"], "--add", a["id"])
+        assert r.returncode != 0
+        assert "cycle" in r.stderr.lower()
+        # c acquired no dep.
+        c_show = _show(env, c["id"])
+        assert c_show.get("depends_on") in (None, [])
+
+
+def test_remove_breaks_preexisting_cycle_not_blocked():
+    # A pre-existing cycle (constructed by editing scope on disk-ish via
+    # two adds that DON'T themselves close the loop is impossible now, so
+    # we verify the inverse: a --remove is never blocked by the cycle
+    # guard. Build a->b, then removing it is always allowed.
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+        _run(env, "queue", "depend", a["id"], "--add", b["id"], check=True)
+        # Removing is always allowed (loosening a gate is safe).
+        r = _run(env, "queue", "depend", a["id"], "--remove", b["id"],
+                 "--json", check=True)
+        out = json.loads(r.stdout)
+        assert out["depends_on"] == []
+        assert out["ready_now"] is True
+        assert out["unmet"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +296,99 @@ def test_abandoned_dep_keeps_blocked():
         # explicitly removes the dep.
         assert b_show["ready_now"] is False
         assert b_show["dep_blockers"] == [a["id"]]
+
+
+# ---------------------------------------------------------------------------
+# 9. safe-edit semantics on running / done items (2026-06-17)
+# ---------------------------------------------------------------------------
+def test_add_dep_on_running_item_refused_without_force():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+        _register(env, b["id"])  # b -> running
+
+        # ADD on a running item is refused by default.
+        r = _run(env, "queue", "depend", b["id"], "--add", a["id"])
+        assert r.returncode != 0
+        assert "force" in r.stderr.lower()
+        # Nothing was written.
+        b_show = _show(env, b["id"])
+        assert b_show.get("depends_on") in (None, [])
+
+        # --force lets the operator record the edge anyway.
+        r = _run(env, "queue", "depend", b["id"], "--add", a["id"],
+                 "--force", "--json", check=True)
+        out = json.loads(r.stdout)
+        assert out["depends_on"] == [a["id"]]
+        # The running item is NOT silently re-gated — status stays running.
+        b_show = _show(env, b["id"])
+        assert b_show["status"] == "running"
+
+
+def test_remove_dep_on_running_item_allowed():
+    # Loosening a gate is always safe — no --force needed, even mid-flight.
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"], "--depends-on", a["id"])
+        # Satisfy the dep so b can register, then b is running with the
+        # (now-met) dep edge still on it.
+        _register(env, a["id"])
+        _done(env, a["id"])
+        _register(env, b["id"])  # b -> running, still carries task:a
+        b_show = _show(env, b["id"])
+        assert b_show["status"] == "running"
+        assert b_show["depends_on"] == [a["id"]]
+        # Removing the edge from the running item needs no --force.
+        r = _run(env, "queue", "depend", b["id"], "--remove", a["id"],
+                 "--json", check=True)
+        out = json.loads(r.stdout)
+        assert out["depends_on"] == []
+
+
+def test_edit_deps_on_done_item_refused():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+        _register(env, b["id"])
+        _done(env, b["id"])  # b -> done (terminal)
+        # Even a remove/clear is refused on a terminal item.
+        for argv in (["--add", a["id"]], ["--clear"]):
+            r = _run(env, "queue", "depend", b["id"], *argv)
+            assert r.returncode != 0
+            assert "terminal" in r.stderr.lower() or "done" in r.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# 10. JSON output contract parity with `queue add` / `queue show`
+# ---------------------------------------------------------------------------
+def test_depend_json_reports_unmet_and_dep_blockers():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+
+        r = _run(env, "queue", "depend", b["id"], "--add", a["id"],
+                 "--json", check=True)
+        out = json.loads(r.stdout)
+        # mirror show: a is not done -> unmet
+        assert out["depends_on"] == [a["id"]]
+        assert out["unmet"] == [a["id"]]
+        assert out["dep_blockers"] == [a["id"]]  # alias of unmet
+        assert out["ready_now"] is False
+        assert out["dep_cycle"] is False
+
+        # finishing a clears unmet
+        _register(env, a["id"])
+        _done(env, a["id"])
+        r = _run(env, "queue", "depend", b["id"], "--add", a["id"],
+                 "--json", check=True)  # idempotent re-add
+        out = json.loads(r.stdout)
+        assert out["unmet"] == []
+        assert out["dep_blockers"] == []
+        assert out["ready_now"] is True
 
 
 if __name__ == "__main__":
