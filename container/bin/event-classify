@@ -230,6 +230,10 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("*", "workload-done", None, AMBIENT,
         "Workload finished; context only."),
 
+    # Host-job routine (hostjob runner; parallels workload-done).
+    ("*", "hostjob-done", None, AMBIENT,
+        "Host job finished; context only."),
+
     # Watcher routine events.
     ("*", "watcher-cleanup", None, AMBIENT,
         "Watcher cleanup tick; context only."),
@@ -378,6 +382,7 @@ def _self_test() -> int:
 
         # Ambient: workload + watcher
         (("manual", "workload-done", ""), AMBIENT),
+        (("hostjob", "hostjob-done", ""), AMBIENT),
         (("claude-watch", "memory-reminder", ""), AMBIENT),
         (("manual", "watcher-cleanup", ""), AMBIENT),
         # claude-watch/* catch-all stays ambient for non-heartbeat tags.
