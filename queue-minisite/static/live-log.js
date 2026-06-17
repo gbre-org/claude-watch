@@ -147,6 +147,11 @@
   // but the server tails /tmp/claude-workloads/<label>.output instead of
   // an agent JSONL — same wire format, simpler line-oriented payload.
   let mode = 'live';
+  // Subagent id for mode==='subagent' — the per-subagent live-log
+  // tree under each running card. In that mode the EventSource points
+  // at /api/subagent/<subagentId>/stream (NOT the queue stream); the
+  // SSE wire format is identical so the renderer is unchanged.
+  let subagentId = null;
   // Starting-state polling: when a queue row carries
   // data-queue-starting="1" the modal opens but no agent record / JSONL
   // exists yet. The backend's /stream endpoint emits a one-shot error
@@ -393,6 +398,41 @@
     if (!meta || typeof meta !== 'object' || !meta.ok) return;
     if (!metaSummaryEl) return;
 
+    // Subagent meta payload (/api/subagent/<id>/meta) is a different,
+    // smaller shape: { ok, subagent_id, parent_session_id, label, age,
+    // age_seconds }. It has none of the queue-state fields, so render a
+    // compact subagent-specific header and return early rather than
+    // showing a row of "undefined" pills. The live transcript below is
+    // identical to the agent stream.
+    if (meta.subagent_id) {
+      stopRuntimeTicker();
+      if (meta.label) {
+        setMetaRow('status', esc(meta.label), true);
+      } else {
+        setMetaRow('status', esc(meta.subagent_id), true);
+      }
+      if (meta.parent_session_id) {
+        setMetaRow('group', 'session ' + esc(meta.parent_session_id), true);
+      } else {
+        setMetaRow('group', '');
+      }
+      if (meta.age) {
+        setMetaRow('runtime', esc(meta.age), false);
+      } else {
+        setMetaRow('runtime', '');
+      }
+      // Hide the queue-only rows in subagent mode.
+      setMetaRow('times', '');
+      setMetaRow('scope', '');
+      setMetaRow('deps', '');
+      setMetaRow('dependents', '');
+      setMetaRow('by', '');
+      setMetaRow('usage', '');
+      setMetaRow('abandon', '');
+      metaSummaryEl.hidden = false;
+      return;
+    }
+
     // status pill (always visible when meta loaded)
     setMetaRow('status', statusPillHtml(meta.status), true);
 
@@ -597,7 +637,13 @@
   // summary block hidden; the prompt + transcript still render.
   function fetchMetaSummary(qid) {
     if (!qid) return;
-    fetch('/api/queue/' + encodeURIComponent(qid) + '/meta', {
+    // Subagent mode resolves its own cheap meta endpoint; the payload shape
+    // differs (subagent_id / parent_session_id / label) so applyMetaSummary
+    // tolerates missing queue-only fields gracefully.
+    const metaUrl = (mode === 'subagent')
+      ? '/api/subagent/' + encodeURIComponent(qid) + '/meta'
+      : '/api/queue/' + encodeURIComponent(qid) + '/meta';
+    fetch(metaUrl, {
       headers: { 'Accept': 'application/json' },
       credentials: 'same-origin',
     })
@@ -1430,15 +1476,25 @@
     // 'workload' uses /stream — server-side dispatch tails
     //   /tmp/claude-workloads/<label>.output (line-oriented plain text)
     //   instead of an agent JSONL. Same wire envelope, simpler payloads.
+    // 'subagent' uses /api/subagent/<subagent-id>/stream — tails a child
+    //   subagent's JSONL directly (nested tree under a running card). Same
+    //   wire envelope as 'live', just a different endpoint + meta source.
     mode = (row.getAttribute('data-log-mode') || 'live').toLowerCase();
-    if (mode !== 'archive' && mode !== 'workload') mode = 'live';
-    if (!id) return;
+    if (mode !== 'archive' && mode !== 'workload' && mode !== 'subagent') mode = 'live';
+    // Subagent rows carry their own id distinct from the queue id; the
+    // header + stream + meta key off it in subagent mode.
+    subagentId = (mode === 'subagent')
+      ? (row.getAttribute('data-subagent-id') || '')
+      : null;
+    if (mode === 'subagent' && !subagentId) return;
+    if (mode !== 'subagent' && !id) return;
 
     modal.setAttribute('data-mode', mode);
-    titleIdEl.textContent = id;
+    titleIdEl.textContent = (mode === 'subagent') ? subagentId : id;
     if (modeLabelEl) {
       if (mode === 'archive') modeLabelEl.textContent = 'Archived log';
       else if (mode === 'workload') modeLabelEl.textContent = 'Workload output';
+      else if (mode === 'subagent') modeLabelEl.textContent = 'Subagent log';
       else modeLabelEl.textContent = 'Live log';
     }
     summaryEl.textContent = summary;
@@ -1503,12 +1559,15 @@
     // BEFORE the EventSource open avoids any "first event scrolls past
     // the meta block" race.
     resetMetaSummary();
-    fetchMetaSummary(id);
+    // Subagent mode has its own cheap meta endpoint (/api/subagent/<id>/meta);
+    // everything else uses the queue meta. fetchMetaSummary handles the
+    // dispatch internally based on `mode`.
+    fetchMetaSummary(mode === 'subagent' ? subagentId : id);
 
     modal.hidden = false;
     document.body.classList.add('modal-open');
 
-    connectEventSource(id);
+    connectEventSource(mode === 'subagent' ? subagentId : id);
 
     setTimeout(() => closeBtn && closeBtn.focus(), 0);
   }
@@ -1526,9 +1585,16 @@
     // both hit /stream — the server dispatches on the queue item's scope
     // (workload-bound items tail the workload output file; everything
     // else falls through to the agent JSONL tail).
-    const endpoint = mode === 'archive'
-      ? '/api/queue/' + encodeURIComponent(id) + '/archive'
-      : '/api/queue/' + encodeURIComponent(id) + '/stream';
+    let endpoint;
+    if (mode === 'archive') {
+      endpoint = '/api/queue/' + encodeURIComponent(id) + '/archive';
+    } else if (mode === 'subagent') {
+      // Subagent mode tails the child subagent transcript directly. Same
+      // SSE wire format as the agent stream, so the renderer is unchanged.
+      endpoint = '/api/subagent/' + encodeURIComponent(id) + '/stream';
+    } else {
+      endpoint = '/api/queue/' + encodeURIComponent(id) + '/stream';
+    }
 
     // Open the EventSource. In live mode browsers auto-reconnect if
     // the server closes; in archive mode the server always closes on
@@ -1645,6 +1711,17 @@
     if (ev.target.closest('.drag-handle')) return;
     if (ev.target.closest('#log-modal')) return;
     if (ev.target.closest('summary')) return;
+    // A subagent node lives INSIDE a .log-clickable running card, so it must
+    // be checked FIRST — otherwise the queue-card handler would swallow the
+    // click and open the wrong (parent agent) stream. The subagent node
+    // carries data-log-mode="subagent" + data-subagent-id; open() dispatches.
+    const subRow = ev.target.closest('.subagent-log-clickable');
+    if (subRow) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      open(subRow);
+      return;
+    }
     const row = ev.target.closest('.log-clickable');
     if (!row) return;
     ev.preventDefault();
@@ -1738,8 +1815,19 @@
       }
       return;
     }
-    // Activate row when focused.
-    const row = document.activeElement && document.activeElement.closest && document.activeElement.closest('.log-clickable');
+    // Activate row when focused. Subagent nodes (nested inside a
+    // .log-clickable card) are checked first so keyboard activation opens
+    // the subagent stream, not the parent queue stream.
+    const active = document.activeElement;
+    const subRow = active && active.closest && active.closest('.subagent-log-clickable');
+    if (subRow) {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        open(subRow);
+      }
+      return;
+    }
+    const row = active && active.closest && active.closest('.log-clickable');
     if (!row) return;
     if (ev.key === 'Enter' || ev.key === ' ') {
       ev.preventDefault();

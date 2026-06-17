@@ -113,8 +113,20 @@ grace_period = 300
 cooldown = 300
 
 [auto_update]
-# Disabled — host integration. Phase 2+ work item.
-enabled = false
+# Enabled. The original "host integration / Phase 2+" disable was a
+# carry-over from the reauth/hybrid block below (those DO need host hooks);
+# auto_update's update sequence is entirely in-container tmux work
+# (interrupt -> /exit -> relaunch `claude` -> resume), no host dependency.
+# The real reason it'd misbehave was the npm-global version-detection bug:
+# get_version_info() only understood the native versioned-symlink layout, so
+# in this `installMethod: global` container both installed+running resolved to
+# None and check_auto_update() bailed before ever nudging. With that fixed
+# (status.rs resolve_installed_version/resolve_running_version now handle the
+# npm-global layout via package.json + ~/.claude/sessions/<PID>.json), the
+# running-behind-on-disk case (e.g. running 2.1.175 while 2.1.178 is already
+# installed) is detected and the restart nudge fires. The relaunch picks up
+# the new build because npm already atomically swapped the package symlink.
+enabled = true
 
 [reauth]
 # Disabled — host push-notification integration. Phase 2+ work item.

@@ -434,3 +434,38 @@ enabled = true
 # on a specific host; otherwise a bump to the const is the only change needed.
 #   heartbeat_tick_interval_secs = 300     # default: 5min
 #   memory_reminder_interval_secs = 1800   # default: 30min
+
+[ask_question_monitor]
+# AFK auto-reject of a stale interactive AskUserQuestion prompt.
+#
+# Motivating incident: an unanswered AskUserQuestion froze the main loop.
+# A pending interactive question reads as Idle (the menu still renders a
+# selection cursor, so the idle-prompt scan classifies it as idle, NOT
+# Thinking), so the prolonged-thinking detector never fired and the loop
+# sat blocked until the heartbeat-stale alarm finally tripped at 389
+# minutes. This monitor gives a FAST, specific
+# "AskUserQuestion pending > N min" alarm.
+#
+# PHASE 1 (current): detect + alarm ONLY. claude-watch emits a
+# `ask-question-stale` claude-event + pingme exactly once per pending
+# question; it sends NO Escape and injects NOTHING (reject_enabled = false).
+# Phase 2 will gate an Escape-based auto-reject on reject_enabled; Phase 3
+# will then inject `explanation`. This composes with the already-live
+# presence-gate (blocks the question outright when the operator is
+# known-away) and heartbeat-stale (eventual last-resort backstop).
+#
+# Master switch for detection + alarm. Default true.
+enabled = true
+# Seconds an interactive AskUserQuestion prompt may sit pending (main loop
+# blocked, reads as Idle) before the alarm fires. Default 240 (4 min) —
+# fast relative to the ~10-15 min heartbeat-stale window.
+stale_seconds = 240
+# PHASE 2/3 gate. When true, claude-watch will auto-REJECT the stale
+# question (Escape) and inject `explanation`. DEFAULT FALSE — Phase 1 ships
+# detect + alarm only; the reject path is not yet wired.
+reject_enabled = false
+# PHASE 3 payload (unused in Phase 1 — no inject happens). The
+# "use your judgement" text injected AFTER an auto-reject so the loop
+# proceeds autonomously and safely. Carried now so the schema is stable
+# across the phased rollout.
+explanation = "claude-watch auto-rejected this prompt because it blocked the main loop while the operator was away. Do NOT ask again — use your judgement and proceed autonomously with the safest reasonable default, noting the assumption you made."

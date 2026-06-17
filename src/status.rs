@@ -339,23 +339,143 @@ pub(crate) fn extract_version_from_path(path: &str) -> Option<String> {
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
 }
 
-/// Get installed and running Claude Code versions via symlink and /proc.
+/// Extract the `"version"` field from a Claude `package.json` / session-marker
+/// JSON blob. Pure string parse (no `serde` round-trip) so it stays cheap and
+/// tolerant of the surrounding fields varying between Claude releases.
+pub(crate) fn extract_version_from_json(json: &str) -> Option<String> {
+    let re = Regex::new(r#""version"\s*:\s*"([\d][\d.]*)""#).unwrap();
+    re.captures(json)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+}
+
+/// Resolve the on-disk (installed) Claude Code version, handling both install
+/// layouts Claude itself ships:
 ///
-/// - Installed: `readlink ~/.local/bin/claude` → extract version from path
-/// - Running: `pgrep -a claude` → `readlink /proc/PID/exe` → extract version
+/// 1. **Native versioned-symlink layout** (`installMethod: native`): the
+///    `claude` launcher is a symlink into
+///    `~/.local/share/claude/versions/X.Y.Z/...`, so the version is encoded in
+///    the canonicalized path and `extract_version_from_path` recovers it.
+/// 2. **npm-global layout** (`installMethod: global`): the launcher resolves to
+///    `.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`, which has NO
+///    version in the path. The authoritative version is the `"version"` field
+///    of that package's `package.json`. We walk up from the canonicalized
+///    binary to the package root and read it.
+///
+/// `claude_bin` is the launcher path to canonicalize (e.g. the result of
+/// resolving `claude` on `PATH`, or a well-known install location).
+pub(crate) fn resolve_installed_version(claude_bin: &std::path::Path) -> Option<String> {
+    let target = std::fs::canonicalize(claude_bin).ok()?;
+    let target_str = target.to_string_lossy();
+
+    // Layout 1: native versioned-symlink — version is in the path.
+    if let Some(ver) = extract_version_from_path(&target_str) {
+        return Some(ver);
+    }
+
+    // Layout 2: npm-global — walk up from the binary looking for the
+    // package.json that carries the version. The canonical npm layout is
+    // `<pkg>/bin/claude.exe` so the package.json is typically 1-2 levels up,
+    // but bound the walk so a pathological symlink can't loop us forever.
+    let mut dir = target.parent();
+    for _ in 0..4 {
+        let Some(d) = dir else { break };
+        let pkg_json = d.join("package.json");
+        if let Ok(contents) = std::fs::read_to_string(&pkg_json) {
+            // Only trust a package.json that is actually the claude-code
+            // package, so we don't accidentally read some unrelated
+            // `bin/package.json` higher up the tree.
+            if contents.contains("@anthropic-ai/claude-code") {
+                if let Some(ver) = extract_version_from_json(&contents) {
+                    return Some(ver);
+                }
+            }
+        }
+        dir = d.parent();
+    }
+
+    None
+}
+
+/// Locate the `claude` launcher binary to inspect for the installed version.
+///
+/// Prefers the native versioned-symlink location (`~/.local/bin/claude`) when
+/// present — it canonicalizes straight to a versioned path. Otherwise falls
+/// back to resolving `claude` on `PATH`, which covers the npm-global layout
+/// (`~/.npm-global/bin/claude` and friends) without hardcoding any
+/// install-method-specific path.
+fn find_claude_launcher() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+
+    // Native layout first (cheap, deterministic).
+    let native = std::path::PathBuf::from(format!("{home}/.local/bin/claude"));
+    if native.exists() {
+        return Some(native);
+    }
+
+    // Fall back to PATH resolution (npm-global, distro packages, etc).
+    if let Ok(output) = std::process::Command::new("sh")
+        .args(["-c", "command -v claude"])
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve the running Claude Code version for a given PID.
+///
+/// 1. **Native layout**: `/proc/PID/exe` resolves to the versioned binary path,
+///    so the version is recoverable directly from the link target.
+/// 2. **npm-global layout**: `/proc/PID/exe` points at a now-deleted temp path
+///    (npm's atomic install renames a `.claude-code-XXXX` staging dir over the
+///    live package, leaving the running process mapped to the old, deleted
+///    inode), so the path carries no usable version. Claude itself records the
+///    running version in `~/.claude/sessions/<PID>.json` (the `"version"`
+///    field), which is authoritative for every install method — read that.
+fn resolve_running_version(pid: &str) -> Option<String> {
+    // Layout 1: versioned /proc/PID/exe target.
+    let exe_path = format!("/proc/{pid}/exe");
+    if let Ok(target) = std::fs::read_link(&exe_path) {
+        if let Some(ver) = extract_version_from_path(&target.to_string_lossy()) {
+            return Some(ver);
+        }
+    }
+
+    // Layout 2: Claude's own per-PID session marker.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+    let session_marker = format!("{home}/.claude/sessions/{pid}.json");
+    if let Ok(contents) = std::fs::read_to_string(&session_marker) {
+        if let Some(ver) = extract_version_from_json(&contents) {
+            return Some(ver);
+        }
+    }
+
+    None
+}
+
+/// Get installed and running Claude Code versions.
+///
+/// Handles both Claude install layouts (native versioned-symlink and
+/// npm-global) generically — see [`resolve_installed_version`] and
+/// [`resolve_running_version`]. This matters for restart-nudge detection: when
+/// the running session is behind an already-on-disk newer build (e.g. running
+/// 2.1.175 while 2.1.178 is installed), both fields must resolve so the
+/// auto-update policy can detect the mismatch instead of bailing on `None`.
 pub fn get_version_info() -> VersionInfo {
     let mut info = VersionInfo::default();
 
-    // Installed version from symlink
-    let claude_bin = format!(
-        "{}/.local/bin/claude",
-        std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string())
-    );
-    if let Ok(target) = std::fs::canonicalize(&claude_bin) {
-        info.installed = extract_version_from_path(&target.to_string_lossy());
+    // Installed (on-disk) version.
+    if let Some(bin) = find_claude_launcher() {
+        info.installed = resolve_installed_version(&bin);
     }
 
-    // Running version from /proc
+    // Running version: iterate claude PIDs, take the first that resolves.
     if let Ok(output) = std::process::Command::new("pgrep")
         .args(["-a", "claude"])
         .output()
@@ -367,12 +487,9 @@ pub fn get_version_info() -> VersionInfo {
                 continue;
             }
             if let Some(pid_str) = line.split_whitespace().next() {
-                let exe_path = format!("/proc/{}/exe", pid_str);
-                if let Ok(target) = std::fs::read_link(&exe_path) {
-                    if let Some(ver) = extract_version_from_path(&target.to_string_lossy()) {
-                        info.running = Some(ver);
-                        break;
-                    }
+                if let Some(ver) = resolve_running_version(pid_str) {
+                    info.running = Some(ver);
+                    break;
                 }
             }
         }
@@ -1250,6 +1367,139 @@ mod tests {
     #[test]
     fn test_extract_version_empty() {
         assert_eq!(extract_version_from_path(""), None);
+    }
+
+    // --- extract_version_from_json tests ---
+
+    #[test]
+    fn test_extract_version_from_json_package_json() {
+        // Shape of @anthropic-ai/claude-code package.json.
+        let json = r#"{
+  "name": "@anthropic-ai/claude-code",
+  "version": "2.1.178",
+  "bin": { "claude": "bin/claude.exe" }
+}"#;
+        assert_eq!(
+            extract_version_from_json(json),
+            Some("2.1.178".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_version_from_json_session_marker() {
+        // Shape of ~/.claude/sessions/<PID>.json (the running-version source
+        // for the npm-global layout).
+        let json = r#"{"pid":68,"sessionId":"5d5f5863","cwd":"/repos","version":"2.1.175","kind":"interactive","status":"busy"}"#;
+        assert_eq!(
+            extract_version_from_json(json),
+            Some("2.1.175".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_version_from_json_whitespace_variants() {
+        assert_eq!(
+            extract_version_from_json(r#"{ "version" : "1.0.0" }"#),
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_version_from_json_no_version() {
+        assert_eq!(extract_version_from_json(r#"{"name":"x"}"#), None);
+    }
+
+    #[test]
+    fn test_extract_version_from_json_non_numeric_ignored() {
+        // A "version" that isn't a numeric semver (e.g. an unrelated field)
+        // must not be mistaken for the package version.
+        assert_eq!(
+            extract_version_from_json(r#"{"version":"latest"}"#),
+            None
+        );
+    }
+
+    // --- resolve_installed_version tests ---
+
+    #[test]
+    fn test_resolve_installed_version_native_layout() {
+        // Native versioned-symlink layout: a symlink whose canonical target
+        // contains /versions/X.Y.Z/ — version comes straight from the path.
+        let tmp = std::env::temp_dir().join(format!("cw-native-{}", std::process::id()));
+        let versions = tmp.join(".local/share/claude/versions/2.1.77/node_modules/.bin");
+        std::fs::create_dir_all(&versions).unwrap();
+        let real_bin = versions.join("claude");
+        std::fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+        let bindir = tmp.join(".local/bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let link = bindir.join("claude");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real_bin, &link).unwrap();
+
+        assert_eq!(
+            resolve_installed_version(&link),
+            Some("2.1.77".to_string())
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_resolve_installed_version_npm_global_layout() {
+        // npm-global layout: launcher -> .../@anthropic-ai/claude-code/bin/claude.exe,
+        // no version in the path. Version must come from package.json.
+        let tmp = std::env::temp_dir().join(format!("cw-npm-{}", std::process::id()));
+        let pkg = tmp.join("lib/node_modules/@anthropic-ai/claude-code");
+        let bin = pkg.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@anthropic-ai/claude-code","version":"2.1.178"}"#,
+        )
+        .unwrap();
+        let real_bin = bin.join("claude.exe");
+        std::fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+        let bindir = tmp.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let link = bindir.join("claude");
+        let _ = std::fs::remove_file(&link);
+        // Mirror the real npm symlink: ../lib/node_modules/.../bin/claude.exe
+        std::os::unix::fs::symlink(&real_bin, &link).unwrap();
+
+        assert_eq!(
+            resolve_installed_version(&link),
+            Some("2.1.178".to_string())
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_resolve_installed_version_unrelated_package_json_ignored() {
+        // A package.json that isn't @anthropic-ai/claude-code must not be
+        // trusted as the source of the claude version.
+        let tmp = std::env::temp_dir().join(format!("cw-other-{}", std::process::id()));
+        let bin = tmp.join("some-tool/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            tmp.join("some-tool/package.json"),
+            r#"{"name":"some-other-tool","version":"9.9.9"}"#,
+        )
+        .unwrap();
+        let real_bin = bin.join("claude.exe");
+        std::fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+
+        // Canonicalize directly (no symlink) — walk up finds the unrelated
+        // package.json but rejects it; no native version in path either.
+        assert_eq!(resolve_installed_version(&real_bin), None);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_resolve_installed_version_missing_binary() {
+        let missing = std::path::PathBuf::from("/nonexistent/path/to/claude");
+        assert_eq!(resolve_installed_version(&missing), None);
     }
 
     // --- parse_watchers_config tests ---

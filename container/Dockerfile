@@ -291,9 +291,9 @@ RUN case "$(uname -m)" in \
 # with CW_STATE_PATH=/host/path, docker bind-mounts the host dir
 # wholesale and the image-side ownership is irrelevant — the operator
 # is responsible for making the host path uid-1000 writable.
-RUN mkdir -p /var/lib/claude-watch \
-    && chown 1000:1000 /var/lib/claude-watch \
-    && chmod 0755 /var/lib/claude-watch
+RUN mkdir -p /var/lib/claude-watch /var/lib/claude-watch/cron-disabled \
+    && chown 1000:1000 /var/lib/claude-watch /var/lib/claude-watch/cron-disabled \
+    && chmod 0755 /var/lib/claude-watch /var/lib/claude-watch/cron-disabled
 
 # Pre-create /var/run/claude/workload-state owned by uid 1000 so
 # `workload run` can write state files without needing root or
@@ -1049,6 +1049,18 @@ RUN chmod +x /usr/local/bin/self-clear
 # events are accumulating). Fired by the */2 cron entry in cw-default.
 COPY container/bin/cw-watcher-health-check /usr/local/bin/cw-watcher-health-check
 RUN chmod +x /usr/local/bin/cw-watcher-health-check
+
+# cw-cron-run + cw-cron-toggle — toggle baked cron.d entries without sudo.
+# cw-cron-run is the flag-file exec-wrapper prefixed in front of every
+# cw-default cron command; if a job's flag file exists under the
+# uid-1000-writable /var/lib/claude-watch/cron-disabled it skips the job
+# (exit 0), else it `exec`s the real command. cw-cron-toggle is the
+# operator CLI that flips those flag files. No sudoers change required.
+# See docs/cron-toggle.md.
+COPY container/bin/cw-cron-run /usr/local/bin/cw-cron-run
+RUN chmod +x /usr/local/bin/cw-cron-run
+COPY container/bin/cw-cron-toggle /usr/local/bin/cw-cron-toggle
+RUN chmod +x /usr/local/bin/cw-cron-toggle
 
 # claude-event-watch — the canonical block-print-exit event watcher.
 # Session runs this as a `run_in_background` task; it blocks on inotifywait,

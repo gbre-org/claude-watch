@@ -290,6 +290,22 @@ pub struct State {
     /// (now - pane_content_unchanged_since) >= pane_unchanged_secs.
     #[serde(default)]
     pub pane_content_unchanged_since: Option<String>,
+
+    // --- AskUserQuestion stale monitor (Phase 1: detect + alarm) -------
+    /// RFC3339 timestamp of when an interactive `AskUserQuestion` prompt
+    /// was first observed pending (main loop blocked, reads as Idle).
+    /// `None` when no interactive prompt is currently up. Set on the first
+    /// cycle the prompt is seen; cleared when the prompt clears. Mirrors
+    /// the `thinking_start` timer lifecycle. Transient — cleared on daemon
+    /// load (daemon downtime makes the elapsed measurement unreliable).
+    #[serde(default)]
+    pub ask_question_pending_since: Option<String>,
+    /// Whether the stale-question alarm has already fired for the CURRENT
+    /// pending question. Set true when the alarm fires so it fires exactly
+    /// once per pending question; reset to false when the prompt clears.
+    /// Transient — cleared on daemon load alongside the timer.
+    #[serde(default)]
+    pub ask_question_alerted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -360,6 +376,11 @@ pub fn load_state(path: &str) -> State {
     // for metrics.)
     state.api_retry_consecutive = 0;
     state.api_retry_first_seen = None;
+    // AskUserQuestion stale-monitor timer is transient — daemon downtime
+    // makes the elapsed measurement unreliable. Reset on load so tracking
+    // starts fresh (mirrors thinking_start).
+    state.ask_question_pending_since = None;
+    state.ask_question_alerted = false;
     state
 }
 
@@ -641,4 +662,33 @@ mod tests {
         assert_eq!(loaded.reminder_to_update_latency_count, 2);
         let _ = std::fs::remove_file(path);
     }
+
+
+    #[test]
+    fn test_ask_question_fields_roundtrip_and_default() {
+        // The AskUserQuestion stale-monitor timer field round-trips through
+        // save, and old state files (without the field) default to None.
+        // The timer is transient, so load_state() clears it — assert the
+        // CLEAR-on-load behavior (mirrors thinking_start).
+        let path = "/tmp/claude-watch-test-ask-question.json";
+        let mut state = State::default();
+        state.ask_question_pending_since = Some("2026-06-17T12:00:00-05:00".to_string());
+        state.ask_question_alerted = true;
+        save_state(path, &state);
+
+        // load_state resets the transient timer.
+        let loaded = load_state(path);
+        assert!(loaded.ask_question_pending_since.is_none());
+        assert!(!loaded.ask_question_alerted);
+        let _ = std::fs::remove_file(path);
+
+        // Old state file (no field) -> default None / false, not an error.
+        let path2 = "/tmp/claude-watch-test-ask-question-default.json";
+        std::fs::write(path2, "{}").unwrap();
+        let loaded2 = load_state(path2);
+        assert!(loaded2.ask_question_pending_since.is_none());
+        assert!(!loaded2.ask_question_alerted);
+        let _ = std::fs::remove_file(path2);
+    }
+
 }

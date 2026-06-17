@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# cw-cron-toggle — enable/disable baked cron.d entries from inside the
+# container WITHOUT sudo.
+#
+# WHY (2026-06-16 incident): the baked /etc/cron.d/cw-default entries are
+# root-owned and can't be edited without an interactive sudo (Touch ID on
+# macOS = prohibitive). This CLI flips flag files under a uid-1000-writable,
+# named-volume-persistent dir; the cw-cron-run wrapper baked in front of
+# each cron command honors the flag and skips the job. No sudo anywhere.
+#
+# A disabled job stays disabled across container redeploys (the flag dir is
+# on the claude-watch-state named volume).
+#
+# USAGE:
+#   cw-cron-toggle list                 # show each job + enabled/disabled
+#   cw-cron-toggle status               # alias of list
+#   cw-cron-toggle disable <job-name>   # stop a job (creates flag file)
+#   cw-cron-toggle enable  <job-name>   # resume a job (removes flag file)
+#   cw-cron-toggle --help
+#
+# ENVIRONMENT:
+#   CW_CRON_DISABLED_DIR — flag dir (default /var/lib/claude-watch/cron-disabled)
+#
+# See docs/cron-toggle.md.
+
+set -euo pipefail
+
+DISABLE_DIR="${CW_CRON_DISABLED_DIR:-/var/lib/claude-watch/cron-disabled}"
+
+# Canonical list of cw-default job-names. MUST stay in sync with the
+# job-names assigned in the cw-cron-run wrappers in
+# container/cron.d/cw-default.
+KNOWN_JOBS=(
+    active-agents
+    metrics
+    stale-ready-check
+    queue-check
+    watcher-health-check
+)
+
+usage() {
+    cat <<'USAGE'
+cw-cron-toggle — toggle baked cron.d entries without sudo
+
+Usage:
+  cw-cron-toggle list                 list jobs + enabled/disabled state
+  cw-cron-toggle status               alias of list
+  cw-cron-toggle disable <job-name>   disable a job (creates flag file)
+  cw-cron-toggle enable  <job-name>   enable a job (removes flag file)
+  cw-cron-toggle --help               this help
+
+Known jobs:
+  active-agents  metrics  stale-ready-check  queue-check  watcher-health-check
+
+Disabling takes effect on the next cron tick (~1 min) and persists across
+container redeploys via the claude-watch-state named volume. Flag files live
+under: ${CW_CRON_DISABLED_DIR:-/var/lib/claude-watch/cron-disabled}
+USAGE
+}
+
+is_known() {
+    local want="$1"
+    local j
+    for j in "${KNOWN_JOBS[@]}"; do
+        if [ "$j" = "$want" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+cmd_list() {
+    echo "cron jobs (flag dir: ${DISABLE_DIR}):"
+    local j state
+    for j in "${KNOWN_JOBS[@]}"; do
+        if [ -e "${DISABLE_DIR}/${j}" ]; then
+            state="DISABLED"
+        else
+            state="enabled"
+        fi
+        printf '  %-22s %s\n' "$j" "$state"
+    done
+}
+
+cmd_disable() {
+    local job="$1"
+    if ! is_known "$job"; then
+        echo "cw-cron-toggle: unknown job '${job}'" >&2
+        echo "known jobs: ${KNOWN_JOBS[*]}" >&2
+        return 1
+    fi
+    mkdir -p "$DISABLE_DIR"
+    : > "${DISABLE_DIR}/${job}"
+    echo "disabled '${job}' (flag: ${DISABLE_DIR}/${job})"
+    echo "takes effect on the next cron tick (~1 min); persists across redeploys via the named volume"
+}
+
+cmd_enable() {
+    local job="$1"
+    if ! is_known "$job"; then
+        echo "cw-cron-toggle: unknown job '${job}'" >&2
+        echo "known jobs: ${KNOWN_JOBS[*]}" >&2
+        return 1
+    fi
+    rm -f "${DISABLE_DIR}/${job}"
+    echo "enabled '${job}' (removed flag: ${DISABLE_DIR}/${job})"
+    echo "takes effect on the next cron tick (~1 min)"
+}
+
+main() {
+    local sub="${1:-}"
+    case "$sub" in
+        ""|list|status)
+            cmd_list
+            ;;
+        disable)
+            if [ "$#" -lt 2 ]; then
+                echo "cw-cron-toggle: 'disable' needs a job-name" >&2
+                return 2
+            fi
+            cmd_disable "$2"
+            ;;
+        enable)
+            if [ "$#" -lt 2 ]; then
+                echo "cw-cron-toggle: 'enable' needs a job-name" >&2
+                return 2
+            fi
+            cmd_enable "$2"
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            echo "cw-cron-toggle: unknown subcommand '${sub}'" >&2
+            usage >&2
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

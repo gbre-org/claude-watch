@@ -52,6 +52,14 @@ pub struct Config {
     /// conservative defaults. See `MalformedToolCallConfig`.
     #[serde(default)]
     pub malformed_tool_call: MalformedToolCallConfig,
+    /// AFK auto-reject of a stale interactive `AskUserQuestion` prompt.
+    /// Phase 1 (this): DETECT a pending interactive question that has
+    /// blocked the main loop for longer than `stale_seconds` and EMIT AN
+    /// ALARM (claude-event + pingme). No Escape / inject / auto-reject yet
+    /// (`reject_enabled` defaults false). Default ON with a 240s threshold.
+    /// See `AskQuestionMonitorConfig`.
+    #[serde(default)]
+    pub ask_question_monitor: AskQuestionMonitorConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1008,6 +1016,87 @@ fn default_memory_reminder_interval_secs() -> u64 {
     crate::cadence::MEMORY_REMINDER_INTERVAL_SECS
 }
 
+/// AFK auto-reject of a stale interactive `AskUserQuestion` prompt.
+///
+/// Motivating incident: an unanswered `AskUserQuestion` froze the main
+/// loop. A pending interactive question reads as `ClaudeActivity::Idle`
+/// (the menu still renders a `\u{276f}` selection cursor, so the bare
+/// idle-prompt scan classifies it as idle, NOT Thinking) — so the
+/// prolonged-thinking detector never fired, and the loop sat blocked
+/// until the heartbeat-stale alarm finally tripped at 389 minutes.
+///
+/// This monitor gives a FAST, specific "AskUserQuestion pending > N min"
+/// alarm. It runs a thinking-timer-style lifecycle: start a timer when an
+/// interactive prompt is first observed Idle, fire an alarm once when the
+/// elapsed time crosses `stale_seconds`, and reset when the prompt clears.
+///
+/// **Phase 1 (this struct as shipped): detect + alarm ONLY.**
+/// `reject_enabled` defaults FALSE — claude-watch sends NO Escape and
+/// injects NOTHING; it only emits a `claude-event` + pingme. Phase 2 will
+/// gate an Escape-based auto-reject on `reject_enabled`; Phase 3 will then
+/// inject `explanation` after the reject. This zero-session-risk increment
+/// composes with the already-live presence-gate (which blocks the question
+/// outright when the operator is known-away) and the heartbeat-stale alarm
+/// (the eventual last-resort backstop).
+#[derive(Debug, Deserialize, Clone)]
+// `explanation` is unused until Phase 3 (it carries the post-reject inject
+// text); `reject_enabled` is consumed only in a log field in Phase 1. Allow
+// dead_code so the warning-free release build (RUSTFLAGS=-D warnings) passes
+// while the action paths are still gated off. Remove when Phase 2/3 lands.
+#[allow(dead_code)]
+pub struct AskQuestionMonitorConfig {
+    /// Master switch. Default: true — detection + alarm are on by default;
+    /// the *action* (reject) stays gated behind `reject_enabled`.
+    #[serde(default = "default_ask_question_enabled")]
+    pub enabled: bool,
+    /// Seconds an interactive `AskUserQuestion` prompt may sit pending
+    /// (main loop blocked, reads as Idle) before the alarm fires. Default
+    /// 240 (4 min) — fast relative to the ~15-min heartbeat-stale window.
+    #[serde(default = "default_ask_question_stale_seconds")]
+    pub stale_seconds: u64,
+    /// Phase 2/3 gate: when true, claude-watch will auto-REJECT the stale
+    /// question (Escape) and inject `explanation`. **Default FALSE** —
+    /// Phase 1 ships detect+alarm only; the reject path is not yet wired.
+    #[serde(default = "default_ask_question_reject_enabled")]
+    pub reject_enabled: bool,
+    /// Phase 3 payload: the "use your judgement" text injected AFTER an
+    /// auto-reject so the loop proceeds autonomously and safely. Unused in
+    /// Phase 1 (no inject happens) — carried now so the config schema is
+    /// stable across the phased rollout.
+    #[serde(default = "default_ask_question_explanation")]
+    pub explanation: String,
+}
+
+impl Default for AskQuestionMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ask_question_enabled(),
+            stale_seconds: default_ask_question_stale_seconds(),
+            reject_enabled: default_ask_question_reject_enabled(),
+            explanation: default_ask_question_explanation(),
+        }
+    }
+}
+
+fn default_ask_question_enabled() -> bool {
+    true
+}
+
+fn default_ask_question_stale_seconds() -> u64 {
+    240
+}
+
+fn default_ask_question_reject_enabled() -> bool {
+    // Phase 1: detect + alarm only. The auto-reject action stays OFF until
+    // Phase 2 wires the Escape path and it is explicitly opted into.
+    false
+}
+
+fn default_ask_question_explanation() -> String {
+    "claude-watch auto-rejected this prompt because it blocked the main      loop while the operator was away. Do NOT ask again — use your      judgement and proceed autonomously with the safest reasonable      default, noting the assumption you made."
+        .to_string()
+}
+
 /// Load config from well-known paths or CLAUDE_WATCH_CONFIG env var.
 /// Exits the process on failure — suitable for the daemon, not for
 /// best-effort subcommands. Use `try_load_config` for those.
@@ -1550,6 +1639,30 @@ cooldown = 300
         assert_eq!(config.task_watch.agent_done_delay, 120);
         assert_eq!(config.task_watch.max_panes, 20);
         assert!(!config.task_watch.show_all);
+    }
+
+    #[test]
+    fn test_ask_question_monitor_defaults() {
+        // No [ask_question_monitor] in SAMPLE_CONFIG -> Phase-1 defaults.
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert!(config.ask_question_monitor.enabled);
+        assert_eq!(config.ask_question_monitor.stale_seconds, 240);
+        // Phase 1: the reject ACTION is OFF by default.
+        assert!(!config.ask_question_monitor.reject_enabled);
+        assert!(!config.ask_question_monitor.explanation.is_empty());
+    }
+
+    #[test]
+    fn test_ask_question_monitor_override() {
+        let cfg_str = format!(
+            "{}\n[ask_question_monitor]\nenabled = false\nstale_seconds = 120\nreject_enabled = true\nexplanation = \"custom\"\n",
+            SAMPLE_CONFIG
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert!(!config.ask_question_monitor.enabled);
+        assert_eq!(config.ask_question_monitor.stale_seconds, 120);
+        assert!(config.ask_question_monitor.reject_enabled);
+        assert_eq!(config.ask_question_monitor.explanation, "custom");
     }
 
     #[test]

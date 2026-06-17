@@ -442,124 +442,14 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
 /// scrollback, custom theme, etc.) and waiting longer doesn't help.
 /// We send anyway.
 pub async fn inject_text(pane: &str, text: &str) {
-    // Step 0: Settle. Most callers reach inject_text right after
-    // interrupt_and_wait, which has already fired Escape repeatedly.
-    // If interrupt_and_wait returned false (idle never confirmed) the
-    // pane may still be processing the very last Escape — settling here
-    // gives Claude Code time to finish before our own Escape loop below
-    // piles on. interrupt_and_wait's success path also settles, so this
-    // is a low-cost extra guard, not a duplicate delay. No-op when
-    // post_escape_settle_ms is 0 (fast-path default).
-    settle_after_escape().await;
-
-    // Step 1: Escape to NORMAL mode. ALWAYS send at least two Escapes
-    // before checking `is_insert_mode` — Escape in NORMAL mode is a no-op
-    // (just a bell), so two Escapes is idempotent coercion. This guards
-    // against:
-    //   (a) wrap-truncated status bars where `is_insert_mode` mis-reports
-    //       NORMAL while the pane is actually in INSERT (the wrap-detection
-    //       fix in `is_insert_mode` itself is best-effort but capture
-    //       parsing isn't bulletproof);
-    //   (b) autocomplete dropdowns / ghost-text overlays that absorb the
-    //       FIRST Escape (dismissing the overlay) without exiting INSERT —
-    //       the SECOND Escape is what reaches NORMAL.
-    // After the two unconditional Escapes, do up to one additional Escape
-    // gated on `is_insert_mode` for the rare case where INSERT is still
-    // detected. Total cap remains 3 Escapes / ~3s, matching pre-fix budget.
-    for i in 0..3 {
-        send_keys(pane, &["Escape"]).await;
-        sleep(Duration::from_secs(1)).await;
-        // Only break out AFTER two Escapes have been sent — the first
-        // Escape result is unreliable (overlay-eaten / wrap-truncated).
-        if i >= 1 && !is_insert_mode(pane).await {
-            break;
-        }
-    }
-    // Step 1a: Optional configurable settle after the Escape loop, before
-    // typing dd/i/text. Default 0 (no extra wait — fast path). Tunable
-    // via [tmux].post_escape_settle_ms when a slow environment needs the
-    // extra cushion. Replaced what used to be a hardcoded 500ms sleep so
-    // the wait is opt-in rather than always-paid.
-    settle_after_escape().await;
-
-    // Step 1b: Wait briefly for the activity indicator to settle to Idle
-    // (thinking indicator cleared). `interrupt_and_wait` is normally
-    // called first and has already done the heavy lifting — this is a
-    // last-line check in case the predicate flickers across the Escape
-    // boundary. Fast-path bails after `INJECT_IDLE_FAST_PATH_MS` and
-    // sends anyway: if the pane's idle predicate hasn't matched by then,
-    // it almost certainly never will (stale scrollback thinking text,
-    // custom prompt, etc.), and blocking longer just makes recovery feel
-    // sluggish without changing the outcome.
-    const INJECT_IDLE_FAST_PATH_MS: u64 = 1500;
-    let idle_deadline =
-        tokio::time::Instant::now() + Duration::from_millis(INJECT_IDLE_FAST_PATH_MS);
-    let mut idle_observed = false;
-    while tokio::time::Instant::now() < idle_deadline {
-        if get_activity(pane).await == ClaudeActivity::Idle {
-            idle_observed = true;
-            break;
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-    if !idle_observed {
-        debug!(
-            pane = %pane,
-            fast_path_ms = INJECT_IDLE_FAST_PATH_MS,
-            "inject_text: idle not observed within fast-path window, sending anyway"
-        );
-    }
-
-    // Step 2: dd -- delete entire line
-    send_keys(pane, &["d"]).await;
-    sleep(Duration::from_millis(100)).await;
-    send_keys(pane, &["d"]).await;
-    sleep(Duration::from_millis(500)).await;
-
-    // Step 3: i -- enter INSERT mode, AND VERIFY we actually entered INSERT
-    // before typing the payload.
-    //
-    // ROOT CAUSE of "cursor stuck mid-text" bug (Andrew flagged 2026-04-28):
-    // The old code was a fixed 1500ms sleep after `i` with NO verification.
-    // When that wasn't long enough (Claude Code's input editor still
-    // processing the previous keystrokes — Escape, dd — under load), the
-    // FIRST characters of `send_literal(text)` arrived while the editor was
-    // still in NORMAL mode. NORMAL-mode interpretation of typical inject-text
-    // characters jumps the cursor around:
-    //   `[`  — back to previous section
-    //   `C`  — change-to-end-of-line
-    //   `L`  — jump to bottom of viewport
-    //   `A`  — append at end of line (FINALLY enters INSERT)
-    //   etc.
-    // After `A` finally engaged INSERT, the rest of the text inserted at
-    // wherever the NORMAL-mode commands had left the cursor, leaving the
-    // cursor visibly mid-text on a letter (the "n" in `event-watch` Andrew
-    // saw). Symmetric design fix: do the SAME verify-loop the Escape→NORMAL
-    // path does at Step 1 (lines 256-262), but in reverse — verify
-    // INSERT mode is active before proceeding.
-    let mut entered_insert = false;
-    for _ in 0..3 {
-        send_keys(pane, &["i"]).await;
-        sleep(Duration::from_millis(500)).await;
-        if is_insert_mode(pane).await {
-            entered_insert = true;
-            break;
-        }
-    }
-    // Final settle even on success — Claude Code may render `-- INSERT --`
-    // before the input editor has fully accepted typed characters.
-    sleep(Duration::from_millis(500)).await;
-    if !entered_insert {
-        debug!(
-            pane = pane,
-            "inject_text: INSERT mode not confirmed after 3 `i` attempts; \
-             proceeding anyway (fall-through to legacy behavior)"
-        );
-    }
-
-    // Step 4: Type the text
-    send_literal(pane, text).await;
-    sleep(Duration::from_millis(500)).await;
+    // Steps 0-4 (settle, Escape→NORMAL coercion, idle-wait, dd line-clear,
+    // `i` INSERT verify-and-retry, literal type) are factored into
+    // `inject_text_no_submit` so this fire-and-forget path and the verified
+    // `inject_and_verify` path share ONE copy of the typing choreography —
+    // the divergence the `claude-watch inject` centralization exists to
+    // prevent. See `inject_text_no_submit` for the per-step root-cause
+    // commentary (cursor-stuck-mid-text bug, INSERT verify-and-retry, etc.).
+    inject_text_no_submit(pane, text).await;
 
     // Step 5: Tab -> Escape -> Enter to submit.
     //
@@ -602,6 +492,217 @@ pub async fn inject_text(pane: &str, text: &str) {
 /// buffer (operator-confirmed regression, 2026-06-11).
 pub(crate) fn submit_keystroke_sequence() -> &'static [&'static str] {
     &["Tab", "Escape", "Enter"]
+}
+
+/// Outcome of a verified inject (`inject_and_verify`).
+///
+/// Unlike the fire-and-forget `inject_text`, the verified path confirms the
+/// submission actually landed by polling the pane after the submit
+/// keystrokes: a successful submit CLEARS the typed payload from the input
+/// line (Claude Code consumes it as a new turn). If the payload prefix is
+/// still visible after the poll window, the submit did NOT land — the exact
+/// failure mode the `cw-watcher-health-check` bug exhibited (alert text typed
+/// into the pane but never submitted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectOutcome {
+    /// Text typed and (if requested) submission confirmed — the payload
+    /// cleared from the prompt line.
+    Submitted,
+    /// `--no-submit` requested: text typed, no submission attempted. The
+    /// payload is expected to remain on the prompt line.
+    Typed,
+    /// Submit keystrokes were sent but the payload was still visible on the
+    /// prompt line after the verify window — submission likely did NOT land.
+    SubmitUnverified,
+}
+
+/// Pure helper: extract the text after the LAST `❯` prompt char in the
+/// capture (the live input line), trimmed. Returns `None` when no prompt
+/// char is present. Mirrors `container/bin/self-clear`'s
+/// `get_prompt_line_text`, the battle-tested verification primitive.
+pub(crate) fn prompt_line_text(pane_output: &str) -> Option<String> {
+    for line in pane_output.lines().rev() {
+        if let Some(idx) = line.find('\u{276f}') {
+            // Byte index is valid: `❯` is a known char, `find` returns its
+            // start. Slice from just past it (the char is 3 bytes in UTF-8).
+            let after = &line[idx + '\u{276f}'.len_utf8()..];
+            return Some(after.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Inject text into a Claude Code (vim-mode) pane and, unless `submit` is
+/// false, submit it — then VERIFY the submission landed.
+///
+/// This is the verified, exit-code-bearing entry point behind the public
+/// `claude-watch inject` subcommand. It carries the SAME keystroke
+/// choreography as `inject_text` (Escape→NORMAL coercion, dd line-clear,
+/// `i` INSERT-mode verify-and-retry, literal type) so the verified and
+/// daemon paths can never drift — the divergence this whole change exists
+/// to eliminate. The ONE addition over `inject_text` is post-submit
+/// verification, modeled on `container/bin/self-clear`'s gold-standard
+/// "confirm the typed text disappears = submission succeeded" check.
+///
+/// Submit-keystroke selection mirrors self-clear's two branches:
+///   - regular text: `submit_keystroke_sequence()` = Tab → Escape → Enter
+///     (Tab clears autocomplete, Escape reaches NORMAL, Enter submits).
+///   - `slash_command = true`: a bare Enter from INSERT mode. Slash
+///     commands MUST submit from INSERT — Escape→NORMAL then Enter does
+///     NOT submit a slash command (the documented self-clear `/clear` bug).
+///
+/// Returns:
+///   - `InjectOutcome::Typed` when `submit == false`.
+///   - `InjectOutcome::Submitted` when submission was verified (payload
+///     prefix cleared from the prompt line).
+///   - `InjectOutcome::SubmitUnverified` when the payload prefix was still
+///     visible after the verify window — the caller can treat this as a
+///     non-zero exit so a stuck inject is detectable.
+pub async fn inject_and_verify(
+    pane: &str,
+    text: &str,
+    submit: bool,
+    slash_command: bool,
+) -> InjectOutcome {
+    // Reuse inject_text's proven type-and-(maybe-)submit choreography for
+    // the regular-text submit path so there is exactly ONE copy of the
+    // Escape/dd/i/type + Tab→Escape→Enter sequence. For the no-submit and
+    // slash-command paths we drive the shared low-level helpers directly
+    // (inject_text always submits with the regular-text sequence).
+    if submit && !slash_command {
+        inject_text(pane, text).await;
+    } else {
+        inject_text_no_submit(pane, text).await;
+        if submit && slash_command {
+            // Slash commands submit with a bare Enter from INSERT mode.
+            send_keys(pane, &["Enter"]).await;
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    if !submit {
+        return InjectOutcome::Typed;
+    }
+
+    // Verify: a landed submit CLEARS the payload from the prompt line.
+    // Poll a short window (self-clear uses ~3s) for the payload prefix to
+    // disappear. We check a prefix because tmux may wrap/truncate long
+    // payloads, so the full string is not reliably present even pre-submit.
+    let check_prefix: String = text.chars().take(10).collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(out) = capture_pane(pane).await {
+            // Cleared from the prompt line == submitted. We scope the check
+            // to the prompt line (not the whole pane) because the submitted
+            // payload legitimately appears in the scrollback above as the
+            // new user turn — only its ABSENCE from the live input line
+            // signals a successful submit.
+            let still_on_prompt = prompt_line_text(&out)
+                .map(|p| !check_prefix.is_empty() && p.contains(&check_prefix))
+                .unwrap_or(false);
+            if !still_on_prompt {
+                return InjectOutcome::Submitted;
+            }
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+    debug!(
+        pane = %pane,
+        "inject_and_verify: payload still on prompt line after verify window; submit likely did not land"
+    );
+    InjectOutcome::SubmitUnverified
+}
+
+/// The type-without-submit portion of `inject_text`: Escape→NORMAL,
+/// dd line-clear, `i` INSERT verify-and-retry, then type the literal text.
+/// Does NOT send any submit keystrokes. Factored out so `inject_and_verify`
+/// can reuse the exact same proven typing choreography for its `--no-submit`
+/// and slash-command paths without duplicating it.
+pub(crate) async fn inject_text_no_submit(pane: &str, text: &str) {
+    // Step 0: Settle. Most callers reach here right after interrupt_and_wait,
+    // which has already fired Escape repeatedly. No-op when
+    // post_escape_settle_ms is 0 (fast-path default).
+    settle_after_escape().await;
+
+    // Step 1: Escape to NORMAL mode. ALWAYS send at least two Escapes before
+    // checking `is_insert_mode` — Escape in NORMAL mode is a no-op, so two
+    // Escapes is idempotent coercion. Guards against (a) wrap-truncated
+    // status bars where `is_insert_mode` mis-reports NORMAL, and (b)
+    // autocomplete/ghost-text overlays that absorb the FIRST Escape
+    // (dismissing the overlay) without exiting INSERT. Cap at 3 / ~3s.
+    for i in 0..3 {
+        send_keys(pane, &["Escape"]).await;
+        sleep(Duration::from_secs(1)).await;
+        if i >= 1 && !is_insert_mode(pane).await {
+            break;
+        }
+    }
+    // Step 1a: Optional configurable settle after the Escape loop. Default 0
+    // (fast path). Tunable via [tmux].post_escape_settle_ms.
+    settle_after_escape().await;
+
+    // Step 1b: Wait briefly for the activity indicator to settle to Idle.
+    // Fast-path bails after INJECT_IDLE_FAST_PATH_MS and proceeds anyway: if
+    // the idle predicate hasn't matched by then it almost certainly won't
+    // (stale scrollback, custom prompt).
+    const INJECT_IDLE_FAST_PATH_MS: u64 = 1500;
+    let idle_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(INJECT_IDLE_FAST_PATH_MS);
+    let mut idle_observed = false;
+    while tokio::time::Instant::now() < idle_deadline {
+        if get_activity(pane).await == ClaudeActivity::Idle {
+            idle_observed = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    if !idle_observed {
+        debug!(
+            pane = %pane,
+            fast_path_ms = INJECT_IDLE_FAST_PATH_MS,
+            "inject_text_no_submit: idle not observed within fast-path window, sending anyway"
+        );
+    }
+
+    // Step 2: dd -- delete entire line
+    send_keys(pane, &["d"]).await;
+    sleep(Duration::from_millis(100)).await;
+    send_keys(pane, &["d"]).await;
+    sleep(Duration::from_millis(500)).await;
+
+    // Step 3: i -- enter INSERT mode, AND VERIFY we actually entered INSERT
+    // before typing the payload.
+    //
+    // ROOT CAUSE of "cursor stuck mid-text" bug (Andrew flagged 2026-04-28):
+    // a fixed 1500ms sleep after `i` with NO verification let the FIRST
+    // chars of `send_literal(text)` arrive while still in NORMAL mode, where
+    // they're interpreted as motion/edit commands (`[`, `C`, `L`, `A`, …)
+    // that jump the cursor around before INSERT finally engages. Symmetric
+    // fix: verify INSERT is active (mirror of the Step 1 Escape→NORMAL
+    // verify loop), retry up to 3 times.
+    let mut entered_insert = false;
+    for _ in 0..3 {
+        send_keys(pane, &["i"]).await;
+        sleep(Duration::from_millis(500)).await;
+        if is_insert_mode(pane).await {
+            entered_insert = true;
+            break;
+        }
+    }
+    // Final settle even on success — Claude Code may render `-- INSERT --`
+    // before the input editor has fully accepted typed characters.
+    sleep(Duration::from_millis(500)).await;
+    if !entered_insert {
+        debug!(
+            pane = pane,
+            "inject_text_no_submit: INSERT mode not confirmed after 3 `i` attempts; \
+             proceeding anyway (fall-through to legacy behavior)"
+        );
+    }
+
+    // Step 4: Type the text
+    send_literal(pane, text).await;
+    sleep(Duration::from_millis(500)).await;
 }
 
 /// Inject a command into a shell prompt.
@@ -1481,6 +1582,49 @@ mod tests {
             seq.contains(&"Escape"),
             "must Escape to reach NORMAL mode before the submitting Enter"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // prompt_line_text — the verification primitive behind
+    // `inject_and_verify`. A landed submit clears the payload from the
+    // prompt line; these pin the extractor so the verify check is sound.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prompt_line_text_extracts_text_after_cursor() {
+        let output = "some output\n\u{276f} /mcp";
+        assert_eq!(prompt_line_text(output).as_deref(), Some("/mcp"));
+    }
+
+    #[test]
+    fn prompt_line_text_empty_when_prompt_bare() {
+        // A submitted (cleared) input line: bare cursor, no payload.
+        let output = "scrollback\n\u{276f} \n──────\n  -- INSERT --";
+        // The LAST `❯` line is the bare prompt → empty payload.
+        assert_eq!(prompt_line_text(output).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn prompt_line_text_none_without_prompt() {
+        let output = "no prompt char here\njust text";
+        assert_eq!(prompt_line_text(output), None);
+    }
+
+    #[test]
+    fn prompt_line_text_uses_last_prompt_line() {
+        // An older `❯` in scrollback must not shadow the live input line.
+        let output = "\u{276f} old typed text\nstuff\n\u{276f} new text";
+        assert_eq!(prompt_line_text(output).as_deref(), Some("new text"));
+    }
+
+    #[test]
+    fn inject_outcome_variants_are_distinct() {
+        // Guard the three-state contract the `claude-watch inject` exit
+        // codes lean on: Typed (no-submit), Submitted (verified),
+        // SubmitUnverified (sent but payload still on prompt line).
+        assert_ne!(InjectOutcome::Typed, InjectOutcome::Submitted);
+        assert_ne!(InjectOutcome::Submitted, InjectOutcome::SubmitUnverified);
+        assert_ne!(InjectOutcome::Typed, InjectOutcome::SubmitUnverified);
     }
 
     #[test]

@@ -350,6 +350,43 @@ pub(crate) fn dead_process_restart_suppressed(
     suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
 }
 
+/// Pure gate: should the fresh-external-session checklist kick-start inject
+/// FIRE this cycle? Mirrors the decision made at the fire site (the
+/// dead-process block's `else if`) so the conditions — including the
+/// interactive-prompt suppression — are unit-testable without mocking tmux.
+///
+/// The inject fires iff ALL hold:
+///   * `dead_checks >= fresh_inject_checks` — enough consecutive
+///     tokens==0 / bashes==0 observations to be confident the session is
+///     genuinely a fresh idle one (not a momentary between-turns reading).
+///   * `!already_injected` — we haven't already kick-started this session.
+///   * `is_idle` — the Claude prompt (`❯`) is visible.
+///   * `!interactive_prompt` — there is NO `AskUserQuestion` / tool-permission
+///     / selection menu on screen awaiting the operator.
+///
+/// The last clause is the fix for the reported bug: a legitimately pending
+/// interactive question idles the loop with tokens==0 and renders a `❯`
+/// cursor, so `is_idle` reads true and the loop lands in the dead-process
+/// block. Without this clause the kick-start inject `send-keys` (leading
+/// Escape) would CANCEL the operator's question. A pending question is a
+/// recognized, legitimate idle state — the #356 ask_question_monitor uses
+/// the same `is_interactive_prompt` signal to detect it — so it must EXEMPT
+/// the loop from the wedge/restart inject for the question's lifetime.
+/// Suppressing is recoverable (a later cycle injects once the prompt
+/// clears); injecting into a live menu is not.
+pub(crate) fn fresh_inject_due(
+    dead_checks: u32,
+    fresh_inject_checks: u32,
+    already_injected: bool,
+    is_idle: bool,
+    interactive_prompt: bool,
+) -> bool {
+    dead_checks >= fresh_inject_checks
+        && !already_injected
+        && is_idle
+        && !interactive_prompt
+}
+
 /// Pure predicate: is at least one workload heartbeat fresh?
 ///
 /// Scans `dir` for files (any name) and returns `true` if any has an
@@ -2615,6 +2652,152 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
 }
 
 /// Run a single check cycle.
+/// Outcome of evaluating the AskUserQuestion stale-monitor timer for one
+/// cycle. Pure decision separated from I/O (pane capture + alarm emit) so
+/// the lifecycle is unit-testable without mocking tmux.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AskQuestionTimerDecision {
+    /// Monitor disabled, or no interactive prompt pending — clear the timer
+    /// (idempotent: also the reset path when a prompt clears).
+    Clear,
+    /// Interactive prompt pending; timer running but threshold not reached
+    /// (or already alerted). Set `ask_question_pending_since` if unset; do
+    /// not fire.
+    Pending,
+    /// Threshold reached on a not-yet-alerted pending question — FIRE the
+    /// alarm once. Carries the elapsed minutes for the alert payload.
+    Fire { stale_minutes: u64 },
+}
+
+/// Pure lifecycle for the AskUserQuestion stale monitor. Mirrors the
+/// thinking-timer lifecycle (start when observed / reset when cleared /
+/// fire once at threshold). Mutates `ask_question_pending_since` /
+/// `ask_question_alerted` on `state` and returns what the caller should do.
+///
+/// Phase 1: the caller only EMITS AN ALARM on `Fire` — it does NOT Escape,
+/// reject, or inject (that is Phase 2/3, gated on `reject_enabled`).
+///
+/// Args:
+///   * `enabled` / `stale_seconds` — from `[ask_question_monitor]`.
+///   * `interactive_prompt` — whether an `AskUserQuestion` / selection /
+///     permission prompt is currently on screen (`tmux::is_interactive_prompt`).
+///   * `now` — RFC3339 timestamp string (the daemon's per-check `now`).
+pub(crate) fn ask_question_timer_step(
+    state: &mut State,
+    enabled: bool,
+    stale_seconds: u64,
+    interactive_prompt: bool,
+    now: &str,
+) -> AskQuestionTimerDecision {
+    // Disabled, or the question has cleared/been answered: reset the timer.
+    // (When NOT an interactive prompt, the question is gone — clear so the
+    // next fresh question gets its own timer + single alarm.)
+    if !enabled || !interactive_prompt {
+        state.ask_question_pending_since = None;
+        state.ask_question_alerted = false;
+        return AskQuestionTimerDecision::Clear;
+    }
+
+    // Interactive prompt is pending. Start the timer on first observation.
+    let started = match state.ask_question_pending_since.as_deref() {
+        Some(ts) => ts.to_string(),
+        None => {
+            state.ask_question_pending_since = Some(now.to_string());
+            now.to_string()
+        }
+    };
+
+    // Already alerted for THIS pending question — fire only once.
+    if state.ask_question_alerted {
+        return AskQuestionTimerDecision::Pending;
+    }
+
+    // Elapsed since the question was first observed pending. A malformed
+    // timestamp (elapsed_since None) fails safe toward NOT firing.
+    let elapsed = elapsed_since(&started).unwrap_or(0.0);
+    if elapsed >= stale_seconds as f64 {
+        state.ask_question_alerted = true;
+        AskQuestionTimerDecision::Fire {
+            stale_minutes: (elapsed as u64) / 60,
+        }
+    } else {
+        AskQuestionTimerDecision::Pending
+    }
+}
+
+/// AskUserQuestion stale monitor (Phase 1: detect + alarm ONLY).
+///
+/// Detects when an interactive `AskUserQuestion` / tool-permission /
+/// selection prompt has blocked the main loop (which reads as
+/// `ClaudeActivity::Idle` while the prompt is up — the menu still renders a
+/// `\u{276f}` cursor, so the prolonged-thinking detector never engages) for
+/// longer than `[ask_question_monitor].stale_seconds`, and emits a
+/// `ask-question-stale` claude-event + pingme exactly once per pending
+/// question. Resets when the prompt clears.
+///
+/// Phase 1 does NOT Escape / auto-reject / inject. The reject path (Phase 2
+/// Escape, Phase 3 inject of `explanation`) hooks in at the marked TODO
+/// below, gated on `config.ask_question_monitor.reject_enabled`.
+async fn check_ask_question_stale(config: &Config, state: &mut State, pane: &str, now: &str) {
+    let cfg = &config.ask_question_monitor;
+    if !cfg.enabled || pane.is_empty() {
+        // Still run the timer step so a disabled monitor clears any stale
+        // timer state (idempotent reset).
+        ask_question_timer_step(state, cfg.enabled, cfg.stale_seconds, false, now);
+        return;
+    }
+
+    let interactive = tmux::is_interactive_prompt(pane).await;
+    let decision =
+        ask_question_timer_step(state, cfg.enabled, cfg.stale_seconds, interactive, now);
+
+    if let AskQuestionTimerDecision::Fire { stale_minutes } = decision {
+        let msg = format!(
+            "claude-watch: an interactive AskUserQuestion prompt has blocked \
+             the main loop for ~{}min (>{}s threshold). The operator may be \
+             away — the loop reads as Idle, so the prolonged-thinking \
+             detector never fired. Answer it or let it auto-resolve.",
+            stale_minutes, cfg.stale_seconds
+        );
+        warn!(
+            stale_minutes,
+            threshold_secs = cfg.stale_seconds,
+            "AskUserQuestion prompt stale — emitting alarm (Phase 1: alarm only)"
+        );
+        write_jsonl_log(
+            &config.general.log_file,
+            "ask_question_stale",
+            serde_json::json!({
+                "stale_minutes": stale_minutes,
+                "threshold_secs": cfg.stale_seconds,
+                "reject_enabled": cfg.reject_enabled,
+            }),
+        );
+        // Sink 1: structured claude-event (forces the loop to see the
+        // parseable stale_minutes field). Sink 2: pingme push.
+        alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+            alert_type: "ask-question-stale",
+            stuck_reason: "AskUserQuestion prompt pending past stale threshold",
+            stale_minutes: Some(stale_minutes),
+            affected_watchers: vec![],
+            severity: crate::event_bus::Severity::Medium,
+            message: &msg,
+        });
+        alert::send_pingme(&msg).await;
+
+        // TODO(Phase 2/3): gate an auto-reject on `cfg.reject_enabled`.
+        //   Phase 2: when `cfg.reject_enabled`, send Escape to the pane
+        //     (tmux::interrupt_and_wait / a dedicated reject keystroke) to
+        //     cancel the AskUserQuestion menu safely.
+        //   Phase 3: after the reject lands, inject `cfg.explanation`
+        //     ("use your judgement") via inject_dispatch so the loop
+        //     proceeds autonomously. Both paths should claim the global
+        //     interrupt cooldown via try_claim_global_interrupt and apply
+        //     a per-fire backoff, mirroring the prolonged-thinking path.
+        // Phase 1 intentionally stops here: ALARM ONLY, no keystrokes.
+    }
+}
+
 pub async fn check_cycle(config: &Config, state: &mut State) {
     let now = Local::now().to_rfc3339();
 
@@ -2982,10 +3165,24 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     state.alert_count = 0;
                     reset_suppression(state);
                 }
-            } else if dead_checks >= config.dead_process.fresh_inject_checks
-                && !state.fresh_session_injected
-                && tmux::is_idle(&effective_pane).await
-            {
+            } else if {
+                // Evaluate the pane reads ONCE into locals, then defer the
+                // FIRE/SUPPRESS decision to the pure `fresh_inject_due` gate
+                // (unit-tested, so the interactive-prompt suppression is
+                // locked). `is_interactive_prompt` is only consulted when
+                // `is_idle` already holds, to avoid a second pane capture on
+                // the common not-idle path.
+                let idle = tmux::is_idle(&effective_pane).await;
+                let interactive =
+                    idle && tmux::is_interactive_prompt(&effective_pane).await;
+                fresh_inject_due(
+                    dead_checks,
+                    config.dead_process.fresh_inject_checks,
+                    state.fresh_session_injected,
+                    idle,
+                    interactive,
+                )
+            } {
                 // Claude Code is running (idle prompt visible) but tokens=0 — this is
                 // a fresh session launched externally (e.g. dashboard --fresh), not by
                 // claude-watch. Inject a checklist kick-start prompt.
@@ -2998,6 +3195,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // here is already fresh at the idle prompt, so the prompt
                 // says so explicitly and points at the resume checklist
                 // without any "restart" verb.
+                //
+                // SUPPRESSION (interactive prompt): the `fresh_inject_due`
+                // gate above also requires `!interactive_prompt`. A legitimately
+                // pending `AskUserQuestion` / tool-permission / selection menu
+                // idles the loop with tokens==0 (no generation) and renders a
+                // `❯` selection cursor, so it lands in THIS dead-process block
+                // and reads as `is_idle` — without the guard the fresh-/resume-
+                // checklist inject below would `send-keys` (leading Escape)
+                // into the live menu and CANCEL the operator's question before
+                // they can answer it. This mirrors the identical guard on the
+                // fresh-/clear path below; the #356 ask_question_monitor
+                // already uses `is_interactive_prompt` as its detection signal,
+                // so a pending question is a recognized, legitimate idle state
+                // that must NOT be preempted by a wedge/restart inject. A FALSE
+                // POSITIVE here only DELAYS the kick-start by a cycle
+                // (recoverable); a FALSE NEGATIVE destroys a live question.
                 info!(
                     dead_checks,
                     "fresh external session detected — injecting checklist kick-start"
@@ -3279,6 +3492,13 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // No heartbeat file -- give it time
         }
     }
+
+    // --- AskUserQuestion stale detection (Phase 1: detect + alarm) ---
+    // A pending interactive question blocks the main loop but reads as
+    // Idle, so the prolonged-thinking detector misses it. Fire a fast,
+    // specific alarm when it sits pending past the configured threshold.
+    // ALARM ONLY in Phase 1 — no Escape / reject / inject.
+    check_ask_question_stale(config, state, &effective_pane, &now).await;
 
     // --- Foreground blocking detection ---
     // Delegated to check_foreground() which runs on its own timer in the main loop.
@@ -7265,4 +7485,138 @@ pane_unchanged_secs = 600
         };
         assert!(suppressed_on, "master switch on must let fresh hb suppress");
     }
+
+
+    // --- fresh-external-session inject gate (interactive-prompt suppression) ---
+
+    #[test]
+    fn test_fresh_inject_due_fires_when_idle_and_no_interactive_prompt() {
+        // The canonical fresh-idle case: enough dead checks, not yet
+        // injected, idle prompt visible, NO interactive menu → inject.
+        assert!(fresh_inject_due(
+            /* dead_checks */ 3,
+            /* fresh_inject_checks */ 3,
+            /* already_injected */ false,
+            /* is_idle */ true,
+            /* interactive_prompt */ false,
+        ));
+    }
+
+    #[test]
+    fn test_fresh_inject_due_suppressed_when_interactive_prompt_pending() {
+        // THE BUG FIX: a legitimately pending AskUserQuestion idles the loop
+        // (tokens==0) and renders a `❯` cursor, so `is_idle` is true and we
+        // are deep in the dead-process block — but an interactive prompt is
+        // up. The inject MUST be suppressed so its leading-Escape send-keys
+        // does not cancel the operator's question. Every other condition is
+        // satisfied; only the interactive-prompt clause must hold the gate.
+        assert!(
+            !fresh_inject_due(
+                /* dead_checks */ 10,
+                /* fresh_inject_checks */ 3,
+                /* already_injected */ false,
+                /* is_idle */ true,
+                /* interactive_prompt */ true,
+            ),
+            "a pending interactive question must suppress the fresh-inject"
+        );
+    }
+
+    #[test]
+    fn test_fresh_inject_due_requires_idle() {
+        // Not at the idle prompt (e.g. still rendering) → never inject,
+        // regardless of the interactive flag.
+        assert!(!fresh_inject_due(5, 3, false, false, false));
+        assert!(!fresh_inject_due(5, 3, false, false, true));
+    }
+
+    #[test]
+    fn test_fresh_inject_due_requires_threshold_and_not_already_injected() {
+        // Under the dead-check threshold → no inject yet.
+        assert!(!fresh_inject_due(2, 3, false, true, false));
+        // Already injected this session → don't re-inject.
+        assert!(!fresh_inject_due(5, 3, true, true, false));
+    }
+
+    // --- AskUserQuestion stale-monitor timer lifecycle (Phase 1) ---
+
+    fn ask_q_now_offset(secs: i64) -> String {
+        (Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339()
+    }
+
+    #[test]
+    fn test_ask_question_timer_fires_once_at_threshold_then_resets() {
+        let mut state = State::default();
+        let stale = 240u64;
+
+        // Cycle 1: prompt appears. Timer starts; not yet stale (use a
+        // freshly-stamped now). No fire.
+        let t0 = Utc::now().to_rfc3339();
+        let d = ask_question_timer_step(&mut state, true, stale, true, &t0);
+        assert_eq!(d, AskQuestionTimerDecision::Pending);
+        assert!(state.ask_question_pending_since.is_some());
+        assert!(!state.ask_question_alerted);
+
+        // Cycle 2: still pending, still under threshold. No fire.
+        let d = ask_question_timer_step(&mut state, true, stale, true, &Utc::now().to_rfc3339());
+        assert_eq!(d, AskQuestionTimerDecision::Pending);
+        assert!(!state.ask_question_alerted);
+
+        // Cycle 3: the question has now been pending past the threshold.
+        // Simulate by backdating pending_since to > stale seconds ago.
+        state.ask_question_pending_since = Some(ask_q_now_offset(stale as i64 + 5));
+        let d = ask_question_timer_step(&mut state, true, stale, true, &Utc::now().to_rfc3339());
+        match d {
+            AskQuestionTimerDecision::Fire { stale_minutes } => {
+                assert!(stale_minutes >= 4, "expected >=4 min, got {}", stale_minutes);
+            }
+            other => panic!("expected Fire, got {:?}", other),
+        }
+        assert!(state.ask_question_alerted, "alerted flag must latch after fire");
+
+        // Cycle 4: still pending + still over threshold, but already
+        // alerted — must NOT fire again (fires exactly once per question).
+        let d = ask_question_timer_step(&mut state, true, stale, true, &Utc::now().to_rfc3339());
+        assert_eq!(d, AskQuestionTimerDecision::Pending);
+
+        // Cycle 5: the prompt clears (question answered). Timer resets.
+        let d = ask_question_timer_step(&mut state, true, stale, false, &Utc::now().to_rfc3339());
+        assert_eq!(d, AskQuestionTimerDecision::Clear);
+        assert!(state.ask_question_pending_since.is_none());
+        assert!(!state.ask_question_alerted);
+
+        // Cycle 6: a NEW question appears — gets its own fresh timer and can
+        // fire again later (proves the reset re-arms the once-per-question
+        // semantics).
+        let d = ask_question_timer_step(&mut state, true, stale, true, &Utc::now().to_rfc3339());
+        assert_eq!(d, AskQuestionTimerDecision::Pending);
+        assert!(state.ask_question_pending_since.is_some());
+    }
+
+    #[test]
+    fn test_ask_question_timer_never_fires_when_not_interactive() {
+        // A busy / non-interactive pane (no AskUserQuestion prompt) must
+        // never start the timer or fire, regardless of how much time
+        // passes.
+        let mut state = State::default();
+        for _ in 0..10 {
+            let d = ask_question_timer_step(&mut state, true, 1, false, &ask_q_now_offset(3600));
+            assert_eq!(d, AskQuestionTimerDecision::Clear);
+            assert!(state.ask_question_pending_since.is_none());
+            assert!(!state.ask_question_alerted);
+        }
+    }
+
+    #[test]
+    fn test_ask_question_timer_disabled_never_fires() {
+        // enabled = false: even with an interactive prompt long past the
+        // threshold, the monitor stays silent and clears any timer state.
+        let mut state = State::default();
+        state.ask_question_pending_since = Some(ask_q_now_offset(99999));
+        let d = ask_question_timer_step(&mut state, false, 1, true, &Utc::now().to_rfc3339());
+        assert_eq!(d, AskQuestionTimerDecision::Clear);
+        assert!(state.ask_question_pending_since.is_none());
+        assert!(!state.ask_question_alerted);
+    }
+
 }

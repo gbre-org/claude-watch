@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Tests for cw-cron-run (flag-file exec-wrapper) + cw-cron-toggle (CLI).
+#
+# Exercises:
+#   cw-cron-run:
+#     - runs the wrapped command when no flag present (output + exit 0)
+#     - skips the wrapped command (exit 0, no stdout) when flag present
+#     - usage error (exit 2) when called with <2 args
+#     - propagates the wrapped command's nonzero exit when enabled
+#   cw-cron-toggle:
+#     - list shows all known jobs as enabled by default
+#     - disable creates the flag file + list shows DISABLED
+#     - enable removes the flag file + list shows enabled
+#     - unknown job-name rejected (nonzero) for disable + enable
+#     - --help exits 0
+#
+# Uses a tempdir as CW_CRON_DISABLED_DIR so no real state is touched.
+#
+# Run:  ./cw-cron-toggle.test
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN="${HERE}/../cw-cron-run"
+TOGGLE="${HERE}/../cw-cron-toggle"
+
+TMPDIR_TEST="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_TEST"' EXIT
+
+export CW_CRON_DISABLED_DIR="${TMPDIR_TEST}/cron-disabled"
+
+PASS=0
+FAIL=0
+
+ok() {
+    PASS=$((PASS + 1))
+    echo "ok   - $1"
+}
+
+bad() {
+    FAIL=$((FAIL + 1))
+    echo "FAIL - $1"
+}
+
+# --- cw-cron-run: runs command when no flag ---------------------------------
+out="$("$RUN" metrics echo hello 2>/dev/null)"
+if [ "$out" = "hello" ]; then
+    ok "cw-cron-run runs wrapped command when not disabled"
+else
+    bad "cw-cron-run should run command when not disabled (got: '$out')"
+fi
+
+# --- cw-cron-run: exit 0 when command succeeds ------------------------------
+if "$RUN" metrics true; then
+    ok "cw-cron-run exit 0 when wrapped command succeeds"
+else
+    bad "cw-cron-run should exit 0 when wrapped command succeeds"
+fi
+
+# --- cw-cron-run: propagates nonzero exit of wrapped command ----------------
+set +e
+"$RUN" metrics false
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    ok "cw-cron-run propagates nonzero exit of wrapped command (rc=$rc)"
+else
+    bad "cw-cron-run should propagate nonzero exit (got rc=$rc)"
+fi
+
+# --- cw-cron-run: skips command when flag present ---------------------------
+mkdir -p "$CW_CRON_DISABLED_DIR"
+: > "${CW_CRON_DISABLED_DIR}/metrics"
+out="$("$RUN" metrics echo SHOULD_NOT_PRINT 2>/dev/null)"
+if [ -z "$out" ]; then
+    ok "cw-cron-run produces no stdout when job disabled"
+else
+    bad "cw-cron-run should not run command when disabled (got: '$out')"
+fi
+
+set +e
+"$RUN" metrics echo SHOULD_NOT_PRINT >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    ok "cw-cron-run exit 0 when job disabled (no cron failure logged)"
+else
+    bad "cw-cron-run should exit 0 when disabled (got rc=$rc)"
+fi
+rm -f "${CW_CRON_DISABLED_DIR}/metrics"
+
+# --- cw-cron-run: usage error when <2 args ----------------------------------
+set +e
+"$RUN" onlyone >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 2 ]; then
+    ok "cw-cron-run exit 2 on usage error (<2 args)"
+else
+    bad "cw-cron-run should exit 2 on usage error (got rc=$rc)"
+fi
+
+# --- cw-cron-toggle: list shows enabled by default --------------------------
+out="$("$TOGGLE" list)"
+if echo "$out" | grep -q 'watcher-health-check' && ! echo "$out" | grep -q 'DISABLED'; then
+    ok "cw-cron-toggle list shows jobs enabled by default"
+else
+    bad "cw-cron-toggle list default state wrong (got: $out)"
+fi
+
+# --- cw-cron-toggle: disable creates flag + list shows DISABLED -------------
+"$TOGGLE" disable watcher-health-check >/dev/null
+if [ -e "${CW_CRON_DISABLED_DIR}/watcher-health-check" ]; then
+    ok "cw-cron-toggle disable creates flag file"
+else
+    bad "cw-cron-toggle disable should create flag file"
+fi
+out="$("$TOGGLE" list)"
+if echo "$out" | grep -q 'watcher-health-check.*DISABLED'; then
+    ok "cw-cron-toggle list shows DISABLED after disable"
+else
+    bad "cw-cron-toggle list should show DISABLED (got: $out)"
+fi
+
+# --- cw-cron-toggle: enable removes flag ------------------------------------
+"$TOGGLE" enable watcher-health-check >/dev/null
+if [ ! -e "${CW_CRON_DISABLED_DIR}/watcher-health-check" ]; then
+    ok "cw-cron-toggle enable removes flag file"
+else
+    bad "cw-cron-toggle enable should remove flag file"
+fi
+
+# --- cw-cron-toggle: unknown job rejected -----------------------------------
+set +e
+"$TOGGLE" disable bogus-job >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    ok "cw-cron-toggle disable rejects unknown job (rc=$rc)"
+else
+    bad "cw-cron-toggle disable should reject unknown job"
+fi
+
+set +e
+"$TOGGLE" enable bogus-job >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    ok "cw-cron-toggle enable rejects unknown job (rc=$rc)"
+else
+    bad "cw-cron-toggle enable should reject unknown job"
+fi
+
+# --- cw-cron-toggle: --help exit 0 ------------------------------------------
+if "$TOGGLE" --help >/dev/null 2>&1; then
+    ok "cw-cron-toggle --help exit 0"
+else
+    bad "cw-cron-toggle --help should exit 0"
+fi
+
+# --- summary ----------------------------------------------------------------
+echo ""
+echo "cw-cron-toggle tests: ${PASS} passed, ${FAIL} failed"
+if [ "$FAIL" -ne 0 ]; then
+    exit 1
+fi

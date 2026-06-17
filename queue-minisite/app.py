@@ -89,8 +89,19 @@ QUEUE_LOG_ARCHIVE_DIR = os.environ.get(
 # The host path is /tmp/claude-workloads; we bind-mount that dir read-only
 # at /workloads inside the container. Override via WORKLOAD_LOG_DIR.
 WORKLOAD_LOG_DIR = os.environ.get("WORKLOAD_LOG_DIR", "/workloads")
+# Hostjob output directory (tail target for hostjob-bound queue items).
+# The `hostjob` runner (andrew-sf-tools) writes a per-label DIRECTORY:
+#   ~/.cache/hostjob/<label>/log        (line-oriented stdout/stderr)
+#   ~/.cache/hostjob/<label>/heartbeat  (progress heartbeat, optional)
+# NOTE the layout differs from workload's flat `<label>.output`: hostjob
+# nests the log file inside a per-label dir, so the tail path is
+# `<HOSTJOB_LOG_DIR>/<label>/log`. The host path is ~/.cache/hostjob; the
+# container bind-mounts it read-only at /hostjobs. Override via
+# HOSTJOB_LOG_DIR.
+HOSTJOB_LOG_DIR = os.environ.get("HOSTJOB_LOG_DIR", "/hostjobs")
 # Label format: same as queue-id-ish — letters, digits, dots, dashes,
-# underscores. Path-traversal guard for the tail endpoint.
+# underscores. Path-traversal guard for the tail endpoint. Shared by both
+# the workload and hostjob label extractors / tail endpoints.
 _WORKLOAD_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 CACHE_TTL_SECONDS = float(os.environ.get("CACHE_TTL_SECONDS", "5"))
 # Cap on the recent done / abandoned tails — full list is hundreds of items.
@@ -121,6 +132,13 @@ STOP_TIMEOUT_SECONDS = float(os.environ.get("STOP_TIMEOUT_SECONDS", "10"))
 # Mirrors the canonical format used by session-task. Strict pattern keeps
 # subprocess invocation safe even if upstream gating ever drifts.
 _QUEUE_ID_RE = re.compile(r"^q-[a-z0-9-]{4,64}$")
+# Queue-item marker embedded in an agent's first user message. The
+# main loop seeds every spawn prompt with a ``Queue item: q-XXXX`` line
+# (the queue-gate hook enforces it), so a subagent's transcript carries
+# the q-id of the item it belongs to. We parse it to attribute each
+# subagent to its owning queue item (see ``_list_session_subagents`` +
+# the per-item filter in ``_shape``).
+_QUEUE_MARKER_RE = re.compile(r"Queue item:\s*(q-[a-z0-9-]{4,64})")
 # Reason length cap — the value is stored verbatim in queue.json; no
 # need to allow paragraphs.
 _MAX_REASON_LEN = 500
@@ -669,13 +687,42 @@ def _shape(
         # totals (queue.json says they're running), but render with
         # a distinct pill + suppress orphan badging during the window.
         shaped["is_starting"] = bool(owner.get("is_starting"))
+        # Nested subagent tree -- for running items with a known owner
+        # agent, resolve the owner's parent main-loop session and list
+        # its subagents, then keep only the ones belonging to THIS queue
+        # item. ``_list_session_subagents`` returns every subagent in the
+        # owner's session (it can't tell items apart on its own); each
+        # record carries a ``queue_id`` parsed from the spawn-prompt
+        # ``Queue item: q-XXXX`` marker, so we filter here. The dir walk is
+        # cheap (running items are few) and fail-soft.
+        subagents: list[dict[str, Any]] = []
+        owner_agent_id = owner.get("agent_id") or ""
+        if owner_agent_id:
+            session_id = _session_id_for_subagent(owner_agent_id)
+            if session_id:
+                subagents = _list_session_subagents(session_id)
+        # Filter the session-wide list down to this item's own subagents.
+        # Only apply the strict filter when at least one sibling carries a
+        # parseable q-id marker: if NONE do (older transcripts predating
+        # the marker), fall back to the unfiltered list rather than render
+        # a silently-empty tree.
+        iid = item.get("id", "")
+        if any(s.get("queue_id") for s in subagents):
+            subagents = [s for s in subagents if s.get("queue_id") == iid]
+        shaped["subagents"] = subagents
     else:
         shaped["is_starting"] = False
+        shaped["subagents"] = []
     # Workload label — derived from scope. Items created by `workload run`
     # have a scope entry of the form `workload:<label>`. Surface the bare
     # label so the front-end can render `data-log-mode="workload"` on
     # running items (the live-log endpoint dispatches on this).
     shaped["workload_label"] = _extract_workload_label(shaped["scope"])
+    # Hostjob label — derived from scope. Items created by the `hostjob`
+    # runner carry a scope entry `hostjob:<label>`. Surface the bare label
+    # so the front-end / live-log endpoint can dispatch on it, mirroring
+    # the workload path above.
+    shaped["hostjob_label"] = _extract_hostjob_label(shaped["scope"])
     return shaped
 
 
@@ -692,6 +739,26 @@ def _extract_workload_label(scope: list[Any]) -> str:
     for s in scope:
         if isinstance(s, str) and s.startswith("workload:"):
             label = s[len("workload:") :]
+            if _WORKLOAD_LABEL_RE.match(label):
+                return label
+    return ""
+
+
+def _extract_hostjob_label(scope: list[Any]) -> str:
+    """Return the hostjob label encoded in a queue item's scope, or "".
+
+    Parallel to ``_extract_workload_label``: the ``hostjob`` runner
+    (andrew-sf-tools) creates a queue item with scope
+    ``["hostjob:<label>"]``. Only the first match is honored — an item
+    bound to more than one hostjob would be a bug elsewhere we don't
+    silently paper over here. Reuses the shared ``_WORKLOAD_LABEL_RE``
+    path-traversal guard.
+    """
+    if not isinstance(scope, list):
+        return ""
+    for s in scope:
+        if isinstance(s, str) and s.startswith("hostjob:"):
+            label = s[len("hostjob:") :]
             if _WORKLOAD_LABEL_RE.match(label):
                 return label
     return ""
@@ -1651,6 +1718,189 @@ def _find_parent_session_jsonl(session_id: str) -> Path | None:
     return best[1] if best else None
 
 
+# ---------------------------------------------------------------------------
+# Nested subagent tree + per-subagent log streams.
+# ---------------------------------------------------------------------------
+#
+# A main-loop session spawns subagents; each subagent transcript lives at
+# ``<AGENTS_JSONL_ROOT>/[<project-slug>/]<session-uuid>/subagents/agent-<id>.jsonl``
+# and its FIRST record carries ``sessionId`` (the parent main-loop session
+# UUID) + ``agentId``. For a running queue item the minisite already resolves
+# the OWNER agent via claude-watch's active-agents map (queue_id -> agent_id);
+# that owner agent IS a subagent under some session's ``subagents/`` dir.
+#
+# To surface the FULL set of sibling subagents for that main-loop session we:
+#   1. resolve the owner agent's transcript via _find_agent_jsonl,
+#   2. read its first record to recover the parent ``sessionId``,
+#   3. enumerate EVERY ``agent-*.jsonl`` in that same ``subagents/`` dir.
+#
+# LIMITATION (documented honestly): the on-disk layout is FLAT per-session --
+# subagents spawned BY a subagent are not nested on disk; they sit as siblings
+# under the same session dir. So the tree we render groups subagents by their
+# PARENT MAIN-LOOP SESSION, not by which specific agent spawned each one.
+# There is no on-disk signal to reconstruct deeper parent->child edges, so we
+# don't pretend to.
+
+# Session UUIDs are dashed alphanum (same guard _find_parent_session_jsonl
+# uses). Path-traversal guard for the directory walk below.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]{4,64}$")
+# Subagent id format -- same shape _find_agent_jsonl enforces on agent ids.
+_SUBAGENT_ID_RE = re.compile(r"^[a-z0-9-]{4,64}$")
+# `agent-<id>.jsonl` filename -> bare id capture.
+_SUBAGENT_FILE_RE = re.compile(r"^agent-([a-z0-9-]{4,64})\.jsonl$")
+# Cap on how much of a subagent transcript we read just to derive a label.
+_SUBAGENT_LABEL_MAX_CHARS = 80
+
+
+def _session_id_for_subagent(agent_id: str) -> str | None:
+    """Resolve ``agent_id`` to its parent main-loop ``sessionId``, or None.
+
+    Locates the subagent transcript via ``_find_agent_jsonl`` (which handles
+    both mount shapes + the path-traversal guard) and reads its first record's
+    ``sessionId`` via ``_extract_agent_anchor_from_archive``. Fail-soft:
+    returns None on any miss / parse failure.
+    """
+    path = _find_agent_jsonl(agent_id)
+    if path is None:
+        return None
+    anchor = _extract_agent_anchor_from_archive(path)
+    if anchor is None:
+        return None
+    session_id, _agent_id = anchor
+    return session_id
+
+
+def _first_user_text(path: Path) -> str:
+    """Best-effort: pull the first USER-message text from a transcript.
+
+    Scans the leading lines of the JSONL for the first ``type==user`` record
+    whose ``message.content`` yields text, and returns it truncated to
+    ``_SUBAGENT_LABEL_MAX_CHARS``. Returns "" on any miss / error. Cheap -- we
+    only read a bounded number of lines, not the whole transcript.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(50):
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "user":
+                    continue
+                msg = rec.get("message") or {}
+                content = msg.get("content") if isinstance(msg, dict) else None
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            t = c.get("text")
+                            if isinstance(t, str):
+                                parts.append(t)
+                        elif isinstance(c, str):
+                            parts.append(c)
+                    text = " ".join(parts)
+                text = " ".join(text.split())  # collapse whitespace
+                if text:
+                    return text[:_SUBAGENT_LABEL_MAX_CHARS]
+    except OSError:
+        return ""
+    return ""
+
+
+def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
+    """Enumerate the subagents of a main-loop session.
+
+    Given a parent ``session_id``, locate that session's ``subagents/`` dir
+    under AGENTS_JSONL_ROOT (handling BOTH mount shapes exactly like
+    ``_find_agent_jsonl``: ``<root>/<session>/subagents/`` first, then
+    ``<root>/<project-slug>/<session>/subagents/``) and return one record per
+    ``agent-*.jsonl`` file::
+
+        {"subagent_id": <id>, "label": <short label>,
+         "queue_id": <q-id from the spawn-prompt marker, or "">,
+         "age_seconds": <now-mtime>, "age": <humanized>}
+
+    Sorted most-recently-active first (mtime desc). Path-traversal guarded.
+    Fail-soft: returns [] on any error / bad session id.
+    """
+    if not _SESSION_ID_RE.match(session_id):
+        return []
+    root = Path(AGENTS_JSONL_ROOT)
+    if not root.is_dir():
+        return []
+
+    # Resolve the session's subagents dir across both mount shapes.
+    candidates: list[Path] = []
+    direct = root / session_id / "subagents"
+    if direct.is_dir():
+        candidates.append(direct)
+    else:
+        try:
+            for project in root.iterdir():
+                if not project.is_dir():
+                    continue
+                sub = project / session_id / "subagents"
+                if sub.is_dir():
+                    candidates.append(sub)
+        except OSError:
+            return []
+    if not candidates:
+        return []
+
+    now = time.time()
+    # Dedup by subagent id, keeping the most-recently-modified transcript.
+    best: dict[str, tuple[float, Path]] = {}
+    for sub_dir in candidates:
+        try:
+            entries = list(sub_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            m = _SUBAGENT_FILE_RE.match(entry.name)
+            if not m:
+                continue
+            sid = m.group(1)
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            prev = best.get(sid)
+            if prev is None or mtime > prev[0]:
+                best[sid] = (mtime, entry)
+
+    out: list[dict[str, Any]] = []
+    for sid, (mtime, path) in best.items():
+        age_seconds = max(0.0, now - mtime)
+        first_user = _first_user_text(path)
+        label = first_user or sid
+        # Attribute the subagent to its owning queue item by parsing the
+        # ``Queue item: q-XXXX`` marker the main loop seeds into every
+        # spawn prompt (the same first-user text used for the label).
+        # Empty string when the transcript predates / omits the marker;
+        # ``_shape`` only filters when at least one sibling carries one.
+        m = _QUEUE_MARKER_RE.search(first_user)
+        out.append(
+            {
+                "subagent_id": sid,
+                "label": label,
+                "queue_id": m.group(1) if m else "",
+                "age_seconds": age_seconds,
+                "age": _humanize_age(age_seconds),
+            }
+        )
+    out.sort(key=lambda r: r["age_seconds"])  # most-recently-active first
+    return out
+
+
 def _format_sse(data: dict[str, Any]) -> bytes:
     """Encode a dict as a single SSE `data:` event.
 
@@ -2056,6 +2306,176 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
             pass
 
 
+def _hostjob_item_terminal(label: str) -> bool:
+    """Return True once the hostjob-bound queue item has left a running
+    state (done / abandoned / blocked / vanished).
+
+    hostjob has NO `.exit` sidecar like workload — the runner instead
+    flips the queue item to done/abandoned on completion. So the live
+    tail uses the queue item's terminal status as its end-of-stream
+    signal. We re-read the queue (uncached) so a just-flipped status is
+    observed promptly. Fail-soft: any read error returns False so the
+    tail keeps following rather than cutting off a live log.
+    """
+    data, err = _read_queue()
+    if err is not None or not isinstance(data, dict):
+        return False
+    for it in data.get("items", []) or []:
+        if not isinstance(it, dict):
+            continue
+        if _extract_hostjob_label(it.get("scope") or []) != label:
+            continue
+        status = it.get("status")
+        # running / starting (a running item with no content yet) keep
+        # the stream open; anything else is terminal for streaming.
+        return status not in ("running", "pending")
+    # No matching item in the queue (pruned / archived) -> terminal.
+    return True
+
+
+def _tail_hostjob_output(label: str) -> Iterator[bytes]:
+    """Generator yielding SSE events for a tailed hostjob output file.
+
+    Mirrors ``_tail_workload_output`` (same line-oriented plain-text wire
+    format, same backfill / keepalive / timeout knobs, same CR/LF
+    transient handling) with two hostjob-specific differences:
+
+      * Path shape: hostjob nests the log inside a per-label dir, so we
+        tail ``<HOSTJOB_LOG_DIR>/<label>/log`` rather than the flat
+        ``<label>.output``.
+      * End-of-stream: hostjob writes NO ``.exit`` sidecar. The runner
+        flips the bound queue item to done/abandoned on completion, so we
+        poll that terminal status (``_hostjob_item_terminal``) as the
+        stop signal.
+    """
+    started = time.monotonic()
+    last_data_at = started
+    last_keepalive_at = started
+
+    out_path = Path(HOSTJOB_LOG_DIR) / label / "log"
+
+    yield _format_sse({
+        "type": "meta",
+        "kind": "stream-start",
+        "mode": "hostjob",
+        "path": str(out_path),
+        "label": label,
+        "ts": time.time(),
+    })
+
+    try:
+        # newline="" — preserve bare \r so _split_cr_lf_segments sees
+        # rsync-style progress frames (same rationale as the workload tail).
+        f = open(out_path, "r", encoding="utf-8", errors="replace", newline="")
+    except OSError as exc:
+        yield _format_sse({"type": "error", "kind": "open-failed", "error": str(exc)})
+        return
+
+    def _emit_end(reason: str) -> Iterator[bytes]:
+        # hostjob has no .exit file; the runner emits the exit_code on the
+        # claude-event + flips the queue item. We surface a terminal frame
+        # without an exit_code (None) — the front-end flips to done off the
+        # queue status, same as it would for any terminal item.
+        yield _format_sse({
+            "type": "meta",
+            "kind": "workload-end",
+            "label": label,
+            "reason": reason,
+            "exit_code": None,
+        })
+
+    pending = ""
+    READ_CHUNK = 8192
+
+    try:
+        try:
+            initial = f.read()
+        except OSError as exc:
+            yield _format_sse({"type": "error", "kind": "read-failed", "error": str(exc)})
+            return
+        backfill_segments, _ = _split_cr_lf_segments(initial, flush_remainder=True)
+        backfill_segments = _collapse_transient_runs(backfill_segments)
+        if len(backfill_segments) > SSE_TAIL_BACKFILL_LINES:
+            backfill_segments = backfill_segments[-SSE_TAIL_BACKFILL_LINES:]
+
+        if backfill_segments:
+            yield _format_sse({
+                "type": "meta",
+                "kind": "backfill-begin",
+                "lines": len(backfill_segments),
+            })
+            for text, transient in backfill_segments:
+                yield _format_sse({
+                    "type": "event",
+                    "kind": "workload_line",
+                    "text": text,
+                    "transient": transient,
+                })
+                last_data_at = time.monotonic()
+            yield _format_sse({"type": "meta", "kind": "backfill-end"})
+
+        # Tail loop. Terminate once the bound queue item reaches a
+        # terminal status AND we've drained the log at EOF — that ordering
+        # avoids cutting off the last line of a job that exits between
+        # reads (analogous to workload's .exit-after-EOF check).
+        while True:
+            chunk = f.read(READ_CHUNK)
+            if chunk:
+                pending += chunk
+                segments, pending = _split_cr_lf_segments(pending)
+                for text, transient in segments:
+                    yield _format_sse({
+                        "type": "event",
+                        "kind": "workload_line",
+                        "text": text,
+                        "transient": transient,
+                    })
+                    last_data_at = time.monotonic()
+                continue
+            # EOF — check if the bound queue item has gone terminal.
+            if _hostjob_item_terminal(label):
+                trailing = f.read()
+                if trailing:
+                    pending += trailing
+                segments, _ = _split_cr_lf_segments(pending, flush_remainder=True)
+                pending = ""
+                for text, transient in segments:
+                    yield _format_sse({
+                        "type": "event",
+                        "kind": "workload_line",
+                        "text": text,
+                        "transient": transient,
+                    })
+                yield from _emit_end("terminal")
+                return
+            now = time.monotonic()
+            if now - last_data_at > SSE_TAIL_MAX_IDLE_SECONDS:
+                yield _format_sse({
+                    "type": "meta",
+                    "kind": "idle-timeout",
+                    "idle_seconds": int(now - last_data_at),
+                })
+                return
+            if now - started > SSE_TAIL_MAX_LIFETIME_SECONDS:
+                yield _format_sse({
+                    "type": "meta",
+                    "kind": "lifetime-timeout",
+                    "seconds": int(now - started),
+                })
+                return
+            if now - last_keepalive_at > SSE_KEEPALIVE_SECONDS:
+                yield _format_sse_comment(f"keep-alive {int(now - started)}s")
+                last_keepalive_at = now
+            time.sleep(SSE_TAIL_POLL_SECONDS)
+    except GeneratorExit:
+        return
+    finally:
+        try:
+            f.close()
+        except OSError:
+            pass
+
+
 def _parse_jsonl_line(line: str) -> dict[str, Any]:
     """Parse a single transcript JSONL line into a stream event payload.
 
@@ -2158,14 +2578,27 @@ def api_queue_stream(qid: str) -> Any:
     # through to ``_no_agent`` and the user sees a placeholder error.
     queue_data, _qerr = _read_queue()
     workload_label = ""
+    hostjob_label = ""
     if isinstance(queue_data, dict):
         for it in queue_data.get("items", []) or []:
             if isinstance(it, dict) and it.get("id") == qid:
-                workload_label = _extract_workload_label(it.get("scope") or [])
+                scope = it.get("scope") or []
+                workload_label = _extract_workload_label(scope)
+                hostjob_label = _extract_hostjob_label(scope)
                 break
     if workload_label:
         return Response(
             stream_with_context(_tail_workload_output(workload_label)),
+            headers=headers,
+            direct_passthrough=True,
+        )
+    # Hostjob dispatch — items created by the `hostjob` runner carry scope
+    # `["hostjob:<label>"]` and (like workloads) have NO entry in the
+    # active-agents map. Tail <HOSTJOB_LOG_DIR>/<label>/log instead of
+    # falling through to the agent lookup + `_no_agent` placeholder.
+    if hostjob_label:
+        return Response(
+            stream_with_context(_tail_hostjob_output(hostjob_label)),
             headers=headers,
             direct_passthrough=True,
         )
@@ -2222,6 +2655,114 @@ def api_queue_stream(qid: str) -> Any:
         stream_with_context(_tail_jsonl(jsonl_path)),
         headers=headers,
         direct_passthrough=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-subagent live log stream + meta (nested subagent tree).
+# ---------------------------------------------------------------------------
+#
+# `GET /api/subagent/<subagent_id>/stream` tails the subagent's own
+# `agent-<id>.jsonl` transcript directly -- no queue-id indirection. The wire
+# format is IDENTICAL to `/api/queue/<id>/stream` (both use `_tail_jsonl`), so
+# the front-end's existing SSE renderer works unchanged; the UI only points
+# the EventSource at this URL instead. Used by the nested subagent tree under
+# each running queue card.
+
+
+@app.route("/api/subagent/<subagent_id>/stream")
+def api_subagent_stream(subagent_id: str) -> Any:
+    """Server-Sent Events tail of a subagent transcript by subagent id.
+
+    Resolves ``agent-<subagent_id>.jsonl`` via ``_find_agent_jsonl`` (which
+    handles both mount shapes + a path-traversal guard) and tails it with the
+    same SSE framing as ``/api/queue/<id>/stream``. A malformed id short-
+    circuits with a 400; a well-formed-but-unresolvable id emits a one-shot
+    ``no-jsonl`` error SSE frame then closes (so the client's EventSource
+    logic stays uniform).
+    """
+    if not _SUBAGENT_ID_RE.match(subagent_id):
+        return jsonify({"ok": False, "error": "invalid subagent id format"}), 400
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    jsonl_path = _find_agent_jsonl(subagent_id)
+    if jsonl_path is None:
+        def _no_jsonl() -> Iterator[bytes]:
+            yield _format_sse({
+                "type": "error",
+                "kind": "no-jsonl",
+                "subagent_id": subagent_id,
+                "error": (
+                    f"Subagent transcript not found for "
+                    f"subagent_id={subagent_id!r}. The JSONL file may not "
+                    "yet exist or is outside the configured AGENTS_JSONL_ROOT."
+                ),
+            })
+
+        return Response(
+            stream_with_context(_no_jsonl()),
+            headers=headers,
+            direct_passthrough=True,
+        )
+
+    return Response(
+        stream_with_context(_tail_jsonl(jsonl_path)),
+        headers=headers,
+        direct_passthrough=True,
+    )
+
+
+@app.route("/api/subagent/<subagent_id>/meta")
+def api_subagent_meta(subagent_id: str) -> Any:
+    """Return cheap metadata for a single subagent.
+
+    Resolves the transcript, stats its mtime for an age, and reads the first
+    record for the parent ``sessionId`` + a short label (first user-message
+    text). 400 on bad id format, 404 when no transcript is found.
+    """
+    if not _SUBAGENT_ID_RE.match(subagent_id):
+        return jsonify({"ok": False, "error": "invalid subagent id format"}), 400
+
+    path = _find_agent_jsonl(subagent_id)
+    if path is None:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "no transcript for this subagent id",
+                    "subagent_id": subagent_id,
+                }
+            ),
+            404,
+        )
+
+    try:
+        mtime = path.stat().st_mtime
+        age_seconds: float | None = max(0.0, time.time() - mtime)
+    except OSError:
+        age_seconds = None
+
+    parent_session_id: str | None = None
+    anchor = _extract_agent_anchor_from_archive(path)
+    if anchor is not None:
+        parent_session_id, _aid = anchor
+    label = _first_user_text(path) or subagent_id
+
+    return jsonify(
+        {
+            "ok": True,
+            "subagent_id": subagent_id,
+            "parent_session_id": parent_session_id,
+            "label": label,
+            "age": _humanize_age(age_seconds) if age_seconds is not None else "?",
+            "age_seconds": age_seconds,
+        }
     )
 
 
@@ -2751,7 +3292,9 @@ def api_queue_meta(qid: str) -> Any:
         "dependents": dependents,
         "has_archive": shaped["has_archive"],
         "is_starting": shaped["is_starting"],
+        "subagents": shaped.get("subagents", []),
         "workload_label": shaped["workload_label"],
+        "hostjob_label": shaped["hostjob_label"],
         "age": shaped["age"],
         "age_label": shaped["age_label"],
         "runtime_seconds": runtime_seconds,

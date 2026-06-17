@@ -322,82 +322,101 @@ label; exit 2 = bad `--qid`.
 ## Queue protocol — every Agent tool call
 
 Before firing **any** `Agent` tool call, you MUST first add a queue
-item via `session-task queue`. The queue serializes work that touches
-overlapping scopes (e.g. two agents editing the same repo at once),
-and the in-container scope namespace is **shared with the host** —
-`repo:claude-watch` covers BOTH host-side and container-side work
-touching that repo. An in-container agent that skips the queue can
-race against host-side work on the same repo, lose edits to a parallel
-agent, or stomp on a long-running build.
+item via `session-task queue`. The queue serializes work touching
+overlapping scopes, and the in-container scope namespace is **shared
+with the host** — `repo:claude-watch` covers BOTH host- and
+container-side work on that repo. An agent that skips the queue can
+race host-side work, lose edits to a parallel agent, or stomp builds.
+
+**Scope: this governs every `Agent` call the MAIN LOOP dispatches —
+one queue item per main-loop-spawned agent, the queue being the main
+loop's audit trail of work IT dispatched.** It does NOT separately
+enqueue *nested* subagents (agents an agent spawns under itself, or
+sub-work an agent runs internally) — those are not individually
+queue-tracked by the main loop. (The `subagent_queue_item_running`
+predicate below is the related-but-distinct case: it keeps a RUNNING
+subagent's already-bound q-id valid — that q-id is the one the main
+loop enqueued at spawn, not a fresh per-nested-agent item.)
 
 **The `pre-agent-queue-gate-hook` PreToolUse hook IS active inside
-this container** when `CLAUDE_CONTAINER_OBLIGATIONS=1` (the default,
-set by the entrypoint). The hook is baked at
-`/usr/local/bin/pre-agent-queue-gate-hook` and wired into Claude
-Code's PreToolUse cascade via the entrypoint-generated
-`/tmp/claude-shim/settings.json` (matcher `"Agent"`). Any `Agent`
-tool call that lacks a `Queue item: q-XXXX` marker in its prompt
-— or carries an unknown / non-`running` queue id — is HARD-DENIED
-at dispatch time, exactly like on the host. The model never sees
-the spawn happen; it gets the deny banner back as a tool-use
-permission denial.
+this container** when `CLAUDE_CONTAINER_OBLIGATIONS=1` (the default).
+Baked at `/usr/local/bin/pre-agent-queue-gate-hook` and wired into
+Claude Code's PreToolUse cascade via the entrypoint-generated
+`/tmp/claude-shim/settings.json` (matcher `"Agent"`). Any `Agent` call
+lacking a `Queue item: q-XXXX` marker in its prompt — or carrying an
+unknown / non-`running` queue id — is HARD-DENIED at dispatch, exactly
+like on the host; the model gets the deny banner back as a permission
+denial and never sees the spawn happen.
 
-The hook resolves queue state by shelling out to
-`session-task queue show <id>`. That CLI ships in the bind-mounted
-`~/repos/claude-watch/tools/session-task/` tree. When the bind-mount
-is absent (stripped-down `docker run` without `~/repos`), the
-lookup returns "not found" and the hook still DENIES — the deny
-reason names `session-task` so the operator can see why. If you
-hit that in a fresh container, ask the operator to bind-mount
-`~/repos/claude-watch` (the example compose does this by default).
-The hook only default-opens on TRULY unexpected internal errors
-(broad-except fail-safe), not on the routine "CLI missing" path.
+The hook resolves queue state via `session-task queue show <id>`. That
+CLI ships in the bind-mounted `~/repos/claude-watch/tools/session-task/`
+tree. When the bind-mount is absent (stripped-down `docker run` without
+`~/repos`), the lookup returns "not found" and the hook still DENIES —
+the deny reason names `session-task` so the operator can see why; ask
+them to bind-mount `~/repos/claude-watch` (the example compose does this
+by default). The hook only default-opens on TRULY unexpected internal
+errors (broad-except fail-safe), not the routine "CLI missing" path.
 
-The five-step protocol (mirrors the host CLAUDE.md `## Resume Actions`
-spawn workflow):
+The five-step protocol (mirrors the host `## Resume Actions` workflow):
 
 1. `session-task queue add "<task description>" --scope <scope> --summary "~10 word headline"`
    → returns JSON with a queue id (`q-YYYY-MM-DD-XXXX`). **Exit 3 =
    HARD REFUSED for scope overlap; DO NOT spawn.** Wait or pick a
    different scope.
-2. Read `ready_now` from the JSON. If `false`, DO NOT FIRE — another
-   item with overlapping scope is in flight. Wait for blockers and
-   re-check via `session-task queue spawn-check <id>`.
+2. Read `ready_now` from the JSON. If `false`, DO NOT FIRE — an
+   overlapping-scope item is in flight; wait and re-check via
+   `session-task queue spawn-check <id>`.
 3. If `ready_now=true`: `session-task queue register <id>` to claim
    the slot.
 4. **Include the line `Queue item: q-XXXX` in the Agent's prompt.**
    The hook DENIES the spawn without it.
 5. Fire the Agent. On completion: `session-task queue done <id>`
-   (success) or `session-task queue abandon <id> --reason "..."`
-   (failure / cancelled).
+   (success) or `abandon <id> --reason "..."` (failure / cancelled).
 
 Quick reference: `session-task queue --help` for the full subcommand
-surface (`add | list | spawn-check | register | done | abandon | show`).
+surface (`add | list | spawn-check | register | block | unblock |
+wedge | unwedge | done | abandon | show`).
 The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
 if it's not on PATH, the operator hasn't wired the bind-mount and you
 should flag that before spawning agents at all.
+
+### Parking on an external blocker — use `block`, not a fake `running`
+
+When an agent finishes all autonomous work and is parked on something
+OUTSIDE the system (awaiting CI, human greenlight, branch-protection
+toggle, a third-party API window), flip the item to `blocked` — do NOT
+leave it as a fake `running`. Flow: `register` (→running) →
+`block <id> --reason "awaiting <X>"` (→blocked) → `unblock <id>` when
+the blocker clears (or `done` / `abandon`). `unblock` preserves
+`blocked_at` + `block_reason` as audit.
+
+`blocked` (system did its part, waiting on someone/something else) is
+distinct from `wedge` (the system itself is STUCK). Blocked items are
+labeled distinctly by the exporter and are EXEMPT from the
+WorkQueueOrphaned / running-without-owner alert. So `block` is the
+HONEST way to park work: a fake `running` lies about state, holds the
+scope lock, and trips the orphaned-running alert; abandon-and-re-add
+loses the item's identity + audit trail.
 
 ### Verify agent success before marking done
 
 **Never call `session-task queue done <id>` until you have received the
 agent's task-notification AND verified the agent reported success.** The
-main loop receives many `<task-notification>` messages (from watchers,
-other background tasks, etc.) — only the one carrying the agent's
-`task-id` signals that agent's completion. Specifically:
+main loop receives many `<task-notification>` messages (watchers, other
+background tasks) — only the one carrying the agent's `task-id` signals
+that agent's completion. Specifically:
 
 - Wait for the `<task-notification>` whose `task-id` matches the agent
   you spawned (not any other background task).
-- Verify `<status>completed</status>` in that notification (not
-  `failed`, not `cancelled`).
-- Only THEN call `session-task queue done <id>`.
+- Verify `<status>completed</status>` (not `failed`/`cancelled`), THEN
+  call `session-task queue done <id>`.
 - If the agent failed or you cannot confirm success, call
-  `session-task queue abandon <id> --reason "agent failed: <reason>"`
-  instead.
+  `session-task queue abandon <id> --reason "agent failed: <reason>"`.
 
-Marking a queue item `done` prematurely (before agent completion or
-on a misidentified notification) releases the scope lock and allows
-conflicting work to start — which races against the still-running
-agent or silently drops failed work on the floor.
+Marking a queue item `done` prematurely (before agent completion or on
+a misidentified notification) releases the scope lock and lets
+conflicting work start — racing the still-running agent or silently
+dropping failed work on the floor.
 
 ### Agent completion ack obligation (enforced)
 
@@ -461,26 +480,18 @@ agent-ack clear                                   # escape hatch
 **Queue items the moment you intend to do the work.** Never "I'll queue
 it once X finishes" — queue it NOW. Use scopes + the blocking mechanism
 to keep it from RUNNING until the right time. Holding a task in your
-head instead of the queue means it gets lost on compaction/clear.
+head instead of the queue means it gets lost on compaction/clear. If
+the scope genuinely conflicts, add it with `--force-enqueue` — it'll be
+serialized behind the running item automatically:
 
-Wrong:
 ```
-# scope conflict — "I'll queue it later"
-```
-
-Right:
-```
-session-task queue add "..." --scope <non-conflicting-scope> --summary "..."
-# OR if the scope genuinely conflicts:
 session-task queue add "..." --scope <same-scope> --force-enqueue
-# (it'll be serialized behind the running item automatically)
 ```
 
 **Restart-tasks are queueable too.** Redeploy / `cwsr` / restart are
 ordinary work — enqueue them via `session-task`, encoding the restart
-dependency with a blocking scope rather than holding it in your head.
-The queue survives restarts (at worst a running agent needs
-resurrecting, which the tooling supports).
+dependency with a blocking scope. The queue survives restarts (at worst
+a running agent needs resurrecting, which the tooling supports).
 
 ### Continuous subagent queue-discipline enforcement
 
@@ -494,48 +505,34 @@ by `obligations-init` (run from the entrypoint when
 How it works:
 
   - `post-tool-agent-arm-hook` fires on every successful Agent spawn
-    (`PostToolUse:Agent` with `async_launched=true`), reads the
-    `Queue item: q-XXXX` marker from the spawn prompt + the new
-    subagent's `agentId` from the tool response, and writes a binding
-    record to `~/.config/claude/agent-queue-bindings.json`.
-  - On every subsequent **subagent** tool call, the
-    `subagent_queue_item_running` predicate looks up the agent's q-id
-    in the queue:
-      - `status=running` → **ALLOW**.
-      - `status=done` / `status=abandoned` → **DENY** with a banner
-        naming the q-id + current status.
-      - q-id has vanished from the queue entirely → **DENY**
-        (the canonical "main loop abandoned this work" case).
-  - Main-loop calls are always allowed (the row is scoped via
+    (`PostToolUse:Agent`, `async_launched=true`), binds the spawn's
+    `Queue item: q-XXXX` marker to the new subagent's `agentId` in
+    `~/.config/claude/agent-queue-bindings.json`.
+  - On each subsequent **subagent** tool call, the
+    `subagent_queue_item_running` predicate looks up that q-id:
+    `running` → **ALLOW**; `done`/`abandoned`, or vanished from the
+    queue (the "main loop abandoned this work" case) → **DENY** with a
+    banner naming the q-id + status.
+  - Main-loop calls are always allowed (row scoped via
     `is_main_loop {negate: true}` inside an `all_of`).
 
 **As a subagent, when you hit this gate:** your queue item has been
-finished, abandoned, or pruned. The right responses are usually:
-
-  - **Re-register**: if the main loop just rotated the queue id (rare
-    but possible during dispatch transitions), `session-task queue
-    register <new-q-id>` is exempt from the gate, so you can run it
-    to pick up the new id.
-  - **Stop**: if your work is genuinely done from the main loop's
-    perspective, return your final value and let your process exit.
-    Don't try to keep working past a `done` queue state — the main
-    loop is no longer tracking your scope.
+finished, abandoned, or pruned. Either **re-register** (if the main
+loop just rotated the queue id, `session-task queue register <new-q-id>`
+is exempt, so run it to pick up the new id), or **stop** (if your work
+is genuinely done, return your final value and exit — don't work past a
+`done` state, the main loop no longer tracks your scope).
 
 The exempt set lets you reach `session-task queue
 {status,spawn-check,register,show,list}`, `obligations
 {list,show,status,check,override,satisfy}`, `claude-watch-ack`,
-`claude-watch-dispatch`, and `agent-msg {ack,inbox,gc,disarm}` /
-`agent-tail` even while the gate is firing, so you can always inspect
-state + recover.
+`claude-watch-dispatch`, `agent-msg {ack,inbox,gc,disarm}`, and
+`agent-tail` while the gate fires, so you can always inspect + recover.
 
-Default-open contracts (predicate inert, tool call ALLOWED):
-
-  - Call is from the main loop (no `agent_id`) — predicate doesn't
-    apply.
-  - Binding file missing / corrupt / unreadable — defensive.
-  - No binding entry for this agent_id — subagent was either spawned
-    before the predicate rolled out OR carries no `Queue item: q-XXXX`
-    marker.
+Default-open contracts (predicate inert, tool call ALLOWED): call is
+from the main loop (no `agent_id`); binding file missing / corrupt /
+unreadable; or no binding entry for this agent_id (spawned before the
+predicate rolled out, OR carries no `Queue item: q-XXXX` marker).
 
 A hook bug can never blackhole a real subagent.
 
@@ -1027,13 +1024,12 @@ project settings — that's by design and matches the
 ## MCP servers
 
 MCP server definitions live in `~/.claude.json` `mcpServers` on the host,
-which is bind-mounted in. Claude Code's MCP discovery path is gated on
-the `user` settings tier being in `--setting-sources`. When
-`CLAUDE_CONTAINER_REWRITE_HOOKS=1` is set, the entrypoint drops the
-`user` tier (to suppress cross-arch host hooks; see "Hooks" below) and
-instead writes a project-tier `.mcp.json` inside
-`${CLAUDE_HOST_PROJECT_DIR}` that mirrors the host's `mcpServers` with
-each `command` wrapped in `exec-hook`. Run `/mcp` to see what loaded.
+which is bind-mounted in. MCP discovery is gated on the `user` settings
+tier being in `--setting-sources`. When `CLAUDE_CONTAINER_REWRITE_HOOKS=1`,
+the entrypoint drops the `user` tier (to suppress cross-arch host hooks;
+see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
+`${CLAUDE_HOST_PROJECT_DIR}` mirroring the host's `mcpServers` with each
+`command` wrapped in `exec-hook`. Run `/mcp` to see what loaded.
 
 **Common bridged MCP servers**:
 
@@ -1041,8 +1037,8 @@ each `command` wrapped in `exec-hook`. Run `/mcp` to see what loaded.
   `CLAUDE_MCP_HTTP_BRIDGE=name=url:other=url` rewrites a stdio MCP
   server entry to Claude Code's native HTTP transport, so the
   in-container claude dials a host-side adapter (e.g.
-  `http://host.docker.internal:8765/mcp`) instead of trying to exec a
-  cross-arch binary. The host adapter is the operator's responsibility
+  `http://host.docker.internal:8765/mcp`) instead of exec'ing a
+  cross-arch binary. The host adapter is the operator's job
   (`mcp-proxy`, `mcphost`, etc.); the container only rewrites the
   in-container `.mcp.json`. Full surface in
   [container/README.md](/opt/claude-container/container/README.md#blast-radius).
@@ -1054,26 +1050,36 @@ each `command` wrapped in `exec-hook`. Run `/mcp` to see what loaded.
   the conservative read-only set):
   `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, no shell operators,
   `$HOME` boundary, 30s timeout. Trust-profile `CW_PROFILE=corp-dev-trusted`
-  widens this with host-scheduling tooling (see the
-  "Host-side scheduled tasks" section below). **Reach for host-bash as
-  a normal tool, not a last resort** — it's the supported way to do
-  host-side work from inside the container. If it's not available
-  (`/mcp` doesn't list it), the operator hasn't wired up the host-side
-  launcher. See
+  widens this with host-scheduling tooling (see "Host-side scheduled
+  tasks" below). **Reach for host-bash as a normal tool, not a last
+  resort** — it's the supported way to do host-side work from inside
+  the container. If it's not available (`/mcp` doesn't list it), the
+  operator hasn't wired up the host-side launcher. See
   [examples/compose/bin/mcp-host-bash](/opt/claude-container/examples/compose/bin).
 
   **Boundary discipline**: host-bash is a *window* to the host, not
-  the host. When you report what you did, frame it as "I ran X on the
-  host via host-bash" — not "I ran X" (ambiguous) and not "I'm on the
-  host" (false; you remain inside the container the whole time). The
-  in-container claude orchestrates host-side work; the host-side
-  shell executes it. Keep that distinction crisp in self-reports so
-  the operator never has to guess where a command actually ran.
+  the host. Report it as "I ran X on the host via host-bash" — not "I
+  ran X" (ambiguous) nor "I'm on the host" (false; you stay inside the
+  container). The in-container claude orchestrates; the host shell
+  executes. Keep that crisp so the operator knows where a command ran.
 
 If `/mcp` shows "No MCP servers configured" inside the container, either
 `CLAUDE_CONTAINER_REWRITE_HOOKS` is off (so user-tier MCP discovery is
 suppressed by-default — the host's `mcpServers` simply don't load), or
 the host's `~/.claude.json` has none defined.
+
+**"⏸ Pending approval" is NOT a hard block — VERIFY by calling a tool.**
+`claude mcp list` showing a server as "Pending approval (run `claude` to
+approve)" is a stale/misleading status line, not ground truth: the
+transport can be fully connected and its tools callable while the list
+still prints it. Do NOT idle waiting for an operator approval on that
+display alone. VERIFY by actually CALLING one of the server's tools (in
+this harness: load the deferred schema via ToolSearch `select:<tool>`,
+then run a cheap read-only command — e.g. host-bash `uname -s`). Only if
+the CALL ITSELF fails with a transport/auth error is the server genuinely
+down (then `/mcp` reauth is the fix). (2026-06-16: a fresh post-redeploy
+session saw all servers "Pending approval", treated it as a block, and
+idled ~30+ heartbeat cycles — the tools worked the whole time.)
 
 ## Hooks
 
@@ -1081,9 +1087,8 @@ The container ships [`exec-hook`](/opt/claude-container/container/hooks-shim/exe
 a safe-exec wrapper for `settings.json` hook commands whose target
 binary may not be Linux-native. It inspects magic bytes, exec's ELF /
 shebang-script targets transparently, and silently no-ops on Mach-O /
-unknown formats with a single stderr heads-up per target per container
-lifetime (so cross-arch hook references don't spam the log on every
-event).
+unknown formats with one stderr heads-up per target per container
+lifetime (so cross-arch hook refs don't spam the log every event).
 
 When `CLAUDE_CONTAINER_REWRITE_HOOKS=1`, the entrypoint generates a
 container-local copy of `~/.claude/settings.json` with every hook command
@@ -1101,11 +1106,11 @@ so the host file is never mutated.
 | Missing file | silent no-op, exit 0 | Same dedup behavior. |
 
 **Implication for corporate telemetry hooks**: a Mac-host telemetry
-binary referenced from `~/.claude/settings.json` (typical pattern: under
-`~/.local/bin/` or similar) by default **does not fire inside the
-container**. exec-hook detects the Mach-O and silently no-ops — the
-alternative ("Exec format error" on every hook event) is worse. If your
-team requires telemetry from container sessions, the options are:
+binary referenced from `~/.claude/settings.json` (typically under
+`~/.local/bin/`) by default **does not fire inside the container**.
+exec-hook detects the Mach-O and silently no-ops — the alternative
+("Exec format error" every hook event) is worse. If your team requires
+telemetry from container sessions, the options are:
 
 1. Ship a Linux-amd64 build of the hook binary and bind-mount it at the
    same path the host config references. (Coordinate with the team that
@@ -1115,82 +1120,25 @@ team requires telemetry from container sessions, the options are:
    `exec-hook-bridge`, which marshals the call across the host-bash MCP
    server (`mcp-host-bash` at `host.docker.internal:8766/mcp` by
    default) so the REAL host binary runs with the same env + args and
-   its exit code propagates back into the in-container claude session.
-   The operator must also add the hook binary basename to the
-   `mcp-host-bash` allow-list via `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook`
-   (comma-separated for multiple). Bridge failures (host-bash
-   unreachable, allow-list reject) fall back to the legacy silent-no-op
-   contract — a misconfigured bridge never brings the session down.
+   its exit code propagates back. The operator must also add the hook
+   basename to the `mcp-host-bash` allow-list via
+   `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook` (comma-separated for many).
+   Bridge failures (host-bash unreachable, allow-list reject) fall back
+   to the silent-no-op contract — a misconfigured bridge never brings
+   the session down.
 3. Accept that in-container sessions are not telemetered into the host's
    pipeline. Coordinate with your team's privacy / observability stance.
 
-The container does **not** carry corp telemetry pipelines into a
-sandboxed Linux environment by default — that's an explicit design
-choice. Make this decision with your team.
+The container does **not** carry corp telemetry into a sandboxed Linux
+environment by default — that's an explicit design choice. Decide with
+your team.
 
-**Verifying hooks are reaching the right fate**: with
+**Verifying hooks reach the right fate**: with
 `CLAUDE_CONTAINER_REWRITE_HOOKS=1` and `verbose=true` in settings.json,
-Claude Code logs each hook invocation. exec-hook writes its
-"skipped non-ELF hook" heads-up to stderr on first occurrence per target
-path. Tail `/tmp/exec-hook-skipped` inside the container for the list of
-skipped binaries (one line per target).
-
-## Semantic search — eichi
-
-The container has access to `eichi`, a local-first semantic search CLI
-backed by sqlite-vec + sentence-transformers. Use it as the **default
-first step** when you need to find prior context, decisions, notes, or
-conversations — query eichi before falling back to grep or asking the
-operator.
-
-### When to search
-
-- "Where did we decide X?" / "What was the context around Y?"
-- Looking for a file, note, or conversation fragment by concept (not
-  exact string).
-- Answering questions about prior work, past decisions, or existing
-  documentation.
-
-### How to invoke (from inside the container)
-
-The eichi CLI runs on the **host** (it needs the host venv + index DB).
-Use `host-bash` to run queries:
-
-```sh
-# Semantic search (default hybrid vec+BM25 retrieval):
-host-bash: eichi query "how did we decide on the alerting tiers" -k 5
-
-# With filters:
-host-bash: eichi query "docker compose networking" --added-since 7d
-host-bash: eichi query "PR review feedback" --sort added -k 10
-
-# Check what's indexed:
-host-bash: eichi stats
-host-bash: eichi ls
-```
-
-If `host-bash` is unavailable, the eichi web UI runs at
-`http://localhost:8001/` (the `eichi-search` container in the compose
-stack) — use `curl` against `/api/search?q=<query>&k=<n>` as a
-fallback.
-
-### When to re-index
-
-If `eichi stats` shows the last-indexed timestamp is old relative to
-recent activity, or if important new corpus has been added to the
-standard indexing paths, prompt the operator: "eichi index looks stale
-(last indexed N days ago) — want me to re-index?" Re-indexing is
-idempotent and delta-only, so it's safe to run frequently.
-
-### Search-first, grep-second
-
-- **Semantic query** (`eichi query`): for concept-level lookup, fuzzy
-  recall, "what was the conversation about X."
-- **Literal grep** (`grep -r`): for exact strings, function names,
-  error messages, config keys — things that need character-exact match.
-
-Default to eichi for open-ended "find" questions. Fall back to grep
-when you know the exact string you're looking for.
+Claude Code logs each hook invocation. exec-hook writes its "skipped
+non-ELF hook" heads-up to stderr on first occurrence per target path.
+Tail `/tmp/exec-hook-skipped` for the list of skipped binaries (one
+line per target).
 
 ## Workflow boundaries
 
@@ -1237,6 +1185,9 @@ grep — not before.
 curl -s "http://eichi-search:8000/api/search?q=alerting+tiers&k=5" | jq .
 ```
 
+(The `eichi-search` compose container also serves a browser UI at
+`http://localhost:8001/` as a fallback.)
+
 Query params: `q` (required), `k` (top-K, default 20), `source`
 (filter tag), `added_since` (duration: `1d`, `7d`, `30d`), `retrieval`
 (`hybrid`|`vector`|`bm25`).
@@ -1248,6 +1199,8 @@ Query params: `q` (required), `k` (top-K, default 20), `source`
 eichi query "alerting tier design decisions" -k 5
 eichi query "docker networking" --added-since 7d
 eichi query "PR feedback" --sort added -k 10
+eichi stats        # last-indexed timestamp / corpus size
+eichi ls           # what's indexed
 ```
 
 ### Interpreting results
