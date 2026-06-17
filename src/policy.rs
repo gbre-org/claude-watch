@@ -3808,78 +3808,128 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // (the 2026-06-17 incident).
     //
     // A well-formed tool call is consumed by the harness and shows only as a
-    // tool-use widget; the raw tags never reach the pane as text. So the mere
-    // presence of a raw non-namespaced `<invoke`/`<parameter` tag in the live
-    // tail IS the malformation signal. Recovery is the lightest possible: a
-    // single short corrective tmux-inject (no /clear, no restart — the model
-    // is not wedged, it just produced unparseable output and must retry).
+    // tool-use widget; the raw tags never reach the pane as text. Detection is
+    // STRUCTURAL (AST-style: a confirmed `<invoke name=...>`+`<parameter>`/
+    // `</invoke>` construct, code-fence-excluded) — see
+    // `tmux::check_lines_for_malformed_tool_call`.
+    //
+    // Enforcement is ESCALATING. A malformed call renders as assistant TEXT and
+    // never reaches a PreToolUse hook, so claude-watch CANNOT truly pre-empt the
+    // (non-)execution — there is no pre-execution block at this layer (the
+    // enforcement ceiling; documented in the PR). The strongest feasible
+    // enforcement is a relentless escalating inject that HALTS forward progress
+    // until a clean call is observed:
+    //   * Phase 1: after `consecutive` observations, inject the soft `nudge`,
+    //     cooldown-gated by `cooldown`.
+    //   * Phase 2 (hard block): after `escalate_after` soft nudges in the same
+    //     unbroken episode without the malform clearing, switch to the firmer
+    //     `hard_block_nudge` and DROP the cooldown — interrupt + re-inject on
+    //     EVERY cycle until a clean turn is observed.
     if config.malformed_tool_call.enabled && !effective_pane.is_empty() {
-        let malformed = tmux::detect_malformed_tool_call(&effective_pane).await;
+        let malformed = tmux::detect_malformed_tool_call(
+            &effective_pane,
+            &config.malformed_tool_call.override_marker,
+        )
+        .await;
 
         if malformed {
             state.malformed_tool_call_consecutive += 1;
             debug!(
                 consecutive = state.malformed_tool_call_consecutive,
                 threshold = config.malformed_tool_call.consecutive,
+                episode_nudges = state.malformed_tool_call_episode_nudges,
                 "malformed tool-call signature detected"
             );
 
             if state.malformed_tool_call_consecutive >= config.malformed_tool_call.consecutive {
-                let in_cooldown = state
-                    .last_malformed_nudge
-                    .as_deref()
-                    .and_then(elapsed_since)
-                    .is_some_and(|e| e < config.malformed_tool_call.cooldown as f64);
+                // Phase 2 (hard block) once we've already fired `escalate_after`
+                // soft nudges in this episode without the malform clearing.
+                let hard_block = state.malformed_tool_call_episode_nudges
+                    >= config.malformed_tool_call.escalate_after;
+
+                // The hard block deliberately ignores the soft cooldown so it
+                // can re-fire every cycle and genuinely block forward progress.
+                let in_cooldown = !hard_block
+                    && state
+                        .last_malformed_nudge
+                        .as_deref()
+                        .and_then(elapsed_since)
+                        .is_some_and(|e| e < config.malformed_tool_call.cooldown as f64);
 
                 if api_retrying {
                     debug!(
-                        "malformed tool-call detected but api_retry active — suppressing nudge"
+                        "malformed tool-call detected but api_retry active — suppressing inject"
                     );
                 } else if in_cooldown {
-                    debug!("malformed tool-call detected but nudge cooldown active");
+                    debug!("malformed tool-call detected but phase-1 nudge cooldown active");
                 } else {
+                    let (phase, text): (&str, &str) = if hard_block {
+                        ("hard_block", &config.malformed_tool_call.hard_block_nudge)
+                    } else {
+                        ("nudge", &config.malformed_tool_call.nudge)
+                    };
                     warn!(
                         consecutive = state.malformed_tool_call_consecutive,
-                        "malformed tool-call sustained — injecting corrective nudge"
+                        episode_nudges = state.malformed_tool_call_episode_nudges,
+                        phase,
+                        "malformed tool-call sustained — injecting corrective directive"
                     );
                     write_jsonl_log(
                         &config.general.log_file,
-                        "malformed_tool_call_nudge",
+                        "malformed_tool_call_inject",
                         serde_json::json!({
+                            "phase": phase,
                             "consecutive": state.malformed_tool_call_consecutive,
+                            "episode_nudges": state.malformed_tool_call_episode_nudges,
                             "tokens": tokens,
                         }),
                     );
                     write_legacy_log(
                         &config.general.legacy_log_file,
                         &format!(
-                            "malformed tool-call ({} consecutive) — injecting corrective nudge",
-                            state.malformed_tool_call_consecutive,
+                            "malformed tool-call ({} consecutive, phase={}) — injecting corrective directive",
+                            state.malformed_tool_call_consecutive, phase,
                         ),
                     );
 
                     tmux::interrupt_and_wait(&effective_pane, 5).await;
-                    inject_dispatch::inject_to_agent(
-                        &effective_pane,
-                        &config.malformed_tool_call.nudge,
-                    )
-                    .await;
+                    inject_dispatch::inject_to_agent(&effective_pane, text).await;
 
                     state.last_malformed_nudge = Some(now.clone());
                     state.malformed_tool_call_nudge_count =
                         state.malformed_tool_call_nudge_count.saturating_add(1);
                     state.last_interrupt_at = Some(now.clone());
-                    // Reset the run so the next nudge requires a fresh
-                    // `consecutive` streak (and is also gated by the cooldown).
-                    state.malformed_tool_call_consecutive = 0;
+                    if hard_block {
+                        state.malformed_tool_call_hard_block_count =
+                            state.malformed_tool_call_hard_block_count.saturating_add(1);
+                        // Do NOT reset the observation streak in hard-block mode:
+                        // keeping it at/above `consecutive` means that as long as
+                        // the malform persists, the block re-fires EVERY cycle
+                        // (no cooldown) and genuinely halts forward progress.
+                    } else {
+                        // Count this episode's soft nudges toward escalation, and
+                        // reset the per-cycle observation streak so a fresh
+                        // `consecutive` run is required before the next phase-1
+                        // nudge (which, combined with the cooldown, keeps phase-1
+                        // polite while the model recovers on its own).
+                        state.malformed_tool_call_episode_nudges =
+                            state.malformed_tool_call_episode_nudges.saturating_add(1);
+                        state.malformed_tool_call_consecutive = 0;
+                    }
                 }
             }
-        } else if state.malformed_tool_call_consecutive > 0 {
+        } else if state.malformed_tool_call_consecutive > 0
+            || state.malformed_tool_call_episode_nudges > 0
+        {
             debug!(
                 prev_consecutive = state.malformed_tool_call_consecutive,
-                "malformed tool-call signature cleared — resetting counter"
+                prev_episode_nudges = state.malformed_tool_call_episode_nudges,
+                "malformed tool-call signature cleared — resetting episode state"
             );
             state.malformed_tool_call_consecutive = 0;
+            // Clean cycle ends the episode: reset escalation so a future malform
+            // starts fresh at phase 1.
+            state.malformed_tool_call_episode_nudges = 0;
         }
     }
 

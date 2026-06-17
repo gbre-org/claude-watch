@@ -1419,11 +1419,17 @@ pub async fn detect_wedged(pane: &str) -> Option<WedgedReason> {
 ///
 /// To further guard against false positives from chat-history / documentation
 /// that legitimately discusses these tags (including THIS source file being
-/// read into a pane), the caller requires multiple consecutive observations
-/// before acting, and the corrective action is a low-cost text nudge — never
-/// a /clear or any destructive recovery.
+/// read into a pane), the detector is STRUCTURAL (not a substring grep): it
+/// tokenizes the candidate region and confirms an actual attempted tool-call
+/// *construct* — a non-namespaced opening `<invoke name="...">` tag corroborated
+/// by a following `<parameter name="...">` and/or a `</invoke>` close — rather
+/// than a bare substring match. It also skips any region inside a fenced code
+/// block (```...```), since prose/docs that legitimately quote the tags do so
+/// inside fences. The caller still requires multiple consecutive observations
+/// before acting, and supports an explicit override marker for manual bypass.
 ///
-/// Returns `true` on the FIRST malformed-tag match found in the tail.
+/// Returns `true` when a structurally-confirmed malformed tool-call construct
+/// is present in the tail.
 pub(crate) fn check_lines_for_malformed_tool_call(pane_output: &str) -> bool {
     let lines: Vec<&str> = pane_output.lines().collect();
     let start = if lines.len() > 40 {
@@ -1432,36 +1438,168 @@ pub(crate) fn check_lines_for_malformed_tool_call(pane_output: &str) -> bool {
         0
     };
     let tail = &lines[start..];
+    detect_malformed_construct(tail)
+}
 
-    // Match a raw opening `<invoke ...` or `<parameter ...` tag that is NOT
-    // namespaced (i.e. not immediately preceded by `antml:` or any `word:`
-    // prefix). `<invoke ...>` is the correct form and is consumed by the
-    // harness, so it never shows as text — but we still explicitly exclude any
-    // namespaced form to be safe. The negative lookbehind is emulated by
-    // requiring the char before `invoke`/`parameter` to be `<` exactly.
-    //
-    // Examples that MATCH (malformed, rendered as text):
-    //   <invoke name="Bash">
-    //   court<invoke name="Bash">
-    //   <parameter name="command">
-    // Examples that do NOT match:
-    //   <invoke name="Bash">   (namespaced; never reaches pane anyway)
-    //   please invoke the watcher     (prose, no `<` tag)
-    let re = match regex_lite::Regex::new(r"<(invoke|parameter)\b") {
-        Ok(re) => re,
-        Err(_) => return false,
-    };
+/// A single token extracted from the candidate region: a raw, non-namespaced
+/// `<invoke ...>` / `<parameter ...>` opening tag, or a `</invoke>` /
+/// `</parameter>` closing tag. Used to confirm a *structural* tool-call
+/// construct rather than an incidental substring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MalformedToken {
+    /// `<invoke name="...">` with the captured tool name (empty if no `name=`).
+    OpenInvoke { has_name: bool },
+    /// `<parameter name="...">` with a `name=` attribute.
+    OpenParameter { has_name: bool },
+    /// `</invoke>`
+    CloseInvoke,
+    /// `</parameter>`
+    CloseParameter,
+}
 
-    // Any matching line is by construction a NON-namespaced raw tag: a
-    // correctly namespaced tag has a namespace prefix between `<` and
-    // `invoke`/`parameter`, which the `<` requirement in the regex excludes.
-    tail.iter().any(|line| re.is_match(line))
+/// Tokenize a single line into the malformed-tool-call tags it contains.
+///
+/// Only RAW, NON-namespaced tags are emitted. A correctly-namespaced tag
+/// (`<invoke ...>` or any `<word:invoke ...>`) is consumed by the harness
+/// and never reaches the pane as text; we additionally exclude it structurally
+/// here so a namespaced tag that somehow appears (e.g. quoted in this file)
+/// does not contribute a token.
+fn tokenize_malformed_line(line: &str) -> Vec<MalformedToken> {
+    let bytes = line.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &line[i..];
+        // Closing tags.
+        if let Some(stripped) = rest.strip_prefix("</invoke>") {
+            tokens.push(MalformedToken::CloseInvoke);
+            i = line.len() - stripped.len();
+            continue;
+        }
+        if let Some(stripped) = rest.strip_prefix("</parameter>") {
+            tokens.push(MalformedToken::CloseParameter);
+            i = line.len() - stripped.len();
+            continue;
+        }
+        // Opening tags. `after` is the text immediately following `<invoke` /
+        // `<parameter`; for a real tag it must be a tag-boundary char
+        // (whitespace, `>`, or `/`) so `<invokeXYZ` / `<parameters` don't match.
+        for (kw, is_invoke) in [("invoke", true), ("parameter", false)] {
+            let opener = format!("<{kw}");
+            if let Some(after) = rest.strip_prefix(&opener) {
+                let boundary = after
+                    .chars()
+                    .next()
+                    .map(|c| c.is_whitespace() || c == '>' || c == '/')
+                    .unwrap_or(false);
+                if boundary {
+                    // Scan to the end of this opening tag (`>`), staying on the
+                    // same line, to check for a `name="..."` attribute.
+                    let tag_body = after.split('>').next().unwrap_or(after);
+                    let has_name = tag_name_attr_present(tag_body);
+                    if is_invoke {
+                        tokens.push(MalformedToken::OpenInvoke { has_name });
+                    } else {
+                        tokens.push(MalformedToken::OpenParameter { has_name });
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// True if the tag body contains a `name="..."` (or `name='...'`) attribute
+/// with a non-empty value.
+fn tag_name_attr_present(tag_body: &str) -> bool {
+    if let Some(idx) = tag_body.find("name=") {
+        let after = &tag_body[idx + "name=".len()..];
+        let mut chars = after.chars();
+        match chars.next() {
+            Some('"') => after[1..].contains('"') && !after.starts_with("\"\""),
+            Some('\'') => after[1..].contains('\'') && !after.starts_with("''"),
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
+/// Structural detector. Walks the tail line-by-line, skipping any region inside
+/// a fenced code block (```...```), tokenizes each remaining line, and confirms
+/// a real tool-call *construct*:
+///
+///   * a non-namespaced `<invoke name="...">` opener, AND
+///   * structural corroboration — a `<parameter ...>` opener and/or a
+///     `</invoke>` close somewhere in the candidate region.
+///
+/// A lone `<parameter name="...">` (without any invoke) ALSO qualifies, since
+/// the model frequently malforms only the tail of a call; but a bare
+/// `<invoke>` with NEITHER a `name=` attribute NOR any corroborating tag is
+/// treated as prose/noise and ignored. This is what cuts the false positives
+/// that a substring grep produced.
+fn detect_malformed_construct(tail: &[&str]) -> bool {
+    let mut in_fence = false;
+    let mut tokens: Vec<MalformedToken> = Vec::new();
+    for line in tail {
+        let trimmed = line.trim_start();
+        // Toggle fenced-code-block state on a fence marker line. Anything
+        // inside a fence is quoted text (docs/chat), never a live tool call.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        tokens.extend(tokenize_malformed_line(line));
+    }
+
+    let has_named_invoke = tokens
+        .iter()
+        .any(|t| matches!(t, MalformedToken::OpenInvoke { has_name: true }));
+    let has_any_invoke = tokens
+        .iter()
+        .any(|t| matches!(t, MalformedToken::OpenInvoke { .. }));
+    let has_named_parameter = tokens
+        .iter()
+        .any(|t| matches!(t, MalformedToken::OpenParameter { has_name: true }));
+    let has_close_invoke = tokens.iter().any(|t| *t == MalformedToken::CloseInvoke);
+
+    // Construct rules (any one is a confirmed malformed tool call):
+    //  1. A named `<invoke name="...">` corroborated by a parameter or a close.
+    //  2. A bare `<invoke>` (no name) corroborated by BOTH a named parameter
+    //     and a close (very strong structural signal, no name needed).
+    //  3. A named `<parameter name="...">` corroborated by an invoke open or a
+    //     close (the "only-the-tail-malformed" case).
+    let rule_named_invoke = has_named_invoke && (has_named_parameter || has_close_invoke);
+    let rule_bare_invoke = has_any_invoke && has_named_parameter && has_close_invoke;
+    let rule_param_construct = has_named_parameter && (has_any_invoke || has_close_invoke);
+
+    rule_named_invoke || rule_bare_invoke || rule_param_construct
 }
 
 /// Capture the pane and check whether the live tail shows a malformed
 /// (non-namespaced) tool-call block rendered as assistant text. Returns true
 /// on detection. See `check_lines_for_malformed_tool_call` for the rationale.
-pub async fn detect_malformed_tool_call(pane: &str) -> bool {
+///
+/// `override_marker`, when it points at an existing file, disables detection
+/// entirely (a manual false-positive bypass — see the AskUserQuestion-allowed
+/// marker pattern). This lets an operator who is legitimately driving a turn
+/// that discusses the tags suppress the guardrail without editing config.
+pub async fn detect_malformed_tool_call(pane: &str, override_marker: &str) -> bool {
+    if !override_marker.is_empty() && std::path::Path::new(override_marker).exists() {
+        debug!(
+            marker = override_marker,
+            "malformed-tool-call detection suppressed by override marker"
+        );
+        return false;
+    }
     if let Some(out) = capture_pane_history(pane, 60).await {
         return check_lines_for_malformed_tool_call(&out);
     }
@@ -2645,15 +2783,85 @@ some prior output\n\
     #[test]
     fn test_malformed_with_stray_text_prefix() {
         // The 2026-06-17 signature: a stray literal word glued to the front
-        // of the opening tag (e.g. `court<invoke ...`).
-        let output = "court<invoke name=\"Bash\">\n";
+        // of the opening tag (e.g. `court<invoke ...`). The stray prefix on the
+        // opener does not prevent structural detection — the construct is still
+        // corroborated by the parameter + close.
+        let output = "\
+court<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n\
+</invoke>\n";
         assert!(check_lines_for_malformed_tool_call(output));
     }
 
     #[test]
-    fn test_malformed_bare_parameter_tag() {
-        let output = "<parameter name=\"command\">touch /var/run/claude/heartbeat</parameter>\n";
+    fn test_malformed_single_line_construct() {
+        // A whole construct collapsed onto ONE line (no surrounding fence) is
+        // still detected.
+        let output =
+            "x<invoke name=\"Bash\"><parameter name=\"command\">ls</parameter></invoke>\n";
         assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    // --- tokenizer / attr-helper unit tests ---
+
+    #[test]
+    fn test_tokenize_named_invoke() {
+        let toks = tokenize_malformed_line("<invoke name=\"Bash\">");
+        assert_eq!(toks, vec![MalformedToken::OpenInvoke { has_name: true }]);
+    }
+
+    #[test]
+    fn test_tokenize_bare_invoke() {
+        let toks = tokenize_malformed_line("<invoke>");
+        assert_eq!(toks, vec![MalformedToken::OpenInvoke { has_name: false }]);
+    }
+
+    #[test]
+    fn test_tokenize_close_tags() {
+        assert_eq!(
+            tokenize_malformed_line("</invoke>"),
+            vec![MalformedToken::CloseInvoke]
+        );
+        assert_eq!(
+            tokenize_malformed_line("</parameter>"),
+            vec![MalformedToken::CloseParameter]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_ignores_non_tag_words() {
+        // `<invokexyz` and bare prose produce no tokens.
+        assert!(tokenize_malformed_line("<invokexyz name=\"x\">").is_empty());
+        assert!(tokenize_malformed_line("please invoke the parameter").is_empty());
+    }
+
+    #[test]
+    fn test_tag_name_attr_present() {
+        assert!(tag_name_attr_present(" name=\"Bash\""));
+        assert!(tag_name_attr_present(" name='Bash'"));
+        assert!(!tag_name_attr_present(" name=\"\""));
+        assert!(!tag_name_attr_present(" name="));
+        assert!(!tag_name_attr_present(" other=\"x\""));
+        assert!(!tag_name_attr_present(""));
+    }
+
+    #[test]
+    fn test_malformed_parameter_with_close_invoke() {
+        // A malformed tail: only the parameter + close-invoke survived as text.
+        // The `</invoke>` close corroborates the `<parameter name=...>` opener,
+        // so this is a confirmed construct.
+        let output =
+            "<parameter name=\"command\">touch /var/run/claude/heartbeat</parameter>\n</invoke>\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_lone_parameter_no_corroboration() {
+        // A lone `<parameter name=...>` with NO invoke and NO close is NOT a
+        // confirmed construct — could be quoted/partial noise. Structural
+        // detector must not fire (a substring grep WOULD have).
+        let output = "<parameter name=\"command\">some text</parameter>\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
     }
 
     #[test]
@@ -2665,6 +2873,50 @@ some prior output\n\
     }
 
     #[test]
+    fn test_not_malformed_lone_invoke_no_name_no_corroboration() {
+        // A bare `<invoke>` with no name= and no parameter/close is treated as
+        // prose/noise (e.g. someone discussing the literal tag).
+        let output = "consider the <invoke> tag and how it works\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_inside_code_fence() {
+        // Docs / chat output that quotes a full malformed construct INSIDE a
+        // fenced code block must NOT fire — this is the classic false positive
+        // (e.g. this very design discussion rendered into the pane).
+        let output = "\
+Here is what a malformed call looks like:\n\
+```\n\
+<invoke name=\"Bash\">\n\
+<parameter name=\"command\">ls</parameter>\n\
+</invoke>\n\
+```\n\
+That is the failure mode.\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_malformed_outside_fence_still_fires() {
+        // A real malform after a (closed) earlier code fence still fires.
+        let output = "\
+```\n\
+some quoted code\n\
+```\n\
+<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n\
+</invoke>\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
+    fn test_not_malformed_invokexyz_not_a_tag() {
+        // `<invokexyz` / `<parameters` must not match — tag-name boundary check.
+        let output = "<invokexyz name=\"x\"> and <parameters name=\"y\">\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    #[test]
     fn test_not_malformed_normal_output() {
         let output = "\u{25cf} Bash(watcher-ctl run claude-event-watch)\nTokens: 50000\nBashes: 1";
         assert!(!check_lines_for_malformed_tool_call(output));
@@ -2672,9 +2924,13 @@ some prior output\n\
 
     #[test]
     fn test_malformed_only_checks_recent_lines() {
-        // A malformed tag far up in scrollback (>40 lines back) should NOT
-        // count — only the live tail is inspected.
-        let mut lines: Vec<String> = vec!["<invoke name=\"Bash\">".to_string()];
+        // A full malformed construct far up in scrollback (>40 lines back)
+        // should NOT count — only the live tail is inspected.
+        let mut lines: Vec<String> = vec![
+            "<invoke name=\"Bash\">".to_string(),
+            "<parameter name=\"command\">ls</parameter>".to_string(),
+            "</invoke>".to_string(),
+        ];
         for _ in 0..100 {
             lines.push("normal conversation line".to_string());
         }
