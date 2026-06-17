@@ -89,8 +89,19 @@ QUEUE_LOG_ARCHIVE_DIR = os.environ.get(
 # The host path is /tmp/claude-workloads; we bind-mount that dir read-only
 # at /workloads inside the container. Override via WORKLOAD_LOG_DIR.
 WORKLOAD_LOG_DIR = os.environ.get("WORKLOAD_LOG_DIR", "/workloads")
+# Hostjob output directory (tail target for hostjob-bound queue items).
+# The `hostjob` runner (andrew-sf-tools) writes a per-label DIRECTORY:
+#   ~/.cache/hostjob/<label>/log        (line-oriented stdout/stderr)
+#   ~/.cache/hostjob/<label>/heartbeat  (progress heartbeat, optional)
+# NOTE the layout differs from workload's flat `<label>.output`: hostjob
+# nests the log file inside a per-label dir, so the tail path is
+# `<HOSTJOB_LOG_DIR>/<label>/log`. The host path is ~/.cache/hostjob; the
+# container bind-mounts it read-only at /hostjobs. Override via
+# HOSTJOB_LOG_DIR.
+HOSTJOB_LOG_DIR = os.environ.get("HOSTJOB_LOG_DIR", "/hostjobs")
 # Label format: same as queue-id-ish — letters, digits, dots, dashes,
-# underscores. Path-traversal guard for the tail endpoint.
+# underscores. Path-traversal guard for the tail endpoint. Shared by both
+# the workload and hostjob label extractors / tail endpoints.
 _WORKLOAD_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 CACHE_TTL_SECONDS = float(os.environ.get("CACHE_TTL_SECONDS", "5"))
 # Cap on the recent done / abandoned tails — full list is hundreds of items.
@@ -689,6 +700,11 @@ def _shape(
     # label so the front-end can render `data-log-mode="workload"` on
     # running items (the live-log endpoint dispatches on this).
     shaped["workload_label"] = _extract_workload_label(shaped["scope"])
+    # Hostjob label — derived from scope. Items created by the `hostjob`
+    # runner carry a scope entry `hostjob:<label>`. Surface the bare label
+    # so the front-end / live-log endpoint can dispatch on it, mirroring
+    # the workload path above.
+    shaped["hostjob_label"] = _extract_hostjob_label(shaped["scope"])
     return shaped
 
 
@@ -705,6 +721,26 @@ def _extract_workload_label(scope: list[Any]) -> str:
     for s in scope:
         if isinstance(s, str) and s.startswith("workload:"):
             label = s[len("workload:") :]
+            if _WORKLOAD_LABEL_RE.match(label):
+                return label
+    return ""
+
+
+def _extract_hostjob_label(scope: list[Any]) -> str:
+    """Return the hostjob label encoded in a queue item's scope, or "".
+
+    Parallel to ``_extract_workload_label``: the ``hostjob`` runner
+    (andrew-sf-tools) creates a queue item with scope
+    ``["hostjob:<label>"]``. Only the first match is honored — an item
+    bound to more than one hostjob would be a bug elsewhere we don't
+    silently paper over here. Reuses the shared ``_WORKLOAD_LABEL_RE``
+    path-traversal guard.
+    """
+    if not isinstance(scope, list):
+        return ""
+    for s in scope:
+        if isinstance(s, str) and s.startswith("hostjob:"):
+            label = s[len("hostjob:") :]
             if _WORKLOAD_LABEL_RE.match(label):
                 return label
     return ""
@@ -2243,6 +2279,176 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
             pass
 
 
+def _hostjob_item_terminal(label: str) -> bool:
+    """Return True once the hostjob-bound queue item has left a running
+    state (done / abandoned / blocked / vanished).
+
+    hostjob has NO `.exit` sidecar like workload — the runner instead
+    flips the queue item to done/abandoned on completion. So the live
+    tail uses the queue item's terminal status as its end-of-stream
+    signal. We re-read the queue (uncached) so a just-flipped status is
+    observed promptly. Fail-soft: any read error returns False so the
+    tail keeps following rather than cutting off a live log.
+    """
+    data, err = _read_queue()
+    if err is not None or not isinstance(data, dict):
+        return False
+    for it in data.get("items", []) or []:
+        if not isinstance(it, dict):
+            continue
+        if _extract_hostjob_label(it.get("scope") or []) != label:
+            continue
+        status = it.get("status")
+        # running / starting (a running item with no content yet) keep
+        # the stream open; anything else is terminal for streaming.
+        return status not in ("running", "pending")
+    # No matching item in the queue (pruned / archived) -> terminal.
+    return True
+
+
+def _tail_hostjob_output(label: str) -> Iterator[bytes]:
+    """Generator yielding SSE events for a tailed hostjob output file.
+
+    Mirrors ``_tail_workload_output`` (same line-oriented plain-text wire
+    format, same backfill / keepalive / timeout knobs, same CR/LF
+    transient handling) with two hostjob-specific differences:
+
+      * Path shape: hostjob nests the log inside a per-label dir, so we
+        tail ``<HOSTJOB_LOG_DIR>/<label>/log`` rather than the flat
+        ``<label>.output``.
+      * End-of-stream: hostjob writes NO ``.exit`` sidecar. The runner
+        flips the bound queue item to done/abandoned on completion, so we
+        poll that terminal status (``_hostjob_item_terminal``) as the
+        stop signal.
+    """
+    started = time.monotonic()
+    last_data_at = started
+    last_keepalive_at = started
+
+    out_path = Path(HOSTJOB_LOG_DIR) / label / "log"
+
+    yield _format_sse({
+        "type": "meta",
+        "kind": "stream-start",
+        "mode": "hostjob",
+        "path": str(out_path),
+        "label": label,
+        "ts": time.time(),
+    })
+
+    try:
+        # newline="" — preserve bare \r so _split_cr_lf_segments sees
+        # rsync-style progress frames (same rationale as the workload tail).
+        f = open(out_path, "r", encoding="utf-8", errors="replace", newline="")
+    except OSError as exc:
+        yield _format_sse({"type": "error", "kind": "open-failed", "error": str(exc)})
+        return
+
+    def _emit_end(reason: str) -> Iterator[bytes]:
+        # hostjob has no .exit file; the runner emits the exit_code on the
+        # claude-event + flips the queue item. We surface a terminal frame
+        # without an exit_code (None) — the front-end flips to done off the
+        # queue status, same as it would for any terminal item.
+        yield _format_sse({
+            "type": "meta",
+            "kind": "workload-end",
+            "label": label,
+            "reason": reason,
+            "exit_code": None,
+        })
+
+    pending = ""
+    READ_CHUNK = 8192
+
+    try:
+        try:
+            initial = f.read()
+        except OSError as exc:
+            yield _format_sse({"type": "error", "kind": "read-failed", "error": str(exc)})
+            return
+        backfill_segments, _ = _split_cr_lf_segments(initial, flush_remainder=True)
+        backfill_segments = _collapse_transient_runs(backfill_segments)
+        if len(backfill_segments) > SSE_TAIL_BACKFILL_LINES:
+            backfill_segments = backfill_segments[-SSE_TAIL_BACKFILL_LINES:]
+
+        if backfill_segments:
+            yield _format_sse({
+                "type": "meta",
+                "kind": "backfill-begin",
+                "lines": len(backfill_segments),
+            })
+            for text, transient in backfill_segments:
+                yield _format_sse({
+                    "type": "event",
+                    "kind": "workload_line",
+                    "text": text,
+                    "transient": transient,
+                })
+                last_data_at = time.monotonic()
+            yield _format_sse({"type": "meta", "kind": "backfill-end"})
+
+        # Tail loop. Terminate once the bound queue item reaches a
+        # terminal status AND we've drained the log at EOF — that ordering
+        # avoids cutting off the last line of a job that exits between
+        # reads (analogous to workload's .exit-after-EOF check).
+        while True:
+            chunk = f.read(READ_CHUNK)
+            if chunk:
+                pending += chunk
+                segments, pending = _split_cr_lf_segments(pending)
+                for text, transient in segments:
+                    yield _format_sse({
+                        "type": "event",
+                        "kind": "workload_line",
+                        "text": text,
+                        "transient": transient,
+                    })
+                    last_data_at = time.monotonic()
+                continue
+            # EOF — check if the bound queue item has gone terminal.
+            if _hostjob_item_terminal(label):
+                trailing = f.read()
+                if trailing:
+                    pending += trailing
+                segments, _ = _split_cr_lf_segments(pending, flush_remainder=True)
+                pending = ""
+                for text, transient in segments:
+                    yield _format_sse({
+                        "type": "event",
+                        "kind": "workload_line",
+                        "text": text,
+                        "transient": transient,
+                    })
+                yield from _emit_end("terminal")
+                return
+            now = time.monotonic()
+            if now - last_data_at > SSE_TAIL_MAX_IDLE_SECONDS:
+                yield _format_sse({
+                    "type": "meta",
+                    "kind": "idle-timeout",
+                    "idle_seconds": int(now - last_data_at),
+                })
+                return
+            if now - started > SSE_TAIL_MAX_LIFETIME_SECONDS:
+                yield _format_sse({
+                    "type": "meta",
+                    "kind": "lifetime-timeout",
+                    "seconds": int(now - started),
+                })
+                return
+            if now - last_keepalive_at > SSE_KEEPALIVE_SECONDS:
+                yield _format_sse_comment(f"keep-alive {int(now - started)}s")
+                last_keepalive_at = now
+            time.sleep(SSE_TAIL_POLL_SECONDS)
+    except GeneratorExit:
+        return
+    finally:
+        try:
+            f.close()
+        except OSError:
+            pass
+
+
 def _parse_jsonl_line(line: str) -> dict[str, Any]:
     """Parse a single transcript JSONL line into a stream event payload.
 
@@ -2345,14 +2551,27 @@ def api_queue_stream(qid: str) -> Any:
     # through to ``_no_agent`` and the user sees a placeholder error.
     queue_data, _qerr = _read_queue()
     workload_label = ""
+    hostjob_label = ""
     if isinstance(queue_data, dict):
         for it in queue_data.get("items", []) or []:
             if isinstance(it, dict) and it.get("id") == qid:
-                workload_label = _extract_workload_label(it.get("scope") or [])
+                scope = it.get("scope") or []
+                workload_label = _extract_workload_label(scope)
+                hostjob_label = _extract_hostjob_label(scope)
                 break
     if workload_label:
         return Response(
             stream_with_context(_tail_workload_output(workload_label)),
+            headers=headers,
+            direct_passthrough=True,
+        )
+    # Hostjob dispatch — items created by the `hostjob` runner carry scope
+    # `["hostjob:<label>"]` and (like workloads) have NO entry in the
+    # active-agents map. Tail <HOSTJOB_LOG_DIR>/<label>/log instead of
+    # falling through to the agent lookup + `_no_agent` placeholder.
+    if hostjob_label:
+        return Response(
+            stream_with_context(_tail_hostjob_output(hostjob_label)),
             headers=headers,
             direct_passthrough=True,
         )
@@ -3048,6 +3267,7 @@ def api_queue_meta(qid: str) -> Any:
         "is_starting": shaped["is_starting"],
         "subagents": shaped.get("subagents", []),
         "workload_label": shaped["workload_label"],
+        "hostjob_label": shaped["hostjob_label"],
         "age": shaped["age"],
         "age_label": shaped["age_label"],
         "runtime_seconds": runtime_seconds,
