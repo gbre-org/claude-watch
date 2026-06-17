@@ -231,6 +231,16 @@ fn build_metrics(
             current_version, latest_version
         ),
         "".to_string(),
+        "# HELP claude_watch_build_info Build identity of the running claude-watch binary"
+            .to_string(),
+        "# TYPE claude_watch_build_info gauge".to_string(),
+        format!(
+            "claude_watch_build_info{{version=\"{}\",commit=\"{}\",pr=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION"),
+            env!("CW_GIT_COMMIT"),
+            env!("CW_GIT_PR")
+        ),
+        "".to_string(),
         "# HELP claude_watcher_inject_total Total watcher inject events".to_string(),
         "# TYPE claude_watcher_inject_total counter".to_string(),
         format!("claude_watcher_inject_total {}", watcher_inject),
@@ -571,6 +581,15 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("claude_version_info{current=\"1.2.3\",latest=\"1.2.4\"} 1")));
+        // Build-info gauge is emitted with version/commit/pr labels and value 1.
+        // commit/pr come from build.rs env stamping (fall back to "unknown"/"").
+        assert!(lines.iter().any(|l| l == "# TYPE claude_watch_build_info gauge"));
+        assert!(lines.iter().any(|l| {
+            l.starts_with("claude_watch_build_info{version=\"")
+                && l.contains(",commit=\"")
+                && l.contains(",pr=\"")
+                && l.ends_with("} 1")
+        }));
     }
 
     #[test]
