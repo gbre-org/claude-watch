@@ -181,6 +181,38 @@
               <pre class="prompt-body">{{ it.description }}</pre>
             </details>
           {% endif %}
+          {# ---------- NESTED SUBAGENT TREE ----------
+             Expandable list of the child subagents of this running item's
+             owner main-loop session. it.subagents is computed server-side in
+             app.py _shape() (running items only): the owner agent's parent
+             sessionId -> every agent-*.jsonl sibling under that session's
+             subagents/ dir. Each node is clickable to open the SAME live-log
+             modal pointed at /api/subagent/<id>/stream (live-log.js dispatches
+             on data-log-mode="subagent"). Mirrored in static/refresh.js so the
+             5s SPA refresh re-renders the tree (otherwise it would be wiped).
+             NOTE (flat-per-session): the on-disk layout groups subagents by
+             SESSION, not by which specific agent spawned each one. #}
+          {% if it.subagents %}
+            <details class="prompt-toggle subagent-tree">
+              <summary class="prompt-summary">Subagents ({{ it.subagents|length }})</summary>
+              <ul class="subagent-list">
+                {% for sa in it.subagents %}
+                  <li
+                    class="subagent-node subagent-log-clickable"
+                    data-subagent-id="{{ sa.subagent_id }}"
+                    data-log-mode="subagent"
+                    tabindex="0"
+                    role="button"
+                    aria-label="View live log for subagent {{ sa.subagent_id }}"
+                    title="Click to tail this subagent's live log">
+                    <code class="subagent-id">{{ sa.subagent_id[:12] }}</code>
+                    <span class="subagent-label">{{ sa.label }}</span>
+                    <span class="subagent-age">{{ sa.age }}</span>
+                  </li>
+                {% endfor %}
+              </ul>
+            </details>
+          {% endif %}
         </article>
       {% endfor %}
     </section>

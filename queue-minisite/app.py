@@ -680,8 +680,21 @@ def _shape(
         # totals (queue.json says they're running), but render with
         # a distinct pill + suppress orphan badging during the window.
         shaped["is_starting"] = bool(owner.get("is_starting"))
+        # Nested subagent tree -- for running items with a known owner
+        # agent, resolve the owner's parent main-loop session and list
+        # ALL sibling subagents of that session. The dir walk is cheap
+        # (running items are few) and fail-soft. See
+        # _list_session_subagents for the flat-per-session limitation.
+        subagents: list[dict[str, Any]] = []
+        owner_agent_id = owner.get("agent_id") or ""
+        if owner_agent_id:
+            session_id = _session_id_for_subagent(owner_agent_id)
+            if session_id:
+                subagents = _list_session_subagents(session_id)
+        shaped["subagents"] = subagents
     else:
         shaped["is_starting"] = False
+        shaped["subagents"] = []
     # Workload label — derived from scope. Items created by `workload run`
     # have a scope entry of the form `workload:<label>`. Surface the bare
     # label so the front-end can render `data-log-mode="workload"` on
@@ -1687,6 +1700,180 @@ def _find_parent_session_jsonl(session_id: str) -> Path | None:
     return best[1] if best else None
 
 
+# ---------------------------------------------------------------------------
+# Nested subagent tree + per-subagent log streams.
+# ---------------------------------------------------------------------------
+#
+# A main-loop session spawns subagents; each subagent transcript lives at
+# ``<AGENTS_JSONL_ROOT>/[<project-slug>/]<session-uuid>/subagents/agent-<id>.jsonl``
+# and its FIRST record carries ``sessionId`` (the parent main-loop session
+# UUID) + ``agentId``. For a running queue item the minisite already resolves
+# the OWNER agent via claude-watch's active-agents map (queue_id -> agent_id);
+# that owner agent IS a subagent under some session's ``subagents/`` dir.
+#
+# To surface the FULL set of sibling subagents for that main-loop session we:
+#   1. resolve the owner agent's transcript via _find_agent_jsonl,
+#   2. read its first record to recover the parent ``sessionId``,
+#   3. enumerate EVERY ``agent-*.jsonl`` in that same ``subagents/`` dir.
+#
+# LIMITATION (documented honestly): the on-disk layout is FLAT per-session --
+# subagents spawned BY a subagent are not nested on disk; they sit as siblings
+# under the same session dir. So the tree we render groups subagents by their
+# PARENT MAIN-LOOP SESSION, not by which specific agent spawned each one.
+# There is no on-disk signal to reconstruct deeper parent->child edges, so we
+# don't pretend to.
+
+# Session UUIDs are dashed alphanum (same guard _find_parent_session_jsonl
+# uses). Path-traversal guard for the directory walk below.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]{4,64}$")
+# Subagent id format -- same shape _find_agent_jsonl enforces on agent ids.
+_SUBAGENT_ID_RE = re.compile(r"^[a-z0-9-]{4,64}$")
+# `agent-<id>.jsonl` filename -> bare id capture.
+_SUBAGENT_FILE_RE = re.compile(r"^agent-([a-z0-9-]{4,64})\.jsonl$")
+# Cap on how much of a subagent transcript we read just to derive a label.
+_SUBAGENT_LABEL_MAX_CHARS = 80
+
+
+def _session_id_for_subagent(agent_id: str) -> str | None:
+    """Resolve ``agent_id`` to its parent main-loop ``sessionId``, or None.
+
+    Locates the subagent transcript via ``_find_agent_jsonl`` (which handles
+    both mount shapes + the path-traversal guard) and reads its first record's
+    ``sessionId`` via ``_extract_agent_anchor_from_archive``. Fail-soft:
+    returns None on any miss / parse failure.
+    """
+    path = _find_agent_jsonl(agent_id)
+    if path is None:
+        return None
+    anchor = _extract_agent_anchor_from_archive(path)
+    if anchor is None:
+        return None
+    session_id, _agent_id = anchor
+    return session_id
+
+
+def _first_user_text(path: Path) -> str:
+    """Best-effort: pull the first USER-message text from a transcript.
+
+    Scans the leading lines of the JSONL for the first ``type==user`` record
+    whose ``message.content`` yields text, and returns it truncated to
+    ``_SUBAGENT_LABEL_MAX_CHARS``. Returns "" on any miss / error. Cheap -- we
+    only read a bounded number of lines, not the whole transcript.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(50):
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "user":
+                    continue
+                msg = rec.get("message") or {}
+                content = msg.get("content") if isinstance(msg, dict) else None
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            t = c.get("text")
+                            if isinstance(t, str):
+                                parts.append(t)
+                        elif isinstance(c, str):
+                            parts.append(c)
+                    text = " ".join(parts)
+                text = " ".join(text.split())  # collapse whitespace
+                if text:
+                    return text[:_SUBAGENT_LABEL_MAX_CHARS]
+    except OSError:
+        return ""
+    return ""
+
+
+def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
+    """Enumerate the subagents of a main-loop session.
+
+    Given a parent ``session_id``, locate that session's ``subagents/`` dir
+    under AGENTS_JSONL_ROOT (handling BOTH mount shapes exactly like
+    ``_find_agent_jsonl``: ``<root>/<session>/subagents/`` first, then
+    ``<root>/<project-slug>/<session>/subagents/``) and return one record per
+    ``agent-*.jsonl`` file::
+
+        {"subagent_id": <id>, "label": <short label>,
+         "age_seconds": <now-mtime>, "age": <humanized>}
+
+    Sorted most-recently-active first (mtime desc). Path-traversal guarded.
+    Fail-soft: returns [] on any error / bad session id.
+    """
+    if not _SESSION_ID_RE.match(session_id):
+        return []
+    root = Path(AGENTS_JSONL_ROOT)
+    if not root.is_dir():
+        return []
+
+    # Resolve the session's subagents dir across both mount shapes.
+    candidates: list[Path] = []
+    direct = root / session_id / "subagents"
+    if direct.is_dir():
+        candidates.append(direct)
+    else:
+        try:
+            for project in root.iterdir():
+                if not project.is_dir():
+                    continue
+                sub = project / session_id / "subagents"
+                if sub.is_dir():
+                    candidates.append(sub)
+        except OSError:
+            return []
+    if not candidates:
+        return []
+
+    now = time.time()
+    # Dedup by subagent id, keeping the most-recently-modified transcript.
+    best: dict[str, tuple[float, Path]] = {}
+    for sub_dir in candidates:
+        try:
+            entries = list(sub_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            m = _SUBAGENT_FILE_RE.match(entry.name)
+            if not m:
+                continue
+            sid = m.group(1)
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            prev = best.get(sid)
+            if prev is None or mtime > prev[0]:
+                best[sid] = (mtime, entry)
+
+    out: list[dict[str, Any]] = []
+    for sid, (mtime, path) in best.items():
+        age_seconds = max(0.0, now - mtime)
+        label = _first_user_text(path) or sid
+        out.append(
+            {
+                "subagent_id": sid,
+                "label": label,
+                "age_seconds": age_seconds,
+                "age": _humanize_age(age_seconds),
+            }
+        )
+    out.sort(key=lambda r: r["age_seconds"])  # most-recently-active first
+    return out
+
+
 def _format_sse(data: dict[str, Any]) -> bytes:
     """Encode a dict as a single SSE `data:` event.
 
@@ -2445,6 +2632,114 @@ def api_queue_stream(qid: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Per-subagent live log stream + meta (nested subagent tree).
+# ---------------------------------------------------------------------------
+#
+# `GET /api/subagent/<subagent_id>/stream` tails the subagent's own
+# `agent-<id>.jsonl` transcript directly -- no queue-id indirection. The wire
+# format is IDENTICAL to `/api/queue/<id>/stream` (both use `_tail_jsonl`), so
+# the front-end's existing SSE renderer works unchanged; the UI only points
+# the EventSource at this URL instead. Used by the nested subagent tree under
+# each running queue card.
+
+
+@app.route("/api/subagent/<subagent_id>/stream")
+def api_subagent_stream(subagent_id: str) -> Any:
+    """Server-Sent Events tail of a subagent transcript by subagent id.
+
+    Resolves ``agent-<subagent_id>.jsonl`` via ``_find_agent_jsonl`` (which
+    handles both mount shapes + a path-traversal guard) and tails it with the
+    same SSE framing as ``/api/queue/<id>/stream``. A malformed id short-
+    circuits with a 400; a well-formed-but-unresolvable id emits a one-shot
+    ``no-jsonl`` error SSE frame then closes (so the client's EventSource
+    logic stays uniform).
+    """
+    if not _SUBAGENT_ID_RE.match(subagent_id):
+        return jsonify({"ok": False, "error": "invalid subagent id format"}), 400
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    jsonl_path = _find_agent_jsonl(subagent_id)
+    if jsonl_path is None:
+        def _no_jsonl() -> Iterator[bytes]:
+            yield _format_sse({
+                "type": "error",
+                "kind": "no-jsonl",
+                "subagent_id": subagent_id,
+                "error": (
+                    f"Subagent transcript not found for "
+                    f"subagent_id={subagent_id!r}. The JSONL file may not "
+                    "yet exist or is outside the configured AGENTS_JSONL_ROOT."
+                ),
+            })
+
+        return Response(
+            stream_with_context(_no_jsonl()),
+            headers=headers,
+            direct_passthrough=True,
+        )
+
+    return Response(
+        stream_with_context(_tail_jsonl(jsonl_path)),
+        headers=headers,
+        direct_passthrough=True,
+    )
+
+
+@app.route("/api/subagent/<subagent_id>/meta")
+def api_subagent_meta(subagent_id: str) -> Any:
+    """Return cheap metadata for a single subagent.
+
+    Resolves the transcript, stats its mtime for an age, and reads the first
+    record for the parent ``sessionId`` + a short label (first user-message
+    text). 400 on bad id format, 404 when no transcript is found.
+    """
+    if not _SUBAGENT_ID_RE.match(subagent_id):
+        return jsonify({"ok": False, "error": "invalid subagent id format"}), 400
+
+    path = _find_agent_jsonl(subagent_id)
+    if path is None:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "no transcript for this subagent id",
+                    "subagent_id": subagent_id,
+                }
+            ),
+            404,
+        )
+
+    try:
+        mtime = path.stat().st_mtime
+        age_seconds: float | None = max(0.0, time.time() - mtime)
+    except OSError:
+        age_seconds = None
+
+    parent_session_id: str | None = None
+    anchor = _extract_agent_anchor_from_archive(path)
+    if anchor is not None:
+        parent_session_id, _aid = anchor
+    label = _first_user_text(path) or subagent_id
+
+    return jsonify(
+        {
+            "ok": True,
+            "subagent_id": subagent_id,
+            "parent_session_id": parent_session_id,
+            "label": label,
+            "age": _humanize_age(age_seconds) if age_seconds is not None else "?",
+            "age_seconds": age_seconds,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
 # Archive replay (SSE) — historical transcripts for done / abandoned items.
 # ---------------------------------------------------------------------------
 #
@@ -2970,6 +3265,7 @@ def api_queue_meta(qid: str) -> Any:
         "dependents": dependents,
         "has_archive": shaped["has_archive"],
         "is_starting": shaped["is_starting"],
+        "subagents": shaped.get("subagents", []),
         "workload_label": shaped["workload_label"],
         "hostjob_label": shaped["hostjob_label"],
         "age": shaped["age"],
