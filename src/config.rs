@@ -657,12 +657,28 @@ fn default_threshold_percent() -> u64 {
 /// DOWN, drove the heartbeat stale, and produced hours of
 /// failure / heartbeat-stale / watcher-down alert storms.
 ///
-/// Recovery here is deliberately the LIGHTEST possible: when the malformed
-/// signature is observed for `consecutive` cycles in a row, claude-watch
-/// tmux-injects a single short corrective sentence telling the loop to re-emit
-/// the LAST action as a well-formed tool call (no stray prefix) and to verify
-/// each watcher actually came up. No /clear, no restart — the model is not
-/// wedged, it just produced unparseable output and needs to retry cleanly.
+/// Enforcement is ESCALATING. A malformed tool call renders as assistant TEXT
+/// and never reaches a PreToolUse hook, so claude-watch CANNOT pre-empt the
+/// (non-)execution — there is no true pre-execution block available at this
+/// layer (see the module docs / PR description for the enforcement ceiling).
+/// The strongest feasible enforcement is therefore a relentless, escalating
+/// tmux-inject that halts forward progress until a clean call is observed:
+///
+///   * Phase 1 (soft nudge) — after `consecutive` observations, inject the
+///     short corrective `nudge`, cooldown-gated by `cooldown`.
+///   * Phase 2 (hard block) — if the malform PERSISTS for `escalate_after`
+///     additional nudges without clearing, switch to the forceful
+///     `hard_block_nudge` and DROP the cooldown: re-interrupt and re-inject on
+///     EVERY check cycle until a clean turn is observed. This is the closest
+///     claude-watch's architecture gets to "halt forward progress" — the loop
+///     cannot make headway on a wedged malform because every cycle interrupts
+///     and re-demands a clean re-emit.
+///
+/// `override_marker` is a manual false-positive escape hatch (mirrors the
+/// AskUserQuestion-allowed marker): when the file exists, detection is
+/// suppressed. The structural (AST) detector + code-fence exclusion already
+/// guard against prose/doc false positives; the marker covers the residual
+/// case where an operator is deliberately driving a turn about the tags.
 #[derive(Debug, Deserialize, Clone)]
 pub struct MalformedToolCallConfig {
     /// Master switch. Default true (opt-out).
@@ -675,15 +691,31 @@ pub struct MalformedToolCallConfig {
     /// tag strings — does not trip it.
     #[serde(default = "default_malformed_consecutive")]
     pub consecutive: u32,
-    /// Cooldown in seconds between malformed-tool-call corrective nudges.
-    /// Prevents spamming the pane if the model keeps malforming across the
-    /// next few turns while it recovers. Default 180s (3 min).
+    /// Cooldown in seconds between PHASE-1 (soft) corrective nudges. Prevents
+    /// spamming the pane while the model recovers on its own. The PHASE-2 hard
+    /// block deliberately ignores this cooldown. Default 180s (3 min).
     #[serde(default = "default_malformed_cooldown")]
     pub cooldown: u64,
-    /// The corrective text injected into the pane. Single-line by design (the
-    /// inject_text vim-mode pipeline expects one literal send_keys -l call).
+    /// Number of soft nudges that may fire (without the malform ever clearing)
+    /// before claude-watch ESCALATES to the phase-2 hard block. Default 2: two
+    /// polite nudges, then relentless per-cycle enforcement. Set to 0 to start
+    /// in hard-block mode immediately; set very high to keep it nudge-only.
+    #[serde(default = "default_malformed_escalate_after")]
+    pub escalate_after: u32,
+    /// Path to a marker file that, when present, fully disables malformed
+    /// detection (manual false-positive override). Empty disables the marker
+    /// check. Mirrors the AskUserQuestion-allowed marker pattern.
+    #[serde(default = "default_malformed_override_marker")]
+    pub override_marker: String,
+    /// The PHASE-1 corrective text injected into the pane. Single-line by
+    /// design (the inject_text vim-mode pipeline expects one literal
+    /// send_keys -l call).
     #[serde(default = "default_malformed_nudge")]
     pub nudge: String,
+    /// The PHASE-2 (hard-block) corrective text. Firmer, and re-injected every
+    /// cycle until the malform clears.
+    #[serde(default = "default_malformed_hard_block_nudge")]
+    pub hard_block_nudge: String,
 }
 
 impl Default for MalformedToolCallConfig {
@@ -692,7 +724,10 @@ impl Default for MalformedToolCallConfig {
             enabled: default_malformed_enabled(),
             consecutive: default_malformed_consecutive(),
             cooldown: default_malformed_cooldown(),
+            escalate_after: default_malformed_escalate_after(),
+            override_marker: default_malformed_override_marker(),
             nudge: default_malformed_nudge(),
+            hard_block_nudge: default_malformed_hard_block_nudge(),
         }
     }
 }
@@ -709,8 +744,20 @@ fn default_malformed_cooldown() -> u64 {
     180
 }
 
+fn default_malformed_escalate_after() -> u32 {
+    2
+}
+
+fn default_malformed_override_marker() -> String {
+    "/var/run/claude/malformed-detection-disabled".to_string()
+}
+
 fn default_malformed_nudge() -> String {
     "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). Re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is actually up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn.".to_string()
+}
+
+fn default_malformed_hard_block_nudge() -> String {
+    "claude-watch HARD BLOCK: you are STILL emitting malformed (raw non-namespaced invoke/parameter) tool calls — they are NOT executing. STOP all other work. Do nothing except re-emit the single intended action as ONE well-formed tool call with no stray text before the tag. claude-watch will keep interrupting every cycle until a clean call is observed.".to_string()
 }
 
 /// Hybrid hooks + daemon-fallback tuning.

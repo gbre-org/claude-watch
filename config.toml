@@ -230,21 +230,48 @@ cooldown = 300
 # heartbeat `touch`) silently never ran. Sustained, this strands one-shot
 # watchers DOWN, drives the heartbeat stale, and produces hours of
 # failure / heartbeat-stale / watcher-down alert storms (the 2026-06-17
-# incident). Recovery is the lightest possible: a single short corrective
-# tmux-inject — NO /clear, NO restart (the model is not wedged, it just
-# produced unparseable output and must retry cleanly).
+# incident).
+#
+# Detection is STRUCTURAL (AST-style), not a substring grep: claude-watch
+# tokenizes the candidate region and only fires on a confirmed tool-call
+# CONSTRUCT — a non-namespaced `<invoke name="...">` opener corroborated by a
+# `<parameter name="...">` and/or a `</invoke>` close — and it SKIPS anything
+# inside a fenced code block (```...```). This is what cuts the false positives
+# a plain grep produced on text turns that merely mention the tags.
+#
+# Enforcement is ESCALATING. A malformed call renders as assistant TEXT and
+# never reaches a PreToolUse hook, so there is no true pre-execution block at
+# this layer (the enforcement ceiling). The strongest feasible enforcement is a
+# relentless escalating inject that halts forward progress until a clean call is
+# observed: phase-1 soft nudge (cooldown-gated) escalating, after
+# `escalate_after` un-cleared nudges, to a phase-2 HARD BLOCK that re-interrupts
+# and re-injects EVERY cycle (no cooldown) until a clean turn appears.
 enabled = true
 # Consecutive check cycles the malformed signature must be observed before
 # injecting the nudge (at the 10s general interval, 2 ≈ 20s of sustained
 # malformation). Conservative so a single transient render — or a pane that
 # merely quotes the tag strings — does not trip it.
 consecutive = 2
-# Cooldown between corrective nudges (seconds). Avoids spamming the pane if
-# the model keeps malforming across the next few turns while it recovers.
+# Cooldown between PHASE-1 (soft) corrective nudges (seconds). Avoids spamming
+# the pane while the model recovers on its own. The phase-2 hard block ignores
+# this cooldown.
 cooldown = 180
-# The corrective text injected into the pane. Single-line by design (the
-# inject_text vim-mode pipeline expects one literal send_keys -l call).
+# Number of soft nudges that may fire (without the malform ever clearing)
+# before escalating to the phase-2 hard block. 0 = hard-block immediately;
+# a very large value = stay nudge-only.
+escalate_after = 2
+# Marker file that, when present, fully disables malformed detection (manual
+# false-positive override; mirrors the AskUserQuestion-allowed marker). Create
+# it with `sudo touch <path>` while deliberately driving a turn about the tags;
+# remove it to re-arm. Empty string disables the marker check.
+override_marker = "/var/run/claude/malformed-detection-disabled"
+# The PHASE-1 (soft) corrective text injected into the pane. Single-line by
+# design (the inject_text vim-mode pipeline expects one literal send_keys -l
+# call).
 nudge = "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). Re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is actually up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn."
+# The PHASE-2 (hard-block) corrective text. Firmer, and re-injected every cycle
+# until the malform clears.
+hard_block_nudge = "claude-watch HARD BLOCK: you are STILL emitting malformed (raw non-namespaced invoke/parameter) tool calls — they are NOT executing. STOP all other work. Do nothing except re-emit the single intended action as ONE well-formed tool call with no stray text before the tag. claude-watch will keep interrupting every cycle until a clean call is observed."
 
 [auto_update]
 # Enable automatic version update checks

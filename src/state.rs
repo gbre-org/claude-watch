@@ -89,6 +89,16 @@ pub struct State {
     /// Cumulative count of malformed-tool-call corrective nudges (for metrics).
     #[serde(default)]
     pub malformed_tool_call_nudge_count: u64,
+    /// Number of corrective nudges (phase-1 soft) fired so far in the CURRENT
+    /// unbroken malform episode. Drives escalation to the phase-2 hard block:
+    /// once this reaches `malformed_tool_call.escalate_after`, claude-watch
+    /// switches to the relentless per-cycle hard-block injection. Reset to 0
+    /// when a clean (non-malformed) cycle is observed.
+    #[serde(default)]
+    pub malformed_tool_call_episode_nudges: u32,
+    /// Cumulative count of phase-2 (hard-block) malformed re-injections (metric).
+    #[serde(default)]
+    pub malformed_tool_call_hard_block_count: u64,
     // Watcher health
     pub watcher_health: HashMap<String, WatcherState>,
     /// Per-watcher RFC3339 timestamp of when the watcher was FIRST observed
