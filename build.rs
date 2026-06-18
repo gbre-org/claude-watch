@@ -1,12 +1,18 @@
 use std::process::Command;
 
+// Shared, dependency-free PR-subject parser. Included verbatim so the build
+// script and the crate's test target exercise the exact same `parse_pr_number`.
+// (Build scripts cannot depend on the crate they build, hence `include!`.)
+include!("src/pr_parse.rs");
+
 /// Build-time git stamping.
 ///
 /// Exposes two env vars to the crate so the exporter can emit a
 /// `claude_watch_build_info` gauge identifying the deployed build:
 ///   - `CW_GIT_COMMIT`: short commit hash of HEAD (e.g. `abc1234`).
-///   - `CW_GIT_PR`: PR number parsed from the trailing `(#N)` squash-merge
-///     convention in the latest commit subject (e.g. `358`), or "" if none.
+///   - `CW_GIT_PR`: PR number parsed from the latest commit subject. Recognizes
+///     both GitHub merge-commit subjects (`Merge pull request #N from ...`) and
+///     the trailing `(#N)` squash-merge convention; "" if neither matches.
 ///
 /// Robust by design: if git is unavailable or any step fails, falls back to
 /// `"unknown"` / `""` so the build never breaks.
@@ -38,19 +44,5 @@ fn git_output(args: &[&str]) -> Option<String> {
         None
     } else {
         Some(s)
-    }
-}
-
-/// Parse the trailing `(#N)` from a squash-merge commit subject.
-/// e.g. "feat(x): do thing (#358)" -> Some("358").
-fn parse_pr_number(subject: &str) -> Option<String> {
-    let subject = subject.trim_end();
-    let close = subject.strip_suffix(')')?;
-    let open = close.rfind("(#")?;
-    let digits = &close[open + 2..];
-    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-        Some(digits.to_string())
-    } else {
-        None
     }
 }
