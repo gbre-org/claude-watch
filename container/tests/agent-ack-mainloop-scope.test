@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Regression tests for the main-loop scoping of the evaluator-backed
+default-seed obligations (agent_ack_pending + siblings).
+
+BUG (the reason this test exists): obligations-init seeded
+``agent_ack_pending`` (and ``event_must_act`` / ``queue_ready_unspawned`` /
+``no_grep_watcher_output``) as a BARE ``evaluator`` predicate with NO
+main-loop scope-guard. The ``evaluator`` predicate has no notion of
+main-loop vs subagent, so the gate fired INSIDE subagent contexts -- a
+subagent got blocked over the MAIN loop's pending-ack bookkeeping (state it
+does not own) and then "cleared" that state to unblock itself, corrupting
+main-loop state.
+
+FIX: wrap each main-loop-only evaluator behind ``all_of [is_main_loop {},
+evaluator]`` (via ``_main_loop_only_evaluator_params``). In a subagent the
+``is_main_loop`` child fails and short-circuits the all_of to inactive (the
+gate does not fire); in the main loop it passes and the evaluator decides.
+This mirrors ``subagent_queue_item_running`` (the INVERSE: ``is_main_loop
+{negate: true}`` to fire ONLY in subagents).
+
+Asserts:
+
+  1. obligations-init --dry-run seeds each of the four main-loop-only
+     evaluator rows as ``--predicate all_of`` wrapping
+     ``[is_main_loop {} , evaluator {cmd: <eval-script>}]``.
+  2. ``subagent_queue_item_running`` is UNCHANGED: ``all_of`` wrapping
+     ``is_main_loop {negate: true}`` (regression guard -- we must not flip
+     the subagent gate's polarity while fixing the others).
+  3. End-to-end via the real ``obligations`` CLI against an isolated HOME:
+     with a pending agent-ack present, ``agent_ack_pending`` DENIES in
+     main-loop context (no agent_id) and ALLOWS in subagent context
+     (agent_id present). This is the exact behavior the bug violated.
+
+Run:  ./agent-ack-mainloop-scope.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+OBLIGATIONS_INIT = REPO_ROOT / "tools" / "obligations" / "obligations-init"
+OBLIGATIONS_CLI = REPO_ROOT / "tools" / "obligations" / "obligations"
+EVAL_AGENT_ACK = CONTAINER_DIR / "bin" / "eval-agent-ack-pending"
+
+# The four evaluator-backed rows that are conceptually MAIN-LOOP ONLY and
+# MUST be wrapped in all_of[is_main_loop{}, evaluator].
+MAIN_LOOP_ONLY_EVAL_SCRIPTS = {
+    "no_grep_watcher_output": "/usr/local/bin/eval-no-grep-watcher-output",
+    "event_must_act": "/usr/local/bin/eval-event-must-act",
+    "agent_ack_pending": "/usr/local/bin/eval-agent-ack-pending",
+    "queue_ready_unspawned": "/usr/local/bin/eval-queue-ready-unspawned",
+}
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        print(f"  FAIL {msg}")
+        failures.append(msg)
+
+
+def _extract_json_after(line: str, marker: str) -> str | None:
+    """Extract a balanced-brace JSON object that immediately follows
+    ``marker`` (e.g. '--params ') in a space-joined argv line."""
+    idx = line.find(marker)
+    if idx < 0:
+        return None
+    start = line.find("{", idx)
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(line)):
+        c = line[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return line[start:i + 1]
+    return None
+
+
+def _dry_run_rows() -> list[dict]:
+    """Parse each `obligations add` invocation that obligations-init
+    --force --dry-run prints into {predicate, params(dict), deny_msg}.
+
+    The dry-run line is `" ".join(argv)`, so the `--params` JSON contains
+    spaces; we brace-match it rather than naively tokenizing on whitespace.
+    """
+    proc = subprocess.run(
+        [sys.executable, str(OBLIGATIONS_INIT), "--force", "--dry-run"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    expect(proc.returncode == 0,
+           f"obligations-init --dry-run rc={proc.returncode}\n{proc.stderr}")
+    rows: list[dict] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("DRY-RUN: "):
+            continue
+        pred_m = re.search(r"--predicate\s+(\S+)", line)
+        params_raw = _extract_json_after(line, "--params ")
+        # --deny-msg value is "[default-seed] <name>" (runs until the next
+        # " --" flag boundary).
+        deny_m = re.search(r"--deny-msg\s+(.+?)(?:\s+--\S+|\s*$)", line)
+        rows.append({
+            "predicate": pred_m.group(1) if pred_m else None,
+            "params": json.loads(params_raw) if params_raw else None,
+            "deny_msg": deny_m.group(1).strip() if deny_m else None,
+        })
+    return rows
+
+
+def _row_by_deny_msg(rows: list[dict], substr: str) -> dict | None:
+    for row in rows:
+        if row.get("deny_msg") and substr in row["deny_msg"]:
+            return row
+    return None
+
+
+# ---------------------------------------------------------------- 1
+
+def test_main_loop_only_rows_wrapped_in_all_of() -> None:
+    rows = _dry_run_rows()
+    for tag, eval_script in MAIN_LOOP_ONLY_EVAL_SCRIPTS.items():
+        row = _row_by_deny_msg(rows, tag)
+        expect(row is not None,
+               f"{tag}: no seed row found in dry-run output")
+        if row is None:
+            continue
+        predicate = row.get("predicate")
+        expect(predicate == "all_of",
+               f"{tag}: --predicate must be all_of (got {predicate!r}); "
+               f"a bare evaluator row fires inside subagent contexts")
+        params = row.get("params")
+        expect(params is not None, f"{tag}: missing --params")
+        if params is None:
+            continue
+        preds = params.get("predicates", [])
+        expect(isinstance(preds, list) and len(preds) == 2,
+               f"{tag}: all_of must wrap exactly [is_main_loop, evaluator]; "
+               f"got {preds}")
+        if not (isinstance(preds, list) and len(preds) == 2):
+            continue
+        guard, ev = preds[0], preds[1]
+        # Guard: is_main_loop WITHOUT negate (fires only in main loop).
+        expect(guard.get("kind") == "is_main_loop",
+               f"{tag}: first child must be is_main_loop; got {guard}")
+        expect(not guard.get("params", {}).get("negate", False),
+               f"{tag}: is_main_loop guard must NOT negate (main-loop only); "
+               f"got {guard}")
+        # Evaluator child unchanged: same eval script + exit_code mode.
+        expect(ev.get("kind") == "evaluator",
+               f"{tag}: second child must be evaluator; got {ev}")
+        expect(ev.get("params", {}).get("cmd") == eval_script,
+               f"{tag}: evaluator cmd must be {eval_script}; got {ev}")
+        expect(ev.get("params", {}).get("decision_mode") == "exit_code",
+               f"{tag}: evaluator decision_mode must stay exit_code; got {ev}")
+
+
+# ---------------------------------------------------------------- 2
+
+def test_subagent_queue_item_running_polarity_unchanged() -> None:
+    """Regression guard: the subagent gate must keep its INVERSE polarity
+    (is_main_loop negate=true, firing ONLY in subagents). We must not have
+    flipped it while fixing the main-loop-only rows."""
+    rows = _dry_run_rows()
+    row = _row_by_deny_msg(rows, "subagent_queue_item_running")
+    expect(row is not None, "subagent_queue_item_running row not found")
+    if row is None:
+        return
+    expect(row.get("predicate") == "all_of",
+           "subagent_queue_item_running must stay all_of")
+    params = row.get("params") or {}
+    preds = params.get("predicates", [])
+    expect(len(preds) == 2 and preds[0].get("kind") == "is_main_loop",
+           f"subagent gate must lead with is_main_loop; got {preds}")
+    if len(preds) >= 1:
+        expect(preds[0].get("params", {}).get("negate") is True,
+               f"subagent gate's is_main_loop MUST negate=true (fires only "
+               f"in subagents); got {preds[0]}")
+
+
+# ---------------------------------------------------------------- 3
+
+def test_e2e_agent_ack_gate_main_loop_only() -> None:
+    """With a pending agent-ack, the agent_ack_pending gate DENIES in the
+    main loop (no agent_id) but ALLOWS in a subagent (agent_id present)."""
+    if not OBLIGATIONS_CLI.exists():
+        print("  SKIP: obligations CLI not found alongside obligations-init")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        cfg = home / ".config" / "claude"
+        cfg.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+
+        # Seed the default rows into the isolated HOME.
+        seed = subprocess.run(
+            [sys.executable, str(OBLIGATIONS_INIT), "--force"],
+            capture_output=True, text=True, timeout=30, env=env, check=False,
+        )
+        expect(seed.returncode == 0,
+               f"seed rc={seed.returncode}\n{seed.stderr}")
+
+        # Plant a pending agent-ack so eval-agent-ack-pending DENIES
+        # (default threshold N=0 -> denies as soon as one entry exists).
+        (cfg / "agent-ack-pending.json").write_text(json.dumps({
+            "pending": [{
+                "queue_id": "q-test-0001",
+                "agent_id": "aTEST",
+                "registered_at": "2026-06-18T00:00:00Z",
+            }],
+            "counter": 0,
+        }), encoding="utf-8")
+
+        def check(agent_id: str | None) -> dict:
+            cmd = [sys.executable, str(OBLIGATIONS_CLI), "check",
+                   "--tool", "Bash", "--command", "ls /tmp", "--json"]
+            if agent_id:
+                cmd += ["--agent-id", agent_id]
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               env=env, timeout=20, check=False)
+            return json.loads(p.stdout)
+
+        # Main loop: no agent_id -> the gate fires (ok=False) and the
+        # agent_ack_pending row is among the blockers.
+        main = check(None)
+        expect(main.get("ok") is False,
+               f"main-loop call must be BLOCKED by agent_ack_pending; "
+               f"got {main}")
+        blockers = [b.get("deny_message", "") for b in main.get("blocking", [])]
+        expect(any("agent_ack_pending" in b for b in blockers),
+               f"main-loop blocker must be agent_ack_pending; got {blockers}")
+
+        # Subagent: agent_id present -> the is_main_loop guard fails ->
+        # all_of inactive -> gate does NOT fire (ok=True). This is the bug
+        # fix: previously the bare evaluator blocked the subagent here.
+        sub = check("aSUB-1234")
+        expect(sub.get("ok") is True,
+               f"subagent call must NOT be blocked by a main-loop-only "
+               f"gate; got {sub}")
+
+
+# --------------------------------------------------------------------
+
+def main() -> int:
+    tests = [
+        test_main_loop_only_rows_wrapped_in_all_of,
+        test_subagent_queue_item_running_polarity_unchanged,
+        test_e2e_agent_ack_gate_main_loop_only,
+    ]
+    for t in tests:
+        print(f"== {t.__name__} ==")
+        t()
+    if failures:
+        print(f"\nFAIL agent-ack-mainloop-scope.test "
+              f"({len(failures)} assertion(s) failed)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"\nPASS agent-ack-mainloop-scope.test "
+          f"({len(tests)} test functions, all assertions passed)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
