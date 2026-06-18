@@ -146,6 +146,20 @@ Same settings.json schema with each hook command rewritten:
 The original command may already start with "exec-hook " (the
 operator pre-wrapped on the host). In that case we don't double-wrap.
 
+PROJECT MCP AUTO-APPROVE (--mcp-autoapprove / CLAUDE_MCP_AUTOAPPROVE)
+
+The entrypoint launches claude with `--setting-sources project,local`
+and a sibling helper (generate-project-mcp-json) writes a project-tier
+`.mcp.json`. Per `claude mcp list --help`: "Unapproved .mcp.json servers
+are shown as ⏸ Pending approval and not connected to; approved servers
+are health-checked." So a freshly-generated `.mcp.json` server starts
+UNAPPROVED → "Pending approval" → never connected. By default this helper
+writes the top-level boolean `"enableAllProjectMcpServers": true` into the
+shim settings.json, which records the approval up-front so host-bash /
+mcp-adaptor / chrome-devtools connect cleanly. Disable by setting
+`CLAUDE_MCP_AUTOAPPROVE=0` (or `--mcp-autoapprove 0`) to omit the key and
+approve each project `.mcp.json` server interactively instead.
+
 EXIT CODES
 
   0  output written successfully, or input lacks any hooks
@@ -536,10 +550,25 @@ def main(argv: list[str]) -> int:
              "tier and the shim only adds the obligations gates on top. "
              "Falls back to CLAUDE_SHIM_OBLIGATIONS_ONLY env var.",
     )
+    p.add_argument(
+        "--mcp-autoapprove",
+        default=os.environ.get("CLAUDE_MCP_AUTOAPPROVE", "1"),
+        help="When '1' (the default), write "
+             "\"enableAllProjectMcpServers\": true into the generated "
+             "settings.json so the project-tier .mcp.json servers "
+             "(host-bash, mcp-adaptor, chrome-devtools) are auto-approved "
+             "instead of starting as ⏸ 'Pending approval' / "
+             "unconnected. Set to '0' (or CLAUDE_MCP_AUTOAPPROVE=0) to omit "
+             "the key — useful if the operator wants to approve each "
+             "project .mcp.json server interactively. Default-on so the "
+             "container ships with project MCP servers auto-approved "
+             "without operator opt-in.",
+    )
     args = p.parse_args(argv)
     patterns = parse_patterns(args.shim_patterns)
     inject_obligations = args.inject_obligations.strip() not in ("", "0")
     obligations_only = bool(args.obligations_only)
+    mcp_autoapprove = args.mcp_autoapprove.strip() not in ("", "0")
 
     in_path = Path(args.input)
     out_path = Path(args.output)
@@ -601,6 +630,20 @@ def main(argv: list[str]) -> int:
             )
     if inject_obligations:
         rewritten = inject_obligations_hooks(rewritten)
+
+    # Auto-approve project-tier .mcp.json servers. The entrypoint launches
+    # claude with `--setting-sources project,local` and a sibling helper
+    # (generate-project-mcp-json) writes a project `.mcp.json`. Per
+    # `claude mcp list --help`, unapproved .mcp.json servers show as
+    # ⏸ "Pending approval" and are NOT connected to; only approved servers
+    # are health-checked. Setting `enableAllProjectMcpServers: true` here
+    # records the approval up-front so host-bash / mcp-adaptor /
+    # chrome-devtools connect cleanly instead of stalling on a never-
+    # arriving interactive approval. Overridable via CLAUDE_MCP_AUTOAPPROVE
+    # (default on; set to 0 to omit and approve interactively).
+    if mcp_autoapprove:
+        rewritten = dict(rewritten)
+        rewritten["enableAllProjectMcpServers"] = True
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp file then atomic-rename so a concurrent claude

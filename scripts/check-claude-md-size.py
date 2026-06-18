@@ -60,11 +60,12 @@ WARN_LIMIT = 32_000
 # The value is a "do-not-regress" cap pinned at the file's current size: the
 # file may not grow past it. Lower these as files are trimmed — NEVER raise.
 #
-# container/baked-CLAUDE.md: current size ~76,323 chars (2026-06-11). Pinned
-# just above current so it cannot grow. TODO: trim below HARD_LIMIT (40k) and
-# delete this entry once it fits the generic budget.
+# container/baked-CLAUDE.md: current size ~74,869 chars (2026-06-18, after
+# removing the Signal-messenger docs + adding the MCP auto-approve / triage
+# notes). Pinned just above current so it cannot grow. TODO: trim below
+# HARD_LIMIT (40k) and delete this entry once it fits the generic budget.
 ALLOWLIST: dict[str, int] = {
-    "container/baked-CLAUDE.md": 76_500,
+    "container/baked-CLAUDE.md": 75_000,
 }
 
 
