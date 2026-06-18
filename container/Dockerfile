@@ -90,6 +90,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         vim \
         gnupg \
+        jq \
         iproute2 \
         procps \
         inotify-tools \
@@ -154,6 +155,26 @@ RUN printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         > /etc/sudoers.d/hndrewaall-cron \
     && chmod 0440 /etc/sudoers.d/hndrewaall-cron \
     && visudo -cf /etc/sudoers.d/hndrewaall-cron
+
+# Passwordless-sudo for uid 1000 to run apt / dpkg at RUNTIME. There is no
+# blanket "no-sudo" policy inside this container: the host-side aversion to
+# sudo is purely about macOS Touch ID / fingerprint prompts, which do NOT
+# exist in the Linux container. So baking a NOPASSWD carve-out for the
+# package-manager binaries lets an in-session `sudo apt-get install <pkg>`
+# work non-interactively (no password, no prompt) — handy when a one-off
+# tool is missing from the baked image and the operator doesn't want to
+# rebuild + redeploy just to try it. Scoped to the apt/dpkg binaries only,
+# mirroring the cron carve-out's minimal-blast-radius shape. The package
+# DB / installed tools do NOT persist across `docker compose up
+# --force-recreate` (no named volume backs /usr or /var/lib/dpkg), so a
+# tool that proves durably useful should still be added to the apt layer
+# above and the image rebuilt — this carve-out is for runtime convenience,
+# not a persistence mechanism.
+RUN printf '%s\n' \
+        'hndrewaall ALL=(root) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg' \
+        > /etc/sudoers.d/hndrewaall-apt \
+    && chmod 0440 /etc/sudoers.d/hndrewaall-apt \
+    && visudo -cf /etc/sudoers.d/hndrewaall-apt
 
 # cron — Debian's vixie-cron daemon for in-container recurring jobs.
 #

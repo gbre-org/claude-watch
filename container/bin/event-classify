@@ -152,6 +152,17 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "Workbot prompt waiting; needs dispatch."),
 
     # queue-stale-ready -> needs spawn/abandon decision.
+    #
+    # The PRODUCER (`src/stale_ready.rs`, EVENT_SOURCE / EVENT_TAG) emits
+    # source="claude-watch", tag="queue-stale-ready" -- NOT source="queue".
+    # The original `("queue", ...)` row below therefore never matched and the
+    # event fell through to the `("claude-watch", "*", AMBIENT)` catch-all
+    # (Bug B). The `("claude-watch", "queue-stale-ready", ...)` row is the one
+    # that actually fires; it MUST precede the claude-watch/* ambient
+    # catch-all. The `("queue", ...)` row is kept for back-compat in case a
+    # future producer emits under source="queue".
+    ("claude-watch", "queue-stale-ready", None, ACTIONABLE,
+        "Queue item ready but stale; needs spawn/abandon decision."),
     ("queue", "queue-stale-ready", None, ACTIONABLE,
         "Queue item ready but stale; needs spawn/abandon decision."),
 

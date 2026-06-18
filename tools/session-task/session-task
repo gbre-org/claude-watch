@@ -151,12 +151,17 @@ QUEUE_SCHEMA_VERSION = 2
 #
 # `ACTIVE_STATUSES` is the canonical "in-flight" set used by serialization
 # and spawn-gating. `RUNNING_STATUSES` is the subset that owns a slot
-# (running, wedged, OR blocked); wedged is included precisely because a wedge
-# is transient and the agent still holds the scope. Blocked is included
-# because the queue item is still parked on its scope until the external
-# blocker resolves -- letting a peer grab the scope would race the unblock.
+# (running, wedged); wedged is included precisely because a wedge is
+# transient and the agent still holds the scope. Blocked is DELIBERATELY
+# EXCLUDED: per design, `queue block` RELEASES the scope lock (blocked
+# items are exempt from orphaned-running alerts), so a blocked item must
+# NOT hold its scope -- a pending peer in the same scope/group is free to
+# become ready and spawn. (Earlier this wrongly included `blocked`, which
+# made a blocked group-head pin its scope and starve its pending peers;
+# this now matches the proven-correct web UI `_compute_ready_now`, which
+# gates readiness on ("pending","running") membership only.)
 ACTIVE_STATUSES = ("pending", "running", "wedged", "blocked")
-RUNNING_STATUSES = ("running", "wedged", "blocked")
+RUNNING_STATUSES = ("running", "wedged")
 
 # Agent-transcript archive directory. At queue-done / queue-abandon time the
 # spawning subagent's JSONL transcript (if locatable) is copied here so it
@@ -1042,6 +1047,15 @@ def _group_head(items, group_id):
     Wedged items count as "in flight" for head-of-group purposes so a
     peer pending item in the same group cannot be promoted while the
     wedge is unresolved.
+
+    `blocked` items are EXCLUDED from head candidacy entirely: per design
+    `queue block` releases the scope lock, so a blocked item must never be
+    the group head (which would pin the scope and starve a pending peer).
+    This mirrors the proven-correct web UI `_compute_ready_now`, which
+    computes the head from ("pending","running") membership only. Concretely:
+    an in-flight (running/wedged) member is the head if present; otherwise
+    the oldest *pending* member is the head -- a lone blocked member yields
+    no head, freeing its pending peers to become ready.
     """
     members = [it for it in _group_members(items, group_id) if it.get("status") in ACTIVE_STATUSES]
     if not members:
@@ -1049,7 +1063,13 @@ def _group_head(items, group_id):
     running = [it for it in members if it.get("status") in RUNNING_STATUSES]
     if running:
         return sorted(running, key=_sort_key)[0]
-    return sorted(members, key=_sort_key)[0]
+    # FIFO fallback: head is the oldest *pending* member. Exclude blocked
+    # (and any non-pending residue) so a blocked item never re-selects as
+    # head via the fallback and pins the scope against its pending peers.
+    pending = [it for it in members if it.get("status") == "pending"]
+    if not pending:
+        return None
+    return sorted(pending, key=_sort_key)[0]
 
 
 def _locked_tokens_blocking_item(item, locked_scopes):
