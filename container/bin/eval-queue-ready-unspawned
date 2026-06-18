@@ -3,9 +3,18 @@
 eval-queue-ready-unspawned — obligation evaluator that blocks the main loop
 when ready-but-unspawned queue items exist.
 
-If `session-task queue list --json` shows any item with status=pending and
-ready_now=true, this evaluator DENIES (exit 1). The main loop must spawn
-the ready items before doing other work.
+If `session-task queue ready --json` reports any pending item that has
+been ready for longer than READY_AGE_THRESHOLD_SECS, this evaluator
+DENIES (exit 1). The main loop must spawn the ready items before doing
+other work.
+
+`queue ready --json` returns exactly the ready-pending items (the
+`_item_is_ready` predicate is applied server-side and the result is
+pre-filtered), so we do NOT consult a `ready_now` field -- `list --json`
+never emitted one, which was Bug A (the evaluator was always inert). We
+keep a defensive `status == "pending"` check anyway. An age threshold
+(~6 min, matching the stale-ready cron cadence) keeps freshly-registered
+items from being flagged during the register->spawn window.
 
 Exempt commands (never denied): same set as eval-event-must-act (session-task,
 obligations, claude-watch-ack, etc.) plus Agent (spawning IS the fix).
@@ -17,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 _EXEMPT_PATTERNS = [
     r"session-task(\s|$)",
@@ -40,8 +50,29 @@ _EXEMPT_RE = re.compile(
 )
 
 
+# Only flag items that have been ready longer than this (seconds). Matches
+# the stale-ready cron cadence (~6 min) so an item that was JUST registered
+# and is about to be spawned in the same turn isn't falsely flagged during
+# the register->spawn window. Override via env for tests.
+READY_AGE_THRESHOLD_SECS = int(os.environ.get("READY_AGE_THRESHOLD_SECS", "360"))
+
+
 def _is_exempt(cmd: str) -> bool:
     return bool(_EXEMPT_RE.match(cmd))
+
+
+def _age_secs(item: dict) -> float | None:
+    """Seconds since the item was created (its ready clock). None if unknown."""
+    ts = item.get("registered_at") or item.get("created_at")
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds()
 
 
 def main() -> int:
@@ -52,7 +83,7 @@ def main() -> int:
 
     try:
         result = subprocess.run(
-            ["session-task", "queue", "list", "--json"],
+            ["session-task", "queue", "ready", "--json"],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
@@ -62,10 +93,23 @@ def main() -> int:
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
         return 0  # default-open
 
-    ready_unspawned = [
-        i for i in items
-        if i.get("status") == "pending" and i.get("ready_now") is True
-    ]
+    # `queue ready --json` may return a bare list or {"items": [...]}.
+    if isinstance(items, dict):
+        items = items.get("items", [])
+    if not isinstance(items, list):
+        return 0  # default-open on unexpected shape
+
+    # `queue ready` is already pre-filtered to ready-pending items. Keep a
+    # defensive status check, and require the item to have been ready longer
+    # than the threshold so we don't flag items mid register->spawn.
+    ready_unspawned = []
+    for i in items:
+        if i.get("status") != "pending":
+            continue
+        age = _age_secs(i)
+        if age is not None and age < READY_AGE_THRESHOLD_SECS:
+            continue
+        ready_unspawned.append(i)
 
     if not ready_unspawned:
         return 0
