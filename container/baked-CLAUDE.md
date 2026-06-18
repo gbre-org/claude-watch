@@ -751,16 +751,18 @@ agent-tail <id> --path    # print resolved transcript path
 Both `agent-msg` and `agent-tail` are baked at `/usr/local/bin/` and
 on PATH by default; no bind-mount required.
 
-## Avoid `sudo` — fingerprint prompt is prohibitive
+## `sudo` in-container — no fingerprint prompt, apt is carved out
 
-On the operator's host (typically macOS), every `sudo` invocation
-triggers a Touch ID / fingerprint prompt. That's prohibitive when an
-agent loop chains many short commands, so **prefer non-sudo paths in
-this container whenever possible**.
+The "avoid sudo" instinct is a **HOST** concern, not a container one. On
+the operator's host (typically macOS), every `sudo` invocation triggers a
+Touch ID / fingerprint prompt — prohibitive when an agent loop chains many
+short commands. **That prompt does not exist inside this Linux container**:
+there is no Touch ID, and the container user has no password set. So `sudo`
+in-container does not block on any prompt.
 
-The container user is uid 1000 (`hndrewaall`) and is in the right
-groups (including `docker`, where applicable) so the following commands
-**never need `sudo`** inside the container:
+Most container work still **doesn't need `sudo` at all**. The container
+user is uid 1000 (`hndrewaall`) and is in the right groups (including
+`docker`, where applicable), so these run as the container user directly:
 
 - `docker compose ...` — when docker socket is bind-mounted, the
   container user has docker-group access; bare `docker compose` works.
@@ -773,14 +775,27 @@ groups (including `docker`, where applicable) so the following commands
   `uv`, `go`, `make` — language toolchains run as the container user.
 - `audit-hooks`, `trust-workspace` — container-baked helpers, both
   run as the container user.
+- `jq` — baked into the image's apt layer, on PATH; no sudo needed.
 
-If you find yourself wanting `sudo` for something that isn't on this
-list (e.g. `apt install`, writing to `/etc/`, editing a system service
-unit), **pause and ask the operator first**. The fingerprint prompt
-makes silent retries painful, and most "I need sudo" instincts inside
-the container are a sign of either a missing bind-mount or a
-container-vs-host confusion that's better resolved by talking to the
-operator than by working around it.
+**Runtime package installs work without a prompt.** The Dockerfile bakes a
+NOPASSWD sudoers carve-out (`/etc/sudoers.d/hndrewaall-apt`) for the
+package-manager binaries, so:
+
+```sh
+sudo apt-get install -y <pkg>    # non-interactive: no password, no prompt
+```
+
+just works in-session when a one-off tool is missing from the baked image.
+Note this is RUNTIME convenience only — installs do NOT persist across a
+`docker compose up --force-recreate` (no named volume backs `/usr` or
+`/var/lib/dpkg`). A tool that proves durably useful should be added to the
+Dockerfile's apt layer and the image rebuilt, not re-`sudo apt-get`'d every
+session.
+
+Other system mutation (writing to arbitrary `/etc/` paths, editing a
+system service unit, etc.) still warrants deliberation — it's outside the
+apt carve-out, mutates the image's baked state, and won't persist anyway.
+Prefer a bind-mount or a Dockerfile change for anything you want to stick.
 
 The lone documented exception is the `cw` host shim referenced in
 `examples/compose/bin/cw`, which falls back to `sudo docker` only if
