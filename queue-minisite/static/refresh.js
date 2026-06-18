@@ -205,13 +205,17 @@
     const isStarting = !!it.is_starting;
     const workloadLabel = it.workload_label || '';
     const isWorkload = workloadLabel.length > 0;
-    // Workload-bound items render as RUNNING (not starting) regardless of
-    // active-agents.json — they are tailing /tmp/claude-workloads/<label>.output,
-    // not waiting on a subagent JSONL. Orphan badging is also suppressed
-    // for workloads since active-agents tracks subagents, not workload procs.
+    const hostjobLabel = it.hostjob_label || '';
+    const isHostjob = hostjobLabel.length > 0;
+    // Workload- and hostjob-bound items render as RUNNING (not starting)
+    // regardless of active-agents.json — they tail a plain-text output file
+    // (workload: /tmp/claude-workloads/<label>.output; hostjob:
+    // <HOSTJOB_LOG_DIR>/<label>/log), not a subagent JSONL. Orphan badging is
+    // also suppressed for both since active-agents tracks subagents, not
+    // workload / hostjob procs.
     const ownerAlive = owner.alive;
-    const orphan = ownerAlive === false && !isStarting && !isWorkload;
-    const stateCls = (isStarting && !isWorkload) ? 'state-starting' : 'state-running';
+    const orphan = ownerAlive === false && !isStarting && !isWorkload && !isHostjob;
+    const stateCls = (isStarting && !isWorkload && !isHostjob) ? 'state-starting' : 'state-running';
     // PR #131: starting rows are clickable too — clicking opens the
     // log modal in a polling state, retrying SSE until the agent's
     // first event lands. Must match the server-side template
@@ -226,29 +230,38 @@
       'log-clickable',
       orphan ? 'orphan' : '',
     ].filter(Boolean).join(' ');
-    const startingFlag = (isStarting && !isWorkload) ? '1' : '0';
-    const logMode = isWorkload ? 'workload' : 'live';
+    const startingFlag = (isStarting && !isWorkload && !isHostjob) ? '1' : '0';
+    const logMode = isHostjob ? 'hostjob' : (isWorkload ? 'workload' : 'live');
     // aria-label / title vary by state so screen readers + tooltips
     // describe the polling behaviour for starting rows. Mirrors the
     // template's logic.
     let logKindLabel;
-    if (isWorkload) logKindLabel = 'workload';
+    if (isHostjob) logKindLabel = 'hostjob';
+    else if (isWorkload) logKindLabel = 'workload';
     else if (isStarting) logKindLabel = 'live (polling — waiting for first event)';
     else logKindLabel = 'live';
-    const titleText = (isStarting && !isWorkload)
+    let logViewNoun;
+    if (isHostjob) logViewNoun = 'hostjob output';
+    else if (isWorkload) logViewNoun = 'workload output';
+    else logViewNoun = 'live log';
+    const titleText = (isStarting && !isWorkload && !isHostjob)
       ? 'Click to open log viewer — polls for the agent\'s first event, then tails live. Drop a pending item here to set this as its dependency.'
-      : `Click to view ${isWorkload ? 'workload output' : 'live log'}. Drop a pending item here to set this as its dependency.`;
+      : `Click to view ${logViewNoun}. Drop a pending item here to set this as its dependency.`;
     const logModeAttr = `data-log-mode="${logMode}" tabindex="0" role="button" aria-label="View ${logKindLabel} log for ${attr(it.id)}" title="${attr(titleText)}"`;
     const workloadAttr = isWorkload ? ` data-workload-label="${attr(workloadLabel)}"` : '';
+    const hostjobAttr = isHostjob ? ` data-hostjob-label="${attr(hostjobLabel)}"` : '';
 
     let head = '';
-    if (isStarting && !isWorkload) {
+    if (isStarting && !isWorkload && !isHostjob) {
       head += '<span class="badge state-starting" title="registered, waiting for agent to emit first event">starting</span>';
     } else {
       head += '<span class="badge state-running">running</span>';
     }
     if (isWorkload) {
       head += `<span class="badge workload-badge" title="workload-bound: tails /tmp/claude-workloads/${attr(workloadLabel)}.output">workload</span>`;
+    }
+    if (isHostjob) {
+      head += `<span class="badge hostjob-badge" title="hostjob-bound: tails the host job log for ${attr(hostjobLabel)}">hostjob</span>`;
     }
     if (orphan) head += '<span class="badge state-orphan">orphan</span>';
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
@@ -257,11 +270,13 @@
     head += `<button type="button" class="action-btn stop-btn" data-action="stop" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Stop this running item">stop</button>`;
 
     const startedIso = it.started_at_iso || '';
-    const ageLabel = (isStarting && !isWorkload) ? 'registered' : 'running';
+    const ageLabel = (isStarting && !isWorkload && !isHostjob) ? 'registered' : 'running';
     let ageBlock = '';
     ageBlock += `<span ${startedIso ? `data-local-time-iso="${attr(startedIso)}" data-local-time-title-only` : ''} title="${attr(startedIso)}">${esc(ageLabel)} ${esc(it.age)}</span>`;
     ageBlock += '<span class="sep">·</span>';
-    if (isWorkload) {
+    if (isHostjob) {
+      ageBlock += `<span title="hostjob output tail for ${attr(hostjobLabel)}">hostjob ${esc(hostjobLabel)}</span>`;
+    } else if (isWorkload) {
       ageBlock += `<span title="workload output tail: /tmp/claude-workloads/${attr(workloadLabel)}.output">workload ${esc(workloadLabel)}</span>`;
     } else if (isStarting) {
       ageBlock += '<span class="agent-spawning" title="queue item registered, waiting for agent\'s first JSONL event"><span class="spinner" aria-hidden="true"></span>agent spawning…</span>';
@@ -322,7 +337,7 @@
     }
 
     return (
-      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr} ${logModeAttr}>` +
+      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr}${hostjobAttr} ${logModeAttr}>` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       `<div class="age">${ageBlock}</div>` +
