@@ -116,10 +116,16 @@ WORKLOAD_LOG_DIR = os.environ.get("WORKLOAD_LOG_DIR", "/workloads")
 #   ~/.cache/hostjob/<label>/heartbeat  (progress heartbeat, optional)
 # NOTE the layout differs from workload's flat `<label>.output`: hostjob
 # nests the log file inside a per-label dir, so the tail path is
-# `<HOSTJOB_LOG_DIR>/<label>/log`. The host path is ~/.cache/hostjob; the
-# container bind-mounts it read-only at /hostjobs. Override via
-# HOSTJOB_LOG_DIR.
-HOSTJOB_LOG_DIR = os.environ.get("HOSTJOB_LOG_DIR", "/hostjobs")
+# `<HOSTJOB_LOG_DIR>/<label>/log`. The default is the hostjob runner's
+# own STATE_ROOT, `~/.cache/hostjob` (expanded at import time), so the
+# per-label log resolves to `~/.cache/hostjob/<label>/log`. This dir must
+# be readable by the minisite process; if the minisite runs in a
+# container, bind-mount the host's `~/.cache/hostjob` into it (there is no
+# `/hostjobs` mount). Override the location via HOSTJOB_LOG_DIR.
+HOSTJOB_LOG_DIR = os.environ.get(
+    "HOSTJOB_LOG_DIR",
+    os.path.join(os.path.expanduser("~"), ".cache", "hostjob"),
+)
 # Label format: same as queue-id-ish — letters, digits, dots, dashes,
 # underscores. Path-traversal guard for the tail endpoint. Shared by both
 # the workload and hostjob label extractors / tail endpoints.
