@@ -449,6 +449,15 @@ services:
       # live-log modal tails <HOSTJOB_LOG_DIR>/<label>/log for running queue
       # items whose scope is `hostjob:<label>`. Bind-mounted read-only below.
       HOSTJOB_LOG_DIR: /hostjobs
+      # Authoritative agent_id -> queue_id bindings, written by the host's
+      # `post-tool-agent-arm-hook` PostToolUse hook. The minisite reads this
+      # to build the REAL hierarchical subagent tree (group each subagent
+      # under the item that actually dispatched it; drop the self-nested
+      # owner; collapse retry siblings). This file lives under
+      # ~/.config/claude, which is ALREADY bind-mounted below (the
+      # obligations write path) — so no new mount is required; this env var
+      # just points the loader at the in-container path explicitly.
+      AGENT_QUEUE_BINDINGS_JSON: /queue-home/.config/claude/agent-queue-bindings.json
     volumes:
       # session-task queue.json — rw because the Stop button mutates it
       # via session-task (atomic tmp+rename + flock).
@@ -465,7 +474,10 @@ services:
       # the claude-container mount above; both containers see the same bytes.
       - "${CW_STATE_PATH:-claude-watch-state}:/agents-state:ro"
       # Host obligations.json — rw because the Force-start button
-      # registers a hard-gate row that the host main loop reads.
+      # registers a hard-gate row that the host main loop reads. This same
+      # dir also carries agent-queue-bindings.json (written by the host's
+      # post-tool-agent-arm-hook), which the minisite reads to build the
+      # real hierarchical subagent tree — see AGENT_QUEUE_BINDINGS_JSON above.
       - "${HOME}/.config/claude:/queue-home/.config/claude:rw"
       # Canonical session-task script — bind-mounted read-only so the
       # container always runs the upstream version. Path is relative to
