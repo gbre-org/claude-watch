@@ -198,5 +198,59 @@ class HostjobMinisiteTest(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class HostjobLogDirDefaultTest(unittest.TestCase):
+    """Regression for the live-log RECONNECTING bug: the minisite defaulted
+    HOSTJOB_LOG_DIR to a non-existent `/hostjobs` bind-mount, so the hostjob
+    tail built `/hostjobs/<label>/log` and got stuck emitting
+    `open-failed: [Errno 2] No such file or directory`. The correct default
+    is the hostjob runner's STATE_ROOT, `~/.cache/hostjob`.
+
+    Does its OWN isolated env setup/teardown (separate from
+    HostjobMinisiteTest, which always sets HOSTJOB_LOG_DIR and so never
+    exercised the buggy default).
+    """
+
+    def setUp(self):
+        self._saved_environ = dict(os.environ)
+        self._saved_modules = {
+            m: sys.modules[m] for m in ("app", "claude_agents") if m in sys.modules
+        }
+        self.tmp = tempfile.mkdtemp(prefix="qmin-hostjob-default-")
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._saved_environ)
+        for m in ("app", "claude_agents"):
+            sys.modules.pop(m, None)
+        sys.modules.update(self._saved_modules)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_default_resolves_to_cache_hostjob(self):
+        # Fresh HOME, HOSTJOB_LOG_DIR UNSET — exercise the module-level default.
+        os.environ["HOME"] = self.tmp
+        os.environ.pop("HOSTJOB_LOG_DIR", None)
+        Path(self.tmp, ".config/session").mkdir(parents=True, exist_ok=True)
+        Path(self.tmp, ".config/claude").mkdir(parents=True, exist_ok=True)
+        os.environ["PINGME_SESSION_TASK"] = "0"
+        os.environ["CLAUDE_EVENT_SESSION_TASK"] = "0"
+        os.environ["QUEUE_JSON"] = str(Path(self.tmp) / ".config/session/queue.json")
+        os.environ["SESSION_TASK_BIN"] = str(SESSION_TASK)
+
+        sys.path.insert(0, str(HERE))
+        for mod in ("app", "claude_agents"):
+            sys.modules.pop(mod, None)
+        import app as appmod  # noqa: E402
+
+        expected = os.path.join(os.path.expanduser("~"), ".cache", "hostjob")
+        self.assertEqual(
+            appmod.HOSTJOB_LOG_DIR, expected,
+            f"default HOSTJOB_LOG_DIR should be ~/.cache/hostjob, "
+            f"got {appmod.HOSTJOB_LOG_DIR!r}",
+        )
+        # The original bug: defaulting to the bogus /hostjobs bind-mount.
+        self.assertNotEqual(appmod.HOSTJOB_LOG_DIR, "/hostjobs")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
