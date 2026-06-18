@@ -72,6 +72,27 @@ AGENT_STATE_PATH = os.environ.get(
 AGENTS_JSONL_ROOT = os.environ.get(
     "AGENTS_JSONL_ROOT", "/agents-jsonl"
 )
+# Authoritative agent_id -> queue_id bindings, written by the
+# ``post-tool-agent-arm-hook`` PostToolUse hook every time the main loop
+# (or a subagent) successfully fires an Agent tool call. Shape on disk::
+#
+#     {"bindings": {"<agent_id>": {"queue_id": "q-XXXX",
+#                                  "registered_at": <int>, ...}, ...}}
+#
+# This is the SOURCE OF TRUTH for "which queue item dispatched which
+# agent" — strictly better than re-parsing the ``Queue item: q-XXXX``
+# marker out of each subagent's transcript (which the prior tree did and
+# which mis-attributed an item's own owner + retry siblings UNDER the
+# item, producing a bogus one-level self-nesting). The host already
+# bind-mounts ``~/.config/claude`` into the container (the obligations
+# write path), so this file is reachable at the default path below with
+# no new mount required; we still surface an explicit env override for
+# clarity + tests. Fail-soft: a missing / corrupt file yields ``{}`` and
+# the tree falls back to the transcript-marker attribution.
+AGENT_QUEUE_BINDINGS_PATH = os.environ.get(
+    "AGENT_QUEUE_BINDINGS_JSON",
+    "/queue-home/.config/claude/agent-queue-bindings.json",
+)
 # Persistent archive directory for spawning-subagent transcripts. The
 # vendored session-task `_archive_agent_transcript` copies the active
 # JSONL into this directory at queue-done / queue-abandon time and
@@ -343,6 +364,49 @@ def _load_agent_state() -> dict[str, dict[str, Any]]:
     return _agents_by_qid(_load_state(AGENT_STATE_PATH))
 
 
+def _load_agent_queue_bindings() -> dict[str, str]:
+    """Map ``agent_id -> queue_id`` from the arm-hook bindings file.
+
+    Reads ``AGENT_QUEUE_BINDINGS_PATH`` (written by
+    ``post-tool-agent-arm-hook``) and flattens the nested record shape
+    ``{"bindings": {aid: {"queue_id": qid, ...}}}`` to a flat
+    ``{aid: qid}`` lookup. This is the AUTHORITATIVE parent-attribution
+    signal the subagent tree groups on — see ``_build_subagent_tree``.
+
+    Fail-soft: returns ``{}`` on missing file, unreadable file, bad JSON,
+    or any unexpected shape. The tree degrades to transcript-marker
+    attribution when the map is empty, so a missing mount never blanks
+    the tree.
+    """
+    try:
+        raw = Path(AGENT_QUEUE_BINDINGS_PATH).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    bindings = data.get("bindings")
+    if not isinstance(bindings, dict):
+        return {}
+    out: dict[str, str] = {}
+    for aid, rec in bindings.items():
+        if not isinstance(aid, str):
+            continue
+        if isinstance(rec, dict):
+            qid = rec.get("queue_id")
+        elif isinstance(rec, str):
+            # Tolerate a flat {aid: qid} shape too (forward-compat / tests).
+            qid = rec
+        else:
+            qid = None
+        if isinstance(qid, str) and _QUEUE_ID_RE.match(qid):
+            out[aid] = qid
+    return out
+
+
 def _classify_owner(
     item: dict[str, Any],
     now: datetime,
@@ -563,6 +627,7 @@ def _shape(
     now: datetime,
     agent_by_qid: dict[str, dict[str, Any]],
     items: list[dict[str, Any]] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     status = item.get("status", "unknown")
     created = _parse_iso(item.get("created_at"))
@@ -694,28 +759,27 @@ def _shape(
         # a distinct pill + suppress orphan badging during the window.
         shaped["is_starting"] = bool(owner.get("is_starting"))
         # Nested subagent tree -- for running items with a known owner
-        # agent, resolve the owner's parent main-loop session and list
-        # its subagents, then keep only the ones belonging to THIS queue
-        # item. ``_list_session_subagents`` returns every subagent in the
-        # owner's session (it can't tell items apart on its own); each
-        # record carries a ``queue_id`` parsed from the spawn-prompt
-        # ``Queue item: q-XXXX`` marker, so we filter here. The dir walk is
-        # cheap (running items are few) and fail-soft.
-        subagents: list[dict[str, Any]] = []
+        # agent, resolve the owner's parent main-loop session, enumerate
+        # the session's subagent transcripts, then build the REAL tree via
+        # the authoritative agent_id -> queue_id bindings. See
+        # ``_build_subagent_tree`` for the attribution rules (drop the
+        # self-nested owner, collapse retry-attempts, surface genuine
+        # children). The dir walk is cheap (running items are few) and
+        # fail-soft.
+        session_subagents: list[dict[str, Any]] = []
         owner_agent_id = owner.get("agent_id") or ""
         if owner_agent_id:
             session_id = _session_id_for_subagent(owner_agent_id)
             if session_id:
-                subagents = _list_session_subagents(session_id)
-        # Filter the session-wide list down to this item's own subagents.
-        # Only apply the strict filter when at least one sibling carries a
-        # parseable q-id marker: if NONE do (older transcripts predating
-        # the marker), fall back to the unfiltered list rather than render
-        # a silently-empty tree.
+                session_subagents = _list_session_subagents(session_id)
         iid = item.get("id", "")
-        if any(s.get("queue_id") for s in subagents):
-            subagents = [s for s in subagents if s.get("queue_id") == iid]
-        shaped["subagents"] = subagents
+        # Bindings map is loaded once per render pass and threaded in; load
+        # lazily here for legacy callers that don't pass it (e.g. the /meta
+        # endpoint can pass None and we read the file directly).
+        bmap = bindings if bindings is not None else _load_agent_queue_bindings()
+        shaped["subagents"] = _build_subagent_tree(
+            iid, owner_agent_id, session_subagents, bmap
+        )
     else:
         shaped["is_starting"] = False
         shaped["subagents"] = []
@@ -821,13 +885,17 @@ def _render_payload() -> dict[str, Any]:
     items = data.get("items", []) if isinstance(data, dict) else []
     now = datetime.now(timezone.utc)
     agent_by_qid = _load_agent_state()
+    # Authoritative agent_id -> queue_id bindings, loaded ONCE per render
+    # pass (not per item) and threaded into _shape so the subagent-tree
+    # builder doesn't re-stat the bindings file for every running item.
+    bindings = _load_agent_queue_bindings()
 
     running, pending, blocked, done, abandoned = [], [], [], [], []
     for it in items:
         # Pass the full items list so _shape can compute ready_now
         # (depends_on resolution requires the full graph) and decorate
         # depends_on_status per-edge.
-        s = _shape(it, now, agent_by_qid, items=items)
+        s = _shape(it, now, agent_by_qid, items=items, bindings=bindings)
         st = s["status"]
         if st == "running":
             running.append(s)
@@ -1905,6 +1973,109 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
         )
     out.sort(key=lambda r: r["age_seconds"])  # most-recently-active first
     return out
+
+
+def _build_subagent_tree(
+    item_id: str,
+    owner_agent_id: str,
+    session_subagents: list[dict[str, Any]],
+    bindings: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Shape a running item's REAL subagent tree from authoritative bindings.
+
+    ``session_subagents`` is the flat per-session list from
+    ``_list_session_subagents`` (every ``agent-*.jsonl`` under the owner's
+    parent main-loop session). ``bindings`` is ``agent_id -> queue_id`` from
+    ``_load_agent_queue_bindings`` (the arm-hook source of truth).
+
+    The PRIOR tree parsed the ``Queue item: q-XXXX`` marker out of each
+    transcript and kept every subagent whose marker == ``item_id``. Because
+    the main loop dispatches EACH queue item AS an Agent, that marker is the
+    item's OWN id on the owner agent's transcript — so the item nested its
+    own owner agent (and any retry siblings re-dispatched for the same id)
+    UNDER itself. That produced a bogus one-level "tree" that was really
+    just the item pointing at itself.
+
+    The fix, using the authoritative bindings:
+
+      * **Authoritative attribution** — each subagent's owning queue id is
+        ``bindings[agent_id]`` (falls back to the transcript-parsed marker
+        ``queue_id`` only when the binding is missing, e.g. a transcript
+        predating the arm-hook).
+      * **Drop the self-nested owner** — the ``owner_agent_id`` agent IS
+        this item's live dispatch; it represents the item itself, not a
+        child of it, so it is never emitted as a child node.
+      * **Collapse retry-siblings** — other agents bound to ``item_id`` are
+        earlier dispatch attempts of the SAME item (the main loop
+        re-fired the Agent after an abandon / crash). They are NOT distinct
+        children; we emit them as ``kind="attempt"`` nodes labeled
+        ``attempt N`` (oldest = attempt 1) rather than as separate work.
+      * **Genuine children** — agents bound to a DIFFERENT queue id are
+        their own queue items (each renders its own top-level card), so we
+        do NOT duplicate them under this card. The honest on-disk layout is
+        flat-per-session (see the module comment above
+        ``_session_id_for_subagent``); we cannot reconstruct a deeper
+        agent->agent spawn edge, so we don't fabricate one.
+
+    Returns a list of node dicts. Each node carries the same display keys
+    the template/refresh.js expect (``subagent_id``, ``label``, ``age``,
+    ``age_seconds``, ``queue_id``) plus:
+
+      * ``kind``     — ``"attempt"`` for a collapsed prior dispatch attempt.
+      * ``attempt``  — 1-based attempt ordinal (attempt nodes only).
+      * ``children`` — nested node list (always present, possibly empty) so
+        the recursive template has a uniform shape to walk.
+
+    Fail-soft fallback: when NO subagent has either a binding or a parsed
+    marker (pre-arm-hook transcripts), keep the prior unfiltered behaviour
+    rather than render a silently-empty tree — but STILL drop the owner so
+    the self-nesting bug can't resurface even in fallback mode.
+    """
+    def _auth_qid(sa: dict[str, Any]) -> str:
+        aid = sa.get("subagent_id", "")
+        b = bindings.get(aid, "")
+        if b:
+            return b
+        return sa.get("queue_id", "") or ""
+
+    # Did ANY sibling carry an attributable owning-item signal?
+    have_attribution = any(_auth_qid(sa) for sa in session_subagents)
+
+    if not have_attribution:
+        # Pre-arm-hook fallback: no bindings + no markers anywhere. Keep the
+        # session list but still drop the owner (it's the item, not a child)
+        # so we never re-introduce the self-nest. Annotate children=[] for
+        # the recursive renderer.
+        nodes: list[dict[str, Any]] = []
+        for sa in session_subagents:
+            if sa.get("subagent_id") == owner_agent_id:
+                continue
+            node = dict(sa)
+            node.setdefault("queue_id", "")
+            node["kind"] = node.get("kind", "child")
+            node["children"] = []
+            nodes.append(node)
+        return nodes
+
+    # Authoritative path: keep only the agents bound to THIS item, drop the
+    # owner, and label the remaining same-item agents as retry attempts.
+    own: list[dict[str, Any]] = [
+        sa
+        for sa in session_subagents
+        if _auth_qid(sa) == item_id and sa.get("subagent_id") != owner_agent_id
+    ]
+    # Oldest first so attempt numbering reads chronologically (attempt 1 =
+    # earliest dispatch). ``session_subagents`` came in most-recent-first.
+    own.sort(key=lambda sa: sa.get("age_seconds", 0.0), reverse=True)
+    nodes = []
+    for idx, sa in enumerate(own, start=1):
+        node = dict(sa)
+        node["queue_id"] = item_id
+        node["kind"] = "attempt"
+        node["attempt"] = idx
+        node["children"] = []
+        nodes.append(node)
+    return nodes
 
 
 def _format_sse(data: dict[str, Any]) -> bytes:

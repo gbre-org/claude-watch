@@ -53,6 +53,23 @@ Currently seeded rows:
     (``/usr/local/bin/eval-queue-ready-unspawned``) denies Bash calls
     when ready-but-unspawned items exist. Default-open on errors.
 
+MAIN-LOOP SCOPING: the four evaluator-backed rows above
+(``no_grep_watcher_output``, ``event_must_act``, ``agent_ack_pending``,
+``queue_ready_unspawned``) are all conceptually MAIN-LOOP ONLY -- they gate
+on state that only the main loop owns (watcher output it must read in full,
+event triage, pending agent-ack bookkeeping, ready-queue spawning). They MUST
+NOT fire inside a subagent. The ``evaluator`` predicate alone has no
+main-loop scoping, so each is wrapped in
+``all_of [is_main_loop {}, evaluator]`` via
+``_main_loop_only_evaluator_params()``: in a subagent the ``is_main_loop``
+child fails and short-circuits the all_of to inactive (the gate does not
+fire); in the main loop it passes and the evaluator decides. This mirrors
+``subagent_queue_item_running`` (which uses the INVERSE
+``is_main_loop {negate: true}`` to fire ONLY in subagents). Without the guard
+a bare evaluator row fired inside subagent contexts, letting a subagent block
+itself over -- and then clobber -- the main loop's pending-ack / event /
+queue state.
+
 The script is best-effort: any failure (missing CLI, broken state file,
 permission error) is logged to stderr but exits 0 so the entrypoint
 keeps going. The whole obligations system is default-open on internal
@@ -149,6 +166,49 @@ def _row_already_present(cli: str, tag: str) -> bool:
     return False
 
 
+def _main_loop_only_evaluator_params(eval_cmd: str) -> dict:
+    """Return ``all_of`` params wrapping an ``evaluator`` predicate behind an
+    ``is_main_loop`` scope-guard so the gate fires ONLY in the main loop.
+
+    This is the canonical "main-loop only enforce X" wiring documented in the
+    obligations CLI docstring (and mirrored by ``seed_subagent_queue_item_running``,
+    which uses the INVERSE ``is_main_loop {negate: true}`` to fire only in
+    SUBAGENTS). Inside an ``all_of``, a FAILING ``is_main_loop`` child
+    short-circuits the whole ``all_of`` to "inactive" (satisfied=True):
+
+      - Subagent (hook payload carries an ``agent_id``): ``is_main_loop`` FAILS
+        -> all_of short-circuits to inactive -> gate does NOT fire. Subagents
+        bypass entirely. This is the bug fix -- without the guard, the bare
+        ``evaluator`` row fired inside subagent contexts, blocking a subagent
+        over the MAIN loop's pending-ack / event / queue state (state the
+        subagent does not own and must not mutate).
+
+      - Main loop (no ``agent_id``): ``is_main_loop`` PASSES -> the all_of
+        proceeds to the ``evaluator`` child -> the gate fires iff the
+        evaluator denies. Unchanged from the previous behavior in the main
+        loop.
+
+    NOTE: ``is_main_loop`` takes NO ``negate`` here -- plain ``is_main_loop``
+    is satisfied in the main loop, so it is the correct precondition gate for
+    "main-loop only". (``subagent_queue_item_running`` wants the opposite, so
+    it uses ``negate: true``.)
+    """
+    return {
+        "predicates": [
+            {"kind": "is_main_loop", "params": {}},
+            {
+                "kind": "evaluator",
+                "params": {
+                    "cmd": eval_cmd,
+                    "timeout_ms": 5000,
+                    "stdin_field": "tool_input.command",
+                    "decision_mode": "exit_code",
+                },
+            },
+        ]
+    }
+
+
 def seed_subagent_queue_item_running(cli: str, *, dry_run: bool = False,
                                        force: bool = False,
                                        verbose: bool = False) -> int:
@@ -232,17 +292,19 @@ def seed_no_grep_watcher_output(cli: str, *, dry_run: bool = False,
     # exits 0 (allow) or 1 (deny). Only scoped to the main loop
     # (subagents reading their own task output is fine; the main loop
     # should read ALL output unfiltered).
-    predicate_params = {
-        "cmd": "/usr/local/bin/eval-no-grep-watcher-output",
-        "timeout_ms": 5000,
-        "stdin_field": "tool_input.command",
-        "decision_mode": "exit_code",
-    }
+    # Main-loop ONLY: wrap the evaluator behind an is_main_loop
+    # scope-guard inside all_of so this gate NEVER fires inside a
+    # subagent context (which carries an agent_id). A bare evaluator
+    # row (no guard) fired in subagents, letting a subagent clobber
+    # the MAIN loop's state it does not own. See
+    # _main_loop_only_evaluator_params().
+    predicate_params = _main_loop_only_evaluator_params(
+        "/usr/local/bin/eval-no-grep-watcher-output")
 
     cmd = [
         cli, "add",
         "--tool-pattern", "Bash",
-        "--predicate", "evaluator",
+        "--predicate", "all_of",
         "--params", json.dumps(predicate_params),
         "--ttl", "0",  # non-expiring
         "--enforcement", "gate",
@@ -294,17 +356,19 @@ def seed_event_must_act(cli: str, *, dry_run: bool = False,
     # The evaluator script checks pending-actions.json and denies if
     # non-empty. Only scoped to the main loop (subagents don't need
     # this gate — they work on delegated tasks, not event triage).
-    predicate_params = {
-        "cmd": "/usr/local/bin/eval-event-must-act",
-        "timeout_ms": 5000,
-        "stdin_field": "tool_input.command",
-        "decision_mode": "exit_code",
-    }
+    # Main-loop ONLY: wrap the evaluator behind an is_main_loop
+    # scope-guard inside all_of so this gate NEVER fires inside a
+    # subagent context (which carries an agent_id). A bare evaluator
+    # row (no guard) fired in subagents, letting a subagent clobber
+    # the MAIN loop's state it does not own. See
+    # _main_loop_only_evaluator_params().
+    predicate_params = _main_loop_only_evaluator_params(
+        "/usr/local/bin/eval-event-must-act")
 
     cmd = [
         cli, "add",
         "--tool-pattern", "Bash",
-        "--predicate", "evaluator",
+        "--predicate", "all_of",
         "--params", json.dumps(predicate_params),
         "--ttl", "0",  # non-expiring
         "--enforcement", "gate",
@@ -357,17 +421,19 @@ def seed_agent_ack_pending(cli: str, *, dry_run: bool = False,
     # pending entries exist past the N-counter threshold. Only scoped to
     # the main loop (subagents don't receive task-notifications for other
     # agents).
-    predicate_params = {
-        "cmd": "/usr/local/bin/eval-agent-ack-pending",
-        "timeout_ms": 5000,
-        "stdin_field": "tool_input.command",
-        "decision_mode": "exit_code",
-    }
+    # Main-loop ONLY: wrap the evaluator behind an is_main_loop
+    # scope-guard inside all_of so this gate NEVER fires inside a
+    # subagent context (which carries an agent_id). A bare evaluator
+    # row (no guard) fired in subagents, letting a subagent clobber
+    # the MAIN loop's state it does not own. See
+    # _main_loop_only_evaluator_params().
+    predicate_params = _main_loop_only_evaluator_params(
+        "/usr/local/bin/eval-agent-ack-pending")
 
     cmd = [
         cli, "add",
         "--tool-pattern", "Bash",
-        "--predicate", "evaluator",
+        "--predicate", "all_of",
         "--params", json.dumps(predicate_params),
         "--ttl", "0",  # non-expiring
         "--enforcement", "gate",
@@ -419,17 +485,19 @@ def seed_queue_ready_unspawned(cli: str, *, dry_run: bool = False,
     # The evaluator script checks session-task queue list for items with
     # status=pending and ready_now=true, and denies if any exist. Only
     # scoped to the main loop (subagents don't manage the queue dispatch).
-    predicate_params = {
-        "cmd": "/usr/local/bin/eval-queue-ready-unspawned",
-        "timeout_ms": 5000,
-        "stdin_field": "tool_input.command",
-        "decision_mode": "exit_code",
-    }
+    # Main-loop ONLY: wrap the evaluator behind an is_main_loop
+    # scope-guard inside all_of so this gate NEVER fires inside a
+    # subagent context (which carries an agent_id). A bare evaluator
+    # row (no guard) fired in subagents, letting a subagent clobber
+    # the MAIN loop's state it does not own. See
+    # _main_loop_only_evaluator_params().
+    predicate_params = _main_loop_only_evaluator_params(
+        "/usr/local/bin/eval-queue-ready-unspawned")
 
     cmd = [
         cli, "add",
         "--tool-pattern", "Bash",
-        "--predicate", "evaluator",
+        "--predicate", "all_of",
         "--params", json.dumps(predicate_params),
         "--ttl", "0",  # non-expiring
         "--enforcement", "gate",
