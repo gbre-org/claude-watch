@@ -1567,8 +1567,11 @@ body.modal-open { overflow: hidden; }
 .subagent-list {
   list-style: none;
   /* Indent the child list under the caret so the tree visibly nests beneath
-   * its summary; the left border is the tree's "trunk". One level deep only
-   * (running item -> its session's subagents) — see refresh.js / index.html. */
+   * its summary; the left border is the tree's "trunk". Subagents are
+   * attributed to their owning queue item via the authoritative
+   * agent->item bindings (see app.py _build_subagent_tree); the renderer is
+   * recursive (subagent_node macro / renderSubagentNode) so nested
+   * .subagent-children lists indent another level under their parent node. */
   margin: 6px 0 0 0.55em;
   padding-left: 12px;
   border-left: 2px solid var(--line);
@@ -1577,14 +1580,40 @@ body.modal-open { overflow: hidden; }
   gap: 4px;
 }
 
+/* Nested child list inside a node — full-width new row beneath the node's
+ * own id/label/age line (the parent .subagent-node is flex-wrap), indented
+ * one more level via the same trunk border. */
+.subagent-children {
+  flex-basis: 100%;
+  margin-top: 4px;
+}
+
 .subagent-node {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: 8px;
   padding: 3px 6px;
   border-radius: 3px;
   cursor: pointer;
   font-size: 0.78rem;
+}
+
+/* A collapsed prior dispatch attempt of the same queue item (the live
+ * owner is dropped server-side; earlier attempts surface as attempt N). */
+.subagent-node.subagent-attempt {
+  opacity: 0.8;
+}
+
+.subagent-attempt-badge {
+  flex: 0 0 auto;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--line);
+  color: var(--fg-muted, #93a1a1);
 }
 
 .subagent-node:hover,
