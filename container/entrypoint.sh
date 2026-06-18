@@ -256,7 +256,11 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     # Fix: write a project-tier `.mcp.json` inside CLAUDE_HOST_PROJECT_DIR.
     # Project tier IS in `--setting-sources project,local`, and
     # `.mcp.json` is Claude Code's standard project-level MCP config
-    # file. The helper wraps each server's `command` with
+    # file. (These project servers are AUTO-APPROVED via the shim's
+    # `enableAllProjectMcpServers: true` — written by
+    # generate-hooks-shim-settings above unless CLAUDE_MCP_AUTOAPPROVE=0 —
+    # so they connect instead of showing ⏸ "Pending approval".)
+    # The helper wraps each server's `command` with
     # /usr/local/bin/exec-hook so cross-arch host binaries (Mac
     # Mach-O, etc.) silently no-op instead of spamming "Exec format
     # error" on each invocation.

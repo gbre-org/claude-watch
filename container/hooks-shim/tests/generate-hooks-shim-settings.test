@@ -52,6 +52,7 @@ def run_helper(
     patterns: str | None = None,
     env_patterns: str | None = None,
     inject_obligations: bool = False,
+    mcp_autoapprove: bool = False,
 ) -> tuple[str, str]:
     cmd = [str(SCRIPT), "--input", input_path, "--output", output_path, "--quiet"]
     if patterns is not None:
@@ -60,6 +61,12 @@ def run_helper(
     # rewrite-only path stays inspectable. Production callers (entrypoint.sh)
     # pass --inject-obligations explicitly via $CLAUDE_CONTAINER_OBLIGATIONS.
     cmd += ["--inject-obligations", "1" if inject_obligations else "0"]
+    # Default to NOT auto-approving project MCP servers in this shared
+    # helper so the rewrite-only equality assertions (exact-dict compares)
+    # stay clean. Production default is ON; the dedicated mcp-autoapprove
+    # tests below exercise the default-on / opt-out behavior via
+    # _run_helper_mcp().
+    cmd += ["--mcp-autoapprove", "1" if mcp_autoapprove else "0"]
     env = dict(os.environ)
     # Always wipe CLAUDE_SHIM_PATTERNS so a host-set value doesn't leak
     # into tests that don't explicitly opt in.
@@ -68,6 +75,9 @@ def run_helper(
     # override the explicit per-test default above.
     env.pop("CLAUDE_CONTAINER_OBLIGATIONS", None)
     env.pop("CLAUDE_SHIM_OBLIGATIONS_ONLY", None)
+    # And the MCP auto-approve env var (explicit flag above already wins,
+    # but wipe for hygiene / clarity).
+    env.pop("CLAUDE_MCP_AUTOAPPROVE", None)
     if env_patterns is not None:
         env["CLAUDE_SHIM_PATTERNS"] = env_patterns
     result = subprocess.run(
@@ -849,6 +859,111 @@ def test_obligations_only_writes_output_with_missing_input() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Project MCP auto-approve (--mcp-autoapprove / CLAUDE_MCP_AUTOAPPROVE)
+# ---------------------------------------------------------------------------
+
+
+def _run_helper_mcp(
+    input_path: str,
+    output_path: str,
+    mcp_autoapprove: str | None = None,
+    env_autoapprove: str | None = None,
+) -> None:
+    """Run the helper exercising the --mcp-autoapprove flag / env var.
+
+    `mcp_autoapprove` (when not None) is passed as the CLI flag value;
+    `env_autoapprove` (when not None) is set in CLAUDE_MCP_AUTOAPPROVE.
+    Both default to NOT setting them so the helper's own default applies.
+    """
+    cmd = [str(SCRIPT), "--input", input_path, "--output", output_path,
+           "--quiet", "--inject-obligations", "0"]
+    if mcp_autoapprove is not None:
+        cmd += ["--mcp-autoapprove", mcp_autoapprove]
+    env = dict(os.environ)
+    env.pop("CLAUDE_SHIM_PATTERNS", None)
+    env.pop("CLAUDE_CONTAINER_OBLIGATIONS", None)
+    env.pop("CLAUDE_SHIM_OBLIGATIONS_ONLY", None)
+    # Wipe any host-set CLAUDE_MCP_AUTOAPPROVE so it doesn't leak into the
+    # default-behavior tests; re-set it only when env_autoapprove is given.
+    env.pop("CLAUDE_MCP_AUTOAPPROVE", None)
+    if env_autoapprove is not None:
+        env["CLAUDE_MCP_AUTOAPPROVE"] = env_autoapprove
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"helper exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
+def test_mcp_autoapprove_on_by_default() -> None:
+    """No --mcp-autoapprove flag + no env var → key written as true."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {}})
+        _run_helper_mcp(str(inp), str(out))
+        result = load_output(out)
+        expect(
+            result.get("enableAllProjectMcpServers") is True,
+            f"mcp-autoapprove: key should default to true, got "
+            f"{result.get('enableAllProjectMcpServers')!r}",
+        )
+
+
+def test_mcp_autoapprove_disabled_via_flag() -> None:
+    """--mcp-autoapprove 0 → key omitted entirely."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {}})
+        _run_helper_mcp(str(inp), str(out), mcp_autoapprove="0")
+        result = load_output(out)
+        expect(
+            "enableAllProjectMcpServers" not in result,
+            f"mcp-autoapprove: --mcp-autoapprove 0 should omit the key, got "
+            f"{result.get('enableAllProjectMcpServers')!r}",
+        )
+
+
+def test_mcp_autoapprove_disabled_via_env() -> None:
+    """CLAUDE_MCP_AUTOAPPROVE=0 (no flag) → key omitted entirely."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {}})
+        _run_helper_mcp(str(inp), str(out), env_autoapprove="0")
+        result = load_output(out)
+        expect(
+            "enableAllProjectMcpServers" not in result,
+            f"mcp-autoapprove: CLAUDE_MCP_AUTOAPPROVE=0 should omit the key, "
+            f"got {result.get('enableAllProjectMcpServers')!r}",
+        )
+
+
+def test_mcp_autoapprove_preserves_other_keys() -> None:
+    """The auto-approve key is added alongside hook rewrites + other top-
+    level keys, not in place of them."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "env": {"FOO": "bar"},
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/p/x"}]}]},
+        })
+        _run_helper_mcp(str(inp), str(out))
+        result = load_output(out)
+        expect(result.get("enableAllProjectMcpServers") is True,
+               "mcp-autoapprove+keys: auto-approve key should be present")
+        expect(result.get("env") == {"FOO": "bar"},
+               "mcp-autoapprove+keys: unrelated env key must survive")
+        expect(result["hooks"]["Stop"][0]["hooks"][0]["command"] == f"{EXEC_HOOK} /p/x",
+               "mcp-autoapprove+keys: hooks still wrapped alongside the key")
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -970,6 +1085,10 @@ TESTS = [
     test_obligations_only_drops_host_hooks,
     test_obligations_disabled_via_flag,
     test_obligations_only_writes_output_with_missing_input,
+    test_mcp_autoapprove_on_by_default,
+    test_mcp_autoapprove_disabled_via_flag,
+    test_mcp_autoapprove_disabled_via_env,
+    test_mcp_autoapprove_preserves_other_keys,
 ]
 
 for t in TESTS:

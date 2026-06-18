@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for the four-tier event-must-act infrastructure
-(q-2026-05-21-856d refinement).
+"""Tests for the event-must-act tier infrastructure
+(q-2026-05-21-856d refinement). The event model is now three tiers
+(Ambient / Actionable / Unknown) after Signal docs were removed from
+baked-CLAUDE.md per operator policy.
 
 Asserts:
 
@@ -8,8 +10,8 @@ Asserts:
      expected shebang.
   2. Each script's --self-test (or equivalent) passes inline.
   3. The Dockerfile bakes each new script with a COPY + chmod +x.
-  4. baked-CLAUDE.md documents the four-tier model + the Signal-
-     distinct guarantee.
+  4. baked-CLAUDE.md documents the event-response tier model (now
+     three tiers; Signal docs removed per operator policy).
   5. obligations-init still seeds the event_must_act row (no
      regression vs v1).
   6. generate-hooks-shim-settings injects the
@@ -111,14 +113,20 @@ def test_dockerfile_bakes_scripts() -> None:
 
 # ---------------------------------------------------------------- 4
 
-def test_baked_claude_md_documents_four_tier() -> None:
+def test_baked_claude_md_documents_tier_model() -> None:
     md = BAKED_CLAUDE_MD.read_text()
-    expect("four-tier" in md.lower(),
-           "baked-CLAUDE.md must document 'four-tier' model")
+    # Signal docs were removed from baked-CLAUDE.md per operator policy
+    # (Signal is private operator config; it does not belong in the public
+    # claude-watch image docs). With the Signal Tier 3 section gone, the
+    # event model is now THREE tiers (Ambient / Actionable / Unknown), not
+    # four. Do NOT re-add Signal here; assert the post-removal reality.
+    expect("tier model" in md.lower(),
+           "baked-CLAUDE.md must document the event-response tier model")
     expect("Ambient" in md and "Actionable" in md,
            "baked-CLAUDE.md must name the Ambient + Actionable tiers")
-    expect("Signal" in md and "distinct" in md.lower(),
-           "baked-CLAUDE.md must call out Signal-distinct guarantee")
+    expect("Signal" not in md,
+           "baked-CLAUDE.md must NOT document Signal (removed per "
+           "operator policy)")
     expect("EVENT_MUST_ACT_N" in md,
            "baked-CLAUDE.md must document the $EVENT_MUST_ACT_N knob")
     expect("event-classify" in md,
@@ -448,7 +456,7 @@ def main() -> int:
         test_scripts_exist_and_executable,
         test_self_tests_pass,
         test_dockerfile_bakes_scripts,
-        test_baked_claude_md_documents_four_tier,
+        test_baked_claude_md_documents_tier_model,
         test_obligations_init_seeds_event_must_act,
         test_generator_injects_ambient_hook,
         test_audit_hooks_knows_new_names,

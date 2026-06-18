@@ -194,7 +194,7 @@ all that's needed.
 
 **Event watchers inside this container are scoped narrowly.**
 The container is a code-writing sandbox, not a host automation hub.
-Don't try to start signal watchers, torrent watchers, podcast watchers,
+Don't try to start torrent watchers, podcast watchers,
 or anything else from the host's resume-checklist playbook; the
 relevant tools and services aren't installed here. The baked watcher
 (`claude-event-watch`) covers the in-container event bus at
@@ -614,9 +614,6 @@ operator owns that surface, the primitive stays small).
 Use-case sketches (all separate obligation rows, all reusing this one
 primitive):
 
-  - Outbound Signal pronoun audit on `signal-send` invocations —
-    evaluator script parses the staged body, queries the local
-    members.json, denies on pronoun mismatch.
   - Dispatcher-quality reviewer on every `Agent` spawn — evaluator
     invokes an LLM-backed audit script that scores the prompt.
   - Security-classification triage on outbound `gh issue comment` —
@@ -1047,34 +1044,30 @@ see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
 **Common bridged MCP servers**:
 
 - **HTTP-bridge for cross-arch MCP binaries** —
-  `CLAUDE_MCP_HTTP_BRIDGE=name=url:other=url` rewrites a stdio MCP
-  server entry to Claude Code's native HTTP transport, so the
-  in-container claude dials a host-side adapter (e.g.
-  `http://host.docker.internal:8765/mcp`) instead of exec'ing a
-  cross-arch binary. The host adapter is the operator's job
-  (`mcp-proxy`, `mcphost`, etc.); the container only rewrites the
+  `CLAUDE_MCP_HTTP_BRIDGE=name=url:other=url` rewrites a stdio MCP server
+  entry to Claude Code's native HTTP transport, so the in-container claude
+  dials a host-side adapter (e.g. `http://host.docker.internal:8765/mcp`)
+  instead of exec'ing a cross-arch binary. The host adapter is the operator's
+  job (`mcp-proxy`, `mcphost`, etc.); the container only rewrites the
   in-container `.mcp.json`. Full surface in
   [container/README.md](/opt/claude-container/container/README.md#blast-radius).
 - **`host-bash`** — generic "run a safe command on the host" MCP server,
-  shipped as an off-the-shelf
+  an off-the-shelf
   [`cli-mcp-server`](https://github.com/MladenSU/cli-mcp-server) +
   [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) combo with an
-  env-var-driven allow-list. Default allow-list (`CW_PROFILE=corp-dev`,
-  the conservative read-only set):
-  `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, no shell operators,
-  `$HOME` boundary, 30s timeout. Trust-profile `CW_PROFILE=corp-dev-trusted`
-  widens this with host-scheduling tooling (see "Host-side scheduled
-  tasks" below). **Reach for host-bash as a normal tool, not a last
-  resort** — it's the supported way to do host-side work from inside
-  the container. If it's not available (`/mcp` doesn't list it), the
-  operator hasn't wired up the host-side launcher. See
+  env-var-driven allow-list. Default (`CW_PROFILE=corp-dev`, conservative
+  read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, no shell
+  operators, `$HOME` boundary, 30s timeout. `CW_PROFILE=corp-dev-trusted`
+  widens it with host-scheduling tooling (see "Host-side scheduled tasks").
+  **Reach for host-bash as a normal tool, not a last resort** — it's the
+  supported way to do host-side work from inside the container. If it's not
+  listed by `/mcp`, the operator hasn't wired the host-side launcher. See
   [examples/compose/bin/mcp-host-bash](/opt/claude-container/examples/compose/bin).
 
-  **Boundary discipline**: host-bash is a *window* to the host, not
-  the host. Report it as "I ran X on the host via host-bash" — not "I
-  ran X" (ambiguous) nor "I'm on the host" (false; you stay inside the
-  container). The in-container claude orchestrates; the host shell
-  executes. Keep that crisp so the operator knows where a command ran.
+  **Boundary discipline**: host-bash is a *window* to the host, not the
+  host. Report "I ran X on the host via host-bash" — not "I ran X"
+  (ambiguous) nor "I'm on the host" (false; you stay in the container). The
+  in-container claude orchestrates; the host shell executes.
 
 If `/mcp` shows "No MCP servers configured" inside the container, either
 `CLAUDE_CONTAINER_REWRITE_HOOKS` is off (so user-tier MCP discovery is
@@ -1082,32 +1075,51 @@ suppressed by-default — the host's `mcpServers` simply don't load), or
 the host's `~/.claude.json` has none defined.
 
 **"⏸ Pending approval" is NOT a hard block — VERIFY by calling a tool.**
-`claude mcp list` showing a server as "Pending approval (run `claude` to
-approve)" is a stale/misleading status line, not ground truth: the
-transport can be fully connected and its tools callable while the list
-still prints it. Do NOT idle waiting for an operator approval on that
-display alone. VERIFY by actually CALLING one of the server's tools (in
-this harness: load the deferred schema via ToolSearch `select:<tool>`,
-then run a cheap read-only command — e.g. host-bash `uname -s`). Only if
-the CALL ITSELF fails with a transport/auth error is the server genuinely
-down (then `/mcp` reauth is the fix). (2026-06-16: a fresh post-redeploy
-session saw all servers "Pending approval", treated it as a block, and
-idled ~30+ heartbeat cycles — the tools worked the whole time.)
+`claude mcp list` showing "Pending approval (run `claude` to approve)" is a
+stale/misleading status line, not ground truth: the transport can be fully
+connected and its tools callable while the list still prints it. Do NOT idle
+waiting for approval on that display alone. VERIFY by CALLING one of the
+server's tools (load the deferred schema via ToolSearch `select:<tool>`, then
+run a cheap read-only command — e.g. host-bash `uname -s`). Only if the CALL
+fails with a transport/auth error is the server genuinely down (then `/mcp`
+reauth is the fix). (2026-06-16: a fresh post-redeploy session saw all servers
+"Pending approval", treated it as a block, idled ~30+ heartbeat cycles — the
+tools worked the whole time.)
+
+*Cross-server triage*: `host-bash`/`mcp-adaptor`/`chrome-devtools` share the
+`host.docker.internal` transport but each has its OWN HTTP session/TTL. To
+tell a dead bridge from one expired session, CALL a SIBLING's tool (if
+`host-bash` errors, try `mcp-adaptor` `search`). Sibling answers => transport
+fine, only that server's session died — don't reauth/restart the whole stack.
+
+*Self-heal*: a server's HTTP session can expire while `claude mcp list` STILL
+lists it (config intact, NOT removed — no revert needed); the harness then
+delists its deferred tools (un-re-surfaceable via ToolSearch) and there's no
+in-loop reconnect. Recovery: `/mcp` if available; else, if you can't reconnect
+AND you're out of other useful work, **`/restart`** (MCP reconnects cleanly on
+restart — operator's standing instruction). Don't idle waiting for it.
+
+*Auto-approve is baked*: the shim `settings.json`
+(`generate-hooks-shim-settings`) writes `"enableAllProjectMcpServers": true`,
+so project `.mcp.json` servers are auto-approved and "Pending approval"
+should NOT appear in normal operation. If it DOES, the shim setting didn't
+take (check `CLAUDE_MCP_AUTOAPPROVE` isn't `0` + shim generation ran) — NOT an
+interactive approval to wait on. Opt out via `CLAUDE_MCP_AUTOAPPROVE=0`.
 
 ## Hooks
 
 The container ships [`exec-hook`](/opt/claude-container/container/hooks-shim/exec-hook),
-a safe-exec wrapper for `settings.json` hook commands whose target
-binary may not be Linux-native. It inspects magic bytes, exec's ELF /
-shebang-script targets transparently, and silently no-ops on Mach-O /
-unknown formats with one stderr heads-up per target per container
-lifetime (so cross-arch hook refs don't spam the log every event).
+a safe-exec wrapper for `settings.json` hook commands whose target binary may
+not be Linux-native. It inspects magic bytes, exec's ELF / shebang-script
+targets transparently, and silently no-ops on Mach-O / unknown formats with
+one stderr heads-up per target per container lifetime (so cross-arch hook refs
+don't spam the log every event).
 
 When `CLAUDE_CONTAINER_REWRITE_HOOKS=1`, the entrypoint generates a
 container-local copy of `~/.claude/settings.json` with every hook command
-wrapped in `exec-hook` and launches claude with
-`--setting-sources project,local --settings /tmp/claude-shim/settings.json`
-so the host file is never mutated.
+wrapped in `exec-hook` and launches claude with `--setting-sources
+project,local --settings /tmp/claude-shim/settings.json` so the host file is
+never mutated.
 
 **Realistic hook fate inside the container** (per hook event type):
 
@@ -1118,77 +1130,71 @@ so the host file is never mutated.
 | macOS Mach-O / Windows PE / unknown | silent no-op, exit 0 | One stderr line per unique target path per container lifetime. |
 | Missing file | silent no-op, exit 0 | Same dedup behavior. |
 
-**Implication for corporate telemetry hooks**: a Mac-host telemetry
-binary referenced from `~/.claude/settings.json` (typically under
-`~/.local/bin/`) by default **does not fire inside the container**.
-exec-hook detects the Mach-O and silently no-ops — the alternative
-("Exec format error" every hook event) is worse. If your team requires
-telemetry from container sessions, the options are:
+**Implication for corporate telemetry hooks**: a Mac-host telemetry binary
+referenced from `~/.claude/settings.json` (typically under `~/.local/bin/`)
+by default **does not fire inside the container** — exec-hook detects the
+Mach-O and silently no-ops (the alternative, "Exec format error" every hook
+event, is worse). If your team requires telemetry from container sessions:
 
-1. Ship a Linux-amd64 build of the hook binary and bind-mount it at the
-   same path the host config references. (Coordinate with the team that
-   owns the hook.)
-2. **Enable the host-bash bridge** (`CLAUDE_HOST_HOOK_BRIDGE=1`). When
-   set, exec-hook hands every Mach-O / wrong-arch hook off to
-   `exec-hook-bridge`, which marshals the call across the host-bash MCP
-   server (`mcp-host-bash` at `host.docker.internal:8766/mcp` by
-   default) so the REAL host binary runs with the same env + args and
-   its exit code propagates back. The operator must also add the hook
-   basename to the `mcp-host-bash` allow-list via
-   `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook` (comma-separated for many).
-   Bridge failures (host-bash unreachable, allow-list reject) fall back
-   to the silent-no-op contract — a misconfigured bridge never brings
-   the session down.
-3. Accept that in-container sessions are not telemetered into the host's
-   pipeline. Coordinate with your team's privacy / observability stance.
+1. Ship a Linux-amd64 build of the hook binary and bind-mount it at the same
+   path the host config references (coordinate with the hook's owning team).
+2. **Enable the host-bash bridge** (`CLAUDE_HOST_HOOK_BRIDGE=1`): exec-hook
+   hands every Mach-O / wrong-arch hook off to `exec-hook-bridge`, which
+   marshals the call across the host-bash MCP server (`mcp-host-bash` at
+   `host.docker.internal:8766/mcp`) so the REAL host binary runs with the same
+   env + args and its exit code propagates back. The operator must also add
+   the hook basename to the `mcp-host-bash` allow-list via
+   `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook` (comma-separated for many). Bridge
+   failures (host-bash unreachable, allow-list reject) fall back to the
+   silent-no-op contract — a misconfigured bridge never brings the session
+   down.
+3. Accept that in-container sessions aren't telemetered into the host's
+   pipeline.
 
 The container does **not** carry corp telemetry into a sandboxed Linux
-environment by default — that's an explicit design choice. Decide with
-your team.
+environment by default — an explicit design choice. Decide with your team.
 
 **Verifying hooks reach the right fate**: with
-`CLAUDE_CONTAINER_REWRITE_HOOKS=1` and `verbose=true` in settings.json,
-Claude Code logs each hook invocation. exec-hook writes its "skipped
-non-ELF hook" heads-up to stderr on first occurrence per target path.
-Tail `/tmp/exec-hook-skipped` for the list of skipped binaries (one
-line per target).
+`CLAUDE_CONTAINER_REWRITE_HOOKS=1` and `verbose=true` in settings.json, Claude
+Code logs each hook invocation; exec-hook writes its "skipped non-ELF hook"
+heads-up to stderr on first occurrence per target path. Tail
+`/tmp/exec-hook-skipped` for the list of skipped binaries (one per target).
 
 ## Workflow boundaries
 
-This Claude Code session runs inside an isolated container. Its strengths
-and limits:
+This Claude Code session runs inside an isolated container. Strengths and
+limits:
 
-- **Strong fit**: writing code in `${CLAUDE_HOST_PROJECT_DIR}`, talking
-  to APIs the operator has bridged in (corp gateways via host-mcp-server,
-  off-the-shelf MCP servers, the Anthropic API). All TLS chains terminate
-  at the in-container Node / Python; corporate-CA bundles forward
-  through `NODE_EXTRA_CA_CERTS` etc. when the operator wires them up.
-- **Weak fit**: anything that requires the host's full toolchain, the
-  host's keychain, or commands not on the `host-bash` allow-list. Use
-  `host-bash` (when available) for those — its allow-list is
-  intentionally conservative.
-- **Not in scope**: managing services on the host machine itself. If you
-  need to restart a host daemon, edit host cron, or touch a host service,
-  ask the operator on their host session; the container is a code-writing
-  sandbox, not a host-administration tool.
+- **Strong fit**: writing code in `${CLAUDE_HOST_PROJECT_DIR}`, talking to
+  APIs the operator bridged in (corp gateways via host-mcp-server, off-the-
+  shelf MCP servers, the Anthropic API). All TLS chains terminate at the
+  in-container Node / Python; corporate-CA bundles forward through
+  `NODE_EXTRA_CA_CERTS` etc. when the operator wires them up.
+- **Weak fit**: anything needing the host's full toolchain, the host's
+  keychain, or commands not on the `host-bash` allow-list — use `host-bash`
+  (when available) for those; its allow-list is intentionally conservative.
+- **Not in scope**: managing services on the host itself. To restart a host
+  daemon, edit host cron, or touch a host service, ask the operator on their
+  host session; the container is a code-writing sandbox, not a host-admin
+  tool.
 
 ## Semantic search — query eichi before grepping
 
-The container has access to [eichi](https://github.com/hndrewaall/eichi),
-a local sqlite-vec + sentence-transformers semantic search index. Use it
-as the **default first lookup** for open-ended recall questions ("where
-is X", "what did we decide about Y", "find the conversation where Z").
+The container has access to [eichi](https://github.com/hndrewaall/eichi), a
+local sqlite-vec + sentence-transformers semantic search index. Use it as the
+**default first lookup** for open-ended recall questions ("where is X", "what
+did we decide about Y", "find the conversation where Z").
 
 Decision tree:
 
 1. **Concept-level question** (fuzzy, semantic) -> query eichi first.
 2. **Exact-string question** (function name, error code, config key) ->
    `grep -r` or code search.
-3. **Structured data** (metrics, timestamps, statuses) -> domain-specific
-   tool (Prometheus, DB query, etc.).
+3. **Structured data** (metrics, timestamps, statuses) -> domain tool
+   (Prometheus, DB query, etc.).
 
-If eichi returns no results or all `[distant]` scores, THEN fall back to
-grep — not before.
+If eichi returns no results or all `[distant]` scores, THEN fall back to grep
+— not before.
 
 ### How to invoke
 
@@ -1209,75 +1215,68 @@ Query params: `q` (required), `k` (top-K, default 20), `source`
 
 ```sh
 # host-bash run_command:
-eichi query "alerting tier design decisions" -k 5
-eichi query "docker networking" --added-since 7d
-eichi query "PR feedback" --sort added -k 10
+eichi query "alerting tier design decisions" -k 5   # also: --added-since 7d, --sort added
 eichi stats        # last-indexed timestamp / corpus size
 eichi ls           # what's indexed
 ```
 
 ### Interpreting results
 
-Each result includes a score with a human-readable label: `[strong]` >
-`[moderate]` > `[weak]` > `[distant]`. Treat `[distant]` as noise
-unless the query is highly specialized. Results also carry a source tag
-(`[file]`, `[obsidian]`, etc.) and a timestamp (last modified or added).
+Each result has a human-readable score label: `[strong]` > `[moderate]` >
+`[weak]` > `[distant]`. Treat `[distant]` as noise unless the query is highly
+specialized. Results also carry a source tag (`[file]`, `[obsidian]`, etc.)
+and a timestamp.
 
 ### When to re-index
 
 The operator maintains the index via `eichi index <path>` on the host
-(delta-only, idempotent). If `eichi stats` shows `last indexed at` is
-stale relative to recent corpus activity, flag it to the operator —
-re-indexing is a host-side operation (the container reads the index
-read-only via the bind-mounted DB at `~/.local/share/eichi/index.db`).
+(delta-only, idempotent). If `eichi stats` shows `last indexed at` is stale
+vs. recent corpus activity, flag it to the operator — re-indexing is host-side
+(the container reads the index read-only via the bind-mounted DB at
+`~/.local/share/eichi/index.db`).
 
 ## Quick reference for common in-container surprises
 
-- **`claude` resumes a prior conversation**: when `CLAUDE_AUTO_CONTINUE`
-  is set, the entrypoint appends `--continue <value>` to the claude
-  invocation. Default is unset (bare `claude`).
+- **`claude` resumes a prior conversation**: when `CLAUDE_AUTO_CONTINUE` is
+  set, the entrypoint appends `--continue <value>`. Default unset (bare
+  `claude`).
 - **`session-task`, `claude-event` on PATH**: only when the operator
-  bind-mounts `~/repos/claude-watch` (the example compose does this).
-  Missing bind mount = these two CLIs are unavailable; that's
-  expected for a stripped-down `docker run`. (`obligations`,
-  `agent-msg`, and `agent-tail` are baked at `/usr/local/bin/` so
-  they're always available; the bind-mounted source wins on PATH
-  when present for live dev iteration.)
-- **Permission denied writing into `${HOME}/.local/share/claude/`**:
-  the in-container claude binary's auto-update path. Backed by a named
-  volume (`claude-container-versions`); should Just Work after the
-  one-shot Dockerfile chown. If it doesn't, check that the named volume
-  is mounted (the example compose does this) and that uid 1000 owns it.
-- **`tmux` session is `claude-container:0.0`** — not `dashboard:main`
-  like a typical host install. claude-watch's in-container config pins to
-  this session name.
+  bind-mounts `~/repos/claude-watch` (the example compose does). Missing
+  bind-mount = these two CLIs are unavailable (expected for a stripped-down
+  `docker run`). (`obligations`, `agent-msg`, `agent-tail` are baked at
+  `/usr/local/bin/` so they're always available; bind-mounted source wins on
+  PATH when present.)
+- **Permission denied writing into `${HOME}/.local/share/claude/`**: the
+  in-container claude's auto-update path, backed by a named volume
+  (`claude-container-versions`); should Just Work after the one-shot
+  Dockerfile chown. If not, check the named volume is mounted and uid 1000
+  owns it.
+- **`tmux` session is `claude-container:0.0`** — not `dashboard:main` like a
+  typical host install. claude-watch's in-container config pins this name.
 
-## Event response protocol — four-tier model
+## Event response protocol — tier model
 
 > **Read first — the conceptual model:** the
 > [event hierarchy concept doc](/opt/claude-container/docs/concepts/event-hierarchy.md)
-> is the entry point that explains how **events vs. obligations vs.
-> interruptions** differ as signaling mechanisms. (The `docs/` tree is baked
-> into this image alongside this file, so the link above resolves to a local
-> path — read it directly.) The four tiers below are a *different, orthogonal*
-> axis: they
-> are the container's **event-classification** routing (how each individual
-> `claude-event` is triaged), not the event→obligation→interruption *force
-> ladder*. The concept doc's terminology applies here verbatim:
+> explains how **events vs. obligations vs. interruptions** differ as signaling
+> mechanisms (the `docs/` tree is baked into this image, so the link resolves
+> to a local path — read it directly). The tiers below are a *different,
+> orthogonal* axis: the container's **event-classification** routing (how each
+> individual `claude-event` is triaged), not the event→obligation→interruption
+> *force ladder*. The concept doc's terminology applies here verbatim:
 >
-> - A **watcher** is the one-shot tool the main loop runs (`claude-event-watch`,
->   `signal-wait-*`) — it **blocks, prints events to stdout, and exits**;
->   the loop reads that stdout and respawns a fresh instance. It is the
->   signal-*delivery* mechanism, not a long-lived poller.
-> - An **event producer** (a cron job, alertmanager, the queue) is what
->   *emits* a `claude-event` onto the bus for the `claude-event-watch` watcher
->   to surface. Cron ticks below are producer output — cron jobs are **not**
->   watchers.
+> - A **watcher** is the one-shot tool the main loop runs
+>   (`claude-event-watch`) — it **blocks, prints events to stdout, and exits**;
+>   the loop reads that stdout and respawns a fresh instance. Event-*delivery*,
+>   not a long-lived poller.
+> - An **event producer** (cron job, alertmanager, the queue) *emits* a
+>   `claude-event` onto the bus for the `claude-event-watch` watcher to surface.
+>   Cron ticks below are producer output — cron jobs are **not** watchers.
 
-When `claude-event-watch` (the watcher) delivers events, the container
-classifies each event into one of four tiers based on its `source` and `tag`.
-The tiers escalate from "purely informational" to "blocking" and exist so the
-LLM sees the right level of pressure for each event class.
+When `claude-event-watch` delivers events, the container classifies each into
+one of three tiers by its `source` and `tag`. The tiers escalate from "purely
+informational" to "blocking" so the LLM sees the right pressure per event
+class.
 
 ### Tier 1 — Ambient (info-only, context-inject only)
 
@@ -1287,10 +1286,10 @@ done, non-fatal claude-watch alerts, routine PR status (push/pending/
 mergeable), etc.
 
   - Routed by `event-ack ingest` into `ambient-context.json`.
-  - Surfaced by the `user-prompt-ambient-inject-hook` (UserPromptSubmit)
-    on the NEXT user prompt as additional context.
-  - **Non-blocking**. No gate. The LLM sees them, can act if anything
-    stands out, otherwise just absorbs context.
+  - Surfaced by the `user-prompt-ambient-inject-hook` (UserPromptSubmit) on
+    the NEXT user prompt as additional context.
+  - **Non-blocking**. No gate. The LLM sees them, acts if something stands
+    out, else just absorbs context.
 
 ### Tier 2 — Actionable (pending list + N-call gate)
 
@@ -1302,76 +1301,56 @@ success, workbot-prompt, queue-stale-ready, slack-unread,
 **claude-watch/heartbeat-tick**.
 
 > **`heartbeat-tick` — touch the heartbeat file.** Every ~5 min the
-> claude-watch daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat
-> tick [path=<FILE> interval_secs=…]`. When you see it, run **`touch
-> <FILE>`** (the path on the event line, e.g.
-> `touch /var/run/claude/claude-heartbeat`).
-> That file is the daemon's wedge-detector: it watches the file's mtime and,
-> if it goes stale (~10 min), fires a "heartbeat stale" alert and may try to
-> recover a loop it thinks is wedged. The touch MUST come from you acting on
-> the event (it proves the loop is alive) — the daemon never
-> touches the file itself. This is a one-command self-service action; it does
-> not need an agent spawn or an `event-ack` transaction, just the `touch`.
+> claude-watch daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick
+> [path=<FILE> interval_secs=…]`. When you see it, run **`touch <FILE>`** (the
+> path on the event line, e.g. `touch /var/run/claude/claude-heartbeat`). That
+> file is the daemon's wedge-detector: it watches the mtime and, if it goes
+> stale (~10 min), fires a "heartbeat stale" alert and may try to recover a
+> loop it thinks is wedged. The touch MUST come from you acting on the event
+> (it proves the loop is alive) — the daemon never touches the file itself. A
+> one-command self-service action; no agent spawn or `event-ack` needed, just
+> the `touch`.
 
   - Routed by `event-ack ingest` into `pending-actions.json`.
-  - The `event_must_act` obligation evaluator counts CONSECUTIVE non-
-    exempt Bash tool calls while pending. **Default N=3**: under
-    threshold = ALLOW + bump counter; threshold reached = DENY.
-    Override via `$EVENT_MUST_ACT_N`.
-  - **Each `event-ack` transaction resets the counter to 0**, so the
-    LLM gets a fresh N-call grace window after every ack.
-  - The gate does NOT fire immediately on every actionable event — only
-    after the LLM has missed N consecutive opportunities to triage. This
-    is the q-2026-05-21-856d refinement (Andrew: "only TRULY actionable
-    events go into pending, and the gate escalates after N missed calls
-    rather than firing immediately").
+  - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt
+    Bash tool calls while pending. **Default N=3**: under threshold = ALLOW +
+    bump counter; threshold reached = DENY. Override via `$EVENT_MUST_ACT_N`.
+  - **Each `event-ack` transaction resets the counter to 0**, so the LLM gets
+    a fresh N-call grace window after every ack.
+  - The gate does NOT fire immediately on every actionable event — only after
+    the LLM has missed N consecutive triage opportunities (the q-2026-05-21-
+    856d refinement: "only TRULY actionable events go into pending, and the
+    gate escalates after N missed calls rather than firing immediately").
 
-### Tier 3 — Signal (distinct, NOT migrated)
+### Tier 3 — Unknown (defaults to ambient)
 
-Signal-DM inbound and signal-group inbound stay on their existing
-per-thread obligation path. The `signal-wait-*` watcher records inbound
-DMs, and the per-thread `signal-send` ack-gate blocks outbound until the
-inbound is acked via `signal-ack`.
-
-  - Routed by `event-ack ingest` as `excluded` (no-op).
-  - **NOT migrated to the new shared event-must-act infrastructure.**
-    Andrew (2026-05-21): "for now keep signal distinct even if it fits
-    conceptually. too mission critical to risk on new shared infra".
-  - Long-term: a separate later PR may migrate Signal once the new
-    infra is proven.
-
-### Tier 4 — Unknown (defaults to ambient)
-
-Any event whose source/tag pair doesn't match a rule in the
-`event-classify` table falls through to the default tier (ambient).
-Conservative posture — unknown events become context, never block.
+Any event whose source/tag pair doesn't match an `event-classify` rule falls
+through to the default tier (ambient). Conservative posture — unknown events
+become context, never block.
 
 ### Event classification table
 
-The mapping is DATA, in `event-classify`'s `CLASSIFICATIONS` table.
-Inspect with:
+The mapping is DATA, in `event-classify`'s `CLASSIFICATIONS` table. Inspect:
 
 ```sh
 event-classify --list-rules
 event-classify --source <src> --tag <tag> [--message <text>] --json
 ```
 
-Adding a new event source = appending a row to the table. No code
-change in the gate logic itself.
+Adding a new event source = appending a row to the table. No gate-logic code
+change.
 
 ### Workflow
 
 1. **Watcher fires** — `claude-event-watch` prints `EVENT[source/tag]
    message` lines and exits.
 2. **Restart watcher immediately** (before processing).
-3. **For each event line**, call `event-ack ingest --source <src>
-   --tag <tag> --message "<msg>"`. The classifier routes it to the
-   right queue automatically.
-4. **For actionable events**, queue an agent / act directly / dismiss,
-   then ack with `event-ack ack "<key>" --action "<what you did>"`.
-   Each ack resets the N-counter.
-5. **Ambient events** require no action — they'll appear in the next
-   prompt's context automatically via the UserPromptSubmit hook.
+3. **For each event line**, call `event-ack ingest --source <src> --tag <tag>
+   --message "<msg>"`. The classifier routes it to the right queue.
+4. **For actionable events**, queue an agent / act directly / dismiss, then
+   `event-ack ack "<key>" --action "<what you did>"` (resets the N-counter).
+5. **Ambient events** need no action — they surface in the next prompt's
+   context via the UserPromptSubmit hook.
 
 ### CLI reference
 
@@ -1398,47 +1377,21 @@ event-classify --list-rules
 
 ### Gate behavior (Tier 2 actionable)
 
-- **Default-open**: missing state file, corrupt JSON, empty list,
-  python unavailable — all ALLOW.
+- **Default-open**: missing state file, corrupt JSON, empty list, python
+  unavailable — all ALLOW.
 - **N-counter**: tracks CONSECUTIVE missed non-exempt Bash calls while
-  pending. Reset on any `event-ack` mutation. Threshold default 3;
-  configurable via `$EVENT_MUST_ACT_N`.
-- **Exempt commands** (never increment counter, never blocked):
-  `event-ack`, `event-classify`, `session-task queue`, `obligations`,
-  `claude-watch-ack`, `claude-watch-dispatch`, `agent-msg`,
-  `agent-tail`, `signal-history`, `signal-ack`, `signal-mark-read`.
-- **Concurrency**: every state read-modify-write goes through `flock(2)`
-  on a sidecar lockfile (`.lock` next to the state file). Two parallel
-  `event-ack` invocations cannot race.
-- **Scope**: main loop only (the existing obligation row scopes via
-  `is_main_loop`). Subagents are not gated.
-- **Override**: `obligations override "reason" --duration <N>` bypasses
-  this gate (and every other) for the documented escape-hatch window.
-
-### Signal-distinct guarantee (audit-trail)
-
-This refactor explicitly does NOT touch any Signal code path. Verify
-via grep:
-
-```sh
-grep -rE "signal[-_]" container/bin/eval-event-must-act \
-                       container/bin/event-ack \
-                       container/bin/event-classify \
-                       container/bin/user-prompt-ambient-inject-hook
-```
-
-The matches you SHOULD see:
-
-  - `event-classify` carries `signal-*` exclusion rules so any signal-
-    tagged event is classified as `excluded` (no-op).
-  - `eval-event-must-act` exempts `signal-history`, `signal-ack`,
-    `signal-mark-read` so its gate never blocks Signal investigation
-    when an unrelated actionable event is pending.
-  - `signal-send` is NOT exempted by THIS gate (it has its own
-    per-thread ack-gate elsewhere).
-
-No code in this refactor calls into `signal-send`, modifies
-`signal-wait-*`, or mutates the per-thread Signal obligation rows.
+  pending. Reset on any `event-ack` mutation. Threshold default 3, via
+  `$EVENT_MUST_ACT_N`.
+- **Exempt commands** (never increment counter, never blocked): `event-ack`,
+  `event-classify`, `session-task queue`, `obligations`, `claude-watch-ack`,
+  `claude-watch-dispatch`, `agent-msg`, `agent-tail`.
+- **Concurrency**: every state read-modify-write goes through `flock(2)` on a
+  sidecar lockfile (`.lock` next to the state file) — parallel `event-ack`
+  invocations cannot race.
+- **Scope**: main loop only (obligation row scopes via `is_main_loop`);
+  subagents not gated.
+- **Override**: `obligations override "reason" --duration <N>` bypasses this
+  gate (and every other) for the escape-hatch window.
 
 ## Host-side scheduled tasks (via `host-bash`)
 
