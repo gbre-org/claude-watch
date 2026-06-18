@@ -444,6 +444,11 @@ services:
       # copies the JSONL here at queue-done / queue-abandon time; the minisite
       # reads it back for the "View log" button on done / abandoned items.
       QUEUE_LOG_ARCHIVE_DIR: /queue-home/.config/session/queue-logs
+      # Hostjob output dir — the `hostjob` runner (andrew-sf-tools) writes a
+      # per-label DIRECTORY ~/.cache/hostjob/<label>/log on the host. The
+      # live-log modal tails <HOSTJOB_LOG_DIR>/<label>/log for running queue
+      # items whose scope is `hostjob:<label>`. Bind-mounted read-only below.
+      HOSTJOB_LOG_DIR: /hostjobs
     volumes:
       # session-task queue.json — rw because the Stop button mutates it
       # via session-task (atomic tmp+rename + flock).
@@ -466,6 +471,11 @@ services:
       # container always runs the upstream version. Path is relative to
       # the build context (claude-watch repo root).
       - "../../tools/session-task/session-task:/app/session-task:ro"
+      # Hostjob output dir — read-only tail target for queue items bound to
+      # the host-side `hostjob` runner (scope `hostjob:<label>`). The runner
+      # writes ~/.cache/hostjob/<label>/log on the host; the live-log modal
+      # tails it via <HOSTJOB_LOG_DIR>/<label>/log (HOSTJOB_LOG_DIR above).
+      - "${HOME}/.cache/hostjob:/hostjobs:ro"
     restart: unless-stopped
 
   # ---------------------------------------------------------------------

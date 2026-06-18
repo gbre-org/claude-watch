@@ -107,41 +107,46 @@
         {% set owner = it.owner %}
         {% set is_starting = it.is_starting %}
         {% set is_workload = it.workload_label|length > 0 %}
-        {# All running rows (including starting) are clickable. Workload-bound
-           items dispatch to the workload tail branch; agent items hit the
-           agent JSONL tail; starting items open the same modal in a "polling"
-           state and retry the SSE connection until the agent's first event
-           lands (live-log.js handles the transition). #}
+        {% set is_hostjob = it.hostjob_label|length > 0 %}
+        {# All running rows (including starting) are clickable. Workload- and
+           hostjob-bound items dispatch to their plain-text tail branch; agent
+           items hit the agent JSONL tail; starting items open the same modal in
+           a "polling" state and retry the SSE connection until the agent's
+           first event lands (live-log.js handles the transition). #}
         {% set is_clickable = True %}
-        {% if is_workload %}
+        {% if is_hostjob %}
+          {% set log_mode = 'hostjob' %}
+        {% elif is_workload %}
           {% set log_mode = 'workload' %}
         {% else %}
           {% set log_mode = 'live' %}
         {% endif %}
         <article
           id="queue-{{ it.id }}"
-          class="item {% if is_starting and not is_workload %}state-starting{% else %}state-running{% endif %} drop-zone log-clickable {% if owner.alive == False and not is_starting and not is_workload %}orphan{% endif %}"
+          class="item {% if is_starting and not is_workload and not is_hostjob %}state-starting{% else %}state-running{% endif %} drop-zone log-clickable {% if owner.alive == False and not is_starting and not is_workload and not is_hostjob %}orphan{% endif %}"
           data-queue-id="{{ it.id }}"
           data-queue-status="running"
           data-created-by="{{ it.created_by }}"
-          data-queue-starting="{{ '1' if (is_starting and not is_workload) else '0' }}"
+          data-queue-starting="{{ '1' if (is_starting and not is_workload and not is_hostjob) else '0' }}"
           data-queue-summary="{{ it.summary }}"
           data-queue-description="{{ it.description }}"
           data-agent-id="{{ owner.agent_id }}"
           {% if is_workload %}data-workload-label="{{ it.workload_label }}"{% endif %}
+          {% if is_hostjob %}data-hostjob-label="{{ it.hostjob_label }}"{% endif %}
           data-log-mode="{{ log_mode }}"
           tabindex="0"
           role="button"
-          aria-label="View {% if is_workload %}workload{% elif is_starting %}live (polling — waiting for first event){% else %}live{% endif %} log for {{ it.id }}"
-          title="{% if is_starting and not is_workload %}Click to open log viewer — polls for the agent's first event, then tails live. Drop a pending item here to set this as its dependency.{% else %}Click to view {% if is_workload %}workload output{% else %}live log{% endif %}. Drop a pending item here to set this as its dependency.{% endif %}">
+          aria-label="View {% if is_hostjob %}hostjob{% elif is_workload %}workload{% elif is_starting %}live (polling — waiting for first event){% else %}live{% endif %} log for {{ it.id }}"
+          title="{% if is_starting and not is_workload and not is_hostjob %}Click to open log viewer — polls for the agent's first event, then tails live. Drop a pending item here to set this as its dependency.{% else %}Click to view {% if is_hostjob %}hostjob output{% elif is_workload %}workload output{% else %}live log{% endif %}. Drop a pending item here to set this as its dependency.{% endif %}">
           <header class="item-head">
-            {% if is_starting and not is_workload %}
+            {% if is_starting and not is_workload and not is_hostjob %}
               <span class="badge state-starting" title="registered, waiting for agent to emit first event">starting</span>
             {% else %}
               <span class="badge state-running">running</span>
             {% endif %}
             {% if is_workload %}<span class="badge workload-badge" title="workload-bound: tails /tmp/claude-workloads/{{ it.workload_label }}.output">workload</span>{% endif %}
-            {% if owner.alive == False and not is_starting and not is_workload %}<span class="badge state-orphan">orphan</span>{% endif %}
+            {% if is_hostjob %}<span class="badge hostjob-badge" title="hostjob-bound: tails the host job log for {{ it.hostjob_label }}">hostjob</span>{% endif %}
+            {% if owner.alive == False and not is_starting and not is_workload and not is_hostjob %}<span class="badge state-orphan">orphan</span>{% endif %}
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
@@ -157,9 +162,11 @@
           <div class="age">
             <span
               {% if it.started_at_iso %}data-local-time-iso="{{ it.started_at_iso }}" data-local-time-title-only{% endif %}
-              title="{{ it.started_at_iso }}">{% if is_starting %}registered{% else %}running{% endif %} {{ it.age }}</span>
+              title="{{ it.started_at_iso }}">{% if is_starting and not is_workload and not is_hostjob %}registered{% else %}running{% endif %} {{ it.age }}</span>
             <span class="sep">·</span>
-            {% if is_workload %}
+            {% if is_hostjob %}
+              <span title="hostjob output tail for {{ it.hostjob_label }}">hostjob {{ it.hostjob_label }}</span>
+            {% elif is_workload %}
               <span title="workload output tail: /tmp/claude-workloads/{{ it.workload_label }}.output">workload {{ it.workload_label }}</span>
             {% elif is_starting %}
               <span class="agent-spawning" title="queue item registered, waiting for agent's first JSONL event"><span class="spinner" aria-hidden="true"></span>agent spawning…</span>

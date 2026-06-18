@@ -1316,19 +1316,32 @@
           setStatus('replaying…', 'ok');
         } else if (mode === 'workload') {
           setStatus('tailing workload', 'ok');
+        } else if (mode === 'hostjob') {
+          setStatus('tailing hostjob', 'ok');
         } else {
           setStatus('streaming', 'ok');
         }
       } else if (k === 'backfill-begin') {
         msg = 'backfilling ' + (payload.lines || 0) + ' recent lines…';
       } else if (k === 'backfill-end') {
-        msg = mode === 'workload' ? '— live tail (workload) —' : '— live tail —';
+        if (mode === 'workload') msg = '— live tail (workload) —';
+        else if (mode === 'hostjob') msg = '— live tail (hostjob) —';
+        else msg = '— live tail —';
       } else if (k === 'archive-end') {
         msg = '— end of archive (' + (payload.lines || 0) + ' lines) —';
         setStatus('archived', 'ok');
       } else if (k === 'workload-end') {
-        const ec = (payload.exit_code === null || payload.exit_code === undefined) ? '?' : payload.exit_code;
-        msg = '— workload exited (exit_code=' + esc(ec) + ') —';
+        // Shared terminal frame for both workload and hostjob tails (the
+        // hostjob backend reuses the workload-end kind). Hostjob has no
+        // .exit sidecar so its exit_code is always null — render a
+        // job-flavored message in that case rather than a bogus
+        // "exit_code=?".
+        if (mode === 'hostjob') {
+          msg = '— hostjob finished (queue item terminal) —';
+        } else {
+          const ec = (payload.exit_code === null || payload.exit_code === undefined) ? '?' : payload.exit_code;
+          msg = '— workload exited (exit_code=' + esc(ec) + ') —';
+        }
         setStatus('exited', 'ok');
       } else if (k === 'idle-timeout') {
         msg = 'idle timeout (' + (payload.idle_seconds || '?') + 's)';
@@ -1343,9 +1356,10 @@
       // A meta frame breaks the transient-replace chain so subsequent
       // workload frames don't accidentally overwrite an unrelated row.
       lastTransientRow = null;
-      // Workload mode: server closes after the workload-end meta. Close
-      // the source proactively so the browser doesn't reconnect.
-      if (mode === 'workload' && k === 'workload-end' && evtSource) {
+      // Workload / hostjob mode: server closes after the workload-end meta
+      // (hostjob reuses the same terminal kind). Close the source
+      // proactively so the browser doesn't reconnect.
+      if ((mode === 'workload' || mode === 'hostjob') && k === 'workload-end' && evtSource) {
         try { evtSource.close(); } catch (_) {}
       }
       return;
@@ -1476,11 +1490,15 @@
     // 'workload' uses /stream — server-side dispatch tails
     //   /tmp/claude-workloads/<label>.output (line-oriented plain text)
     //   instead of an agent JSONL. Same wire envelope, simpler payloads.
+    // 'hostjob' uses /stream — server-side dispatch tails
+    //   <HOSTJOB_LOG_DIR>/<label>/log (line-oriented plain text), same wire
+    //   envelope as 'workload' (kind workload_line + workload-end terminal),
+    //   so the renderer is shared; only the status / label strings differ.
     // 'subagent' uses /api/subagent/<subagent-id>/stream — tails a child
     //   subagent's JSONL directly (nested tree under a running card). Same
     //   wire envelope as 'live', just a different endpoint + meta source.
     mode = (row.getAttribute('data-log-mode') || 'live').toLowerCase();
-    if (mode !== 'archive' && mode !== 'workload' && mode !== 'subagent') mode = 'live';
+    if (mode !== 'archive' && mode !== 'workload' && mode !== 'hostjob' && mode !== 'subagent') mode = 'live';
     // Subagent rows carry their own id distinct from the queue id; the
     // header + stream + meta key off it in subagent mode.
     subagentId = (mode === 'subagent')
@@ -1494,6 +1512,7 @@
     if (modeLabelEl) {
       if (mode === 'archive') modeLabelEl.textContent = 'Archived log';
       else if (mode === 'workload') modeLabelEl.textContent = 'Workload output';
+      else if (mode === 'hostjob') modeLabelEl.textContent = 'Hostjob output';
       else if (mode === 'subagent') modeLabelEl.textContent = 'Subagent log';
       else modeLabelEl.textContent = 'Live log';
     }
@@ -1581,10 +1600,11 @@
       try { evtSource.close(); } catch (_) {}
       evtSource = null;
     }
-    // 'archive' hits the dedicated replay endpoint; 'live' AND 'workload'
-    // both hit /stream — the server dispatches on the queue item's scope
-    // (workload-bound items tail the workload output file; everything
-    // else falls through to the agent JSONL tail).
+    // 'archive' hits the dedicated replay endpoint; 'live', 'workload' AND
+    // 'hostjob' all hit /stream — the server dispatches on the queue item's
+    // scope (workload-bound items tail the workload output file; hostjob-bound
+    // items tail <HOSTJOB_LOG_DIR>/<label>/log; everything else falls through
+    // to the agent JSONL tail).
     let endpoint;
     if (mode === 'archive') {
       endpoint = '/api/queue/' + encodeURIComponent(id) + '/archive';

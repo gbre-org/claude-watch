@@ -1370,6 +1370,18 @@ body.modal-open { overflow: hidden; }
   color: #fff;
 }
 
+/* ------- hostjob badge (running cards bound to the `hostjob` runner) -------
+ *
+ * Surfaces that the live-log endpoint will tail
+ * <HOSTJOB_LOG_DIR>/<label>/log instead of an agent JSONL. Parallel to
+ * the workload badge but a distinct hue so the operator can tell hostjob-
+ * (host-side detached command) from workload- (in-container detached
+ * command) bound items at a glance. */
+.badge.hostjob-badge {
+  background: #8a5cf6;
+  color: #fff;
+}
+
 /* ------- vim-style keyboard selection (j/k) -------
  *
  * Painted by static/keyboard.js when the user navigates with j/k. The
