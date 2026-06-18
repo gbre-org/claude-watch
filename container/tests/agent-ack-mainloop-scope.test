@@ -52,6 +52,25 @@ OBLIGATIONS_INIT = REPO_ROOT / "tools" / "obligations" / "obligations-init"
 OBLIGATIONS_CLI = REPO_ROOT / "tools" / "obligations" / "obligations"
 EVAL_AGENT_ACK = CONTAINER_DIR / "bin" / "eval-agent-ack-pending"
 
+
+def _env_with_cli_on_path(base: dict | None = None) -> dict:
+    """Return an env with the in-repo ``tools/obligations`` dir prepended to
+    PATH so ``obligations-init``'s ``_resolve_cli()`` (``shutil.which`` ->
+    ``/usr/local/bin`` -> ``~/bin``) finds the in-repo ``obligations`` CLI.
+
+    On a fresh CI runner the obligations CLI is NOT installed (no PATH entry,
+    no ``/usr/local/bin/obligations``, no ``~/bin/obligations``), so without
+    this ``obligations-init`` resolves no CLI and exits 0 with EMPTY output --
+    both the ``--dry-run`` parse and the e2e seed then find zero rows. Locally
+    it happens to pass only because the operator has ``~/bin/obligations``.
+    Pinning the in-repo CLI on PATH makes the test hermetic in every env.
+    """
+    env = dict(base if base is not None else os.environ)
+    cli_dir = str(OBLIGATIONS_CLI.parent)
+    existing = env.get("PATH", "")
+    env["PATH"] = f"{cli_dir}{os.pathsep}{existing}" if existing else cli_dir
+    return env
+
 # The four evaluator-backed rows that are conceptually MAIN-LOOP ONLY and
 # MUST be wrapped in all_of[is_main_loop{}, evaluator].
 MAIN_LOOP_ONLY_EVAL_SCRIPTS = {
@@ -101,6 +120,7 @@ def _dry_run_rows() -> list[dict]:
     proc = subprocess.run(
         [sys.executable, str(OBLIGATIONS_INIT), "--force", "--dry-run"],
         capture_output=True, text=True, timeout=30, check=False,
+        env=_env_with_cli_on_path(),
     )
     expect(proc.returncode == 0,
            f"obligations-init --dry-run rc={proc.returncode}\n{proc.stderr}")
@@ -204,7 +224,10 @@ def test_e2e_agent_ack_gate_main_loop_only() -> None:
         home = Path(td)
         cfg = home / ".config" / "claude"
         cfg.mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ)
+        # Pin the in-repo obligations CLI on PATH so obligations-init can
+        # resolve it on a fresh CI runner (see _env_with_cli_on_path), and
+        # isolate HOME so the seed lands in the temp dir, not the operator's.
+        env = _env_with_cli_on_path()
         env["HOME"] = str(home)
 
         # Seed the default rows into the isolated HOME.
