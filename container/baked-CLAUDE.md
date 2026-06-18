@@ -1021,6 +1021,19 @@ This file (the managed-policy one) **cannot be excluded** by user or
 project settings — that's by design and matches the
 [Claude Code managed-CLAUDE.md contract](https://code.claude.com/docs/en/memory#deploy-organization-wide-claude-md).
 
+## Memory is searchable, NOT auto-loaded
+
+Claude Code's file-based memory (under the project memory dir) is **not**
+loaded into context each session — only the `MEMORY.md` index loads by
+default. To USE a remembered fact you must actively RETRIEVE it via
+recall/search; recalled memories then appear inside `<system-reminder>`
+blocks as background context. Do NOT assume a memory is already in context.
+
+Therefore any **load-bearing operational rule that must ALWAYS be honored**
+belongs in an always-in-context location (the CLAUDE.md hierarchy above),
+not solely in a memory file. Use memory for the detailed / why; mirror the
+non-negotiable rule into a CLAUDE.md.
+
 ## MCP servers
 
 MCP server definitions live in `~/.claude.json` `mcpServers` on the host,
