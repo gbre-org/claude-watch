@@ -168,6 +168,9 @@ class SubagentTreeTest(unittest.TestCase):
         cls.archive_dir = Path(cls.tmp) / "queue-logs"
         cls.agent_state = Path(cls.tmp) / "active-agents.json"
         cls.jsonl_root = Path(cls.tmp) / "agents-jsonl"
+        # Authoritative agent_id -> queue_id bindings (post-tool-agent-arm-hook
+        # output). The minisite reads this to build the REAL subagent tree.
+        cls.bindings_path = Path(cls.tmp) / ".config/claude/agent-queue-bindings.json"
 
         os.environ["QUEUE_JSON"] = str(cls.queue_actual)
         os.environ["AGENT_STATE_JSON"] = str(cls.agent_state)
@@ -175,6 +178,7 @@ class SubagentTreeTest(unittest.TestCase):
         os.environ["QUEUE_LOG_ARCHIVE_DIR"] = str(cls.archive_dir)
         os.environ["WORKLOAD_LOG_DIR"] = str(Path(cls.tmp) / "no-workloads")
         os.environ["SESSION_TASK_BIN"] = str(SESSION_TASK)
+        os.environ["AGENT_QUEUE_BINDINGS_JSON"] = str(cls.bindings_path)
 
         sys.path.insert(0, str(HERE))
         for mod in list(sys.modules):
@@ -195,7 +199,23 @@ class SubagentTreeTest(unittest.TestCase):
             self.agent_state.unlink()
         if self.jsonl_root.exists():
             shutil.rmtree(self.jsonl_root)
+        if self.bindings_path.exists():
+            self.bindings_path.unlink()
         self.appmod._cache.fetched_at = 0.0
+
+    def _seed_bindings(self, mapping: dict) -> None:
+        """Write the arm-hook bindings file: {agent_id: queue_id}.
+
+        Mirrors post-tool-agent-arm-hook's on-disk shape
+        ``{"bindings": {aid: {"queue_id": qid, "registered_at": <int>}}}``
+        so app.py _load_agent_queue_bindings parses it identically.
+        """
+        self.bindings_path.parent.mkdir(parents=True, exist_ok=True)
+        bindings = {
+            aid: {"queue_id": qid, "registered_at": 1700000000}
+            for aid, qid in mapping.items()
+        }
+        self.bindings_path.write_text(json.dumps({"bindings": bindings}))
 
     # ---------- helpers ----------
 
@@ -217,9 +237,11 @@ class SubagentTreeTest(unittest.TestCase):
 
     def test_meta_surfaces_subagents_for_running_owner(self):
         """A running item whose owner agent resolves to a session dir with
-        multiple ``agent-*.jsonl`` siblings must surface ALL of them in the
-        ``subagents`` list on /meta. The owner agent is itself one of the
-        siblings (it has a transcript in the same session subagents/ dir).
+        multiple ``agent-*.jsonl`` siblings surfaces the siblings in the
+        ``subagents`` list on /meta. The OWNER agent itself is DROPPED (it IS
+        the item, not a child of it — the self-nesting fix). With no bindings
+        and no markers this exercises the fallback path, which still drops
+        the owner.
         """
         item = _add(self.env, "nested subagent tree", ["repo:subagent-test"])
         qid = item["id"]
@@ -242,7 +264,8 @@ class SubagentTreeTest(unittest.TestCase):
         subs = body.get("subagents")
         self.assertIsInstance(subs, list, f"no subagents list: {body}")
         ids = {s["subagent_id"] for s in subs}
-        self.assertIn(owner_id, ids, f"owner not in subagents: {subs}")
+        self.assertNotIn(owner_id, ids,
+                         f"owner must NOT self-nest: {subs}")
         self.assertIn(sibling_id, ids, f"sibling not in subagents: {subs}")
         # Each record carries the documented key set.
         for s in subs:
@@ -250,9 +273,9 @@ class SubagentTreeTest(unittest.TestCase):
             self.assertIn("label", s)
             self.assertIn("age_seconds", s)
             self.assertIn("age", s)
-        # The owner record's label is derived from the first user-message text.
-        owner_rec = next(s for s in subs if s["subagent_id"] == owner_id)
-        self.assertEqual(owner_rec["label"], "do the thing")
+        # The sibling record's label is derived from the first user message.
+        sib_rec = next(s for s in subs if s["subagent_id"] == sibling_id)
+        self.assertEqual(sib_rec["label"], "do the thing")
 
     def test_meta_subagents_empty_when_no_owner_agent(self):
         """A running item with NO agent record (owner unknown) -> empty
@@ -292,7 +315,9 @@ class SubagentTreeTest(unittest.TestCase):
         r = self.client.get(f"/api/queue/{qid}/meta")
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         ids = {s["subagent_id"] for s in r.get_json().get("subagents", [])}
-        self.assertIn(owner_id, ids)
+        # Owner dropped (self-nest fix); the sibling resolves through the
+        # two-level (project-slug + session) mount shape.
+        self.assertNotIn(owner_id, ids)
         self.assertIn(sibling_id, ids)
 
     def _seed_marked_subagent(self, jsonl_root, session_uuid, agent_id, qid):
@@ -315,9 +340,12 @@ class SubagentTreeTest(unittest.TestCase):
             jsonl_root, session_uuid, agent_id, lines=lines)
 
     def test_meta_subagents_filtered_to_owning_item(self):
-        """When session siblings carry DIFFERENT ``Queue item:`` markers, a
-        running item must surface ONLY the subagents bound to ITS q-id -- not
-        every subagent in the owner's parent main-loop session.
+        """Marker fallback (no bindings file): when session siblings carry
+        DIFFERENT ``Queue item:`` markers, a running item surfaces ONLY the
+        subagents attributed to ITS q-id -- and the OWNER agent is dropped
+        (it is the item itself). Here owner_a carries qid_a's marker (so it's
+        this item's own dispatch -> dropped) and the only other sibling is
+        attributed to item B -> excluded. Result: empty tree for A.
         """
         # Two distinct items, both registered running, sharing one session.
         item_a = _add(self.env, "scoped item A", ["repo:subagent-filter-a"])
@@ -344,15 +372,17 @@ class SubagentTreeTest(unittest.TestCase):
         subs = r.get_json().get("subagents")
         self.assertIsInstance(subs, list, f"no subagents list: {subs}")
         ids = {s["subagent_id"] for s in subs}
-        # Only item A's own subagent -- the item-B sibling is filtered out.
-        self.assertEqual(ids, {owner_a},
-                         f"expected only owner_a, got {subs}")
-        self.assertEqual(subs[0].get("queue_id"), qid_a)
+        # Owner is self -> dropped; item-B sibling attributed elsewhere ->
+        # excluded. A's tree is empty (no genuine child work under A).
+        self.assertEqual(ids, set(),
+                         f"expected empty tree for A, got {subs}")
 
     def test_meta_subagents_unfiltered_when_no_markers(self):
         """Back-compat fallback: when NO sibling carries a ``Queue item:``
-        marker (older transcripts), keep the prior unfiltered behavior rather
-        than render a silently-empty tree.
+        marker AND there is no bindings file (pre-arm-hook transcripts), keep
+        the session siblings rather than render a silently-empty tree -- but
+        STILL drop the owner so the self-nesting bug can't resurface even in
+        fallback mode.
         """
         item = _add(self.env, "no-marker fallback", ["repo:subagent-nomarker"])
         qid = item["id"]
@@ -370,9 +400,117 @@ class SubagentTreeTest(unittest.TestCase):
         r = self.client.get(f"/api/queue/{qid}/meta")
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         ids = {s["subagent_id"] for s in r.get_json().get("subagents", [])}
-        # No markers -> fallback keeps both (unfiltered).
-        self.assertEqual(ids, {owner_id, sibling_id},
-                         f"fallback should keep all, got {ids}")
+        # No attribution -> fallback keeps siblings, but the owner is dropped.
+        self.assertEqual(ids, {sibling_id},
+                         f"fallback keeps siblings minus owner, got {ids}")
+
+    # ---------- authoritative-bindings tree (the FULL fix) ----------
+
+    def test_bindings_drop_self_nested_owner(self):
+        """With authoritative bindings, an item's OWN owner agent must NOT
+        appear as a child of itself. The prior tree parsed the spawn marker
+        and nested the owner under the item — the self-nesting bug. The
+        owner is dropped; with only the owner present the tree is empty.
+        """
+        item = _add(self.env, "self-nest guard", ["repo:subagent-selfnest"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "aa11bb22-cc33-dd44-ee55-ff6600000001"
+        owner_id = "aaa111bbb222ccc33"
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=5)
+        # Owner transcript carries this item's own marker (as the main loop
+        # seeds it) — the prior code would have nested it under the item.
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, owner_id, qid)
+        # Authoritative binding: owner agent -> this item.
+        self._seed_bindings({owner_id: qid})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        self.assertIsInstance(subs, list)
+        ids = {s["subagent_id"] for s in subs}
+        self.assertNotIn(owner_id, ids,
+                         f"owner must NOT be nested under itself: {subs}")
+        self.assertEqual(subs, [], f"only-owner session -> empty tree: {subs}")
+
+    def test_bindings_parent_attribution(self):
+        """Bindings are authoritative: a subagent bound (via the bindings
+        file) to a DIFFERENT queue id must NOT be attributed to this item,
+        even if its transcript marker would (mis)match this item's id.
+        """
+        item_a = _add(self.env, "attrib item A", ["repo:subagent-attrib-a"])
+        qid_a = item_a["id"]
+        _register(self.env, qid_a)
+        item_b = _add(self.env, "attrib item B", ["repo:subagent-attrib-b"])
+        qid_b = item_b["id"]
+        _register(self.env, qid_b)
+
+        session_uuid = "bb22cc33-dd44-ee55-ff66-110000000002"
+        owner_a = "bbb222ccc333ddd44"
+        # A sibling whose TRANSCRIPT marker says qid_a (stale/misleading)
+        # but whose AUTHORITATIVE binding says qid_b. It must be attributed
+        # to B (i.e. excluded from A's tree).
+        sibling = "ccc333ddd444eee55"
+        _seed_agent_state(self.agent_state, owner_a, qid_a, alive=True, age=5)
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, owner_a, qid_a)
+        # sibling's transcript marker claims qid_a...
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, sibling, qid_a)
+        # ...but the authoritative binding attributes it to qid_b.
+        self._seed_bindings({owner_a: qid_a, sibling: qid_b})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid_a}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        ids = {s["subagent_id"] for s in r.get_json().get("subagents", [])}
+        # Owner dropped (self), sibling attributed to B by binding -> A's
+        # tree is empty. The sibling is NOT mis-pulled into A.
+        self.assertNotIn(sibling, ids,
+                         "binding -> B sibling must not appear under A")
+        self.assertNotIn(owner_a, ids, "owner is self, must be dropped")
+
+    def test_bindings_retry_siblings_collapsed_as_attempts(self):
+        """Multiple agents bound to the SAME queue id are retry attempts of
+        that item, NOT distinct children. The live owner is dropped; the
+        earlier attempt(s) surface as kind='attempt' nodes (attempt N), in
+        chronological order — never as separate child work.
+        """
+        item = _add(self.env, "retry attempts", ["repo:subagent-retry"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "cc33dd44-ee55-ff66-1122-330000000003"
+        owner_id = "ddd444eee555fff66"      # current live dispatch
+        retry_old = "eee555fff666aaa77"     # earlier abandoned attempt
+        # owner is the live agent per active-agents.
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
+        # Make retry_old OLDER (larger age) than owner so it's attempt 1.
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, owner_id, qid)
+        retry_path = self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, retry_old, qid)
+        # Backdate the retry transcript so its mtime is clearly older.
+        old_t = retry_path.stat().st_mtime - 600
+        os.utime(retry_path, (old_t, old_t))
+        # Both bound to the SAME item id.
+        self._seed_bindings({owner_id: qid, retry_old: qid})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        ids = {s["subagent_id"] for s in subs}
+        # Owner dropped; only the earlier attempt remains, labeled attempt 1.
+        self.assertNotIn(owner_id, ids, "live owner must be dropped")
+        self.assertEqual(ids, {retry_old},
+                         f"only the prior attempt remains: {subs}")
+        attempt = next(s for s in subs if s["subagent_id"] == retry_old)
+        self.assertEqual(attempt.get("kind"), "attempt",
+                         f"retry sibling must be kind=attempt: {attempt}")
+        self.assertEqual(attempt.get("attempt"), 1,
+                         f"oldest retry is attempt 1: {attempt}")
+        # And it carries an empty children list (uniform recursive shape).
+        self.assertEqual(attempt.get("children"), [])
 
     # ---------- GET /api/subagent/<id>/stream ----------
 
