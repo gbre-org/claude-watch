@@ -406,6 +406,90 @@ def _watcher_ctl_deny(op: str, cmd: str) -> dict:
 MONITOR_TOOL_NAME = "Monitor"
 
 
+# ---------------------------------------------------------------------------
+# Hardcoded ALLOW: the heartbeat-liveness `touch` must never be blocked.
+#
+# When claude-watch detects a stale heartbeat it injects an instruction to run
+# `touch /var/run/claude/heartbeat` as a single Bash tool call to restore
+# liveness. But a stale heartbeat very often coincides with a watcher being
+# momentarily down -- which means the obligations CLI's `watchers_healthy`
+# (and frequently `no_pending_watcher_outputs`) predicates would DENY that
+# very touch. That is a catch-22: the liveness-recovery touch the daemon is
+# begging for can't execute until watchers are restarted first, defeating the
+# whole fallback.
+#
+# The fix is a narrow ALLOW, evaluated BEFORE the obligations CLI dispatch:
+# a Bash command whose SOLE effective action is `touch /var/run/claude/
+# heartbeat` passes the gate regardless of obligation state. We scope it
+# tightly via the AST matcher:
+#   - exactly ONE top-level segment (no `&&`, `||`, `;`, `|`, `&`, newline) --
+#     so `touch /var/run/claude/heartbeat && rm -rf x` is NOT exempt;
+#   - effective head (after stripping env-assignments / sudo / wrappers) is
+#     `touch`;
+#   - the only non-flag operand is exactly `/var/run/claude/heartbeat`.
+# Anything else (a different path, a second path, a glob, a subshell in the
+# operand) falls through to the normal gate. The liveness touch is a pure
+# state-restore with no destructive side effect, so allowing it is safe.
+#
+# Like the watcher-ctl / Monitor gates, this lives in the hook itself (NOT a
+# stored obligation) so it holds even with corrupt obligation state. On parse
+# failure we FAIL CLOSED (return False -> normal gate applies); a real
+# liveness touch is a trivially-parseable bare command, so a parse failure
+# means the command is something else and should NOT be auto-allowed.
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_PATH = "/var/run/claude/heartbeat"
+
+
+def _is_heartbeat_liveness_touch(cmd: str) -> bool:
+    """True iff `cmd`'s sole effective action is `touch /var/run/claude/heartbeat`.
+
+    AST-aware and tightly scoped (see the block comment above). Returns False
+    on parse failure or whenever the structural helper is unavailable -- the
+    exemption fails CLOSED so only an unambiguous bare liveness touch is
+    auto-allowed.
+    """
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
+    if _shell_ast is None:
+        return False
+    try:
+        parsed = _shell_ast.parse(cmd)
+    except Exception:  # noqa: BLE001 -- any parse failure => not exempt
+        return False
+
+    # Exactly one real top-level segment, no top-level operators. A trailing
+    # empty segment can appear after a separator; require precisely one
+    # word-bearing segment AND no operators at all.
+    if parsed.has_top_level_operator():
+        return False
+    word_segs = [s for s in parsed.segments if s.words]
+    if len(word_segs) != 1:
+        return False
+
+    seg = word_segs[0]
+    words = _shell_ast._strip_command_prefix(seg.words)
+    if not words or words[0] != "touch":
+        return False
+
+    # Collect operands after the `touch` head. ANY operand other than the
+    # exact heartbeat path disqualifies the exemption. We treat a leading-dash
+    # token as a flag and everything else as an operand. Value-taking flags
+    # (-r/-t/-d) could smuggle another path/operand in, so they disqualify.
+    operands = []
+    for w in words[1:]:
+        if w == "--":
+            continue
+        if w.startswith("-"):
+            flag = w.lstrip("-")
+            if any(c in flag for c in ("r", "t", "d")):
+                return False
+            continue
+        operands.append(w)
+
+    return operands == [HEARTBEAT_PATH]
+
+
 def _monitor_subagent_deny() -> dict:
     banner_lines = [
         "!! BLOCKED: Monitor tool is disabled for subagents",
@@ -706,6 +790,20 @@ def main() -> int:
         if violation:
             print(json.dumps(_watcher_ctl_deny(violation, cmd_str)))
             return 0
+
+    # ---------------------------------------------------------------------
+    # Hardcoded ALLOW: the heartbeat-liveness touch. See
+    # `_is_heartbeat_liveness_touch` above. claude-watch's stale-heartbeat
+    # fallback injects exactly `touch /var/run/claude/heartbeat`; that touch
+    # must execute even when `watchers_healthy` / `no_pending_watcher_outputs`
+    # would otherwise DENY (a stale heartbeat frequently coincides with a
+    # momentarily-down watcher). Tightly scoped via the AST so a bundled
+    # command (`touch ... && rm -rf x`) or a different path is NOT exempt.
+    # Runs BEFORE the obligations CLI dispatch so no predicate can block it.
+    # ---------------------------------------------------------------------
+    if tool_name == "Bash" and _is_heartbeat_liveness_touch(cmd_str):
+        print(json.dumps(_allow()))
+        return 0
 
     # Locate the obligations CLI. Prefer PATH, fall back to a sibling in
     # the claude-watch tools/ tree (when this hook is run uninstalled).

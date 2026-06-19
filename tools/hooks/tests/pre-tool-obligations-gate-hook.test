@@ -2687,6 +2687,197 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
 
+        # ===================================================================
+        # Tests 74hb1-74hb9: heartbeat-liveness `touch` exemption.
+        #
+        # claude-watch's stale-heartbeat fallback injects exactly
+        # `touch /var/run/claude/heartbeat`. That touch must execute even
+        # when the obligations gate would otherwise DENY (a stale heartbeat
+        # frequently coincides with a momentarily-down watcher tripping
+        # watchers_healthy / no_pending_watcher_outputs). The exemption is a
+        # hardcoded ALLOW in the hook, evaluated before the obligations CLI
+        # dispatch, tightly scoped via the AST: ONLY a single-segment bare
+        # `touch /var/run/claude/heartbeat` is exempt; a bundled command or a
+        # different path is NOT.
+        # ===================================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-heartbeat-") as td_hb:
+            tmpdir_hb = Path(td_hb)
+            env_hb, _ = _make_isolated_env(tmpdir_hb)
+
+            # Register a no_pending_watcher_outputs gate that ACTUALLY denies:
+            # an unread sidecar with written output (same recipe as test 23).
+            # This proves the heartbeat touch passes even with a live deny.
+            hb_sidecar_dir = tmpdir_hb / "watcher-output-pending"
+            env_hb["WATCHER_PENDING_DIR"] = str(hb_sidecar_dir)
+            _add_ob(
+                env_hb,
+                tool_pattern="*",
+                predicate="no_pending_watcher_outputs",
+                params={},
+                ttl=0,
+                deny_msg="Read the captured watcher output before proceeding",
+            )
+            # Also register a watchers_healthy-shaped deny that does not need a
+            # live watcher-status: a file_exists gate on a missing path denies
+            # every Bash call deterministically, standing in for the
+            # watchers_healthy DENY at the moment liveness goes stale.
+            hb_missing = tmpdir_hb / "definitely-missing-marker"
+            _add_ob(
+                env_hb,
+                tool_pattern="Bash",
+                predicate="file_exists",
+                params={"path": str(hb_missing)},
+                ttl=0,
+                deny_msg="stand-in for watchers_healthy DENY",
+            )
+
+            def _write_hb_sidecar() -> Path:
+                hb_sidecar_dir.mkdir(parents=True, exist_ok=True)
+                of = tmpdir_hb / "hb-captured.output"
+                of.write_text("watcher fired with content\n")
+                os.utime(of, (time.time(), time.time()))
+                sc = {
+                    "task_id": "hbsidecar",
+                    "command": "watcher-ctl run sample-hb",
+                    "watcher_name": "sample-hb",
+                    "output_file_path": str(of),
+                    "registered_at": time.time() - 10,
+                }
+                (hb_sidecar_dir / "hbsidecar.json").write_text(json.dumps(sc))
+                return of
+
+            # Sanity: with both gates live, an UNRELATED Bash command DENIES.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_hb,
+            )
+            results.append(_check(
+                "74hb1. unrelated `ls` DENIES while gates live (baseline)",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb2: bare `touch /var/run/claude/heartbeat` -> ALLOW despite
+            # the live denying gates (the whole point of the fix).
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "touch /var/run/claude/heartbeat"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb2. bare heartbeat touch -> allow despite unhealthy/unread gates",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb3: leading/trailing whitespace still ALLOWED.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "  touch /var/run/claude/heartbeat  "}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb3. whitespace-padded heartbeat touch -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb4: bundled `touch ... && rm -rf x` -> NOT exempt -> DENY.
+            # The exemption must never let a second action ride along.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "touch /var/run/claude/heartbeat && rm -rf /tmp/x",
+                 }},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb4. heartbeat touch bundled with `&& rm` -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb5: heartbeat touch piped -> NOT exempt -> DENY.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "touch /var/run/claude/heartbeat | cat",
+                 }},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb5. heartbeat touch piped -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb6: `touch` of a DIFFERENT path -> NOT exempt -> DENY.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "touch /var/run/claude/other"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb6. touch of a different path -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb7: `touch` of the heartbeat path PLUS a second path ->
+            # NOT exempt -> DENY (a second operand smuggles work in).
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "touch /var/run/claude/heartbeat /tmp/evil",
+                 }},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb7. heartbeat touch + second operand -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb8: the heartbeat path mentioned only inside a quoted arg to
+            # another command (echo) is NOT a touch of it -> NOT exempt ->
+            # DENY (proves the exemption keys on the real command head, not
+            # substring presence of the path).
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "echo 'touch /var/run/claude/heartbeat'",
+                 }},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb8. heartbeat path inside echo arg -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb9: a value-taking touch flag (-r reffile) that smuggles a
+            # second path -> NOT exempt -> DENY.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "touch -r /etc/passwd /var/run/claude/heartbeat",
+                 }},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb9. heartbeat touch with -r reffile -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
         # ---------------------------------------------------------------
         # Tests 74p1-74p5: AST-aware no_pipe_pattern predicate.
         #
