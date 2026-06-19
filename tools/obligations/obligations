@@ -455,6 +455,46 @@ NO_PENDING_WATCHER_OUTPUTS_EXEMPT_PATTERNS = [
 # in `_universal_recovery_exempt_match` and SHORT-CIRCUIT the per-obligation
 # evaluation in both gate-mode (_check_core) and inform-mode
 # (_inform_check_core).
+# MUTATING `session-task queue` subcommands a SUBAGENT must not run. The
+# universal recovery floor (`Bash:^session-task\b`, below) deliberately
+# allows EVERY `session-task` command past every obligation so a wedged
+# MAIN loop can always dispatch / clear the queue. That floor must NOT be
+# narrowed for the main loop. But a SUBAGENT never dispatches: its only
+# legitimate queue surface is read-only inspection + `register` (the
+# documented rotated-q-id recovery). So for a subagent ONLY, we carve
+# these item-CREATION / lifecycle-MUTATION subcommands OUT of the floor so
+# the `subagent_queue_mutating_banned` predicate can actually DENY them.
+#
+# `register` is deliberately ABSENT (it is the recovery path the
+# subagent_queue_item_running lifetime gate instructs a denied subagent to
+# use; banning it would blackhole live subagents). Read-only subcommands
+# (list/show/scope/groups/ready/spawn-check/banner/locks) are also absent.
+# Single source of truth, reused by the subagent_queue_mutating_banned
+# predicate.
+SUBAGENT_BANNED_QUEUE_SUBCOMMANDS = frozenset({
+    "add", "done", "abandon", "resurrect", "pop", "heartbeat", "wedge",
+    "unwedge", "block", "unblock", "force-start", "promote", "set-summary",
+    "update-scope", "depend", "prune", "lock", "unlock", "migrate",
+})
+
+# Anchored matcher for `session-task queue <subcmd>`, tolerating a leading
+# path prefix (e.g. /usr/local/bin/) and arbitrary inter-token whitespace.
+_SESSION_TASK_QUEUE_SUBCMD_RE = re.compile(
+    r"^\s*(?:\S*/)?session-task\s+queue\s+([a-z][a-z-]*)\b"
+)
+
+
+def _session_task_queue_subcommand(command_string):
+    """Return the `session-task queue <subcmd>` subcommand name (str) for
+    a Bash command, or None if it is not a `session-task queue ...`
+    invocation. Shared by the universal-floor subagent carve-out and the
+    subagent_queue_mutating_banned predicate so they parse identically."""
+    if not command_string:
+        return None
+    m = _SESSION_TASK_QUEUE_SUBCMD_RE.search(command_string)
+    return m.group(1) if m else None
+
+
 UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
     # The escape hatch itself. `obligations override` MUST always work --
     # it's the documented recovery for any deadlock scenario. Same for
@@ -467,6 +507,13 @@ UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
     # heartbeat / show / list / banner` and the layer-1 helpers
     # (`session-task set / clear / get`). Listing the leading `session-task`
     # token is enough to cover the entire dispatcher surface.
+    #
+    # SUBAGENT CARVE-OUT: this floor is UNCONDITIONAL for the main loop,
+    # but for a SUBAGENT the MUTATING queue subcommands in
+    # SUBAGENT_BANNED_QUEUE_SUBCOMMANDS are carved out of the floor (see
+    # _universal_recovery_exempt_match) so subagent_queue_mutating_banned
+    # can DENY them. Read-only subcommands + `register` stay floored for
+    # everyone.
     "Bash:^session-task\\b",
     # Agent spawn. The dispatcher's primary recovery action is "delegate
     # the queued item to a subagent". Blocking Agent from the main loop
@@ -504,6 +551,7 @@ VALID_PREDICATE_KINDS = {
     "stale_ready_queue_present",
     "force_started_unspawned",
     "subagent_queue_item_running",
+    "subagent_queue_mutating_banned",
     "no_backgrounded_watcher",
     "evaluator",
     "all_of",
@@ -2211,6 +2259,84 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
                     f"subagent_queue_item_running default-open on "
                     f"error: {e}")
 
+    if kind == "subagent_queue_mutating_banned":
+        # BAN-style predicate: returns satisfied=True (=ALLOW) for every
+        # command EXCEPT a `session-task queue <MUTATING-subcmd>` invocation,
+        # for which it returns satisfied=False (=DENY).
+        #
+        # Wired in production as `all_of [is_main_loop {negate: true},
+        # subagent_queue_mutating_banned]` (see obligations-init), so the
+        # surrounding all_of's is_main_loop scope-guard makes this fire ONLY
+        # inside subagent contexts (main-loop calls short-circuit to ALLOW).
+        # The predicate body itself does NOT re-check agent_id -- scoping is
+        # the wrapper's job, mirroring subagent_queue_item_running.
+        #
+        # WHY: subagents were observed calling `session-task queue add`
+        # (creating redundant orphan queue items) and then `done`/`abandon`
+        # on work the MAIN loop owns and audits. The queue is the main loop's
+        # audit trail of work IT dispatched; a subagent mutating it races the
+        # main loop and pollutes that trail. Read-only inspection stays free.
+        #
+        # RECOVERY-PATH PRESERVATION (critical): `register` is deliberately
+        # NOT in the banned set. The subagent_queue_item_running lifetime gate
+        # tells a denied subagent to run `session-task queue register q-NEW`
+        # to pick up a rotated q-id; that recovery is also exempt in that
+        # seed. Banning `register` here would blackhole live subagents whose
+        # q-id rotated. The orphan-item problem is driven by `add` (item
+        # CREATION) + the subsequent `done`/`abandon` (lifecycle MUTATION),
+        # NOT by `register` of an already-main-loop-enqueued item. So
+        # `register` is treated as ALLOWED (read/claim/recovery), exactly like
+        # the existing recovery exemption.
+        #
+        # Read-only / allowed subcommands (NOT banned): list, show, scope,
+        # groups, ready, spawn-check, banner, locks, status (status has no
+        # `qsub` parser today, but is listed for parity with the
+        # subagent_queue_item_running exempt set), and register (recovery).
+        #
+        # Banned (mutating) subcommands: add, done, abandon, resurrect, pop,
+        # heartbeat, wedge, unwedge, block, unblock, force-start, promote,
+        # set-summary, update-scope, depend, prune, lock, unlock, migrate.
+        #
+        # Default-open contract: non-Bash tool, empty command, parse failure,
+        # or any unexpected exception => ALLOW. A predicate bug must never
+        # blackhole the loop.
+        try:
+            if tool_name not in ("Bash",):
+                return (True, f"tool {tool_name} is not Bash (predicate N/A)")
+            cmd = command_string or ""
+            if not cmd.strip():
+                return (True, "empty command (allow)")
+            # Parse the `session-task queue <subcmd>` subcommand via the
+            # shared helper (tolerates a leading path prefix + arbitrary
+            # inter-token whitespace). Reuses the SAME parse + banned-set the
+            # universal-floor subagent carve-out uses, so the two can never
+            # disagree about what counts as "mutating".
+            subcmd = _session_task_queue_subcommand(cmd)
+            if subcmd is None:
+                return (True,
+                        "not a `session-task queue <subcmd>` command (allow)")
+            if subcmd in SUBAGENT_BANNED_QUEUE_SUBCOMMANDS:
+                return (False,
+                        f"subagents may not run the MUTATING queue subcommand "
+                        f"`session-task queue {subcmd}`. The queue is the MAIN "
+                        f"loop's audit trail of work IT dispatched; a subagent "
+                        f"creating items (`add`) or mutating lifecycle "
+                        f"(`done`/`abandon`/`block`/...) races the main loop "
+                        f"and orphans items. Read-only subcommands (list, "
+                        f"show, scope, groups, ready, spawn-check, banner, "
+                        f"locks) and `register` (rotated-q-id recovery) ARE "
+                        f"allowed. If your work is genuinely done, return your "
+                        f"final value and let the MAIN loop close the queue "
+                        f"item; if your q-id rotated, run `session-task queue "
+                        f"register q-NEW` to recover.")
+            return (True,
+                    f"`session-task queue {subcmd}` is read-only/recovery "
+                    f"(allow)")
+        except Exception as e:  # noqa: BLE001 -- default-open on any error
+            return (True,
+                    f"subagent_queue_mutating_banned default-open on "
+                    f"error: {e}")
+
     if kind == "no_backgrounded_watcher":
         # BAN-style predicate: satisfied (=allow) UNLESS the Bash command
         # backgrounds a watcher LAUNCH with a real top-level shell ``&``
@@ -2425,7 +2551,8 @@ def _exempt_match(exempt_patterns, tool_name, command_string):
     return (False, None)
 
 
-def _universal_recovery_exempt_match(tool_name, command_string):
+def _universal_recovery_exempt_match(tool_name, command_string,
+                                     agent_id=None):
     """Return (matched: bool, which: str|None) against
     ``UNIVERSAL_RECOVERY_EXEMPT_PATTERNS``.
 
@@ -2434,11 +2561,31 @@ def _universal_recovery_exempt_match(tool_name, command_string):
     deadlock-prevention floor: no matter how many obligations are active,
     the recovery / escape-hatch surface always passes.
 
-    See ``UNIVERSAL_RECOVERY_EXEMPT_PATTERNS`` for rationale + the list.
+    SUBAGENT CARVE-OUT: the ``Bash:^session-task\b`` floor pattern allows
+    EVERY ``session-task`` command for the MAIN loop (the dispatcher must
+    always be able to clear the queue, even when deadlocked). For a SUBAGENT
+    (``agent_id`` present), however, a MUTATING ``session-task queue``
+    subcommand (``SUBAGENT_BANNED_QUEUE_SUBCOMMANDS``) is NOT floored -- it
+    is carved out so the per-row ``subagent_queue_mutating_banned`` predicate
+    gets to run and DENY. Read-only subcommands + ``register`` (recovery) are
+    still floored for everyone. The main-loop floor is left fully intact:
+    this NEVER narrows the recovery surface the main loop relies on.
+
+    See ``UNIVERSAL_RECOVERY_EXEMPT_PATTERNS`` for the full rationale + list.
     """
-    return _exempt_match(
+    matched, which = _exempt_match(
         UNIVERSAL_RECOVERY_EXEMPT_PATTERNS, tool_name, command_string,
     )
+    if (matched and tool_name == "Bash"
+            and _is_subagent_context(agent_id)):
+        subcmd = _session_task_queue_subcommand(command_string)
+        if subcmd in SUBAGENT_BANNED_QUEUE_SUBCOMMANDS:
+            # Subagent + mutating queue subcommand: do NOT let the floor
+            # short-circuit; fall through to per-obligation evaluation so
+            # subagent_queue_mutating_banned can DENY. (The main loop keeps
+            # the unconditional floor -- this branch requires agent_id.)
+            return (False, None)
+    return (matched, which)
 
 
 # ---------------------------------------------------------------------------
@@ -2901,7 +3048,7 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
     # obligations is active. See UNIVERSAL_RECOVERY_EXEMPT_PATTERNS for
     # the rationale + the list.
     universal_hit, _universal_pat = _universal_recovery_exempt_match(
-        tool_name, command_string,
+        tool_name, command_string, agent_id=agent_id,
     )
     if universal_hit:
         return (True, [])
@@ -2978,7 +3125,7 @@ def _inform_check_core(tool_name, command_string, agent_id=None):
     # stale" advisory rather than re-surfacing what the caller is already
     # acting on. Mirrors _check_core's framework floor.
     universal_hit, _universal_pat = _universal_recovery_exempt_match(
-        tool_name, command_string,
+        tool_name, command_string, agent_id=agent_id,
     )
     if universal_hit:
         return []
