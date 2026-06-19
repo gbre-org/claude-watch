@@ -512,6 +512,198 @@ class SubagentTreeTest(unittest.TestCase):
         # And it carries an empty children list (uniform recursive shape).
         self.assertEqual(attempt.get("children"), [])
 
+    def _seed_parent_with_spawn(self, jsonl_root, session_uuid, agent_id, qid,
+                                child_agent_id):
+        """Seed a transcript carrying the item marker AND a recorded
+        Agent-tool spawn of ``child_agent_id``.
+
+        The spawn shows up as an ``Agent`` ``tool_use`` block plus its matching
+        ``tool_result`` whose text echoes ``agentId: <child>`` — exactly the
+        ``run_in_background`` launch record Claude Code writes. This is the
+        signal ``_session_subagent_parent_map`` uses to reconstruct the real
+        spawn hierarchy.
+        """
+        tuid = f"toolu_{child_agent_id[:8]}"
+        lines = [
+            {
+                "type": "user",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+                "isSidechain": True,
+                "uuid": "u1",
+                "message": {
+                    "role": "user",
+                    "content": f"Queue item: {qid}\nParent task.",
+                },
+            },
+            {
+                "type": "assistant",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+                "uuid": "a1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tuid,
+                            "name": "Agent",
+                            "input": {"prompt": f"Queue item: {qid}\nChild."},
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+                "uuid": "u2",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tuid,
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Async agent launched successfully.\n"
+                                        f"agentId: {child_agent_id} (internal "
+                                        "ID - do not mention to user.)"
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+        ]
+        return _seed_subagent_jsonl(
+            jsonl_root, session_uuid, agent_id, lines=lines)
+
+    def test_nested_child_not_mislabeled_as_attempt(self):
+        """REGRESSION (q-2026-06-19-7aa6): a nested child spawned BY the owner
+        agent — which inherits the owner's ``Queue item: q-XXXX`` line and so
+        binds to the SAME item — must render as a nested ``kind='child'``
+        under the owner's tree, NOT as a false peer ``kind='attempt'`` retry.
+        """
+        item = _add(self.env, "nested child", ["repo:subagent-nested"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "dd44ee55-ff66-1122-3344-550000000004"
+        owner_id = "a63d61fcdccb43cb6"   # the main-loop dispatch (owner)
+        child_id = "aaa255509254c3c81"   # nested child the owner spawned
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
+        # Owner transcript records the Agent-tool spawn of child_id.
+        self._seed_parent_with_spawn(
+            self.jsonl_root, session_uuid, owner_id, qid, child_id)
+        # Child transcript carries the inherited item marker.
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, child_id, qid)
+        # BOTH bound to the SAME item id (the child inherited the line).
+        self._seed_bindings({owner_id: qid, child_id: qid})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        self.assertIsInstance(subs, list)
+        # Owner dropped; the child surfaces (parent == dropped owner) at top
+        # level of the owner's tree — but as a CHILD, never an attempt.
+        ids = {s["subagent_id"] for s in subs}
+        self.assertEqual(ids, {child_id},
+                         f"only the nested child should surface: {subs}")
+        child = next(s for s in subs if s["subagent_id"] == child_id)
+        self.assertEqual(child.get("kind"), "child",
+                         f"nested child must be kind=child, not attempt: {child}")
+        self.assertNotIn("attempt", child,
+                         f"child must carry no attempt ordinal: {child}")
+        # No node anywhere is mislabeled an attempt.
+        self.assertFalse(any(s.get("kind") == "attempt" for s in subs),
+                         f"a parent->child pair must yield ZERO attempts: {subs}")
+
+    def test_grandchild_nests_under_child(self):
+        """A 3-level chain owner -> child -> grandchild (all bound to the same
+        item via inherited markers) renders as real nesting: the grandchild
+        hangs UNDER the child, and neither is an attempt.
+        """
+        item = _add(self.env, "grandchild chain", ["repo:subagent-gchild"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "ee55ff66-1122-3344-5566-770000000005"
+        owner_id = "1111aaaa2222bbbb3"
+        child_id = "4444cccc5555dddd6"
+        grandchild_id = "7777eeee8888ffff9"
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
+        # owner spawns child; child spawns grandchild.
+        self._seed_parent_with_spawn(
+            self.jsonl_root, session_uuid, owner_id, qid, child_id)
+        self._seed_parent_with_spawn(
+            self.jsonl_root, session_uuid, child_id, qid, grandchild_id)
+        self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, grandchild_id, qid)
+        self._seed_bindings(
+            {owner_id: qid, child_id: qid, grandchild_id: qid})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        # Owner dropped -> child is the single top-level node; grandchild
+        # nests under it. Zero attempts.
+        self.assertEqual(len(subs), 1, f"child should be the lone root: {subs}")
+        top = subs[0]
+        self.assertEqual(top["subagent_id"], child_id)
+        self.assertEqual(top.get("kind"), "child")
+        self.assertEqual(len(top["children"]), 1,
+                         f"grandchild must nest under child: {top}")
+        self.assertEqual(top["children"][0]["subagent_id"], grandchild_id)
+        self.assertEqual(top["children"][0].get("kind"), "child")
+        self.assertFalse(any(s.get("kind") == "attempt" for s in subs))
+
+    def test_genuine_retry_and_nested_child_coexist(self):
+        """A genuine main-loop retry (NOT spawned by any session agent) stays
+        ``kind='attempt'`` while a nested child of the owner stays
+        ``kind='child'`` — the two are partitioned correctly when both are
+        bound to the same item.
+        """
+        item = _add(self.env, "retry plus child", ["repo:subagent-mix"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "ff661122-3344-5566-7788-990000000006"
+        owner_id = "aaaa1111bbbb2222c"   # live owner dispatch
+        retry_old = "dddd3333eeee4444f"  # earlier main-loop attempt (no parent)
+        child_id = "5555aaaa6666bbbb7"   # owner's nested child
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
+        # owner spawns child_id (nested).
+        self._seed_parent_with_spawn(
+            self.jsonl_root, session_uuid, owner_id, qid, child_id)
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, child_id, qid)
+        # retry_old is a plain transcript with the marker but NO spawn record
+        # pointing at it -> main-loop attempt. Backdate so it's attempt 1.
+        retry_path = self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, retry_old, qid)
+        old_t = retry_path.stat().st_mtime - 600
+        os.utime(retry_path, (old_t, old_t))
+        self._seed_bindings(
+            {owner_id: qid, retry_old: qid, child_id: qid})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        by_id = {s["subagent_id"]: s for s in subs}
+        self.assertIn(retry_old, by_id, f"retry must surface: {subs}")
+        self.assertIn(child_id, by_id, f"nested child must surface: {subs}")
+        self.assertEqual(by_id[retry_old].get("kind"), "attempt",
+                         f"main-loop retry must stay attempt: {subs}")
+        self.assertEqual(by_id[retry_old].get("attempt"), 1)
+        self.assertEqual(by_id[child_id].get("kind"), "child",
+                         f"owner's nested child must stay child: {subs}")
+
     # ---------- GET /api/subagent/<id>/stream ----------
 
     def test_subagent_stream_emits_backfill(self):
