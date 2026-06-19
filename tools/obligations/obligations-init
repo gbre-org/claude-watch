@@ -107,6 +107,7 @@ EVENT_MUST_ACT_TAG = "[default-seed] event_must_act"
 AGENT_ACK_PENDING_TAG = "[default-seed] agent_ack_pending"
 QUEUE_READY_UNSPAWNED_TAG = "[default-seed] queue_ready_unspawned"
 NO_BACKGROUNDED_WATCHER_TAG = "[default-seed] no_backgrounded_watcher"
+SUBAGENT_QUEUE_MUTATING_BANNED_TAG = "[default-seed] subagent_queue_mutating_banned"
 
 # Exempts that must always pass even when the gate is firing. These are
 # the recovery surface a subagent uses to either re-register a queue
@@ -617,6 +618,105 @@ def seed_no_backgrounded_watcher(cli: str, *, dry_run: bool = False,
     return 0
 
 
+def seed_subagent_queue_mutating_banned(cli: str, *, dry_run: bool = False,
+                                          force: bool = False,
+                                          verbose: bool = False) -> int:
+    """Add the subagent_queue_mutating_banned obligation. Uses the native
+    ``subagent_queue_mutating_banned`` predicate to DENY a subagent that
+    invokes a MUTATING ``session-task queue`` subcommand (add / done /
+    abandon / block / depend / ...), while ALLOWING read-only subcommands
+    (list / show / scope / groups / ready / spawn-check / banner / locks)
+    and -- critically -- ``register`` (the documented rotated-q-id recovery
+    path). Returns 0 on success.
+
+    SCOPING: wrapped in ``all_of [is_main_loop {negate: true},
+    subagent_queue_mutating_banned]`` so the gate fires ONLY inside subagent
+    contexts. A main-loop call (no agent_id) makes the ``is_main_loop
+    {negate: true}`` child FAIL, which the all_of treats as an inactive
+    scope-guard -> the whole row short-circuits to satisfied=True (ALLOW).
+    This is the exact inverse-scope pattern used by
+    ``seed_subagent_queue_item_running``.
+
+    RECOVERY PRESERVATION: the read-only/recovery surface is ALSO listed as
+    ``--exempt-tool-pattern`` rows (belt-and-suspenders with the predicate's
+    own allow logic), mirroring DEFAULT_EXEMPT_PATTERNS on the
+    subagent_queue_item_running seed. ``register`` is exempt so the
+    re-register recovery instructed by the lifetime gate keeps working.
+    """
+    if not force and _row_already_present(
+            cli, SUBAGENT_QUEUE_MUTATING_BANNED_TAG):
+        if verbose:
+            print("subagent_queue_mutating_banned: already seeded -- "
+                  "skipping", file=sys.stderr)
+        return 0
+
+    # Subagent-ONLY: fire the ban only inside subagent contexts. Wrap the
+    # native predicate behind an is_main_loop {negate: true} scope-guard
+    # inside all_of so main-loop calls short-circuit to ALLOW (the all_of's
+    # is_main_loop child FAILS in the main loop and the all_of treats a
+    # failing is_main_loop child as "inactive scope"). Mirrors
+    # seed_subagent_queue_item_running.
+    predicate_params = {
+        "predicates": [
+            {"kind": "is_main_loop", "params": {"negate": True}},
+            {"kind": "subagent_queue_mutating_banned", "params": {}},
+        ]
+    }
+
+    cmd = [
+        cli, "add",
+        "--tool-pattern", "*",
+        "--predicate", "all_of",
+        "--params", json.dumps(predicate_params),
+        "--ttl", "0",  # non-expiring
+        "--enforcement", "gate",
+        "--deny-msg", SUBAGENT_QUEUE_MUTATING_BANNED_TAG,
+        "--created-by", "obligations-init",
+        "--json",
+    ]
+    # Belt-and-suspenders exempts for the read-only + recovery surface. The
+    # predicate already ALLOWS these, but listing them makes the row's intent
+    # self-documenting and ensures the recovery path can never be gated even
+    # if the predicate's match logic regresses. NOTE: `register` is exempt to
+    # preserve the documented rotated-q-id recovery instructed by the
+    # subagent_queue_item_running lifetime gate.
+    for pat in (
+        r"Bash:^session-task\s+queue\s+"
+        r"(list|show|scope|groups|ready|spawn-check|banner|locks|status|"
+        r"register)\b",
+        # Obligations inspection / override escape hatch.
+        r"Bash:^obligations\s+(list|show|status|check|override|satisfy)",
+    ):
+        cmd.extend(["--exempt-tool-pattern", pat])
+
+    if dry_run:
+        print("DRY-RUN: " + " ".join(cmd))
+        return 0
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print("obligations-init: obligations add failed "
+              f"rc={proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        return 1
+    if verbose:
+        try:
+            row = json.loads(proc.stdout)
+            print(f"subagent_queue_mutating_banned: seeded "
+                  f"id={row.get('id', '?')}", file=sys.stderr)
+        except (json.JSONDecodeError, ValueError):
+            print(f"subagent_queue_mutating_banned: seeded "
+                  f"(rc={proc.returncode})", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="obligations-init",
@@ -672,8 +772,12 @@ def main() -> int:
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
 
+    rc7 = seed_subagent_queue_mutating_banned(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+
     # Return first non-zero exit code (if any)
-    return rc or rc2 or rc3 or rc4 or rc5 or rc6
+    return rc or rc2 or rc3 or rc4 or rc5 or rc6 or rc7
 
 
 if __name__ == "__main__":

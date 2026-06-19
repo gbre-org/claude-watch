@@ -105,11 +105,6 @@ machine. The distinction matters for many decisions:
 - Hostname is typically `claude-container-<rand>` or whatever
   `docker run --name` was passed; do not infer the host identity from it.
 
-**Quick self-check**: if you need to confirm "am I in the container?",
-run `cat /etc/claude-code/CLAUDE.md | head -3`. If you see this file's
-header, you are in the container. The host has no `/etc/claude-code/`
-unless the operator explicitly created one.
-
 ## Session-start checklist — MANDATORY first action
 
 **ON EVERY SESSION START (including `/clear`, restart, or context
@@ -224,7 +219,7 @@ work is **not** the main loop:
 call, reads multiple files, makes multi-file edits, runs tests, or ships
 code through review → delegate it to an Agent, not inline in the main loop.
 
-Why this matters even when nothing is forcing the choice:
+Why delegate even when nothing forces it:
 
 - **Context is precious in the main loop.** A subagent runs in its own
   context window — large reads, long test output, verbose CI logs all stay

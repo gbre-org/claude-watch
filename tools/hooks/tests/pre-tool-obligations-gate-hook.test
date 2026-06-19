@@ -134,6 +134,11 @@ Test cases (PreToolUse):
 121. subagent_queue_item_running: corrupt bindings -> allow (default-open)
 122. subagent_queue_item_running: main-loop call -> allow (scope-guard skip)
 123. subagent_queue_item_running: no entry for this agent -> allow
+300-30x. subagent_queue_mutating_banned: subagent MUTATING subcmd -> deny
+310-31x. subagent_queue_mutating_banned: subagent read-only subcmd -> allow
+320. subagent_queue_mutating_banned: subagent `register` -> allow (recovery)
+321. subagent_queue_mutating_banned: main-loop mutating subcmd -> allow (scope-guard)
+322-327. subagent_queue_mutating_banned: path-prefix/whitespace/non-Bash/empty/non-session-task edge cases
 124. end-to-end: arm-hook -> bind -> queue=running allow -> queue=done deny
 125. evaluator (exit_code): cmd returns 0 -> allow
 126. evaluator (exit_code): cmd returns 1 -> deny + stderr in reason
@@ -4528,6 +4533,189 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
             _run([str(CLI), "satisfy", ob_123], env_sqr)
+
+        # ===========================================================
+        # Tests 300-3xx: subagent_queue_mutating_banned predicate.
+        # BANS subagents from MUTATING `session-task queue` subcommands
+        # while ALLOWING read-only ones + `register` (recovery), and
+        # ALWAYS allowing the main loop (via the all_of+is_main_loop
+        # {negate:true} scope-guard, matching the production seed shape).
+        # ===========================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-sqmb-") as td_sqmb:
+            tmpdir_sqmb = Path(td_sqmb)
+            env_sqmb, _ob_path_sqmb = _make_isolated_env(tmpdir_sqmb)
+
+            SUBAGENT_AID = "agent-sqmb-001"
+
+            def _add_sqmb_ob():
+                """Seed-shape row: all_of[is_main_loop{negate:true},
+                subagent_queue_mutating_banned]."""
+                return _add_ob(
+                    env_sqmb,
+                    tool_pattern="*",
+                    predicate="all_of",
+                    params={"predicates": [
+                        {"kind": "is_main_loop", "params": {"negate": True}},
+                        {"kind": "subagent_queue_mutating_banned",
+                         "params": {}},
+                    ]},
+                    ttl=600,
+                    deny_msg="subagent queue mutation banned",
+                )
+
+            def _sub_payload(command):
+                return {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                    "agent_id": SUBAGENT_AID,
+                }
+
+            def _main_payload(command):
+                # No agent_id => main loop.
+                return {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                }
+
+            # --- 300-30x: subagent + MUTATING subcmd -> DENY ---
+            for n, subcmd in enumerate((
+                "add", "done", "abandon", "block", "depend", "prune",
+                "wedge", "force-start", "update-scope", "migrate",
+            )):
+                ob = _add_sqmb_ob()
+                cmd_str = f"session-task queue {subcmd} q-x"
+                rc, out, _err = _hook_pre(_sub_payload(cmd_str), env_sqmb)
+                reason = (out.get("hookSpecificOutput", {})
+                          .get("permissionDecisionReason", "")
+                          ) if isinstance(out, dict) else ""
+                results.append(_check(
+                    f"30{n}. subagent_queue_mutating_banned: subagent "
+                    f"`queue {subcmd}` -> DENY",
+                    (rc == 0 and _is_deny(out) and subcmd in reason),
+                    f"rc={rc} reason={reason!r}",
+                ))
+                _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 310-31x: subagent + READ-ONLY subcmd -> ALLOW ---
+            for n, subcmd in enumerate((
+                "list", "show", "scope", "groups", "ready", "spawn-check",
+                "banner", "locks",
+            )):
+                ob = _add_sqmb_ob()
+                cmd_str = f"session-task queue {subcmd}"
+                rc, out, _err = _hook_pre(_sub_payload(cmd_str), env_sqmb)
+                results.append(_check(
+                    f"31{n}. subagent_queue_mutating_banned: subagent "
+                    f"`queue {subcmd}` -> ALLOW (read-only)",
+                    rc == 0 and _is_allow(out),
+                    f"rc={rc} out={out}",
+                ))
+                _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 320: subagent + `register` -> ALLOW (recovery path) ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre(
+                _sub_payload("session-task queue register q-new-rotated"),
+                env_sqmb)
+            results.append(_check(
+                "320. subagent_queue_mutating_banned: subagent `queue "
+                "register` -> ALLOW (rotated-q-id recovery preserved)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 321: MAIN LOOP + MUTATING subcmd -> ALLOW (scope-guard) ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre(
+                _main_payload("session-task queue add 'foo' --scope bar"),
+                env_sqmb)
+            results.append(_check(
+                "321. subagent_queue_mutating_banned: MAIN-LOOP `queue add` "
+                "-> ALLOW (is_main_loop scope-guard skip)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 322: subagent + path-prefixed mutating subcmd -> DENY ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre(
+                _sub_payload("/usr/local/bin/session-task queue add 'foo'"),
+                env_sqmb)
+            results.append(_check(
+                "322. subagent_queue_mutating_banned: subagent "
+                "`/usr/local/bin/session-task queue add` -> DENY "
+                "(path prefix tolerated)",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 323: subagent + leading-whitespace mutating subcmd -> DENY ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre(
+                _sub_payload("   session-task  queue   done   q-x"),
+                env_sqmb)
+            results.append(_check(
+                "323. subagent_queue_mutating_banned: subagent extra "
+                "whitespace `queue done` -> DENY",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 324: subagent + unrelated command -> ALLOW ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre(_sub_payload("ls -la"), env_sqmb)
+            results.append(_check(
+                "324. subagent_queue_mutating_banned: subagent unrelated "
+                "command (`ls`) -> ALLOW",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 325: subagent + non-Bash tool -> ALLOW (predicate N/A) ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre({
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/tmp/x"},
+                "agent_id": SUBAGENT_AID,
+            }, env_sqmb)
+            results.append(_check(
+                "325. subagent_queue_mutating_banned: subagent non-Bash "
+                "tool -> ALLOW (predicate N/A)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 326: subagent + malformed/empty Bash command -> ALLOW
+            #          (default-open) ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre(_sub_payload(""), env_sqmb)
+            results.append(_check(
+                "326. subagent_queue_mutating_banned: subagent empty "
+                "command -> ALLOW (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 327: a different tool whose `queue` subcmd merely RESEMBLES
+            #          session-task (e.g. another binary) -> ALLOW. Only
+            #          `session-task queue <subcmd>` is matched. ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre(
+                _sub_payload("my-other-tool queue add thing"), env_sqmb)
+            results.append(_check(
+                "327. subagent_queue_mutating_banned: non-session-task "
+                "`... queue add` -> ALLOW (not session-task)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
 
         # ===========================================================
         # Test 124: end-to-end -- arm via post-hook + mutate queue
