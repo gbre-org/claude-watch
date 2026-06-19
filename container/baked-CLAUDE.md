@@ -1058,40 +1058,25 @@ If `/mcp` shows "No MCP servers configured" inside the container, either
 suppressed by-default — the host's `mcpServers` simply don't load), or
 the host's `~/.claude.json` has none defined.
 
-**"⏸ Pending approval" — root cause + the `claude` wrapper fix.**
-`claude mcp list` showing "Pending approval (run `claude` to approve)" was a
-stale display artifact, NOT a real block on the live session. ROOT CAUSE: the
-interactive session launches with `--setting-sources project,local --settings
-$CLAUDE_SHIM_SETTINGS_PATH`, and that shim settings.json carries
-`enableAllProjectMcpServers: true`, which auto-approves the project-tier
-`.mcp.json` servers FOR THAT SESSION (they connect; their tools are callable).
-But a SEPARATE bare `claude mcp list` (the session-start checklist, the
-operator, or the session's own Bash tool) is a FRESH `claude` process that
-does NOT inherit those flags — it defaults to `--setting-sources
-user,project,local`, never loads the shim, and so reports the project servers
-as "Pending approval" even though the live session has them Connected. (The
-user-tier approval in `~/.claude.json` `enabledMcpjsonServers` is dead config:
-the user tier is dropped by `--setting-sources project,local`.)
+**"⏸ Pending approval" — stale display, fixed by a `claude` shim.**
+`claude mcp list` reporting "Pending approval" was NEVER a real block on the
+live session. ROOT CAUSE: the interactive session launches with
+`--setting-sources project,local --settings $CLAUDE_SHIM_SETTINGS_PATH`, whose
+shim sets `enableAllProjectMcpServers: true`, auto-approving the project-tier
+`.mcp.json` servers for that session (they connect, tools callable). But a
+SEPARATE bare `claude mcp list` is a FRESH process not inheriting those flags
+(defaults to `--setting-sources user,project,local`, never loads the shim), so
+it shows them as "Pending approval" though the live session has them Connected (the
+`~/.claude.json` `enabledMcpjsonServers` user-tier approval is dead config).
 
-FIX (image-baked): a `claude` wrapper shim
-(`container/hooks-shim/claude-mcp-settings-shim`, symlinked as `claude` first
-on PATH in `/usr/local/lib/claude-hooks-shim/`) transparently injects the same
-`--setting-sources project,local --settings $CLAUDE_SHIM_SETTINGS_PATH` flags
-into `claude mcp` subcommands, so bare `claude mcp list` now reports the
-session's REAL state (host-bash + mcp-adaptor: ✔ Connected). All other
-subcommands and the interactive launch pass through to the real claude
-verbatim. If you still see "Pending approval", the wrapper isn't on PATH yet
-(pre-fix image — redeploy to pick it up), or the caller explicitly passed
-`--setting-sources user,...` (which the wrapper respects).
-
-Regardless: "Pending approval" is NEVER a hard block — VERIFY by CALLING one
-of the server's tools (load the deferred schema via ToolSearch
-`select:<tool>`, then a cheap read-only command — e.g. host-bash `uname -s`).
-Only if the CALL fails with a transport/auth error is the server genuinely
-down (then `/mcp` reauth is the fix). (2026-06-16: a fresh post-redeploy
-session saw all servers "Pending approval", treated it as a block, idled ~30+
-heartbeat cycles — the tools worked the whole time. The wrapper fix removes
-the misleading display at its source.)
+FIX (baked): a `claude` wrapper shim
+(`container/hooks-shim/claude-mcp-settings-shim`, symlinked as `claude` first on PATH)
+injects those flags into `claude mcp` subcommands, so bare `claude mcp list`
+now reports the REAL state; other subcommands and the
+interactive launch pass through verbatim. Still "Pending approval"? Wrapper not on
+PATH (pre-fix image, redeploy), or caller passed `--setting-sources user,...`. Regardless it is NEVER a hard block — VERIFY by CALLING a tool (load its schema via ToolSearch, run a cheap read-only command,
+e.g. host-bash `uname -s`); only a CALL transport/auth error means the
+server is down (then `/mcp` reauth).
 
 *Cross-server triage*: `host-bash`/`mcp-adaptor`/`chrome-devtools` share the
 `host.docker.internal` transport but each has its OWN HTTP session/TTL. To
