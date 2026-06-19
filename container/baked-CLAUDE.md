@@ -111,23 +111,14 @@ machine. The distinction matters for many decisions:
 - Hostname is typically `claude-container-<rand>` or whatever
   `docker run --name` was passed; do not infer the host identity from it.
 
-**Quick self-check**: if you need to confirm "am I in the container?",
-run `cat /etc/claude-code/CLAUDE.md | head -3`. If you see this file's
-header, you are in the container. The host has no `/etc/claude-code/`
-unless the operator explicitly created one.
-
 ## Session-start checklist — MANDATORY first action
 
 **ON EVERY SESSION START (including `/clear`, restart, or context
-compaction): run this checklist BEFORE doing anything else.** The whole
-point is to surface what the container exposes — and what it doesn't —
-in this session, so the rest of the conversation doesn't drift into
-assumptions about a host-side surface that isn't here.
-
-This is the container equivalent of a host-side "resume checklist".
-The list is intentionally short — the container is a sandbox for code
-work, not the host's full automation stack, so the checks below are
-all that's needed.
+compaction): run this checklist BEFORE doing anything else.** It surfaces
+what the container exposes — and what it doesn't — so the conversation
+doesn't drift into assumptions about a host-side surface that isn't here.
+The list is intentionally short: the container is a code-work sandbox, not
+the host's full automation stack.
 
 1. **Self-id**: run `cat /etc/claude-code/CLAUDE.md | head -3`. Confirm
    you see the "claude-container — runtime environment" header. If you
@@ -236,29 +227,20 @@ tool call, OR that reads multiple files, OR that makes multi-file
 edits, OR that runs tests, OR that ships code through review →
 delegate it to an Agent. Do not do it inline in the main loop.
 
-Why this matters even when nothing is forcing the choice:
+Why delegate even when nothing forces it:
 
-- **Context is precious in the main loop.** Every tool result the
-  main loop sees costs context the operator can never get back. A
-  subagent runs in its own context window — large reads, long test
-  output, verbose CI logs all stay there, not in the main loop's
-  transcript. When the agent returns, the main loop sees only the
-  agent's final summary.
-- **Failures are easier to recover from when bounded.** If a
-  subagent goes sideways (wrong direction, infinite loop, bad
-  edit), the main loop can abandon the queue item and try again
-  from a clean slate. An inline failure pollutes the main loop's
-  state — the operator sees the half-finished work, the wrong
-  edits, the dead-end exploration.
-- **Parallelism.** While an agent is working, the main loop can
-  handle inbound (queue events, notifications, operator messages)
-  instead of blocking. Many in-flight subagents at once is normal
-  and healthy.
-- **The queue is the audit trail.** Every queue item is a
-  durable record of "the main loop decided to spawn an agent for
-  X scope at Y time." Inline work leaves no such record — it's
-  invisible to the operator and to anyone reviewing what the
-  session did.
+- **Context is precious in the main loop.** Each tool result the main loop
+  sees costs context the operator never gets back. A subagent runs in its
+  own window. Large reads, test output, and verbose logs stay there, and the
+  main loop sees only the agent final summary.
+- **Bounded failures recover cleanly.** If a subagent goes sideways the main
+  loop can abandon the queue item and retry from a clean slate. An inline
+  failure pollutes the main loop state.
+- **Parallelism.** While an agent works, the main loop handles inbound
+  (events, notifications, operator messages) instead of blocking. Many
+  in-flight subagents at once is normal.
+- **The queue is the audit trail.** Each item durably records that the main
+  loop spawned an agent for a scope at a time. Inline work leaves no record.
 
 Tier choice in practice:
 
