@@ -219,6 +219,22 @@ pub struct AlertsConfig {
     pub escalation_tiers: Vec<u64>,
     pub max_pingme_alerts: u32,
     pub resume_prompt: String,
+    /// Prompt injected on the heartbeat-stale path specifically (as opposed
+    /// to the generic `resume_prompt`). The heartbeat file
+    /// (`[claude].heartbeat_file`) is a LIVENESS signal the main loop is
+    /// supposed to `touch` on each daemon-emitted `heartbeat-tick` event;
+    /// when it goes stale, the recovery action is to touch the file, NOT to
+    /// run a generic /cleanup. The generic `resume_prompt` never mentions
+    /// the heartbeat file, so injecting it left the file stale even after the
+    /// inject landed and the loop resumed working (2026-06-19: heartbeat sat
+    /// stale ~85 min while the loop was demonstrably active). This prompt is
+    /// a plain-text DIRECTIVE — the loop reads it and emits its own
+    /// well-formed `touch` tool call. It deliberately does NOT contain a raw
+    /// `<invoke>`/`<parameter>` payload: injecting raw tool-call tags as pane
+    /// text is the malformed-tool-call failure mode the daemon guards against
+    /// elsewhere; such text renders as prose and is silently dropped.
+    #[serde(default = "default_heartbeat_stale_prompt")]
+    pub heartbeat_stale_prompt: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -282,6 +298,16 @@ pub struct ForegroundMonitorConfig {
 
 fn default_interrupt_enabled() -> bool {
     true
+}
+
+/// Default heartbeat-stale recovery prompt. Single-line (the tmux inject
+/// pipeline assumes single-line). Explicitly instructs the loop to touch
+/// the host heartbeat file so liveness recovers — the whole point of the
+/// inject fallback. Marked `[CLAUDE-WATCH]` so the loop recognises it as a
+/// daemon interrupt, and asks for a watcher sanity-check + heartbeat-tick
+/// triage so a genuinely-wedged event pipeline still gets surfaced.
+fn default_heartbeat_stale_prompt() -> String {
+    "[CLAUDE-WATCH] The host heartbeat file went stale — you are not touching /var/run/claude/heartbeat. Immediately run `touch /var/run/claude/heartbeat` as a single well-formed Bash tool call to restore liveness, then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details.".to_string()
 }
 
 fn default_interrupt_message() -> String {
@@ -1755,6 +1781,75 @@ cooldown = 300
         assert!(config.hybrid.enabled);
         assert_eq!(config.hybrid.context_fallback_secs, 300);
         assert_eq!(config.hybrid.version_fallback_secs, 900);
+    }
+
+    #[test]
+    fn test_heartbeat_stale_prompt_defaults_when_absent() {
+        // SAMPLE_CONFIG has no `heartbeat_stale_prompt` in [alerts] — the
+        // field must default (backward compat: existing configs in the field
+        // never set it) rather than fail to parse.
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        let p = &config.alerts.heartbeat_stale_prompt;
+        assert!(!p.is_empty(), "heartbeat_stale_prompt should default non-empty");
+    }
+
+    #[test]
+    fn test_default_heartbeat_stale_prompt_targets_the_heartbeat_file() {
+        // The whole point of the heartbeat-stale recovery inject is to restore
+        // liveness by touching the host heartbeat file. A generic /cleanup
+        // directive (the old `resume_prompt`) left the file stale even after
+        // the inject landed (2026-06-19 incident). Pin that the default prompt
+        // actually names the file and the touch action.
+        let p = default_heartbeat_stale_prompt();
+        assert!(
+            p.contains("/var/run/claude/heartbeat"),
+            "heartbeat-stale prompt must name the heartbeat file path; got: {p:?}"
+        );
+        assert!(
+            p.contains("touch"),
+            "heartbeat-stale prompt must instruct touching the file; got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_heartbeat_stale_prompt_is_single_line() {
+        // The tmux inject pipeline (inject_text) assumes a single-line
+        // payload; a newline would split the submission.
+        let p = default_heartbeat_stale_prompt();
+        assert!(
+            !p.contains('\n'),
+            "heartbeat-stale prompt must be single-line (tmux inject assumes single-line); got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_heartbeat_stale_prompt_has_no_raw_tool_call_tags() {
+        // The prompt is a plain-text DIRECTIVE the loop reads to emit its OWN
+        // well-formed tool call. It must NOT itself contain raw `<invoke>` /
+        // `<parameter>` tags: injecting those as pane text is the
+        // malformed-tool-call failure mode the daemon guards against — such
+        // text renders as prose and is silently dropped (never runs).
+        let p = default_heartbeat_stale_prompt();
+        assert!(
+            !p.contains("<invoke") && !p.contains("<parameter"),
+            "heartbeat-stale prompt must not embed raw tool-call tags; got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_stale_prompt_override_parses() {
+        // An explicit override in [alerts] is honored. Inject the key into the
+        // existing [alerts] section (appending to the end of SAMPLE_CONFIG
+        // would land it under a later section, not [alerts]).
+        let cfg_str = SAMPLE_CONFIG.replace(
+            "resume_prompt = \"Resume your work.\"",
+            "resume_prompt = \"Resume your work.\"\nheartbeat_stale_prompt = \"custom hb recovery: touch /var/run/claude/heartbeat\"",
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert_eq!(
+            config.alerts.heartbeat_stale_prompt,
+            "custom hb recovery: touch /var/run/claude/heartbeat"
+        );
     }
 
     #[test]

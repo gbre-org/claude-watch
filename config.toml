@@ -84,6 +84,13 @@ escalation_tiers = [600, 600, 1800, 3600, 3600, 3600]
 max_pingme_alerts = 6
 # Resume prompt injected into Claude Code
 resume_prompt = "[CLAUDE-WATCH] Daemon detected stuck state: no background tasks running and not thinking. Please run the cleanup skill (/cleanup) to restart all watchers. If this alert fired incorrectly, DM Andrew with the details."
+# Prompt injected on the heartbeat-stale path specifically. The heartbeat
+# file is a liveness signal the main loop touches on each heartbeat-tick;
+# when it goes stale the recovery action is to TOUCH the file (restore
+# liveness), not run a generic /cleanup. Plain-text directive — the loop
+# reads it and emits its own well-formed `touch` tool call (injecting raw
+# tool-call tags as pane text would render as prose and be silently dropped).
+heartbeat_stale_prompt = "[CLAUDE-WATCH] The host heartbeat file went stale — you are not touching /var/run/claude/heartbeat. Immediately run `touch /var/run/claude/heartbeat` as a single well-formed Bash tool call to restore liveness, then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details."
 
 [foreground_monitor]
 # Enable foreground blocking pattern detection
