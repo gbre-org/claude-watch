@@ -2905,7 +2905,23 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                     last_transient = text if transient else None
                     last_data_at = time.monotonic()
                 continue
-            # EOF — check if the bound queue item has gone terminal.
+            # EOF on this read. The hostjob log lives on the host and is
+            # appended by a detached host process; when the minisite reads it
+            # through a bind-mount (Docker Desktop virtiofs / gRPC-FUSE) the
+            # client can cache the file size/EOF on the open handle, so a plain
+            # follow-up f.read() keeps returning '' forever and the live tail
+            # goes deaf right after backfill even though the job is producing
+            # output (operator-reported). Re-seeking to the current offset
+            # busts that cached attribute so the NEXT read observes appended
+            # bytes — the canonical `tail -f`-on-a-network-fs technique. It is a
+            # no-op (position unchanged) on a local filesystem, so the workload
+            # tail's behavior on /tmp is unaffected. Best-effort: a seek failure
+            # must never kill the stream.
+            try:
+                f.seek(f.tell())
+            except OSError:
+                pass
+            # Check if the bound queue item has gone terminal.
             if _hostjob_item_terminal(label):
                 trailing = f.read()
                 if trailing:

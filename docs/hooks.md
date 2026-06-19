@@ -51,7 +51,7 @@ In `~/.claude/settings.json` (after `make install` puts the binaries in
 | Script | Hook event | Matcher | Purpose |
 |--------|------------|---------|---------|
 | `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses `Agent` spawns missing a `Queue item: q-XXXX` marker, or whose marker isn't `running` in the queue. |
-| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces built-in architectural gates: (a) bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`); (b) `Monitor` tool denied inside subagent context (see "Hardcoded gates" below). |
+| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces built-in architectural gates: (a) bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`); (b) `Monitor` tool denied inside subagent context; (c) narrow ALLOW for the heartbeat-liveness `touch` (see "Hardcoded gates" below). |
 | `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories) and manages a sidecar registry for `no_pending_watcher_outputs`. |
 | `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks external-messaging attachments as read via a host-specific `*-mark-read` shim when Claude opens a file under a configured attachment dir. Host-specific integration; safe no-op when neither the shim nor the dir is present. |
 
@@ -60,10 +60,11 @@ the loop.
 
 ## Hardcoded architectural gates
 
-`pre-tool-obligations-gate-hook` enforces two architectural rules in
+`pre-tool-obligations-gate-hook` enforces a few architectural rules in
 script-local code, BEFORE the obligations CLI dispatch. These run even
 with an empty obligations store -- they encode invariants that must hold
-regardless of stored-state health.
+regardless of stored-state health. Two are DENY gates (`watcher-ctl run`,
+`Monitor`); one is a narrow ALLOW (the heartbeat-liveness `touch`).
 
 ### Bare `watcher-ctl run`
 
@@ -109,9 +110,33 @@ Run that loop with `run_in_background: true` so the agent blocks in a
 normal tool-call wait state (not a Monitor-event-driven async state).
 The harness's "agent is done" semantics correctly distinguish the two.
 
+### Heartbeat-liveness `touch` (narrow ALLOW)
+
+When claude-watch detects a stale heartbeat it injects an instruction to
+run `touch /var/run/claude/heartbeat` as a single Bash tool call to
+restore liveness. But a stale heartbeat frequently coincides with a
+watcher being momentarily down -- so the `watchers_healthy` (and often
+`no_pending_watcher_outputs`) predicate would DENY that very touch. That
+is a catch-22: the liveness-recovery touch the daemon is begging for
+can't run until watchers are restarted first.
+
+The fix is a narrow ALLOW evaluated BEFORE the obligations CLI dispatch:
+a Bash command whose SOLE effective action is `touch
+/var/run/claude/heartbeat` passes the gate regardless of obligation
+state. It is tightly scoped via the AST matcher -- the command must be a
+single top-level segment (no `&&` / `||` / `;` / `|` / `&` / newline),
+its effective head (after stripping env-assignments / `sudo` / wrappers)
+must be `touch`, and its only non-flag operand must be exactly
+`/var/run/claude/heartbeat`. A bundled command (`touch
+/var/run/claude/heartbeat && rm -rf x`), a different path, a second
+operand, or a value-taking flag (`-r`/`-t`/`-d`) all fall through to the
+normal gate. The liveness touch is a pure state-restore with no
+destructive side effect, so allowing it is safe. Parse failure fails
+CLOSED (the command is treated as non-exempt).
+
 ### Bypass
 
-Both hardcoded gates honor `OBLIGATIONS_BYPASS=1` (audited to
+Both hardcoded DENY gates honor `OBLIGATIONS_BYPASS=1` (audited to
 `~/.config/claude/obligations-bypass.log`) and per-obligation overrides
 fired via `obligations override "<reason>" --duration <60|5m|1h>`.
 

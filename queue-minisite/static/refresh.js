@@ -519,13 +519,22 @@
     const stateCls = isDone ? 'state-done' : 'state-abandoned';
     const badgeCls = isErroredHostjob ? 'state-errored' : stateCls;
     const badgeTxt = isDone ? 'done' : (isErroredHostjob ? 'errored' : 'abandoned');
+    // A terminal hostjob keeps its on-disk log (<HOSTJOB_LOG_DIR>/<label>/log)
+    // after completion, so the row stays clickable in hostjob mode even though
+    // it has no archived agent transcript. hostjob mode takes precedence over
+    // archive so a hostjob item opens its plain-text job log (its real
+    // artifact). Mirrors the templates/index.html Done/Abandoned sections.
+    const isHostjob = (it.hostjob_label || '').length > 0;
+    const isClickable = it.has_archive || isHostjob;
     const cardClasses = [
       'item',
       stateCls,
       isErroredHostjob ? 'state-errored' : '',
-      it.has_archive ? 'log-clickable' : '',
+      isClickable ? 'log-clickable' : '',
     ].filter(Boolean).join(' ');
-    const archiveAttr = it.has_archive
+    const archiveAttr = isHostjob
+      ? `data-hostjob-label="${attr(it.hostjob_label)}" data-log-mode="hostjob" tabindex="0" role="button" aria-label="View hostjob output for ${attr(it.id)}" title="Click to view hostjob output."`
+      : it.has_archive
       ? `data-log-mode="archive" tabindex="0" role="button" aria-label="View archived log for ${attr(it.id)}" title="Click to view archived log."`
       : '';
     const erroredAttr = isErroredHostjob ? ' data-errored-hostjob="1"' : '';

@@ -4693,10 +4693,19 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     severity,
                     message: &msg,
                 };
+                // Inject the heartbeat-SPECIFIC recovery prompt, not the
+                // generic `resume_prompt`. This is the heartbeat-stale path
+                // (the only site that sets `stuck = true`), and the recovery
+                // action is to touch the host heartbeat file to restore
+                // liveness. The generic resume_prompt (a "/cleanup" directive)
+                // never mentions the heartbeat file, so prior to this the
+                // inject landed but the loop never touched the file and it
+                // stayed stale even while the loop was actively working
+                // (2026-06-19 incident: ~85 min stale with a live loop).
                 alert::alert(
                     &msg,
                     &alert_pane,
-                    &config.alerts.resume_prompt,
+                    &config.alerts.heartbeat_stale_prompt,
                     use_pingme,
                     event_alert,
                 )
