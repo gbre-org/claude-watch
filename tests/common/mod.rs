@@ -44,6 +44,8 @@ pub struct TestEnv {
     pub mock_bin_dir: PathBuf,
     /// Watchers config file path.
     pub watchers_config: PathBuf,
+    /// Path to the mock self-clear invocation log (one line per invocation).
+    pub self_clear_log: PathBuf,
 }
 
 /// Configuration for mock claude-status output.
@@ -157,6 +159,13 @@ pub struct TestEnvOptions {
     /// default healthy MockStatus still references the configured pane,
     /// but no tmux session is spawned.
     pub skip_tmux_session: bool,
+    /// Enable the [context_monitor] block (default: false). The wedged-pane
+    /// detector lives under this block; tests that exercise wedged recovery
+    /// turn it on.
+    pub context_monitor_enabled: bool,
+    /// Consecutive wedged-pattern observations required before self-clear
+    /// fires (default: 3, mirroring production).
+    pub wedged_consecutive: u32,
 }
 
 impl Default for TestEnvOptions {
@@ -177,6 +186,8 @@ impl Default for TestEnvOptions {
             watcher_inject_cooldown: 60,
             watcher_grace_secs: 90,
             skip_tmux_session: false,
+            context_monitor_enabled: false,
+            wedged_consecutive: 3,
         }
     }
 }
@@ -218,6 +229,7 @@ impl TestEnv {
             log_file: log_dir.join("claude-watch.jsonl"),
             legacy_log_file: log_dir.join("claude-watch.log"),
             heartbeat_file: tmp_dir.join("heartbeat"),
+            self_clear_log: tmp_dir.join("self-clear.log"),
             mock_bin_dir,
             watchers_config: tmp_dir.join("watchers.conf"),
             tmp_dir,
@@ -231,6 +243,9 @@ impl TestEnv {
 
         // Write mock tmux-healthcheck script
         env.write_mock_tmux_healthcheck();
+
+        // Write mock self-clear script (logs invocation instead of injecting /clear)
+        env.write_mock_self_clear_script();
 
         // Write empty watchers config
         fs::write(&env.watchers_config, "# test watchers\n").expect("write watchers config");
@@ -278,6 +293,27 @@ echo "$(date -Is) $@" >> "{log}"
         );
         fs::write(&self.mock_pingme_script, &script).expect("write mock pingme");
         make_executable(&self.mock_pingme_script);
+    }
+
+    /// Write mock self-clear that records its invocation instead of injecting
+    /// `/clear` into a real pane. The wedged-recovery path spawns `self-clear`
+    /// (via PATH), so a test can assert recovery fired by checking this log.
+    fn write_mock_self_clear_script(&self) {
+        let script = format!(
+            r#"#!/bin/bash
+# Mock self-clear for e2e tests -- records invocation instead of clearing.
+echo "$(date -Is) self-clear $@" >> "{log}"
+"#,
+            log = self.self_clear_log.display()
+        );
+        let path = self.mock_bin_dir.join("self-clear");
+        fs::write(&path, &script).expect("write mock self-clear");
+        make_executable(&path);
+    }
+
+    /// Read the mock self-clear invocation log (empty string if never invoked).
+    pub fn read_self_clear_log(&self) -> String {
+        fs::read_to_string(&self.self_clear_log).unwrap_or_default()
     }
 
     /// Write mock tmux-healthcheck that returns OK.
@@ -375,11 +411,13 @@ inject_cooldown = {watcher_inject_cooldown}
 grace_secs = {watcher_grace_secs}
 
 [context_monitor]
-enabled = false
+enabled = {context_monitor_enabled}
 threshold_percent = 75
 compact_trigger_percent = 5
 grace_period = 120
 cooldown = 300
+wedged_consecutive = {wedged_consecutive}
+wedged_cooldown = 300
 
 [auto_update]
 enabled = false
@@ -406,6 +444,8 @@ resume_prompt = "resume"
             watcher_inject_threshold = opts.watcher_inject_threshold,
             watcher_inject_cooldown = opts.watcher_inject_cooldown,
             watcher_grace_secs = opts.watcher_grace_secs,
+            context_monitor_enabled = opts.context_monitor_enabled,
+            wedged_consecutive = opts.wedged_consecutive,
         );
         fs::write(&self.config_path, &config).expect("write test config");
     }
@@ -413,6 +453,15 @@ resume_prompt = "resume"
     /// Update the mock claude-status data file with new status values.
     pub fn set_status(&self, status: &MockStatus) {
         fs::write(&self.mock_status_data, status.to_json()).expect("write mock status data");
+    }
+
+    /// Make the mock `claude-status --json` emit unparseable output so
+    /// `get_claude_status()` returns `None` — simulating the real-world case
+    /// where a wedged context-limit/429 banner covers the status bar and the
+    /// parse misses, even though Claude Code is still running.
+    pub fn set_status_unparseable(&self) {
+        fs::write(&self.mock_status_data, "not json — banner covering status bar\n")
+            .expect("write unparseable mock status data");
     }
 
     /// Send text to the tmux pane to simulate pane content.
@@ -532,6 +581,12 @@ resume_prompt = "resume"
             .env("PATH", self.test_path())
             .env("CLAUDE_STATUS_CMD", "1")
             .env("RUST_LOG", "debug")
+            // Hermeticity: point HOME at the test tmp dir so the layered
+            // user config at ~/.config/claude-watch/config.toml does NOT
+            // overlay (and override e.g. [tmux] dashboard_pane onto) the
+            // test config. Without this, a developer's real config leaks
+            // into the daemon under test.
+            .env("HOME", &self.tmp_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
