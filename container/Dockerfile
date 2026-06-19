@@ -720,6 +720,29 @@ COPY container/hooks-shim/exec-hook-bridge /usr/local/lib/claude-hooks-shim/exec
 RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook-bridge \
     && ln -s /usr/local/lib/claude-hooks-shim/exec-hook-bridge /usr/local/bin/exec-hook-bridge
 
+# claude-mcp-settings-shim — make bare `claude mcp ...` report the TRUTH.
+# The interactive session launches with `--setting-sources project,local
+# --settings $CLAUDE_SHIM_SETTINGS_PATH`, whose shim settings.json carries
+# `enableAllProjectMcpServers: true` (auto-approving the project-tier
+# .mcp.json servers). But a SEPARATE bare `claude mcp list` (the
+# session-start checklist, the operator, the session's own Bash tool) is a
+# FRESH claude process that does NOT inherit those flags — it defaults to
+# `--setting-sources user,project,local`, never loads the shim, and so
+# reports the project .mcp.json servers as "Pending approval" even though
+# the live session has them Connected. That stale/alarming display is the
+# entire long-standing "MCP servers stuck Pending approval" bug.
+#
+# This wrapper sits FIRST on PATH (the entrypoint prepends
+# /usr/local/lib/claude-hooks-shim ahead of the real claude in
+# ~/.npm-global/bin) as a `claude` shim. For `mcp` subcommands it injects
+# the SAME setting-sources + settings flags the session uses, so
+# `claude mcp list` reports the session's real (Connected) state. Every
+# other subcommand execs the real claude verbatim. Surgical: only `mcp`,
+# only when the caller hasn't already supplied the flags.
+COPY container/hooks-shim/claude-mcp-settings-shim /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim
+RUN chmod +x /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim \
+    && ln -s /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim /usr/local/lib/claude-hooks-shim/claude
+
 # generate-hooks-shim-settings — entrypoint-side companion to exec-hook.
 # When CLAUDE_CONTAINER_REWRITE_HOOKS=1 is set in the container env, the
 # entrypoint runs this helper to generate a container-local copy of
