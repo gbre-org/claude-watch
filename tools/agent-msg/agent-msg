@@ -742,9 +742,13 @@ def _obligations_cli() -> str | None:
 #   Bash:^agent-msg disarm\b   -- teardown / cleanup
 #
 # We intentionally do NOT exempt `agent-msg send` (an agent shouldn't be
-# sending messages to other agents while gated) or `agent-msg arm` (the
-# main loop arms via the post-tool hook; subagents have no reason to arm
-# and doing so while gated is a smell).
+# sending messages to other agents while gated) or `agent-msg arm` (only
+# the main loop arms an agent; subagents have no reason to arm and doing so
+# while gated is a smell). Note: arming is no longer solely a separate
+# `arm` step -- `cmd_send` auto-arms the inbox gate idempotently on first
+# send (see below), so a forgotten `arm` no longer means a delivered-but-
+# non-blocking message. There is NO post-tool auto-arm-on-spawn hook; that
+# was never implemented.
 INBOX_GATE_EXEMPT_PATTERNS = (
     r"Bash:^agent-msg\s+ack\b",
     r"Bash:^agent-msg\s+inbox\b",
@@ -954,9 +958,32 @@ def cmd_send(args) -> int:
         inbox_path.chmod(INBOX_MODE)
     except OSError:
         pass
+
+    # Auto-arm: if no inbox gate obligation exists yet for this agent,
+    # register one now so the message actually blocks the subagent. Before
+    # this, a `send` without a prior `arm` delivered the message to the
+    # inbox file but never registered the gate, so the subagent was never
+    # actually blocked (the message sat unread until the agent exited).
+    # Idempotent -- skip if a row already exists (explicit `arm` ran first,
+    # or a prior `send` already armed). `--no-arm` opts out for the rare
+    # test / no-gate case.
+    armed_ob_id = None
+    if not getattr(args, "no_arm", False):
+        tag = f"{OBLIGATION_TAG_PREFIX}{agent_id}"
+        already_armed = any(
+            ob.get("deny_message") == tag for ob in _list_obligations()
+        )
+        if not already_armed:
+            ok, info = _register_inbox_obligation(agent_id, inbox_path)
+            if ok:
+                armed_ob_id = info
+            else:
+                print(f"WARN: auto-arm failed: {info}", file=sys.stderr)
+
     unread = sum(1 for m in messages if isinstance(m, dict) and not m.get("read"))
     if args.json:
         print(json.dumps({"ok": True, "inbox": str(inbox_path),
+                          "auto_armed_obligation": armed_ob_id,
                           "unread": unread, "total": len(messages),
                           "entry": entry}, indent=2))
     else:
@@ -1279,6 +1306,7 @@ def _make_args(**kwargs):
         "queue_item": None, "dry_run": False, "json": False,
         "inbox_dir": None, "ttl": DEFAULT_OBLIGATION_TTL_SECS,
         "no_obligation": True,  # tests default to skipping obligation registration
+        "no_arm": True,  # tests default to skipping send's auto-arm path
         "description": "",
         # New v2 fields (read/all/gc):
         "all": False,
@@ -1771,6 +1799,85 @@ def test_send_default_from_label():
         path = Path(inbox_dir) / "dflt.json"
         data = _load_inbox_messages(path)
         assert data[0]["from"] == "andrew@signal"
+    return True
+
+
+def test_send_auto_arms_idempotently():
+    """send (without --no-arm) auto-registers the inbox gate obligation, and
+    is idempotent -- a second send to the same agent does NOT add a 2nd row.
+
+    Skips silently if the obligations CLI is unavailable (default-open).
+    """
+    cli = _obligations_cli()
+    if not cli:
+        return True  # default-open: nothing to assert without the CLI
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        env_home = os.environ.get("HOME")
+        os.environ["HOME"] = td
+        try:
+            inbox_dir = str(Path(td) / "inbox")
+            tag = f"{OBLIGATION_TAG_PREFIX}autoarm"
+
+            def _inbox_rows():
+                return [ob for ob in _list_obligations()
+                        if ob.get("deny_message") == tag]
+
+            assert len(_inbox_rows()) == 0, "precondition: no inbox row yet"
+            # First send arms.
+            cmd_send(_make_args(agent_id="autoarm", text="first",
+                                inbox_dir=inbox_dir, no_arm=False))
+            rows_after_first = _inbox_rows()
+            assert len(rows_after_first) == 1, (
+                f"first send must auto-arm exactly one obligation, "
+                f"got {len(rows_after_first)}")
+            # Second send is idempotent -- still exactly one row.
+            cmd_send(_make_args(agent_id="autoarm", text="second",
+                                inbox_dir=inbox_dir, no_arm=False))
+            rows_after_second = _inbox_rows()
+            assert len(rows_after_second) == 1, (
+                f"second send must NOT add a duplicate obligation, "
+                f"got {len(rows_after_second)}")
+            # Cleanup the row we created.
+            for ob in rows_after_second:
+                ob_id = ob.get("id")
+                if ob_id:
+                    subprocess.run([cli, "satisfy", ob_id],
+                                   capture_output=True, text=True, timeout=5)
+        finally:
+            if env_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = env_home
+    return True
+
+
+def test_send_no_arm_skips_obligation():
+    """send --no-arm does NOT register any inbox gate obligation.
+
+    Skips silently if the obligations CLI is unavailable (default-open).
+    """
+    cli = _obligations_cli()
+    if not cli:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        env_home = os.environ.get("HOME")
+        os.environ["HOME"] = td
+        try:
+            inbox_dir = str(Path(td) / "inbox")
+            tag = f"{OBLIGATION_TAG_PREFIX}noarm"
+            cmd_send(_make_args(agent_id="noarm", text="x",
+                                inbox_dir=inbox_dir, no_arm=True))
+            rows = [ob for ob in _list_obligations()
+                    if ob.get("deny_message") == tag]
+            assert len(rows) == 0, (
+                f"--no-arm must NOT register an obligation, got {len(rows)}")
+        finally:
+            if env_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = env_home
     return True
 
 
@@ -2890,6 +2997,8 @@ def run_tests():
          test_gc_dead_implicit_runs_respects_rate_limit),
         ("gc_dead_implicit_disabled_when_interval_zero",
          test_gc_dead_implicit_disabled_when_interval_zero),
+        ("send_auto_arms_idempotently", test_send_auto_arms_idempotently),
+        ("send_no_arm_skips_obligation", test_send_no_arm_skips_obligation),
     ]
     passed = 0
     failed = 0
@@ -2944,6 +3053,9 @@ def build_parser():
                         help="override inbox dir (default: ~/.config/claude/agent-inbox/)")
     p_send.add_argument("--dry-run", action="store_true",
                         help="show what would be sent; do not write")
+    p_send.add_argument("--no-arm", action="store_true",
+                        help="do NOT auto-register the inbox gate obligation "
+                             "(rare; test / no-gate delivery only)")
     p_send.add_argument("--json", action="store_true")
 
     # inbox (read without consuming) -- defaults to UNREAD only

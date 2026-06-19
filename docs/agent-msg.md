@@ -47,7 +47,15 @@ spawned subagent ─── tool ─▶  │ PreToolUse: pre-tool-obligations-  �
    - Adds exempt patterns for `agent-msg ack/inbox/gc/disarm` so the
      agent can always clear its own inbox.
 2. **send**: `agent-msg send <id> <text>` atomically appends a message:
-   `{id, from, ts, queue_item, text, read=false, read_at=null}`.
+   `{id, from, ts, queue_item, text, read=false, read_at=null}`. It then
+   **auto-arms the gate idempotently**: if no inbox obligation exists yet for
+   `<id>`, `send` registers one (the same gate-mode obligation `arm` would
+   have). This means a forgotten `arm` no longer silently delivers a
+   non-blocking message -- the first `send` always ensures the gate is live.
+   The auto-arm is a no-op when a row already exists (explicit `arm` ran
+   first, or a prior `send` already armed). Pass `--no-arm` to skip it (rare;
+   test / no-gate delivery only). So step 1 (`arm`) is now optional -- a bare
+   `send` is sufficient to both deliver AND block.
 3. **gate fires**: on the subagent's next non-exempt tool call, the
    PreToolUse hook DENIES with the message body in the deny banner.
 4. **ack**: subagent runs `agent-msg ack <id>` (exempt — always passes).
@@ -64,7 +72,7 @@ spawned subagent ─── tool ─▶  │ PreToolUse: pre-tool-obligations-  �
 |---------|---------|
 | `agent-msg arm <id>` | initialise inbox + register gate-mode obligation |
 | `agent-msg disarm <id>` | clear inbox + remove obligation |
-| `agent-msg send <id> <text>` | atomic-append message to inbox |
+| `agent-msg send <id> <text>` | atomic-append message to inbox; auto-arms the gate idempotently (`--no-arm` to skip) |
 | `agent-msg inbox <id>` | read inbox (default UNREAD only; `--all` = full) |
 | `agent-msg ack <id>` | flip unread → read; KEEPS bodies on disk |
 | `agent-msg gc <id>` | drop already-read messages older than the TTL |

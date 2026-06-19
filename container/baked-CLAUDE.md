@@ -613,11 +613,13 @@ agent-msg send <agent-id> "<message text>"
 ```
 
 That appends the message to the subagent's inbox file at
-`~/.config/claude/agent-inbox/<agent-id>.json` and registers a
-**gate-mode obligation** scoped to that agent. The subagent's next
-non-exempt tool call is HARD-DENIED by the existing
-`pre-tool-obligations-gate-hook` (already wired by the entrypoint),
-with the message body in the deny banner.
+`~/.config/claude/agent-inbox/<agent-id>.json` and **auto-arms the
+gate-mode obligation idempotently** (registering one scoped to that agent if
+none exists yet). So a bare `send` both delivers AND blocks -- a separate
+`arm` is optional, and forgetting it no longer leaves the message
+delivered-but-non-blocking. The subagent's next non-exempt tool call is
+HARD-DENIED by the existing `pre-tool-obligations-gate-hook` (already wired
+by the entrypoint), with the message body in the deny banner.
 
 **As a subagent, when you see a deny banner that includes the message
 text, run:**
@@ -638,7 +640,7 @@ agent-msg list                    # show currently tracked agents
 agent-msg show <id>               # metadata for one agent
 agent-msg arm <id>                # main-loop-only: register inbox gate
 agent-msg disarm <id>             # main-loop-only: tear down gate
-agent-msg send <id> <text>        # main-loop-only: deliver a message
+agent-msg send <id> <text>        # main-loop-only: deliver a message (auto-arms the gate idempotently)
 agent-msg inbox <id>              # read inbox (default: unread only)
 agent-msg ack <id>                # subagent-side: clear unread
 agent-msg gc <id>                 # drop read messages older than TTL
