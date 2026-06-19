@@ -219,6 +219,21 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         Env override: ``CLAUDE_AGENT_QUEUE_BINDINGS_PATH`` (used by the
         post-tool arm hook for matching test isolation).
 
+  - no_backgrounded_watcher: {watcher_heads?}
+        BAN-style predicate: for Bash commands, satisfied (= OK) UNLESS the
+        command backgrounds a WATCHER LAUNCH with a real top-level shell
+        ``&`` (also ``nohup ... &`` and the ``(... &)`` subshell form).
+        Steers the loop toward the Bash tool's ``run_in_background: true``
+        instead of detaching a watcher with ``&`` (which loses the
+        completion handle and trips the tracked-restart singleton lock).
+        Matching is AST-aware (shell_ast.has_backgrounded_head): a ``&``
+        inside a quoted argument / heredoc body / a ``2>&1`` redirection
+        does NOT false-positive-deny, and ``watcher && other`` (logical
+        AND, not background) is ignored. Parse failure falls back
+        (fail-closed) to a coarse raw-string heuristic. Always satisfied
+        for non-Bash tools. ``watcher_heads`` (optional list) overrides the
+        default launcher set (``/opt/claude-container/watchers/`` path
+        prefix, ``watcher-ctl run``, ``claude-event-watch``).
   - is_main_loop: {negate?}
         satisfied iff the tool call is from the main session loop (i.e. the
         hook payload's ``agent_id`` field is empty/missing). With
@@ -489,9 +504,21 @@ VALID_PREDICATE_KINDS = {
     "stale_ready_queue_present",
     "force_started_unspawned",
     "subagent_queue_item_running",
+    "no_backgrounded_watcher",
     "evaluator",
     "all_of",
 }
+
+# Default set of watcher-launcher head specs the no_backgrounded_watcher
+# predicate refuses to see backgrounded with a shell ``&``. Each spec is
+# interpreted by ``shell_ast.has_backgrounded_head`` (plain name,
+# multi-word phrase, or path-prefix). Override per-row via the predicate's
+# ``watcher_heads`` param.
+DEFAULT_WATCHER_LAUNCHER_HEADS = [
+    "/opt/claude-container/watchers/",  # any baked watcher script path
+    "watcher-ctl run",                  # watcher-ctl run <name>
+    "claude-event-watch",               # the canonical event watcher
+]
 
 # Predicates that are ALWAYS treated as mandatory regardless of the
 # explicit ``--mandatory`` flag passed at registration. A mandatory
@@ -2183,6 +2210,84 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
             return (True,
                     f"subagent_queue_item_running default-open on "
                     f"error: {e}")
+
+    if kind == "no_backgrounded_watcher":
+        # BAN-style predicate: satisfied (=allow) UNLESS the Bash command
+        # backgrounds a watcher LAUNCH with a real top-level shell ``&``
+        # (also ``nohup ... &`` / a ``(... &)`` subshell). The intent is to
+        # steer the loop toward the Bash tool's ``run_in_background: true``
+        # instead of detaching a watcher with ``&`` (which loses the
+        # completion handle and races the tracked-restart singleton lock).
+        #
+        # AST-backed via shell_ast.has_backgrounded_head so a ``&`` that
+        # appears inside a quoted argument, a heredoc body, or a ``2>&1``
+        # redirection does NOT false-positive-deny, and a ``watcher &&
+        # other`` (AND, not background) is correctly ignored. On parse
+        # failure we FAIL CLOSED (per shell_ast's contract) back to a
+        # conservative raw-string heuristic so a real ``watcher ... &``
+        # hidden behind a malformed construct still trips the gate.
+        #
+        # NOTE on the ``watcher-ctl run`` head spec: a ``watcher-ctl ...``
+        # command is in UNIVERSAL_RECOVERY_EXEMPT_PATTERNS
+        # (``Bash:^watcher-(ctl|status|restart)\b``), the framework-level
+        # recovery floor that lets the loop always restart a watcher. That
+        # exempt is checked in ``_check_core`` BEFORE this predicate runs,
+        # so a bare ``watcher-ctl run X &`` is allowed by the recovery
+        # floor regardless of this predicate. We keep ``watcher-ctl run``
+        # in the default head set anyway (it is the correct semantic
+        # target, and harmless), but the fully-enforced cases are
+        # ``claude-event-watch`` and the baked-watcher script paths under
+        # ``/opt/claude-container/watchers/`` -- which is exactly what the
+        # original ``check-no-bg-ampersand`` hook (a ``grep 'watch.*&'``)
+        # was guarding. Weakening the recovery floor to also block a
+        # backgrounded ``watcher-ctl run`` is deliberately NOT done here:
+        # the recovery floor must never be narrowed by a single new gate.
+        if tool_name not in ("Bash",):
+            return (True, f"tool {tool_name} is not Bash (predicate N/A)")
+        cmd = command_string or ""
+        heads_param = params.get("watcher_heads")
+        if isinstance(heads_param, list) and heads_param:
+            watcher_heads = [h for h in heads_param
+                             if isinstance(h, str) and h]
+        else:
+            watcher_heads = DEFAULT_WATCHER_LAUNCHER_HEADS
+        deny_msg = (
+            "command backgrounds a watcher launch with a shell '&' "
+            "(or nohup/subshell). Launch watchers via the Bash tool's "
+            "run_in_background:true, never with '&' -- '&' detaches the "
+            "process (losing the completion handle) and its singleton "
+            "lock blocks the tracked restart."
+        )
+        if _shell_ast is not None:
+            try:
+                if _shell_ast.has_backgrounded_head(cmd, watcher_heads):
+                    return (False,
+                            f"{deny_msg} (matched heads: {watcher_heads})")
+                return (True, "no backgrounded watcher launch detected "
+                              "(structural match)")
+            except _shell_ast.ShellParseError:
+                pass  # fall through to fail-closed raw heuristic
+            except Exception:  # noqa: BLE001 -- never let a helper bug gate
+                pass
+        # Fail-closed fallback (parse failure or helper unavailable): a
+        # blunt heuristic -- a watcher token followed (anywhere later) by a
+        # trailing ``&`` at end of a line. Coarser than the AST path (it
+        # can match a ``&`` inside data on an unparseable command) but that
+        # is the intended fail-CLOSED posture: better a rare false-positive
+        # deny on a command we could not parse than a missed real
+        # background-launch.
+        for head in watcher_heads:
+            token = head.rstrip("/").split()[0] if head else ""
+            if not token:
+                continue
+            try:
+                if re.search(re.escape(token) + r".*&\s*(\n|$)", cmd):
+                    return (False, f"{deny_msg} (raw-string fail-closed; "
+                                   f"token {token!r})")
+            except re.error:
+                continue
+        return (True, "no backgrounded watcher launch detected "
+                      "(raw-string fallback)")
 
     if kind == "evaluator":
         # Generic delegation primitive: run a user-supplied subprocess

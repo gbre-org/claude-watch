@@ -53,6 +53,16 @@ Currently seeded rows:
     (``/usr/local/bin/eval-queue-ready-unspawned``) denies Bash calls
     when ready-but-unspawned items exist. Default-open on errors.
 
+  - ``no_backgrounded_watcher`` — prevents the main loop from launching a
+    watcher with a shell ``&`` (or ``nohup ... &`` / ``(... &)``) instead
+    of the Bash tool's ``run_in_background: true``. Uses the NATIVE
+    AST-backed ``no_backgrounded_watcher`` predicate (shell_ast), not an
+    external evaluator, so a ``&`` inside quotes / a heredoc body / a
+    ``2>&1`` redirection does NOT false-positive-deny. Replaces the
+    half-ported ``check-no-bg-ampersand`` exec-hook whose target binary
+    was absent from the container image (silent no-op). Main-loop scoped
+    via ``all_of [is_main_loop, no_backgrounded_watcher]``.
+
 MAIN-LOOP SCOPING: the four evaluator-backed rows above
 (``no_grep_watcher_output``, ``event_must_act``, ``agent_ack_pending``,
 ``queue_ready_unspawned``) are all conceptually MAIN-LOOP ONLY -- they gate
@@ -96,6 +106,7 @@ NO_GREP_WATCHER_OUTPUT_TAG = "[default-seed] no_grep_watcher_output"
 EVENT_MUST_ACT_TAG = "[default-seed] event_must_act"
 AGENT_ACK_PENDING_TAG = "[default-seed] agent_ack_pending"
 QUEUE_READY_UNSPAWNED_TAG = "[default-seed] queue_ready_unspawned"
+NO_BACKGROUNDED_WATCHER_TAG = "[default-seed] no_backgrounded_watcher"
 
 # Exempts that must always pass even when the gate is firing. These are
 # the recovery surface a subagent uses to either re-register a queue
@@ -534,6 +545,78 @@ def seed_queue_ready_unspawned(cli: str, *, dry_run: bool = False,
     return 0
 
 
+def seed_no_backgrounded_watcher(cli: str, *, dry_run: bool = False,
+                                    force: bool = False,
+                                    verbose: bool = False) -> int:
+    """Add the no_backgrounded_watcher obligation. Uses the native
+    AST-backed ``no_backgrounded_watcher`` predicate (NOT an external
+    evaluator) to DENY Bash commands that launch a watcher with a shell
+    ``&`` instead of the Bash tool's ``run_in_background: true``.
+
+    This replaces the half-ported ``check-no-bg-ampersand`` exec-hook
+    (which referenced a binary absent from the container image and so
+    silently no-op'd). The native predicate imports shell_ast directly,
+    so a ``&`` inside a quoted arg / heredoc body / ``2>&1`` does not
+    false-positive-deny. Returns 0 on success."""
+    if not force and _row_already_present(cli, NO_BACKGROUNDED_WATCHER_TAG):
+        if verbose:
+            print("no_backgrounded_watcher: already seeded -- skipping",
+                  file=sys.stderr)
+        return 0
+
+    # Main-loop ONLY: only the main loop launches watchers (subagents must
+    # never start them, per the watcher singleton contract). Wrap the
+    # native predicate behind an is_main_loop scope-guard inside all_of so
+    # the gate never fires inside a subagent context. Mirrors the wiring
+    # of the evaluator-backed main-loop gates, but with a NATIVE predicate
+    # leaf instead of an evaluator subprocess.
+    predicate_params = {
+        "predicates": [
+            {"kind": "is_main_loop", "params": {}},
+            {"kind": "no_backgrounded_watcher", "params": {}},
+        ]
+    }
+
+    cmd = [
+        cli, "add",
+        "--tool-pattern", "Bash",
+        "--predicate", "all_of",
+        "--params", json.dumps(predicate_params),
+        "--ttl", "0",  # non-expiring
+        "--enforcement", "gate",
+        "--deny-msg", NO_BACKGROUNDED_WATCHER_TAG,
+        "--created-by", "obligations-init",
+        "--json",
+    ]
+
+    if dry_run:
+        print("DRY-RUN: " + " ".join(cmd))
+        return 0
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print("obligations-init: obligations add failed "
+              f"rc={proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        return 1
+    if verbose:
+        try:
+            row = json.loads(proc.stdout)
+            print(f"no_backgrounded_watcher: seeded "
+                  f"id={row.get('id', '?')}", file=sys.stderr)
+        except (json.JSONDecodeError, ValueError):
+            print(f"no_backgrounded_watcher: seeded "
+                  f"(rc={proc.returncode})", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="obligations-init",
@@ -585,8 +668,12 @@ def main() -> int:
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
 
+    rc6 = seed_no_backgrounded_watcher(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+
     # Return first non-zero exit code (if any)
-    return rc or rc2 or rc3 or rc4 or rc5
+    return rc or rc2 or rc3 or rc4 or rc5 or rc6
 
 
 if __name__ == "__main__":

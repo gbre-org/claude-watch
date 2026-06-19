@@ -634,6 +634,103 @@ def has_real_compound_operator(cmd: str) -> bool:
     return parse(cmd).has_top_level_operator()
 
 
+def backgrounded_segment_heads(cmd: str) -> List[str]:
+    """Return the effective command heads of every segment that is
+    BACKGROUNDED by a REAL top-level ``&`` operator.
+
+    A segment is backgrounded iff its ``op_after`` is the literal ``&``
+    background operator (not ``&&``, which the tokenizer emits as the
+    distinct ``"&&"`` op, and not a ``&`` that appears inside quotes /
+    heredocs / a redirection like ``2>&1``, all of which the tokenizer
+    already excludes from being top-level ops). The subshell form
+    ``(cmd &)`` is also caught: the tokenizer maps ``(`` / ``)`` to ``;``
+    boundaries, so the inner ``&`` is a real top-level op on the segment
+    holding ``cmd``.
+
+    Each returned head is run through the same prefix-stripping as
+    ``command_present_as_head`` (leading ``VAR=val`` env assignments and
+    wrapper words like ``sudo`` / ``env`` / ``nohup`` are removed) so the
+    EFFECTIVE launcher is exposed -- e.g. ``nohup watcher-ctl run x &``
+    yields head ``watcher-ctl``.
+
+    Returns the first word of each backgrounded segment's stripped words
+    (``""`` for an empty segment, which is filtered out). Raises
+    ``ShellParseError`` on parse failure (caller FAILS CLOSED).
+    """
+    parsed = parse(cmd)
+    out: List[str] = []
+    for seg in parsed.segments:
+        if seg.op_after != "&":
+            continue
+        words = _strip_command_prefix(seg.words)
+        if words:
+            out.append(words[0])
+    return out
+
+
+def has_backgrounded_head(cmd: str, targets) -> bool:
+    """True iff ANY segment backgrounded by a real top-level ``&`` has a
+    command head (after prefix-stripping) matching one of ``targets``.
+
+    ``targets`` is an iterable of head specs. Each spec may be:
+      * a plain command name (``"claude-event-watch"``) -- matched against
+        the segment's first stripped word, OR
+      * a multi-word phrase (``"watcher-ctl run"``) -- matched against the
+        segment's leading stripped words, OR
+      * a path basename match: a spec containing ``/`` (e.g.
+        ``"/opt/claude-container/watchers/"``) matches when the head's
+        directory prefix equals the spec (so any
+        ``/opt/claude-container/watchers/<x>.sh`` launcher matches the
+        spec ``"/opt/claude-container/watchers/"``).
+
+    Quoted / heredoc occurrences never count (they were absorbed into a
+    single data word and carry no ``&`` op). Raises ``ShellParseError`` on
+    parse failure (caller FAILS CLOSED).
+    """
+    parsed = parse(cmd)
+    specs = list(targets or [])
+    for seg in parsed.segments:
+        if seg.op_after != "&":
+            continue
+        if _segment_head_matches_any(seg, specs):
+            return True
+    return False
+
+
+def _segment_head_matches_any(seg: "Segment", specs: List[str]) -> bool:
+    """Does this segment's effective head match any spec in ``specs``?
+
+    Reuses the same prefix-stripping as ``_head_matches`` and supports
+    plain names, multi-word phrases, and directory-prefix path specs
+    (a spec ending in ``/`` or containing ``/`` matches by path prefix
+    on the head token)."""
+    words = _strip_command_prefix(seg.words)
+    if not words:
+        return False
+    head = words[0]
+    for spec in specs:
+        if not isinstance(spec, str) or not spec:
+            continue
+        # Path-prefix spec: a spec containing a slash matches when the
+        # head is a path under that prefix (or equals it). Catches
+        # ``/opt/claude-container/watchers/<name>.sh``.
+        if "/" in spec:
+            if head == spec or head.startswith(spec):
+                return True
+            continue
+        # Multi-word phrase (e.g. ``watcher-ctl run``): compare against
+        # the leading stripped words.
+        parts = spec.split()
+        if len(parts) > 1:
+            if len(words) >= len(parts) and words[:len(parts)] == parts:
+                return True
+            continue
+        # Plain command name.
+        if head == spec:
+            return True
+    return False
+
+
 def structure_string(cmd: str) -> str:
     """Reconstruct a "structure-only" rendering of ``cmd``.
 
@@ -751,6 +848,47 @@ def _run_tests() -> int:
        not has_real_compound_operator("foo bar 2>&1"))
     ok("> file not an operator",
        not has_real_compound_operator("foo > out.txt"))
+
+    # --- backgrounded_segment_heads / has_backgrounded_head ---
+    WATCHERS = ["/opt/claude-container/watchers/", "watcher-ctl run",
+                "claude-event-watch"]
+    # Real trailing & on a watcher launcher -> MUST match.
+    ok("claude-event-watch & -> backgrounded head",
+       has_backgrounded_head("claude-event-watch &", WATCHERS))
+    ok("watcher-ctl run X & -> backgrounded head",
+       has_backgrounded_head("watcher-ctl run signal &", WATCHERS))
+    ok("nohup watcher-ctl run X & -> backgrounded head (prefix stripped)",
+       has_backgrounded_head("nohup watcher-ctl run signal &", WATCHERS))
+    ok("/opt watcher path & -> backgrounded head (path prefix)",
+       has_backgrounded_head(
+           "/opt/claude-container/watchers/foo.sh &", WATCHERS))
+    ok("subshell (claude-event-watch &) -> backgrounded head",
+       has_backgrounded_head("(claude-event-watch &)", WATCHERS))
+    # & followed by another command (cmd & echo done) still backgrounds cmd.
+    ok("watcher & echo done -> backgrounded head",
+       has_backgrounded_head("claude-event-watch & echo done", WATCHERS))
+    # FALSE-POSITIVE guards: a & that is NOT a real background op.
+    ok("claude-event-watch with no & -> NOT backgrounded",
+       not has_backgrounded_head("claude-event-watch", WATCHERS))
+    ok("run_in_background mention quoted -> NOT backgrounded",
+       not has_backgrounded_head(
+           "echo 'launch claude-event-watch &'", WATCHERS))
+    ok("& inside heredoc body -> NOT backgrounded",
+       not has_backgrounded_head(
+           "cat <<'EOF'\nclaude-event-watch &\nEOF", WATCHERS))
+    ok("2>&1 on a watcher (foreground) -> NOT backgrounded",
+       not has_backgrounded_head("claude-event-watch 2>&1", WATCHERS))
+    ok("watcher && other (AND, not bg) -> NOT backgrounded",
+       not has_backgrounded_head(
+           "claude-event-watch " + "&&" + " echo ok", WATCHERS))
+    # A non-watcher backgrounded with & must NOT match the watcher specs.
+    ok("non-watcher sleep & -> NOT a watcher background",
+       not has_backgrounded_head("sleep 30 &", WATCHERS))
+    # backgrounded_segment_heads enumerates the heads regardless of target.
+    ok("backgrounded_segment_heads sees the bg head",
+       backgrounded_segment_heads("sleep 30 & echo hi") == ["sleep"])
+    ok("backgrounded_segment_heads empty when no bg",
+       backgrounded_segment_heads("echo hi") == [])
 
     # --- parse-failure cases raise ShellParseError ---
     for bad in ("echo 'unterminated", 'echo "unterminated', "echo $(unbal"):

@@ -353,7 +353,7 @@ def test_realistic_corp_settings() -> None:
                     {
                         "matcher": "Bash",
                         "hooks": [
-                            {"type": "command", "command": "check-no-bg-ampersand"},
+                            {"type": "command", "command": "some-bare-path-hook"},
                             {"type": "command", "command": "/Users/me/.local/bin/telemetry-hook pre-tool"},
                         ],
                     },
@@ -363,8 +363,12 @@ def test_realistic_corp_settings() -> None:
         run_helper(str(inp), str(out))
         result = load_output(out)
         # Every command, regardless of whether it points at a Mach-O or a
-        # bare name on PATH (check-no-bg-ampersand), gets wrapped. The
-        # shim is transparent on ELF + shebang, so this is safe.
+        # bare name on PATH (some-bare-path-hook), gets wrapped. The
+        # shim is transparent on ELF + shebang, so this is safe. (We use a
+        # generic bare name here on purpose: backgrounded-watcher guarding
+        # is now an AST-backed `no_backgrounded_watcher` obligation, not a
+        # string-match exec-hook, so the fixture must not imply the image
+        # ships/wires a `check-no-bg-ampersand` binary.)
         expect(
             result["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             == f"{EXEC_HOOK} /Users/me/.local/bin/telemetry-hook session-start",
@@ -372,7 +376,7 @@ def test_realistic_corp_settings() -> None:
         )
         expect(
             result["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            == f"{EXEC_HOOK} check-no-bg-ampersand",
+            == f"{EXEC_HOOK} some-bare-path-hook",
             "corp: bare PATH command should also be wrapped",
         )
 
