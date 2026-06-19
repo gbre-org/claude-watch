@@ -10,8 +10,8 @@ Covers:
   * `queue unblock <id>` from blocked -> running, refreshes heartbeat,
     preserves blocked_at + block_reason as audit
   * `queue unblock` refuses on non-blocked statuses
-  * a blocked item still owns its scope (peer with overlapping scope
-    is blocked)
+  * a blocked item RELEASES its scope (peer with overlapping scope
+    becomes ready -- blocked is not in-flight; #371)
   * `queue done` and `queue abandon` accept blocked items (terminal
     exit)
   * `queue list` (default view) includes blocked items
@@ -260,14 +260,20 @@ def test_unblock_refused_on_wedged():
         assert "must be blocked" in r.stderr.lower()
 
 
-# -------------------- scope ownership --------------------
+# -------------------- scope ownership (blocked RELEASES scope) --------------------
 
 
-def test_blocked_item_still_owns_scope():
-    """A blocked item blocks a peer item with overlapping scope from spawning.
+def test_blocked_item_releases_scope():
+    """A blocked item RELEASES its scope -- a peer with overlapping scope
+    becomes ready and may spawn.
 
-    Pre-2026-05-19 this hard-failed (exit 3). Now soft-serializes: peer is
-    enqueued, ready_now=false, serialized_after points at the blocked owner.
+    Per design (#371), `queue block` releases the scope lock: blocked items
+    are EXEMPT from the orphaned-running alert because they hold no live
+    slot, so a pending peer in the same scope/group must be free to become
+    ready and spawn rather than be starved behind the external blocker.
+    This matches the proven-correct web UI `_compute_ready_now`, which gates
+    readiness on ("pending","running") membership only -- blocked (like a
+    terminal item) does not count as in-flight.
     """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
@@ -277,22 +283,32 @@ def test_blocked_item_still_owns_scope():
         _run(env, "queue", "block", a_id, "--reason", "ext blocker",
              "--silent", expect_exit=0)
 
-        # Adding a peer with the same scope soft-serializes since blocked
-        # items still own their scope (the blocked owner stays in
-        # serialized_after; ready_now=false).
+        # Adding a peer with the same scope succeeds and is READY: the blocked
+        # owner no longer holds the scope (it is not in serialized_after, and
+        # there is no running_scope_conflict), so the peer can spawn now.
         r = _run(env, "queue", "add", "second", "--scope",
                  "repo:bscope-share", "--summary", "b", "--json")
         assert r.returncode == 0, (
-            f"expected exit 0 (soft-serialize behind blocked peer), got "
+            f"expected exit 0 (blocked peer releases scope), got "
             f"{r.returncode}: stderr={r.stderr!r}"
         )
         d = json.loads(r.stdout)
-        assert d["ready_now"] is False, d
-        assert a_id in d["serialized_after"], d
+        assert d["ready_now"] is True, d
+        assert a_id not in d["serialized_after"], d
+        # The blocked owner is not a running conflict either.
+        assert a_id not in [
+            c.get("id") for c in d.get("running_scope_conflicts", [])
+        ], d
 
 
-def test_blocked_item_blocks_spawn_check_of_pending_peer():
-    """spawn-check on a pending peer of a blocked owner reports blocked."""
+def test_blocked_owner_does_not_block_spawn_check_of_pending_peer():
+    """spawn-check on a pending peer of a blocked owner REPORTS READY.
+
+    Counterpart to `test_blocked_item_releases_scope` at the spawn-check
+    surface: because `queue block` releases the scope lock (#371), the
+    blocked owner does not gate its pending peer -- the peer is the live
+    group head and spawn-check approves it (exit 0, ok=true).
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         a = _add(env, "first", ["repo:bspawn-block"], "--summary", "a")
@@ -301,10 +317,10 @@ def test_blocked_item_blocks_spawn_check_of_pending_peer():
         _register(env, a["id"])
         _run(env, "queue", "block", a["id"], "--reason", "x", "--silent",
              expect_exit=0)
-        r = _run(env, "queue", "spawn-check", b["id"], "--json")
-        assert r.returncode != 0, (
-            "spawn-check on pending peer of blocked owner must refuse"
-        )
+        r = _run(env, "queue", "spawn-check", b["id"], "--json", expect_exit=0)
+        out = json.loads(r.stdout)
+        assert out["ok"] is True, out
+        assert out["status"] == "pending", out
 
 
 # -------------------- terminal transitions from blocked --------------------
