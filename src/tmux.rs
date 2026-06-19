@@ -1135,6 +1135,50 @@ pub async fn get_pane_pid(pane: &str) -> Option<u32> {
     pid_str.trim().parse::<u32>().ok()
 }
 
+/// Robustly answer "does this tmux pane spec point at a live pane?" WITHOUT
+/// depending on resolving the pane's process tree.
+///
+/// This exists to DECOUPLE the recovery decision from the agent-PID probe.
+/// `get_pane_pid` (and the `find_claude_pid_in_tree` walk above it) can
+/// stall or return `None` when the in-pane claude loop is wedged -- the same
+/// failure that motivates recovery in the first place. If pane-presence were
+/// derived from that probe, a wedged loop would make the dispatcher conclude
+/// "no pane / no in-band channel" and emit an unactionable
+/// `inject-dispatch-unknown-mode` event instead of attempting the
+/// `tmux send-keys` that would recover the pane.
+///
+/// Instead we ask tmux a question that is independent of the pane's process
+/// state: does a pane with this id exist? The pane spec is checked directly
+/// with `display-message -p '#{pane_id}'`; a non-empty answer means the pane
+/// is live. To survive a single transient slow/timed-out tmux call we retry
+/// once before giving up -- a real recovery decision should not be stranded
+/// by one slow probe.
+///
+/// Empty pane spec => `false` (genuinely no pane; preserves the historical
+/// no-pane behavior). A wedged pane that tmux still tracks => `true`, so the
+/// dispatcher takes the Terminal/tmux-inject recovery path.
+pub async fn pane_exists(pane: &str) -> bool {
+    if pane.is_empty() {
+        return false;
+    }
+    for attempt in 0..2 {
+        let (out, ok) = run_cmd_any(
+            &["tmux", "display-message", "-t", pane, "-p", "#{pane_id}"],
+            5,
+        )
+        .await;
+        if ok && !out.trim().is_empty() {
+            return true;
+        }
+        if attempt == 0 {
+            // Transient slow/timed-out probe -- retry once before concluding
+            // the pane is gone, so a single stall doesn't strand recovery.
+            sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    false
+}
+
 /// Check if the pane's process tree includes the actual claude binary.
 async fn has_claude_binary(pane: &str) -> bool {
     let (pid_str, ok) = run_cmd_any(

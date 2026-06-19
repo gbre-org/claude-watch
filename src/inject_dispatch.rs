@@ -270,13 +270,23 @@ pub async fn inject_to_agent(pane: &str, text: &str) {
     let backends = RealBackends;
     let agent_pid = resolve_agent_pid_for_pane(pane).await;
     let mode = mode_for(agent_pid);
-    // "Pane present" = a non-empty pane spec whose pane_pid tmux can
-    // resolve. This is a weaker, more available signal than the claude
-    // PID (which `resolve_agent_pid_for_pane` walks the tree for and may
-    // miss during the boot window). The Unknown-mode dispatch arm uses it
-    // to decide between the tmux Terminal default and claude-event
-    // escalation. See the `AgentDeploymentMode::Unknown` contract.
-    let pane_present = !pane.is_empty() && crate::tmux::get_pane_pid(pane).await.is_some();
+    // "Pane present" = a non-empty pane spec that tmux still tracks as a
+    // live pane. This is DECOUPLED from the agent-PID probe on purpose:
+    // both `mode` (via `resolve_agent_pid_for_pane` -> `get_pane_pid` ->
+    // `find_claude_pid_in_tree`) and the older pane_present derivation
+    // shared the same `get_pane_pid` query, which stalls/returns None when
+    // the in-pane claude loop is wedged -- the very condition we are trying
+    // to recover from. When that probe failed, mode collapsed to Unknown
+    // AND pane_present collapsed to false together, so the Unknown arm
+    // concluded "no in-band channel" and emitted an unactionable
+    // `inject-dispatch-unknown-mode` event instead of attempting the
+    // `tmux send-keys` that recovers the pane. `tmux::pane_exists` asks a
+    // question independent of the pane's process state (does a pane with
+    // this id exist?), with a one-shot retry, so a wedged-but-live pane is
+    // correctly reported present and the Unknown arm takes the tmux
+    // Terminal recovery path. See the `AgentDeploymentMode::Unknown`
+    // contract and `tmux::pane_exists`.
+    let pane_present = crate::tmux::pane_exists(pane).await;
     let _ = dispatch_inject(&backends, pane, text, mode, agent_pid, pane_present).await;
 }
 
