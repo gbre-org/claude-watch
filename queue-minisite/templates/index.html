@@ -433,16 +433,24 @@
       {% endif %}
       {% for it in abandoned_recent %}
         <article
-          class="item state-abandoned {% if it.has_archive %}log-clickable{% endif %}"
+          class="item state-abandoned {% if it.is_errored_hostjob %}state-errored{% endif %} {% if it.has_archive %}log-clickable{% endif %}"
           data-queue-id="{{ it.id }}"
           data-queue-status="abandoned"
+          {% if it.is_errored_hostjob %}data-errored-hostjob="1"{% endif %}
           data-created-by="{{ it.created_by }}"
           data-queue-summary="{{ it.summary }}"
           data-queue-description="{{ it.description }}"
           {% if it.has_archive %}data-log-mode="archive" tabindex="0" role="button" aria-label="View archived log for {{ it.id }}" title="Click to view archived log."{% endif %}>
           <header class="item-head">
-            <span class="badge state-abandoned">abandoned</span>
+            {% if it.is_errored_hostjob %}
+              <span class="badge state-errored" title="hostjob exited non-zero (exit {{ it.hostjob_exit_code }}) — failed, not operator-cancelled">errored</span>
+            {% else %}
+              <span class="badge state-abandoned">abandoned</span>
+            {% endif %}
             <span class="id">{{ it.id }}</span>
+            {% if it.is_errored_hostjob %}
+              <span class="badge hostjob-badge" title="hostjob-bound: {{ it.hostjob_label }}">hostjob</span>
+            {% endif %}
             {% if it.has_archive %}
               <span class="badge log-badge" title="archived agent transcript available">log</span>
             {% endif %}
@@ -452,7 +460,7 @@
           <div class="age">
             <span
               {% if it.abandoned_at_iso %}data-local-time-iso="{{ it.abandoned_at_iso }}" data-local-time-title-only{% endif %}
-              title="{{ it.abandoned_at_iso }}">abandoned {{ it.age }}</span>
+              title="{{ it.abandoned_at_iso }}">{% if it.is_errored_hostjob %}errored{% else %}abandoned{% endif %} {{ it.age }}</span>
             {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
           {% if it.description %}

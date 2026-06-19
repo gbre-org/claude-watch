@@ -252,6 +252,10 @@ main {
 .item.state-pending.ready { border-left-color: var(--ready); }
 .item.state-done      { border-left-color: var(--done); opacity: 0.75; }
 .item.state-abandoned { border-left-color: var(--abandoned); opacity: 0.6; }
+/* Errored hostjob (non-zero exit). Reuses the orphan red and overrides the
+   faded abandoned styling above (the card carries BOTH classes) so a FAILED
+   hostjob reads as an error, not a dimmed operator-cancel. */
+.item.state-errored   { border-left-color: var(--orphan); opacity: 1; background: color-mix(in srgb, var(--orphan) 8%, var(--bg-alt)); }
 .item.orphan          { border-left-color: var(--orphan); background: color-mix(in srgb, var(--orphan) 8%, var(--bg-alt)); }
 
 .item-head {
@@ -299,6 +303,7 @@ main {
 .badge.state-pending   { background: var(--pending); color: #000; }
 .badge.state-done      { background: var(--done); }
 .badge.state-abandoned { background: var(--abandoned); }
+.badge.state-errored   { background: var(--orphan); }
 .badge.state-orphan    { background: var(--orphan); }
 .badge.ghead {
   background: transparent;
