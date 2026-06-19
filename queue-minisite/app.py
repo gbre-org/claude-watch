@@ -767,18 +767,23 @@ def _shape(
         # children). The dir walk is cheap (running items are few) and
         # fail-soft.
         session_subagents: list[dict[str, Any]] = []
+        parent_map: dict[str, str] = {}
         owner_agent_id = owner.get("agent_id") or ""
         if owner_agent_id:
             session_id = _session_id_for_subagent(owner_agent_id)
             if session_id:
                 session_subagents = _list_session_subagents(session_id)
+                # Real spawn hierarchy (child -> parent) reconstructed from
+                # the transcripts' Agent/Task launch records. Distinguishes a
+                # nested child from a main-loop retry attempt.
+                parent_map = _session_subagent_parent_map(session_id)
         iid = item.get("id", "")
         # Bindings map is loaded once per render pass and threaded in; load
         # lazily here for legacy callers that don't pass it (e.g. the /meta
         # endpoint can pass None and we read the file directly).
         bmap = bindings if bindings is not None else _load_agent_queue_bindings()
         shaped["subagents"] = _build_subagent_tree(
-            iid, owner_agent_id, session_subagents, bmap
+            iid, owner_agent_id, session_subagents, bmap, parent_map
         )
     else:
         shaped["is_starting"] = False
@@ -1824,6 +1829,18 @@ _SUBAGENT_ID_RE = re.compile(r"^[a-z0-9-]{4,64}$")
 _SUBAGENT_FILE_RE = re.compile(r"^agent-([a-z0-9-]{4,64})\.jsonl$")
 # Cap on how much of a subagent transcript we read just to derive a label.
 _SUBAGENT_LABEL_MAX_CHARS = 80
+# When an agent fires the Agent/Task tool in ``run_in_background`` mode, the
+# tool_result records the spawned child's id as a line of the shape
+# ``agentId: <id> (internal ID - do not mention to user...)``. We scan each
+# session subagent transcript for this marker to reconstruct the REAL
+# parent->child spawn edges (which agent spawned which) — the signal that
+# distinguishes a NESTED child from a main-loop retry attempt. See
+# ``_session_subagent_parent_map`` + ``_build_subagent_tree``.
+_LAUNCHED_AGENT_RE = re.compile(r"agentId:\s*([a-z0-9-]{4,64})")
+# Bound on bytes read per transcript when scanning for launch markers, so a
+# huge transcript can't blow up a render pass. Launch records sit in the
+# tool_use/tool_result stream and are tiny; 4 MiB is generous headroom.
+_PARENT_SCAN_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _session_id_for_subagent(agent_id: str) -> str | None:
@@ -1890,6 +1907,135 @@ def _first_user_text(path: Path) -> str:
     return ""
 
 
+def _session_subagent_dirs(session_id: str) -> list[Path]:
+    """Resolve a session's ``subagents/`` dir(s) across both mount shapes.
+
+    Returns the ``<root>/<session>/subagents`` dir when present, else every
+    ``<root>/<project-slug>/<session>/subagents`` match (the two-level
+    container layout). Path-traversal guarded; ``[]`` on bad id / no match.
+    Shared by ``_list_session_subagents`` and ``_session_subagent_parent_map``
+    so both walk identical directories.
+    """
+    if not _SESSION_ID_RE.match(session_id):
+        return []
+    root = Path(AGENTS_JSONL_ROOT)
+    if not root.is_dir():
+        return []
+    candidates: list[Path] = []
+    direct = root / session_id / "subagents"
+    if direct.is_dir():
+        candidates.append(direct)
+    else:
+        try:
+            for project in root.iterdir():
+                if not project.is_dir():
+                    continue
+                sub = project / session_id / "subagents"
+                if sub.is_dir():
+                    candidates.append(sub)
+        except OSError:
+            return []
+    return candidates
+
+
+def _session_subagent_parent_map(session_id: str) -> dict[str, str]:
+    """Map ``child_agent_id -> parent_agent_id`` for a main-loop session.
+
+    The on-disk layout is FLAT per session (every subagent transcript sits
+    as a sibling under one ``subagents/`` dir, regardless of which agent
+    spawned it). To recover the REAL spawn hierarchy we scan each
+    transcript for the Agent/Task tool's launch records: when an agent fires
+    ``Agent``/``Task`` in ``run_in_background`` mode the tool_result echoes
+    the spawned child's id as ``agentId: <id> (internal ID ...)``. The agent
+    whose transcript carries that record is the child's PARENT.
+
+    This is the authoritative signal that tells a NESTED child apart from a
+    main-loop retry attempt: a nested child appears in this map (some session
+    agent spawned it); a genuine retry was dispatched by the MAIN LOOP and so
+    appears in NO subagent's transcript.
+
+    Cheap + fail-soft: each transcript is read once (bounded by
+    ``_PARENT_SCAN_MAX_BYTES``), with a per-line substring pre-filter before
+    the JSON parse. Returns ``{}`` on any error / bad id. A child that two
+    agents both claim keeps the FIRST writer seen (cycles are impossible on
+    disk — a child is spawned by exactly one parent).
+    """
+    out: dict[str, str] = {}
+    for sub_dir in _session_subagent_dirs(session_id):
+        try:
+            entries = list(sub_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            m = _SUBAGENT_FILE_RE.match(entry.name)
+            if not m:
+                continue
+            parent_id = m.group(1)
+            for child_id in _launched_children(entry):
+                if child_id == parent_id:
+                    continue  # never self-parent
+                out.setdefault(child_id, parent_id)
+    return out
+
+
+def _launched_children(transcript_path: Path) -> list[str]:
+    """Extract the agent ids launched by the agent owning ``transcript_path``.
+
+    Walks the transcript pairing each ``Agent``/``Task`` ``tool_use`` block
+    with its matching ``tool_result`` (by ``tool_use_id``), and pulls the
+    spawned child id from the result text (``agentId: <id>``). Only counts a
+    launched id when it came from a result for a known Agent/Task tool_use,
+    so an ``agentId:`` mention in arbitrary prose can't fabricate an edge.
+    Bounded read; fail-soft (``[]`` on any error).
+    """
+    children: list[str] = []
+    spawn_tool_use_ids: set[str] = set()
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+            read = 0
+            for line in f:
+                read += len(line)
+                if read > _PARENT_SCAN_MAX_BYTES:
+                    break
+                # Cheap pre-filter: only lines that could carry a spawn or a
+                # launch result are worth the JSON parse.
+                if "tool_use" not in line and "agentId:" not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                msg = rec.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "tool_use" and block.get("name") in (
+                        "Agent",
+                        "Task",
+                    ):
+                        bid = block.get("id")
+                        if isinstance(bid, str):
+                            spawn_tool_use_ids.add(bid)
+                    elif btype == "tool_result":
+                        tuid = block.get("tool_use_id")
+                        if tuid not in spawn_tool_use_ids:
+                            continue
+                        mm = _LAUNCHED_AGENT_RE.search(
+                            json.dumps(block.get("content"))
+                        )
+                        if mm:
+                            children.append(mm.group(1))
+    except OSError:
+        return []
+    return children
+
+
 def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
     """Enumerate the subagents of a main-loop session.
 
@@ -1906,27 +2052,7 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
     Sorted most-recently-active first (mtime desc). Path-traversal guarded.
     Fail-soft: returns [] on any error / bad session id.
     """
-    if not _SESSION_ID_RE.match(session_id):
-        return []
-    root = Path(AGENTS_JSONL_ROOT)
-    if not root.is_dir():
-        return []
-
-    # Resolve the session's subagents dir across both mount shapes.
-    candidates: list[Path] = []
-    direct = root / session_id / "subagents"
-    if direct.is_dir():
-        candidates.append(direct)
-    else:
-        try:
-            for project in root.iterdir():
-                if not project.is_dir():
-                    continue
-                sub = project / session_id / "subagents"
-                if sub.is_dir():
-                    candidates.append(sub)
-        except OSError:
-            return []
+    candidates = _session_subagent_dirs(session_id)
     if not candidates:
         return []
 
@@ -1980,6 +2106,7 @@ def _build_subagent_tree(
     owner_agent_id: str,
     session_subagents: list[dict[str, Any]],
     bindings: dict[str, str],
+    parent_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Shape a running item's REAL subagent tree from authoritative bindings.
 
@@ -1987,41 +2114,49 @@ def _build_subagent_tree(
     ``_list_session_subagents`` (every ``agent-*.jsonl`` under the owner's
     parent main-loop session). ``bindings`` is ``agent_id -> queue_id`` from
     ``_load_agent_queue_bindings`` (the arm-hook source of truth).
+    ``parent_map`` is ``child_agent_id -> parent_agent_id`` from
+    ``_session_subagent_parent_map`` — the REAL spawn hierarchy reconstructed
+    from the transcripts' Agent/Task launch records. ``None`` / ``{}`` means
+    no hierarchy signal (legacy callers / pre-this-fix transcripts), in which
+    case we degrade to the old flat attempt-collapse.
 
-    The PRIOR tree parsed the ``Queue item: q-XXXX`` marker out of each
-    transcript and kept every subagent whose marker == ``item_id``. Because
-    the main loop dispatches EACH queue item AS an Agent, that marker is the
-    item's OWN id on the owner agent's transcript — so the item nested its
-    own owner agent (and any retry siblings re-dispatched for the same id)
-    UNDER itself. That produced a bogus one-level "tree" that was really
-    just the item pointing at itself.
+    The PRIOR tree kept every subagent bound to ``item_id`` (minus the owner)
+    and labeled them ALL as ``kind="attempt"`` retry siblings. That was wrong
+    for NESTED agents: when the owner agent (or one of its descendants) spawns
+    a child agent, that child inherits the ``Queue item: q-XXXX`` line in its
+    prompt, so it binds to the SAME ``item_id`` — and got mislabeled as
+    "attempt 2", a false peer-retry of the owner. But it is the owner's CHILD,
+    not a competing dispatch of the same work. (Observed: q-2026-06-19-7aa6
+    rendered owner ``a63d61`` + nested grandchild ``aaa255`` as ATTEMPT 1/2.)
 
-    The fix, using the authoritative bindings:
+    The fix distinguishes the two using ``parent_map``:
 
       * **Authoritative attribution** — each subagent's owning queue id is
         ``bindings[agent_id]`` (falls back to the transcript-parsed marker
         ``queue_id`` only when the binding is missing, e.g. a transcript
         predating the arm-hook).
       * **Drop the self-nested owner** — the ``owner_agent_id`` agent IS
-        this item's live dispatch; it represents the item itself, not a
-        child of it, so it is never emitted as a child node.
-      * **Collapse retry-siblings** — other agents bound to ``item_id`` are
-        earlier dispatch attempts of the SAME item (the main loop
-        re-fired the Agent after an abandon / crash). They are NOT distinct
-        children; we emit them as ``kind="attempt"`` nodes labeled
-        ``attempt N`` (oldest = attempt 1) rather than as separate work.
-      * **Genuine children** — agents bound to a DIFFERENT queue id are
-        their own queue items (each renders its own top-level card), so we
-        do NOT duplicate them under this card. The honest on-disk layout is
-        flat-per-session (see the module comment above
-        ``_session_id_for_subagent``); we cannot reconstruct a deeper
-        agent->agent spawn edge, so we don't fabricate one.
+        this item's live dispatch; it is never emitted as a child node, but
+        it IS the ROOT under which genuine nested children hang.
+      * **Nested children → real hierarchy** — any same-item agent that was
+        SPAWNED BY another session agent (``agent_id in parent_map``) is a
+        nested child, NOT a retry. We render it as ``kind="child"`` nested
+        under its actual parent (walking ``parent_map`` up to the owner). A
+        child whose parent chain does not reach the owner still surfaces as a
+        top-level child rather than being mislabeled an attempt.
+      * **Genuine retry attempts** — a same-item agent that is NOT in
+        ``parent_map`` (no session agent spawned it) was dispatched by the
+        MAIN LOOP — a real earlier attempt of this item. Those collapse to
+        ``kind="attempt"`` nodes labeled ``attempt N`` (oldest = attempt 1).
+      * **Other-item agents** — bound to a DIFFERENT queue id render their
+        own top-level card; excluded here.
 
     Returns a list of node dicts. Each node carries the same display keys
     the template/refresh.js expect (``subagent_id``, ``label``, ``age``,
     ``age_seconds``, ``queue_id``) plus:
 
-      * ``kind``     — ``"attempt"`` for a collapsed prior dispatch attempt.
+      * ``kind``     — ``"attempt"`` (collapsed main-loop retry) or
+        ``"child"`` (genuine nested spawn).
       * ``attempt``  — 1-based attempt ordinal (attempt nodes only).
       * ``children`` — nested node list (always present, possibly empty) so
         the recursive template has a uniform shape to walk.
@@ -2031,6 +2166,8 @@ def _build_subagent_tree(
     rather than render a silently-empty tree — but STILL drop the owner so
     the self-nesting bug can't resurface even in fallback mode.
     """
+    pmap = parent_map or {}
+
     def _auth_qid(sa: dict[str, Any]) -> str:
         aid = sa.get("subagent_id", "")
         b = bindings.get(aid, "")
@@ -2058,24 +2195,82 @@ def _build_subagent_tree(
         return nodes
 
     # Authoritative path: keep only the agents bound to THIS item, drop the
-    # owner, and label the remaining same-item agents as retry attempts.
+    # owner.
     own: list[dict[str, Any]] = [
         sa
         for sa in session_subagents
         if _auth_qid(sa) == item_id and sa.get("subagent_id") != owner_agent_id
     ]
+    own_ids = {sa.get("subagent_id", "") for sa in own}
+
+    def _is_nested_child(aid: str) -> bool:
+        """True when some OTHER session agent spawned ``aid`` (not the main
+        loop). We treat a spawn edge as hierarchy whenever the parent is the
+        owner or itself one of this item's same-item agents — i.e. the child
+        descends from this item's dispatch tree rather than being an
+        independent main-loop retry."""
+        seen: set[str] = set()
+        cur = aid
+        while cur in pmap and cur not in seen:
+            seen.add(cur)
+            parent = pmap[cur]
+            if parent == owner_agent_id or parent in own_ids:
+                return True
+            cur = parent
+        return False
+
+    # Partition: nested children (hierarchy) vs genuine main-loop retries.
+    nested_children = [
+        sa for sa in own if _is_nested_child(sa.get("subagent_id", ""))
+    ]
+    retries = [
+        sa for sa in own if not _is_nested_child(sa.get("subagent_id", ""))
+    ]
+
+    # --- Build the nested hierarchy for the children. ---
+    # Map each child to a node dict and link it under its parent. Parents not
+    # in our child set (e.g. the owner) anchor a child at the top level.
+    child_nodes: dict[str, dict[str, Any]] = {}
+    for sa in nested_children:
+        node = dict(sa)
+        node["queue_id"] = item_id
+        node["kind"] = "child"
+        node["children"] = []
+        child_nodes[sa.get("subagent_id", "")] = node
+    roots: list[dict[str, Any]] = []
+    for cid, node in child_nodes.items():
+        parent = pmap.get(cid, "")
+        parent_node = child_nodes.get(parent)
+        if parent_node is not None and parent != cid:
+            parent_node["children"].append(node)
+        else:
+            # Parent is the owner (dropped) or outside this item's set:
+            # surface this child at the top level of the owner's tree.
+            roots.append(node)
+    # Stable, chronological ordering at every level (most-recent first to
+    # match _list_session_subagents).
+    def _sort_children(nodes: list[dict[str, Any]]) -> None:
+        nodes.sort(key=lambda n: n.get("age_seconds", 0.0))
+        for n in nodes:
+            _sort_children(n["children"])
+
+    _sort_children(roots)
+
+    # --- Collapse the genuine main-loop retries as attempt N. ---
     # Oldest first so attempt numbering reads chronologically (attempt 1 =
     # earliest dispatch). ``session_subagents`` came in most-recent-first.
-    own.sort(key=lambda sa: sa.get("age_seconds", 0.0), reverse=True)
-    nodes = []
-    for idx, sa in enumerate(own, start=1):
+    retries.sort(key=lambda sa: sa.get("age_seconds", 0.0), reverse=True)
+    attempt_nodes: list[dict[str, Any]] = []
+    for idx, sa in enumerate(retries, start=1):
         node = dict(sa)
         node["queue_id"] = item_id
         node["kind"] = "attempt"
         node["attempt"] = idx
         node["children"] = []
-        nodes.append(node)
-    return nodes
+        attempt_nodes.append(node)
+
+    # Retries (attempts) first, then the live dispatch's nested children.
+    return attempt_nodes + roots
 
 
 def _format_sse(data: dict[str, Any]) -> bytes:
