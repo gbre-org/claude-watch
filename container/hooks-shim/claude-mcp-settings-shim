@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# claude-mcp-settings-shim — make bare `claude mcp ...` report the TRUTH.
+#
+# THE PROBLEM
+# -----------
+# Inside claude-container, the interactive claude session is launched with
+# `--setting-sources project,local --settings $CLAUDE_SHIM_SETTINGS_PATH`
+# (see container/entrypoint.sh CLAUDE_CMD construction). That shim
+# settings.json carries `"enableAllProjectMcpServers": true`, which
+# auto-approves the project-tier `.mcp.json` servers (host-bash,
+# mcp-adaptor, chrome-devtools) for that session — they connect cleanly
+# and their tools are callable.
+#
+# But a SEPARATE, bare `claude mcp list` (run from the session's Bash
+# tool, the session-start checklist, or by the operator) is a FRESH claude
+# process that DOES NOT inherit the session's `--setting-sources` /
+# `--settings` flags. It defaults to `--setting-sources user,project,local`
+# and never loads the shim file, so it never sees `enableAllProjectMcpServers`.
+# The project `.mcp.json` servers are therefore reported as
+# "⏸ Pending approval (run `claude` to approve)" — even though the LIVE
+# session has them fully approved + connected. That stale, alarming display
+# is the entire bug the operator kept hitting: the checklist says "expect
+# Connected", bare `claude mcp list` can NEVER show Connected, and the
+# operator (reasonably) reads "Pending approval" as a real, reconnect-
+# blocking failure.
+#
+# THE FIX
+# -------
+# This wrapper sits FIRST on PATH (in /usr/local/lib/claude-hooks-shim,
+# which the entrypoint prepends ahead of the real `claude`). For `mcp`
+# subcommands it transparently injects the SAME setting-sources + settings
+# flags the live session uses, so `claude mcp list` reports the same
+# approval/connection state the session actually has (Connected). For every
+# OTHER subcommand it execs the real claude verbatim — zero behavior change.
+#
+# It is deliberately surgical: it ONLY augments `mcp` subcommands, and ONLY
+# when the caller hasn't already supplied the relevant flag (so an explicit
+# `claude --setting-sources ... mcp list` is respected untouched).
+
+set -euo pipefail
+
+# Resolve the REAL claude binary, skipping THIS wrapper. We can't just use
+# `command -v claude` because that would find us again. Walk PATH and pick
+# the first `claude` that is not this script.
+self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+real_claude=""
+IFS=':' read -ra _path_dirs <<< "${PATH}"
+for _d in "${_path_dirs[@]}"; do
+    [ -n "$_d" ] || continue
+    _cand="$_d/claude"
+    [ -x "$_cand" ] || continue
+    _cand_resolved="$(readlink -f "$_cand" 2>/dev/null || echo "$_cand")"
+    if [ "$_cand_resolved" != "$self" ]; then
+        real_claude="$_cand"
+        break
+    fi
+done
+
+# Fail-safe: if we somehow can't find the real claude, there is nothing we
+# can sensibly do — print a diagnostic and exit non-zero rather than loop.
+if [ -z "$real_claude" ]; then
+    echo "claude-mcp-settings-shim: could not locate the real claude binary on PATH" >&2
+    exit 127
+fi
+
+# Only the `mcp` subcommand gets special handling. Find the first
+# non-flag argument; if it's `mcp`, we may inject. Otherwise pass through.
+first_subcmd=""
+for _a in "$@"; do
+    case "$_a" in
+        -*) continue ;;          # skip global flags
+        *) first_subcmd="$_a"; break ;;
+    esac
+done
+
+if [ "$first_subcmd" != "mcp" ]; then
+    exec "$real_claude" "$@"
+fi
+
+# We're handling `claude mcp ...`. Decide whether to inject.
+# Respect an explicit caller-supplied --setting-sources / --settings:
+# if either is already present, don't second-guess the caller.
+already_has_setting_sources=0
+already_has_settings=0
+for _a in "$@"; do
+    case "$_a" in
+        --setting-sources|--setting-sources=*) already_has_setting_sources=1 ;;
+        --settings|--settings=*) already_has_settings=1 ;;
+    esac
+done
+
+inject=()
+# Mirror the live session: filter the user tier out (project,local) so the
+# approval state matches what the session actually loaded. Only inject when
+# the caller didn't already specify sources.
+if [ "$already_has_setting_sources" -eq 0 ]; then
+    inject+=(--setting-sources project,local)
+fi
+# Layer the shim settings (which carries enableAllProjectMcpServers:true)
+# only if it exists and the caller didn't already pass --settings.
+shim_path="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
+if [ "$already_has_settings" -eq 0 ] && [ -f "$shim_path" ]; then
+    inject+=(--settings "$shim_path")
+fi
+
+# Global flags MUST precede the subcommand. Reconstruct: injected globals,
+# then the original argv verbatim.
+exec "$real_claude" "${inject[@]}" "$@"
