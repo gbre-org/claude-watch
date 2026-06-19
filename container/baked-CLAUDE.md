@@ -7,10 +7,10 @@ before any user-level (`~/.claude/CLAUDE.md`) or project-level
 (`<cwd>/CLAUDE.md`) instructions. It exists so every session inside the
 container starts with a load-bearing description of the runtime — what's
 real, what's a bind-mount, what doesn't work — without depending on host
-config the operator may or may not have wired up.
+config the operator may not have wired up.
 
 It is **container-owned, not user-owned**: do not edit
-`/etc/claude-code/CLAUDE.md` from a session. The source of truth lives at
+`/etc/claude-code/CLAUDE.md` from a session. Source of truth:
 `container/baked-CLAUDE.md` in the claude-watch repo; rebuild the image to
 pick up changes.
 
@@ -113,15 +113,11 @@ unless the operator explicitly created one.
 ## Session-start checklist — MANDATORY first action
 
 **ON EVERY SESSION START (including `/clear`, restart, or context
-compaction): run this checklist BEFORE doing anything else.** The whole
-point is to surface what the container exposes — and what it doesn't —
-in this session, so the rest of the conversation doesn't drift into
-assumptions about a host-side surface that isn't here.
-
-This is the container equivalent of a host-side "resume checklist".
-The list is intentionally short — the container is a sandbox for code
-work, not the host's full automation stack, so the checks below are
-all that's needed.
+compaction): run this checklist BEFORE doing anything else.** It surfaces
+what the container exposes — and what it doesn't — so the conversation
+doesn't drift into assumptions about a host-side surface that isn't here.
+The list is intentionally short — the container is a sandbox for code work,
+not the host's full automation stack, so these checks are all that's needed.
 
 1. **Self-id**: run `cat /etc/claude-code/CLAUDE.md | head -3`. Confirm
    you see the "claude-container — runtime environment" header. If you
@@ -186,17 +182,16 @@ all that's needed.
    all watchers. Run it at step 7 of this checklist and again whenever
    a watcher exits with output.
 
-**Event watchers inside this container are scoped narrowly.**
-The container is a code-writing sandbox, not a host automation hub.
-Don't try to start torrent watchers, podcast watchers,
-or anything else from the host's resume-checklist playbook; the
+**Event watchers inside this container are scoped narrowly.** The container
+is a code-writing sandbox, not a host automation hub. Don't start torrent /
+podcast watchers or anything from the host's resume-checklist playbook; the
 relevant tools and services aren't installed here. The baked watcher
 (`claude-event-watch`) covers the in-container event bus at
 `~/claude-events/`.
 
-If the operator gives you a job that genuinely needs a host-side
-watcher / notifier, run it on the host instead (via the operator's host
-Claude Code session) or bridge the watch event over `host-bash`.
+If a job genuinely needs a host-side watcher / notifier, run it on the host
+(via the operator's host Claude Code session) or bridge the event over
+`host-bash`.
 
 > **Watcher vs. producer (cron) decision:** before adding a new *watcher*
 > (a one-shot, main-loop-supervised tool that blocks-prints-exits), confirm
@@ -212,8 +207,8 @@ Claude Code session) or bridge the watch event over `host-bash`.
 
 ## Main loop is a coordinator, not a worker
 
-The in-container Claude Code session has two execution tiers, and the
-default tier for substantive work is **not** the main loop:
+The session has two execution tiers, and the default tier for substantive
+work is **not** the main loop:
 
 - **Agent tool calls** — semantic LLM work with bounded scope. Reading
   multiple files, multi-file edits, running tests, shipping a PR,
@@ -225,24 +220,26 @@ default tier for substantive work is **not** the main loop:
   Validates the agent's return value. Composes the operator-facing
   reply. That's it.
 
-**Bias toward delegation.** Any operation that involves more than ~1
-tool call, OR that reads multiple files, OR that makes multi-file
-edits, OR that runs tests, OR that ships code through review →
-delegate it to an Agent. Do not do it inline in the main loop.
+**Bias toward delegation.** Any operation that involves more than ~1 tool
+call, reads multiple files, makes multi-file edits, runs tests, or ships
+code through review → delegate it to an Agent, not inline in the main loop.
 
 Why this matters even when nothing is forcing the choice:
 
-- **Context is precious.** A subagent runs in its own context window —
-  large reads, long test output, verbose CI logs stay there, not in the
-  main loop's transcript; the loop sees only the agent's final summary.
-- **Failures stay bounded.** If a subagent goes sideways, the main loop
-  abandons the queue item and retries from a clean slate; an inline
-  failure pollutes the loop's state.
-- **Parallelism.** While an agent works, the main loop handles inbound
-  (queue events, notifications, operator messages) instead of blocking.
-- **The queue is the audit trail.** Every queue item durably records
-  "the loop spawned an agent for X scope at Y time"; inline work leaves
-  no such record.
+- **Context is precious in the main loop.** A subagent runs in its own
+  context window — large reads, long test output, verbose CI logs all stay
+  there. The main loop sees only the agent's final summary, never the tool
+  results whose context it can never get back.
+- **Failures are easier to recover from when bounded.** If a subagent goes
+  sideways (wrong direction, infinite loop, bad edit), the main loop can
+  abandon the queue item and retry from a clean slate. An inline failure
+  pollutes the main loop's state with half-finished work the operator sees.
+- **Parallelism.** While an agent works, the main loop handles inbound (queue
+  events, notifications, operator messages) instead of blocking. Many
+  in-flight subagents at once is normal and healthy.
+- **The queue is the audit trail.** Every queue item durably records that the
+  main loop spawned an agent for X scope at Y time. Inline work leaves no
+  such record — invisible to the operator and to session reviewers.
 
 Tier choice in practice:
 
@@ -254,12 +251,10 @@ Tier choice in practice:
   loop should never sit in a polling sleep loop.
 
 **One concern per agent.** Each agent handles ONE task — never batch
-unrelated work into a single agent prompt. If you have 3 independent
-things to do, queue 3 items and spawn 3 agents. Batching unrelated work
-means: a failure on task 2 loses task 3, the queue audit trail is
-useless, and parallelizable work gets serialized. The signal you're
-batching wrong: your agent prompt has numbered sections for unrelated
-concerns. Split them.
+unrelated work into a single prompt. For 3 independent things, queue 3 items
+and spawn 3 agents. Batching means a failure on task 2 loses task 3, the
+audit trail is useless, and parallelizable work gets serialized. The signal
+you're batching wrong: numbered sections for unrelated concerns. Split them.
 
 If you're in the main loop and find yourself about to chain
 `Read` → `Edit` → `Edit` → `Bash` → `Bash`, **stop and queue an
@@ -735,11 +730,10 @@ on PATH by default; no bind-mount required.
 ## `sudo` in-container — no fingerprint prompt, apt is carved out
 
 The "avoid sudo" instinct is a **HOST** concern, not a container one. On
-the operator's host (typically macOS), every `sudo` invocation triggers a
-Touch ID / fingerprint prompt — prohibitive when an agent loop chains many
-short commands. **That prompt does not exist inside this Linux container**:
-there is no Touch ID, and the container user has no password set. So `sudo`
-in-container does not block on any prompt.
+the operator's host (typically macOS), every `sudo` triggers a Touch ID
+prompt — prohibitive when an agent loop chains many short commands. **That
+prompt does not exist inside this Linux container**: no Touch ID, and the
+container user has no password set, so `sudo` never blocks on a prompt.
 
 Most container work still **doesn't need `sudo` at all**. The container
 user is uid 1000 (`hndrewaall`) and is in the right groups (including
@@ -773,10 +767,9 @@ Note this is RUNTIME convenience only — installs do NOT persist across a
 Dockerfile's apt layer and the image rebuilt, not re-`sudo apt-get`'d every
 session.
 
-Other system mutation (writing to arbitrary `/etc/` paths, editing a
-system service unit, etc.) still warrants deliberation — it's outside the
-apt carve-out, mutates the image's baked state, and won't persist anyway.
-Prefer a bind-mount or a Dockerfile change for anything you want to stick.
+Other system mutation (writing arbitrary `/etc/` paths, editing a service
+unit, etc.) still warrants deliberation — outside the apt carve-out, mutates
+baked state, won't persist. Prefer a bind-mount or Dockerfile change to stick.
 
 The lone documented exception is the `cw` host shim referenced in
 `examples/compose/bin/cw`, which falls back to `sudo docker` only if
@@ -800,10 +793,10 @@ cwsr --upgrade-only     # install without rolling (operator can `cwsr --no-upgra
 cwsr --print            # dry-run; print planned NPM + TMUX argv
 ```
 
-What survives the roll: the tmux session (`claude-container:0.0`), the
-wrapping container, every MCP bridge that was up, the named-volume
-`~/.local/share/claude/versions/` directory, the operator's tmux
-attach. What rolls: the claude process inside pane 0.
+What survives the roll: the tmux session (`claude-container:0.0`), the wrapping
+container, every MCP bridge that was up, the named-volume
+`~/.local/share/claude/versions/` dir, the operator's tmux attach. What rolls:
+the claude process inside pane 0.
 
 When you should run `cwsr`:
 - The operator says "upgrade to latest" or asks you to pick up a
@@ -820,10 +813,9 @@ When `cwsr` is NOT the right tool:
   inner process with whatever shape entrypoint.sh already chose. Ask
   the operator to `docker compose up -d --force-recreate` for those.
 
-The package name (`@anthropic-ai/claude-code`) and install command
-(`npm install -g`) are cross-platform — same shape works whether the
-host is Linux, macOS, or Windows. The in-container npm itself runs as
-uid 1000 against a writable global path, no sudo needed.
+The package name (`@anthropic-ai/claude-code`) and `npm install -g` are
+cross-platform (Linux, macOS, or Windows). The in-container npm runs as uid
+1000 against a writable global path, no sudo needed.
 
 ## Container redeploy (incl. self-redeploy from inside the container)
 
@@ -840,17 +832,16 @@ daemon owns the operation — **no nohup, no disown, no `&`
 backgrounding, and NOT a `rm -sf && up -d` split** (the second command
 in a split never runs once the issuing container dies).
 
-Why force-recreate no longer wedges: in-place recreate only ever stuck
-when a grandchild outlived process-compose's shutdown and pinned the
-container netns + the shared tmux-socket named volume. The chief
-offender was crond — `sudo -n /usr/sbin/cron` FORKED a root cron that
-survived SIGKILL of the sudo wrapper. Fixed at the source: the
-Dockerfile sudoers carve-out disables `pam_session` + `pam_setcred` for
-the cron argv (`Defaults!CRON_NOFORK !pam_session, !pam_setcred`) so
-sudo `execve()`s cron DIRECTLY (the supervised process IS the daemon,
-no orphan), and `cw-claude-watch-launch` `exec`s claude-watch. With
-clean teardown the old container releases the netns + named volumes
-before the fresh one starts.
+Why force-recreate no longer wedges: in-place recreate only stuck when a
+grandchild outlived process-compose's shutdown and pinned the container netns
++ shared tmux-socket named volume. Chief offender was crond — `sudo -n
+/usr/sbin/cron` FORKED a root cron surviving SIGKILL of the sudo wrapper.
+Fixed at source: the Dockerfile sudoers carve-out disables `pam_session` +
+`pam_setcred` for the cron argv (`Defaults!CRON_NOFORK !pam_session,
+!pam_setcred`) so sudo `execve()`s cron DIRECTLY (the supervised process
+IS the daemon, no orphan), and `cw-claude-watch-launch` `exec`s
+claude-watch. With clean teardown the old container releases the netns +
+named volumes before the fresh one starts.
 
 `docker-compose.yml` sets `stop_grace_period: 15s`, sized to fit
 process-compose's graceful shutdown (each supervised process pins
@@ -858,10 +849,10 @@ process-compose's graceful shutdown (each supervised process pins
 a `-t`/timeout shorter than that total: it SIGKILLs PID 1
 (process-compose) mid-teardown.
 
-This kills the current session. The next session starts with the new
-image and picks up via the resume prompt (claude-watch's
-resume-injection fires "you've ALREADY been restarted — continue", and
-the entrypoint's `CLAUDE_AUTO_CONTINUE` resumes the prior conversation).
+This kills the current session. The next session starts with the new image
+and picks up via the resume prompt (claude-watch resume-injection fires
+"you've ALREADY been restarted — continue", and the entrypoint's
+`CLAUDE_AUTO_CONTINUE` resumes the prior conversation).
 
 ### Validating self-redeploy (end-to-end, from inside the container)
 
@@ -934,11 +925,11 @@ The public `examples/compose/docker-compose.yml` is intentionally
 universal to any operator (`~/.claude`, `~/.claude.json`, `~/repos`,
 `~/bin`, `~/claude-events`, `~/.config/session`, plus the optional
 `CLAUDE_HOST_*` env-driven mounts) and nothing else. Personal paths
-(`gh` token dir, `gitconfig`, `ssh-agent` socket, work-private
-bare-repo paths under Google Drive / external SSDs / etc.) live in a
-**gitignored** sibling file: `examples/compose/docker-compose.override.yml`.
-Docker Compose auto-merges any `docker-compose.override.yml` into the
-main file at `up` time, so no extra `-f` flag is needed.
+(`gh` token dir, `gitconfig`, `ssh-agent` socket, work-private bare-repo
+paths under Google Drive / external SSDs / etc.) live in a **gitignored**
+sibling file: `examples/compose/docker-compose.override.yml`. Docker Compose
+auto-merges any `docker-compose.override.yml` into the main file at `up` time,
+so no extra `-f` flag is needed.
 
 The shape:
 
@@ -1158,8 +1149,7 @@ heads-up to stderr on first occurrence per target path. Tail
 
 ## Workflow boundaries
 
-This Claude Code session runs inside an isolated container. Strengths and
-limits:
+This session runs inside an isolated container. Strengths and limits:
 
 - **Strong fit**: writing code in `${CLAUDE_HOST_PROJECT_DIR}`, talking to
   APIs the operator bridged in (corp gateways via host-mcp-server, off-the-
@@ -1179,7 +1169,7 @@ limits:
 The container has access to [eichi](https://github.com/hndrewaall/eichi), a
 local sqlite-vec + sentence-transformers semantic search index. Use it as the
 **default first lookup** for open-ended recall questions ("where is X", "what
-did we decide about Y", "find the conversation where Z").
+did we decide about Y").
 
 Decision tree:
 
@@ -1491,10 +1481,10 @@ isn't; the host scheduler is).
 ## Where to learn more
 
 - [Top-level claude-watch README](/opt/claude-container/README.md)
-- [docs/concepts/event-hierarchy.md](/opt/claude-container/docs/concepts/event-hierarchy.md) — the conceptual entry point: how **events vs. obligations vs. interruptions** differ, and the precise **watcher** (one-shot main-loop tool) vs. **event producer** (cron / alertmanager / queue) terminology used throughout these docs
+- [docs/concepts/event-hierarchy.md](/opt/claude-container/docs/concepts/event-hierarchy.md) — conceptual entry point: how **events vs. obligations vs. interruptions** differ, and the **watcher** (one-shot main-loop tool) vs. **event producer** (cron / alertmanager / queue) terminology used throughout
 - [container/ README](/opt/claude-container/container/README.md) — full Dockerfile / entrypoint / blast-radius reference
 - [examples/compose/ README](/opt/claude-container/examples/compose/README.md) — fresh-laptop developer stack walkthrough
-- [docs/watchers.md](/opt/claude-container/docs/watchers.md) — operator-side hygiene rules for watchers, including the **watcher-vs-producer (cron) decision framework** (when a cron producer suffices, when a dedicated watcher is justified, and alternatives)
+- [docs/watchers.md](/opt/claude-container/docs/watchers.md) — operator-side watcher hygiene + the **watcher-vs-producer (cron) decision framework**
 - [docs/adding-watchers.md](/opt/claude-container/docs/adding-watchers.md) — authoring walkthrough for new watchers (fire-and-exit contract, host- and container-side layouts, worked Jenkins example)
 - [Claude Code memory docs](https://code.claude.com/docs/en/memory) — canonical CLAUDE.md hierarchy reference
 - [Claude Code hooks docs](https://code.claude.com/docs/en/hooks) — full hook event list + exit-code semantics
