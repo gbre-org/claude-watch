@@ -794,7 +794,16 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
         "claude --dangerously-skip-permissions --continue".to_string()
     };
 
-    // Write relaunch script
+    // Write relaunch script. Ensure its parent dir exists first: the
+    // default lives under `/var/run/claude/`, which is a tmpfs that does
+    // NOT survive a container redeploy — if the dir is gone the write
+    // fails, the relaunch never happens, and the later resume-inject would
+    // hit a raw shell. `create_dir_all` is idempotent (Ok if it exists).
+    if let Some(parent) = std::path::Path::new(&config.relaunch_script).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(error = %e, dir = %parent.display(), "could not create relaunch-script parent dir");
+        }
+    }
     let script_content = format!(
         "#!/bin/bash\ncd $HOME\n{}\necho \"\\n[claude-watch-relaunch] Claude exited with code $?\"\n",
         launch
@@ -2309,6 +2318,14 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         "claude --dangerously-skip-permissions --continue".to_string()
     };
 
+    // Ensure the relaunch-script parent dir exists (see crash-recovery
+    // note above): `/var/run/claude/` is tmpfs and may be gone after a
+    // redeploy. Idempotent.
+    if let Some(parent) = std::path::Path::new(&config.claude.relaunch_script).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(error = %e, dir = %parent.display(), "auto-update: could not create relaunch-script parent dir");
+        }
+    }
     let script_content = format!(
         "#!/bin/bash\ncd $HOME\n{}\necho \"\\n[claude-watch-update] Claude exited with code $?\"\n",
         launch
@@ -2330,27 +2347,64 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     info!("auto-update: injecting relaunch command...");
     tmux::inject_shell(pane, &format!("bash {}", config.claude.relaunch_script)).await;
 
-    // Step 7: Wait for claude binary to appear in process tree
+    // Step 7: Wait for claude binary to appear in process tree.
+    //
+    // This is the load-bearing DECOUPLE point. The relaunch command in
+    // Step 6 (`bash <relaunch_script>`) is typed into a raw shell. If the
+    // relaunch script is missing (e.g. `/var/run/claude/claude-relaunch.sh`
+    // doesn't exist after a redeploy) or Claude otherwise fails to boot,
+    // the pane is left sitting at a `/bin/sh` prompt -- NOT the Claude TUI.
+    //
+    // Historically Steps 7 and 8 only `warn!`ed and Step 9 injected the
+    // resume prompt regardless. That coupled the resume-inject to the
+    // relaunch: with no Claude running, the resume text (which begins
+    // "You have ALREADY been restarted..." and contains shell-hostile
+    // chars like "(") got typed straight into `/bin/sh`, dying with
+    // `-sh: Syntax error: "(" unexpected` -- and the session never resumed.
+    //
+    // So: gate the resume-inject on Claude actually being up. If the
+    // binary never appears, ABORT the inject (never type the prompt into a
+    // raw shell) and emit a high-severity alert so the operator / main
+    // loop can recover, rather than silently corrupting the shell.
     info!("auto-update: waiting for Claude binary to start...");
     if !tmux::wait_for_claude_binary(pane, 120).await {
-        warn!("auto-update: claude binary not detected after 120s");
+        warn!(
+            "auto-update: claude binary not detected after 120s -- \
+             relaunch likely failed (missing relaunch script or boot error); \
+             ABORTING resume-inject so the resume prompt is never typed into a raw shell"
+        );
         write_jsonl_log(
             &config.general.log_file,
-            "auto_update_warning",
-            serde_json::json!({"reason": "binary_not_found"}),
+            "auto_update_failed",
+            serde_json::json!({"reason": "binary_not_found_resume_inject_aborted"}),
         );
+        alert::notify(crate::event_bus::ClaudeWatchAlert {
+            alert_type: "auto-update-failed",
+            stuck_reason: "auto-update: claude binary never started after relaunch; resume-inject aborted to avoid corrupting the shell",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: crate::event_bus::Severity::High,
+            message: "claude-watch: auto-update FAILED -- Claude did not restart; resume prompt NOT injected (would have hit a raw shell). Operator must relaunch manually.",
+        })
+        .await;
+        return;
     }
 
-    // Step 8: Wait for ❯ prompt (Claude Code is ready for input)
+    // Step 8: Wait for the idle prompt (Claude Code is ready for input).
+    // Claude binary IS running (Step 7 confirmed it), so a missed prompt
+    // here is a slow-render, not a failed relaunch -- best-effort wait,
+    // then inject anyway (the pane is the Claude TUI, not a raw shell).
     info!("auto-update: waiting for idle prompt...");
     if !tmux::wait_for_idle_prompt(pane, 90).await {
-        warn!("auto-update: prompt not found after 90s, trying inject anyway");
+        warn!("auto-update: prompt not found after 90s, trying inject anyway (claude binary is up)");
     }
 
     // Brief settle after prompt appears
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    // Step 9: Inject resume text
+    // Step 9: Inject resume text. Reached ONLY when Step 7 confirmed the
+    // Claude binary is running, so this lands in the Claude TUI -- never a
+    // raw shell. (Decoupled from the relaunch path above.)
     info!("auto-update: injecting resume prompt...");
     inject_dispatch::inject_to_agent(pane, &config.auto_update.resume_prompt).await;
 
