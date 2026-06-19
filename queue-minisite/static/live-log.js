@@ -1493,7 +1493,12 @@
     // 'hostjob' uses /stream — server-side dispatch tails
     //   <HOSTJOB_LOG_DIR>/<label>/log (line-oriented plain text), same wire
     //   envelope as 'workload' (kind workload_line + workload-end terminal),
-    //   so the renderer is shared; only the status / label strings differ.
+    //   so the renderer is shared
+    //   Used for BOTH running hostjob rows (live tail) AND terminal
+    //   (done/abandoned) hostjob rows: the per-label log file persists
+    //   on disk after the job exits, so the same /stream tail backfills
+    //   the full file and ends immediately on the terminal queue status.
+    //   Only the status / label strings differ from live mode.
     // 'subagent' uses /api/subagent/<subagent-id>/stream — tails a child
     //   subagent's JSONL directly (nested tree under a running card). Same
     //   wire envelope as 'live', just a different endpoint + meta source.

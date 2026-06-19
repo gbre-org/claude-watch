@@ -793,6 +793,27 @@ def _shape(
     # so the front-end / live-log endpoint can dispatch on it, mirroring
     # the workload path above.
     shaped["hostjob_label"] = _extract_hostjob_label(shaped["scope"])
+    # Hostjob log presence: unlike subagent/workload archives (which
+    # session-task copies into QUEUE_LOG_ARCHIVE_DIR and stamps as
+    # log_archive_path), the hostjob runner leaves its per-label log in
+    # place at HOSTJOB_LOG_DIR/label/log and never archives it. That file
+    # PERSISTS after the job finishes (until hostjob clean), so a DONE
+    # hostjob item can still serve its full log via the same /stream tail
+    # the running item used (_tail_hostjob_output backfills the whole file
+    # and ends on the item terminal status). Surface a boolean the
+    # template uses to render the View-log affordance on terminal hostjob
+    # rows -- mirrors has_archive but for the still-present hostjob log
+    # path. Fail-soft on any stat error.
+    has_hostjob_log = False
+    if shaped["hostjob_label"]:
+        hostjob_log_path = os.path.join(
+            HOSTJOB_LOG_DIR, shaped["hostjob_label"], "log"
+        )
+        try:
+            has_hostjob_log = os.path.isfile(hostjob_log_path)
+        except OSError:
+            has_hostjob_log = False
+    shaped["has_hostjob_log"] = has_hostjob_log
     return shaped
 
 
@@ -3472,6 +3493,7 @@ def api_queue_meta(qid: str) -> Any:
         "subagents": shaped.get("subagents", []),
         "workload_label": shaped["workload_label"],
         "hostjob_label": shaped["hostjob_label"],
+        "has_hostjob_log": shaped["has_hostjob_log"],
         "age": shaped["age"],
         "age_label": shaped["age_label"],
         "runtime_seconds": runtime_seconds,
