@@ -510,8 +510,15 @@
     //   - aria-label phrasing (archived log link)
     //   - abandoned has an optional reason paragraph
     const isDone = status === 'done';
+    // An abandoned item the hostjob reaper flipped on a NON-ZERO worker exit
+    // is a FAILURE, not an operator cancel — badge + label it `errored` and
+    // class it `state-errored` so it's visually distinct (the backend also
+    // pins these to the top of the abandoned bucket so the cap can't hide
+    // them). Mirrors the SSR template branch in index.html.
+    const isErroredHostjob = !isDone && !!it.is_errored_hostjob;
     const stateCls = isDone ? 'state-done' : 'state-abandoned';
-    const badgeTxt = isDone ? 'done' : 'abandoned';
+    const badgeCls = isErroredHostjob ? 'state-errored' : stateCls;
+    const badgeTxt = isDone ? 'done' : (isErroredHostjob ? 'errored' : 'abandoned');
     // A terminal hostjob keeps its on-disk log (<HOSTJOB_LOG_DIR>/<label>/log)
     // after completion, so the row stays clickable in hostjob mode even though
     // it has no archived agent transcript. hostjob mode takes precedence over
@@ -522,6 +529,7 @@
     const cardClasses = [
       'item',
       stateCls,
+      isErroredHostjob ? 'state-errored' : '',
       isClickable ? 'log-clickable' : '',
     ].filter(Boolean).join(' ');
     const archiveAttr = isHostjob
@@ -529,15 +537,22 @@
       : it.has_archive
       ? `data-log-mode="archive" tabindex="0" role="button" aria-label="View archived log for ${attr(it.id)}" title="Click to view archived log."`
       : '';
+    const erroredAttr = isErroredHostjob ? ' data-errored-hostjob="1"' : '';
 
-    let head = `<span class="badge ${stateCls}">${esc(badgeTxt)}</span>` +
+    const badgeTitle = isErroredHostjob
+      ? ` title="hostjob exited non-zero (exit ${attr(it.hostjob_exit_code || '')}) — failed, not operator-cancelled"`
+      : '';
+    let head = `<span class="badge ${badgeCls}"${badgeTitle}>${esc(badgeTxt)}</span>` +
       `<span class="id">${esc(it.id)}</span>`;
+    if (isErroredHostjob) {
+      head += `<span class="badge hostjob-badge" title="hostjob-bound: ${attr(it.hostjob_label || '')}">hostjob</span>`;
+    }
     if (it.has_archive) {
       head += '<span class="badge log-badge" title="archived agent transcript available">log</span>';
     }
 
     const anchorIso = isDone ? it.completed_at_iso : it.abandoned_at_iso;
-    const anchorLabel = isDone ? 'completed' : 'abandoned';
+    const anchorLabel = isDone ? 'completed' : (isErroredHostjob ? 'errored' : 'abandoned');
     let ageBlock = `<span ${anchorIso ? `data-local-time-iso="${attr(anchorIso)}" data-local-time-title-only` : ''} title="${attr(anchorIso || '')}">${esc(anchorLabel)} ${esc(it.age)}</span>`;
     if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
 
@@ -555,7 +570,7 @@
     }
 
     return (
-      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="${attr(status)}" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" ${archiveAttr}>` +
+      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="${attr(status)}"${erroredAttr} data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" ${archiveAttr}>` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       reasonHtml +
