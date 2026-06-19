@@ -153,10 +153,19 @@ for pkg in "${PACKAGES[@]}"; do
     # under `set -e`; bare `uv ...` would abort the script). Default
     # to 0 first so a successful run is recognised correctly.
     uv_rc=0
-    uv "${install_args[@]}" "$pkg" 2> >(tee "$uv_log" >&2) || uv_rc=$?
-    # The process substitution running tee can lag the parent. Wait
-    # briefly so the log file is fully flushed before we grep it.
-    wait 2>/dev/null || true
+    # Capture uv's stderr to the log file SYNCHRONOUSLY (plain `2>`, no
+    # process substitution), then replay it to the operator's terminal.
+    # The previous `2> >(tee "$uv_log" >&2)` form raced: a `>(...)`
+    # process substitution's child is NOT reliably reaped by `wait`, so
+    # on some platforms (notably the Linux CI runner) a fast next-loop
+    # `grep "$uv_log"` could read the file before tee had flushed the
+    # current iteration's output — making the TLS pattern miss and the
+    # script wrongly take the "non-TLS, do not fall back" branch.
+    # Truncate-then-write here is deterministic: the log is complete
+    # before we grep it.
+    : >"$uv_log"
+    uv "${install_args[@]}" "$pkg" 2>"$uv_log" || uv_rc=$?
+    cat "$uv_log" >&2
 
     if [ "$uv_rc" = "0" ]; then
         continue

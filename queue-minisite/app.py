@@ -2406,6 +2406,27 @@ def _split_cr_lf_segments(
     return segments, remainder
 
 
+def _pending_transient_frame(pending: str) -> str | None:
+    """The in-place (transient) progress frame currently buffered in
+    ``pending`` but not yet graduated by a terminator, or ``None``.
+
+    The live-tail follow loop holds a trailing bare-``\r`` frame (or a
+    long unterminated tail) in ``pending`` so a ``\r\n`` straddling the
+    next read can fuse. But a pure-``\r`` progress producer (download
+    bars: ``downloaded 7.3 MB\r`` rewriting in place, no newline) never
+    emits a ``\n``, so without surfacing the buffered frame the live
+    tail goes deaf after backfill. At EOF we speculatively surface this
+    frame as a transient line; the front-end replaces it in place, and a
+    later ``\r\n`` still fuses correctly because ``pending`` is left
+    intact.
+    """
+    if not pending:
+        return None
+    body = pending[:-1] if pending.endswith("\r") else pending
+    cut = max(body.rfind("\n"), body.rfind("\r"))
+    return body[cut + 1:] if cut >= 0 else body
+
+
 def _tail_jsonl(path: Path) -> Iterator[bytes]:
     """Generator yielding SSE events for a tailed agent JSONL.
 
@@ -2614,6 +2635,11 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
                 last_data_at = time.monotonic()
             yield _format_sse({"type": "meta", "kind": "backfill-end"})
 
+        # Track the last transient (\r-terminated) frame we yielded so we
+        # can (a) suppress consecutive duplicates and (b) speculatively
+        # surface a buffered \r progress frame at EOF without re-emitting
+        # an unchanged one.
+        last_transient: str | None = None
         # Tail loop. Terminate as soon as we observe the .exit file AND
         # have drained the output file at EOF — that ordering avoids
         # cutting off the last line of a workload that exits between
@@ -2624,12 +2650,15 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
                 pending += chunk
                 segments, pending = _split_cr_lf_segments(pending)
                 for text, transient in segments:
+                    if transient and text == last_transient:
+                        continue
                     yield _format_sse({
                         "type": "event",
                         "kind": "workload_line",
                         "text": text,
                         "transient": transient,
                     })
+                    last_transient = text if transient else None
                     last_data_at = time.monotonic()
                 continue
             # EOF — check if the workload has exited.
@@ -2642,14 +2671,37 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
                 segments, _ = _split_cr_lf_segments(pending, flush_remainder=True)
                 pending = ""
                 for text, transient in segments:
+                    if transient and text == last_transient:
+                        continue
                     yield _format_sse({
                         "type": "event",
                         "kind": "workload_line",
                         "text": text,
                         "transient": transient,
                     })
+                    last_transient = text if transient else None
                 yield from _emit_end("exit")
                 return
+            # No chunk and not yet terminal: speculatively surface the
+            # buffered transient (\r) progress frame. A pure-\r producer
+            # (download bars, no trailing \n) leaves its latest frame
+            # stuck in `pending` forever otherwise, so the live tail goes
+            # deaf after backfill while the file grows. We do NOT consume
+            # `pending` — leaving it intact lets a future \r\n still fuse.
+            # The `!= last_transient` guard makes this cheap + idempotent
+            # (the front-end replaces the transient row in place), and an
+            # UNCHANGED frame is skipped so a genuinely stalled producer
+            # still idle-times-out (only CHANGED frames bump last_data_at).
+            spec = _pending_transient_frame(pending)
+            if spec is not None and spec != last_transient:
+                yield _format_sse({
+                    "type": "event",
+                    "kind": "workload_line",
+                    "text": spec,
+                    "transient": True,
+                })
+                last_transient = spec
+                last_data_at = time.monotonic()
             now = time.monotonic()
             if now - last_data_at > SSE_TAIL_MAX_IDLE_SECONDS:
                 yield _format_sse({
@@ -2786,6 +2838,11 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                 last_data_at = time.monotonic()
             yield _format_sse({"type": "meta", "kind": "backfill-end"})
 
+        # Track the last transient (\r-terminated) frame we yielded so we
+        # can (a) suppress consecutive duplicates and (b) speculatively
+        # surface a buffered \r progress frame at EOF without re-emitting
+        # an unchanged one.
+        last_transient: str | None = None
         # Tail loop. Terminate once the bound queue item reaches a
         # terminal status AND we've drained the log at EOF — that ordering
         # avoids cutting off the last line of a job that exits between
@@ -2796,12 +2853,15 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                 pending += chunk
                 segments, pending = _split_cr_lf_segments(pending)
                 for text, transient in segments:
+                    if transient and text == last_transient:
+                        continue
                     yield _format_sse({
                         "type": "event",
                         "kind": "workload_line",
                         "text": text,
                         "transient": transient,
                     })
+                    last_transient = text if transient else None
                     last_data_at = time.monotonic()
                 continue
             # EOF — check if the bound queue item has gone terminal.
@@ -2812,14 +2872,37 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                 segments, _ = _split_cr_lf_segments(pending, flush_remainder=True)
                 pending = ""
                 for text, transient in segments:
+                    if transient and text == last_transient:
+                        continue
                     yield _format_sse({
                         "type": "event",
                         "kind": "workload_line",
                         "text": text,
                         "transient": transient,
                     })
+                    last_transient = text if transient else None
                 yield from _emit_end("terminal")
                 return
+            # No chunk and not yet terminal: speculatively surface the
+            # buffered transient (\r) progress frame. A pure-\r producer
+            # (download bars, no trailing \n) leaves its latest frame
+            # stuck in `pending` forever otherwise, so the live tail goes
+            # deaf after backfill while the file grows. We do NOT consume
+            # `pending` — leaving it intact lets a future \r\n still fuse.
+            # The `!= last_transient` guard makes this cheap + idempotent
+            # (the front-end replaces the transient row in place), and an
+            # UNCHANGED frame is skipped so a genuinely stalled producer
+            # still idle-times-out (only CHANGED frames bump last_data_at).
+            spec = _pending_transient_frame(pending)
+            if spec is not None and spec != last_transient:
+                yield _format_sse({
+                    "type": "event",
+                    "kind": "workload_line",
+                    "text": spec,
+                    "transient": True,
+                })
+                last_transient = spec
+                last_data_at = time.monotonic()
             now = time.monotonic()
             if now - last_data_at > SSE_TAIL_MAX_IDLE_SECONDS:
                 yield _format_sse({

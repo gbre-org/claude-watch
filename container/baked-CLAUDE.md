@@ -39,9 +39,6 @@ Examples that are OK inline (single tool call):
 - A single Edit when the change is one localized hunk and you've already
   read the file in a prior turn
 
-The session's job is to DISPATCH work, not perform it. The Task agent
-handles the work; the session orchestrates.
-
 **Agents MUST be backgrounded — never foreground.** Always spawn with
 `run_in_background: true`. A foreground Agent call blocks this loop until the
 subagent finishes, which freezes everything the dispatcher must keep doing
@@ -63,15 +60,12 @@ alert.
 > **A claude-watch interruption LOOKS like a user rejection — it is NOT one.**
 > claude-watch intervenes via `tmux send-keys`, the same input channel a human
 > uses. When it preempts mid-generation it cancels the in-flight turn, so the
-> harness surfaces it exactly like the user pressing Escape or rejecting a
-> tool call. **Do not interpret it as the user being dissatisfied, rejecting
-> your work, or telling you to stop the task.** It is the monitoring daemon
-> forcing attention to an urgent operational condition (context exhaustion,
-> dead watcher, stalled session) — not feedback on what you were doing. Read
-> the injected `[CLAUDE-WATCH]` text as the actual instruction; attend that
-> condition, then RESUME the work you were preempted from (after saving state
-> per the checklist below). Never silently abandon the original task as though
-> it had been declined.
+> harness surfaces it like the user pressing Escape. **Do not read it as the
+> user being dissatisfied or telling you to stop.** It is the daemon forcing
+> attention to an urgent condition (context exhaustion, dead watcher, stalled
+> session). Read the injected `[CLAUDE-WATCH]` text as the instruction; attend
+> that condition, then RESUME the preempted work (after saving state per the
+> checklist below). Never silently abandon the original task.
 
 Compaction or context clearing doesn't kill background tasks but you LOSE
 HANDLES on them. Delaying the alert means the situation is WORSE when the
@@ -424,14 +418,11 @@ agent completes will be DENIED unless you have already called
 work the main loop can do — nothing else proceeds until they are
 processed.
 
-**Why N=0 (no grace window)?** Claude Code does not fire a PostToolUse
-hook on agent completion — completions arrive as system messages
-(task-notifications). There is no automated hook to populate
-`agent-ack-pending.json`. The main loop MUST call `agent-ack register`
-as its first action upon receiving a task-notification. With N=0,
-forgetting to register means the gate fires on the very next call,
-making the omission immediately visible rather than silently letting
-2 calls slip through.
+**Why N=0 (no grace window)?** Claude Code fires no PostToolUse hook on
+agent completion — completions arrive as system messages, so nothing
+auto-populates `agent-ack-pending.json`. The loop MUST `agent-ack
+register` as its first action on a task-notification. With N=0, forgetting
+to register fires the gate on the very next call — immediately visible.
 
 **Concrete sequence when you receive a task-notification:**
 
