@@ -319,11 +319,15 @@ pub struct WatcherMonitorConfig {
     /// Consecutive missing checks before injecting a restart prompt (default: 6 = ~60s)
     #[serde(default = "default_watcher_inject_threshold")]
     pub inject_threshold: u32,
-    /// Cooldown in seconds between watcher-missing injections (default: 60).
-    /// Tightened 300 -> 60 on 2026-04-28: a down watcher is a hard liveness
-    /// failure (no signal, no events, no torrents getting through), so when
-    /// the previous inject didn't land we want to re-inject quickly rather
-    /// than wait 5 minutes while the user is silent.
+    /// Cooldown in seconds between watcher-missing injections (default: 150).
+    /// History: tightened 300 -> 60 on 2026-04-28 (a down watcher is a hard
+    /// liveness failure, so re-inject quickly rather than wait 5 minutes).
+    /// Raised 60 -> 150 on 2026-06-18: 60s re-nagged the main loop far too
+    /// often for an already-surfaced watcher-down/stuck interruption, so the
+    /// re-injection cadence is now ~2.5min. This throttles the RE-FIRE of an
+    /// already-injected interruption, NOT the initial detection latency
+    /// (`inject_threshold` is unchanged) — the daemon still NOTICES a down
+    /// watcher just as fast; it just re-nags less often while it stays down.
     #[serde(default = "default_watcher_inject_cooldown")]
     pub inject_cooldown: u64,
     /// When true, suppress the tmux-INJECT (interrupt + prompt) part of
@@ -405,7 +409,7 @@ fn default_watcher_inject_threshold() -> u32 {
 }
 
 fn default_watcher_inject_cooldown() -> u64 {
-    60
+    150
 }
 
 fn default_watcher_grace_secs() -> u64 {
