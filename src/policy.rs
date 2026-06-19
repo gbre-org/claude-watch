@@ -1716,6 +1716,152 @@ fn spawn_immediate_clear(state: &mut State) {
     }
 }
 
+/// Wedged-pane detection + immediate-self-clear recovery, factored out so it
+/// can run from BOTH the normal active-session path AND the `cs.is_none()`
+/// "looks-not-running" early-return path.
+///
+/// Why it must also run on the `cs.is_none()` path (real incident
+/// 2026-06-19): when Claude Code hits the context wall it renders an error
+/// banner ("Context limit reached. /compact or /clear to continue" / "Context
+/// low (N% remaining)") OVER the status bar. `get_claude_status()` parses the
+/// status bar for tokens/bashes; with the banner covering it, the parse can
+/// miss and `find_claude_pane()`'s status-bar heuristic returns no pane, so
+/// the whole status read comes back `None`. The session is NOT gone — it is
+/// WEDGED — but `check_cycle` took the `cs.is_none()` "not running" branch and
+/// `return`ed BEFORE ever reaching the wedged-detection block lower down. The
+/// daemon logged "claude-status returned None -- not running" every cycle for
+/// 83 minutes while the loop sat wedged at 975K tokens; the auto-clear-at-limit
+/// recovery never fired (it lives past the early return). The slower
+/// heartbeat-stale path eventually recovered it ~13 min late.
+///
+/// This helper carries the same consecutive-cycle gate, api-retry suppression,
+/// cooldown gate, breadcrumb, alert, and `spawn_immediate_clear` that the
+/// inline site uses, so both entry points behave identically. Returns `true`
+/// if a wedge was DETECTED this cycle (regardless of whether a clear actually
+/// fired — it may be gated by consecutive/cooldown/api-retry), so the
+/// `cs.is_none()` caller can skip the misleading "not running" bookkeeping.
+async fn handle_wedged_pane(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    api_retrying: bool,
+    tokens: u64,
+    now: &str,
+) -> bool {
+    if !config.context_monitor.wedged_detection_enabled || pane.is_empty() {
+        return false;
+    }
+
+    let wedged = tmux::detect_wedged(pane).await;
+
+    let Some(reason) = wedged else {
+        // Pane is no longer wedged — reset the counter.
+        if state.wedged_consecutive > 0 {
+            debug!(
+                prev_consecutive = state.wedged_consecutive,
+                "wedged pane cleared — resetting counter"
+            );
+            state.wedged_consecutive = 0;
+        }
+        return false;
+    };
+
+    state.wedged_consecutive += 1;
+    debug!(
+        reason = %reason,
+        consecutive = state.wedged_consecutive,
+        threshold = config.context_monitor.wedged_consecutive,
+        "wedged pane detected"
+    );
+
+    if state.wedged_consecutive >= config.context_monitor.wedged_consecutive {
+        // Cooldown gate: don't re-fire within wedged_cooldown seconds.
+        let in_cooldown = state
+            .last_wedged_clear
+            .as_deref()
+            .and_then(elapsed_since)
+            .is_some_and(|e| e < config.context_monitor.wedged_cooldown as f64);
+
+        if api_retrying {
+            debug!(
+                reason = %reason,
+                "wedged pane detected but api_retry active — suppressing self-clear"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "wedged_clear_api_retry_deferred",
+                serde_json::json!({
+                    "reason": reason.to_string(),
+                    "consecutive": state.wedged_consecutive,
+                }),
+            );
+        } else if !in_cooldown {
+            warn!(
+                reason = %reason,
+                consecutive = state.wedged_consecutive,
+                "wedged pane sustained — running self-clear immediately (no agent cooperation possible)"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "wedged_clear",
+                serde_json::json!({
+                    "reason": reason.to_string(),
+                    "consecutive": state.wedged_consecutive,
+                    "tokens": tokens,
+                }),
+            );
+            write_legacy_log(
+                &config.general.legacy_log_file,
+                &format!(
+                    "wedged pane ({reason}) — running self-clear (consecutive={})",
+                    state.wedged_consecutive,
+                ),
+            );
+
+            // Run session-event compact-prep so the next session has a
+            // breadcrumb in the session log explaining why context was
+            // dropped. Best-effort — if it fails, still proceed with
+            // self-clear.
+            let note = format!("auto-clear: pane wedged ({reason})");
+            let _ = crate::cmd::run_cmd(
+                &["session-event", "compact-prep", "--note", &note],
+                10,
+            )
+            .await;
+
+            // Notify Andrew so he knows claude-watch had to step in.
+            let alert_msg = format!(
+                "claude-watch: agent wedged ({reason}) -- running self-clear",
+            );
+            let wedged_reason = format!("wedged pane: {reason}");
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "wedged-pane",
+                stuck_reason: &wedged_reason,
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &alert_msg,
+            })
+            .await;
+
+            spawn_immediate_clear(state);
+
+            state.last_wedged_clear = Some(now.to_string());
+            state.wedged_clear_count += 1;
+            state.wedged_clear_interrupts_total =
+                state.wedged_clear_interrupts_total.saturating_add(1);
+            state.wedged_consecutive = 0;
+        } else {
+            debug!(
+                reason = %reason,
+                "wedged pane detected but cooldown active"
+            );
+        }
+    }
+
+    true
+}
+
 /// Spawn a deferred self-clear child process.
 /// The child sleeps for the grace period, then checks if tokens are still high.
 /// If so, it runs `self-clear` to force a context clear.
@@ -2859,6 +3005,37 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     let cs = status::get_claude_status().await;
 
     if cs.is_none() {
+        // A `None` status does NOT necessarily mean Claude Code exited. When
+        // the session hits the context wall (or a persistent 429), Claude
+        // renders an error banner OVER the status bar; the status-bar parse
+        // then misses and `find_claude_pane()`'s heuristic returns no pane, so
+        // the whole read comes back `None`. The session is WEDGED, not gone.
+        //
+        // Before taking the "not running" path (which skips the entire
+        // context-monitor + wedged-detection block below and just bumps
+        // bookkeeping), look for the dashboard pane directly — `find_dashboard_pane`
+        // is status-bar-independent — and run the wedged-recovery there. This is
+        // the auto-clear-at-limit fix: without it, an 83-minute wedge logged
+        // "claude-status returned None -- not running" every cycle and never
+        // self-cleared (real incident 2026-06-19).
+        let fallback_pane = tmux::find_dashboard_pane(&config.tmux).await;
+        if let Some(ref wedge_pane) = fallback_pane {
+            // Honor the same api-retry suppression the active path uses: a 429
+            // backoff must not be clobbered by a self-clear.
+            let api_retrying =
+                update_api_retry_state(config, state, wedge_pane).await;
+            if handle_wedged_pane(config, state, wedge_pane, api_retrying, 0, &now).await {
+                debug!(
+                    pane = %wedge_pane,
+                    "status read None but pane is WEDGED — ran wedged recovery instead of 'not running'"
+                );
+                state.last_known_pane = wedge_pane.clone();
+                state.last_check = Some(now);
+                crate::state::save_state(&config.general.state_file, state);
+                return;
+            }
+        }
+
         debug!("claude-status returned None -- not running");
         write_legacy_log(
             &config.general.legacy_log_file,
@@ -3740,114 +3917,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // immediately, no grace period, no agent dependency.
     //
     // To avoid false positives from chat-history references to the strings,
-    // we require N consecutive cycles before firing.
-    if config.context_monitor.wedged_detection_enabled && !effective_pane.is_empty() {
-        let wedged = tmux::detect_wedged(&effective_pane).await;
-
-        if let Some(reason) = wedged {
-            state.wedged_consecutive += 1;
-            debug!(
-                reason = %reason,
-                consecutive = state.wedged_consecutive,
-                threshold = config.context_monitor.wedged_consecutive,
-                "wedged pane detected"
-            );
-
-            if state.wedged_consecutive >= config.context_monitor.wedged_consecutive {
-                // Cooldown gate: don't re-fire within wedged_cooldown seconds.
-                let in_cooldown = state
-                    .last_wedged_clear
-                    .as_deref()
-                    .and_then(elapsed_since)
-                    .is_some_and(|e| e < config.context_monitor.wedged_cooldown as f64);
-
-                if api_retrying {
-                    debug!(
-                        reason = %reason,
-                        "wedged pane detected but api_retry active — suppressing self-clear"
-                    );
-                    write_jsonl_log(
-                        &config.general.log_file,
-                        "wedged_clear_api_retry_deferred",
-                        serde_json::json!({
-                            "reason": reason.to_string(),
-                            "consecutive": state.wedged_consecutive,
-                        }),
-                    );
-                } else if !in_cooldown {
-                    warn!(
-                        reason = %reason,
-                        consecutive = state.wedged_consecutive,
-                        "wedged pane sustained — running self-clear immediately (no agent cooperation possible)"
-                    );
-                    write_jsonl_log(
-                        &config.general.log_file,
-                        "wedged_clear",
-                        serde_json::json!({
-                            "reason": reason.to_string(),
-                            "consecutive": state.wedged_consecutive,
-                            "tokens": tokens,
-                        }),
-                    );
-                    write_legacy_log(
-                        &config.general.legacy_log_file,
-                        &format!(
-                            "wedged pane ({reason}) — running self-clear (consecutive={})",
-                            state.wedged_consecutive,
-                        ),
-                    );
-
-                    // Run session-event compact-prep so the next session has a
-                    // breadcrumb in the session log explaining why context was
-                    // dropped. Best-effort — if it fails, still proceed with
-                    // self-clear.
-                    let note = format!("auto-clear: pane wedged ({reason})");
-                    let _ = crate::cmd::run_cmd(
-                        &["session-event", "compact-prep", "--note", &note],
-                        10,
-                    )
-                    .await;
-
-                    // Notify Andrew so he knows claude-watch had to step in.
-                    let alert_msg = format!(
-                        "claude-watch: agent wedged ({reason}) -- running self-clear",
-                    );
-                    let wedged_reason = format!("wedged pane: {reason}");
-                    alert::notify(crate::event_bus::ClaudeWatchAlert {
-                        alert_type: "wedged-pane",
-                        stuck_reason: &wedged_reason,
-                        stale_minutes: None,
-                        affected_watchers: vec![],
-                        severity: crate::event_bus::Severity::High,
-                        message: &alert_msg,
-                    })
-                    .await;
-
-                    spawn_immediate_clear(state);
-
-                    state.last_wedged_clear = Some(now.clone());
-                    state.wedged_clear_count += 1;
-                    state.wedged_clear_interrupts_total =
-                        state.wedged_clear_interrupts_total.saturating_add(1);
-                    state.wedged_consecutive = 0;
-                } else {
-                    debug!(
-                        reason = %reason,
-                        "wedged pane detected but cooldown active"
-                    );
-                }
-            }
-        } else {
-            // Pane is no longer wedged — reset the counter.
-            if state.wedged_consecutive > 0 {
-                debug!(
-                    prev_consecutive = state.wedged_consecutive,
-                    "wedged pane cleared — resetting counter"
-                );
-                state.wedged_consecutive = 0;
-            }
-        }
-    }
+    // we require N consecutive cycles before firing. Shared with the
+    // `cs.is_none()` early-return path so a wedge that hides the status bar
+    // (and thus makes the session read as "not running") is still recovered.
+    handle_wedged_pane(config, state, &effective_pane, api_retrying, tokens, &now).await;
 
     // --- Malformed-tool-call detection (non-namespaced invoke/parameter) ---
     //
