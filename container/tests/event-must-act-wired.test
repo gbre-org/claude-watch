@@ -54,12 +54,19 @@ AUDIT_HOOKS = CONTAINER_DIR / "bin" / "audit-hooks.py"
 GENERATOR = CONTAINER_DIR / "hooks-shim" / "generate-hooks-shim-settings"
 OBLIGATIONS_INIT = REPO_ROOT / "tools" / "obligations" / "obligations-init"
 
+# The event-must-act scripts now live in tools/event-must-act/ (shared,
+# host-portable location) so the non-container (systemd host) deployment can
+# symlink them into ~/bin alongside the container's COPY-bake. They are
+# environment-agnostic (state under ~/.config/claude-events/), so a single
+# copy serves both deployments. The container still bakes them via COPY from
+# the new tools/ path (asserted below).
+EVENT_MUST_ACT_DIR = REPO_ROOT / "tools" / "event-must-act"
 NEW_SCRIPTS = {
-    "event-ack": CONTAINER_DIR / "bin" / "event-ack",
-    "event-classify": CONTAINER_DIR / "bin" / "event-classify",
-    "eval-event-must-act": CONTAINER_DIR / "bin" / "eval-event-must-act",
+    "event-ack": EVENT_MUST_ACT_DIR / "event-ack",
+    "event-classify": EVENT_MUST_ACT_DIR / "event-classify",
+    "eval-event-must-act": EVENT_MUST_ACT_DIR / "eval-event-must-act",
     "user-prompt-ambient-inject-hook":
-        CONTAINER_DIR / "bin" / "user-prompt-ambient-inject-hook",
+        EVENT_MUST_ACT_DIR / "user-prompt-ambient-inject-hook",
 }
 
 BAKED_PATHS = {name: f"/usr/local/bin/{name}" for name in NEW_SCRIPTS}
@@ -105,7 +112,7 @@ def test_self_tests_pass() -> None:
 def test_dockerfile_bakes_scripts() -> None:
     df = DOCKERFILE.read_text()
     for name, baked in BAKED_PATHS.items():
-        copy_line = f"COPY container/bin/{name} {baked}"
+        copy_line = f"COPY tools/event-must-act/{name} {baked}"
         expect(copy_line in df, f"Dockerfile missing: {copy_line!r}")
         expect(baked in df,
                f"Dockerfile missing reference to {baked}")

@@ -16,6 +16,10 @@ Covers:
     seconds of the most recent ack, ALLOW even with alerts still pending
   - Obligations override (added in #314): an active (unexpired) override
     in obligations.json -> ALLOW; an expired one -> still DENY
+  - Main-loop call (no/empty/blank agent_id) with a pending alert: DENY
+  - Subagent call (agent_id present) with the SAME pending alert: ALLOW
+    (gate is main-loop only -- only the main loop owns the heartbeat +
+    watchers and can resolve a claude-watch alert)
   - CLAUDE_WATCH_ALERT_BYPASS=1: allow + audit log
   - Malformed JSON on stdin: allow (default-open)
   - Corrupt state file: allow (default-open)
@@ -450,6 +454,72 @@ def test_compound_bash_still_denied():
         h.cleanup()
 
 
+def test_main_loop_call_denies_with_pending_alert():
+    """A main-loop call (NO agent_id in the payload) with a pending alert
+    is DENIED -- the gate still enforces the recovery path for the loop
+    that actually owns the heartbeat + watchers."""
+    h = Harness()
+    try:
+        aid = h.add_alert("[CLAUDE-WATCH] heartbeat stale")
+        # No agent_id key at all == main loop.
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls -la"}})
+        check(_is_deny(out), "main-loop (no agent_id): deny", f"out={out}")
+        check(aid in out.get("systemMessage", ""),
+              "main-loop: banner mentions alert id")
+        # Empty-string agent_id is ALSO main loop (Claude Code sometimes
+        # sends "" rather than omitting the key).
+        rc, out, err = h.run_hook({"tool_name": "Bash", "agent_id": "",
+                                   "tool_input": {"command": "ls -la"}})
+        check(_is_deny(out), "main-loop (empty agent_id): deny", f"out={out}")
+        # Whitespace-only agent_id strips to empty -> still main loop.
+        rc, out, err = h.run_hook({"tool_name": "Bash", "agent_id": "   ",
+                                   "tool_input": {"command": "ls -la"}})
+        check(_is_deny(out), "main-loop (blank agent_id): deny", f"out={out}")
+    finally:
+        h.cleanup()
+
+
+def test_subagent_call_inert_with_pending_alert():
+    """A subagent call (agent_id present in the payload) with the SAME
+    pending alert is ALLOWED -- the gate is main-loop only. A subagent is
+    structurally powerless to resolve a claude-watch alert (can't touch
+    the heartbeat / restart watchers), so gating it would force it to ack
+    alerts just to unblock its own next call, racing the watcher
+    spawn-lock and causing an alert storm. This is the bug-fix this test
+    pins: previously the alert gate denied subagent tool calls too."""
+    h = Harness()
+    try:
+        h.add_alert("[CLAUDE-WATCH] watcher down: claude-event-watch")
+        # Non-exempt Bash from a subagent -> ALLOW (gate inert).
+        rc, out, err = h.run_hook({
+            "tool_name": "Bash",
+            "agent_id": "agent-abc123",
+            "tool_input": {"command": "ls -la"},
+        })
+        check(_is_allow(out),
+              "subagent (agent_id set): allow despite pending alert",
+              f"out={out}")
+        # Other non-exempt tools from a subagent also pass.
+        for tool, ti in [
+            ("Edit", {"file_path": "/x", "old_string": "a", "new_string": "b"}),
+            ("Write", {"file_path": "/x", "content": "x"}),
+            ("Agent", {"prompt": "nested work"}),
+        ]:
+            rc, out, err = h.run_hook({"tool_name": tool,
+                                       "agent_id": "agent-abc123",
+                                       "tool_input": ti})
+            check(_is_allow(out), f"subagent {tool}: allow", f"out={out}")
+        # Sanity cross-check: the SAME alert + SAME command WITHOUT an
+        # agent_id (main loop) denies -- proving the only difference is the
+        # subagent scoping, not some other allow path (cooldown/override).
+        rc, out, err = h.run_hook({"tool_name": "Bash",
+                                   "tool_input": {"command": "ls -la"}})
+        check(_is_deny(out), "cross-check main-loop: deny", f"out={out}")
+    finally:
+        h.cleanup()
+
+
 def test_deny_response_shape():
     h = Harness()
     try:
@@ -489,6 +559,8 @@ def main() -> int:
         test_malformed_stdin_allows,
         test_corrupt_state_allows,
         test_compound_bash_still_denied,
+        test_main_loop_call_denies_with_pending_alert,
+        test_subagent_call_inert_with_pending_alert,
         test_deny_response_shape,
     ]
     for t in tests:
