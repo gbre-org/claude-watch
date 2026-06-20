@@ -1,0 +1,69 @@
+# Prometheus scrape config for the claude-watch monitoring stack.
+#
+# Targets the claude-watch metrics surface, which is THREE distinct sources
+# (see examples/compose/monitoring/README.md for the full map):
+#
+#   1. work-queue-exporter   — Python HTTP exporter on :9099 /metrics.
+#        Reads queue.json + active-agents.json. Emits worktask_queue_*.
+#        Drives WorkQueueOrphaned / WorkQueueStuck / WorkQueueReadyStuck.
+#   2. claude-events-exporter — Python HTTP exporter on :9103 /metrics.
+#        Reads ~/claude-events/. Emits claude_events_*.
+#   3. claude-watch daemon    — writes a node-exporter *textfile* .prom
+#        (claude_watch_* / claude_code_*). NOT an HTTP endpoint, so it is
+#        scraped indirectly via node-exporter's textfile collector (the
+#        optional `node-exporter` profile below).
+#
+# The two Python exporters are scraped over the compose network by service
+# name when they run in THIS stack (docker-compose.yml). If instead they run
+# on the HOST (or in the fresh-laptop stack's own network), set
+# CW_EXPORTER_HOST=host.docker.internal in .env and the host-gateway targets
+# below take over — mirroring the extra_hosts/host-gateway pattern the
+# sibling examples/compose/docker-compose.yml already uses.
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    monitor: claude-watch
+
+# Alert rules translated from the prose in container/baked-CLAUDE.md +
+# README.md (claude-watch ships NO rule files of its own — external alerting
+# is "out of scope" per the README; these are a clearly-labelled STARTER set).
+rule_files:
+  - /etc/prometheus/alerts.rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # Prometheus self-scrape.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # work-queue-exporter (:9099) — worktask_queue_* metrics.
+  - job_name: work-queue-exporter
+    static_configs:
+      - targets: ["work-queue-exporter:9099"]
+        labels:
+          source: work-queue-exporter
+
+  # claude-events-exporter (:9103) — claude_events_* metrics.
+  - job_name: claude-events-exporter
+    static_configs:
+      - targets: ["claude-events-exporter:9103"]
+        labels:
+          source: claude-events-exporter
+
+  # node-exporter (:9100) — surfaces the claude-watch daemon's textfile
+  # metrics (claude_watch_* / claude_code_*) written by `claude-watch
+  # metrics` into the textfile-collector dir. Only present when the
+  # `node-exporter` compose profile is enabled (see docker-compose.yml).
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          source: claude-watch-daemon
