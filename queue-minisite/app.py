@@ -170,6 +170,21 @@ _QUEUE_MARKER_RE = re.compile(r"Queue item:\s*(q-[a-z0-9-]{4,64})")
 # need to allow paragraphs.
 _MAX_REASON_LEN = 500
 
+# Errored-hostjob detection. The `hostjob` runner (andrew-sf-tools) flips
+# its queue item to `abandoned` with `abandon_reason = "hostjob exit <N>"`
+# when the host worker exits NON-ZERO (see the reaper's `finalize_queue`).
+# That conflates a FAILED hostjob with an operator CANCEL — and, worse,
+# the errored item then sinks into the time-sorted, capped `abandoned`
+# bucket where it can fall out of the visible window entirely. We can't
+# change the upstream `queue abandon` call (it lives in the separate,
+# read-only andrew-sf-tools repo), so we recover the distinction here at
+# render time: an abandoned item whose reason matches this pattern with a
+# NON-ZERO exit code is an ERRORED hostjob. The minisite then badges it
+# distinctly and pins it to the top of the abandoned section so it is
+# never hidden. (`hostjob exit 0` is not produced by the reaper — rc==0
+# flips to `done` — but we still gate on non-zero to be defensive.)
+_HOSTJOB_EXIT_RE = re.compile(r"^hostjob exit (\d+)$")
+
 # Whitelabel branding hooks. All values are read from the environment
 # with empty / generic defaults so the public open-source build renders
 # cleanly without any private branding bleeding through. A deployer
@@ -798,6 +813,21 @@ def _shape(
     # so the front-end / live-log endpoint can dispatch on it, mirroring
     # the workload path above.
     shaped["hostjob_label"] = _extract_hostjob_label(shaped["scope"])
+    # Errored-hostjob recovery. An `abandoned` item that the hostjob reaper
+    # flipped on a NON-ZERO worker exit is a FAILURE, not an operator
+    # cancel — surface that distinctly so it (a) reads as errored in the UI
+    # and (b) gets pinned ahead of genuine cancels in the abandoned bucket
+    # (see `_build_state`). We gate on the `hostjob exit <N>` reason rather
+    # than merely `hostjob_label` so an operator who manually cancels a
+    # running hostjob (a real abandon, blank/other reason) still reads as
+    # abandoned.
+    shaped["is_errored_hostjob"] = False
+    shaped["hostjob_exit_code"] = ""
+    if status == "abandoned" and shaped["hostjob_label"]:
+        m = _HOSTJOB_EXIT_RE.match((shaped["abandon_reason"] or "").strip())
+        if m and m.group(1) != "0":
+            shaped["is_errored_hostjob"] = True
+            shaped["hostjob_exit_code"] = m.group(1)
     return shaped
 
 
@@ -935,7 +965,18 @@ def _render_payload() -> dict[str, Any]:
         )
     )
     done.sort(key=lambda a: a.get("completed_at_iso") or "", reverse=True)
-    abandoned.sort(key=lambda a: a.get("abandoned_at_iso") or "", reverse=True)
+    # Abandoned order: ERRORED hostjobs first (a non-zero hostjob exit is a
+    # failure the operator needs to see — pin it ahead of genuine cancels so
+    # the RECENT_ABANDONED_LIMIT cap can never hide it), then most-recently-
+    # abandoned. Within each group, newest-first. (With reverse=True the
+    # larger leading key sorts first, so errored => 1, cancel => 0.)
+    abandoned.sort(
+        key=lambda a: (
+            1 if a.get("is_errored_hostjob") else 0,
+            a.get("abandoned_at_iso") or "",
+        ),
+        reverse=True,
+    )
 
     done_recent = done[:RECENT_DONE_LIMIT]
     abandoned_recent = abandoned[:RECENT_ABANDONED_LIMIT]
@@ -2864,7 +2905,23 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
                     last_transient = text if transient else None
                     last_data_at = time.monotonic()
                 continue
-            # EOF — check if the bound queue item has gone terminal.
+            # EOF on this read. The hostjob log lives on the host and is
+            # appended by a detached host process; when the minisite reads it
+            # through a bind-mount (Docker Desktop virtiofs / gRPC-FUSE) the
+            # client can cache the file size/EOF on the open handle, so a plain
+            # follow-up f.read() keeps returning '' forever and the live tail
+            # goes deaf right after backfill even though the job is producing
+            # output (operator-reported). Re-seeking to the current offset
+            # busts that cached attribute so the NEXT read observes appended
+            # bytes — the canonical `tail -f`-on-a-network-fs technique. It is a
+            # no-op (position unchanged) on a local filesystem, so the workload
+            # tail's behavior on /tmp is unaffected. Best-effort: a seek failure
+            # must never kill the stream.
+            try:
+                f.seek(f.tell())
+            except OSError:
+                pass
+            # Check if the bound queue item has gone terminal.
             if _hostjob_item_terminal(label):
                 trailing = f.read()
                 if trailing:
