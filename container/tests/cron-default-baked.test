@@ -228,12 +228,12 @@ if DOCKERFILE.is_file():
     # 6. cw-watcher-health-check baked.
     expect(
         re.search(
-            r"COPY\s+container/bin/cw-watcher-health-check\s+"
+            r"COPY\s+tools/event-must-act/cw-watcher-health-check\s+"
             r"/usr/local/bin/cw-watcher-health-check",
             df,
         )
         is not None,
-        "Dockerfile must COPY container/bin/cw-watcher-health-check "
+        "Dockerfile must COPY tools/event-must-act/cw-watcher-health-check "
         "to /usr/local/bin/cw-watcher-health-check. Without this the "
         "watcher health check cron entry has no script to run.",
     )

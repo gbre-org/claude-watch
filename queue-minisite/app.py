@@ -51,6 +51,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,6 +126,20 @@ WORKLOAD_LOG_DIR = os.environ.get("WORKLOAD_LOG_DIR", "/workloads")
 HOSTJOB_LOG_DIR = os.environ.get(
     "HOSTJOB_LOG_DIR",
     os.path.join(os.path.expanduser("~"), ".cache", "hostjob"),
+)
+# Live-tail broker base URL. The hostjob reaper tees each worker output line
+# to a tiny host-side localhost line broker (andrew-sf-tools `hostjob broker`)
+# that the minisite subscribes to over `host.docker.internal`. This is the
+# fix for the Docker Desktop VirtioFS coherence gap: a macOS-host writer
+# holding the log fd open freezes the guest reader's cached inode size, so a
+# bind-mount tail goes deaf until the writer exits. The broker carries the
+# LIVE delta over a fully host<->guest-coherent kernel socket; the
+# bind-mounted file stays the durable backfill source AND the fallback when
+# the broker is unavailable (graceful degradation to the pre-broker
+# file-poll behavior). Default targets the Docker-Desktop gateway host on the
+# broker's conventional loopback port 8799.
+HOSTJOB_BROKER_URL = os.environ.get(
+    "HOSTJOB_BROKER_URL", "http://host.docker.internal:8799"
 )
 # Label format: same as queue-id-ish — letters, digits, dots, dashes,
 # underscores. Path-traversal guard for the tail endpoint. Shared by both
@@ -2882,12 +2897,149 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
         # Track the last transient (\r-terminated) frame we yielded so we
         # can (a) suppress consecutive duplicates and (b) speculatively
         # surface a buffered \r progress frame at EOF without re-emitting
-        # an unchanged one.
+        # an unchanged one. Shared across the broker-live and file-fallback
+        # paths so a switch between them does not re-emit an unchanged row.
         last_transient: str | None = None
-        # Tail loop. Terminate once the bound queue item reaches a
-        # terminal status AND we've drained the log at EOF — that ordering
-        # avoids cutting off the last line of a job that exits between
-        # reads (analogous to workload's .exit-after-EOF check).
+
+        def _drain_pending_terminal() -> Iterator[bytes]:
+            # Shared terminal drain: flush any buffered file tail through the
+            # CR/LF splitter, emit the last lines, then the end frame. The
+            # file is fully coherent once the host writer has closed it (the
+            # job is terminal), so the trailing bytes are authoritative.
+            nonlocal pending, last_transient
+            try:
+                trailing = f.read()
+            except OSError:
+                trailing = ""
+            if trailing:
+                pending += trailing
+            segments, _ = _split_cr_lf_segments(pending, flush_remainder=True)
+            pending = ""
+            for text, transient in segments:
+                if transient and text == last_transient:
+                    continue
+                yield _format_sse({
+                    "type": "event",
+                    "kind": "workload_line",
+                    "text": text,
+                    "transient": transient,
+                })
+                last_transient = text if transient else None
+            yield from _emit_end("terminal")
+
+        def _emit_segments_from(buf: str) -> Iterator[bytes]:
+            # Push complete CR/LF segments out of `pending` (mutated in
+            # place), applying the same transient de-dup the file path uses.
+            nonlocal pending, last_transient, last_data_at
+            pending = buf
+            segments, pending = _split_cr_lf_segments(pending)
+            for text, transient in segments:
+                if transient and text == last_transient:
+                    continue
+                yield _format_sse({
+                    "type": "event",
+                    "kind": "workload_line",
+                    "text": text,
+                    "transient": transient,
+                })
+                last_transient = text if transient else None
+                last_data_at = time.monotonic()
+
+        def _relay_broker_live() -> Iterator[bytes]:
+            # LIVE-delta path: subscribe to the host-side broker SSE and
+            # relay each line into the same workload_line frames. The broker
+            # transport is a plain loopback TCP socket reached over
+            # `host.docker.internal`, so it is fully host<->guest coherent —
+            # the VirtioFS coherence gap that freezes the bind-mount tail
+            # does NOT apply here.
+            #
+            # CONTRACT (matches the broker's `_send_line`): the broker
+            # forwards COMPLETE lines, terminator stripped. We re-run each
+            # delivered line through `_split_cr_lf_segments` (re-appending a
+            # \n so a permanent line graduates; a bare-\r progress line stays
+            # transient) so CR/LF transient handling is IDENTICAL to the
+            # file-backfill path.
+            #
+            # Yields frames on success. Raises on ANY broker error
+            # (connection refused / timeout / malformed / mid-stream drop) so
+            # the caller falls back to the file-poll loop and behavior is
+            # never worse than the pre-broker code.
+            url = HOSTJOB_BROKER_URL.rstrip("/") + "/tail/" + label
+            # Short connect timeout so an absent broker fails FAST into the
+            # file fallback rather than stalling the modal.
+            resp = urllib.request.urlopen(url, timeout=3)
+            try:
+                while True:
+                    # Terminal check first so a job that finished before/while
+                    # we subscribed still closes the stream promptly. The
+                    # final bytes live in the (coherent-on-close) file, so we
+                    # drain the file tail, not the broker, at end-of-stream.
+                    if _hostjob_item_terminal(label):
+                        yield from _drain_pending_terminal()
+                        return
+                    raw = resp.readline()
+                    if raw:
+                        line = raw.decode("utf-8", "replace")
+                        if line.startswith("data:"):
+                            payload = line[len("data:"):]
+                            if payload.startswith(" "):
+                                payload = payload[1:]
+                            payload = payload.rstrip("\n")
+                            if payload == "":
+                                # SSE event boundary (blank line) — ignore.
+                                continue
+                            # Re-graduate via the CR/LF splitter: a normal
+                            # line gets a \n so it is permanent; a bare-\r
+                            # progress line stays transient.
+                            graduated = (
+                                payload if payload.endswith("\r")
+                                else payload + "\n"
+                            )
+                            yield from _emit_segments_from(graduated)
+                        # SSE comments (": keep-alive") + other lines: skip.
+                        continue
+                    # readline() returned b"" -> broker closed the stream.
+                    # The common cause is the job FINISHING: the reaper stops
+                    # feeding and the connection winds down right around the
+                    # moment the queue item flips terminal. Give that flip a
+                    # brief grace to propagate (the file is the source of
+                    # truth) so a clean completion drains + ends WITHOUT a
+                    # spurious broker-fallback frame. Only a stream that drops
+                    # while the item is still genuinely running is treated as
+                    # a broker error worth falling back to the file for.
+                    for _ in range(20):  # ~2s grace
+                        if _hostjob_item_terminal(label):
+                            yield from _drain_pending_terminal()
+                            return
+                        time.sleep(0.1)
+                    raise OSError("broker stream closed before item terminal")
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+        # Prefer the broker (coherent live transport). On ANY broker error,
+        # fall back to the file-poll loop so behavior is never worse than the
+        # pre-broker code. The fallback re-reads from the file handle's
+        # current position, so no bytes are lost on the switch (the broker
+        # only ever delivered lines that were ALSO appended to the file).
+        try:
+            yield from _relay_broker_live()
+            return
+        except GeneratorExit:
+            return
+        except Exception as exc:
+            yield _format_sse({
+                "type": "meta",
+                "kind": "broker-fallback",
+                "reason": str(exc),
+            })
+
+        # File-poll fallback (the pre-broker behavior, preserved verbatim).
+        # Tail loop: terminate once the bound queue item reaches a terminal
+        # status AND we've drained the log at EOF — that ordering avoids
+        # cutting off the last line of a job that exits between reads.
         while True:
             chunk = f.read(READ_CHUNK)
             if chunk:
@@ -2915,30 +3067,17 @@ def _tail_hostjob_output(label: str) -> Iterator[bytes]:
             # busts that cached attribute so the NEXT read observes appended
             # bytes — the canonical `tail -f`-on-a-network-fs technique. It is a
             # no-op (position unchanged) on a local filesystem, so the workload
-            # tail's behavior on /tmp is unaffected. Best-effort: a seek failure
-            # must never kill the stream.
+            # tail's behavior on /tmp is unaffected. NOTE: this is the FALLBACK
+            # path; the broker (above) is the primary live transport and does
+            # not rely on this seek. Best-effort: a seek failure must never
+            # kill the stream.
             try:
                 f.seek(f.tell())
             except OSError:
                 pass
             # Check if the bound queue item has gone terminal.
             if _hostjob_item_terminal(label):
-                trailing = f.read()
-                if trailing:
-                    pending += trailing
-                segments, _ = _split_cr_lf_segments(pending, flush_remainder=True)
-                pending = ""
-                for text, transient in segments:
-                    if transient and text == last_transient:
-                        continue
-                    yield _format_sse({
-                        "type": "event",
-                        "kind": "workload_line",
-                        "text": text,
-                        "transient": transient,
-                    })
-                    last_transient = text if transient else None
-                yield from _emit_end("terminal")
+                yield from _drain_pending_terminal()
                 return
             # No chunk and not yet terminal: speculatively surface the
             # buffered transient (\r) progress frame. A pure-\r producer

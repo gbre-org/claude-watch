@@ -419,6 +419,11 @@ services:
       context: ../..
       dockerfile: queue-minisite/Dockerfile
     image: queue-minisite:dev
+    extra_hosts:
+      # Lets the minisite dial the host-side hostjob live-tail broker (see
+      # HOSTJOB_BROKER_URL below) over the Docker-Desktop gateway. Same
+      # entry the claude-container service uses for its IDE-host override.
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     user: "1000:1000"
@@ -449,6 +454,18 @@ services:
       # live-log modal tails <HOSTJOB_LOG_DIR>/<label>/log for running queue
       # items whose scope is `hostjob:<label>`. Bind-mounted read-only below.
       HOSTJOB_LOG_DIR: /hostjobs
+      # Live-tail broker URL. The hostjob reaper (andrew-sf-tools) tees each
+      # worker output line to a tiny host-side localhost line broker; the
+      # minisite subscribes to it here over the Docker-Desktop gateway host
+      # (extra_hosts above). This is the fix for the VirtioFS coherence gap:
+      # a macOS-host writer holding the log fd open freezes the guest
+      # reader's cached inode size, so the bind-mount tail (HOSTJOB_LOG_DIR
+      # above) goes deaf until the writer exits. The broker carries the LIVE
+      # delta over a fully coherent kernel socket; the bind-mount file stays
+      # the durable backfill source AND the automatic fallback when the
+      # broker is unavailable (graceful degradation to the prior file-poll
+      # behavior). Port 8799 is the broker's conventional loopback port.
+      HOSTJOB_BROKER_URL: http://host.docker.internal:8799
       # Authoritative agent_id -> queue_id bindings, written by the host's
       # `post-tool-agent-arm-hook` PostToolUse hook. The minisite reads this
       # to build the REAL hierarchical subagent tree (group each subagent

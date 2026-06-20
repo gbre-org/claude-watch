@@ -146,12 +146,12 @@ container image:
 - `tools/obligations/obligations-init` registers the `event_must_act`
   obligation on every entrypoint run (idempotent — already-seeded rows
   are detected by a marker tag in `deny_message`).
-- `container/bin/eval-event-must-act` is the evaluator script the
+- `tools/event-must-act/eval-event-must-act` is the evaluator script the
   obligation row points at (`/usr/local/bin/eval-event-must-act`).
-- `container/bin/event-classify` and `container/bin/event-ack` are the
+- `tools/event-must-act/event-classify` and `tools/event-must-act/event-ack` are the
   classifier + ack CLI. Both are copied to `/usr/local/bin/` by the
   Dockerfile.
-- `container/bin/user-prompt-ambient-inject-hook` drains the ambient
+- `tools/event-must-act/user-prompt-ambient-inject-hook` drains the ambient
   queue on every `UserPromptSubmit`.
 
 To pick up changes to any of the above on workbot, rebuild and
@@ -207,9 +207,9 @@ container/tests/baked-obligations-hooks.test
 
 ## Where the rules live (single source of truth)
 
-- **Tier mapping**: `container/bin/event-classify` (`CLASSIFICATIONS`
+- **Tier mapping**: `tools/event-must-act/event-classify` (`CLASSIFICATIONS`
   table). Add a new event source = append a row; no gate-logic change.
-- **Gate behavior**: `container/bin/eval-event-must-act` (counter,
+- **Gate behavior**: `tools/event-must-act/eval-event-must-act` (counter,
   exempts, default-open posture).
 - **Pending / counter state**:
   `~/.config/claude-events/pending-actions.json` and

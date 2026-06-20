@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -71,6 +71,20 @@ test-agent-tail:
 # Run the claude-event + claude-event-tail unit tests.
 test-claude-event:
 	python3 tools/claude-event/tests/test_claude_event.py
+
+# Run the event-must-act toolchain tests. These four scripts
+# (event-classify, event-ack, eval-event-must-act,
+# user-prompt-ambient-inject-hook) now live in tools/event-must-act/ as
+# the SHARED, host-portable copy: the container bakes them via COPY, and
+# the non-container (systemd) host symlinks them into ~/bin. Plus the
+# cron-driven dead-watcher recovery injector (cw-watcher-health-check),
+# whose bash test stubs `claude-watch` so nothing is ever injected into a
+# real pane.
+test-event-must-act:
+	python3 tools/event-must-act/event-classify --self-test
+	python3 tools/event-must-act/event-ack --self-test
+	python3 tools/event-must-act/eval-event-must-act --self-test
+	tools/event-must-act/tests/cw-watcher-health-check.test
 
 # Run the self-clear config-only smoke tests (the full inject flow needs
 # a live Claude Code tmux pane, which can't be reproduced in unit tests).
