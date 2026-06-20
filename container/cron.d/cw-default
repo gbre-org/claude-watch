@@ -70,6 +70,10 @@
 # files in the queue dir that have been sitting unconsumed for >2 min.
 # If any exist, the event watcher is dead (container recreate, session
 # clear, etc). Injects a [CLAUDE-WATCH] alert directly into the tmux
-# pane via send-keys — bypasses the event system entirely (which is the
-# whole point: if events are accumulating, the event path is broken).
-* * * * *  hndrewaall /usr/local/bin/cw-cron-run watcher-health-check /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log
+# pane via `claude-watch inject` — bypasses the event system entirely
+# (which is the whole point: if events are accumulating, the event path
+# is broken). The script now defaults its pane to `claude-watch inject`'s
+# own resolution (so a non-container host can share it); the container
+# pins the pane + its slash-command restart hint explicitly here to keep
+# behavior identical to the pre-tools/ move.
+* * * * *  hndrewaall CW_WATCHER_HEALTH_PANE=claude-container:0.0 CW_WATCHER_HEALTH_RESTART_HINT='Restart the event watcher via /claude-container:start-watchers' /usr/local/bin/cw-cron-run watcher-health-check /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log

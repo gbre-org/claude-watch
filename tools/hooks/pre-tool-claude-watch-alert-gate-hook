@@ -38,6 +38,17 @@ This hook runs ALONGSIDE the existing obligations-gate hook on the `*`
 matcher; Claude Code runs every matching hook and treats the first DENY
 as authoritative.
 
+Main-loop only
+--------------
+
+The gate fires ONLY on main-loop tool calls. Subagent tool calls (which
+carry an `agent_id` in the hook payload) are exempt entirely: only the
+main loop can resolve a claude-watch alert (it owns the heartbeat file,
+restarts watchers, runs the canonical recovery), so gating a subagent
+would force it to ack alerts / restart watchers just to unblock its own
+next tool call -- racing the watcher's singleton spawn-lock and causing
+an alert storm. Same `agent_id` signal the dispatcher gate uses.
+
 Exempt patterns
 ---------------
 
@@ -384,6 +395,28 @@ def main() -> int:
 
     tool_name = payload.get("tool_name", "")
     if not isinstance(tool_name, str) or not tool_name:
+        print(json.dumps(_allow()))
+        return 0
+
+    # Short-circuit: subagents are exempt from the claude-watch alert gate.
+    # The gate enforces the main-loop recovery path for claude-watch alerts
+    # (prolonged thinking, heartbeat stall, watcher-down, zombie session,
+    # context-low, main-pane crash). ONLY the main loop can resolve those
+    # conditions -- it owns the heartbeat file, restarts watchers, and runs
+    # the canonical recovery (session-task set + commit + self-clear). A
+    # subagent is structurally powerless here: it can't restart the watcher
+    # supervisor or touch the heartbeat. If the gate fired on subagent tool
+    # calls, the subagent would ack alerts / restart claude-event-watch just
+    # to unblock its OWN next tool call -- racing the watcher's singleton
+    # spawn-lock and causing a relentless DOWN/stuck/spawn-lock alert STORM.
+    # So make the gate main-loop ONLY. Detection: Claude Code's hook contract
+    # includes `agent_id` in the payload ONLY when the tool call originates
+    # from a subagent; main-loop calls have no `agent_id` (or empty string).
+    # Same signal used by the dispatcher gate (pre-tool-dispatch-gate-hook)
+    # and the obligations gate's `is_main_loop` predicate.
+    raw_agent_id = payload.get("agent_id", "")
+    agent_id = raw_agent_id.strip() if isinstance(raw_agent_id, str) else ""
+    if agent_id:
         print(json.dumps(_allow()))
         return 0
 
