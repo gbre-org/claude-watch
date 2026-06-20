@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# cw-watcher-health-check — detect dead event watcher via stale queue and
+# inject a recovery alert into the Claude Code pane.
+#
+# The event watcher (claude-event-watch) runs as a `run_in_background` task
+# inside the Claude Code session. When the container is recreated, the
+# session clears, or the watcher otherwise dies, nobody restarts it and
+# claude-events pile up unconsumed in the spool directory. This script
+# detects that condition by checking for `*.json` event files that have sat
+# past a staleness threshold.
+#
+# If stale events exist, the watcher is dead (or stuck). We inject a
+# [CLAUDE-WATCH] alert directly into the tmux pane via `claude-watch inject`,
+# bypassing the event system entirely (which is the whole point — if events
+# are accumulating, the event consumption path is broken).
+#
+# This is the CRON-DRIVEN RECOVERY injector. It is distinct from, and
+# complementary to, the claude-watch DAEMON's own heartbeat-stale inject:
+#   - The daemon fires when the *host heartbeat file* mtime goes stale (the
+#     main loop stopped touching it). PREVENTION/liveness path.
+#   - This script fires when *event files* go unconsumed (the event WATCHER
+#     is dead, even if the loop is otherwise alive). RECOVERY path for the
+#     watcher itself.
+# They watch different signals, so they don't double-fire on the same
+# condition. The per-condition cooldown below keeps THIS script from
+# re-injecting every cron tick while a stale window persists.
+#
+# Runs via cron. In the container that's the baked cron.d/cw-default entry;
+# on a non-container (systemd) host it's wired into the host crontab. Both
+# default to once per minute.
+#
+# Environment:
+#   CLAUDE_EVENT_QUEUE  — event spool directory (default ~/claude-events)
+#   CW_WATCHER_HEALTH_STALE_MIN — age threshold in minutes (default 2)
+#   CW_WATCHER_HEALTH_PANE — tmux pane target. When UNSET/empty (the
+#       default), `--pane` is omitted entirely and `claude-watch inject`
+#       resolves the pane itself ($CW_WATCHER_HEALTH_PANE -> $CLAUDE_WATCH_PANE
+#       -> `[tmux] dashboard_pane` config -> claude-pane auto-detect). Set it
+#       explicitly to pin a pane (e.g. the container sets claude-container:0.0).
+#   CW_WATCHER_HEALTH_RESTART_HINT — operator-specific instruction appended
+#       to the alert telling the loop how to restart the watcher (default:
+#       "Restart the event watcher (watcher-restart) immediately.").
+#   CW_WATCHER_HEALTH_COOLDOWN_SECS — minimum seconds between injects while a
+#       stale window persists (default 600 = 10 min). 0 disables the
+#       cooldown (inject every tick that finds stale events).
+#   CW_WATCHER_HEALTH_STATE — cooldown ledger path
+#       (default $CLAUDE_EVENT_STATE_DIR/watcher-health-last-inject, falling
+#       back to ~/.config/claude-events/watcher-health-last-inject).
+
+set -euo pipefail
+
+QUEUE="${CLAUDE_EVENT_QUEUE:-$HOME/claude-events}"
+STALE_MIN="${CW_WATCHER_HEALTH_STALE_MIN:-2}"
+PANE="${CW_WATCHER_HEALTH_PANE:-}"
+RESTART_HINT="${CW_WATCHER_HEALTH_RESTART_HINT:-Restart the event watcher (watcher-restart) immediately.}"
+COOLDOWN_SECS="${CW_WATCHER_HEALTH_COOLDOWN_SECS:-600}"
+
+STATE_DIR_DEFAULT="${CLAUDE_EVENT_STATE_DIR:-$HOME/.config/claude-events}"
+STATE_FILE="${CW_WATCHER_HEALTH_STATE:-$STATE_DIR_DEFAULT/watcher-health-last-inject}"
+
+# If the queue directory doesn't exist, nothing to check.
+if [ ! -d "$QUEUE" ]; then
+    exit 0
+fi
+
+# Count .json files older than the threshold.
+STALE=$(find "$QUEUE" -name '*.json' -mmin +"$STALE_MIN" 2>/dev/null | wc -l)
+
+if [ "$STALE" -le 0 ]; then
+    exit 0
+fi
+
+# Cooldown: avoid re-injecting on every cron tick while the stale window
+# persists (a single recovery nudge per cooldown window is enough; the loop
+# either restarts the watcher and the events drain, or it's genuinely wedged
+# and the daemon's own escalation takes over). Disabled when COOLDOWN_SECS=0.
+NOW=$(date +%s)
+if [ "$COOLDOWN_SECS" -gt 0 ] && [ -f "$STATE_FILE" ]; then
+    LAST=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+    case "$LAST" in
+        ''|*[!0-9]*) LAST=0 ;;
+    esac
+    if [ $((NOW - LAST)) -lt "$COOLDOWN_SECS" ]; then
+        # Still within cooldown — stay silent.
+        exit 0
+    fi
+fi
+
+# Inject directly into the tmux pane. This bypasses the event system (which
+# is broken if we got here) and uses the same [CLAUDE-WATCH] prefix that the
+# daemon uses for its alerts, triggering the "STOP EVERYTHING" protocol.
+#
+# The type-and-submit choreography is CENTRALIZED in `claude-watch inject`
+# (src/tmux.rs) — the ONE verified copy of the Escape->NORMAL / dd / `i`
+# INSERT verify-and-retry / type / Tab->Escape->Enter sequence. Shelling out
+# to it (instead of hand-rolling send-keys) carries the proven keystroke
+# order AND verifies the submission landed (payload cleared from the prompt
+# line), exiting non-zero if it didn't.
+ALERT="[CLAUDE-WATCH] WATCHER DOWN: $STALE event(s) unconsumed >${STALE_MIN}min — the event watcher is dead or stuck. $RESTART_HINT"
+
+inject_rc=0
+if [ -n "$PANE" ]; then
+    claude-watch inject --pane "$PANE" --submit "$ALERT" || inject_rc=$?
+else
+    claude-watch inject --submit "$ALERT" || inject_rc=$?
+fi
+
+if [ "$inject_rc" -ne 0 ]; then
+    printf 'cw-watcher-health-check: claude-watch inject reported submit not verified (rc=%s, pane=%q)\n' \
+        "$inject_rc" "${PANE:-<auto>}" >&2
+    # Do NOT record the cooldown stamp on a failed inject — let the next tick
+    # retry rather than going silent for the whole cooldown window after a
+    # submit that never landed.
+    exit "$inject_rc"
+fi
+
+# Record the successful-inject timestamp for the cooldown gate.
+mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+printf '%s\n' "$NOW" > "$STATE_FILE" 2>/dev/null || true

@@ -131,6 +131,9 @@ jobs:
       - name: Run agent-tail embedded test suite
         run: make test-agent-tail
 
+      - name: Run event-must-act toolchain tests
+        run: make test-event-must-act
+
       - name: Run entrypoint CLAUDE_CMD construction tests
         run: make test-entrypoint
 

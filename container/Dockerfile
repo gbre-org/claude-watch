@@ -917,7 +917,7 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output
 # never feed into pending-actions.json; the Signal-DM ack-gate lives
 # on a separate obligation row (signal-wait-* watcher + signal-send
 # ack-gate path, NOT migrated to this gate per Andrew 2026-05-21).
-COPY container/bin/eval-event-must-act /usr/local/bin/eval-event-must-act
+COPY tools/event-must-act/eval-event-must-act /usr/local/bin/eval-event-must-act
 RUN chmod +x /usr/local/bin/eval-event-must-act
 
 # eval-agent-ack-pending — obligations evaluator that blocks Bash tool
@@ -954,7 +954,7 @@ RUN chmod +x /usr/local/bin/agent-ack
 #   - reset-counter/bump-counter: N-counter knobs
 # Signal-tagged events are excluded by classification (the Signal-DM
 # ack-gate stays on its existing per-thread obligation path).
-COPY container/bin/event-ack /usr/local/bin/event-ack
+COPY tools/event-must-act/event-ack /usr/local/bin/event-ack
 RUN chmod +x /usr/local/bin/event-ack
 
 # event-classify — data-driven source/tag -> tier classifier (ambient
@@ -962,7 +962,7 @@ RUN chmod +x /usr/local/bin/event-ack
 # every known event source to its tier; new sources are added by
 # appending to the table. Used by event-ack ingest + by the main loop
 # (event-classify --source X --tag Y) when manually triaging events.
-COPY container/bin/event-classify /usr/local/bin/event-classify
+COPY tools/event-must-act/event-classify /usr/local/bin/event-classify
 RUN chmod +x /usr/local/bin/event-classify
 
 # user-prompt-ambient-inject-hook — UserPromptSubmit hook that drains
@@ -973,7 +973,7 @@ RUN chmod +x /usr/local/bin/event-classify
 # event model -- ambient (this hook), actionable (must-act gate),
 # signal-distinct (NOT touched by this refactor; stays on signal-wait-
 # watcher + signal-send ack-gate), unknown (defaults to ambient).
-COPY container/bin/user-prompt-ambient-inject-hook /usr/local/bin/user-prompt-ambient-inject-hook
+COPY tools/event-must-act/user-prompt-ambient-inject-hook /usr/local/bin/user-prompt-ambient-inject-hook
 RUN chmod +x /usr/local/bin/user-prompt-ambient-inject-hook
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
@@ -1091,7 +1091,7 @@ RUN chmod +x /usr/local/bin/self-clear
 # if any exist, injects a [CLAUDE-WATCH] alert into the tmux pane
 # via send-keys (bypasses the event system, which is broken if
 # events are accumulating). Fired by the */2 cron entry in cw-default.
-COPY container/bin/cw-watcher-health-check /usr/local/bin/cw-watcher-health-check
+COPY tools/event-must-act/cw-watcher-health-check /usr/local/bin/cw-watcher-health-check
 RUN chmod +x /usr/local/bin/cw-watcher-health-check
 
 # cw-cron-run + cw-cron-toggle — toggle baked cron.d entries without sudo.
