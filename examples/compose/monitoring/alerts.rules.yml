@@ -1,0 +1,167 @@
+# alerts.rules.yml — STARTER alert rules for the claude-watch stack.
+#
+# IMPORTANT: claude-watch ships NO alert-rule files of its own. The README
+# (§ "External alerting — not a fourth tier") states Prometheus/Alertmanager
+# are OUT OF SCOPE for the daemon; the rule NAMES below (WorkQueueOrphaned,
+# WorkQueueStuckSoft, WorkQueueReadyStuck, ...) are referenced in the repo
+# ONLY as prose — as "the out-of-tree Prometheus alert rules" that the
+# in-tree `claude-watch queue-check` subcommand mirrors (see
+# src/config.rs QueueCheckConfig and config.toml [queue_check]).
+#
+# These rules are therefore DERIVED FROM THE DOCS, not copied from any
+# existing file. They translate the documented intent into runnable PromQL
+# against the metric names the two Python exporters + the daemon textfile
+# actually emit. Treat thresholds as starting points and tune for your host.
+#
+# Metric provenance:
+#   worktask_queue_*  -> exporters/work-queue-exporter/work_queue_exporter.py
+#   claude_events_*   -> exporters/claude-events-exporter/claude_events_exporter.py
+#   claude_watch_* / claude_code_* -> `claude-watch metrics` textfile (src/metrics.rs)
+
+groups:
+  - name: claude-watch-work-queue
+    rules:
+      # WorkQueueOrphaned — a RUNNING queue item whose owning agent is no
+      # longer alive. The exporter emits has_live_owner for both running and
+      # blocked items; the docstring is explicit that alert rules MUST filter
+      # to {status="running"} so blocked items (no live agent BY DESIGN) do
+      # not fire. Items with no agent record are absent from the gauge
+      # entirely (no signal beats false-alert), so == 0 only matches genuine
+      # orphans.
+      - alert: WorkQueueOrphaned
+        expr: worktask_queue_item_has_live_owner{status="running"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Work-queue item {{ $labels.id }} is running but orphaned"
+          description: >-
+            Running queue item {{ $labels.id }} ({{ $labels.summary }}) has no
+            live agent owner (agent {{ $labels.agent_id }}). Derived from the
+            documented WorkQueueOrphaned rule. Either re-register the work or
+            abandon the item.
+
+      # WorkQueueStuckSoft — a running item with long runtime AND stale (or
+      # absent) progress. Per the work_queue_exporter docstring, WorkQueueStuck
+      # joins running_elapsed against progress_age and fires on items WITHOUT
+      # a progress series (agents) OR WITH stale progress (workloads) — the
+      # `unless on(id)` half excludes healthy long-running workloads that are
+      # still emitting a fresh heartbeat. 15m mirrors the deployed
+      # WorkQueueStuckSoft for:15m window documented in config.toml
+      # [queue_check] stale_heartbeat_min = 15.
+      - alert: WorkQueueStuckSoft
+        expr: >-
+          (worktask_queue_items_running_elapsed_seconds > 900)
+          unless on(id) (worktask_queue_item_progress_age_seconds < 900)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Work-queue item {{ $labels.id }} appears stuck"
+          description: >-
+            Running queue item {{ $labels.id }} ({{ $labels.summary }}) has
+            been running >15m with no fresh progress heartbeat. Derived from
+            the documented WorkQueueStuckSoft rule (config.toml
+            stale_heartbeat_min=15). Healthy long-running workloads that keep
+            touching their progress heartbeat are excluded via the
+            `unless on(id)` join.
+
+      # WorkQueueReadyStuck — a ready-to-spawn pending item that has been
+      # sitting unclaimed too long. The exporter only emits ready_age for
+      # pending group-heads that are NOT scope-locked and have empty
+      # dep_blockers (intentionally-held items go to locked_age instead), so
+      # this gauge is already the "genuinely waiting" set.
+      - alert: WorkQueueReadyStuck
+        expr: worktask_queue_item_ready_age_seconds > 1800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ready work-queue item {{ $labels.id }} is unclaimed"
+          description: >-
+            Pending, ready (group-head, unlocked, no dep blockers) queue item
+            {{ $labels.id }} ({{ $labels.summary }}) has waited >30m for the
+            main loop to spawn it. Derived from the documented
+            WorkQueueReadyStuck rule.
+
+      # AgentStateFileStale — the exporter sets agent_state_last_modified to 0
+      # when claude-watch's active-agents.json is missing; the docstring says
+      # to alert when it stays 0 (claude-watch stopped publishing the file),
+      # which also blinds WorkQueueOrphaned.
+      - alert: AgentStateFileMissing
+        expr: worktask_queue_agent_state_last_modified == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "claude-watch active-agents state file missing"
+          description: >-
+            worktask_queue_agent_state_last_modified has been 0 for >10m —
+            claude-watch is not publishing active-agents.json, so owner
+            liveness (WorkQueueOrphaned) is blind. Check the active-agents
+            cron / daemon.
+
+  - name: claude-watch-events
+    rules:
+      # ClaudeEventsBacklog — the oldest unconsumed event has aged out,
+      # which the claude-events-exporter docstring calls out as the signal of
+      # a wedged main loop / dead claude-event-watch watcher.
+      - alert: ClaudeEventsBacklogStale
+        expr: claude_events_age_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "claude-events backlog is going stale"
+          description: >-
+            Oldest unconsumed claude-event is >10m old (queue depth
+            {{ with query "claude_events_queue_depth" }}{{ . | first | value }}{{ end }}).
+            Suggests a wedged main loop or a dead claude-event-watch watcher.
+
+  - name: claude-watch-daemon
+    rules:
+      # ClaudeWatchDown — the daemon writes claude_watch_up 0 (down_metrics)
+      # when its state file is unreadable, or the node-exporter target is
+      # absent. Only meaningful with the node-exporter profile enabled.
+      - alert: ClaudeWatchDown
+        expr: claude_watch_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "claude-watch daemon is down or state file unreadable"
+          description: >-
+            claude_watch_up == 0 — claude-watch's state.json is unreadable or
+            the daemon is not running. Derived from the daemon's down_metrics
+            textfile output (src/metrics.rs).
+
+      # WatchersMissing — enabled watchers that have gone missing. The daemon
+      # exports claude_watchers_missing / claude_watchers_total; the
+      # watcher_down interrupt is the in-tree escalation, this is the external
+      # mirror.
+      - alert: ClaudeWatchersMissing
+        expr: claude_watchers_missing > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} claude-watch watcher(s) missing"
+          description: >-
+            claude_watchers_missing > 0 — one or more enabled watchers have
+            gone missing (consecutive_missing > 3). The daemon's watcher_down
+            interrupt handles this in-tree; this is the external mirror.
+
+      # MainLoopHeartbeatStale — the host main-loop heartbeat FILE mtime has
+      # frozen, the canonical wedge signal per src/metrics.rs. Only emitted
+      # when the heartbeat file exists, so absent != firing.
+      - alert: ClaudeMainLoopHeartbeatStale
+        expr: time() - claude_mainloop_heartbeat_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "claude main-loop heartbeat is stale"
+          description: >-
+            The host main-loop heartbeat file hasn't been touched in >15m
+            (claude_mainloop_heartbeat_timestamp_seconds). The main loop is
+            likely wedged. Derived from the daemon textfile gauge.

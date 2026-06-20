@@ -1,0 +1,175 @@
+# claude-watch monitoring stack — Prometheus (+ Alertmanager, optional
+# Grafana / node-exporter) that scrapes the claude-watch metrics surface.
+#
+# This complements the sibling fresh-laptop stack in
+# examples/compose/docker-compose.yml — it is a SEPARATE compose file so the
+# monitoring plane can be brought up / torn down independently of the
+# claude-container / queue-minisite plane (and so an operator who only wants
+# metrics doesn't pull in the full dev stack). Bring it up from this dir:
+#
+#   cd examples/compose/monitoring && docker compose up -d
+#
+# What it scrapes (full map in README.md):
+#   * work-queue-exporter   (:9099)  worktask_queue_*   (built from repo root)
+#   * claude-events-exporter(:9103)  claude_events_*    (built from repo root)
+#   * node-exporter         (:9100)  claude_watch_* / claude_code_* textfile
+#                                     (OPTIONAL `node-exporter` profile)
+#
+# Exporter data sources are bind-mounted read-only from the host (queue.json,
+# active-agents.json, claude-events spool, workload/hostjob heartbeats) so the
+# exporters observe the SAME files the live system writes. Override each via
+# the CW_* env vars (see .env.example in this dir).
+
+services:
+  # ---------------------------------------------------------------------
+  # work-queue-exporter — reads queue.json + active-agents.json, exposes
+  # worktask_queue_* on :9099/metrics. Built from the in-repo exporter.
+  # ---------------------------------------------------------------------
+  work-queue-exporter:
+    build:
+      # Build context is the repo root so the Dockerfile can COPY the
+      # exporter + its claude_agents.py helper (same shape as the sibling
+      # stack's repo-root build contexts).
+      context: ../../..
+      dockerfile: exporters/work-queue-exporter/Dockerfile
+    image: claude-watch-work-queue-exporter:dev
+    environment:
+      PORT: "9099"
+      QUEUE_JSON: /queue/queue.json
+      AGENT_STATE_JSON: /agents-state/active-agents.json
+      WORKLOAD_HEARTBEAT_DIR: /workload-heartbeats
+      HOSTJOB_HEARTBEAT_DIR: /hostjob-heartbeats
+    volumes:
+      # session-task queue.json (rw on the host; mounted ro here).
+      - "${CW_QUEUE_DIR:-${HOME}/.config/session}:/queue:ro"
+      # claude-watch active-agents.json state dir (owner liveness).
+      - "${CW_STATE_PATH:-${HOME}/.local/share/claude-watch}:/agents-state:ro"
+      # Per-workload progress heartbeats (claude-watch workload wrapper).
+      - "${CW_WORKLOAD_HEARTBEAT_DIR:-/run/claude/workloads}:/workload-heartbeats:ro"
+      # Per-hostjob progress heartbeats (andrew-sf-tools hostjob runner).
+      - "${CW_HOSTJOB_HEARTBEAT_DIR:-${HOME}/.cache/hostjob}:/hostjob-heartbeats:ro"
+    expose:
+      - "9099"
+    ports:
+      - "9099:9099"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # claude-events-exporter — reads the claude-events spool, exposes
+  # claude_events_* on :9103/metrics. Built from the in-repo exporter.
+  # ---------------------------------------------------------------------
+  claude-events-exporter:
+    build:
+      context: ../../..
+      dockerfile: exporters/claude-events-exporter/Dockerfile
+    image: claude-watch-claude-events-exporter:dev
+    environment:
+      PORT: "9103"
+      CLAUDE_EVENTS_DIR: /events
+    volumes:
+      - "${CW_EVENTS_DIR:-${HOME}/claude-events}:/events:ro"
+    expose:
+      - "9103"
+    ports:
+      - "9103:9103"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # prometheus — scrapes the two exporters (+ node-exporter when enabled)
+  # and evaluates the starter alert rules.
+  # ---------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    extra_hosts:
+      # So scrape_configs can fall back to host-gateway targets when an
+      # exporter runs on the HOST instead of in this stack (set
+      # CW_EXPORTER_HOST=host.docker.internal). Matches the sibling stack's
+      # extra_hosts/host-gateway pattern.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - "./prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - "./alerts.rules.yml:/etc/prometheus/alerts.rules.yml:ro"
+      - "prometheus-data:/prometheus"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - work-queue-exporter
+      - claude-events-exporter
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # alertmanager — receives + routes the fired alerts. Default routing is a
+  # null receiver; the README + alertmanager.yml document the claude-event
+  # webhook-bridge integration point (alerts -> ~/claude-events/).
+  # ---------------------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - "./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro"
+      - "alertmanager-data:/alertmanager"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "9093:9093"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # node-exporter — OPTIONAL (profile: node-exporter). Surfaces the
+  # claude-watch DAEMON's textfile metrics (claude_watch_* / claude_code_*)
+  # written by `claude-watch metrics` into the textfile-collector dir. The
+  # daemon does NOT serve HTTP /metrics — it only writes a .prom file — so
+  # this is how those metrics reach Prometheus. Enable with:
+  #   docker compose --profile node-exporter up -d
+  # and ensure `claude-watch metrics` (cron) writes into CW_TEXTFILE_DIR.
+  # ---------------------------------------------------------------------
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    profiles: ["node-exporter"]
+    command:
+      - "--collector.textfile.directory=/textfile"
+      # Trim the default collector set to just the textfile collector — we
+      # only want claude-watch's .prom here, not full host metrics.
+      - "--collector.disable-defaults"
+      - "--collector.textfile"
+    volumes:
+      # claude-watch metrics writes /var/lib/node-exporter/textfile/
+      # claude_watch.prom by default (src/metrics.rs PROM_FILE). Point
+      # CW_TEXTFILE_DIR at whatever dir your `claude-watch metrics` cron
+      # writes into.
+      - "${CW_TEXTFILE_DIR:-/var/lib/node-exporter/textfile}:/textfile:ro"
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # grafana — OPTIONAL (profile: grafana). Pre-provisioned with the
+  # prometheus datasource. Lightweight + clearly separable: only starts
+  # with `docker compose --profile grafana up -d`.
+  # ---------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["grafana"]
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - "./grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "grafana-data:/var/lib/grafana"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

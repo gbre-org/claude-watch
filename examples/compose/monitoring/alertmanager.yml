@@ -1,0 +1,37 @@
+# Alertmanager config for the claude-watch monitoring stack.
+#
+# Minimal starter routing: everything goes to a single null/log receiver by
+# default. claude-watch's OWN model is that external alerts should route
+# back INTO one of its three native tiers (events / obligations /
+# interruptions) — see README § "External alerting". The idiomatic wiring is
+# a webhook receiver that shells `claude-event` to drop a JSON file into
+# ~/claude-events/, which the in-container claude-event-watch then surfaces.
+#
+# That webhook bridge is operator-specific (it needs a tiny HTTP->claude-event
+# shim), so it is left commented below as the documented integration point
+# rather than shipped half-wired.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 3h
+
+receivers:
+  # Default receiver — no external delivery. Alerts are still visible in the
+  # Alertmanager UI (:9093) and Prometheus (/alerts). Swap in the webhook
+  # bridge below to route into the claude-event bus.
+  - name: default
+
+  # Example: route INTO the claude-event bus (README § External alerting ->
+  # "into events"). Point this at a host-side shim that turns the webhook POST
+  # into `claude-event emit --source alertmanager --tag claude-watch-alert ...`
+  # so the alert surfaces in the next UserPromptSubmit context.
+  # - name: claude-event-bridge
+  #   webhook_configs:
+  #     - url: http://host.docker.internal:9094/alertmanager-to-claude-event
+  #       send_resolved: true
