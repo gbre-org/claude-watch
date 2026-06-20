@@ -8,7 +8,10 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN uv pip install --system --no-cache prometheus_client
 
-COPY claude_events_exporter.py /app/
+# COPY source is relative to the build context, which the monitoring compose
+# stack sets to the REPO ROOT (build.context: ../../..) — so reference the
+# exporter source by its full in-repo path, not a bare filename.
+COPY exporters/claude-events-exporter/claude_events_exporter.py /app/
 WORKDIR /app
 
 EXPOSE 9103
