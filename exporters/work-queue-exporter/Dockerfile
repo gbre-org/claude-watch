@@ -8,11 +8,15 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN uv pip install --system --no-cache prometheus_client
 
-COPY work_queue_exporter.py /app/
+# COPY sources are relative to the build context, which the monitoring
+# compose stack sets to the REPO ROOT (build.context: ../../..) so it can
+# also reach shared repo files — so the exporter sources must be referenced
+# by their full in-repo path, not bare filenames.
+COPY exporters/work-queue-exporter/work_queue_exporter.py /app/
 # Shared agent-id / agent-state helper. Lives alongside the exporter
 # in claude-watch/exporters/work-queue-exporter/. Originally vendored
 # from claude-config/lib/claude_agents.py; now maintained here.
-COPY claude_agents.py /app/
+COPY exporters/work-queue-exporter/claude_agents.py /app/
 WORKDIR /app
 
 EXPOSE 9099
