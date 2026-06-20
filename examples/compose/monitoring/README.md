@@ -18,9 +18,43 @@ Then:
 
 - Prometheus UI / targets / alerts: <http://localhost:9090>
 - Alertmanager UI: <http://localhost:9093>
-- (optional) Grafana: `docker compose --profile grafana up -d` -> <http://localhost:3000>
+- (optional) Grafana + Solarized theme + claude-watch dashboard:
+  ```bash
+  docker compose --profile grafana up -d --build
+  ```
+  -> <http://localhost:3000> (admin / admin by default)
 
 Tear down: `docker compose down` (add `-v` to drop the TSDB/Grafana volumes).
+
+## Grafana — Solarized theme + claude-watch dashboard
+
+The optional `grafana` profile brings up a Grafana instance with:
+
+1. **Solarized dark/light theme** — `grafana/Dockerfile` patches Grafana's
+   compiled CSS and JS bundles with Solarized color replacements at image-build
+   time, and injects `grafana/solarized.css` to catch Emotion-generated runtime
+   classes. The `--build` flag on first run builds the image; subsequent starts
+   are instant (cached layer).
+
+2. **claude-watch dashboard** — provisioned from
+   `grafana/dashboards/claude-watch.json`. 27 panels covering:
+   - Current status, heartbeat age, context tokens, Claude Code version
+   - Watcher health (live vs enabled), agent/task/shell counts
+   - Interruption rate by kind (thinking, context-warning, watcher-down, etc.)
+   - Hybrid-hook cooperation ratio + reminder/fallback rates
+   - Build info (commit + PR of the running daemon binary)
+   - Config file sizes, restarts, alerts fired
+
+   Most panels require the `node-exporter` profile (daemon textfile metrics).
+   Queue and events panels work with just the core stack.
+
+3. **Datasource** — auto-provisioned pointing at the `prometheus` service in
+   this stack (UID `prometheus`, so the dashboard JSON's datasource refs resolve
+   without manual setup).
+
+To use stock Grafana without the Solarized theme, edit `docker-compose.yml`:
+replace `build: { context: ./grafana, dockerfile: Dockerfile }` with
+`image: grafana/grafana:11.2.0` and remove the `--build` flag.
 
 ## The claude-watch metrics surface — THREE sources
 
