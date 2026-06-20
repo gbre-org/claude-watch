@@ -1,10 +1,14 @@
 # Grafana datasource provisioning — points the bundled Grafana at the
 # prometheus service in this stack. Auto-loaded on Grafana startup.
+#
+# uid: prometheus — stable UID so the claude-watch dashboard JSON can reference
+# this datasource by uid without a hash that changes on re-provision.
 apiVersion: 1
 
 datasources:
   - name: Prometheus
     type: prometheus
+    uid: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true

@@ -1,0 +1,362 @@
+/*
+ * Solarized theme for Grafana 11+
+ * Comprehensive override via CSS custom properties and broad selectors
+ *
+ * Solarized palette:
+ *   base03:  #002b36  (dark bg)
+ *   base02:  #073642  (dark bg highlights)
+ *   base01:  #586e75  (dark content/light emphasis)
+ *   base00:  #657b83  (light content/dark emphasis)
+ *   base0:   #839496  (dark content)
+ *   base1:   #93a1a1  (light emphasis)
+ *   base2:   #eee8d5  (light bg highlights)
+ *   base3:   #fdf6e3  (light bg)
+ *   yellow:  #b58900
+ *   orange:  #cb4b16
+ *   red:     #dc322f
+ *   magenta: #d33682
+ *   violet:  #6c71c4
+ *   blue:    #268bd2
+ *   cyan:    #2aa198
+ *   green:   #859900
+ */
+
+/* === DARK MODE (Solarized Dark) === */
+
+/*
+ * Override Grafana's CSS custom properties.
+ * Grafana 11 uses Emotion (runtime CSS-in-JS) which reads from a theme object,
+ * but the compiled dark theme CSS also uses hardcoded colors.
+ * We override both CSS vars and use broad selectors + the Dockerfile sed
+ * approach for compiled colors.
+ */
+body.theme-dark {
+  /* Grafana internal CSS vars */
+  --grafana-color-bg-canvas: #002b36 !important;
+  --grafana-color-bg-primary: #073642 !important;
+  --grafana-color-bg-secondary: #073642 !important;
+  --grafana-color-border-weak: #586e7540 !important;
+  --grafana-color-border-medium: #586e75 !important;
+  --grafana-color-border-strong: #839496 !important;
+  --grafana-color-text-primary: #839496 !important;
+  --grafana-color-text-secondary: #657b83 !important;
+  --grafana-color-text-disabled: #586e75 !important;
+  --grafana-color-text-link: #268bd2 !important;
+  --grafana-color-text-maxContrast: #fdf6e3 !important;
+
+  /* Common CSS variable patterns used by Grafana/Emotion */
+  --color-bg-canvas: #002b36 !important;
+  --color-bg-primary: #073642 !important;
+  --color-bg-secondary: #073642 !important;
+  --color-border-weak: #586e7540 !important;
+  --color-border-medium: #586e75 !important;
+  --color-border-strong: #839496 !important;
+}
+
+/* Global background - catch the page/app shell */
+body.theme-dark,
+body.theme-dark .main-view,
+body.theme-dark .grafana-app,
+body.theme-dark .scrollbar-view,
+body.theme-dark [class*="page-container"],
+body.theme-dark [class*="scroll-canvas"] {
+  background-color: #002b36 !important;
+}
+
+/* Navigation, toolbar, header areas */
+body.theme-dark header,
+body.theme-dark nav,
+body.theme-dark [class*="page-toolbar"],
+body.theme-dark [class*="navbar"],
+body.theme-dark [class*="sidemenu"],
+body.theme-dark [class*="top-bar"],
+body.theme-dark [class*="NavToolbar"],
+body.theme-dark [class*="AppChrome"] {
+  background-color: #073642 !important;
+}
+
+/* Panel containers - the main graph/chart boxes */
+body.theme-dark .panel-container,
+body.theme-dark [class*="panel-container"],
+body.theme-dark [class*="panel-content"],
+body.theme-dark [class*="PanelChrome"],
+body.theme-dark [class*="panel-wrapper"] {
+  background-color: #073642 !important;
+  border-color: #586e7540 !important;
+}
+
+/* Panel titles */
+body.theme-dark .panel-title,
+body.theme-dark [class*="panel-title"] {
+  color: #93a1a1 !important;
+}
+
+/* Dropdown menus, popovers, tooltips */
+body.theme-dark [class*="dropdown"],
+body.theme-dark [class*="menu-content"],
+body.theme-dark [class*="popper"],
+body.theme-dark [class*="tooltip"],
+body.theme-dark [class*="popover"],
+body.theme-dark [role="menu"],
+body.theme-dark [role="tooltip"],
+body.theme-dark [role="dialog"],
+body.theme-dark [class*="Menu"] {
+  background-color: #073642 !important;
+}
+
+/* Modals and overlays */
+body.theme-dark [class*="modal"],
+body.theme-dark [class*="Modal"],
+body.theme-dark [class*="overlay-content"],
+body.theme-dark [class*="drawer"] {
+  background-color: #002b36 !important;
+}
+
+/* Table rows and cards */
+body.theme-dark .table-panel-table,
+body.theme-dark [class*="table-cell"],
+body.theme-dark [class*="table-row"],
+body.theme-dark [class*="card"],
+body.theme-dark [class*="Card"] {
+  background-color: #073642 !important;
+}
+
+/* Input fields and form elements */
+body.theme-dark input,
+body.theme-dark textarea,
+body.theme-dark select,
+body.theme-dark [class*="input-wrapper"],
+body.theme-dark [class*="gf-form"] {
+  background-color: #002b36 !important;
+  border-color: #586e75 !important;
+  color: #839496 !important;
+}
+
+/* Side navigation / mega menu (Grafana 11 style) */
+body.theme-dark [class*="mega-menu"],
+body.theme-dark [class*="MegaMenu"],
+body.theme-dark [class*="dock-menu"],
+body.theme-dark [class*="nav-tree"] {
+  background-color: #002b36 !important;
+}
+
+/* Variable picker / template variable bar */
+body.theme-dark [class*="submenu"],
+body.theme-dark [class*="variable"],
+body.theme-dark [class*="SubMenu"] {
+  background-color: #002b36 !important;
+}
+
+/* Dashboard settings, edit mode backgrounds */
+body.theme-dark [class*="dashboard-settings"],
+body.theme-dark [class*="options-group"] {
+  background-color: #002b36 !important;
+}
+
+/* Alert/annotation markers keep their accent colors but darken backgrounds */
+body.theme-dark [class*="alert-rule"],
+body.theme-dark [class*="AlertRule"] {
+  background-color: #073642 !important;
+}
+
+/*
+ * Nuclear override: catch any Emotion-generated class with dark backgrounds.
+ * Grafana 11 generates css-XXXXX classes at runtime. We can't target them
+ * by name, but we can use very broad selectors for common patterns.
+ * The Dockerfile sed handles the compiled CSS; this catches runtime styles.
+ */
+
+/* Override black/near-black backgrounds on divs (most Emotion targets are divs) */
+body.theme-dark div[style*="background-color: rgb(17, 18, 23)"],
+body.theme-dark div[style*="background-color: rgb(24, 27, 31)"],
+body.theme-dark div[style*="background-color: rgb(34, 37, 43)"],
+body.theme-dark div[style*="background-color: rgb(20, 20, 20)"],
+body.theme-dark div[style*="background-color: rgb(24, 24, 26)"],
+body.theme-dark div[style*="background-color: rgb(33, 33, 36)"],
+body.theme-dark div[style*="background-color: #111217"],
+body.theme-dark div[style*="background-color: #181b1f"],
+body.theme-dark div[style*="background-color: #22252b"],
+body.theme-dark div[style*="background-color: #141414"],
+body.theme-dark div[style*="background-color: #18181a"],
+body.theme-dark div[style*="background: #111217"],
+body.theme-dark div[style*="background: #181b1f"],
+body.theme-dark div[style*="background: #22252b"],
+body.theme-dark div[style*="background: #141414"],
+body.theme-dark div[style*="background: #18181a"] {
+  background-color: #002b36 !important;
+}
+
+/* === LIGHT MODE (Solarized Light) === */
+
+/*
+ * Solarized Light palette:
+ *   base3:  #fdf6e3  (light bg — canvas)
+ *   base2:  #eee8d5  (light bg highlights — panels, cards)
+ *   base1:  #93a1a1  (light emphasis — borders, subtle text)
+ *   base0:  #839496  (secondary text)
+ *   base00: #657b83  (primary text)
+ *   base01: #586e75  (emphasis text — headings, titles)
+ *   base02: #073642  (max contrast)
+ *   base03: #002b36  (max contrast alt)
+ */
+
+body.theme-light {
+  /* Grafana internal CSS vars */
+  --grafana-color-bg-canvas: #fdf6e3 !important;
+  --grafana-color-bg-primary: #eee8d5 !important;
+  --grafana-color-bg-secondary: #fdf6e3 !important;
+  --grafana-color-border-weak: #93a1a140 !important;
+  --grafana-color-border-medium: #93a1a1 !important;
+  --grafana-color-border-strong: #657b83 !important;
+  --grafana-color-text-primary: #657b83 !important;
+  --grafana-color-text-secondary: #839496 !important;
+  --grafana-color-text-disabled: #93a1a1 !important;
+  --grafana-color-text-link: #268bd2 !important;
+  --grafana-color-text-maxContrast: #002b36 !important;
+
+  /* Common CSS variable patterns used by Grafana/Emotion */
+  --color-bg-canvas: #fdf6e3 !important;
+  --color-bg-primary: #eee8d5 !important;
+  --color-bg-secondary: #fdf6e3 !important;
+  --color-border-weak: #93a1a140 !important;
+  --color-border-medium: #93a1a1 !important;
+  --color-border-strong: #657b83 !important;
+}
+
+/* Global background - catch the page/app shell */
+body.theme-light,
+body.theme-light .main-view,
+body.theme-light .grafana-app,
+body.theme-light .scrollbar-view,
+body.theme-light [class*="page-container"],
+body.theme-light [class*="scroll-canvas"] {
+  background-color: #fdf6e3 !important;
+}
+
+/* Navigation, toolbar, header areas */
+body.theme-light header,
+body.theme-light nav,
+body.theme-light [class*="page-toolbar"],
+body.theme-light [class*="navbar"],
+body.theme-light [class*="sidemenu"],
+body.theme-light [class*="top-bar"],
+body.theme-light [class*="NavToolbar"],
+body.theme-light [class*="AppChrome"] {
+  background-color: #eee8d5 !important;
+}
+
+/* Panel containers - the main graph/chart boxes */
+body.theme-light .panel-container,
+body.theme-light [class*="panel-container"],
+body.theme-light [class*="panel-content"],
+body.theme-light [class*="PanelChrome"],
+body.theme-light [class*="panel-wrapper"] {
+  background-color: #eee8d5 !important;
+  border-color: #93a1a140 !important;
+}
+
+/* Panel titles */
+body.theme-light .panel-title,
+body.theme-light [class*="panel-title"] {
+  color: #586e75 !important;
+}
+
+/* Dropdown menus, popovers, tooltips */
+body.theme-light [class*="dropdown"],
+body.theme-light [class*="menu-content"],
+body.theme-light [class*="popper"],
+body.theme-light [class*="tooltip"],
+body.theme-light [class*="popover"],
+body.theme-light [role="menu"],
+body.theme-light [role="tooltip"],
+body.theme-light [role="dialog"],
+body.theme-light [class*="Menu"] {
+  background-color: #eee8d5 !important;
+}
+
+/* Modals and overlays */
+body.theme-light [class*="modal"],
+body.theme-light [class*="Modal"],
+body.theme-light [class*="overlay-content"],
+body.theme-light [class*="drawer"] {
+  background-color: #fdf6e3 !important;
+}
+
+/* Table rows and cards */
+body.theme-light .table-panel-table,
+body.theme-light [class*="table-cell"],
+body.theme-light [class*="table-row"],
+body.theme-light [class*="card"],
+body.theme-light [class*="Card"] {
+  background-color: #eee8d5 !important;
+}
+
+/* Input fields and form elements */
+body.theme-light input,
+body.theme-light textarea,
+body.theme-light select,
+body.theme-light [class*="input-wrapper"],
+body.theme-light [class*="gf-form"] {
+  background-color: #fdf6e3 !important;
+  border-color: #93a1a1 !important;
+  color: #657b83 !important;
+}
+
+/* Side navigation / mega menu (Grafana 11 style) */
+body.theme-light [class*="mega-menu"],
+body.theme-light [class*="MegaMenu"],
+body.theme-light [class*="dock-menu"],
+body.theme-light [class*="nav-tree"] {
+  background-color: #fdf6e3 !important;
+}
+
+/* Variable picker / template variable bar */
+body.theme-light [class*="submenu"],
+body.theme-light [class*="variable"],
+body.theme-light [class*="SubMenu"] {
+  background-color: #fdf6e3 !important;
+}
+
+/* Dashboard settings, edit mode backgrounds */
+body.theme-light [class*="dashboard-settings"],
+body.theme-light [class*="options-group"] {
+  background-color: #fdf6e3 !important;
+}
+
+/* Alert/annotation markers keep their accent colors but use solarized backgrounds */
+body.theme-light [class*="alert-rule"],
+body.theme-light [class*="AlertRule"] {
+  background-color: #eee8d5 !important;
+}
+
+/* Override Emotion-generated inline styles for light theme backgrounds */
+body.theme-light div[style*="background-color: rgb(244, 245, 245)"],
+body.theme-light div[style*="background-color: rgb(251, 251, 251)"],
+body.theme-light div[style*="background-color: rgb(244, 245, 248)"],
+body.theme-light div[style*="background-color: rgb(236, 236, 236)"],
+body.theme-light div[style*="background-color: #f4f5f5"],
+body.theme-light div[style*="background-color: #fbfbfb"],
+body.theme-light div[style*="background-color: #f4f5f8"],
+body.theme-light div[style*="background: #f4f5f5"],
+body.theme-light div[style*="background: #fbfbfb"] {
+  background-color: #fdf6e3 !important;
+}
+
+body.theme-light div[style*="background-color: rgb(255, 255, 255)"],
+body.theme-light div[style*="background-color: #ffffff"],
+body.theme-light div[style*="background: #ffffff"],
+body.theme-light div[style*="background-color: white"] {
+  background-color: #eee8d5 !important;
+}
+
+/* === Shared accent colors === */
+body.theme-dark a { color: #268bd2 !important; }
+body.theme-dark a:hover { color: #2aa198 !important; }
+body.theme-light a { color: #268bd2 !important; }
+body.theme-light a:hover { color: #2aa198 !important; }
+
+/* Graph colors - use solarized accent palette */
+:root {
+  --grafana-color-primary: #268bd2;
+  --grafana-color-secondary: #2aa198;
+}

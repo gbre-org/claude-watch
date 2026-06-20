@@ -150,18 +150,30 @@ services:
 
   # ---------------------------------------------------------------------
   # grafana — OPTIONAL (profile: grafana). Pre-provisioned with the
-  # prometheus datasource. Lightweight + clearly separable: only starts
-  # with `docker compose --profile grafana up -d`.
+  # prometheus datasource + the claude-watch dashboard. Lightweight +
+  # clearly separable: only starts with:
+  #   docker compose --profile grafana up -d
+  #
+  # The grafana service builds a custom Solarized-themed image from
+  # grafana/Dockerfile (which patches Grafana's compiled CSS/JS bundles
+  # with Solarized dark/light palette replacements + injects solarized.css).
+  # Set `image: grafana/grafana:11.2.0` + remove the `build:` block if you
+  # prefer the stock Grafana image without the theme.
   # ---------------------------------------------------------------------
   grafana:
-    image: grafana/grafana:11.2.0
+    build:
+      context: ./grafana
+      dockerfile: Dockerfile
+    image: claude-watch-grafana-solarized:dev
     profiles: ["grafana"]
     environment:
       GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_DEFAULT_THEME: "dark"
     volumes:
       - "./grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "./grafana/dashboards:/var/lib/grafana/dashboards:ro"
       - "grafana-data:/var/lib/grafana"
     ports:
       - "3000:3000"
