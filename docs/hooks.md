@@ -310,8 +310,8 @@ obligation is one concrete instance of that gate, wired specifically to
 the `claude-event` bus to enforce that the main loop triages actionable
 events instead of letting them pile up unread. It's seeded by
 `tools/obligations/obligations-init`, evaluated by
-`container/bin/eval-event-must-act`, and acked via
-`container/bin/event-ack`. See [event-must-act.md](event-must-act.md)
+`tools/event-must-act/eval-event-must-act`, and acked via
+`tools/event-must-act/event-ack`. See [event-must-act.md](event-must-act.md)
 for the four-tier classification model, the CLI surface, the
 N-tool-call escalation semantics, and the container deploy + smoke-test
 path. The behaviour is baked into the container image, so workbot and

@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Tests for cw-watcher-health-check — the cron-driven dead-watcher recovery
+# injector. Exercises the stale-detection, cooldown, pane-resolution, and
+# restart-hint logic with a STUBBED `claude-watch` so nothing is ever
+# injected into a real pane.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$HERE/../cw-watcher-health-check"
+
+fails=0
+pass() { printf '  ok   %s\n' "$1"; }
+fail() { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
+
+# Build an isolated sandbox: a fake `claude-watch` that records its argv to
+# $CW_LOG and succeeds, a fresh event queue, and a fresh state dir.
+setup() {
+    SBX="$(mktemp -d)"
+    QUEUE="$SBX/claude-events"
+    STATE_DIR="$SBX/state"
+    BIN="$SBX/bin"
+    CW_LOG="$SBX/inject.log"
+    mkdir -p "$QUEUE" "$STATE_DIR" "$BIN"
+    : > "$CW_LOG"
+    cat > "$BIN/claude-watch" <<EOF
+#!/usr/bin/env bash
+# stub: record the full argv on ONE line, succeed (exit 0 = submit verified)
+printf '%s\n' "\$*" >> "$CW_LOG"
+exit 0
+EOF
+    chmod +x "$BIN/claude-watch"
+}
+
+teardown() { rm -rf "$SBX"; }
+
+# Run the script under the sandbox with given extra `VAR=val` env args
+# (passed via `env` so they actually export into the script's process).
+run_check() {
+    env PATH="$BIN:$PATH" \
+        CLAUDE_EVENT_QUEUE="$QUEUE" \
+        CLAUDE_EVENT_STATE_DIR="$STATE_DIR" \
+        "$@" \
+        bash "$SCRIPT"
+}
+
+inject_count() {
+    # One line in CW_LOG per inject invocation.
+    if [ -s "$CW_LOG" ]; then grep -c . "$CW_LOG"; else echo 0; fi
+}
+
+# Drop a stale event file (mtime 5 min ago) into the queue.
+stale_event() {
+    local f="$QUEUE/ev-$RANDOM.json"
+    echo '{}' > "$f"
+    touch -d '5 minutes ago' "$f"
+}
+
+# ---------------------------------------------------------------- 1
+# No queue dir -> exit 0, no inject.
+setup
+rm -rf "$QUEUE"
+rc=$(run_check >/dev/null 2>&1; echo $?)
+[ "$rc" = 0 ] && [ "$(inject_count)" = 0 ] \
+    && pass "missing queue dir: no inject, exit 0" \
+    || fail "missing queue dir (rc=$rc, injects=$(inject_count))"
+teardown
+
+# ---------------------------------------------------------------- 2
+# Empty queue (no stale files) -> no inject.
+setup
+rc=$(run_check >/dev/null 2>&1; echo $?)
+[ "$rc" = 0 ] && [ "$(inject_count)" = 0 ] \
+    && pass "empty queue: no inject" \
+    || fail "empty queue (rc=$rc, injects=$(inject_count))"
+teardown
+
+# ---------------------------------------------------------------- 3
+# Fresh (non-stale) event only -> no inject.
+setup
+echo '{}' > "$QUEUE/fresh.json"   # mtime = now
+rc=$(run_check >/dev/null 2>&1; echo $?)
+[ "$(inject_count)" = 0 ] \
+    && pass "fresh event: no inject" \
+    || fail "fresh event injected (injects=$(inject_count))"
+teardown
+
+# ---------------------------------------------------------------- 4
+# Stale event -> exactly one inject.
+setup
+stale_event
+run_check >/dev/null 2>&1
+[ "$(inject_count)" = 1 ] \
+    && pass "stale event: one inject" \
+    || fail "stale event inject count=$(inject_count) (want 1)"
+teardown
+
+# ---------------------------------------------------------------- 5
+# No --pane when CW_WATCHER_HEALTH_PANE unset (auto-resolution).
+setup
+stale_event
+run_check >/dev/null 2>&1
+if grep -q -- '--pane' "$CW_LOG"; then
+    fail "unset pane should omit --pane but it was passed"
+else
+    pass "unset pane: --pane omitted (inject auto-resolves)"
+fi
+teardown
+
+# ---------------------------------------------------------------- 6
+# --pane passed when CW_WATCHER_HEALTH_PANE set.
+setup
+stale_event
+run_check CW_WATCHER_HEALTH_PANE=mysession:0.0 >/dev/null 2>&1
+if grep -q -- '--pane' "$CW_LOG" && grep -q -- 'mysession:0.0' "$CW_LOG"; then
+    pass "set pane: --pane mysession:0.0 passed through"
+else
+    fail "set pane not passed (log: $(cat "$CW_LOG"))"
+fi
+teardown
+
+# ---------------------------------------------------------------- 7
+# Restart hint appears in the alert text.
+setup
+stale_event
+run_check CW_WATCHER_HEALTH_RESTART_HINT='RUN-THE-THING-XYZ' >/dev/null 2>&1
+if grep -q -- 'RUN-THE-THING-XYZ' "$CW_LOG"; then
+    pass "custom restart hint embedded in alert"
+else
+    fail "restart hint missing (log: $(cat "$CW_LOG"))"
+fi
+teardown
+
+# ---------------------------------------------------------------- 8
+# Cooldown: second run within window stays silent.
+setup
+stale_event
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=600 >/dev/null 2>&1
+stale_event   # still stale
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=600 >/dev/null 2>&1
+[ "$(inject_count)" = 1 ] \
+    && pass "cooldown: second run within window suppressed" \
+    || fail "cooldown failed, injects=$(inject_count) (want 1)"
+teardown
+
+# ---------------------------------------------------------------- 9
+# Cooldown=0 disables the gate: both runs inject.
+setup
+stale_event
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=0 >/dev/null 2>&1
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=0 >/dev/null 2>&1
+[ "$(inject_count)" = 2 ] \
+    && pass "cooldown=0: both runs inject" \
+    || fail "cooldown=0 injects=$(inject_count) (want 2)"
+teardown
+
+# ---------------------------------------------------------------- 10
+# Failed inject (stub exits non-zero) does NOT write the cooldown stamp,
+# so the next tick retries.
+setup
+stale_event
+cat > "$BIN/claude-watch" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CW_LOG"
+exit 3
+EOF
+chmod +x "$BIN/claude-watch"
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=600 >/dev/null 2>&1
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=600 >/dev/null 2>&1
+[ "$(inject_count)" = 2 ] \
+    && pass "failed inject: no cooldown stamp, next tick retries" \
+    || fail "failed-inject retry injects=$(inject_count) (want 2)"
+teardown
+
+# ----------------------------------------------------------------
+if [ "$fails" -gt 0 ]; then
+    printf 'FAIL: %d case(s)\n' "$fails" >&2
+    exit 1
+fi
+printf 'OK: cw-watcher-health-check tests pass.\n'
