@@ -2,12 +2,16 @@
 """Integration test for container/bin/xclip (cross-host clipboard shim).
 
 Coverage:
-  1. The shim's embedded `--self-test` mode exits 0 (all 11 unit tests pass).
+  1. The shim's embedded `--self-test` mode exits 0 (all unit tests pass).
   2. TARGETS query against a populated bridge dir returns image/png on
      stdout and exits 0.
   3. Image read returns the exact PNG bytes that were written to the
      bridge dir.
-  4. Missing bridge dir is graceful (TARGETS exits 0 + empty; read exits 1).
+  4. Missing bridge dir is graceful (TARGETS exits 0 + empty; read exits 1)
+     AND emits a misconfiguration diagnostic to stderr (a missing bind-mount
+     must never silently masquerade as an empty clipboard).
+  4b. Present-but-empty bridge dir is SILENT (genuinely-empty clipboard —
+     no diagnostic), confirming the misconfig-vs-empty distinction.
   5. Stale bridge file (mtime > XCLIP_BRIDGE_STALE_SECONDS ago) is treated
      as empty.
   6. Disable-via-env path: XCLIP_SHIM=disabled with no real xclip exits 1
@@ -92,7 +96,7 @@ with tempfile.TemporaryDirectory() as tmp:
     )
 
 
-# 4. Missing bridge dir is graceful.
+# 4. Missing bridge dir is graceful AND warns on stderr.
 r = run(
     "-selection", "clipboard", "-t", "TARGETS", "-o",
     env={"XCLIP_BRIDGE_DIR": "/nonexistent/totally/bogus/path"},
@@ -100,6 +104,10 @@ r = run(
 expect(
     r.returncode == 0 and r.stdout == b"",
     f"missing-bridge TARGETS should be (0,''); got ({r.returncode},{r.stdout!r})",
+)
+expect(
+    b"does not exist" in r.stderr and b"force-recreate" in r.stderr,
+    f"missing-bridge TARGETS should emit a misconfig diagnostic; got {r.stderr!r}",
 )
 
 r = run(
@@ -110,6 +118,23 @@ expect(
     r.returncode == 1,
     f"missing-bridge image read should exit 1; got {r.returncode}",
 )
+expect(
+    b"does not exist" in r.stderr,
+    f"missing-bridge image read should emit a misconfig diagnostic; got {r.stderr!r}",
+)
+
+
+# 4b. Present-but-empty bridge dir is SILENT (genuinely-empty clipboard).
+with tempfile.TemporaryDirectory() as tmp:
+    r = run(
+        "-selection", "clipboard", "-t", "TARGETS", "-o",
+        env={"XCLIP_BRIDGE_DIR": tmp},
+    )
+    expect(
+        r.returncode == 0 and r.stdout == b"" and r.stderr == b"",
+        f"present-but-empty bridge should be SILENT (0,'',''); "
+        f"got ({r.returncode},{r.stdout!r},{r.stderr!r})",
+    )
 
 
 # 5. Stale bridge file.
