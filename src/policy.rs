@@ -3953,18 +3953,33 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     //     `hard_block_nudge` and DROP the cooldown — interrupt + re-inject on
     //     EVERY cycle until a clean turn is observed.
     if config.malformed_tool_call.enabled && !effective_pane.is_empty() {
-        let malformed = tmux::detect_malformed_tool_call(
+        let malformed_fingerprint = tmux::detect_malformed_tool_call(
             &effective_pane,
             &config.malformed_tool_call.override_marker,
         )
         .await;
 
-        if malformed {
+        if let Some(ref fingerprint) = malformed_fingerprint {
+            // Dedup: is THIS the same malformed block we last injected on? If
+            // so, the model may well have already recovered (emitted a clean
+            // call below it) and the block is merely lingering in pane
+            // scrollback — re-interrupting on it every cycle is the tight,
+            // self-perpetuating interruption loop that motivated this fix (the
+            // 2026-06-20 incident: the interrupter false-positiving on stale
+            // scrollback, cancelling well-formed turns mid-flight). A NEW
+            // fingerprint (different offending text) means a genuinely new
+            // malform and is acted on immediately.
+            let same_block_already_nudged = state
+                .last_malformed_fingerprint
+                .as_deref()
+                .is_some_and(|prev| prev == fingerprint.as_str());
+
             state.malformed_tool_call_consecutive += 1;
             debug!(
                 consecutive = state.malformed_tool_call_consecutive,
                 threshold = config.malformed_tool_call.consecutive,
                 episode_nudges = state.malformed_tool_call_episode_nudges,
+                same_block_already_nudged,
                 "malformed tool-call signature detected"
             );
 
@@ -3986,6 +4001,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 if api_retrying {
                     debug!(
                         "malformed tool-call detected but api_retry active — suppressing inject"
+                    );
+                } else if same_block_already_nudged {
+                    // SAME offending block as the last inject. We have already
+                    // corrected it once; re-firing now would interrupt whatever
+                    // turn is currently in flight (very often a well-formed
+                    // recovery call) purely because the old malformed text is
+                    // still scrolled into the captured tail. Suppress. A truly
+                    // persistent malform changes nothing on screen, so the
+                    // model can only clear the episode by emitting a clean turn
+                    // — which produces a clean cycle below and resets state.
+                    debug!(
+                        fingerprint = fingerprint.as_str(),
+                        "malformed tool-call block unchanged since last inject — \
+                         suppressing re-inject (stale scrollback / already corrected)"
                     );
                 } else if in_cooldown {
                     debug!("malformed tool-call detected but phase-1 nudge cooldown active");
@@ -4022,6 +4051,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     tmux::interrupt_and_wait(&effective_pane, 5).await;
                     inject_dispatch::inject_to_agent(&effective_pane, text).await;
 
+                    // Record the offending block we just injected on so the
+                    // SAME block lingering in scrollback next cycle does not
+                    // re-fire (see `same_block_already_nudged` above).
+                    state.last_malformed_fingerprint = Some(fingerprint.clone());
                     state.last_malformed_nudge = Some(now.clone());
                     state.malformed_tool_call_nudge_count =
                         state.malformed_tool_call_nudge_count.saturating_add(1);
@@ -4047,6 +4080,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         } else if state.malformed_tool_call_consecutive > 0
             || state.malformed_tool_call_episode_nudges > 0
+            || state.last_malformed_fingerprint.is_some()
         {
             debug!(
                 prev_consecutive = state.malformed_tool_call_consecutive,
@@ -4057,6 +4091,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // Clean cycle ends the episode: reset escalation so a future malform
             // starts fresh at phase 1.
             state.malformed_tool_call_episode_nudges = 0;
+            // Clear the dedup fingerprint: the offending block has scrolled out
+            // of the tail (genuinely recovered), so an IDENTICAL malform later
+            // is a fresh failure that should fire again.
+            state.last_malformed_fingerprint = None;
         }
     }
 
