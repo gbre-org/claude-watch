@@ -1430,6 +1430,7 @@ pub async fn detect_wedged(pane: &str) -> Option<WedgedReason> {
 ///
 /// Returns `true` when a structurally-confirmed malformed tool-call construct
 /// is present in the tail.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn check_lines_for_malformed_tool_call(pane_output: &str) -> bool {
     malformed_tool_call_fingerprint(pane_output).is_some()
 }
