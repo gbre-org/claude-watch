@@ -5116,17 +5116,32 @@ def cmd_queue_depend(args):
         terminal; re-gating it is meaningless and editing its dep set
         only corrupts the audit trail.
 
-      * running / wedged / blocked items: ADDS are refused by default
-        (exit 1) and require --force. Rationale: a running item is
-        already past the ready_now gate — an agent is actively working
-        it. Silently bolting on a new unmet dep does NOT pause that
-        agent (status stays running; ready_now is only consulted at
-        spawn time for PENDING items), so the edge would be a lie:
-        "depends on X" while the work it gates already ran. Refusing by
-        default surfaces the mistake. --force lets an operator who
-        really means it (e.g. correcting a mis-modeled graph mid-flight)
-        record the edge anyway. REMOVES / --clear on these states are
-        always allowed (loosening a gate is always safe).
+      * running / wedged items: ADDS are refused by default (exit 1)
+        and require --force. Rationale: a running item is already past
+        the ready_now gate — an agent is actively working it. Refusing
+        by default surfaces the likely mistake. --force lets an operator
+        who really means it (e.g. correcting a mis-modeled graph
+        mid-flight) record the edge anyway.
+
+        DEMOTION (2026-06-22): when a --force add (or a remove that
+        leaves an unmet dep) DOES re-gate a running/wedged item — i.e.
+        the post-edit dep set has an unmet dep — the item is no longer
+        logically running: its work is gated on a dep that isn't done.
+        It is therefore DEMOTED to `blocked` (mirroring `queue block`),
+        with an auto `block_reason` naming the unmet dep(s). This avoids
+        the old "lying" RUNNING+ORPHAN state: previously the status
+        stayed `running` while ready_now went false and the agent
+        binding went stale, so the exporter's WorkQueueOrphaned alert
+        (status="running" + no-live-owner) fired on it. `blocked` is
+        the honest state — exempt from the orphan alert, no live owner
+        expected — and `queue unblock <id>` resumes it once the dep
+        clears. (A force-add that does NOT introduce an unmet dep — e.g.
+        the dep is already `done` — leaves the item running, as before.)
+
+        blocked items: ADDS still require --force; a force-add that
+        leaves an unmet dep keeps the item blocked (already the honest
+        state). REMOVES / --clear on any of these states are always
+        allowed (loosening a gate is always safe).
 
       * pending items: any edit is allowed (adds re-gate ready_now as
         intended; this is the normal case the verbs exist for).
@@ -5275,6 +5290,38 @@ def cmd_queue_depend(args):
         target["scope"] = non_task_scope + [f"task:{d}" for d in after_deps]
         target.pop("depends_on", None)
         target["depends_on_updated_at"] = _fmt_ts()
+
+        # Demote a re-gated live item (2026-06-22). A running / wedged item
+        # that GAINS an unmet dependency (via --force --add, or a remove
+        # that left an unmet dep behind) is no longer logically running:
+        # its work is gated on a dep that isn't done. Leaving it `running`
+        # produces a "lying" RUNNING+ORPHAN state in the exporter — ready_now
+        # is false but status stays running with a now-stale/dead agent
+        # binding, so the WorkQueueOrphaned alert (which filters
+        # status="running" + no-live-owner) fires on it. A running item with
+        # an unmet dep IS logically blocked, so flip it to `blocked` here —
+        # mirroring `queue block`, which the exporter labels separately and
+        # exempts from the orphan alert. The agent binding goes stale
+        # naturally; `blocked` expects no live owner by design.
+        by_id_lock = {x.get("id"): x for x in items if x.get("id")}
+        unmet_after = [
+            d for d in after_deps
+            if (by_id_lock.get(d) is None)
+            or (by_id_lock[d].get("status") != "done")
+        ]
+        demoted = False
+        if status in RUNNING_STATUSES and unmet_after:
+            target["status"] = "blocked"
+            target["blocked_at"] = _fmt_ts()
+            target["block_reason"] = (
+                "auto-blocked: gained unmet dependency via `queue depend` "
+                f"(unmet: {','.join(unmet_after)})"
+            )
+            demoted = True
+            # group_head bookkeeping mirrors cmd_queue_block: a blocked item
+            # is still the in-flight head of its group.
+            _recompute_group_heads(items)
+
         _queue_write_and_unlock(fh, data)
     except Exception:
         try:
@@ -5305,6 +5352,16 @@ def cmd_queue_depend(args):
         d for d in fresh_deps
         if (by_id2.get(d) is None) or (by_id2[d].get("status") != "done")
     ]
+    # Surface a demotion (running/wedged -> blocked) when a re-gating add
+    # parked the live item on a now-unmet dep. Read the persisted status
+    # for the authoritative post-edit value, but gate `was_demoted` on the
+    # PRE-edit status being a live (running/wedged) state — an item that was
+    # ALREADY blocked and stayed blocked was not demoted by this edit.
+    fresh_status = fresh.get("status") if fresh else None
+    was_demoted = (
+        status in RUNNING_STATUSES
+        and fresh_status == "blocked"
+    )
 
     if getattr(args, "json", False):
         print(json.dumps(
@@ -5320,6 +5377,8 @@ def cmd_queue_depend(args):
                 # use; alias it so consumers reading either name work.
                 "dep_blockers": unmet,
                 "dep_cycle": cycle,
+                "status": fresh_status,
+                "demoted_to_blocked": was_demoted,
             },
             indent=2,
         ))
@@ -5329,6 +5388,13 @@ def cmd_queue_depend(args):
         print(f"  after  : {fresh_deps}")
         print(f"  unmet  : {unmet}")
         print(f"  ready_now: {'true' if ready else 'false'}")
+        if was_demoted:
+            print(
+                f"  demoted: running -> blocked (gained unmet dependency; "
+                f"releasing the stale agent binding so the exporter renders "
+                f"it BLOCKED, not RUNNING+ORPHAN). `queue unblock {args.id}` "
+                f"once the dep clears."
+            )
         if cycle:
             # Should be unreachable for edits this verb makes (cycle
             # creation is now refused at write time), but a PRE-EXISTING
