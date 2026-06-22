@@ -316,14 +316,61 @@ def test_add_dep_on_running_item_refused_without_force():
         b_show = _show(env, b["id"])
         assert b_show.get("depends_on") in (None, [])
 
-        # --force lets the operator record the edge anyway.
+        # --force lets the operator record the edge anyway. Because `a`
+        # is NOT done, the new dep is unmet — so the running item is
+        # DEMOTED to blocked rather than left in a lying RUNNING+ORPHAN
+        # state (2026-06-22).
         r = _run(env, "queue", "depend", b["id"], "--add", a["id"],
                  "--force", "--json", check=True)
         out = json.loads(r.stdout)
         assert out["depends_on"] == [a["id"]]
-        # The running item is NOT silently re-gated — status stays running.
+        assert out["unmet"] == [a["id"]]
+        assert out["demoted_to_blocked"] is True
+        assert out["status"] == "blocked"
+        b_show = _show(env, b["id"])
+        assert b_show["status"] == "blocked"
+        assert b_show.get("block_reason")
+        assert a["id"] in b_show["block_reason"]
+
+
+def test_force_add_met_dep_on_running_keeps_running():
+    # A --force add whose dep is ALREADY done introduces no unmet edge, so
+    # there is nothing to gate on — the running item stays running.
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+        _register(env, a["id"])
+        _done(env, a["id"])  # a -> done (a met dep)
+        _register(env, b["id"])  # b -> running
+        r = _run(env, "queue", "depend", b["id"], "--add", a["id"],
+                 "--force", "--json", check=True)
+        out = json.loads(r.stdout)
+        assert out["depends_on"] == [a["id"]]
+        assert out["unmet"] == []
+        assert out["demoted_to_blocked"] is False
+        assert out["status"] == "running"
         b_show = _show(env, b["id"])
         assert b_show["status"] == "running"
+
+
+def test_demoted_item_recovers_via_unblock():
+    # After a re-gating --force add demotes a running item to blocked,
+    # finishing the dep + `queue unblock` returns it to running (no
+    # RUNNING+ORPHAN limbo in between).
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+        _register(env, b["id"])  # b -> running
+        _run(env, "queue", "depend", b["id"], "--add", a["id"],
+             "--force", "--json", check=True)
+        assert _show(env, b["id"])["status"] == "blocked"
+        # Finish the dep, then unblock b.
+        _register(env, a["id"])
+        _done(env, a["id"])
+        _run(env, "queue", "unblock", b["id"], check=True)
+        assert _show(env, b["id"])["status"] == "running"
 
 
 def test_remove_dep_on_running_item_allowed():
