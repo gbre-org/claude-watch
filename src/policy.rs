@@ -2,8 +2,6 @@
 //! heartbeat stale, foreground monitor, and watcher health.
 
 use chrono::{DateTime, Local, Timelike, Utc};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use std::os::unix::process::CommandExt;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
@@ -1439,11 +1437,10 @@ async fn check_foreground_inner(
     }
 }
 
-/// Check if a PID is still alive (signal 0 probe).
+/// Check if a PID is still alive (signal 0 probe). Delegates to the shared
+/// helper in `status` so the daemon and CLI share one implementation.
 fn is_pid_alive(pid: u32) -> bool {
-    kill(Pid::from_raw(pid as i32), Signal::SIGCONT)
-        .map(|_| true)
-        .unwrap_or(false)
+    crate::status::is_pid_alive(pid)
 }
 
 /// Check if a PID is genuinely alive — i.e. exists AND is not a zombie
@@ -1457,42 +1454,14 @@ fn is_pid_alive(pid: u32) -> bool {
 /// a non-Linux test host) so behaviour degrades to "exists?" rather than
 /// always-false.
 fn is_pid_genuinely_alive(pid: u32) -> bool {
-    let path = format!("/proc/{}/stat", pid);
-    match std::fs::read_to_string(&path) {
-        Ok(stat) => {
-            // /proc/PID/stat: `pid (comm) STATE ...`. comm can contain spaces
-            // and parens, so find the LAST ')' and take the next token.
-            if let Some(close) = stat.rfind(')') {
-                let rest = stat[close + 1..].trim_start();
-                let state = rest.split_whitespace().next().unwrap_or("");
-                // 'Z' = zombie/defunct, 'X'/'x' = dead. Anything else is a
-                // live, reapable-or-running process.
-                return state != "Z" && state != "X" && state != "x";
-            }
-            // Malformed stat — fall back to existence probe.
-            is_pid_alive(pid)
-        }
-        // No /proc entry (already reaped) or non-Linux host: fall back to the
-        // signal probe.
-        Err(_) => is_pid_alive(pid),
-    }
+    crate::status::is_pid_genuinely_alive(pid)
 }
 
 /// Read `/proc/<pid>/cmdline` (NUL-separated argv) into a space-joined string.
 /// Returns `None` if the process is gone, the file is unreadable, or the
 /// cmdline is empty (e.g. a kernel thread). Used for watcher identity checks.
 fn read_proc_cmdline(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/cmdline", pid);
-    let data = std::fs::read(&path).ok()?;
-    let s = String::from_utf8_lossy(&data)
-        .replace('\0', " ")
-        .trim()
-        .to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    crate::status::read_proc_cmdline(pid)
 }
 
 /// Read a watcher PID file and return the recorded PID, if the file exists
@@ -1508,9 +1477,7 @@ fn read_proc_cmdline(pid: u32) -> Option<String> {
 /// diagnostics / potential future use and remains unit-tested.
 #[allow(dead_code)]
 fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
-    let path = format!("{}/{}.pid", pid_dir, name);
-    let content = std::fs::read_to_string(&path).ok()?;
-    content.trim().parse::<u32>().ok()
+    crate::status::read_watcher_pid(pid_dir, name)
 }
 
 /// Decide whether a watcher should be considered DOWN, given:
@@ -1570,17 +1537,7 @@ pub fn watcher_is_down(
 ///   2. `$XDG_RUNTIME_DIR` (matches the watcher's lockfile default).
 ///   3. `/var/run/claude` (final fallback — the baked container path).
 pub(crate) fn watcher_pid_dir() -> String {
-    if let Ok(p) = std::env::var("CLAUDE_WATCH_PID_DIR") {
-        if !p.trim().is_empty() {
-            return p;
-        }
-    }
-    if let Ok(p) = std::env::var("XDG_RUNTIME_DIR") {
-        if !p.trim().is_empty() {
-            return p;
-        }
-    }
-    "/var/run/claude".to_string()
+    crate::status::watcher_pid_dir()
 }
 
 /// Read the PID the watcher recorded for itself, from the runtime dir.
@@ -1598,13 +1555,7 @@ pub(crate) fn watcher_pid_dir() -> String {
 /// and fall back to `<name>.pid`. Returns the first file that parses to a PID,
 /// or `None` if neither exists / parses.
 fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
-    let lock = format!("{}/{}.lock", pid_dir, name);
-    if let Ok(content) = std::fs::read_to_string(&lock) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            return Some(pid);
-        }
-    }
-    read_watcher_pid(pid_dir, name)
+    crate::status::read_watcher_recorded_pid(pid_dir, name)
 }
 
 /// Does the live process `pid`'s cmdline look like *this* watcher (identity
@@ -1623,22 +1574,7 @@ fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
 /// transform while still rejecting an obviously-unrelated recycled PID (whose
 /// cmdline won't contain the watcher's name stem).
 fn cmdline_matches_watcher(cmdline: &str, start_cmd: &str) -> bool {
-    let token = match start_cmd.split_whitespace().next() {
-        Some(t) if !t.is_empty() => t,
-        _ => return false,
-    };
-    let base = token.rsplit('/').next().unwrap_or(token);
-    // Strip a trailing script extension so a `.sh` launcher that exec's a bare
-    // binary of the same stem still matches.
-    let stem = base
-        .strip_suffix(".sh")
-        .or_else(|| base.strip_suffix(".bash"))
-        .or_else(|| base.strip_suffix(".py"))
-        .unwrap_or(base);
-    if stem.is_empty() {
-        return false;
-    }
-    cmdline.contains(token) || cmdline.contains(base) || cmdline.contains(stem)
+    crate::status::cmdline_matches_watcher(cmdline, start_cmd)
 }
 
 /// Pure decision: is the watcher DOWN, given what the daemon observed about its
@@ -1671,10 +1607,7 @@ pub fn pidfile_watcher_is_down(
     pid_alive: bool,
     cmdline_matches: bool,
 ) -> bool {
-    match recorded_pid {
-        Some(_) => !(pid_alive && cmdline_matches),
-        None => true,
-    }
+    crate::status::pidfile_watcher_is_down(recorded_pid, pid_alive, cmdline_matches)
 }
 
 /// Spawn `self-clear` immediately (no grace period). Used for the
