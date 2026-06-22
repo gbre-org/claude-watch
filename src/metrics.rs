@@ -100,11 +100,17 @@ fn build_metrics(
         .and_then(|v| v.as_str())
         .map(parse_iso_timestamp)
         .unwrap_or(0.0);
+    // Epoch (float secs) of the last context clear, or `None` when the daemon
+    // has not yet recorded a clear this session. Crucially we DO NOT default a
+    // missing/unparseable value to `0.0`: a zero epoch makes a downstream
+    // "now - last_clear" panel render ~56.5 years (2026 - 1970), the classic
+    // epoch-zero bug. Treating "no clear recorded" as an absent series (gauge
+    // omitted) matches how `mainloop_heartbeat_mtime` handles a missing file.
     let last_context_clear = state
         .get("last_context_clear")
         .and_then(|v| v.as_str())
         .map(parse_iso_timestamp)
-        .unwrap_or(0.0);
+        .filter(|&t| t > 0.0);
 
     let last_known_tokens = num(state, "last_known_tokens");
     let last_known_bashes = num(state, "last_known_bashes");
@@ -216,14 +222,6 @@ fn build_metrics(
         "# HELP claude_watchers_total Total number of enabled watchers".to_string(),
         "# TYPE claude_watchers_total gauge".to_string(),
         format!("claude_watchers_total {}", watchers_total),
-        "".to_string(),
-        "# HELP claude_last_context_clear_timestamp_seconds Epoch of last context clear"
-            .to_string(),
-        "# TYPE claude_last_context_clear_timestamp_seconds gauge".to_string(),
-        format!(
-            "claude_last_context_clear_timestamp_seconds {:.3}",
-            last_context_clear
-        ),
         "".to_string(),
         "# HELP claude_version_info Claude Code version info".to_string(),
         "# TYPE claude_version_info gauge".to_string(),
@@ -400,6 +398,23 @@ fn build_metrics(
         lines.push(format!(
             "claude_mainloop_heartbeat_timestamp_seconds {:.3}",
             mtime
+        ));
+    }
+
+    // Last context-clear timestamp. Omitted entirely when the daemon has not
+    // recorded a clear this session (see `last_context_clear` derivation
+    // above) so a downstream "time since last clear" panel shows "no data"
+    // rather than a bogus ~56-year duration computed from epoch zero.
+    if let Some(ts) = last_context_clear {
+        lines.push("".to_string());
+        lines.push(
+            "# HELP claude_last_context_clear_timestamp_seconds Epoch of last context clear"
+                .to_string(),
+        );
+        lines.push("# TYPE claude_last_context_clear_timestamp_seconds gauge".to_string());
+        lines.push(format!(
+            "claude_last_context_clear_timestamp_seconds {:.3}",
+            ts
         ));
     }
 
@@ -595,6 +610,36 @@ mod tests {
                 && l.contains(",pr=\"")
                 && l.ends_with("} 1")
         }));
+    }
+
+    #[test]
+    fn last_context_clear_omitted_when_unset() {
+        // Regression: a missing `last_context_clear` must NOT export the gauge
+        // with a 0.0 (epoch-zero) value — that renders downstream as ~56.5
+        // years ("now - 1970"). Absent clear => absent series.
+        let state = json!({});
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("claude_last_context_clear_timestamp_seconds")),
+            "gauge must be omitted when no clear recorded, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn last_context_clear_emitted_when_set() {
+        let state = json!({ "last_context_clear": "2026-01-01T00:00:00Z" });
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("claude_last_context_clear_timestamp_seconds "))
+            .expect("gauge should be present when a clear is recorded");
+        // 2026-01-01T00:00:00Z == 1767225600 epoch secs.
+        assert!(
+            line.contains("1767225600"),
+            "expected recorded epoch in line, got: {line}"
+        );
     }
 
     #[test]
