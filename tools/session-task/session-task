@@ -1041,7 +1041,12 @@ def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
 
 
 def _sort_key(item):
-    # Priority descending (higher priority = earlier), FIFO tiebreak.
+    # Spawn/readiness ordering within a group is PRIORITY-FIRST: higher
+    # priority number sorts earlier (so it becomes the group head and goes
+    # ready first), with created_at (insertion order) only as the FIFO
+    # tiebreak among equal priorities. This is what lets a higher-priority
+    # item added LATER overtake an earlier lower-priority same-scope peer
+    # without abandon+re-add (see `queue reprioritize` / `queue promote`).
     return (-int(item.get("priority", 5)), item.get("created_at", ""))
 
 
@@ -5528,8 +5533,10 @@ def cmd_queue_promote(args):
         max_p = max((int(m.get("priority", 5)) for m in members), default=5)
         target["priority"] = max(max_p + 1, int(target.get("priority", 5)) + 1)
         target["promoted_at"] = _fmt_ts()
-        # Rewrite created_at to "now" so FIFO places this FIRST among equal priorities.
-        # Actually safer: leave created_at alone and trust the priority bump.
+        # Leave created_at alone -- the priority bump alone reorders the group
+        # head (spawn ordering is priority-first via _group_head/_sort_key,
+        # with created_at only the tiebreak). Rewriting created_at would
+        # destroy the audit trail for no ordering benefit.
         _recompute_group_heads(items)
         _queue_write_and_unlock(fh, data)
     except Exception:
@@ -5537,6 +5544,80 @@ def cmd_queue_promote(args):
         fh.close()
         raise
     print(f"promoted: {args.id} (priority={target['priority']})")
+
+
+def cmd_queue_reprioritize(args):
+    """Set a pending item's priority to an EXPLICIT value, in place.
+
+    Motivation: previously the only way to reorder a same-scope (same-group)
+    contender was `abandon` + re-`add` (which destroys the item's identity +
+    audit trail) or `promote` (which only bumps to group head). This gives the
+    operator a direct, identity-preserving knob: `queue reprioritize <id>
+    --priority N`.
+
+    Because spawn-readiness ordering within a group is priority-first
+    (`_group_head` -> `_sort_key`: higher priority number wins, created_at is
+    the tiebreak), raising an item's priority above its group's current head
+    makes it the next ready-to-spawn item WITHOUT abandon+re-add. Lowering it
+    de-prioritizes it behind same-group peers.
+
+    Behavior:
+      * Item must exist and be in status=pending. Reprioritizing a
+        running/wedged/blocked/done/abandoned item is REFUSED (exit 1) -- the
+        spawn ordering only consults priority for *pending* heads, so a
+        priority edit on an in-flight item would be silently inert.
+      * `--priority N` is REQUIRED (any int; higher = earlier; 5 is the
+        system default). Recomputes group heads so `ready_now` reflects the
+        new ordering immediately.
+      * Pure metadata edit: no pingme, no claude-event (matches set-summary /
+        promote). Records `priority_updated_at` for audit; keeps the prior
+        priority in the output.
+    """
+    new_priority = int(args.priority)
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        if target.get("status") != "pending":
+            print(
+                "can only reprioritize pending items "
+                f"(status={target.get('status')}); priority only affects "
+                "spawn ordering among pending same-group peers.",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        old_priority = int(target.get("priority", 5))
+        target["priority"] = new_priority
+        target["priority_updated_at"] = _fmt_ts()
+        _recompute_group_heads(items)
+        # Recompute ready_now under the new ordering so callers can decide
+        # whether the bump made this item spawnable.
+        locked_scopes = data.get("locked_scopes") or {}
+        ready_now = _item_is_ready(items, target, locked_scopes=locked_scopes)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "id": args.id,
+            "old_priority": old_priority,
+            "priority": new_priority,
+            "ready_now": ready_now,
+        }, indent=2))
+    else:
+        print(f"reprioritized: {args.id}")
+        print(f"  old priority: {old_priority}")
+        print(f"  new priority: {new_priority}")
+        print(f"  ready_now: {'true' if ready_now else 'false'}")
 
 
 _DURATION_RE = re.compile(r"^(\d+)([dhm])$")
@@ -6373,8 +6454,35 @@ def build_parser():
         help="Suppress the pingme lifecycle notification for this operation.",
     )
 
-    q_promote = qsub.add_parser("promote", help="Bump item priority to group head")
+    q_promote = qsub.add_parser(
+        "promote",
+        aliases=["bump"],
+        help=(
+            "Convenience: raise a pending item's priority just above its "
+            "group's current head so it becomes the next ready-to-spawn item "
+            "(without abandon+re-add). For an explicit target priority use "
+            "`queue reprioritize <id> --priority N`."
+        ),
+    )
     q_promote.add_argument("id")
+
+    q_reprioritize = qsub.add_parser(
+        "reprioritize",
+        help=(
+            "Set a PENDING item's priority to an explicit value, in place "
+            "(no abandon+re-add). Higher priority number = earlier in spawn "
+            "ordering among same-group peers (created_at is the tiebreak); 5 "
+            "is the default. Raising it above the group head makes it ready "
+            "first; lowering it de-prioritizes it. Refused on non-pending "
+            "items (priority only affects pending spawn ordering)."
+        ),
+    )
+    q_reprioritize.add_argument("id")
+    q_reprioritize.add_argument(
+        "--priority", type=int, required=True,
+        help="New priority (int; higher = earlier; default elsewhere is 5).",
+    )
+    q_reprioritize.add_argument("--json", action="store_true")
 
     q_setsum = qsub.add_parser(
         "set-summary",
@@ -6579,6 +6687,8 @@ def main():
             "spawn-check": cmd_queue_spawn_check,
             "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,
+            "bump": cmd_queue_promote,
+            "reprioritize": cmd_queue_reprioritize,
             "set-summary": cmd_queue_set_summary,
             "set-block-reason": cmd_queue_set_block_reason,
             "update-scope": cmd_queue_update_scope,
