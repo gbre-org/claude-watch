@@ -50,6 +50,10 @@ Usage:
                                                        # blocked-pending to running
     session-task queue promote <id>
     session-task queue set-summary <id> "text"   # edit one-line summary
+    session-task queue set-block-reason <id> --reason TEXT  # update the
+                                                 # block_reason on an already-
+                                                 # blocked item, in place
+                                                 # (preserves blocked_at)
     session-task queue depend <id> [--add q-AAA[,q-BBB]] [--remove q-CCC]
                                    [--clear] [--json]
     session-task queue prune [--older-than DURATION] [-n/--dry-run]
@@ -5078,6 +5082,103 @@ def cmd_queue_set_summary(args):
     print(f"  new: {new_summary}")
 
 
+def cmd_queue_set_block_reason(args):
+    """Update the block_reason on an ALREADY-blocked item, in place.
+
+    Motivation: `queue block <id> --reason ...` only transitions a
+    *running* item to blocked and REFUSES an already-blocked item (the
+    state machine allows only running -> blocked). So once an item is
+    blocked, the block_reason was frozen -- when the real-world situation
+    evolved (e.g. "awaiting build #140" after #140 already landed and
+    produced its verdict), the only way to refresh the reason was
+    abandon + re-add, which destroys the item's identity + audit trail.
+
+    This subcommand mirrors `set-summary`: a pure in-place metadata edit
+    that refreshes `block_reason` WITHOUT changing status and WITHOUT
+    touching `blocked_at` (the original block timestamp is preserved as
+    audit). It records `block_reason_updated_at` so the refresh itself is
+    auditable, and keeps the prior reason available in the plain-text /
+    --json output.
+
+    Behavior:
+      * Item must exist and be in status=blocked. Any other status
+        (running, pending, wedged, done, abandoned) REFUSES (exit 1).
+        Use `queue block <id> --reason ...` to take a *running* item to
+        blocked; this command only EDITS the reason of an item that is
+        already blocked.
+      * `--reason TEXT` is REQUIRED and must be non-empty (an empty
+        reason defeats the operator-attention purpose, same as `block`).
+      * Preserves `blocked_at`. Does NOT flip status, does NOT touch
+        heartbeat/pid. Idempotent in the sense that re-setting the same
+        text just refreshes `block_reason_updated_at`.
+      * Pure metadata edit: no pingme, no claude-event by default
+        (matches `set-summary`). The refreshed reason WILL appear in the
+        next unblock/done/abandon notification for this item.
+    """
+    new_reason = (args.reason or "").strip()
+    if not new_reason:
+        print(
+            "ERROR: --reason is required for set-block-reason "
+            "(an empty reason defeats the operator-attention purpose).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        status = target.get("status")
+        if status != "blocked":
+            print(
+                f"set-block-reason refused: {args.id} status={status!r} "
+                f"(must be blocked -- use `queue block <id> --reason ...` to "
+                f"block a running item first)",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        old_reason = target.get("block_reason") or "(unspecified)"
+        target["block_reason"] = new_reason
+        target["block_reason_updated_at"] = _fmt_ts()
+        # Intentionally DO NOT touch blocked_at or status -- this is a pure
+        # in-place reason edit; the original block timestamp is the audit.
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']} BLOCK-REASON-UPDATED] "
+        f"{target.get('description','')} (reason: {new_reason})",
+        extra={
+            "source": "queue",
+            "event": "set-block-reason",
+            "id": target["id"],
+            "group_id": target.get("group_id"),
+            "old_reason": old_reason,
+            "reason": new_reason,
+        },
+    )
+
+    if getattr(args, "json", False):
+        print(json.dumps(updated, indent=2))
+    else:
+        print(f"block_reason updated: {args.id}")
+        print(f"  old: {old_reason}")
+        print(f"  new: {new_reason}")
+        print(f"  blocked_at (preserved): {target.get('blocked_at')}")
+
+
 def cmd_queue_depend(args):
     """Edit explicit interjob dependencies on an existing queue item.
 
@@ -6217,6 +6318,28 @@ def build_parser():
     q_setsum.add_argument("id")
     q_setsum.add_argument("summary", help="New summary text (~10 words)")
 
+    q_setbr = qsub.add_parser(
+        "set-block-reason",
+        help=(
+            "Update the block_reason on an ALREADY-blocked item, in place. "
+            "Item must be status=blocked; preserves blocked_at (and status). "
+            "Use this to refresh a stale block reason as the situation "
+            "evolves without abandon+re-add (which loses item identity). To "
+            "block a running item use `queue block <id> --reason ...`."
+        ),
+    )
+    q_setbr.add_argument("id")
+    q_setbr.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "New block_reason text. REQUIRED and non-empty. Replaces the "
+            "existing block_reason on the item; records "
+            "`block_reason_updated_at`; preserves the original `blocked_at`."
+        ),
+    )
+    q_setbr.add_argument("--json", action="store_true")
+
     q_updscope = qsub.add_parser(
         "update-scope",
         help=(
@@ -6391,6 +6514,7 @@ def main():
             "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,
             "set-summary": cmd_queue_set_summary,
+            "set-block-reason": cmd_queue_set_block_reason,
             "update-scope": cmd_queue_update_scope,
             "depend": cmd_queue_depend,
             "prune": cmd_queue_prune,
