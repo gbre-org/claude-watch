@@ -99,6 +99,18 @@ pub struct State {
     /// Cumulative count of phase-2 (hard-block) malformed re-injections (metric).
     #[serde(default)]
     pub malformed_tool_call_hard_block_count: u64,
+    /// Fingerprint of the malformed block that the LAST corrective inject fired
+    /// on (see `tmux::malformed_tool_call_fingerprint`). Used to suppress
+    /// re-injecting on the SAME malformed block when it merely lingers in pane
+    /// scrollback after the model has already recovered with a well-formed call
+    /// below it — the tight self-perpetuating interruption loop documented in
+    /// the 2026-06-20 incident (the interrupter false-positiving on stale
+    /// scrollback). A genuinely NEW malform produces a DIFFERENT fingerprint and
+    /// is acted on immediately. Cleared when a clean (non-malformed) cycle is
+    /// observed so a recurrence of the identical text after recovery still
+    /// fires.
+    #[serde(default)]
+    pub last_malformed_fingerprint: Option<String>,
     // Watcher health
     pub watcher_health: HashMap<String, WatcherState>,
     /// Per-watcher RFC3339 timestamp of when the watcher was FIRST observed

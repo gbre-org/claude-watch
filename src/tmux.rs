@@ -1430,7 +1430,30 @@ pub async fn detect_wedged(pane: &str) -> Option<WedgedReason> {
 ///
 /// Returns `true` when a structurally-confirmed malformed tool-call construct
 /// is present in the tail.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn check_lines_for_malformed_tool_call(pane_output: &str) -> bool {
+    malformed_tool_call_fingerprint(pane_output).is_some()
+}
+
+/// Like `check_lines_for_malformed_tool_call`, but on a positive detection ALSO
+/// returns a stable FINGERPRINT of the specific malformed block found in the
+/// tail. The fingerprint lets the caller (the daemon's policy loop) DEDUP:
+/// re-firing the corrective inject every cycle while the SAME malformed block
+/// merely lingers in pane scrollback — even though the model has already
+/// recovered with a well-formed call below it — is exactly the tight
+/// self-perpetuating interruption loop that motivated the 2026-06-20 incident
+/// (the operator killed claude-watch because the interrupter was "too
+/// aggressive", false-positiving on stale scrollback). A genuinely NEW malform
+/// produces a DIFFERENT fingerprint and is acted on immediately.
+///
+/// The fingerprint is built from the malformed tag tokens together with the
+/// raw text of every tail line that contributes a malformed tag, joined with
+/// `\n`. Two captures whose malformed region is byte-identical hash to the same
+/// fingerprint; a fresh malform (different command, different stray prefix,
+/// different tags) hashes differently. The pane's surrounding chrome (prompt
+/// box, separators, status bar) — which is ALWAYS present and would otherwise
+/// make every capture look "fresh" — is deliberately excluded.
+pub(crate) fn malformed_tool_call_fingerprint(pane_output: &str) -> Option<String> {
     let lines: Vec<&str> = pane_output.lines().collect();
     let start = if lines.len() > 40 {
         lines.len() - 40
@@ -1438,7 +1461,35 @@ pub(crate) fn check_lines_for_malformed_tool_call(pane_output: &str) -> bool {
         0
     };
     let tail = &lines[start..];
-    detect_malformed_construct(tail)
+    if !detect_malformed_construct(tail) {
+        return None;
+    }
+    Some(malformed_block_fingerprint(tail))
+}
+
+/// Build the dedup fingerprint for the malformed block in `tail`: the
+/// concatenation (newline-joined) of every non-fenced tail line that
+/// contributes at least one malformed tag. This captures the actual offending
+/// text (stray prefix + the raw tags + their attribute values) while ignoring
+/// the always-present TUI chrome and any unrelated scrollback, so the same
+/// malformed block hashes identically across cycles.
+fn malformed_block_fingerprint(tail: &[&str]) -> String {
+    let mut in_fence = false;
+    let mut parts: Vec<&str> = Vec::new();
+    for line in tail {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if !tokenize_malformed_line(line).is_empty() {
+            parts.push(line.trim_end());
+        }
+    }
+    parts.join("\n")
 }
 
 /// A single token extracted from the candidate region: a raw, non-namespaced
@@ -1664,25 +1715,30 @@ fn detect_malformed_construct(tail: &[&str]) -> bool {
 }
 
 /// Capture the pane and check whether the live tail shows a malformed
-/// (non-namespaced) tool-call block rendered as assistant text. Returns true
-/// on detection. See `check_lines_for_malformed_tool_call` for the rationale.
+/// (non-namespaced) tool-call block rendered as assistant text. On detection
+/// returns `Some(fingerprint)` (a stable hash-input string identifying the
+/// specific malformed block — see `malformed_tool_call_fingerprint`); on no
+/// detection returns `None`. The caller dedups re-injects on the fingerprint so
+/// the SAME malformed block lingering in scrollback (after the model already
+/// recovered) does not re-fire every cycle — the tight-loop false positive that
+/// motivated the 2026-06-20 fix.
 ///
 /// `override_marker`, when it points at an existing file, disables detection
 /// entirely (a manual false-positive bypass — see the AskUserQuestion-allowed
 /// marker pattern). This lets an operator who is legitimately driving a turn
 /// that discusses the tags suppress the guardrail without editing config.
-pub async fn detect_malformed_tool_call(pane: &str, override_marker: &str) -> bool {
+pub async fn detect_malformed_tool_call(pane: &str, override_marker: &str) -> Option<String> {
     if !override_marker.is_empty() && std::path::Path::new(override_marker).exists() {
         debug!(
             marker = override_marker,
             "malformed-tool-call detection suppressed by override marker"
         );
-        return false;
+        return None;
     }
     if let Some(out) = capture_pane_history(pane, 60).await {
-        return check_lines_for_malformed_tool_call(&out);
+        return malformed_tool_call_fingerprint(&out);
     }
-    false
+    None
 }
 
 /// Pure function: detect whether the pane shows Claude Code in an upstream-API
@@ -3093,6 +3149,86 @@ end of example\n";
         }
         let output = lines.join("\n");
         assert!(!check_lines_for_malformed_tool_call(&output));
+    }
+
+    // --- malformed_tool_call_fingerprint / dedup tests ---
+    //
+    // These guard the 2026-06-20 fix: the daemon dedups corrective injects on
+    // a stable fingerprint of the offending block, so the SAME malformed text
+    // lingering in pane scrollback (after the model already recovered with a
+    // well-formed call below it) does NOT re-fire the interrupter every cycle
+    // (the tight self-perpetuating loop the operator killed claude-watch over).
+
+    #[test]
+    fn test_fingerprint_some_on_malformed() {
+        // A real malform yields a Some(fingerprint); detection parity with
+        // check_lines_for_malformed_tool_call is preserved.
+        let output = "\
+court<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n\
+</invoke>\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+        assert!(malformed_tool_call_fingerprint(output).is_some());
+    }
+
+    #[test]
+    fn test_fingerprint_none_on_clean() {
+        // A clean pane (no malformed construct) yields None.
+        let output = "\u{276f} all good\nTokens: 1234\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+        assert!(malformed_tool_call_fingerprint(output).is_none());
+    }
+
+    #[test]
+    fn test_fingerprint_stable_across_chrome_changes() {
+        // The SAME malformed block, captured in two different cycles where only
+        // the surrounding TUI chrome (prompt box, separators, status bar,
+        // unrelated scrollback) differs, must produce the SAME fingerprint — so
+        // the daemon recognizes it as "already nudged" and suppresses the
+        // re-inject. This is the core stale-scrollback case.
+        let cycle_a = "\
+some earlier output\n\
+court<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n\
+</invoke>\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f}\n";
+        let cycle_b = "\
+totally different scrollback line\n\
+and another\n\
+court<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n\
+</invoke>\n\
+\u{25cf} Bash(echo recovered)\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f} -- INSERT --\n";
+        let fa = malformed_tool_call_fingerprint(cycle_a).expect("a malformed");
+        let fb = malformed_tool_call_fingerprint(cycle_b).expect("b malformed");
+        assert_eq!(
+            fa, fb,
+            "identical malformed block must fingerprint identically regardless of chrome"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_differs_for_different_malform() {
+        // A genuinely NEW malform (different command) must produce a DIFFERENT
+        // fingerprint, so the daemon fires on it immediately rather than
+        // mistaking it for the already-nudged block.
+        let first = "\
+court<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n\
+</invoke>\n";
+        let second = "\
+court<invoke name=\"Bash\">\n\
+<parameter name=\"command\">touch /var/run/claude/heartbeat</parameter>\n\
+</invoke>\n";
+        let f1 = malformed_tool_call_fingerprint(first).expect("first malformed");
+        let f2 = malformed_tool_call_fingerprint(second).expect("second malformed");
+        assert_ne!(
+            f1, f2,
+            "different malformed blocks must fingerprint differently"
+        );
     }
 
     // --- check_lines_for_api_retry tests ---
