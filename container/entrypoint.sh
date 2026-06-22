@@ -192,11 +192,30 @@ CLAUDE_SHIM_FILTER_USER=""
 export CLAUDE_SHIM_FILTER_USER
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
+    # Project-tier settings file. When an operator bind-mounts host
+    # ~/.claude at the project-cwd path (so the cwd's .claude symlink
+    # resolves + project-tier slash commands load), that host
+    # settings.json ALSO becomes Claude Code's PROJECT tier, read RAW
+    # from <cwd>/.claude/settings.json. A poison `apiKeyHelper` there
+    # (a host-only Mach-O helper) bypasses the user-tier sanitizer and
+    # 127s on every inference. We pass the project-tier path to the
+    # generator so it can neutralize that helper by writing an
+    # empty-string apiKeyHelper into the shim (flagSettings tier, which
+    # outranks projectSettings) -- no host-file mutation, no mount.
+    # Strictly gated inside the generator on a detected NON-runnable
+    # project helper, so operators without the leak see no change.
+    _project_settings=""
+    if [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] \
+            && [ -f "${CLAUDE_HOST_PROJECT_DIR}/.claude/settings.json" ]; then
+        _project_settings="${CLAUDE_HOST_PROJECT_DIR}/.claude/settings.json"
+    fi
     /usr/local/bin/generate-hooks-shim-settings \
         --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
         --output "$CLAUDE_SHIM_SETTINGS_PATH" \
         --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
+        --neutralize-project-apikeyhelper "$_project_settings" \
         --inject-obligations "$CLAUDE_CONTAINER_OBLIGATIONS" || true
+    unset _project_settings
     CLAUDE_SHIM_FILTER_USER=1
 elif [ "$CLAUDE_CONTAINER_OBLIGATIONS" = "1" ]; then
     # Obligations gate without the cross-arch hook rewrite. Generate a
