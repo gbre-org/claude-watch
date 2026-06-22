@@ -1793,6 +1793,10 @@ mod tests {
         assert!(!pid_is_alive(u32::MAX - 1));
     }
 
+    // /proc-dependent: pid_cmdline reads /proc/PID/cmdline, Linux-only.
+    // On macOS pid_cmdline returns None so the self-match assert fails.
+    // Gate to Linux (CI runs Linux). Sibling non-match tests stay unguarded.
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_pid_matches_watcher_self() {
         // Our own cmdline contains the test binary path. Use the actual first

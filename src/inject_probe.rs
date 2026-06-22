@@ -64,6 +64,10 @@ pub enum ProbeOutcome {
     /// SHOULD process the message on its next event-loop tick; this probe
     /// does NOT block waiting for the response (caller inspects the agent's
     /// stdout / transcript independently).
+    // Only constructed inside the cfg(target_os = "linux") arm of probe().
+    // On non-Linux the variant is read-only (pattern-matched), which trips
+    // dead_code under CI/pre-commit -D warnings. Allow it off-Linux only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Ok { bytes: usize, parent_pid: u32, parent_fd: u32 },
     /// Agent's stdin is a pty — wrong deployment mode for pidfd inject.
     /// Caller should fall back to `tmux send-keys`.
