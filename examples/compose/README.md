@@ -88,8 +88,14 @@ behavior or claude-watch monitoring.
 
 Host-specific integration mounts (shell-history databases, messaging
 attachment dirs, etc.) are intentionally out of scope for this example.
-Add them in a local `docker-compose.override.yml` if your operator setup
-needs them.
+Add them in `~/.config/claude-container/docker-compose.override.yml`
+(copied from `docker-compose.override.yml.example`) if your operator setup
+needs them — the deploy paths (`make redeploy`, `cw --up`) point
+`COMPOSE_FILE` at that config-dir override so it merges regardless of which
+clone or worktree the deploy runs from. (Keeping it out of the repo, rather
+than as a gitignored sibling, is deliberate: a gitignored sibling is absent
+from every worktree, so deploys run from the build worktree silently dropped
+all of these mounts.)
 
 ### Corporate VPN / SSL passthrough
 

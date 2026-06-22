@@ -1,4 +1,4 @@
-Probe the host for bind-mount candidates (gh CLI token, gitconfig, ssh-agent socket, work-private bare-repo paths, etc.) and write / update the operator's `examples/compose/docker-compose.override.yml` with the detected mounts. Re-runnable: parses the existing override (if any), proposes adds / removes / changes, confirms with the operator, then writes — never blows the file away.
+Probe the host for bind-mount candidates (gh CLI token, gitconfig, ssh-agent socket, work-private bare-repo paths, etc.) and write / update the operator's `~/.config/claude-container/docker-compose.override.yml` (the stable config-dir location the deploy wires `COMPOSE_FILE` at) with the detected mounts. Re-runnable: parses the existing override (if any), proposes adds / removes / changes, confirms with the operator, then writes — never blows the file away.
 
 ## When to invoke
 
@@ -8,9 +8,9 @@ Probe the host for bind-mount candidates (gh CLI token, gitconfig, ssh-agent soc
 
 ## Steps
 
-1. **Probe `host-bash` availability**: `claude mcp list` should show `host-bash` as `Connected`. If it's not connected, **stop and tell the operator** — this skill needs `host-bash` to probe the host filesystem; without it, you'd be guessing host paths blindly. The operator either needs to wire up host-bash (`mcp-host-bash` launcher) or hand-edit the override file from the template at `examples/compose/docker-compose.override.yml.example`.
+1. **Probe `host-bash` availability**: `claude mcp list` should show `host-bash` as `Connected`. If it's not connected, **stop and tell the operator** — this skill needs `host-bash` to probe the host filesystem; without it, you'd be guessing host paths blindly. The operator either needs to wire up host-bash (`mcp-host-bash` launcher) or hand-edit `~/.config/claude-container/docker-compose.override.yml` from the template at `examples/compose/docker-compose.override.yml.example`.
 
-2. **Read the existing override** (if any). The override lives at `~/repos/claude-watch/examples/compose/docker-compose.override.yml` (host-side path; the file isn't bind-mounted into the container by default — read it via `host-bash cat`). Parse out the currently-mounted host paths so step 4 can diff against them.
+2. **Read the existing override** (if any). The override lives at `~/.config/claude-container/docker-compose.override.yml` (host-side path; that config dir IS bind-mounted into the container RW, but read it via `host-bash cat` to be safe). Parse out the currently-mounted host paths so step 4 can diff against them.
 
 3. **Probe the host for standard candidates**. Use `host-bash` for each of the following; record which exist on this host. The probes are cheap (each is a single `ls` / `test`), so probe all of them even if some are obviously not relevant.
 
@@ -48,7 +48,7 @@ Probe the host for bind-mount candidates (gh CLI token, gitconfig, ssh-agent soc
 
    Wait for the operator's confirmation before writing. If the operator wants to add a path that wasn't auto-detected (e.g. `/Users/x/work/scripts:/home/hndrewaall/work-scripts:rw`), accept the explicit instruction and merge it into the proposal.
 
-6. **Write the override**. Build the final mount list (existing kept + adds, minus removes), then write the new override file via `host-bash`. Preserve the existing comments in the file where possible — when in doubt, regenerate from the canonical template at `examples/compose/docker-compose.override.yml.example` and inject the resolved mount lines. The override goes at the host path `~/repos/claude-watch/examples/compose/docker-compose.override.yml` (the same file `docker compose` auto-merges).
+6. **Write the override**. Build the final mount list (existing kept + adds, minus removes), then write the new override file via `host-bash`. Preserve the existing comments in the file where possible — when in doubt, regenerate from the canonical template at `examples/compose/docker-compose.override.yml.example` and inject the resolved mount lines. The override goes at the host path `~/.config/claude-container/docker-compose.override.yml` (the file the deploy paths point `COMPOSE_FILE` at — `make redeploy` / `cw --up` merge it regardless of which clone/worktree they run from).
 
 7. **Tell the operator to recreate**. Bind-mount changes don't apply on a plain `up -d`; the container has to be recreated. Print:
 
@@ -62,7 +62,7 @@ Probe the host for bind-mount candidates (gh CLI token, gitconfig, ssh-agent soc
 
 ## Important
 
-- **The override file is gitignored.** It's in `.gitignore` (`examples/compose/docker-compose.override.yml`) precisely because it leaks personal paths. Don't suggest committing it; don't `git add` it.
+- **The override file lives OUTSIDE the repo** (in `~/.config/claude-container/`) precisely because it leaks personal paths — it's not a tracked or gitignored repo file at all. Don't suggest committing it; don't `git add` it. (A legacy gitignored sibling at `examples/compose/docker-compose.override.yml` may still exist on some hosts and auto-merges harmlessly, but new setups use the config dir.)
 - **The canonical template is `docker-compose.override.yml.example`** (committed). When generating a fresh override from scratch (no existing file), start from that template's structure so the comments + uncomment-pattern stay consistent across operators.
 - **Keep the in-container destination paths stable**. Even when the host source path changes (Linux vs macOS, `${HOME}` vs `/Users/x`), the in-container destination should stay the same so the rest of the container's tooling doesn't have to switch on host OS. Standard destinations: `/home/hndrewaall/.config/gh`, `/home/hndrewaall/.gitconfig`, `/run/host-services/ssh-auth.sock`, `/home/hndrewaall/work-repos`, etc.
 - **No private keys.** The ssh-agent socket forwards key signing to the host agent — never bind-mount `~/.ssh/id_*` private keys themselves. If the operator asks you to mount a private key directly, push back and explain the agent-forwarding alternative.
