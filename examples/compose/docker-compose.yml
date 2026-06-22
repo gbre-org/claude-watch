@@ -639,33 +639,6 @@ services:
       - claude-container
     restart: unless-stopped
 
-  # ---------------------------------------------------------------------
-  # pr-watch-minisite — read-only viewer for the pr-watch tracked-PR
-  # state (~/.config/pr-watch/tracked.json + poll.log), accessible at
-  # http://localhost:8002. Mirrors the queue-minisite / eichi-search
-  # pattern (python:3.12-alpine + flask/gunicorn, Solarized UI) but is a
-  # PURE VIEWER: no mutation/SSE routes, and the /state mount is
-  # read-only. The minisite CODE lives in the pr-watch repo at
-  # minisite/ (Dockerfile + Flask app); we build it here the same way
-  # eichi-search builds from ../../../eichi.
-  pr-watch-minisite:
-    build:
-      context: ../../../pr-watch
-      dockerfile: minisite/Dockerfile
-    image: pr-watch-minisite:dev
-    ports:
-      - "8002:8000"
-    user: "1000:1000"
-    environment:
-      PR_WATCH_TRACKED_JSON: /state/tracked.json
-      PR_WATCH_POLL_LOG: /state/poll.log
-      SITE_TITLE: pr-watch
-    volumes:
-      # Host pr-watch state dir — READ-ONLY. The viewer only reads
-      # tracked.json + stats poll.log's mtime; it never mutates state.
-      - "${HOME}/.config/pr-watch:/state:ro"
-    restart: unless-stopped
-
 volumes:
   # In-container claude binary's auto-updated versions/ tree. First
   # launch the volume is empty and the container falls through to the
