@@ -197,8 +197,38 @@ _BAKED_BASH_EXEMPT_PATTERNS = [
     # Without this exemption, repeated watcher-down events in a row
     # would trip the dispatcher gate on the very command the alert
     # told the loop to run.
-    r"^watcher-ctl\s+run(?:\s|$)",
-    r"^/usr/local/bin/watcher-ctl\s+run(?:\s|$)",
+    r"^watcher-ctl\s+(?:run|status)(?:\s|$)",
+    r"^/usr/local/bin/watcher-ctl\s+(?:run|status)(?:\s|$)",
+    # Dispatcher-loop maintenance surface. These mirror the event_must_act
+    # gate's exempt-set (tools/event-must-act/eval-event-must-act
+    # _EXEMPT_PATTERNS) so routine main-loop maintenance does NOT count as
+    # an inline "worker chain":
+    #   - agent-ack: agent-completion ack protocol (register/done/list/
+    #     status/...). The N=0 ack gate forces these as the FIRST calls
+    #     after a subagent completes -- they are loop bookkeeping, not work.
+    #   - event-ack / event-classify: the event-tier triage + gate-
+    #     resolution surface (same role event_must_act exempts them for).
+    # claude-watch-ack + claude-watch-dispatch + obligations(list/show/
+    # status) + agent-msg(inbox/...) + agent-tail + session-task are
+    # already exempt above; together these complete the dispatcher-
+    # maintenance mirror of event_must_act.
+    r"^agent-ack(?:\s|$)",
+    r"^/usr/local/bin/agent-ack(?:\s|$)",
+    r"^event-ack(?:\s|$)",
+    r"^/usr/local/bin/event-ack(?:\s|$)",
+    r"^event-classify(?:\s|$)",
+    r"^/usr/local/bin/event-classify(?:\s|$)",
+    # Heartbeat-liveness touch. claude-watch injects a `touch
+    # /var/run/claude/[claude-]heartbeat` instruction to prove loop
+    # liveness; that single-command self-service touch is dispatcher
+    # bookkeeping, not inline worker behaviour, so it must not count
+    # against the consecutive-non-exempt counter. Matches both the
+    # un-prefixed `heartbeat` (the running daemon's watched path) and
+    # the `claude-heartbeat` path advertised by events/config. NOTE the
+    # match is intentionally loose (it allows a trailing path) -- the
+    # obligations gate already enforces the strict bare-touch shape; here
+    # we only need to keep the touch from tripping the dispatcher counter.
+    r"^touch\s+/var/run/claude/(?:claude-)?heartbeat(?:\s|$)",
     # In-container baked watcher launchers. /opt/claude-container/ is
     # the current bake root; the /etc/claude-code/ entry is kept for
     # images built before the managed-config-dir cleanup (that dir is
