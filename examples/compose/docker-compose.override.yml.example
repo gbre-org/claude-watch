@@ -1,9 +1,27 @@
 # docker-compose.override.yml.example — operator-specific bind-mount template
 #
-# Copy this file to `docker-compose.override.yml` (sibling, gitignored) and
-# uncomment the mounts that apply to your host. Docker Compose
-# automatically merges any `docker-compose.override.yml` into the main
-# `docker-compose.yml` at `up` time — no extra `-f` flag needed.
+# Copy this file to the STABLE CONFIG DIR (NOT the repo):
+#
+#   mkdir -p ~/.config/claude-container
+#   cp docker-compose.override.yml.example \
+#      ~/.config/claude-container/docker-compose.override.yml
+#
+# then uncomment the mounts that apply to your host. The deploy paths
+# (`make redeploy` and `cw --up`) point COMPOSE_FILE at
+# `~/.config/claude-container/docker-compose.override.yml`, so the merge
+# is LOCATION-INDEPENDENT — the override is picked up no matter which
+# clone or worktree the deploy runs from.
+#
+# WHY NOT a sibling `examples/compose/docker-compose.override.yml`?
+# Docker only AUTO-merges a sibling file literally named
+# `docker-compose.override.yml`, and that file is gitignored — so it
+# never exists in a git worktree. The workflow runs builds/deploys from
+# the build worktree `~/repos/.worktrees/<repo>/main`, where a sibling
+# override is absent, so the container recreated with NONE of these
+# mounts (the recurring "clipboard / gh / ssh mount missing after
+# recreate" bug). Putting the override in the config dir + wiring
+# COMPOSE_FILE fixes that for good. (A legacy sibling override, if you
+# still have one, is harmless — docker auto-merges it on top.)
 #
 # Why an override file (and not the main compose):
 #
@@ -25,8 +43,8 @@
 #
 # After editing this file (or running the skill), apply changes with:
 #
-#   cd examples/compose
-#   docker compose up -d --force-recreate claude-container
+#   make redeploy            # from the claude-watch repo root, OR
+#   cw --up                  # which also wire COMPOSE_FILE for you
 #
 # `--force-recreate` is required because docker doesn't pick up
 # bind-mount changes on a plain `up -d`; it has to recreate the

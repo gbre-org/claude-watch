@@ -923,18 +923,31 @@ universal to any operator (`~/.claude`, `~/.claude.json`, `~/repos`,
 `~/bin`, `~/claude-events`, `~/.config/session`, plus the optional
 `CLAUDE_HOST_*` env-driven mounts) and nothing else. Personal paths
 (`gh` token dir, `gitconfig`, `ssh-agent` socket, work-private bare-repo
-paths under Google Drive / external SSDs / etc.) live in a **gitignored**
-sibling file: `examples/compose/docker-compose.override.yml`. Docker Compose
-auto-merges any `docker-compose.override.yml` into the main file at `up` time,
-so no extra `-f` flag is needed.
+paths under Google Drive / external SSDs / etc.) live in an override file
+kept OUT of the git tree, in the stable config dir
+`~/.config/claude-container/docker-compose.override.yml`. The deploy paths
+(`make redeploy`, `cw --up`) point `COMPOSE_FILE` at it
+(`COMPOSE_FILE=<repo>/examples/compose/docker-compose.yml:~/.config/claude-container/docker-compose.override.yml`),
+so the merge is **location-independent** — picked up no matter which clone
+or worktree issues the deploy.
+
+> **Why the config dir and not a sibling `examples/compose/docker-compose.override.yml`?**
+> Docker only AUTO-merges a sibling file literally named
+> `docker-compose.override.yml`, and that file is gitignored — so it never
+> exists in a git worktree. Builds/deploys run from the build worktree
+> `~/repos/.worktrees/<repo>/main`, where the sibling override is absent, so
+> the container recreated with NONE of the personal mounts (the recurring
+> "clipboard / gh / ssh mount missing after recreate" bug). Moving the
+> override to the config dir + wiring `COMPOSE_FILE` fixes it for good. A
+> legacy sibling override, if present, still auto-merges harmlessly.
 
 The shape:
 
 | File | Tracked? | Purpose |
 | --- | --- | --- |
 | `examples/compose/docker-compose.yml` | yes | Universal services + bind-mounts. Personal-paths-free. |
-| `examples/compose/docker-compose.override.yml.example` | yes | Canonical template with commented-out mount blocks. Operators copy this to `.override.yml` and uncomment what applies. |
-| `examples/compose/docker-compose.override.yml` | **no** (gitignored) | The operator's actual personal mounts. Generated from the template (manually, or via the `/edit-host-mounts` skill). |
+| `examples/compose/docker-compose.override.yml.example` | yes | Canonical template with commented-out mount blocks. Operators copy this to `~/.config/claude-container/docker-compose.override.yml` and uncomment what applies. |
+| `~/.config/claude-container/docker-compose.override.yml` | **no** (outside repo) | The operator's actual personal mounts, in the stable config dir. The deploy wires `COMPOSE_FILE` at it. Generated from the template (manually, or via the `/edit-host-mounts` skill). |
 
 **Why the override pattern instead of hardcoding?** Personal paths
 differ per operator (`/Users/<you>/.config/gh` vs `/home/<you>/.config/gh`),

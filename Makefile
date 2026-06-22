@@ -485,10 +485,36 @@ compose-down:
 # so the recipe shell survives to issue the atomic recreate below —
 # the self-redeploy contract is preserved. Guarded by `-x` exactly as
 # cw does, so a removed/relocated helper just skips the step.
+# COMPOSE_FILE wiring (q-2026-06-22-a072): the operator's personal
+# bind-mounts (gh token, gitconfig, ssh-agent, Dropbox, ci-logs, the
+# clipboard bridge, etc.) live in an override that is intentionally
+# OUT of the git tree, in the stable config dir
+# `$(HOME)/.config/claude-container/docker-compose.override.yml`.
+#
+# Docker only AUTO-merges a sibling file literally named
+# `docker-compose.override.yml` in the project dir. Because the override
+# is gitignored it never exists in a worktree, so a redeploy run from the
+# build worktree `~/repos/.worktrees/claude-watch/main` (per the workflow
+# convention) silently merged ZERO override and recreated the container
+# with NONE of those mounts — the recurring "clipboard mount missing
+# after recreate" bug. Moving the override to the config dir + pointing
+# COMPOSE_FILE at it makes the merge LOCATION-INDEPENDENT: the base is
+# this clone's own compose, the override is always the config-dir file,
+# regardless of which clone/worktree issues the redeploy.
+#
+# The override is appended only if it exists, so a fresh host with no
+# personal override still recreates cleanly (base-only).
+COMPOSE_BASE := $(CURDIR)/examples/compose/docker-compose.yml
+COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
+
 redeploy:
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
-	  docker compose up -d --force-recreate claude-container
+	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then \
+	    COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)" docker compose up -d --force-recreate claude-container; \
+	  else \
+	    docker compose up -d --force-recreate claude-container; \
+	  fi
 
 # Clean build artifacts
 clean:
