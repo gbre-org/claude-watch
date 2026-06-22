@@ -26,14 +26,18 @@ This skill exists so the in-container agent has a single canonical place to:
 2. **If the listing is empty**: report back to the operator:
    > "No watchers are baked into this container image. The convention dir at `/opt/claude-container/watchers/` exists for future watcher integrations; no concrete watchers ship today."
 
-3. **If the listing has entries**: for each `<name>.toml`, check whether the launcher is already running:
+3. **If the listing has entries**: for each `<name>.toml`, check whether the watcher is already running via its **pidfile liveness** (NOT `pgrep`):
 
    ```sh
-   pgrep -af '/opt/claude-container/watchers/<name>.sh'
+   watcher-ctl status
    ```
 
-   - **Already running** (e.g. an earlier launch in this same session): do NOT double-launch — report the existing PID.
-   - **Not running**: launch the launcher script as a backgrounded subprocess **only via Claude Code's `run_in_background: true` Bash invocation** — never via shell `&` or `nohup` (matches the host's cardinal watcher rule: watchers can ONLY be started by Claude Code's main loop). Capture the resulting `bash_id` so the watcher can be monitored / killed later.
+   `watcher-ctl status` reads the PID the watcher records in `<name>.lock` / `<name>.pid` under the runtime dir and probes it for liveness — it does NOT `pgrep` the launcher path. This matters: the launcher `<name>.sh` does `exec /usr/local/bin/<name>`, which replaces the process argv with the exec'd binary's, so the `.sh` path is GONE from the live cmdline and a `pgrep -f '/opt/claude-container/watchers/<name>.sh'` could NEVER match a healthy watcher (it would always report DOWN). Use `watcher-ctl status` (or read the pidfile) — never pgrep the launcher path.
+
+   - **Already running** (e.g. an earlier launch in this same session — `watcher-ctl status` shows `ok`): do NOT double-launch.
+   - **Not running** (`watcher-ctl status` shows `DOWN`): launch via `watcher-ctl run <name>`, invoked **only through Claude Code's `run_in_background: true` Bash invocation** — never via shell `&` or `nohup` (matches the host's cardinal watcher rule: watchers can ONLY be started by Claude Code's main loop). `watcher-ctl run` writes the `<name>.pid` / `<name>.runlock` files (so the daemon's pidfile-based liveness check can see the watcher) and is idempotent (it no-ops if a live instance already holds the slot). Capture the resulting `bash_id` so the watcher can be monitored / killed later.
+
+   > Do NOT launch the raw `bash /opt/claude-container/watchers/<name>.sh` directly: a raw launch skips the pidfile/runlock bookkeeping `watcher_run` performs, so the daemon's watcher_monitor (pidfile-based since PR #339) can't see it and will report a false DOWN.
 
 4. **Report** which watchers were started (or were already alive), their `restart_policy`, and the path of each watcher's log (`/var/log/claude-watch/watchers/<name>.log` by convention).
 
@@ -41,7 +45,7 @@ This skill exists so the in-container agent has a single canonical place to:
 
 When a watcher's background task completes (Claude Code surfaces its stdout), **restart the watcher immediately, then process the events**. A watcher that has exited is deaf — events that arrive while it's down are only caught on the next launch's catch-up scan (if the watcher implements one).
 
-The claude-watch daemon's `[watcher_monitor]` is the fallback alert layer: if a watcher's pgrep pattern stays missing for several consecutive checks, the daemon fires a `[CLAUDE-WATCH] WATCHER(S) DOWN` alert into the session.
+The claude-watch daemon's `[watcher_monitor]` is the fallback alert layer: if a watcher's recorded PID (its `<name>.lock` / `<name>.pid` file) is missing or names a dead/recycled process for several consecutive checks, the daemon fires a `[CLAUDE-WATCH] WATCHER(S) DOWN` alert into the session. (Liveness is pidfile-based, NOT pgrep — the launcher `exec`s the bare binary, so the `.sh` argv that pgrep would match is gone; see PR #339.)
 
 ## Adding a new watcher
 

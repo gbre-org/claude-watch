@@ -739,6 +739,240 @@ pub(crate) fn parse_watchers_config_str(content: &str) -> Vec<WatcherEntry> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Shared watcher-liveness helpers (single source of truth).
+//
+// These were originally private to `policy.rs` (the daemon's watcher_monitor,
+// migrated to pidfile-based liveness in the 2026-06-11 exec-defeats-pgrep fix,
+// PR #339). The parallel `watcher.rs` CLI status path (`watcher_status`) was
+// left on the broken `pgrep -f <launcher.sh>` approach and therefore reported a
+// healthy watcher as DOWN (the launcher `exec`s the bare binary, so the live
+// argv no longer contains the `.sh` path). Hoisting the helpers here lets BOTH
+// the daemon (`policy.rs`) AND the CLI (`watcher.rs`) decide UP/DOWN from the
+// SAME pidfile-liveness logic, so they can never disagree again.
+// ---------------------------------------------------------------------------
+
+/// Check if a PID is still alive (signal-0 probe via SIGCONT delivery test).
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid as i32), Signal::SIGCONT)
+        .map(|_| true)
+        .unwrap_or(false)
+}
+
+/// Check if a PID is genuinely alive — i.e. exists AND is not a zombie
+/// (`<defunct>`). `pgrep` still lists zombies because they linger in the
+/// process table until reaped, so a plain `kill -0` probe (or a raw `pgrep`
+/// count) would treat a defunct watcher as "running". We read `/proc/PID/stat`
+/// and reject state `Z`/`X` so a watcher whose process has died-but-not-yet-
+/// reaped is correctly seen as not-alive.
+///
+/// Falls back to the signal-0 probe when `/proc/PID/stat` is unreadable (e.g.
+/// a non-Linux test host) so behaviour degrades to "exists?" rather than
+/// always-false.
+pub(crate) fn is_pid_genuinely_alive(pid: u32) -> bool {
+    let path = format!("/proc/{}/stat", pid);
+    match std::fs::read_to_string(&path) {
+        Ok(stat) => {
+            // /proc/PID/stat: `pid (comm) STATE ...`. comm can contain spaces
+            // and parens, so find the LAST ')' and take the next token.
+            if let Some(close) = stat.rfind(')') {
+                let rest = stat[close + 1..].trim_start();
+                let state = rest.split_whitespace().next().unwrap_or("");
+                // 'Z' = zombie/defunct, 'X'/'x' = dead. Anything else is a
+                // live, reapable-or-running process.
+                return state != "Z" && state != "X" && state != "x";
+            }
+            // Malformed stat — fall back to existence probe.
+            is_pid_alive(pid)
+        }
+        // No /proc entry (already reaped) or non-Linux host: fall back to the
+        // signal probe.
+        Err(_) => is_pid_alive(pid),
+    }
+}
+
+/// Read `/proc/<pid>/cmdline` (NUL-separated argv) into a space-joined string.
+/// Returns `None` if the process is gone, the file is unreadable, or the
+/// cmdline is empty (e.g. a kernel thread). Used for watcher identity checks.
+pub(crate) fn read_proc_cmdline(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/cmdline", pid);
+    let data = std::fs::read(&path).ok()?;
+    let s = String::from_utf8_lossy(&data)
+        .replace('\0', " ")
+        .trim()
+        .to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Resolve the directory that holds watcher PID / lock files.
+///
+/// Mirrors the watcher's own lockfile resolution
+/// (`$XDG_RUNTIME_DIR/<name>.lock` else `/var/run/claude/<name>.lock`) and
+/// `watcher::pid_dir()` (`$CLAUDE_WATCH_PID_DIR` else `/var/run/claude`), so
+/// both the daemon AND the CLI read the SAME file the watcher writes.
+/// Precedence:
+///   1. `$CLAUDE_WATCH_PID_DIR` (explicit override; used by tests + the
+///      watcher_run spawn path).
+///   2. `$XDG_RUNTIME_DIR` (matches the watcher's lockfile default).
+///   3. `/var/run/claude` (final fallback — the baked container path).
+pub(crate) fn watcher_pid_dir() -> String {
+    if let Ok(p) = std::env::var("CLAUDE_WATCH_PID_DIR") {
+        if !p.trim().is_empty() {
+            return p;
+        }
+    }
+    if let Ok(p) = std::env::var("XDG_RUNTIME_DIR") {
+        if !p.trim().is_empty() {
+            return p;
+        }
+    }
+    "/var/run/claude".to_string()
+}
+
+/// Read a watcher PID file (`<name>.pid`) and return the recorded PID, if the
+/// file exists and contains a parseable integer. Whitespace is trimmed.
+/// `None` on missing / unreadable / non-numeric content.
+pub(crate) fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
+    let path = format!("{}/{}.pid", pid_dir, name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    content.trim().parse::<u32>().ok()
+}
+
+/// Read the PID the watcher recorded for itself, from the runtime dir.
+///
+/// A watcher records its live PID in one of two files under [`watcher_pid_dir`]:
+///   * `<name>.lock` — written by the watcher itself (the flock singleton
+///     guard writes `printf '%s\n' "$$" >&9`). This is the authoritative
+///     source in the container, where watchers are spawned by the session as
+///     `run_in_background` tasks (NOT via `watcher_run`), so no `.pid` file
+///     exists.
+///   * `<name>.pid` — written by `watcher::watcher_run` with the child PID when
+///     claude-watch spawns the watcher.
+///
+/// We prefer `<name>.lock` (always present for a live watcher in the container)
+/// and fall back to `<name>.pid`. Returns the first file that parses to a PID,
+/// or `None` if neither exists / parses.
+pub(crate) fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
+    let lock = format!("{}/{}.lock", pid_dir, name);
+    if let Ok(content) = std::fs::read_to_string(&lock) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    read_watcher_pid(pid_dir, name)
+}
+
+/// Does the live process `pid`'s cmdline look like *this* watcher (identity
+/// check to reject a recycled PID the kernel handed to an unrelated process)?
+///
+/// The match is lenient because the watcher's launcher `exec`s a child or
+/// re-execs itself, so the live argv rarely equals the literal `start_cmd`.
+/// Concretely, the start_cmd is the launcher SCRIPT
+/// (`/opt/claude-container/watchers/claude-event-watch.sh`) but the live
+/// process — after `exec /usr/local/bin/claude-event-watch` — has cmdline
+/// `/bin/bash /usr/local/bin/claude-event-watch`. The `.sh` is gone, so a
+/// naive `cmdline.contains(start_cmd)` fails. We therefore reduce the
+/// start_cmd's first token to its basename AND strip a trailing script
+/// extension (`.sh`, `.bash`, `.py`), yielding the stem `claude-event-watch`,
+/// which DOES appear in the exec'd cmdline. This tolerates the exec-to-binary
+/// transform while still rejecting an obviously-unrelated recycled PID (whose
+/// cmdline won't contain the watcher's name stem).
+pub(crate) fn cmdline_matches_watcher(cmdline: &str, start_cmd: &str) -> bool {
+    let token = match start_cmd.split_whitespace().next() {
+        Some(t) if !t.is_empty() => t,
+        _ => return false,
+    };
+    let base = token.rsplit('/').next().unwrap_or(token);
+    // Strip a trailing script extension so a `.sh` launcher that exec's a bare
+    // binary of the same stem still matches.
+    let stem = strip_script_suffix(base);
+    if stem.is_empty() {
+        return false;
+    }
+    cmdline.contains(token) || cmdline.contains(base) || cmdline.contains(stem)
+}
+
+/// Strip a trailing watcher-launcher script extension (`.sh`, `.bash`, `.py`)
+/// from a file basename, yielding the bare stem. Used so a `.sh` launcher that
+/// `exec`s a same-stem binary still matches by identity. Returns the input
+/// unchanged when no known extension is present.
+pub(crate) fn strip_script_suffix(base: &str) -> &str {
+    base.strip_suffix(".sh")
+        .or_else(|| base.strip_suffix(".bash"))
+        .or_else(|| base.strip_suffix(".py"))
+        .unwrap_or(base)
+}
+
+/// Pure decision: is the watcher DOWN, given what was observed about its
+/// recorded PID file?
+///
+/// Kept pure (no `/proc`, no `pgrep`, no filesystem) so the DOWN logic is
+/// unit-testable.
+///
+/// Inputs (all already probed by the caller):
+/// - `recorded_pid`: the PID read from the watcher's `<name>.lock` / `<name>.pid`
+///   file, or `None` if no pidfile exists.
+/// - `pid_alive`: whether that recorded PID is currently alive (genuine-liveness
+///   probe). Meaningless when `recorded_pid` is `None`.
+/// - `cmdline_matches`: whether that PID's `/proc/<pid>/cmdline` matches this
+///   watcher's identity (rejects a recycled PID). Meaningless when
+///   `recorded_pid` is `None` or `!pid_alive`.
+///
+/// A watcher is UP iff its pidfile names a live process whose cmdline matches
+/// the watcher. DOWN in every other case:
+///   * missing pidfile  → DOWN (no recorded instance),
+///   * stale pidfile (recorded PID dead) → DOWN (triggers a legit restart),
+///   * recycled PID (alive but cmdline mismatch) → DOWN.
+///
+/// NOTE: there is intentionally no `pgrep` / process-scan path here — `exec`
+/// replacing the launcher's argv with the exec'd binary's argv defeats any
+/// `pgrep -f <launcher.sh>` match (this bug). Liveness comes ONLY from the
+/// pidfile the watcher itself maintains.
+pub(crate) fn pidfile_watcher_is_down(
+    recorded_pid: Option<u32>,
+    pid_alive: bool,
+    cmdline_matches: bool,
+) -> bool {
+    match recorded_pid {
+        Some(_) => !(pid_alive && cmdline_matches),
+        None => true,
+    }
+}
+
+/// Convenience: resolve the recorded PID for `name` and decide UP/DOWN using
+/// the SAME pidfile-liveness model the daemon's watcher_monitor uses. Performs
+/// the `/proc` reads (PID liveness + cmdline identity) and returns
+/// `(recorded_pid, is_down)`.
+///
+/// `start_cmd` is the watcher's configured launch command (used for the
+/// cmdline identity check). When `None`, a live recorded PID is accepted
+/// without an identity check (we have nothing to reject it with, and the
+/// pidfile naming it is itself evidence) — mirroring the daemon's behaviour.
+pub(crate) fn watcher_pidfile_liveness(
+    pid_dir: &str,
+    name: &str,
+    start_cmd: Option<&str>,
+) -> (Option<u32>, bool) {
+    let recorded_pid = read_watcher_recorded_pid(pid_dir, name);
+    let pid_alive = recorded_pid.is_some_and(is_pid_genuinely_alive);
+    let cmdline_matches = match (recorded_pid, pid_alive, start_cmd) {
+        (Some(pid), true, Some(sc)) => match read_proc_cmdline(pid) {
+            Some(cmdline) => cmdline_matches_watcher(&cmdline, sc),
+            None => false,
+        },
+        (Some(_), true, None) => true,
+        _ => false,
+    };
+    let down = pidfile_watcher_is_down(recorded_pid, pid_alive, cmdline_matches);
+    (recorded_pid, down)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,5 +1829,79 @@ mod tests {
     fn test_parse_watchers_config_missing_file() {
         let entries = parse_watchers_config("/tmp/nonexistent-watchers-test.conf");
         assert_eq!(entries.len(), 0);
+    }
+
+    // --- shared watcher-liveness helpers (hoisted from policy.rs) -----------
+
+    #[test]
+    fn test_strip_script_suffix() {
+        assert_eq!(strip_script_suffix("claude-event-watch.sh"), "claude-event-watch");
+        assert_eq!(strip_script_suffix("x.bash"), "x");
+        assert_eq!(strip_script_suffix("y.py"), "y");
+        assert_eq!(strip_script_suffix("no-ext"), "no-ext");
+        // Only a trailing known extension is stripped.
+        assert_eq!(strip_script_suffix("a.sh.txt"), "a.sh.txt");
+    }
+
+    #[test]
+    fn test_cmdline_matches_exec_transform() {
+        // The `.sh` launcher execs the bare binary → cmdline loses `.sh`, must
+        // still match (the exec-argv false-DOWN fix).
+        let start_cmd = "/opt/claude-container/watchers/claude-event-watch.sh";
+        assert!(cmdline_matches_watcher(
+            "/bin/bash /usr/local/bin/claude-event-watch",
+            start_cmd
+        ));
+        // Literal (no exec) cmdline still matches.
+        assert!(cmdline_matches_watcher(
+            "/bin/bash /opt/claude-container/watchers/claude-event-watch.sh",
+            start_cmd
+        ));
+        // Unrelated process rejected.
+        assert!(!cmdline_matches_watcher(
+            "/usr/bin/python3 /home/u/other-tool.py",
+            start_cmd
+        ));
+        // Empty start_cmd rejected.
+        assert!(!cmdline_matches_watcher("/bin/bash /usr/local/bin/x", ""));
+        assert!(!cmdline_matches_watcher("/bin/bash /usr/local/bin/x", "   "));
+    }
+
+    #[test]
+    fn test_pidfile_watcher_is_down_decision() {
+        // Live + identity-matched → UP.
+        assert!(!pidfile_watcher_is_down(Some(4242), true, true));
+        // Missing pidfile → DOWN.
+        assert!(pidfile_watcher_is_down(None, false, false));
+        assert!(pidfile_watcher_is_down(None, true, true));
+        // Stale (dead) recorded PID → DOWN.
+        assert!(pidfile_watcher_is_down(Some(4242), false, false));
+        // Recycled (alive, cmdline mismatch) → DOWN.
+        assert!(pidfile_watcher_is_down(Some(4242), true, false));
+    }
+
+    #[test]
+    fn test_read_watcher_recorded_pid_prefers_lock_then_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        // No files → None.
+        assert_eq!(read_watcher_recorded_pid(d, "evw"), None);
+        // Only .pid present → falls back to it.
+        std::fs::write(dir.path().join("evw.pid"), "777").unwrap();
+        assert_eq!(read_watcher_recorded_pid(d, "evw"), Some(777));
+        // .lock present → preferred over .pid.
+        std::fs::write(dir.path().join("evw.lock"), "888").unwrap();
+        assert_eq!(read_watcher_recorded_pid(d, "evw"), Some(888));
+    }
+
+    #[test]
+    fn test_is_pid_alive_self_and_bogus() {
+        // The test process is, definitionally, alive.
+        assert!(is_pid_alive(std::process::id()));
+        // A very high PID is essentially guaranteed not to exist. (We do NOT
+        // assert on PID 0: `kill(0, ...)` targets the caller's process group
+        // and "succeeds", so it is not a meaningful liveness probe — callers
+        // that care special-case 0 themselves.)
+        assert!(!is_pid_alive(u32::MAX - 1));
     }
 }
