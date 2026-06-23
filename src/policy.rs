@@ -2,8 +2,6 @@
 //! heartbeat stale, foreground monitor, and watcher health.
 
 use chrono::{DateTime, Local, Timelike, Utc};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use std::os::unix::process::CommandExt;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
@@ -1439,11 +1437,10 @@ async fn check_foreground_inner(
     }
 }
 
-/// Check if a PID is still alive (signal 0 probe).
+/// Check if a PID is still alive (signal 0 probe). Delegates to the shared
+/// helper in `status` so the daemon and CLI share one implementation.
 fn is_pid_alive(pid: u32) -> bool {
-    kill(Pid::from_raw(pid as i32), Signal::SIGCONT)
-        .map(|_| true)
-        .unwrap_or(false)
+    crate::status::is_pid_alive(pid)
 }
 
 /// Check if a PID is genuinely alive — i.e. exists AND is not a zombie
@@ -1457,42 +1454,14 @@ fn is_pid_alive(pid: u32) -> bool {
 /// a non-Linux test host) so behaviour degrades to "exists?" rather than
 /// always-false.
 fn is_pid_genuinely_alive(pid: u32) -> bool {
-    let path = format!("/proc/{}/stat", pid);
-    match std::fs::read_to_string(&path) {
-        Ok(stat) => {
-            // /proc/PID/stat: `pid (comm) STATE ...`. comm can contain spaces
-            // and parens, so find the LAST ')' and take the next token.
-            if let Some(close) = stat.rfind(')') {
-                let rest = stat[close + 1..].trim_start();
-                let state = rest.split_whitespace().next().unwrap_or("");
-                // 'Z' = zombie/defunct, 'X'/'x' = dead. Anything else is a
-                // live, reapable-or-running process.
-                return state != "Z" && state != "X" && state != "x";
-            }
-            // Malformed stat — fall back to existence probe.
-            is_pid_alive(pid)
-        }
-        // No /proc entry (already reaped) or non-Linux host: fall back to the
-        // signal probe.
-        Err(_) => is_pid_alive(pid),
-    }
+    crate::status::is_pid_genuinely_alive(pid)
 }
 
 /// Read `/proc/<pid>/cmdline` (NUL-separated argv) into a space-joined string.
 /// Returns `None` if the process is gone, the file is unreadable, or the
 /// cmdline is empty (e.g. a kernel thread). Used for watcher identity checks.
 fn read_proc_cmdline(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/cmdline", pid);
-    let data = std::fs::read(&path).ok()?;
-    let s = String::from_utf8_lossy(&data)
-        .replace('\0', " ")
-        .trim()
-        .to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    crate::status::read_proc_cmdline(pid)
 }
 
 /// Read a watcher PID file and return the recorded PID, if the file exists
@@ -1508,9 +1477,7 @@ fn read_proc_cmdline(pid: u32) -> Option<String> {
 /// diagnostics / potential future use and remains unit-tested.
 #[allow(dead_code)]
 fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
-    let path = format!("{}/{}.pid", pid_dir, name);
-    let content = std::fs::read_to_string(&path).ok()?;
-    content.trim().parse::<u32>().ok()
+    crate::status::read_watcher_pid(pid_dir, name)
 }
 
 /// Decide whether a watcher should be considered DOWN, given:
@@ -1570,17 +1537,7 @@ pub fn watcher_is_down(
 ///   2. `$XDG_RUNTIME_DIR` (matches the watcher's lockfile default).
 ///   3. `/var/run/claude` (final fallback — the baked container path).
 pub(crate) fn watcher_pid_dir() -> String {
-    if let Ok(p) = std::env::var("CLAUDE_WATCH_PID_DIR") {
-        if !p.trim().is_empty() {
-            return p;
-        }
-    }
-    if let Ok(p) = std::env::var("XDG_RUNTIME_DIR") {
-        if !p.trim().is_empty() {
-            return p;
-        }
-    }
-    "/var/run/claude".to_string()
+    crate::status::watcher_pid_dir()
 }
 
 /// Read the PID the watcher recorded for itself, from the runtime dir.
@@ -1598,13 +1555,7 @@ pub(crate) fn watcher_pid_dir() -> String {
 /// and fall back to `<name>.pid`. Returns the first file that parses to a PID,
 /// or `None` if neither exists / parses.
 fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
-    let lock = format!("{}/{}.lock", pid_dir, name);
-    if let Ok(content) = std::fs::read_to_string(&lock) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            return Some(pid);
-        }
-    }
-    read_watcher_pid(pid_dir, name)
+    crate::status::read_watcher_recorded_pid(pid_dir, name)
 }
 
 /// Does the live process `pid`'s cmdline look like *this* watcher (identity
@@ -1623,22 +1574,7 @@ fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
 /// transform while still rejecting an obviously-unrelated recycled PID (whose
 /// cmdline won't contain the watcher's name stem).
 fn cmdline_matches_watcher(cmdline: &str, start_cmd: &str) -> bool {
-    let token = match start_cmd.split_whitespace().next() {
-        Some(t) if !t.is_empty() => t,
-        _ => return false,
-    };
-    let base = token.rsplit('/').next().unwrap_or(token);
-    // Strip a trailing script extension so a `.sh` launcher that exec's a bare
-    // binary of the same stem still matches.
-    let stem = base
-        .strip_suffix(".sh")
-        .or_else(|| base.strip_suffix(".bash"))
-        .or_else(|| base.strip_suffix(".py"))
-        .unwrap_or(base);
-    if stem.is_empty() {
-        return false;
-    }
-    cmdline.contains(token) || cmdline.contains(base) || cmdline.contains(stem)
+    crate::status::cmdline_matches_watcher(cmdline, start_cmd)
 }
 
 /// Pure decision: is the watcher DOWN, given what the daemon observed about its
@@ -1671,10 +1607,7 @@ pub fn pidfile_watcher_is_down(
     pid_alive: bool,
     cmdline_matches: bool,
 ) -> bool {
-    match recorded_pid {
-        Some(_) => !(pid_alive && cmdline_matches),
-        None => true,
-    }
+    crate::status::pidfile_watcher_is_down(recorded_pid, pid_alive, cmdline_matches)
 }
 
 /// Spawn `self-clear` immediately (no grace period). Used for the
@@ -3953,18 +3886,33 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     //     `hard_block_nudge` and DROP the cooldown — interrupt + re-inject on
     //     EVERY cycle until a clean turn is observed.
     if config.malformed_tool_call.enabled && !effective_pane.is_empty() {
-        let malformed = tmux::detect_malformed_tool_call(
+        let malformed_fingerprint = tmux::detect_malformed_tool_call(
             &effective_pane,
             &config.malformed_tool_call.override_marker,
         )
         .await;
 
-        if malformed {
+        if let Some(ref fingerprint) = malformed_fingerprint {
+            // Dedup: is THIS the same malformed block we last injected on? If
+            // so, the model may well have already recovered (emitted a clean
+            // call below it) and the block is merely lingering in pane
+            // scrollback — re-interrupting on it every cycle is the tight,
+            // self-perpetuating interruption loop that motivated this fix (the
+            // 2026-06-20 incident: the interrupter false-positiving on stale
+            // scrollback, cancelling well-formed turns mid-flight). A NEW
+            // fingerprint (different offending text) means a genuinely new
+            // malform and is acted on immediately.
+            let same_block_already_nudged = state
+                .last_malformed_fingerprint
+                .as_deref()
+                .is_some_and(|prev| prev == fingerprint.as_str());
+
             state.malformed_tool_call_consecutive += 1;
             debug!(
                 consecutive = state.malformed_tool_call_consecutive,
                 threshold = config.malformed_tool_call.consecutive,
                 episode_nudges = state.malformed_tool_call_episode_nudges,
+                same_block_already_nudged,
                 "malformed tool-call signature detected"
             );
 
@@ -3986,6 +3934,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 if api_retrying {
                     debug!(
                         "malformed tool-call detected but api_retry active — suppressing inject"
+                    );
+                } else if same_block_already_nudged {
+                    // SAME offending block as the last inject. We have already
+                    // corrected it once; re-firing now would interrupt whatever
+                    // turn is currently in flight (very often a well-formed
+                    // recovery call) purely because the old malformed text is
+                    // still scrolled into the captured tail. Suppress. A truly
+                    // persistent malform changes nothing on screen, so the
+                    // model can only clear the episode by emitting a clean turn
+                    // — which produces a clean cycle below and resets state.
+                    debug!(
+                        fingerprint = fingerprint.as_str(),
+                        "malformed tool-call block unchanged since last inject — \
+                         suppressing re-inject (stale scrollback / already corrected)"
                     );
                 } else if in_cooldown {
                     debug!("malformed tool-call detected but phase-1 nudge cooldown active");
@@ -4022,6 +3984,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     tmux::interrupt_and_wait(&effective_pane, 5).await;
                     inject_dispatch::inject_to_agent(&effective_pane, text).await;
 
+                    // Record the offending block we just injected on so the
+                    // SAME block lingering in scrollback next cycle does not
+                    // re-fire (see `same_block_already_nudged` above).
+                    state.last_malformed_fingerprint = Some(fingerprint.clone());
                     state.last_malformed_nudge = Some(now.clone());
                     state.malformed_tool_call_nudge_count =
                         state.malformed_tool_call_nudge_count.saturating_add(1);
@@ -4047,6 +4013,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         } else if state.malformed_tool_call_consecutive > 0
             || state.malformed_tool_call_episode_nudges > 0
+            || state.last_malformed_fingerprint.is_some()
         {
             debug!(
                 prev_consecutive = state.malformed_tool_call_consecutive,
@@ -4057,6 +4024,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // Clean cycle ends the episode: reset escalation so a future malform
             // starts fresh at phase 1.
             state.malformed_tool_call_episode_nudges = 0;
+            // Clear the dedup fingerprint: the offending block has scrolled out
+            // of the tail (genuinely recovered), so an IDENTICAL malform later
+            // is a fresh failure that should fire again.
+            state.last_malformed_fingerprint = None;
         }
     }
 

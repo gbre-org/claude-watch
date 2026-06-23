@@ -192,6 +192,133 @@ def test_block_refused_on_done():
         assert r.returncode != 0
 
 
+# -------------------- set-block-reason (in-place reason edit) --------------------
+
+
+def test_set_block_reason_updates_in_place():
+    """`set-block-reason` on a blocked item refreshes block_reason in place,
+    preserves blocked_at + status, and stamps block_reason_updated_at."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        added = _add(env, "evolving block", ["repo:setbr-update"],
+                     "--summary", "sbr")
+        qid = added["id"]
+        _register(env, qid)
+        _run(env, "queue", "block", qid, "--reason", "awaiting build #140",
+             "--silent", expect_exit=0)
+        before = _show(env, qid)
+        orig_blocked_at = before["blocked_at"]
+        assert orig_blocked_at
+
+        r = _run(env, "queue", "set-block-reason", qid,
+                 "--reason", "build #140 landed; awaiting #141 verdict",
+                 "--json", expect_exit=0)
+        out = json.loads(r.stdout)
+        assert out["status"] == "blocked"
+        assert out["block_reason"] == "build #140 landed; awaiting #141 verdict"
+        # blocked_at preserved (audit history intact).
+        assert out["blocked_at"] == orig_blocked_at
+        assert out["block_reason_updated_at"]
+
+        shown = _show(env, qid)
+        assert shown["status"] == "blocked"
+        assert shown["block_reason"] == "build #140 landed; awaiting #141 verdict"
+        assert shown["blocked_at"] == orig_blocked_at
+        assert shown["block_reason_updated_at"]
+
+
+def test_set_block_reason_requires_nonempty_reason():
+    """`set-block-reason --reason ''` (empty/whitespace) is refused."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        added = _add(env, "empty", ["repo:setbr-empty"], "--summary", "x")
+        qid = added["id"]
+        _register(env, qid)
+        _run(env, "queue", "block", qid, "--reason", "first", "--silent",
+             expect_exit=0)
+        r = _run(env, "queue", "set-block-reason", qid, "--reason", "   ")
+        assert r.returncode != 0
+        assert "reason is required" in r.stderr.lower()
+        # Original reason untouched.
+        shown = _show(env, qid)
+        assert shown["block_reason"] == "first"
+
+
+def test_set_block_reason_refused_on_running():
+    """A running (non-blocked) item refuses set-block-reason -- use `block`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        added = _add(env, "running", ["repo:setbr-running"], "--summary", "x")
+        qid = added["id"]
+        _register(env, qid)
+        r = _run(env, "queue", "set-block-reason", qid, "--reason", "x")
+        assert r.returncode != 0
+        assert "must be blocked" in r.stderr.lower()
+        shown = _show(env, qid)
+        assert shown["status"] == "running"
+        assert "block_reason" not in shown or not shown.get("block_reason")
+
+
+def test_set_block_reason_refused_on_pending():
+    """A pending (unregistered) item refuses set-block-reason."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        added = _add(env, "pending", ["repo:setbr-pending"], "--summary", "x")
+        qid = added["id"]
+        r = _run(env, "queue", "set-block-reason", qid, "--reason", "x")
+        assert r.returncode != 0
+        assert "must be blocked" in r.stderr.lower()
+
+
+def test_set_block_reason_refused_on_done():
+    """A done (terminal) item refuses set-block-reason."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        added = _add(env, "done", ["repo:setbr-done"], "--summary", "x")
+        qid = added["id"]
+        _register(env, qid)
+        _run(env, "queue", "done", qid, "--silent", expect_exit=0)
+        r = _run(env, "queue", "set-block-reason", qid, "--reason", "x")
+        assert r.returncode != 0
+        assert "must be blocked" in r.stderr.lower()
+
+
+def test_set_block_reason_refused_on_abandoned():
+    """An abandoned (terminal) item refuses set-block-reason."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        added = _add(env, "abandon", ["repo:setbr-abandon"], "--summary", "x")
+        qid = added["id"]
+        _register(env, qid)
+        _run(env, "queue", "abandon", qid, "--reason", "nope", "--silent",
+             expect_exit=0)
+        r = _run(env, "queue", "set-block-reason", qid, "--reason", "x")
+        assert r.returncode != 0
+        assert "must be blocked" in r.stderr.lower()
+
+
+def test_block_on_running_still_transitions_regression():
+    """REGRESSION GUARD: `block --reason` on a RUNNING item still works
+    (running -> blocked) -- the new set-block-reason subcommand did not
+    alter the block state machine."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        added = _add(env, "still blocks", ["repo:setbr-regress"],
+                     "--summary", "x")
+        qid = added["id"]
+        _register(env, qid)
+        r = _run(env, "queue", "block", qid, "--reason", "ext blocker",
+                 "--silent", "--json", expect_exit=0)
+        out = json.loads(r.stdout)
+        assert out["status"] == "blocked"
+        assert out["block_reason"] == "ext blocker"
+        assert out["blocked_at"]
+        # And block is still refused on an already-blocked item (unchanged).
+        r2 = _run(env, "queue", "block", qid, "--reason", "second", "--silent")
+        assert r2.returncode != 0
+        assert "must be running" in r2.stderr.lower()
+
+
 # -------------------- unblock --------------------
 
 

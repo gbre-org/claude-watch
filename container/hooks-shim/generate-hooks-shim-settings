@@ -412,6 +412,79 @@ def sanitize_api_key_helper(settings: dict) -> tuple[dict, str | None]:
     return out, helper
 
 
+def neutralize_poison_project_helper(
+    settings: dict, project_settings_path: str | None
+) -> tuple[dict, str | None]:
+    """Neutralize a cross-arch / missing `apiKeyHelper` that the PROJECT
+    tier (``<cwd>/.claude/settings.json``) would otherwise contribute.
+
+    WHY THIS IS A SEPARATE PATH FROM sanitize_api_key_helper()
+
+    sanitize_api_key_helper() drops `apiKeyHelper` from the bind-mounted
+    USER-tier settings (the input to this shim). But when an operator
+    bind-mounts host ``~/.claude`` at the in-container project-cwd path
+    (so the cwd's ``.claude`` absolute symlink resolves and project-tier
+    slash commands load), that same host settings.json ALSO becomes
+    Claude Code's PROJECT-tier settings file. The project tier is read
+    RAW from ``<cwd>/.claude/settings.json`` and bypasses this shim's
+    sanitizer entirely, so a poison `apiKeyHelper` there still 127s on
+    every inference (a Mac Mach-O helper can't exec under Linux).
+
+    We cannot mutate the project file (it's the operator's host file, or
+    a symlink to it) and the project tier cannot be redirected with a
+    flag. BUT this shim is loaded via ``--settings`` = the **flagSettings**
+    tier, which sits ABOVE projectSettings in Claude Code's merge order
+    (``[userSettings, projectSettings, localSettings, flagSettings,
+    policySettings]``). Claude Code resolves the effective helper as
+    ``flagSettings.apiKeyHelper`` when flagSettings defines the key (else
+    the merged value, where flagSettings still wins over projectSettings),
+    and treats an empty / whitespace value as "no helper -> fall back to
+    env auth" (it never exec()s a falsy command). So writing
+    ``apiKeyHelper: ""`` into THIS shim overrides the project tier's
+    poison helper without touching the host file and without ever
+    exec()ing anything.
+
+    Strictly gated: we only inject the empty override when the project
+    settings file actually carries an `apiKeyHelper` whose target is NOT
+    runnable here (reusing target_runnable_here). Operators without the
+    leak see ZERO behaviour change — no key is added.
+
+    Returns (new_settings, neutralized_command_or_None). The input is not
+    mutated. When there is no poison project helper (file missing /
+    unparseable / no apiKeyHelper / a runnable helper), the settings are
+    returned unchanged and the second element is None.
+    """
+    if not project_settings_path:
+        return settings, None
+    path = Path(project_settings_path)
+    if not path.exists():
+        return settings, None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            project = json.load(f)
+    except Exception:
+        # Fail-safe: an unparseable project file is not our problem to
+        # validate; leave the shim unchanged.
+        return settings, None
+    if not isinstance(project, dict):
+        return settings, None
+    helper = project.get("apiKeyHelper")
+    if not isinstance(helper, str) or not helper.strip():
+        return settings, None
+    target = command_first_token(helper).strip("'\"")
+    if target_runnable_here(target):
+        # A genuinely runnable project helper (e.g. a Linux host's ELF /
+        # shebang helper, or a bare PATH command) is left alone.
+        return settings, None
+    out = dict(settings)
+    # Empty string in the flagSettings tier => Claude Code treats it as
+    # "no helper" and falls back to env-based auth (ANTHROPIC_API_KEY,
+    # Bedrock/Vertex, OAuth). It overrides the poison project helper via
+    # flagSettings > projectSettings precedence.
+    out["apiKeyHelper"] = ""
+    return out, helper
+
+
 def wrap_command(cmd: str, patterns: list[str] | None = None) -> str:
     """Prefix `cmd` with `exec-hook ` unless already wrapped or filtered
     out by the operator's pattern list.
@@ -551,6 +624,21 @@ def main(argv: list[str]) -> int:
              "Falls back to CLAUDE_SHIM_OBLIGATIONS_ONLY env var.",
     )
     p.add_argument(
+        "--neutralize-project-apikeyhelper",
+        default=os.environ.get("CLAUDE_PROJECT_SETTINGS_PATH", ""),
+        help="Path to the PROJECT-tier settings.json "
+             "(<cwd>/.claude/settings.json). When set AND that file's "
+             "`apiKeyHelper` target is NOT runnable in this container "
+             "(missing / Mach-O / unknown format), write an empty-string "
+             "`apiKeyHelper` into THIS shim (the flagSettings tier, which "
+             "outranks projectSettings) so the poison project helper is "
+             "neutralized and Claude Code falls back to env-based auth. "
+             "Strictly gated: a runnable / absent project helper is left "
+             "untouched (no key added). Empty / unset = no project-tier "
+             "neutralization (default). Falls back to "
+             "CLAUDE_PROJECT_SETTINGS_PATH env var.",
+    )
+    p.add_argument(
         "--mcp-autoapprove",
         default=os.environ.get("CLAUDE_MCP_AUTOAPPROVE", "1"),
         help="When '1' (the default), write "
@@ -626,6 +714,24 @@ def main(argv: list[str]) -> int:
                 "generate-hooks-shim-settings: dropped apiKeyHelper "
                 f"(target not runnable in this container): {dropped_helper!r} "
                 "-- falling back to env-based auth",
+                file=sys.stderr,
+            )
+        # Neutralize a poison PROJECT-tier apiKeyHelper too. When an
+        # operator bind-mounts host ~/.claude at the project-cwd path, the
+        # same settings.json becomes Claude Code's PROJECT tier (read raw,
+        # bypassing the sanitize above). Writing apiKeyHelper:"" into this
+        # shim (flagSettings) overrides it via tier precedence without
+        # touching the host file. Strictly gated on a detected poison
+        # (non-runnable) project helper -- no-op otherwise.
+        rewritten, neutralized = neutralize_poison_project_helper(
+            rewritten, args.neutralize_project_apikeyhelper
+        )
+        if neutralized and not args.quiet:
+            print(
+                "generate-hooks-shim-settings: neutralized PROJECT-tier "
+                f"apiKeyHelper (target not runnable in this container): "
+                f"{neutralized!r} -- shim sets apiKeyHelper=\"\" (flagSettings "
+                "outranks projectSettings); falling back to env-based auth",
                 file=sys.stderr,
             )
     if inject_obligations:

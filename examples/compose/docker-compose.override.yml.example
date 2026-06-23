@@ -1,9 +1,27 @@
 # docker-compose.override.yml.example — operator-specific bind-mount template
 #
-# Copy this file to `docker-compose.override.yml` (sibling, gitignored) and
-# uncomment the mounts that apply to your host. Docker Compose
-# automatically merges any `docker-compose.override.yml` into the main
-# `docker-compose.yml` at `up` time — no extra `-f` flag needed.
+# Copy this file to the STABLE CONFIG DIR (NOT the repo):
+#
+#   mkdir -p ~/.config/claude-container
+#   cp docker-compose.override.yml.example \
+#      ~/.config/claude-container/docker-compose.override.yml
+#
+# then uncomment the mounts that apply to your host. The deploy paths
+# (`make redeploy` and `cw --up`) point COMPOSE_FILE at
+# `~/.config/claude-container/docker-compose.override.yml`, so the merge
+# is LOCATION-INDEPENDENT — the override is picked up no matter which
+# clone or worktree the deploy runs from.
+#
+# WHY NOT a sibling `examples/compose/docker-compose.override.yml`?
+# Docker only AUTO-merges a sibling file literally named
+# `docker-compose.override.yml`, and that file is gitignored — so it
+# never exists in a git worktree. The workflow runs builds/deploys from
+# the build worktree `~/repos/.worktrees/<repo>/main`, where a sibling
+# override is absent, so the container recreated with NONE of these
+# mounts (the recurring "clipboard / gh / ssh mount missing after
+# recreate" bug). Putting the override in the config dir + wiring
+# COMPOSE_FILE fixes that for good. (A legacy sibling override, if you
+# still have one, is harmless — docker auto-merges it on top.)
 #
 # Why an override file (and not the main compose):
 #
@@ -25,8 +43,8 @@
 #
 # After editing this file (or running the skill), apply changes with:
 #
-#   cd examples/compose
-#   docker compose up -d --force-recreate claude-container
+#   make redeploy            # from the claude-watch repo root, OR
+#   cw --up                  # which also wire COMPOSE_FILE for you
 #
 # `--force-recreate` is required because docker doesn't pick up
 # bind-mount changes on a plain `up -d`; it has to recreate the
@@ -50,6 +68,11 @@ services:
     #   # what the host source is).
     #   SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
     volumes:
+      # NOTE: the ~/.config/claude-container DIRECTORY bind-mount (durable
+      # persistent-state dir + home of this override file) now lives in the
+      # BASE docker-compose.yml, so it is ALWAYS present even on a base-only
+      # deploy. Do NOT re-add it here (a duplicate is harmless — docker
+      # concatenates volume lists — but the template should not carry it).
       # gh CLI token storage. RW so an in-container `gh auth login`
       # (token refresh, scope upgrade) propagates back to the host.
       # - "${HOME}/.config/gh:/home/hndrewaall/.config/gh:rw"
@@ -117,3 +140,37 @@ services:
       # Mac has already written.
       # ----------------------------------------------------------------
       # - "${HOME}/.cache/claude-clipboard-bridge:/host-clipboard:ro"
+
+      # ----------------------------------------------------------------
+      # LEGACY STOPGAP (no longer needed on current images) — shadow a
+      # poison project-tier apiKeyHelper.
+      #
+      # When you ALSO bind-mount host ~/.claude at the in-container
+      # project-cwd path (so the cwd's `.claude` absolute symlink
+      # resolves and project-tier slash commands load) AND run the inner
+      # claude with `--setting-sources project,local` (the
+      # CLAUDE_CONTAINER_REWRITE_HOOKS=1 path), that same host
+      # settings.json becomes Claude Code's PROJECT-tier settings file.
+      # If it has an `apiKeyHelper` pointing at a host-only macOS binary
+      # (e.g. "/Applications/<corp-tool>.app/.../helper auth claude"),
+      # that helper can't exec under Linux and — because apiKeyHelper
+      # takes precedence over ANTHROPIC_API_KEY — Claude gets no usable
+      # key and throws API errors on every inference.
+      #
+      # The OLD per-operator workaround was to shadow that one file with
+      # an empty read-only /dev/null mount (the project tier then reads
+      # an empty settings.json; the .claude symlink + project slash
+      # commands still load, since command discovery is independent of
+      # settings.json content):
+      #
+      # - "/dev/null:${CLAUDE_HOST_PROJECT_DIR}/.claude/settings.json:ro"
+      #
+      # This is NO LONGER REQUIRED on current images: the entrypoint now
+      # detects a non-runnable (Mach-O / missing) project-tier
+      # apiKeyHelper and neutralizes it durably by writing an
+      # empty-string apiKeyHelper into the container-local shim settings
+      # (the flagSettings tier, which outranks projectSettings), so
+      # Claude falls back to env-based auth (ANTHROPIC_API_KEY). Keep the
+      # mount above ONLY if you are pinned to an OLDER image that predates
+      # that fix; on a current image it is a harmless no-op.
+      # ----------------------------------------------------------------

@@ -50,6 +50,10 @@ Usage:
                                                        # blocked-pending to running
     session-task queue promote <id>
     session-task queue set-summary <id> "text"   # edit one-line summary
+    session-task queue set-block-reason <id> --reason TEXT  # update the
+                                                 # block_reason on an already-
+                                                 # blocked item, in place
+                                                 # (preserves blocked_at)
     session-task queue depend <id> [--add q-AAA[,q-BBB]] [--remove q-CCC]
                                    [--clear] [--json]
     session-task queue prune [--older-than DURATION] [-n/--dry-run]
@@ -1037,7 +1041,12 @@ def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
 
 
 def _sort_key(item):
-    # Priority descending (higher priority = earlier), FIFO tiebreak.
+    # Spawn/readiness ordering within a group is PRIORITY-FIRST: higher
+    # priority number sorts earlier (so it becomes the group head and goes
+    # ready first), with created_at (insertion order) only as the FIFO
+    # tiebreak among equal priorities. This is what lets a higher-priority
+    # item added LATER overtake an earlier lower-priority same-scope peer
+    # without abandon+re-add (see `queue reprioritize` / `queue promote`).
     return (-int(item.get("priority", 5)), item.get("created_at", ""))
 
 
@@ -5078,6 +5087,103 @@ def cmd_queue_set_summary(args):
     print(f"  new: {new_summary}")
 
 
+def cmd_queue_set_block_reason(args):
+    """Update the block_reason on an ALREADY-blocked item, in place.
+
+    Motivation: `queue block <id> --reason ...` only transitions a
+    *running* item to blocked and REFUSES an already-blocked item (the
+    state machine allows only running -> blocked). So once an item is
+    blocked, the block_reason was frozen -- when the real-world situation
+    evolved (e.g. "awaiting build #140" after #140 already landed and
+    produced its verdict), the only way to refresh the reason was
+    abandon + re-add, which destroys the item's identity + audit trail.
+
+    This subcommand mirrors `set-summary`: a pure in-place metadata edit
+    that refreshes `block_reason` WITHOUT changing status and WITHOUT
+    touching `blocked_at` (the original block timestamp is preserved as
+    audit). It records `block_reason_updated_at` so the refresh itself is
+    auditable, and keeps the prior reason available in the plain-text /
+    --json output.
+
+    Behavior:
+      * Item must exist and be in status=blocked. Any other status
+        (running, pending, wedged, done, abandoned) REFUSES (exit 1).
+        Use `queue block <id> --reason ...` to take a *running* item to
+        blocked; this command only EDITS the reason of an item that is
+        already blocked.
+      * `--reason TEXT` is REQUIRED and must be non-empty (an empty
+        reason defeats the operator-attention purpose, same as `block`).
+      * Preserves `blocked_at`. Does NOT flip status, does NOT touch
+        heartbeat/pid. Idempotent in the sense that re-setting the same
+        text just refreshes `block_reason_updated_at`.
+      * Pure metadata edit: no pingme, no claude-event by default
+        (matches `set-summary`). The refreshed reason WILL appear in the
+        next unblock/done/abandon notification for this item.
+    """
+    new_reason = (args.reason or "").strip()
+    if not new_reason:
+        print(
+            "ERROR: --reason is required for set-block-reason "
+            "(an empty reason defeats the operator-attention purpose).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        status = target.get("status")
+        if status != "blocked":
+            print(
+                f"set-block-reason refused: {args.id} status={status!r} "
+                f"(must be blocked -- use `queue block <id> --reason ...` to "
+                f"block a running item first)",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        old_reason = target.get("block_reason") or "(unspecified)"
+        target["block_reason"] = new_reason
+        target["block_reason_updated_at"] = _fmt_ts()
+        # Intentionally DO NOT touch blocked_at or status -- this is a pure
+        # in-place reason edit; the original block timestamp is the audit.
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']} BLOCK-REASON-UPDATED] "
+        f"{target.get('description','')} (reason: {new_reason})",
+        extra={
+            "source": "queue",
+            "event": "set-block-reason",
+            "id": target["id"],
+            "group_id": target.get("group_id"),
+            "old_reason": old_reason,
+            "reason": new_reason,
+        },
+    )
+
+    if getattr(args, "json", False):
+        print(json.dumps(updated, indent=2))
+    else:
+        print(f"block_reason updated: {args.id}")
+        print(f"  old: {old_reason}")
+        print(f"  new: {new_reason}")
+        print(f"  blocked_at (preserved): {target.get('blocked_at')}")
+
+
 def cmd_queue_depend(args):
     """Edit explicit interjob dependencies on an existing queue item.
 
@@ -5116,17 +5222,32 @@ def cmd_queue_depend(args):
         terminal; re-gating it is meaningless and editing its dep set
         only corrupts the audit trail.
 
-      * running / wedged / blocked items: ADDS are refused by default
-        (exit 1) and require --force. Rationale: a running item is
-        already past the ready_now gate — an agent is actively working
-        it. Silently bolting on a new unmet dep does NOT pause that
-        agent (status stays running; ready_now is only consulted at
-        spawn time for PENDING items), so the edge would be a lie:
-        "depends on X" while the work it gates already ran. Refusing by
-        default surfaces the mistake. --force lets an operator who
-        really means it (e.g. correcting a mis-modeled graph mid-flight)
-        record the edge anyway. REMOVES / --clear on these states are
-        always allowed (loosening a gate is always safe).
+      * running / wedged items: ADDS are refused by default (exit 1)
+        and require --force. Rationale: a running item is already past
+        the ready_now gate — an agent is actively working it. Refusing
+        by default surfaces the likely mistake. --force lets an operator
+        who really means it (e.g. correcting a mis-modeled graph
+        mid-flight) record the edge anyway.
+
+        DEMOTION (2026-06-22): when a --force add (or a remove that
+        leaves an unmet dep) DOES re-gate a running/wedged item — i.e.
+        the post-edit dep set has an unmet dep — the item is no longer
+        logically running: its work is gated on a dep that isn't done.
+        It is therefore DEMOTED to `blocked` (mirroring `queue block`),
+        with an auto `block_reason` naming the unmet dep(s). This avoids
+        the old "lying" RUNNING+ORPHAN state: previously the status
+        stayed `running` while ready_now went false and the agent
+        binding went stale, so the exporter's WorkQueueOrphaned alert
+        (status="running" + no-live-owner) fired on it. `blocked` is
+        the honest state — exempt from the orphan alert, no live owner
+        expected — and `queue unblock <id>` resumes it once the dep
+        clears. (A force-add that does NOT introduce an unmet dep — e.g.
+        the dep is already `done` — leaves the item running, as before.)
+
+        blocked items: ADDS still require --force; a force-add that
+        leaves an unmet dep keeps the item blocked (already the honest
+        state). REMOVES / --clear on any of these states are always
+        allowed (loosening a gate is always safe).
 
       * pending items: any edit is allowed (adds re-gate ready_now as
         intended; this is the normal case the verbs exist for).
@@ -5275,6 +5396,38 @@ def cmd_queue_depend(args):
         target["scope"] = non_task_scope + [f"task:{d}" for d in after_deps]
         target.pop("depends_on", None)
         target["depends_on_updated_at"] = _fmt_ts()
+
+        # Demote a re-gated live item (2026-06-22). A running / wedged item
+        # that GAINS an unmet dependency (via --force --add, or a remove
+        # that left an unmet dep behind) is no longer logically running:
+        # its work is gated on a dep that isn't done. Leaving it `running`
+        # produces a "lying" RUNNING+ORPHAN state in the exporter — ready_now
+        # is false but status stays running with a now-stale/dead agent
+        # binding, so the WorkQueueOrphaned alert (which filters
+        # status="running" + no-live-owner) fires on it. A running item with
+        # an unmet dep IS logically blocked, so flip it to `blocked` here —
+        # mirroring `queue block`, which the exporter labels separately and
+        # exempts from the orphan alert. The agent binding goes stale
+        # naturally; `blocked` expects no live owner by design.
+        by_id_lock = {x.get("id"): x for x in items if x.get("id")}
+        unmet_after = [
+            d for d in after_deps
+            if (by_id_lock.get(d) is None)
+            or (by_id_lock[d].get("status") != "done")
+        ]
+        demoted = False
+        if status in RUNNING_STATUSES and unmet_after:
+            target["status"] = "blocked"
+            target["blocked_at"] = _fmt_ts()
+            target["block_reason"] = (
+                "auto-blocked: gained unmet dependency via `queue depend` "
+                f"(unmet: {','.join(unmet_after)})"
+            )
+            demoted = True
+            # group_head bookkeeping mirrors cmd_queue_block: a blocked item
+            # is still the in-flight head of its group.
+            _recompute_group_heads(items)
+
         _queue_write_and_unlock(fh, data)
     except Exception:
         try:
@@ -5305,6 +5458,16 @@ def cmd_queue_depend(args):
         d for d in fresh_deps
         if (by_id2.get(d) is None) or (by_id2[d].get("status") != "done")
     ]
+    # Surface a demotion (running/wedged -> blocked) when a re-gating add
+    # parked the live item on a now-unmet dep. Read the persisted status
+    # for the authoritative post-edit value, but gate `was_demoted` on the
+    # PRE-edit status being a live (running/wedged) state — an item that was
+    # ALREADY blocked and stayed blocked was not demoted by this edit.
+    fresh_status = fresh.get("status") if fresh else None
+    was_demoted = (
+        status in RUNNING_STATUSES
+        and fresh_status == "blocked"
+    )
 
     if getattr(args, "json", False):
         print(json.dumps(
@@ -5320,6 +5483,8 @@ def cmd_queue_depend(args):
                 # use; alias it so consumers reading either name work.
                 "dep_blockers": unmet,
                 "dep_cycle": cycle,
+                "status": fresh_status,
+                "demoted_to_blocked": was_demoted,
             },
             indent=2,
         ))
@@ -5329,6 +5494,13 @@ def cmd_queue_depend(args):
         print(f"  after  : {fresh_deps}")
         print(f"  unmet  : {unmet}")
         print(f"  ready_now: {'true' if ready else 'false'}")
+        if was_demoted:
+            print(
+                f"  demoted: running -> blocked (gained unmet dependency; "
+                f"releasing the stale agent binding so the exporter renders "
+                f"it BLOCKED, not RUNNING+ORPHAN). `queue unblock {args.id}` "
+                f"once the dep clears."
+            )
         if cycle:
             # Should be unreachable for edits this verb makes (cycle
             # creation is now refused at write time), but a PRE-EXISTING
@@ -5361,8 +5533,10 @@ def cmd_queue_promote(args):
         max_p = max((int(m.get("priority", 5)) for m in members), default=5)
         target["priority"] = max(max_p + 1, int(target.get("priority", 5)) + 1)
         target["promoted_at"] = _fmt_ts()
-        # Rewrite created_at to "now" so FIFO places this FIRST among equal priorities.
-        # Actually safer: leave created_at alone and trust the priority bump.
+        # Leave created_at alone -- the priority bump alone reorders the group
+        # head (spawn ordering is priority-first via _group_head/_sort_key,
+        # with created_at only the tiebreak). Rewriting created_at would
+        # destroy the audit trail for no ordering benefit.
         _recompute_group_heads(items)
         _queue_write_and_unlock(fh, data)
     except Exception:
@@ -5370,6 +5544,80 @@ def cmd_queue_promote(args):
         fh.close()
         raise
     print(f"promoted: {args.id} (priority={target['priority']})")
+
+
+def cmd_queue_reprioritize(args):
+    """Set a pending item's priority to an EXPLICIT value, in place.
+
+    Motivation: previously the only way to reorder a same-scope (same-group)
+    contender was `abandon` + re-`add` (which destroys the item's identity +
+    audit trail) or `promote` (which only bumps to group head). This gives the
+    operator a direct, identity-preserving knob: `queue reprioritize <id>
+    --priority N`.
+
+    Because spawn-readiness ordering within a group is priority-first
+    (`_group_head` -> `_sort_key`: higher priority number wins, created_at is
+    the tiebreak), raising an item's priority above its group's current head
+    makes it the next ready-to-spawn item WITHOUT abandon+re-add. Lowering it
+    de-prioritizes it behind same-group peers.
+
+    Behavior:
+      * Item must exist and be in status=pending. Reprioritizing a
+        running/wedged/blocked/done/abandoned item is REFUSED (exit 1) -- the
+        spawn ordering only consults priority for *pending* heads, so a
+        priority edit on an in-flight item would be silently inert.
+      * `--priority N` is REQUIRED (any int; higher = earlier; 5 is the
+        system default). Recomputes group heads so `ready_now` reflects the
+        new ordering immediately.
+      * Pure metadata edit: no pingme, no claude-event (matches set-summary /
+        promote). Records `priority_updated_at` for audit; keeps the prior
+        priority in the output.
+    """
+    new_priority = int(args.priority)
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        if target.get("status") != "pending":
+            print(
+                "can only reprioritize pending items "
+                f"(status={target.get('status')}); priority only affects "
+                "spawn ordering among pending same-group peers.",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        old_priority = int(target.get("priority", 5))
+        target["priority"] = new_priority
+        target["priority_updated_at"] = _fmt_ts()
+        _recompute_group_heads(items)
+        # Recompute ready_now under the new ordering so callers can decide
+        # whether the bump made this item spawnable.
+        locked_scopes = data.get("locked_scopes") or {}
+        ready_now = _item_is_ready(items, target, locked_scopes=locked_scopes)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "id": args.id,
+            "old_priority": old_priority,
+            "priority": new_priority,
+            "ready_now": ready_now,
+        }, indent=2))
+    else:
+        print(f"reprioritized: {args.id}")
+        print(f"  old priority: {old_priority}")
+        print(f"  new priority: {new_priority}")
+        print(f"  ready_now: {'true' if ready_now else 'false'}")
 
 
 _DURATION_RE = re.compile(r"^(\d+)([dhm])$")
@@ -6206,8 +6454,35 @@ def build_parser():
         help="Suppress the pingme lifecycle notification for this operation.",
     )
 
-    q_promote = qsub.add_parser("promote", help="Bump item priority to group head")
+    q_promote = qsub.add_parser(
+        "promote",
+        aliases=["bump"],
+        help=(
+            "Convenience: raise a pending item's priority just above its "
+            "group's current head so it becomes the next ready-to-spawn item "
+            "(without abandon+re-add). For an explicit target priority use "
+            "`queue reprioritize <id> --priority N`."
+        ),
+    )
     q_promote.add_argument("id")
+
+    q_reprioritize = qsub.add_parser(
+        "reprioritize",
+        help=(
+            "Set a PENDING item's priority to an explicit value, in place "
+            "(no abandon+re-add). Higher priority number = earlier in spawn "
+            "ordering among same-group peers (created_at is the tiebreak); 5 "
+            "is the default. Raising it above the group head makes it ready "
+            "first; lowering it de-prioritizes it. Refused on non-pending "
+            "items (priority only affects pending spawn ordering)."
+        ),
+    )
+    q_reprioritize.add_argument("id")
+    q_reprioritize.add_argument(
+        "--priority", type=int, required=True,
+        help="New priority (int; higher = earlier; default elsewhere is 5).",
+    )
+    q_reprioritize.add_argument("--json", action="store_true")
 
     q_setsum = qsub.add_parser(
         "set-summary",
@@ -6216,6 +6491,28 @@ def build_parser():
     )
     q_setsum.add_argument("id")
     q_setsum.add_argument("summary", help="New summary text (~10 words)")
+
+    q_setbr = qsub.add_parser(
+        "set-block-reason",
+        help=(
+            "Update the block_reason on an ALREADY-blocked item, in place. "
+            "Item must be status=blocked; preserves blocked_at (and status). "
+            "Use this to refresh a stale block reason as the situation "
+            "evolves without abandon+re-add (which loses item identity). To "
+            "block a running item use `queue block <id> --reason ...`."
+        ),
+    )
+    q_setbr.add_argument("id")
+    q_setbr.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "New block_reason text. REQUIRED and non-empty. Replaces the "
+            "existing block_reason on the item; records "
+            "`block_reason_updated_at`; preserves the original `blocked_at`."
+        ),
+    )
+    q_setbr.add_argument("--json", action="store_true")
 
     q_updscope = qsub.add_parser(
         "update-scope",
@@ -6390,7 +6687,10 @@ def main():
             "spawn-check": cmd_queue_spawn_check,
             "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,
+            "bump": cmd_queue_promote,
+            "reprioritize": cmd_queue_reprioritize,
             "set-summary": cmd_queue_set_summary,
+            "set-block-reason": cmd_queue_set_block_reason,
             "update-scope": cmd_queue_update_scope,
             "depend": cmd_queue_depend,
             "prune": cmd_queue_prune,

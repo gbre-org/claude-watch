@@ -1053,6 +1053,240 @@ def test_apikeyhelper_kept_when_bare_command() -> None:
                f"apikeyhelper: bare command should be kept, got {result.get('apiKeyHelper')!r}")
 
 
+# ---------------------------------------------------------------------------
+# Project-tier apiKeyHelper neutralization (--neutralize-project-apikeyhelper)
+# ---------------------------------------------------------------------------
+#
+# When an operator bind-mounts host ~/.claude at the project-cwd path, the
+# host settings.json ALSO becomes Claude Code's PROJECT tier. A poison
+# (non-runnable) project `apiKeyHelper` bypasses the user-tier sanitize
+# above and 127s on every inference. The generator neutralizes it by
+# writing apiKeyHelper:"" into the shim (flagSettings tier, which outranks
+# projectSettings). Strictly gated on a detected NON-runnable project
+# helper -- runnable / absent helpers leave the shim unchanged.
+
+
+def _run_helper_project(
+    input_path: str,
+    output_path: str,
+    project_settings_path: str,
+) -> tuple[str, str]:
+    cmd = [
+        str(SCRIPT), "--input", input_path, "--output", output_path,
+        "--quiet", "--inject-obligations", "0", "--mcp-autoapprove", "0",
+        "--neutralize-project-apikeyhelper", project_settings_path,
+    ]
+    env = dict(os.environ)
+    env.pop("CLAUDE_SHIM_PATTERNS", None)
+    env.pop("CLAUDE_CONTAINER_OBLIGATIONS", None)
+    env.pop("CLAUDE_SHIM_OBLIGATIONS_ONLY", None)
+    env.pop("CLAUDE_MCP_AUTOAPPROVE", None)
+    env.pop("CLAUDE_PROJECT_SETTINGS_PATH", None)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"helper exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout, result.stderr
+
+
+def test_project_apikeyhelper_neutralized_when_macho() -> None:
+    """A present-but-Mach-O apiKeyHelper in the PROJECT settings file is
+    neutralized: the shim sets apiKeyHelper="" (overrides the project tier
+    via flagSettings precedence)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"          # user-tier input (clean)
+        out = Path(td) / "out.json"
+        proj = Path(td) / "proj-settings.json"
+        macho = Path(td) / "helper-macho"
+        macho.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        macho.chmod(0o755)
+        write_json(inp, {"hooks": {}})
+        write_json(proj, {"apiKeyHelper": f"{macho} auth claude"})
+        _run_helper_project(str(inp), str(out), str(proj))
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == "",
+            f"project-neutralize: Mach-O project helper should set shim "
+            f"apiKeyHelper to empty string, got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_project_apikeyhelper_neutralized_when_missing_path() -> None:
+    """A host-only absolute apiKeyHelper path that doesn't exist in the
+    container (the Mac-host leak) is neutralized."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        proj = Path(td) / "proj-settings.json"
+        write_json(inp, {"hooks": {}})
+        write_json(proj, {
+            "apiKeyHelper": "'/Applications/CorpTool.app/Contents/bin/devbar' auth claude",
+        })
+        _run_helper_project(str(inp), str(out), str(proj))
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == "",
+            f"project-neutralize: missing-path project helper should set shim "
+            f"apiKeyHelper to empty string, got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_project_apikeyhelper_kept_when_elf() -> None:
+    """A runnable ELF project helper (Linux host) is NOT neutralized -- the
+    shim must NOT inject an apiKeyHelper key."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        proj = Path(td) / "proj-settings.json"
+        elf = Path(td) / "helper-elf"
+        elf.write_bytes(b"\x7fELF" + b"\x00" * 32)
+        elf.chmod(0o755)
+        write_json(inp, {"hooks": {}})
+        write_json(proj, {"apiKeyHelper": f"{elf} auth claude"})
+        _run_helper_project(str(inp), str(out), str(proj))
+        result = load_output(out)
+        expect(
+            "apiKeyHelper" not in result,
+            f"project-neutralize: runnable ELF project helper should NOT be "
+            f"neutralized, got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_project_apikeyhelper_kept_when_bare_command() -> None:
+    """A bare PATH command project helper (no slash) is assumed runnable and
+    NOT neutralized."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        proj = Path(td) / "proj-settings.json"
+        write_json(inp, {"hooks": {}})
+        write_json(proj, {"apiKeyHelper": "get-my-key --json"})
+        _run_helper_project(str(inp), str(out), str(proj))
+        result = load_output(out)
+        expect(
+            "apiKeyHelper" not in result,
+            f"project-neutralize: bare-command project helper should NOT be "
+            f"neutralized, got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_project_apikeyhelper_noop_when_no_helper() -> None:
+    """A project settings file with NO apiKeyHelper => no key injected."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        proj = Path(td) / "proj-settings.json"
+        write_json(inp, {"hooks": {}})
+        write_json(proj, {"permissions": {"deny": []}})
+        _run_helper_project(str(inp), str(out), str(proj))
+        result = load_output(out)
+        expect(
+            "apiKeyHelper" not in result,
+            f"project-neutralize: no project helper => no key, got "
+            f"{result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_project_apikeyhelper_noop_when_path_empty() -> None:
+    """No --neutralize-project-apikeyhelper path (empty) => no change even if
+    a poison helper would exist; the gate is the path being supplied."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {}})
+        _run_helper_project(str(inp), str(out), "")
+        result = load_output(out)
+        expect(
+            "apiKeyHelper" not in result,
+            f"project-neutralize: empty path => no key, got "
+            f"{result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_project_apikeyhelper_noop_when_project_file_missing() -> None:
+    """A --neutralize path pointing at a non-existent file => no change
+    (fail-safe)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {}})
+        _run_helper_project(str(inp), str(out), str(Path(td) / "nope.json"))
+        result = load_output(out)
+        expect(
+            "apiKeyHelper" not in result,
+            f"project-neutralize: missing project file => no key, got "
+            f"{result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_project_apikeyhelper_user_drop_and_project_neutralize_coexist() -> None:
+    """Both sanitizers fire together: a poison USER-tier helper is DROPPED
+    and a poison PROJECT-tier helper is NEUTRALIZED (apiKeyHelper="")."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        proj = Path(td) / "proj-settings.json"
+        write_json(inp, {
+            "apiKeyHelper": "'/Users/me/.local/bin/get-api-key' auth claude",
+            "env": {"FOO": "bar"},
+        })
+        write_json(proj, {
+            "apiKeyHelper": "'/Applications/CorpTool.app/Contents/bin/devbar' auth",
+        })
+        _run_helper_project(str(inp), str(out), str(proj))
+        result = load_output(out)
+        # User-tier poison helper dropped, then project neutralize sets "".
+        expect(
+            result.get("apiKeyHelper") == "",
+            f"coexist: final shim apiKeyHelper should be empty string, got "
+            f"{result.get('apiKeyHelper')!r}",
+        )
+        expect(
+            result.get("env") == {"FOO": "bar"},
+            "coexist: unrelated user-tier keys must survive",
+        )
+
+
+def test_project_apikeyhelper_env_var_supplies_path() -> None:
+    """CLAUDE_PROJECT_SETTINGS_PATH env var supplies the path when the flag
+    isn't passed."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        proj = Path(td) / "proj-settings.json"
+        macho = Path(td) / "helper-macho"
+        macho.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        macho.chmod(0o755)
+        write_json(inp, {"hooks": {}})
+        write_json(proj, {"apiKeyHelper": f"{macho} auth"})
+        cmd = [str(SCRIPT), "--input", str(inp), "--output", str(out),
+               "--quiet", "--inject-obligations", "0", "--mcp-autoapprove", "0"]
+        env = dict(os.environ)
+        env.pop("CLAUDE_SHIM_PATTERNS", None)
+        env.pop("CLAUDE_CONTAINER_OBLIGATIONS", None)
+        env.pop("CLAUDE_SHIM_OBLIGATIONS_ONLY", None)
+        env.pop("CLAUDE_MCP_AUTOAPPROVE", None)
+        env["CLAUDE_PROJECT_SETTINGS_PATH"] = str(proj)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, env=env,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"helper exited {result.returncode}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        out_settings = load_output(out)
+        expect(
+            out_settings.get("apiKeyHelper") == "",
+            f"project-neutralize-env: env-var path should trigger neutralize, "
+            f"got {out_settings.get('apiKeyHelper')!r}",
+        )
+
+
 TESTS = [
     test_no_hooks_key_passthrough,
     test_empty_hooks_dict_passthrough,
@@ -1093,6 +1327,15 @@ TESTS = [
     test_mcp_autoapprove_disabled_via_flag,
     test_mcp_autoapprove_disabled_via_env,
     test_mcp_autoapprove_preserves_other_keys,
+    test_project_apikeyhelper_neutralized_when_macho,
+    test_project_apikeyhelper_neutralized_when_missing_path,
+    test_project_apikeyhelper_kept_when_elf,
+    test_project_apikeyhelper_kept_when_bare_command,
+    test_project_apikeyhelper_noop_when_no_helper,
+    test_project_apikeyhelper_noop_when_path_empty,
+    test_project_apikeyhelper_noop_when_project_file_missing,
+    test_project_apikeyhelper_user_drop_and_project_neutralize_coexist,
+    test_project_apikeyhelper_env_var_supplies_path,
 ]
 
 for t in TESTS:

@@ -151,19 +151,27 @@ pub fn watcher_list(config_path: &str, extra_config_path: Option<&str>) -> Vec<W
 
 /// Get status for all watchers.
 ///
-/// Runs the per-watcher `pgrep` lookups in parallel. For each enabled watcher
-/// we issue TWO pgrep calls in parallel:
-///   * pattern from watchers.conf → underlying poller PIDs (count + dup check)
-///   * `watcher-ctl run <name>` → supervisor wrapper PIDs (dup check only)
+/// **Liveness is decided by the SAME pidfile model the daemon's
+/// watcher_monitor uses** (`crate::status::watcher_pidfile_liveness`), NOT by
+/// `pgrep`. This is the fix for the exec-argv false-DOWN bug: the watcher
+/// launcher (`<name>.sh`) does `exec /usr/local/bin/<name>`, which REPLACES the
+/// process argv with the exec'd binary's — so the `.sh` path is gone from argv
+/// and a `pgrep -f <.sh path>` (which is the watcher's configured `pattern`)
+/// can NEVER match a healthy watcher. The daemon was migrated to pidfile
+/// liveness in PR #339; this CLI path was left on the broken `pgrep` approach
+/// and reported a live watcher as DOWN (`0/1`). We now read the PID the watcher
+/// itself records (its `<name>.lock` flock file, or the `<name>.pid` written by
+/// `watcher_run`), probe it for genuine (non-zombie) liveness, and verify
+/// cmdline identity — all of which survive the exec-to-binary transform.
+///
+/// The supervisor `pgrep` fan is RETAINED, but ONLY for DUPLICATE detection:
+/// nested `watcher-ctl run <name>` parents accumulating because each redundant
+/// invocation spawns a fresh wrapper that doesn't clean up its predecessors.
+/// The poller `pgrep` fan is also retained, again ONLY to surface duplicate
+/// pollers (and a PID list for the human) — it never decides UP/DOWN.
+///
 /// Both fans run as `tokio::spawn` tasks so the wall-clock per status call
 /// stays near one pgrep round-trip even with many watchers configured.
-///
-/// The supervisor lookup catches a known regression pattern: nested
-/// `watcher-ctl run <name>` parents accumulating because each redundant
-/// `watcher-ctl run` invocation spawns a fresh wrapper that doesn't
-/// clean up its predecessors. The PID-file check that `watcher-status`
-/// USED to do was completely blind to this — we'd report `ok` while
-/// four supervisors raced on the same PID file.
 pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) -> Vec<WatcherStatus> {
     let entries = load_entries(config_path, extra_config_path);
 
@@ -195,6 +203,8 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
         }
     }
 
+    let pid_dir = crate::status::watcher_pid_dir();
+
     let mut results = Vec::with_capacity(entries.len());
     for (entry, joined_opt) in entries.iter().zip(joined.into_iter()) {
         if !entry.enabled {
@@ -211,16 +221,36 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
             continue;
         }
 
-        let (pids, supervisors) = joined_opt.unwrap_or_default();
-        let count = pids.len() as u32;
-        let pid_str = pids
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let (pollers, supervisors) = joined_opt.unwrap_or_default();
 
-        let dup_pollers = if pids.len() > 1 {
-            pids.clone()
+        // --- UP/DOWN: pidfile liveness (NOT pgrep). Same model as the daemon.
+        // min_count == 0 means "never DOWN" — preserve that opt-out so a
+        // watcher explicitly opting out of liveness checks can't trip DOWN.
+        let (recorded_pid, pidfile_down) =
+            crate::status::watcher_pidfile_liveness(&pid_dir, &entry.name, entry.start_cmd.as_deref());
+        let is_down = entry.min_count != 0 && pidfile_down;
+
+        // `count` reflects the single-instance pidfile model: 1 when the
+        // pidfile names a live matching watcher, else 0. (The poller pgrep
+        // count is unreliable post-exec, so it must NOT drive this.)
+        let count: u32 = if is_down { 0 } else { 1 };
+
+        // PID display: prefer the recorded watcher PID (authoritative). Fall
+        // back to the pgrep poller PIDs only for the human-readable column.
+        let pid_str = match recorded_pid {
+            Some(pid) if !is_down => pid.to_string(),
+            _ => pollers
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+
+        // Duplicate detection is orthogonal to UP/DOWN and still uses pgrep.
+        // Multiple live pollers matching the pattern, or multiple supervisor
+        // wrappers, indicate a state-cleanliness problem the human should fix.
+        let dup_pollers = if pollers.len() > 1 {
+            pollers.clone()
         } else {
             Vec::new()
         };
@@ -232,9 +262,8 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
 
         // Status precedence: DOWN > DUPLICATE > ok. A dead poller is the more
         // urgent failure; duplicates are a state-cleanliness issue. If both
-        // apply (e.g. min_count=2, only 1 poller, but 3 supervisors), the
-        // dup_supervisors vec is still populated so the human sees both.
-        let status = if count < entry.min_count {
+        // apply the dup vecs are still populated so the human sees both.
+        let status = if is_down {
             "DOWN".to_string()
         } else if !dup_pollers.is_empty() || !dup_supervisors.is_empty() {
             "DUPLICATE".to_string()
@@ -331,8 +360,19 @@ fn pid_matches_watcher(pid: u32, start_cmd: &str) -> bool {
     // (e.g. `/usr/local/bin/claude-event-watch`) still matches a cmdline that
     // records the bare name, and vice-versa.
     let token_base = token.rsplit('/').next().unwrap_or(token);
+    // ALSO strip a trailing launcher-script extension (`.sh`/`.bash`/`.py`):
+    // the launcher `<name>.sh` does `exec /usr/local/bin/<name>`, so the live
+    // cmdline carries the bare stem (no `.sh`). Without this, a `.sh` start_cmd
+    // would never match the exec'd binary — the same exec-defeats-match bug the
+    // daemon's `cmdline_matches_watcher` already handles. Kept consistent with
+    // that helper (see `crate::status::cmdline_matches_watcher`).
+    let stem = crate::status::strip_script_suffix(token_base);
     match pid_cmdline(pid) {
-        Some(cmdline) => cmdline.contains(token) || cmdline.contains(token_base),
+        Some(cmdline) => {
+            cmdline.contains(token)
+                || cmdline.contains(token_base)
+                || (!stem.is_empty() && cmdline.contains(stem))
+        }
         None => false,
     }
 }
@@ -1753,6 +1793,10 @@ mod tests {
         assert!(!pid_is_alive(u32::MAX - 1));
     }
 
+    // /proc-dependent: pid_cmdline reads /proc/PID/cmdline, Linux-only.
+    // On macOS pid_cmdline returns None so the self-match assert fails.
+    // Gate to Linux (CI runs Linux). Sibling non-match tests stay unguarded.
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_pid_matches_watcher_self() {
         // Our own cmdline contains the test binary path. Use the actual first
@@ -2119,6 +2163,181 @@ mod tests {
         // Cleanup.
         let _ = first.start_kill();
         let _ = first.wait().await;
+    }
+
+    /// REGRESSION (exec-argv false-DOWN, the bug this PR fixes): a watcher
+    /// whose launcher `exec`s the bare binary (so the live cmdline has the
+    /// `.sh` STRIPPED) and whose PID is recorded in a `<name>.lock` file MUST
+    /// read as UP — `watcher_status` must report `ok`, NOT `DOWN`.
+    ///
+    /// Before the fix, `watcher_status` derived liveness from
+    /// `pgrep -f -- <pattern>` where `<pattern>` was the `.sh` launcher path
+    /// from watchers.conf. After the launcher execs `/usr/local/bin/<name>`,
+    /// the `.sh` is gone from argv, so the pgrep never matched and the CLI
+    /// reported `0/1` DOWN while the daemon (pidfile-based since PR #339)
+    /// correctly saw it UP. This test pins the migrated CLI to the pidfile
+    /// model: we record a live process's PID in `<name>.lock`, give the
+    /// watcher a `.sh` start_cmd and a poller `pattern` that DELIBERATELY
+    /// cannot match the live process, and assert the status is `ok`.
+    // Reads /proc (PID liveness + cmdline identity) via the shared liveness
+    // helpers, so it only runs on Linux — the container deploy target. On a
+    // macOS dev host there is no /proc, so cmdline identity can't be verified;
+    // the pure decision logic is covered by
+    // `test_watcher_status_decision_is_pidfile_based` below (runs everywhere).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_watcher_status_exec_argv_is_up_via_pidfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+
+        // The live process's argv[0] carries the bare STEM (no `.sh`) — exactly
+        // the post-`exec` shape. We name the script `claude-event-watch` (stem)
+        // and sleep so it stays alive across the status read.
+        let stem = format!("claude-event-watch-{}", unique_token("exec"));
+        let script = make_poller_script(dir.path(), &stem, "30");
+
+        // start_cmd is the `.sh` LAUNCHER (what watchers.conf records); the
+        // live cmdline is the stem (no `.sh`) — the identity check must still
+        // match via suffix-stripping. The `pattern` is the `.sh` path too,
+        // which `pgrep -f` can NEVER find against the exec'd process — proving
+        // the status decision does NOT depend on pgrep.
+        let launcher_sh = format!("{}.sh", script); // `<stem>.sh` — never spawned
+        std::fs::write(
+            &cfg,
+            format!("evw|{}|1|true|{}\n", launcher_sh, launcher_sh),
+        )
+        .unwrap();
+
+        // Spawn the live "exec'd binary" (argv carries the bare stem) and
+        // record its PID in `<name>.lock` (the file a real watcher writes).
+        let mut child = tokio::process::Command::new(&script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live watcher");
+        let live_pid = child.id().expect("child pid");
+        let lock_file = pid_dir.join("evw.lock");
+        std::fs::write(&lock_file, live_pid.to_string()).unwrap();
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+
+        let statuses = watcher_status(&config_path(), config_path_extra().as_deref()).await;
+        let evw = statuses
+            .iter()
+            .find(|s| s.name == "evw")
+            .expect("evw status present");
+
+        assert_eq!(
+            evw.status, "ok",
+            "a live watcher recorded in <name>.lock whose argv lost the `.sh` \
+             (exec-to-binary transform) MUST read as UP — got {:?} (this is the \
+             exec-argv false-DOWN regression)",
+            evw
+        );
+        assert_eq!(evw.count, 1, "pidfile model: one live matching instance");
+        // The reported PID is the authoritative recorded watcher PID.
+        assert_eq!(evw.pids, live_pid.to_string());
+
+        // Cleanup.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    /// Negative companion: a STALE `<name>.lock` (recorded PID dead) with no
+    /// live process must read as DOWN — proves the pidfile model still detects
+    /// a genuinely-dead watcher (and doesn't paper over it).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_watcher_status_stale_lock_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+
+        let stem = format!("claude-event-watch-{}", unique_token("dead"));
+        let launcher_sh = format!("/opt/x/{}.sh", stem);
+        std::fs::write(&cfg, format!("evw|{}|1|true|{}\n", launcher_sh, launcher_sh)).unwrap();
+
+        // Record a definitely-dead PID in <name>.lock.
+        let lock_file = pid_dir.join("evw.lock");
+        std::fs::write(&lock_file, (u32::MAX - 1).to_string()).unwrap();
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+
+        let statuses = watcher_status(&config_path(), config_path_extra().as_deref()).await;
+        let evw = statuses.iter().find(|s| s.name == "evw").expect("evw present");
+        assert_eq!(
+            evw.status, "DOWN",
+            "a stale <name>.lock (dead recorded PID) must read as DOWN, got {:?}",
+            evw
+        );
+        assert_eq!(evw.count, 0);
+    }
+
+    /// Portable (macOS + Linux) PURE coverage of the exec-argv fix decision
+    /// logic — no `/proc`, so it runs on the dev host too (unlike the gated
+    /// integration tests above, which need Linux `/proc`).
+    ///
+    /// Pins the two facts that make the false-DOWN bug impossible now:
+    ///   1. The shared `cmdline_matches_watcher` matches the exec'd bare binary
+    ///      cmdline against the `.sh` launcher start_cmd (suffix-stripping).
+    ///   2. Given a recorded PID that is alive AND whose cmdline matches, the
+    ///      pidfile decision says UP (`!is_down`) — the case the old pgrep path
+    ///      wrongly reported DOWN.
+    #[test]
+    fn test_watcher_status_decision_is_pidfile_based() {
+        // (1) The exec-to-binary identity match (the crux of the bug).
+        let start_cmd = "/opt/claude-container/watchers/claude-event-watch.sh";
+        let exec_cmdline = "/bin/bash /usr/local/bin/claude-event-watch"; // .sh gone
+        assert!(
+            crate::status::cmdline_matches_watcher(exec_cmdline, start_cmd),
+            "the exec'd bare-binary cmdline (no .sh) MUST match the .sh launcher \
+             start_cmd via suffix-stripping — this is what defeats the old \
+             pgrep-on-.sh-path approach"
+        );
+
+        // (2) The pidfile UP/DOWN decision, in the four canonical states.
+        // Live + identity-matched recorded PID → UP (the false-DOWN case).
+        assert!(
+            !crate::status::pidfile_watcher_is_down(Some(4242), true, true),
+            "a live, identity-matched recorded PID must read as UP"
+        );
+        // Missing pidfile → DOWN.
+        assert!(crate::status::pidfile_watcher_is_down(None, false, false));
+        // Stale pidfile (recorded PID dead) → DOWN.
+        assert!(crate::status::pidfile_watcher_is_down(Some(4242), false, false));
+        // Recycled PID (alive but cmdline mismatch) → DOWN.
+        assert!(crate::status::pidfile_watcher_is_down(Some(4242), true, false));
+    }
+
+    /// `pid_matches_watcher` must tolerate the exec-to-binary transform too:
+    /// a `.sh` launcher start_cmd whose live cmdline carries only the bare stem
+    /// is a match. (Pure string-level coverage of the suffix-stripping; the
+    /// `/proc`-reading path is exercised by the Linux-gated integration tests.)
+    #[test]
+    fn test_pid_matches_watcher_strips_sh_suffix_via_shared_helper() {
+        // The identity helper `pid_matches_watcher` delegates suffix-stripping
+        // to `crate::status::strip_script_suffix`; verify the stem the live
+        // cmdline would carry is what we'd match on.
+        assert_eq!(
+            crate::status::strip_script_suffix("claude-event-watch.sh"),
+            "claude-event-watch"
+        );
+        assert_eq!(
+            crate::status::strip_script_suffix("memory-remind.bash"),
+            "memory-remind"
+        );
+        assert_eq!(
+            crate::status::strip_script_suffix("emit.py"),
+            "emit"
+        );
+        // No known extension → unchanged.
+        assert_eq!(
+            crate::status::strip_script_suffix("claude-event-watch"),
+            "claude-event-watch"
+        );
     }
 
     fn unique_token(prefix: &str) -> String {
