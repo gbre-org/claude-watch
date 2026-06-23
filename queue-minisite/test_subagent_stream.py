@@ -470,47 +470,108 @@ class SubagentTreeTest(unittest.TestCase):
                          "binding -> B sibling must not appear under A")
         self.assertNotIn(owner_a, ids, "owner is self, must be dropped")
 
-    def test_bindings_retry_siblings_collapsed_as_attempts(self):
-        """Multiple agents bound to the SAME queue id are retry attempts of
-        that item, NOT distinct children. The live owner is dropped; the
-        earlier attempt(s) surface as kind='attempt' nodes (attempt N), in
-        chronological order — never as separate child work.
+    def test_bindings_cobound_no_spawn_edge_is_flat_peer(self):
+        """A subagent bound to the SAME queue id as the owner but with NO
+        parent->child spawn edge to it is a co-bound PEER, not a "retry
+        attempt". The binding only associates the agent-id with the queue
+        item; it encodes NO retry/supersession relationship. The live owner is
+        dropped; the co-bound sibling surfaces as a FLAT kind='peer' node with
+        NO attempt number and NO supersession framing.
         """
-        item = _add(self.env, "retry attempts", ["repo:subagent-retry"])
+        item = _add(self.env, "cobound peer", ["repo:subagent-peer"])
         qid = item["id"]
         _register(self.env, qid)
 
         session_uuid = "cc33dd44-ee55-ff66-1122-330000000003"
         owner_id = "ddd444eee555fff66"      # current live dispatch
-        retry_old = "eee555fff666aaa77"     # earlier abandoned attempt
+        peer_old = "eee555fff666aaa77"      # co-bound sibling, no spawn edge
         # owner is the live agent per active-agents.
         _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
-        # Make retry_old OLDER (larger age) than owner so it's attempt 1.
         self._seed_marked_subagent(self.jsonl_root, session_uuid, owner_id, qid)
-        retry_path = self._seed_marked_subagent(
-            self.jsonl_root, session_uuid, retry_old, qid)
-        # Backdate the retry transcript so its mtime is clearly older.
-        old_t = retry_path.stat().st_mtime - 600
-        os.utime(retry_path, (old_t, old_t))
-        # Both bound to the SAME item id.
-        self._seed_bindings({owner_id: qid, retry_old: qid})
+        peer_path = self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, peer_old, qid)
+        # Backdate the peer transcript so its mtime is clearly older — proving
+        # we do NOT use recency to infer "attempt 1" / supersession ordering.
+        old_t = peer_path.stat().st_mtime - 600
+        os.utime(peer_path, (old_t, old_t))
+        # Both bound to the SAME item id; NO spawn edge between them.
+        self._seed_bindings({owner_id: qid, peer_old: qid})
         self.appmod._cache.fetched_at = 0.0
 
         r = self.client.get(f"/api/queue/{qid}/meta")
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         subs = r.get_json().get("subagents")
         ids = {s["subagent_id"] for s in subs}
-        # Owner dropped; only the earlier attempt remains, labeled attempt 1.
+        # Owner dropped; only the co-bound peer remains, FLAT + neutral.
         self.assertNotIn(owner_id, ids, "live owner must be dropped")
-        self.assertEqual(ids, {retry_old},
-                         f"only the prior attempt remains: {subs}")
-        attempt = next(s for s in subs if s["subagent_id"] == retry_old)
-        self.assertEqual(attempt.get("kind"), "attempt",
-                         f"retry sibling must be kind=attempt: {attempt}")
-        self.assertEqual(attempt.get("attempt"), 1,
-                         f"oldest retry is attempt 1: {attempt}")
-        # And it carries an empty children list (uniform recursive shape).
-        self.assertEqual(attempt.get("children"), [])
+        self.assertEqual(ids, {peer_old},
+                         f"only the co-bound peer remains: {subs}")
+        peer = next(s for s in subs if s["subagent_id"] == peer_old)
+        self.assertEqual(peer.get("kind"), "peer",
+                         f"co-bound non-child must be kind=peer: {peer}")
+        # No attempt-number / supersession framing whatsoever.
+        self.assertNotIn("attempt", peer,
+                         f"peer must carry NO attempt ordinal: {peer}")
+        self.assertNotIn("attempt_head", peer,
+                         f"peer must carry NO live-HEAD flag: {peer}")
+        # And it carries an empty children list (flat — no nesting).
+        self.assertEqual(peer.get("children"), [])
+
+    def test_multiple_cobound_no_spawn_edge_are_flat_peers(self):
+        """REGRESSION (q-2026-06-23-1ae2 / q-2026-06-23-7144): when MULTIPLE
+        subagents are co-bound to the same queue id but have NO parent->child
+        spawn edge between them (none is a spawn-descendant of another), they
+        are DIFFERENT agents that happened to share the q-id — NOT retries or
+        supersessions of one another. They MUST render as FLAT NEUTRAL PEER
+        siblings: each a top-level kind='peer' node with NO attempt number, NO
+        'live HEAD' flag, and NO nesting of one under another. (The real
+        q-2026-06-23-1ae2 ids a464cd2cd527 + a43122a0f2f9 had no spawn edge in
+        parent_map — they are peers, not 'attempt 1/2'.)
+        """
+        item = _add(self.env, "multi cobound peers", ["repo:subagent-multi"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "ff66aa77-bb88-cc99-dd00-ee0000000006"
+        owner_id = "fff666aaa777bbb88"   # current live dispatch (dropped)
+        peer_a = "a464cd2cd527aaa11"     # co-bound, no spawn edge (q-1ae2 a464)
+        peer_b = "a43122a0f2f9bbb22"     # co-bound, no spawn edge (q-1ae2 a431)
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=1)
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, owner_id, qid)
+        a_path = self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, peer_a, qid)
+        b_path = self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, peer_b, qid)
+        # Give them DIFFERENT ages — proving age is NOT used to infer a
+        # supersession ordering; both stay flat peers regardless.
+        now = a_path.stat().st_mtime
+        os.utime(a_path, (now - 120, now - 120))
+        os.utime(b_path, (now - 600, now - 600))
+        # All three co-bound to the SAME item id; NO spawn edges between them.
+        self._seed_bindings({owner_id: qid, peer_a: qid, peer_b: qid})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        # Owner dropped. BOTH peers are TOP-LEVEL siblings — a flat list, not a
+        # one-node nested hierarchy.
+        self.assertEqual(len(subs), 2,
+                         f"co-bound peers must be FLAT siblings: {subs}")
+        ids = {s["subagent_id"] for s in subs}
+        self.assertNotIn(owner_id, ids, "live owner must be dropped")
+        self.assertEqual(ids, {peer_a, peer_b},
+                         f"both co-bound peers surface flat: {subs}")
+        for node in subs:
+            self.assertEqual(node.get("kind"), "peer",
+                             f"each co-bound non-child is kind=peer: {node}")
+            self.assertNotIn("attempt", node,
+                             f"peer carries NO attempt ordinal: {node}")
+            self.assertNotIn("attempt_head", node,
+                             f"peer carries NO live-HEAD flag: {node}")
+            # Flat — no peer nests another peer under itself.
+            self.assertEqual(node.get("children"), [],
+                             f"peers must NOT nest one another: {node}")
 
     def _seed_parent_with_spawn(self, jsonl_root, session_uuid, agent_id, qid,
                                 child_agent_id):
@@ -586,7 +647,8 @@ class SubagentTreeTest(unittest.TestCase):
         """REGRESSION (q-2026-06-19-7aa6): a nested child spawned BY the owner
         agent — which inherits the owner's ``Queue item: q-XXXX`` line and so
         binds to the SAME item — must render as a nested ``kind='child'``
-        under the owner's tree, NOT as a false peer ``kind='attempt'`` retry.
+        under the owner's tree, NOT as a false co-bound ``kind='peer'`` (it has
+        a real parent->child spawn edge, so it is a genuine child, not a peer).
         """
         item = _add(self.env, "nested child", ["repo:subagent-nested"])
         qid = item["id"]
@@ -616,12 +678,13 @@ class SubagentTreeTest(unittest.TestCase):
                          f"only the nested child should surface: {subs}")
         child = next(s for s in subs if s["subagent_id"] == child_id)
         self.assertEqual(child.get("kind"), "child",
-                         f"nested child must be kind=child, not attempt: {child}")
+                         f"nested child must be kind=child, not peer: {child}")
         self.assertNotIn("attempt", child,
                          f"child must carry no attempt ordinal: {child}")
-        # No node anywhere is mislabeled an attempt.
-        self.assertFalse(any(s.get("kind") == "attempt" for s in subs),
-                         f"a parent->child pair must yield ZERO attempts: {subs}")
+        # No node anywhere is mislabeled a flat peer (or a legacy attempt).
+        self.assertFalse(
+            any(s.get("kind") in ("attempt", "peer") for s in subs),
+            f"a parent->child pair must yield a genuine child, no peers: {subs}")
 
     def test_grandchild_nests_under_child(self):
         """A 3-level chain owner -> child -> grandchild (all bound to the same
@@ -661,7 +724,8 @@ class SubagentTreeTest(unittest.TestCase):
                          f"grandchild must nest under child: {top}")
         self.assertEqual(top["children"][0]["subagent_id"], grandchild_id)
         self.assertEqual(top["children"][0].get("kind"), "child")
-        self.assertFalse(any(s.get("kind") == "attempt" for s in subs))
+        self.assertFalse(
+            any(s.get("kind") in ("attempt", "peer") for s in subs))
 
     def test_deep_tree_descendant_bound_to_other_item_still_nests(self):
         """REGRESSION (depth-1-only bug): a deeply-nested descendant that
@@ -736,12 +800,12 @@ class SubagentTreeTest(unittest.TestCase):
             c for c in top["children"] if c["subagent_id"] == gc_other)
         self.assertEqual(gc_other_node.get("queue_id"), qid_b,
                          f"item-B grandchild keeps its own queue_id: {gc_other_node}")
-        # Zero attempts anywhere (every node is a genuine spawn).
-        def _has_attempt(nodes):
-            return any(n.get("kind") == "attempt" or _has_attempt(
+        # Zero non-child nodes anywhere (every node is a genuine spawn).
+        def _has_non_child(nodes):
+            return any(n.get("kind") in ("attempt", "peer") or _has_non_child(
                 n.get("children", [])) for n in nodes)
-        self.assertFalse(_has_attempt(subs),
-                         f"a pure spawn tree must yield ZERO attempts: {subs}")
+        self.assertFalse(_has_non_child(subs),
+                         f"a pure spawn tree must be all children: {subs}")
 
     def _seed_parent_with_two_spawns(self, jsonl_root, session_uuid, agent_id,
                                      qid, child_a, child_b):
@@ -794,44 +858,47 @@ class SubagentTreeTest(unittest.TestCase):
         return _seed_subagent_jsonl(
             jsonl_root, session_uuid, agent_id, lines=lines)
 
-    def test_genuine_retry_and_nested_child_coexist(self):
-        """A genuine main-loop retry (NOT spawned by any session agent) stays
-        ``kind='attempt'`` while a nested child of the owner stays
-        ``kind='child'`` — the two are partitioned correctly when both are
-        bound to the same item.
+    def test_cobound_peer_and_nested_child_coexist(self):
+        """A co-bound peer (NOT spawned by any session agent — no spawn edge to
+        the owner) stays ``kind='peer'`` while a genuine nested child of the
+        owner stays ``kind='child'`` — the two are partitioned correctly by the
+        spawn graph when both are bound to the same item. The peer carries NO
+        attempt/supersession framing.
         """
-        item = _add(self.env, "retry plus child", ["repo:subagent-mix"])
+        item = _add(self.env, "peer plus child", ["repo:subagent-mix"])
         qid = item["id"]
         _register(self.env, qid)
 
         session_uuid = "ff661122-3344-5566-7788-990000000006"
         owner_id = "aaaa1111bbbb2222c"   # live owner dispatch
-        retry_old = "dddd3333eeee4444f"  # earlier main-loop attempt (no parent)
-        child_id = "5555aaaa6666bbbb7"   # owner's nested child
+        peer_old = "dddd3333eeee4444f"   # co-bound peer (no spawn edge)
+        child_id = "5555aaaa6666bbbb7"   # owner's genuine nested child
         _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
         # owner spawns child_id (nested).
         self._seed_parent_with_spawn(
             self.jsonl_root, session_uuid, owner_id, qid, child_id)
         self._seed_marked_subagent(self.jsonl_root, session_uuid, child_id, qid)
-        # retry_old is a plain transcript with the marker but NO spawn record
-        # pointing at it -> main-loop attempt. Backdate so it's attempt 1.
-        retry_path = self._seed_marked_subagent(
-            self.jsonl_root, session_uuid, retry_old, qid)
-        old_t = retry_path.stat().st_mtime - 600
-        os.utime(retry_path, (old_t, old_t))
+        # peer_old is a plain transcript with the marker but NO spawn record
+        # pointing at it -> co-bound peer. Backdate it (age must NOT promote it
+        # to an "attempt 1" — there is no such inference any more).
+        peer_path = self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, peer_old, qid)
+        old_t = peer_path.stat().st_mtime - 600
+        os.utime(peer_path, (old_t, old_t))
         self._seed_bindings(
-            {owner_id: qid, retry_old: qid, child_id: qid})
+            {owner_id: qid, peer_old: qid, child_id: qid})
         self.appmod._cache.fetched_at = 0.0
 
         r = self.client.get(f"/api/queue/{qid}/meta")
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         subs = r.get_json().get("subagents")
         by_id = {s["subagent_id"]: s for s in subs}
-        self.assertIn(retry_old, by_id, f"retry must surface: {subs}")
+        self.assertIn(peer_old, by_id, f"peer must surface: {subs}")
         self.assertIn(child_id, by_id, f"nested child must surface: {subs}")
-        self.assertEqual(by_id[retry_old].get("kind"), "attempt",
-                         f"main-loop retry must stay attempt: {subs}")
-        self.assertEqual(by_id[retry_old].get("attempt"), 1)
+        self.assertEqual(by_id[peer_old].get("kind"), "peer",
+                         f"co-bound non-child must be kind=peer: {subs}")
+        self.assertNotIn("attempt", by_id[peer_old],
+                         f"peer carries NO attempt ordinal: {subs}")
         self.assertEqual(by_id[child_id].get("kind"), "child",
                          f"owner's nested child must stay child: {subs}")
 

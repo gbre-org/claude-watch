@@ -1604,21 +1604,15 @@ body.modal-open { overflow: hidden; }
   font-size: 0.78rem;
 }
 
-/* A collapsed prior dispatch attempt of the same queue item (the live
- * owner is dropped server-side; earlier attempts surface as attempt N). */
-.subagent-node.subagent-attempt {
-  opacity: 0.8;
-}
-
-.subagent-attempt-badge {
-  flex: 0 0 auto;
-  font-size: 0.66rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 0 5px;
-  border-radius: 3px;
-  background: var(--line);
-  color: var(--fg-muted, #93a1a1);
+/* A co-bound subagent of the same queue item with NO spawn edge to the owner
+ * (the live owner is dropped server-side). These are FLAT NEUTRAL peers: the
+ * binding only associates them with the item, recording no retry/supersession
+ * relationship, so we do NOT dim them as "superseded" or badge them as
+ * "attempt N" — they read as plain sibling subagents, distinguished by their
+ * id / label / age. (Hook left in place for future per-peer affordances; no
+ * dimming today so peers are not visually demoted.) */
+.subagent-node.subagent-peer {
+  opacity: 1;
 }
 
 .subagent-node:hover,

@@ -204,18 +204,21 @@
   // Jinja macro in templates/index.html so morphdom doesn't flap between
   // the server paint and the SPA refresh. Node shape (from app.py
   // _build_subagent_tree): { subagent_id, label, age, age_seconds,
-  // queue_id, kind: "attempt"|"child", attempt: <int?>, children: [...] }.
-  // `kind=="attempt"` nodes are prior dispatch attempts of the same queue
-  // item (owner dropped server-side) — labeled "attempt N".
+  // queue_id, kind: "peer"|"child", children: [...] }.
+  // `kind=="peer"` nodes are co-bound subagents (same queue id, NO spawn
+  // edge to the owner). The binding only associates them with the item; it
+  // records no retry/supersession relationship, so they render as FLAT
+  // NEUTRAL siblings — no "attempt N" badge, no "superseded"/"live HEAD"
+  // framing, no implied ordering — distinguished only by id / label / age.
+  // `kind=="child"` nodes are genuine spawn descendants of the owner and
+  // nest under their real parent (arbitrary depth via children).
   function renderSubagentNode(sa) {
     const sid = sa.subagent_id || '';
-    const isAttempt = sa.kind === 'attempt';
-    const cls = 'subagent-node subagent-log-clickable' + (isAttempt ? ' subagent-attempt' : '');
+    const isPeer = sa.kind === 'peer';
+    const cls = 'subagent-node subagent-log-clickable' +
+      (isPeer ? ' subagent-peer' : '');
     let html =
       `<li class="${cls}" data-subagent-id="${attr(sid)}" data-log-mode="subagent" tabindex="0" role="button" aria-label="View live log for subagent ${attr(sid)}" title="Click to tail this subagent's live log">`;
-    if (isAttempt) {
-      html += `<span class="subagent-attempt-badge" title="prior dispatch attempt of this queue item">attempt ${esc(sa.attempt)}</span>`;
-    }
     html +=
       `<code class="subagent-id">${esc(sid.slice(0, 12))}</code>` +
       `<span class="subagent-label">${esc(sa.label || sid)}</span>` +
@@ -339,9 +342,10 @@
     // app.py _build_subagent_tree for running items: subagents are
     // attributed to their owning queue item via the AUTHORITATIVE
     // agent_id->queue_id bindings (post-tool-agent-arm-hook), the owner
-    // agent is DROPPED (it IS the item, not a child), and remaining
-    // same-item agents are collapsed as "attempt N" nodes. Each node is
-    // rendered by the recursive renderSubagentNode() below — MUST mirror
+    // agent is DROPPED (it IS the item, not a child); genuine spawn-children
+    // nest under their real parent, while co-bound same-item agents with NO
+    // spawn edge render as FLAT NEUTRAL peers (kind="peer", no "attempt N").
+    // Each node is rendered by the recursive renderSubagentNode() below — MUST mirror
     // the subagent_node() Jinja macro in templates/index.html so morphdom
     // doesn't flap between the server paint and this 5s SPA re-render.
     const subagents = it.subagents || [];

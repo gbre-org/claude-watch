@@ -805,7 +805,7 @@ def _shape(
                 session_subagents = _list_session_subagents(session_id)
                 # Real spawn hierarchy (child -> parent) reconstructed from
                 # the transcripts' Agent/Task launch records. Distinguishes a
-                # nested child from a main-loop retry attempt.
+                # nested spawn-child from a co-bound peer (no spawn edge).
                 parent_map = _session_subagent_parent_map(session_id)
         iid = item.get("id", "")
         # Bindings map is loaded once per render pass and threaded in; load
@@ -1893,7 +1893,7 @@ _SUBAGENT_LABEL_MAX_CHARS = 80
 # ``agentId: <id> (internal ID - do not mention to user...)``. We scan each
 # session subagent transcript for this marker to reconstruct the REAL
 # parent->child spawn edges (which agent spawned which) — the signal that
-# distinguishes a NESTED child from a main-loop retry attempt. See
+# distinguishes a NESTED spawn-child from a co-bound peer. See
 # ``_session_subagent_parent_map`` + ``_build_subagent_tree``.
 _LAUNCHED_AGENT_RE = re.compile(r"agentId:\s*([a-z0-9-]{4,64})")
 # Bound on bytes read per transcript when scanning for launch markers, so a
@@ -2009,7 +2009,7 @@ def _session_subagent_parent_map(session_id: str) -> dict[str, str]:
     whose transcript carries that record is the child's PARENT.
 
     This is the authoritative signal that tells a NESTED child apart from a
-    main-loop retry attempt: a nested child appears in this map (some session
+    co-bound peer: a nested child appears in this map (some session
     agent spawned it); a genuine retry was dispatched by the MAIN LOOP and so
     appears in NO subagent's transcript.
 
@@ -2177,18 +2177,26 @@ def _build_subagent_tree(
     ``_session_subagent_parent_map`` — the REAL spawn hierarchy reconstructed
     from the transcripts' Agent/Task launch records. ``None`` / ``{}`` means
     no hierarchy signal (legacy callers / pre-this-fix transcripts), in which
-    case we degrade to the old flat attempt-collapse.
+    case we degrade to a flat peer list (no spawn nesting available).
 
     The PRIOR tree kept every subagent bound to ``item_id`` (minus the owner)
     and labeled them ALL as ``kind="attempt"`` retry siblings. That was wrong
-    for NESTED agents: when the owner agent (or one of its descendants) spawns
-    a child agent, that child inherits the ``Queue item: q-XXXX`` line in its
-    prompt, so it binds to the SAME ``item_id`` — and got mislabeled as
-    "attempt 2", a false peer-retry of the owner. But it is the owner's CHILD,
-    not a competing dispatch of the same work. (Observed: q-2026-06-19-7aa6
-    rendered owner ``a63d61`` + nested grandchild ``aaa255`` as ATTEMPT 1/2.)
+    on two counts. (1) For NESTED agents: when the owner agent (or one of its
+    descendants) spawns a child agent, that child inherits the
+    ``Queue item: q-XXXX`` line in its prompt, so it binds to the SAME
+    ``item_id`` — and got mislabeled as "attempt 2", a false peer-retry of the
+    owner. But it is the owner's CHILD, not a competing dispatch of the same
+    work. (Observed: q-2026-06-19-7aa6 rendered owner ``a63d61`` + nested
+    grandchild ``aaa255`` as ATTEMPT 1/2.) (2) For co-bound agents with NO
+    spawn edge between them: labeling them "attempt N" (and later nesting the
+    "older" under a "newer" live HEAD) inferred a retry/supersession
+    relationship the data never recorded — they could just be DIFFERENT agents
+    doing DIFFERENT work under the same q-id. (q-2026-06-23-1ae2: a464cd2cd527
+    + a43122a0f2f9 had no parent->child edge — they are flat peers, not
+    attempt 1/2.)
 
-    The fix distinguishes the two using ``parent_map``:
+    The fix distinguishes spawn-children from co-bound peers using
+    ``parent_map``:
 
       * **Authoritative attribution** — each subagent's owning queue id is
         ``bindings[agent_id]`` (falls back to the transcript-parsed marker
@@ -2209,23 +2217,26 @@ def _build_subagent_tree(
         and dropped. (That severing was the depth-1-only bug: the prior code
         kept only SAME-item agents as children, so the tree was pruned at the
         first descendant bound to a different item.)
-      * **Genuine retry attempts** — a same-item agent that is NOT a
-        descendant of the owner (no session agent spawned it) was dispatched
-        by the MAIN LOOP — a real earlier attempt of this item. Those collapse
-        to ``kind="attempt"`` nodes labeled ``attempt N`` (oldest = attempt 1).
+      * **Co-bound peers (no spawn edge)** — a same-item agent that is NOT a
+        descendant of the owner (no session agent spawned it). The binding
+        data only records that these agent-ids were ASSOCIATED with this queue
+        item; it does NOT encode a retry/supersession relationship, so we make
+        NO such inference. They render as FLAT ``kind="peer"`` siblings,
+        labeled neutrally (short id / first-prompt-line / timestamp) — never
+        "attempt N", never nested under one another.
       * **Unrelated agents** — agents that are neither descendants of this
-        owner nor same-item retries (e.g. another item'''s subtree) render under
+        owner nor same-item peers (e.g. another item'''s subtree) render under
         their own item'''s card; excluded here.
 
     Returns a list of node dicts. Each node carries the same display keys
     the template/refresh.js expect (``subagent_id``, ``label``, ``age``,
     ``age_seconds``, ``queue_id``) plus:
 
-      * ``kind``     — ``"attempt"`` (collapsed main-loop retry) or
-        ``"child"`` (genuine nested spawn).
-      * ``attempt``  — 1-based attempt ordinal (attempt nodes only).
+      * ``kind``     — ``"peer"`` (co-bound, no spawn edge to the owner) or
+        ``"child"`` (genuine nested spawn descendant of the owner).
       * ``children`` — nested node list (always present, possibly empty) so
-        the recursive template has a uniform shape to walk.
+        the recursive template has a uniform shape to walk. Peers are flat
+        (always ``[]``); only genuine spawn-children nest.
 
     Fail-soft fallback: when NO subagent has either a binding or a parsed
     marker (pre-arm-hook transcripts), keep the prior unfiltered behaviour
@@ -2279,10 +2290,11 @@ def _build_subagent_tree(
     #     depth-1-only bug: the prior code filtered children to same-item
     #     agents only, pruning the graph wherever a descendant bound to a
     #     different item — so grandchildren/great-grandchildren vanished.)
-    #   * **Genuine main-loop retry attempts** — agents bound to THIS item that
-    #     are NOT descendants of the owner (no session agent spawned them, so
-    #     the MAIN LOOP dispatched them as an earlier attempt). Collapsed to
-    #     ``kind="attempt"`` nodes labeled ``attempt N`` (oldest = attempt 1).
+    #   * **Co-bound peers (no spawn edge)** — agents bound to THIS item that
+    #     are NOT descendants of the owner (no session agent spawned them). The
+    #     binding only associates them with the q-id; it records no retry or
+    #     supersession relationship, so we render them as FLAT ``kind="peer"``
+    #     siblings, labeled neutrally — NOT "attempt N", NOT nested.
     #
     # Cycle-guarded (a child is spawned by exactly one parent on disk, so
     # cycles are impossible — but we guard defensively against a corrupt map).
@@ -2344,31 +2356,46 @@ def _build_subagent_tree(
 
     _sort_children(roots)
 
-    # --- Collapse the genuine main-loop retries as attempt N. ---
-    # A retry is a same-item agent that is NOT the owner and is NOT one of the
-    # owner'''s descendants (i.e. no session agent spawned it -> the main loop
-    # dispatched it). Oldest first so attempt numbering reads chronologically
-    # (attempt 1 = earliest dispatch). ``session_subagents`` is most-recent
-    # first.
-    retries = [
+    # --- Co-bound subagents with NO spawn edge -> FLAT NEUTRAL PEERS. ---
+    # A "peer" is a same-item agent that is NOT the owner and is NOT one of the
+    # owner's spawn descendants. The binding data (agent_id -> queue_id) only
+    # records that these agent-ids were ASSOCIATED with this queue item; it does
+    # NOT encode any retry / supersession / ordering relationship between them.
+    # Multiple agents under one queue id could just be DIFFERENT agents doing
+    # DIFFERENT things (e.g. the main loop dispatched two independent agents
+    # against the same scope, or rotated the q-id) -- there is NO basis to infer
+    # one is a reiteration/supersession of another.
+    #
+    # So we render them as FLAT siblings (no nesting between them), labeled
+    # NEUTRALLY by what actually distinguishes them -- short agent-id, first-
+    # prompt-line/role (``label``), and timestamp (``age``). We do NOT label
+    # them "attempt N", do NOT mark one a "live HEAD", and do NOT nest the
+    # "older" ones under a "newer" one -- all of that was an unjustified
+    # supersession inference (removed; see q-2026-06-23-7144). Genuine
+    # parent->child spawn edges DO nest (handled above via ``parent_map`` ->
+    # ``roots``, arbitrary depth) -- that is a real hierarchy and is kept.
+    #
+    # Most-recently-active first (matches the ``roots`` sort and
+    # ``_list_session_subagents``).
+    peers = [
         sa
         for sa in session_subagents
         if _auth_qid(sa) == item_id
         and sa.get("subagent_id") != owner_agent_id
         and sa.get("subagent_id", "") not in descendant_ids
     ]
-    retries.sort(key=lambda sa: sa.get("age_seconds", 0.0), reverse=True)
-    attempt_nodes: list[dict[str, Any]] = []
-    for idx, sa in enumerate(retries, start=1):
+    peers.sort(key=lambda sa: sa.get("age_seconds", 0.0))
+    peer_nodes: list[dict[str, Any]] = []
+    for sa in peers:
         node = dict(sa)
         node["queue_id"] = item_id
-        node["kind"] = "attempt"
-        node["attempt"] = idx
-        node["children"] = []
-        attempt_nodes.append(node)
+        node["kind"] = "peer"
+        node["children"] = []  # flat -- no supersession nesting
+        peer_nodes.append(node)
 
-    # Retries (attempts) first, then the live dispatch'''s nested children.
-    return attempt_nodes + roots
+    # Co-bound peers first (flat, neutral), then the live dispatch's genuine
+    # nested spawn-children.
+    return peer_nodes + roots
 
 
 def _format_sse(data: dict[str, Any]) -> bytes:

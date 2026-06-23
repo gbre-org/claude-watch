@@ -27,27 +27,31 @@
 </head>
 <body>
   {#- ---------- RECURSIVE SUBAGENT NODE MACRO ----------
-      Renders ONE subagent node (and, recursively, its children). The node
-      shape is produced by app.py _build_subagent_tree:
+      Renders ONE subagent node (and, recursively, its genuine spawn-children).
+      The node shape is produced by app.py _build_subagent_tree:
         { subagent_id, label, age, age_seconds, queue_id,
-          kind: "attempt"|"child", attempt: <int?>, children: [ ... ] }
+          kind: "peer"|"child", children: [ ... ] }
       MUST stay byte-identical to renderSubagentNode() in static/refresh.js
       so morphdom doesn't flap between the server paint and the 5s SPA
-      refresh. The macro is recursive so genuine multi-level nesting (when
-      app.py ever attributes deeper edges) renders without template changes.
-      `kind=="attempt"` nodes are PRIOR dispatch attempts of the same queue
-      item (the owner is dropped in _build_subagent_tree) — labeled
-      "attempt N" so retries don't masquerade as distinct child work. -#}
+      refresh. The macro is recursive so genuine multi-level spawn nesting
+      (real parent->child edges from parent_map) renders to arbitrary depth
+      without template changes.
+      `kind=="peer"` nodes are co-bound subagents (same queue id, NO spawn
+      edge to the owner). The binding only associates them with the item; it
+      records no retry/supersession relationship, so they render as FLAT
+      NEUTRAL siblings (no "attempt N" badge, no "superseded"/"live HEAD"
+      framing, no implied ordering) — distinguished only by id / label / age.
+      `kind=="child"` nodes are genuine spawn descendants of the owner and
+      nest under their real parent. -#}
   {%- macro subagent_node(sa) -%}
     <li
-      class="subagent-node subagent-log-clickable{% if sa.kind == 'attempt' %} subagent-attempt{% endif %}"
+      class="subagent-node subagent-log-clickable{% if sa.kind == 'peer' %} subagent-peer{% endif %}"
       data-subagent-id="{{ sa.subagent_id }}"
       data-log-mode="subagent"
       tabindex="0"
       role="button"
       aria-label="View live log for subagent {{ sa.subagent_id }}"
       title="Click to tail this subagent's live log">
-      {% if sa.kind == 'attempt' %}<span class="subagent-attempt-badge" title="prior dispatch attempt of this queue item">attempt {{ sa.attempt }}</span>{% endif %}
       <code class="subagent-id">{{ sa.subagent_id[:12] }}</code>
       <span class="subagent-label">{{ sa.label }}</span>
       <span class="subagent-age">{{ sa.age }}</span>
@@ -232,12 +236,14 @@
              ATTRIBUTION (authoritative): app.py _build_subagent_tree groups
              subagents by the AGENT->QUEUE-ITEM bindings written by
              post-tool-agent-arm-hook — NOT by the transcript marker (which
-             mis-nested an item's own owner + retries under itself). The owner
-             agent is DROPPED (it IS the item); remaining same-item agents are
-             rendered as collapsed "attempt N" nodes. Each node is rendered by
-             the recursive subagent_node() macro (top of <body>), so genuine
-             multi-level nesting renders without template changes if app.py
-             ever attributes deeper edges. The tree is DEFAULT-EXPANDED (`open`) and collapsible
+             mis-nested an item's own owner under itself). The owner agent is
+             DROPPED (it IS the item); genuine spawn-children nest under their
+             real parent (arbitrary depth, from parent_map), while co-bound
+             same-item agents with NO spawn edge render as FLAT NEUTRAL peers
+             (kind="peer"; no "attempt N"/supersession framing — the binding
+             records no such relationship). Each node is rendered by the
+             recursive subagent_node() macro (top of <body>), so genuine
+             multi-level spawn nesting renders without template changes. The tree is DEFAULT-EXPANDED (`open`) and collapsible
              via the native <details>/<summary> disclosure; per-card collapse
              state is persisted in localStorage keyed by `data-tree-key` (the
              queue id) — see static/refresh.js (toggle listener +
