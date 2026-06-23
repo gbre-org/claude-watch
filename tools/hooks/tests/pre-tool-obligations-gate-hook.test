@@ -886,6 +886,54 @@ def main() -> int:
             f"rc={rc} out={out} sidecar_gone={sidecar_gone}",
         ))
 
+        # --- Test 25a: noise-only output (restart/heartbeat boilerplate) ->
+        #     auto-clear + allow (the surface-and-exit churn must not wedge) ---
+        noise_out = tmpdir / "noise.output"
+        noise_out.write_text(
+            "EVENT[claude-watch/heartbeat-tick] heartbeat tick "
+            "[interval_secs=300 path=/var/run/claude/heartbeat]\n"
+            "====\n"
+            "WATCHER EXITED. RESTART NOW: watcher-ctl run claude-event-watch\n"
+            "====\n"
+        )
+        os.utime(noise_out, (time.time(), time.time()))
+        sc_noise = _write_sidecar(
+            "bsidecarnoise", noise_out, registered_at=time.time() - 10)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_npwo,
+        )
+        noise_cleaned = not sc_noise.exists()
+        results.append(_check(
+            "25a. no_pending_watcher_outputs noise-only output -> auto-clear + allow",
+            rc == 0 and _is_allow(out) and noise_cleaned,
+            f"rc={rc} out={out} noise_cleaned={noise_cleaned}",
+        ))
+
+        # --- Test 25b: output that surfaced a REAL event alongside boilerplate
+        #     -> still gates (regression guard: don't over-skip actionable) ---
+        real_out = tmpdir / "real.output"
+        real_out.write_text(
+            "  [backoff] waited 12.0s, collected 1 additional message(s)\n"
+            "=== 1 new DM message(s) ===\n"
+            "  [andrew] Andrew Hall: please grab the new season\n"
+            "====\n"
+            "WATCHER EXITED. RESTART NOW: watcher-ctl run signal-wait-dm\n"
+            "====\n"
+        )
+        os.utime(real_out, (time.time(), time.time()))
+        sc_real = _write_sidecar(
+            "bsidecarreal", real_out, registered_at=time.time() - 10)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_npwo,
+        )
+        results.append(_check(
+            "25b. no_pending_watcher_outputs real-event output -> still deny",
+            rc == 0 and _is_deny(out) and str(real_out) in (
+                out.get("systemMessage", "") or ""),
+            f"rc={rc} out={out}",
+        ))
+        sc_real.unlink()
+
         # --- Test 26: Read of sidecar output path clears sidecar ---
         # Re-create an unread sidecar, then PostToolUse hook for a Read of
         # the output path -> sidecar should be deleted -> next non-exempt
