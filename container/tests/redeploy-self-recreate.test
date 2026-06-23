@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""File-level test that the Makefile `redeploy` target is a SINGLE
+"""File-level test that the Makefile `deploy-container` target is a SINGLE
 `docker compose up -d --force-recreate claude-container` so it works
-when issued FROM INSIDE the container (self-redeploy).
+when issued FROM INSIDE the container (self-redeploy). The real recipe
+now lives on `deploy-container`; `redeploy` is a DEPRECATED ALIAS
+(`redeploy: deploy-container`) kept so the baked self-redeploy contract
+keeps working — this test also asserts that alias is present.
 
 Why this matters — the workbot's container must be able to redeploy
-ITSELF: run `make redeploy` from inside, have the container recreate,
+ITSELF: run `make deploy-container` (or its alias `make redeploy`) from
+inside, have the container recreate,
 and a fresh claude session come back up and resume. For that to work
 the redeploy MUST be one host-daemon operation. When the in-container
 docker CLI issues `up -d --force-recreate`, it hands ONE create+start
@@ -23,7 +27,7 @@ This test locks in the single-force-recreate invariant so a future
 refactor can't silently reintroduce a teardown-then-up split (or a
 nohup / disown / `&` detach hack), all of which break self-redeploy.
 
-Asserts (against the Makefile `redeploy:` recipe body):
+Asserts (against the Makefile `deploy-container:` recipe body):
 
   1. The recipe runs `up -d --force-recreate` (the single atomic
      host-daemon recreate).
@@ -94,19 +98,30 @@ def extract_recipe(makefile_text: str, target: str) -> str:
 expect(MAKEFILE.is_file(), f"Makefile missing at {MAKEFILE}")
 if MAKEFILE.is_file():
     text = MAKEFILE.read_text(encoding="utf-8")
-    recipe = extract_recipe(text, "redeploy")
+    recipe = extract_recipe(text, "deploy-container")
 
     expect(
         recipe.strip() != "",
-        "Makefile: a `redeploy` target must exist with a non-empty "
-        "recipe.",
+        "Makefile: a `deploy-container` target must exist with a "
+        "non-empty recipe.",
+    )
+
+    # 0. the deprecated `redeploy` alias must still exist and depend on
+    #    `deploy-container` (the baked self-redeploy contract calls
+    #    `make redeploy` until a rebuild bakes the new name).
+    expect(
+        re.search(r"^redeploy:\s*deploy-container\s*$", text, re.M)
+        is not None,
+        "Makefile: `redeploy` must remain as a deprecated alias "
+        "`redeploy: deploy-container` so `make redeploy` keeps working "
+        "for the baked image's self-redeploy contract.",
     )
 
     # 1. single force-recreate.
     expect(
         re.search(r"up\s+-d\s+--force-recreate", recipe) is not None
         or re.search(r"up\s+--force-recreate\s+-d", recipe) is not None,
-        "Makefile redeploy: must run `docker compose up -d "
+        "Makefile deploy-container: must run `docker compose up -d "
         "--force-recreate claude-container` — a SINGLE host-daemon "
         "recreate that completes even after the issuing (in-container) "
         "shell is torn down. This is the crux of self-redeploy.",
@@ -115,7 +130,7 @@ if MAKEFILE.is_file():
     # 2. no rm -sf split.
     expect(
         re.search(r"\brm\s+-(sf|fs)\b", recipe) is None,
-        "Makefile redeploy: must NOT use `docker compose rm -sf` — the "
+        "Makefile deploy-container: must NOT use `docker compose rm -sf` — the "
         "teardown-then-up split breaks self-redeploy because the first "
         "command destroys the container running the make recipe, so "
         "the `&& up -d` never executes and the container never comes "
@@ -125,7 +140,7 @@ if MAKEFILE.is_file():
     # 3. no `down`.
     expect(
         re.search(r"compose\s+down\b", recipe) is None,
-        "Makefile redeploy: must NOT run `docker compose down` — it "
+        "Makefile deploy-container: must NOT run `docker compose down` — it "
         "tears down sibling services AND, like rm -sf, can't be the "
         "first half of a self-redeploy (it kills the issuing "
         "container so any following command never runs).",
@@ -135,7 +150,7 @@ if MAKEFILE.is_file():
     for bad in ("nohup", "disown", "setsid"):
         expect(
             bad not in recipe,
-            f"Makefile redeploy: must NOT use `{bad}` — HARD "
+            f"Makefile deploy-container: must NOT use `{bad}` — HARD "
             "CONSTRAINT. The host docker daemon owns the recreate, so "
             "no backgrounding/detach is needed; any detach hack dies "
             "with the issuing container's shell anyway.",
@@ -146,7 +161,7 @@ if MAKEFILE.is_file():
     recipe_no_andand = recipe.replace("&&", "")
     expect(
         "&" not in recipe_no_andand,
-        "Makefile redeploy: must NOT background the compose call with "
+        "Makefile deploy-container: must NOT background the compose call with "
         "a trailing `&` — the daemon completes the recreate "
         "synchronously from the CLI's perspective; backgrounding it "
         "from inside the container detaches it into a shell that the "
@@ -156,7 +171,7 @@ if MAKEFILE.is_file():
     # 5. targets the claude-container service by name.
     expect(
         "claude-container" in recipe,
-        "Makefile redeploy: must name the `claude-container` service "
+        "Makefile deploy-container: must name the `claude-container` service "
         "so it recreates only that service and leaves siblings "
         "(queue-minisite, eichi-search, ttyd) running.",
     )

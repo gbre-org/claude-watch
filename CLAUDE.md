@@ -102,7 +102,7 @@ make test-e2e          # e2e tmux tests only (~10s)
 make test-live         # live e2e tests (spawn real Claude Code, ~1-2 min each)
 make test-verbose      # all tests with stdout/stderr visible
 make build             # release build
-make deploy            # release build + systemctl restart
+make deploy-systemd    # release build + systemctl restart (host/systemd; `make deploy` is a deprecated alias)
 make install-hooks     # install git pre-commit hook
 ```
 

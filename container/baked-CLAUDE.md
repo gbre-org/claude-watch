@@ -816,15 +816,18 @@ cross-platform (Linux, macOS, or Windows). The in-container npm runs as uid
 
 ## Container redeploy (incl. self-redeploy from inside the container)
 
-To redeploy: `make redeploy` from the repo root (via host-bash).
+To redeploy: `make deploy-container` from the repo root (via host-bash).
+(`make redeploy` is a DEPRECATED ALIAS that still works; the rename
+distinguishes the Docker-container recreate from `deploy-systemd`, the
+host/systemd install.)
 Equivalent: `cd examples/compose && docker compose up -d --force-recreate claude-container`
 
-`make redeploy` is a SINGLE `docker compose up -d --force-recreate
+`make deploy-container` is a SINGLE `docker compose up -d --force-recreate
 claude-container`. That single-command shape makes it safe to run FROM
 INSIDE the container (self-redeploy): the in-container docker CLI hands
 ONE create+start request to the HOST docker daemon, which carries
 stop-old + start-new to completion even after the issuing container
-(and the shell that ran `make redeploy`) is torn down. The
+(and the shell that ran `make deploy-container`) is torn down. The
 daemon owns the operation — **no nohup, no disown, no `&`
 backgrounding, and NOT a `rm -sf && up -d` split** (the second command
 in a split never runs once the issuing container dies).
@@ -834,11 +837,10 @@ grandchild outlived process-compose's shutdown and pinned the container netns
 + shared tmux-socket named volume. Chief offender was crond — `sudo -n
 /usr/sbin/cron` FORKED a root cron surviving SIGKILL of the sudo wrapper.
 Fixed at source: the Dockerfile sudoers carve-out disables `pam_session` +
-`pam_setcred` for the cron argv (`Defaults!CRON_NOFORK !pam_session,
-!pam_setcred`) so sudo `execve()`s cron DIRECTLY (the supervised process
-IS the daemon, no orphan), and `cw-claude-watch-launch` `exec`s
-claude-watch. With clean teardown the old container releases the netns +
-named volumes before the fresh one starts.
+`pam_setcred` for the cron argv so sudo `execve()`s cron DIRECTLY (no
+orphan), and `cw-claude-watch-launch` `exec`s claude-watch. With clean
+teardown the old container releases the netns + named volumes before the
+fresh one starts.
 
 `docker-compose.yml` sets `stop_grace_period: 15s`, sized to fit
 process-compose's graceful shutdown (each supervised process pins
@@ -861,7 +863,7 @@ daemon is fine; the point is no MANUAL host step and no nohup):
 
    ```sh
    date -u +%s > /home/hndrewaall/.cache/claude-watch/redeploy-marker
-   make redeploy   # single up -d --force-recreate; this kills THIS session
+   make deploy-container   # single up -d --force-recreate; kills THIS session (alias: make redeploy)
    ```
 
 2. The container recreates host-side. The fresh entrypoint boots
@@ -880,18 +882,10 @@ daemon is fine; the point is no MANUAL host step and no nohup):
    it survives the recreate. A readable marker + a fresh container
    uptime + an active session = self-redeploy validated.
 
-4. Clean-shutdown spot-check (proves no orphaned cron pins the netns).
-   Before/after a `docker stop` of a throwaway container, assert no
-   stray root `cron` survives:
-
-   ```sh
-   docker compose -f examples/compose/docker-compose.yml exec claude-container \
-     sh -c 'ps -eo pid,user,comm | grep -E "[c]ron" || echo "no cron"'
-   docker stop <container>           # graceful; process-compose tears down
-   # After stop the container is gone; a second `up -d --force-recreate`
-   # must succeed with NO "address already in use" / netns-pinned wedge.
-   # If it wedges, an orphan survived teardown.
-   ```
+4. Clean-shutdown spot-check (proves no orphaned cron pins the netns):
+   after a graceful `docker stop`, a second `up -d --force-recreate` must
+   succeed with NO "address already in use" / netns-pinned wedge. If it
+   wedges, an orphan survived teardown.
 
 ## What is bind-mounted from the host
 
@@ -924,7 +918,7 @@ The public `examples/compose/docker-compose.yml` is intentionally
 `gitconfig`, `ssh-agent` socket, work-private repos) live in an override
 file OUT of the git tree, in the stable config dir
 `~/.config/claude-container/docker-compose.override.yml`. The deploy paths
-(`make redeploy`, `cw --up`) point `COMPOSE_FILE` at it, so the merge is
+(`make deploy-container` [alias `make redeploy`], `cw --up`) point `COMPOSE_FILE` at it, so the merge is
 location-independent no matter which clone or worktree deploys (a
 gitignored sibling would be absent from the build worktree deploys run
 from -- the recurring "mount missing after recreate" bug).
