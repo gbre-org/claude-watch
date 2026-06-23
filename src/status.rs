@@ -467,17 +467,6 @@ fn is_executable_file(path: &std::path::Path) -> bool {
     }
 }
 
-/// Parse the leading semver out of `claude --version` output.
-///
-/// `claude --version` prints e.g. `2.1.186 (Claude Code)`, so we anchor on a
-/// leading `MAJOR.MINOR.PATCH`. Returns `None` for junk that doesn't start
-/// with a semver. Pure string parse so it's cheap + unit-testable.
-pub(crate) fn parse_claude_version_output(output: &str) -> Option<String> {
-    let re = Regex::new(r"^(\d+\.\d+\.\d+)").unwrap();
-    re.captures(output.trim())
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
-}
-
 /// Resolve the running Claude Code version for a given PID.
 ///
 /// 1. **Native layout**: `/proc/PID/exe` resolves to the versioned binary path,
@@ -489,13 +478,15 @@ pub(crate) fn parse_claude_version_output(output: &str) -> Option<String> {
 ///    running version in `~/.claude/sessions/<PID>.json` (the `"version"`
 ///    field), which is the authoritative "what THIS running PID loaded"
 ///    snapshot for every install method — read that.
-/// 3. **Last-resort fallback**: if neither `/proc/PID/exe` nor the per-PID
-///    session marker yields a version (e.g. the marker was written at session
-///    start and never refreshed after a `cwsr` in-place roll, so it's missing
-///    or unparseable), shell out to `claude --version` and parse the leading
-///    semver. This reports the INSTALLED version, which can differ from a
-///    not-yet-rolled running PID — so it is intentionally LAST, never preferred
-///    over the per-PID marker in the normal path.
+///
+/// These two layouts are the ONLY sources. We intentionally do NOT shell out to
+/// `claude --version` as a fallback: that yields the INSTALLED version, not what
+/// is running in this PID. On a deleted-inode exe link the truthful running
+/// version is the OLD version this PID loaded (per the session marker) — never
+/// the newly-installed one. If neither layout resolves, return `None`; we never
+/// substitute the installed value for the running one. (The separate
+/// `installed`/`latest` field IS sourced from the installed binary — see
+/// [`find_claude_launcher`] + [`resolve_installed_version`].)
 fn resolve_running_version(pid: &str) -> Option<String> {
     // Layout 1: versioned /proc/PID/exe target.
     let exe_path = format!("/proc/{pid}/exe");
@@ -505,29 +496,26 @@ fn resolve_running_version(pid: &str) -> Option<String> {
         }
     }
 
-    // Layout 2: Claude's own per-PID session marker (authoritative for the
-    // version THIS PID loaded).
+    // Layout 2 (terminal fallback): Claude's own per-PID session marker. This
+    // is the authoritative "what THIS running PID loaded" snapshot, written at
+    // process start, for every install method.
+    //
+    // We deliberately STOP here. We do NOT shell out to `claude --version` as a
+    // further fallback: that reports the INSTALLED version, not what is actually
+    // running in this PID. When `/proc/PID/exe` is a deleted inode (npm's atomic
+    // install renamed a newer package over the live one) the truthful running
+    // version is the OLD version this PID loaded — recorded in the session
+    // marker — NOT the freshly-installed one. Reporting the installed version
+    // here would lie about what is in-process. If neither the exe link nor the
+    // marker yields a version we return `None` rather than "freshen" it with the
+    // installed value. (The `installed`/`latest` field is sourced separately via
+    // find_claude_launcher() + resolve_installed_version(), where the installed
+    // binary IS the right answer.)
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let session_marker = format!("{home}/.claude/sessions/{pid}.json");
     if let Ok(contents) = std::fs::read_to_string(&session_marker) {
         if let Some(ver) = extract_version_from_json(&contents) {
             return Some(ver);
-        }
-    }
-
-    // Layout 3: last-resort — ask the real binary directly. Resolve `claude`
-    // via find_claude_launcher() so we run the real CLI, not the hooks-shim
-    // (the shim passes `--version` through verbatim anyway, but be explicit).
-    let claude_bin = find_claude_launcher()?;
-    if let Ok(output) = std::process::Command::new(&claude_bin)
-        .arg("--version")
-        .output()
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(ver) = parse_claude_version_output(&stdout) {
-                return Some(ver);
-            }
         }
     }
 
@@ -1726,44 +1714,6 @@ mod tests {
             extract_version_from_json(r#"{"version":"latest"}"#),
             None
         );
-    }
-
-    // --- parse_claude_version_output tests ---
-
-    #[test]
-    fn test_parse_claude_version_output_typical() {
-        // `claude --version` prints "2.1.186 (Claude Code)".
-        assert_eq!(
-            parse_claude_version_output("2.1.186 (Claude Code)"),
-            Some("2.1.186".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_claude_version_output_trailing_newline() {
-        assert_eq!(
-            parse_claude_version_output("2.1.186 (Claude Code)\n"),
-            Some("2.1.186".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_claude_version_output_bare_semver() {
-        assert_eq!(
-            parse_claude_version_output("1.0.0"),
-            Some("1.0.0".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_claude_version_output_junk() {
-        // Junk / non-version input must not produce a version.
-        assert_eq!(parse_claude_version_output("not a version"), None);
-        assert_eq!(parse_claude_version_output(""), None);
-        // No leading semver (only major.minor) — reject.
-        assert_eq!(parse_claude_version_output("2.1 (Claude Code)"), None);
-        // A line that mentions a version mid-string but doesn't START with one.
-        assert_eq!(parse_claude_version_output("Claude Code 2.1.186"), None);
     }
 
     // --- is_claude_hooks_shim tests ---
