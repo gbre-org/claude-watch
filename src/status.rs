@@ -3,6 +3,7 @@
 use crate::cmd::{run_cmd, run_cmd_any};
 use regex_lite::Regex;
 use serde::Serialize;
+use std::time::SystemTime;
 use tracing::{debug, warn};
 
 /// Parsed Claude Code status from tmux pane capture + /proc.
@@ -1036,9 +1037,150 @@ pub(crate) fn watcher_pidfile_liveness(
     (recorded_pid, down)
 }
 
+/// Age (seconds) since the most-recently-modified watcher runtime file
+/// (`<name>.lock`, `<name>.pid`, `<name>.runlock`) under `pid_dir`. Returns
+/// `None` if none of the three exist.
+///
+/// A freshly-written pidfile is proof the watcher was (re)spawned recently. The
+/// watcher-monitor uses this to keep a fire-and-exit watcher in its grace window
+/// across the brief exit->restart gap even when the daemon's poll never caught
+/// it genuinely alive: `<name>.lock`/`<name>.pid` are rewritten on EVERY restart
+/// (by the watcher's flock guard / `watcher_run`), so as long as the main loop
+/// keeps restarting within the grace window, the freshest mtime stays young. A
+/// GENUINELY dead watcher (main loop stopped restarting) has its pidfiles age
+/// past the window, so real DOWN detection is preserved.
+///
+/// Pure-ish: filesystem stats only, no `pgrep` / `/proc`.
+// dead_code allow: the sole non-test caller is `policy::check_cycle`, which
+// the lib-only dead-code pass (release build, RUSTFLAGS=-D warnings) does not
+// treat as a root (it's reached via the `bin`'s `main`). Genuinely used by the
+// running daemon's watcher_monitor; the allow keeps `-D warnings` green.
+#[allow(dead_code)]
+pub(crate) fn watcher_runtime_file_age_secs(pid_dir: &str, name: &str) -> Option<f64> {
+    let now = SystemTime::now();
+    let suffixes = ["lock", "pid", "runlock"];
+    let mut youngest: Option<f64> = None;
+    for suffix in suffixes {
+        let path = format!("{}/{}.{}", pid_dir, name, suffix);
+        let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // Age = now - mtime. A clock skew that puts mtime in the future
+        // clamps to 0 (treat a future-dated file as freshly written, never
+        // negative) so a skewed clock can't manufacture a stale reading.
+        let age = now
+            .duration_since(mtime)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        youngest = Some(match youngest {
+            Some(cur) => cur.min(age),
+            None => age,
+        });
+    }
+    youngest
+}
+
+/// Pure decision: is a watcher still within its grace window?
+///
+/// The grace window is anchored on RECENT PROOF-OF-LIFE that does NOT require
+/// the daemon to catch the short-lived (fire-and-exit) watcher mid-flight. The
+/// watcher is in-grace if EITHER:
+///   * `last_seen_age` (seconds since the last poll that caught it genuinely
+///     running) is within `grace_secs`, OR
+///   * `pidfile_age` (seconds since its freshest runtime file was written, from
+///     [`watcher_runtime_file_age_secs`]) is within `grace_secs`.
+///
+/// The pidfile anchor is what kills the restart-gap false-DOWN: a watcher whose
+/// pidfile was just rewritten is mid-restart-cycle, NOT down, even when the
+/// daemon's poll never observed it alive between exit and respawn.
+#[allow(dead_code)] // see watcher_runtime_file_age_secs: lib-only dead-code false positive
+pub(crate) fn watcher_in_grace(
+    last_seen_age: Option<f64>,
+    pidfile_age: Option<f64>,
+    grace_secs: f64,
+) -> bool {
+    last_seen_age.is_some_and(|e| e < grace_secs)
+        || pidfile_age.is_some_and(|e| e < grace_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_watcher_runtime_file_age_secs_none_when_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            watcher_runtime_file_age_secs(dir.path().to_str().unwrap(), "evw"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_watcher_runtime_file_age_secs_fresh_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("evw.lock"), "70071").unwrap();
+        let age = watcher_runtime_file_age_secs(dir.path().to_str().unwrap(), "evw")
+            .expect("a just-written lock file must yield Some(age)");
+        // Just-written file: age is essentially zero, certainly well under a
+        // generous bound.
+        assert!(age >= 0.0, "age must be non-negative, got {age}");
+        assert!(age < 5.0, "freshly-written lock should be young, got {age}");
+    }
+
+    #[test]
+    fn test_watcher_runtime_file_age_secs_takes_freshest() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        // Write a .pid first, then make the .lock the fresher of the two by
+        // backdating the .pid's mtime well past the .lock's.
+        std::fs::write(dir.path().join("evw.pid"), "111").unwrap();
+        std::fs::write(dir.path().join("evw.lock"), "222").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        filetime_set(&dir.path().join("evw.pid"), old);
+        let age = watcher_runtime_file_age_secs(d, "evw").unwrap();
+        // The freshest (.lock) is young; the result must reflect IT, not the
+        // hour-old .pid.
+        assert!(age < 5.0, "should report freshest (lock) age, got {age}");
+    }
+
+    // Helper: backdate a file's mtime (std-only; `File::set_modified`, 1.75+).
+    fn filetime_set(path: &std::path::Path, t: SystemTime) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn test_watcher_in_grace_pidfile_fresh_overrides_stale_last_seen() {
+        // The regression case: last_seen_running is STALE (well past grace) but
+        // the pidfile was just rewritten (mid restart-cycle). The watcher must
+        // be treated as IN-GRACE (not a miss / not DOWN).
+        let grace = 90.0;
+        assert!(
+            watcher_in_grace(Some(300.0), Some(2.0), grace),
+            "fresh pidfile must keep a stale-last-seen watcher in grace"
+        );
+    }
+
+    #[test]
+    fn test_watcher_in_grace_both_stale_is_not_in_grace() {
+        // Genuinely down: last_seen stale AND pidfile aged past grace -> NOT in
+        // grace, so real DOWN detection still fires.
+        let grace = 90.0;
+        assert!(!watcher_in_grace(Some(300.0), Some(300.0), grace));
+        assert!(!watcher_in_grace(Some(300.0), None, grace));
+        assert!(!watcher_in_grace(None, None, grace));
+    }
+
+    #[test]
+    fn test_watcher_in_grace_either_anchor_fresh() {
+        let grace = 90.0;
+        // Fresh last_seen alone keeps it in grace (legacy behaviour preserved).
+        assert!(watcher_in_grace(Some(10.0), None, grace));
+        // Fresh pidfile alone keeps it in grace (the new anchor).
+        assert!(watcher_in_grace(None, Some(10.0), grace));
+    }
 
     // --- parse_status_bar tests ---
 
