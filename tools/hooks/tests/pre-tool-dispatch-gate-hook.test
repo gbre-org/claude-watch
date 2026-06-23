@@ -253,6 +253,25 @@ def test_baked_bash_exempt_patterns_allow():
             "watcher-ctl run signal-wait-dm",
             "watcher-ctl run signal-wait-dm 2>&1",
             "/usr/local/bin/watcher-ctl run torrent-check",
+            "watcher-ctl status",
+            "/usr/local/bin/watcher-ctl status",
+            # Dispatcher-loop maintenance surface (mirrors event_must_act
+            # exempt-set) -- routine main-loop bookkeeping, not worker work.
+            "agent-ack register q-2026-06-22-aee8",
+            "agent-ack done q-2026-06-22-aee8",
+            "agent-ack list",
+            "agent-ack status",
+            "/usr/local/bin/agent-ack register q-x --agent-id a1",
+            "event-ack ingest --source manual --tag workbot-prompt --message m",
+            "event-ack ack key --action done",
+            "event-ack list",
+            "/usr/local/bin/event-ack clear",
+            "event-classify --list-rules",
+            "event-classify --source s --tag t --json",
+            "/usr/local/bin/event-classify --source s --tag t",
+            # Heartbeat-liveness touch (both watched paths).
+            "touch /var/run/claude/heartbeat",
+            "touch /var/run/claude/claude-heartbeat",
         ]
         for cmd in exempt_cmds:
             rc, out, _ = h.run_hook({"tool_name": "Bash",
