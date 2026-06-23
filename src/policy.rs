@@ -4119,12 +4119,29 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // Default 90s; tunable via [watcher_monitor].grace_secs (0 in
                 // the e2e auto-restart test for fast firing).
                 let grace_secs = config.watcher_monitor.grace_secs as f64;
-                let in_grace = health
+                // Anchor the grace window on RECENT PROOF-OF-LIFE that does NOT
+                // require the daemon to catch the short-lived (fire-and-exit)
+                // watcher mid-flight. `last_seen_running` is refreshed ONLY on a
+                // poll cycle that happens to observe the watcher genuinely alive
+                // — but claude-event-watch is alive only a few seconds per
+                // restart cycle, so the poll frequently MISSES the live window
+                // and `last_seen_running` goes stale even while the main loop is
+                // faithfully restarting the watcher. That stale anchor expired
+                // the grace window and produced a false-DOWN inject storm.
+                //
+                // The watcher's `.lock`/`.pid` (and `.runlock`) are rewritten on
+                // EVERY restart, so the freshest pidfile mtime is independent
+                // proof the watcher was (re)spawned recently. Treat the watcher
+                // as in-grace if EITHER `last_seen_running` OR its freshest
+                // pidfile is within grace_secs. A GENUINELY dead watcher (main
+                // loop stopped restarting) has its pidfiles age past grace_secs
+                // → DOWN still fires correctly.
+                let last_seen_age = health
                     .last_seen_running
                     .as_deref()
-                    .and_then(elapsed_since)
-                    .is_some_and(|e| e < grace_secs);
-                if in_grace {
+                    .and_then(elapsed_since);
+                let pidfile_age = status::watcher_runtime_file_age_secs(&pid_dir, &entry.name);
+                if status::watcher_in_grace(last_seen_age, pidfile_age, grace_secs) {
                     continue;
                 }
                 health.consecutive_missing += 1;
