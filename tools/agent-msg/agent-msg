@@ -74,6 +74,12 @@ Subcommand surface:
   agent-msg arm <id>               — initialise inbox + register inform-mode obligation
   agent-msg disarm <id>            — clear inbox + remove obligation
   agent-msg send <id> <text>       — append a message to <id>'s inbox
+  agent-msg send --queue-id q-XXXX <text>
+                                   — resolve the q-id to its single LIVE agent
+                                     then send (errors on zero / multiple live)
+  agent-msg resolve <q-id>         — print the live agent id bound to a queue id
+                                     (--all lists every match incl. stale)
+  agent-msg whoami <id>            — reverse lookup: print the q-id bound to <id>
   agent-msg inbox <id>             — read inbox; default UNREAD only (--all shows read too)
   agent-msg ack <id>               — flip every UNREAD message to read=true (keeps body)
   agent-msg gc <id>                — drop read messages older than the TTL
@@ -923,6 +929,30 @@ def cmd_index_done(args) -> int:
 
 
 def cmd_send(args) -> int:
+    # Resolution path: if --queue-id is given (and no explicit agent id),
+    # resolve it to the single live agent bound to that queue item. LOUD
+    # failure on zero / multiple live agents -- never guess (a guess is
+    # how corrections got misrouted to the wrong agent's inbox).
+    queue_id_arg = getattr(args, "queue_id", None)
+    if queue_id_arg:
+        if args.agent_id:
+            print("ERROR: pass EITHER a positional <agent-id> OR "
+                  "--queue-id, not both.", file=sys.stderr)
+            return 1
+        try:
+            args.agent_id = _resolve_queue_id_unique(queue_id_arg, args)
+        except ValueError as e:
+            if getattr(args, "json", False):
+                print(json.dumps({"ok": False, "queue_id": queue_id_arg,
+                                  "error": str(e)}, indent=2))
+            else:
+                print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+    elif not args.agent_id:
+        print("ERROR: send requires a positional <agent-id> or "
+              "--queue-id <q-id>.", file=sys.stderr)
+        return 1
+
     agent_id = args.agent_id
     text = args.text
     from_label = args.from_label or "andrew@signal"
@@ -1315,6 +1345,9 @@ def _make_args(**kwargs):
         "ttl_hours": None,
         # gc-dead default
         "command": None,
+        # resolve / send-by-queue-id / whoami:
+        "queue_id": None,
+        "bindings_path": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -2929,6 +2962,314 @@ def test_gc_dead_implicit_disabled_when_interval_zero():
     return True
 
 
+# ----------------------------------------------------------------------
+# Resolution tests (q-id -> agent-id binding map)
+# ----------------------------------------------------------------------
+
+
+def _write_bindings(path: Path, mapping: dict) -> None:
+    """Test helper: write a {agent_id: queue_id} mapping in arm-hook schema."""
+    import time as _t
+    now = int(_t.time())
+    bindings = {
+        aid: {"queue_id": qid, "registered_at": now,
+              "registered_at_iso": _now_iso(), "pid": 1}
+        for aid, qid in mapping.items()
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"bindings": bindings}, indent=2) + "\n")
+
+
+def _resolve_args(td: Path, **kw):
+    """Args namespace pointing both binding map + inbox dir into a sandbox."""
+    return _make_args(
+        bindings_path=str(Path(td) / "bindings.json"),
+        inbox_dir=str(Path(td) / "inbox"),
+        **kw,
+    )
+
+
+def test_bindings_roundtrip():
+    """_read_bindings reads back exactly what the arm-hook schema writes."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        bpath = Path(td) / "bindings.json"
+        _write_bindings(bpath, {"agent-a": "q-1", "agent-b": "q-2"})
+        args = _resolve_args(td)
+        b = _read_bindings(args)
+        assert set(b.keys()) == {"agent-a", "agent-b"}
+        assert b["agent-a"]["queue_id"] == "q-1"
+        assert b["agent-b"]["queue_id"] == "q-2"
+    return True
+
+
+def test_bindings_corrupt_tolerated_on_read():
+    """A corrupt / empty / wrong-shape binding file reads as {} (no crash)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        bpath = Path(td) / "bindings.json"
+        args = _resolve_args(td)
+        # Missing file.
+        assert _read_bindings(args) == {}
+        # Empty file.
+        bpath.write_text("")
+        assert _read_bindings(args) == {}
+        # Truncated / invalid JSON (the exact failure the main loop hit).
+        bpath.write_text('{"bindings": {"a": {"queue_id": "q-1"')
+        assert _read_bindings(args) == {}
+        # Not-an-object root.
+        bpath.write_text("[1, 2, 3]")
+        assert _read_bindings(args) == {}
+        # bindings is not a dict.
+        bpath.write_text('{"bindings": []}')
+        assert _read_bindings(args) == {}
+        # Concatenated JSON objects (interleaved non-atomic writes).
+        bpath.write_text('{"bindings": {}}{"bindings": {}}')
+        assert _read_bindings(args) == {}
+    return True
+
+
+def test_resolve_happy_path():
+    """resolve a q-id with one live agent -> that agent id."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        bpath = Path(td) / "bindings.json"
+        _write_bindings(bpath, {"agent-live": "q-go"})
+        # Make agent-live live by giving it an inbox file.
+        cmd_send(_resolve_args(td, agent_id="agent-live", text="x", no_arm=True))
+        args = _resolve_args(td, queue_id="q-go")
+        aid = _resolve_queue_id_unique("q-go", args)
+        assert aid == "agent-live", aid
+        # cmd_resolve prints just the id and exits 0.
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cmd_resolve(_resolve_args(td, queue_id="q-go"))
+        assert rc == 0
+        assert buf.getvalue().strip() == "agent-live"
+    return True
+
+
+def test_resolve_zero_match_errors():
+    """resolve a q-id no agent is bound to -> non-zero exit, clear message."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json", {"agent-other": "q-other"})
+        args = _resolve_args(td, queue_id="q-missing")
+        try:
+            _resolve_queue_id_unique("q-missing", args)
+            assert False, "expected ValueError on zero match"
+        except ValueError as e:
+            assert "no binding found" in str(e)
+        rc = cmd_resolve(_resolve_args(td, queue_id="q-missing", json=True))
+        assert rc == 1
+    return True
+
+
+def test_resolve_dead_only_errors():
+    """A bound agent with NO inbox (dead) does not count as live -> error."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json", {"agent-dead": "q-dead"})
+        # No inbox file written -> agent-dead is not live.
+        args = _resolve_args(td, queue_id="q-dead")
+        try:
+            _resolve_queue_id_unique("q-dead", args)
+            assert False, "expected ValueError -- bound but not live"
+        except ValueError as e:
+            assert "NONE are live" in str(e), str(e)
+    return True
+
+
+def test_resolve_multi_match_errors():
+    """Two LIVE agents on the same q-id (retry) -> non-zero exit, no guess."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json",
+                        {"agent-1": "q-dup", "agent-2": "q-dup"})
+        # Both live (inbox files exist).
+        cmd_send(_resolve_args(td, agent_id="agent-1", text="x", no_arm=True))
+        cmd_send(_resolve_args(td, agent_id="agent-2", text="x", no_arm=True))
+        args = _resolve_args(td, queue_id="q-dup")
+        try:
+            _resolve_queue_id_unique("q-dup", args)
+            assert False, "expected ValueError on multiple live agents"
+        except ValueError as e:
+            assert "MULTIPLE live agents" in str(e), str(e)
+        rc = cmd_resolve(_resolve_args(td, queue_id="q-dup"))
+        assert rc == 1
+    return True
+
+
+def test_resolve_all_lists_live_and_stale():
+    """resolve --all lists every match, marking live vs stale, never errors."""
+    import tempfile
+    import io
+    from contextlib import redirect_stdout
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json",
+                        {"agent-live": "q-mix", "agent-stale": "q-mix"})
+        cmd_send(_resolve_args(td, agent_id="agent-live", text="x", no_arm=True))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cmd_resolve(_resolve_args(td, queue_id="q-mix",
+                                           all=True, json=True))
+        assert rc == 0
+        result = json.loads(buf.getvalue())
+        assert result["live"] == ["agent-live"]
+        assert result["stale"] == ["agent-stale"]
+        assert set(result["all"]) == {"agent-live", "agent-stale"}
+    return True
+
+
+def test_send_by_queue_id_happy():
+    """send --queue-id resolves to the single live agent and delivers."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json", {"agent-x": "q-send"})
+        # Pre-create the inbox so agent-x is live.
+        cmd_send(_resolve_args(td, agent_id="agent-x", text="seed", no_arm=True))
+        rc = cmd_send(_resolve_args(td, queue_id="q-send",
+                                    text="resolved msg", no_arm=True))
+        assert rc == 0
+        path = Path(td) / "inbox" / "agent-x.json"
+        data = _load_inbox_messages(path)
+        assert [m["text"] for m in data] == ["seed", "resolved msg"]
+    return True
+
+
+def test_send_by_queue_id_zero_match_errors():
+    """send --queue-id with no bound agent -> non-zero exit, nothing written."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json", {})
+        rc = cmd_send(_resolve_args(td, queue_id="q-nope", text="msg",
+                                    no_arm=True))
+        assert rc == 1
+        # No inbox written for anyone.
+        inbox_dir = Path(td) / "inbox"
+        assert not inbox_dir.exists() or not any(inbox_dir.glob("*.json"))
+    return True
+
+
+def test_send_by_queue_id_multi_match_errors():
+    """send --queue-id with two live agents -> non-zero exit, no guess."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json",
+                        {"agent-1": "q-d", "agent-2": "q-d"})
+        cmd_send(_resolve_args(td, agent_id="agent-1", text="x", no_arm=True))
+        cmd_send(_resolve_args(td, agent_id="agent-2", text="x", no_arm=True))
+        rc = cmd_send(_resolve_args(td, queue_id="q-d", text="msg",
+                                    no_arm=True))
+        assert rc == 1
+        # Neither inbox grew beyond the seed.
+        for aid in ("agent-1", "agent-2"):
+            data = _load_inbox_messages(Path(td) / "inbox" / f"{aid}.json")
+            assert [m["text"] for m in data] == ["x"], aid
+    return True
+
+
+def test_send_rejects_both_agent_and_queue_id():
+    """Passing both a positional agent id and --queue-id is an error."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json", {"a": "q-z"})
+        rc = cmd_send(_resolve_args(td, agent_id="a", queue_id="q-z",
+                                    text="x", no_arm=True))
+        assert rc == 1
+    return True
+
+
+def test_whoami_reverse_lookup():
+    """whoami prints the q-id bound to an agent; errors on unknown agent."""
+    import tempfile
+    import io
+    from contextlib import redirect_stdout
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json", {"agent-w": "q-who"})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cmd_whoami(_resolve_args(td, agent_id="agent-w"))
+        assert rc == 0
+        assert buf.getvalue().strip() == "q-who"
+        # Unknown agent -> rc 1.
+        rc = cmd_whoami(_resolve_args(td, agent_id="ghost"))
+        assert rc == 1
+    return True
+
+
+def test_bindings_concurrent_writes_never_corrupt():
+    """Parallel arm-hook _upsert_binding writers keep the file always-parseable.
+
+    Imports the real _upsert_binding from the arm hook and hammers it from
+    many threads against one binding file; after every write the file must
+    parse as JSON (atomic tmp+rename under flock), and the final file must
+    contain every agent's binding.
+    """
+    import tempfile
+    import threading
+    import importlib.machinery
+    import importlib.util
+    hook_path = (Path(__file__).resolve().parent.parent
+                 / "hooks" / "post-tool-agent-arm-hook")
+    if not hook_path.exists():
+        return True  # hook not co-located in this layout -- skip
+    # The hook file has no .py extension, so use SourceFileLoader directly
+    # (spec_from_file_location returns None for unrecognised suffixes).
+    loader = importlib.machinery.SourceFileLoader("_arm_hook", str(hook_path))
+    spec = importlib.util.spec_from_loader("_arm_hook", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    with tempfile.TemporaryDirectory() as td:
+        bpath = Path(td) / "bindings.json"
+        old = os.environ.get("CLAUDE_AGENT_QUEUE_BINDINGS_PATH")
+        os.environ["CLAUDE_AGENT_QUEUE_BINDINGS_PATH"] = str(bpath)
+        stop = threading.Event()
+        errors = []
+
+        def reader():
+            # Continuously read; the file must NEVER fail to parse once it
+            # exists (atomic rename guarantees a reader sees old-or-new,
+            # never a half-written file).
+            while not stop.is_set():
+                if bpath.exists():
+                    try:
+                        raw = bpath.read_text()
+                        if raw.strip():
+                            json.loads(raw)
+                    except json.JSONDecodeError as e:
+                        errors.append(f"reader saw corrupt JSON: {e}")
+                        return
+
+        def writer(i):
+            for j in range(10):
+                mod._upsert_binding(f"agent-{i}-{j}", f"q-{i}")
+
+        try:
+            rd = threading.Thread(target=reader)
+            rd.start()
+            ws = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+            for w in ws:
+                w.start()
+            for w in ws:
+                w.join()
+            stop.set()
+            rd.join()
+            assert not errors, errors
+            # Final file parses and holds every binding (8 * 10 = 80).
+            final = json.loads(bpath.read_text())
+            assert len(final["bindings"]) == 80, len(final["bindings"])
+        finally:
+            stop.set()
+            if old is None:
+                os.environ.pop("CLAUDE_AGENT_QUEUE_BINDINGS_PATH", None)
+            else:
+                os.environ["CLAUDE_AGENT_QUEUE_BINDINGS_PATH"] = old
+    return True
+
+
 def run_tests():
     tests = [
         ("send_writes_correct_json", test_send_writes_correct_json),
@@ -2999,6 +3340,26 @@ def run_tests():
          test_gc_dead_implicit_disabled_when_interval_zero),
         ("send_auto_arms_idempotently", test_send_auto_arms_idempotently),
         ("send_no_arm_skips_obligation", test_send_no_arm_skips_obligation),
+        # Resolution tests (q-id -> agent-id binding map):
+        ("bindings_roundtrip", test_bindings_roundtrip),
+        ("bindings_corrupt_tolerated_on_read",
+         test_bindings_corrupt_tolerated_on_read),
+        ("bindings_concurrent_writes_never_corrupt",
+         test_bindings_concurrent_writes_never_corrupt),
+        ("resolve_happy_path", test_resolve_happy_path),
+        ("resolve_zero_match_errors", test_resolve_zero_match_errors),
+        ("resolve_dead_only_errors", test_resolve_dead_only_errors),
+        ("resolve_multi_match_errors", test_resolve_multi_match_errors),
+        ("resolve_all_lists_live_and_stale",
+         test_resolve_all_lists_live_and_stale),
+        ("send_by_queue_id_happy", test_send_by_queue_id_happy),
+        ("send_by_queue_id_zero_match_errors",
+         test_send_by_queue_id_zero_match_errors),
+        ("send_by_queue_id_multi_match_errors",
+         test_send_by_queue_id_multi_match_errors),
+        ("send_rejects_both_agent_and_queue_id",
+         test_send_rejects_both_agent_and_queue_id),
+        ("whoami_reverse_lookup", test_whoami_reverse_lookup),
     ]
     passed = 0
     failed = 0
@@ -3024,6 +3385,206 @@ def run_tests():
 # ----------------------------------------------------------------------
 
 
+# ----------------------------------------------------------------------
+# Queue-id -> agent-id resolution (binding map)
+#
+# The PostToolUse:Agent arm hook (tools/hooks/post-tool-agent-arm-hook)
+# writes an agent_id -> queue_id binding map to
+# ~/.config/claude/agent-queue-bindings.json with the schema:
+#
+#     {"bindings": {
+#        "<agent_id>": {"queue_id": "q-...", "registered_at": <int>,
+#                       "registered_at_iso": "...", "pid": <int>},
+#        ...
+#     }}
+#
+# The main loop usually knows the QUEUE id (e.g. q-2026-06-23-96a0) but
+# `agent-msg send` takes the AGENT id. Guessing the agent id caused a
+# real misroute (corrections delivered to the wrong agent's inbox). These
+# helpers resolve q-id -> agent-id(s) off the binding map, and `resolve`
+# / `send --queue-id` use them so the main loop never has to guess.
+#
+# "Live" definition: a bound agent is considered LIVE iff it still has an
+# inbox file on disk (~/.config/claude/agent-inbox/<agent_id>.json). The
+# inbox file is created by `arm` / the first `send` and removed by
+# `disarm` / `gc-dead`, so its presence is the most reliable in-process
+# signal that the agent is the one we should message. A binding whose
+# inbox file is gone is treated as a stale/dead binding and skipped. This
+# is intentionally conservative: messaging a dead agent is the failure we
+# are guarding against, so resolution that finds ZERO or MULTIPLE live
+# agents for a q-id ERRORS loudly rather than silently picking one.
+# ----------------------------------------------------------------------
+
+
+DEFAULT_BINDINGS_PATH = CONFIG_DIR / "agent-queue-bindings.json"
+
+
+def _bindings_path(args=None) -> Path:
+    """Resolve the binding-map path. --bindings-path > env > default."""
+    if args is not None and getattr(args, "bindings_path", None):
+        return Path(os.path.expanduser(args.bindings_path))
+    env_override = os.environ.get(
+        "CLAUDE_AGENT_QUEUE_BINDINGS_PATH", "",
+    ).strip()
+    if env_override:
+        return Path(os.path.expanduser(env_override))
+    return DEFAULT_BINDINGS_PATH
+
+
+def _read_bindings(args=None) -> dict:
+    """Read the binding map, returning {agent_id: {"queue_id": ...}}.
+
+    Tolerant on read: a missing / empty / corrupt-JSON / wrong-shape file
+    returns {} (never raises). This mirrors the default-open posture the
+    arm-hook writer and the subagent_queue_item_running predicate use --
+    a malformed binding file must never crash a send/resolve.
+    """
+    path = _bindings_path(args)
+    try:
+        if not path.exists():
+            return {}
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    bindings = data.get("bindings", {})
+    if not isinstance(bindings, dict):
+        return {}
+    return bindings
+
+
+def _agent_is_live(agent_id: str, args=None) -> bool:
+    """An agent is LIVE iff it still has an inbox file on disk."""
+    try:
+        return _inbox_path(agent_id, args).exists()
+    except OSError:
+        return False
+
+
+def _resolve_queue_id(queue_id: str, args=None,
+                      *, live_only: bool = True) -> tuple[list, list]:
+    """Resolve a queue id to bound agent ids.
+
+    Returns (live, all) where:
+      * ``all``  = every agent_id whose binding's queue_id == queue_id
+      * ``live`` = the subset whose inbox file still exists on disk
+
+    When ``live_only`` is False the caller wants the raw set (used by
+    resolve --all for diagnostics). Resolution + send always operate on
+    ``live`` and ERROR on a non-unique result.
+    """
+    bindings = _read_bindings(args)
+    matched = []
+    for agent_id, rec in bindings.items():
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("queue_id") == queue_id:
+            matched.append(agent_id)
+    matched.sort()
+    if not live_only:
+        return list(matched), list(matched)
+    live = [a for a in matched if _agent_is_live(a, args)]
+    return live, matched
+
+
+def _resolve_queue_id_unique(queue_id: str, args=None) -> str:
+    """Resolve a q-id to EXACTLY ONE live agent id, or raise ValueError.
+
+    LOUD failure on zero/multiple so a misroute is structurally impossible.
+    """
+    live, matched = _resolve_queue_id(queue_id, args)
+    if len(live) == 1:
+        return live[0]
+    if not matched:
+        raise ValueError(
+            f"no binding found for queue id {queue_id!r} "
+            f"(no agent was ever bound to it; check the q-id, or the "
+            f"agent was spawned without a 'Queue item:' marker / before "
+            f"the arm hook ran)"
+        )
+    if not live:
+        raise ValueError(
+            f"queue id {queue_id!r} resolves to {len(matched)} bound "
+            f"agent(s) but NONE are live (no inbox on disk): "
+            f"{matched!r} -- the agent(s) likely already exited; refusing "
+            f"to message a dead agent"
+        )
+    raise ValueError(
+        f"queue id {queue_id!r} resolves to MULTIPLE live agents "
+        f"{live!r} (e.g. a retry spawned a second agent on the same "
+        f"q-id) -- refusing to guess which to message. Disambiguate "
+        f"with an explicit agent id: agent-msg send <agent-id> <text>"
+    )
+
+
+def cmd_resolve(args) -> int:
+    """Print the live agent id(s) bound to a queue id.
+
+    Default: requires EXACTLY ONE live agent and prints just that id
+    (so it composes in scripts / command substitution). --all prints all
+    matches (live + stale) for diagnostics and never errors on count.
+    """
+    queue_id = args.queue_id
+    show_all = bool(getattr(args, "all", False))
+
+    if show_all:
+        live, matched = _resolve_queue_id(queue_id, args)
+        stale = [a for a in matched if a not in live]
+        if args.json:
+            print(json.dumps({
+                "queue_id": queue_id,
+                "live": live, "stale": stale, "all": matched,
+            }, indent=2))
+        else:
+            if not matched:
+                print(f"(no agent bound to {queue_id})")
+            else:
+                for a in matched:
+                    marker = "live" if a in live else "stale"
+                    print(f"{a}\t{marker}")
+        return 0
+
+    try:
+        agent_id = _resolve_queue_id_unique(queue_id, args)
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "queue_id": queue_id,
+                              "error": str(e)}, indent=2))
+        else:
+            print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps({"ok": True, "queue_id": queue_id,
+                          "agent_id": agent_id}, indent=2))
+    else:
+        print(agent_id)
+    return 0
+
+
+def cmd_whoami(args) -> int:
+    """Reverse lookup: print the queue id bound to an agent id."""
+    agent_id = args.agent_id
+    bindings = _read_bindings(args)
+    rec = bindings.get(agent_id)
+    qid = rec.get("queue_id") if isinstance(rec, dict) else None
+    if args.json:
+        print(json.dumps({"ok": qid is not None, "agent_id": agent_id,
+                          "queue_id": qid}, indent=2))
+        return 0 if qid else 1
+    if qid:
+        print(qid)
+        return 0
+    print(f"(no binding found for agent {agent_id})", file=sys.stderr)
+    return 1
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="agent-msg",
@@ -3042,9 +3603,19 @@ def build_parser():
     p_show.add_argument("agent_id")
 
     # send
-    p_send = sub.add_parser("send", help="append a message to an agent's inbox")
-    p_send.add_argument("agent_id")
+    p_send = sub.add_parser(
+        "send",
+        help="append a message to an agent's inbox "
+             "(by agent id, or --queue-id <q-id> to resolve)")
+    p_send.add_argument("agent_id", nargs="?", default=None,
+                        help="target agent id (omit when using --queue-id)")
     p_send.add_argument("text")
+    p_send.add_argument("--queue-id", default=None,
+                        help="resolve the target agent from this queue id "
+                             "(errors loudly on zero / multiple live agents)")
+    p_send.add_argument("--bindings-path", default=None,
+                        help="override the q-id->agent-id binding map path "
+                             "(default: ~/.config/claude/agent-queue-bindings.json)")
     p_send.add_argument("--from", dest="from_label", default=None,
                         help="sender label (default: andrew@signal)")
     p_send.add_argument("--queue-item", default=None,
@@ -3115,6 +3686,29 @@ def build_parser():
                        help="skip obligation cleanup (testing only)")
     p_dis.add_argument("--json", action="store_true")
 
+    # resolve -- q-id -> live agent id
+    p_res = sub.add_parser(
+        "resolve",
+        help="print the live agent id bound to a queue id "
+             "(errors on zero / multiple live agents; --all lists matches)")
+    p_res.add_argument("queue_id", help="queue item id, e.g. q-2026-06-23-96a0")
+    p_res.add_argument("--bindings-path", default=None,
+                       help="override the binding map path")
+    p_res.add_argument("--inbox-dir", default=None,
+                       help="override inbox dir (used for liveness check)")
+    p_res.add_argument("--all", action="store_true",
+                       help="list ALL bound agents (live+stale) for the q-id; "
+                            "does not error on count")
+    p_res.add_argument("--json", action="store_true")
+
+    # whoami -- agent id -> q-id (reverse lookup)
+    p_who = sub.add_parser(
+        "whoami", help="print the queue id bound to an agent id (reverse lookup)")
+    p_who.add_argument("agent_id")
+    p_who.add_argument("--bindings-path", default=None,
+                       help="override the binding map path")
+    p_who.add_argument("--json", action="store_true")
+
     # index
     p_idx = sub.add_parser("index", help="manage the agent index")
     idx_sub = p_idx.add_subparsers(dest="index_cmd")
@@ -3159,6 +3753,10 @@ def main(argv=None):
         return cmd_gc(args)
     if args.command == "gc-dead":
         return cmd_gc_dead(args)
+    if args.command == "resolve":
+        return cmd_resolve(args)
+    if args.command == "whoami":
+        return cmd_whoami(args)
     if args.command == "arm":
         return cmd_arm(args)
     if args.command == "disarm":

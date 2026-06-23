@@ -77,6 +77,12 @@ agent-msg index done <id>         # drop from index
 agent-msg arm <id>                # initialise inbox + register gate
 agent-msg disarm <id>             # clear inbox + remove gate
 agent-msg send <id> <text>        # append message to inbox
+agent-msg send --queue-id q-XXXX <text>
+                                  # resolve the q-id to its single LIVE agent,
+                                  #   then send (see "Resolving a queue id")
+agent-msg resolve <q-id>          # print the live agent id bound to a q-id
+agent-msg resolve <q-id> --all    # list every bound agent (live + stale)
+agent-msg whoami <id>             # reverse lookup: print the q-id bound to <id>
 agent-msg inbox <id>              # read inbox (default: unread only)
 agent-msg ack <id>                # mark unread messages as read
 agent-msg gc <id>                 # drop read messages older than TTL
@@ -85,6 +91,42 @@ agent-msg gc-dead [--dry-run]     # satisfy inbox obligations whose owner is
                                   #   PostToolUse disarm path; see below)
 agent-msg --test                  # run embedded test suite
 ```
+
+## Resolving a queue id (`resolve` / `send --queue-id`)
+
+`send`/`arm` take the AGENT id, but the main loop usually knows only the
+QUEUE id (e.g. `q-2026-06-23-96a0`). Guessing the agent id caused a real
+misroute — corrections delivered to the wrong agent's inbox, that agent
+ack'd-and-ignored them, and the intended agent never saw them.
+
+The `PostToolUse:Agent` arm hook
+(`tools/hooks/post-tool-agent-arm-hook`) records the mapping in
+`~/.config/claude/agent-queue-bindings.json`:
+
+```json
+{"bindings": {"<agent_id>": {"queue_id": "q-...", "registered_at": 0,
+                             "registered_at_iso": "...", "pid": 0}}}
+```
+
+`agent-msg resolve <q-id>` reads that map and prints the agent id;
+`agent-msg send --queue-id <q-id> <text>` resolves then delivers in one
+step (auto-arming like a normal `send`). So the main loop never guesses.
+
+**"Live" definition + loud failure.** A bound agent is LIVE iff it still
+has an inbox file on disk (`~/.config/claude/agent-inbox/<agent_id>.json`,
+created by `arm`/first `send`, removed by `disarm`/`gc-dead`). `resolve`
+and `send --queue-id` require EXACTLY ONE live agent and **error
+(non-zero exit) on zero or multiple** — a retry that spawned a second
+agent on the same q-id, or a q-id whose agent already exited, is a
+loud failure, never a silent pick. `resolve --all` lists every match
+(live + stale) for diagnostics and never errors on count.
+
+The binding map is read defensively everywhere (`agent-msg` and the
+`subagent_queue_item_running` predicate): a missing / empty / truncated /
+wrong-shape file is treated as empty, never a crash. The arm-hook writer
+is atomic (temp file + `os.replace` under `flock`), so concurrent
+`PostToolUse:Agent` spawns can never interleave a half-written file for a
+reader to choke on.
 
 ## Inbox schema (v2)
 

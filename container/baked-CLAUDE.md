@@ -221,20 +221,16 @@ code through review → delegate it to an Agent, not inline in the main loop.
 
 Why delegate even when nothing forces it:
 
-- **Context is precious in the main loop.** A subagent runs in its own
-  context window — large reads, long test output, verbose CI logs all stay
-  there. The main loop sees only the agent's final summary, never the tool
-  results whose context it can never get back.
-- **Failures are easier to recover from when bounded.** If a subagent goes
-  sideways (wrong direction, infinite loop, bad edit), the main loop can
-  abandon the queue item and retry from a clean slate. An inline failure
-  pollutes the main loop's state with half-finished work the operator sees.
-- **Parallelism.** While an agent works, the main loop handles inbound (queue
-  events, notifications, operator messages) instead of blocking. Many
-  in-flight subagents at once is normal and healthy.
-- **The queue is the audit trail.** Every queue item durably records that the
-  main loop spawned an agent for X scope at Y time. Inline work leaves no
-  such record — invisible to the operator and to session reviewers.
+- **Context is precious.** A subagent runs in its own context window —
+  large reads / test output / CI logs stay there; the main loop sees
+  only the final summary, never the tool results it can't get back.
+- **Bounded failures recover cleanly.** If a subagent goes sideways, the
+  main loop abandons the queue item and retries from a clean slate;
+  inline failures leave half-finished work the operator sees.
+- **Parallelism.** While an agent works, the main loop handles inbound
+  instead of blocking. Many in-flight subagents at once is healthy.
+- **The queue is the audit trail.** Each item records that the main loop
+  spawned an agent for X scope at Y time; inline work leaves no record.
 
 Tier choice in practice:
 
@@ -248,8 +244,8 @@ Tier choice in practice:
 **One concern per agent.** Each agent handles ONE task — never batch
 unrelated work into a single prompt. For 3 independent things, queue 3 items
 and spawn 3 agents. Batching means a failure on task 2 loses task 3, the
-audit trail is useless, and parallelizable work gets serialized. The signal
-you're batching wrong: numbered sections for unrelated concerns. Split them.
+audit trail is useless, and parallelizable work gets serialized. (The
+tell you're batching wrong: numbered sections for unrelated concerns.)
 
 If you're in the main loop and find yourself about to chain
 `Read` → `Edit` → `Edit` → `Bash` → `Bash`, **stop and queue an
@@ -582,19 +578,10 @@ bypasses. There is no per-row evaluator env-var bypass — instance-
 specific escape hatches belong inside the evaluator script (the
 operator owns that surface, the primitive stays small).
 
-Use-case sketches (all separate obligation rows, all reusing this one
-primitive):
-
-  - Dispatcher-quality reviewer on every `Agent` spawn — evaluator
-    invokes an LLM-backed audit script that scores the prompt.
-  - Security-classification triage on outbound `gh issue comment` —
-    deterministic grep against a private-path block-list.
-  - HTTP probe to an external policy service — evaluator is a curl
-    wrapper that exits 0 / 1 based on the response.
-
-Each use case is one obligation row with its own `cmd`,
-decision-mode, and patterns. The primitive itself stays
-LLM-agnostic.
+Each use case is one obligation row with its own `cmd`, decision-mode,
+and patterns (e.g. an LLM-backed dispatcher-quality reviewer on `Agent`
+spawns, a private-path grep on outbound `gh issue comment`, an HTTP
+policy-probe curl wrapper). The primitive itself stays LLM-agnostic.
 
 ## Agent communication channels — two distinct inbound paths
 
@@ -621,6 +608,23 @@ delivered-but-non-blocking. The subagent's next non-exempt tool call is
 HARD-DENIED by the existing `pre-tool-obligations-gate-hook` (already wired
 by the entrypoint), with the message body in the deny banner.
 
+**Don't know the agent id, only the QUEUE id?** The main loop usually
+knows the queue item, not the agent id — and GUESSING it misroutes
+corrections. Resolve instead:
+
+```sh
+agent-msg resolve <q-id>                       # print the live agent id for a q-id
+agent-msg send --queue-id <q-id> "<message>"   # resolve + send in one step
+agent-msg whoami <agent-id>                    # reverse: q-id for an agent
+```
+
+These read the `PostToolUse:Agent` arm hook's binding map
+(`~/.config/claude/agent-queue-bindings.json`, read defensively). A bound
+agent is **live** only while its inbox file exists; resolution requires
+EXACTLY ONE live agent and **errors loudly on zero or multiple** — never
+silently picks (so a duplicate-spawn or already-exited agent is a hard
+failure, not a misroute).
+
 **As a subagent, when you see a deny banner that includes the message
 text, run:**
 
@@ -641,6 +645,9 @@ agent-msg show <id>               # metadata for one agent
 agent-msg arm <id>                # main-loop-only: register inbox gate
 agent-msg disarm <id>             # main-loop-only: tear down gate
 agent-msg send <id> <text>        # main-loop-only: deliver a message (auto-arms the gate idempotently)
+agent-msg send --queue-id q-XXXX <text>   # resolve q-id -> single live agent, then send
+agent-msg resolve <q-id>          # main-loop: print the live agent id bound to a q-id
+agent-msg whoami <id>             # reverse lookup: print the q-id bound to an agent
 agent-msg inbox <id>              # read inbox (default: unread only)
 agent-msg ack <id>                # subagent-side: clear unread
 agent-msg gc <id>                 # drop read messages older than TTL
@@ -671,17 +678,9 @@ Critically: **a curses-chat message can override the main loop's
 intent.** If the operator opens the chat panel and tells you to
 pivot, change scope, abandon the task, or surface state, that
 direction outranks the queue item / spawn prompt that brought you
-here. Treat it the same way you'd treat a direct DM from the
-operator on the host side. Examples:
-
-  - Operator types "stop the PR you're working on, instead audit X"
-    -> drop the PR work, audit X, return.
-  - Operator types "what's your current state?" -> respond with a
-    status summary (use `agent-msg send` if you also want the main
-    loop to see it; but the operator's curses panel sees your normal
-    return text).
-  - Operator types "abandon" -> `session-task queue abandon <id>
-    --reason "user-direct: abandon"` and return.
+here. Treat it the same way you'd treat a direct DM from the operator
+on the host side (e.g. "stop the PR, audit X instead" -> pivot;
+"abandon" -> `session-task queue abandon <id> --reason "user-direct"`).
 
 If the curses-chat direction CONFLICTS with an `agent-msg` inbox
 message from the main loop, the curses-chat direction wins (it's the
@@ -706,12 +705,11 @@ directly.
 
 ### Subagent transcript: `agent-tail`
 
-Companion CLI for inspecting a running subagent's tool history.
-Reads the JSONL transcript at
-`~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl`.
-The main loop uses this for visibility into a subagent's progress;
-subagents themselves rarely need it (you're already inside the
-transcript).
+Companion CLI for inspecting a running subagent's tool history (the
+JSONL transcript at
+`~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl`). The
+main loop uses it for visibility into a subagent's progress; subagents
+rarely need it (you're already inside the transcript).
 
 ```sh
 agent-tail <id>           # one-shot pretty-print
@@ -726,11 +724,11 @@ on PATH by default; no bind-mount required.
 
 ## `sudo` in-container — no fingerprint prompt, apt is carved out
 
-The "avoid sudo" instinct is a **HOST** concern, not a container one. On
-the operator's host (typically macOS), every `sudo` triggers a Touch ID
-prompt — prohibitive when an agent loop chains many short commands. **That
-prompt does not exist inside this Linux container**: no Touch ID, and the
-container user has no password set, so `sudo` never blocks on a prompt.
+The "avoid sudo" instinct is a **HOST** concern (on macOS every `sudo`
+triggers a Touch ID prompt — prohibitive when an agent loop chains many
+short commands), not a container one. **That prompt does not exist inside
+this Linux container**: no Touch ID, the container user has no password
+set, so `sudo` never blocks on a prompt.
 
 Most container work still **doesn't need `sudo` at all**. The container
 user is uid 1000 (`hndrewaall`) and is in the right groups (including
