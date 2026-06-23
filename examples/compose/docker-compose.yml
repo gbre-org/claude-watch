@@ -395,6 +395,15 @@ services:
       # read the same file). Set the env var in .env or export before
       # running docker compose up.
       - "${CW_STATE_PATH:-claude-watch-state}:/var/lib/claude-watch"
+      # ~/.config/claude-container — rw. DURABLE persistent-state dir for
+      # in-container scripts (drobo-prompt-latest marker, cron.d, etc.) AND
+      # the home of the operator's docker-compose.override.yml itself. This
+      # MUST live in the BASE compose, NOT the override: a deploy that runs
+      # base-only (override not merged) would otherwise lose the mount, the
+      # persistent state would silently break, and the override file itself
+      # would become invisible in-container — the self-redeploy trap that
+      # caused the clipboard-mount-drop / "override not visible" failures.
+      - "${HOME}/.config/claude-container:/home/hndrewaall/.config/claude-container:rw"
     # working_dir flip: when CLAUDE_HOST_PROJECT_DIR is set, override the
     # image WORKDIR (/workspace) with the host path so the in-container
     # claude lands at the project-memory-matching cwd. Empty / unset

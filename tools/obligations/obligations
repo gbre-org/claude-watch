@@ -409,6 +409,46 @@ def _watcher_pending_dir() -> Path:
         return Path(override)
     return Path("/tmp/claude-watcher-output-pending")
 
+
+# Watcher-output "noise" lines. A captured output consisting ENTIRELY of these
+# (plus blank lines) carries nothing the loop needs to act on: it's a
+# surface-and-exit watcher's restart boilerplate (claude-event-watch emits a
+# `heartbeat-tick` EVENT + a "RESTART NOW" banner every single cycle) or a
+# signal watcher's zero-new-message backoff line. Forcing the loop to Read
+# such a file just to clear the no_pending_watcher_outputs gate is pure
+# friction -- and orphaned copies left in the (fixed-location) sidecar dir by
+# a prior session wedge the gate forever. An output that surfaced a REAL event
+# (a DM body, a torrent-completed, a non-tick alert, any actual message) has
+# lines that do NOT match these, so it still gates -- the predicate's real job
+# (force a Read before the loop barrels on) is preserved.
+_WATCHER_OUTPUT_NOISE_RE = re.compile(
+    r"^(?:"
+    r"=+"                                                  # ==== separators
+    r"|\s*WATCHER EXITED\. RESTART NOW.*"                  # restart banner
+    r"|EVENT\[claude-watch/heartbeat-tick\].*"            # heartbeat tick ONLY
+    r"|\s*\[backoff\] waited .*collected 0 additional message.*"  # 0 new msgs
+    r")\s*$"
+)
+
+
+def _watcher_output_is_noise_only(output_path: str) -> bool:
+    """True iff the captured watcher output has at least one non-blank line and
+    EVERY non-blank line is restart/heartbeat/zero-backoff boilerplate -- i.e.
+    nothing actionable was surfaced. Default-False (gate as normal) on any read
+    error, so a real output is never silently skipped."""
+    try:
+        text = Path(output_path).read_text(errors="replace")
+    except OSError:
+        return False
+    saw_line = False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        saw_line = True
+        if not _WATCHER_OUTPUT_NOISE_RE.match(line):
+            return False
+    return saw_line
+
 # Tool/command patterns exempt from the no_pending_watcher_outputs gate.
 # Without exemptions the gate would self-deadlock: the gate fires, but every
 # tool needed to clear it (Read the output, restart the watcher, diagnose
@@ -1762,6 +1802,18 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
                 # Predicate fails iff the output file has been written since
                 # the watcher was registered (size > 0 AND mtime > registered_at).
                 if st.st_size > 0 and st.st_mtime > float(registered_at):
+                    # Content-aware auto-clear: if the captured output is ONLY
+                    # restart/heartbeat/zero-backoff boilerplate it surfaced
+                    # nothing actionable, so don't gate on it -- and drop the
+                    # sidecar so it (and orphaned prior-session copies) stop
+                    # wedging the gate. Outputs that surfaced a real event still
+                    # count as unread and gate normally.
+                    if _watcher_output_is_noise_only(output_path):
+                        try:
+                            sidecar_path.unlink()
+                        except OSError:
+                            pass
+                        continue
                     unread.append(output_path)
             if not unread:
                 return (True, "all pending watcher outputs are empty or read")

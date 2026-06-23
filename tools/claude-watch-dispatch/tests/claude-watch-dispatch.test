@@ -242,6 +242,17 @@ def test_list_exempt_baked():
         check("session-task" in proc.stdout,
               "list-exempt: session-task pattern listed")
         check("git" in proc.stdout, "list-exempt: git patterns listed")
+        # Dispatcher-loop maintenance surface (mirrors event_must_act).
+        check("agent-ack" in proc.stdout,
+              "list-exempt: agent-ack pattern listed")
+        check("event-ack" in proc.stdout,
+              "list-exempt: event-ack pattern listed")
+        check("event-classify" in proc.stdout,
+              "list-exempt: event-classify pattern listed")
+        check("heartbeat" in proc.stdout,
+              "list-exempt: heartbeat touch pattern listed")
+        check("watcher-ctl" in proc.stdout and "status" in proc.stdout,
+              "list-exempt: watcher-ctl run|status pattern listed")
         check("not present" in proc.stdout,
               "list-exempt: notes override file absent")
     finally:
