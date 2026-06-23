@@ -2318,6 +2318,55 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
     });
 }
 
+/// Build the `claude ...` relaunch command line for the auto-update
+/// relaunch script, mirroring the entrypoint's CLAUDE_CMD shape
+/// (`container/entrypoint.sh` + `container/bin/cwsr` `build_claude_cmd`).
+///
+/// Shape, in order (each flag conditional on the matching env var, exactly
+/// like the entrypoint so the relaunched claude is identical to the one the
+/// container booted):
+///   - `--setting-sources project,local --settings <CLAUDE_SHIM_SETTINGS_PATH>`
+///     when `CLAUDE_SHIM_SETTINGS_PATH` is set (drops the host user tier and
+///     loads the MCP-settings shim). On the host this env var is unset, so
+///     the flags are omitted and we degrade to bare `claude` — the previous
+///     behavior.
+///   - `--plugin-dir /opt/claude-container/plugin` when that plugin dir
+///     exists (baked container skills + agents). Absent on the host.
+///   - `--dangerously-skip-permissions` always (harness-managed instances
+///     run in permanent permission-bypass mode).
+///   - `--resume <sid>` when a session id was captured, else `--continue`
+///     (the resume / continue selector the caller already computed).
+///
+/// Pure modulo env + a filesystem existence check; no I/O side effects.
+fn build_relaunch_claude_argv(session_id: Option<&str>) -> String {
+    let mut cmd = String::from("claude");
+    if let Ok(shim) = std::env::var("CLAUDE_SHIM_SETTINGS_PATH") {
+        if !shim.is_empty() {
+            cmd.push_str(" --setting-sources project,local --settings ");
+            cmd.push_str(&shim);
+        }
+    }
+    // Mirror entrypoint.sh / cwsr: append the baked container plugin dir
+    // when present so the relaunched claude keeps the /claude-container:*
+    // skills + agents. Falls back gracefully (no flag) on the host or on
+    // images that predate the plugin bake.
+    let plugin_dir = std::env::var("CWSR_PLUGIN_DIR")
+        .unwrap_or_else(|_| "/opt/claude-container/plugin".to_string());
+    if std::path::Path::new(&plugin_dir).join(".claude-plugin").is_dir() {
+        cmd.push_str(" --plugin-dir ");
+        cmd.push_str(&plugin_dir);
+    }
+    cmd.push_str(" --dangerously-skip-permissions");
+    match session_id {
+        Some(sid) => {
+            cmd.push_str(" --resume ");
+            cmd.push_str(sid);
+        }
+        None => cmd.push_str(" --continue"),
+    }
+    cmd
+}
+
 /// Execute the auto-update sequence: interrupt → /exit → wait → relaunch → resume.
 async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, config: &Config) {
     info!("auto-update: interrupting Claude Code...");
@@ -2391,11 +2440,20 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     //
     // --dangerously-skip-permissions: harness-managed instances run in permanent
     // permission-bypass mode (see also crash-recovery launch above).
-    let launch = if let Some(ref sid) = session_id {
-        format!("claude --dangerously-skip-permissions --resume {}", sid)
-    } else {
-        "claude --dangerously-skip-permissions --continue".to_string()
-    };
+    //
+    // The launch argv MUST mirror the entrypoint's CLAUDE_CMD shape
+    // (container/entrypoint.sh + container/bin/cwsr build_claude_cmd):
+    // when CLAUDE_SHIM_SETTINGS_PATH is set the in-container claude is
+    // launched with `--setting-sources project,local --settings <shim>`
+    // (drops the host user tier, loads the MCP-settings shim) and a
+    // `--plugin-dir` for the baked container plugin (skills + agents).
+    // A bare `claude` relaunch loses those: it would load the wrong
+    // settings tier (host user settings, whose macOS apiKeyHelper can't
+    // exec on Linux) and silently drop the baked /claude-container:<name>
+    // commands. `build_relaunch_claude_argv` reconstructs the correct
+    // shape from the same env vars; on the host (no shim env) it degrades
+    // to the previous bare-`claude` behavior.
+    let launch = build_relaunch_claude_argv(session_id.as_deref());
 
     // Ensure the relaunch-script parent dir exists (see crash-recovery
     // note above): `/var/run/claude/` is tmpfs and may be gone after a
@@ -2450,23 +2508,70 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         warn!(
             "auto-update: claude binary not detected after 120s -- \
              relaunch likely failed (missing relaunch script or boot error); \
-             ABORTING resume-inject so the resume prompt is never typed into a raw shell"
+             attempting a CLEAN restart via the configured restart command \
+             before giving up (never leave a dead pane)"
         );
         write_jsonl_log(
             &config.general.log_file,
-            "auto_update_failed",
-            serde_json::json!({"reason": "binary_not_found_resume_inject_aborted"}),
+            "auto_update_relaunch_retry",
+            serde_json::json!({"reason": "binary_not_found_after_script_relaunch"}),
         );
-        alert::notify(crate::event_bus::ClaudeWatchAlert {
-            alert_type: "auto-update-failed",
-            stuck_reason: "auto-update: claude binary never started after relaunch; resume-inject aborted to avoid corrupting the shell",
-            stale_minutes: None,
-            affected_watchers: vec![],
-            severity: crate::event_bus::Severity::High,
-            message: "claude-watch: auto-update FAILED -- Claude did not restart; resume prompt NOT injected (would have hit a raw shell). Operator must relaunch manually.",
-        })
-        .await;
-        return;
+
+        // CLEAN-RESTART FALLBACK. The shell-injected relaunch script didn't
+        // bring Claude up. Rather than abort into a dead `/bin/sh` pane,
+        // try the same in-place roll the container's auto-respawn path uses:
+        // `cwsr --no-upgrade` (tmux respawn-pane -k) — the upgrade already
+        // landed via npm's atomic symlink swap, so we only need to respawn
+        // the pane. cwsr reconstructs the correct entrypoint argv itself
+        // (settings shim, plugin-dir, --continue). On the host (no cwsr on
+        // PATH) this is a best-effort no-op and we fall through to the
+        // hard-fail alert below. The fallback command is configurable via
+        // `[auto_respawn_on_hang] respawn_command` (container default
+        // `["cwsr", "--no-upgrade"]`).
+        let restart_argv: Vec<&str> = config
+            .auto_respawn_on_hang
+            .respawn_command
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let mut clean_restart_ok = false;
+        if !restart_argv.is_empty() {
+            info!(
+                restart_command = ?config.auto_respawn_on_hang.respawn_command,
+                "auto-update: shell relaunch failed -- invoking clean-restart fallback"
+            );
+            let (_out, ok) = crate::cmd::run_cmd_any(&restart_argv, 60).await;
+            if ok {
+                // Give the respawned pane time to bring claude up.
+                clean_restart_ok = tmux::wait_for_claude_binary(pane, 120).await;
+            } else {
+                warn!("auto-update: clean-restart fallback command exited non-zero");
+            }
+        }
+
+        if !clean_restart_ok {
+            warn!(
+                "auto-update: claude binary still not detected after clean-restart \
+                 fallback -- ABORTING resume-inject so the resume prompt is never \
+                 typed into a raw shell"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_update_failed",
+                serde_json::json!({"reason": "binary_not_found_resume_inject_aborted"}),
+            );
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "auto-update-failed",
+                stuck_reason: "auto-update: claude binary never started after relaunch (incl. clean-restart fallback); resume-inject aborted to avoid corrupting the shell",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: "claude-watch: auto-update FAILED -- Claude did not restart even after a clean-restart fallback; resume prompt NOT injected (would have hit a raw shell). Operator must relaunch manually.",
+            })
+            .await;
+            return;
+        }
+        info!("auto-update: clean-restart fallback brought Claude back up");
     }
 
     // Step 8: Wait for the idle prompt (Claude Code is ready for input).
@@ -7794,4 +7899,41 @@ pane_unchanged_secs = 600
         assert!(!state.ask_question_alerted);
     }
 
+    // -------------------------------------------------------------------
+    // build_relaunch_claude_argv — auto-update relaunch argv shape.
+    //
+    // These assert the env-INdependent parts of the argv (always present
+    // regardless of CLAUDE_SHIM_SETTINGS_PATH / plugin-dir), so they stay
+    // stable under nextest's parallel execution (no process-env mutation).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn relaunch_argv_always_skips_permissions_and_continues() {
+        let cmd = build_relaunch_claude_argv(None);
+        assert!(cmd.starts_with("claude"), "argv must start with claude: {cmd}");
+        assert!(
+            cmd.contains("--dangerously-skip-permissions"),
+            "harness-managed relaunch must skip permissions: {cmd}"
+        );
+        assert!(
+            cmd.trim_end().ends_with("--continue"),
+            "no session id => --continue: {cmd}"
+        );
+        assert!(!cmd.contains("--resume"), "no session id => no --resume: {cmd}");
+    }
+
+    #[test]
+    fn relaunch_argv_resumes_with_session_id() {
+        let sid = "12345678-1234-1234-1234-123456789abc";
+        let cmd = build_relaunch_claude_argv(Some(sid));
+        assert!(
+            cmd.contains(&format!("--resume {sid}")),
+            "session id => --resume <sid>: {cmd}"
+        );
+        assert!(!cmd.contains("--continue"), "session id => no --continue: {cmd}");
+        assert!(
+            cmd.contains("--dangerously-skip-permissions"),
+            "skip-permissions present on resume path too: {cmd}"
+        );
+    }
 }

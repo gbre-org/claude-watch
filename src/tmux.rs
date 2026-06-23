@@ -1103,7 +1103,12 @@ pub async fn wait_for_exit(pane: &str, timeout_secs: u64) -> bool {
 }
 
 /// Check if the actual Claude binary (not a wrapper script) is running under a pane's process tree.
-/// Walks /proc looking for an exe pointing to ~/.local/share/claude/versions/.
+///
+/// Walks /proc looking for an exe under the native versioned-symlink layout
+/// (`~/.local/share/claude/versions/`) AND — when
+/// `CLAUDE_WATCH_CONTAINER_MODE=1` — under the in-container npm-global layout
+/// (`~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/`). See
+/// `has_claude_binary` for the container-mode rationale.
 pub async fn wait_for_claude_binary(pane: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
@@ -1136,6 +1141,26 @@ pub async fn get_pane_pid(pane: &str) -> Option<u32> {
 }
 
 /// Check if the pane's process tree includes the actual claude binary.
+///
+/// Delegates to `agent::find_claude_pid_in_tree`, which walks the subtree
+/// rooted at the pane's shell PID and matches the claude exe against BOTH
+/// install layouts:
+///   - the native versioned-symlink layout (`~/.local/share/claude/versions/`), and
+///   - (when `CLAUDE_WATCH_CONTAINER_MODE=1`) the in-container npm-global layout
+///     (`~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/`).
+///
+/// Historically this function (and the now-removed local `check_proc_tree`)
+/// matched ONLY the versioned-symlink path. That predates the
+/// 2026-05-15 autoupdate-v2 container-mode fix that taught
+/// `find_claude_pid*` about the npm-global layout. The mismatch meant that
+/// inside the npm-global container (where there is NO
+/// `~/.local/share/claude/versions/` dir and the running claude exe lives
+/// under `~/.npm-global/...`) `wait_for_claude_binary` could NEVER succeed.
+/// After PR #379 turned that wait into a HARD GATE on the auto-update
+/// relaunch path, the never-passing detection produced a fatal
+/// "claude binary never started after relaunch" alert and a dead pane on
+/// every in-container auto-update. Routing through the container-mode-aware
+/// `agent` helper fixes the relaunch detection without disabling auto-update.
 async fn has_claude_binary(pane: &str) -> bool {
     let (pid_str, ok) = run_cmd_any(
         &["tmux", "display-message", "-t", pane, "-p", "#{pane_pid}"],
@@ -1145,50 +1170,17 @@ async fn has_claude_binary(pane: &str) -> bool {
     if !ok || pid_str.is_empty() {
         return false;
     }
-
-    let versions_dir = format!(
-        "{}/.local/share/claude/versions",
-        std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string())
-    );
-
-    // Spawn blocking since we're walking /proc
-    let pid_str_owned = pid_str.clone();
-    let versions_dir_owned = versions_dir;
-    tokio::task::spawn_blocking(move || check_proc_tree(&pid_str_owned, &versions_dir_owned, 0))
-        .await
-        .unwrap_or(false)
-}
-
-/// Recursively check process tree for claude binary.
-fn check_proc_tree(pid: &str, versions_dir: &str, depth: u32) -> bool {
-    if depth > 4 {
+    let Ok(pane_pid) = pid_str.trim().parse::<u32>() else {
         return false;
-    }
+    };
 
-    // Check this PID's exe link
-    let exe_path = format!("/proc/{}/exe", pid);
-    if let Ok(target) = std::fs::read_link(&exe_path) {
-        let target_str = target.to_string_lossy();
-        if target_str.starts_with(versions_dir) {
-            return true;
-        }
-    }
-
-    // Check children via /proc/PID/task/PID/children or pgrep
-    if let Ok(output) = std::process::Command::new("pgrep")
-        .args(["-P", pid])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let child_pid = line.trim();
-            if !child_pid.is_empty() && check_proc_tree(child_pid, versions_dir, depth + 1) {
-                return true;
-            }
-        }
-    }
-
-    false
+    // Spawn blocking since we're walking /proc. Depth 4 mirrors the
+    // previous local walk (pane shell -> bash relaunch -> node -> claude).
+    tokio::task::spawn_blocking(move || {
+        crate::agent::find_claude_pid_in_tree(pane_pid, 4).is_some()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Wait for the Claude idle prompt (❯) to appear. Returns true if found within timeout.
