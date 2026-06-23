@@ -263,20 +263,21 @@ make test-watchers       # claude-event-watch fast-path + self-clear config
 
 make build               # release build
 make install             # build + copy daemon + tools into $BIN_DIR (default ~/bin/)
-make deploy              # build + systemctl restart
+make deploy-systemd      # build + systemctl restart (host/systemd install)
 make install-hooks       # install the git pre-commit hook (warnings + tests)
 ```
 
-> **Deploy gotcha — `make deploy` and `make install` update DIFFERENT
-> copies of the daemon.** `make deploy` rebuilds and `systemctl restart`s
+> **Deploy gotcha — `make deploy-systemd` and `make install` update DIFFERENT
+> copies of the daemon.** `make deploy-systemd` (formerly `make deploy`, still
+> a working deprecated alias) rebuilds and `systemctl restart`s
 > the service, whose `ExecStart` runs the binary out of `target/release/`
 > directly — it does **not** refresh `$BIN_DIR/claude-watch` (default
 > `~/bin/claude-watch`). But that `$BIN_DIR` copy is the CLI invoked as
 > `claude-watch ...` on the operator's `PATH` — including the `workload`
 > subcommands (`workload run` / `babysit` / ...) that agents and the main
 > loop call. When you ship a change to a CLI subcommand, run **`make
-> install`** (or `make install` *and* `make deploy`) so both the running
-> service and the on-PATH CLI pick up the new binary. A `deploy`-only roll
+> install`** (or `make install` *and* `make deploy-systemd`) so both the running
+> service and the on-PATH CLI pick up the new binary. A `deploy-systemd`-only roll
 > leaves the CLI stale and the new subcommand "not found".
 
 ### Pre-commit hook

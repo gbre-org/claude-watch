@@ -7,7 +7,7 @@
 #      ~/.config/claude-container/docker-compose.override.yml
 #
 # then uncomment the mounts that apply to your host. The deploy paths
-# (`make redeploy` and `cw --up`) point COMPOSE_FILE at
+# (`make deploy-container` [alias `make redeploy`] and `cw --up`) point COMPOSE_FILE at
 # `~/.config/claude-container/docker-compose.override.yml`, so the merge
 # is LOCATION-INDEPENDENT — the override is picked up no matter which
 # clone or worktree the deploy runs from.
@@ -43,7 +43,7 @@
 #
 # After editing this file (or running the skill), apply changes with:
 #
-#   make redeploy            # from the claude-watch repo root, OR
+#   make deploy-container    # from the claude-watch repo root (alias: make redeploy), OR
 #   cw --up                  # which also wire COMPOSE_FILE for you
 #
 # `--force-recreate` is required because docker doesn't pick up

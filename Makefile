@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -312,9 +312,15 @@ test-ttyd-paste-handler:
 build:
 	cargo build --release
 
-# Build + restart systemd service
-deploy: build
+# Build + restart systemd service (HOST / systemd install — NOT used in the
+# Docker-container setup; see `deploy-container` for that).
+deploy-systemd: build
 	sudo systemctl restart claude-watch
+
+# DEPRECATED alias — kept so any docs / muscle-memory invoking `make deploy`
+# keep working. Prefer `make deploy-systemd` (self-documenting). No recipe body;
+# just depends on the renamed target.
+deploy: deploy-systemd
 
 # Install built binaries + scripts onto $PATH ($BIN_DIR, default ~/bin).
 # Targets:
@@ -456,7 +462,10 @@ compose-up:
 compose-down:
 	@cd examples/compose && docker compose down
 
-# Redeploy the claude-container service (picks up new image / config).
+# Deploy/recreate the claude-container service (picks up new image / config).
+# This is the ONLY correct deploy for the Docker-container setup (the host/
+# systemd variant is `deploy-systemd`). `make redeploy` remains a working
+# DEPRECATED alias of this target.
 #
 # A SINGLE `docker compose up -d --force-recreate claude-container`.
 # This is deliberately one host-daemon operation so the target works
@@ -521,7 +530,7 @@ compose-down:
 COMPOSE_BASE := $(CURDIR)/examples/compose/docker-compose.yml
 COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 
-redeploy:
+deploy-container:
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
 	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then \
@@ -529,6 +538,13 @@ redeploy:
 	  else \
 	    docker compose up -d --force-recreate claude-container; \
 	  fi
+
+# DEPRECATED alias — kept so the baked image's own scripts/docs (entrypoint,
+# cwsr, container/tests/redeploy-self-recreate.test, baked-CLAUDE.md) and the
+# self-redeploy contract keep working until an image rebuild bakes the new name
+# `deploy-container` everywhere. `make redeploy` MUST keep working. No recipe
+# body; just depends on the renamed target.
+redeploy: deploy-container
 
 # Clean build artifacts
 clean:
