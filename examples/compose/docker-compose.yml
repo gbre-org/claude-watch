@@ -53,6 +53,21 @@ services:
       # Same shape as the queue-minisite service below.
       context: ../..
       dockerfile: container/Dockerfile
+      # Build-time git identity for the `claude_watch_build_info` Prometheus
+      # gauge (the Grafana "Build Info" panel: commit + PR #). The repo-root
+      # .dockerignore prunes `.git/` from the build context, so build.rs
+      # cannot run git inside the image and falls back to `commit="unknown"`
+      # / `pr=""` UNLESS these args are supplied. The Makefile's
+      # `deploy-container` / `compose-build` targets compute them on the
+      # host (where git IS available) and export CW_BUILD_COMMIT /
+      # CW_BUILD_PR / GIT_SHA into the compose environment, which these refs
+      # then forward into the builder stage. Empty defaults keep a bare
+      # `docker compose build` (no Makefile, no exported vars) working —
+      # build.rs cleanly degrades to "unknown" exactly as before.
+      args:
+        CW_BUILD_COMMIT: ${CW_BUILD_COMMIT:-}
+        CW_BUILD_PR: ${CW_BUILD_PR:-}
+        GIT_SHA: ${GIT_SHA:-}
     image: claude-container:dev
     # Give PID 1 (process-compose) room to run its own graceful
     # shutdown before docker SIGKILLs it. process-compose signals each

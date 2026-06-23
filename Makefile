@@ -553,6 +553,9 @@ deploy-container:
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
 	  env_flag=""; \
 	  if [ -f "$(DEPLOY_ENV_FILE)" ]; then env_flag="--env-file $(DEPLOY_ENV_FILE)"; fi; \
+	  export CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)"; \
+	  export CW_BUILD_PR="$(CW_BUILD_PR)"; \
+	  export GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"; \
 	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then \
 	    COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)" docker compose $$env_flag up -d --force-recreate claude-container; \
 	  else \
