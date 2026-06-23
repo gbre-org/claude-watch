@@ -502,6 +502,42 @@ operator is driving the agent from a non-browser context (e.g. a
 shell SSH into the container, or a tmux client outside the browser),
 where the browser-side Clipboard API never sees the paste at all.
 
+#### Troubleshooting: pasted image comes back "empty"
+
+If a pasted image is reported as empty in BOTH the ttyd console and a
+VS Code remote session, the usual cause is that the
+`/host-clipboard` bind-mount is **not present in the running
+container** — not an actually-empty clipboard. Both surfaces funnel
+through the same in-container `xclip` shim, so a missing mount fails
+them identically.
+
+**Why the mount can go missing:** the clipboard-bridge mount lives in
+the operator-personal, git-ignored `docker-compose.override.yml`
+(`${HOME}/.clipboard-bridge:/host-clipboard:rw`). Docker Compose only
+re-reads the merged config — and therefore (re)applies bind-mount
+changes — on `docker compose up`. A plain **`docker compose restart`
+does NOT re-read the config**, so a container that was last `up`'d
+before the override existed (or was `restart`ed rather than recreated)
+keeps running with no `/host-clipboard` mount.
+
+**Confirm the mount** from the host:
+
+```sh
+docker compose exec claude-container ls -la /host-clipboard
+#  → lists clipboard.png/.mime/.meta.json  ⇒ mount is present
+#  → "No such file or directory"           ⇒ mount is MISSING
+```
+
+The shim also surfaces the misconfiguration itself: when
+`/host-clipboard` is absent it writes a one-line diagnostic to stderr
+(`xclip-shim: clipboard bridge dir /host-clipboard does not exist …`)
+rather than silently returning an empty clipboard.
+
+**Fix:** recreate the container so the override is re-applied — use
+`docker compose up -d --force-recreate claude-container` (equivalently
+`make redeploy`), **not** `docker compose restart`. Bind-mount changes
+of any kind require a recreate, not a restart.
+
 ### Security note
 
 The published port `7681` is unauthenticated by design for local-only
