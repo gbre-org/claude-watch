@@ -4885,7 +4885,7 @@ mod tests {
     // liveness) — NOT off a separately-recorded PID file that drifts out of
     // sync after a restart. A watcher that `pgrep` finds genuinely alive must
     // NEVER be reported DOWN, even when its `/var/run/claude/<name>.pid` file
-    // is stale (points at a now-reaped PID from before a `make deploy` /
+    // is stale (points at a now-reaped PID from before a `make deploy-systemd` /
     // watcher respawn). The zombie guard preserves the original orphan-
     // detection intent: a `<defunct>` match does not count as alive.
 
@@ -4930,7 +4930,7 @@ mod tests {
     ///
     /// Before the fix, the monitor read a recorded PID from
     /// `/var/run/claude/<name>.pid`, found it dead (the watcher had been
-    /// respawned under a fresh PID by `make deploy` / watchmen), and reported
+    /// respawned under a fresh PID by `make deploy-systemd` / watchmen), and reported
     /// the watcher DOWN — while `pgrep` (and `watcher-status`, and `ps`) all
     /// saw it genuinely running. Now the monitor probes the matched PIDs
     /// directly, so the genuinely-running watcher is NEVER reported DOWN

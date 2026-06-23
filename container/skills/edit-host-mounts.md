@@ -48,7 +48,7 @@ Probe the host for bind-mount candidates (gh CLI token, gitconfig, ssh-agent soc
 
    Wait for the operator's confirmation before writing. If the operator wants to add a path that wasn't auto-detected (e.g. `/Users/x/work/scripts:/home/hndrewaall/work-scripts:rw`), accept the explicit instruction and merge it into the proposal.
 
-6. **Write the override**. Build the final mount list (existing kept + adds, minus removes), then write the new override file via `host-bash`. Preserve the existing comments in the file where possible — when in doubt, regenerate from the canonical template at `examples/compose/docker-compose.override.yml.example` and inject the resolved mount lines. The override goes at the host path `~/.config/claude-container/docker-compose.override.yml` (the file the deploy paths point `COMPOSE_FILE` at — `make redeploy` / `cw --up` merge it regardless of which clone/worktree they run from).
+6. **Write the override**. Build the final mount list (existing kept + adds, minus removes), then write the new override file via `host-bash`. Preserve the existing comments in the file where possible — when in doubt, regenerate from the canonical template at `examples/compose/docker-compose.override.yml.example` and inject the resolved mount lines. The override goes at the host path `~/.config/claude-container/docker-compose.override.yml` (the file the deploy paths point `COMPOSE_FILE` at — `make deploy-container` (alias `make redeploy`) / `cw --up` merge it regardless of which clone/worktree they run from).
 
 7. **Tell the operator to recreate**. Bind-mount changes don't apply on a plain `up -d`; the container has to be recreated. Print:
 
