@@ -663,6 +663,137 @@ class SubagentTreeTest(unittest.TestCase):
         self.assertEqual(top["children"][0].get("kind"), "child")
         self.assertFalse(any(s.get("kind") == "attempt" for s in subs))
 
+    def test_deep_tree_descendant_bound_to_other_item_still_nests(self):
+        """REGRESSION (depth-1-only bug): a deeply-nested descendant that
+        binds to a DIFFERENT queue item than the owner must STILL nest under
+        its real parent — it must not be severed and dropped.
+
+        Real-world shape that broke (session 227ccc1f, item q-...-ade0):
+
+            owner (item A)
+              └─ child (item A)            # inherited A's marker
+                   ├─ grandchild (item A)  # inherited A's marker
+                   └─ grandchild (item B)  # re-seeded a FRESH queue line
+
+        The prior tree filtered children to SAME-item agents only, so the
+        item-B grandchild was pruned out of A's tree entirely (and its own
+        item-B card showed nothing useful) — the tree rendered only the
+        contiguous same-item sub-chain. The full-spawn-graph walk renders
+        ALL transitive descendants of the owner regardless of binding, so
+        BOTH grandchildren nest under the child, to full depth.
+        """
+        item_a = _add(self.env, "deep cross-item", ["repo:subagent-deepx"])
+        qid_a = item_a["id"]
+        item_b = _add(self.env, "child reseed", ["repo:subagent-deepx-b"])
+        qid_b = item_b["id"]
+        _register(self.env, qid_a)
+
+        session_uuid = "11223344-5566-7788-99aa-bb0000000007"
+        owner_id = "owner000aaaa1111a"
+        child_id = "child111bbbb2222b"
+        gc_same = "gcsame22cccc3333c"   # grandchild bound to item A
+        gc_other = "gcother3dddd4444d"  # grandchild bound to item B (re-seed)
+
+        _seed_agent_state(self.agent_state, owner_id, qid_a, alive=True, age=2)
+        # owner -> child (both item A); child -> two grandchildren.
+        self._seed_parent_with_spawn(
+            self.jsonl_root, session_uuid, owner_id, qid_a, child_id)
+        # child spawns gc_same (still item A) AND gc_other (re-seeded item B).
+        # _seed_parent_with_spawn overwrites the child transcript, so seed the
+        # child with BOTH launch records via a single transcript below.
+        self._seed_parent_with_two_spawns(
+            self.jsonl_root, session_uuid, child_id, qid_a, gc_same, gc_other)
+        # Grandchild transcripts carry their respective inherited markers.
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, gc_same, qid_a)
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, gc_other, qid_b)
+        # Authoritative bindings: gc_other binds to item B, the rest to A.
+        self._seed_bindings({
+            owner_id: qid_a, child_id: qid_a,
+            gc_same: qid_a, gc_other: qid_b,
+        })
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid_a}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        # Owner dropped -> child is the lone top-level node.
+        self.assertEqual(len(subs), 1, f"child should be lone root: {subs}")
+        top = subs[0]
+        self.assertEqual(top["subagent_id"], child_id)
+        self.assertEqual(top.get("kind"), "child")
+        # BOTH grandchildren nest under the child — including the item-B one.
+        gc_ids = {c["subagent_id"] for c in top["children"]}
+        self.assertEqual(
+            gc_ids, {gc_same, gc_other},
+            f"both grandchildren must nest under child (the item-B one was "
+            f"the dropped node in the depth-1 bug): {top}")
+        for c in top["children"]:
+            self.assertEqual(c.get("kind"), "child",
+                             f"grandchild must be a child node: {c}")
+        # The item-B grandchild keeps its OWN owning-item attribution for
+        # display even while nested under an item-A parent.
+        gc_other_node = next(
+            c for c in top["children"] if c["subagent_id"] == gc_other)
+        self.assertEqual(gc_other_node.get("queue_id"), qid_b,
+                         f"item-B grandchild keeps its own queue_id: {gc_other_node}")
+        # Zero attempts anywhere (every node is a genuine spawn).
+        def _has_attempt(nodes):
+            return any(n.get("kind") == "attempt" or _has_attempt(
+                n.get("children", [])) for n in nodes)
+        self.assertFalse(_has_attempt(subs),
+                         f"a pure spawn tree must yield ZERO attempts: {subs}")
+
+    def _seed_parent_with_two_spawns(self, jsonl_root, session_uuid, agent_id,
+                                     qid, child_a, child_b):
+        """Like _seed_parent_with_spawn but records TWO Agent-tool launches in
+        one transcript (one agent that spawned two children)."""
+        def _spawn_pair(child, n):
+            tuid = f"toolu_{child[:8]}{n}"
+            return [
+                {
+                    "type": "assistant",
+                    "sessionId": session_uuid,
+                    "agentId": agent_id,
+                    "uuid": f"a{n}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use", "id": tuid, "name": "Agent",
+                            "input": {"prompt": f"Queue item: {qid}\nChild."},
+                        }],
+                    },
+                },
+                {
+                    "type": "user",
+                    "sessionId": session_uuid,
+                    "agentId": agent_id,
+                    "uuid": f"u{n}r",
+                    "message": {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result", "tool_use_id": tuid,
+                            "content": [{
+                                "type": "text",
+                                "text": (
+                                    "Async agent launched successfully.\n"
+                                    f"agentId: {child} (internal ID - do not "
+                                    "mention to user.)"),
+                            }],
+                        }],
+                    },
+                },
+            ]
+        lines = [{
+            "type": "user", "sessionId": session_uuid, "agentId": agent_id,
+            "isSidechain": True, "uuid": "u1",
+            "message": {"role": "user",
+                        "content": f"Queue item: {qid}\nParent task."},
+        }]
+        lines += _spawn_pair(child_a, 1)
+        lines += _spawn_pair(child_b, 2)
+        return _seed_subagent_jsonl(
+            jsonl_root, session_uuid, agent_id, lines=lines)
+
     def test_genuine_retry_and_nested_child_coexist(self):
         """A genuine main-loop retry (NOT spawned by any session agent) stays
         ``kind='attempt'`` while a nested child of the owner stays
