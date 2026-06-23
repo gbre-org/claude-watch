@@ -34,6 +34,22 @@ FROM rust:1-bookworm AS claude-watch-builder
 
 WORKDIR /build
 
+# Build-time git identity for the `claude_watch_build_info` Prometheus gauge.
+#
+# build.rs stamps CW_GIT_COMMIT / CW_GIT_PR into the binary. It prefers live
+# git, but `.dockerignore` prunes `.git/` from this build context (see the
+# repo-root .dockerignore — shipping the pack files to the daemon is wasteful),
+# so live git is UNAVAILABLE here and would otherwise fall back to
+# `commit="unknown"`. We therefore plumb the host-computed commit + PR in as
+# build args and expose them as env vars build.rs reads as its fallback. The
+# Makefile (compose-build / container-build) computes these on the host where
+# git IS present; a bare `docker build` with no args cleanly degrades to
+# "unknown" (same as before).
+ARG CW_BUILD_COMMIT=
+ARG CW_BUILD_PR=
+ENV CW_BUILD_COMMIT=${CW_BUILD_COMMIT} \
+    CW_BUILD_PR=${CW_BUILD_PR}
+
 # COPY the working tree from the build context (the repo root). The
 # .dockerignore at the repo root prunes target/, __pycache__/, .git/,
 # editor swap files, etc. — only the source files Cargo + the rest of
