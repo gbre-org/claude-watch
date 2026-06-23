@@ -415,11 +415,23 @@ bootstrap:
 # operators who want origin/main should `git pull --rebase` before
 # invoking this target (the Dockerfile no longer pins a remote SHA — it
 # COPYs the local working tree).
+# Host-computed build identity passed to container/Dockerfile's
+# claude-watch-builder stage (CW_BUILD_COMMIT / CW_BUILD_PR), which build.rs
+# bakes into the `claude_watch_build_info` Prometheus gauge. The Docker build
+# context prunes `.git/` (.dockerignore), so build.rs cannot run git inside
+# the image — we resolve commit + PR HERE on the host (git available) and feed
+# them in. CW_BUILD_PR parses the trailing `(#N)` squash-merge convention from
+# the HEAD subject (empty if none — matches build.rs's "" fallback).
+CW_BUILD_COMMIT = $(shell git rev-parse --short HEAD 2>/dev/null)
+CW_BUILD_PR = $(shell git log -1 --format=%s 2>/dev/null | grep -oE '\#[0-9]+' | tail -1 | tr -d '\#')
+
 compose-build:
 	@cd examples/compose && \
 	  GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
 	  docker compose build \
-	    --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"
+	    --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
+	    --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
+	    --build-arg CW_BUILD_PR="$(CW_BUILD_PR)"
 
 # Build just the claude-container image directly (no compose). Same
 # GIT_SHA plumbing as compose-build. Context is the repo root because the
@@ -429,6 +441,8 @@ compose-build:
 container-build:
 	docker build \
 	  --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
+	  --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
+	  --build-arg CW_BUILD_PR="$(CW_BUILD_PR)" \
 	  -t claude-container:dev \
 	  -f container/Dockerfile \
 	  .
