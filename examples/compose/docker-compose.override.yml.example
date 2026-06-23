@@ -68,6 +68,11 @@ services:
     #   # what the host source is).
     #   SSH_AUTH_SOCK: /run/host-services/ssh-auth.sock
     volumes:
+      # NOTE: the ~/.config/claude-container DIRECTORY bind-mount (durable
+      # persistent-state dir + home of this override file) now lives in the
+      # BASE docker-compose.yml, so it is ALWAYS present even on a base-only
+      # deploy. Do NOT re-add it here (a duplicate is harmless — docker
+      # concatenates volume lists — but the template should not carry it).
       # gh CLI token storage. RW so an in-container `gh auth login`
       # (token refresh, scope upgrade) propagates back to the host.
       # - "${HOME}/.config/gh:/home/hndrewaall/.config/gh:rw"
