@@ -57,6 +57,10 @@ REAL_XCLIP = "/usr/bin/xclip"
 STALE_SECONDS_ENV = "XCLIP_BRIDGE_STALE_SECONDS"
 DEFAULT_STALE_SECONDS = 3600  # 1 hour: anything older than this is "no clipboard"
 
+# Per-process dedup flag for the absent-bridge-dir diagnostic (claude
+# probes xclip twice per paste; we want at most one stderr line).
+_WARNED_MISSING_BRIDGE = False
+
 
 # Mimetype suffixes we look for under bridge_dir. claude probes only
 # image/* in TUI mode (see binary reverse: image/png, image/jpeg,
@@ -213,6 +217,35 @@ def _parse_xclip_argv(argv: list[str]) -> tuple[Optional[str], Optional[str]]:
     return (selection, target)
 
 
+def _warn_bridge_dir_missing(bridge: Path, stderr) -> None:
+    """Emit ONE stderr diagnostic when the bridge DIR is absent.
+
+    An absent bridge directory means the clipboard bridge is not
+    wired up (the /host-clipboard bind-mount was not applied to this
+    container) — a misconfiguration, distinct from a present-but-empty
+    bridge (a genuinely-empty clipboard, which stays silent). We keep
+    stdout/exit unchanged for claude compatibility and surface the
+    misconfiguration here so it is no longer invisible.
+
+    Deduped per-process via a module flag so we never spam more than
+    one line, even though claude probes xclip twice per paste (TARGETS
+    then image/png).
+    """
+    global _WARNED_MISSING_BRIDGE
+    if _WARNED_MISSING_BRIDGE:
+        return
+    _WARNED_MISSING_BRIDGE = True
+    print(
+        f"xclip-shim: clipboard bridge dir {bridge} does not exist — the "
+        "bind-mount is not present in this container, so image paste will "
+        "be EMPTY (this is a misconfiguration, not an empty clipboard). "
+        "Re-create the container with "
+        "'docker compose up -d --force-recreate' (NOT 'restart') to apply "
+        "the clipboard-bridge bind-mount.",
+        file=stderr,
+    )
+
+
 def main(argv: list[str], *, stdout=None, stderr=None) -> int:
     if stdout is None:
         stdout = sys.stdout.buffer
@@ -254,8 +287,19 @@ def main(argv: list[str], *, stdout=None, stderr=None) -> int:
 
     bridge = _bridge_dir()
     if not bridge.exists():
-        # No bridge → empty clipboard, not an error (claude treats this
-        # as "no image to paste" and moves on).
+        # The bridge DIRECTORY itself is absent. This is almost always a
+        # MISCONFIGURATION (the /host-clipboard bind-mount was not applied
+        # to the running container) — NOT a genuinely-empty clipboard.
+        # Distinguishing the two is the whole point of this branch: a
+        # missing mount used to silently masquerade as an empty clipboard,
+        # so a pasted image came back as "empty" with no signal anywhere.
+        #
+        # We MUST preserve the exit contract claude relies on (TARGETS
+        # query → exit 0 / empty stdout = "no image"; specific read → exit
+        # 1), so stdout stays empty and the exit code is unchanged. But we
+        # ALSO emit ONE diagnostic line to STDERR so the failure is visible
+        # in logs / diagnostics instead of being silently swallowed.
+        _warn_bridge_dir_missing(bridge, stderr)
         if target and target.upper() == "TARGETS":
             return 0
         return 1
@@ -281,6 +325,8 @@ def main(argv: list[str], *, stdout=None, stderr=None) -> int:
 class XclipShimTests(unittest.TestCase):
     def setUp(self):
         import tempfile
+        global _WARNED_MISSING_BRIDGE
+        _WARNED_MISSING_BRIDGE = False  # reset per-process dedup guard
         self._tmp = tempfile.TemporaryDirectory()
         self.bridge = Path(self._tmp.name)
         os.environ[BRIDGE_ENV] = str(self.bridge)
@@ -371,11 +417,44 @@ class XclipShimTests(unittest.TestCase):
         sel, tgt = _parse_xclip_argv(["-selection", "clipboard", "-i"])
         self.assertEqual(sel, "__write__")
 
-    def test_missing_bridge_dir_is_graceful(self):
+    def test_missing_bridge_dir_is_graceful_but_warns(self):
+        # Absent bridge DIR = misconfiguration (missing bind-mount). The
+        # exit contract is preserved (TARGETS → rc 0, empty stdout) so
+        # claude still behaves, but a diagnostic MUST hit stderr so the
+        # missing mount is no longer silently masked as an empty clipboard.
         os.environ[BRIDGE_ENV] = "/nonexistent/bridge/dir/totally"
-        rc, out, _ = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        rc, out, err = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
         self.assertEqual(rc, 0)
         self.assertEqual(out, b"")
+        self.assertIn("does not exist", err)
+        self.assertIn("force-recreate", err)
+
+    def test_missing_bridge_dir_image_read_warns(self):
+        # The specific-MIME read path keeps its rc 1 ("no data") contract
+        # but also surfaces the missing-mount diagnostic on stderr.
+        os.environ[BRIDGE_ENV] = "/nonexistent/bridge/dir/totally"
+        rc, out, err = self._run(["-selection", "clipboard", "-t", "image/png", "-o"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, b"")
+        self.assertIn("does not exist", err)
+
+    def test_present_but_empty_bridge_is_silent(self):
+        # The bridge DIR EXISTS (it's the tempdir from setUp) but holds no
+        # clipboard.png — a genuinely-empty clipboard. This must stay
+        # SILENT (no diagnostic): distinguishing it from the absent-dir
+        # misconfiguration above is the whole point of the change.
+        rc, out, err = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, "")
+
+    def test_missing_bridge_dir_warning_is_deduped(self):
+        # claude probes xclip twice per paste (TARGETS then image/png).
+        # Only ONE process should emit at most one line; here we assert a
+        # single main() invocation emits exactly one diagnostic line.
+        os.environ[BRIDGE_ENV] = "/nonexistent/bridge/dir/totally"
+        _, _, err = self._run(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        self.assertEqual(err.count("does not exist"), 1)
 
 
 def _run_self_tests() -> int:
