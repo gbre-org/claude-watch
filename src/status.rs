@@ -397,13 +397,34 @@ pub(crate) fn resolve_installed_version(claude_bin: &std::path::Path) -> Option<
     None
 }
 
+/// Returns true if `canonical` looks like the Claude Code MCP-settings hooks
+/// shim (a bash wrapper) rather than the real CLI binary.
+///
+/// The container puts a shim FIRST on `PATH` (e.g.
+/// `/usr/local/lib/claude-hooks-shim/claude` → `.../claude-mcp-settings-shim`,
+/// a bash script) so `command -v claude` resolves to the wrapper, not the real
+/// binary. Resolving the installed version off the shim yields `None` (no
+/// `/versions/` segment, no `@anthropic-ai/claude-code/package.json` up the
+/// tree). Mirror the shim's own self-skip logic: a canonical path containing
+/// `hooks-shim` or `claude-mcp-settings-shim` is the wrapper.
+fn is_claude_hooks_shim(canonical: &std::path::Path) -> bool {
+    let s = canonical.to_string_lossy();
+    s.contains("hooks-shim") || s.contains("claude-mcp-settings-shim")
+}
+
 /// Locate the `claude` launcher binary to inspect for the installed version.
 ///
 /// Prefers the native versioned-symlink location (`~/.local/bin/claude`) when
-/// present — it canonicalizes straight to a versioned path. Otherwise falls
-/// back to resolving `claude` on `PATH`, which covers the npm-global layout
-/// (`~/.npm-global/bin/claude` and friends) without hardcoding any
-/// install-method-specific path.
+/// present — it canonicalizes straight to a versioned path. Otherwise walks
+/// `PATH` (like `which -a`) and returns the FIRST `claude` whose canonicalized
+/// target is NOT the MCP-settings hooks shim. This is deliberately NOT
+/// `command -v claude`: that returns whatever is first on `PATH`, which in the
+/// container is the hooks-shim wrapper (`/usr/local/lib/claude-hooks-shim/claude`
+/// → `claude-mcp-settings-shim`, a bash script) — canonicalizing it finds no
+/// version, so `latest`/`installed` would read "unknown". Skipping the shim
+/// (see [`is_claude_hooks_shim`]) returns the real binary
+/// (`.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`), off which the
+/// walk-up in [`resolve_installed_version`] finds the package.json version.
 fn find_claude_launcher() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
 
@@ -413,20 +434,38 @@ fn find_claude_launcher() -> Option<std::path::PathBuf> {
         return Some(native);
     }
 
-    // Fall back to PATH resolution (npm-global, distro packages, etc).
-    if let Ok(output) = std::process::Command::new("sh")
-        .args(["-c", "command -v claude"])
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(std::path::PathBuf::from(path));
+    // Walk every PATH entry (like `which -a claude`) and return the first
+    // `claude` that exists, is executable, and is NOT the hooks-shim wrapper.
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+            let candidate = std::path::Path::new(dir).join("claude");
+            if !is_executable_file(&candidate) {
+                continue;
+            }
+            // Canonicalize to see through the shim symlink chain; skip the shim.
+            match std::fs::canonicalize(&candidate) {
+                Ok(canonical) if !is_claude_hooks_shim(&canonical) => {
+                    return Some(candidate);
+                }
+                // Shim (or unresolvable) — keep looking down PATH.
+                _ => continue,
             }
         }
     }
 
     None
+}
+
+/// Returns true if `path` exists, is a regular file (following symlinks), and
+/// has any execute bit set. Used to mirror `which`'s "executable on PATH"
+/// check while walking `PATH` entries.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        // metadata follows symlinks, so a symlink → real binary is a file here.
+        Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
 }
 
 /// Resolve the running Claude Code version for a given PID.
@@ -438,7 +477,17 @@ fn find_claude_launcher() -> Option<std::path::PathBuf> {
 ///    live package, leaving the running process mapped to the old, deleted
 ///    inode), so the path carries no usable version. Claude itself records the
 ///    running version in `~/.claude/sessions/<PID>.json` (the `"version"`
-///    field), which is authoritative for every install method — read that.
+///    field), which is the authoritative "what THIS running PID loaded"
+///    snapshot for every install method — read that.
+///
+/// These two layouts are the ONLY sources. We intentionally do NOT shell out to
+/// `claude --version` as a fallback: that yields the INSTALLED version, not what
+/// is running in this PID. On a deleted-inode exe link the truthful running
+/// version is the OLD version this PID loaded (per the session marker) — never
+/// the newly-installed one. If neither layout resolves, return `None`; we never
+/// substitute the installed value for the running one. (The separate
+/// `installed`/`latest` field IS sourced from the installed binary — see
+/// [`find_claude_launcher`] + [`resolve_installed_version`].)
 fn resolve_running_version(pid: &str) -> Option<String> {
     // Layout 1: versioned /proc/PID/exe target.
     let exe_path = format!("/proc/{pid}/exe");
@@ -448,7 +497,21 @@ fn resolve_running_version(pid: &str) -> Option<String> {
         }
     }
 
-    // Layout 2: Claude's own per-PID session marker.
+    // Layout 2 (terminal fallback): Claude's own per-PID session marker. This
+    // is the authoritative "what THIS running PID loaded" snapshot, written at
+    // process start, for every install method.
+    //
+    // We deliberately STOP here. We do NOT shell out to `claude --version` as a
+    // further fallback: that reports the INSTALLED version, not what is actually
+    // running in this PID. When `/proc/PID/exe` is a deleted inode (npm's atomic
+    // install renamed a newer package over the live one) the truthful running
+    // version is the OLD version this PID loaded — recorded in the session
+    // marker — NOT the freshly-installed one. Reporting the installed version
+    // here would lie about what is in-process. If neither the exe link nor the
+    // marker yields a version we return `None` rather than "freshen" it with the
+    // installed value. (The `installed`/`latest` field is sourced separately via
+    // find_claude_launcher() + resolve_installed_version(), where the installed
+    // binary IS the right answer.)
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let session_marker = format!("{home}/.claude/sessions/{pid}.json");
     if let Ok(contents) = std::fs::read_to_string(&session_marker) {
@@ -1793,6 +1856,27 @@ mod tests {
             extract_version_from_json(r#"{"version":"latest"}"#),
             None
         );
+    }
+
+    // --- is_claude_hooks_shim tests ---
+
+    #[test]
+    fn test_is_claude_hooks_shim() {
+        // The container's shim wrapper paths.
+        assert!(is_claude_hooks_shim(std::path::Path::new(
+            "/usr/local/lib/claude-hooks-shim/claude"
+        )));
+        assert!(is_claude_hooks_shim(std::path::Path::new(
+            "/usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim"
+        )));
+        // The real npm-global binary is NOT a shim.
+        assert!(!is_claude_hooks_shim(std::path::Path::new(
+            "/home/u/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+        )));
+        // The native versioned binary is NOT a shim.
+        assert!(!is_claude_hooks_shim(std::path::Path::new(
+            "/home/u/.local/share/claude/versions/2.1.186/node_modules/.bin/claude"
+        )));
     }
 
     // --- resolve_installed_version tests ---
