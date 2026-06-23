@@ -250,8 +250,26 @@ services:
       # always stays visible.
       #
       # Default is /dev/null (graceful no-op): docker mounts the null
-      # device at the staging path, the baked symlink dangles, and the
-      # in-container claude sees no managed-settings tier.
+      # device at the staging path. The entrypoint then sees no real
+      # managed-settings.json under the staging mount and removes the
+      # /etc/claude-code/managed-settings.json symlink, so the in-container
+      # claude sees no managed-settings tier (ENOENT, which it tolerates).
+      #
+      # The symlink is NOT baked into the image and is NOT created here. A
+      # /dev/null mount at the staging path is a NON-directory: a symlink
+      # pointing through it would resolve to ENOTDIR (a hard read error,
+      # not a tolerated ENOENT) and wedge Claude Code's launch in its
+      # blocking "Settings Error" modal. The entrypoint creates the symlink
+      # CONDITIONALLY (only for a real managed-settings.json under the
+      # staging mount) and otherwise removes it — see
+      # container/entrypoint.sh "Managed-settings guard".
+      #
+      # NOTE: CLAUDE_HOST_MANAGED_SETTINGS_DIR is loaded from the deploy
+      # dir's `.env`, which is gitignored and therefore absent in a build
+      # worktree. To opt into managed settings reliably regardless of which
+      # clone/worktree deploys, set it in the config-dir env-file
+      # ~/.config/claude-container/deploy.env (the Makefile passes that via
+      # --env-file) rather than only in examples/compose/.env.
       - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/dev/null}:/mnt/host-managed-claude-config:ro"
       # ~/.claude — rw: Claude Code writes session JSONLs, project state,
       # cache, telemetry here on every interaction. Also the location of

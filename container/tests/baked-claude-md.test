@@ -25,9 +25,12 @@ This test asserts:
      /mnt/host-managed-claude-config — never at the host's own path (a
      macOS-path mirror inside a Linux container is silently ignored by
      Claude Code) and never directly over /etc/claude-code (which would
-     shadow the baked CLAUDE.md). The image's
-     /etc/claude-code/managed-settings.json symlink (asserted in 4b)
-     surfaces the staged file at the documented Linux managed-config path.
+     shadow the baked CLAUDE.md). The entrypoint creates the
+     /etc/claude-code/managed-settings.json symlink CONDITIONALLY at
+     startup (asserted in 4b) — surfacing the staged file at the documented
+     Linux managed-config path only when one is actually mounted, and
+     removing the link otherwise so a /dev/null staging mount can't wedge
+     the launch with an ENOTDIR symlink.
   5. Public-repo hygiene: baked-CLAUDE.md does NOT reference any private homelab
      path (no /mnt/Raiden, no /home/<known-personal-user>, no ADHPrivate, etc).
      The file ships in a public repo and lands in every container session as
@@ -50,6 +53,7 @@ REPO_ROOT = CONTAINER_DIR.parent
 
 BAKED = CONTAINER_DIR / "baked-CLAUDE.md"
 DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
 COMPOSE = REPO_ROOT / "examples" / "compose" / "docker-compose.yml"
 
 
@@ -451,8 +455,13 @@ if COMPOSE.exists():
         "baked symlink surfaces managed-settings.json at the Linux path.",
     )
 
-# 4b. Dockerfile bakes the managed-settings.json symlink into the managed
-#     dir so the staged host file surfaces at the documented Linux path.
+# 4b. The managed-settings.json symlink is NOT baked statically into the
+#     Dockerfile — a baked symlink traverses the default /dev/null staging
+#     mount and resolves to ENOTDIR (a hard read error that wedges Claude
+#     Code's launch in its blocking "Settings Error" modal). The entrypoint
+#     creates it CONDITIONALLY at startup instead (only when a readable
+#     managed-settings.json is present under the staging mount), and removes
+#     it otherwise so the tier is cleanly absent (ENOENT, tolerated).
 if DOCKERFILE.is_file():
     df_text = DOCKERFILE.read_text(encoding="utf-8")
     expect(
@@ -461,11 +470,37 @@ if DOCKERFILE.is_file():
             r"(\\\s*)?\n?\s*/etc/claude-code/managed-settings\.json",
             df_text,
         )
-        is not None,
-        "Dockerfile missing the `ln -s /mnt/host-managed-claude-config/"
-        "managed-settings.json /etc/claude-code/managed-settings.json` "
-        "symlink — without it the staged host managed settings never "
+        is None,
+        "Dockerfile must NOT bake a static `ln -s /mnt/host-managed-claude-"
+        "config/managed-settings.json /etc/claude-code/managed-settings.json` "
+        "symlink — when CLAUDE_HOST_MANAGED_SETTINGS_DIR is unset the compose "
+        "mounts /dev/null at the staging path, so the symlink traverses a "
+        "non-directory and resolves to ENOTDIR (a HARD read error that wedges "
+        "Claude Code's launch). The entrypoint creates it conditionally instead.",
+    )
+
+if ENTRYPOINT.is_file():
+    ep_text = ENTRYPOINT.read_text(encoding="utf-8")
+    expect(
+        re.search(
+            r"ln\s+-sf?\s+.*managed[_-]?src.*managed[_-]?link",
+            ep_text,
+        )
+        is not None
+        or "/etc/claude-code/managed-settings.json" in ep_text,
+        "entrypoint.sh missing the conditional managed-settings symlink "
+        "creation — without it the staged host managed settings never "
         "surface at the Linux managed-config path Claude Code reads.",
+    )
+    # The entrypoint must also remove the link when no real
+    # managed-settings.json is mounted, so a /dev/null staging mount can
+    # never leave a wedging ENOTDIR symlink behind.
+    expect(
+        re.search(r"rm\s+-f\s+.*managed[_-]?link", ep_text) is not None,
+        "entrypoint.sh missing the `rm -f` of the managed-settings symlink "
+        "for the no-managed-settings / bad-mount case — required so a "
+        "/dev/null staging mount resolves to tier-absent (ENOENT) instead "
+        "of a wedging ENOTDIR.",
     )
 
 

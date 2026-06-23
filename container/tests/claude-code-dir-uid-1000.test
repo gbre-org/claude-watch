@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Tests that /etc/claude-code/ is chowned to uid 1000 in the image so the
+entrypoint (which runs as uid 1000) can create/remove the runtime
+managed-settings.json symlink under it.
+
+Background: this PR (ah/fix-redeploy-no-session) stopped baking a STATIC
+/etc/claude-code/managed-settings.json symlink in the Dockerfile, because
+when CLAUDE_HOST_MANAGED_SETTINGS_DIR is unset the example compose mounts
+/dev/null at the staging path, so a baked symlink traversed a NON-directory
+and resolved to ENOTDIR — a hard read error that drops Claude Code into its
+blocking "Settings Error" modal and wedges the detached tmux pane ("no
+session to connect to"). Instead the entrypoint now manages the symlink
+CONDITIONALLY at startup: `ln -sf` when the staging mount holds a readable
+managed-settings.json, else `rm -f`.
+
+The reintroduced bug this test guards: the entrypoint runs as
+`hndrewaall` / uid 1000 (per the image-level `USER hndrewaall` directive),
+NOT root. /etc/claude-code is root-owned by default (the
+`COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md` step lands its
+content as root:root, and Docker creates the parent dir root-owned). Adding
+or unlinking the managed-settings.json ENTRY requires WRITE permission on
+the PARENT DIRECTORY /etc/claude-code. Without a chown, the entrypoint's
+`ln -sf` / `rm -f` fail with "Permission denied" — and because the
+entrypoint runs under `set -euo pipefail`, that aborts the whole entrypoint,
+leaving no tmux session. That is the EXACT redeploy wedge this PR set out to
+fix, reintroduced by moving symlink creation from build-time (root) to
+runtime (uid 1000).
+
+Fix shape: `RUN chown 1000:1000 /etc/claude-code` (the DIRECTORY only — its
+contents, notably the baked CLAUDE.md, stay root-owned/read-only since the
+entrypoint never writes them, only manages the sibling managed-settings.json
+entry). Mirrors the existing config-dir-uid-1000 pattern.
+
+Asserts:
+  1. Dockerfile contains a RUN line that chowns /etc/claude-code to
+     1000:1000 (or hndrewaall:hndrewaall).
+  2. That chown lives BEFORE the `USER hndrewaall` directive (RUN steps run
+     as the current USER; the chown must happen while still root).
+  3. The chown lands AFTER the useradd that creates uid 1000.
+  4. The chown targets the DIRECTORY (`/etc/claude-code`), not recursively
+     (`-R`) — recursive would also flip the baked CLAUDE.md to uid 1000,
+     which is unnecessary and weakens the read-only posture of that file.
+  5. A rationale comment sits immediately above the RUN so a future
+     refactor doesn't strip it as redundant.
+
+Run:  ./claude-code-dir-uid-1000.test
+
+No external dependencies beyond Python 3.8+ stdlib.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+
+if DOCKERFILE.is_file():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    # 1. A RUN line chowns /etc/claude-code to uid 1000. Accept the standard
+    #    idioms (1000:1000 or hndrewaall:hndrewaall). Tolerate a trailing
+    #    slash on the path.
+    chown_run = re.search(
+        r"(?m)^\s*RUN[^\n]*chown\s+(?:1000:1000|hndrewaall:hndrewaall)"
+        r"\s+/etc/claude-code/?\s*$",
+        text,
+    )
+    expect(
+        chown_run is not None,
+        "Dockerfile: must contain a RUN step that chowns /etc/claude-code "
+        "to uid 1000:1000. The entrypoint runs as uid 1000 and manages the "
+        "managed-settings.json symlink at runtime (ln -sf / rm -f), which "
+        "needs WRITE on the parent dir. Without this chown the entrypoint "
+        "aborts with 'Permission denied' under set -e, leaving no tmux "
+        "session ('no session to connect to').",
+    )
+
+    # 2. The chown must run BEFORE `USER hndrewaall` (RUN steps execute as
+    #    the current USER; once switched to uid 1000 the chown would fail).
+    user_directive = re.search(r"(?m)^\s*USER\s+hndrewaall\s*$", text)
+    expect(
+        user_directive is not None,
+        "Dockerfile: missing `USER hndrewaall` directive — required to "
+        "drop privileges before runtime",
+    )
+    if chown_run is not None and user_directive is not None:
+        expect(
+            chown_run.start() < user_directive.start(),
+            "Dockerfile: the /etc/claude-code chown RUN step must appear "
+            "BEFORE the `USER hndrewaall` directive. RUN steps execute as "
+            "the current USER; if USER is already uid 1000 the chown fails "
+            "(only root can chown other uids).",
+        )
+
+    # 3. The chown must run AFTER the useradd that creates uid 1000.
+    useradd_line = re.search(
+        r"useradd\s+--uid\s+1000\s+--gid\s+1000",
+        text,
+    )
+    expect(
+        useradd_line is not None,
+        "Dockerfile: missing the canonical `useradd --uid 1000 --gid 1000` "
+        "line that creates the hndrewaall user.",
+    )
+    if chown_run is not None and useradd_line is not None:
+        expect(
+            useradd_line.end() < chown_run.start(),
+            "Dockerfile: the /etc/claude-code chown RUN step must appear "
+            "AFTER the useradd that creates uid 1000, otherwise the chown "
+            "targets a uid/gid that doesn't yet exist.",
+        )
+
+    # 4. The chown must NOT be recursive (-R). Recursive would also flip the
+    #    baked CLAUDE.md to uid 1000; we only need the directory writable so
+    #    the entrypoint can add/unlink the managed-settings.json entry.
+    recursive_chown = re.search(
+        r"(?m)^\s*RUN[^\n]*chown\s+-R\s+(?:1000:1000|hndrewaall:hndrewaall)"
+        r"\s+/etc/claude-code/?\s*$",
+        text,
+    )
+    expect(
+        recursive_chown is None,
+        "Dockerfile: the /etc/claude-code chown must target the DIRECTORY "
+        "only, NOT be recursive (-R). The entrypoint only needs write on "
+        "the parent dir to manage the managed-settings.json entry; the "
+        "baked CLAUDE.md should stay root-owned/read-only.",
+    )
+
+    # 5. A rationale comment sits immediately above the RUN.
+    if chown_run is not None:
+        run_start_line = text[: chown_run.start()].count("\n")
+        lines = text.splitlines()
+        i = run_start_line - 1
+        saw_comment = False
+        while i >= 0:
+            stripped = lines[i].strip()
+            if not stripped:
+                i -= 1
+                continue
+            if stripped.startswith("#"):
+                saw_comment = True
+                break
+            break
+        expect(
+            saw_comment,
+            "Dockerfile: the /etc/claude-code chown RUN step is missing a "
+            "rationale comment immediately above it. Add a comment "
+            "explaining that the uid-1000 entrypoint needs to manage the "
+            "managed-settings.json symlink at runtime (else a future "
+            "refactor may strip the step as redundant).",
+        )
+
+
+if failures:
+    print("FAIL claude-code-dir-uid-1000.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS claude-code-dir-uid-1000.test")
+sys.exit(0)

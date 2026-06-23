@@ -41,6 +41,43 @@ set -euo pipefail
 
 SESSION="claude-container"
 
+# Managed-settings guard — make a bad/empty managed-settings mount resolve
+# to tier-ABSENT, never a hard read error that wedges the launch.
+#
+# The Dockerfile no longer bakes a static symlink at
+# /etc/claude-code/managed-settings.json (it used to point at the
+# /mnt/host-managed-claude-config staging mount). The reason: when
+# CLAUDE_HOST_MANAGED_SETTINGS_DIR is empty/unset, the example compose
+# mounts /dev/null at that staging path, so the symlink traversed a
+# NON-directory and resolved to ENOTDIR — a hard read error (NOT the
+# dangling-ENOENT the old comment assumed). Claude Code then drops into
+# the interactive "Settings Error" modal on the ENOTDIR read and BLOCKS
+# on a keypress nobody presses → the detached `tmux new-session -d` pane
+# wedges and the operator sees "no session to connect to".
+#
+# We create the symlink CONDITIONALLY here: only when the staging mount
+# is a real directory holding a readable regular managed-settings.json.
+# Otherwise we `rm -f` the link so the managed tier is genuinely absent
+# (ENOENT, which Claude Code tolerates). The final `test -f -r` re-check
+# is an unconditional belt-and-suspenders guard that ALSO catches a stale
+# symlink, a directly-mounted /dev/null, or any other non-regular-file
+# shape at the managed path — so a bad mount can NEVER wedge the pane.
+_managed_link="/etc/claude-code/managed-settings.json"
+_managed_src="/mnt/host-managed-claude-config/managed-settings.json"
+if [ -d /mnt/host-managed-claude-config ] && [ -f "${_managed_src}" ] && [ -r "${_managed_src}" ]; then
+    ln -sf "${_managed_src}" "${_managed_link}"
+else
+    rm -f "${_managed_link}"
+fi
+# Final unconditional guard: if the managed-settings path is anything
+# other than a readable regular file (covers ENOTDIR via /dev/null mount,
+# a directory, a dangling/looping symlink, a non-regular special file),
+# remove it so claude launches with the managed tier cleanly absent.
+if [ ! -f "${_managed_link}" ] || [ ! -r "${_managed_link}" ]; then
+    rm -f "${_managed_link}"
+fi
+unset _managed_link _managed_src
+
 # Tell the in-container claude-watch where its config lives. The host's
 # ~/.config/ is NOT bind-mounted (only ~/.claude, ~/repos, $PWD per the
 # wrapper's "blast radius" header), so we ship a container-tailored config

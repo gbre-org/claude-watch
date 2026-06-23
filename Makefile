@@ -184,6 +184,7 @@ test-entrypoint:
 	container/tests/baked-dirs.test
 	container/tests/baked-obligations-hooks.test
 	container/tests/config-dir-uid-1000.test
+	container/tests/claude-code-dir-uid-1000.test
 	container/tests/queue-gate-wired.test
 	container/tests/claude-watch-alert-gate-wired.test
 	container/tests/dispatch-gate-wired.test
@@ -530,13 +531,32 @@ compose-down:
 COMPOSE_BASE := $(CURDIR)/examples/compose/docker-compose.yml
 COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 
+# DEPLOY_ENV_FILE wiring (same worktree-invisibility class of bug as the
+# COMPOSE_OVERRIDE above): docker compose auto-loads `.env` from the
+# project dir (examples/compose/), but `.env` is gitignored — it exists in
+# the main clone's examples/compose/.env but NOT in a worktree's. Since the
+# workflow convention deploys from the build worktree
+# `~/repos/.worktrees/claude-watch/main`, that auto-loaded `.env` is EMPTY,
+# so deploy-critical vars (notably CLAUDE_HOST_MANAGED_SETTINGS_DIR) default
+# to their fallbacks (e.g. the managed-settings dir → /dev/null mount).
+#
+# Fix: keep the deploy-critical vars in a LOCATION-INDEPENDENT config-dir
+# env-file and pass it explicitly with `--env-file`, mirroring how
+# COMPOSE_FILE resolves the override from the config dir. Operators migrate
+# the relevant vars into this file once (see the PR / README note); a host
+# without it still recreates cleanly (compose falls back to the project
+# `.env` if present, else the in-file defaults).
+DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
+
 deploy-container:
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
+	  env_flag=""; \
+	  if [ -f "$(DEPLOY_ENV_FILE)" ]; then env_flag="--env-file $(DEPLOY_ENV_FILE)"; fi; \
 	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then \
-	    COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)" docker compose up -d --force-recreate claude-container; \
+	    COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)" docker compose $$env_flag up -d --force-recreate claude-container; \
 	  else \
-	    docker compose up -d --force-recreate claude-container; \
+	    docker compose $$env_flag up -d --force-recreate claude-container; \
 	  fi
 
 # DEPRECATED alias — kept so the baked image's own scripts/docs (entrypoint,
