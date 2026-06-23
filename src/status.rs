@@ -3,6 +3,7 @@
 use crate::cmd::{run_cmd, run_cmd_any};
 use regex_lite::Regex;
 use serde::Serialize;
+use std::time::SystemTime;
 use tracing::{debug, warn};
 
 /// Parsed Claude Code status from tmux pane capture + /proc.
@@ -396,13 +397,34 @@ pub(crate) fn resolve_installed_version(claude_bin: &std::path::Path) -> Option<
     None
 }
 
+/// Returns true if `canonical` looks like the Claude Code MCP-settings hooks
+/// shim (a bash wrapper) rather than the real CLI binary.
+///
+/// The container puts a shim FIRST on `PATH` (e.g.
+/// `/usr/local/lib/claude-hooks-shim/claude` → `.../claude-mcp-settings-shim`,
+/// a bash script) so `command -v claude` resolves to the wrapper, not the real
+/// binary. Resolving the installed version off the shim yields `None` (no
+/// `/versions/` segment, no `@anthropic-ai/claude-code/package.json` up the
+/// tree). Mirror the shim's own self-skip logic: a canonical path containing
+/// `hooks-shim` or `claude-mcp-settings-shim` is the wrapper.
+fn is_claude_hooks_shim(canonical: &std::path::Path) -> bool {
+    let s = canonical.to_string_lossy();
+    s.contains("hooks-shim") || s.contains("claude-mcp-settings-shim")
+}
+
 /// Locate the `claude` launcher binary to inspect for the installed version.
 ///
 /// Prefers the native versioned-symlink location (`~/.local/bin/claude`) when
-/// present — it canonicalizes straight to a versioned path. Otherwise falls
-/// back to resolving `claude` on `PATH`, which covers the npm-global layout
-/// (`~/.npm-global/bin/claude` and friends) without hardcoding any
-/// install-method-specific path.
+/// present — it canonicalizes straight to a versioned path. Otherwise walks
+/// `PATH` (like `which -a`) and returns the FIRST `claude` whose canonicalized
+/// target is NOT the MCP-settings hooks shim. This is deliberately NOT
+/// `command -v claude`: that returns whatever is first on `PATH`, which in the
+/// container is the hooks-shim wrapper (`/usr/local/lib/claude-hooks-shim/claude`
+/// → `claude-mcp-settings-shim`, a bash script) — canonicalizing it finds no
+/// version, so `latest`/`installed` would read "unknown". Skipping the shim
+/// (see [`is_claude_hooks_shim`]) returns the real binary
+/// (`.../node_modules/@anthropic-ai/claude-code/bin/claude.exe`), off which the
+/// walk-up in [`resolve_installed_version`] finds the package.json version.
 fn find_claude_launcher() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
 
@@ -412,20 +434,38 @@ fn find_claude_launcher() -> Option<std::path::PathBuf> {
         return Some(native);
     }
 
-    // Fall back to PATH resolution (npm-global, distro packages, etc).
-    if let Ok(output) = std::process::Command::new("sh")
-        .args(["-c", "command -v claude"])
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(std::path::PathBuf::from(path));
+    // Walk every PATH entry (like `which -a claude`) and return the first
+    // `claude` that exists, is executable, and is NOT the hooks-shim wrapper.
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+            let candidate = std::path::Path::new(dir).join("claude");
+            if !is_executable_file(&candidate) {
+                continue;
+            }
+            // Canonicalize to see through the shim symlink chain; skip the shim.
+            match std::fs::canonicalize(&candidate) {
+                Ok(canonical) if !is_claude_hooks_shim(&canonical) => {
+                    return Some(candidate);
+                }
+                // Shim (or unresolvable) — keep looking down PATH.
+                _ => continue,
             }
         }
     }
 
     None
+}
+
+/// Returns true if `path` exists, is a regular file (following symlinks), and
+/// has any execute bit set. Used to mirror `which`'s "executable on PATH"
+/// check while walking `PATH` entries.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        // metadata follows symlinks, so a symlink → real binary is a file here.
+        Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
 }
 
 /// Resolve the running Claude Code version for a given PID.
@@ -437,7 +477,17 @@ fn find_claude_launcher() -> Option<std::path::PathBuf> {
 ///    live package, leaving the running process mapped to the old, deleted
 ///    inode), so the path carries no usable version. Claude itself records the
 ///    running version in `~/.claude/sessions/<PID>.json` (the `"version"`
-///    field), which is authoritative for every install method — read that.
+///    field), which is the authoritative "what THIS running PID loaded"
+///    snapshot for every install method — read that.
+///
+/// These two layouts are the ONLY sources. We intentionally do NOT shell out to
+/// `claude --version` as a fallback: that yields the INSTALLED version, not what
+/// is running in this PID. On a deleted-inode exe link the truthful running
+/// version is the OLD version this PID loaded (per the session marker) — never
+/// the newly-installed one. If neither layout resolves, return `None`; we never
+/// substitute the installed value for the running one. (The separate
+/// `installed`/`latest` field IS sourced from the installed binary — see
+/// [`find_claude_launcher`] + [`resolve_installed_version`].)
 fn resolve_running_version(pid: &str) -> Option<String> {
     // Layout 1: versioned /proc/PID/exe target.
     let exe_path = format!("/proc/{pid}/exe");
@@ -447,7 +497,21 @@ fn resolve_running_version(pid: &str) -> Option<String> {
         }
     }
 
-    // Layout 2: Claude's own per-PID session marker.
+    // Layout 2 (terminal fallback): Claude's own per-PID session marker. This
+    // is the authoritative "what THIS running PID loaded" snapshot, written at
+    // process start, for every install method.
+    //
+    // We deliberately STOP here. We do NOT shell out to `claude --version` as a
+    // further fallback: that reports the INSTALLED version, not what is actually
+    // running in this PID. When `/proc/PID/exe` is a deleted inode (npm's atomic
+    // install renamed a newer package over the live one) the truthful running
+    // version is the OLD version this PID loaded — recorded in the session
+    // marker — NOT the freshly-installed one. Reporting the installed version
+    // here would lie about what is in-process. If neither the exe link nor the
+    // marker yields a version we return `None` rather than "freshen" it with the
+    // installed value. (The `installed`/`latest` field is sourced separately via
+    // find_claude_launcher() + resolve_installed_version(), where the installed
+    // binary IS the right answer.)
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let session_marker = format!("{home}/.claude/sessions/{pid}.json");
     if let Ok(contents) = std::fs::read_to_string(&session_marker) {
@@ -973,9 +1037,150 @@ pub(crate) fn watcher_pidfile_liveness(
     (recorded_pid, down)
 }
 
+/// Age (seconds) since the most-recently-modified watcher runtime file
+/// (`<name>.lock`, `<name>.pid`, `<name>.runlock`) under `pid_dir`. Returns
+/// `None` if none of the three exist.
+///
+/// A freshly-written pidfile is proof the watcher was (re)spawned recently. The
+/// watcher-monitor uses this to keep a fire-and-exit watcher in its grace window
+/// across the brief exit->restart gap even when the daemon's poll never caught
+/// it genuinely alive: `<name>.lock`/`<name>.pid` are rewritten on EVERY restart
+/// (by the watcher's flock guard / `watcher_run`), so as long as the main loop
+/// keeps restarting within the grace window, the freshest mtime stays young. A
+/// GENUINELY dead watcher (main loop stopped restarting) has its pidfiles age
+/// past the window, so real DOWN detection is preserved.
+///
+/// Pure-ish: filesystem stats only, no `pgrep` / `/proc`.
+// dead_code allow: the sole non-test caller is `policy::check_cycle`, which
+// the lib-only dead-code pass (release build, RUSTFLAGS=-D warnings) does not
+// treat as a root (it's reached via the `bin`'s `main`). Genuinely used by the
+// running daemon's watcher_monitor; the allow keeps `-D warnings` green.
+#[allow(dead_code)]
+pub(crate) fn watcher_runtime_file_age_secs(pid_dir: &str, name: &str) -> Option<f64> {
+    let now = SystemTime::now();
+    let suffixes = ["lock", "pid", "runlock"];
+    let mut youngest: Option<f64> = None;
+    for suffix in suffixes {
+        let path = format!("{}/{}.{}", pid_dir, name, suffix);
+        let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // Age = now - mtime. A clock skew that puts mtime in the future
+        // clamps to 0 (treat a future-dated file as freshly written, never
+        // negative) so a skewed clock can't manufacture a stale reading.
+        let age = now
+            .duration_since(mtime)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        youngest = Some(match youngest {
+            Some(cur) => cur.min(age),
+            None => age,
+        });
+    }
+    youngest
+}
+
+/// Pure decision: is a watcher still within its grace window?
+///
+/// The grace window is anchored on RECENT PROOF-OF-LIFE that does NOT require
+/// the daemon to catch the short-lived (fire-and-exit) watcher mid-flight. The
+/// watcher is in-grace if EITHER:
+///   * `last_seen_age` (seconds since the last poll that caught it genuinely
+///     running) is within `grace_secs`, OR
+///   * `pidfile_age` (seconds since its freshest runtime file was written, from
+///     [`watcher_runtime_file_age_secs`]) is within `grace_secs`.
+///
+/// The pidfile anchor is what kills the restart-gap false-DOWN: a watcher whose
+/// pidfile was just rewritten is mid-restart-cycle, NOT down, even when the
+/// daemon's poll never observed it alive between exit and respawn.
+#[allow(dead_code)] // see watcher_runtime_file_age_secs: lib-only dead-code false positive
+pub(crate) fn watcher_in_grace(
+    last_seen_age: Option<f64>,
+    pidfile_age: Option<f64>,
+    grace_secs: f64,
+) -> bool {
+    last_seen_age.is_some_and(|e| e < grace_secs)
+        || pidfile_age.is_some_and(|e| e < grace_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_watcher_runtime_file_age_secs_none_when_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            watcher_runtime_file_age_secs(dir.path().to_str().unwrap(), "evw"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_watcher_runtime_file_age_secs_fresh_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("evw.lock"), "70071").unwrap();
+        let age = watcher_runtime_file_age_secs(dir.path().to_str().unwrap(), "evw")
+            .expect("a just-written lock file must yield Some(age)");
+        // Just-written file: age is essentially zero, certainly well under a
+        // generous bound.
+        assert!(age >= 0.0, "age must be non-negative, got {age}");
+        assert!(age < 5.0, "freshly-written lock should be young, got {age}");
+    }
+
+    #[test]
+    fn test_watcher_runtime_file_age_secs_takes_freshest() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        // Write a .pid first, then make the .lock the fresher of the two by
+        // backdating the .pid's mtime well past the .lock's.
+        std::fs::write(dir.path().join("evw.pid"), "111").unwrap();
+        std::fs::write(dir.path().join("evw.lock"), "222").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        filetime_set(&dir.path().join("evw.pid"), old);
+        let age = watcher_runtime_file_age_secs(d, "evw").unwrap();
+        // The freshest (.lock) is young; the result must reflect IT, not the
+        // hour-old .pid.
+        assert!(age < 5.0, "should report freshest (lock) age, got {age}");
+    }
+
+    // Helper: backdate a file's mtime (std-only; `File::set_modified`, 1.75+).
+    fn filetime_set(path: &std::path::Path, t: SystemTime) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn test_watcher_in_grace_pidfile_fresh_overrides_stale_last_seen() {
+        // The regression case: last_seen_running is STALE (well past grace) but
+        // the pidfile was just rewritten (mid restart-cycle). The watcher must
+        // be treated as IN-GRACE (not a miss / not DOWN).
+        let grace = 90.0;
+        assert!(
+            watcher_in_grace(Some(300.0), Some(2.0), grace),
+            "fresh pidfile must keep a stale-last-seen watcher in grace"
+        );
+    }
+
+    #[test]
+    fn test_watcher_in_grace_both_stale_is_not_in_grace() {
+        // Genuinely down: last_seen stale AND pidfile aged past grace -> NOT in
+        // grace, so real DOWN detection still fires.
+        let grace = 90.0;
+        assert!(!watcher_in_grace(Some(300.0), Some(300.0), grace));
+        assert!(!watcher_in_grace(Some(300.0), None, grace));
+        assert!(!watcher_in_grace(None, None, grace));
+    }
+
+    #[test]
+    fn test_watcher_in_grace_either_anchor_fresh() {
+        let grace = 90.0;
+        // Fresh last_seen alone keeps it in grace (legacy behaviour preserved).
+        assert!(watcher_in_grace(Some(10.0), None, grace));
+        // Fresh pidfile alone keeps it in grace (the new anchor).
+        assert!(watcher_in_grace(None, Some(10.0), grace));
+    }
 
     // --- parse_status_bar tests ---
 
@@ -1651,6 +1856,27 @@ mod tests {
             extract_version_from_json(r#"{"version":"latest"}"#),
             None
         );
+    }
+
+    // --- is_claude_hooks_shim tests ---
+
+    #[test]
+    fn test_is_claude_hooks_shim() {
+        // The container's shim wrapper paths.
+        assert!(is_claude_hooks_shim(std::path::Path::new(
+            "/usr/local/lib/claude-hooks-shim/claude"
+        )));
+        assert!(is_claude_hooks_shim(std::path::Path::new(
+            "/usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim"
+        )));
+        // The real npm-global binary is NOT a shim.
+        assert!(!is_claude_hooks_shim(std::path::Path::new(
+            "/home/u/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+        )));
+        // The native versioned binary is NOT a shim.
+        assert!(!is_claude_hooks_shim(std::path::Path::new(
+            "/home/u/.local/share/claude/versions/2.1.186/node_modules/.bin/claude"
+        )));
     }
 
     // --- resolve_installed_version tests ---
