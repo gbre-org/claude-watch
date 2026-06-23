@@ -819,7 +819,28 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
         );
     }
 
-    tmux::inject_shell(pane, &format!("bash {}", config.relaunch_script)).await;
+    // Verify the script actually landed on disk before injecting. If the
+    // write somehow didn't stick (tmpfs gone, race) do NOT type a broken
+    // `bash <path>` into the pane -- bail and let the crash-recovery path
+    // try again on the next loop pass.
+    if !std::path::Path::new(&config.relaunch_script).exists() {
+        tracing::error!(
+            path = %config.relaunch_script,
+            "relaunch script missing immediately after write -- aborting inject (would hit a dead shell)"
+        );
+        return;
+    }
+
+    // Inject a self-healing guarded one-liner: run the script if present at
+    // exec time, else run the claude launch argv inline (the script could
+    // still vanish between this write and the pane shell executing it --
+    // tmpfs wipe / respawn.rs remove_file race). The inline fallback gets a
+    // `cd $HOME &&` prefix to match the script's `cd $HOME` so resume/continue
+    // resolves correctly. (Resume PROMPT text -- which has parens -- is NOT
+    // included; only the shell-safe `claude` argv is.)
+    let inline_launch = format!("cd $HOME && {}", launch);
+    let inject_cmd = build_relaunch_inject_cmd(&config.relaunch_script, &inline_launch);
+    tmux::inject_shell(pane, &inject_cmd).await;
 
     state.last_restart = Some(now);
     state.restart_count += 1;
@@ -2367,6 +2388,28 @@ fn build_relaunch_claude_argv(session_id: Option<&str>) -> String {
     cmd
 }
 
+/// Build the shell one-liner injected into the pane to relaunch Claude.
+///
+/// The daemon writes a relaunch script (`config.relaunch_script`, default
+/// `/var/run/claude/claude-relaunch.sh`) then types `bash <path>` into the
+/// pane shell. But `/var/run` is a tmpfs: it is wiped on every container
+/// start and `respawn.rs` also `remove_file`s the script. If the file is
+/// absent at the moment the pane shell runs the command, a bare
+/// `bash <path>` dies with `No such file or directory`, leaving a dead
+/// `/bin/sh` pane -> recreate loop (operator-observed bug; PR #412 fixed
+/// post-relaunch detection/argv but NOT this script-write/exec path).
+///
+/// So inject a SELF-HEALING guarded one-liner instead: run the script if it
+/// exists at exec time, else run the `claude` launch argv directly inline so
+/// Claude still comes up. POSIX-safe (`[ -f X ] && bash X || { CMD; }`)
+/// so it works in both `/bin/sh` and bash panes. `launch` is the same
+/// `claude ...` argv computed by the caller (flags + a uuid, no
+/// shell-hostile chars), so the inline fallback is safe to type verbatim.
+/// Pure (no I/O) so it is unit-testable in parallel.
+fn build_relaunch_inject_cmd(script_path: &str, launch: &str) -> String {
+    format!("[ -f {p} ] && bash {p} || {{ {launch}; }}", p = script_path, launch = launch)
+}
+
 /// Execute the auto-update sequence: interrupt → /exit → wait → relaunch → resume.
 async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, config: &Config) {
     info!("auto-update: interrupting Claude Code...");
@@ -2480,9 +2523,29 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         );
     }
 
-    // Step 6: Inject relaunch command into shell
+    // Verify the script landed before injecting; if not, abort the inject
+    // rather than type a broken `bash <path>` into the pane. The clean-restart
+    // fallback (Step 7, on binary-not-found) recovers a dead pane, but skipping
+    // a write that didn't stick avoids the doomed inject entirely.
+    if !std::path::Path::new(&config.claude.relaunch_script).exists() {
+        tracing::error!(
+            path = %config.claude.relaunch_script,
+            "auto-update: relaunch script missing immediately after write -- aborting inject"
+        );
+        return;
+    }
+
+    // Step 6: Inject the self-healing guarded relaunch one-liner. If the
+    // script vanishes (tmpfs wipe / respawn.rs remove_file race) between this
+    // write and the pane shell running it, the `|| { <launch>; }` fallback
+    // runs the same claude argv inline so Claude still comes up rather than
+    // dying with "No such file or directory". `launch` already has the right
+    // `cd $HOME` semantics baked into the script; for the inline fallback we
+    // prefix `cd $HOME &&` to match.
     info!("auto-update: injecting relaunch command...");
-    tmux::inject_shell(pane, &format!("bash {}", config.claude.relaunch_script)).await;
+    let inline_launch = format!("cd $HOME && {}", launch);
+    let inject_cmd = build_relaunch_inject_cmd(&config.claude.relaunch_script, &inline_launch);
+    tmux::inject_shell(pane, &inject_cmd).await;
 
     // Step 7: Wait for claude binary to appear in process tree.
     //
@@ -7934,6 +7997,60 @@ pane_unchanged_secs = 600
         assert!(
             cmd.contains("--dangerously-skip-permissions"),
             "skip-permissions present on resume path too: {cmd}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // build_relaunch_inject_cmd — self-healing guarded relaunch one-liner.
+    //
+    // Pure (no I/O), so parallel-safe like the argv tests above. Guards the
+    // second bug PR #412 didn't touch: a missing/vanished relaunch script
+    // must NOT leave a dead `bash <path>: No such file or directory` pane.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn relaunch_inject_cmd_runs_script_when_present() {
+        let path = "/var/run/claude/claude-relaunch.sh";
+        let launch = "cd $HOME && claude --dangerously-skip-permissions --continue";
+        let cmd = build_relaunch_inject_cmd(path, launch);
+        // (a) references the script path with bash
+        assert!(
+            cmd.contains(&format!("bash {path}")),
+            "must bash the script path: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("[ -f {path} ]")),
+            "must guard on the file existing: {cmd}"
+        );
+    }
+
+    #[test]
+    fn relaunch_inject_cmd_falls_back_to_inline_launch() {
+        let path = "/var/run/claude/claude-relaunch.sh";
+        let launch = "cd $HOME && claude --dangerously-skip-permissions --resume abc";
+        let cmd = build_relaunch_inject_cmd(path, launch);
+        // (b) contains the inline launch fallback after `||`
+        let (_before, after) = cmd.split_once("||").expect("must have an || fallback");
+        assert!(
+            after.contains(launch),
+            "inline launch must appear after ||: {cmd}"
+        );
+        assert!(
+            after.contains('{') && after.contains('}'),
+            "fallback must be brace-grouped for sh/bash: {cmd}"
+        );
+    }
+
+    #[test]
+    fn relaunch_inject_cmd_is_single_line() {
+        let cmd = build_relaunch_inject_cmd(
+            "/var/run/claude/claude-relaunch.sh",
+            "cd $HOME && claude --dangerously-skip-permissions --continue",
+        );
+        // (c) single line — tmux inject_shell types the literal then Enter.
+        assert!(
+            !cmd.contains('\n'),
+            "injected command must be a single line: {cmd}"
         );
     }
 }
