@@ -18,10 +18,17 @@ Owner-liveness model (rev 2026-05-01-v3 — claude-watch agent-state):
 
   For each running queue.json item, we look up its agent record by
   `queue_id`. If found, has_live_owner reflects that record's `alive`
-  field. If NOT found (no transcript with this queue id, e.g. spawner
-  forgot to include the marker, or the agent finished and its JSONL
-  was rotated), we DO NOT emit has_live_owner — silence beats either
-  false-alert or false-healthy when we genuinely have no signal.
+  field. If NOT found we normally stay silent (silence beats either
+  false-alert or false-healthy when we genuinely have no signal) —
+  EXCEPT for `running` items whose `last_heartbeat_at` (falling back to
+  `registered_at` / `started_at`) is older than
+  ORPHAN_HEARTBEAT_STALE_SECONDS: those are never-spawned / abandoned-
+  without-binding orphans (a `running` item whose Agent was never fired,
+  so no transcript ever existed). For them we emit has_live_owner=0 with
+  agent_id="" (the empty agent_id distinguishes a no-binding
+  orphan from a died-after-spawn one). `blocked` items are exempt — they
+  have no live agent by design. A fresh / unparseable heartbeat stays
+  silent so a just-registered item is not false-flagged before its beat.
 
 Lock-awareness (rev 2026-05-09 — queue lock feature):
 
@@ -69,7 +76,11 @@ Metrics:
   - worktask_queue_items_running_elapsed_seconds{id,summary} gauge (per running item)
   - worktask_queue_item_has_live_owner{id,summary,agent_id} gauge (1=alive, 0=orphaned)
         Drives the WorkQueueOrphaned alert. Source: claude-watch
-        active-agents.json. Items with no matching agent record are
+        active-agents.json. Items with a matching agent record reflect
+        its `alive` flag. `running` items with NO agent record but a
+        `last_heartbeat_at` older than ORPHAN_HEARTBEAT_STALE_SECONDS
+        emit has_live_owner=0 with agent_id="" (never-spawned /
+        abandoned-without-binding orphan). All other no-record items are
         absent from the gauge entirely.
   - worktask_queue_item_agent_jsonl_age_seconds{id,summary,agent_id} gauge
         Mirror of claude-watch's per-agent jsonl_age_seconds for the
@@ -154,6 +165,14 @@ HOSTJOB_HEARTBEAT_DIR = os.environ.get(
     "HOSTJOB_HEARTBEAT_DIR", "/hostjob-heartbeats"
 )
 HOSTJOB_SCOPE_PREFIX = "hostjob:"
+# Staleness threshold (seconds) for flagging a `running` queue item with
+# no agent record as a never-spawned / abandoned-without-binding orphan.
+# 10-min default -- generous enough to avoid racing a just-registered
+# item before its first heartbeat / agent-state publish. The
+# WorkQueueOrphaned alert's own `for: 5m` adds further dwell on top.
+ORPHAN_HEARTBEAT_STALE_SECONDS = int(
+    os.environ.get("ORPHAN_HEARTBEAT_STALE_SECONDS", "600")
+)
 
 REG = CollectorRegistry()
 
@@ -188,8 +207,12 @@ g_has_live_owner = Gauge(
         "orphaned. Source: claude-watch active-agents JSON state file. "
         "Matched by `queue_id` parsed from the agent JSONL's first user "
         "message (`Queue item: q-XXXX` marker). Items with no matching "
-        "agent record are absent from this gauge entirely (no signal "
-        "beats false-alert OR false-healthy). "
+        "agent record are normally absent from this gauge (no signal "
+        "beats false-alert OR false-healthy) -- EXCEPT `running` items "
+        "with no agent record AND a `last_heartbeat_at` older than "
+        "ORPHAN_HEARTBEAT_STALE_SECONDS, which emit 0 with agent_id empty "
+        "(never-spawned / abandoned-without-binding orphan -- an Agent "
+        "was never fired so no transcript ever existed). "
         "The `status` label is the queue item's current state: "
         "`running` (alert candidate) or `blocked` (parked on external "
         "blocker, NOT an alert candidate -- no live agent expected by "
@@ -514,6 +537,34 @@ def collect():
                     g_agent_jsonl_age.labels(
                         id=iid, summary=summary, agent_id=aid, status=status,
                     ).set(age)
+            elif status == "running":
+                # Never-spawned / abandoned-without-binding orphan -- a
+                # `running` item whose Agent was never fired has NO agent
+                # record at all (vs died-after-spawn, which has a record
+                # with alive=0 handled above). Without this branch such an
+                # item emits no has_live_owner series, so the
+                # WorkQueueOrphaned {status=running} == 0 alert matches
+                # nothing and never fires. Fall back to heartbeat
+                # staleness -- if the item has not heartbeat in
+                # ORPHAN_HEARTBEAT_STALE_SECONDS, flag it orphaned with
+                # agent_id empty (the empty agent_id distinguishes a
+                # no-binding orphan from a died-after-spawn one). ONLY
+                # `running` -- `blocked` items legitimately have no live
+                # agent by design. A fresh or unparseable heartbeat stays
+                # SILENT to preserve no-false-alert on a just-spawned
+                # item. No g_agent_jsonl_age is emitted -- no transcript.
+                hb_ts = _parse_ts(
+                    it.get("last_heartbeat_at")
+                    or it.get("registered_at")
+                    or it.get("started_at")
+                )
+                if hb_ts is not None:
+                    hb_age = (now - hb_ts).total_seconds()
+                    if hb_age >= ORPHAN_HEARTBEAT_STALE_SECONDS:
+                        g_has_live_owner.labels(
+                            id=iid, summary=summary, agent_id="",
+                            status="running",
+                        ).set(0)
 
         # Ready-stuck / locked-age gauges.
         # A pending group-head may be intentionally held by a scope lock

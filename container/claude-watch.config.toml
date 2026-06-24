@@ -67,6 +67,19 @@ cooldown = 120
 [heartbeat]
 stale_minutes = 10
 
+[queue_check]
+# Enable in-tree stuck/orphaned queue-item detection events. The cron
+# (container/cron.d/cw-default) runs `claude-watch queue-check` every 5
+# min. With emit_events=false (the code default) it DETECTS qualifying
+# items but stays silent (logs "emit_events is OFF"). Flip it on so
+# orphaned (running, dead-PID) and stuck (wedged, or running with a stale
+# last_heartbeat_at) items surface as queue-orphaned/queue-stuck
+# claude-events. This is the in-container equivalent of the out-of-tree
+# WorkQueueOrphaned/WorkQueueStuckSoft Prometheus alerts (no exporter or
+# Prometheus runs in-container). Single-emit per (qid,condition), ledger
+# at /var/lib/claude-watch/queue-check-state.json.
+emit_events = true
+
 [alerts]
 initial_cooldown = 600
 escalation_tiers = [600, 600, 1800, 3600, 3600, 3600]

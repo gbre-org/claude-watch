@@ -789,6 +789,63 @@ def run_scenarios():
     check("S18 hj empty label -> None",
           mod._hostjob_label_from_scope(["hostjob:"]) is None, "got non-None")
 
+    # ---- Scenario 19: never-spawned running orphan (NO agent record).
+    # A running item whose Agent was never fired has no agent binding at
+    # all. The exporter falls back to last_heartbeat_at staleness and
+    # emits has_live_owner=0 with agent_id empty so WorkQueueOrphaned can
+    # fire. A fresh heartbeat stays silent (no false-alert). Blocked items
+    # are exempt even when stale.
+    print("\nScenario 19: never-spawned running orphan -- heartbeat-staleness fallback")
+
+    # 19a: running, NO agent record, STALE last_heartbeat_at, orphan fires.
+    stale_iso = (datetime.now(timezone.utc) - timedelta(seconds=1200)).isoformat()
+    item = make_running_item("q-s19a", "never-spawned stale")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-s19a", "agent_id": ""},
+    )
+    check(
+        "S19a never-spawned stale orphan has_live_owner == 0, agent_id empty",
+        v == 0.0,
+        "got " + repr(v),
+    )
+
+    # 19b: running, NO agent record, FRESH last_heartbeat_at, stays silent.
+    fresh_iso = datetime.now(timezone.utc).isoformat()
+    item = make_running_item("q-s19b", "just-spawned fresh")
+    item["last_heartbeat_at"] = fresh_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-s19b")
+    check(
+        "S19b fresh heartbeat has_live_owner absent (no false-alert)",
+        v is None,
+        "expected None, got " + repr(v),
+    )
+
+    # 19c: blocked, NO agent record, STALE heartbeat, exempt (absent).
+    item = make_blocked_item("q-s19c", "blocked stale")
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-s19c")
+    check(
+        "S19c blocked stale item exempt has_live_owner absent",
+        v is None,
+        "expected None, got " + repr(v),
+    )
+
     print()
     if failures:
         print(f"FAILED: {len(failures)} test(s)")

@@ -27,7 +27,14 @@ groups:
       # to {status="running"} so blocked items (no live agent BY DESIGN) do
       # not fire. Items with no agent record are absent from the gauge
       # entirely (no signal beats false-alert), so == 0 only matches genuine
-      # orphans.
+      # orphans. This now ALSO covers never-spawned orphans -- a running
+      # item whose Agent was never fired has no agent record, so the
+      # exporter falls back to heartbeat staleness and emits
+      # has_live_owner=0 with agent_id empty once last_heartbeat_at exceeds
+      # ORPHAN_HEARTBEAT_STALE_SECONDS (default 600s). Running items with
+      # no agent record AND a fresh heartbeat stay absent from the gauge,
+      # so == 0 matches both the died-after-spawn (agent_id set) and the
+      # never-spawned (agent_id empty) orphan cases.
       - alert: WorkQueueOrphaned
         expr: worktask_queue_item_has_live_owner{status="running"} == 0
         for: 5m
