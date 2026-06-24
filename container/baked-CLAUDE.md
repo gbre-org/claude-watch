@@ -464,54 +464,54 @@ a running agent needs resurrecting, which the tooling supports).
 
 The `pre-agent-queue-gate-hook` above only fires at SPAWN time. A
 second gate, the `subagent_queue_item_running` obligations predicate,
-continues to enforce queue discipline THROUGHOUT a subagent's
-lifetime. The predicate is seeded as a default-bundled obligation row
-by `obligations-init` (run from the entrypoint when
-`CLAUDE_CONTAINER_OBLIGATIONS=1`).
+enforces queue discipline THROUGHOUT a subagent's lifetime. It is
+seeded as a default-bundled obligation row by `obligations-init` (run
+from the entrypoint when `CLAUDE_CONTAINER_OBLIGATIONS=1`).
+
+> **Operator obligation manifests (bind-mounted, NOT baked).**
+> `obligations-init` also applies each `*.json` obligation-row manifest
+> from `$CLAUDE_HOST_OBLIGATIONS_DIR` (`/mnt/host-obligations-config`)
+> idempotently every start, AFTER baked rows — so operator gates (e.g.
+> the presence-gate) stay DECLARATIVE private config: never baked, no
+> `register-*` step. Absent mount = no-op.
 
 How it works:
 
   - `post-tool-agent-arm-hook` fires on every successful Agent spawn
-    (`PostToolUse:Agent`, `async_launched=true`), binds the spawn's
-    `Queue item: q-XXXX` marker to the new subagent's `agentId` in
+    (`PostToolUse:Agent`), binding the spawn's `Queue item: q-XXXX`
+    marker to the new subagent's `agentId` in
     `~/.config/claude/agent-queue-bindings.json`.
   - On each subsequent **subagent** tool call, the
     `subagent_queue_item_running` predicate looks up that q-id:
-    `running` → **ALLOW**; `done`/`abandoned`, or vanished from the
-    queue (the "main loop abandoned this work" case) → **DENY** with a
-    banner naming the q-id + status.
-  - Main-loop calls are always allowed (row scoped via
-    `is_main_loop {negate: true}` inside an `all_of`).
+    `running` → **ALLOW**; `done`/`abandoned`/vanished → **DENY**
+    (banner names q-id + status).
+  - Main-loop calls always allowed (`is_main_loop {negate: true}` in
+    an `all_of`).
 
-**As a subagent, when you hit this gate:** your queue item has been
-finished, abandoned, or pruned. Either **re-register** (if the main
-loop just rotated the queue id, `session-task queue register <new-q-id>`
-is exempt, so run it to pick up the new id), or **stop** (if your work
-is genuinely done, return your final value and exit — don't work past a
-`done` state, the main loop no longer tracks your scope).
+**As a subagent, when you hit this gate:** the queue item was
+finished, abandoned, or pruned. Either **re-register** (`session-task
+queue register <new-q-id>` is exempt — pick up a rotated q-id), or
+**stop** (if done, return your value and exit — don't work past a
+`done` state; the main loop no longer tracks you).
 
-The exempt set lets you reach `session-task queue
-{status,spawn-check,register,show,list}`, `obligations
-{list,show,status,check,override,satisfy}`, `claude-watch-ack`,
-`claude-watch-dispatch`, `agent-msg {ack,inbox,gc,disarm}`, and
-`agent-tail` while the gate fires, so you can always inspect + recover.
+The exempt set: `session-task queue {status,spawn-check,register,show,list}`,
+`obligations {list,show,status,check,override,satisfy}`,
+`claude-watch-ack`, `claude-watch-dispatch`, `agent-msg
+{ack,inbox,gc,disarm}`, `agent-tail`.
 
-Default-open contracts (predicate inert, tool call ALLOWED): call is
-from the main loop (no `agent_id`); binding file missing / corrupt /
-unreadable; or no binding entry for this agent_id (spawned before the
-predicate rolled out, OR carries no `Queue item: q-XXXX` marker).
-
-A hook bug can never blackhole a real subagent.
+Default-open (predicate inert, ALLOWED): main-loop call (no
+`agent_id`); binding file missing/corrupt; or no binding entry for this
+agent_id (spawned pre-rollout, OR no `Queue item: q-XXXX` marker). A
+hook bug can never blackhole a real subagent.
 
 ### Generic `evaluator` predicate — delegate gate decisions to a script
 
 `evaluator` is a general-purpose obligation predicate that runs an
 external subprocess and uses its result to allow or deny a tool call.
-Use it whenever a gate needs to defer to an outside decision-maker —
-a deterministic script, an LLM call, an HTTP probe to a policy
-service, a regex audit, etc. The predicate is deliberately
-implementation-agnostic; the obligation row carries the `cmd` and the
-operator supplies whatever the gate should consult.
+Use it whenever a gate must defer to an outside decision-maker — a
+script, an LLM call, an HTTP policy probe, a regex audit, etc. It is
+deliberately implementation-agnostic; the obligation row carries the
+`cmd` and the operator supplies whatever the gate consults.
 
 Register one obligation row per use case:
 
