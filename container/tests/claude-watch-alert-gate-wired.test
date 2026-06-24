@@ -213,8 +213,11 @@ def test_e2e_record_then_deny_then_ack() -> None:
                f"deny banner should mention alert id {alert_id!r}; "
                f"banner preview={banner[:200]!r}")
 
-        # Step 3: PreToolUse on `claude-watch-ack ack <id>` -> allow
-        ack_cmd = f"claude-watch-ack ack {alert_id}"
+        # Step 3: PreToolUse on `claude-watch-ack ack <id> --confirm-read
+        # <token>` -> allow. (The ack-nerf made a bare `ack <id>` refuse; the
+        # real clearing command now carries --confirm-read, and the gate must
+        # exempt that form too.)
+        ack_cmd = f"claude-watch-ack ack {alert_id} --confirm-read deadbeef"
         gate_proc2 = subprocess.run(
             [str(GATE_HOOK)],
             input=json.dumps({"tool_name": "Bash",
@@ -226,12 +229,32 @@ def test_e2e_record_then_deny_then_ack() -> None:
         expect(decision2 != "deny",
                f"claude-watch-ack ack should be EXEMPT; got decision={decision2!r}")
 
-        # Step 4: actually run the ack via the CLI -> state cleared
-        subprocess.run([str(ACK_CLI), "ack", alert_id], env=env,
-                       capture_output=True, text=True, timeout=10, check=True)
+        # Step 4: actually clear via the CLI. NERF: a bare `ack <id>` REFUSES
+        # (exit 2) and prints a per-alert `read-token=<hex>` in the body; the
+        # blind-ack path is gone. So first run a bare ack to learn the token
+        # (refused, nothing cleared), then echo it back with --confirm-read.
+        import re
+        bare = subprocess.run([str(ACK_CLI), "ack", alert_id], env=env,
+                              capture_output=True, text=True, timeout=10,
+                              check=False)
+        expect(bare.returncode == 2,
+               f"bare ack <id> should REFUSE (exit 2) post-nerf; "
+               f"got rc={bare.returncode}, stderr={bare.stderr!r}")
+        m = re.search(r"read-token=([0-9a-f]{8})", bare.stdout)
+        expect(m is not None,
+               f"bare ack should print read-token; stdout={bare.stdout!r}")
+        token = m.group(1) if m else ""
+        # Bare ack must NOT have cleared anything.
+        state_after_bare = json.loads(state_file.read_text(encoding="utf-8"))
+        expect(len(state_after_bare.get("alerts", [])) == 1,
+               f"bare ack must clear nothing; got: {state_after_bare}")
+        # Now clear with the read-confirm token.
+        subprocess.run([str(ACK_CLI), "ack", alert_id, "--confirm-read", token],
+                       env=env, capture_output=True, text=True, timeout=10,
+                       check=True)
         state2 = json.loads(state_file.read_text(encoding="utf-8"))
         expect(state2["alerts"] == [],
-               f"ack should clear state; got: {state2}")
+               f"ack --confirm-read <token> should clear state; got: {state2}")
 
         # Step 5: next Bash call -> allow
         gate_proc3 = subprocess.run(

@@ -1035,18 +1035,31 @@ see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
   [`cli-mcp-server`](https://github.com/MladenSU/cli-mcp-server) +
   [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) combo with an
   env-var-driven allow-list. Default (`CW_PROFILE=corp-dev`, conservative
-  read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, no shell
-  operators, `$HOME` boundary, 30s timeout. `CW_PROFILE=corp-dev-trusted`
-  widens it with host-scheduling tooling (see "Host-side scheduled tasks").
-  **Reach for host-bash as a normal tool, not a last resort** — it's the
-  supported way to do host-side work from inside the container. If it's not
-  listed by `/mcp`, the operator hasn't wired the host-side launcher. See
-  [examples/compose/bin/mcp-host-bash](/opt/claude-container/examples/compose/bin).
+  read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, `$HOME`
+  boundary, 30s timeout (shell-operator gating: see `run_command` vs
+  `run_script` below). `CW_PROFILE=corp-dev-trusted` widens it with
+  host-scheduling tooling (see "Host-side scheduled tasks").
+  **Reach for host-bash as a normal tool, not a last resort** — the supported
+  way to do host-side work from the container. Not listed by `/mcp` => operator
+  hasn't wired the launcher
+  ([examples/compose/bin/mcp-host-bash](/opt/claude-container/examples/compose/bin)).
 
-  **Boundary discipline**: host-bash is a *window* to the host, not the
-  host. Report "I ran X on the host via host-bash" — not "I ran X"
-  (ambiguous) nor "I'm on the host" (false; you stay in the container). The
-  in-container claude orchestrates; the host shell executes.
+  **Boundary discipline**: host-bash is a *window* to the host. Report "I ran X
+  on the host via host-bash", not "I ran X" / "I'm on the host" — the
+  in-container claude orchestrates, the host shell executes.
+
+  **`run_command` vs `run_script` — pick by quoting; NEVER base64-ferry.** Two
+  tools. `run_command` runs the string through cli-mcp-server's allow-list
+  tokenizer; top-level operators (`|`, `;`, `&&`, `>`, `2>&1`) between separate
+  commands work (`ALLOW_SHELL_OPERATORS=true` on a typical host), but the
+  tokenizer splits on those chars **without respecting quotes**, so an operator
+  INSIDE a quoted arg is split mid-quote and rejected ("No closing quotation" /
+  "Command 'X' not allowed"). Upstream limitation; no env var fixes it. FAILS
+  via run_command: `grep -E 'a|b'`, `gh --jq '.x | .y'`, `bash -lc 'a && b'`,
+  heredocs, quoted `2>&1`. Fix: `mcp__host-bash__run_script` feeds the body to
+  the `interpreter` on STDIN, NEVER tokenized — use it for ANY quoted operators,
+  nested quotes, pipes-in-args, heredocs, or multi-line. NEVER base64-ferry a
+  script across the boundary — run_script takes the body verbatim.
 
 If `/mcp` shows "No MCP servers configured" inside the container, either
 `CLAUDE_CONTAINER_REWRITE_HOOKS` is off (so user-tier MCP discovery is
@@ -1054,44 +1067,34 @@ suppressed by-default — the host's `mcpServers` simply don't load), or
 the host's `~/.claude.json` has none defined.
 
 **"⏸ Pending approval" — stale display, fixed by a `claude` shim.**
-`claude mcp list` reporting "Pending approval" was NEVER a real block on the
-live session. ROOT CAUSE: the interactive session launches with
+`claude mcp list` reporting "Pending approval" was NEVER a real block. ROOT
+CAUSE: the interactive session launches with
 `--setting-sources project,local --settings $CLAUDE_SHIM_SETTINGS_PATH`, whose
 shim sets `enableAllProjectMcpServers: true`, auto-approving the project-tier
-`.mcp.json` servers for that session (they connect, tools callable). But a
-SEPARATE bare `claude mcp list` is a FRESH process not inheriting those flags
-(defaults to `--setting-sources user,project,local`, never loads the shim), so
-it shows them as "Pending approval" though the live session has them Connected (the
-`~/.claude.json` `enabledMcpjsonServers` user-tier approval is dead config).
+`.mcp.json` servers. But a SEPARATE bare `claude mcp list` is a FRESH process
+not inheriting those flags (defaults to `--setting-sources user,project,local`),
+so it shows "Pending approval" though the session has them Connected.
 
 FIX (baked): a `claude` wrapper shim
-(`container/hooks-shim/claude-mcp-settings-shim`, symlinked as `claude` first on PATH)
-injects those flags into `claude mcp` subcommands, so bare `claude mcp list`
-now reports the REAL state; other subcommands and the
-interactive launch pass through verbatim. Still "Pending approval"? Wrapper not on
-PATH (pre-fix image, redeploy), or caller passed `--setting-sources user,...`. Regardless it is NEVER a hard block — VERIFY by CALLING a tool (load its schema via ToolSearch, run a cheap read-only command,
-e.g. host-bash `uname -s`); only a CALL transport/auth error means the
-server is down (then `/mcp` reauth).
+(`container/hooks-shim/claude-mcp-settings-shim`, first on PATH) injects those
+flags into `claude mcp` subcommands, so bare `claude mcp list` reports the REAL
+state. Still "Pending approval"? Wrapper not on PATH (pre-fix image → redeploy),
+or caller passed `--setting-sources user,...`. It is NEVER a hard block —
+VERIFY by CALLING a tool (load its schema via ToolSearch, run a cheap read-only
+command, e.g. host-bash `uname -s`); only a CALL transport/auth error means the
+server is down (then `/mcp` reauth). Auto-approve is baked
+(`enableAllProjectMcpServers: true`); opt out with `CLAUDE_MCP_AUTOAPPROVE=0`.
 
-*Cross-server triage*: `host-bash`/`mcp-adaptor`/`chrome-devtools` share the
-`host.docker.internal` transport but each has its OWN HTTP session/TTL. To
-tell a dead bridge from one expired session, CALL a SIBLING's tool (if
-`host-bash` errors, try `mcp-adaptor` `search`). Sibling answers => transport
-fine, only that server's session died — don't reauth/restart the whole stack.
-
-*Self-heal*: a server's HTTP session can expire while `claude mcp list` STILL
-lists it (config intact, NOT removed — no revert needed); the harness then
-delists its deferred tools (un-re-surfaceable via ToolSearch) and there's no
-in-loop reconnect. Recovery: `/mcp` if available; else, if you can't reconnect
-AND you're out of other useful work, **`/restart`** (MCP reconnects cleanly on
-restart — operator's standing instruction). Don't idle waiting for it.
-
-*Auto-approve is baked*: the shim `settings.json`
-(`generate-hooks-shim-settings`) writes `"enableAllProjectMcpServers": true`,
-so project `.mcp.json` servers are auto-approved and "Pending approval"
-should NOT appear in normal operation. If it DOES, the shim setting didn't
-take (check `CLAUDE_MCP_AUTOAPPROVE` isn't `0` + shim generation ran) — NOT an
-interactive approval to wait on. Opt out via `CLAUDE_MCP_AUTOAPPROVE=0`.
+*Session liveness*: `host-bash`/`mcp-adaptor`/`chrome-devtools` share the
+`host.docker.internal` transport but each has its OWN HTTP session/TTL. A
+session can expire while `claude mcp list` STILL lists the server (config
+intact, no revert needed); the harness then delists its deferred tools
+(un-re-surfaceable via ToolSearch). To tell a dead bridge from one expired
+session, CALL a SIBLING's tool (`host-bash` errors → try `mcp-adaptor`
+`search`); a sibling answer => transport fine, only that server's session
+died — don't restart the whole stack. Recovery: `/mcp` if available; else, if
+you can't reconnect AND you're out of other useful work, **`/restart`** (MCP
+reconnects cleanly — operator's standing instruction).
 
 ## Hooks
 
