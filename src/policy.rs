@@ -5026,14 +5026,21 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         }),
                     );
 
-                    // Interrupt first (like prolonged-thinking) to break any inline work
-                    if tmux::interrupt_and_wait(&effective_pane, 10).await {
-                        info!("watcher inject: Claude Code is idle after interrupt");
-                    } else {
-                        warn!("watcher inject: could not confirm idle, injecting anyway");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
+                    // KNOB #4 (2026-06-24): watcher-down is a ROUTINE tier — the
+                    // recovery action is "spawn the restart command as a
+                    // background task", which can wait for the next turn
+                    // boundary. The OLD behavior (interrupt_and_wait: a
+                    // rapid-fire Escape blast "to break any inline work") was
+                    // the single most destructive part of the watcher-down
+                    // storm: it CANCELLED the loop's in-flight turn AND killed
+                    // any mid-flight background agents, every re-fire — turning
+                    // a benign "restart a watcher" nudge into repeated
+                    // turn-aborts that made the loop spend all its cycles
+                    // recovering instead of working. So we no longer Escape
+                    // here; we QUEUE the restart prompt via the non-cancelling
+                    // path (`inject_to_agent_queued`). The prompt + the
+                    // structured claude-event below are unchanged.
+                    //
                     // Build specific restart commands
                     let restart_cmds: Vec<String> = missing_names
                         .iter()
@@ -5045,7 +5052,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         missing_list,
                         restart_cmds.join(", ")
                     );
-                    inject_dispatch::inject_to_agent(&effective_pane, &prompt).await;
+                    inject_dispatch::inject_to_agent_queued(&effective_pane, &prompt).await;
                     // Third sink: claude-event so the main loop sees the
                     // missing-watchers list as structured data and can
                     // decide which restart command(s) to actually run,
@@ -5294,6 +5301,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             &config.alerts.heartbeat_stale_prompt,
                             use_pingme,
                             event_alert,
+                            // KNOB #4 (2026-06-24): heartbeat-stale is a ROUTINE
+                            // tier — recovery is a `touch` of the heartbeat file,
+                            // which can wait for the next turn boundary. Do NOT
+                            // seize the turn / kill subagents: queue the nudge.
+                            false,
                         )
                         .await;
                         // Obligation served its purpose — disarm so the next
