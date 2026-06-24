@@ -384,6 +384,74 @@ def _humanize_age(seconds: float | None) -> str:
     return f"{d}d {rem // 3600}h {suffix}"
 
 
+def _epoch_to_iso(epoch: "float | int | None") -> str:
+    """Convert an epoch float/int to an ISO-8601 UTC string, or "".
+
+    Used to synthesize an ISO timestamp for a virtual hostjob queue item
+    from the hostjob ``status.json`` ``started_at`` epoch field, so
+    ``_shape``'s running age-anchor (which reads ``registered_at`` /
+    ``started_at`` via ``_parse_iso``) gets a parseable value. Fail-soft:
+    returns "" on ``None`` / non-numeric / out-of-range input so a bad
+    field never raises during a render pass.
+    """
+    if epoch is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
+    except (ValueError, TypeError, OSError, OverflowError):
+        return ""
+
+
+def _load_hostjob_states() -> list[dict[str, Any]]:
+    """Scan HOSTJOB_LOG_DIR for ``<label>/status.json`` and return their dicts.
+
+    The ``hostjob`` runner (andrew-sf-tools) writes a per-label directory
+    ``<HOSTJOB_LOG_DIR>/<label>/status.json`` with the schema::
+
+        {"label","cmd"(list[str]),"cwd","status","rc","pid","reaper_pid",
+         "started_at"(epoch float),"ended_at","queue_id"(str|null)}
+
+    This is the source we use to surface ``--no-queue`` / main-loop hostjobs
+    that have NO queue row at all (and thus are invisible to the queue.json-
+    only render path). See ``_render_payload`` for how the running ones are
+    synthesized into virtual queue items.
+
+    Fail-soft at every step: a missing dir, an unreadable entry, a non-dir
+    entry (the runner also drops sidecar files like ``broker.json`` /
+    ``fd-*.wfapi.json`` directly under the root), a label that fails the
+    path-traversal guard, a missing/unreadable/non-JSON ``status.json``, or a
+    non-dict payload all SKIP that entry — never raise. The dir-name label is
+    validated against ``_WORKLOAD_LABEL_RE`` (the same guard the tail
+    endpoints use) since it is the path component.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        entries = list(os.scandir(HOSTJOB_LOG_DIR))
+    except OSError:
+        return out
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue
+        label = entry.name
+        # Validate the dir name (the path component) against the shared
+        # path-traversal guard before touching anything under it.
+        if not _WORKLOAD_LABEL_RE.match(label):
+            continue
+        status_path = os.path.join(entry.path, "status.json")
+        try:
+            with open(status_path, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        out.append(data)
+    return out
+
+
 def _load_agent_state() -> dict[str, dict[str, Any]]:
     """Map queue_id -> agent record from claude-watch's active-agents JSON.
 
@@ -958,6 +1026,83 @@ def _render_payload() -> dict[str, Any]:
         elif st == "abandoned":
             abandoned.append(s)
 
+    # --- Surface in-flight hostjobs that have NO queue row (q-2026-06-24-0368). ---
+    #
+    # The buckets above are built from queue.json items ONLY. A hostjob run
+    # WITHOUT a queue row — e.g. a `hostjob run --no-queue` job, or a
+    # main-loop hostjob (`cw-deploy-*`) — is therefore INVISIBLE here even
+    # while it is actively running, because nothing in queue.json represents
+    # it. We recover those by scanning the hostjob state dir and synthesizing
+    # a VIRTUAL running queue item for each running hostjob that isn't already
+    # represented by a real queue row.
+    #
+    # DESIGN CHOICE — "shape real items first, then shape virtual hostjob
+    # items and extend the `running` bucket BEFORE the sort". This is the
+    # least-invasive path: the real queue items already went through the
+    # normal `_shape` + bucketing + ready_now/dep-graph machinery above,
+    # untouched. The virtual items are shaped SEPARATELY and only appended to
+    # `running` — they are deliberately NOT fed back into `items` /
+    # the bucketing / ready_now / dependency-cycle computations (a synthetic
+    # `hostjob:<label>` id has no deps and must not perturb any real item's
+    # dep resolution). They DO get `items=items` passed to `_shape` purely so
+    # depends_on resolution degrades cleanly (the virtual item has no deps, so
+    # this is a no-op for it).
+    real_ids = {it.get("id") for it in items if isinstance(it, dict)}
+    real_hostjob_labels: set[str] = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        lbl = _extract_hostjob_label(it.get("scope") or [])
+        if lbl:
+            real_hostjob_labels.add(lbl)
+
+    synthesized_hostjob = False
+    for state in _load_hostjob_states():
+        if state.get("status") != "running":
+            continue
+        label = _extract_hostjob_label([f"hostjob:{state.get('label', '')}"])
+        # `_extract_hostjob_label` re-validates against `_WORKLOAD_LABEL_RE`,
+        # so an invalid / empty label yields "" and is skipped.
+        if not label:
+            continue
+        qid = state.get("queue_id")
+        # Dedup #1: a real queue row already owns this hostjob's queue_id.
+        if isinstance(qid, str) and qid and qid in real_ids:
+            continue
+        # Dedup #2: a real queue row already carries this `hostjob:<label>`
+        # scope (the q-2026-06-24-2c98 complement — once that change makes
+        # every hostjob create a real row, BOTH dedup conditions fire and
+        # this synthesizer becomes a no-op; the real row renders instead).
+        if label in real_hostjob_labels:
+            continue
+
+        cmd = state.get("cmd")
+        cmd_parts = [c for c in cmd if isinstance(c, str)] if isinstance(cmd, list) else []
+        cmd_joined = " ".join(cmd_parts)
+        started_iso = _epoch_to_iso(state.get("started_at"))
+        virtual_item = {
+            "id": qid if (isinstance(qid, str) and qid) else f"hostjob:{label}",
+            "status": "running",
+            "scope": [f"hostjob:{label}"],
+            "summary": f"hostjob: {label}",
+            "description": cmd_joined,
+            "created_by": "hostjob",
+            # Both anchors set so `_shape`'s `registered_at or started_at`
+            # running age-anchor resolves regardless of which it reads.
+            "registered_at": started_iso,
+            "started_at": started_iso,
+            "is_hostjob_virtual": True,
+        }
+        shaped_virtual = _shape(
+            virtual_item, now, agent_by_qid, items=items, bindings=bindings
+        )
+        # Carry the virtual marker through to the shaped payload (the
+        # template / API consumers can distinguish a synthesized hostjob row
+        # from a real queue item).
+        shaped_virtual["is_hostjob_virtual"] = True
+        running.append(shaped_virtual)
+        synthesized_hostjob = True
+
     # Order:
     #   running   — oldest-running first (most concerning)
     #   pending   — group-heads first, then by priority asc, then by age desc
@@ -1021,13 +1166,17 @@ def _render_payload() -> dict[str, Any]:
     # Derived from the GLOBAL item list (not a per-section facet): the old
     # dropdown showed nothing because no global distinct-source query
     # existed to feed it.
-    sources = sorted(
-        {
-            (it.get("created_by") or "").strip()
-            for it in items
-            if isinstance(it, dict) and (it.get("created_by") or "").strip()
-        }
-    )
+    source_set = {
+        (it.get("created_by") or "").strip()
+        for it in items
+        if isinstance(it, dict) and (it.get("created_by") or "").strip()
+    }
+    # Virtual hostjob items carry created_by="hostjob"; union it into the
+    # facet so the source dropdown lists it as a legit producer whenever at
+    # least one --no-queue / main-loop hostjob was synthesized into `running`.
+    if synthesized_hostjob:
+        source_set.add("hostjob")
+    sources = sorted(source_set)
 
     return {
         "running": running,
