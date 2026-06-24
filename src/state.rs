@@ -46,6 +46,31 @@ pub struct State {
     /// re-fires from the other paths for a short window.
     #[serde(default)]
     pub last_interrupt_at: Option<String>,
+    /// RFC3339 timestamp of when the prolonged-thinking OBLIGATION was armed
+    /// (pending-alert written, event emitted) WITHOUT yet interrupting. The
+    /// two-phase escalation gate (BUG 1 fix) requires the obligation to be
+    /// armed and the dwell window to elapse before escalating to a tmux
+    /// interrupt. Cleared when the condition clears or after the interrupt
+    /// fires. Transient — daemon downtime breaks the dwell semantics (same
+    /// rationale as `last_interrupt_at`).
+    #[serde(default)]
+    pub thinking_obligation_armed_at: Option<String>,
+    /// RFC3339 timestamp of when the context-low OBLIGATION was armed. See
+    /// `thinking_obligation_armed_at`. Transient.
+    #[serde(default)]
+    pub context_obligation_armed_at: Option<String>,
+    /// RFC3339 timestamp of when the heartbeat-stale OBLIGATION was armed.
+    /// See `thinking_obligation_armed_at`. Transient.
+    #[serde(default)]
+    pub heartbeat_obligation_armed_at: Option<String>,
+    /// Count of consecutive global interrupts within the rolling cooldown
+    /// window — drives the exponential global-cooldown backoff. Incremented
+    /// (saturating) on each successful `try_claim_global_interrupt`; reset to
+    /// 0 when a full effective cooldown window elapses with no interrupt.
+    /// Transient — daemon downtime breaks the streak semantics (same
+    /// rationale as `last_interrupt_at`).
+    #[serde(default)]
+    pub global_interrupt_streak: u32,
     // Last known pane/status for foreground polling (not persisted meaningfully)
     #[serde(default)]
     pub last_known_pane: String,
@@ -380,6 +405,14 @@ pub fn load_state(path: &str) -> State {
     // indefinitely-suppressive). Clear on load so the next interrupt is
     // allowed to fire immediately.
     state.last_interrupt_at = None;
+    // The two-phase escalation obligation timers and the global-interrupt
+    // backoff streak are transient for the same reason as last_interrupt_at:
+    // daemon downtime makes the dwell/streak measurement meaningless. Reset
+    // on load so escalation re-builds from scratch.
+    state.thinking_obligation_armed_at = None;
+    state.context_obligation_armed_at = None;
+    state.heartbeat_obligation_armed_at = None;
+    state.global_interrupt_streak = 0;
     state.foreground_start = None;
     state.foreground_alerted = false;
     // wedged_consecutive is transient — daemon downtime breaks the
@@ -627,6 +660,38 @@ mod tests {
         assert_eq!(loaded.consecutive_suppressions, 0);
         assert!(loaded.first_suppression_at.is_none());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_obligation_arm_timers_cleared_on_load() {
+        // The two-phase escalation obligation timers and the global-interrupt
+        // backoff streak are transient — daemon downtime breaks the
+        // dwell/streak semantics, so load_state() must clear all four
+        // (mirrors thinking_start / last_interrupt_at).
+        let path = "/tmp/claude-watch-test-obligation-arm-timers.json";
+        let mut state = State::default();
+        state.thinking_obligation_armed_at = Some("2026-06-24T00:00:00+00:00".to_string());
+        state.context_obligation_armed_at = Some("2026-06-24T00:00:00+00:00".to_string());
+        state.heartbeat_obligation_armed_at = Some("2026-06-24T00:00:00+00:00".to_string());
+        state.global_interrupt_streak = 7;
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert!(loaded.thinking_obligation_armed_at.is_none());
+        assert!(loaded.context_obligation_armed_at.is_none());
+        assert!(loaded.heartbeat_obligation_armed_at.is_none());
+        assert_eq!(loaded.global_interrupt_streak, 0);
+        let _ = std::fs::remove_file(path);
+
+        // Old state file (no fields) -> defaults, not an error.
+        let path2 = "/tmp/claude-watch-test-obligation-arm-timers-default.json";
+        std::fs::write(path2, "{}").unwrap();
+        let loaded2 = load_state(path2);
+        assert!(loaded2.thinking_obligation_armed_at.is_none());
+        assert!(loaded2.context_obligation_armed_at.is_none());
+        assert!(loaded2.heartbeat_obligation_armed_at.is_none());
+        assert_eq!(loaded2.global_interrupt_streak, 0);
+        let _ = std::fs::remove_file(path2);
     }
 
     #[test]
