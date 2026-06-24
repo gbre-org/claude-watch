@@ -48,6 +48,7 @@ test-hooks:
 	tools/hooks/tests/pre-tool-claude-watch-alert-gate-hook.test
 	tools/hooks/tests/user-prompt-claude-watch-alert-record-hook.test
 	tools/hooks/tests/pre-tool-dispatch-gate-hook.test
+	tools/hooks/tests/post-tool-agent-arm-hook.test
 	tools/hooks/pre-agent-background-required-hook --test
 	tools/hooks/pre-agent-worktree-isolation-hook --test
 	tools/hooks/worktree-create-hook --test

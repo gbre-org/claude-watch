@@ -4,10 +4,10 @@ writes agent_id -> queue_id bindings consumed by the
 ``subagent_queue_item_running`` obligations predicate.
 
 Test cases:
-  1. PostToolUse:Agent + async_launched=true + q-id marker  -> binding written
+  1. PostToolUse:Agent + real async-launch markers + q-id marker -> binding written
   2. Re-arm same agent_id refreshes registered_at
   3. Multiple distinct agent_ids -> separate bindings preserved
-  4. async_launched=false (sync Agent call) -> NO binding written
+  4. sync Agent call (no async markers) -> NO binding written
   5. Missing agentId -> NO binding written (default-open)
   6. Missing prompt -> NO binding written
   7. Prompt without 'Queue item: q-XXXX' marker -> NO binding written
@@ -17,6 +17,7 @@ Test cases:
  11. Stale entries (>7d) pruned on next write
  12. File written with 0600 perms
  13. CLAUDE_AGENT_QUEUE_BINDINGS_PATH env override is honored
+ 14. Each async-launch marker variant (isAsync / status / legacy bool) writes
 
 Each test isolates the bindings file path via the env var so we never
 touch the real ~/.config/claude/agent-queue-bindings.json.
@@ -92,7 +93,12 @@ def main() -> int:
                 "prompt": "Do the thing.\nQueue item: q-2026-05-15-aaaa\nMore text.",
             },
             "tool_response": {
-                "async_launched": True,
+                # Real Claude Code async-spawn shape: isAsync + status,
+                # NOT a boolean field named "async_launched" (the runtime
+                # never emits that; the prior hook checked for it and so
+                # never wrote a binding -- this is the regression guard).
+                "isAsync": True,
+                "status": "async_launched",
                 "agentId": "agent-test-001",
             },
         }
@@ -147,12 +153,18 @@ def main() -> int:
         # Clean slate for the next batch.
         bindings_path.unlink()
 
-        # ---- Test 4: async_launched=false -> no binding ----
+        # ---- Test 4: sync Agent call (no async markers) -> no binding ----
+        # A sync call returns in-band with no separately-running subagent:
+        # neither isAsync nor status == "async_launched".
         payload_sync = json.loads(json.dumps(payload_ok))
-        payload_sync["tool_response"]["async_launched"] = False
+        payload_sync["tool_response"] = {
+            "isAsync": False,
+            "status": "completed",
+            "agentId": "agent-test-001",
+        }
         rc, _, _ = _run_hook(payload_sync, env)
         results.append(_check(
-            "4. async_launched=false -> no binding written",
+            "4. sync Agent call (no async markers) -> no binding written",
             rc == 0 and not bindings_path.exists(),
             f"rc={rc} exists={bindings_path.exists()}",
         ))
@@ -290,6 +302,44 @@ def main() -> int:
             rc == 0 and default_bindings.exists(),
             f"rc={rc} default={default_bindings} "
             f"exists={default_bindings.exists()}",
+        ))
+
+        # ---- Test 14: each async-launch marker variant is honored ----
+        # Regression guard for the bug where the hook only recognized a
+        # boolean ``async_launched`` field (which the runtime never emits),
+        # so no binding was ever written. Each of the three accepted
+        # markers must independently trigger a write.
+        marker_variants = [
+            ("isAsync-only", {"isAsync": True}),
+            ("status-only", {"status": "async_launched"}),
+            ("legacy-bool", {"async_launched": True}),
+        ]
+        variant_ok = True
+        variant_detail = []
+        for name, marker in marker_variants:
+            if bindings_path.exists():
+                bindings_path.unlink()
+            payload_v = json.loads(json.dumps(payload_ok))
+            payload_v["tool_response"] = {
+                **marker,
+                "agentId": f"agent-variant-{name}",
+            }
+            payload_v["tool_input"]["prompt"] = (
+                f"v.\nQueue item: q-2026-05-15-{name[:4]}"
+            )
+            rc, _, _ = _run_hook(payload_v, env)
+            data = _read_bindings(bindings_path)
+            this_ok = (
+                rc == 0
+                and data is not None
+                and f"agent-variant-{name}" in data.get("bindings", {})
+            )
+            variant_ok = variant_ok and this_ok
+            variant_detail.append(f"{name}={this_ok}")
+        results.append(_check(
+            "14. each async-launch marker variant writes a binding",
+            variant_ok,
+            " ".join(variant_detail),
         ))
 
     total = len(results)
