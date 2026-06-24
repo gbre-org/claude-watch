@@ -349,6 +349,25 @@ pub(crate) fn obligation_escalation_decision(
     }
 }
 
+/// Watcher-down two-phase decision: like [`obligation_escalation_decision`],
+/// but an active cross-gate suppression-escalation (`suppression_escalated`)
+/// FORCES `Escalate`. A capped suppression run is exactly the "lower rung
+/// demonstrably failed" case — the dwell must not re-delay the inject the
+/// suppression backstop just decided to force through. With no suppression
+/// escalation the normal dwell gate applies.
+pub(crate) fn watcher_down_obligation_decision(
+    suppression_escalated: bool,
+    armed_at: Option<&str>,
+    dwell_secs: u64,
+    active_subagents: u32,
+    now: &str,
+) -> ObligationDecision {
+    if suppression_escalated {
+        return ObligationDecision::Escalate;
+    }
+    obligation_escalation_decision(armed_at, dwell_secs, active_subagents, now)
+}
+
 /// Exponential global cooldown: `base * backoff_base^streak`, capped at
 /// `max_secs`, using SATURATING arithmetic so a huge streak never panics.
 /// `backoff_base <= 1` or `streak == 0` => `base` (flat — exact legacy
@@ -4888,6 +4907,97 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             }),
                         );
                     } else {
+                    // Two-phase obligation-precedence gate (BUG 2 follow-up to
+                    // #424). The watcher-down inject was the 4th interrupt fire
+                    // site #424's gate did NOT cover — #424 scoped the
+                    // obligation rung to prolonged-thinking / context-low /
+                    // heartbeat-stale and explicitly left "watcher-down ...
+                    // unchanged", so a down watcher escalated straight from
+                    // event to a turn-cancelling tmux interrupt with no
+                    // obligation rung in between. Mirror the other three: on
+                    // first detection ARM the obligation (pending alert the
+                    // PreToolUse alert-gate hook bites on + emit the event)
+                    // WITHOUT interrupting; only escalate to the interrupt
+                    // once the dwell has elapsed and no background subagents
+                    // are live (interrupting would kill healthy in-flight
+                    // agents). The cross-gate suppression `escalation` backstop
+                    // already forced past active-turn suppression above; the
+                    // obligation dwell is an INDEPENDENT, additional rung —
+                    // EXCEPT we honor an active suppression-escalation by
+                    // forcing the obligation to Escalate too (a capped
+                    // suppression run is exactly the "lower rung demonstrably
+                    // failed" case the dwell must not re-delay). `dwell_secs`
+                    // of 0 disables the gate (legacy same-cycle interrupt).
+                    let wd_active_subagents =
+                        crate::respawn::count_active_subagents_with_versions_dir(None);
+                    let wd_decision = watcher_down_obligation_decision(
+                        escalation.is_some(),
+                        state.watcher_down_obligation_armed_at.as_deref(),
+                        config.general.obligation_dwell_secs,
+                        wd_active_subagents,
+                        &now,
+                    );
+                    if matches!(
+                        wd_decision,
+                        ObligationDecision::ArmObligation | ObligationDecision::Hold
+                    ) {
+                        let _ = crate::obligation_arm::arm_alert_obligation(
+                            &format!(
+                                "[CLAUDE-WATCH] WATCHER(S) DOWN: {}. Restart them \
+                                 with: {}",
+                                missing_list,
+                                missing_names
+                                    .iter()
+                                    .map(|n| format!("watcher-ctl run {}", n))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            ),
+                            "claude-watch-watcher-down",
+                        );
+                        if state.watcher_down_obligation_armed_at.is_none() {
+                            state.watcher_down_obligation_armed_at = Some(now.clone());
+                        }
+                        // Event sink only (NOT the interrupt) this cycle. The
+                        // self-feedback guard still applies: skip the emit when
+                        // the only down watcher is the event consumer itself.
+                        let emit_targets = filter_consumer_for_event_emit(
+                            &missing_names,
+                            &event_consumer_name,
+                        );
+                        if let Some(targets) = emit_targets {
+                            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                                alert_type: "watcher-down",
+                                stuck_reason: &watcher_reason,
+                                stale_minutes: None,
+                                affected_watchers: targets,
+                                severity: crate::event_bus::Severity::Medium,
+                                message: &watcher_reason,
+                            });
+                        }
+                        debug!(
+                            missing = %missing_list,
+                            dwell_secs = config.general.obligation_dwell_secs,
+                            active_subagents = wd_active_subagents,
+                            "watcher-down: obligation armed/held — deferring interrupt"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "watcher_down_obligation_armed",
+                            serde_json::json!({
+                                "missing": missing_names,
+                                "dwell_secs": config.general.obligation_dwell_secs,
+                                "active_subagents": wd_active_subagents,
+                            }),
+                        );
+                        // Do NOT stamp last_watcher_inject — no inject fired,
+                        // so the per-watcher cooldown clock stays untouched and
+                        // the next cycle re-evaluates the dwell.
+                        crate::state::save_state(&config.general.state_file, state);
+                    } else {
+                    // Escalate: obligation served its purpose — disarm so a
+                    // fresh outage re-arms — then run the existing
+                    // interrupt+inject path unchanged.
+                    state.watcher_down_obligation_armed_at = None;
                     if let Some(reason) = escalation {
                         warn!(
                             missing = %missing_list,
@@ -4981,8 +5091,18 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         state.watcher_down_interrupts_total.saturating_add(1);
                     reset_suppression(state);
                     crate::state::save_state(&config.general.state_file, state);
+                    } // end Escalate branch (obligation-precedence gate)
                     }
                 }
+            }
+        } else {
+            // No critically-missing watchers this cycle — disarm the
+            // watcher-down obligation so a future fresh outage re-arms from
+            // scratch (mirrors the heartbeat-stale "condition cleared" disarm).
+            // Only persist if it was actually armed, to avoid a needless write.
+            if state.watcher_down_obligation_armed_at.is_some() {
+                state.watcher_down_obligation_armed_at = None;
+                crate::state::save_state(&config.general.state_file, state);
             }
         }
     }
@@ -6525,6 +6645,84 @@ cooldown = 300
         );
         assert_eq!(
             obligation_escalation_decision(None, 0, 5, &now),
+            ObligationDecision::Escalate
+        );
+    }
+
+    // --- watcher_down_obligation_decision tests (BUG 2 follow-up to #424) ---
+
+    #[test]
+    fn test_watcher_down_decision_arms_on_first_detection() {
+        // First detection (unarmed), no suppression escalation: ARM the
+        // obligation, do NOT interrupt — closing the #424 gap where
+        // watcher-down went straight to a tmux interrupt.
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            watcher_down_obligation_decision(false, None, 90, 0, &now),
+            ObligationDecision::ArmObligation
+        );
+    }
+
+    #[test]
+    fn test_watcher_down_decision_holds_within_dwell() {
+        // Armed but dwell not elapsed: Hold (no interrupt yet).
+        let armed = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            watcher_down_obligation_decision(false, Some(&armed), 90, 0, &now),
+            ObligationDecision::Hold
+        );
+    }
+
+    #[test]
+    fn test_watcher_down_decision_holds_when_subagents_live() {
+        // Dwell elapsed but background subagents are live: Hold — interrupting
+        // would kill healthy in-flight agents.
+        let armed = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            watcher_down_obligation_decision(false, Some(&armed), 90, 3, &now),
+            ObligationDecision::Hold
+        );
+    }
+
+    #[test]
+    fn test_watcher_down_decision_escalates_after_dwell_no_subagents() {
+        // Armed, dwell elapsed, 0 subagents: Escalate to the interrupt+inject.
+        let armed = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            watcher_down_obligation_decision(false, Some(&armed), 90, 0, &now),
+            ObligationDecision::Escalate
+        );
+    }
+
+    #[test]
+    fn test_watcher_down_decision_suppression_escalation_forces_escalate() {
+        // An active cross-gate suppression-escalation FORCES Escalate even
+        // when unarmed (would otherwise ArmObligation) — the capped
+        // suppression run is the "lower rung failed" case the dwell must not
+        // re-delay.
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            watcher_down_obligation_decision(true, None, 90, 0, &now),
+            ObligationDecision::Escalate
+        );
+        // ...and even when subagents are live (suppression backstop wins).
+        let armed = (Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        assert_eq!(
+            watcher_down_obligation_decision(true, Some(&armed), 90, 9, &now),
+            ObligationDecision::Escalate
+        );
+    }
+
+    #[test]
+    fn test_watcher_down_decision_dwell_zero_legacy_same_cycle() {
+        // dwell_secs == 0 disables the precedence gate (legacy behavior:
+        // arm+interrupt same cycle) -> Escalate immediately.
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            watcher_down_obligation_decision(false, None, 0, 0, &now),
             ObligationDecision::Escalate
         );
     }

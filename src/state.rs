@@ -63,6 +63,17 @@ pub struct State {
     /// See `thinking_obligation_armed_at`. Transient.
     #[serde(default)]
     pub heartbeat_obligation_armed_at: Option<String>,
+    /// RFC3339 timestamp of when the watcher-down OBLIGATION was armed.
+    /// The watcher-down inject was the 4th interrupt fire site that #424's
+    /// obligation-precedence gate did NOT cover (its commit message scoped
+    /// the gate to prolonged-thinking / context-low / heartbeat-stale only,
+    /// leaving "watcher-down ... unchanged"). It now arms an obligation
+    /// (pending alert + event) on first detection and only escalates to the
+    /// turn-cancelling tmux interrupt after the dwell elapses with no live
+    /// subagents — same two-phase shape as the other three.
+    /// See `thinking_obligation_armed_at`. Transient.
+    #[serde(default)]
+    pub watcher_down_obligation_armed_at: Option<String>,
     /// Count of consecutive global interrupts within the rolling cooldown
     /// window — drives the exponential global-cooldown backoff. Incremented
     /// (saturating) on each successful `try_claim_global_interrupt`; reset to
@@ -388,6 +399,13 @@ pub struct WatcherState {
 }
 
 pub fn load_state(path: &str) -> State {
+    load_state_with_now(path, &chrono::Utc::now().to_rfc3339())
+}
+
+/// `load_state` with an injectable "startup now" timestamp so the cold-start
+/// cooldown-seeding behavior is unit-testable without mocking the clock.
+/// Production callers use [`load_state`], which passes the real wall clock.
+pub fn load_state_with_now(path: &str, startup_now: &str) -> State {
     let mut state: State = match std::fs::read_to_string(path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => State::default(),
@@ -400,18 +418,36 @@ pub fn load_state(path: &str) -> State {
     state.thinking_alerted = false;
     state.thinking_interrupt_count = 0;
     state.thinking_episode_start_tokens = None;
-    // last_interrupt_at is a short-lived global cooldown gate — daemon
-    // downtime makes any persisted value meaningless (either stale or
-    // indefinitely-suppressive). Clear on load so the next interrupt is
-    // allowed to fire immediately.
-    state.last_interrupt_at = None;
-    // The two-phase escalation obligation timers and the global-interrupt
-    // backoff streak are transient for the same reason as last_interrupt_at:
-    // daemon downtime makes the dwell/streak measurement meaningless. Reset
-    // on load so escalation re-builds from scratch.
+    // last_interrupt_at is the global post-interrupt cooldown gate. On a
+    // fresh daemon/container start it must INITIALIZE AT MAX COOLDOWN, NOT
+    // be cleared. Clearing it to `None` makes `elapsed_since` read as
+    // "never injected" → the cooldown check sees the daemon as infinitely
+    // overdue → the very first cycle can fire an interrupt IMMEDIATELY,
+    // before any real condition has had time to warrant it (the cold-start
+    // injection storm). Seeding it to startup-time instead makes
+    // `interrupt_in_global_cooldown` measure elapsed ≈ 0 on the first
+    // cycle, so a cold-started daemon waits a FULL `post_interrupt_cooldown_secs`
+    // window before the first interrupt is even eligible — "as if we just
+    // injected at startup". A genuinely-stuck condition still fires once
+    // the cooldown elapses; this only suppresses the spurious cold-start
+    // fire in the first cooldown window. (Was: `= None`.)
+    state.last_interrupt_at = Some(startup_now.to_string());
+    // The two-phase escalation obligation timers are transient — daemon
+    // downtime makes the dwell measurement meaningless — so they reset to
+    // None on load. That's the SAFE direction here (independent of the
+    // cooldown seeding above): `obligation_escalation_decision` treats a
+    // `None` armed-at as `ArmObligation` (arm the obligation, DON'T
+    // interrupt) on the first detection cycle, so a fresh start can never
+    // escalate-to-interrupt on cycle 1 regardless of the cooldown.
     state.thinking_obligation_armed_at = None;
     state.context_obligation_armed_at = None;
     state.heartbeat_obligation_armed_at = None;
+    state.watcher_down_obligation_armed_at = None;
+    // The global-interrupt backoff streak is transient for the same reason:
+    // daemon downtime makes the streak measurement meaningless. Reset to 0
+    // so the cold-start cooldown above is the BASE `post_interrupt_cooldown_secs`
+    // (not an inflated exponential window), which is the intended
+    // "one full base cooldown after startup" behavior.
     state.global_interrupt_streak = 0;
     state.foreground_start = None;
     state.foreground_alerted = false;
@@ -637,8 +673,67 @@ mod tests {
         // Transient state cleared (guarded by existing behavior in load_state)
         assert_eq!(loaded.thinking_interrupt_count, 0);
         assert!(loaded.thinking_episode_start_tokens.is_none());
-        assert!(loaded.last_interrupt_at.is_none());
+        // last_interrupt_at is no longer cleared to None — it is SEEDED to
+        // startup-time so the global cooldown initializes at max on a cold
+        // start (cold-start injection-storm fix). It must be Some(...), not
+        // the stale persisted 2026-01-01 value, and not None.
+        assert!(loaded.last_interrupt_at.is_some());
+        assert_ne!(
+            loaded.last_interrupt_at.as_deref(),
+            Some("2026-01-01T00:00:00+00:00"),
+            "stale persisted timestamp must be replaced by startup-time seed"
+        );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_cold_start_seeds_last_interrupt_at_to_startup_now() {
+        // Cold-start injection-storm fix: on a fresh start, the global
+        // post-interrupt cooldown gate (`last_interrupt_at`) must INITIALIZE
+        // AT MAX COOLDOWN — seeded to the daemon's startup-time — NOT cleared
+        // to None. None would read as "infinitely overdue" and let the first
+        // cycle fire an interrupt immediately. With the seed, elapsed-since
+        // ≈ 0 at startup, so the daemon waits a full cooldown window first.
+        let startup_now = "2026-06-24T12:00:00+00:00";
+
+        // (a) missing state file (brand-new daemon) -> seeded, not None.
+        let loaded = load_state_with_now(
+            "/tmp/nonexistent-claude-watch-cold-start.json",
+            startup_now,
+        );
+        assert_eq!(
+            loaded.last_interrupt_at.as_deref(),
+            Some(startup_now),
+            "fresh daemon must seed last_interrupt_at to startup_now"
+        );
+        // The exponential backoff streak resets so the seeded cooldown is the
+        // BASE window, not an inflated one.
+        assert_eq!(loaded.global_interrupt_streak, 0);
+
+        // (b) existing state file with a stale timestamp -> overwritten with
+        // startup_now (the persisted value is meaningless across downtime).
+        let path = "/tmp/claude-watch-test-cold-start-seed.json";
+        let mut state = State::default();
+        state.last_interrupt_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        state.global_interrupt_streak = 9;
+        save_state(path, &state);
+        let loaded = load_state_with_now(path, startup_now);
+        assert_eq!(loaded.last_interrupt_at.as_deref(), Some(startup_now));
+        assert_eq!(loaded.global_interrupt_streak, 0);
+        let _ = std::fs::remove_file(path);
+
+        // (c) the seed actually engages the cooldown predicate: a freshly
+        // loaded state is IN the global cooldown for any positive window
+        // (elapsed ≈ 0 < cooldown), so the first-cycle interrupt is gated.
+        let loaded = load_state_with_now(
+            "/tmp/nonexistent-claude-watch-cold-start-2.json",
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        assert!(
+            crate::policy::interrupt_in_global_cooldown(&loaded, 300),
+            "cold-started state must be inside the global cooldown so the \
+             first cycle cannot fire immediately"
+        );
     }
 
     #[test]
@@ -673,6 +768,7 @@ mod tests {
         state.thinking_obligation_armed_at = Some("2026-06-24T00:00:00+00:00".to_string());
         state.context_obligation_armed_at = Some("2026-06-24T00:00:00+00:00".to_string());
         state.heartbeat_obligation_armed_at = Some("2026-06-24T00:00:00+00:00".to_string());
+        state.watcher_down_obligation_armed_at = Some("2026-06-24T00:00:00+00:00".to_string());
         state.global_interrupt_streak = 7;
         save_state(path, &state);
 
@@ -680,6 +776,7 @@ mod tests {
         assert!(loaded.thinking_obligation_armed_at.is_none());
         assert!(loaded.context_obligation_armed_at.is_none());
         assert!(loaded.heartbeat_obligation_armed_at.is_none());
+        assert!(loaded.watcher_down_obligation_armed_at.is_none());
         assert_eq!(loaded.global_interrupt_streak, 0);
         let _ = std::fs::remove_file(path);
 
@@ -690,6 +787,7 @@ mod tests {
         assert!(loaded2.thinking_obligation_armed_at.is_none());
         assert!(loaded2.context_obligation_armed_at.is_none());
         assert!(loaded2.heartbeat_obligation_armed_at.is_none());
+        assert!(loaded2.watcher_down_obligation_armed_at.is_none());
         assert_eq!(loaded2.global_interrupt_streak, 0);
         let _ = std::fs::remove_file(path2);
     }
