@@ -8,6 +8,7 @@ pub mod cadence;
 pub mod cmd;
 pub mod config;
 pub mod event_bus;
+pub mod obligation_arm;
 pub mod obligations;
 pub mod pr_parse;
 pub mod proc_util;

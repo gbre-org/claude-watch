@@ -163,12 +163,16 @@ def test_list_populated():
 def test_ack_by_id():
     h = Harness()
     try:
-        id_a = h.run("add", "[CLAUDE-WATCH] A").stdout.strip()
+        id_a = h.run("add", "[CLAUDE-WATCH] body-of-A-must-be-printed").stdout.strip()
         id_b = h.run("add", "[CLAUDE-WATCH] B").stdout.strip()
         proc = h.run("ack", id_a)
         check(proc.returncode == 0, "ack <id>: exit 0",
               f"stderr={proc.stderr!r}")
         check(id_a in proc.stdout, "ack <id>: confirms id")
+        # Blind-ack guard: the FULL body must be surfaced before clearing.
+        check("body-of-A-must-be-printed" in proc.stdout,
+              "ack <id>: prints full body before clearing",
+              f"stdout={proc.stdout!r}")
         state = h.load_state()
         check(len(state["alerts"]) == 1, "ack <id>: state count -> 1",
               f"got {len(state['alerts'])}")
@@ -193,31 +197,84 @@ def test_ack_missing_id():
         h.cleanup()
 
 
-def test_ack_all():
+def test_ack_all_refuses_without_confirm_read():
+    """Bare `ack --all` must REFUSE to clear, print all bodies, exit 2."""
     h = Harness()
     try:
-        h.run("add", "[CLAUDE-WATCH] A")
-        h.run("add", "[CLAUDE-WATCH] B")
-        h.run("add", "[CLAUDE-WATCH] C")
+        h.run("add", "[CLAUDE-WATCH] body-AAA")
+        h.run("add", "[CLAUDE-WATCH] body-BBB")
+        h.run("add", "[CLAUDE-WATCH] body-CCC")
         proc = h.run("ack", "--all")
-        check(proc.returncode == 0, "ack --all: exit 0")
-        check("ack'd 3" in proc.stdout, "ack --all: count message",
+        check(proc.returncode == 2, "ack --all (no confirm): exit 2 (refused)",
+              f"got rc={proc.returncode}, stdout={proc.stdout!r}")
+        # All three bodies surfaced before the refusal.
+        check("body-AAA" in proc.stdout and "body-BBB" in proc.stdout
+              and "body-CCC" in proc.stdout,
+              "ack --all (no confirm): prints every body",
               f"stdout={proc.stdout!r}")
+        check("REFUSED" in proc.stderr,
+              "ack --all (no confirm): stderr explains refusal",
+              f"stderr={proc.stderr!r}")
+        # CRITICAL: nothing cleared.
         state = h.load_state()
-        check(state["alerts"] == [], "ack --all: state cleared")
+        check(len(state["alerts"]) == 3,
+              "ack --all (no confirm): state UNCHANGED (nothing cleared)",
+              f"got {len(state['alerts'])}")
+    finally:
+        h.cleanup()
+
+
+def test_ack_all_with_confirm_read():
+    """`ack --all --confirm-read` prints bodies then clears."""
+    h = Harness()
+    try:
+        h.run("add", "[CLAUDE-WATCH] body-AAA")
+        h.run("add", "[CLAUDE-WATCH] body-BBB")
+        h.run("add", "[CLAUDE-WATCH] body-CCC")
+        proc = h.run("ack", "--all", "--confirm-read")
+        check(proc.returncode == 0, "ack --all --confirm-read: exit 0",
+              f"got rc={proc.returncode}, stderr={proc.stderr!r}")
+        check("ack'd 3" in proc.stdout,
+              "ack --all --confirm-read: count message", f"stdout={proc.stdout!r}")
+        check("body-AAA" in proc.stdout,
+              "ack --all --confirm-read: still prints bodies")
+        state = h.load_state()
+        check(state["alerts"] == [], "ack --all --confirm-read: state cleared")
+    finally:
+        h.cleanup()
+
+
+def test_ack_all_empty_ok():
+    """`ack --all` with no pending alerts is a no-op success (no read needed)."""
+    h = Harness()
+    try:
+        proc = h.run("ack", "--all")
+        check(proc.returncode == 0, "ack --all (empty): exit 0",
+              f"got rc={proc.returncode}, stderr={proc.stderr!r}")
+        check("ack'd 0" in proc.stdout, "ack --all (empty): 0 count")
     finally:
         h.cleanup()
 
 
 def test_clear_alias():
+    """`clear` is `ack --all` -- same read-confirm guard."""
     h = Harness()
     try:
-        h.run("add", "[CLAUDE-WATCH] A")
-        h.run("add", "[CLAUDE-WATCH] B")
+        h.run("add", "[CLAUDE-WATCH] body-A")
+        h.run("add", "[CLAUDE-WATCH] body-B")
+        # Bare clear refuses + prints bodies.
         proc = h.run("clear")
-        check(proc.returncode == 0, "clear: exit 0")
+        check(proc.returncode == 2, "clear (no confirm): exit 2 (refused)",
+              f"got rc={proc.returncode}")
+        check("body-A" in proc.stdout and "body-B" in proc.stdout,
+              "clear (no confirm): prints bodies")
         state = h.load_state()
-        check(state["alerts"] == [], "clear: state cleared")
+        check(len(state["alerts"]) == 2, "clear (no confirm): nothing cleared")
+        # With confirm-read it clears.
+        proc = h.run("clear", "--confirm-read")
+        check(proc.returncode == 0, "clear --confirm-read: exit 0")
+        state = h.load_state()
+        check(state["alerts"] == [], "clear --confirm-read: state cleared")
     finally:
         h.cleanup()
 
@@ -288,7 +345,9 @@ def main() -> int:
         test_list_populated,
         test_ack_by_id,
         test_ack_missing_id,
-        test_ack_all,
+        test_ack_all_refuses_without_confirm_read,
+        test_ack_all_with_confirm_read,
+        test_ack_all_empty_ok,
         test_clear_alias,
         test_status,
         test_corrupt_state_recovers,

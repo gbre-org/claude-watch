@@ -264,16 +264,112 @@ pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) ->
 /// and the timestamp is still stamped (so other sites observe the fire).
 ///
 /// `now` is an RFC3339 timestamp string (the daemon's per-check `now`).
+///
+/// The cooldown is EXPONENTIAL: the base `cooldown_secs` is widened by
+/// `effective_global_cooldown_secs(base, backoff_base, max_secs, streak)`
+/// where `streak` is `state.global_interrupt_streak`. `backoff_base <= 1`
+/// reproduces the exact legacy flat-cooldown behavior. On a successful
+/// claim the streak is incremented (saturating); a full effective-cooldown
+/// window elapsing with no interrupt resets the streak to 0 (so a quiet
+/// period decays the backoff).
 pub(crate) fn try_claim_global_interrupt(
     state: &mut State,
-    cooldown_secs: u64,
+    base_cooldown_secs: u64,
+    backoff_base: u64,
+    max_secs: u64,
     now: &str,
 ) -> bool {
-    if interrupt_in_global_cooldown(state, cooldown_secs) {
+    let effective = effective_global_cooldown_secs(
+        base_cooldown_secs,
+        backoff_base,
+        max_secs,
+        state.global_interrupt_streak,
+    );
+    // Decay: if the last interrupt is older than the full effective window,
+    // a quiet period has elapsed — reset the streak BEFORE the claim so the
+    // next interrupt starts from the base cooldown again.
+    if let Some(elapsed) = state.last_interrupt_at.as_deref().and_then(elapsed_since) {
+        if elapsed >= effective as f64 {
+            state.global_interrupt_streak = 0;
+        }
+    }
+    if interrupt_in_global_cooldown(state, effective) {
         return false;
     }
     state.last_interrupt_at = Some(now.to_string());
+    state.global_interrupt_streak = state.global_interrupt_streak.saturating_add(1);
     true
+}
+
+/// Two-phase escalation decision (BUG 1 fix). The daemon ARMS an obligation
+/// (writes a pending alert + emits an event, the lower rung) on the first
+/// detection cycle, and only ESCALATES to a tmux interrupt once the
+/// obligation has been armed, the dwell has elapsed, and no background
+/// subagents are live (interrupting would kill healthy in-flight agents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObligationDecision {
+    /// First detection: arm the obligation, emit the event, DON'T interrupt.
+    ArmObligation,
+    /// Armed but dwell not elapsed (or subagents live): hold — re-emit event
+    /// (idempotent arm), still no interrupt.
+    Hold,
+    /// Dwell elapsed + 0 subagents: proceed to the existing interrupt path.
+    Escalate,
+}
+
+/// Pure decision for the two-phase escalation gate.
+///
+/// - `dwell_secs == 0` => `Escalate` (precedence gate disabled — legacy
+///   arm+interrupt same cycle).
+/// - `armed_at == None` => `ArmObligation` (first detection cycle).
+/// - armed AND dwell elapsed AND `active_subagents == 0` => `Escalate`.
+/// - otherwise => `Hold`.
+///
+/// `now` is kept for symmetry / future use and tests (elapsed is measured
+/// against the armed timestamp via `elapsed_since`).
+pub(crate) fn obligation_escalation_decision(
+    armed_at: Option<&str>,
+    dwell_secs: u64,
+    active_subagents: u32,
+    _now: &str,
+) -> ObligationDecision {
+    if dwell_secs == 0 {
+        return ObligationDecision::Escalate;
+    }
+    match armed_at {
+        None => ObligationDecision::ArmObligation,
+        Some(ts) => {
+            let dwelled = elapsed_since(ts).is_some_and(|e| e >= dwell_secs as f64);
+            if dwelled && active_subagents == 0 {
+                ObligationDecision::Escalate
+            } else {
+                ObligationDecision::Hold
+            }
+        }
+    }
+}
+
+/// Exponential global cooldown: `base * backoff_base^streak`, capped at
+/// `max_secs`, using SATURATING arithmetic so a huge streak never panics.
+/// `backoff_base <= 1` or `streak == 0` => `base` (flat — exact legacy
+/// behavior). Mirrors the shape of `thinking_backoff_threshold_with_multiplier`.
+pub(crate) fn effective_global_cooldown_secs(
+    base: u64,
+    backoff_base: u64,
+    max_secs: u64,
+    interrupt_streak: u32,
+) -> u64 {
+    if backoff_base <= 1 || interrupt_streak == 0 {
+        return base;
+    }
+    let mut cooldown = base;
+    for _ in 0..interrupt_streak {
+        cooldown = cooldown.saturating_mul(backoff_base);
+        if cooldown >= max_secs {
+            return max_secs;
+        }
+    }
+    cooldown.min(max_secs)
 }
 
 /// Pure predicate: should the watcher-down inject path fire now, given
@@ -1258,6 +1354,60 @@ async fn check_foreground_inner(
                         );
                         return;
                     }
+                    // Two-phase escalation gate (BUG 1 fix): before any
+                    // interrupt, ARM the OBLIGATION rung first. The first
+                    // detection cycle writes a pending alert (so the
+                    // PreToolUse alert-gate hook bites) + emits the event,
+                    // WITHOUT interrupting. Only a later cycle — condition
+                    // persists, dwell elapsed, obligation armed, and NO live
+                    // background subagents (interrupting would kill healthy
+                    // in-flight agents) — escalates to the tmux interrupt.
+                    let pt_msg = format!(
+                        "[CLAUDE-WATCH] Prolonged thinking detected (>{}s in thinking state, interrupt #{}). \
+                        You appear to be stuck in a long generation. If you have complex work to do, \
+                        delegate it to a background Agent instead of doing it inline. \
+                        Use run_in_background: true for long Bash commands. \
+                        Resume your current task now.",
+                        next_threshold,
+                        state.thinking_interrupt_count + 1,
+                    );
+                    let active_subagents =
+                        crate::respawn::count_active_subagents_with_versions_dir(None);
+                    match obligation_escalation_decision(
+                        state.thinking_obligation_armed_at.as_deref(),
+                        config.general.obligation_dwell_secs,
+                        active_subagents,
+                        &now,
+                    ) {
+                        ObligationDecision::ArmObligation | ObligationDecision::Hold => {
+                            let _ = crate::obligation_arm::arm_alert_obligation(
+                                &pt_msg,
+                                "claude-watch-prolonged-thinking",
+                            );
+                            if state.thinking_obligation_armed_at.is_none() {
+                                state.thinking_obligation_armed_at = Some(now.clone());
+                            }
+                            // Event sink only (NOT the interrupt) this cycle.
+                            let pt_reason = format!("prolonged thinking ({}s, armed)", elapsed as u64);
+                            alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                                alert_type: "prolonged-thinking",
+                                stuck_reason: &pt_reason,
+                                stale_minutes: None,
+                                affected_watchers: vec![],
+                                severity: crate::event_bus::Severity::Medium,
+                                message: &pt_msg,
+                            });
+                            debug!(
+                                elapsed_secs = elapsed,
+                                threshold = next_threshold,
+                                dwell_secs = config.general.obligation_dwell_secs,
+                                active_subagents,
+                                "prolonged thinking: obligation armed/held — deferring interrupt"
+                            );
+                            return;
+                        }
+                        ObligationDecision::Escalate => {}
+                    }
                     // Global interrupt gate (single chokepoint): atomically
                     // claim-and-stamp. If ANY interrupt fired within the
                     // cooldown window (watcher-down, context-warning,
@@ -1274,6 +1424,8 @@ async fn check_foreground_inner(
                     if !try_claim_global_interrupt(
                         state,
                         config.general.post_interrupt_cooldown_secs,
+                        config.general.global_cooldown_backoff_base,
+                        config.general.global_cooldown_max_secs,
                         &now,
                     ) {
                         debug!(
@@ -1284,6 +1436,10 @@ async fn check_foreground_inner(
                         );
                         return;
                     }
+                    // Escalating to interrupt — the obligation has served its
+                    // purpose; clear the armed timestamp so a fresh episode
+                    // re-arms.
+                    state.thinking_obligation_armed_at = None;
                     // Fire-time token observability: ALWAYS log the episode
                     // baseline, current tokens, and delta — even when the
                     // fire proceeds — so the token-progress guard's
@@ -1405,6 +1561,9 @@ async fn check_foreground_inner(
         state.thinking_alerted = false;
         state.thinking_interrupt_count = 0;
         state.thinking_episode_start_tokens = None;
+        // Condition cleared — disarm the two-phase obligation so the next
+        // episode re-arms from scratch.
+        state.thinking_obligation_armed_at = None;
     }
 
     // --- Foreground blocking tracking ---
@@ -1939,6 +2098,10 @@ pub(crate) fn maybe_reset_context_clear(
     if tokens >= CONTEXT_FRESH_TOKEN_THRESHOLD {
         return;
     }
+
+    // Context-low condition has cleared (tokens below the fresh threshold) —
+    // disarm the two-phase obligation so the next crossing re-arms.
+    state.context_obligation_armed_at = None;
 
     // Path 1: we triggered the clear and it landed (tokens dropped). Reset
     // the in-flight flag + child-pid bookkeeping so the next threshold
@@ -2881,6 +3044,8 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
     if !try_claim_global_interrupt(
         state,
         config.general.post_interrupt_cooldown_secs,
+        config.general.global_cooldown_backoff_base,
+        config.general.global_cooldown_max_secs,
         now,
     ) {
         debug!(
@@ -3971,9 +4136,61 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                                 "grace_secs": config.hybrid.context_fallback_secs,
                             }),
                         );
+                    } else if matches!(
+                        obligation_escalation_decision(
+                            state.context_obligation_armed_at.as_deref(),
+                            config.general.obligation_dwell_secs,
+                            crate::respawn::count_active_subagents_with_versions_dir(None),
+                            &now,
+                        ),
+                        ObligationDecision::ArmObligation | ObligationDecision::Hold
+                    ) {
+                        // Two-phase escalation (BUG 1 fix): ARM the obligation
+                        // rung first (pending alert + event) without
+                        // interrupting. inject_context_warning is Escalate-only
+                        // (the interrupt is deferred); the deferred self-clear
+                        // child remains the hard context backstop and is spawned
+                        // only on Escalate below.
+                        let ctx_msg = format!(
+                            "[CLAUDE-WATCH] Context at {:.0}% — auto-clear pending. \
+                            Commit/push in-flight work and save state NOW before compaction.",
+                            pct
+                        );
+                        let _ = crate::obligation_arm::arm_alert_obligation(
+                            &ctx_msg,
+                            "claude-watch-context-low",
+                        );
+                        if state.context_obligation_armed_at.is_none() {
+                            state.context_obligation_armed_at = Some(now.clone());
+                        }
+                        alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                            alert_type: "context-low",
+                            stuck_reason: "context threshold exceeded (armed)",
+                            stale_minutes: None,
+                            affected_watchers: vec![],
+                            severity: crate::event_bus::Severity::High,
+                            message: &ctx_msg,
+                        });
+                        debug!(
+                            tokens,
+                            pct,
+                            dwell_secs = config.general.obligation_dwell_secs,
+                            "context threshold exceeded — obligation armed/held, deferring interrupt"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "context_threshold_obligation_armed",
+                            serde_json::json!({
+                                "tokens": tokens,
+                                "pct": pct,
+                                "dwell_secs": config.general.obligation_dwell_secs,
+                            }),
+                        );
                     } else if !try_claim_global_interrupt(
                         state,
                         config.general.post_interrupt_cooldown_secs,
+                        config.general.global_cooldown_backoff_base,
+                        config.general.global_cooldown_max_secs,
                         &now,
                     ) {
                         debug!(
@@ -3992,6 +4209,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             }),
                         );
                     } else {
+                        // Escalate: obligation dwelled — clear the armed
+                        // timestamp and proceed with the full interrupt path.
+                        state.context_obligation_armed_at = None;
                         warn!(
                             tokens,
                             pct,
@@ -4649,6 +4869,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         || try_claim_global_interrupt(
                             state,
                             config.general.post_interrupt_cooldown_secs,
+                            config.general.global_cooldown_backoff_base,
+                            config.general.global_cooldown_max_secs,
                             &now,
                         );
                     if !global_gate_ok {
@@ -4898,23 +5120,67 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     severity,
                     message: &msg,
                 };
-                // Inject the heartbeat-SPECIFIC recovery prompt, not the
-                // generic `resume_prompt`. This is the heartbeat-stale path
-                // (the only site that sets `stuck = true`), and the recovery
-                // action is to touch the host heartbeat file to restore
-                // liveness. The generic resume_prompt (a "/cleanup" directive)
-                // never mentions the heartbeat file, so prior to this the
-                // inject landed but the loop never touched the file and it
-                // stayed stale even while the loop was actively working
-                // (2026-06-19 incident: ~85 min stale with a live loop).
-                alert::alert(
-                    &msg,
-                    &alert_pane,
-                    &config.alerts.heartbeat_stale_prompt,
-                    use_pingme,
-                    event_alert,
-                )
-                .await;
+                // Two-phase escalation gate (BUG 1 fix): ARM the obligation
+                // rung first. The first detection cycle writes a pending alert
+                // + emits the event (and keeps the pingme push) WITHOUT
+                // interrupting; only a later cycle (dwell elapsed, obligation
+                // armed, 0 live subagents) escalates to the full
+                // interrupt+inject `alert::alert`. `active_subagents` is
+                // recomputed here (cheap /proc scan) since the detection-time
+                // value is out of scope at this fire site.
+                let hb_active_subagents =
+                    crate::respawn::count_active_subagents_with_versions_dir(None);
+                match obligation_escalation_decision(
+                    state.heartbeat_obligation_armed_at.as_deref(),
+                    config.general.obligation_dwell_secs,
+                    hb_active_subagents,
+                    &now,
+                ) {
+                    ObligationDecision::ArmObligation | ObligationDecision::Hold => {
+                        let _ = crate::obligation_arm::arm_alert_obligation(
+                            &msg,
+                            "claude-watch-heartbeat-stale",
+                        );
+                        if state.heartbeat_obligation_armed_at.is_none() {
+                            state.heartbeat_obligation_armed_at = Some(now.clone());
+                        }
+                        // Keep the push notification + structured event, but
+                        // NOT the interrupting `alert::alert`.
+                        if use_pingme {
+                            alert::send_pingme(&msg).await;
+                        }
+                        alert::emit_event(event_alert);
+                        debug!(
+                            stuck_reason = %stuck_reason,
+                            dwell_secs = config.general.obligation_dwell_secs,
+                            active_subagents = hb_active_subagents,
+                            "heartbeat-stale: obligation armed/held — deferring interrupt"
+                        );
+                    }
+                    ObligationDecision::Escalate => {
+                        // Inject the heartbeat-SPECIFIC recovery prompt, not the
+                        // generic `resume_prompt`. This is the heartbeat-stale
+                        // path (the only site that sets `stuck = true`), and the
+                        // recovery action is to touch the host heartbeat file to
+                        // restore liveness. The generic resume_prompt (a
+                        // "/cleanup" directive) never mentions the heartbeat
+                        // file, so prior to this the inject landed but the loop
+                        // never touched the file and it stayed stale even while
+                        // the loop was actively working (2026-06-19 incident:
+                        // ~85 min stale with a live loop).
+                        alert::alert(
+                            &msg,
+                            &alert_pane,
+                            &config.alerts.heartbeat_stale_prompt,
+                            use_pingme,
+                            event_alert,
+                        )
+                        .await;
+                        // Obligation served its purpose — disarm so the next
+                        // fresh stale episode re-arms.
+                        state.heartbeat_obligation_armed_at = None;
+                    }
+                }
             }
 
             state.last_alert = Some(now.clone());
@@ -4922,6 +5188,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     } else {
         state.consecutive_failures = 0;
         state.alert_count = 0;
+        // Heartbeat-stale condition cleared — disarm the two-phase obligation.
+        state.heartbeat_obligation_armed_at = None;
     }
 
     state.last_check = Some(now);
@@ -6068,21 +6336,25 @@ cooldown = 300
     #[test]
     fn test_try_claim_global_interrupt_grants_when_no_prior() {
         // No prior interrupt -> claim succeeds and stamps last_interrupt_at.
+        // backoff_base=1 => flat cooldown (legacy equivalence).
         let mut state = State::default();
         let now = Utc::now().to_rfc3339();
-        assert!(try_claim_global_interrupt(&mut state, 300, &now));
+        assert!(try_claim_global_interrupt(&mut state, 300, 1, 1800, &now));
         assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
+        // Streak bumps on a successful claim.
+        assert_eq!(state.global_interrupt_streak, 1);
     }
 
     #[test]
     fn test_try_claim_global_interrupt_denies_within_cooldown() {
         // A recent interrupt within the window -> claim DENIED and the
         // existing stamp is NOT overwritten (atomic check-and-stamp).
+        // backoff_base=1 => flat cooldown (legacy equivalence).
         let mut state = State::default();
         let prior = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
         state.last_interrupt_at = Some(prior.clone());
         let now = Utc::now().to_rfc3339();
-        assert!(!try_claim_global_interrupt(&mut state, 300, &now));
+        assert!(!try_claim_global_interrupt(&mut state, 300, 1, 1800, &now));
         assert_eq!(
             state.last_interrupt_at.as_deref(),
             Some(prior.as_str()),
@@ -6093,23 +6365,168 @@ cooldown = 300
     #[test]
     fn test_try_claim_global_interrupt_grants_after_window() {
         // Prior interrupt older than the cooldown -> claim succeeds and
-        // re-stamps to now.
+        // re-stamps to now. backoff_base=1 => flat cooldown (legacy).
         let mut state = State::default();
         let prior = (Utc::now() - chrono::Duration::seconds(400)).to_rfc3339();
         state.last_interrupt_at = Some(prior);
         let now = Utc::now().to_rfc3339();
-        assert!(try_claim_global_interrupt(&mut state, 300, &now));
+        assert!(try_claim_global_interrupt(&mut state, 300, 1, 1800, &now));
         assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
     }
 
     #[test]
     fn test_try_claim_global_interrupt_zero_cooldown_always_grants() {
         // cooldown=0 disables the gate: claim always succeeds, still stamps.
+        // backoff_base=1 => flat (legacy equivalence).
         let mut state = State::default();
         state.last_interrupt_at = Some(Utc::now().to_rfc3339());
         let now = Utc::now().to_rfc3339();
-        assert!(try_claim_global_interrupt(&mut state, 0, &now));
+        assert!(try_claim_global_interrupt(&mut state, 0, 1, 1800, &now));
         assert_eq!(state.last_interrupt_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_try_claim_backoff_base_1_is_flat_legacy() {
+        // backoff_base=1 must reproduce the exact flat-cooldown behavior
+        // regardless of the streak value: a prior interrupt 100s ago with a
+        // 300s base is STILL in cooldown (effective cooldown stays 300, not
+        // widened).
+        let mut state = State::default();
+        state.global_interrupt_streak = 5; // would matter only if base>1
+        let prior = (Utc::now() - chrono::Duration::seconds(100)).to_rfc3339();
+        state.last_interrupt_at = Some(prior.clone());
+        let now = Utc::now().to_rfc3339();
+        assert!(
+            !try_claim_global_interrupt(&mut state, 300, 1, 1800, &now),
+            "flat 300s cooldown still active at 100s elapsed"
+        );
+        assert_eq!(state.last_interrupt_at.as_deref(), Some(prior.as_str()));
+    }
+
+    #[test]
+    fn test_try_claim_exponential_widens_cooldown() {
+        // With backoff_base=2 and streak=2, effective cooldown = 300*2^2 =
+        // 1200s. A prior interrupt 600s ago is now STILL in cooldown
+        // (flat-300 would have granted).
+        let mut state = State::default();
+        state.global_interrupt_streak = 2;
+        let prior = (Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        state.last_interrupt_at = Some(prior);
+        let now = Utc::now().to_rfc3339();
+        assert!(
+            !try_claim_global_interrupt(&mut state, 300, 2, 1800, &now),
+            "1200s effective cooldown still active at 600s elapsed"
+        );
+    }
+
+    #[test]
+    fn test_try_claim_streak_resets_after_quiet_window() {
+        // A prior interrupt older than the FULL effective window resets the
+        // streak to 0 before the claim, so the claim grants and the streak
+        // restarts at 1.
+        let mut state = State::default();
+        state.global_interrupt_streak = 3;
+        // effective = 300*2^3 = 2400 (under 1800 cap? no -> capped at 1800).
+        // Use a prior older than 1800 so the decay branch fires.
+        let prior = (Utc::now() - chrono::Duration::seconds(2000)).to_rfc3339();
+        state.last_interrupt_at = Some(prior);
+        let now = Utc::now().to_rfc3339();
+        assert!(try_claim_global_interrupt(&mut state, 300, 2, 1800, &now));
+        assert_eq!(state.global_interrupt_streak, 1, "streak reset then +1");
+    }
+
+    // --- effective_global_cooldown_secs tests ---
+
+    #[test]
+    fn test_effective_cooldown_streak_zero_is_base() {
+        assert_eq!(effective_global_cooldown_secs(300, 2, 1800, 0), 300);
+    }
+
+    #[test]
+    fn test_effective_cooldown_growth() {
+        // 300 * 2^1 = 600, 300 * 2^2 = 1200.
+        assert_eq!(effective_global_cooldown_secs(300, 2, 1800, 1), 600);
+        assert_eq!(effective_global_cooldown_secs(300, 2, 1800, 2), 1200);
+    }
+
+    #[test]
+    fn test_effective_cooldown_caps_at_max() {
+        // 300 * 2^3 = 2400 -> capped at 1800.
+        assert_eq!(effective_global_cooldown_secs(300, 2, 1800, 3), 1800);
+        assert_eq!(effective_global_cooldown_secs(300, 2, 1800, 50), 1800);
+    }
+
+    #[test]
+    fn test_effective_cooldown_base_1_is_flat() {
+        assert_eq!(effective_global_cooldown_secs(300, 1, 1800, 5), 300);
+        // base 0 also treated as flat (no growth).
+        assert_eq!(effective_global_cooldown_secs(300, 0, 1800, 5), 300);
+    }
+
+    #[test]
+    fn test_effective_cooldown_saturating_no_panic() {
+        // Huge streak + huge base must not overflow-panic; caps at max.
+        assert_eq!(
+            effective_global_cooldown_secs(u64::MAX, u64::MAX, 1800, u32::MAX),
+            1800
+        );
+    }
+
+    // --- obligation_escalation_decision tests ---
+
+    #[test]
+    fn test_obligation_decision_arm_when_unarmed() {
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            obligation_escalation_decision(None, 90, 0, &now),
+            ObligationDecision::ArmObligation
+        );
+    }
+
+    #[test]
+    fn test_obligation_decision_hold_when_dwell_not_elapsed() {
+        let armed = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            obligation_escalation_decision(Some(&armed), 90, 0, &now),
+            ObligationDecision::Hold
+        );
+    }
+
+    #[test]
+    fn test_obligation_decision_hold_when_subagents_active() {
+        // Dwell elapsed but live subagents -> HOLD (don't kill healthy agents).
+        let armed = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            obligation_escalation_decision(Some(&armed), 90, 2, &now),
+            ObligationDecision::Hold
+        );
+    }
+
+    #[test]
+    fn test_obligation_decision_escalate_when_dwelled_and_idle() {
+        let armed = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            obligation_escalation_decision(Some(&armed), 90, 0, &now),
+            ObligationDecision::Escalate
+        );
+    }
+
+    #[test]
+    fn test_obligation_decision_dwell_zero_short_circuits_escalate() {
+        // dwell_secs == 0 disables the precedence gate: always Escalate, even
+        // when unarmed (legacy arm+interrupt same cycle).
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            obligation_escalation_decision(None, 0, 0, &now),
+            ObligationDecision::Escalate
+        );
+        assert_eq!(
+            obligation_escalation_decision(None, 0, 5, &now),
+            ObligationDecision::Escalate
+        );
     }
 
     // --- Fresh session inject loop prevention tests ---
