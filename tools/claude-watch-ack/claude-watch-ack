@@ -53,14 +53,23 @@ Subcommands
         --json prints the full state dict.
 
     claude-watch-ack ack <id>
-        Remove a single alert by id. Exit 0 if ack'd, exit 1 if id was
+        Print the FULL alert body, then remove that single alert by id.
+        The body is ALWAYS surfaced before the clear so a "reflexive ack
+        without reading" is structurally impossible -- the text lands in
+        the transcript on the way out. Exit 0 if ack'd, exit 1 if id was
         not found (printable to stderr).
 
-    claude-watch-ack ack --all
-        Remove every pending alert.
+    claude-watch-ack ack --all [--confirm-read]
+        Remove EVERY pending alert. Guarded: a bare `ack --all` REFUSES
+        and instead PRINTS every pending alert body, then exits non-zero
+        telling you to either ack each alert by id or re-run with
+        `--confirm-read`. You can only blanket-clear AFTER the bodies have
+        been surfaced and you echo back `--confirm-read`. This kills the
+        blind `ack --all` footgun that let alerts (and the kill loop they
+        described) get cleared unread.
 
-    claude-watch-ack clear
-        Alias for `ack --all`.
+    claude-watch-ack clear [--confirm-read]
+        Alias for `ack --all` -- same read-confirm guard applies.
 
     claude-watch-ack status [--json]
         Print "OK" + exit 0 when no alerts pending; print the count +
@@ -73,7 +82,7 @@ Exit codes
 
     0  success
     1  no such alert (ack <missing-id>)
-    2  bad usage / argparse failure
+    2  bad usage / argparse failure / `ack --all` refused (no --confirm-read)
 """
 
 from __future__ import annotations
@@ -206,6 +215,24 @@ def _human_age(created_at: int) -> str:
     return f"{delta // 3600}h{(delta % 3600) // 60:02d}m"
 
 
+def _render_alert(a: dict) -> str:
+    """Render an alert as a multi-line block: id/age/source header plus
+    the FULL message body. Used by `ack` so the content is always
+    surfaced (in the transcript) before the alert is cleared -- the
+    structural guarantee against blind-ack.
+    """
+    if not isinstance(a, dict):
+        return f"  (malformed alert entry: {a!r})"
+    age = _human_age(a.get("created_at", 0))
+    source = a.get("source", "?")
+    body = a.get("message") or "(empty)"
+    indented = "\n".join("    " + line for line in body.splitlines()) or "    (empty)"
+    return (
+        f"  {a.get('id')}  age={age}  source={source}\n"
+        f"{indented}"
+    )
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     state = _load_state()
     if args.json:
@@ -242,19 +269,55 @@ def cmd_ack(args: argparse.Namespace) -> int:
     state = _load_state()
     alerts = state.get("alerts") or []
     if args.all:
+        dict_alerts = [a for a in alerts if isinstance(a, dict)]
+        if not dict_alerts:
+            # Nothing to clear -- not an error, no read needed.
+            state["alerts"] = []
+            _save_state(state)
+            _write_ack_timestamp()
+            print("ack'd 0 alert(s)")
+            return 0
+        # Blind-ack guard: ALWAYS print every body first. Without an
+        # explicit --confirm-read echo, REFUSE to clear -- the operator
+        # (or agent) must demonstrably have seen the content. This makes
+        # a reflexive `ack --all` that masks an unread alert impossible.
+        print(f"{len(dict_alerts)} pending claude-watch alert(s) -- "
+              f"FULL bodies below; read before clearing:\n")
+        for a in dict_alerts:
+            print(_render_alert(a))
+            print()
+        if not args.confirm_read:
+            print("REFUSED: `ack --all` will not clear unread alerts.",
+                  file=sys.stderr)
+            print("The bodies are printed above. To clear them, EITHER ack "
+                  "each by id (`claude-watch-ack ack <id>`), OR -- only after "
+                  "reading the bodies above -- re-run with --confirm-read:",
+                  file=sys.stderr)
+            print("    claude-watch-ack ack --all --confirm-read",
+                  file=sys.stderr)
+            return 2
         cleared = len(alerts)
         state["alerts"] = []
         _save_state(state)
         _write_ack_timestamp()
-        print(f"ack'd {cleared} alert(s)")
+        print(f"ack'd {cleared} alert(s) (bodies surfaced above)")
         return 0
     if not args.alert_id:
         print("claude-watch-ack: ack requires <id> or --all", file=sys.stderr)
         return 2
-    new_alerts = [a for a in alerts if isinstance(a, dict) and a.get("id") != args.alert_id]
-    if len(new_alerts) == len(alerts):
+    target = next(
+        (a for a in alerts
+         if isinstance(a, dict) and a.get("id") == args.alert_id),
+        None,
+    )
+    if target is None:
         print(f"claude-watch-ack: no such alert: {args.alert_id}", file=sys.stderr)
         return 1
+    # Surface the FULL body before removing it -- the read happens in the
+    # same breath as the clear, so the content always lands in context.
+    print("acking claude-watch alert (full body):")
+    print(_render_alert(target))
+    new_alerts = [a for a in alerts if not (isinstance(a, dict) and a.get("id") == args.alert_id)]
     state["alerts"] = new_alerts
     _save_state(state)
     _write_ack_timestamp()
@@ -263,9 +326,13 @@ def cmd_ack(args: argparse.Namespace) -> int:
 
 
 def cmd_clear(args: argparse.Namespace) -> int:
-    """Alias for `ack --all`."""
+    """Alias for `ack --all` -- inherits the read-confirm guard."""
     args.all = True
     args.alert_id = None
+    # `confirm_read` is set by the clear subparser's own flag; default
+    # to False if (e.g. an old caller) didn't supply it.
+    if not hasattr(args, "confirm_read"):
+        args.confirm_read = False
     return cmd_ack(args)
 
 
@@ -307,14 +374,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print the full state dict as JSON")
     p_list.set_defaults(func=cmd_list)
 
-    p_ack = sub.add_parser("ack", help="acknowledge an alert")
+    p_ack = sub.add_parser("ack", help="acknowledge an alert (prints body first)")
     p_ack.add_argument("alert_id", nargs="?", default=None,
                        help="alert id to ack (omit + use --all to clear all)")
     p_ack.add_argument("--all", action="store_true",
-                       help="ack every pending alert")
+                       help="ack every pending alert (requires --confirm-read)")
+    p_ack.add_argument("--confirm-read", dest="confirm_read", action="store_true",
+                       help="confirm you read the bodies; required to clear "
+                            "with --all (bare --all only prints + refuses)")
     p_ack.set_defaults(func=cmd_ack)
 
     p_clear = sub.add_parser("clear", help="ack every pending alert (alias for `ack --all`)")
+    p_clear.add_argument("--confirm-read", dest="confirm_read", action="store_true",
+                         help="confirm you read the bodies; required to clear "
+                              "(bare `clear` only prints + refuses)")
     p_clear.set_defaults(func=cmd_clear, all=True, alert_id=None)
 
     p_status = sub.add_parser("status", help="exit 0 when clean, exit 1 when blocked")

@@ -84,6 +84,25 @@ pub struct GeneralConfig {
     /// same global ceiling as every other fire path.
     #[serde(default = "default_global_cooldown_exempt_watcher_down")]
     pub global_cooldown_exempt_watcher_down: bool,
+    /// Minimum dwell (seconds) between ARMING an obligation (writing a
+    /// pending alert + emitting an event, the first detection cycle) and
+    /// ESCALATING to a tmux interrupt. The two-phase escalation (BUG 1 fix)
+    /// gives the obligation gate a chance to bite first. `0` disables the
+    /// precedence gate entirely — restoring the legacy arm+interrupt
+    /// same-cycle behavior.
+    #[serde(default = "default_obligation_dwell_secs")]
+    pub obligation_dwell_secs: u64,
+    /// Exponential base for the global interrupt cooldown backoff. The
+    /// effective cooldown is `post_interrupt_cooldown_secs *
+    /// global_cooldown_backoff_base ^ global_interrupt_streak`, capped at
+    /// `global_cooldown_max_secs`. `1` (or `0`) = flat cooldown (the exact
+    /// legacy behavior).
+    #[serde(default = "default_global_cooldown_backoff_base")]
+    pub global_cooldown_backoff_base: u64,
+    /// Cap (seconds) for the exponential global cooldown so a long interrupt
+    /// streak can't suppress all interrupts indefinitely.
+    #[serde(default = "default_global_cooldown_max_secs")]
+    pub global_cooldown_max_secs: u64,
 }
 
 fn default_post_interrupt_cooldown_secs() -> u64 {
@@ -95,6 +114,18 @@ fn default_post_interrupt_cooldown_secs() -> u64 {
 
 fn default_global_cooldown_exempt_watcher_down() -> bool {
     true
+}
+
+fn default_obligation_dwell_secs() -> u64 {
+    90
+}
+
+fn default_global_cooldown_backoff_base() -> u64 {
+    2
+}
+
+fn default_global_cooldown_max_secs() -> u64 {
+    1800
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
