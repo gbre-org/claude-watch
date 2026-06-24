@@ -61,7 +61,7 @@ const initialHTML = `<!doctype html>
   <main id="queue-root">
     <section id="section-running">
       <h2 class="section-title">Running <span class="section-count">1</span></h2>
-      <article class="item state-running drop-zone log-clickable" data-queue-id="q-aaaa" data-queue-status="running" data-queue-starting="0" data-queue-summary="alpha" data-queue-description="" data-agent-id="agent-aaaa" data-log-mode="live" tabindex="0" role="button">
+      <article id="queue-q-aaaa" class="item state-running drop-zone log-clickable" data-queue-id="q-aaaa" data-queue-status="running" data-queue-starting="0" data-queue-summary="alpha" data-queue-description="" data-agent-id="agent-aaaa" data-log-mode="live" tabindex="0" role="button">
         <header class="item-head"><span class="badge state-running">running</span><span class="id">q-aaaa</span><span class="prio" title="priority">p3</span><button type="button" class="action-btn stop-btn" data-action="stop" data-id="q-aaaa" data-summary="alpha">stop</button></header>
         <p class="summary">alpha</p>
         <div class="age"><span>running 5m ago</span></div>
@@ -70,12 +70,12 @@ const initialHTML = `<!doctype html>
     </section>
     <section id="section-pending">
       <h2 class="section-title">Pending <span class="section-count">2</span></h2>
-      <article class="item state-pending drop-zone draggable ready" draggable="true" data-queue-id="q-bbbb" data-queue-status="pending" data-queue-summary="beta">
+      <article id="queue-q-bbbb" class="item state-pending drop-zone draggable ready" draggable="true" data-queue-id="q-bbbb" data-queue-status="pending" data-queue-summary="beta">
         <header class="item-head"><span class="badge state-pending">pending</span><span class="badge ghead">ready</span><span class="id">q-bbbb</span><span class="prio" title="priority">p4</span><span class="drag-handle">☰</span><button type="button" class="action-btn abandon-btn" data-action="abandon" data-id="q-bbbb" data-summary="beta">abandon</button></header>
         <p class="summary">beta</p>
         <div class="age"><span>created 2m ago</span></div>
       </article>
-      <article class="item state-pending drop-zone draggable" draggable="true" data-queue-id="q-cccc" data-queue-status="pending" data-queue-summary="gamma">
+      <article id="queue-q-cccc" class="item state-pending drop-zone draggable" draggable="true" data-queue-id="q-cccc" data-queue-status="pending" data-queue-summary="gamma">
         <header class="item-head"><span class="badge state-pending">pending</span><span class="id">q-cccc</span><span class="prio" title="priority">p5</span><span class="drag-handle">☰</span><button type="button" class="action-btn abandon-btn" data-action="abandon" data-id="q-cccc" data-summary="gamma">abandon</button></header>
         <p class="summary">gamma</p>
         <div class="age"><span>created 1m ago</span></div>
@@ -523,6 +523,72 @@ assert('T18a: #section-blocked materializes on tick when blocked item appears',
   !!$('#section-blocked'));
 assert('T18b: q-zzzz rendered',
   !!$('article[data-queue-id="q-zzzz"]'));
+
+// === TEST 19: running card with a nested subagent tree updates IN PLACE
+// across a refresh tick — the article keeps its identity (morphdom key
+// matches the server paint) and the subagent hierarchy survives. ===
+//
+// REGRESSION (refresh-flatten): the running <article> must carry
+// id="queue-<id>" so getNodeKey (keys by el.id first) yields the SAME key
+// as the server paint. If the renderer omits it, the article keys as
+// "qid:<id>" instead of "queue-<id>" → KEY MISMATCH → morphdom discards the
+// server card (with its nested subagent <ul>) and recreates it every tick,
+// which flapped/flattened the subagent tree. Here we seed a server-painted
+// running card with a child→grandchild tree, tick with the SAME data, and
+// require: (a) the article element identity is preserved (no discard), and
+// (b) the grandchild stays nested under the child.
+const treeHTML =
+  '<details class="prompt-toggle subagent-tree" open data-tree-key="q-tree1">' +
+  '<summary class="prompt-summary">Subagents (1)</summary>' +
+  '<ul class="subagent-list">' +
+  '<li class="subagent-node subagent-log-clickable" data-subagent-id="childAAAA" data-log-mode="subagent" tabindex="0" role="button">' +
+  '<code class="subagent-id">childAAAA</code><span class="subagent-label">Child.</span><span class="subagent-age">1m</span>' +
+  '<ul class="subagent-list subagent-children">' +
+  '<li class="subagent-node subagent-log-clickable" data-subagent-id="grandBBBB" data-log-mode="subagent" tabindex="0" role="button">' +
+  '<code class="subagent-id">grandBBBB</code><span class="subagent-label">Grand.</span><span class="subagent-age">0s</span>' +
+  '</li></ul></li></ul></details>';
+const serverCard =
+  '<article id="queue-q-tree1" class="item state-running drop-zone log-clickable" ' +
+  'data-queue-id="q-tree1" data-queue-status="running" data-created-by="" ' +
+  'data-queue-starting="0" data-queue-summary="treecard" data-queue-description="" ' +
+  'data-agent-id="agent-tree1" data-log-mode="live" tabindex="0" role="button">' +
+  '<header class="item-head"><span class="badge state-running">running</span>' +
+  '<span class="id">q-tree1</span><span class="prio">p3</span>' +
+  '<button type="button" class="action-btn stop-btn" data-action="stop" data-id="q-tree1" data-summary="treecard">stop</button></header>' +
+  '<p class="summary">treecard</p><div class="age"><span>running 1m</span></div>' +
+  treeHTML + '</article>';
+// Inject the server-painted card into #section-running (as the only running
+// item) to mimic the Jinja initial paint.
+$('#section-running').insertAdjacentHTML('beforeend', serverCard);
+const treeState = JSON.parse(JSON.stringify(stateE));
+treeState.blocked = [];
+treeState.totals.blocked = 0;
+treeState.running = [{
+  id: 'q-tree1', summary: 'treecard', description: '', scope: [],
+  group_head: false, status: 'running', priority: 3, created_by: '',
+  depends_on: [], started_at_iso: '2026-05-01T19:59:00Z', age: '1m',
+  is_starting: false,
+  owner: { mode: 'agent', alive: true, agent_id: 'agent-tree1', jsonl_age: '5s' },
+  subagents: [
+    { subagent_id: 'childAAAA', label: 'Child.', age: '1m', age_seconds: 60, queue_id: 'q-tree1', kind: 'child',
+      children: [ { subagent_id: 'grandBBBB', label: 'Grand.', age: '0s', age_seconds: 0, queue_id: 'q-tree1', kind: 'child', children: [] } ] },
+  ],
+}];
+treeState.totals.running = 1;
+const treeCardBefore = $('article[data-queue-id="q-tree1"]');
+refresh.mergeQueueRoot(treeState);
+refresh.applySubtreeState();
+const treeCardAfter = $('article[data-queue-id="q-tree1"]');
+assert('T19a: running card with subagent tree updates IN PLACE (identity preserved, not discarded)',
+  treeCardBefore && treeCardAfter && treeCardBefore === treeCardAfter,
+  treeCardAfter ? `before===after: ${treeCardBefore === treeCardAfter}` : 'card vanished');
+assert('T19b: running card keeps id="queue-q-tree1" after merge (morphdom key intact)',
+  treeCardAfter && treeCardAfter.id === 'queue-q-tree1',
+  treeCardAfter ? `id=${treeCardAfter.id}` : 'no card');
+const gcNested = treeCardAfter &&
+  treeCardAfter.querySelector('li[data-subagent-id="childAAAA"] > ul.subagent-children > li[data-subagent-id="grandBBBB"]');
+assert('T19c: grandchild stays nested under child after refresh (no flatten)',
+  !!gcNested);
 
 console.log('---');
 if (failures) {
