@@ -983,6 +983,196 @@ class SubagentTreeTest(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
         self.assertFalse(r.get_json().get("ok"))
 
+    # ---------- initial-paint ↔ SPA-refresh parity (anti-flatten) ----------
+
+    def _seed_grandchild_running(self):
+        """Seed a running item with a 3-level subagent chain
+        owner -> child -> grandchild (all bound to the same item via the
+        arm-hook bindings + transcript spawn records). Returns the qid.
+
+        Shared fixture for the two parity regressions below; mirrors
+        ``test_grandchild_nests_under_child`` so the shaped ``subagents``
+        carries a genuinely-nested tree (child at top, grandchild under it).
+        """
+        item = _add(self.env, "refresh-parity chain", ["repo:subagent-parity"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "ffff0011-2233-4455-6677-880000000006"
+        owner_id = "aaaa1111bbbb2222c"
+        child_id = "cccc3333dddd4444e"
+        grandchild_id = "eeee5555ffff6666a"
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
+        self._seed_parent_with_spawn(
+            self.jsonl_root, session_uuid, owner_id, qid, child_id)
+        self._seed_parent_with_spawn(
+            self.jsonl_root, session_uuid, child_id, qid, grandchild_id)
+        self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, grandchild_id, qid)
+        self._seed_bindings(
+            {owner_id: qid, child_id: qid, grandchild_id: qid})
+        self.appmod._cache.fetched_at = 0.0
+        return qid, child_id, grandchild_id
+
+    @staticmethod
+    def _flatten_tree(nodes):
+        """Flatten a nested subagent node list to a set of
+        ``(subagent_id, parent_subagent_id_or_None, kind)`` triples so two
+        renders can be compared structurally (nesting + kind), independent of
+        ordering / display-only fields."""
+        out = set()
+
+        def walk(nlist, parent):
+            for n in nlist:
+                sid = n.get("subagent_id")
+                out.add((sid, parent, n.get("kind")))
+                walk(n.get("children") or [], sid)
+
+        walk(nodes, None)
+        return out
+
+    def test_refresh_path_subagent_structure_matches_initial_render(self):
+        """The SPA refresh path (GET /api/queue JSON) and the initial
+        server-render path (GET /) MUST expose the IDENTICAL nested subagent
+        structure for the same running item.
+
+        Both routes call the SAME ``_render_payload`` builder, so any
+        divergence (jsonify reshaping nested children, a field the template
+        tolerates but JSON omits, parent_map resolving differently per call,
+        etc.) would let the 5s refresh tick re-render a DIFFERENT tree than the
+        server painted — the flatten symptom. This pins data parity: the
+        ``it.subagents`` the template iterates (HTML) and the ``it.subagents``
+        the refresh.js renderer iterates (JSON) carry the same
+        (id, parent, kind) graph including the deep grandchild nesting.
+        """
+        qid, child_id, grandchild_id = self._seed_grandchild_running()
+
+        # Refresh path: /api/queue JSON.
+        self.appmod._cache.fetched_at = 0.0
+        jr = self.client.get("/api/queue")
+        self.assertEqual(jr.status_code, 200, jr.get_data(as_text=True))
+        jrun = next(r for r in jr.get_json()["running"] if r["id"] == qid)
+        json_struct = self._flatten_tree(jrun["subagents"])
+
+        # The JSON path must carry the genuine nesting.
+        self.assertIn((child_id, None, "child"), json_struct,
+                      f"child must be a top-level child node: {json_struct}")
+        self.assertIn((grandchild_id, child_id, "child"), json_struct,
+                      f"grandchild must nest under child: {json_struct}")
+
+        # Initial-render path: parse the / HTML subagent tree into the same
+        # (id, parent, kind) triples and require an EXACT structural match.
+        self.appmod._cache.fetched_at = 0.0
+        hr = self.client.get("/")
+        self.assertEqual(hr.status_code, 200)
+        html = hr.get_data(as_text=True)
+        html_struct = self._parse_html_subagent_struct(html, qid)
+
+        self.assertEqual(
+            html_struct, json_struct,
+            "initial-render (/) and refresh (/api/queue) subagent structures "
+            f"diverge:\n  HTML={sorted(html_struct)}\n  JSON={sorted(json_struct)}",
+        )
+
+    @staticmethod
+    def _parse_html_subagent_struct(html, qid):
+        """Extract (subagent_id, parent_subagent_id_or_None, kind) triples from
+        the running card's rendered subagent-tree <ul>/<li> markup. Uses
+        Python's stdlib HTMLParser (no external dep) and tracks nesting via the
+        <ul class="subagent-children"> wrappers + each <li>'s data-subagent-id /
+        subagent-peer class (kind="peer" when present, else "child")."""
+        import re
+        from html.parser import HTMLParser
+
+        # Narrow to this card's subagent-tree <details> block.
+        m = re.search(
+            r'<article[^>]*id="queue-' + re.escape(qid) + r'".*?'
+            r'(<details class="prompt-toggle subagent-tree".*?</details>)',
+            html, re.S)
+        if not m:
+            return set()
+        block = m.group(1)
+
+        triples = set()
+
+        class P(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.stack = []  # current chain of open subagent <li> ids
+
+            def handle_starttag(self, tag, attrs):
+                a = dict(attrs)
+                if tag == "li" and "subagent-node" in (a.get("class") or ""):
+                    sid = a.get("data-subagent-id")
+                    kind = ("peer" if "subagent-peer" in (a.get("class") or "")
+                            else "child")
+                    parent = self.stack[-1] if self.stack else None
+                    triples.add((sid, parent, kind))
+                    self.stack.append(sid)
+
+            def handle_endtag(self, tag):
+                if tag == "li" and self.stack:
+                    self.stack.pop()
+
+        P().feed(block)
+        return triples
+
+    def test_running_card_morphdom_key_matches_initial_render(self):
+        """REGRESSION (refresh-flatten): the running <article> emitted by the
+        SPA refresh renderer (static/refresh.js ``renderRunningItem``) MUST
+        carry the SAME ``id="queue-<id>"`` the Jinja template paints, so the
+        morphdom merge key is identical across the initial paint and the 5s
+        refresh tick.
+
+        ``getNodeKey`` (refresh.js) keys nodes by ``el.id`` FIRST, falling back
+        to ``data-queue-id`` (``qid:<id>``). The server paints
+        ``id="queue-<id>"`` (morphdom key ``queue-<id>``). If the refresh
+        renderer OMITS the id, its node keys as ``qid:<id>`` — a KEY MISMATCH —
+        so the first tick can't match the keyed server card to the new node and
+        morphdom DISCARDS the server-painted running card (INCLUDING its nested
+        subagent tree) and inserts a freshly-built one. That wholesale
+        discard/recreate is what flapped the subagent hierarchy on refresh.
+
+        This asserts BOTH halves of the key contract:
+          1. the server (/) running <article> carries ``id="queue-<qid>"``;
+          2. ``renderRunningItem`` in static/refresh.js emits the same
+             ``id="queue-${attr(it.id)}"`` attribute on its running <article>.
+        Pre-fix (1) holds but (2) is absent — this test FAILS; post-fix both
+        hold and it PASSES.
+        """
+        import re
+
+        qid, _child, _gc = self._seed_grandchild_running()
+
+        # (1) Server paint carries id="queue-<qid>" on the running card.
+        self.appmod._cache.fetched_at = 0.0
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertRegex(
+            html,
+            r'<article[^>]*\bid="queue-' + re.escape(qid) + r'"',
+            "server-rendered running <article> must carry id=queue-<qid>")
+
+        # (2) The refresh renderer must emit the SAME id attribute so the
+        # morphdom key matches. Inspect the shipped refresh.js source for the
+        # running <article> template literal.
+        refresh_js = (HERE / "static" / "refresh.js").read_text()
+        run_fn = refresh_js.split("function renderRunningItem", 1)
+        self.assertEqual(len(run_fn), 2, "renderRunningItem not found in refresh.js")
+        # Bound the scan to renderRunningItem's body (up to the next function).
+        body = run_fn[1].split("\n  function ", 1)[0]
+        # The running <article> template literal that getNodeKey will key on.
+        m = re.search(r'`<article\b[^`]*data-queue-status="running"', body)
+        self.assertIsNotNone(
+            m, "could not locate the running <article> template literal")
+        article_open = m.group(0)
+        self.assertIn(
+            'id="queue-${attr(it.id)}"', article_open,
+            "renderRunningItem must emit id=\"queue-${attr(it.id)}\" on the "
+            "running <article> so its morphdom key matches the server paint "
+            "(getNodeKey keys by el.id first); without it the SPA refresh "
+            "discards + recreates the running card every tick, flattening the "
+            "subagent tree. Found: " + article_open)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
