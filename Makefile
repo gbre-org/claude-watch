@@ -189,6 +189,7 @@ test-entrypoint:
 	container/tests/claude-watch-alert-gate-wired.test
 	container/tests/dispatch-gate-wired.test
 	container/tests/event-must-act-wired.test
+	container/tests/user-obligation-manifest-wired.test
 	container/tests/agent-ack-mainloop-scope.test
 	container/tests/agent-comms-baked.test
 	container/tests/compose-mount-modes.test

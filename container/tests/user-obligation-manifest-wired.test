@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""user-obligation-manifest-wired.test — verify the bind-mounted,
+USER-MANAGED obligation-manifest mechanism is wired end-to-end.
+
+WHAT THIS GUARDS
+----------------
+Operator-specific obligations (e.g. the AskUserQuestion presence-gate) must
+NOT be baked into the shared container image and must NOT depend on an
+imperative `register-*.sh` re-run each session (session-scoped obligation
+state is WIPED on every container recreate). Instead they live as declarative
+`*.json` manifests in the operator's PRIVATE bind-mounted config dir, which
+`obligations-init` applies idempotently on EVERY container start, AFTER the
+baked default-seed rows.
+
+This test asserts:
+
+  1. obligations-init defines `seed_from_manifest_dir()` + helpers and WIRES
+     it into main() (reading the dir from $CLAUDE_OBLIGATIONS_MANIFEST_DIR,
+     defaulting to DEFAULT_MANIFEST_DIR).
+  2. The entrypoint exports CLAUDE_OBLIGATIONS_MANIFEST_DIR before invoking
+     obligations-init.
+  3. examples/compose/docker-compose.yml adds the CLAUDE_HOST_OBLIGATIONS_DIR
+     bind-mount at /mnt/host-obligations-config (ro), with a /dev/null default.
+  4. .env.example + README document CLAUDE_HOST_OBLIGATIONS_DIR.
+  5. baked-CLAUDE.md notes the operator-manifest mechanism.
+  6. FUNCTIONAL: a manifest dry-run emits the correct `obligations add`
+     invocation (replace-not-duplicate marker included).
+  7. FUNCTIONAL: an absent / empty / non-directory (/dev/null) manifest dir is
+     a clean no-op (heeds the #417 ENOTDIR lesson — obligations-init guards
+     with os.path.isdir()).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+OBLIGATIONS_INIT = REPO_ROOT / "tools" / "obligations" / "obligations-init"
+OBLIGATIONS_CLI = REPO_ROOT / "tools" / "obligations" / "obligations"
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+COMPOSE = REPO_ROOT / "examples" / "compose" / "docker-compose.yml"
+ENV_EXAMPLE = REPO_ROOT / "examples" / "compose" / ".env.example"
+README = REPO_ROOT / "examples" / "compose" / "README.md"
+BAKED_CLAUDE_MD = CONTAINER_DIR / "baked-CLAUDE.md"
+
+MOUNT_TARGET = "/mnt/host-obligations-config"
+HOST_VAR = "CLAUDE_HOST_OBLIGATIONS_DIR"
+IN_CONTAINER_VAR = "CLAUDE_OBLIGATIONS_MANIFEST_DIR"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        print(f"  FAIL {msg}")
+        failures.append(msg)
+
+
+# ---------------------------------------------------------------- 1
+
+def test_obligations_init_defines_and_wires_seed() -> None:
+    text = OBLIGATIONS_INIT.read_text()
+    expect("def seed_from_manifest_dir(" in text,
+           "obligations-init must define seed_from_manifest_dir()")
+    expect("def _apply_one_manifest(" in text,
+           "obligations-init must define _apply_one_manifest()")
+    expect("DEFAULT_MANIFEST_DIR" in text,
+           "obligations-init must define DEFAULT_MANIFEST_DIR")
+    expect(f'"{MOUNT_TARGET}"' in text,
+           f"DEFAULT_MANIFEST_DIR must point at {MOUNT_TARGET}")
+    # Wired into main(): read env, call seed_from_manifest_dir, fold rc.
+    expect(f'os.environ.get(\n        "{IN_CONTAINER_VAR}"' in text
+           or f'os.environ.get("{IN_CONTAINER_VAR}"' in text,
+           f"main() must read {IN_CONTAINER_VAR} from env")
+    expect("seed_from_manifest_dir(\n        cli, manifest_dir" in text
+           or "seed_from_manifest_dir(cli, manifest_dir" in text,
+           "main() must call seed_from_manifest_dir with the manifest dir")
+    expect("rc8" in text and "or rc8" in text,
+           "main() must fold the manifest seed rc into its return")
+    # Idempotency-by-signature, not by deny_message.
+    expect("[user-manifest]" in text,
+           "manifested rows must carry a [user-manifest] created_by marker "
+           "for replace-not-duplicate idempotency")
+    expect("os.path.isdir(manifest_dir)" in text,
+           "seed_from_manifest_dir must guard with os.path.isdir() (ENOTDIR "
+           "safety, #417 lesson)")
+
+
+# ---------------------------------------------------------------- 2
+
+def test_entrypoint_exports_manifest_dir() -> None:
+    text = ENTRYPOINT.read_text()
+    expect(f"export {IN_CONTAINER_VAR}" in text,
+           f"entrypoint must export {IN_CONTAINER_VAR}")
+    expect(f'{IN_CONTAINER_VAR}="${{{IN_CONTAINER_VAR}:-{MOUNT_TARGET}}}"'
+           in text,
+           f"entrypoint must default {IN_CONTAINER_VAR} to {MOUNT_TARGET}")
+
+
+# ---------------------------------------------------------------- 3
+
+def test_compose_adds_obligations_mount() -> None:
+    text = COMPOSE.read_text()
+    expect(MOUNT_TARGET in text,
+           f"docker-compose.yml must reference {MOUNT_TARGET}")
+    # The mount line: ${CLAUDE_HOST_OBLIGATIONS_DIR:-/dev/null}:<target>:ro
+    expected = (f'"${{{HOST_VAR}:-/dev/null}}:{MOUNT_TARGET}:ro"')
+    expect(expected in text,
+           f"docker-compose.yml must mount {expected}")
+
+
+# ---------------------------------------------------------------- 4
+
+def test_docs_mention_host_var() -> None:
+    env_ex = ENV_EXAMPLE.read_text()
+    expect(HOST_VAR in env_ex,
+           f".env.example must document {HOST_VAR}")
+    readme = README.read_text()
+    expect(HOST_VAR in readme,
+           f"README must document {HOST_VAR}")
+    expect("Operator obligation manifests" in readme,
+           "README must have an 'Operator obligation manifests' section")
+
+
+# ---------------------------------------------------------------- 5
+
+def test_baked_claude_md_notes_mechanism() -> None:
+    md = BAKED_CLAUDE_MD.read_text()
+    expect(HOST_VAR in md,
+           f"baked-CLAUDE.md must mention {HOST_VAR}")
+    expect(MOUNT_TARGET in md,
+           f"baked-CLAUDE.md must mention {MOUNT_TARGET}")
+    expect("Operator obligation manifests" in md,
+           "baked-CLAUDE.md must note the operator-manifest mechanism")
+
+
+# ---------------------------------------------------------------- 6
+
+def _run_init(manifest_dir: str, extra_env: dict | None = None,
+              dry_run: bool = True) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env[IN_CONTAINER_VAR] = manifest_dir
+    # Put the in-repo obligations CLI on PATH so _resolve_cli() finds it.
+    env["PATH"] = f"{OBLIGATIONS_CLI.parent}:{env.get('PATH', '')}"
+    if extra_env:
+        env.update(extra_env)
+    argv = [sys.executable, str(OBLIGATIONS_INIT), "-v"]
+    if dry_run:
+        argv.append("--dry-run")
+    return subprocess.run(
+        argv, capture_output=True, text=True, env=env, timeout=30, check=False,
+    )
+
+
+def test_manifest_dryrun_emits_add() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        mdir = Path(td)
+        (mdir / "presence-gate.json").write_text(json.dumps({
+            "tool_pattern": "AskUserQuestion",
+            "predicate": "file_mtime_within",
+            "params": {"path": "~/.claude/operator-present",
+                       "max_age_secs": 90},
+            "ttl": 0,
+            "enforcement": "gate",
+            "deny_msg": "presence stale — blocked",
+            "created_by": "claude-config:presence-gate",
+            "mandatory": False,
+        }), encoding="utf-8")
+        proc = _run_init(str(mdir))
+        expect(proc.returncode == 0,
+               f"dry-run rc={proc.returncode}\n{proc.stderr}")
+        out = proc.stdout + proc.stderr
+        expect("--tool-pattern AskUserQuestion" in out,
+               f"dry-run must emit the AskUserQuestion add; got:\n{out}")
+        expect("--predicate file_mtime_within" in out,
+               "dry-run must emit the file_mtime_within predicate")
+        expect("claude-config:presence-gate [user-manifest]" in out,
+               "manifested row's created_by must carry the [user-manifest] "
+               f"marker; got:\n{out}")
+
+
+# ---------------------------------------------------------------- 7
+
+def test_absent_and_nondir_are_noops() -> None:
+    # Absent dir.
+    proc = _run_init("/nonexistent/obligations/xyz")
+    expect(proc.returncode == 0,
+           f"absent manifest dir must exit 0; rc={proc.returncode}")
+    out = proc.stdout + proc.stderr
+    expect("absent / not-a-dir" in out,
+           f"absent dir must report a clean no-op; got:\n{out}")
+
+    # Non-directory (/dev/null) — the #417 ENOTDIR lesson: must NOT crash.
+    proc = _run_init("/dev/null")
+    expect(proc.returncode == 0,
+           f"/dev/null manifest dir must exit 0 (no ENOTDIR); "
+           f"rc={proc.returncode}\n{proc.stderr}")
+    out = proc.stdout + proc.stderr
+    expect("absent / not-a-dir" in out,
+           f"/dev/null must be treated as no-op; got:\n{out}")
+
+    # Empty dir.
+    with tempfile.TemporaryDirectory() as td:
+        proc = _run_init(td)
+        expect(proc.returncode == 0,
+               f"empty manifest dir must exit 0; rc={proc.returncode}")
+        out = proc.stdout + proc.stderr
+        expect("empty -- no user obligations" in out,
+               f"empty dir must report a clean no-op; got:\n{out}")
+
+
+def main() -> int:
+    tests = [
+        test_obligations_init_defines_and_wires_seed,
+        test_entrypoint_exports_manifest_dir,
+        test_compose_adds_obligations_mount,
+        test_docs_mention_host_var,
+        test_baked_claude_md_notes_mechanism,
+        test_manifest_dryrun_emits_add,
+        test_absent_and_nondir_are_noops,
+    ]
+    for t in tests:
+        print(f"== {t.__name__} ==")
+        t()
+    if failures:
+        print(f"\nFAIL user-obligation-manifest-wired.test "
+              f"({len(failures)} assertion(s) failed)")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"\nPASS user-obligation-manifest-wired.test "
+          f"({len(tests)} test functions, all assertions passed)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
