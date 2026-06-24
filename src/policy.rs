@@ -233,7 +233,7 @@ pub(crate) fn apply_heartbeat_fresh_rearm(
 /// long as it takes to clear. The watcher-down
 /// inject must be allowed to fire even when another interrupt fired
 /// recently. The per-watcher `last_watcher_inject` cooldown
-/// (`watcher_monitor.inject_cooldown`, default 150s) still rate-limits
+/// (`watcher_monitor.inject_cooldown`, default 300s) still rate-limits
 /// re-injects on the same fire path.
 ///
 /// A `cooldown_secs` of 0 disables the gate entirely.
@@ -5026,14 +5026,21 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         }),
                     );
 
-                    // Interrupt first (like prolonged-thinking) to break any inline work
-                    if tmux::interrupt_and_wait(&effective_pane, 10).await {
-                        info!("watcher inject: Claude Code is idle after interrupt");
-                    } else {
-                        warn!("watcher inject: could not confirm idle, injecting anyway");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
+                    // KNOB #4 (2026-06-24): watcher-down is a ROUTINE tier — the
+                    // recovery action is "spawn the restart command as a
+                    // background task", which can wait for the next turn
+                    // boundary. The OLD behavior (interrupt_and_wait: a
+                    // rapid-fire Escape blast "to break any inline work") was
+                    // the single most destructive part of the watcher-down
+                    // storm: it CANCELLED the loop's in-flight turn AND killed
+                    // any mid-flight background agents, every re-fire — turning
+                    // a benign "restart a watcher" nudge into repeated
+                    // turn-aborts that made the loop spend all its cycles
+                    // recovering instead of working. So we no longer Escape
+                    // here; we QUEUE the restart prompt via the non-cancelling
+                    // path (`inject_to_agent_queued`). The prompt + the
+                    // structured claude-event below are unchanged.
+                    //
                     // Build specific restart commands
                     let restart_cmds: Vec<String> = missing_names
                         .iter()
@@ -5045,7 +5052,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         missing_list,
                         restart_cmds.join(", ")
                     );
-                    inject_dispatch::inject_to_agent(&effective_pane, &prompt).await;
+                    inject_dispatch::inject_to_agent_queued(&effective_pane, &prompt).await;
                     // Third sink: claude-event so the main loop sees the
                     // missing-watchers list as structured data and can
                     // decide which restart command(s) to actually run,
@@ -5294,6 +5301,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             &config.alerts.heartbeat_stale_prompt,
                             use_pingme,
                             event_alert,
+                            // KNOB #4 (2026-06-24): heartbeat-stale is a ROUTINE
+                            // tier — recovery is a `touch` of the heartbeat file,
+                            // which can wait for the next turn boundary. Do NOT
+                            // seize the turn / kill subagents: queue the nudge.
+                            false,
                         )
                         .await;
                         // Obligation served its purpose — disarm so the next
@@ -7556,10 +7568,13 @@ cooldown = 300
 
     #[test]
     fn test_default_watcher_inject_cooldown() {
-        // Pin the 150s default (raised 60 -> 150 on 2026-06-18 so an
-        // already-surfaced watcher-down/stuck interruption re-nags the
-        // main loop ~every 2.5min instead of ~every 60s). If you change
-        // this default, also update the comment in config.rs and the
+        // Pin the 300s default (KNOB #3, raised 150 -> 300 on 2026-06-24:
+        // once a watcher-down inject has fired, re-nagging the main loop more
+        // often than ~5min was the most disruptive part of the storm, so the
+        // re-injection cadence is now ~5min; history: 60 -> 150 on 2026-06-18,
+        // 300 -> 60 on 2026-04-28). This throttles RE-FIRE of an
+        // already-surfaced interruption, NOT initial detection latency. If you
+        // change this default, also update the comment in config.rs and the
         // watcher_inject_due doc comment in policy.rs.
         use crate::config::parse_config;
         let cfg = r#"
@@ -7612,8 +7627,8 @@ cooldown = 300
 "#;
         let cfg = parse_config(cfg).expect("parse");
         assert_eq!(
-            cfg.watcher_monitor.inject_cooldown, 150,
-            "default watcher inject_cooldown should be 150s (re-inject cadence); \
+            cfg.watcher_monitor.inject_cooldown, 300,
+            "default watcher inject_cooldown should be 300s (re-inject cadence); \
              see src/policy.rs::watcher_inject_due doc comment"
         );
     }

@@ -466,11 +466,19 @@ fn default_watcher_inject_threshold() -> u32 {
 }
 
 fn default_watcher_inject_cooldown() -> u64 {
-    150
+    // KNOB #3 (watcher-down injection cadence), 2026-06-24: 150 -> 300.
+    // Mirrors config.toml. Once a watcher-down inject has fired, re-nagging
+    // the loop more often than ~5min was the most disruptive part of the
+    // storm; this throttles RE-FIRE, not initial detection (inject_threshold).
+    300
 }
 
 fn default_watcher_grace_secs() -> u64 {
-    90
+    // KNOB #1 (grace before WATCHER(S) DOWN alert), 2026-06-24: 90 -> 180.
+    // Mirrors config.toml. The block-print-exit watcher cycle (debounce up to
+    // ~120s + read + restart) must not begin accruing consecutive_missing, so
+    // a missing watcher is uncounted for its first 180s after last_seen_running.
+    180
 }
 
 fn default_suppress_inject_when_active() -> bool {
@@ -498,7 +506,12 @@ fn default_watcher_event_consumer_name() -> String {
 }
 
 fn default_watcher_health_grace_secs() -> u64 {
-    30
+    // KNOB #1 (grace), 2026-06-24: 30 -> 180. Mirrors config.toml. The
+    // obligations health gate (`watcher-status --unhealthy-only`) must not trip
+    // on the brief print-and-exit blip during the read/restart cycle, which was
+    // cancelling whole batches of unrelated tool calls. Only a SUSTAINED outage
+    // (> 3min) is a real failure worth gating on.
+    180
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1737,7 +1750,8 @@ cooldown = 300
             "claude-event-watch"
         );
         // Health-grace default (no health_grace_secs key in SAMPLE_CONFIG).
-        assert_eq!(config.watcher_monitor.health_grace_secs, 30);
+        // KNOB #1 (2026-06-24): default raised 30 -> 180.
+        assert_eq!(config.watcher_monitor.health_grace_secs, 180);
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
         assert!(config.task_watch.enabled);

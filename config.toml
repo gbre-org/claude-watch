@@ -162,20 +162,27 @@ enabled = true
 watchers_config = "~/.config/watchmen/watchers.conf"
 # Expected watchmen supervisor count
 expected_watchmen = 0
-# Consecutive missing checks before injecting restart (3 = ~30s at 10s interval).
-# Bumped from 6 → 3 — tighter detection latency, matches event_threshold so quiet-path
-# event + loud tmux-inject fire on the same cycle.
-inject_threshold = 3
+# Consecutive missing checks before the loud tmux-inject restart fires.
+# KNOB #1 (grace before WATCHER(S) DOWN inject), 2026-06-24: raised 3 -> 18.
+# The block-print-exit watcher cycle (claude-event-watch) now debounces up to
+# ~120s (KNOB #2) before delivering events; the main loop must then READ all
+# delivered events and RESTART the watcher. During that whole window the watcher
+# is legitimately "missing". At a 10s check_interval, 18 consecutive misses is
+# ~180s of SUSTAINED absence — comfortably past the normal debounce + read +
+# restart gap — so the routine cycle no longer trips a down-inject. Only a
+# genuinely-stuck loop (watcher never restarted) crosses this threshold.
+inject_threshold = 18
 # Cooldown between watcher-missing injections (seconds).
-# 2026-04-28: Tightened 300 -> 60 (PR #44). A down watcher is a hard
-# liveness failure (no signal, no events, no torrents getting through),
-# so when the previous inject didn't land — e.g. main loop was
-# mid-tool-call and ate the tmux keystroke — we want to re-inject
-# quickly rather than wait 5 minutes while the user is silent. Paired
-# with the global-post-interrupt-cooldown EXEMPTION on the watcher-down
-# path (src/policy.rs check_once); the prior cascade-suppression
-# rationale from the 2026-04-21 raise no longer applies.
-inject_cooldown = 60
+# KNOB #3 (watcher-down injection cadence), 2026-06-24: raised 60 -> 300.
+# History: 300 (orig) -> 60 (PR #44, 2026-04-28, "re-inject quickly") ->
+# 150 (PR, 2026-06-18) -> 300 here. Once a watcher-down inject has ALREADY
+# fired and surfaced, re-nagging the main loop every 60s (or 150s) was the
+# single most disruptive part of the storm: it kept seizing the loop while it
+# was trying to read events and restart the watcher. When the watcher genuinely
+# stays down, ~5min between re-injections is plenty — the operator still gets
+# the out-of-band claude-event each cycle; this only throttles the heavyweight
+# in-pane RE-FIRE, NOT initial detection latency (that is inject_threshold).
+inject_cooldown = 300
 # NOTE (2026-05-01): `auto_restart_cooldown_secs` was removed along with the
 # daemon-side auto-restart path. Watchers can ONLY be spawned by Claude
 # Code's main loop (cardinal rule); claude-watch's only emergency action
@@ -184,9 +191,12 @@ inject_cooldown = 60
 # Quiet path (PR #48): emit a `watcher-down` claude-event
 # (source=claude-watch, tag=watcher-down) when consecutive_missing hits
 # this threshold. Set below inject_threshold so the quiet path runs first
-# and the loud tmux-inject is reserved as a fallback. Default 3 (~30s at
-# 10s interval).
-event_threshold = 3
+# and the loud tmux-inject is reserved as a fallback.
+# KNOB #1, 2026-06-24: raised 3 -> 12 (~120s at 10s interval). The quiet
+# `watcher-down` claude-event still fires well before the loud inject
+# (inject_threshold=18, ~180s), but only after the ~120s event-delivery
+# debounce window (KNOB #2) has had a chance to deliver + the loop to restart.
+event_threshold = 12
 # Grace period (seconds) after a quiet-path event is emitted, during
 # which the heavyweight tmux-inject path is suppressed for the same
 # watcher. If the watcher is still missing past the grace window, the
@@ -200,6 +210,23 @@ event_command = "claude-event"
 # for the event). When THIS watcher is the missing one, claude-watch
 # skips event emission and falls through to inject immediately.
 event_consumer_watcher_name = "claude-event-watch"
+# KNOB #1 (grace before WATCHER(S) DOWN alert), 2026-06-24: set explicitly to 180.
+# grace_secs is the window after a watcher's last_seen_running during which a
+# missing watcher is NOT counted toward consecutive_missing at all. The
+# block-print-exit watcher (claude-event-watch) legitimately exits every
+# delivery; with the ~120s debounce (KNOB #2) the gap between exit and the
+# loop's restart can be ~120-150s. 180s tolerance keeps that NORMAL cycle from
+# ever beginning to accrue consecutive_missing, so no down-detection clock even
+# starts during routine operation. (Code default is 90; made explicit here.)
+grace_secs = 180
+# KNOB #1 (grace), 2026-06-24: set explicitly to 180 (code default 30).
+# health_grace_secs governs the `watcher-status --unhealthy-only` predicate the
+# obligations gate consults on EVERY tool call. At 30s, the brief print-and-exit
+# blip during the read/restart cycle could trip the gate and cancel whole
+# batches of unrelated tool calls — a major contributor to the loop spending
+# all its cycles on watcher churn instead of work. 180s matches grace_secs so
+# only a SUSTAINED outage (down > 3min) trips the health gate.
+health_grace_secs = 180
 
 [context_monitor]
 # Enable context usage monitoring and deferred self-clear
