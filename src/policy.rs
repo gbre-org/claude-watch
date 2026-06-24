@@ -468,6 +468,28 @@ pub(crate) fn workload_heartbeat_suppresses_stuck(config: &Config) -> bool {
     )
 }
 
+/// Pure decision: should the heartbeat-stale `stuck` flag be suppressed
+/// for THIS cycle?
+///
+/// Two independent proof-of-life conditions suppress the flag:
+///   * `workload_fresh` -- a `workload run` (stv-promote, rsync, ffmpeg)
+///     emitted a fresh per-label heartbeat (see
+///     `workload_heartbeat_suppresses_stuck`).
+///   * `active_subagents > 0` -- the main loop is legitimately blocked
+///     dispatcher-waiting on long-running background subagents (5-15min,
+///     few counted tool calls). Firing the Escape interrupt here would
+///     cancel the in-flight turn AND kill those healthy subagents. This
+///     mirrors the auto-respawn guard in `respawn::should_respawn`
+///     (active subagents veto a respawn) -- applied at detection time so
+///     it fixes BOTH the destructive interrupt AND the downstream
+///     `HangSignal::HeartbeatStale` fed to the respawn collector.
+///
+/// Kept pure (no /proc, no Config) so it is unit-testable; the caller
+/// computes the two inputs.
+pub(crate) fn stuck_suppressed_by_activity(workload_fresh: bool, active_subagents: u32) -> bool {
+    workload_fresh || active_subagents > 0
+}
+
 /// Reason a force-inject escalation should fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EscalationReason {
@@ -3787,12 +3809,37 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // cycle. The heartbeat-stale counter is also held
                     // back so a long workload doesn't accumulate
                     // suppressed-fire history.
-                    if workload_heartbeat_suppresses_stuck(config) {
+                    // Two proof-of-life conditions suppress the stuck flag for
+                    // this cycle: a fresh workload heartbeat (as before) OR
+                    // active background subagents. The main loop is often
+                    // LEGITIMATELY dispatcher-waiting on long-running (5-15min)
+                    // subagents with few counted tool calls -- firing the
+                    // Escape interrupt here would cancel the in-flight turn
+                    // AND kill those healthy agents. The active-subagent count
+                    // mirrors the auto-respawn guard
+                    // (`respawn::should_respawn`); applying it at DETECTION
+                    // time fixes both the destructive interrupt and the
+                    // downstream `HangSignal::HeartbeatStale` (so no stuck flag
+                    // is set and no hang-signal is fed to the respawn
+                    // collector). The count is cheap (one /proc scan) and
+                    // fail-open (returns 0 when no Claude PID is detectable).
+                    let workload_fresh = workload_heartbeat_suppresses_stuck(config);
+                    let active_subagents =
+                        crate::respawn::count_active_subagents_with_versions_dir(None);
+                    if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
                         let age_min = age / 60;
+                        let reason = if workload_fresh {
+                            "workload_heartbeat_fresh"
+                        } else {
+                            "active_subagents"
+                        };
                         debug!(
                             stale_age_min = age_min,
                             threshold_min = config.heartbeat.stale_minutes,
-                            "heartbeat-stale suppressed by fresh workload heartbeat"
+                            workload_fresh,
+                            active_subagents,
+                            reason,
+                            "heartbeat-stale suppressed (proof-of-life)"
                         );
                         write_jsonl_log(
                             &config.general.log_file,
@@ -3800,7 +3847,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             serde_json::json!({
                                 "stale_age_min": age_min,
                                 "threshold_min": config.heartbeat.stale_minutes,
-                                "reason": "workload_heartbeat_fresh",
+                                "reason": reason,
+                                "workload_fresh": workload_fresh,
+                                "active_subagents": active_subagents,
                                 "dir": &config.stuck_detection.workload_heartbeat_dir,
                                 "max_age_secs": config.stuck_detection.workload_heartbeat_max_age_secs,
                             }),
@@ -7827,6 +7876,47 @@ pane_unchanged_secs = 600
             )
         };
         assert!(suppressed_on, "master switch on must let fresh hb suppress");
+    }
+
+    // -------------------------------------------------------------------
+    // Active-subagent heartbeat-stale suppression (2026-06-24).
+    //
+    // The heartbeat-stale detection block fires a destructive Escape
+    // interrupt that kills healthy background subagents when the main
+    // loop is legitimately dispatcher-waiting on them. `stuck_suppressed_
+    // by_activity` is the pure decision the detection block uses: stuck
+    // is suppressed when EITHER a workload heartbeat is fresh OR any
+    // subagents are active. This mirrors the auto-respawn active-subagent
+    // guard (`respawn::should_respawn`), tested in `respawn.rs`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn stuck_suppressed_by_activity_truth_table() {
+        // Neither proof-of-life condition -> not suppressed (stuck may fire).
+        assert!(
+            !stuck_suppressed_by_activity(false, 0),
+            "no workload + 0 subagents must NOT suppress"
+        );
+        // Fresh workload heartbeat alone suppresses (pre-existing behavior).
+        assert!(
+            stuck_suppressed_by_activity(true, 0),
+            "fresh workload heartbeat must suppress"
+        );
+        // Active subagents alone suppress (the NEW guard -- prevents the
+        // false-positive Escape that kills healthy dispatcher-waited agents).
+        assert!(
+            stuck_suppressed_by_activity(false, 1),
+            "one active subagent must suppress"
+        );
+        assert!(
+            stuck_suppressed_by_activity(false, 5),
+            "many active subagents must suppress"
+        );
+        // Both conditions -> suppressed.
+        assert!(
+            stuck_suppressed_by_activity(true, 3),
+            "both conditions must suppress"
+        );
     }
 
 
