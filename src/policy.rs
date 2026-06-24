@@ -233,7 +233,7 @@ pub(crate) fn apply_heartbeat_fresh_rearm(
 /// long as it takes to clear. The watcher-down
 /// inject must be allowed to fire even when another interrupt fired
 /// recently. The per-watcher `last_watcher_inject` cooldown
-/// (`watcher_monitor.inject_cooldown`, default 150s) still rate-limits
+/// (`watcher_monitor.inject_cooldown`, default 300s) still rate-limits
 /// re-injects on the same fire path.
 ///
 /// A `cooldown_secs` of 0 disables the gate entirely.
@@ -7568,10 +7568,13 @@ cooldown = 300
 
     #[test]
     fn test_default_watcher_inject_cooldown() {
-        // Pin the 150s default (raised 60 -> 150 on 2026-06-18 so an
-        // already-surfaced watcher-down/stuck interruption re-nags the
-        // main loop ~every 2.5min instead of ~every 60s). If you change
-        // this default, also update the comment in config.rs and the
+        // Pin the 300s default (KNOB #3, raised 150 -> 300 on 2026-06-24:
+        // once a watcher-down inject has fired, re-nagging the main loop more
+        // often than ~5min was the most disruptive part of the storm, so the
+        // re-injection cadence is now ~5min; history: 60 -> 150 on 2026-06-18,
+        // 300 -> 60 on 2026-04-28). This throttles RE-FIRE of an
+        // already-surfaced interruption, NOT initial detection latency. If you
+        // change this default, also update the comment in config.rs and the
         // watcher_inject_due doc comment in policy.rs.
         use crate::config::parse_config;
         let cfg = r#"
@@ -7624,8 +7627,8 @@ cooldown = 300
 "#;
         let cfg = parse_config(cfg).expect("parse");
         assert_eq!(
-            cfg.watcher_monitor.inject_cooldown, 150,
-            "default watcher inject_cooldown should be 150s (re-inject cadence); \
+            cfg.watcher_monitor.inject_cooldown, 300,
+            "default watcher inject_cooldown should be 300s (re-inject cadence); \
              see src/policy.rs::watcher_inject_due doc comment"
         );
     }
