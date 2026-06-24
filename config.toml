@@ -340,10 +340,19 @@ show_all = false
 # Counters are SHARED across all three gates (see State.consecutive_suppressions).
 #
 # After this many consecutive suppressed fires, the next fire force-injects.
-max_consecutive_suppressions = 3
+# Raised 3 -> 10000 (2026-06-23, Andrew): claude-event-watch is surface-and-exit
+# (it exits after every event), so its watcher-down condition is PERPETUAL and
+# the suppression counter never resets while the main loop is actively turning +
+# restarting it. At cap=3 the escalation force-injected a destructive tmux
+# interrupt every ~30s, which cancelled in-flight turns and KILLED freshly
+# spawned background agents (the all-night "agent stopped by user" mystery).
+# The heartbeat-stale path remains the genuine-wedge backstop, so suppressing
+# this force-inject while actively-turning is safe. Root fix (make
+# claude-event-watch a resident poller so it stops flapping) is a follow-up.
+max_consecutive_suppressions = 10000
 # Wall-clock backstop (seconds) since the FIRST suppression in the current run.
-# 600 = 10 min; the 33-min real-world incident would have triggered at 10 min.
-max_suppression_window_secs = 600
+# Raised 600 -> 86400 for the same reason as the consecutive cap above.
+max_suppression_window_secs = 86400
 
 [api_retry]
 # Upstream-API retry-backoff detection.
