@@ -499,6 +499,37 @@ DEFAULT_GC_DEAD_INTERVAL_SECS = 300
 # it isolated when tests override AGENT_MSG_INBOX_DIR.
 GC_DEAD_STAMP_FILENAME = ".gc-dead.stamp"
 
+# Liveness window (seconds) passed to `claude-watch active-agents
+# --max-age-seconds` when deciding which agents are DEAD for gc purposes.
+#
+# This is DELIBERATELY much larger than claude-watch's own 120s default
+# (`DEFAULT_AGENT_ALIVE_MAX_AGE_SECS`). That 120s window answers a
+# different question — "is the main loop legitimately blocked by a child
+# right now" — and is appropriately short. Reusing it for gc-dead was a
+# latent bug: a subagent that simply goes quiet for >120s (a long thinking
+# pass, a slow Bash/tool call, or waiting on a backgrounded child) is NOT
+# dead, yet active-agents reports alive=false and the sweeper would then
+# unlink its inbox + satisfy its obligation OUT FROM UNDER the still-running
+# agent — silently defeating every main-loop->subagent redirection.
+#
+# gc-dead's job is only to reap obligations LEAKED by agents that exited
+# long ago; the 4h obligation TTL is the real backstop, so this window can
+# be generously large. 30 min is comfortably above any realistic in-turn
+# quiet gap while still cleaning up genuinely-dead agents well before TTL.
+# Override via AGENT_MSG_GC_ALIVE_MAX_AGE_SECS.
+DEFAULT_GC_ALIVE_MAX_AGE_SECS = 1800
+
+
+def _gc_alive_max_age_secs() -> int:
+    raw = os.environ.get("AGENT_MSG_GC_ALIVE_MAX_AGE_SECS", "").strip()
+    if not raw:
+        return DEFAULT_GC_ALIVE_MAX_AGE_SECS
+    try:
+        val = int(float(raw))
+    except ValueError:
+        return DEFAULT_GC_ALIVE_MAX_AGE_SECS
+    return val if val > 0 else DEFAULT_GC_ALIVE_MAX_AGE_SECS
+
 
 def _gc_dead_interval_secs() -> int:
     raw = os.environ.get("AGENT_MSG_GC_DEAD_INTERVAL_SECS", "").strip()
@@ -563,11 +594,28 @@ def _alive_agent_ids() -> set[str] | None:
     cli = _claude_watch_cli()
     if not cli:
         return None
+    # Use a generous liveness window for gc purposes (see
+    # DEFAULT_GC_ALIVE_MAX_AGE_SECS): an agent quiet for >120s is NOT dead,
+    # and reaping its inbox/obligation while it is still running is the bug
+    # this guards against. Older claude-watch builds without the
+    # `--max-age-seconds` flag ignore the extra arg gracefully? No — clap
+    # would reject an unknown arg, so fall back to a bare query if the
+    # flagged invocation fails (returncode != 0 / spawn error).
+    max_age = _gc_alive_max_age_secs()
     try:
         proc = subprocess.run(
-            [cli, "active-agents", "--json"],
+            [cli, "active-agents", "--json",
+             "--max-age-seconds", str(max_age)],
             capture_output=True, text=True, timeout=10, check=False,
         )
+        if proc.returncode != 0:
+            # Possibly an older claude-watch that lacks --max-age-seconds.
+            # Retry without the flag rather than treating the whole query
+            # as a failure (which would refuse to GC forever).
+            proc = subprocess.run(
+                [cli, "active-agents", "--json"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
     if proc.returncode != 0:
@@ -2809,6 +2857,49 @@ def test_gc_dead_satisfies_dead_agent_obligations():
     return True
 
 
+def test_gc_dead_queries_active_agents_with_generous_max_age():
+    """Regression (q-2026-06-24-fd10): the gc-dead liveness query MUST pass a
+    large --max-age-seconds so a subagent quiet for >120s (long thinking pass /
+    slow tool call) is NOT classed dead and reaped out from under itself.
+
+    A fake claude-watch records the argv it was invoked with; we assert
+    --max-age-seconds is present and well above claude-watch's own 120s
+    default, and that the parsed alive set still comes back correctly.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        argv_log = tmpdir / "cw-argv.log"
+        cw = tmpdir / "fake-claude-watch"
+        payload = json.dumps({
+            "subagents": [], "workloads": [],
+            "agents": [{"agent_id": "aQUIET0000", "alive": True,
+                        "queue_id": None, "jsonl_age_seconds": 300}],
+        })
+        # Record argv, then emit the payload. (jsonl_age_seconds=300 models a
+        # quiet-but-running agent; the flag is what makes cw report alive=True.)
+        cw.write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$@" > "{argv_log}"\n'
+            f"cat <<'EOJ'\n{payload}\nEOJ\n"
+        )
+        cw.chmod(0o755)
+        old_env = os.environ.copy()
+        try:
+            os.environ["AGENT_MSG_CLAUDE_WATCH_CLI"] = str(cw)
+            alive = _alive_agent_ids()
+            assert alive == {"aQUIET0000"}, alive
+            argv = argv_log.read_text().split()
+            assert "--max-age-seconds" in argv, argv
+            idx = argv.index("--max-age-seconds")
+            passed = int(argv[idx + 1])
+            assert passed >= 600, f"max-age too small: {passed}"
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+    return True
+
+
 def test_gc_dead_default_open_when_claude_watch_unavailable():
     """If claude-watch CLI is missing, gc-dead must be a no-op (default-open)."""
     import tempfile
@@ -3328,6 +3419,8 @@ def run_tests():
          test_gc_dead_returns_none_when_unparseable),
         ("gc_dead_satisfies_dead_agent_obligations",
          test_gc_dead_satisfies_dead_agent_obligations),
+        ("gc_dead_queries_active_agents_with_generous_max_age",
+         test_gc_dead_queries_active_agents_with_generous_max_age),
         ("gc_dead_default_open_when_claude_watch_unavailable",
          test_gc_dead_default_open_when_claude_watch_unavailable),
         ("gc_dead_default_open_on_malformed_output",
