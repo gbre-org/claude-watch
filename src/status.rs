@@ -562,11 +562,87 @@ pub fn get_version_info() -> VersionInfo {
     info
 }
 
+/// Find the MAIN-LOOP Claude Code pane, preferring the explicitly-configured
+/// `[tmux] dashboard_pane` / `dashboard_session` over the unconstrained
+/// auto-detect scan.
+///
+/// ## Why this exists (the focus-follows-inject bug)
+///
+/// The bare `find_claude_pane()` scans `tmux list-panes -a` and returns the
+/// FIRST pane whose `pane_current_command == "claude"`. In a single-claude
+/// layout that is always the main loop. But Claude Code's TUI agent-view
+/// (the operator focusing a running SUBAGENT in the curses panel) spawns a
+/// SECOND `claude` process in its own pane. With two `claude` panes present,
+/// `find_claude_pane()`'s "first match wins" is order-dependent and can
+/// resolve to the SUBAGENT's pane — so the daemon's MAIN-LOOP-SCOPED injects
+/// (watcher-down restart, heartbeat-stale nudge, resume) land in the
+/// subagent's context. That is pure noise there: a subagent cannot restart a
+/// watcher or act on a heartbeat tick, the inject pollutes its context and
+/// burns its tokens, and the main loop never sees the alert it must act on.
+///
+/// The daemon ALREADY knows the fixed main-loop pane — the in-container config
+/// pins `dashboard_pane = "claude-container:0.0"` / `dashboard_session =
+/// "claude-container"`. `send-keys` to a specific pane id works regardless of
+/// which pane the operator has focused, so targeting the configured pane
+/// EXPLICITLY (never the active/first-scanned pane) is both correct and
+/// focus-independent. There is no legitimate case for a watcher-down /
+/// heartbeat inject to target the active pane — the main loop is always the
+/// configured pane.
+///
+/// Resolution order:
+///   1. If `dashboard_pane` / `dashboard_session` is configured (non-empty),
+///      resolve via `tmux::find_dashboard_pane` (config-first, status-bar
+///      independent). This is the fixed main-loop pane and is returned even
+///      when the operator has an agent-view pane focused.
+///   2. Otherwise (unconfigured — fresh install / host dev), fall back to the
+///      historical `find_claude_pane()` auto-detect scan.
+pub async fn find_claude_pane_with_config(config: &crate::config::TmuxConfig) -> Option<String> {
+    // Config-first: an explicitly-configured pane/session is the fixed
+    // main-loop target. `find_dashboard_pane` checks `has-session` +
+    // `display-message` on the configured pane before returning it, so a
+    // configured-but-gone pane correctly falls through to the scan below.
+    if prefer_configured_pane(config) {
+        if let Some(p) = crate::tmux::find_dashboard_pane(config).await {
+            debug!(pane = %p, "resolved main-loop pane via configured dashboard_pane/session");
+            return Some(p);
+        }
+        debug!(
+            session = %config.dashboard_session,
+            "configured dashboard_session set but pane unresolved; falling back to auto-detect scan"
+        );
+    }
+    find_claude_pane().await
+}
+
+/// Pure predicate: should pane resolution PREFER the explicitly-configured
+/// `[tmux]` pane/session over the unconstrained auto-detect scan?
+///
+/// True iff a `dashboard_session` is configured (non-empty). When set, the
+/// daemon has been told exactly which session hosts the main loop, so the
+/// fixed configured pane is the correct inject target even if the operator
+/// has a TUI agent-view subagent pane focused. When unset (fresh install /
+/// host dev), there is nothing to prefer — fall back to the scan.
+///
+/// Factored out as a pure fn so the config-branch decision is unit-testable
+/// without a live tmux (the actual pane lookup shells out and is covered by
+/// the live-tmux e2e test).
+pub(crate) fn prefer_configured_pane(config: &crate::config::TmuxConfig) -> bool {
+    !config.dashboard_session.is_empty()
+}
+
 /// Find the tmux pane running Claude Code.
 ///
 /// Primary: look for `pane_current_command == "claude"`.
 /// Fallback: check "bash"/"node" panes for Claude Code status bar content
 /// (handles wrapper scripts).
+///
+/// NOTE: this is the CONFIG-IGNORANT auto-detect scan — it returns the FIRST
+/// `claude` pane in tmux's list, which is order/focus-dependent when more than
+/// one `claude` pane exists (e.g. the operator focusing a TUI agent-view
+/// subagent). Daemon paths that inject MAIN-LOOP-SCOPED keystrokes must prefer
+/// `find_claude_pane_with_config` so the inject targets the configured fixed
+/// main-loop pane, never whichever `claude` pane happens to sort first. See
+/// `find_claude_pane_with_config` for the focus-follows-inject bug it fixes.
 pub async fn find_claude_pane() -> Option<String> {
     let out = run_cmd(
         &[
@@ -636,17 +712,50 @@ pub async fn find_claude_pane() -> Option<String> {
 /// Get Claude Code status by natively finding the pane, parsing the status bar,
 /// and reading version info from /proc.
 ///
+/// CONFIG-IGNORANT convenience shim: resolves the pane via the bare
+/// auto-detect scan (`find_claude_pane`). Use `get_claude_status_with_config`
+/// from any path that injects MAIN-LOOP-SCOPED keystrokes (the daemon
+/// `check_cycle`) so the returned `pane` is the configured fixed main-loop
+/// pane rather than whichever `claude` pane sorts first — see
+/// `find_claude_pane_with_config`. Non-injecting callers (metrics exporter,
+/// hook context probe, `claude-watch status`) keep using this no-arg form:
+/// they only READ token/bash counts off the pane, where the multi-pane
+/// ambiguity is harmless.
+///
 /// Falls back to shelling out to `claude-status --json` if native pane discovery
 /// fails or if `CLAUDE_STATUS_CMD` env var is set (for test environments).
 pub async fn get_claude_status() -> Option<ClaudeStatus> {
+    get_claude_status_inner(None).await
+}
+
+/// Config-aware variant of [`get_claude_status`]. Resolves the pane via
+/// [`find_claude_pane_with_config`], so when `[tmux] dashboard_pane` /
+/// `dashboard_session` is configured the status (and crucially the `pane`
+/// field the daemon then injects into) is pinned to the fixed main-loop pane,
+/// never an operator-focused TUI agent-view subagent pane.
+pub async fn get_claude_status_with_config(
+    config: &crate::config::TmuxConfig,
+) -> Option<ClaudeStatus> {
+    get_claude_status_inner(Some(config)).await
+}
+
+async fn get_claude_status_inner(
+    config: Option<&crate::config::TmuxConfig>,
+) -> Option<ClaudeStatus> {
     // If CLAUDE_STATUS_CMD is set (test mode), skip native discovery and use fallback
     if std::env::var("CLAUDE_STATUS_CMD").is_ok() {
         debug!("CLAUDE_STATUS_CMD set, using fallback");
         return get_claude_status_fallback().await;
     }
 
-    // Try native pane discovery first
-    if let Some(pane) = find_claude_pane().await {
+    // Try native pane discovery first. Prefer the configured fixed main-loop
+    // pane when a config was threaded through (daemon path); otherwise the
+    // historical auto-detect scan.
+    let discovered = match config {
+        Some(cfg) => find_claude_pane_with_config(cfg).await,
+        None => find_claude_pane().await,
+    };
+    if let Some(pane) = discovered {
         debug!(pane = %pane, "found claude pane (native)");
 
         // Use joined capture (-J) for status bar parsing to avoid truncation
@@ -1107,6 +1216,70 @@ pub(crate) fn watcher_in_grace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TmuxConfig;
+
+    // -------------------------------------------------------------------
+    // prefer_configured_pane — the config-branch decision behind the
+    // focus-follows-inject fix. When a dashboard_session is configured the
+    // daemon must resolve the FIXED main-loop pane (via find_dashboard_pane)
+    // instead of the unconstrained `find_claude_pane()` scan, so a
+    // MAIN-LOOP-SCOPED inject can never land in an operator-focused TUI
+    // agent-view subagent pane. These pin the branch logic without a live
+    // tmux (the actual pane lookup is covered by the live-tmux e2e test).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prefer_configured_pane_true_when_session_set() {
+        // The in-container config: dashboard_session = "claude-container",
+        // dashboard_pane = "claude-container:0.0". Configured => prefer the
+        // fixed pane, never the active/first-scanned pane.
+        let cfg = TmuxConfig {
+            dashboard_pane: "claude-container:0.0".to_string(),
+            dashboard_session: "claude-container".to_string(),
+            post_escape_settle_ms: 0,
+        };
+        assert!(
+            prefer_configured_pane(&cfg),
+            "a configured dashboard_session MUST prefer the fixed main-loop pane"
+        );
+    }
+
+    #[test]
+    fn prefer_configured_pane_true_with_only_session() {
+        // Session set but pane left empty: still prefer config — find_dashboard_pane
+        // resolves a shell pane within the session, which is more targeted than
+        // the global `claude`-command scan.
+        let cfg = TmuxConfig {
+            dashboard_pane: String::new(),
+            dashboard_session: "claude-container".to_string(),
+            post_escape_settle_ms: 0,
+        };
+        assert!(prefer_configured_pane(&cfg));
+    }
+
+    #[test]
+    fn prefer_configured_pane_false_when_unconfigured() {
+        // Fresh install / host dev: nothing configured => fall back to the
+        // historical auto-detect scan (single-claude layouts are unambiguous).
+        let cfg = TmuxConfig::default();
+        assert!(
+            !prefer_configured_pane(&cfg),
+            "an unconfigured tmux section MUST fall back to the auto-detect scan"
+        );
+    }
+
+    #[test]
+    fn prefer_configured_pane_false_when_only_pane_set_without_session() {
+        // Defensive: dashboard_pane without a session can't be session-verified
+        // by find_dashboard_pane (it early-returns find_claude_pane when session
+        // is empty), so the decision is driven by the session field.
+        let cfg = TmuxConfig {
+            dashboard_pane: "claude-container:0.0".to_string(),
+            dashboard_session: String::new(),
+            post_escape_settle_ms: 0,
+        };
+        assert!(!prefer_configured_pane(&cfg));
+    }
 
     #[test]
     fn test_watcher_runtime_file_age_secs_none_when_no_files() {

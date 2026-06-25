@@ -3308,8 +3308,15 @@ async fn check_ask_question_stale(config: &Config, state: &mut State, pane: &str
 pub async fn check_cycle(config: &Config, state: &mut State) {
     let now = Local::now().to_rfc3339();
 
-    // Get Claude Code status
-    let cs = status::get_claude_status().await;
+    // Get Claude Code status. Use the CONFIG-AWARE resolver so the `pane`
+    // field is pinned to the configured fixed main-loop pane (e.g.
+    // `claude-container:0.0`) rather than whichever `claude` pane sorts first
+    // in `tmux list-panes -a`. Every inject below targets `cs.pane` /
+    // `effective_pane` derived from it; the bare auto-detect scan would
+    // resolve an operator-focused TUI agent-view subagent pane and land
+    // MAIN-LOOP-SCOPED injects (watcher-down, heartbeat-stale, resume) in the
+    // subagent. See `status::find_claude_pane_with_config`.
+    let cs = status::get_claude_status_with_config(&config.tmux).await;
 
     if cs.is_none() {
         // A `None` status does NOT necessarily mean Claude Code exited. When
@@ -3509,7 +3516,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // A fresh get_claude_status() call re-runs pane discovery and
         // capture, which recovers from the stuck state.
         if dead_checks >= config.dead_process.checks_required {
-            if let Some(retry) = status::get_claude_status().await {
+            if let Some(retry) = status::get_claude_status_with_config(&config.tmux).await {
                 if should_self_heal(
                     dead_checks,
                     config.dead_process.checks_required,
