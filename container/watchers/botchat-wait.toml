@@ -1,0 +1,5 @@
+name = "botchat-wait"
+description = "Blocks on the botchat DB write-sentinel, surfaces NEW unread sender=andrew messages once, exits"
+launcher = "/opt/claude-container/watchers/botchat-wait.sh"
+restart_policy = "session"
+log_path = "/var/log/claude-watch/watchers/botchat-wait.log"
