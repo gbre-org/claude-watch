@@ -71,18 +71,21 @@ def _install_fake_claude_event(bin_dir: Path, log_path: Path, exit_code: int = 0
 
 
 def _install_fake_pingme(bin_dir: Path, log_path: Path | None = None, exit_code: int = 0):
+    # session-task's queue hooks now shell out to ``queue-notify`` (dedicated
+    # Pushover path); install the shim under that name. Helper keeps its
+    # historical name to avoid churn.
     bin_dir.mkdir(parents=True, exist_ok=True)
-    pingme = bin_dir / "pingme"
+    notifier = bin_dir / "queue-notify"
     sink = str(log_path) if log_path else "/dev/null"
-    pingme.write_text(textwrap.dedent(f"""\
+    notifier.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env python3
         import json, sys
         with open({sink!r}, "a") as f:
             f.write(json.dumps(sys.argv[1:]) + "\\n")
         sys.exit({exit_code})
         """))
-    pingme.chmod(0o755)
-    return pingme
+    notifier.chmod(0o755)
+    return notifier
 
 
 def _env_for_tmp(tmp, bin_dir=None, claude_event_session_task=None):
