@@ -166,6 +166,41 @@
   let pollingQid = null;
   let pollTimer = null;
   const POLL_INTERVAL_MS = 2000;
+
+  // --- Managed SSE reconnect ---------------------------------------------
+  // We do NOT trust the browser's native EventSource auto-reconnect. In
+  // practice it is not self-healing: after a long idle, a bfcache restore,
+  // or a network blip the native reconnect can sit in CONNECTING forever —
+  // the status chip stays stuck on "reconnecting…" and the missed log lines
+  // never arrive. Instead we own the lifecycle: on error we tear the source
+  // down and re-open with bounded backoff, and on every wake signal
+  // (pageshow/bfcache, visibilitychange, online, focus) we force an
+  // immediate fresh connect. We resume from a byte-offset cursor
+  // (`?since=`, mirrored by the native Last-Event-ID header), so a reconnect
+  // streams exactly the delta we missed instead of re-backfilling the tail.
+  //
+  // `streamId` is the queue/subagent id the live stream is bound to (set by
+  // connectEventSource); `resumeCursor` is the last `id:` we received (the
+  // server's byte offset). `backoffIdx` walks BACKOFF_STEPS; `reconnectTimer`
+  // is the single pending reconnect handle. All reset by close() / open().
+  let streamId = null;
+  let resumeCursor = null;
+  let backoffIdx = 0;
+  let reconnectTimer = null;
+  // Set when the server emits a terminal frame (workload-end, archive-end,
+  // idle/lifetime cap) — the stream is intentionally finished and must NOT
+  // be auto-reconnected (that would re-stream a completed job or defeat the
+  // lifetime cap). The viewer re-opens manually to resume. Reset on open().
+  let streamTerminal = false;
+  // Bounded reconnect backoff: 1s -> 2s -> 5s -> 10s -> 15s (max). Reset to
+  // index 0 on a successful (re)connect (stream-start / resumed frame).
+  const BACKOFF_STEPS = [1000, 2000, 5000, 10000, 15000];
+  // Modes whose stream is a live tail we want to keep alive across drops.
+  // 'archive' is one-shot (server closes on EOF) and must NOT be managed-
+  // reconnected; the polling path ('pollingQid') has its own retry loop.
+  function isLiveMode() {
+    return mode === 'live' || mode === 'workload' || mode === 'hostjob' || mode === 'subagent';
+  }
   // Cap the number of rendered lines — long-running agents can ship
   // thousands of events; keeping them all in the DOM is pointless and
   // eats memory. We trim from the top once we exceed this.
@@ -1362,6 +1397,12 @@
         msg = k;
       }
       appendLine('<span class="log-meta">[meta] ' + msg + '</span>', 'log-meta-line');
+      // Terminal frames: the server is intentionally ending the stream
+      // (job finished / cap hit). Mark it so onerror's managed reconnect
+      // doesn't re-stream a completed job or fight a lifetime cap.
+      if (k === 'workload-end' || k === 'archive-end' || k === 'idle-timeout' || k === 'lifetime-timeout') {
+        streamTerminal = true;
+      }
       // A meta frame breaks the transient-replace chain so subsequent
       // workload frames don't accidentally overwrite an unrelated row.
       lastTransientRow = null;
@@ -1536,6 +1577,17 @@
       pollTimer = null;
     }
     pollingQid = null;
+    // Reset managed-reconnect state for the new stream — a re-open on a
+    // different row must start from a fresh backfill, not resume the prior
+    // item's cursor.
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    streamId = null;
+    resumeCursor = null;
+    backoffIdx = 0;
+    streamTerminal = false;
     // Detect starting-state rows. The template stamps
     // data-queue-starting="1" on rows where the queue item is
     // registered but the owning agent hasn't emitted its first JSONL
@@ -1609,6 +1661,15 @@
       try { evtSource.close(); } catch (_) {}
       evtSource = null;
     }
+    // A fresh connect attempt is in flight — cancel any pending managed-
+    // reconnect timer so we don't double-open.
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    // Remember the id the live stream is bound to so the wake-signal /
+    // backoff paths can re-open without re-running the modal chrome.
+    streamId = isLiveMode() ? id : null;
     // 'archive' hits the dedicated replay endpoint; 'live', 'workload' AND
     // 'hostjob' all hit /stream — the server dispatches on the queue item's
     // scope (workload-bound items tail the workload output file; hostjob-bound
@@ -1624,25 +1685,51 @@
     } else {
       endpoint = '/api/queue/' + encodeURIComponent(id) + '/stream';
     }
+    // Resume cursor: on a managed reconnect we pass the byte offset of the
+    // last frame we received as ?since=, so the server seeks there and
+    // streams ONLY the delta (no backfill replay, no duplicate lines, no
+    // "reconnecting" flicker). Fresh opens (resumeCursor === null) omit it
+    // and get the normal backfill-from-tail. Native EventSource also echoes
+    // the same value back as the Last-Event-ID header, so the server honors
+    // the resume even on a transport-level auto-reconnect.
+    if (isLiveMode() && resumeCursor !== null) {
+      endpoint += (endpoint.indexOf('?') >= 0 ? '&' : '?') + 'since=' + encodeURIComponent(resumeCursor);
+    }
 
-    // Open the EventSource. In live mode browsers auto-reconnect if
-    // the server closes; in archive mode the server always closes on
-    // EOF, so we explicitly close the source on archive-end to avoid
-    // a noisy reconnect attempt.
+    // Open the EventSource. We manage the reconnect lifecycle ourselves for
+    // live modes (see the managed-reconnect notes above); in archive mode the
+    // server always closes on EOF, so we explicitly close the source on
+    // archive-end to avoid a noisy reconnect attempt.
     try {
       evtSource = new EventSource(endpoint);
     } catch (e) {
       setStatus('failed', 'err');
       appendLine('<span class="log-error">[error] EventSource failed: ' + esc(e && e.message ? e.message : e) + '</span>', 'log-error-line');
+      // A constructor throw is rare (bad URL) but recoverable on a wake
+      // signal — schedule a backoff retry for live modes.
+      if (isLiveMode()) scheduleReconnect();
       return;
     }
 
     evtSource.onmessage = (ev) => {
+      // Track the server's byte-offset cursor (the SSE `id:` line) so a
+      // later reconnect resumes from exactly here. The native EventSource
+      // exposes it as ev.lastEventId; we mirror it into resumeCursor.
+      if (isLiveMode() && ev.lastEventId) {
+        resumeCursor = ev.lastEventId;
+      }
       let payload = null;
       try {
         payload = JSON.parse(ev.data);
       } catch (_) {
         payload = { type: 'raw', line: ev.data };
+      }
+      // A real frame means the (re)connect succeeded — reset the backoff
+      // and clear any pending reconnect timer so the next drop starts from
+      // the fast end of the ladder again.
+      if (isLiveMode()) {
+        backoffIdx = 0;
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       }
       renderEvent(payload);
       // Archive mode: server closes after the archive-end meta. Close
@@ -1676,15 +1763,52 @@
         }
         return;
       }
-      // Live mode: the browser auto-reconnects unless we close —
-      // surface the status change but keep the stream open so a
-      // transient blip doesn't drop the viewer.
-      if (evtSource.readyState === EventSource.CLOSED) {
-        setStatus('closed', 'warn');
-      } else {
-        setStatus('reconnecting…', 'warn');
+      // Terminal stream (job finished / cap hit): the close is expected and
+      // the renderEvent path already set the final status. Swallow the error
+      // without flipping the chip back to "reconnecting…" or re-opening.
+      if (streamTerminal) {
+        try { evtSource.close(); } catch (_) {}
+        evtSource = null;
+        return;
       }
+      // Live modes: do NOT trust the native auto-reconnect (it can wedge in
+      // CONNECTING forever, leaving the chip stuck on "reconnecting…" with
+      // the stream silently dead). Tear the source down ourselves and
+      // schedule a bounded-backoff reconnect that resumes from resumeCursor.
+      try { evtSource.close(); } catch (_) {}
+      evtSource = null;
+      setStatus('reconnecting…', 'warn');
+      scheduleReconnect();
     };
+  }
+
+  // Schedule a managed reconnect for a live-mode stream after a bounded
+  // backoff (1s -> 2s -> 5s -> 10s -> 15s). Single pending timer at a time;
+  // close()/open()/a successful frame cancel it. No-op when the modal is
+  // closed or we have no stream to resume.
+  function scheduleReconnect() {
+    if (reconnectTimer) return;            // already pending; don't stack
+    if (!isLiveMode() || !streamId) return;
+    if (modal.hidden || streamTerminal) return;
+    const delay = BACKOFF_STEPS[Math.min(backoffIdx, BACKOFF_STEPS.length - 1)];
+    backoffIdx++;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (modal.hidden || !isLiveMode() || !streamId) return;
+      connectEventSource(streamId);
+    }, delay);
+  }
+
+  // Wake-signal handler: the tab/network just came back. If the live stream
+  // isn't actively OPEN, force an immediate fresh connect (resuming from
+  // resumeCursor) instead of waiting out the backoff ladder, and reset the
+  // backoff so a subsequent drop starts fast again.
+  function reconnectNow() {
+    if (modal.hidden || !isLiveMode() || !streamId || streamTerminal) return;
+    if (evtSource && evtSource.readyState === EventSource.OPEN) return;
+    backoffIdx = 0;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    connectEventSource(streamId);
   }
 
   // Schedule the next polling retry. Called from renderEvent() when a
@@ -1716,6 +1840,17 @@
       pollTimer = null;
     }
     pollingQid = null;
+    // Tear down managed-reconnect state so a re-open starts clean (fresh
+    // backfill, no stale cursor, no pending reconnect firing into a closed
+    // modal).
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    streamId = null;
+    resumeCursor = null;
+    backoffIdx = 0;
+    streamTerminal = false;
     // Stop the 1Hz runtime ticker (running-item RUNTIME field). Leaves
     // the row's data-started-at attribute removed so the next open
     // starts from a clean slate.
@@ -1728,6 +1863,28 @@
     }
     triggerEl = null;
   }
+
+  // ---- Wake signals: force an immediate reconnect when the tab/network
+  // comes back ------------------------------------------------------------
+  // The native EventSource auto-reconnect does not reliably fire on these
+  // transitions (especially a bfcache restore), so we drive it ourselves.
+  // Each handler is a no-op unless a live-mode modal is open with a stream
+  // that isn't currently OPEN (reconnectNow guards that).
+  //
+  // pageshow with persisted=true means a bfcache restore (back/forward
+  // navigation): the page — and any half-dead EventSource — was frozen and
+  // thawed, so always force a fresh connect.
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted) reconnectNow();
+  });
+  // Tab became visible again after being backgrounded — the socket may have
+  // been reaped while hidden.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') reconnectNow();
+  });
+  // Network came back / window regained focus.
+  window.addEventListener('online', reconnectNow);
+  window.addEventListener('focus', reconnectNow);
 
   // Event delegation for clicks on running rows. We exclude any click
   // that originated inside an action button (stop) or drag handle so
