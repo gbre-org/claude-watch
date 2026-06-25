@@ -191,6 +191,17 @@ expect(
     f"for the /start-watchers skill to discover the watcher. Got: "
     f"{watcher_files}",
 )
+expect(
+    "botchat-wait.sh" in watcher_files,
+    f"container/watchers/botchat-wait.sh missing — the thin launcher for the "
+    f"botchat repo's bind-mounted inbound chat watcher. Got: {watcher_files}",
+)
+expect(
+    "botchat-wait.toml" in watcher_files,
+    f"container/watchers/botchat-wait.toml missing — required metadata for the "
+    f"/start-watchers skill to discover the botchat-wait watcher. Got: "
+    f"{watcher_files}",
+)
 
 # 7. plugin.json present, name=claude-container.
 expect(PLUGIN_JSON.is_file(), f"{PLUGIN_JSON} missing — required to register "
