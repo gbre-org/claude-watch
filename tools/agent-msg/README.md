@@ -175,6 +175,7 @@ live subagents. Override the binary via `AGENT_MSG_CLAUDE_WATCH_CLI`
 | `AGENT_MSG_TTL_HOURS` | `24` | Inbox-message TTL (drops messages whose `read_at` is older). `<= 0` disables the message GC. |
 | `AGENT_MSG_INBOX_DIR` | `~/.config/claude/agent-inbox` | Override the inbox directory (used by tests). |
 | `AGENT_MSG_GC_DEAD_INTERVAL_SECS` | `300` | Min seconds between implicit `gc-dead` sweeps at the top of each CLI call. `<= 0` disables the implicit sweep entirely. |
+| `AGENT_MSG_GC_ALIVE_MAX_AGE_SECS` | `1800` | JSONL-mtime window passed to `claude-watch active-agents --max-age-seconds` when `gc-dead` decides which agents are DEAD. Deliberately much larger than claude-watch's own 120s `alive` default: an agent quiet for >120s (long thinking pass / slow tool call / waiting on a backgrounded child) is NOT dead, and reaping its inbox + obligation while it is still running silently defeats main-loop→subagent redirection. The 4h obligation TTL is the real backstop. `<= 0` falls back to the default. |
 | `AGENT_MSG_CLAUDE_WATCH_CLI` | (PATH lookup) | Override the `claude-watch` binary used by `gc-dead` (test injection). |
 
 ## Tests
