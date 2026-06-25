@@ -450,6 +450,156 @@ def test_blocked_owner_does_not_block_spawn_check_of_pending_peer():
         assert out["status"] == "pending", out
 
 
+# -------------------- multi-scope blocked items do NOT bridge scopes --------
+
+
+def _spawn_check(env, qid):
+    """Return the spawn-check JSON for a queue id (exit 0 = ready)."""
+    r = _run(env, "queue", "spawn-check", qid, "--json")
+    return r.returncode, json.loads(r.stdout)
+
+
+def test_blocked_multiscope_does_not_bridge_independent_scopes():
+    """A multi-scope BLOCKED item must not bridge two otherwise-independent
+    scopes into one serialization group.
+
+    Regression for the live d500 bug: a blocked item parked on an external
+    blocker (a Drive push lock) carried scopes A+B and bridged a RUNNING
+    agent in scope A and a PENDING task in scope B into one group, so the
+    scope-B task could not spawn even though nothing was using scope B's
+    clone. Per design `queue block` RELEASES the scope lock, so the blocked
+    item must connect nothing: scope B is free.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        # 1. Multi-scope item registers, then is blocked (parked externally).
+        bridge = _add(env, "bridge A+B",
+                      ["repo:bridge-A", "repo:bridge-B"], "--summary", "bridge")
+        _register(env, bridge["id"])
+        _run(env, "queue", "block", bridge["id"],
+             "--reason", "awaiting Drive push lock", "--silent", expect_exit=0)
+
+        # 2. A fresh agent registers in scope A (allowed -- blocked released A).
+        agent_a = _add(env, "agent in A", ["repo:bridge-A"], "--summary", "a")
+        # The blocked item must NOT have bridged the new A agent into its
+        # group -- they should be in DIFFERENT groups.
+        assert agent_a["group_id"] != bridge["group_id"], (
+            f"new scope-A agent wrongly co-grouped with blocked bridge: "
+            f"agent_a group={agent_a['group_id']} bridge group={bridge['group_id']}"
+        )
+        _register(env, agent_a["id"])
+
+        # 3. An independent scope-B task is added. Nothing is using scope B
+        #    (the only B claimant is the blocked, lock-released bridge), so it
+        #    MUST be ready and clear to spawn -- not serialized behind the
+        #    running scope-A agent.
+        task_b = _add(env, "task in B", ["repo:bridge-B"], "--summary", "b")
+        assert task_b["ready_now"] is True, task_b
+        assert task_b["serialized_after"] == [], task_b
+        assert task_b["group_id"] != agent_a["group_id"], task_b
+
+        rc, sc = _spawn_check(env, task_b["id"])
+        assert rc == 0, (rc, sc)
+        assert sc["ok"] is True, sc
+
+
+def test_block_unbridges_already_formed_group_live():
+    """Blocking a multi-scope group-bridge item re-splits the already-formed
+    group so the far-scope peer becomes ready WITHOUT re-adding it.
+
+    Where the previous test exercises the ADD path (no future bridging),
+    this exercises the live re-split: the items are all created BEFORE the
+    block, sharing one bridged group; the block must un-bridge them in place.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        # bridge A+B registers + a pending B task -- both land in ONE group
+        # via the bridge's B scope while the bridge is still running.
+        bridge = _add(env, "bridge A+B",
+                      ["repo:ub-A", "repo:ub-B"], "--summary", "bridge")
+        task_b = _add(env, "task in B", ["repo:ub-B"], "--summary", "b")
+        assert task_b["group_id"] == bridge["group_id"], "precondition: bridged"
+        _register(env, bridge["id"])
+        # While the bridge RUNS, task_b is serialized behind it (same group).
+        rc, sc = _spawn_check(env, task_b["id"])
+        assert sc["ok"] is False, sc
+
+        # Now block the bridge. It releases its scope; the group must re-split
+        # so task_b (scope B) is no longer behind anything.
+        _run(env, "queue", "block", bridge["id"], "--reason", "ext",
+             "--silent", expect_exit=0)
+        # task_b is now the sole live (serializing) member of its scope and
+        # must be ready -- the blocked bridge no longer serializes it. (The
+        # blocked item may still SHARE task_b's group for display purposes
+        # since it overlaps only that single component; what matters is that
+        # it holds no slot, so task_b is clear to spawn.)
+        rc, sc = _spawn_check(env, task_b["id"])
+        assert rc == 0, (rc, sc)
+        assert sc["ok"] is True, sc
+        b_shown = _show(env, task_b["id"])
+        assert b_shown["status"] == "pending", b_shown
+
+
+# -------------------- unblock re-acquires + serializes scope ----------------
+
+
+def test_unblock_reacquires_scope_refuses_on_running_conflict():
+    """Unblocking an item whose scope is now held by a running peer REFUSES.
+
+    While blocked the item held no scope, so a peer started running in the
+    same scope. Returning to running would double-occupy the scope, so
+    unblock refuses (exit 3) and the operator must let the peer finish (or
+    abandon) first -- the same serialization guarantee `register` enforces.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "first", ["repo:reacq"], "--summary", "a")
+        _register(env, a["id"])
+        _run(env, "queue", "block", a["id"], "--reason", "ext",
+             "--silent", expect_exit=0)
+
+        # A peer claims the now-released scope and runs.
+        b = _add(env, "peer", ["repo:reacq"], "--summary", "b")
+        _register(env, b["id"])
+
+        # Unblocking `a` would re-acquire repo:reacq, but `b` holds it -> refuse.
+        r = _run(env, "queue", "unblock", a["id"], "--silent")
+        assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+        assert "cannot re-acquire" in r.stderr.lower()
+        assert b["id"] in r.stderr
+        # `a` stays blocked (the refusal did not flip it).
+        assert _show(env, a["id"])["status"] == "blocked"
+
+        # --force overrides.
+        r2 = _run(env, "queue", "unblock", a["id"], "--force", "--silent",
+                  "--json", expect_exit=0)
+        assert json.loads(r2.stdout)["status"] == "running"
+
+
+def test_unblock_reacquires_scope_when_free():
+    """Unblocking succeeds (re-acquires) when no running peer holds the scope,
+    and the re-running item then serializes a same-scope pending peer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "first", ["repo:reacq-free"], "--summary", "a")
+        _register(env, a["id"])
+        _run(env, "queue", "block", a["id"], "--reason", "ext",
+             "--silent", expect_exit=0)
+
+        # Scope is free (only the blocked item claims it) -> unblock succeeds.
+        r = _run(env, "queue", "unblock", a["id"], "--silent", "--json",
+                 expect_exit=0)
+        assert json.loads(r.stdout)["status"] == "running"
+
+        # Now that `a` is running again, a fresh same-scope peer must be
+        # serialized behind it (the lock was re-acquired).
+        b = _add(env, "peer", ["repo:reacq-free"], "--summary", "b")
+        assert b["ready_now"] is False, b
+        rc, sc = _spawn_check(env, b["id"])
+        assert sc["ok"] is False, sc
+
+
 # -------------------- terminal transitions from blocked --------------------
 
 

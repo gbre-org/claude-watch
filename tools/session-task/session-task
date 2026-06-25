@@ -153,18 +153,36 @@ QUEUE_SCHEMA_VERSION = 2
 #   done       -- terminal: completed successfully
 #   abandoned  -- terminal: gave up (with optional reason)
 #
-# `ACTIVE_STATUSES` is the canonical "in-flight" set used by serialization
-# and spawn-gating. `RUNNING_STATUSES` is the subset that owns a slot
-# (running, wedged); wedged is included precisely because a wedge is
-# transient and the agent still holds the scope. Blocked is DELIBERATELY
-# EXCLUDED: per design, `queue block` RELEASES the scope lock (blocked
-# items are exempt from orphaned-running alerts), so a blocked item must
-# NOT hold its scope -- a pending peer in the same scope/group is free to
-# become ready and spawn. (Earlier this wrongly included `blocked`, which
-# made a blocked group-head pin its scope and starve its pending peers;
-# this now matches the proven-correct web UI `_compute_ready_now`, which
-# gates readiness on ("pending","running") membership only.)
+# Three distinct status sets, each scoping a DIFFERENT question. Conflating
+# them is the historical source of the "blocked item holds its scope" class
+# of bugs (#371 fixed RUNNING_STATUSES but left ACTIVE_STATUSES wrong; the
+# group-formation / connectivity sense was still bridging through blocked
+# items -- see SERIALIZING_STATUSES below).
+#
+#   RUNNING_STATUSES = items that OWN A SLOT (a peer cannot spawn into the
+#   same scope while one of these is live). `running` + `wedged`: a wedge is
+#   transient and the agent still holds the scope. `blocked` is EXCLUDED --
+#   `queue block` RELEASES the scope lock (blocked items are exempt from the
+#   orphaned-running alert), so a blocked item must not own a slot.
+#
+#   SERIALIZING_STATUSES = items that PARTICIPATE IN SCOPE SERIALIZATION:
+#   they form groups (connected components over overlapping scope) and gate
+#   readiness. `pending` + `running` + `wedged`. `blocked` is EXCLUDED here
+#   too -- a blocked item must NOT connect (bridge) otherwise-independent
+#   scopes into one serialization group, and must NOT make a same-group peer
+#   not-ready. This is the set that group formation (`_group_ids_overlapping`,
+#   `_recompute_groups`) and head selection (`_group_head`) consult, matching
+#   the proven-correct web UI `_compute_ready_now` (which gates on
+#   ("pending","running") membership only). A blocked item acts like a
+#   done/abandoned item for serialization: parked, holding nothing.
+#
+#   ACTIVE_STATUSES = the "in-flight, non-terminal" set used for OPERATOR
+#   VISIBILITY (`queue list` / `queue groups` default views) and the
+#   "can still edit deps" gate (`queue depend`). `blocked` IS included here
+#   -- a parked item is still something the operator wants to see and can
+#   still be unblocked / re-deped. Visibility != scope-holding.
 ACTIVE_STATUSES = ("pending", "running", "wedged", "blocked")
+SERIALIZING_STATUSES = ("pending", "running", "wedged")
 RUNNING_STATUSES = ("running", "wedged")
 
 # Agent-transcript archive directory. At queue-done / queue-abandon time the
@@ -961,7 +979,12 @@ def _union_scopes(*sets):
 
 
 def _active_items(items):
-    return [it for it in items if it.get("status") in ACTIVE_STATUSES]
+    # NOTE: "active" here means "participates in scope serialization", NOT
+    # "non-terminal for display". Only `_group_ids_overlapping` (group
+    # formation) calls this, so it uses SERIALIZING_STATUSES -- a blocked
+    # item must not bridge scopes into an existing group. (Display surfaces
+    # that want blocked included filter on ACTIVE_STATUSES directly.)
+    return [it for it in items if it.get("status") in SERIALIZING_STATUSES]
 
 
 def _group_members(items, group_id):
@@ -1066,7 +1089,7 @@ def _group_head(items, group_id):
     the oldest *pending* member is the head -- a lone blocked member yields
     no head, freeing its pending peers to become ready.
     """
-    members = [it for it in _group_members(items, group_id) if it.get("status") in ACTIVE_STATUSES]
+    members = [it for it in _group_members(items, group_id) if it.get("status") in SERIALIZING_STATUSES]
     if not members:
         return None
     running = [it for it in members if it.get("status") in RUNNING_STATUSES]
@@ -1258,8 +1281,139 @@ def _gc_groups(items):
     return items
 
 
+def _recompute_groups(items):
+    """Re-derive group_id assignments from actual serializing connectivity.
+
+    Groups are the serialization unit: a group must reflect a connected
+    component of items whose scopes overlap AND that actually serialize
+    (`SERIALIZING_STATUSES` = pending/running/wedged). A `blocked` (or
+    terminal) item must NOT bridge two otherwise-independent scope
+    components into one group -- that is exactly the bug where a multi-scope
+    blocked item parked on an external blocker (e.g. a Drive push lock)
+    bridged a running agent in scope A and a pending task in scope B, so the
+    scope-B task could not spawn even though nothing was using its clone.
+
+    Algorithm:
+      1. Connectors = items in SERIALIZING_STATUSES. Union-find over them,
+         joining two connectors whose serializing scopes overlap. Each
+         resulting component becomes one group; its group_id is reused from
+         the component's members (most common existing id) for stability,
+         else a fresh id.
+      2. Non-connectors (blocked / done / abandoned) do NOT bridge. Each
+         attaches to a connector component ONLY IF its serializing scope
+         overlaps EXACTLY ONE component (it then shares that group_id, which
+         is harmless -- it owns no slot and is not the head). If it overlaps
+         zero or MORE THAN ONE component, it is left in / given its OWN
+         standalone group so it can never act as a bridge.
+
+    Idempotent: running it on an already-correct layout is a no-op (modulo
+    group_id label stability, which is preserved by the reuse heuristic).
+    Mutates `items` in place (sets each item's "group_id").
+    """
+    if not items:
+        return
+
+    connectors = [it for it in items if it.get("status") in SERIALIZING_STATUSES]
+
+    # --- 1. Union-find over connectors by serializing-scope overlap. ---
+    parent = {it["id"]: it["id"] for it in connectors}
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        # path-compress
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    conn_serializing = {
+        it["id"]: _serializing_scope(it.get("scope", [])) for it in connectors
+    }
+    for i in range(len(connectors)):
+        si = conn_serializing[connectors[i]["id"]]
+        if not si:
+            continue
+        for j in range(i + 1, len(connectors)):
+            sj = conn_serializing[connectors[j]["id"]]
+            if sj and _scope_sets_overlap(si, sj):
+                union(connectors[i]["id"], connectors[j]["id"])
+
+    # Component root -> list of connector items.
+    comp_members = {}
+    for it in connectors:
+        comp_members.setdefault(find(it["id"]), []).append(it)
+
+    # Assign a stable group_id per component: reuse the most common existing
+    # group_id among the component's members (deterministic tiebreak on the
+    # id string), else mint a fresh one.
+    comp_gid = {}
+    used_gids = set()
+    for root, members in comp_members.items():
+        counts = {}
+        for m in members:
+            g = m.get("group_id")
+            if g:
+                counts[g] = counts.get(g, 0) + 1
+        if counts:
+            # most frequent, tiebreak by smallest gid string for determinism
+            gid = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+            # avoid collision if another component already claimed this gid
+            if gid in used_gids:
+                gid = _new_group_id()
+        else:
+            gid = _new_group_id()
+        comp_gid[root] = gid
+        used_gids.add(gid)
+        for m in members:
+            m["group_id"] = gid
+
+    # Component root -> aggregated serializing scope (for non-connector match).
+    comp_scope = {}
+    for root, members in comp_members.items():
+        comp_scope[root] = _serializing_scope(
+            _union_scopes(*(m.get("scope", []) for m in members))
+        )
+
+    # --- 2. Attach non-connectors without ever bridging components. ---
+    for it in items:
+        if it.get("status") in SERIALIZING_STATUSES:
+            continue
+        s = _serializing_scope(it.get("scope", []))
+        overlapping_roots = []
+        if s:
+            for root, gscope in comp_scope.items():
+                if gscope and _scope_sets_overlap(s, gscope):
+                    overlapping_roots.append(root)
+        if len(overlapping_roots) == 1:
+            # Safe to co-locate: shares the single overlapping component's
+            # group_id. It owns no slot and is never the head, so this only
+            # affects display grouping -- it cannot bridge anything.
+            it["group_id"] = comp_gid[overlapping_roots[0]]
+        else:
+            # Zero overlap, or overlaps MULTIPLE components (would bridge):
+            # keep a standalone group so this item connects nothing.
+            cur = it.get("group_id")
+            if (not cur) or (cur in used_gids):
+                cur = _new_group_id()
+            it["group_id"] = cur
+            used_gids.add(cur)
+
+
 def _recompute_group_heads(items):
-    """Ensure invariant: at most one running per group, head flag is accurate."""
+    """Ensure invariant: at most one running per group, head flag is accurate.
+
+    First re-derives group membership from actual serializing connectivity
+    (`_recompute_groups`) so a blocked/terminal item that previously bridged
+    two scope components is split back out before heads are assigned. Then
+    assigns the head flag per group.
+    """
+    _recompute_groups(items)
     by_group = {}
     for it in items:
         by_group.setdefault(it.get("group_id"), []).append(it)
@@ -3962,11 +4116,13 @@ def cmd_queue_register(args):
             sys.exit(2)
 
         if target.get("status") == "blocked":
-            # A blocked item is parked on an external blocker but still
-            # owns its scope. Operator must explicitly unblock (back to
-            # running) or move to a terminal state first. Re-registering
-            # would lose the block_reason audit trail and race with
-            # whatever external action is in flight.
+            # A blocked item is parked on an external blocker. It has
+            # RELEASED its scope lock (a peer in the same scope may spawn),
+            # but it is still THIS item -- re-registering it in place would
+            # lose the block_reason audit trail and race the external action
+            # in flight. The operator must explicitly unblock (back to
+            # running, which re-acquires the scope lock and serializes like
+            # any running item) or move it to a terminal state first.
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             print("", file=sys.stderr)
@@ -4781,8 +4937,10 @@ def cmd_queue_block(args):
         target["status"] = "blocked"
         target["blocked_at"] = _fmt_ts()
         target["block_reason"] = raw_reason
-        # group_head stays as-is -- a blocked item is still the in-flight
-        # head of its group. _recompute_group_heads will confirm.
+        # Blocked RELEASES the scope lock: it no longer serializes, is no
+        # longer head-eligible, and must not bridge scopes. _recompute_groups
+        # (invoked by _recompute_group_heads) re-splits any component this
+        # item was bridging and clears its head flag.
         _recompute_group_heads(items)
         updated = dict(target)
         _queue_write_and_unlock(fh, data)
@@ -4858,6 +5016,12 @@ def cmd_queue_unblock(args):
     Behavior:
       * Item must exist and be in status=blocked. Any other status
         refuses.
+      * RE-ACQUIRES the scope lock. While blocked the item held no scope,
+        so a peer may have started running in an overlapping scope. Returning
+        to running would double-occupy that scope, so unblock REFUSES (exit
+        3) if any other running/wedged item now overlaps this item's scope --
+        the operator must let that work finish (or abandon this item) first,
+        exactly like a fresh `register` serializes. `--force` overrides.
       * Flips status=running. Refreshes `last_heartbeat_at` so the
         exporter doesn't immediately re-flag the item as stale.
       * Records `unblocked_at` (ISO timestamp). Preserves `blocked_at` /
@@ -4886,6 +5050,30 @@ def cmd_queue_unblock(args):
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             sys.exit(1)
+
+        # Re-acquire the scope lock: refuse if another running/wedged item
+        # now holds an overlapping scope (a peer may have spawned while this
+        # item was blocked and holding nothing). Mirrors register's
+        # serialization guarantee. `--force` overrides.
+        if not getattr(args, "force", False):
+            reacquire_conflicts = _running_scope_conflicts(
+                items, target.get("scope", []), exclude_id=target.get("id"),
+            )
+            if reacquire_conflicts:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                ids = ", ".join(
+                    f"{c['id']}({c.get('group_id')})" for c in reacquire_conflicts
+                )
+                print(
+                    f"unblock refused: {args.id} cannot re-acquire its scope "
+                    f"-- {len(reacquire_conflicts)} running/wedged item(s) now "
+                    f"hold an overlapping scope: {ids}. Let that work finish "
+                    f"(or `queue abandon {args.id}`) first, or pass --force if "
+                    f"concurrent execution is safe.",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
 
         prior_reason = target.get("block_reason") or "(unspecified)"
         now = _fmt_ts()
@@ -6431,6 +6619,16 @@ def build_parser():
     )
     q_unblock.add_argument("id")
     q_unblock.add_argument("--json", action="store_true")
+    q_unblock.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Unblock even if another running/wedged item now holds an "
+            "overlapping scope. Default REFUSES such an unblock (returning "
+            "to running would re-acquire the scope lock and double-occupy "
+            "it). Pass --force only if you know the conflicting work is safe "
+            "to run concurrently."
+        ),
+    )
     q_unblock.add_argument(
         "--silent", action="store_true",
         help="Suppress the pingme + claude-event notifications for this operation.",
