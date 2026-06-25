@@ -528,7 +528,7 @@ RUN --mount=type=cache,target=/home/hndrewaall/.npm,uid=1000,gid=1000,sharing=lo
                             && npm config set fetch-retry-maxtimeout 120000 \
                             && npm config set fetch-timeout 300000 \
                             && npm install -g @anthropic-ai/claude-code \
-                            && claude --version' \
+                            && /home/hndrewaall/.npm-global/bin/claude --version' \
     && ln -sf /home/hndrewaall/.npm-global/bin/claude /usr/bin/claude \
     && chown -h 1000:1000 /usr/bin/claude
 
