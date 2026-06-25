@@ -2398,15 +2398,67 @@ def _build_subagent_tree(
     return peer_nodes + roots
 
 
-def _format_sse(data: dict[str, Any]) -> bytes:
-    """Encode a dict as a single SSE `data:` event.
+def _format_sse(data: dict[str, Any], *, event_id: int | None = None) -> bytes:
+    """Encode a dict as a single SSE event.
+
+    When ``event_id`` is given, an ``id:`` line is prepended. The browser's
+    native ``EventSource`` echoes the last seen ``id`` back as the
+    ``Last-Event-ID`` header on auto-reconnect, which the stream endpoints
+    honor as a resume cursor (the byte offset into the tailed file). Without
+    an ``id:`` line a reconnect has no cursor and the server re-backfills the
+    recent tail, producing duplicate log lines and a visible "reconnecting"
+    flicker — the bug this resume mechanism fixes.
 
     Returns bytes so the surrounding Response can use
     ``direct_passthrough=True`` (which requires byte chunks per WSGI
     PEP-3333). Without this, gunicorn raises
     ``TypeError('...' is not a byte')`` on every yielded frame.
     """
-    return ("data: " + json.dumps(data, separators=(",", ":")) + "\n\n").encode("utf-8")
+    body = "data: " + json.dumps(data, separators=(",", ":")) + "\n\n"
+    if event_id is not None:
+        body = f"id: {event_id}\n" + body
+    return body.encode("utf-8")
+
+
+def _enable_socket_keepalive(environ: dict) -> None:
+    """Enable SO_KEEPALIVE (and, where supported, tune the probe timers) on the
+    client socket backing an SSE request.
+
+    A long-lived live-tail can sit idle between log lines for minutes. The
+    app already emits a ``: keep-alive`` comment every ``SSE_KEEPALIVE_SECONDS``
+    to defeat proxy idle timeouts, but kernel TCP keepalive adds a second,
+    lower layer of liveness: the OS probes the peer directly and tears down a
+    genuinely dead connection promptly, so the worker's generator gets a clean
+    ``GeneratorExit`` instead of hanging on a half-open socket (which would
+    otherwise occupy a worker thread until the lifetime cap).
+
+    Best-effort: gunicorn exposes the client socket on
+    ``environ['gunicorn.socket']``; under another WSGI server (or in tests) the
+    key/options may be missing, so every step is guarded.
+    """
+    import socket
+
+    sock = environ.get("gunicorn.socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    # Linux-only timer knobs: start probing after 30s idle, every 10s, drop
+    # after 3 missed probes (~60s to detect a dead peer). Each is optional.
+    for opt_name, value in (
+        ("TCP_KEEPIDLE", 30),
+        ("TCP_KEEPINTVL", 10),
+        ("TCP_KEEPCNT", 3),
+    ):
+        opt = getattr(socket, opt_name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError:
+            pass
 
 
 def _format_sse_comment(text: str) -> bytes:
@@ -2416,6 +2468,27 @@ def _format_sse_comment(text: str) -> bytes:
     rationale as ``_format_sse``).
     """
     return f": {text}\n\n".encode("utf-8")
+
+
+def _parse_sse_since(req) -> int | None:
+    """Resolve the SSE resume cursor for a stream request.
+
+    Prefers an explicit ``?since=<offset>`` query parameter; otherwise falls
+    back to the standard ``Last-Event-ID`` header the browser's native
+    ``EventSource`` sends automatically on auto-reconnect. Returns a
+    non-negative int byte offset, or ``None`` when neither is present / parses.
+    """
+    since = req.args.get("since", type=int)
+    if since is None:
+        last_event_id = req.headers.get("Last-Event-ID")
+        if last_event_id:
+            try:
+                since = int(last_event_id)
+            except (TypeError, ValueError):
+                since = None
+    if since is not None and since < 0:
+        return None
+    return since
 
 
 def _collapse_transient_runs(
@@ -2552,7 +2625,7 @@ def _pending_transient_frame(pending: str) -> str | None:
     return body[cut + 1:] if cut >= 0 else body
 
 
-def _tail_jsonl(path: Path) -> Iterator[bytes]:
+def _tail_jsonl(path: Path, since: int | None = None) -> Iterator[bytes]:
     """Generator yielding SSE events for a tailed agent JSONL.
 
     Opens the file in tail mode: backfill the last ``SSE_TAIL_BACKFILL_LINES``
@@ -2564,15 +2637,22 @@ def _tail_jsonl(path: Path) -> Iterator[bytes]:
 
     Each yielded chunk is a complete SSE frame; the caller emits them
     verbatim into the response body.
+
+    ``since`` is a resume cursor: the byte offset (the ``id:`` of the last
+    frame the client already received). When it points inside the current
+    file we seek there and skip the backfill entirely — so a reconnecting
+    EventSource fetches only the delta appended since it dropped, instead of
+    re-receiving the recent tail (which appeared as duplicate lines + a
+    "reconnecting" flicker). Each data frame carries ``id: <offset>`` where
+    ``<offset>`` is the file position immediately AFTER that line, so the
+    next reconnect resumes from exactly the right place. ``since`` of ``None``
+    (or one that no longer fits the file — truncation/rotation) falls back to
+    the normal backfill-from-tail behavior.
     """
     started = time.monotonic()
     last_data_at = started
     last_keepalive_at = started
 
-    # Open + seek. We use line-by-line reads from the start so we can
-    # honor the backfill cap without buffering the whole file. For the
-    # initial backfill we read the file once, take the tail N lines,
-    # emit them, then seek to EOF and start polling.
     yield _format_sse({
         "type": "meta",
         "kind": "stream-start",
@@ -2587,33 +2667,76 @@ def _tail_jsonl(path: Path) -> Iterator[bytes]:
         return
 
     try:
-        # Backfill: read all, take tail.
-        try:
-            backfill = f.readlines()[-SSE_TAIL_BACKFILL_LINES:]
-        except OSError as exc:
-            yield _format_sse({"type": "error", "kind": "read-failed", "error": str(exc)})
-            return
+        # Decide whether this is a fresh open (backfill from the tail) or a
+        # reconnect resume (seek to the client's cursor, no backfill).
+        resume_offset: int | None = None
+        if since is not None and since > 0:
+            try:
+                file_size = os.fstat(f.fileno()).st_size
+            except OSError:
+                file_size = None
+            # Only honor the cursor if it still fits the file. A larger-than-
+            # file cursor means the file was truncated/rotated under us; fall
+            # back to a normal backfill so the viewer isn't left blank.
+            if file_size is not None and since <= file_size:
+                resume_offset = since
 
-        if backfill:
+        if resume_offset is not None:
+            f.seek(resume_offset)
             yield _format_sse({
                 "type": "meta",
-                "kind": "backfill-begin",
-                "lines": len(backfill),
+                "kind": "resumed",
+                "since": resume_offset,
             })
-            for line in backfill:
-                line = line.rstrip("\n")
-                if line:
-                    yield _format_sse(_parse_jsonl_line(line))
-                    last_data_at = time.monotonic()
-            yield _format_sse({"type": "meta", "kind": "backfill-end"})
+        else:
+            # Backfill: read the tail N lines and emit each with an ``id:``
+            # carrying the EXACT byte offset at its end-of-line. We read the
+            # raw bytes (not the text handle) so the cursor is a true file
+            # offset — re-encoding decoded text would drift on any byte that
+            # decoded to U+FFFD, and a drifted cursor would seek to the wrong
+            # place on the next reconnect. The text handle ``f`` is only used
+            # for the post-backfill tail loop (repositioned to EOF below).
+            try:
+                with open(path, "rb") as bf:
+                    raw_lines = bf.readlines()
+            except OSError as exc:
+                yield _format_sse({"type": "error", "kind": "read-failed", "error": str(exc)})
+                return
+            head = raw_lines[:-SSE_TAIL_BACKFILL_LINES] if SSE_TAIL_BACKFILL_LINES else raw_lines
+            backfill = raw_lines[-SSE_TAIL_BACKFILL_LINES:] if SSE_TAIL_BACKFILL_LINES else []
+            # Running byte offset: bytes of every line BEFORE the window.
+            offset = sum(len(b) for b in head)
+
+            if backfill:
+                yield _format_sse({
+                    "type": "meta",
+                    "kind": "backfill-begin",
+                    "lines": len(backfill),
+                })
+                for raw in backfill:
+                    offset += len(raw)  # exact: offset at END of this line
+                    line = raw.decode("utf-8", "replace").rstrip("\n")
+                    if line:
+                        yield _format_sse(_parse_jsonl_line(line), event_id=offset)
+                        last_data_at = time.monotonic()
+                yield _format_sse({"type": "meta", "kind": "backfill-end"})
+            # Position the text handle at true EOF so the tail loop reads only
+            # newly-appended bytes. f.tell() there matches the byte ``offset``.
+            f.seek(0, os.SEEK_END)
 
         # Tail loop.
         while True:
             line = f.readline()
             if line:
+                # f.tell() after a readline() is the byte offset of the NEXT
+                # line — exactly the resume cursor we want to hand the client.
+                try:
+                    cursor = f.tell()
+                except OSError:
+                    cursor = None
                 line = line.rstrip("\n")
                 if line:
-                    yield _format_sse(_parse_jsonl_line(line))
+                    yield _format_sse(_parse_jsonl_line(line), event_id=cursor)
                     last_data_at = time.monotonic()
                 continue
             now = time.monotonic()
@@ -3279,6 +3402,12 @@ def api_queue_stream(qid: str) -> Any:
     if not _QUEUE_ID_RE.match(qid):
         return jsonify({"ok": False, "error": "invalid queue id format"}), 400
 
+    # Resume cursor (?since= / Last-Event-ID) so a reconnecting EventSource
+    # fetches only the delta instead of re-backfilling the recent tail.
+    since = _parse_sse_since(request)
+    # Kernel TCP keepalive on the long-lived stream socket (best-effort).
+    _enable_socket_keepalive(request.environ)
+
     headers = {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -3372,7 +3501,7 @@ def api_queue_stream(qid: str) -> Any:
         )
 
     return Response(
-        stream_with_context(_tail_jsonl(jsonl_path)),
+        stream_with_context(_tail_jsonl(jsonl_path, since=since)),
         headers=headers,
         direct_passthrough=True,
     )
@@ -3404,6 +3533,11 @@ def api_subagent_stream(subagent_id: str) -> Any:
     if not _SUBAGENT_ID_RE.match(subagent_id):
         return jsonify({"ok": False, "error": "invalid subagent id format"}), 400
 
+    # Resume cursor (?since= / Last-Event-ID) + kernel TCP keepalive, same as
+    # the queue stream — the subagent tail is the identical wire format.
+    since = _parse_sse_since(request)
+    _enable_socket_keepalive(request.environ)
+
     headers = {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -3432,7 +3566,7 @@ def api_subagent_stream(subagent_id: str) -> Any:
         )
 
     return Response(
-        stream_with_context(_tail_jsonl(jsonl_path)),
+        stream_with_context(_tail_jsonl(jsonl_path, since=since)),
         headers=headers,
         direct_passthrough=True,
     )
