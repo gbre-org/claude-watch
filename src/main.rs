@@ -569,9 +569,14 @@ enum WatcherAction {
         #[arg(long)]
         json: bool,
     },
-    /// Show running status of all watchers
+    /// Show running status of watchers.
+    ///
+    /// By default only ENABLED watchers are listed (the ones that are
+    /// supposed to be running). Disabled (`off`) watchers are intentionally
+    /// not running and are hidden to keep the view focused. Pass `--all` to
+    /// include the disabled rows (the full historical listing).
     Status {
-        /// Output as JSON
+        /// Output as JSON (always includes disabled watchers regardless of --all).
         #[arg(long)]
         json: bool,
         /// Only emit output if at least one enabled watcher is DOWN.
@@ -580,6 +585,10 @@ enum WatcherAction {
         /// after every tool call without spamming on healthy state.
         #[arg(long)]
         unhealthy_only: bool,
+        /// Show ALL watchers, including disabled (`off`) ones. Without this
+        /// flag the listing shows only enabled watchers.
+        #[arg(long)]
+        all: bool,
     },
     /// Enable a watcher (config flip only — main loop must spawn it).
     ///
@@ -1331,8 +1340,9 @@ async fn run_watcher(action: WatcherAction) {
         WatcherAction::Status {
             json,
             unhealthy_only,
+            all,
         } => {
-            watcher::cmd_status(&cfg, extra_ref, json, unhealthy_only).await;
+            watcher::cmd_status(&cfg, extra_ref, json, unhealthy_only, all).await;
             0
         }
         WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, &name, true).await,
