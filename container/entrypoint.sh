@@ -290,6 +290,20 @@ fi
 # the post-tool-agent-arm-hook enforce it AFTER spawn). Best-effort:
 # obligations-init exits 0 on any internal failure so a missing
 # obligations CLI / broken state file never blocks container start.
+# CLAUDE_OBLIGATIONS_MANIFEST_DIR — the in-container path obligations-init
+# scans for USER-MANAGED obligation manifests (one *.json row spec per file),
+# applied idempotently AFTER the baked default-seed rows. This is the
+# bind-mount target of the operator's private $CLAUDE_HOST_OBLIGATIONS_DIR
+# (see examples/compose/docker-compose.yml). It lets operator-specific
+# obligations (e.g. the AskUserQuestion presence-gate) be DECLARATIVE private
+# config that auto-applies on EVERY container start — no per-session
+# `register-*` script to forget, and nothing operator-specific baked into the
+# shared public image. Defaults to the documented mount path; obligations-init
+# itself no-ops cleanly when the dir is absent / empty / a non-directory
+# (e.g. an unset operator leaves the mount off entirely), so this is harmless
+# on a stripped-down deployment.
+CLAUDE_OBLIGATIONS_MANIFEST_DIR="${CLAUDE_OBLIGATIONS_MANIFEST_DIR:-/mnt/host-obligations-config}"
+export CLAUDE_OBLIGATIONS_MANIFEST_DIR
 if [ "$CLAUDE_CONTAINER_OBLIGATIONS" = "1" ] \
         && [ -x /usr/local/bin/obligations-init ]; then
     /usr/local/bin/obligations-init -v || true

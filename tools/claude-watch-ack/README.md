@@ -52,12 +52,19 @@ claude-watch-ack add <message> [--source TAG] [--json]
 claude-watch-ack list [--json]
     Show pending alerts.
 
-claude-watch-ack ack <id>
-    Remove a single alert by id (exit 1 if id not found).
+claude-watch-ack ack <id> [--confirm-read <token>]
+    Remove a single alert by id. A bare `ack <id>` PRINTS the full body
+    (which includes a per-alert `read-token=<hex>`) and REFUSES with exit 2 --
+    it clears NOTHING. To clear, echo that token back:
+    `ack <id> --confirm-read <token>`. The token is derived from the alert
+    body and printed ONLY in the body, so supplying the right token is proof
+    the body was read -- a blind/reflexive ack is structurally impossible.
+    Exit 0 if ack'd, 1 if id not found, 2 if token missing/wrong.
 
-claude-watch-ack ack --all
-claude-watch-ack clear
-    Remove every pending alert.
+claude-watch-ack ack --all --confirm-read
+claude-watch-ack clear --confirm-read
+    Remove every pending alert. A bare `--all`/`clear` PRINTS every body and
+    REFUSES (exit 2); `--confirm-read` (after reading) clears them.
 
 claude-watch-ack status [--json]
     Exit 0 when no alerts pending; exit 1 when any are.

@@ -90,6 +90,7 @@ the next ``obligations-init`` run.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -108,6 +109,24 @@ AGENT_ACK_PENDING_TAG = "[default-seed] agent_ack_pending"
 QUEUE_READY_UNSPAWNED_TAG = "[default-seed] queue_ready_unspawned"
 NO_BACKGROUNDED_WATCHER_TAG = "[default-seed] no_backgrounded_watcher"
 SUBAGENT_QUEUE_MUTATING_BANNED_TAG = "[default-seed] subagent_queue_mutating_banned"
+
+# Default in-container path where the operator's bind-mounted, USER-MANAGED
+# obligation manifest dir lands (the entrypoint mounts
+# $CLAUDE_HOST_OBLIGATIONS_DIR here read-only). Each `*.json` file in this
+# dir is one obligation row spec, applied idempotently AFTER the baked
+# default-seed rows above. Overridable at runtime via
+# $CLAUDE_OBLIGATIONS_MANIFEST_DIR (the entrypoint exports it pointing at the
+# mount). This is how operator-specific obligations (e.g. the presence-gate)
+# live in PRIVATE config instead of being baked into the shared image. See
+# `seed_from_manifest_dir` below + examples/compose/.env.example.
+DEFAULT_MANIFEST_DIR = "/mnt/host-obligations-config"
+
+# Marker prefix written into each manifested row's deny_message-independent
+# audit so re-runs detect "already applied". We key user-manifest idempotency
+# on a (created_by, tool_pattern, predicate) signature rather than the
+# deny_message (operators own the deny text and may reword it), so a reworded
+# message does NOT duplicate the row -- it replaces it (remove-then-add).
+USER_MANIFEST_DEFAULT_CREATED_BY = "user-obligations-manifest"
 
 # Exempts that must always pass even when the gate is firing. These are
 # the recovery surface a subagent uses to either re-register a queue
@@ -717,6 +736,256 @@ def seed_subagent_queue_mutating_banned(cli: str, *, dry_run: bool = False,
     return 0
 
 
+def _existing_user_manifest_rows(cli: str) -> list[dict]:
+    """Return the active obligation rows that were applied from a user
+    manifest, identified by created_by carrying the user-manifest marker.
+
+    We tag every manifested row's ``created_by`` with the
+    ``[user-manifest]`` marker (appended by ``seed_from_manifest_dir`` when
+    the manifest doesn't already include it) so re-runs can find + replace
+    them without touching the baked default-seed rows or any hand-registered
+    operator obligations. Returns [] on any error (default-open)."""
+    try:
+        proc = subprocess.run(
+            [cli, "list", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    rows = []
+    for ob in data.get("obligations", []):
+        if not isinstance(ob, dict):
+            continue
+        cb = ob.get("created_by") or ""
+        if isinstance(cb, str) and "[user-manifest]" in cb:
+            rows.append(ob)
+    return rows
+
+
+def _manifest_row_signature(tool_pattern: str, predicate: str,
+                            created_by: str) -> tuple:
+    """Stable identity for a manifested row: (created_by, tool_pattern,
+    predicate). Two manifest applies with the same signature are the SAME
+    logical row -- the second replaces the first (so editing params / deny
+    text in a manifest updates rather than duplicates)."""
+    return (created_by, tool_pattern, predicate)
+
+
+def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
+                        dry_run: bool, verbose: bool) -> int:
+    """Apply a single manifest JSON file as one obligations row.
+
+    Manifest schema (a JSON object; mirrors the `obligations add` flags):
+
+        {
+          "tool_pattern":  "AskUserQuestion",        # REQUIRED (str)
+          "predicate":     "file_mtime_within",      # REQUIRED (str)
+          "params":        {"path": "...", ...},     # optional (obj|str)
+          "ttl":           0,                         # optional (int, default 0)
+          "enforcement":   "gate",                    # optional ("gate"|"inform")
+          "deny_msg":      "...",                     # REQUIRED (str)
+          "created_by":    "claude-config:presence-gate",  # optional (str)
+          "mandatory":     false,                     # optional (bool)
+          "exempt_tool_patterns": ["Bash:^foo"],      # optional (list[str])
+          "satisfied_by_tool": null,                  # optional (str)
+          "satisfied_by_cmd_regex": null              # optional (str)
+        }
+
+    Idempotency: we REMOVE any pre-existing user-manifest row with the same
+    (created_by, tool_pattern, predicate) signature, then add the fresh row.
+    This makes re-applying a reworded / re-tuned manifest a replace, never a
+    duplicate -- and on every container start the manifest dir is the source
+    of truth. Returns 0 on success (added / replaced), 1 on hard failure.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            spec = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        print(f"obligations-init: manifest {path} unreadable/invalid: {e}",
+              file=sys.stderr)
+        return 1
+    if not isinstance(spec, dict):
+        print(f"obligations-init: manifest {path} is not a JSON object -- "
+              "skipping", file=sys.stderr)
+        return 1
+
+    tool_pattern = spec.get("tool_pattern")
+    predicate = spec.get("predicate")
+    deny_msg = spec.get("deny_msg")
+    if not (isinstance(tool_pattern, str) and isinstance(predicate, str)
+            and isinstance(deny_msg, str)):
+        print(f"obligations-init: manifest {path} missing required "
+              "tool_pattern / predicate / deny_msg -- skipping",
+              file=sys.stderr)
+        return 1
+
+    created_by = spec.get("created_by") or USER_MANIFEST_DEFAULT_CREATED_BY
+    if not isinstance(created_by, str):
+        created_by = USER_MANIFEST_DEFAULT_CREATED_BY
+    # Stamp the user-manifest marker so re-runs can find + replace this row
+    # without disturbing baked default-seed rows or hand-registered ones.
+    if "[user-manifest]" not in created_by:
+        created_by = f"{created_by} [user-manifest]"
+
+    params = spec.get("params", {})
+    if isinstance(params, (dict, list)):
+        params_json = json.dumps(params)
+    elif isinstance(params, str):
+        params_json = params  # already-serialized JSON string
+    else:
+        params_json = "{}"
+
+    ttl = spec.get("ttl", 0)
+    try:
+        ttl = int(ttl)
+    except (TypeError, ValueError):
+        ttl = 0
+
+    enforcement = spec.get("enforcement", "gate")
+    if enforcement not in ("gate", "inform"):
+        enforcement = "gate"
+
+    # Replace-not-duplicate: drop any existing user-manifest row with the
+    # same signature before adding. (created_by here carries the marker, so
+    # the signature is computed against the marked form -- matching what
+    # _existing_user_manifest_rows returns.)
+    sig = _manifest_row_signature(tool_pattern, predicate, created_by)
+    for ob in existing:
+        if _manifest_row_signature(
+                ob.get("tool_pattern", ""),
+                ob.get("predicate", ""),
+                ob.get("created_by", "")) == sig:
+            oid = ob.get("id")
+            if not oid:
+                continue
+            if dry_run:
+                print(f"DRY-RUN: {cli} satisfy {oid}  "
+                      f"(replace existing manifest row from {path})")
+            else:
+                try:
+                    subprocess.run([cli, "satisfy", str(oid)],
+                                   capture_output=True, text=True,
+                                   timeout=10, check=False)
+                except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                    pass
+
+    cmd = [
+        cli, "add",
+        "--tool-pattern", tool_pattern,
+        "--predicate", predicate,
+        "--params", params_json,
+        "--ttl", str(ttl),
+        "--enforcement", enforcement,
+        "--deny-msg", deny_msg,
+        "--created-by", created_by,
+        "--json",
+    ]
+    if spec.get("mandatory"):
+        cmd.append("--mandatory")
+    sbt = spec.get("satisfied_by_tool")
+    if isinstance(sbt, str) and sbt:
+        cmd.extend(["--satisfied-by-tool", sbt])
+    sbr = spec.get("satisfied_by_cmd_regex")
+    if isinstance(sbr, str) and sbr:
+        cmd.extend(["--satisfied-by-cmd-regex", sbr])
+    exempts = spec.get("exempt_tool_patterns")
+    if isinstance(exempts, list):
+        for pat in exempts:
+            if isinstance(pat, str) and pat:
+                cmd.extend(["--exempt-tool-pattern", pat])
+
+    if dry_run:
+        print("DRY-RUN: " + " ".join(cmd))
+        return 0
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"obligations-init: manifest {path} add failed: {e}",
+              file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print(f"obligations-init: manifest {path} obligations add failed "
+              f"rc={proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        return 1
+    if verbose:
+        try:
+            row = json.loads(proc.stdout)
+            print(f"user-manifest {os.path.basename(path)}: applied "
+                  f"id={row.get('id', '?')} tool={tool_pattern} "
+                  f"predicate={predicate}", file=sys.stderr)
+        except (json.JSONDecodeError, ValueError):
+            print(f"user-manifest {os.path.basename(path)}: applied "
+                  f"(rc={proc.returncode})", file=sys.stderr)
+    return 0
+
+
+def seed_from_manifest_dir(cli: str, manifest_dir: str, *,
+                           dry_run: bool = False,
+                           verbose: bool = False) -> int:
+    """Apply every ``*.json`` obligation manifest in ``manifest_dir`` as a
+    user-managed obligation row, idempotently, AFTER the baked default-seed
+    rows.
+
+    This is the mechanism for BIND-MOUNTED, USER-MANAGED obligation configs:
+    the operator's private config dir (host ``$CLAUDE_HOST_OBLIGATIONS_DIR``,
+    bind-mounted read-only at ``manifest_dir`` inside the container) holds one
+    JSON file per obligation row. The entrypoint runs ``obligations-init``
+    pointed at this dir on EVERY container start, so operator-specific
+    obligations (e.g. the presence-gate) are declarative private config that
+    auto-applies -- no per-session ``register-*`` script to forget, and
+    nothing operator-specific baked into the shared public image.
+
+    Tolerant of an absent / empty mount: a missing dir, an empty dir, or a
+    dir that is actually a non-directory (e.g. a stray ``/dev/null`` mount)
+    is a clean no-op (returns 0). A single malformed manifest is skipped with
+    a stderr warning but does NOT abort the others. Returns the first
+    non-zero per-file rc (so the operator sees a failure), but never raises.
+    """
+    if not manifest_dir:
+        return 0
+    if not os.path.isdir(manifest_dir):
+        # Absent mount (typical when the operator hasn't set
+        # CLAUDE_HOST_OBLIGATIONS_DIR) OR a non-dir mount (e.g. /dev/null):
+        # clean no-op, never an error.
+        if verbose:
+            print(f"obligations-init: manifest dir {manifest_dir} absent / "
+                  "not-a-dir -- no user obligations to apply", file=sys.stderr)
+        return 0
+
+    manifests = sorted(glob.glob(os.path.join(manifest_dir, "*.json")))
+    if not manifests:
+        if verbose:
+            print(f"obligations-init: manifest dir {manifest_dir} empty -- "
+                  "no user obligations to apply", file=sys.stderr)
+        return 0
+
+    # Snapshot existing user-manifest rows ONCE so each apply can replace its
+    # own prior incarnation without re-listing per file.
+    existing = _existing_user_manifest_rows(cli)
+
+    first_rc = 0
+    for path in manifests:
+        rc = _apply_one_manifest(
+            cli, path, existing=existing, dry_run=dry_run, verbose=verbose,
+        )
+        if rc and not first_rc:
+            first_rc = rc
+    return first_rc
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="obligations-init",
@@ -776,8 +1045,22 @@ def main() -> int:
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
 
+    # User-managed obligation manifests from the bind-mounted, operator-owned
+    # config dir. Applied AFTER all baked default-seed rows so an operator
+    # manifest can layer on top of (never displace) the container-policy
+    # gates. The dir is the bind-mount target of $CLAUDE_HOST_OBLIGATIONS_DIR
+    # (resolved at runtime via $CLAUDE_OBLIGATIONS_MANIFEST_DIR, defaulting to
+    # DEFAULT_MANIFEST_DIR). Absent / empty / non-dir mount is a clean no-op,
+    # so this is harmless on a stripped-down deployment that wires nothing.
+    manifest_dir = os.environ.get(
+        "CLAUDE_OBLIGATIONS_MANIFEST_DIR", DEFAULT_MANIFEST_DIR,
+    )
+    rc8 = seed_from_manifest_dir(
+        cli, manifest_dir, dry_run=args.dry_run, verbose=args.verbose,
+    )
+
     # Return first non-zero exit code (if any)
-    return rc or rc2 or rc3 or rc4 or rc5 or rc6 or rc7
+    return rc or rc2 or rc3 or rc4 or rc5 or rc6 or rc7 or rc8
 
 
 if __name__ == "__main__":

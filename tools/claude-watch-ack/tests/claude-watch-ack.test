@@ -160,19 +160,96 @@ def test_list_populated():
         h.cleanup()
 
 
-def test_ack_by_id():
+def _extract_read_token(stdout: str) -> str:
+    """Pull the `read-token=<hex>` value out of a rendered alert body."""
+    import re
+    m = re.search(r"read-token=([0-9a-f]{8})", stdout)
+    return m.group(1) if m else ""
+
+
+def test_ack_by_id_bare_refuses():
+    """NERF: a bare `ack <id>` REFUSES (exit 2), prints body + read-token,
+    and clears NOTHING -- the blind-ack path is gone."""
     h = Harness()
     try:
-        id_a = h.run("add", "[CLAUDE-WATCH] A").stdout.strip()
-        id_b = h.run("add", "[CLAUDE-WATCH] B").stdout.strip()
+        id_a = h.run("add", "[CLAUDE-WATCH] body-of-A-must-be-printed").stdout.strip()
+        h.run("add", "[CLAUDE-WATCH] B")
         proc = h.run("ack", id_a)
-        check(proc.returncode == 0, "ack <id>: exit 0",
-              f"stderr={proc.stderr!r}")
-        check(id_a in proc.stdout, "ack <id>: confirms id")
+        check(proc.returncode == 2, "ack <id> (bare): exit 2 (refused)",
+              f"got rc={proc.returncode}, stderr={proc.stderr!r}")
+        # Body surfaced before the refusal.
+        check("body-of-A-must-be-printed" in proc.stdout,
+              "ack <id> (bare): prints full body", f"stdout={proc.stdout!r}")
+        check("read-token=" in proc.stdout,
+              "ack <id> (bare): prints read-token", f"stdout={proc.stdout!r}")
+        check("REFUSED" in proc.stderr,
+              "ack <id> (bare): stderr refuses", f"stderr={proc.stderr!r}")
+        # CRITICAL: nothing cleared.
         state = h.load_state()
-        check(len(state["alerts"]) == 1, "ack <id>: state count -> 1",
+        check(len(state["alerts"]) == 2,
+              "ack <id> (bare): state UNCHANGED (nothing cleared)",
               f"got {len(state['alerts'])}")
-        check(state["alerts"][0]["id"] == id_b, "ack <id>: B remains")
+    finally:
+        h.cleanup()
+
+
+def test_ack_by_id_with_token_clears():
+    """`ack <id> --confirm-read <token>` (token from the body) clears that
+    one alert, exit 0."""
+    h = Harness()
+    try:
+        id_a = h.run("add", "[CLAUDE-WATCH] body-of-A-must-be-printed").stdout.strip()
+        id_b = h.run("add", "[CLAUDE-WATCH] B").stdout.strip()
+        # First a bare ack to learn the token (refused), then echo it back.
+        token = _extract_read_token(h.run("ack", id_a).stdout)
+        check(len(token) == 8, "ack <id>: token is 8 hex chars",
+              f"got {token!r}")
+        proc = h.run("ack", id_a, "--confirm-read", token)
+        check(proc.returncode == 0, "ack <id> --confirm-read <token>: exit 0",
+              f"got rc={proc.returncode}, stderr={proc.stderr!r}")
+        check(id_a in proc.stdout, "ack <id> --confirm-read: confirms id")
+        check("body-of-A-must-be-printed" in proc.stdout,
+              "ack <id> --confirm-read: still prints body")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1, "ack <id> --confirm-read: count -> 1",
+              f"got {len(state['alerts'])}")
+        check(state["alerts"][0]["id"] == id_b,
+              "ack <id> --confirm-read: B remains")
+    finally:
+        h.cleanup()
+
+
+def test_ack_by_id_wrong_token_refuses():
+    """A wrong/guessed token is refused (exit 2), clears nothing."""
+    h = Harness()
+    try:
+        id_a = h.run("add", "[CLAUDE-WATCH] secret-body").stdout.strip()
+        proc = h.run("ack", id_a, "--confirm-read", "deadbeef")
+        check(proc.returncode == 2, "ack <id> --confirm-read <wrong>: exit 2",
+              f"got rc={proc.returncode}")
+        check("mismatch" in proc.stderr,
+              "ack <id> wrong token: stderr says mismatch",
+              f"stderr={proc.stderr!r}")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1,
+              "ack <id> wrong token: nothing cleared")
+    finally:
+        h.cleanup()
+
+
+def test_ack_by_id_bare_flag_does_not_satisfy():
+    """A bare `--confirm-read` flag (no token) does NOT satisfy the single-id
+    path -- you must supply the actual per-alert token."""
+    h = Harness()
+    try:
+        id_a = h.run("add", "[CLAUDE-WATCH] body").stdout.strip()
+        proc = h.run("ack", id_a, "--confirm-read")
+        check(proc.returncode == 2,
+              "ack <id> --confirm-read (bare flag, no token): exit 2",
+              f"got rc={proc.returncode}, stderr={proc.stderr!r}")
+        state = h.load_state()
+        check(len(state["alerts"]) == 1,
+              "ack <id> bare flag: nothing cleared")
     finally:
         h.cleanup()
 
@@ -193,31 +270,84 @@ def test_ack_missing_id():
         h.cleanup()
 
 
-def test_ack_all():
+def test_ack_all_refuses_without_confirm_read():
+    """Bare `ack --all` must REFUSE to clear, print all bodies, exit 2."""
     h = Harness()
     try:
-        h.run("add", "[CLAUDE-WATCH] A")
-        h.run("add", "[CLAUDE-WATCH] B")
-        h.run("add", "[CLAUDE-WATCH] C")
+        h.run("add", "[CLAUDE-WATCH] body-AAA")
+        h.run("add", "[CLAUDE-WATCH] body-BBB")
+        h.run("add", "[CLAUDE-WATCH] body-CCC")
         proc = h.run("ack", "--all")
-        check(proc.returncode == 0, "ack --all: exit 0")
-        check("ack'd 3" in proc.stdout, "ack --all: count message",
+        check(proc.returncode == 2, "ack --all (no confirm): exit 2 (refused)",
+              f"got rc={proc.returncode}, stdout={proc.stdout!r}")
+        # All three bodies surfaced before the refusal.
+        check("body-AAA" in proc.stdout and "body-BBB" in proc.stdout
+              and "body-CCC" in proc.stdout,
+              "ack --all (no confirm): prints every body",
               f"stdout={proc.stdout!r}")
+        check("REFUSED" in proc.stderr,
+              "ack --all (no confirm): stderr explains refusal",
+              f"stderr={proc.stderr!r}")
+        # CRITICAL: nothing cleared.
         state = h.load_state()
-        check(state["alerts"] == [], "ack --all: state cleared")
+        check(len(state["alerts"]) == 3,
+              "ack --all (no confirm): state UNCHANGED (nothing cleared)",
+              f"got {len(state['alerts'])}")
+    finally:
+        h.cleanup()
+
+
+def test_ack_all_with_confirm_read():
+    """`ack --all --confirm-read` prints bodies then clears."""
+    h = Harness()
+    try:
+        h.run("add", "[CLAUDE-WATCH] body-AAA")
+        h.run("add", "[CLAUDE-WATCH] body-BBB")
+        h.run("add", "[CLAUDE-WATCH] body-CCC")
+        proc = h.run("ack", "--all", "--confirm-read")
+        check(proc.returncode == 0, "ack --all --confirm-read: exit 0",
+              f"got rc={proc.returncode}, stderr={proc.stderr!r}")
+        check("ack'd 3" in proc.stdout,
+              "ack --all --confirm-read: count message", f"stdout={proc.stdout!r}")
+        check("body-AAA" in proc.stdout,
+              "ack --all --confirm-read: still prints bodies")
+        state = h.load_state()
+        check(state["alerts"] == [], "ack --all --confirm-read: state cleared")
+    finally:
+        h.cleanup()
+
+
+def test_ack_all_empty_ok():
+    """`ack --all` with no pending alerts is a no-op success (no read needed)."""
+    h = Harness()
+    try:
+        proc = h.run("ack", "--all")
+        check(proc.returncode == 0, "ack --all (empty): exit 0",
+              f"got rc={proc.returncode}, stderr={proc.stderr!r}")
+        check("ack'd 0" in proc.stdout, "ack --all (empty): 0 count")
     finally:
         h.cleanup()
 
 
 def test_clear_alias():
+    """`clear` is `ack --all` -- same read-confirm guard."""
     h = Harness()
     try:
-        h.run("add", "[CLAUDE-WATCH] A")
-        h.run("add", "[CLAUDE-WATCH] B")
+        h.run("add", "[CLAUDE-WATCH] body-A")
+        h.run("add", "[CLAUDE-WATCH] body-B")
+        # Bare clear refuses + prints bodies.
         proc = h.run("clear")
-        check(proc.returncode == 0, "clear: exit 0")
+        check(proc.returncode == 2, "clear (no confirm): exit 2 (refused)",
+              f"got rc={proc.returncode}")
+        check("body-A" in proc.stdout and "body-B" in proc.stdout,
+              "clear (no confirm): prints bodies")
         state = h.load_state()
-        check(state["alerts"] == [], "clear: state cleared")
+        check(len(state["alerts"]) == 2, "clear (no confirm): nothing cleared")
+        # With confirm-read it clears.
+        proc = h.run("clear", "--confirm-read")
+        check(proc.returncode == 0, "clear --confirm-read: exit 0")
+        state = h.load_state()
+        check(state["alerts"] == [], "clear --confirm-read: state cleared")
     finally:
         h.cleanup()
 
@@ -286,9 +416,14 @@ def main() -> int:
         test_add_with_source_and_json,
         test_list_empty,
         test_list_populated,
-        test_ack_by_id,
+        test_ack_by_id_bare_refuses,
+        test_ack_by_id_with_token_clears,
+        test_ack_by_id_wrong_token_refuses,
+        test_ack_by_id_bare_flag_does_not_satisfy,
         test_ack_missing_id,
-        test_ack_all,
+        test_ack_all_refuses_without_confirm_read,
+        test_ack_all_with_confirm_read,
+        test_ack_all_empty_ok,
         test_clear_alias,
         test_status,
         test_corrupt_state_recovers,

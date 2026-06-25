@@ -481,6 +481,68 @@ pub async fn inject_text(pane: &str, text: &str) {
     }
 }
 
+/// NON-CANCELLING inject: type `text` and submit it as a QUEUED message
+/// WITHOUT seizing the in-flight turn.
+///
+/// KNOB #4 (soften escape-on-inject), 2026-06-24. The default `inject_text`
+/// path leads with an Escape loop (Step 1 of `inject_text_no_submit`) +
+/// `dd` line-clear that REQUIRES NORMAL mode. As `docs/two-channel-design.md`
+/// and `inject_dispatch.rs` document, *the Escape is what CANCELS the current
+/// generation* — typing alone does not. For routine, can-wait-for-a-turn-
+/// boundary alerts (watcher-down, heartbeat-stale, ambient) that cancellation
+/// is pure collateral damage: it aborts the loop's in-flight turn AND kills
+/// mid-flight background agents, and makes every nudge look like a user
+/// rejection. Those tiers do not need the turn seized — they need the nudge
+/// to ARRIVE (by the next turn boundary is fine).
+///
+/// So this path deliberately OMITS the leading Escape blast and the `dd`
+/// NORMAL-mode line-clear. It just enters INSERT (idempotent `i`), types the
+/// payload, and submits with a bare Enter from INSERT mode. Enter-from-INSERT
+/// is a proven submit (it is exactly how `inject_and_verify` submits slash
+/// commands, see that fn's `slash_command` branch) and — crucially — Claude
+/// Code QUEUES a message typed-and-Entered while a turn is generating instead
+/// of cancelling it. The result: the nudge is delivered, the active turn and
+/// any running background agents are left intact.
+///
+/// Trade-off vs `inject_text`: no `dd` line-clear means if the operator had
+/// half-typed input on the prompt line, this payload glues onto it. That is
+/// acceptable for the routine tiers (the daemon firing while the operator is
+/// also typing is rare, and a queued nudge that needs a manual cleanup is far
+/// less destructive than cancelling a turn + killing subagents). Emergencies
+/// that genuinely must seize the turn (context-critical, wedged, auto-update,
+/// prolonged-thinking) keep using `inject_text` + `interrupt_and_wait`.
+pub async fn inject_text_queued(pane: &str, text: &str) {
+    // Enter INSERT mode (idempotent — `i` in INSERT just inserts an 'i' that
+    // the line-clear-free submit tolerates; verify-and-retry up to 3x mirrors
+    // inject_text_no_submit Step 3 so a NORMAL-mode pane still ends up typing
+    // into the input editor, NOT issuing motion commands). NO leading Escape:
+    // that is the whole point — we must not cancel the active turn.
+    let mut entered_insert = false;
+    for _ in 0..3 {
+        send_keys(pane, &["i"]).await;
+        sleep(Duration::from_millis(400)).await;
+        if is_insert_mode(pane).await {
+            entered_insert = true;
+            break;
+        }
+    }
+    sleep(Duration::from_millis(300)).await;
+    if !entered_insert {
+        debug!(
+            pane = %pane,
+            "inject_text_queued: INSERT mode not confirmed after 3 `i` attempts; proceeding anyway"
+        );
+    }
+
+    // Type the payload, then submit with a bare Enter from INSERT. A message
+    // typed-and-Entered while a turn is generating is QUEUED by Claude Code,
+    // not injected mid-generation — so the active turn keeps running.
+    send_literal(pane, text).await;
+    sleep(Duration::from_millis(500)).await;
+    send_keys(pane, &["Enter"]).await;
+    sleep(Duration::from_millis(300)).await;
+}
+
 /// The ordered keystroke sequence used by `inject_text` Step 5 to submit
 /// the typed payload to a Claude Code (vim-mode) pane.
 ///

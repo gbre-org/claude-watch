@@ -79,8 +79,18 @@ pub enum InjectBackend {
 /// what was called.
 #[async_trait::async_trait]
 pub trait InjectBackends: Send + Sync {
-    /// Call into `tmux::inject_text`.
+    /// Call into `tmux::inject_text` (CANCELLING — leads with Escape, seizes
+    /// the in-flight turn). Used by emergency tiers.
     async fn tmux_inject(&self, pane: &str, text: &str);
+    /// Call into `tmux::inject_text_queued` (NON-CANCELLING — types + submits
+    /// as a queued message without an Escape, leaving the active turn and any
+    /// running background agents intact). KNOB #4: used by routine tiers
+    /// (watcher-down, heartbeat-stale, ambient). Defaults to the cancelling
+    /// path so existing test backends that only implement `tmux_inject` keep
+    /// compiling — production `RealBackends` overrides it.
+    async fn tmux_inject_queued(&self, pane: &str, text: &str) {
+        self.tmux_inject(pane, text).await;
+    }
     /// Call into `inject_probe::inject` for a panel-mode agent.
     /// Returns the raw `ProbeOutcome` so the dispatcher can decide
     /// whether to fall through on EPERM / WrongMode.
@@ -98,6 +108,9 @@ pub struct RealBackends;
 impl InjectBackends for RealBackends {
     async fn tmux_inject(&self, pane: &str, text: &str) {
         crate::tmux::inject_text(pane, text).await;
+    }
+    async fn tmux_inject_queued(&self, pane: &str, text: &str) {
+        crate::tmux::inject_text_queued(pane, text).await;
     }
     fn pidfd_inject(&self, agent_pid: u32, text: &str) -> ProbeOutcome {
         inject_probe::inject(agent_pid, text)
@@ -179,10 +192,18 @@ pub async fn dispatch_inject(
     mode: AgentDeploymentMode,
     agent_pid: Option<u32>,
     pane_present: bool,
+    cancel_turn: bool,
 ) -> InjectBackend {
     match mode {
         AgentDeploymentMode::Terminal => {
-            backends.tmux_inject(pane, text).await;
+            // KNOB #4: route through the NON-CANCELLING tmux path for routine
+            // tiers (cancel_turn=false). The pidfd (IdePanel) path already
+            // appends-not-cancels, so this flag only changes the terminal arm.
+            if cancel_turn {
+                backends.tmux_inject(pane, text).await;
+            } else {
+                backends.tmux_inject_queued(pane, text).await;
+            }
             InjectBackend::Tmux
         }
         AgentDeploymentMode::IdePanel => {
@@ -248,9 +269,16 @@ pub async fn dispatch_inject(
             if pane_present {
                 info!(
                     pane = %pane,
+                    cancel_turn,
                     "agent deployment mode unknown but pane present; defaulting to tmux inject (Terminal contract)"
                 );
-                backends.tmux_inject(pane, text).await;
+                // KNOB #4: honor cancel_turn here too (Unknown defaults to
+                // Terminal behavior, so the same cancel/queue split applies).
+                if cancel_turn {
+                    backends.tmux_inject(pane, text).await;
+                } else {
+                    backends.tmux_inject_queued(pane, text).await;
+                }
                 InjectBackend::Tmux
             } else {
                 info!(
@@ -264,9 +292,23 @@ pub async fn dispatch_inject(
     }
 }
 
-/// Convenience: full pipeline — resolve agent PID, pick mode, dispatch.
-/// This is the function callers in `policy.rs` / `alert.rs` should use.
+/// Convenience: full pipeline — resolve agent PID, pick mode, dispatch with
+/// the CANCELLING (Escape-leading) tmux path. Use for EMERGENCY tiers that
+/// must seize the in-flight turn (context-critical, wedged, auto-update,
+/// prolonged-thinking).
 pub async fn inject_to_agent(pane: &str, text: &str) {
+    inject_to_agent_inner(pane, text, /* cancel_turn = */ true).await;
+}
+
+/// KNOB #4: NON-CANCELLING variant — types + submits a queued message without
+/// seizing the active turn (no Escape). Use for ROUTINE tiers that can wait
+/// for a turn boundary (watcher-down, heartbeat-stale, ambient): the nudge is
+/// delivered without aborting the loop's turn or killing background agents.
+pub async fn inject_to_agent_queued(pane: &str, text: &str) {
+    inject_to_agent_inner(pane, text, /* cancel_turn = */ false).await;
+}
+
+async fn inject_to_agent_inner(pane: &str, text: &str, cancel_turn: bool) {
     let backends = RealBackends;
     let agent_pid = resolve_agent_pid_for_pane(pane).await;
     let mode = mode_for(agent_pid);
@@ -277,7 +319,16 @@ pub async fn inject_to_agent(pane: &str, text: &str) {
     // to decide between the tmux Terminal default and claude-event
     // escalation. See the `AgentDeploymentMode::Unknown` contract.
     let pane_present = !pane.is_empty() && crate::tmux::get_pane_pid(pane).await.is_some();
-    let _ = dispatch_inject(&backends, pane, text, mode, agent_pid, pane_present).await;
+    let _ = dispatch_inject(
+        &backends,
+        pane,
+        text,
+        mode,
+        agent_pid,
+        pane_present,
+        cancel_turn,
+    )
+    .await;
 }
 
 fn emit_panel_fallback_event(
@@ -334,6 +385,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
         Tmux { pane: String, text: String },
+        TmuxQueued { pane: String, text: String },
         Pidfd { pid: u32, text: String },
         Event { alert_type: String },
     }
@@ -361,6 +413,12 @@ mod tests {
     impl InjectBackends for RecordingBackends {
         async fn tmux_inject(&self, pane: &str, text: &str) {
             self.calls.lock().unwrap().push(Call::Tmux {
+                pane: pane.to_string(),
+                text: text.to_string(),
+            });
+        }
+        async fn tmux_inject_queued(&self, pane: &str, text: &str) {
+            self.calls.lock().unwrap().push(Call::TmuxQueued {
                 pane: pane.to_string(),
                 text: text.to_string(),
             });
@@ -441,6 +499,7 @@ mod tests {
             AgentDeploymentMode::Terminal,
             Some(9999),
             true,
+            true, // cancel_turn — preserves the cancelling terminal routing these tests assert
         )
         .await;
         assert_eq!(out, InjectBackend::Tmux);
@@ -448,6 +507,60 @@ mod tests {
             b.calls(),
             vec![Call::Tmux {
                 pane: "dashboard:0.0".to_string(),
+                text: "hello".to_string()
+            }]
+        );
+    }
+
+    // KNOB #4: a Terminal-mode inject with cancel_turn=false must route to the
+    // NON-CANCELLING tmux_inject_queued backend (queue the nudge, don't seize
+    // the turn / kill subagents) — while still reporting InjectBackend::Tmux.
+    #[tokio::test]
+    async fn dispatch_terminal_queued_routes_to_tmux_queued() {
+        let _g = reset_for_test();
+        let b = RecordingBackends::ok_pidfd();
+        let out = dispatch_inject(
+            &b,
+            "dashboard:0.0",
+            "hello",
+            AgentDeploymentMode::Terminal,
+            Some(9999),
+            true,
+            false, // cancel_turn=false -> queued (non-cancelling) path
+        )
+        .await;
+        assert_eq!(out, InjectBackend::Tmux);
+        assert_eq!(
+            b.calls(),
+            vec![Call::TmuxQueued {
+                pane: "dashboard:0.0".to_string(),
+                text: "hello".to_string()
+            }]
+        );
+    }
+
+    // KNOB #4: cancel_turn is a no-op for the IdePanel (pidfd) path — pidfd
+    // already APPENDS rather than cancelling, so a queued routine inject still
+    // takes the pidfd backend unchanged.
+    #[tokio::test]
+    async fn dispatch_ide_panel_queued_still_routes_to_pidfd() {
+        let _g = reset_for_test();
+        let b = RecordingBackends::ok_pidfd();
+        let out = dispatch_inject(
+            &b,
+            "dashboard:0.0",
+            "hello",
+            AgentDeploymentMode::IdePanel,
+            Some(4321),
+            true,
+            false, // cancel_turn=false: pidfd append path is unaffected
+        )
+        .await;
+        assert_eq!(out, InjectBackend::Pidfd);
+        assert_eq!(
+            b.calls(),
+            vec![Call::Pidfd {
+                pid: 4321,
                 text: "hello".to_string()
             }]
         );
@@ -464,6 +577,7 @@ mod tests {
             AgentDeploymentMode::IdePanel,
             Some(4321),
             true,
+            true, // cancel_turn — preserves the cancelling terminal routing these tests assert
         )
         .await;
         assert_eq!(out, InjectBackend::Pidfd);
@@ -487,6 +601,7 @@ mod tests {
             AgentDeploymentMode::Unknown,
             None,
             false,
+            true, // cancel_turn — preserves the cancelling terminal routing these tests assert
         )
         .await;
         assert_eq!(out, InjectBackend::UnknownEvent);
@@ -515,6 +630,7 @@ mod tests {
             AgentDeploymentMode::Unknown,
             None,
             true,
+            true, // cancel_turn — preserves the cancelling terminal routing these tests assert
         )
         .await;
         assert_eq!(out, InjectBackend::Tmux);
@@ -542,6 +658,7 @@ mod tests {
             AgentDeploymentMode::IdePanel,
             Some(8765),
             true,
+            true, // cancel_turn — preserves the cancelling terminal routing these tests assert
         )
         .await;
         assert_eq!(out, InjectBackend::PidfdFailedEvent);
@@ -579,6 +696,7 @@ mod tests {
             AgentDeploymentMode::IdePanel,
             Some(8765),
             true,
+            true, // cancel_turn — preserves the cancelling terminal routing these tests assert
         )
         .await;
         assert_eq!(out, InjectBackend::PidfdFailedEvent);
@@ -598,6 +716,7 @@ mod tests {
             AgentDeploymentMode::IdePanel,
             None,
             true,
+            true, // cancel_turn — preserves the cancelling terminal routing these tests assert
         )
         .await;
         assert_eq!(out, InjectBackend::UnknownEvent);

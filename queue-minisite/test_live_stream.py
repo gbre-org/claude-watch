@@ -473,6 +473,166 @@ class LiveStreamEndpointTest(unittest.TestCase):
         self.assertTrue(owner.get("alive"))
         self.assertEqual(owner.get("agent_id"), agent_id)
 
+    # ---------- SSE reconnect resume (Last-Event-ID / ?since=) ----------
+
+    def _read_sse_frames(self, body_bytes: bytes) -> list[dict]:
+        """Parse SSE frames, capturing each frame's ``id:`` (when present).
+
+        Returns ``[{"id": int|None, "data": dict}, ...]`` in wire order so a
+        test can both inspect event payloads AND recover the resume cursor
+        emitted on each data frame.
+        """
+        frames: list[dict] = []
+        pending_id: int | None = None
+        for raw in body_bytes.decode("utf-8", errors="replace").splitlines():
+            if raw.startswith("id: "):
+                try:
+                    pending_id = int(raw[len("id: "):])
+                except ValueError:
+                    pending_id = None
+            elif raw.startswith("data: "):
+                frames.append({
+                    "id": pending_id,
+                    "data": json.loads(raw[len("data: "):]),
+                })
+                pending_id = None
+        return frames
+
+    def _seed_running_agent(self, qid: str, agent_id: str, session_uuid: str,
+                            lines: list[dict]):
+        _seed_agent_state(self.agent_state, agent_id, qid, alive=True, age=1)
+        _seed_jsonl(self.jsonl_root, session_uuid, agent_id, lines=lines)
+        self.appmod._cache.fetched_at = 0.0
+
+    def test_data_frames_carry_byte_offset_id(self):
+        """Every backfilled data frame must carry a monotonically increasing
+        ``id:`` (the byte offset) so the browser can echo it back as
+        ``Last-Event-ID`` on reconnect.
+        """
+        item = _add(self.env, self.queue_actual,
+                    "sse id frames", ["repo:sse-id-test"])
+        qid = item["id"]
+        _register(self.env, qid)
+        self._seed_running_agent(qid, "aidframe0000000ab",
+                                 "11111111-2222-3333-4444-555555555555", [
+            {"type": "user",
+             "message": {"role": "user", "content": "Queue item: " + qid},
+             "uuid": "u1"},
+            {"type": "assistant",
+             "message": {"role": "assistant",
+                         "content": [{"type": "text", "text": "line two"}]},
+             "uuid": "a1"},
+        ])
+        self.appmod.SSE_TAIL_MAX_IDLE_SECONDS = 0.1
+        self.appmod.SSE_TAIL_POLL_SECONDS = 0.05
+        self.appmod.SSE_TAIL_MAX_LIFETIME_SECONDS = 5.0
+
+        r = self.client.get(f"/api/queue/{qid}/stream")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        frames = self._read_sse_frames(r.get_data())
+        data_ids = [f["id"] for f in frames
+                    if f["data"].get("type") != "meta" and f["id"] is not None]
+        self.assertGreaterEqual(len(data_ids), 2,
+                                f"expected ≥2 id-bearing data frames: {frames!r}")
+        self.assertEqual(data_ids, sorted(data_ids),
+                         "byte-offset ids must be monotonically increasing")
+        self.assertTrue(all(i > 0 for i in data_ids))
+
+    def test_reconnect_with_last_event_id_resumes_without_backfill(self):
+        """Reconnecting with ``Last-Event-ID`` set to the cursor of the last
+        seen line must emit a ``resumed`` meta and SKIP the backfill replay —
+        no ``backfill-begin`` frame and none of the already-seen lines
+        re-sent. This is the core fix: a flaky SSE reconnect no longer
+        duplicates the recent tail (the "reconnecting" flicker).
+        """
+        item = _add(self.env, self.queue_actual,
+                    "sse resume", ["repo:sse-resume-test"])
+        qid = item["id"]
+        _register(self.env, qid)
+        self._seed_running_agent(qid, "aresume00000000ab",
+                                 "99999999-8888-7777-6666-555555555555", [
+            {"type": "user",
+             "message": {"role": "user", "content": "Queue item: " + qid},
+             "uuid": "u1"},
+            {"type": "assistant",
+             "message": {"role": "assistant",
+                         "content": [{"type": "text", "text": "first"}]},
+             "uuid": "a1"},
+        ])
+        self.appmod.SSE_TAIL_MAX_IDLE_SECONDS = 0.1
+        self.appmod.SSE_TAIL_POLL_SECONDS = 0.05
+        self.appmod.SSE_TAIL_MAX_LIFETIME_SECONDS = 5.0
+
+        # First connect: full backfill — grab the last data frame's cursor.
+        r1 = self.client.get(f"/api/queue/{qid}/stream")
+        frames1 = self._read_sse_frames(r1.get_data())
+        kinds1 = [f["data"].get("kind") for f in frames1
+                  if f["data"].get("type") == "meta"]
+        self.assertIn("backfill-begin", kinds1)
+        last_cursor = max(f["id"] for f in frames1 if f["id"] is not None)
+        self.assertGreater(last_cursor, 0)
+
+        # Reconnect with the cursor in Last-Event-ID. The server should seek
+        # past everything we've seen and replay nothing.
+        r2 = self.client.get(
+            f"/api/queue/{qid}/stream",
+            headers={"Last-Event-ID": str(last_cursor)},
+        )
+        frames2 = self._read_sse_frames(r2.get_data())
+        meta2 = [f["data"] for f in frames2 if f["data"].get("type") == "meta"]
+        kinds2 = [m.get("kind") for m in meta2]
+        self.assertIn("resumed", kinds2,
+                      f"reconnect did not emit 'resumed' meta: {meta2!r}")
+        self.assertNotIn("backfill-begin", kinds2,
+                         f"reconnect re-ran backfill (duplicate tail): {meta2!r}")
+        # No NON-meta data frames — nothing new appended after the cursor.
+        data2 = [f["data"] for f in frames2 if f["data"].get("type") != "meta"]
+        self.assertEqual(data2, [],
+                         f"reconnect replayed already-seen lines: {data2!r}")
+
+    def test_reconnect_streams_only_the_delta(self):
+        """After a reconnect at the cursor, a newly-appended line IS streamed
+        (the delta) — resume must not go deaf to genuinely new content.
+        """
+        item = _add(self.env, self.queue_actual,
+                    "sse delta", ["repo:sse-delta-test"])
+        qid = item["id"]
+        _register(self.env, qid)
+        session_uuid = "abcdef00-1111-2222-3333-444444444444"
+        agent_id = "adelta000000000ab"
+        self._seed_running_agent(qid, agent_id, session_uuid, [
+            {"type": "user",
+             "message": {"role": "user", "content": "Queue item: " + qid},
+             "uuid": "u1"},
+        ])
+        self.appmod.SSE_TAIL_MAX_IDLE_SECONDS = 0.1
+        self.appmod.SSE_TAIL_POLL_SECONDS = 0.05
+        self.appmod.SSE_TAIL_MAX_LIFETIME_SECONDS = 5.0
+
+        r1 = self.client.get(f"/api/queue/{qid}/stream")
+        frames1 = self._read_sse_frames(r1.get_data())
+        last_cursor = max(f["id"] for f in frames1 if f["id"] is not None)
+
+        # Append a brand-new line past the cursor.
+        jsonl_path = (self.jsonl_root / session_uuid / "subagents"
+                      / f"agent-{agent_id}.jsonl")
+        with jsonl_path.open("a") as fh:
+            fh.write(json.dumps({
+                "type": "assistant",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "fresh delta"}]},
+                "uuid": "a2",
+            }) + "\n")
+
+        r2 = self.client.get(
+            f"/api/queue/{qid}/stream",
+            headers={"Last-Event-ID": str(last_cursor)},
+        )
+        frames2 = self._read_sse_frames(r2.get_data())
+        texts = json.dumps([f["data"] for f in frames2])
+        self.assertIn("fresh delta", texts,
+                      "resume did not stream the newly-appended delta line")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
