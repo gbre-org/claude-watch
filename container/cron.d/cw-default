@@ -76,4 +76,18 @@
 # own resolution (so a non-container host can share it); the container
 # pins the pane + its slash-command restart hint explicitly here to keep
 # behavior identical to the pre-tools/ move.
-* * * * *  hndrewaall CW_WATCHER_HEALTH_PANE=claude-container:0.0 CW_WATCHER_HEALTH_RESTART_HINT='Restart the event watcher via /claude-container:start-watchers' /usr/local/bin/cw-cron-run watcher-health-check /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log
+#
+# LAST-RESORT AUTO-RESTART (opt-in, ENABLED in-container here):
+# CW_WATCHER_HEALTH_AUTORESTART=1 turns on the bounded self-heal fallback.
+# When the inject (main-loop) path has fired CW_WATCHER_HEALTH_AUTORESTART_AFTER
+# times (default 3, gated by the script's 600s cooldown ≈ 30 min of a
+# sustained-blind bus) without the queue draining, the cron relaunches
+# claude-event-watch itself, DETACHED. The watcher's fd-based flock singleton
+# guard makes that a no-op whenever a real watcher is alive, so it can only win
+# when the bus is genuinely unconsumed — this is the cure for the inject-only
+# WATCHER(S) DOWN churn (events stuck >1.5h when no main loop acted on the
+# inject). See the script header for the full cardinal-rule safety argument.
+# The inject path STILL fires first and remains primary; this only kicks in
+# after that path provably failed. Disable per-deployment by dropping the
+# CW_WATCHER_HEALTH_AUTORESTART var (or set it to anything but "1").
+* * * * *  hndrewaall CW_WATCHER_HEALTH_PANE=claude-container:0.0 CW_WATCHER_HEALTH_RESTART_HINT='Restart the event watcher via /claude-container:start-watchers' CW_WATCHER_HEALTH_AUTORESTART=1 /usr/local/bin/cw-cron-run watcher-health-check /usr/local/bin/cw-watcher-health-check > /dev/null 2>>/tmp/claude-watch-cron-watcher-health.log

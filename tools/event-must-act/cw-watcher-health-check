@@ -46,6 +46,56 @@
 #   CW_WATCHER_HEALTH_STATE — cooldown ledger path
 #       (default $CLAUDE_EVENT_STATE_DIR/watcher-health-last-inject, falling
 #       back to ~/.config/claude-events/watcher-health-last-inject).
+#
+# --- Last-resort auto-restart fallback (opt-in, 2026-06-25) ----------------
+#   CW_WATCHER_HEALTH_AUTORESTART — when set to "1", enable the bounded
+#       last-resort auto-restart of the event-consumer watcher described
+#       below. DEFAULT OFF (empty): the script behaves exactly as before
+#       (inject-only). This is an OPT-IN escape from the cardinal "watchers
+#       are spawned only by the main loop" rule, scoped to the ONE watcher
+#       whose death blinds the entire event bus.
+#   CW_WATCHER_HEALTH_AUTORESTART_AFTER — how many consecutive successful
+#       injects must fire (i.e. how many times the main-loop restart path
+#       must demonstrably FAIL to drain the queue) before the fallback
+#       relaunches the watcher itself. Default 3. Each inject is gated by the
+#       cooldown above, so the default ~= 3 * COOLDOWN_SECS (≈30 min at 600s)
+#       of a sustained-blind bus before the cron takes over.
+#   CW_WATCHER_HEALTH_WATCHER_CMD — the command the fallback runs to relaunch
+#       the consumer. Default "claude-event-watch". It is launched DETACHED
+#       (setsid, fully backgrounded, output discarded) so the per-minute cron
+#       tick returns immediately. The watcher's own fd-based flock singleton
+#       guard (see tools/watchers/claude-event-watch) makes this a guaranteed
+#       NO-OP if a live watcher already holds the lock — so the fallback can
+#       only ever win when the bus is genuinely unconsumed.
+#   CW_WATCHER_HEALTH_ESCALATION_STATE — escalation-counter ledger path
+#       (default alongside the cooldown ledger as
+#       <state-dir>/watcher-health-escalations).
+#
+# WHY THIS IS SAFE / HOW IT RESPECTS THE CARDINAL RULE.
+#   The cardinal rule (watchers spawned ONLY by the Claude Code main loop, in
+#   the main loop's process tree) exists because a daemon-spawned watcher in a
+#   detached systemd/user slice is orphaned, invisible to the obligation gate,
+#   and a surprise to the next session (see src/watcher.rs "REMOVED 2026-05-01"
+#   + feedback_watcher-architecture-cardinal.md). This fallback is a deliberate,
+#   NARROW, opt-in exception that respects the rule's intent four ways:
+#     1. The inject (main-loop) path fires FIRST and remains primary. The
+#        auto-restart only triggers after that path has PROVABLY failed
+#        AUTORESTART_AFTER times in a row (the queue stayed stale across that
+#        many inject windows).
+#     2. It is scoped to the event-CONSUMER watcher ONLY — the single watcher
+#        whose death blinds the WHOLE event bus (all other watchers' deaths are
+#        merely a missed signal; this one's death means nothing is consumed and
+#        events pile up unbounded, as happened for >1.5h this session).
+#     3. The watcher's own flock singleton guard means a cron-spawned instance
+#        is a no-op whenever a real watcher is alive — there is no double-spawn
+#        and no race; the fallback only succeeds when the bus is truly blind.
+#     4. It self-corrects: once the watcher is alive again, events drain, the
+#        next cron tick finds nothing stale, and the next main-loop exit/restart
+#        cycle naturally re-parents a fresh watcher into the main-loop tree. A
+#        cron-parented-but-ALIVE consumer for a few minutes is strictly better
+#        than a blind bus.
+#   It is OFF by default so the exception is an explicit operator opt-in, never
+#   silent.
 
 set -euo pipefail
 
@@ -58,6 +108,12 @@ COOLDOWN_SECS="${CW_WATCHER_HEALTH_COOLDOWN_SECS:-600}"
 STATE_DIR_DEFAULT="${CLAUDE_EVENT_STATE_DIR:-$HOME/.config/claude-events}"
 STATE_FILE="${CW_WATCHER_HEALTH_STATE:-$STATE_DIR_DEFAULT/watcher-health-last-inject}"
 
+# Last-resort auto-restart fallback config (opt-in; see header).
+AUTORESTART="${CW_WATCHER_HEALTH_AUTORESTART:-}"
+AUTORESTART_AFTER="${CW_WATCHER_HEALTH_AUTORESTART_AFTER:-3}"
+WATCHER_CMD="${CW_WATCHER_HEALTH_WATCHER_CMD:-claude-event-watch}"
+ESCALATION_FILE="${CW_WATCHER_HEALTH_ESCALATION_STATE:-$STATE_DIR_DEFAULT/watcher-health-escalations}"
+
 # If the queue directory doesn't exist, nothing to check.
 if [ ! -d "$QUEUE" ]; then
     exit 0
@@ -67,6 +123,10 @@ fi
 STALE=$(find "$QUEUE" -name '*.json' -mmin +"$STALE_MIN" 2>/dev/null | wc -l)
 
 if [ "$STALE" -le 0 ]; then
+    # Bus is healthy (nothing stale) — clear the escalation counter so a
+    # FRESH outage starts counting from zero. (Removing the ledger is the
+    # reset; absence reads as 0 below.)
+    rm -f "$ESCALATION_FILE" 2>/dev/null || true
     exit 0
 fi
 
@@ -117,3 +177,50 @@ fi
 # Record the successful-inject timestamp for the cooldown gate.
 mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
 printf '%s\n' "$NOW" > "$STATE_FILE" 2>/dev/null || true
+
+# --- Last-resort auto-restart fallback ------------------------------------
+# A successful inject just fired but the queue is STILL stale (we only reach
+# here while $STALE > 0), so the main-loop restart path has not yet drained
+# the bus. Count these consecutive escalations; once they reach the
+# AUTORESTART_AFTER threshold (and the operator opted in via
+# CW_WATCHER_HEALTH_AUTORESTART=1), relaunch the event-consumer watcher
+# ourselves as a detached last resort. See the header for the full
+# cardinal-rule safety argument. When the fallback is OFF, this whole block
+# is inert except for keeping the counter (harmless) so flipping it on
+# mid-outage takes effect promptly.
+ESC=0
+if [ -f "$ESCALATION_FILE" ]; then
+    ESC=$(cat "$ESCALATION_FILE" 2>/dev/null || echo 0)
+    case "$ESC" in
+        ''|*[!0-9]*) ESC=0 ;;
+    esac
+fi
+ESC=$((ESC + 1))
+mkdir -p "$(dirname "$ESCALATION_FILE")" 2>/dev/null || true
+printf '%s\n' "$ESC" > "$ESCALATION_FILE" 2>/dev/null || true
+
+if [ "$AUTORESTART" = "1" ] && [ "$ESC" -ge "$AUTORESTART_AFTER" ]; then
+    # The main-loop restart path has demonstrably failed $ESC times in a row
+    # (>= threshold). Relaunch the consumer ourselves, fully DETACHED so this
+    # per-minute cron tick returns immediately and the watcher outlives it.
+    # The watcher's own fd-based flock singleton guard makes this a NO-OP if a
+    # live watcher already holds the lock (it exits 3) — so we only ever win
+    # when the bus is genuinely blind. We discard the watcher's stdout/stderr
+    # here: when cron-launched there is no main loop reading its block-print
+    # output, and that is fine — its job in this fallback is purely to DRAIN
+    # the spool and keep the bus alive until the main loop re-parents a fresh
+    # in-tree watcher on its next restart cycle.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh -c "$WATCHER_CMD >/dev/null 2>&1 &" >/dev/null 2>&1 || true
+    else
+        # No setsid (rare): nohup + background as a best-effort detach.
+        nohup sh -c "$WATCHER_CMD >/dev/null 2>&1 &" >/dev/null 2>&1 || true
+    fi
+    printf 'cw-watcher-health-check: LAST-RESORT auto-restart of event consumer (%s) after %s consecutive failed injects\n' \
+        "$WATCHER_CMD" "$ESC" >&2
+    # Reset the counter: we just took the corrective action, so the next
+    # window starts fresh. If the relaunch was a flock no-op (watcher already
+    # alive) the next healthy tick clears it anyway; if it genuinely revived
+    # the bus, events drain and the healthy-tick reset fires.
+    rm -f "$ESCALATION_FILE" 2>/dev/null || true
+fi

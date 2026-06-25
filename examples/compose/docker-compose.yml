@@ -437,6 +437,31 @@ services:
       # would become invisible in-container — the self-redeploy trap that
       # caused the clipboard-mount-drop / "override not visible" failures.
       - "${HOME}/.config/claude-container:/home/hndrewaall/.config/claude-container:rw"
+      # Operator-managed obligation-manifest dir — ro. Holds one *.json file
+      # per USER-MANAGED obligation row (schema mirrors the `obligations add`
+      # flags: tool_pattern / predicate / params / ttl / enforcement /
+      # deny_msg / created_by / mandatory / exempt_tool_patterns / ...).
+      # obligations-init scans this dir on EVERY container start and applies
+      # each manifest idempotently AFTER the baked container-policy default
+      # rows (see tools/obligations/obligations-init seed_from_manifest_dir).
+      # This is how operator-specific obligations (e.g. the AskUserQuestion
+      # presence-gate) live in PRIVATE config — declarative, auto-applied,
+      # NEVER baked into the shared public image and NEVER imperatively
+      # `register`-ed per session. Read-only so the in-container session can
+      # never tamper with the operator's gate definitions.
+      #
+      # Default /dev/null (graceful no-op) when CLAUDE_HOST_OBLIGATIONS_DIR is
+      # unset — matches the CLAUDE_HOST_EVENTS_DIR / HOOKS_DIR / project-dir
+      # patterns above. Unlike the managed-settings staging mount (which the
+      # entrypoint symlinks THROUGH, making a /dev/null source resolve to a
+      # launch-wedging ENOTDIR — the #417 lesson), NOTHING traverses INTO this
+      # path as a directory: obligations-init guards with os.path.isdir() and
+      # treats a missing dir, an empty dir, OR a non-directory (/dev/null)
+      # mount identically as "no user obligations to apply" (clean exit 0). So
+      # /dev/null is a safe absent-fallback here. Operators opt in by setting
+      # CLAUDE_HOST_OBLIGATIONS_DIR (e.g. ~/.config/claude-container/
+      # obligations) in their deploy.env / .env.
+      - "${CLAUDE_HOST_OBLIGATIONS_DIR:-/dev/null}:/mnt/host-obligations-config:ro"
     # working_dir flip: when CLAUDE_HOST_PROJECT_DIR is set, override the
     # image WORKDIR (/workspace) with the host path so the in-container
     # claude lands at the project-memory-matching cwd. Empty / unset

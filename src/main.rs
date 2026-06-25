@@ -31,6 +31,7 @@ mod inject_dispatch;
 mod inject_probe;
 mod logging;
 mod metrics;
+mod obligation_arm;
 mod policy;
 mod proc_util;
 mod queue_check;
