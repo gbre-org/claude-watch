@@ -1321,6 +1321,15 @@
         } else {
           setStatus('streaming', 'ok');
         }
+      } else if (k === 'resumed') {
+        // The server honored our Last-Event-ID / ?since= cursor and is
+        // streaming only the delta appended since we dropped — no backfill
+        // replay, so no duplicate lines or "reconnecting" flicker. Restore
+        // the live status (onerror may have left it on 'reconnecting…').
+        if (mode === 'workload') setStatus('tailing workload', 'ok');
+        else if (mode === 'hostjob') setStatus('tailing hostjob', 'ok');
+        else setStatus('streaming', 'ok');
+        msg = '— resumed live tail —';
       } else if (k === 'backfill-begin') {
         msg = 'backfilling ' + (payload.lines || 0) + ' recent lines…';
       } else if (k === 'backfill-end') {
