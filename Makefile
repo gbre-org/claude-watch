@@ -436,6 +436,7 @@ CW_BUILD_PR = $(shell git log -1 --format=%s 2>/dev/null | grep -oE '\#[0-9]+' |
 
 compose-build:
 	@cd examples/compose && \
+	  DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
 	  GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
 	  docker compose build \
 	    --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
@@ -448,7 +449,7 @@ compose-build:
 # claude-watch-builder stage COPYs the whole working tree to compile the
 # Rust daemon.
 container-build:
-	docker build \
+	DOCKER_BUILDKIT=1 docker build \
 	  --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
 	  --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
 	  --build-arg CW_BUILD_PR="$(CW_BUILD_PR)" \

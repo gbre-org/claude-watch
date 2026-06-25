@@ -1,5 +1,17 @@
 # claude-container — Phase 1b image
 #
+# BuildKit note: the npm-install layer below uses `RUN --mount=type=cache,...`.
+# The cache-mount syntax is understood by the BUILT-IN BuildKit frontend that
+# ships with Docker 23+ (the deploy host runs 29.x) — NO `# syntax=docker/...`
+# directive is used on purpose: that directive forces BuildKit to fetch the
+# `docker/dockerfile` frontend image from Docker Hub at build start, which adds
+# exactly the registry-fetch dependency this hardening is trying to remove (a
+# Hub hiccup would wedge the build before it does anything). The Makefile
+# `container-build` / `compose-build` targets export DOCKER_BUILDKIT=1 to
+# guarantee BuildKit is the active builder even on a host whose default is the
+# legacy builder; with the built-in frontend that is all the `--mount` flag
+# needs.
+#
 # Multi-stage build:
 #   Stage 1 ("claude-watch-builder"): rust:1-bookworm. COPYs the
 #     claude-watch source from the build context (the repo root the
@@ -483,11 +495,40 @@ RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
 # in-process `npm install -g` upgrades (which unlink+relink the symlink)
 # don't fail with EACCES on a root-owned symlink in /usr/bin/. PR #204's
 # rationale stands; only the target of the symlink changed.
-RUN install -d -o 1000 -g 1000 /home/hndrewaall/.npm-global \
+# Build-resilience hardening (2026-06-25), three parts on this one layer:
+#
+#  1. BuildKit cache mount on /home/hndrewaall/.npm (npm's per-user cache dir,
+#     since the install runs as uid 1000 via `su - hndrewaall`). npm install
+#     -g @anthropic-ai/claude-code pulls nodejs + a ~232MB native dependency
+#     every rebuild; a persistent, locked cache mount lets repeat builds reuse
+#     the tarball/metadata cache instead of re-fetching from the registry —
+#     the registry re-download was what WEDGED multiple deploys (it stalled
+#     mid-fetch even under --no-cache). `uid=1000,gid=1000` so npm-as-uid-1000
+#     can write the cache; `sharing=locked` serializes concurrent builds on
+#     the same cache. Requires BuildKit (see `# syntax` directive at the top +
+#     DOCKER_BUILDKIT=1 in the Makefile target).
+#
+#  2. npm fetch-retry / timeout config in the SAME `su` invocation so a
+#     transient registry stall fails-fast-and-retries (3 retries, bounded
+#     timeouts) instead of hanging the build indefinitely on a slow socket.
+#
+#  3. A build-time `claude --version` smoke check right after the install:
+#     if npm baked a truncated/broken binary (this session's outage baked a
+#     500-byte STUB that ran but did nothing), `claude --version` exits
+#     non-zero and FAILS THE BUILD here rather than shipping a dead binary.
+#     Mirrors the `claude-watch --help` and `code --version` guards elsewhere
+#     in this Dockerfile. Run as uid 1000 (the user the npm-global bindir is
+#     on PATH for) via the same `su - hndrewaall` login shell.
+RUN --mount=type=cache,target=/home/hndrewaall/.npm,uid=1000,gid=1000,sharing=locked \
+    install -d -o 1000 -g 1000 /home/hndrewaall/.npm-global \
                                 /home/hndrewaall/.npm-global/lib \
                                 /home/hndrewaall/.npm-global/bin \
     && su - hndrewaall -c 'npm config set prefix /home/hndrewaall/.npm-global \
-                            && npm install -g @anthropic-ai/claude-code' \
+                            && npm config set fetch-retries 3 \
+                            && npm config set fetch-retry-maxtimeout 120000 \
+                            && npm config set fetch-timeout 300000 \
+                            && npm install -g @anthropic-ai/claude-code \
+                            && claude --version' \
     && ln -sf /home/hndrewaall/.npm-global/bin/claude /usr/bin/claude \
     && chown -h 1000:1000 /usr/bin/claude
 
