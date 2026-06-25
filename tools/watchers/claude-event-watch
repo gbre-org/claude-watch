@@ -16,7 +16,7 @@
 #     GROWS we reset the quiet timer; once the count holds steady for one
 #     full quiet interval (a "quiet period") we drain EVERYTHING in one
 #     batch and exit. A hard cap of $EVENT_WATCH_DEBOUNCE_SECONDS (default
-#     30) bounds the total wait so a slow drip of events can't stall the
+#     120) bounds the total wait so a slow drip of events can't stall the
 #     surface indefinitely. This batches staggered bursts (e.g. a
 #     torrent-completed flood, or four unrelated events landing within a
 #     few seconds) into a SINGLE .output so the main loop's mandatory
@@ -91,9 +91,18 @@ LOG_KEEP_ROTATIONS=3
 # Debounce window (seconds) — HARD CAP on the total collect wait. Once an
 # event is pending we run an adaptive quiet-period collect loop (see below);
 # this value bounds how long that loop can run regardless of continued
-# arrivals. Default 30s; override via --debounce flag or env var. Setting 0
-# disables batching entirely (surface immediately — pre-debounce behavior).
-DEBOUNCE_SECONDS="${EVENT_WATCH_DEBOUNCE_SECONDS:-30}"
+# arrivals. Override via --debounce flag or env var. Setting 0 disables
+# batching entirely (surface immediately — pre-debounce behavior).
+#
+# KNOB #2 (event-delivery debounce), 2026-06-24: default raised 30 -> 120.
+# At 30s the watcher fired-and-exited up to every 30s; each exit is a
+# block-print-exit cycle the main loop MUST read + restart, and (combined with
+# the daemon's aggressive watcher-down detection) the loop spent all its cycles
+# acking + restarting instead of working. A ~120s window delivers AT MOST once
+# every ~2min, batching everything in the window into a SINGLE delivery and
+# slashing the read/restart churn. Events are never dropped — they accumulate
+# on disk and surface in the next batch (see the CRITICAL note above).
+DEBOUNCE_SECONDS="${EVENT_WATCH_DEBOUNCE_SECONDS:-120}"
 
 # Quiet-period (seconds) — the settle interval for the adaptive collect loop.
 # We poll the queue every QUIET_SECONDS; each time the pending count grows we
@@ -112,7 +121,7 @@ Block until a new claude-event arrives in \$CLAUDE_EVENT_QUEUE
 adaptive window, print them all as one-liners, then exit.
 
 Options:
-  --debounce SECONDS  Hard cap on the collect window (default: 30). Bounds
+  --debounce SECONDS  Hard cap on the collect window (default: 120). Bounds
                       how long the adaptive quiet-period loop may run.
                       Set to 0 to disable batching (surface immediately).
                       Also configurable via \$EVENT_WATCH_DEBOUNCE_SECONDS.

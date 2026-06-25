@@ -80,6 +80,19 @@ class Harness:
         )
         return proc.stdout.strip()
 
+    def ack_by_id(self, alert_id: str, message: str) -> None:
+        """Ack a single alert through the nerfed CLI: bare `ack <id>` now
+        refuses, so derive the per-alert read-token (same scheme the CLI
+        uses: sha256(id + NUL + message)[:8]) and pass --confirm-read."""
+        import hashlib
+        token = hashlib.sha256(
+            (alert_id + "\x00" + message).encode("utf-8", "replace")
+        ).hexdigest()[:8]
+        subprocess.run(
+            [str(ACK_CLI), "ack", alert_id, "--confirm-read", token],
+            env=self.env, check=True, capture_output=True, timeout=10,
+        )
+
     def run_hook(self, payload: dict, extra_env: dict | None = None) -> tuple[int, dict, str]:
         env = self.env.copy()
         if extra_env:
@@ -277,8 +290,7 @@ def test_multiple_alerts_persist():
         check(a1 in banner and a2 in banner,
               "2-pending: banner shows both ids", f"banner={banner!r}")
         # Ack the first one via the CLI (this exercises round-trip with the hook)
-        subprocess.run([str(ACK_CLI), "ack", a1], env=h.env, check=True,
-                       capture_output=True, timeout=10)
+        h.ack_by_id(a1, "[CLAUDE-WATCH] first")
         # Still 1 pending -> still deny. (The harness sets
         # CLAUDE_WATCH_ALERT_ACK_COOLDOWN=0; with the default 30s
         # cooldown the ack above would open an allow window -- that
@@ -290,8 +302,7 @@ def test_multiple_alerts_persist():
         check(a2 in banner, "1-still-pending: shows remaining id")
         check(a1 not in banner, "1-still-pending: ack'd id gone")
         # Ack the last one
-        subprocess.run([str(ACK_CLI), "ack", a2], env=h.env, check=True,
-                       capture_output=True, timeout=10)
+        h.ack_by_id(a2, "[CLAUDE-WATCH] second")
         rc, out, err = h.run_hook({"tool_name": "Bash",
                                    "tool_input": {"command": "ls"}})
         check(_is_allow(out), "all-ack'd: allow")
@@ -310,8 +321,7 @@ def test_ack_cooldown_allows():
         a1 = h.add_alert("[CLAUDE-WATCH] first")
         h.add_alert("[CLAUDE-WATCH] second")
         # Ack one; the ack CLI stamps last-ack-timestamp.
-        subprocess.run([str(ACK_CLI), "ack", a1], env=h.env, check=True,
-                       capture_output=True, timeout=10)
+        h.ack_by_id(a1, "[CLAUDE-WATCH] first")
         check((h.state_dir / "last-ack-timestamp").exists(),
               "cooldown: ack CLI wrote last-ack-timestamp")
         # With the cooldown active (generous window so the assertion

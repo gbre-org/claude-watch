@@ -58,13 +58,25 @@ pub async fn notify(alert: ClaudeWatchAlert<'_>) {
     event_bus::emit(&alert);
 }
 
-/// Stuck-state alert: pingme (gated) + claude-event + interrupt + inject.
+/// Stuck-state alert: pingme (gated) + claude-event + (maybe) interrupt + inject.
+///
+/// `cancel_turn` (KNOB #4, 2026-06-24) selects the injection tier:
+///   * `true`  — EMERGENCY: rapid-fire Escape (`interrupt_and_wait`) seizes the
+///     in-flight turn, then inject. Use only when waiting for a turn boundary
+///     is too costly (context-critical, wedged/zombie session).
+///   * `false` — ROUTINE: skip the Escape blast entirely and inject via the
+///     NON-CANCELLING queued path. The nudge is delivered as a queued message
+///     at the next turn boundary WITHOUT aborting the loop's active turn or
+///     killing mid-flight background agents. Use for watcher-down,
+///     heartbeat-stale, and other can-wait recovery prompts. Cancelling those
+///     was the root of the agent-loop churn this change targets.
 pub async fn alert(
     message: &str,
     pane: &str,
     resume_prompt: &str,
     use_pingme: bool,
     event_alert: ClaudeWatchAlert<'_>,
+    cancel_turn: bool,
 ) {
     if use_pingme {
         send_pingme(message).await;
@@ -75,18 +87,25 @@ pub async fn alert(
     // — silencing it would defeat the whole point of this sink.
     event_bus::emit(&event_alert);
 
-    // Actively interrupt, then inject resume prompt. 5s budget keeps the
-    // perceived recovery latency low; if the pane never goes idle we
-    // proceed with the inject anyway (Claude has typically responded long
-    // before the timeout fires).
-    //
-    // The Escape/interrupt phase only matters for terminal-mode panes —
-    // for panel-mode agents the pidfd path appends rather than cancels,
-    // so the interrupt is a no-op there. We still call interrupt_and_wait
-    // because the cost is bounded and a stray Escape into a defunct pane
-    // is harmless.
-    tmux::interrupt_and_wait(pane, 5).await;
-    inject_dispatch::inject_to_agent(pane, resume_prompt).await;
+    if cancel_turn {
+        // EMERGENCY tier: actively interrupt, then inject. 5s budget keeps
+        // perceived recovery latency low; if the pane never goes idle we
+        // proceed with the inject anyway.
+        //
+        // The Escape/interrupt phase only matters for terminal-mode panes —
+        // for panel-mode agents the pidfd path appends rather than cancels,
+        // so the interrupt is a no-op there. We still call interrupt_and_wait
+        // because the cost is bounded and a stray Escape into a defunct pane
+        // is harmless.
+        tmux::interrupt_and_wait(pane, 5).await;
+        inject_dispatch::inject_to_agent(pane, resume_prompt).await;
+    } else {
+        // ROUTINE tier (KNOB #4): NO Escape blast. Queue the nudge without
+        // seizing the turn — the active turn and any running background
+        // agents survive. `inject_to_agent_queued` types + Enter-submits as
+        // a queued message (terminal) or appends via pidfd (panel mode).
+        inject_dispatch::inject_to_agent_queued(pane, resume_prompt).await;
+    }
 }
 
 /// Convenience: emit a claude-event for a fire-and-forget alert path

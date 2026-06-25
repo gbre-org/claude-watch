@@ -920,7 +920,13 @@ pub fn cmd_list(config_path: &str, extra_config_path: Option<&str>, json: bool) 
 /// `DUPLICATE` the full status output is printed (same format as the default
 /// case) so the caller can see what's wrong. Designed for the PostToolUse
 /// hook that surfaces watcher health on every tool call.
-pub async fn cmd_status(config_path: &str, extra_config_path: Option<&str>, json: bool, unhealthy_only: bool) {
+pub async fn cmd_status(
+    config_path: &str,
+    extra_config_path: Option<&str>,
+    json: bool,
+    unhealthy_only: bool,
+    all: bool,
+) {
     let statuses = watcher_status(config_path, extra_config_path).await;
 
     if unhealthy_only && !any_unhealthy(&statuses) {
@@ -930,9 +936,12 @@ pub async fn cmd_status(config_path: &str, extra_config_path: Option<&str>, json
     }
 
     if json {
+        // JSON always carries the full set (including disabled watchers) so
+        // machine consumers keep a complete picture; the `--all` filter only
+        // affects the human-readable rendering.
         println!("{}", serde_json::to_string_pretty(&statuses).unwrap());
     } else {
-        print!("{}", format_status(&statuses));
+        print!("{}", format_status(&statuses, all));
     }
 }
 
@@ -1014,13 +1023,28 @@ pub fn format_list(entries: &[WatcherEntry]) -> String {
 /// that grep for `ok` keep working. The status column widens from 4 to 9
 /// characters to fit the literal `DUPLICATE` (and the `DOWN` / `ok` rows
 /// just get a few extra trailing spaces — still parses fine).
-pub fn format_status(statuses: &[WatcherStatus]) -> String {
+///
+/// `show_all`: when `false` (the default `watcher-ctl status` view), the
+/// `off (disabled)` rows are omitted entirely so the listing shows only the
+/// watchers that are SUPPOSED to be running. Disabled watchers are
+/// intentionally off and are never part of the health picture (see
+/// [`any_unhealthy`]), so hiding them keeps the default view focused on the
+/// enabled set. When `true` (`watcher-ctl status --all`) the full list —
+/// including the `off (disabled)` rows — is rendered, matching the historical
+/// behaviour. Health/WARNING/recovery logic is identical in both modes: it
+/// has always considered only enabled watchers, so the footer never changes
+/// based on the filter.
+pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
     let mut out = String::new();
     let mut all_healthy = true;
     let mut down_names: Vec<String> = Vec::new();
     let mut has_duplicate = false;
     for s in statuses {
         if s.status == "off" {
+            // Default view hides disabled watchers; only `--all` shows them.
+            if !show_all {
+                continue;
+            }
             out.push_str(&format!("{:<20} {:<9} (disabled)\n", s.name, s.status));
         } else {
             if s.status == "DOWN" || s.status == "DUPLICATE" {
@@ -1189,7 +1213,7 @@ mod tests {
     #[test]
     fn test_format_status_all_ok() {
         let statuses = vec![ok_status("alerts", 1, 1, "1234")];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(output.contains("ok"));
         assert!(output.contains("All watchers healthy."));
         // Healthy-state output must NOT mention "duplicate" — that's the
@@ -1201,7 +1225,7 @@ mod tests {
     #[test]
     fn test_format_status_some_down() {
         let statuses = vec![ok_status("alerts", 1, 1, "1234"), down_status("torrent", 1)];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(output.contains("DOWN"));
         assert!(output.contains("WARNING: Some watchers are down or duplicated!"));
     }
@@ -1218,10 +1242,88 @@ mod tests {
             dup_supervisors: Vec::new(),
             dup_pollers: Vec::new(),
         }];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(output.contains("off"));
         assert!(output.contains("disabled"));
         assert!(output.contains("All watchers healthy."));
+    }
+
+    /// Test helper: build an `off` (disabled) watcher status.
+    fn off_status(name: &str) -> WatcherStatus {
+        WatcherStatus {
+            name: name.to_string(),
+            status: "off".to_string(),
+            count: 0,
+            required: 1,
+            pids: String::new(),
+            enabled: false,
+            dup_supervisors: Vec::new(),
+            dup_pollers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_format_status_default_hides_disabled() {
+        // Default view (show_all=false): enabled watchers render, disabled
+        // (`off`) ones are omitted entirely.
+        let statuses = vec![
+            ok_status("alerts", 1, 1, "1234"),
+            off_status("torrent-wait"),
+            off_status("tv-remind"),
+        ];
+        let output = format_status(&statuses, false);
+        assert!(output.contains("alerts"), "enabled watcher must show, got:\n{output}");
+        assert!(
+            !output.contains("torrent-wait"),
+            "disabled watcher must be hidden in default view, got:\n{output}"
+        );
+        assert!(
+            !output.contains("tv-remind"),
+            "disabled watcher must be hidden in default view, got:\n{output}"
+        );
+        assert!(
+            !output.contains("disabled"),
+            "no `(disabled)` rows in default view, got:\n{output}"
+        );
+        // Health is unaffected: disabled watchers never count, so an all-ok
+        // enabled set is still healthy.
+        assert!(output.contains("All watchers healthy."));
+    }
+
+    #[test]
+    fn test_format_status_all_shows_disabled() {
+        // `--all` (show_all=true): the disabled rows reappear.
+        let statuses = vec![ok_status("alerts", 1, 1, "1234"), off_status("torrent-wait")];
+        let output = format_status(&statuses, true);
+        assert!(output.contains("alerts"));
+        assert!(
+            output.contains("torrent-wait"),
+            "disabled watcher must show under --all, got:\n{output}"
+        );
+        assert!(output.contains("(disabled)"));
+        assert!(output.contains("All watchers healthy."));
+    }
+
+    #[test]
+    fn test_format_status_default_hides_disabled_but_keeps_warning() {
+        // A disabled watcher must NOT suppress (or affect) the WARNING for a
+        // genuinely-DOWN enabled watcher. Default view hides the `off` row but
+        // still flags the DOWN one.
+        let statuses = vec![
+            down_status("claude-event-watch", 1),
+            off_status("context-watch"),
+        ];
+        let output = format_status(&statuses, false);
+        assert!(output.contains("DOWN"));
+        assert!(
+            !output.contains("context-watch"),
+            "disabled watcher hidden in default view, got:\n{output}"
+        );
+        assert!(output.contains("WARNING: Some watchers are down or duplicated!"));
+        // Recovery hint reflects the filtered (enabled) view: it names the
+        // DOWN watcher, never the disabled one.
+        assert!(output.contains("claude-event-watch"));
+        assert!(!output.contains("context-watch"));
     }
 
     #[test]
@@ -1300,7 +1402,7 @@ mod tests {
             dup_supervisors: Vec::new(),
             dup_pollers: vec![111, 222, 333],
         }];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(output.contains("DUPLICATE"));
         assert!(
             output.contains("duplicate pollers: 111 222 333"),
@@ -1329,7 +1431,7 @@ mod tests {
             dup_supervisors: vec![358036, 359170, 705775, 761576],
             dup_pollers: Vec::new(),
         }];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(output.contains("DUPLICATE"));
         assert!(
             output.contains("duplicate supervisors: 358036 359170 705775 761576"),
@@ -1354,7 +1456,7 @@ mod tests {
             dup_supervisors: vec![10, 20],
             dup_pollers: vec![100, 200],
         }];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(output.contains("duplicate pollers: 100 200"));
         assert!(output.contains("duplicate supervisors: 10 20"));
     }
@@ -1375,7 +1477,7 @@ mod tests {
             dup_supervisors: vec![10, 20],
             dup_pollers: Vec::new(),
         }];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         // DOWN appears as the headline status
         assert!(
             output.contains("DOWN"),
@@ -1438,7 +1540,7 @@ mod tests {
             dup_supervisors: vec![3, 4],
             dup_pollers: vec![1, 2],
         }];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         // These exact substrings are part of the public contract
         assert!(output.contains("duplicate pollers:"));
         assert!(output.contains("duplicate supervisors:"));
@@ -1466,7 +1568,7 @@ mod tests {
             dup_supervisors: Vec::new(),
             dup_pollers: vec![111, 222, 333],
         }];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(
             output.contains("Recovery for DUPLICATE state:"),
             "expected 'Recovery for DUPLICATE state:' footer, got:\n{}",
@@ -1493,7 +1595,7 @@ mod tests {
     #[test]
     fn test_format_status_down_only_suggests_watcher_ctl_run() {
         let statuses = vec![down_status("claude-event-watch", 1)];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(
             output.contains("Recovery for DOWN state:"),
             "expected 'Recovery for DOWN state:' footer, got:\n{}",
@@ -1541,7 +1643,7 @@ mod tests {
                 dup_pollers: vec![111, 222, 333],
             },
         ];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(
             output.contains("Recovery for DUPLICATE state:"),
             "DUPLICATE wins precedence in mixed state, got:\n{}",
@@ -1559,7 +1661,7 @@ mod tests {
         // The recovery hints must only appear when something is wrong;
         // an all-healthy run should print only "All watchers healthy."
         let statuses = vec![ok_status("alerts-watcher", 1, 1, "1234")];
-        let output = format_status(&statuses);
+        let output = format_status(&statuses, true);
         assert!(output.contains("All watchers healthy."));
         assert!(
             !output.contains("Recovery for"),

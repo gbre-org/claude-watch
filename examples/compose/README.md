@@ -85,6 +85,7 @@ behavior or claude-watch monitoring.
 | `~/.config/session` | _(not overridable; shared with queue-minisite)_ | `/home/hndrewaall/.config/session` | `rw` | session-task queue.json (same path the queue-minisite mounts). |
 | `/dev/null` _(default; corp-CA bundle on VPN)_ | `CLAUDE_HOST_CORP_CA_BUNDLE` | _(same path as source)_ | `ro` | Corporate-CA bundle for operators behind a TLS MITM proxy. The forwarded `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` env vars carry an ABSOLUTE host path; this mount makes that path resolve INSIDE the container. Set to the same value as `NODE_EXTRA_CA_CERTS`. Default `/dev/null` is a no-op for non-corp setups. |
 | `/dev/null` _(default; host hook-script dir)_ | `CLAUDE_HOST_HOOKS_DIR` | _(same path as source)_ | `ro` | Host directory of settings.json hook scripts referenced by ABSOLUTE host path (e.g. corp telemetry hooks at `~/.local/bin/`). Without this, Claude Code logs `SessionStart:startup hook error — /bin/sh: 1: <path>: not found`. Default `/dev/null` is a no-op for hosts without external hooks. |
+| `/dev/null` _(default; operator obligation manifests)_ | `CLAUDE_HOST_OBLIGATIONS_DIR` | `/mnt/host-obligations-config` | `ro` | Operator-managed obligation-manifest dir — one `*.json` row spec per file (schema mirrors the `obligations add` flags). `obligations-init` scans it on EVERY container start and applies each manifest idempotently AFTER the baked container-policy default rows, so operator-specific obligations (e.g. the AskUserQuestion presence-gate) are DECLARATIVE private config — auto-applied, never baked into the shared image, never imperatively `register`-ed per session. Default `/dev/null` is a clean no-op (obligations-init guards with `os.path.isdir()`; absent / empty / non-dir mount = "no user obligations"). Set to your private dir (e.g. `~/.config/claude-container/obligations`) to opt in. See [Operator obligation manifests](#operator-obligation-manifests) below. |
 
 Host-specific integration mounts (shell-history databases, messaging
 attachment dirs, etc.) are intentionally out of scope for this example.
@@ -96,6 +97,58 @@ clone or worktree the deploy runs from. (Keeping it out of the repo, rather
 than as a gitignored sibling, is deliberate: a gitignored sibling is absent
 from every worktree, so deploys run from the build worktree silently dropped
 all of these mounts.)
+
+### Operator obligation manifests
+
+The container's obligations gate ships a set of baked, default-seeded
+**container-policy** rows (queue discipline, event-must-act, agent-ack, etc.)
+that `obligations-init` re-applies on every container start when
+`CLAUDE_CONTAINER_OBLIGATIONS=1`. Those are universal and belong in the shared
+image.
+
+**Operator-specific** obligations (gates that only YOUR deployment wants —
+e.g. blocking the interactive `AskUserQuestion` tool unless an operator-presence
+carrier file is fresh) should NOT be baked into the public image and should NOT
+rely on an imperative `register-*.sh` you re-run each session (session-scoped
+obligation state is WIPED on every container recreate, and nothing re-arms it
+automatically — the exact gap this mechanism closes). Instead, declare them as
+**bind-mounted manifests**:
+
+1. Create a host dir, e.g. `~/.config/claude-container/obligations/`.
+2. Drop one JSON file per obligation row. The schema mirrors the
+   `obligations add` flags:
+
+   ```json
+   {
+     "tool_pattern": "AskUserQuestion",
+     "predicate": "file_mtime_within",
+     "params": { "path": "~/.claude/operator-present", "max_age_secs": 90 },
+     "ttl": 0,
+     "enforcement": "gate",
+     "deny_msg": "Operator presence unknown/stale — AskUserQuestion blocked.",
+     "created_by": "claude-config:presence-gate",
+     "mandatory": false
+   }
+   ```
+
+   Required keys: `tool_pattern`, `predicate`, `deny_msg`. Optional:
+   `params` (object or pre-serialized JSON string), `ttl` (default `0` =
+   non-expiring), `enforcement` (`gate` | `inform`, default `gate`),
+   `created_by`, `mandatory` (bool), `exempt_tool_patterns` (list of strings),
+   `satisfied_by_tool`, `satisfied_by_cmd_regex`.
+3. Point `CLAUDE_HOST_OBLIGATIONS_DIR` at that host dir (in your
+   `~/.config/claude-container/deploy.env` or `.env`) and recreate the
+   container.
+
+On every start, `obligations-init` scans the mounted dir AFTER seeding the
+baked defaults and applies each manifest idempotently. Idempotency is keyed on
+`(created_by, tool_pattern, predicate)` — re-applying a re-tuned manifest
+REPLACES the prior row rather than duplicating it (manifested rows carry a
+`[user-manifest]` marker in `created_by` so re-runs find + replace only their
+own rows, never the baked default-seed rows or hand-registered ones). The mount
+is read-only so the in-container session cannot tamper with your gate
+definitions. An absent / empty / non-directory (`/dev/null`) mount is a clean
+no-op — wiring nothing leaves the container exactly as before.
 
 ### Corporate VPN / SSL passthrough
 

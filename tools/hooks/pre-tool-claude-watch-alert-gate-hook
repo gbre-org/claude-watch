@@ -272,10 +272,14 @@ def _build_banner(alerts: list[dict], tool_name: str) -> str:
         "!!   3. `session-task set \"...\"` with enough context to resume",
         "!!   4. `self-clear` if the alert says to",
         "!!",
-        "!! Then clear the gate:",
-        "!!   claude-watch-ack list                 # show pending alerts",
-        "!!   claude-watch-ack ack <id>             # ack a specific alert",
-        "!!   claude-watch-ack ack --all            # ack everything",
+        "!! Then clear the gate. EVERY ack path PRINTS the alert body first --",
+        "!! you cannot clear an alert without its text being surfaced, and the",
+        "!! single-id path now requires the per-alert `read-token` echoed in",
+        "!! that body (so a blind ack is structurally impossible):",
+        "!!   claude-watch-ack list                              # show pending alerts",
+        "!!   claude-watch-ack ack <id>                          # PRINTS body+token, REFUSES (exit 2)",
+        "!!   claude-watch-ack ack <id> --confirm-read <token>   # echo the token from the body to clear",
+        "!!   claude-watch-ack ack --all --confirm-read          # read ALL bodies, then clear",
         "!!",
         "!! Exempt while alerts pending: claude-watch-ack, session-task,",
         "!!   git status/diff/log/commit/push/add, obligations list/show,",
@@ -304,9 +308,10 @@ def _build_reason(alerts: list[dict]) -> str:
     if len(out) > 800:
         out = out[:797] + "..."
     return (
-        f"{len(alerts)} pending claude-watch alert(s) -- "
-        f"run `claude-watch-ack ack <id>` (or `ack --all`) to clear. "
-        f"Details: {out}"
+        f"{len(alerts)} pending claude-watch alert(s) -- run "
+        f"`claude-watch-ack ack <id>` to PRINT the body+read-token, then "
+        f"`ack <id> --confirm-read <token>` (or `ack --all --confirm-read`) "
+        f"to clear. Details: {out}"
     )
 
 

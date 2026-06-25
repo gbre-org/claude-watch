@@ -234,6 +234,23 @@
   }
 
   function renderRunningItem(it) {
+    // The <article> MUST carry `id="queue-<id>"` to mirror the Jinja
+    // template (templates/index.html RUNNING block: `id="queue-{{ it.id }}"`).
+    // getNodeKey() below keys nodes by `el.id` FIRST, falling back to
+    // `data-queue-id`. The server paints `id="queue-<id>"` (morphdom key
+    // `queue-<id>`); if this renderer OMITS the id, the refreshed node keys
+    // as `qid:<id>` instead — a KEY MISMATCH. On the first 5s tick morphdom
+    // then can't match the keyed server card to the new node, so it DISCARDS
+    // the server-painted running card (INCLUDING its nested subagent tree)
+    // and inserts a freshly-built one. That wholesale discard/recreate is
+    // what flapped the subagent hierarchy on refresh (a transient
+    // empty/partial `it.subagents` on the rebuild renders FLAT, with no
+    // in-place server tree to morph against). Emitting the id keeps the
+    // morphdom key stable across paint↔refresh so the card (and its tree) is
+    // updated IN PLACE — identity preserved, no discard. (Sibling renderers
+    // renderBlockedItem/renderPendingItem already emit it; this one had
+    // drifted. renderTerminalItem intentionally omits it to match the
+    // template's done/abandoned sections, which also omit it — consistent.)
     const owner = it.owner || {};
     const isStarting = !!it.is_starting;
     const workloadLabel = it.workload_label || '';
@@ -363,7 +380,7 @@
     }
 
     return (
-      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr}${hostjobAttr} ${logModeAttr}>` +
+      `<article id="queue-${attr(it.id)}" class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-created-by="${attr(it.created_by || '')}" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr}${hostjobAttr} ${logModeAttr}>` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       `<div class="age">${ageBlock}</div>` +

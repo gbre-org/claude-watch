@@ -7,8 +7,8 @@ subagent tool call must correspond to a currently-running queue item"
 AFTER spawn; this hook is what populates the binding state the predicate
 reads.
 
-When the Agent tool fires successfully with ``async_launched=true`` (the
-fire-and-forget shape from the main loop's perspective), Claude Code's
+When the Agent tool fires successfully as a fire-and-forget background
+spawn (the shape from the main loop's perspective), Claude Code's
 PostToolUse hook receives a payload of the shape::
 
     {
@@ -18,11 +18,19 @@ PostToolUse hook receives a payload of the shape::
         "prompt": "...Queue item: q-2026-05-15-XXXX..."
       },
       "tool_response": {
-        "async_launched": true,
+        "isAsync": true,
+        "status": "async_launched",
         "agentId": "agent-abc123..."
       },
       ...
     }
+
+The async-launch marker lives in ``isAsync: true`` / ``status:
+"async_launched"`` -- NOT in a boolean field literally named
+``async_launched`` (an earlier version of this hook checked for that
+non-existent field and so never wrote a single binding; the file at
+``~/.config/claude/agent-queue-bindings.json`` stayed absent). We accept
+any of the real markers (and the legacy boolean, for forward-safety).
 
 We extract:
   - the new subagent's ``agent_id`` from ``tool_response.agentId``
@@ -221,6 +229,26 @@ def _upsert_binding(agent_id: str, queue_id: str) -> None:
                 pass
 
 
+def _is_async_launched(tool_response: dict) -> bool:
+    """True iff the tool_response describes a fire-and-forget async spawn.
+
+    The real Claude Code Agent payload marks an async launch with either
+    ``isAsync: true`` or ``status == "async_launched"``. The original hook
+    checked for a boolean field literally named ``async_launched``, which
+    the runtime never emits -- so this guard always failed and no binding
+    was ever written. We accept the real markers and keep the legacy
+    boolean for forward-safety.
+    """
+    if tool_response.get("isAsync") is True:
+        return True
+    if tool_response.get("status") == "async_launched":
+        return True
+    # Legacy / documented-but-never-seen boolean shape.
+    if bool(tool_response.get("async_launched", False)):
+        return True
+    return False
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -242,9 +270,13 @@ def main() -> int:
     if not isinstance(tool_response, dict):
         return 0
 
-    # Only act on async_launched spawns -- a sync Agent call that returns
-    # in-band doesn't have a separately-running subagent to bind.
-    if not bool(tool_response.get("async_launched", False)):
+    # Only act on async-launched spawns -- a sync Agent call that returns
+    # in-band doesn't have a separately-running subagent to bind. The real
+    # Claude Code payload marks the async launch with ``isAsync: true`` and
+    # ``status: "async_launched"`` (NOT a boolean ``async_launched`` field,
+    # which never existed -- the prior check on it meant this hook never
+    # fired). Accept any of the real markers plus the legacy boolean.
+    if not _is_async_launched(tool_response):
         return 0
 
     agent_id = tool_response.get("agentId", "")
