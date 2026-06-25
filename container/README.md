@@ -431,9 +431,10 @@ plugin loader treats the baked dir as a real plugin.
 
 **Currently shipping:**
 
-- Skills: [`restart`](skills/restart.md) (mirrors the host's `/restart`
-  but invokes the in-container `cwsr` instead of `claude-watch update
-  --force`); [`start-watchers`](skills/start-watchers.md)
+- Skills: [`claude-code-restart`](skills/claude-code-restart.md) (mirrors
+  the host's `/restart` but invokes the in-container `cwsr` instead of
+  `claude-watch update --force` — it rolls the inner Claude Code process
+  only, NOT the container); [`start-watchers`](skills/start-watchers.md)
   (launches the baked watchers as session-scoped `run_in_background`
   tasks and documents the restart-on-exit contract).
 - Agents: none yet — the dir is a stub for future agent ports (Explore,
