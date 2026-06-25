@@ -171,6 +171,118 @@ run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=600 >/dev/null 2>&1
     || fail "failed-inject retry injects=$(inject_count) (want 2)"
 teardown
 
+# ---------------------------------------------------------------- 11
+# Auto-restart OFF (default): never launches the watcher, no matter how many
+# escalations. We stub the watcher cmd to a marker-writer and assert it never
+# runs. Cooldown=0 so every tick injects + escalates.
+setup
+WCMD_MARKER="$SBX/watcher-ran"
+cat > "$BIN/fake-watcher" <<EOF
+#!/usr/bin/env bash
+touch "$WCMD_MARKER"
+EOF
+chmod +x "$BIN/fake-watcher"
+for _ in 1 2 3 4 5; do
+    stale_event
+    run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=0 \
+              CW_WATCHER_HEALTH_WATCHER_CMD="$BIN/fake-watcher" \
+              CW_WATCHER_HEALTH_AUTORESTART_AFTER=3 >/dev/null 2>&1
+done
+if [ -e "$WCMD_MARKER" ]; then
+    fail "autorestart OFF but watcher cmd ran (marker present)"
+else
+    pass "autorestart OFF (default): watcher cmd never launched"
+fi
+teardown
+
+# ---------------------------------------------------------------- 12
+# Auto-restart ON: fires only AFTER the threshold of consecutive injects.
+# With AFTER=3 and cooldown=0: ticks 1,2 inject but do NOT launch; tick 3
+# reaches the threshold and launches.
+setup
+WCMD_MARKER="$SBX/watcher-ran"
+RUNLOG="$SBX/watcher-runs.log"
+cat > "$BIN/fake-watcher" <<EOF
+#!/usr/bin/env bash
+echo run >> "$RUNLOG"
+EOF
+chmod +x "$BIN/fake-watcher"
+: > "$RUNLOG"
+launched_at=""
+for n in 1 2 3; do
+    stale_event
+    run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=0 \
+              CW_WATCHER_HEALTH_AUTORESTART=1 \
+              CW_WATCHER_HEALTH_WATCHER_CMD="$BIN/fake-watcher" \
+              CW_WATCHER_HEALTH_AUTORESTART_AFTER=3 >/dev/null 2>&1
+    # setsid detaches; give the child a beat to write the marker.
+    sleep 0.3
+    runs=$( [ -s "$RUNLOG" ] && grep -c . "$RUNLOG" || echo 0 )
+    if [ "$runs" -ge 1 ] && [ -z "$launched_at" ]; then
+        launched_at="$n"
+    fi
+done
+if [ "$launched_at" = "3" ]; then
+    pass "autorestart ON: launches at threshold tick (n=3), not before"
+else
+    fail "autorestart threshold wrong: launched_at=${launched_at:-never} (want 3)"
+fi
+teardown
+
+# ---------------------------------------------------------------- 13
+# Healthy tick (no stale events) resets the escalation counter: after two
+# injects, a clean tick wipes the ledger so the count restarts from zero.
+setup
+ESC_FILE="$STATE_DIR/watcher-health-escalations"
+stale_event
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=0 CW_WATCHER_HEALTH_AUTORESTART_AFTER=99 >/dev/null 2>&1
+stale_event
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=0 CW_WATCHER_HEALTH_AUTORESTART_AFTER=99 >/dev/null 2>&1
+count_before=$( [ -f "$ESC_FILE" ] && cat "$ESC_FILE" || echo 0 )
+# Now a clean tick: drain the queue first.
+rm -f "$QUEUE"/*.json
+run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=0 >/dev/null 2>&1
+if [ "$count_before" = "2" ] && [ ! -f "$ESC_FILE" ]; then
+    pass "healthy tick resets escalation counter (was 2, ledger cleared)"
+else
+    fail "escalation reset failed: before=$count_before, ledger_exists=$([ -f "$ESC_FILE" ] && echo yes || echo no)"
+fi
+teardown
+
+# ---------------------------------------------------------------- 14
+# Failed inject does NOT escalate (it exits before the counter bump), so a
+# string of failed injects never trips the auto-restart.
+setup
+RUNLOG="$SBX/watcher-runs.log"
+ESC_FILE="$STATE_DIR/watcher-health-escalations"
+cat > "$BIN/claude-watch" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CW_LOG"
+exit 3
+EOF
+chmod +x "$BIN/claude-watch"
+cat > "$BIN/fake-watcher" <<EOF
+#!/usr/bin/env bash
+echo run >> "$RUNLOG"
+EOF
+chmod +x "$BIN/fake-watcher"
+: > "$RUNLOG"
+for _ in 1 2 3 4; do
+    stale_event
+    run_check CW_WATCHER_HEALTH_COOLDOWN_SECS=0 \
+              CW_WATCHER_HEALTH_AUTORESTART=1 \
+              CW_WATCHER_HEALTH_WATCHER_CMD="$BIN/fake-watcher" \
+              CW_WATCHER_HEALTH_AUTORESTART_AFTER=2 >/dev/null 2>&1
+    sleep 0.1
+done
+runs=$( [ -s "$RUNLOG" ] && grep -c . "$RUNLOG" || echo 0 )
+if [ "$runs" = 0 ] && [ ! -f "$ESC_FILE" ]; then
+    pass "failed injects never escalate / never auto-restart"
+else
+    fail "failed inject escalated: watcher runs=$runs, ledger_exists=$([ -f "$ESC_FILE" ] && echo yes || echo no)"
+fi
+teardown
+
 # ----------------------------------------------------------------
 if [ "$fails" -gt 0 ]; then
     printf 'FAIL: %d case(s)\n' "$fails" >&2
