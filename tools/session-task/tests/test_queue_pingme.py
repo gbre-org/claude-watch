@@ -54,32 +54,37 @@ SESSION_TASK = Path(__file__).resolve().parent.parent / "session-task"
 
 
 def _install_fake_pingme(bin_dir: Path, log_path: Path, exit_code: int = 0):
-    """Drop a fake ``pingme`` executable that logs argv to a file.
+    """Drop a fake ``queue-notify`` executable that logs argv to a file.
+
+    session-task's queue lifecycle hooks shell out to ``queue-notify`` (a
+    dedicated Pushover path), so the shim is named ``queue-notify``. The
+    helper keeps its historical ``_install_fake_pingme`` name to minimise
+    churn across the existing test suite.
 
     Format of each logged call: one JSON object per line with keys
     ``priority`` (or None), ``message``, ``title``. The shim writes the
     argv verbatim; we parse argparse-style in the test.
     """
     bin_dir.mkdir(parents=True, exist_ok=True)
-    pingme = bin_dir / "pingme"
+    notifier = bin_dir / "queue-notify"
     # Keep the shim minimal: log all argv after argv[0], then exit.
-    pingme.write_text(textwrap.dedent(f"""\
+    notifier.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env python3
         import json, sys
         with open({str(log_path)!r}, "a") as f:
             f.write(json.dumps(sys.argv[1:]) + "\\n")
         sys.exit({exit_code})
         """))
-    pingme.chmod(0o755)
-    return pingme
+    notifier.chmod(0o755)
+    return notifier
 
 
 def _env_for_tmp(tmp, extra_path_dir=None, pingme_session_task=None):
     """Build env with HOME=tmp and (optionally) extra dir prepended to PATH.
 
     If ``extra_path_dir`` is None, PATH is set to a single empty dir so
-    ``pingme`` cannot be found -- used for the no-op test. Otherwise the
-    extra dir (containing the shim) is prepended.
+    ``queue-notify`` cannot be found -- used for the no-op test. Otherwise
+    the extra dir (containing the shim) is prepended.
     """
     env = dict(os.environ)
     env["HOME"] = str(tmp)
