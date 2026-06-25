@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Send a claude-watch QUEUE push notification via Pushover.
+
+This is the dedicated delivery path for session-task queue lifecycle
+notifications (queue started / done / abandoned / force-start / blocked,
+etc.). It deliberately does NOT go through ``pingme``:
+
+  * It uses a SEPARATE Pushover application/API token so queue pushes are
+    distinguishable from pingme's general-purpose pushes, and can carry a
+    dedicated default sound.
+  * It REUSES the existing Pushover *user* key (the same recipient pingme
+    pushes to) so notifications still land on the same device(s).
+  * It delivers quietly by default (``sound=vibrate``).
+
+Drop-in argv compatibility
+---------------------------
+session-task previously shelled out to ``pingme -p <priority> <message>
+<title>``. This tool accepts the same shape so the session-task call site
+needed only a binary-name swap:
+
+    queue-notify [-p PRIORITY] [--sound SOUND] <message> [title]
+
+``PRIORITY`` is one of ``low|normal|high|emergency`` (mapped to Pushover
+priority -1/0/1/2). ``--sound`` overrides the default ``vibrate``.
+
+Credential lookup
+-----------------
+Token (dedicated, queue-only):
+  1. ``QUEUE_NOTIFY_TOKEN`` / ``PUSHOVER_TOKEN`` already in env.
+  2. ``$QUEUE_NOTIFY_ENV`` file (default
+     ``$XDG_CONFIG_HOME/queue-notify/env``, chmod 600) → ``PUSHOVER_TOKEN``.
+
+User key (reused from pingme — same recipient):
+  1. ``PUSHOVER_USER`` already in env.
+  2. ``PUSHOVER_USER`` set in the queue-notify env file (explicit override).
+  3. ``PUSHOVER_USER`` sourced from pingme's env file
+     (``$PINGME_ENV`` / ``$XDG_CONFIG_HOME/pingme/env``).
+
+The token NEVER lives in this (public-repo) file — only in the local
+``queue-notify/env`` secret. If creds can't be found, this exits non-zero
+with a clear message; callers (session-task) swallow that so the queue op
+is never blocked by a notification failure.
+"""
+import argparse
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API_URL = "https://api.pushover.net/1/messages.json"
+DEFAULT_SOUND = "vibrate"
+
+_PRIORITY_MAP = {"low": -1, "normal": 0, "high": 1, "emergency": 2}
+
+
+def _config_home() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a tiny ``KEY="value"`` env file. No shell execution.
+
+    Tolerates blank lines, ``#`` comments, optional ``export`` prefix, and
+    single/double quoted values. Unknown lines are skipped silently.
+    """
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def _resolve_token() -> str | None:
+    for var in ("QUEUE_NOTIFY_TOKEN", "PUSHOVER_TOKEN"):
+        v = os.environ.get(var)
+        if v:
+            return v
+    env_path = Path(
+        os.environ.get("QUEUE_NOTIFY_ENV")
+        or (_config_home() / "queue-notify" / "env")
+    )
+    return _parse_env_file(env_path).get("PUSHOVER_TOKEN") or None
+
+
+def _resolve_user() -> str | None:
+    # 1. Already exported.
+    v = os.environ.get("PUSHOVER_USER")
+    if v:
+        return v
+    # 2. Explicit override in the queue-notify env file.
+    qn_path = Path(
+        os.environ.get("QUEUE_NOTIFY_ENV")
+        or (_config_home() / "queue-notify" / "env")
+    )
+    v = _parse_env_file(qn_path).get("PUSHOVER_USER")
+    if v:
+        return v
+    # 3. Reuse pingme's user key (same recipient as pingme).
+    pingme_path = Path(
+        os.environ.get("PINGME_ENV")
+        or (_config_home() / "pingme" / "env")
+    )
+    return _parse_env_file(pingme_path).get("PUSHOVER_USER") or None
+
+
+def _post(user: str, token: str, title: str, message: str,
+          priority: int, sound: str) -> tuple[bool, str]:
+    fields = {
+        "user": user,
+        "token": token,
+        "title": title,
+        "message": message,
+        "priority": str(priority),
+        "sound": sound,
+    }
+    if priority == 2:
+        # Emergency: required retry/expire (hourly retries for 24h).
+        fields["retry"] = "3600"
+        fields["expire"] = "86400"
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(API_URL, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            return (resp.status == 200, body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace") if exc.fp else str(exc)
+        return (False, body)
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"{exc.__class__.__name__}: {exc}")
+
+
+def main(argv=None) -> int:
+    import socket
+
+    parser = argparse.ArgumentParser(
+        prog="queue-notify",
+        description="Send a claude-watch queue push notification via Pushover.",
+    )
+    parser.add_argument("-p", "--priority", default="normal",
+                        choices=list(_PRIORITY_MAP.keys()))
+    parser.add_argument("--sound", default=DEFAULT_SOUND,
+                        help=f"Pushover sound (default: {DEFAULT_SOUND}).")
+    parser.add_argument("message", help="Notification body.")
+    parser.add_argument("title", nargs="?", default=None,
+                        help="Notification title (default: hostname).")
+    args = parser.parse_args(argv)
+
+    title = args.title if args.title is not None else socket.gethostname().split(".")[0]
+    priority = _PRIORITY_MAP[args.priority]
+
+    token = _resolve_token()
+    user = _resolve_user()
+    if not token or not user:
+        missing = []
+        if not token:
+            missing.append("PUSHOVER_TOKEN (queue-notify/env)")
+        if not user:
+            missing.append("PUSHOVER_USER (pingme/env or queue-notify/env)")
+        print(f"queue-notify: missing creds: {', '.join(missing)}", file=sys.stderr)
+        return 1
+
+    ok, body = _post(user, token, title, args.message, priority, args.sound)
+    if not ok:
+        print(f"queue-notify: delivery failed: {body}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

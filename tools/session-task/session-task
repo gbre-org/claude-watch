@@ -1277,28 +1277,40 @@ def _fmt_ts():
 
 
 def _pingme_notify(title, message, priority="normal", silent=False):
-    """Fire a Pushover notification via the ``pingme`` CLI.
+    """Fire a queue Pushover notification via the ``queue-notify`` CLI.
 
-    Called from queue lifecycle hooks (register / done / abandon). Failures
-    MUST NOT block the underlying queue state transition, so every error
-    path here is swallowed to stderr and returns None.
+    Called from queue lifecycle hooks (register / done / abandon / etc.).
+    Queue notifications go through a DEDICATED Pushover application token
+    (distinct from ``pingme``'s general-purpose token) and deliver quietly
+    (``sound=vibrate``). ``queue-notify`` reuses pingme's Pushover *user*
+    key, so notifications still land on the same recipient. See
+    ``tools/session-task/queue-notify`` for the credential lookup; the
+    dedicated token lives in local config (``~/.config/queue-notify/env``),
+    never in this (public) repo.
+
+    Failures MUST NOT block the underlying queue state transition, so every
+    error path here is swallowed to stderr and returns None.
 
     Suppression:
         * ``silent=True`` (from ``--silent`` on the CLI) skips the call.
-        * ``PINGME_SESSION_TASK=0`` env var skips all session-task pingmes
-          (useful for batch scripts / noisy flows).
-        * ``pingme`` not on PATH -> silent no-op (not an error).
+        * ``PINGME_SESSION_TASK=0`` env var skips all session-task queue
+          notifications (useful for batch scripts / noisy flows).
+        * ``queue-notify`` not on PATH -> silent no-op (not an error).
+
+    The function name is retained (rather than renamed to ``_queue_notify``)
+    to avoid churning the ~dozen lifecycle call sites; the keyword/signature
+    is identical to the prior pingme-based version.
     """
     if silent:
         return None
     if os.environ.get("PINGME_SESSION_TASK") == "0":
         return None
-    pingme = shutil.which("pingme")
-    if not pingme:
+    notifier = shutil.which("queue-notify")
+    if not notifier:
         return None
     if priority not in ("low", "normal", "high", "emergency"):
         priority = "normal"
-    cmd = [pingme, "-p", priority, message, title]
+    cmd = [notifier, "-p", priority, message, title]
     try:
         subprocess.run(
             cmd,
@@ -1308,7 +1320,8 @@ def _pingme_notify(title, message, priority="normal", silent=False):
             timeout=10,
         )
     except Exception as exc:  # noqa: BLE001 -- never block the queue op
-        print(f"[pingme] notification failed ({exc.__class__.__name__}): {exc}",
+        print(f"[queue-notify] notification failed "
+              f"({exc.__class__.__name__}): {exc}",
               file=sys.stderr)
         return None
     return cmd

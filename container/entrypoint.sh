@@ -133,13 +133,16 @@ case ":${PATH}:" in
 esac
 unset _local_bin
 
-# Symlink user utility scripts from the bind-mounted repos/config/ into
-# ~/.local/bin (already on PATH above) so they're discoverable by tools
-# that use shutil.which() — notably session-task's _pingme_notify().
-# The repos/ tree is bind-mounted read-only; the symlink lives on the
-# ephemeral overlay but is recreated every container start by this block.
+# Symlink user utility scripts into ~/.local/bin (already on PATH above) so
+# they're discoverable by tools that use shutil.which() — notably
+# session-task's _pingme_notify(), which shells out to ``queue-notify`` (the
+# dedicated queue Pushover path) and historically to ``pingme``. The repos/
+# tree is bind-mounted read-only; the symlinks live on the ephemeral overlay
+# but are recreated every container start by this block.
 _user_bin="${HOME:-/home/hndrewaall}/.local/bin"
-for _script in "${HOME:-/home/hndrewaall}/repos/config/pingme"; do
+for _script in \
+    "${HOME:-/home/hndrewaall}/repos/config/pingme" \
+    "${HOME:-/home/hndrewaall}/repos/claude-watch/tools/session-task/queue-notify"; do
     if [ -x "$_script" ] && [ ! -e "${_user_bin}/$(basename "$_script")" ]; then
         ln -sf "$_script" "${_user_bin}/$(basename "$_script")" 2>/dev/null || true
     fi
