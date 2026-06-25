@@ -1,16 +1,14 @@
 # claude-container — Phase 1b image
 #
-# BuildKit note: the npm-install layer below uses `RUN --mount=type=cache,...`.
-# The cache-mount syntax is understood by the BUILT-IN BuildKit frontend that
-# ships with Docker 23+ (the deploy host runs 29.x) — NO `# syntax=docker/...`
-# directive is used on purpose: that directive forces BuildKit to fetch the
-# `docker/dockerfile` frontend image from Docker Hub at build start, which adds
-# exactly the registry-fetch dependency this hardening is trying to remove (a
-# Hub hiccup would wedge the build before it does anything). The Makefile
-# `container-build` / `compose-build` targets export DOCKER_BUILDKIT=1 to
-# guarantee BuildKit is the active builder even on a host whose default is the
-# legacy builder; with the built-in frontend that is all the `--mount` flag
-# needs.
+# This Dockerfile uses ONLY plain (non-BuildKit-specific) instructions — no
+# `RUN --mount=...` and no `# syntax=docker/...` directive, so it builds
+# identically under the legacy builder and BuildKit.  PR #433 added a
+# `--mount=type=cache,target=/home/hndrewaall/.npm,...` to the npm-install
+# layer to reuse npm's download cache across builds; that BROKE the build (npm
+# skipped fetching the ~230MB native optional dependency under the cache mount
+# — see the npm-install layer below for the full root cause) and was reverted.
+# The Makefile still exports DOCKER_BUILDKIT=1, which is harmless (BuildKit is
+# the default builder in Docker 23+ anyway).
 #
 # Multi-stage build:
 #   Stage 1 ("claude-watch-builder"): rust:1-bookworm. COPYs the
@@ -495,32 +493,32 @@ RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
 # in-process `npm install -g` upgrades (which unlink+relink the symlink)
 # don't fail with EACCES on a root-owned symlink in /usr/bin/. PR #204's
 # rationale stands; only the target of the symlink changed.
-# Build-resilience hardening (2026-06-25), three parts on this one layer:
+# Build-resilience hardening (2026-06-25), two parts on this layer:
 #
-#  1. BuildKit cache mount on /home/hndrewaall/.npm (npm's per-user cache dir,
-#     since the install runs as uid 1000 via `su - hndrewaall`). npm install
-#     -g @anthropic-ai/claude-code pulls nodejs + a ~232MB native dependency
-#     every rebuild; a persistent, locked cache mount lets repeat builds reuse
-#     the tarball/metadata cache instead of re-fetching from the registry —
-#     the registry re-download was what WEDGED multiple deploys (it stalled
-#     mid-fetch even under --no-cache). `uid=1000,gid=1000` so npm-as-uid-1000
-#     can write the cache; `sharing=locked` serializes concurrent builds on
-#     the same cache. Requires BuildKit (see `# syntax` directive at the top +
-#     DOCKER_BUILDKIT=1 in the Makefile target).
-#
-#  2. npm fetch-retry / timeout config in the SAME `su` invocation so a
+#  1. npm fetch-retry / timeout config in the SAME `su` invocation so a
 #     transient registry stall fails-fast-and-retries (3 retries, bounded
 #     timeouts) instead of hanging the build indefinitely on a slow socket.
 #
-#  3. A build-time `claude --version` smoke check right after the install:
-#     if npm baked a truncated/broken binary (this session's outage baked a
-#     500-byte STUB that ran but did nothing), `claude --version` exits
-#     non-zero and FAILS THE BUILD here rather than shipping a dead binary.
-#     Mirrors the `claude-watch --help` and `code --version` guards elsewhere
-#     in this Dockerfile. Run as uid 1000 (the user the npm-global bindir is
-#     on PATH for) via the same `su - hndrewaall` login shell.
-RUN --mount=type=cache,target=/home/hndrewaall/.npm,uid=1000,gid=1000,sharing=locked \
-    install -d -o 1000 -g 1000 /home/hndrewaall/.npm-global \
+#  2. A two-stage smoke check: this layer ends with `claude --version`, then a
+#     SEPARATE committed-layer RUN below re-verifies the binary exists, is the
+#     ~230MB native binary (not a truncated stub), and runs (see next stanza).
+#
+# NO BuildKit `--mount=type=cache` on ~/.npm here.  An earlier iteration of
+# this layer (PR #433) wrapped the install in
+# `--mount=type=cache,target=/home/hndrewaall/.npm,...`.  That BROKE the build:
+# `@anthropic-ai/claude-code` ships its ~230MB native binary as a
+# platform-specific OPTIONAL dependency (`@anthropic-ai/claude-code-linux-arm64`)
+# that its `postinstall` (install.cjs) hardlinks into `bin/claude.exe`.  Under
+# the cache mount npm resolved the install in ~4s WITHOUT fetching that optional
+# native package ("added 2 packages in 4s"), so install.cjs found no native
+# binary, left the no-op stub, and the trailing `claude --version` died with
+# `claude: command not found` (build exit 127).  A clean install (no cache
+# mount) correctly downloads the native dep and produces the 236MB
+# bin/claude.exe.  The registry re-download is a non-issue: the OUTER Docker
+# layer cache already skips this RUN entirely on an unchanged Dockerfile, and a
+# poisoned/partial ~/.npm cache mount is exactly the failure mode that bit us.
+# So: no cache mount — correctness over a cache that breaks the install.
+RUN install -d -o 1000 -g 1000 /home/hndrewaall/.npm-global \
                                 /home/hndrewaall/.npm-global/lib \
                                 /home/hndrewaall/.npm-global/bin \
     && su - hndrewaall -c 'npm config set prefix /home/hndrewaall/.npm-global \
@@ -528,9 +526,28 @@ RUN --mount=type=cache,target=/home/hndrewaall/.npm,uid=1000,gid=1000,sharing=lo
                             && npm config set fetch-retry-maxtimeout 120000 \
                             && npm config set fetch-timeout 300000 \
                             && npm install -g @anthropic-ai/claude-code \
-                            && claude --version' \
+                            && /home/hndrewaall/.npm-global/bin/claude --version' \
     && ln -sf /home/hndrewaall/.npm-global/bin/claude /usr/bin/claude \
     && chown -h 1000:1000 /usr/bin/claude
+
+# Persistent-layer smoke check for the claude binary.  CRITICAL: this MUST be a
+# SEPARATE RUN from the install above.  The install layer's own `claude
+# --version` runs while any (former) cache mount is still attached and BEFORE
+# the layer is committed, so it can pass against transient state that does not
+# survive into the image (the exact gap that let PR #433 ship a broken image
+# despite "passing" its in-layer check).  This RUN executes against the
+# COMMITTED filesystem of the previous layer, so it verifies what actually
+# ships: (a) the symlink target resolves to a regular file, (b) it is the
+# ~230MB native binary, not a truncated <1MB stub, and (c) it executes and
+# prints a version.  Any failure exits non-zero and FAILS THE BUILD here.
+RUN set -e; \
+    BIN=/home/hndrewaall/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe; \
+    test -f "$BIN" || { echo "FATAL: claude native binary missing: $BIN" >&2; exit 1; }; \
+    SZ=$(stat -c %s "$BIN"); \
+    [ "$SZ" -ge 1000000 ] || { echo "FATAL: claude binary is a $SZ-byte stub (expected ~230MB native binary)" >&2; exit 1; }; \
+    test -x /usr/bin/claude || { echo "FATAL: /usr/bin/claude not executable" >&2; exit 1; }; \
+    su - hndrewaall -c 'claude --version' || { echo "FATAL: claude --version failed in committed layer" >&2; exit 1; }; \
+    echo "claude binary OK: ${SZ} bytes, --version passed"
 
 # Bake the claude-watch Rust binary in from stage 1. Glibc compatibility is
 # guaranteed because the builder is `rust:1-bookworm` and this stage is
