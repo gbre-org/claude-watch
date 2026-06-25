@@ -31,6 +31,42 @@ The daemon's only emergency action is **tmux-injecting** a
 loop re-spawns the watcher itself. If anything else spawns the watcher,
 the main loop has no handle on it and the watcher's stdout disappears.
 
+### The one narrow, opt-in exception: last-resort event-consumer self-heal
+
+The tmux-inject above has a fragility: it only recovers a dead watcher if a
+**responsive main loop** receives and acts on the inject. When the loop is
+wedged, compacting, or simply not turning, the inject lands on deaf ears — and
+if the dead watcher is the **event consumer** (`claude-event-watch`), the
+*entire event bus* goes blind and events pile up unconsumed indefinitely
+(observed in production: >1.5h of stuck events + relentless `WATCHER(S) DOWN`
+churn, because nothing actually restarted the consumer).
+
+For that ONE watcher only, the in-container `cw-watcher-health-check` cron
+(`tools/event-must-act/cw-watcher-health-check`, baked + scheduled via
+`/etc/cron.d/cw-default`) ships an **opt-in, bounded last-resort auto-restart**
+(`CW_WATCHER_HEALTH_AUTORESTART=1`, enabled in the container cron):
+
+- The inject (main-loop) path still fires **first** and remains primary.
+- Only after the inject has fired `CW_WATCHER_HEALTH_AUTORESTART_AFTER` times
+  (default 3, each gated by the script's cooldown) **without the queue
+  draining** — i.e. the main-loop path has *demonstrably failed* — does the
+  cron relaunch `claude-event-watch` itself, detached.
+- The watcher's own fd-based **flock singleton guard** makes that relaunch a
+  guaranteed **no-op whenever a real watcher is alive** (it exits 3 on a held
+  lock), so the cron can only ever win when the bus is genuinely unconsumed.
+- It **self-corrects**: once the bus drains, the next main-loop restart cycle
+  re-parents a fresh in-tree watcher; a cron-parented-but-alive consumer for a
+  few minutes is strictly better than a blind bus.
+
+This respects the cardinal rule's *intent* (don't silently orphan watchers in
+a detached slice) while accepting a narrow, explicit, opt-in exception for the
+single failure mode that the inject-only design could not recover from. It is
+**off by default** so the exception is always an operator opt-in, never silent.
+(The historical daemon-side `auto_restart_watcher` was removed precisely
+because it spawned EVERY watcher detached, unconditionally, in a systemd user
+slice — see `src/watcher.rs`. This fallback differs on all three axes: one
+watcher, only after the main-loop path fails, gated by the singleton lock.)
+
 ## 30-second rule (variable-latency ops)
 
 Any Bash command that **might** take >30s MUST use `run_in_background:
