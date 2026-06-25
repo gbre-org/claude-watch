@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -35,6 +35,12 @@ test-live:
 # ~/.config/session/queue.json is never touched. ~36s, 165 cases.
 test-session-task:
 	uv run --python 3.11 --with pytest pytest tools/session-task/tests/ -v
+
+# Run the obligations-init pytest suite (user-manifest idempotency).
+# Self-contained: runs the real obligations-init + obligations CLIs against
+# a tempdir HOME so the live ~/.config/claude/obligations.json is untouched.
+test-obligations-init:
+	uv run --python 3.11 --with pytest pytest tools/obligations/tests/ -v
 
 # Run the obligations / hooks Python tests. These are self-contained
 # scripts (not pytest), so we just exec them directly. Each runs against

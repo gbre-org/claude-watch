@@ -200,6 +200,11 @@ jobs:
           export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
           make test-session-task
 
+      - name: Run obligations-init pytest suite (user-manifest idempotency)
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+          make test-obligations-init
+
       - name: Run obligations / hooks tests
         # These suites were previously local-only, which let a hook
         # behavior change merge while leaving its test failing on a

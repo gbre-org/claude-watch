@@ -770,13 +770,46 @@ def _existing_user_manifest_rows(cli: str) -> list[dict]:
     return rows
 
 
-def _manifest_row_signature(tool_pattern: str, predicate: str,
+def _predicate_kind(predicate) -> str:
+    """Normalize a predicate to its identity STRING (its ``kind``).
+
+    A manifest spec carries ``predicate`` as a bare string (e.g.
+    ``"file_mtime_within"``). But a STORED obligation row (as returned by
+    ``obligations list --json`` -> ``cmd_add``) persists ``predicate`` as a
+    DICT ``{"kind": "file_mtime_within", "params": {...}}``. The
+    idempotency signature must compare apples to apples, so collapse either
+    shape to the kind string here:
+
+      - str  -> returned as-is (manifest-spec shape).
+      - dict -> ``dict["kind"]`` (stored-row shape).
+      - anything else -> ``""`` (won't match a real row -> fail-open to add).
+
+    This is the FIX for the duplicate-rows bug: previously the signature
+    compared the manifest's predicate STRING against the stored row's
+    predicate DICT, which never matched, so the satisfy-before-add replace
+    branch never fired and every ``obligations-init`` run (every container
+    start / restart) added a fresh duplicate of each user-manifest row.
+    """
+    if isinstance(predicate, str):
+        return predicate
+    if isinstance(predicate, dict):
+        kind = predicate.get("kind")
+        return kind if isinstance(kind, str) else ""
+    return ""
+
+
+def _manifest_row_signature(tool_pattern: str, predicate,
                             created_by: str) -> tuple:
     """Stable identity for a manifested row: (created_by, tool_pattern,
-    predicate). Two manifest applies with the same signature are the SAME
-    logical row -- the second replaces the first (so editing params / deny
-    text in a manifest updates rather than duplicates)."""
-    return (created_by, tool_pattern, predicate)
+    predicate-kind). Two manifest applies with the same signature are the
+    SAME logical row -- the second replaces the first (so editing params /
+    deny text in a manifest updates rather than duplicates).
+
+    ``predicate`` may be either a manifest-spec STRING or a stored-row DICT;
+    it is normalized to its ``kind`` string via ``_predicate_kind`` so the
+    two shapes compare equal. (Comparing the raw shapes is the bug that let
+    duplicates accumulate -- see ``_predicate_kind``.)"""
+    return (created_by, tool_pattern, _predicate_kind(predicate))
 
 
 def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
@@ -856,7 +889,9 @@ def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
     # Replace-not-duplicate: drop any existing user-manifest row with the
     # same signature before adding. (created_by here carries the marker, so
     # the signature is computed against the marked form -- matching what
-    # _existing_user_manifest_rows returns.)
+    # _existing_user_manifest_rows returns.) The signature normalizes the
+    # predicate to its kind string via _manifest_row_signature, so the
+    # manifest's predicate STRING matches the stored row's predicate DICT.
     sig = _manifest_row_signature(tool_pattern, predicate, created_by)
     for ob in existing:
         if _manifest_row_signature(
