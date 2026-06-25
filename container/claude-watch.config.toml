@@ -116,6 +116,38 @@ expected_watchmen = 0
 # Match the in-container watcher's name so the consumer-self-feedback
 # guard in policy.rs fires when claude-event-watch itself is down.
 event_consumer_watcher_name = "claude-event-watch"
+# KNOB #1 (#429) — grace before WATCHER(S) DOWN inject, mirrored from the
+# host root config.toml. WITHOUT these keys the daemon falls back to the
+# src/config.rs serde defaults (inject_threshold=6 ~30s, event_threshold=3),
+# which are far too eager for the in-container block-print-exit watcher: the
+# normal exit->restart gap trips down-detection and the daemon nags the main
+# loop with WATCHER(S) DOWN injects every inject_cooldown. #429 raised these
+# in the host config + the serde defaults only to 6 — the container config
+# (baked to /etc/claude-watch/config.toml) was never updated, so the
+# headline-#429 grace never reached the deployed daemon. These values match
+# config.toml ::[watcher_monitor].
+#
+# inject_threshold: consecutive missing checks (check_interval=5s) before the
+# loud tmux-inject fires. 18 ~= 90s sustained-down before the first nag.
+inject_threshold = 18
+# event_threshold: consecutive missing before the QUIET claude-event path
+# fires. Below inject_threshold so the quiet path strictly precedes the loud
+# one. 12 ~= 60s.
+event_threshold = 12
+# event_grace_secs: after a quiet event has fired, suppress re-escalation for
+# this window (give the main loop a chance to restart).
+event_grace_secs = 60
+# grace_secs: window after a watcher's last_seen_running during which a fresh
+# miss is NOT counted as down (absorbs the normal block-print-exit read+restart
+# cycle). 180s.
+grace_secs = 180
+# health_grace_secs: governs the watcher-status --unhealthy-only predicate the
+# obligations health gate consults; 180 matches grace_secs so the gate doesn't
+# fire on the normal restart cycle.
+health_grace_secs = 180
+# inject_cooldown: seconds between successive loud watcher-down injects (in-pane
+# RE-FIRE throttle, NOT initial detection latency). 300 = one nag per 5 min max.
+inject_cooldown = 300
 
 [context_monitor]
 enabled = true
