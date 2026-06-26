@@ -3665,6 +3665,24 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
 
+            # 93b: Read of an ARBITRARY (non-tasks-output) path is ALSO
+            # allowed -- Read is unconditionally exempt because reads are
+            # side-effect-free and can never mutate guarded state. The
+            # motivating case: viewing an attachment image while clearing
+            # the botchat mark-read gate (claude-config #41).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Read",
+                 "tool_input": {"file_path":
+                                "/home/user/attachments/diagram.png"}},
+                env_u,
+            )
+            results.append(_check(
+                "93b. universal recovery: arbitrary Read allowed past "
+                "arbitrary deny (reads are side-effect-free)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
             # 94: Agent tool always allowed (dispatcher recovery path).
             rc, out, _err = _hook_pre(
                 {"tool_name": "Agent",
