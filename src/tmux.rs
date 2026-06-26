@@ -3,6 +3,7 @@
 use crate::cmd::{run_cmd, run_cmd_any};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::debug;
@@ -25,6 +26,73 @@ pub fn set_post_escape_settle_ms(ms: u64) {
 /// helpers; exposed for tests.
 pub fn post_escape_settle_ms() -> u64 {
     POST_ESCAPE_SETTLE_MS.load(Ordering::Relaxed)
+}
+
+/// FleetView "return to main" keystrokes, sent FIRST on every inject (before
+/// the Escape->NORMAL coercion loop) so injected text lands on the MAIN
+/// conversation rather than on a background agent that happens to be SELECTED
+/// in Claude Code's FleetView. Initialized at daemon startup (and on every
+/// config reload) from `[tmux].focus_main_keys`; defaults to EMPTY (no-op, so
+/// behavior is identical to before this knob). See `TmuxConfig::focus_main_keys`
+/// for the full Andrew-#270/#288/#291 root-cause writeup. A `RwLock<Vec<String>>`
+/// (not an atomic) because the value is a key LIST that can be reloaded.
+static FOCUS_MAIN_KEYS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Update the global FleetView focus-to-main key sequence. Called from main.rs
+/// at daemon startup and on every config reload. Blank/whitespace entries are
+/// dropped here so the live send path never emits an empty `send-keys` key.
+pub fn set_focus_main_keys(keys: Vec<String>) {
+    let sanitized = sanitize_focus_main_keys(&keys);
+    if let Ok(mut guard) = FOCUS_MAIN_KEYS.write() {
+        *guard = sanitized;
+    }
+}
+
+/// Read the current FleetView focus-to-main key sequence. Used by the inject
+/// helpers; exposed for tests.
+pub fn focus_main_keys() -> Vec<String> {
+    FOCUS_MAIN_KEYS
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// Pure: drop blank/whitespace-only entries and trim each key name. Keeps the
+/// configured order. Factored out so the sanitization contract is unit-testable
+/// without touching the global or a live tmux.
+pub(crate) fn sanitize_focus_main_keys(keys: &[String]) -> Vec<String> {
+    keys.iter()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .map(|k| k.to_string())
+        .collect()
+}
+
+/// Send the configured FleetView focus-to-main keys into `pane`, in order,
+/// with a short settle between each. No-op when the knob is empty (the
+/// default) — so a setup that doesn't need the FleetView fix pays nothing.
+///
+/// This is the FIRST thing the inject choreography does (called at the top of
+/// `inject_text_no_submit` and `inject_text_queued`), BEFORE the Escape->NORMAL
+/// coercion loop / `dd` line-clear, because those operate on whatever the TUI
+/// currently has focused: if a background agent is selected, the Escape/dd/i
+/// keys would all hit the agent. Returning the FleetView selection to `main`
+/// first guarantees the rest of the choreography (and the typed payload) lands
+/// on the main conversation.
+async fn send_focus_main_keys(pane: &str) {
+    let keys = focus_main_keys();
+    if keys.is_empty() {
+        return;
+    }
+    debug!(
+        pane = %pane,
+        keys = ?keys,
+        "send_focus_main_keys: returning FleetView selection to main before inject"
+    );
+    for key in &keys {
+        send_keys(pane, &[key.as_str()]).await;
+        sleep(Duration::from_millis(150)).await;
+    }
 }
 
 /// Sleep for the configured post-escape settle delay. No-op when the knob
@@ -512,6 +580,15 @@ pub async fn inject_text(pane: &str, text: &str) {
 /// that genuinely must seize the turn (context-critical, wedged, auto-update,
 /// prolonged-thinking) keep using `inject_text` + `interrupt_and_wait`.
 pub async fn inject_text_queued(pane: &str, text: &str) {
+    // Return FleetView selection to `main` FIRST (before entering INSERT and
+    // typing), so a queued nudge lands on the main conversation and not on a
+    // background agent selected in the FleetView (Andrew #270/#288/#291).
+    // No-op when `[tmux].focus_main_keys` is empty (the default). These keys
+    // do NOT cancel the active turn — arrow/Escape FleetView navigation only
+    // moves the selection; the non-cancelling contract of this path is
+    // preserved.
+    send_focus_main_keys(pane).await;
+
     // Enter INSERT mode (idempotent — `i` in INSERT just inserts an 'i' that
     // the line-clear-free submit tolerates; verify-and-retry up to 3x mirrors
     // inject_text_no_submit Step 3 so a NORMAL-mode pane still ends up typing
@@ -681,6 +758,15 @@ pub async fn inject_and_verify(
 /// can reuse the exact same proven typing choreography for its `--no-submit`
 /// and slash-command paths without duplicating it.
 pub(crate) async fn inject_text_no_submit(pane: &str, text: &str) {
+    // Step -1: Return FleetView selection to `main`. MUST be first — before the
+    // Escape->NORMAL coercion and the dd/i/type keys — because all of those
+    // operate on whatever the CC TUI currently has focused. If a background
+    // agent is SELECTED in the FleetView, the entire choreography (and the
+    // typed payload) would otherwise land on that agent, not the main loop
+    // (Andrew #270/#288/#291). No-op when `[tmux].focus_main_keys` is empty
+    // (the default).
+    send_focus_main_keys(pane).await;
+
     // Step 0: Settle. Most callers reach here right after interrupt_and_wait,
     // which has already fired Escape repeatedly. No-op when
     // post_escape_settle_ms is 0 (fast-path default).
@@ -3424,5 +3510,58 @@ Retrying in 32s\n\
         assert_eq!(post_escape_settle_ms(), 0);
         // Restore for downstream tests.
         set_post_escape_settle_ms(original);
+    }
+
+    /// `sanitize_focus_main_keys` drops blank/whitespace-only entries, trims
+    /// each remaining key name, and preserves order. This is the contract the
+    /// live `send_focus_main_keys` path relies on so it never emits an empty
+    /// `send-keys` key and so config whitespace doesn't break the key names.
+    #[test]
+    fn sanitize_focus_main_keys_trims_and_drops_blanks() {
+        let raw = vec![
+            "  Right ".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+            "Up".to_string(),
+            "\tEscape\n".to_string(),
+        ];
+        let out = sanitize_focus_main_keys(&raw);
+        assert_eq!(out, vec!["Right", "Up", "Escape"]);
+    }
+
+    #[test]
+    fn sanitize_focus_main_keys_empty_stays_empty() {
+        let raw: Vec<String> = vec![];
+        assert!(sanitize_focus_main_keys(&raw).is_empty());
+        // All-blank also collapses to empty (so the send path is a true no-op).
+        let blanks = vec!["".to_string(), "  ".to_string()];
+        assert!(sanitize_focus_main_keys(&blanks).is_empty());
+    }
+
+    /// Verify the FleetView focus-to-main key sequence is wired through the
+    /// process-global RwLock: the getter reflects the setter, sanitization is
+    /// applied on store, and the DEFAULT is empty (no-op — zero regression for
+    /// setups that don't configure the FleetView fix).
+    ///
+    /// NOTE: mutates a process-global; restores the prior value at the end.
+    #[test]
+    fn test_focus_main_keys_get_set_roundtrip() {
+        let original = focus_main_keys();
+
+        // Sanitization is applied on the way in (blank dropped, entries trimmed).
+        set_focus_main_keys(vec![
+            " Right ".to_string(),
+            "".to_string(),
+            "Right".to_string(),
+        ]);
+        assert_eq!(focus_main_keys(), vec!["Right", "Right"]);
+
+        // Empty round-trips to empty: the send path becomes a true no-op,
+        // preserving pre-FleetView-fix behavior.
+        set_focus_main_keys(vec![]);
+        assert!(focus_main_keys().is_empty());
+
+        // Restore for downstream tests.
+        set_focus_main_keys(original);
     }
 }

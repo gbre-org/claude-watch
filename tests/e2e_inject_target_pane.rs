@@ -106,6 +106,7 @@ async fn configured_pane_is_resolved_as_main_loop_target() {
         dashboard_pane: configured_pane.clone(),
         dashboard_session: main_session.clone(),
         post_escape_settle_ms: 0,
+        ..Default::default()
     };
 
     // With the main-loop session configured, resolution MUST return the
@@ -187,6 +188,7 @@ async fn configured_session_absent_does_not_return_dead_pane() {
         dashboard_pane: format!("{}:0.0", absent),
         dashboard_session: absent.clone(),
         post_escape_settle_ms: 0,
+        ..Default::default()
     };
 
     let resolved = find_claude_pane_with_config(&cfg).await;

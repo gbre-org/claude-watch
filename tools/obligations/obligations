@@ -565,12 +565,20 @@ UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
     "Bash:^watcher-(ctl|status|restart)\\b",
     # Process diagnosis -- needed to figure out which watcher is wedged.
     "Bash:^(pgrep|pkill|ps)\\b",
-    # Read of watcher captured-output paths. The pattern matches the
-    # ``file_path`` JSON field rendered by _short_command_string for the
-    # Read tool: ``{"file_path": "/tmp/claude-1000/.../tasks/<id>.output"}``.
-    # We deliberately match by suffix so any watcher captured-output file
-    # (regardless of where claude-1000's tmp dir lands) is allowed.
-    "Read:tasks/[^\"]+\\.output",
+    # Read is UNCONDITIONALLY exempt. Reading a file is inherently
+    # side-effect-free: it can never mutate the state an obligation
+    # guards, so blocking it can only deadlock recovery without
+    # protecting any invariant. Two concrete recovery needs depend on
+    # it: (1) reading a watcher captured-output path
+    # (``{"file_path": ".../tasks/<id>.output"}``) — the
+    # no_pending_watcher_outputs gate's own recovery is to READ that
+    # output, then restart the watcher; (2) reading an attachment image
+    # while HANDLING a botchat message — part of clearing the
+    # botchat mark-read gate, which would otherwise block the very Read
+    # needed to answer the message (claude-config #41). A bare ``Read``
+    # pattern (no ``:regex``) matches the Read tool regardless of path,
+    # superseding the former narrow ``Read:tasks/[^"]+\.output`` exempt.
+    "Read",
     # Self-clear is the controlled-clear path that frees the loop.
     "Bash:^self-clear\\b",
 ]
