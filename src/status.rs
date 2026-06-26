@@ -1237,6 +1237,7 @@ mod tests {
             dashboard_pane: "claude-container:0.0".to_string(),
             dashboard_session: "claude-container".to_string(),
             post_escape_settle_ms: 0,
+            ..Default::default()
         };
         assert!(
             prefer_configured_pane(&cfg),
@@ -1253,6 +1254,7 @@ mod tests {
             dashboard_pane: String::new(),
             dashboard_session: "claude-container".to_string(),
             post_escape_settle_ms: 0,
+            ..Default::default()
         };
         assert!(prefer_configured_pane(&cfg));
     }
@@ -1277,6 +1279,7 @@ mod tests {
             dashboard_pane: "claude-container:0.0".to_string(),
             dashboard_session: String::new(),
             post_escape_settle_ms: 0,
+            ..Default::default()
         };
         assert!(!prefer_configured_pane(&cfg));
     }

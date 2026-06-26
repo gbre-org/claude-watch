@@ -41,6 +41,12 @@ global_cooldown_exempt_watcher_down = true
 dashboard_pane = "claude-container:0.0"
 dashboard_session = "claude-container"
 post_escape_settle_ms = 0
+# FleetView "return to main" keystrokes, sent FIRST on every inject so injected
+# text lands on the MAIN conversation and never on a background agent SELECTED in
+# Claude Code's FleetView (Andrew #270/#288/#291). Each entry is a tmux send-keys
+# key name; default empty = no-op. Set to the key(s) a live FleetView confirms
+# returns the selection to `main` (e.g. ["Right"]).
+focus_main_keys = []
 
 [claude]
 max_context_tokens = 1000000
