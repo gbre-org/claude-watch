@@ -579,6 +579,17 @@ UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
     # pattern (no ``:regex``) matches the Read tool regardless of path,
     # superseding the former narrow ``Read:tasks/[^"]+\.output`` exempt.
     "Read",
+    # ToolSearch is UNCONDITIONALLY exempt for the same reason as Read:
+    # tool-discovery is purely read-only and can NEVER mutate or worsen
+    # any guarded state. It is also a chicken-and-egg recovery
+    # prerequisite at SESSION START: a ``tool_pattern:*`` obligation
+    # (e.g. the out-of-tree botchat mark-read gate) can block ToolSearch,
+    # yet the gate's own recovery command (``botchat-send`` via the
+    # host-bash MCP server) lives behind a DEFERRED tool whose schema
+    # must first be loaded with ToolSearch. Without this exempt, the only
+    # escape is ``obligations override`` every single session start.
+    # Mirrors PR #448 (which made Read unconditionally exempt).
+    "ToolSearch",
     # Self-clear is the controlled-clear path that frees the loop.
     "Bash:^self-clear\\b",
 ]
