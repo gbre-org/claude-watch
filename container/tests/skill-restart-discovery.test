@@ -15,8 +15,8 @@ no live claude required):
   2. Constructing a synthetic plugin layout from the in-tree sources
      (container/skills/ + plugin.json) produces a `claude plugin
      validate`-passable directory.
-  3. Each baked skill (restart.md, start-watchers.md) is present and
-     non-empty in the synthetic layout.
+  3. Each baked skill (claude-code-restart.md, start-watchers.md) is
+     present and non-empty in the synthetic layout.
   4. The synthetic layout is invokable via `claude --plugin-dir ...
      --print '/claude-container:<name>'` AND the response is something
      OTHER than "Unknown command" — proving the loader picked up the
@@ -46,7 +46,7 @@ SKILLS_DIR = CONTAINER_DIR / "skills"
 AGENTS_DIR = CONTAINER_DIR / "agents"
 PLUGIN_JSON = CONTAINER_DIR / "plugin" / ".claude-plugin" / "plugin.json"
 
-EXPECTED_SKILLS = ["restart", "start-watchers"]
+EXPECTED_SKILLS = ["claude-code-restart", "start-watchers"]
 
 failures: list[str] = []
 
@@ -143,7 +143,7 @@ with tempfile.TemporaryDirectory() as td:
         # doesn't always surface it in "list available skills"-style
         # answers (Claude Code's skills listing is curated separately).
         # Invocation is the load-bearing behaviour: when the agent
-        # invokes /claude-container:restart, the loader resolves it
+        # invokes /claude-container:claude-code-restart, the loader resolves it
         # to the baked file and the skill body becomes part of the
         # response. We assert the skill body's signature line lands
         # in the output — that's only possible if the loader picked
@@ -180,7 +180,7 @@ with tempfile.TemporaryDirectory() as td:
             # was actually loaded — not something the model could
             # plausibly paraphrase about an "unknown command".
             distinctive_fragments = {
-                "restart": "Restart the in-container Claude Code process",
+                "claude-code-restart": "Restart the in-container Claude Code process",
                 "start-watchers": "Start the in-container background watchers",
             }
             fragment = distinctive_fragments[skill_name]

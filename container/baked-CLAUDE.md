@@ -143,7 +143,7 @@ not the host's full automation stack, so these checks are all that's needed.
 6. **List baked skills + agents + watchers**: `ls
    /opt/claude-container/skills/ /opt/claude-container/agents/
    /opt/claude-container/watchers/`. Skills land at
-   `/claude-container:<name>` (e.g. `/claude-container:restart`,
+   `/claude-container:<name>` (e.g. `/claude-container:claude-code-restart`,
    `/claude-container:start-watchers`); agents are spawned with
    `Agent(subagent_type="claude-container:<name>", ...)`; watchers are
    shell scripts the agent launches via the `Bash` tool with
@@ -1091,8 +1091,9 @@ intact, no revert needed); the harness then delists its deferred tools
 session, CALL a SIBLING's tool (`host-bash` errors → try `mcp-adaptor`
 `search`); a sibling answer => transport fine, only that server's session
 died — don't restart the whole stack. Recovery: `/mcp` if available; else, if
-you can't reconnect AND you're out of other useful work, **`/restart`** (MCP
-reconnects cleanly — operator's standing instruction).
+you can't reconnect AND you're out of other useful work,
+**`/claude-container:claude-code-restart`** (MCP reconnects cleanly —
+operator's standing instruction).
 
 ## Hooks
 
