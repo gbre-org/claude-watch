@@ -557,7 +557,7 @@ COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 # `.env` if present, else the in-file defaults).
 DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 
-deploy-container:
+deploy-container: compose-build
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
 	  env_flag=""; \
