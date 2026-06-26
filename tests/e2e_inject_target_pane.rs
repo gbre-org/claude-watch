@@ -157,6 +157,7 @@ async fn agent_pane_active_still_resolves_to_main_pane() {
         dashboard_pane: main_pane.clone(),
         dashboard_session: session.clone(),
         post_escape_settle_ms: 0,
+        ..Default::default()
     };
 
     let resolved = find_claude_pane_with_config(&cfg).await;
