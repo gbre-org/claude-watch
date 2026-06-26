@@ -84,7 +84,8 @@ Three flavors (in order of precedence at gate-evaluation time):
      a fixed list of tool patterns that ALWAYS pass, regardless of per-row
      configuration. Covers `obligations override / satisfy / prune`,
      `session-task queue *`, `Agent`, `watcher-(ctl|status|restart)`,
-     `(pgrep|pkill|ps)`, `Read:tasks/<id>.output`, `self-clear`. See
+     `(pgrep|pkill|ps)`, `Read` (unconditional — reads are
+     side-effect-free, can never mutate guarded state), `self-clear`. See
      `UNIVERSAL_RECOVERY_EXEMPT_PATTERNS` in the source for the
      authoritative list + rationale.
   2. Per-obligation `exempt_patterns` — list of tool_pattern strings; if

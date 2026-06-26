@@ -745,8 +745,13 @@ fn default_threshold_percent() -> u64 {
 ///     `hard_block_nudge` and DROP the cooldown: re-interrupt and re-inject on
 ///     EVERY check cycle until a clean turn is observed. This is the closest
 ///     claude-watch's architecture gets to "halt forward progress" — the loop
-///     cannot make headway on a wedged malform because every cycle interrupts
-///     and re-demands a clean re-emit.
+///     cannot make headway on a wedged malform because every cycle interrupts.
+///
+/// Remediation steer: a ONE-OFF malform is fine to fix by re-emitting the same
+/// action cleanly (phase-1 nudge). But a RECURRING malform means the render
+/// state is stuck — blindly re-emitting the same action in that state just
+/// reproduces it. So the phase-1 nudge mentions, and the phase-2 hard block
+/// directs, `/clear` to RESET the rendering state rather than retry forever.
 ///
 /// `override_marker` is a manual false-positive escape hatch (mirrors the
 /// AskUserQuestion-allowed marker): when the file exists, detection is
@@ -827,11 +832,11 @@ fn default_malformed_override_marker() -> String {
 }
 
 fn default_malformed_nudge() -> String {
-    "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). Re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is actually up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn.".to_string()
+    "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). A one-off: re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn. But if malformed calls KEEP recurring, the render state is poisoned and retrying will just reproduce them — run /clear to reset it instead of re-emitting the same call.".to_string()
 }
 
 fn default_malformed_hard_block_nudge() -> String {
-    "claude-watch HARD BLOCK: you are STILL emitting malformed (raw non-namespaced invoke/parameter) tool calls — they are NOT executing. STOP all other work. Do nothing except re-emit the single intended action as ONE well-formed tool call with no stray text before the tag. claude-watch will keep interrupting every cycle until a clean call is observed.".to_string()
+    "claude-watch HARD BLOCK: you are STILL emitting malformed (raw non-namespaced invoke/parameter) tool calls — re-emitting the same way keeps reproducing them because the render state is stuck. STOP retrying: run /clear NOW to reset the rendering state, then re-issue the single intended action as ONE well-formed tool call. claude-watch will keep interrupting every cycle until a clean call is observed.".to_string()
 }
 
 /// Hybrid hooks + daemon-fallback tuning.
@@ -2439,5 +2444,41 @@ legacy_log_file = "/tmp/ll"
 "#;
         let result = parse_config(partial);
         assert!(result.is_err(), "missing sections should fail");
+    }
+
+    #[test]
+    fn test_malformed_nudges_steer_to_clear_on_recurrence() {
+        // Guidance change: a one-off malform → re-emit cleanly is still fine,
+        // but RECURRING malforms must point at /clear (which resets the stuck
+        // render state) instead of blindly retrying the same call. The phase-1
+        // nudge mentions /clear on recurrence; the phase-2 hard block directs
+        // it outright.
+        let nudge = default_malformed_nudge();
+        assert!(
+            nudge.contains("/clear"),
+            "phase-1 nudge must mention /clear for recurring malforms: {nudge}"
+        );
+        assert!(
+            nudge.to_lowercase().contains("recur"),
+            "phase-1 nudge must scope the /clear steer to RECURRING malforms \
+             (one-off re-emit stays fine): {nudge}"
+        );
+        // The one-off re-emit path is still present for a first occurrence.
+        assert!(
+            nudge.contains("re-emit"),
+            "phase-1 nudge must still offer clean re-emit for a one-off: {nudge}"
+        );
+
+        let hard = default_malformed_hard_block_nudge();
+        assert!(
+            hard.contains("/clear"),
+            "phase-2 hard block must direct /clear (render reset), not blind retry: {hard}"
+        );
+
+        // Single-line invariant: the inject_text vim-mode pipeline expects one
+        // literal send_keys -l call, so neither corrective text may contain a
+        // newline.
+        assert!(!nudge.contains('\n'), "phase-1 nudge must stay single-line");
+        assert!(!hard.contains('\n'), "phase-2 hard block must stay single-line");
     }
 }

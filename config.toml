@@ -302,10 +302,11 @@ override_marker = "/var/run/claude/malformed-detection-disabled"
 # The PHASE-1 (soft) corrective text injected into the pane. Single-line by
 # design (the inject_text vim-mode pipeline expects one literal send_keys -l
 # call).
-nudge = "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). Re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is actually up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn."
+nudge = "claude-watch: your last tool call was MALFORMED (raw non-namespaced invoke/parameter tags rendered as text, so it did NOT run). A one-off: re-emit that exact action as a single well-formed tool call with NO stray text before the tag, then verify each watcher is up (watcher-ctl status) and touch the heartbeat if it was a heartbeat turn. But if malformed calls KEEP recurring, the render state is poisoned and retrying will just reproduce them — run /clear to reset it instead of re-emitting the same call."
 # The PHASE-2 (hard-block) corrective text. Firmer, and re-injected every cycle
-# until the malform clears.
-hard_block_nudge = "claude-watch HARD BLOCK: you are STILL emitting malformed (raw non-namespaced invoke/parameter) tool calls — they are NOT executing. STOP all other work. Do nothing except re-emit the single intended action as ONE well-formed tool call with no stray text before the tag. claude-watch will keep interrupting every cycle until a clean call is observed."
+# until the malform clears. On a recurring malform, blind re-emit reproduces the
+# same stuck render state, so the hard block steers to /clear (rendering reset).
+hard_block_nudge = "claude-watch HARD BLOCK: you are STILL emitting malformed (raw non-namespaced invoke/parameter) tool calls — re-emitting the same way keeps reproducing them because the render state is stuck. STOP retrying: run /clear NOW to reset the rendering state, then re-issue the single intended action as ONE well-formed tool call. claude-watch will keep interrupting every cycle until a clean call is observed."
 
 [auto_update]
 # Enable automatic version update checks
