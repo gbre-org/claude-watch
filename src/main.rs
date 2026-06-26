@@ -978,6 +978,12 @@ async fn run_daemon() {
     // when to tune it up.
     tmux::set_post_escape_settle_ms(config.tmux.post_escape_settle_ms);
 
+    // Wire the FleetView focus-to-main key sequence into the tmux module's
+    // process-global. Default is EMPTY (no-op); set [tmux].focus_main_keys to
+    // the key(s) that return the FleetView selection to `main` so injects never
+    // land on a selected background agent (Andrew #270/#288/#291).
+    tmux::set_focus_main_keys(config.tmux.focus_main_keys.clone());
+
     // Ensure log directory exists
     for path in [&config.general.log_file, &config.general.legacy_log_file] {
         if let Some(parent) = Path::new(path).parent() {
@@ -1090,6 +1096,10 @@ async fn run_daemon() {
             // Refresh the post-escape settle delay in case the operator
             // tuned it via config.toml + SIGHUP.
             tmux::set_post_escape_settle_ms(current_config.tmux.post_escape_settle_ms);
+            // Refresh the FleetView focus-to-main keys in case the operator
+            // tuned them via config.toml + SIGHUP (e.g. after confirming the
+            // correct key against a live FleetView).
+            tmux::set_focus_main_keys(current_config.tmux.focus_main_keys.clone());
             // Re-arm the cadence tracker in case the operator tuned the
             // intervals via config.toml + SIGHUP.
             cadence_tracker = cadence::CadenceTracker::with_intervals(

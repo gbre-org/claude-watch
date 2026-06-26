@@ -41,6 +41,19 @@ dashboard_session = "dashboard"
 # confirms each Escape was processed before the next is sent (and PR #46
 # adds explicit INSERT-mode verification after `i`).
 post_escape_settle_ms = 0
+# FleetView "return to main" keystrokes, sent FIRST on every inject (before the
+# Escape->NORMAL coercion loop and the typed payload) so injected text always
+# lands on the MAIN conversation and never on a background agent that happens to
+# be SELECTED in Claude Code's FleetView (Andrew #270/#288/#291). Claude Code's
+# TUI routes typed input to the focused FleetView agent; its status bar shows
+# `← for agents` (leftArrowOpensAgents) — LEFT moves focus INTO the fleet, so the
+# inverse direction returns focus toward `main`. Each entry is a tmux send-keys
+# key name (e.g. "Right", "Up", "Escape"), sent in order with a short settle;
+# blank entries are ignored. Idempotent/safe on an already-on-main pane.
+# Default: empty = no-op (behavior identical to before this knob). Set to the
+# key(s) a LIVE FleetView confirms returns the selection to `main` — candidates:
+# focus_main_keys = ["Right"]   or   focus_main_keys = ["Right", "Right", "Right"]
+focus_main_keys = []
 
 [claude]
 # Max context window tokens

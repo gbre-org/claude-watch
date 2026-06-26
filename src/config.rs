@@ -149,6 +149,38 @@ pub struct TmuxConfig {
     /// explicit INSERT-mode verification after the `i` keystroke).
     #[serde(default)]
     pub post_escape_settle_ms: u64,
+
+    /// FleetView "return to main" keystrokes, sent FIRST on every inject —
+    /// BEFORE the Escape->NORMAL coercion loop, the `dd` line-clear, and the
+    /// typed payload — so the injected text always lands on the MAIN
+    /// conversation and never on a background agent that happens to be
+    /// SELECTED in Claude Code's FleetView.
+    ///
+    /// Background (Andrew #270 / #288 / #291): claude-watch injects via tmux
+    /// send-keys into the correct CC pane, but Claude Code's OWN TUI routes
+    /// typed input to whichever agent is currently focused in its FleetView.
+    /// When a background agent is selected (the `●` marker is on an agent row
+    /// rather than `main`), an inject lands on that agent instead of the main
+    /// loop. Claude Code shows a status-bar hint `← for agents`
+    /// (`leftArrowOpensAgents`, default on) — LEFT arrow moves focus INTO the
+    /// fleet — so the inverse direction returns focus toward `main`. The exact
+    /// key for the live CC version must be confirmed against a real TUI in the
+    /// FleetView repro state; this knob exists so the operator can set it
+    /// WITHOUT a recompile after that live confirmation.
+    ///
+    /// Each entry is a tmux `send-keys` key name (e.g. `"Right"`, `"Up"`,
+    /// `"Escape"`). They are sent in order, with a short settle between each.
+    /// Blank/whitespace entries are ignored. The whole step is IDEMPOTENT and
+    /// SAFE on an already-on-main pane: these are arrow/Escape keys that, on
+    /// an empty main prompt line, only move the (absent) cursor or no-op.
+    ///
+    /// Default: EMPTY = no-op (behavior identical to before this knob — zero
+    /// regression risk). Candidate values to try during live FleetView
+    /// testing: `["Right"]`, `["Right","Right","Right"]` (walk the selection
+    /// back to the `main` boundary), or whatever key the live TUI confirms
+    /// returns the `●` selection to `main`.
+    #[serde(default)]
+    pub focus_main_keys: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
