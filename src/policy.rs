@@ -2163,6 +2163,49 @@ pub(crate) fn maybe_reset_context_clear(
     }
 }
 
+/// Seconds after a detected /clear (or compaction) boundary during which the
+/// malformed-tool-call guardrail is suppressed. The pane-history capture reads
+/// ~60 lines of scrollback, which immediately after a clear STILL includes the
+/// PRE-clear turn — possibly a malformed `<invoke>` block from the OLD context.
+/// That residue did not come from the freshly-reset context, so flagging it
+/// false-fires the first post-clear turn (the reported bug). A genuine malform
+/// recurs continuously, so a short grace window costs us no real coverage.
+pub(crate) const MALFORMED_POST_CLEAR_GRACE_SECS: f64 = 60.0;
+
+/// Pure predicate: is the session at / just past a fresh-/clear or
+/// post-compaction boundary, such that a malformed-tool-call signature in the
+/// captured pane tail is necessarily PRE-clear scrollback residue rather than a
+/// live malform from the current (freshly-reset) context?
+///
+/// Either signal suffices:
+///   * `tokens < CONTEXT_FRESH_TOKEN_THRESHOLD` — the context is freshly
+///     cleared / near-empty (the same low-token threshold used elsewhere to
+///     mean "just cleared / boot state"). A near-empty context cannot have
+///     produced a sustained malformed episode, so any `<invoke>` block visible
+///     on the pane is leftover scrollback from before the clear.
+///   * `last_context_clear` within `MALFORMED_POST_CLEAR_GRACE_SECS` of `now` —
+///     a clear / compaction landed in the immediate past, so the old block is
+///     still lingering in the 60-line scrollback even if the fresh context's
+///     token count has already climbed past the low threshold (e.g. a large
+///     always-loaded preamble pushes a brand-new context over the line). The
+///     window is time-bounded so a genuine LATER malform — which recurs
+///     continuously — is unaffected once the grace expires.
+///
+/// This is the fix for the reported false-fire: the very first turn after a
+/// `/clear` was being classified MALFORMED purely because the pre-clear turn's
+/// `<invoke>` block was still in the captured scrollback. The freshly-reset
+/// context is exempt for the boundary window.
+pub(crate) fn malformed_detection_post_clear(state: &State, tokens: u64) -> bool {
+    if tokens < CONTEXT_FRESH_TOKEN_THRESHOLD {
+        return true;
+    }
+    state
+        .last_context_clear
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e < MALFORMED_POST_CLEAR_GRACE_SECS)
+}
+
 /// Determine if context threshold is exceeded.
 /// Returns Some((pct, triggered_by_compact)) if triggered, None otherwise.
 ///
@@ -4349,11 +4392,28 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     //     `hard_block_nudge` and DROP the cooldown — interrupt + re-inject on
     //     EVERY cycle until a clean turn is observed.
     if config.malformed_tool_call.enabled && !effective_pane.is_empty() {
-        let malformed_fingerprint = tmux::detect_malformed_tool_call(
-            &effective_pane,
-            &config.malformed_tool_call.override_marker,
-        )
-        .await;
+        // Fresh-/clear or post-compaction boundary guard. The pane-history
+        // capture reads ~60 lines of scrollback, which immediately after a
+        // /clear STILL shows the PRE-clear turn — possibly a malformed
+        // `<invoke>` block from the OLD context. That residue did not come from
+        // the freshly-reset context; attributing it to the current turn
+        // false-flags the very first post-clear turn (the reported bug). At such
+        // a boundary skip detection this cycle — the resulting `None` falls
+        // through to the reset arm below, ending any in-flight episode cleanly.
+        let malformed_fingerprint = if malformed_detection_post_clear(state, tokens) {
+            debug!(
+                tokens,
+                "malformed tool-call detection suppressed — fresh-/clear / \
+                 post-compaction boundary (captured tail is pre-clear scrollback)"
+            );
+            None
+        } else {
+            tmux::detect_malformed_tool_call(
+                &effective_pane,
+                &config.malformed_tool_call.override_marker,
+            )
+            .await
+        };
 
         if let Some(ref fingerprint) = malformed_fingerprint {
             // Dedup: is THIS the same malformed block we last injected on? If
@@ -5933,6 +5993,66 @@ cooldown = 300
         maybe_reset_context_clear(&config, &mut state, 5_300, &now);
         assert!(!state.context_clear_triggered);
         assert!(state.context_clear_child_pid.is_none());
+    }
+
+    #[test]
+    fn test_malformed_post_clear_low_tokens_exempt() {
+        // Reported bug: the first turn AFTER a /clear was flagged MALFORMED
+        // because the pre-clear turn's `<invoke>` block was still in the
+        // captured scrollback. A freshly-cleared / near-empty context (tokens
+        // below the fresh threshold) cannot have produced a real malformed
+        // episode, so it is exempt.
+        let state = State::default();
+        assert!(
+            malformed_detection_post_clear(&state, 4_200),
+            "low-token (freshly-cleared) context must be exempt from malformed detection"
+        );
+        assert!(
+            malformed_detection_post_clear(&state, 0),
+            "tokens=0 (just-landed clear) must be exempt"
+        );
+    }
+
+    #[test]
+    fn test_malformed_post_clear_recent_clear_exempt() {
+        // Large-preamble case: a brand-new context can exceed the low-token
+        // threshold immediately (the always-loaded preamble alone is big), yet
+        // the pre-clear malformed block is still lingering in the 60-line
+        // scrollback. A clear recorded within the grace window keeps the
+        // boundary turn exempt even though tokens are already high.
+        let mut state = State::default();
+        state.last_context_clear = Some(Utc::now().to_rfc3339());
+        assert!(
+            malformed_detection_post_clear(&state, 120_000),
+            "a clear within the grace window must exempt even a high-token boundary turn"
+        );
+    }
+
+    #[test]
+    fn test_malformed_not_post_clear_high_tokens_no_recent_clear() {
+        // The guard must NOT swallow genuine malforms: a normal mid-session turn
+        // (high tokens, no recent clear) is fully subject to detection.
+        let state = State::default();
+        assert!(
+            !malformed_detection_post_clear(&state, 120_000),
+            "a normal high-token turn with no recent clear must NOT be exempt — \
+             genuine malforms still fire"
+        );
+    }
+
+    #[test]
+    fn test_malformed_post_clear_old_clear_not_exempt() {
+        // A clear far in the past (well beyond the grace window) does not exempt
+        // a later high-token turn — by then the old scrollback has scrolled out
+        // and any malform is a fresh, live failure.
+        let mut state = State::default();
+        let stale = Utc::now()
+            - chrono::Duration::seconds(MALFORMED_POST_CLEAR_GRACE_SECS as i64 + 120);
+        state.last_context_clear = Some(stale.to_rfc3339());
+        assert!(
+            !malformed_detection_post_clear(&state, 120_000),
+            "a clear older than the grace window must not exempt a later malform"
+        );
     }
 
     #[test]
