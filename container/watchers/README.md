@@ -97,15 +97,17 @@ The canonical event-bus watcher. Blocks on `inotifywait` until a `.json` event f
 
 ### `botchat-wait`
 
-The inbound chat watcher for the [botchat](https://github.com/hndrewaall/botchat) bot↔human chat app. A **thin launcher** that `exec`s the botchat repo's shipped `bin/botchat-wait` (bind-mounted into the container via the existing read-only `~/repos` mount) after exporting the in-container DB path. The watcher LOGIC lives in the botchat repo — this side is just the wrapper, so it tracks the botchat repo rather than the claude-watch image.
+The inbound chat watcher for the [botchat](https://github.com/hndrewaall/botchat) bot↔human chat app. A **thin launcher** that `exec`s the botchat repo's shipped `bin/botchat-wait` (bind-mounted into the container via the existing read-only `~/repos` mount) after pointing it at the running botchat container's HTTP API. The watcher LOGIC lives in the botchat repo — this side is just the wrapper, so it tracks the botchat repo rather than the claude-watch image.
 
-It blocks on the botchat SQLite write-sentinel (`<db>.sentinel`, bumped on every `add_message`), surfaces NEW unread `sender=andrew` messages exactly once via a surfaced-cursor (`<db>.surfaced`) as a `=== N new botchat message(s) ===` block (`[#id] [ts] andrew: body`), prints the standard `WATCHER EXITED. RESTART NOW: ...` banner, and exits. **No-consume contract**: it never sets `read_at`/`acked_at` — the main loop marks messages read+acked via `botchat-send --mark-read <ids> --ack <ids>` once handled.
+It blocks on the botchat write-sentinel (`botchat.sentinel` under the data dir, bumped on every `add_message`), surfaces NEW unread `sender=andrew` messages exactly once via a surfaced-cursor (`botchat.surfaced`) as a `=== N new botchat message(s) ===` block (`[#id] [ts] andrew: body`), prints the standard `WATCHER EXITED. RESTART NOW: ...` banner, and exits. **No-consume contract**: it never sets `read_at`/`acked_at` — the main loop marks messages read+acked via `botchat-send --mark-read <ids> --ack <ids>` once handled.
+
+**HTTP mode — no psycopg in the container.** botchat's store migrated SQLite→Postgres, so `bin/botchat-wait`'s DB path imports `psycopg` (not installed in claude-container, and the host venv is the wrong arch). Rather than add a DB driver to the container, the launcher sets `BOTCHAT_API_BASE=http://host.docker.internal:8111`, which makes `bin/botchat-wait` fetch unread andrew messages over the compose `botchat` container's HTTP API (`GET /api/messages?sender=andrew&unread=1`, urllib/stdlib only — `psycopg`/`botchat.store` are never imported). The sentinel + surfaced-cursor stay plain files on the shared `~/repos/botchat-data` mount (the same dir the botchat container writes `BOTCHAT_DATA_DIR=/data`), so inotify-on-sentinel still wakes the watcher promptly. Reactions are NOT surfaced in HTTP mode (no API endpoint); inbound messages — the critical human→bot path — are.
 
 Two-party model: botchat is a fixed `{andrew, workbot}` stream; the human posts as `sender=andrew` (web/HTTP), the bot replies as `workbot`. This watcher surfaces only the inbound `andrew` direction.
 
 - Implementation: `~/repos/botchat/bin/botchat-wait` (botchat repo; bind-mounted, NOT baked here)
-- Baked launcher: `/opt/claude-container/watchers/botchat-wait.sh` (thin wrapper, execs the above)
+- Baked launcher: `/opt/claude-container/watchers/botchat-wait.sh` (thin wrapper; sets `BOTCHAT_API_BASE` + `BOTCHAT_DATA_DIR`, execs the above)
 - Metadata: `/opt/claude-container/watchers/botchat-wait.toml`
 - Restart policy: `session` (restarted by the session on each exit)
 - Log path: `/var/log/claude-watch/watchers/botchat-wait.log`
-- **No new bind-mount needed** — uses the existing read-only `~/repos` (script) + read-write `~/repos/botchat-data` (DB + sentinel + surfaced-cursor) mounts.
+- **No new bind-mount needed** — uses the existing read-only `~/repos` (script) + read-write `~/repos/botchat-data` (sentinel + surfaced-cursor) mounts; messages come over HTTP from the compose `botchat` container at `host.docker.internal:8111`.
