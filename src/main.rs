@@ -1522,6 +1522,16 @@ async fn resolve_inject_pane(flag: Option<&str>) -> String {
     }
     if let Ok(cfg) = config::try_load_config() {
         if !cfg.tmux.dashboard_pane.is_empty() {
+            // Resolve the configured (positional) pane to its IMMUTABLE
+            // `#{pane_id}` via `find_dashboard_pane`, so an inject targets the
+            // SAME physical main-loop pane even after tmux renumbers pane
+            // indices (e.g. an agent-view pane opened in the same window). A
+            // bare positional spec is an index that can drift onto an agent
+            // pane; the pane_id never does. Fall back to the literal config
+            // string only if resolution fails (session/pane gone).
+            if let Some(p) = tmux::find_dashboard_pane(&cfg.tmux).await {
+                return p;
+            }
             return cfg.tmux.dashboard_pane.clone();
         }
     }
