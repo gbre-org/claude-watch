@@ -22,7 +22,7 @@ The two paths share contents (the Dockerfile copies `container/skills/` into bot
 `entrypoint.sh` adds `--plugin-dir /opt/claude-container/plugin` to the `CLAUDE_CMD` it spawns under tmux. Claude Code's plugin loader walks `commands/` inside the plugin dir and registers each `<name>.md` as a slash command. Inside an interactive session the agent can verify discovery with:
 
 ```
-/claude-container:restart        # invoke the baked /restart skill
+/claude-container:claude-code-restart   # invoke the baked Claude-Code-restart skill
 ```
 
 Listings: ask the agent "list available skills" — the plugin's commands show up with the `claude-container:` prefix.
@@ -30,17 +30,17 @@ Listings: ask the agent "list available skills" — the plugin's commands show u
 ## How to add a new skill
 
 1. Drop `container/skills/<name>.md` in this dir. Match the existing tone — short, punchy, references in-container paths (not host paths).
-2. (Optional) Add a test in `container/tests/` asserting the file exists at the baked path. The skeleton in [`container/tests/baked-dirs.test`](../tests/baked-dirs.test) already covers `restart.md` and `start-watchers.md` — extend it for new skills.
+2. (Optional) Add a test in `container/tests/` asserting the file exists at the baked path. The skeleton in [`container/tests/baked-dirs.test`](../tests/baked-dirs.test) already covers `claude-code-restart.md` and `start-watchers.md` — extend it for new skills.
 3. Rebuild the image (`make compose-build` from the repo root, or `docker compose build claude-container` from `examples/compose/`).
 4. `cwsr` the running container — wait, that won't pick up the new skill (it only re-execs claude with the same `--plugin-dir` arg pointing at the same already-baked files; the new files only land after a container rebuild). Recommend `docker compose up -d --force-recreate claude-container` instead.
 
 ## Test conventions
 
 - Unit-style tests for skill files live alongside other container tests in [`container/tests/`](../tests/).
-- The baseline test ([`container/tests/baked-dirs.test`](../tests/baked-dirs.test)) asserts every documented skill is non-empty and references the right backing tool (e.g. `/restart` references `cwsr`).
+- The baseline test ([`container/tests/baked-dirs.test`](../tests/baked-dirs.test)) asserts every documented skill is non-empty and references the right backing tool (e.g. `claude-code-restart` references `cwsr`).
 - A skill-discovery integration test ([`container/tests/skill-restart-discovery.test`](../tests/skill-restart-discovery.test)) exercises the `--plugin-dir` wiring against a synthetic input directory — no docker required.
 
 ## Currently shipping
 
-- [`restart.md`](restart.md) — restart the in-container `claude` process via `cwsr` (mirrors the host's `/restart` skill, which uses `claude-watch update --force` against the systemd daemon; the container variant rolls only the inner pane-0 process).
+- [`claude-code-restart.md`](claude-code-restart.md) — restart the in-container `claude` (Claude Code) process via `cwsr` (mirrors the host's `/restart` skill, which uses `claude-watch update --force` against the systemd daemon; the container variant rolls only the inner pane-0 process, NOT the container — for that see the sibling `restart-container` skill).
 - [`start-watchers.md`](start-watchers.md) — discover and launch any baked container-scoped watchers (today: none; the dir is a stub for phase-2 watcher integrations).

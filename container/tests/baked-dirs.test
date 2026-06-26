@@ -10,10 +10,11 @@ the convention holds at commit-time:
   1. container/skills/, container/agents/, container/watchers/ all exist
      in the repo.
   2. Each dir has a non-empty README.md.
-  3. container/skills/restart.md exists, references `cwsr` (the
+  3. container/skills/claude-code-restart.md exists, references `cwsr` (the
      in-container self-restart binary; the host's /restart skill calls
      `claude-watch update --force` against systemd, the container variant
-     calls cwsr against tmux).
+     calls cwsr against tmux to roll the inner Claude Code process — NOT
+     the container).
   4. container/skills/start-watchers.md exists, references the watchers
      dir AND honestly tells the agent there are no built-in watchers
      today.
@@ -84,8 +85,8 @@ for d in (SKILLS_DIR, AGENTS_DIR, WATCHERS_DIR):
             f"operators know where the files actually land in the image",
         )
 
-# 3. restart.md present + references cwsr.
-restart = SKILLS_DIR / "restart.md"
+# 3. claude-code-restart.md present + references cwsr.
+restart = SKILLS_DIR / "claude-code-restart.md"
 expect(restart.is_file(), f"{restart} missing — required by PR")
 if restart.is_file():
     text = restart.read_text(encoding="utf-8")
@@ -93,8 +94,8 @@ if restart.is_file():
     expect(
         "cwsr" in text,
         f"{restart} should reference cwsr (the in-container self-restart "
-        f"binary). Without cwsr, /claude-container:restart has no backing "
-        f"tool — it's the container counterpart to the host's "
+        f"binary). Without cwsr, /claude-container:claude-code-restart has no "
+        f"backing tool — it's the container counterpart to the host's "
         f"`claude-watch update --force` invocation.",
     )
     # The host's /restart skill description is "Restart the Claude Code
@@ -281,7 +282,7 @@ if BAKED.is_file():
         "claude-container:" in text,
         "baked-CLAUDE.md should reference the `claude-container:` plugin "
         "namespace so the agent knows how to invoke baked skills "
-        "(e.g. /claude-container:restart)",
+        "(e.g. /claude-container:claude-code-restart)",
     )
 
 
