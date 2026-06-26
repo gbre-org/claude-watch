@@ -1136,7 +1136,21 @@ pub async fn find_dashboard_pane(config: &crate::config::TmuxConfig) -> Option<S
         return None;
     }
 
-    // Check known pane (only if explicitly configured)
+    // Check known pane (only if explicitly configured).
+    //
+    // Resolve the configured pane to its IMMUTABLE `#{pane_id}` (`%N`) and
+    // return THAT, not the positional `session:window.pane` spec the operator
+    // wrote in config. A positional spec is an index into the live layout: tmux
+    // renumbers pane indices when panes are added/removed (e.g. the operator
+    // opening/closing a Claude Code TUI agent-view pane in the same window), so
+    // `dashboard:0.2` can point at a DIFFERENT physical pane from one moment to
+    // the next — and a watcher/heartbeat/reminder inject then lands in whatever
+    // pane now sits at that index (an agent pane). A `pane_id` is assigned once
+    // for the pane's lifetime and never reused, so targeting it pins every
+    // downstream `send-keys`/`capture-pane`/`get_pane_pid` to the SAME physical
+    // main-loop pane regardless of layout churn or which pane the TUI has
+    // selected/active. See `find_claude_pane_with_config`'s focus-follows-inject
+    // notes.
     if !config.dashboard_pane.is_empty() {
         let (out, ok) = run_cmd_any(
             &[
@@ -1151,11 +1165,13 @@ pub async fn find_dashboard_pane(config: &crate::config::TmuxConfig) -> Option<S
         )
         .await;
         if ok && !out.is_empty() {
-            return Some(config.dashboard_pane.clone());
+            return Some(out);
         }
     }
 
-    // Fallback: search for shell panes in dashboard session
+    // Fallback: search for shell panes in dashboard session. Emit the stable
+    // `#{pane_id}` (not the positional `session:window.pane`) for the same
+    // layout-churn reason as the configured-pane branch above.
     let (out, ok) = run_cmd_any(
         &[
             "tmux",
@@ -1164,7 +1180,7 @@ pub async fn find_dashboard_pane(config: &crate::config::TmuxConfig) -> Option<S
             "-t",
             &config.dashboard_session,
             "-F",
-            "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}",
+            "#{pane_id} #{pane_current_command}",
         ],
         5,
     )
