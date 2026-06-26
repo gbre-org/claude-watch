@@ -3683,6 +3683,26 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
 
+            # 93c: ToolSearch is ALSO unconditionally exempt -- like Read
+            # it is side-effect-free (pure tool-discovery, can never mutate
+            # guarded state) AND it is a session-start recovery
+            # prerequisite: a tool_pattern:* gate (e.g. the botchat
+            # mark-read gate) would otherwise block the very ToolSearch
+            # needed to load the deferred MCP tool the gate's own recovery
+            # command runs through (chicken-and-egg deadlock).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "ToolSearch",
+                 "tool_input": {"query":
+                                "select:mcp__host-bash__run_script"}},
+                env_u,
+            )
+            results.append(_check(
+                "93c. universal recovery: ToolSearch allowed past arbitrary "
+                "deny (tool-discovery is side-effect-free)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
             # 94: Agent tool always allowed (dispatcher recovery path).
             rc, out, _err = _hook_pre(
                 {"tool_name": "Agent",
