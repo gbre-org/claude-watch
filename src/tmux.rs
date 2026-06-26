@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
 /// transition and the dd/i/text sequence in `inject_text`. See
@@ -84,7 +84,7 @@ async fn send_focus_main_keys(pane: &str) {
     if keys.is_empty() {
         return;
     }
-    debug!(
+    info!(
         pane = %pane,
         keys = ?keys,
         "send_focus_main_keys: returning FleetView selection to main before inject"
