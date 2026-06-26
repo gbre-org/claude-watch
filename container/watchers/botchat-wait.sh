@@ -9,13 +9,15 @@
 # via `botchat-send --mark-read <ids> --ack <ids>`). This wrapper only points
 # the script at the in-container DB path and execs it. See botchat DEPLOY.md §8.
 #
-# No new bind-mount is required: the script (~/repos/botchat/bin/botchat-wait)
-# rides the existing read-only ~/repos mount, and its writable state (the
-# `<db>.surfaced` cursor + `<db>.sentinel`) lives under ~/repos/botchat-data,
-# which is a SEPARATE read-write bind-mount.
+# The durable store is PostgreSQL now (botchat SQLite->Postgres migration). The
+# watcher connects via BOTCHAT_DSN (provided by the container environment — it
+# carries the DB password, so it is NEVER hardcoded here) and keeps its writable
+# state (the `botchat.surfaced` cursor + `botchat.sentinel`) on the data dir,
+# which rides the SEPARATE read-write ~/repos/botchat-data bind-mount.
 #
-# BOTCHAT_DB stays overridable (${BOTCHAT_DB:-...}) so tests/smoke runs can
-# repoint it at a tmp DB. The script's own default (/data/botchat.db) does NOT
-# exist in this container, which is why this launcher exports the real path.
-export BOTCHAT_DB="${BOTCHAT_DB:-/home/hndrewaall/repos/botchat-data/botchat.db}"
+# BOTCHAT_DATA_DIR stays overridable (${BOTCHAT_DATA_DIR:-...}) so tests/smoke
+# runs can repoint it; it must match the dir the writers (the web container +
+# botchat-send) touch. The script's own default (/data) may not be mounted in
+# this container, which is why this launcher exports the real path.
+export BOTCHAT_DATA_DIR="${BOTCHAT_DATA_DIR:-/home/hndrewaall/repos/botchat-data}"
 exec /home/hndrewaall/repos/botchat/bin/botchat-wait "$@"
