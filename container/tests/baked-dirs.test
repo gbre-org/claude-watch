@@ -109,6 +109,43 @@ if restart.is_file():
         f"claude process (host parity), got: {text.splitlines()[0]!r}",
     )
 
+# 3c. restart-container.md present + references `docker compose restart`
+#     (the backing operation) and obligations re-seed. This is the
+#     CONTAINER restart skill — distinct from restart.md (inner `claude`
+#     process roll via cwsr) and from force-recreate (image/env/mount).
+restart_container = SKILLS_DIR / "restart-container.md"
+expect(
+    restart_container.is_file(),
+    f"{restart_container} missing — the CONTAINER-restart skill "
+    f"(docker compose restart claude-container) is distinct from the "
+    f"inner-process restart.md and must ship as its own skill",
+)
+if restart_container.is_file():
+    text = restart_container.read_text(encoding="utf-8")
+    expect(
+        len(text) > 200,
+        f"{restart_container} suspiciously short (<200 chars)",
+    )
+    expect(
+        "docker compose restart" in text,
+        f"{restart_container} should reference `docker compose restart` — "
+        f"the backing operation that restarts the container's process tree "
+        f"(re-running entrypoint.sh) without recreating from the image",
+    )
+    expect(
+        "obligations" in text,
+        f"{restart_container} should explain that the restart re-runs "
+        f"entrypoint.sh -> obligations-init, RE-SEEDING obligations (the "
+        f"key behavioral difference from the inner-process restart.md)",
+    )
+    first_line = text.splitlines()[0].lower()
+    expect(
+        "restart" in first_line and "container" in first_line,
+        f"{restart_container} first line should describe restarting the "
+        f"CONTAINER (not just the inner claude process), got: "
+        f"{text.splitlines()[0]!r}",
+    )
+
 # 3b. edit-host-mounts.md present + references host-bash and the
 #     override file. The skill is the canonical way to generate /
 #     update the operator's docker-compose.override.yml.

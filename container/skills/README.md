@@ -30,7 +30,7 @@ Listings: ask the agent "list available skills" — the plugin's commands show u
 ## How to add a new skill
 
 1. Drop `container/skills/<name>.md` in this dir. Match the existing tone — short, punchy, references in-container paths (not host paths).
-2. (Optional) Add a test in `container/tests/` asserting the file exists at the baked path. The skeleton in [`container/tests/baked-dirs.test`](../tests/baked-dirs.test) already covers `claude-code-restart.md` and `start-watchers.md` — extend it for new skills.
+2. (Optional) Add a test in `container/tests/` asserting the file exists at the baked path. The skeleton in [`container/tests/baked-dirs.test`](../tests/baked-dirs.test) already covers `claude-code-restart.md`, `restart-container.md`, and `start-watchers.md` — extend it for new skills.
 3. Rebuild the image (`make compose-build` from the repo root, or `docker compose build claude-container` from `examples/compose/`).
 4. `cwsr` the running container — wait, that won't pick up the new skill (it only re-execs claude with the same `--plugin-dir` arg pointing at the same already-baked files; the new files only land after a container rebuild). Recommend `docker compose up -d --force-recreate claude-container` instead.
 
@@ -43,4 +43,5 @@ Listings: ask the agent "list available skills" — the plugin's commands show u
 ## Currently shipping
 
 - [`claude-code-restart.md`](claude-code-restart.md) — restart the in-container `claude` (Claude Code) process via `cwsr` (mirrors the host's `/restart` skill, which uses `claude-watch update --force` against the systemd daemon; the container variant rolls only the inner pane-0 process, NOT the container — for that see the sibling `restart-container` skill).
+- [`restart-container.md`](restart-container.md) — restart the whole CONTAINER via `docker compose restart claude-container` (issued through host-bash): re-runs `entrypoint.sh` → `obligations-init` (RE-SEEDS obligations) and clears in-container process state, WITHOUT recreating from the image / picking up env / mount changes. Distinct from `claude-code-restart.md` (inner-process roll) and from force-recreate (`make deploy-container`, picks up image / env / mounts).
 - [`start-watchers.md`](start-watchers.md) — discover and launch any baked container-scoped watchers (today: none; the dir is a stub for phase-2 watcher integrations).
