@@ -46,7 +46,7 @@ services:
       - "${CW_STATE_PATH:-${HOME}/.local/share/claude-watch}:/agents-state:ro"
       # Per-workload progress heartbeats (claude-watch workload wrapper).
       - "${CW_WORKLOAD_HEARTBEAT_DIR:-/run/claude/workloads}:/workload-heartbeats:ro"
-      # Per-hostjob progress heartbeats (andrew-sf-tools hostjob runner).
+      # Per-hostjob progress heartbeats (examples/compose/bin/hostjob runner).
       - "${CW_HOSTJOB_HEARTBEAT_DIR:-${HOME}/.cache/hostjob}:/hostjob-heartbeats:ro"
     expose:
       - "9099"

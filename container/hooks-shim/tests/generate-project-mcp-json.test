@@ -293,7 +293,7 @@ def test_only_project_scoped_servers_picked_up() -> None:
     rather than top-level.
 
     Workbot v26 surfaced this: a bare `claude mcp add host-bash ...`
-    placed the entry under `projects["/Users/me/repos/claude-config"].mcpServers`
+    placed the entry under `projects["/Users/me/repos/example-repo"].mcpServers`
     not the top-level mcpServers, and an older version of this helper
     only walked the top-level block — so the in-container .mcp.json
     came up empty for host-bash. The fix is to ALSO walk

@@ -64,7 +64,7 @@ const WORKLOAD_DIR: &str = "/var/run/claude/workload-state";
 
 /// Legacy artifact path. Kept as a symlink target for one cycle so
 /// out-of-tree consumers (docker bind-mount into queue-minisite,
-/// `cron-workload-stale-check` in server-config) keep working without a
+/// an out-of-tree `cron-workload-stale-check`) keep working without a
 /// coordinated multi-repo deploy.
 const LEGACY_WORKLOAD_DIR: &str = "/tmp/claude-workloads";
 
@@ -405,7 +405,7 @@ pub fn save_state(state: &WorkloadState) -> std::io::Result<()> {
 
 /// Best-effort: ensure `/tmp/claude-workloads -> /var/run/claude/workload-state`
 /// exists so out-of-tree consumers (docker bind-mount into queue-minisite,
-/// `cron-workload-stale-check` in server-config) keep finding workload
+/// an out-of-tree `cron-workload-stale-check`) keep finding workload
 /// artifacts at the legacy path. The symlink is intentionally lazy —
 /// created on first `workload run` after a reboot — so a fresh tmpfs
 /// always lands us in a known state without depending on a separate
@@ -863,7 +863,7 @@ fn get_descendants(pid: &str) -> Vec<String> {
 ///     `\r`-separated frames that the old `ts | tee` chain buffered
 ///     until a final `\n` — so all the in-flight progress for one file
 ///     accumulated and only flushed when the file finished. Users saw
-///     "rows updating between files, not during them" in queue.gbre.org.
+///     "rows updating between files, not during them" in the queue dashboard.
 ///     With a PTY, rsync emits `\r`-separated frames continuously AND
 ///     `script -f` flushes after every write; the bytes flow straight
 ///     through `tee` (no `\n`-buffered `ts` in front of it) into the
