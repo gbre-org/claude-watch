@@ -1310,7 +1310,7 @@ PR CI failure/success, workbot-prompt, queue-stale-ready, slack-unread,
 A source/tag pair matching no `event-classify` rule now defaults to
 **actionable** (flipped from ambient): a brand-new event source must be handled
 or get a rule, never silently swallowed. Routine events are unaffected —
-deliberately-ambient pairs (`cron/*`, `alertmanager/*`, `claude-watch/*`, queue
+ambient pairs (`cron/*`, `alertmanager/*`, `claude-watch/*`, queue
 transitions) have explicit rules above the catch-alls; only unmatched pairs hit
 this default.
 
