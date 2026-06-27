@@ -143,6 +143,17 @@ jobs:
       - name: Run mcp-host-bash host-shim tests
         run: make test-mcp-host-bash
 
+      - name: Install uv (for hostjob + session-task tests)
+        # test-hostjob shells out to `uv run --python 3.11 ...`; without
+        # uv on PATH that step dies with exit 127. Install once here and
+        # push it onto $GITHUB_PATH so every subsequent step (hostjob,
+        # session-task, obligations, hooks) resolves uv without a
+        # per-step export. Mirrors the curl installer used for the
+        # session-task suites below.
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Run hostjob detached-runner tests
         run: make test-hostjob
 
@@ -176,9 +187,6 @@ jobs:
       - name: Run watcher tests (self-clear + claude-event-watch debounce)
         run: make test-watchers
         timeout-minutes: 5
-
-      - name: Install uv (for session-task tests)
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
       - name: Install session-task companion CLIs onto PATH
         # `make install` would build claude-watch via cargo (heavy), so
