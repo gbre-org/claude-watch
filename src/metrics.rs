@@ -5,7 +5,7 @@
 //! `/var/lib/node-exporter/textfile/claude_watch.prom` atomically.
 //!
 //! Run from cron every minute:
-//!     * * * * * /home/hndrewaall/bin/claude-watch metrics
+//!     * * * * * /path/to/claude-watch metrics
 
 use crate::reminders::all_fire_counts;
 use crate::status::get_version_info;
@@ -562,7 +562,19 @@ pub async fn cmd_metrics() -> i32 {
         .unwrap_or_else(|_| "/run/claude/heartbeat".to_string());
     let mainloop_heartbeat_mtime = heartbeat_file_mtime_secs(Path::new(&heartbeat_path));
 
-    let lines = build_metrics(&state, &cur, &latest, &live, mainloop_heartbeat_mtime);
+    let mut lines = build_metrics(&state, &cur, &latest, &live, mainloop_heartbeat_mtime);
+
+    // Token usage — aggregated from the Claude Code JSONL transcripts (same
+    // observation surface as active_agents) and appended to the existing
+    // textfile output. Kept as a separate pure block so `build_metrics`'s
+    // signature + tests stay untouched. Fail-open: a missing projects dir
+    // yields zeros rather than blanking the rest of the emission.
+    let token_usage = tokio::task::spawn_blocking(crate::token_usage::collect_token_usage)
+        .await
+        .unwrap_or_default();
+    lines.push(String::new());
+    lines.extend(crate::token_usage::token_metric_lines(&token_usage));
+
     if let Err(e) = write_prom(&lines, &prom_path) {
         eprintln!("Error writing prom file: {e}");
         return 1;

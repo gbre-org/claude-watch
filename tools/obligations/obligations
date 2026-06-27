@@ -575,7 +575,7 @@ UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
     # output, then restart the watcher; (2) reading an attachment image
     # while HANDLING a botchat message — part of clearing the
     # botchat mark-read gate, which would otherwise block the very Read
-    # needed to answer the message (claude-config #41). A bare ``Read``
+    # needed to answer the message. A bare ``Read``
     # pattern (no ``:regex``) matches the Read tool regardless of path,
     # superseding the former narrow ``Read:tasks/[^"]+\.output`` exempt.
     "Read",

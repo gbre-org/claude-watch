@@ -10,10 +10,10 @@ whitespace, dedupe.
 
 Run:
     uv run --python 3.11 --with pytest \\
-        pytest ~/repos/config/tests/test_queue_scope_split.py -v
+        pytest tools/session-task/tests/test_queue_scope_split.py -v
 
 Or directly:
-    python3 ~/repos/config/tests/test_queue_scope_split.py
+    python3 tools/session-task/tests/test_queue_scope_split.py
 """
 
 import json

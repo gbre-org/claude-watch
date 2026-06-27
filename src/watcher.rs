@@ -734,7 +734,7 @@ pub fn exit_code_from_status(code: Option<i32>, signal: Option<i32>) -> i32 {
 /// watcher. We do NOT `nohup` (or any other supervisor mechanism) the
 /// start_cmd from this process: a daemon-spawned watcher would live in the
 /// wrong process tree and become invisible to the main loop's obligation
-/// gate. See `feedback_watcher-architecture-cardinal.md` in claude-config.
+/// gate. See the watcher-architecture cardinal rule (operator notes).
 ///
 /// On disable, kills matching processes (this side is fine — the main loop
 /// owns the watcher, killing it cleanly is not the same as spawning).
@@ -832,7 +832,7 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
 // makes it invisible to the obligation gate, orphaned from the main loop's
 // process model, and a surprise to the next session ("ghost watcher: alive
 // but no one in claude-code spawned it"). See
-// `feedback_watcher-architecture-cardinal.md` in claude-config.
+// the watcher-architecture cardinal rule (operator notes).
 //
 // What replaces it: nothing in this file. The daemon's only emergency
 // recovery action is now the existing tmux-inject path in `policy.rs`,

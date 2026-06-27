@@ -164,8 +164,8 @@ RECENT_ABANDONED_LIMIT = int(os.environ.get("RECENT_ABANDONED_LIMIT", "20"))
 STARTING_WINDOW_SECONDS = float(os.environ.get("STARTING_WINDOW_SECONDS", "60"))
 
 # Path to the vendored session-task script inside the container. Same
-# Python-stdlib-only implementation as ~/repos/config/session-task on the
-# host; copied in at Docker build time. See Dockerfile.
+# Python-stdlib-only implementation as the in-repo
+# tools/session-task/session-task; copied in at Docker build time. See Dockerfile.
 SESSION_TASK_BIN = os.environ.get("SESSION_TASK_BIN", "/app/session-task")
 # Stop endpoint timeout — the abandon op is local file I/O + a single
 # claude-event emit, well under a second in practice.
