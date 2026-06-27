@@ -516,12 +516,12 @@ services:
       # copies the JSONL here at queue-done / queue-abandon time; the minisite
       # reads it back for the "View log" button on done / abandoned items.
       QUEUE_LOG_ARCHIVE_DIR: /queue-home/.config/session/queue-logs
-      # Hostjob output dir — the `hostjob` runner (andrew-sf-tools) writes a
-      # per-label DIRECTORY ~/.cache/hostjob/<label>/log on the host. The
+      # Hostjob output dir — the `hostjob` runner (examples/compose/bin/hostjob)
+      # writes a per-label DIRECTORY ~/.cache/hostjob/<label>/log on the host. The
       # live-log modal tails <HOSTJOB_LOG_DIR>/<label>/log for running queue
       # items whose scope is `hostjob:<label>`. Bind-mounted read-only below.
       HOSTJOB_LOG_DIR: /hostjobs
-      # Live-tail broker URL. The hostjob reaper (andrew-sf-tools) tees each
+      # Live-tail broker URL. The hostjob reaper (examples/compose/bin/hostjob) tees each
       # worker output line to a tiny host-side localhost line broker; the
       # minisite subscribes to it here over the Docker-Desktop gateway host
       # (extra_hosts above). This is the fix for the VirtioFS coherence gap:

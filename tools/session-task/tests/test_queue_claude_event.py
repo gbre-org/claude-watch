@@ -25,10 +25,10 @@ hooks don't spam stderr with "pingme: not found" noise.
 
 Run:
     uv run --python 3.11 --with pytest \\
-        pytest ~/repos/config/tests/test_queue_claude_event.py -v
+        pytest tools/session-task/tests/test_queue_claude_event.py -v
 
 Or directly:
-    python3 ~/repos/config/tests/test_queue_claude_event.py
+    python3 tools/session-task/tests/test_queue_claude_event.py
 """
 
 import json

@@ -825,7 +825,7 @@ def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
           "ttl":           0,                         # optional (int, default 0)
           "enforcement":   "gate",                    # optional ("gate"|"inform")
           "deny_msg":      "...",                     # REQUIRED (str)
-          "created_by":    "claude-config:presence-gate",  # optional (str)
+          "created_by":    "myrepo:presence-gate",         # optional (str)
           "mandatory":     false,                     # optional (bool)
           "exempt_tool_patterns": ["Bash:^foo"],      # optional (list[str])
           "satisfied_by_tool": null,                  # optional (str)

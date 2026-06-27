@@ -14,8 +14,7 @@ RUN uv pip install --system --no-cache prometheus_client
 # by their full in-repo path, not bare filenames.
 COPY exporters/work-queue-exporter/work_queue_exporter.py /app/
 # Shared agent-id / agent-state helper. Lives alongside the exporter
-# in claude-watch/exporters/work-queue-exporter/. Originally vendored
-# from claude-config/lib/claude_agents.py; now maintained here.
+# in claude-watch/exporters/work-queue-exporter/ and is maintained here.
 COPY exporters/work-queue-exporter/claude_agents.py /app/
 WORKDIR /app
 
