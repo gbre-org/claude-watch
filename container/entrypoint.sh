@@ -139,10 +139,25 @@ unset _local_bin
 # dedicated queue Pushover path) and historically to ``pingme``. The repos/
 # tree is bind-mounted read-only; the symlinks live on the ephemeral overlay
 # but are recreated every container start by this block.
+#
+# The botchat CLIs (botchat-send / -unread-check / -show / -history) are
+# linked here too so the main loop can invoke them BARE — e.g. `botchat-send
+# "..."` instead of the full `~/repos/botchat/bin/botchat-send`. They live in
+# the operator's botchat repo, bind-mounted read-only under ~/repos; each CLI
+# self-resolves its repo root via `Path(__file__).resolve().parent.parent`,
+# so a symlink works (`.resolve()` canonicalizes through it to the real path).
+# Linking into ~/.local/bin (already on PATH) rather than adding ~/bin to PATH
+# keeps the change surgical — no host-native binaries (falcon, slack, devbar)
+# get pulled onto the container PATH. Missing CLIs are skipped (the `-x` guard),
+# so this is a no-op when the botchat repo isn't mounted.
 _user_bin="${HOME:-/home/hndrewaall}/.local/bin"
 for _script in \
     "${HOME:-/home/hndrewaall}/repos/config/pingme" \
-    "${HOME:-/home/hndrewaall}/repos/claude-watch/tools/session-task/queue-notify"; do
+    "${HOME:-/home/hndrewaall}/repos/claude-watch/tools/session-task/queue-notify" \
+    "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-send" \
+    "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-unread-check" \
+    "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-show" \
+    "${HOME:-/home/hndrewaall}/repos/botchat/bin/botchat-history"; do
     if [ -x "$_script" ] && [ ! -e "${_user_bin}/$(basename "$_script")" ]; then
         ln -sf "$_script" "${_user_bin}/$(basename "$_script")" 2>/dev/null || true
     fi
