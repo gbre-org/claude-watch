@@ -112,7 +112,7 @@ QUEUE_LOG_ARCHIVE_DIR = os.environ.get(
 # at /workloads inside the container. Override via WORKLOAD_LOG_DIR.
 WORKLOAD_LOG_DIR = os.environ.get("WORKLOAD_LOG_DIR", "/workloads")
 # Hostjob output directory (tail target for hostjob-bound queue items).
-# The `hostjob` runner (andrew-sf-tools) writes a per-label DIRECTORY:
+# The `hostjob` runner (`examples/compose/bin/hostjob`) writes a per-label DIRECTORY:
 #   ~/.cache/hostjob/<label>/log        (line-oriented stdout/stderr)
 #   ~/.cache/hostjob/<label>/heartbeat  (progress heartbeat, optional)
 # NOTE the layout differs from workload's flat `<label>.output`: hostjob
@@ -128,7 +128,7 @@ HOSTJOB_LOG_DIR = os.environ.get(
     os.path.join(os.path.expanduser("~"), ".cache", "hostjob"),
 )
 # Live-tail broker base URL. The hostjob reaper tees each worker output line
-# to a tiny host-side localhost line broker (andrew-sf-tools `hostjob broker`)
+# to a tiny host-side localhost line broker (`hostjob broker`, examples/compose/bin/hostjob)
 # that the minisite subscribes to over `host.docker.internal`. This is the
 # fix for the Docker Desktop VirtioFS coherence gap: a macOS-host writer
 # holding the log fd open freezes the guest reader's cached inode size, so a
@@ -185,14 +185,14 @@ _QUEUE_MARKER_RE = re.compile(r"Queue item:\s*(q-[a-z0-9-]{4,64})")
 # need to allow paragraphs.
 _MAX_REASON_LEN = 500
 
-# Errored-hostjob detection. The `hostjob` runner (andrew-sf-tools) flips
+# Errored-hostjob detection. The `hostjob` runner (`examples/compose/bin/hostjob`) flips
 # its queue item to `abandoned` with `abandon_reason = "hostjob exit <N>"`
 # when the host worker exits NON-ZERO (see the reaper's `finalize_queue`).
 # That conflates a FAILED hostjob with an operator CANCEL — and, worse,
 # the errored item then sinks into the time-sorted, capped `abandoned`
 # bucket where it can fall out of the visible window entirely. We can't
 # change the upstream `queue abandon` call (it lives in the separate,
-# read-only andrew-sf-tools repo), so we recover the distinction here at
+# `examples/compose/bin/hostjob`), so we recover the distinction here at
 # render time: an abandoned item whose reason matches this pattern with a
 # NON-ZERO exit code is an ERRORED hostjob. The minisite then badges it
 # distinctly and pins it to the top of the abandoned section so it is
@@ -868,7 +868,7 @@ def _extract_hostjob_label(scope: list[Any]) -> str:
     """Return the hostjob label encoded in a queue item's scope, or "".
 
     Parallel to ``_extract_workload_label``: the ``hostjob`` runner
-    (andrew-sf-tools) creates a queue item with scope
+    (`examples/compose/bin/hostjob`) creates a queue item with scope
     ``["hostjob:<label>"]``. Only the first match is honored — an item
     bound to more than one hostjob would be a bug elsewhere we don't
     silently paper over here. Reuses the shared ``_WORKLOAD_LABEL_RE``

@@ -236,9 +236,15 @@ test-mcp-host-bash:
 # host-job runner that lets an in-container agent launch host commands
 # past the 30s host-bash MCP cap, then poll/wait for them). Exercises the
 # real run/wait/poll/list/clean surface against a throwaway $HOME so no
-# operator state is touched. 10 cases, ~3s (a couple of cases sleep).
+# operator state is touched. The legacy hostjob.test covers the core
+# run/wait/poll/list/clean surface (10 cases, ~3s); the pytest files cover
+# the queue-integration, stop-subcommand, and live-tail-broker features.
 test-hostjob:
 	examples/compose/bin/tests/hostjob.test
+	uv run --python 3.11 --with pytest pytest -v \
+		examples/compose/bin/tests/test_hostjob_broker.py \
+		examples/compose/bin/tests/test_hostjob_queue.py \
+		examples/compose/bin/tests/test_hostjob_stop.py
 
 
 # Tests for examples/compose/bin/mcp-proxy-auth-shim — the bearer-token

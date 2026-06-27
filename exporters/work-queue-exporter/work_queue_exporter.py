@@ -155,7 +155,7 @@ WORKLOAD_HEARTBEAT_DIR = os.environ.get(
 )
 WORKLOAD_SCOPE_PREFIX = "workload:"
 # Directory holding per-hostjob progress heartbeat files written by the
-# `hostjob` runner (andrew-sf-tools). UNLIKE workload's flat
+# `hostjob` runner (`examples/compose/bin/hostjob`). UNLIKE workload's flat
 # `<label>.heartbeat`, hostjob nests the heartbeat inside a per-label
 # dir: `<HOSTJOB_HEARTBEAT_DIR>/<label>/heartbeat`. The runner touches it
 # on progress; we stat its mtime to compute the same
@@ -268,7 +268,7 @@ g_progress_age = Gauge(
         "(claude-watch PR #209): the wrapper sidecar re-touches the "
         "file only when the wrapped command's .output file grows, so "
         "a hung command yields a stale heartbeat. The same gauge is "
-        "also emitted for `hostjob:<label>` items (the andrew-sf-tools "
+        "also emitted for `hostjob:<label>` items (the `examples/compose/bin/hostjob` "
         "hostjob runner touches HOSTJOB_HEARTBEAT_DIR/<label>/heartbeat); "
         "the `workload_label` dimension carries the hostjob label in that "
         "case (the metric/join key is `id`, so the label is informational). "
@@ -355,7 +355,7 @@ def _hostjob_label_from_scope(scope):
     """Return the hostjob label from a `hostjob:<label>` scope token, or
     None if `scope` doesn't include one.
 
-    Parallel to `_workload_label_from_scope`. The andrew-sf-tools hostjob
+    Parallel to `_workload_label_from_scope`. The `examples/compose/bin/hostjob` hostjob
     runner builds the scope token as `hostjob:<label>`. Returns the first
     match defensively.
     """
@@ -498,7 +498,7 @@ def collect():
                         pass
 
                 # Hostjob progress heartbeat — parallels the workload block
-                # above. The hostjob runner (andrew-sf-tools) touches
+                # above. The hostjob runner (`examples/compose/bin/hostjob`) touches
                 # HOSTJOB_HEARTBEAT_DIR/<label>/heartbeat (per-label DIR,
                 # not a flat file). Reuse the same generic
                 # worktask_queue_item_progress_age_seconds gauge so

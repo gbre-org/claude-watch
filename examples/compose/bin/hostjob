@@ -13,15 +13,42 @@ that pattern once.
 
 `python3` IS on the host-bash allowlist, so invoke this as:
 
-    python3 ~/repos/andrew-sf-tools/hostjob run  --label <l> -- <cmd ...>
-    python3 ~/repos/andrew-sf-tools/hostjob wait  <l>            # block <=25s, re-invoke on exit 75
-    python3 ~/repos/andrew-sf-tools/hostjob poll  <l>            # one-shot status + log tail
-    python3 ~/repos/andrew-sf-tools/hostjob list
-    python3 ~/repos/andrew-sf-tools/hostjob clean --label <l> | --all
+    python3 ~/repos/claude-watch/examples/compose/bin/hostjob run  --label <l> -- <cmd ...>
+    python3 ~/repos/claude-watch/examples/compose/bin/hostjob wait  <l>            # block <=25s, re-invoke on exit 75
+    python3 ~/repos/claude-watch/examples/compose/bin/hostjob poll  <l>            # one-shot status + log tail
+    python3 ~/repos/claude-watch/examples/compose/bin/hostjob list
+    python3 ~/repos/claude-watch/examples/compose/bin/hostjob stop  <l> | --all   # SIGTERM->SIGKILL a running job
+    python3 ~/repos/claude-watch/examples/compose/bin/hostjob clean --label <l> | --all
 
 Each invocation is ONE clean argv (host-bash forbids &&/|/;/redirection),
 returns well under the 30s cap, and the worker survives the launching call
 ending because it is detached via start_new_session.
+
+QUEUE INTEGRATION (first-class queue citizen)
+---------------------------------------------
+EVERY hostjob ALWAYS gets a first-class session-task queue row (scope
+`hostjob:<label>`, created-by `hostjob`); `run` stores the returned q-id in
+`status.json` under "queue_id" and prints it. The detached reaper, on worker
+exit, flips that queue item to `done` (rc==0) or `abandon` (rc!=0) and emits a
+`claude-event --source hostjob --tag hostjob-done` so the main loop is notified
+(`done`/`abandon` work on a row in ANY status, so even an unregistered/pending
+row auto-closes fine).
+
+`--no-queue` no longer skips the row — it ONLY skips the scope-claiming
+`queue register` step, so the row stays `pending`: visible + dependable but
+NON-serializing (same-label hostjobs are not serialized on the
+`hostjob:<label>` scope). Without `--no-queue` the row is registered (claims the
+scope slot → same-label work serializes, the original behavior).
+
+DEPEND ON A HOSTJOB via its **q-id** (printed by `run`, stored in status.json,
+surfaced by `poll`/`list`), NOT the `hostjob:<label>` scope-token string:
+`session-task queue depend <other-qid> --add <hostjob-qid>` (depend validates
+`--add` against existing queue ids; a scope token would be rejected). A new
+hostjob can also declare a dependency at launch via `--depends-on <qid>`.
+
+All queue/event plumbing is FAIL-SOFT: if `session-task` / `claude-event` are
+missing or error, the job still runs (and the reaper still records its real
+status) — queue bookkeeping never blocks the actual host work.
 
 Pure stdlib; runs on the host's python3.
 """
@@ -30,6 +57,7 @@ import argparse
 import errno
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -144,6 +172,364 @@ def reconcile(label):
 
 
 # --------------------------------------------------------------------------
+# queue integration (host-side; fail-soft)
+# --------------------------------------------------------------------------
+def _register_queue_item(label, depends_on=None, register=True):
+    """Add (and optionally register) a session-task queue item for this hostjob.
+
+    ALWAYS does `queue add` (scope hostjob:<label>, created-by hostjob,
+    --force-enqueue). When `register` is True (default), ALSO does
+    `queue register <qid>` to claim the scope slot (serializes same-label
+    work). When `register` is False, the `queue register` step is SKIPPED — the
+    row stays `pending`: visible + dependable but NON-serializing.
+
+    Returns the q-id string on success, or None if queue integration is
+    unavailable or fails for any reason. NEVER raises — queue plumbing must
+    never block the actual host job.
+    """
+    st_bin = shutil.which("session-task")
+    if not st_bin:
+        sys.stderr.write(
+            "hostjob: session-task not on PATH — running UNqueued.\n"
+        )
+        return None
+    scope = "hostjob:%s" % label
+    try:
+        add_argv = [
+            st_bin, "queue", "add", label,
+            "--scope", scope,
+            "--summary", "hostjob: %s" % label,
+            "--created-by", "hostjob",
+            "--force-enqueue",
+            "--json",
+        ]
+        for dep in (depends_on or []):
+            add_argv += ["--depends-on", dep]
+        proc = subprocess.run(
+            add_argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+    except Exception as e:
+        sys.stderr.write(
+            "hostjob: queue add failed (%r) — running UNqueued.\n" % e
+        )
+        return None
+    if proc.returncode != 0:
+        sys.stderr.write(
+            "hostjob: queue add exited %d — running UNqueued.\n%s\n"
+            % (proc.returncode, proc.stderr.decode("utf-8", "replace").strip())
+        )
+        return None
+    try:
+        info = json.loads(proc.stdout.decode("utf-8", "replace"))
+        qid = info.get("id")
+    except (ValueError, AttributeError):
+        qid = None
+    if not qid:
+        sys.stderr.write(
+            "hostjob: queue add gave no q-id — running UNqueued.\n"
+        )
+        return None
+    # When register=False (--no-queue), STOP here: the row exists (pending,
+    # visible, dependable) but does NOT claim/serialize the hostjob:<label>
+    # scope. The reaper still auto-closes it (done/abandon work on any status).
+    if not register:
+        return qid
+    # Claim the slot. register can refuse on scope conflict; treat any
+    # non-zero / error as fail-soft (job runs, reaper just won't be able to
+    # flip a registered item — done/abandon on a pending item still works).
+    try:
+        reg = subprocess.run(
+            [st_bin, "queue", "register", qid],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        if reg.returncode != 0:
+            sys.stderr.write(
+                "hostjob: queue register %s exited %d (continuing).\n%s\n"
+                % (qid, reg.returncode,
+                   reg.stderr.decode("utf-8", "replace").strip())
+            )
+    except Exception as e:
+        sys.stderr.write(
+            "hostjob: queue register %s failed (%r) (continuing).\n" % (qid, e)
+        )
+    return qid
+
+
+# --------------------------------------------------------------------------
+# broker (live-tail line broker)
+# --------------------------------------------------------------------------
+# A tiny long-lived host-side process that bridges the reaper's worker
+# output to the queue-minisite over loopback TCP, sidestepping the Docker
+# Desktop VirtioFS coherence gap (a macOS-host writer holding the log fd
+# open freezes the guest reader's cached inode size, so the minisite's
+# bind-mount tail goes deaf until the writer exits). The broker is NOT the
+# source of truth -- the per-label log file still is. The broker only
+# carries the LIVE delta over a fully host<->guest-coherent kernel socket.
+#
+# Transport: stdlib http.server (ThreadingHTTPServer), bound to 127.0.0.1
+# ONLY (never externally exposed; host.docker.internal reaches it via the
+# Docker gateway). NO third-party deps -- matches hostjob's pure-stdlib
+# style. Endpoints:
+#   POST /ingest/<label>   reaper feeds raw line bytes; appended to a small
+#                          per-label in-memory ring + fanned out to live
+#                          subscriber queues.
+#   GET  /tail/<label>     SSE (text/event-stream); replays the ring then
+#                          server-pushes each subsequent line as it arrives.
+# Stateless beyond the in-memory ring; a broker restart simply loses
+# buffered lines (the file remains complete). Lazy-launched (idempotent,
+# detached) by `cmd_run`; liveness recorded in ~/.cache/hostjob/broker.json.
+
+DEFAULT_BROKER_PORT = int(os.environ.get("HOSTJOB_BROKER_PORT", "8799"))
+BROKER_STATE_PATH = os.path.join(STATE_ROOT, "broker.json")
+BROKER_RING_MAX = 2000  # lines retained per label for late subscribers
+
+
+def broker_url_default(port=None):
+    return "http://127.0.0.1:%d" % (port or DEFAULT_BROKER_PORT)
+
+
+def _read_broker_state():
+    try:
+        with open(BROKER_STATE_PATH, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _broker_alive(state):
+    """True if the recorded broker pid is alive AND its port answers."""
+    if not isinstance(state, dict):
+        return False
+    pid = state.get("pid")
+    port = state.get("port")
+    if not pid or not pid_alive(pid):
+        return False
+    # Cheap liveness probe: a TCP connect to the loopback port.
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_broker(port=None):
+    """Lazily, idempotently launch the broker daemon (detached).
+
+    Returns the broker base URL on success, or None if it could not be
+    started. NEVER raises -- a broker failure must not block `hostjob run`.
+    """
+    port = port or DEFAULT_BROKER_PORT
+    try:
+        state = _read_broker_state()
+        if _broker_alive(state):
+            return broker_url_default(state.get("port", port))
+        # Not alive -- (re)launch, detached like the reaper.
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "broker",
+             "--port", str(port)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        # Give it a brief moment to bind + write its state file, then verify.
+        for _ in range(20):
+            time.sleep(0.1)
+            st = _read_broker_state()
+            if _broker_alive(st):
+                return broker_url_default(st.get("port", port))
+        # Couldn't confirm liveness; the launched proc may still be coming
+        # up. Return the conventional URL so the reaper can try -- POSTs are
+        # best-effort anyway.
+        if proc.poll() is None:
+            return broker_url_default(port)
+    except Exception as e:
+        sys.stderr.write("hostjob: broker launch failed (%r) -- live tail "
+                         "will fall back to file polling.\n" % e)
+    return None
+
+
+def cmd_broker(args):
+    """Run the broker daemon in the foreground (this process IS the broker).
+
+    Invoked detached by `ensure_broker`; can also be run by hand for
+    debugging: `python3 hostjob broker --port 8799`.
+    """
+    import socket
+    import threading
+    import queue as _queue
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    port = args.port or DEFAULT_BROKER_PORT
+
+    # Per-label state: a ring buffer of recent line bytes + the set of
+    # subscriber queues currently tailing that label. Guarded by a lock.
+    state_lock = threading.Lock()
+    rings = {}        # label -> list[bytes]
+    subscribers = {}  # label -> set[queue.Queue]
+
+    def publish(label, line_bytes):
+        with state_lock:
+            ring = rings.setdefault(label, [])
+            ring.append(line_bytes)
+            if len(ring) > BROKER_RING_MAX:
+                del ring[: len(ring) - BROKER_RING_MAX]
+            subs = list(subscribers.get(label, ()))
+        for q in subs:
+            try:
+                q.put_nowait(line_bytes)
+            except Exception:
+                pass
+
+    def subscribe(label):
+        q = _queue.Queue(maxsize=10000)
+        with state_lock:
+            backlog = list(rings.get(label, ()))
+            subscribers.setdefault(label, set()).add(q)
+        return q, backlog
+
+    def unsubscribe(label, q):
+        with state_lock:
+            subs = subscribers.get(label)
+            if subs:
+                subs.discard(q)
+                if not subs:
+                    subscribers.pop(label, None)
+
+    label_re = __import__("re").compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):  # silence access logging
+            pass
+
+        def _label_from_path(self, prefix):
+            if not self.path.startswith(prefix):
+                return None
+            label = self.path[len(prefix):]
+            # Strip any query string.
+            label = label.split("?", 1)[0]
+            if not label_re.match(label):
+                return None
+            return label
+
+        def do_POST(self):
+            label = self._label_from_path("/ingest/")
+            if label is None:
+                self.send_error(404)
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            body = self.rfile.read(n) if n else b""
+            if body:
+                publish(label, body)
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            label = self._label_from_path("/tail/")
+            if label is None:
+                self.send_error(404)
+                return
+            q, backlog = subscribe(label)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                # Replay buffered lines (late subscriber backfill).
+                for line in backlog:
+                    self._send_line(line)
+                # Live push loop. A periodic keepalive comment bounds the
+                # block so a dead client is noticed when the write fails.
+                while True:
+                    try:
+                        line = q.get(timeout=15)
+                    except _queue.Empty:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    self._send_line(line)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            finally:
+                unsubscribe(label, q)
+
+        def _send_line(self, line_bytes):
+            # Forward one worker output line as a single SSE `data:` event.
+            #
+            # CONTRACT (documented so the minisite subscriber matches): the
+            # broker forwards COMPLETE lines. The reaper feeds one readline()
+            # chunk per ingest, which ends in a single `\n` line terminator
+            # (the final partial chunk at worker EOF may have none). That
+            # terminator is STRUCTURAL, not content, so we strip exactly one
+            # trailing `\n` before framing -- otherwise it would surface as a
+            # spurious empty data line. Any bare `\r` progress bytes are left
+            # INTACT: the minisite re-runs each delivered line through
+            # `_split_cr_lf_segments`, so CR/LF transient handling stays
+            # identical to the file-backfill path. A line is wrapped in one
+            # SSE event terminated by the blank line per the SSE spec; an
+            # interior `\n` (rare, only in a terminator-less final chunk) is
+            # encoded as multiple `data:` lines, which EventSource rejoins
+            # with `\n` on the client.
+            text = line_bytes.decode("utf-8", "replace")
+            if text.endswith("\n"):
+                text = text[:-1]
+            payload = "".join("data: " + ln + "\n"
+                              for ln in text.split("\n"))
+            self.wfile.write((payload + "\n").encode("utf-8"))
+            self.wfile.flush()
+
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        # Port already bound -- almost certainly another broker instance
+        # won the race. That's fine; exit quietly.
+        sys.stderr.write("hostjob broker: bind 127.0.0.1:%d failed (%r) -- "
+                         "assuming another broker is live.\n" % (port, e))
+        return 0
+    httpd.daemon_threads = True
+    # Record liveness so `ensure_broker` can detect us.
+    try:
+        os.makedirs(STATE_ROOT, exist_ok=True)
+        tmp = BROKER_STATE_PATH + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump({"pid": os.getpid(), "port": port,
+                       "started_at": time.time()}, f)
+            f.write("\n")
+        os.replace(tmp, BROKER_STATE_PATH)
+    except Exception:
+        pass
+    try:
+        httpd.serve_forever(poll_interval=1.0)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# --------------------------------------------------------------------------
 # run
 # --------------------------------------------------------------------------
 def cmd_run(args):
@@ -176,6 +562,26 @@ def cmd_run(args):
     # since returned. The reaper is the session leader; the worker is its child.
     reaper_src = _REAPER_TEMPLATE
 
+    # Register the queue item BEFORE launching the reaper, so the q-id is
+    # known and can be handed to the reaper (which flips it done/abandon on
+    # worker exit). EVERY hostjob gets a first-class queue row; --no-queue only
+    # skips the scope-claiming `register` step (register=False → row stays
+    # pending/non-serializing but visible + dependable). Fail-soft: queue_id
+    # stays None if anything goes wrong.
+    queue_id = _register_queue_item(
+        label,
+        getattr(args, "depends_on", None),
+        register=not args.no_queue,
+    )
+
+    # Lazily launch the live-tail broker (idempotent, detached, fail-soft).
+    # If it can't start, broker_url stays None and the reaper simply skips
+    # the tee -- the file-based tail still works (degrades to today's
+    # behavior). Skippable via --no-broker or HOSTJOB_NO_BROKER=1.
+    broker_url = None
+    if not getattr(args, "no_broker", False) and not os.environ.get("HOSTJOB_NO_BROKER"):
+        broker_url = ensure_broker()
+
     # Initial status: running, pid filled in by the reaper once it knows the
     # worker pid. We seed it so an immediate `poll` after `run` sees 'running'.
     started = time.time()
@@ -191,6 +597,7 @@ def cmd_run(args):
             "reaper_pid": None,
             "started_at": started,
             "ended_at": None,
+            "queue_id": queue_id,
         },
     )
 
@@ -202,6 +609,9 @@ def cmd_run(args):
     env["HOSTJOB_CWD"] = cwd or ""
     env["HOSTJOB_STARTED"] = repr(started)
     env["HOSTJOB_CMD_JSON"] = json.dumps(cmd)
+    env["HOSTJOB_QUEUE_ID"] = queue_id or ""
+    # The reaper tees each worker line to this broker ingest URL (best-effort).
+    env["HOSTJOB_BROKER_URL"] = broker_url or ""
 
     proc = subprocess.Popen(
         [sys.executable, "-c", reaper_src],
@@ -222,14 +632,27 @@ def cmd_run(args):
     print("  cmd: %s" % " ".join(cmd))
     if cwd:
         print("  cwd: %s" % cwd)
+    if queue_id and args.no_queue:
+        print("  queue: %s (scope hostjob:%s, tracking-only / non-serializing)"
+              % (queue_id, label))
+    elif queue_id:
+        print("  queue: %s (scope hostjob:%s, registered)" % (queue_id, label))
+    else:
+        print("  queue: (no row created — see warning above)")
     print("  log: %s" % lp)
+    if broker_url:
+        print("  broker: %s (live tail via %s/tail/%s)"
+              % (broker_url, broker_url, label))
     print("  poll: python3 %s wait %s" % (os.path.abspath(__file__), label))
     return 0
 
 
 # The reaper runs detached. It launches the worker, waits, writes final status.
+# It also, on worker exit, flips the queue item (done/abandon) and emits a
+# hostjob-done claude-event — all fail-soft (guarded by shutil.which, wrapped
+# in try/except) so queue/event plumbing never crashes the reaper.
 _REAPER_TEMPLATE = r"""
-import json, os, subprocess, sys, time
+import json, os, shutil, subprocess, sys, time
 
 label = os.environ["HOSTJOB_LABEL"]
 sp = os.environ["HOSTJOB_STATUS"]
@@ -237,6 +660,7 @@ lp = os.environ["HOSTJOB_LOG"]
 cwd = os.environ.get("HOSTJOB_CWD") or None
 started = float(os.environ["HOSTJOB_STARTED"])
 cmd = json.loads(os.environ["HOSTJOB_CMD_JSON"])
+queue_id = os.environ.get("HOSTJOB_QUEUE_ID") or None
 
 def write_status(data):
     tmp = sp + ".tmp.%d" % os.getpid()
@@ -244,20 +668,101 @@ def write_status(data):
         json.dump(data, f, indent=2); f.write("\n")
     os.replace(tmp, sp)
 
+def finalize_queue(rc):
+    # Flip the queue item done/abandon, then emit a hostjob-done event.
+    # Every step is best-effort; a missing CLI or non-zero exit is ignored.
+    if queue_id:
+        st_bin = shutil.which("session-task")
+        if st_bin:
+            try:
+                if rc == 0:
+                    subprocess.run(
+                        [st_bin, "queue", "done", queue_id],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=20)
+                else:
+                    subprocess.run(
+                        [st_bin, "queue", "abandon", queue_id,
+                         "--reason", "hostjob exit %s" % rc],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=20)
+            except Exception:
+                pass
+    ce_bin = shutil.which("claude-event")
+    if ce_bin:
+        try:
+            argv = [ce_bin, "emit",
+                    "hostjob %s exited %s" % (label, rc),
+                    "--source", "hostjob",
+                    "--tag", "hostjob-done",
+                    "--source-name", "hostjob",
+                    "--data", "label=%s" % label,
+                    "--data", "exit_code=%s" % rc,
+                    "--data", "log_path=%s" % lp]
+            if queue_id:
+                argv += ["--data", "queue_id=%s" % queue_id]
+            subprocess.run(
+                argv, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=20)
+        except Exception:
+            pass
+
+broker_url = os.environ.get("HOSTJOB_BROKER_URL") or None
+
+def _post_line(line_bytes):
+    # Best-effort tee of one raw output line to the broker ingest
+    # endpoint. NEVER raises / NEVER blocks the file write or worker:
+    # any broker error (down, refused, timeout, malformed) is swallowed.
+    if not broker_url:
+        return
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            broker_url.rstrip("/") + "/ingest/" + label,
+            data=line_bytes,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2).read()
+    except Exception:
+        pass
+
 rc = None
 worker_pid = None
 try:
     logf = open(lp, "ab", buffering=0)
+    # PIPE the worker output so we can tee each line to BOTH the log file
+    # (durable backfill / fallback -- unchanged contract) AND, best-effort,
+    # the host-side line broker (live-tail transport that bypasses the
+    # VirtioFS coherence gap). The file write is authoritative; broker I/O
+    # is fail-soft and must never block the worker or the file append.
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL,
-        stdout=logf, stderr=subprocess.STDOUT, close_fds=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, close_fds=True,
     )
     worker_pid = proc.pid
     write_status({
         "label": label, "cmd": cmd, "cwd": cwd, "status": "running",
         "rc": None, "pid": worker_pid, "reaper_pid": os.getpid(),
-        "started_at": started, "ended_at": None,
+        "started_at": started, "ended_at": None, "queue_id": queue_id,
     })
+    # Line-buffered pump: readline() yields a chunk ending in a newline
+    # (or the final partial line at EOF). Append the raw bytes to the log
+    # file verbatim (preserving the existing byte-for-byte log) and tee
+    # the same bytes to the broker.
+    for chunk in iter(proc.stdout.readline, b""):
+        try:
+            logf.write(chunk)
+        except Exception:
+            pass
+        _post_line(chunk)
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
     rc = proc.wait()
     status = "done"
 except Exception as e:
@@ -272,8 +777,15 @@ except Exception as e:
 write_status({
     "label": label, "cmd": cmd, "cwd": cwd, "status": status,
     "rc": rc, "pid": worker_pid, "reaper_pid": os.getpid(),
-    "started_at": started, "ended_at": time.time(),
+    "started_at": started, "ended_at": time.time(), "queue_id": queue_id,
 })
+
+# Queue/event finalization is the LAST thing the reaper does, and is fully
+# guarded — never let it crash the reaper or mask the recorded status.
+try:
+    finalize_queue(rc)
+except Exception:
+    pass
 """
 
 
@@ -295,6 +807,8 @@ def _print_status(label, st, tail_n):
     else:
         print("hostjob[%s]: %s" % (label, state))
     print("  cmd: %s" % " ".join(st.get("cmd", [])))
+    if st.get("queue_id"):
+        print("  queue: %s" % st.get("queue_id"))
     print("  log: %s" % log_path(label))
     if tail_n > 0:
         body = tail_lines(log_path(label), tail_n)
@@ -369,7 +883,11 @@ def cmd_list(args):
             tag = "CRASHED rc=%s" % st.get("rc")
         else:
             tag = state
-        print("%-24s %-16s %-8s  %s" % (label, tag, el, " ".join(st.get("cmd", []))))
+        # Surface the queue_id so it's discoverable for `queue depend --add`
+        # without needing a separate `poll`.
+        qid = st.get("queue_id") or "-"
+        print("%-24s %-16s %-8s %-22s  %s"
+              % (label, tag, el, qid, " ".join(st.get("cmd", []))))
     return 0
 
 
@@ -430,6 +948,175 @@ def cmd_clean(args):
 
 
 # --------------------------------------------------------------------------
+# stop (kill a running job)
+# --------------------------------------------------------------------------
+def _proc_cmdline(pid):
+    """Return the live command line of `pid` as a string, or None if the
+    process is gone / not inspectable. Pure-stdlib: shells out to `ps`,
+    which is present on every macOS/Linux host hostjob runs on."""
+    if not pid:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    return out or None
+
+
+def _cmd_matches_live(recorded_cmd, live_cmdline):
+    """Best-effort guard against killing a RECYCLED pid.
+
+    The recorded cmd is the argv list hostjob launched (e.g.
+    ['python3', '/abs/script.py', '--listen', '9445']). The live `ps`
+    cmdline shows the OS-resolved form (e.g. the absolute interpreter path
+    instead of 'python3'), so exact-string equality is wrong. Instead we
+    require the most DISTINCTIVE recorded tokens to all appear in the live
+    cmdline: any path-like token (contains '/' or ends in a script suffix)
+    plus, if none, the final token. Returns True if the live process still
+    looks like the job we recorded, False if it diverged (=> pid reused).
+    On no recorded cmd / no live cmdline, returns False (cannot verify =>
+    don't claim a match)."""
+    if not recorded_cmd or not live_cmdline:
+        return False
+    distinctive = [
+        t for t in recorded_cmd
+        if ("/" in t) or t.endswith((".py", ".sh", ".js", ".rb"))
+    ]
+    if not distinctive:
+        # No path-like token; fall back to the last argv element (often the
+        # subcommand / target) plus the first (the program name basename).
+        distinctive = [recorded_cmd[-1]]
+        first = os.path.basename(recorded_cmd[0])
+        if first and first not in distinctive:
+            distinctive.append(first)
+    return all(tok in live_cmdline for tok in distinctive)
+
+
+def _mark_stopped(label, st, rc=None, note=None):
+    st = dict(st)
+    st["status"] = "stopped"
+    st["rc"] = rc if rc is not None else st.get("rc")
+    st["ended_at"] = st.get("ended_at") or time.time()
+    if note:
+        st["stop_note"] = note
+    write_status(label, st)
+    return st
+
+
+def _stop_one(label, grace, force):
+    """Stop a single job. Returns (rc, message). rc 0 = stopped/already-gone,
+    1 = error (no such job / pid-mismatch refusal)."""
+    st = reconcile(label)
+    if st is None:
+        return 1, "hostjob stop: no such job %r" % label
+    state = st.get("status")
+    if state != "running":
+        # Already terminal — nothing to kill; leave state as-is so `clean`
+        # can remove it. (A 'stopped'/'done'/'crashed' job is fine.)
+        return 0, "hostjob[%s]: not running (status=%s) — nothing to kill" % (label, state)
+
+    pid = st.get("pid")
+    if not pid or not pid_alive(pid):
+        # Worker pid already gone but state stuck 'running' (reaper died).
+        # Mark stopped so clean can remove it; not an error.
+        _mark_stopped(label, st, note="pid %s already gone at stop time" % pid)
+        return 0, "hostjob[%s]: pid %s already gone — marked stopped" % (label, pid)
+
+    # Guard against a recycled pid: verify the live cmdline still matches the
+    # recorded cmd before sending any signal. --force overrides the guard.
+    live = _proc_cmdline(pid)
+    if not force and not _cmd_matches_live(st.get("cmd"), live):
+        return 1, (
+            "hostjob[%s]: pid %s cmdline does NOT match recorded cmd — "
+            "REFUSING to kill (looks like a reused pid).\n"
+            "  recorded: %s\n  live ps : %s\n"
+            "  Use `stop --force %s` to kill pid %s anyway."
+            % (label, pid, " ".join(st.get("cmd", [])), live or "(gone)", label, pid)
+        )
+
+    # SIGTERM, grace, then SIGKILL the pid (and its process group, since the
+    # reaper launched the worker via start_new_session => worker is a session
+    # / group leader; killing the group reaps any children it spawned).
+    def _signal(sig):
+        try:
+            os.kill(pid, sig)
+        except OSError as e:
+            if e.errno == errno.ESRCH:
+                return False  # already gone
+        # Best-effort group kill too (worker is its own session leader).
+        try:
+            os.killpg(os.getpgid(pid), sig)
+        except OSError:
+            pass
+        return True
+
+    _signal(signal.SIGTERM)
+    deadline = time.time() + max(1, grace)
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            break
+        time.sleep(0.25)
+    killed_hard = False
+    if pid_alive(pid):
+        _signal(signal.SIGKILL)
+        killed_hard = True
+        # brief reap wait
+        for _ in range(20):
+            if not pid_alive(pid):
+                break
+            time.sleep(0.1)
+
+    note = "SIGKILL after %ds grace" % grace if killed_hard else "SIGTERM"
+    _mark_stopped(label, st, note=note)
+    sig_word = "SIGKILL (after %ds grace)" % grace if killed_hard else "SIGTERM"
+    return 0, "hostjob[%s]: stopped pid %s via %s — marked stopped" % (label, pid, sig_word)
+
+
+def cmd_stop(args):
+    grace = args.grace
+    if args.all:
+        if not os.path.isdir(STATE_ROOT):
+            print("hostjob: no jobs to stop")
+            return 0
+        running = []
+        for label in sorted(os.listdir(STATE_ROOT)):
+            if not os.path.isdir(os.path.join(STATE_ROOT, label)):
+                continue
+            st = reconcile(label)
+            if st and st.get("status") == "running":
+                running.append(label)
+        if not running:
+            print("hostjob: no RUNNING jobs to stop")
+            return 0
+        rc_final = 0
+        for label in running:
+            rc, msg = _stop_one(label, grace, args.force)
+            print(msg)
+            if rc != 0:
+                rc_final = rc
+        return rc_final
+
+    if not args.label:
+        sys.stderr.write("hostjob stop: need a <label> or --all\n")
+        return 2
+    rc, msg = _stop_one(args.label, grace, args.force)
+    if rc == 0:
+        print(msg)
+    else:
+        sys.stderr.write(msg + "\n")
+    return rc
+
+
+# --------------------------------------------------------------------------
 # argparse
 # --------------------------------------------------------------------------
 def main(argv):
@@ -445,6 +1132,20 @@ def main(argv):
     pr.add_argument("--cwd", default=None)
     pr.add_argument("--force", action="store_true",
                     help="override an existing RUNNING job with this label")
+    pr.add_argument("--no-queue", action="store_true",
+                    help="do NOT claim/serialize the hostjob:<label> scope slot "
+                         "(the job STILL gets a visible, dependable queue row "
+                         "that auto-closes on completion — only the scope-"
+                         "claiming `queue register` step is skipped). Use when "
+                         "you don't want same-label hostjobs serialized.")
+    pr.add_argument("--no-broker", action="store_true",
+                    help="skip the live-tail broker (reaper tees no lines; "
+                         "the file-based tail still works)")
+    pr.add_argument("--depends-on", action="append", default=[],
+                    help="queue id(s) the auto-created queue item depends on; "
+                         "passed through to session-task queue add --depends-on. "
+                         "Repeatable and/or comma-separated. Applies to the row "
+                         "with or without --no-queue.")
     pr.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- <cmd> [args...] (everything after -- is the command)")
     pr.set_defaults(func=cmd_run)
@@ -467,6 +1168,30 @@ def main(argv):
     pc.add_argument("--label", default=None)
     pc.add_argument("--all", action="store_true")
     pc.set_defaults(func=cmd_clean)
+
+    pk = sub.add_parser("stop",
+                        help="SIGTERM (then SIGKILL after a grace) a RUNNING "
+                             "job's worker, then mark it stopped so `clean` "
+                             "can remove it")
+    pk.add_argument("label", nargs="?", default=None,
+                    help="job label to stop (omit with --all)")
+    pk.add_argument("--all", action="store_true",
+                    help="stop every RUNNING job")
+    pk.add_argument("--grace", type=int, default=8,
+                    help="seconds to wait after SIGTERM before SIGKILL (default 8)")
+    pk.add_argument("--force", action="store_true",
+                    help="skip the recorded-cmd vs live-pid cmdline match "
+                         "guard (kill the recorded pid even if its cmdline "
+                         "no longer matches — use only if you're sure)")
+    pk.set_defaults(func=cmd_stop)
+
+    pb = sub.add_parser("broker",
+                        help="run the live-tail line broker daemon "
+                             "(normally lazy-launched by `run`)")
+    pb.add_argument("--port", type=int, default=None,
+                    help="loopback port to bind (default %d / "
+                         "$HOSTJOB_BROKER_PORT)" % DEFAULT_BROKER_PORT)
+    pb.set_defaults(func=cmd_broker)
 
     args = p.parse_args(argv)
     if not getattr(args, "subcmd", None):

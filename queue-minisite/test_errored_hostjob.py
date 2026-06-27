@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Tests for errored-hostjob recovery in queue-minisite.
 
-A `hostjob` (andrew-sf-tools) whose host worker exits NON-ZERO is flipped
+A `hostjob` (`examples/compose/bin/hostjob`) whose host worker exits NON-ZERO is flipped
 to queue status `abandoned` with `abandon_reason = "hostjob exit <N>"` by
 the reaper's `finalize_queue`. That conflates a FAILED hostjob with an
 operator CANCEL and — because the `abandoned` bucket is time-sorted and
 capped at `RECENT_ABANDONED_LIMIT` — can hide the failure entirely.
 
 The minisite can't change the upstream `queue abandon` call (it lives in
-the separate, read-only andrew-sf-tools repo), so it recovers the
+`examples/compose/bin/hostjob`), so it recovers the
 distinction at render time:
 
   * `_shape` sets `is_errored_hostjob` + `hostjob_exit_code` for an

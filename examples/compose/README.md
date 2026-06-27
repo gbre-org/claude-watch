@@ -389,6 +389,9 @@ python3 <path>/hostjob poll build --tail 60
 # Enumerate known jobs:
 python3 <path>/hostjob list
 
+# Stop a running job (SIGTERM, grace, then SIGKILL; recycled-pid guarded):
+python3 <path>/hostjob stop build      # or --all
+
 # Remove finished job state (refuses while still running):
 python3 <path>/hostjob clean --label build      # or --all
 ```
@@ -399,11 +402,27 @@ the `EX_TEMPFAIL` re-invoke pattern `session-task`'s `workload babysit` uses.
 On `done`, `poll --tail` surfaces the final log output and the worker's exit
 code.
 
-State lives under `~/.cache/hostjob/<label>/` (`log` + `status.json`); the
-script is pure-stdlib Python and stores nothing outside `$HOME`. It is a
-generic primitive — it encodes knowledge of host-bash's own 30s constraint
-and nothing application-specific — which is why it ships here alongside the
-`mcp-host-bash` launcher rather than out-of-tree.
+**Queue integration** (fail-soft): every `hostjob` gets a first-class
+`session-task` queue row (scope `hostjob:<label>`, created-by `hostjob`); the
+reaper flips it to `done`/`abandon` on worker exit and emits a `claude-event
+--source hostjob --tag hostjob-done`. Depend on a hostjob via its **q-id**
+(printed by `run`, stored in `status.json`), not the scope token. `--no-queue`
+keeps the row but skips the scope-claiming `register` (non-serializing). If
+`session-task` / `claude-event` are absent the job still runs — queue
+bookkeeping never blocks the host work.
+
+**Live-tail line broker** (fail-soft): `run` lazily launches a loopback HTTP
+ring-buffer broker (port `HOSTJOB_BROKER_PORT`, default 8799) and tees each
+worker output line to it, so live-tail consumers (e.g. the queue-minisite) see
+output even across a bind-mount coherence gap. The per-label log file remains
+the source of truth; broker I/O never blocks the worker.
+
+State lives under `~/.cache/hostjob/<label>/` (`log` + `status.json`), plus
+`~/.cache/hostjob/broker.json` for broker liveness; the script is pure-stdlib
+Python and stores nothing outside `$HOME`. It is a generic primitive — it
+encodes knowledge of host-bash's own 30s constraint and nothing
+application-specific — which is why it ships here alongside the `mcp-host-bash`
+launcher rather than out-of-tree.
 
 (Complementary, not a replacement: raising `COMMAND_TIMEOUT` lets *everyday*
 commands run a little longer without `hostjob`, but `hostjob` is still the
