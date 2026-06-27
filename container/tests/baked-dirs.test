@@ -146,6 +146,37 @@ if restart_container.is_file():
         f"{text.splitlines()[0]!r}",
     )
 
+# 3d. self-clear.md present + references `self-clear` (the backing
+#     tool). self-clear injects /clear + a resume prompt into the
+#     Claude Code tmux pane for a clean CONTEXT reset — distinct from
+#     the inner-process roll (claude-code-restart.md / cwsr) and from
+#     the container restart (restart-container.md).
+self_clear = SKILLS_DIR / "self-clear.md"
+expect(
+    self_clear.is_file(),
+    f"{self_clear} missing — the /claude-container:self-clear skill wraps "
+    f"the baked /usr/local/bin/self-clear tool (clean context reset) and "
+    f"must ship as its own skill",
+)
+if self_clear.is_file():
+    text = self_clear.read_text(encoding="utf-8")
+    expect(
+        len(text) > 200,
+        f"{self_clear} suspiciously short (<200 chars)",
+    )
+    expect(
+        "self-clear" in text,
+        f"{self_clear} should reference `self-clear` (the in-container tool "
+        f"baked at /usr/local/bin/self-clear). Without it the skill has no "
+        f"backing tool.",
+    )
+    first_line = text.splitlines()[0].lower()
+    expect(
+        "clear" in first_line and "context" in first_line,
+        f"{self_clear} first line should describe a clean CONTEXT reset "
+        f"(inject /clear + resume), got: {text.splitlines()[0]!r}",
+    )
+
 # 3b. edit-host-mounts.md present + references host-bash and the
 #     override file. The skill is the canonical way to generate /
 #     update the operator's docker-compose.override.yml.
