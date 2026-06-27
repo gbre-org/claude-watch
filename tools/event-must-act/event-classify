@@ -220,6 +220,33 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     # cannot-interrupt notices).
     ("claude-watch", "claude-watch-alert", None, AMBIENT,
         "Non-fatal claude-watch alert (test-pane / transient); context."),
+
+    # queue-orphaned / queue-stuck -> the main loop MUST respawn/resurrect (or
+    # abandon) the affected queue item.
+    #
+    # PRODUCER (`src/queue_check.rs`, EVENT_SOURCE / EVENT_TAG_ORPHANED /
+    # EVENT_TAG_STUCK) emits source="claude-watch", tag="queue-orphaned" or
+    # "queue-stuck" -- NOT source="queue". Same Bug-B shape as queue-stale-ready
+    # above: without an explicit row these fell through to the
+    # `("claude-watch", "*", AMBIENT)` catch-all and surfaced as context-only,
+    # so a `running` item whose owning agent died (e.g. killed by a container
+    # recreate) never actionably reminded the loop to respawn it. These rows
+    # MUST precede the claude-watch/* ambient catch-all so the orphan/stuck
+    # signal lands in the actionable tier (N-call gate) instead of ambient.
+    ("claude-watch", "queue-orphaned", None, ACTIONABLE,
+        "Queue item orphaned (running, owner dead); needs respawn/resurrect "
+        "or abandon decision."),
+    ("claude-watch", "queue-stuck", None, ACTIONABLE,
+        "Queue item stuck (wedged, or running with a stale heartbeat); needs "
+        "respawn/unwedge or abandon decision."),
+    # Back-compat: a future producer emitting under source="queue".
+    ("queue", "queue-orphaned", None, ACTIONABLE,
+        "Queue item orphaned (running, owner dead); needs respawn/resurrect "
+        "or abandon decision."),
+    ("queue", "queue-stuck", None, ACTIONABLE,
+        "Queue item stuck (wedged, or running with a stale heartbeat); needs "
+        "respawn/unwedge or abandon decision."),
+
     ("claude-watch", "*", None, AMBIENT,
         "Any non-alert claude-watch event is context-only."),
 
@@ -354,6 +381,14 @@ def _self_test() -> int:
         # heartbeat-tick is actionable (touch the file), and must win over
         # the claude-watch/* ambient catch-all below it.
         (("claude-watch", "heartbeat-tick", "heartbeat tick"), ACTIONABLE),
+        # queue-orphaned / queue-stuck are actionable (respawn/resurrect the
+        # item) and MUST win over the claude-watch/* ambient catch-all. These
+        # are the events `claude-watch queue-check` emits; routing them ambient
+        # was the bug that let a recreate-orphaned item never remind the loop.
+        (("claude-watch", "queue-orphaned", ""), ACTIONABLE),
+        (("claude-watch", "queue-stuck", ""), ACTIONABLE),
+        (("queue", "queue-orphaned", ""), ACTIONABLE),
+        (("queue", "queue-stuck", ""), ACTIONABLE),
 
         # claude-watch-alert: conditional. Fatal -> actionable.
         (("claude-watch", "claude-watch-alert", "CONTEXT CRITICALLY LOW"),
