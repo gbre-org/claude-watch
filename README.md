@@ -216,6 +216,12 @@ version_fallback_secs = 900      # wait 15 min after version_update hook before 
 - `claude_watch_reminder_to_action_latency_seconds_{sum,count}{type=...}`
   — histogram-style counters for the delay between reminder and the
   self-action (context drop / version match) landing.
+- `claude_code_tokens_total{type=...}` — cumulative Claude Code token
+  usage (counter), aggregated from the JSONL transcripts under
+  `~/.claude/projects/`. Labels: `input`, `output`, `cache_creation`,
+  `cache_read`. Drives a per-day bar chart via `increase(...[1d])`.
+- `claude_code_tokens_month_to_date{type=...}` — token usage for the
+  current calendar month (gauge), resets on the 1st. Same `type` labels.
 
 Ratio `fallback_injections_total / reminder_fires_total` = how often
 Claude ignored the conversational hint.
