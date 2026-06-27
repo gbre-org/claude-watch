@@ -620,10 +620,17 @@ agent-msg whoami <agent-id>                    # reverse: q-id for an agent
 
 These read the `PostToolUse:Agent` arm hook's binding map
 (`~/.config/claude/agent-queue-bindings.json`, read defensively). A bound
-agent is **live** only while its inbox file exists; resolution requires
-EXACTLY ONE live agent and **errors loudly on zero or multiple** — never
-silently picks (so a duplicate-spawn or already-exited agent is a hard
-failure, not a misroute).
+agent is **live** iff its transcript JSONL exists
+(`~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl`) —
+NOT whether it has an inbox yet (the inbox is created by the first `send`,
+so inbox-existence would refuse a live-but-never-messaged agent). Resolution
+is **deterministic**: prune dead bindings by transcript-liveness, then pick
+the **newest-registered** live agent (the nested-agent case where a
+sub-subagent inherits the same `Queue item:` marker resolves to whichever is
+most recently running). It **errors only on ZERO bindings** for the q-id;
+default-open (treats a binding as live) when transcript resolution is
+impossible — delivering to a maybe-dead inbox is harmless, refusing a live
+agent is the real failure.
 
 **As a subagent, when you see a deny banner that includes the message
 text, run:**
