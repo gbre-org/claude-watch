@@ -48,6 +48,13 @@ The optional `grafana` profile brings up a Grafana instance with:
    Most panels require the `node-exporter` profile (daemon textfile metrics).
    Queue and events panels work with just the core stack.
 
+   **Claude Token Usage dashboard** — provisioned alongside it from
+   `grafana/dashboards/claude-tokens.json` (uid `claude-tokens`). A per-day
+   stacked bar chart of token usage over the last 7 days
+   (`increase(claude_code_tokens_total[1d])`) plus a month-to-date total
+   stat (`sum(claude_code_tokens_month_to_date)`) that resets on the 1st.
+   Requires the `node-exporter` profile (daemon textfile metrics).
+
 3. **Datasource** — auto-provisioned pointing at the `prometheus` service in
    this stack (UID `prometheus`, so the dashboard JSON's datasource refs resolve
    without manual setup).
