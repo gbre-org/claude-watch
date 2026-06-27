@@ -43,7 +43,11 @@ Usage:
   object with the source / tag / tier / reason fields instead.
 
   ``--default`` picks the tier when no rule matches (default
-  ``ambient`` — safest "do not block" stance).
+  ``actionable`` — fail-LOUD stance: a genuinely unknown
+  (source, tag) pair should PRESS the loop to handle it or add a
+  classifier rule, never be silently swallowed as ambient context.
+  Every deliberately-ambient pair already has an explicit rule
+  above the catch-alls, so only TRULY-unmatched pairs hit this).
 
 Self-tests: ``event-classify --self-test``. Embedded suite covers
 every entry in ``CLASSIFICATIONS`` plus a "no match -> default"
@@ -291,9 +295,20 @@ def _match_pattern(pattern: str, value: str) -> bool:
 
 
 def classify(source: str, tag: str, message: str = "",
-             default_tier: str = AMBIENT) -> dict:
+             default_tier: str = ACTIONABLE) -> dict:
     """Return a dict with keys 'tier' and 'reason'. First matching
-    rule wins; falls back to ``default_tier`` if no rule matches."""
+    rule wins; falls back to ``default_tier`` if no rule matches.
+
+    The fallback default is ``actionable`` (fail-LOUD): an
+    UNKNOWN (source, tag) pair that matches no rule above is surfaced
+    in the actionable tier so the loop is pressed to handle it or add
+    a classifier rule, rather than silently absorbed as ambient
+    context. Every intentionally-ambient pair (heartbeat-tick is
+    actionable; routine cron / queue-running|done|abandoned /
+    memory-reminder / alertmanager / etc.) already has an EXPLICIT
+    rule above the catch-alls, so this fallback only changes the fate
+    of genuinely-novel pairs — it does NOT reclassify any
+    deliberately-ambient event."""
     src = source or ""
     tg = tag or ""
     msg = message or ""
@@ -324,9 +339,11 @@ def main() -> int:
     p.add_argument("--message", default="",
                    help="Event message body (used by message-conditional "
                         "rules like pr-status-change).")
-    p.add_argument("--default", default=AMBIENT, choices=sorted(VALID_TIERS),
+    p.add_argument("--default", default=ACTIONABLE, choices=sorted(VALID_TIERS),
                    help="Tier to return when no rule matches "
-                        f"(default: {AMBIENT}).")
+                        f"(default: {ACTIONABLE} — unknown pairs fail LOUD "
+                        "so the loop surfaces them rather than swallowing "
+                        "them as ambient).")
     p.add_argument("--json", action="store_true",
                    help="Emit JSON instead of a bare tier name.")
     p.add_argument("--list-rules", action="store_true",
@@ -434,8 +451,20 @@ def _self_test() -> int:
         # claude-watch/* catch-all stays ambient for non-heartbeat tags.
         (("claude-watch", "some-other-tag", ""), AMBIENT),
 
-        # Unknown -> default (ambient)
-        (("manual", "totally-novel-tag", ""), AMBIENT),
+        # Unknown -> default. The fallback default is now ACTIONABLE
+        # (fail-LOUD): a genuinely-novel (source, tag) pair matching no
+        # rule above surfaces in the actionable tier so the loop is
+        # pressed to handle it or add a rule, rather than silently
+        # swallowed as ambient. ("manual" has no */* catch-all, and
+        # "novel-future-source" is not a known source, so both fall
+        # through to the default.)
+        (("manual", "totally-novel-tag", ""), ACTIONABLE),
+        (("novel-future-source", "brand-new-tag", ""), ACTIONABLE),
+        # "queue" has NO queue/* catch-all, so an unrecognized queue tag
+        # also falls through to the actionable default — while the
+        # explicit routine queue transitions above STILL classify
+        # ambient (asserted earlier: queue-running/done/abandoned).
+        (("queue", "queue-some-novel-transition", ""), ACTIONABLE),
     ]
     failures = []
     for (src, tag, msg), expected in cases:
@@ -453,18 +482,33 @@ def _self_test() -> int:
                         f"{EXCLUDED} actual={res['tier']} -- excluded "
                         f"rule must run BEFORE alertmanager/* wildcard")
 
-    # --default flag honored when no rule matches.
+    # --default flag honored when no rule matches (explicit ACTIONABLE).
     res2 = classify("torrent", "unknown-tag", default_tier=ACTIONABLE)
     if res2["tier"] != ACTIONABLE:
         failures.append(f"  default-tier override: expected="
                         f"{ACTIONABLE} actual={res2['tier']}")
+
+    # New default is ACTIONABLE: with NO default_tier passed, an
+    # unmatched pair falls through to actionable (fail-LOUD).
+    res3 = classify("torrent", "unknown-tag")
+    if res3["tier"] != ACTIONABLE:
+        failures.append(f"  implicit default: expected={ACTIONABLE} "
+                        f"actual={res3['tier']} -- unknown pairs must "
+                        f"fail LOUD (actionable), not ambient")
+
+    # The default_tier param still honors an explicit AMBIENT override
+    # (so callers that WANT the old swallow-as-context stance can ask).
+    res4 = classify("torrent", "unknown-tag", default_tier=AMBIENT)
+    if res4["tier"] != AMBIENT:
+        failures.append(f"  explicit-ambient override: expected="
+                        f"{AMBIENT} actual={res4['tier']}")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         return 1
-    print(f"OK: {len(cases) + 2} cases pass.")
+    print(f"OK: {len(cases) + 4} cases pass.")
     return 0
 
 

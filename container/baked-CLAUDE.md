@@ -1268,10 +1268,9 @@ class.
 
 ### Tier 1 — Ambient (info-only, context-inject only)
 
-Routine, non-actionable events: alerts that Andrew already gets push for,
-cron ticks, routine queue transitions (running/done/abandoned), workload-
-done, non-fatal claude-watch alerts, routine PR status (push/pending/
-mergeable), etc.
+Routine, non-actionable events: alerts that Andrew already gets push for, cron
+ticks, routine queue transitions (running/done/abandoned), workload-done,
+non-fatal claude-watch alerts, routine PR status (push/pending/mergeable), etc.
 
   - Routed by `event-ack ingest` into `ambient-context.json`.
   - Surfaced by the `user-prompt-ambient-inject-hook` (UserPromptSubmit) on
@@ -1281,23 +1280,20 @@ mergeable), etc.
 
 ### Tier 2 — Actionable (pending list + N-call gate)
 
-Events that demand a response within a reasonable window: torrent-
-completed (needs agent spawn), manual/request-fulfilled (needs requester
-DM), queue/queue-api-dead (needs respawn decision), fatal claude-watch
-alerts (CONTEXT CRITICALLY LOW, main pane crashed), PR CI failure /
-success, workbot-prompt, queue-stale-ready, slack-unread,
+Events that demand a response within a reasonable window: torrent-completed
+(agent spawn), manual/request-fulfilled (requester DM), queue/queue-api-dead
+(respawn), fatal claude-watch alerts (CONTEXT CRITICALLY LOW, main pane crashed),
+PR CI failure/success, workbot-prompt, queue-stale-ready, slack-unread,
 **claude-watch/heartbeat-tick**.
 
 > **`heartbeat-tick` — touch the heartbeat file.** Every ~5 min the
 > claude-watch daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick
 > [path=<FILE> interval_secs=…]`. When you see it, run **`touch <FILE>`** (the
-> path on the event line, e.g. `touch /var/run/claude/claude-heartbeat`). That
-> file is the daemon's wedge-detector: it watches the mtime and, if it goes
-> stale (~10 min), fires a "heartbeat stale" alert and may try to recover a
-> loop it thinks is wedged. The touch MUST come from you acting on the event
-> (it proves the loop is alive) — the daemon never touches the file itself. A
-> one-command self-service action; no agent spawn or `event-ack` needed, just
-> the `touch`.
+> path on the event line, e.g. `/var/run/claude/claude-heartbeat`). That file
+> is the daemon's wedge-detector: if its mtime goes stale (~10 min) the
+> daemon fires a "heartbeat stale" alert and may try to recover the loop. The
+> touch MUST come from you acting on the event (it proves the loop is alive);
+> the daemon never touches it. One command, no agent spawn.
 
   - Routed by `event-ack ingest` into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt
@@ -1306,15 +1302,17 @@ success, workbot-prompt, queue-stale-ready, slack-unread,
   - **Each `event-ack` transaction resets the counter to 0**, so the LLM gets
     a fresh N-call grace window after every ack.
   - The gate does NOT fire immediately on every actionable event — only after
-    the LLM has missed N consecutive triage opportunities (the q-2026-05-21-
-    856d refinement: "only TRULY actionable events go into pending, and the
-    gate escalates after N missed calls rather than firing immediately").
+    the LLM has missed N consecutive triage opportunities (only TRULY actionable
+    events go into pending; the gate escalates after N missed calls).
 
-### Tier 3 — Unknown (defaults to ambient)
+### Tier 3 — Unknown (defaults to ACTIONABLE — fail-LOUD)
 
-Any event whose source/tag pair doesn't match an `event-classify` rule falls
-through to the default tier (ambient). Conservative posture — unknown events
-become context, never block.
+A source/tag pair matching no `event-classify` rule now defaults to
+**actionable** (flipped from ambient): a brand-new event source must be handled
+or get a rule, never silently swallowed. Routine events are unaffected —
+deliberately-ambient pairs (`cron/*`, `alertmanager/*`, `claude-watch/*`, queue
+transitions) have explicit rules above the catch-alls; only unmatched pairs hit
+this default.
 
 ### Event classification table
 
