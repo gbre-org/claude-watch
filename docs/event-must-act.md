@@ -65,11 +65,15 @@ inbound is acked via `signal-ack`.
   `signal-mark-read` so its own gate never blocks Signal investigation
   when an unrelated actionable event is pending.
 
-### Tier 4 — Unknown (defaults to ambient)
+### Tier 4 — Unknown (defaults to ACTIONABLE — fail-LOUD)
 
 Any event whose `(source, tag)` pair doesn't match a rule in the
-`event-classify` table falls through to the default tier (ambient).
-Conservative posture — unknown events become context, never block.
+`event-classify` table falls through to the default tier, which is now
+**actionable** (flipped from ambient). Fail-LOUD posture — a genuinely
+unknown event must be handled or get a classifier rule, never silently
+swallowed as context. Every deliberately-ambient pair already has an
+explicit rule above the catch-alls, so only TRULY-unmatched pairs hit
+this default.
 
 ## Workflow
 
