@@ -4767,7 +4767,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // MAIN LOOP spawns the watcher in its own process tree. claude-watch
         // (the daemon) never spawns watchers itself.
         //
-        // See: feedback_watcher-architecture-cardinal.md in claude-config.
+        // See the watcher-architecture cardinal rule (operator notes).
 
         // Inject restart commands if watchers are down and cooldown has passed.
         //

@@ -3669,7 +3669,7 @@ def main() -> int:
             # allowed -- Read is unconditionally exempt because reads are
             # side-effect-free and can never mutate guarded state. The
             # motivating case: viewing an attachment image while clearing
-            # the botchat mark-read gate (claude-config #41).
+            # the botchat mark-read gate.
             rc, out, _err = _hook_pre(
                 {"tool_name": "Read",
                  "tool_input": {"file_path":

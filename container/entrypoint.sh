@@ -136,13 +136,20 @@ unset _local_bin
 # Symlink user utility scripts into ~/.local/bin (already on PATH above) so
 # they're discoverable by tools that use shutil.which() — notably
 # session-task's _pingme_notify(), which shells out to ``queue-notify`` (the
-# dedicated queue Pushover path) and historically to ``pingme``. The repos/
-# tree is bind-mounted read-only; the symlinks live on the ephemeral overlay
-# but are recreated every container start by this block.
+# dedicated queue Pushover path) and historically to a host-pluggable
+# ``pingme`` push-notification shim. The repos/ tree is bind-mounted
+# read-only; the symlinks live on the ephemeral overlay but are recreated
+# every container start by this block.
+#
+# The ``pingme`` shim is host-pluggable (ntfy / Apprise / a homebrew script /
+# etc.): point ``PINGME_SRC`` at an executable on a mounted path to surface it
+# in the container as ``pingme``. Unset → no pingme symlink (queue-notify
+# still handles the queue Pushover path).
 _user_bin="${HOME:-/home/hndrewaall}/.local/bin"
 for _script in \
-    "${HOME:-/home/hndrewaall}/repos/config/pingme" \
+    "${PINGME_SRC:-}" \
     "${HOME:-/home/hndrewaall}/repos/claude-watch/tools/session-task/queue-notify"; do
+    [ -n "$_script" ] || continue
     if [ -x "$_script" ] && [ ! -e "${_user_bin}/$(basename "$_script")" ]; then
         ln -sf "$_script" "${_user_bin}/$(basename "$_script")" 2>/dev/null || true
     fi

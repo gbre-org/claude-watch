@@ -5,7 +5,7 @@
 //! `/var/lib/node-exporter/textfile/claude_watch.prom` atomically.
 //!
 //! Run from cron every minute:
-//!     * * * * * /home/hndrewaall/bin/claude-watch metrics
+//!     * * * * * /path/to/claude-watch metrics
 
 use crate::reminders::all_fire_counts;
 use crate::status::get_version_info;
