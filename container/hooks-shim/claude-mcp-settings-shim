@@ -41,19 +41,33 @@ set -euo pipefail
 
 # Resolve the REAL claude binary, skipping THIS wrapper. We can't just use
 # `command -v claude` because that would find us again. Walk PATH and pick
-# the first `claude` that is not this script.
+# the first claude binary that is not this script.
+#
+# We accept BOTH names `claude` AND `claude.exe`. The native binary is baked
+# as `bin/claude.exe` (a ~230MB platform-specific dependency), and the image
+# bakes `claude` symlinks (~/.npm-global/bin, /usr/bin, /bin) that point at
+# it. Matching ONLY `claude` is fragile: a self-update / cwsr (or any future
+# package layout) that writes `claude.exe` WITHOUT re-creating the `claude`
+# symlink would leave a PATH dir whose only candidate is `claude.exe`, and
+# this shim would then find no real binary to delegate to and die with
+# "could not locate the real claude binary on PATH" (exit 127). Trying both
+# names makes the resolution robust to that case.
 self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 real_claude=""
 IFS=':' read -ra _path_dirs <<< "${PATH}"
 for _d in "${_path_dirs[@]}"; do
     [ -n "$_d" ] || continue
-    _cand="$_d/claude"
-    [ -x "$_cand" ] || continue
-    _cand_resolved="$(readlink -f "$_cand" 2>/dev/null || echo "$_cand")"
-    if [ "$_cand_resolved" != "$self" ]; then
-        real_claude="$_cand"
-        break
-    fi
+    # Inner loop over candidate names is fine under `set -u` (non-empty list).
+    for _name in claude claude.exe; do
+        _cand="$_d/$_name"
+        [ -x "$_cand" ] || continue
+        _cand_resolved="$(readlink -f "$_cand" 2>/dev/null || echo "$_cand")"
+        if [ "$_cand_resolved" != "$self" ]; then
+            real_claude="$_cand"
+            break
+        fi
+    done
+    [ -n "$real_claude" ] && break
 done
 
 # Fail-safe: if we somehow can't find the real claude, there is nothing we
