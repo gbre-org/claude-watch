@@ -3158,59 +3158,163 @@ def test_resolve_zero_match_errors():
     return True
 
 
+def _transcript_tree(td: Path):
+    """Build an empty projects tree + return a context to point
+    CLAUDE_PROJECTS_DIR at it; caller adds transcripts via _mk_transcript."""
+    proj = Path(td) / "projects"
+    proj.mkdir(parents=True, exist_ok=True)
+    return proj
+
+
+def _mk_transcript(proj: Path, agent_id: str,
+                   project="-p", session="s") -> Path:
+    """Create a transcript JSONL for ``agent_id`` under a fake projects tree,
+    so _agent_is_live(agent_id) sees it as LIVE."""
+    needle = agent_id[len("agent-"):] if agent_id.startswith("agent-") else agent_id
+    d = proj / project / session / "subagents"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"agent-{needle}.jsonl"
+    f.write_text('{"type":"user"}\n', encoding="utf-8")
+    return f
+
+
 def test_resolve_dead_only_errors():
-    """A bound agent with NO inbox (dead) does not count as live -> error."""
+    """A bound agent with a transcript that's GONE is provably dead; with a
+    walkable-but-empty projects tree resolution still returns the (sole)
+    binding rather than refusing (deliver-anyway is harmless)."""
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         _write_bindings(Path(td) / "bindings.json", {"agent-dead": "q-dead"})
-        # No inbox file written -> agent-dead is not live.
-        args = _resolve_args(td, queue_id="q-dead")
+        proj = _transcript_tree(Path(td))
+        # Make the tree walkable (a subagents/ dir exists) but with NO
+        # transcript for agent-dead -> _transcript_exists returns False.
+        _mk_transcript(proj, "someone-else")
+        old = os.environ.get("CLAUDE_PROJECTS_DIR")
+        os.environ["CLAUDE_PROJECTS_DIR"] = str(proj)
         try:
-            _resolve_queue_id_unique("q-dead", args)
-            assert False, "expected ValueError -- bound but not live"
-        except ValueError as e:
-            assert "NONE are live" in str(e), str(e)
+            assert _transcript_exists("agent-dead") is False
+            assert _agent_is_live("agent-dead") is False
+            args = _resolve_args(td, queue_id="q-dead")
+            live, matched = _resolve_queue_id("q-dead", args)
+            assert live == [] and matched == ["agent-dead"], (live, matched)
+            # Best-resolver delivers to the sole (dead) binding anyway.
+            assert _resolve_queue_id_best("q-dead", args) == "agent-dead"
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROJECTS_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECTS_DIR"] = old
     return True
 
 
-def test_resolve_multi_match_errors():
-    """Two LIVE agents on the same q-id (retry) -> non-zero exit, no guess."""
-    import tempfile
-    with tempfile.TemporaryDirectory() as td:
-        _write_bindings(Path(td) / "bindings.json",
-                        {"agent-1": "q-dup", "agent-2": "q-dup"})
-        # Both live (inbox files exist).
-        cmd_send(_resolve_args(td, agent_id="agent-1", text="x", no_arm=True))
-        cmd_send(_resolve_args(td, agent_id="agent-2", text="x", no_arm=True))
-        args = _resolve_args(td, queue_id="q-dup")
-        try:
-            _resolve_queue_id_unique("q-dup", args)
-            assert False, "expected ValueError on multiple live agents"
-        except ValueError as e:
-            assert "MULTIPLE live agents" in str(e), str(e)
-        rc = cmd_resolve(_resolve_args(td, queue_id="q-dup"))
-        assert rc == 1
-    return True
-
-
-def test_resolve_all_lists_live_and_stale():
-    """resolve --all lists every match, marking live vs stale, never errors."""
+def test_resolve_multi_match_picks_newest_live():
+    """Two LIVE agents on the same q-id (nested/retry) -> deterministic
+    newest-registered-live wins, no error (the old behavior errored)."""
     import tempfile
     import io
     from contextlib import redirect_stdout
     with tempfile.TemporaryDirectory() as td:
-        _write_bindings(Path(td) / "bindings.json",
-                        {"agent-live": "q-mix", "agent-stale": "q-mix"})
-        cmd_send(_resolve_args(td, agent_id="agent-live", text="x", no_arm=True))
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            rc = cmd_resolve(_resolve_args(td, queue_id="q-mix",
-                                           all=True, json=True))
-        assert rc == 0
-        result = json.loads(buf.getvalue())
-        assert result["live"] == ["agent-live"]
-        assert result["stale"] == ["agent-stale"]
-        assert set(result["all"]) == {"agent-live", "agent-stale"}
+        # agent-2 registered AFTER agent-1 (newer -> should win).
+        bpath = Path(td) / "bindings.json"
+        bindings = {
+            "agent-1": {"queue_id": "q-dup", "registered_at": 1000,
+                        "registered_at_iso": _now_iso(), "pid": 1},
+            "agent-2": {"queue_id": "q-dup", "registered_at": 2000,
+                        "registered_at_iso": _now_iso(), "pid": 2},
+        }
+        bpath.parent.mkdir(parents=True, exist_ok=True)
+        bpath.write_text(json.dumps({"bindings": bindings}, indent=2) + "\n")
+        proj = _transcript_tree(Path(td))
+        _mk_transcript(proj, "agent-1")
+        _mk_transcript(proj, "agent-2")
+        old = os.environ.get("CLAUDE_PROJECTS_DIR")
+        os.environ["CLAUDE_PROJECTS_DIR"] = str(proj)
+        try:
+            args = _resolve_args(td, queue_id="q-dup")
+            aid = _resolve_queue_id_best("q-dup", args)
+            assert aid == "agent-2", aid  # newest live wins
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cmd_resolve(_resolve_args(td, queue_id="q-dup"))
+            assert rc == 0
+            assert buf.getvalue().strip() == "agent-2"
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROJECTS_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECTS_DIR"] = old
+    return True
+
+
+def test_resolve_multi_match_prunes_dead_picks_live():
+    """Two bindings, only the OLDER has a transcript: the live one wins even
+    though it's older -- dead newest is pruned (the bug-2 nested case where
+    a nested agent exited but the primary is still running)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        bpath = Path(td) / "bindings.json"
+        bindings = {
+            "agent-old-live": {"queue_id": "q-mix2", "registered_at": 1000,
+                               "registered_at_iso": _now_iso(), "pid": 1},
+            "agent-new-dead": {"queue_id": "q-mix2", "registered_at": 2000,
+                               "registered_at_iso": _now_iso(), "pid": 2},
+        }
+        bpath.parent.mkdir(parents=True, exist_ok=True)
+        bpath.write_text(json.dumps({"bindings": bindings}, indent=2) + "\n")
+        proj = _transcript_tree(Path(td))
+        _mk_transcript(proj, "agent-old-live")  # only this one is live
+        _mk_transcript(proj, "decoy")           # make tree walkable
+        old = os.environ.get("CLAUDE_PROJECTS_DIR")
+        os.environ["CLAUDE_PROJECTS_DIR"] = str(proj)
+        try:
+            args = _resolve_args(td, queue_id="q-mix2")
+            assert _resolve_queue_id_best("q-mix2", args) == "agent-old-live"
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROJECTS_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECTS_DIR"] = old
+    return True
+
+
+def test_resolve_all_lists_live_and_stale():
+    """resolve --all lists every match, marking live vs stale, never errors.
+
+    Liveness is now transcript-existence: agent-live has a transcript,
+    agent-stale does not (but the tree is walkable, so it's provably stale)."""
+    import tempfile
+    import io
+    from contextlib import redirect_stdout
+    with tempfile.TemporaryDirectory() as td:
+        bpath = Path(td) / "bindings.json"
+        bindings = {
+            "agent-live": {"queue_id": "q-mix", "registered_at": 2000,
+                           "registered_at_iso": _now_iso(), "pid": 1},
+            "agent-stale": {"queue_id": "q-mix", "registered_at": 1000,
+                            "registered_at_iso": _now_iso(), "pid": 2},
+        }
+        bpath.parent.mkdir(parents=True, exist_ok=True)
+        bpath.write_text(json.dumps({"bindings": bindings}, indent=2) + "\n")
+        proj = _transcript_tree(Path(td))
+        _mk_transcript(proj, "agent-live")
+        _mk_transcript(proj, "decoy")  # tree walkable -> agent-stale provably stale
+        old = os.environ.get("CLAUDE_PROJECTS_DIR")
+        os.environ["CLAUDE_PROJECTS_DIR"] = str(proj)
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cmd_resolve(_resolve_args(td, queue_id="q-mix",
+                                               all=True, json=True))
+            assert rc == 0
+            result = json.loads(buf.getvalue())
+            assert result["live"] == ["agent-live"], result
+            assert result["stale"] == ["agent-stale"], result
+            assert set(result["all"]) == {"agent-live", "agent-stale"}
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROJECTS_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECTS_DIR"] = old
     return True
 
 
@@ -3230,6 +3334,61 @@ def test_send_by_queue_id_happy():
     return True
 
 
+def test_send_by_queue_id_live_no_inbox_yet_resolves():
+    """BUG-1 repro: a live agent (transcript exists) that has NEVER been
+    messaged (no inbox file yet) must resolve + receive the send, which
+    CREATES the inbox. The old inbox-existence liveness check made this a
+    chicken-and-egg: resolution refused the agent before send could create
+    its inbox."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        _write_bindings(Path(td) / "bindings.json", {"agent-fresh": "q-fresh"})
+        proj = _transcript_tree(Path(td))
+        _mk_transcript(proj, "agent-fresh")  # alive: transcript exists
+        # Deliberately do NOT create any inbox file first.
+        inbox_path = Path(td) / "inbox" / "agent-fresh.json"
+        assert not inbox_path.exists()
+        old = os.environ.get("CLAUDE_PROJECTS_DIR")
+        os.environ["CLAUDE_PROJECTS_DIR"] = str(proj)
+        try:
+            # Resolution succeeds (transcript-liveness), not "NONE are live".
+            args = _resolve_args(td, queue_id="q-fresh")
+            assert _resolve_queue_id_best("q-fresh", args) == "agent-fresh"
+            # And the send goes through, creating the inbox.
+            rc = cmd_send(_resolve_args(td, queue_id="q-fresh",
+                                        text="correction", no_arm=True))
+            assert rc == 0
+            assert inbox_path.exists(), "send must create the inbox"
+            data = _load_inbox_messages(inbox_path)
+            assert [m["text"] for m in data] == ["correction"], data
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROJECTS_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECTS_DIR"] = old
+    return True
+
+
+def test_agent_is_live_default_open_no_projects_dir():
+    """When the projects tree doesn't exist (resolution impossible),
+    _agent_is_live defaults OPEN (returns True) -- better to deliver to a
+    maybe-dead inbox than refuse a live agent."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        nonexist = Path(td) / "does-not-exist"
+        old = os.environ.get("CLAUDE_PROJECTS_DIR")
+        os.environ["CLAUDE_PROJECTS_DIR"] = str(nonexist)
+        try:
+            assert _transcript_exists("agent-whatever") is None
+            assert _agent_is_live("agent-whatever") is True
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROJECTS_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECTS_DIR"] = old
+    return True
+
+
 def test_send_by_queue_id_zero_match_errors():
     """send --queue-id with no bound agent -> non-zero exit, nothing written."""
     import tempfile
@@ -3244,21 +3403,39 @@ def test_send_by_queue_id_zero_match_errors():
     return True
 
 
-def test_send_by_queue_id_multi_match_errors():
-    """send --queue-id with two live agents -> non-zero exit, no guess."""
+def test_send_by_queue_id_multi_match_delivers_to_newest_live():
+    """send --queue-id with two live agents -> delivers to the NEWEST live
+    one deterministically (the nested-agent / retry case), not an error."""
     import tempfile
     with tempfile.TemporaryDirectory() as td:
-        _write_bindings(Path(td) / "bindings.json",
-                        {"agent-1": "q-d", "agent-2": "q-d"})
-        cmd_send(_resolve_args(td, agent_id="agent-1", text="x", no_arm=True))
-        cmd_send(_resolve_args(td, agent_id="agent-2", text="x", no_arm=True))
-        rc = cmd_send(_resolve_args(td, queue_id="q-d", text="msg",
-                                    no_arm=True))
-        assert rc == 1
-        # Neither inbox grew beyond the seed.
-        for aid in ("agent-1", "agent-2"):
-            data = _load_inbox_messages(Path(td) / "inbox" / f"{aid}.json")
-            assert [m["text"] for m in data] == ["x"], aid
+        bpath = Path(td) / "bindings.json"
+        bindings = {
+            "agent-1": {"queue_id": "q-d", "registered_at": 1000,
+                        "registered_at_iso": _now_iso(), "pid": 1},
+            "agent-2": {"queue_id": "q-d", "registered_at": 2000,
+                        "registered_at_iso": _now_iso(), "pid": 2},
+        }
+        bpath.parent.mkdir(parents=True, exist_ok=True)
+        bpath.write_text(json.dumps({"bindings": bindings}, indent=2) + "\n")
+        proj = _transcript_tree(Path(td))
+        _mk_transcript(proj, "agent-1")
+        _mk_transcript(proj, "agent-2")
+        old = os.environ.get("CLAUDE_PROJECTS_DIR")
+        os.environ["CLAUDE_PROJECTS_DIR"] = str(proj)
+        try:
+            rc = cmd_send(_resolve_args(td, queue_id="q-d", text="msg",
+                                        no_arm=True))
+            assert rc == 0
+            # Only the newest (agent-2) received the message.
+            d2 = _load_inbox_messages(Path(td) / "inbox" / "agent-2.json")
+            assert [m["text"] for m in d2] == ["msg"], d2
+            p1 = Path(td) / "inbox" / "agent-1.json"
+            assert not p1.exists(), "older agent must not receive the message"
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PROJECTS_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECTS_DIR"] = old
     return True
 
 
@@ -3442,14 +3619,21 @@ def run_tests():
         ("resolve_happy_path", test_resolve_happy_path),
         ("resolve_zero_match_errors", test_resolve_zero_match_errors),
         ("resolve_dead_only_errors", test_resolve_dead_only_errors),
-        ("resolve_multi_match_errors", test_resolve_multi_match_errors),
+        ("agent_is_live_default_open_no_projects_dir",
+         test_agent_is_live_default_open_no_projects_dir),
+        ("resolve_multi_match_picks_newest_live",
+         test_resolve_multi_match_picks_newest_live),
+        ("resolve_multi_match_prunes_dead_picks_live",
+         test_resolve_multi_match_prunes_dead_picks_live),
         ("resolve_all_lists_live_and_stale",
          test_resolve_all_lists_live_and_stale),
         ("send_by_queue_id_happy", test_send_by_queue_id_happy),
+        ("send_by_queue_id_live_no_inbox_yet_resolves",
+         test_send_by_queue_id_live_no_inbox_yet_resolves),
         ("send_by_queue_id_zero_match_errors",
          test_send_by_queue_id_zero_match_errors),
-        ("send_by_queue_id_multi_match_errors",
-         test_send_by_queue_id_multi_match_errors),
+        ("send_by_queue_id_multi_match_delivers_to_newest_live",
+         test_send_by_queue_id_multi_match_delivers_to_newest_live),
         ("send_rejects_both_agent_and_queue_id",
          test_send_rejects_both_agent_and_queue_id),
         ("whoami_reverse_lookup", test_whoami_reverse_lookup),
@@ -3497,15 +3681,35 @@ def run_tests():
 # helpers resolve q-id -> agent-id(s) off the binding map, and `resolve`
 # / `send --queue-id` use them so the main loop never has to guess.
 #
-# "Live" definition: a bound agent is considered LIVE iff it still has an
-# inbox file on disk (~/.config/claude/agent-inbox/<agent_id>.json). The
-# inbox file is created by `arm` / the first `send` and removed by
-# `disarm` / `gc-dead`, so its presence is the most reliable in-process
-# signal that the agent is the one we should message. A binding whose
-# inbox file is gone is treated as a stale/dead binding and skipped. This
-# is intentionally conservative: messaging a dead agent is the failure we
-# are guarding against, so resolution that finds ZERO or MULTIPLE live
-# agents for a q-id ERRORS loudly rather than silently picking one.
+# "Live" definition: a bound agent is considered LIVE iff its Claude Code
+# TRANSCRIPT file exists on disk:
+#
+#     ~/.claude/projects/<slug>/<session>/subagents/agent-<agent_id>.jsonl
+#
+# (honoring CLAUDE_PROJECTS_DIR for tests). Every running subagent has a
+# transcript JSONL the harness appends to as it works, so its presence is
+# the authoritative "is this agent actually alive" signal -- independent
+# of whether the agent has ever been messaged.
+#
+# Why NOT inbox existence (the old definition): the inbox file is created
+# only by `arm` / the FIRST `send`. So `send --queue-id` -- which resolves
+# BEFORE it creates the inbox -- declared a live-but-never-messaged agent
+# DEAD and refused the send (a chicken-and-egg: can't message until messaged).
+# That was the operator-facing bug. Transcript-existence has no such cycle.
+#
+# Default-OPEN posture: if transcript resolution is impossible (no projects
+# dir, walk error, etc.) a binding is treated as LIVE. Delivering to a
+# maybe-dead agent's inbox is harmless (it never reads it); REFUSING to
+# message a genuinely-live agent is the real failure. This inverts the old
+# overly-conservative posture on purpose.
+#
+# Resolution is DETERMINISTIC: among bindings for a q-id, prune the dead
+# (by transcript-liveness), then if MULTIPLE live remain pick the
+# MOST-RECENTLY-REGISTERED (newest `registered_at` wins). The nested-agent
+# case (a sub-subagent inheriting the parent's "Queue item:" marker binds a
+# second agent-id to the same q-id) thus resolves to the newest actively
+# running agent rather than erroring. Resolution ERRORS only when ZERO
+# bindings exist for the q-id at all.
 # ----------------------------------------------------------------------
 
 
@@ -3553,12 +3757,87 @@ def _read_bindings(args=None) -> dict:
     return bindings
 
 
-def _agent_is_live(agent_id: str, args=None) -> bool:
-    """An agent is LIVE iff it still has an inbox file on disk."""
+def _projects_dir() -> Path:
+    """Claude Code projects dir holding subagent transcripts.
+
+    Honors CLAUDE_PROJECTS_DIR (used by tests + agent-tail) so the
+    transcript-liveness check can be exercised against a sandbox tree.
+    """
+    override = os.environ.get("CLAUDE_PROJECTS_DIR", "").strip()
+    if override:
+        return Path(os.path.expanduser(override))
+    return Path.home() / ".claude" / "projects"
+
+
+def _transcript_exists(agent_id: str) -> bool | None:
+    """Does a transcript JSONL exist for ``agent_id``?
+
+    Returns:
+      * True  -- a transcript file exists at
+                 <projects>/<slug>/<session>/subagents/agent-<id>.jsonl
+      * False -- the projects tree was walkable but no transcript matched
+      * None  -- resolution was impossible (no projects dir, walk error);
+                 the caller should treat this as "unknown" and DEFAULT OPEN.
+
+    Mirrors agent-tail's transcript layout / resolution. Accepts an id with
+    or without the ``agent-`` prefix.
+    """
+    base = _projects_dir()
     try:
-        return _inbox_path(agent_id, args).exists()
+        if not base.is_dir():
+            return None
     except OSError:
-        return False
+        return None
+
+    needle = agent_id.strip()
+    if needle.startswith("agent-"):
+        needle = needle[len("agent-"):]
+    target = f"agent-{needle}.jsonl"
+
+    walked_any = False
+    try:
+        for project_entry in base.iterdir():
+            if not project_entry.is_dir():
+                continue
+            for session_entry in project_entry.iterdir():
+                if not session_entry.is_dir():
+                    continue
+                subagents = session_entry / "subagents"
+                if not subagents.is_dir():
+                    continue
+                walked_any = True
+                try:
+                    children = list(subagents.iterdir())
+                except OSError:
+                    continue
+                for child in children:
+                    if child.name == target and child.is_file():
+                        return True
+    except OSError:
+        return None
+
+    # Tree existed and was walkable but no transcript matched. If we never
+    # even found a subagents/ dir to walk, treat as unknown (default-open)
+    # rather than a definitive "dead" -- the layout may differ.
+    if not walked_any:
+        return None
+    return False
+
+
+def _agent_is_live(agent_id: str, args=None) -> bool:
+    """An agent is LIVE iff its transcript JSONL exists on disk.
+
+    DEFAULT-OPEN: if transcript resolution is impossible (None -- no
+    projects dir, walk error, no subagents/ dir to inspect) the agent is
+    treated as LIVE. Refusing to message a genuinely-live agent is the
+    real operator-facing failure; delivering to a maybe-dead agent's inbox
+    is harmless. ``args`` is accepted for signature compatibility / future
+    overrides but the transcript layout is global (CLAUDE_PROJECTS_DIR).
+    """
+    res = _transcript_exists(agent_id)
+    if res is None:
+        return True  # unknown -> default open
+    return res
 
 
 def _resolve_queue_id(queue_id: str, args=None,
@@ -3566,35 +3845,50 @@ def _resolve_queue_id(queue_id: str, args=None,
     """Resolve a queue id to bound agent ids.
 
     Returns (live, all) where:
-      * ``all``  = every agent_id whose binding's queue_id == queue_id
-      * ``live`` = the subset whose inbox file still exists on disk
+      * ``all``  = every agent_id whose binding's queue_id == queue_id,
+                   sorted NEWEST-REGISTERED-FIRST (by ``registered_at``)
+      * ``live`` = the subset whose transcript JSONL exists on disk
+                   (default-open: an un-resolvable transcript counts live),
+                   preserving the newest-first order.
 
-    When ``live_only`` is False the caller wants the raw set (used by
-    resolve --all for diagnostics). Resolution + send always operate on
-    ``live`` and ERROR on a non-unique result.
+    Newest-first ordering means a deterministic ``best`` pick (the newest
+    live agent) falls out of ``live[0]``. When ``live_only`` is False the
+    caller wants the raw set (used by resolve --all for diagnostics).
     """
     bindings = _read_bindings(args)
-    matched = []
+    matched = []  # (registered_at, agent_id)
     for agent_id, rec in bindings.items():
         if not isinstance(rec, dict):
             continue
         if rec.get("queue_id") == queue_id:
-            matched.append(agent_id)
-    matched.sort()
+            ra = rec.get("registered_at")
+            ra = ra if isinstance(ra, (int, float)) else 0
+            matched.append((ra, agent_id))
+    # Newest registration first; tie-break on agent_id for determinism.
+    matched.sort(key=lambda t: (-t[0], t[1]))
+    ordered = [aid for (_, aid) in matched]
     if not live_only:
-        return list(matched), list(matched)
-    live = [a for a in matched if _agent_is_live(a, args)]
-    return live, matched
+        return list(ordered), list(ordered)
+    live = [a for a in ordered if _agent_is_live(a, args)]
+    return live, ordered
 
 
-def _resolve_queue_id_unique(queue_id: str, args=None) -> str:
-    """Resolve a q-id to EXACTLY ONE live agent id, or raise ValueError.
+def _resolve_queue_id_best(queue_id: str, args=None) -> str:
+    """Resolve a q-id to the BEST single agent id, or raise ValueError.
 
-    LOUD failure on zero/multiple so a misroute is structurally impossible.
+    Deterministic: among bindings for the q-id, the dead are pruned (by
+    transcript-liveness) and the NEWEST-REGISTERED live agent is chosen.
+    The nested-agent case (a second agent-id bound to the same q-id because
+    a sub-subagent inherited the parent's "Queue item:" marker) resolves to
+    whichever is most recently registered -- the right correction target.
+
+    ERRORS only when ZERO bindings exist for the q-id at all. If bindings
+    exist but every one is provably dead (transcript gone), the newest
+    binding is still returned (default-toward-delivery) rather than refusing
+    -- delivering to a dead agent's inbox is harmless; refusing a live one
+    is the failure we are guarding against.
     """
     live, matched = _resolve_queue_id(queue_id, args)
-    if len(live) == 1:
-        return live[0]
     if not matched:
         raise ValueError(
             f"no binding found for queue id {queue_id!r} "
@@ -3602,27 +3896,30 @@ def _resolve_queue_id_unique(queue_id: str, args=None) -> str:
             f"agent was spawned without a 'Queue item:' marker / before "
             f"the arm hook ran)"
         )
-    if not live:
-        raise ValueError(
-            f"queue id {queue_id!r} resolves to {len(matched)} bound "
-            f"agent(s) but NONE are live (no inbox on disk): "
-            f"{matched!r} -- the agent(s) likely already exited; refusing "
-            f"to message a dead agent"
-        )
-    raise ValueError(
-        f"queue id {queue_id!r} resolves to MULTIPLE live agents "
-        f"{live!r} (e.g. a retry spawned a second agent on the same "
-        f"q-id) -- refusing to guess which to message. Disambiguate "
-        f"with an explicit agent id: agent-msg send <agent-id> <text>"
-    )
+    if live:
+        return live[0]  # newest live (matched is newest-first)
+    # No provably-live agent, but bindings exist: deliver to the newest
+    # binding anyway (harmless if dead; correct if our liveness check was a
+    # false-negative). matched is newest-first.
+    return matched[0]
+
+
+# Back-compat alias: historic callers / tests referenced _resolve_queue_id_unique.
+# It is no longer "unique" (we pick deterministically rather than erroring on
+# multiple), but keep the name pointing at the best-resolver so old call sites
+# continue to work.
+def _resolve_queue_id_unique(queue_id: str, args=None) -> str:
+    return _resolve_queue_id_best(queue_id, args)
 
 
 def cmd_resolve(args) -> int:
-    """Print the live agent id(s) bound to a queue id.
+    """Print the best agent id bound to a queue id.
 
-    Default: requires EXACTLY ONE live agent and prints just that id
-    (so it composes in scripts / command substitution). --all prints all
-    matches (live + stale) for diagnostics and never errors on count.
+    Default: resolves deterministically (newest-registered live agent, by
+    transcript-liveness) and prints just that id (so it composes in scripts /
+    command substitution); errors only when ZERO agents are bound. --all
+    prints all matches (live + stale) for diagnostics and never errors on
+    count.
     """
     queue_id = args.queue_id
     show_all = bool(getattr(args, "all", False))

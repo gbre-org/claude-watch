@@ -112,14 +112,31 @@ The `PostToolUse:Agent` arm hook
 `agent-msg send --queue-id <q-id> <text>` resolves then delivers in one
 step (auto-arming like a normal `send`). So the main loop never guesses.
 
-**"Live" definition + loud failure.** A bound agent is LIVE iff it still
-has an inbox file on disk (`~/.config/claude/agent-inbox/<agent_id>.json`,
-created by `arm`/first `send`, removed by `disarm`/`gc-dead`). `resolve`
-and `send --queue-id` require EXACTLY ONE live agent and **error
-(non-zero exit) on zero or multiple** — a retry that spawned a second
-agent on the same q-id, or a q-id whose agent already exited, is a
-loud failure, never a silent pick. `resolve --all` lists every match
-(live + stale) for diagnostics and never errors on count.
+**"Live" definition + deterministic resolution.** A bound agent is LIVE
+iff its Claude Code **transcript JSONL** exists on disk
+(`~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl`, honoring
+`CLAUDE_PROJECTS_DIR`). Every running subagent has a transcript the harness
+appends to, so its presence is the authoritative liveness signal —
+independent of whether the agent has ever been messaged.
+
+> *Why not inbox-existence (the old definition)?* The inbox is created only
+> by `arm`/first `send`, so `send --queue-id` — which resolves BEFORE it
+> creates the inbox — used to declare a live-but-never-messaged agent DEAD
+> and refuse the send (a chicken-and-egg). Transcript-existence has no such
+> cycle. **Default-OPEN:** if transcript resolution is impossible (no
+> projects dir / walk error) the binding is treated as LIVE — refusing a
+> genuinely-live agent is the real failure; delivering to a maybe-dead
+> inbox is harmless.
+
+`resolve` and `send --queue-id` resolve **deterministically**: among
+bindings for a q-id, prune the dead (by transcript-liveness), then if
+multiple live remain pick the **most-recently-registered** (newest
+`registered_at` wins). The nested-agent case — a sub-subagent inheriting
+the parent's `Queue item:` marker binds a second agent-id to the same q-id
+— thus resolves to the newest actively running agent instead of erroring.
+Resolution **errors only when ZERO bindings exist** for the q-id at all.
+`resolve --all` lists every match (live + stale) for diagnostics and never
+errors on count.
 
 The binding map is read defensively everywhere (`agent-msg` and the
 `subagent_queue_item_running` predicate): a missing / empty / truncated /
