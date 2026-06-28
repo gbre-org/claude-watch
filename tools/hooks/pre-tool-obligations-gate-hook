@@ -727,13 +727,26 @@ def main() -> int:
     tool_input = payload.get("tool_input", {})
     cmd_str = _short_command_string(tool_input, tool_name)
 
-    # Per Claude Code's hook contract, `agent_id` appears ONLY when the tool
-    # call originates from inside a subagent. Forward it to the obligations
-    # CLI so the `is_main_loop` predicate (and any `all_of` containing it)
-    # can branch on subagent vs main-loop context. Defensive: coerce
-    # non-string / missing to "".
+    # Main-loop-vs-subagent detection. As of Claude Code 2.1.x the main loop
+    # runs as a first-class agent that ALSO carries a non-empty `agent_id`
+    # (the fork/teammate architecture), so `agent_id`-presence alone no longer
+    # distinguishes main loop from subagent -- it falsely attributed the MAIN
+    # LOOP a subagent context, which made `is_main_loop` return False for the
+    # dispatcher and tripped `subagent_queue_mutating_banned` on the main
+    # loop's own `session-task queue done` calls.
+    #
+    # The authoritative signal is `agent_type`: it starts with
+    # `repl_main_thread` (or is `sdk`) for the main loop, and starts with
+    # `agent:` (or is `hook_agent`) for a spawned subagent. We forward BOTH
+    # fields to the obligations CLI; the CLI's `_is_subagent_context` keys on
+    # `agent_type` (primary) and falls back to the `agent_id`-presence
+    # heuristic only when `agent_type` is absent (older Claude Code).
+    # Defensive: coerce non-string / missing to "".
     raw_agent_id = payload.get("agent_id", "")
     agent_id = raw_agent_id.strip() if isinstance(raw_agent_id, str) else ""
+    raw_agent_type = payload.get("agent_type", "")
+    agent_type = (raw_agent_type.strip()
+                  if isinstance(raw_agent_type, str) else "")
 
     # Emergency bypass via env-var prefix. Requires BOTH
     # ``OBLIGATIONS_BYPASS=1`` AND a non-empty ``OBLIGATIONS_BYPASS_REASON``.
@@ -829,6 +842,7 @@ def main() -> int:
             [cli, "check", "--tool", tool_name,
              "--command-string", cmd_str,
              "--agent-id", agent_id,
+             "--agent-type", agent_type,
              "--json"],
             capture_output=True, text=True, timeout=4, check=False,
         )

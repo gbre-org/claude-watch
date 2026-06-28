@@ -40,6 +40,9 @@ Test cases (PreToolUse):
  31. is_main_loop predicate alone: main-loop (no agent_id) -> allow
  32. is_main_loop predicate alone: subagent (agent_id present) -> deny
  32b. is_main_loop predicate: empty-string agent_id -> allow (treated as main loop)
+ 32c. is_main_loop: main-loop agent_type + non-empty agent_id -> allow (agent_type authoritative; regression guard)
+ 32d. is_main_loop: agent_type='sdk' -> allow
+ 32e. is_main_loop: subagent agent_type ('agent:...') -> deny (gating preserved)
  33. is_main_loop {negate: true} alone: subagent -> allow, main-loop -> deny
  34. all_of [is_main_loop, file_exists(missing)]: subagent -> ALLOW (scope-guard skip)
  35. all_of [is_main_loop, file_exists(missing)]: main-loop -> deny (file_exists fails, no skip)
@@ -138,6 +141,8 @@ Test cases (PreToolUse):
 310-31x. subagent_queue_mutating_banned: subagent read-only subcmd -> allow
 320. subagent_queue_mutating_banned: subagent `register` -> allow (recovery)
 321. subagent_queue_mutating_banned: main-loop mutating subcmd -> allow (scope-guard)
+321b. subagent_queue_mutating_banned: MAIN-LOOP `queue done` w/ non-empty agent_id + repl_main_thread agent_type -> allow (regression guard for gate-attribution bug)
+321c. subagent_queue_mutating_banned: subagent `queue done` w/ agent:* agent_type -> deny (gating preserved)
 322-327. subagent_queue_mutating_banned: path-prefix/whitespace/non-Bash/empty/non-session-task edge cases
 124. end-to-end: arm-hook -> bind -> queue=running allow -> queue=done deny
 125. evaluator (exit_code): cmd returns 0 -> allow
@@ -1308,6 +1313,66 @@ def main() -> int:
         results.append(_check(
             "32b. is_main_loop + agent_id='' -> allow (treated as main loop)",
             rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 32c: REGRESSION GUARD (gate-attribution bug) ----------
+        # Claude Code 2.1.x runs the MAIN LOOP as a first-class agent that
+        # ALSO carries a non-empty `agent_id` (fork/teammate architecture),
+        # while `agent_type` starts with `repl_main_thread`. The old
+        # detection ("non-empty agent_id => subagent") MISFIRED here: it
+        # attributed the main loop a subagent context, so `is_main_loop`
+        # FAILED and main-loop tool calls got DENIED. With the fix, the
+        # authoritative `agent_type` signal classifies this as main loop
+        # -> ALLOW even though `agent_id` is non-empty.
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "a3031d61453b49849",       # main loop HAS an id now
+                "agent_type": "repl_main_thread",       # ...but type says main
+            },
+            env,
+        )
+        results.append(_check(
+            "32c. is_main_loop + main-loop agent_type + non-empty agent_id "
+            "-> allow (agent_type authoritative; regression guard)",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 32d: `sdk` agent_type also classifies as main loop ----
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "a3031d61453b49849",
+                "agent_type": "sdk",
+            },
+            env,
+        )
+        results.append(_check(
+            "32d. is_main_loop + agent_type='sdk' -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 32e: genuine subagent (agent_type='agent:...') -> deny -
+        # Subagent gating is PRESERVED: a real subagent reports an
+        # `agent:<id>` agent_type and must still fail is_main_loop (DENY).
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "a3031d61453b49849",
+                "agent_type": "agent:general-purpose",
+            },
+            env,
+        )
+        results.append(_check(
+            "32e. is_main_loop + subagent agent_type -> deny "
+            "(subagent gating preserved)",
+            rc == 0 and _is_deny(out),
             f"rc={rc} out={out}",
         ))
         _run([str(CLI), "satisfy", ob_iml], env)
@@ -4911,6 +4976,55 @@ def main() -> int:
                 "321. subagent_queue_mutating_banned: MAIN-LOOP `queue add` "
                 "-> ALLOW (is_main_loop scope-guard skip)",
                 rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 321b: REGRESSION GUARD (the gate-attribution bug) --------
+            # The PRODUCTION symptom: in Claude Code 2.1.x the MAIN LOOP
+            # carries a non-empty `agent_id` (fork/teammate architecture) AND
+            # an `agent_type` of `repl_main_thread`. With the old "non-empty
+            # agent_id => subagent" detection the all_of's is_main_loop guard
+            # FAILED for the main loop, so `subagent_queue_mutating_banned`
+            # DENIED the dispatcher's own `session-task queue done` -- forcing
+            # a per-close `obligations override`. The fix keys on `agent_type`
+            # (authoritative), so this main-loop close is ALLOWED.
+            def _main_payload_with_id(command):
+                return {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                    "agent_id": "a3031d61453b49849",   # main loop now has one
+                    "agent_type": "repl_main_thread",   # ...but type = main
+                }
+
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre(
+                _main_payload_with_id("session-task queue done q-2026-06-28-7ceb"),
+                env_sqmb)
+            results.append(_check(
+                "321b. subagent_queue_mutating_banned: MAIN-LOOP `queue done` "
+                "with non-empty agent_id + repl_main_thread agent_type -> "
+                "ALLOW (regression guard for gate-attribution bug)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_sqmb)
+
+            # --- 321c: genuine subagent (agent_type='agent:...') doing a
+            #           mutating subcmd -> still DENY. Confirms the fix does
+            #           NOT weaken subagent gating: the authoritative
+            #           agent_type marks this a subagent end-to-end. ---
+            ob = _add_sqmb_ob()
+            rc, out, _err = _hook_pre({
+                "tool_name": "Bash",
+                "tool_input": {"command": "session-task queue done q-x"},
+                "agent_id": "a3031d61453b49849",
+                "agent_type": "agent:general-purpose",
+            }, env_sqmb)
+            results.append(_check(
+                "321c. subagent_queue_mutating_banned: subagent `queue done` "
+                "with agent:* agent_type -> DENY (gating preserved)",
+                rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
             _run([str(CLI), "satisfy", ob], env_sqmb)

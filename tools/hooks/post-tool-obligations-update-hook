@@ -309,8 +309,15 @@ def main() -> int:
     # the obligations CLI so the `is_main_loop` predicate (in `all_of`
     # compositions or standalone) can branch on context, e.g. inform-mode
     # `all_of [is_main_loop, X]` obligations stay silent inside subagents.
+    # `agent_type` is the AUTHORITATIVE main-loop-vs-subagent signal (the
+    # main loop now also carries a non-empty `agent_id`); `agent_id` is a
+    # legacy fallback for older Claude Code. See the PreToolUse hook + the
+    # CLI's `_is_subagent_context` for the full rationale.
     raw_agent_id = payload.get("agent_id", "")
     agent_id = raw_agent_id.strip() if isinstance(raw_agent_id, str) else ""
+    raw_agent_type = payload.get("agent_type", "")
+    agent_type = (raw_agent_type.strip()
+                  if isinstance(raw_agent_type, str) else "")
 
     # Manage the watcher-output-pending sidecars BEFORE running the
     # obligations CLI. These two helpers are best-effort no-ops when the
@@ -339,7 +346,8 @@ def main() -> int:
         proc = subprocess.run(
             [cli, "post-tool", "--tool", tool_name,
              "--command-string", cmd_str,
-             "--agent-id", agent_id],
+             "--agent-id", agent_id,
+             "--agent-type", agent_type],
             capture_output=True, text=True, timeout=5, check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
