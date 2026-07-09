@@ -40,6 +40,9 @@ Exempt commands (never count toward the N-counter, never denied):
   - ``obligations``                    (inspection / override)
   - ``claude-watch-ack`` / ``claude-watch-dispatch``  (alert surface)
   - ``agent-msg`` / ``agent-tail``     (subagent IPC surface)
+  - ``botchat-*``                      (operator DM channel: send/
+    unread-check/history/show/wait -- reading + replying is loop
+    bookkeeping, same role as agent-msg)
   - ``signal-history`` / ``signal-ack`` / ``signal-mark-read``
     (so the LLM can investigate Signal state without being blocked
     by an unrelated actionable event; Signal-DM ack-gating lives on
@@ -90,6 +93,16 @@ _EXEMPT_PATTERNS = [
     r"signal-history(\s|$)",
     r"signal-ack(\s|$)",
     r"signal-mark-read(\s|$)",
+    # botchat comms surface (operator DM channel). Reading / clearing botchat
+    # is loop bookkeeping -- the same role agent-msg/signal play -- so it must
+    # not count against the event-must-act counter. Includes the read/inspect
+    # verbs (history/show/unread-check/wait) AND botchat-send (the reply +
+    # mark-read/ack verb): responding to the operator IS handling the event.
+    r"botchat-send(\s|$)",
+    r"botchat-unread-check(\s|$)",
+    r"botchat-history(\s|$)",
+    r"botchat-show(\s|$)",
+    r"botchat-wait(\s|$)",
     r"/opt/claude-container/watchers/",
 ]
 _EXEMPT_RE = re.compile(
@@ -385,12 +398,26 @@ def _self_test() -> int:
         if evaluate("rm -rf /tmp/foo") != 0:
             fail("malformed pending should ALLOW (default-open)")
 
+    # Case 11: botchat comms surface is exempt (operator DM channel) even at
+    # high counter -- reading + replying to the operator is loop bookkeeping.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=["k1"], counter=99)
+        for c in (
+            "botchat-unread-check --ids",
+            "botchat-history --limit 5",
+            "botchat-show 1132",
+            "botchat-wait --timeout 60",
+            "botchat-send --mark-read 1132 --ack 1132",
+        ):
+            if evaluate(c) != 0:
+                fail(f"botchat command must be exempt: {c!r}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("OK: 10 cases pass.")
+    print("OK: 11 cases pass.")
     return 0
 
 
