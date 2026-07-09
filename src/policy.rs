@@ -921,12 +921,17 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
     // permanent permission-bypass mode. The harness's own gates
     // (obligations, queue, etc.) provide finer-grained safety than
     // per-tool prompts.
+    // Resolve `claude` to an absolute path so the relaunch survives a
+    // stripped-PATH pane shell (a fresh non-login `-sh` after /exit may not
+    // have the npm-global/native-install bin dir on $PATH). See
+    // `resolve_claude_bin` for the failure mode this guards against.
+    let claude_bin = resolve_claude_bin();
     let launch = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "restarting Claude Code with --resume");
-        format!("claude --dangerously-skip-permissions --resume {}", sid)
+        format!("{} --dangerously-skip-permissions --resume {}", claude_bin, sid)
     } else {
         info!("restarting Claude Code with --continue (no session ID found)");
-        "claude --dangerously-skip-permissions --continue".to_string()
+        format!("{} --dangerously-skip-permissions --continue", claude_bin)
     };
 
     // Write relaunch script. Ensure its parent dir exists first: the
@@ -2596,8 +2601,9 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
 ///   - `--setting-sources project,local --settings <CLAUDE_SHIM_SETTINGS_PATH>`
 ///     when `CLAUDE_SHIM_SETTINGS_PATH` is set (drops the host user tier and
 ///     loads the MCP-settings shim). On the host this env var is unset, so
-///     the flags are omitted and we degrade to bare `claude` — the previous
-///     behavior.
+///     the flags are omitted. The leading `claude` token itself is resolved
+///     to an absolute path via `resolve_claude_bin` (see its doc comment)
+///     so the relaunch does not depend on `$PATH` in the pane shell.
 ///   - `--plugin-dir /opt/claude-container/plugin` when that plugin dir
 ///     exists (baked container skills + agents). Absent on the host.
 ///   - `--dangerously-skip-permissions` always (harness-managed instances
@@ -2605,9 +2611,58 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
 ///   - `--resume <sid>` when a session id was captured, else `--continue`
 ///     (the resume / continue selector the caller already computed).
 ///
+/// Resolve the `claude` binary to an ABSOLUTE path for relaunch/restart argv.
+///
+/// Both the auto-update relaunch (`build_relaunch_claude_argv`) and the
+/// crash-recovery restart (`restart_claude`) inject a shell command that
+/// launches `claude` into the pane. Historically both used the BARE name
+/// `claude`, relying on it being on `$PATH` in the pane shell at exec time.
+///
+/// That assumption is fragile. After a self-upgrade `/exit`, the relaunch
+/// one-liner can run in a fresh NON-login `/bin/sh` (`-sh`) that did NOT
+/// inherit the tmux-server env — its `$PATH` is the bare default and does
+/// NOT include the npm-global / native-install bin dir where `claude` lives.
+/// The bare `claude` then dies with `sh: 1: claude: not found`, leaving a
+/// DEAD pane and forcing the operator to manually rebuild (operator-observed
+/// self-upgrade relaunch failure).
+///
+/// Resolving to an absolute path at build time — in the daemon, which either
+/// has the correct env `$PATH` or can probe the known install locations —
+/// removes the `$PATH` dependency entirely. Tries, in order, the first that
+/// exists:
+///   1. `$CLAUDE_BIN` (operator override / test hook) when set + non-empty,
+///   2. `$HOME/.local/bin/claude` (native-install target; highest precedence
+///      in the container's baked `ENV PATH`),
+///   3. `$HOME/.npm-global/bin/claude` (baked npm-global install),
+///   4. `/usr/bin/claude` (the image symlink),
+///   5. bare `"claude"` fallback — preserves prior behavior on the host or an
+///      unknown layout so nothing regresses off-container.
+///
+/// Pure modulo env + filesystem existence checks; no I/O side effects.
+fn resolve_claude_bin() -> String {
+    if let Ok(bin) = std::env::var("CLAUDE_BIN") {
+        if !bin.is_empty() {
+            return bin;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        for rel in [".local/bin/claude", ".npm-global/bin/claude"] {
+            let p = std::path::Path::new(&home).join(rel);
+            if p.exists() {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+    }
+    if std::path::Path::new("/usr/bin/claude").exists() {
+        return "/usr/bin/claude".to_string();
+    }
+    // Host / unknown layout: fall back to bare name (prior behavior).
+    "claude".to_string()
+}
+
 /// Pure modulo env + a filesystem existence check; no I/O side effects.
 fn build_relaunch_claude_argv(session_id: Option<&str>) -> String {
-    let mut cmd = String::from("claude");
+    let mut cmd = resolve_claude_bin();
     if let Ok(shim) = std::env::var("CLAUDE_SHIM_SETTINGS_PATH") {
         if !shim.is_empty() {
             cmd.push_str(" --setting-sources project,local --settings ");
@@ -8820,7 +8875,16 @@ pane_unchanged_secs = 600
     #[test]
     fn relaunch_argv_always_skips_permissions_and_continues() {
         let cmd = build_relaunch_claude_argv(None);
-        assert!(cmd.starts_with("claude"), "argv must start with claude: {cmd}");
+        // The leading token is now `resolve_claude_bin()` — either a bare
+        // `claude` (host / unknown layout) or an absolute path ending in
+        // `/claude` (container). Assert it references a claude binary rather
+        // than a fixed literal, so the test is stable regardless of which
+        // install locations happen to exist on the test host.
+        let first = cmd.split_whitespace().next().unwrap_or("");
+        assert!(
+            first == "claude" || first.ends_with("/claude"),
+            "argv must start with a claude binary token: {cmd}"
+        );
         assert!(
             cmd.contains("--dangerously-skip-permissions"),
             "harness-managed relaunch must skip permissions: {cmd}"
@@ -8830,6 +8894,51 @@ pane_unchanged_secs = 600
             "no session id => --continue: {cmd}"
         );
         assert!(!cmd.contains("--resume"), "no session id => no --resume: {cmd}");
+    }
+
+    // -------------------------------------------------------------------
+    // resolve_claude_bin — absolute-path resolution for the relaunch argv.
+    //
+    // The env-override branch is deterministic + testable; the
+    // filesystem-probe branches depend on which install locations exist on
+    // the host, so we only assert the override precedence and the bare
+    // fallback here. These mutate process env, so they are NOT parallel-safe
+    // with each other under a shared-process runner — nextest isolates each
+    // test in its own process; under `cargo test` they still pass because
+    // each set/removes CLAUDE_BIN within its own body and no OTHER test reads
+    // it. Kept in one #[test] to avoid cross-test env races on `cargo test`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn resolve_claude_bin_honors_env_override_else_falls_back() {
+        // (a) explicit override wins.
+        std::env::set_var("CLAUDE_BIN", "/opt/custom/claude");
+        assert_eq!(resolve_claude_bin(), "/opt/custom/claude");
+
+        // (b) empty override is ignored (treated as unset).
+        std::env::set_var("CLAUDE_BIN", "");
+        let resolved = resolve_claude_bin();
+        assert!(
+            resolved == "claude" || resolved.ends_with("/claude"),
+            "empty override => probe result (bare or absolute): {resolved}"
+        );
+
+        std::env::remove_var("CLAUDE_BIN");
+    }
+
+    #[test]
+    fn relaunch_argv_uses_resolved_absolute_bin_when_env_set() {
+        std::env::set_var("CLAUDE_BIN", "/opt/custom/claude");
+        let cmd = build_relaunch_claude_argv(None);
+        assert!(
+            cmd.starts_with("/opt/custom/claude "),
+            "argv must lead with the resolved absolute bin: {cmd}"
+        );
+        assert!(
+            cmd.contains("--dangerously-skip-permissions") && cmd.trim_end().ends_with("--continue"),
+            "flag logic must be unchanged by the bin swap: {cmd}"
+        );
+        std::env::remove_var("CLAUDE_BIN");
     }
 
     #[test]
