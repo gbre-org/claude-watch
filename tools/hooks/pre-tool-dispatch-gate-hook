@@ -218,6 +218,16 @@ _BAKED_BASH_EXEMPT_PATTERNS = [
     r"^/usr/local/bin/event-ack(?:\s|$)",
     r"^event-classify(?:\s|$)",
     r"^/usr/local/bin/event-classify(?:\s|$)",
+    # botchat comms surface (operator DM channel). Reading + replying to the
+    # operator's botchat messages is dispatcher bookkeeping (the same role the
+    # agent-msg inbox/ack + event-ack surface plays), not an inline worker
+    # chain, so it must not count against the consecutive-non-exempt counter.
+    # Covers the read/inspect verbs (history/show/unread-check/wait) AND
+    # botchat-send (reply + mark-read/ack). Matches bare + PATH-resolved and
+    # (for host-side clones) the ~/repos/botchat/bin/ absolute form.
+    r"^botchat-(?:send|unread-check|history|show|wait)(?:\s|$)",
+    r"^/usr/local/bin/botchat-(?:send|unread-check|history|show|wait)(?:\s|$)",
+    r"^\S*/botchat/bin/botchat-(?:send|unread-check|history|show|wait)(?:\s|$)",
     # Heartbeat-liveness touch. claude-watch injects a `touch
     # /var/run/claude/[claude-]heartbeat` instruction to prove loop
     # liveness; that single-command self-service touch is dispatcher
