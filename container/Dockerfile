@@ -1,20 +1,33 @@
+# syntax=docker/dockerfile:1
 # claude-container — Phase 1b image
 #
-# This Dockerfile uses ONLY plain (non-BuildKit-specific) instructions — no
-# `RUN --mount=...` and no `# syntax=docker/...` directive, so it builds
-# identically under the legacy builder and BuildKit.  PR #433 added a
-# `--mount=type=cache,target=/home/hndrewaall/.npm,...` to the npm-install
-# layer to reuse npm's download cache across builds; that BROKE the build (npm
-# skipped fetching the ~230MB native optional dependency under the cache mount
-# — see the npm-install layer below for the full root cause) and was reverted.
-# The Makefile still exports DOCKER_BUILDKIT=1, which is harmless (BuildKit is
-# the default builder in Docker 23+ anyway).
+# This Dockerfile uses BuildKit `RUN --mount=type=cache` in ONE place: the
+# claude-watch-builder stage's `cargo build --release` (see Stage 1 below),
+# to persist Cargo's crate registry + the crate `target/` dir across image
+# builds so a rebuild recompiles only what changed instead of the whole
+# dependency tree + LTO link from cold every time.  The `# syntax` directive
+# above pins the BuildKit frontend so the cache-mount syntax is understood;
+# the Makefile targets already export DOCKER_BUILDKIT=1 (BuildKit is the
+# default builder in Docker 23+ anyway).  EVERY OTHER layer stays plain.
+#
+# The cargo cache mount is DISTINCT from the npm one that was reverted: PR
+# #433 added `--mount=type=cache,target=/home/hndrewaall/.npm,...` to the
+# npm-install layer and it BROKE the build — npm skipped fetching the ~230MB
+# native optional dependency under a cache mount (see the npm-install layer
+# below for the full root cause).  That failure is npm-specific (optional-dep
+# resolution vs. a cache-backed dir); Cargo has no equivalent behaviour — a
+# registry + target cache mount is the canonical, well-proven way to speed up
+# cargo-in-Docker, so the npm revert does NOT generalise to forbidding all
+# cache mounts.  The cargo mount is scoped to the builder stage and cannot
+# affect the runtime image (the binary is copied OUT of the mount to a stable
+# path in the SAME RUN, then COPYd across — see Stage 1).
 #
 # Multi-stage build:
 #   Stage 1 ("claude-watch-builder"): rust:1-bookworm. COPYs the
 #     claude-watch source from the build context (the repo root the
 #     wrapper invokes `docker build` with) and runs cargo build
-#     --release. Output: /build/target/release/claude-watch.
+#     --release with BuildKit cargo cache mounts. Output: the binary is
+#     copied out of the cache-mounted target dir to /build/claude-watch.
 #   Stage 2 (final): debian:bookworm-slim, same as Phase 0b. Copies the
 #     built binary from stage 1 into /usr/local/bin/claude-watch.
 #
@@ -71,8 +84,32 @@ COPY . /build
 
 # claude-watch's Cargo.toml has `profile.release = { strip = true, lto = true }`,
 # so the resulting binary is already stripped + LTO-optimised.
-RUN cargo build --release \
-    && /build/target/release/claude-watch --help >/dev/null
+#
+# BuildKit cache mounts persist Cargo's crate registry + the crate `target/`
+# dir across image builds. Without them every `make container-build` recompiles
+# the entire dependency tree AND redoes the (expensive) release LTO link from
+# cold, because `.dockerignore` prunes `target/` from the build context and the
+# base `rust:1-bookworm` image ships no populated registry. With them, a rebuild
+# after a source edit recompiles only the changed crate(s) + relinks — the
+# dependency compilation is reused from cache.
+#
+# IMPORTANT: a `type=cache` mount is UNMOUNTED when the RUN finishes, so
+# `/build/target` (the mount target) is empty in the resulting layer — the
+# later `COPY --from=claude-watch-builder ...` could not see the binary there.
+# So we copy the freshly built binary OUT of the mounted target to a stable,
+# un-mounted path (`/build/claude-watch`) in the SAME RUN; that path lands in
+# the layer and is what the runtime stage COPYs. The cache mounts touch only
+# build speed, never the bytes baked into the image.
+#
+# `sharing=locked` serialises concurrent builds sharing the cache (safe if two
+# builds run at once); the cache is keyed per-target so it survives across
+# rebuilds of this stage.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release \
+    && cp /build/target/release/claude-watch /build/claude-watch \
+    && /build/claude-watch --help >/dev/null
 
 # --- Stage 2: runtime image ------------------------------------------------
 FROM debian:bookworm-slim
@@ -554,7 +591,10 @@ RUN set -e; \
 # `debian:bookworm-slim` — same Debian release, same libc.
 # claude-watch has no `--version` flag; we verify by exercising `--help`,
 # which exits 0 only if the binary loads and clap parses its CLI.
-COPY --from=claude-watch-builder /build/target/release/claude-watch /usr/local/bin/claude-watch
+# Reads /build/claude-watch — the binary copied OUT of the cache-mounted
+# /build/target in the builder stage's RUN (the mount is gone from that layer,
+# so /build/target/release is empty; /build/claude-watch is the stable copy).
+COPY --from=claude-watch-builder /build/claude-watch /usr/local/bin/claude-watch
 RUN claude-watch --help >/dev/null
 
 # VS Code CLI (`code` / `code tunnel`) — Microsoft's standalone CLI binary.
