@@ -58,6 +58,8 @@ Exempt commands (never count, never denied):
   - ``session-task queue``        (queue dispatch -- includes ``done``)
   - ``obligations``               (inspection / override)
   - ``agent-msg`` / ``agent-tail`` (subagent IPC)
+  - ``botchat-*``                 (operator DM channel: send/unread-
+    check/history/show/wait)
   - ``event-ack`` / ``event-classify`` (event triage)
   - ``claude-watch-ack`` / ``claude-watch-dispatch`` (alert surface)
   - ``signal-history`` / ``signal-ack`` / ``signal-mark-read``
@@ -106,6 +108,14 @@ _EXEMPT_PATTERNS = [
     r"signal-history(\s|$)",
     r"signal-ack(\s|$)",
     r"signal-mark-read(\s|$)",
+    # botchat comms surface -- same rationale as eval-event-must-act: reading /
+    # replying to the operator's botchat DMs is loop bookkeeping, never inline
+    # work, so it must not count against the agent-ack N-counter.
+    r"botchat-send(\s|$)",
+    r"botchat-unread-check(\s|$)",
+    r"botchat-history(\s|$)",
+    r"botchat-show(\s|$)",
+    r"botchat-wait(\s|$)",
     r"/opt/claude-container/watchers/",
 ]
 _EXEMPT_RE = re.compile(
@@ -303,6 +313,15 @@ def _self_test() -> int:
             fail("exempt obligations should allow")
         if evaluate("agent-msg inbox agent-123") != 0:
             fail("exempt agent-msg should allow")
+        for c in (
+            "botchat-unread-check --ids",
+            "botchat-history --limit 5",
+            "botchat-show 1132",
+            "botchat-wait --timeout 60",
+            "botchat-send --mark-read 1132 --ack 1132",
+        ):
+            if evaluate(c) != 0:
+                fail(f"exempt botchat command should allow: {c!r}")
 
     # Case 4: pending + counter < N -> ALLOW + bump
     with _tf.TemporaryDirectory() as td:
