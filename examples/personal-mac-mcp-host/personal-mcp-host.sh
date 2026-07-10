@@ -132,7 +132,10 @@
 #                                head -c 32 /dev/urandom | base64
 #   CW_PROFILE                 trust profile for mcp-host-bash. Default `corp-dev`
 #                              (read-y floor). Set `corp-dev-trusted` to widen.
-#   ALLOWED_DIR                fence run_command to this dir. Default: $HOME.
+#   ALLOWED_DIR                fence run_command to this dir. Unset here =>
+#                              mcp-host-bash's default "/" applies (path
+#                              boundary disabled). Set to $HOME or a subdir
+#                              to re-enable a boundary.
 #   ALLOW_SHELL_OPERATORS      let run_command chain pipes / &&. Default false.
 #   MCP_HOST_BASH_LOG          override the live log path the default / --enable
 #                              modes tail after the tunnel comes up. Default:
