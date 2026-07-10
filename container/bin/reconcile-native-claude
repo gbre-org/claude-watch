@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""reconcile-native-claude — make the in-container claude resolve to the
+NEWEST volume-persisted native version, and pin installMethod=native.
+
+WHY THIS EXISTS
+---------------
+claude-container installs Claude Code via the NATIVE managed installer
+(`curl -fsSL https://claude.ai/install.sh | bash`), NOT `npm install -g`
+(operator directive 2026-07-10: "i dont want to use npm to install
+claude-code ever ... npm should just be used to manage deps"). The native
+installer lays out:
+
+    ~/.local/share/claude/versions/<ver>   # the ~250MB native binary (a FILE)
+    ~/.local/bin/claude -> .../versions/<ver>   # launcher symlink
+
+and the in-app auto-updater writes NEW versions into that same versions/
+dir + re-points the launcher. The compose stack backs
+`~/.local/share/claude` with the `claude-container-versions` named volume,
+so versions PERSIST across `docker compose up --force-recreate`.
+
+Two things do NOT persist across a recreate and must be reconciled on every
+container start, which is what this script does:
+
+  1. The launcher symlink `~/.local/bin/claude`. `~/.local/bin` is on the
+     ephemeral overlay, NOT on the versions volume. After the auto-updater
+     bumps to a newer version mid-lifetime, a recreate resets the launcher
+     to the image-BAKED symlink (pointing at the older baked version) even
+     though the newer binary is still present in the volume. Without a
+     re-point the container would ROLL BACK to the baked version on every
+     redeploy -- the exact #1158 regression this fix targets. We re-point
+     `~/.local/bin/claude` at the highest-version entry actually present in
+     the volume, so the newest persisted version always wins.
+
+  2. `installMethod` in `~/.claude.json`. That file is bind-mounted rw from
+     the host and may carry `installMethod: "global"` from a prior npm-era
+     install. A native binary running with installMethod=global would drive
+     the in-app updater down the npm-global path (ephemeral, and re-introduces
+     npm for claude-code). We force `installMethod: "native"` +
+     `autoUpdatesProtectedForNative: true` (mirroring what `claude install`
+     writes) so the updater uses the native path and writes into the volume.
+
+Best-effort + fail-safe: every step is guarded and the script always exits
+0 (like trust-workspace). A missing versions dir, a read-only / missing /
+unparseable ~/.claude.json, or any unexpected error is a graceful no-op --
+never a launch-blocking failure under the entrypoint's `set -euo pipefail`.
+
+Usage:
+  reconcile-native-claude [--home DIR] [--claude-json PATH]
+  reconcile-native-claude --test      # run the embedded unit tests
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _version_key(name: str) -> tuple:
+    """Sort key for a version dirent name like '2.1.206' or '2.1.89-beta.1'.
+
+    Returns a tuple of the leading integer components so normal version
+    ordering holds (2.1.89 < 2.1.206). Names with no digits sort lowest.
+    A trailing pre-release suffix ('-beta') sorts BELOW the same base
+    release, matching semver intent (2.1.206-beta < 2.1.206) -- we append a
+    marker that is 0 for a pre-release and 1 for a final release.
+    """
+    base = name.split("-", 1)[0]
+    nums = tuple(int(n) for n in re.findall(r"\d+", base))
+    is_prerelease = "-" in name
+    # Final release (no '-') should outrank its pre-releases with the same
+    # numeric prefix, so give final a higher trailing marker.
+    return (nums, 1 if not is_prerelease else 0, name)
+
+
+def newest_version(versions_dir: Path) -> str | None:
+    """Return the highest-version entry name in versions_dir, or None."""
+    try:
+        entries = [e.name for e in versions_dir.iterdir()]
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return None
+    # Only consider entries that contain at least one digit (real versions).
+    candidates = [e for e in entries if re.search(r"\d", e)]
+    if not candidates:
+        return None
+    return max(candidates, key=_version_key)
+
+
+def repoint_launcher(home: Path) -> str | None:
+    """Point <home>/.local/bin/claude at the newest versions/<ver> entry.
+
+    Returns the version name it pointed at, or None if there was nothing to
+    do (no versions present / could not create the symlink).
+    """
+    versions_dir = home / ".local" / "share" / "claude" / "versions"
+    newest = newest_version(versions_dir)
+    if newest is None:
+        return None
+    target = versions_dir / newest
+    bin_dir = home / ".local" / "bin"
+    launcher = bin_dir / "claude"
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    try:
+        # Replace atomically: write a temp symlink then rename over the
+        # launcher so a concurrent `claude` exec never sees a missing link.
+        tmp = bin_dir / f".claude.reconcile.{os.getpid()}"
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        os.symlink(target, tmp)
+        os.replace(tmp, launcher)
+    except OSError:
+        # Fall back to a best-effort direct relink.
+        try:
+            if launcher.is_symlink() or launcher.exists():
+                launcher.unlink()
+            os.symlink(target, launcher)
+        except OSError:
+            return None
+    return newest
+
+
+def pin_install_method_native(claude_json: Path) -> bool:
+    """Set installMethod=native (+ autoUpdatesProtectedForNative) in
+    ~/.claude.json, preserving every other key. Returns True if the file
+    was updated, False on any graceful no-op (missing / RO / unparseable)."""
+    try:
+        raw = claude_json.read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if (
+        data.get("installMethod") == "native"
+        and data.get("autoUpdatesProtectedForNative") is True
+    ):
+        return False  # already reconciled -- nothing to write
+    data["installMethod"] = "native"
+    data["autoUpdatesProtectedForNative"] = True
+    try:
+        # Atomic write in the same dir so a bind-mounted single-file mount
+        # still round-trips (write temp beside it, then replace).
+        parent = claude_json.parent
+        fd, tmp_path = tempfile.mkstemp(dir=str(parent), prefix=".claude.json.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+                fh.write("\n")
+            os.replace(tmp_path, claude_json)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            # A single-file bind-mount can reject os.replace (EBUSY/EXDEV).
+            # Fall back to an in-place rewrite.
+            try:
+                claude_json.write_text(
+                    json.dumps(data, indent=2) + "\n", encoding="utf-8"
+                )
+            except OSError:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def reconcile(home: Path, claude_json: Path | None = None) -> int:
+    if claude_json is None:
+        claude_json = home / ".claude.json"
+    pointed = repoint_launcher(home)
+    if pointed:
+        print(f"[reconcile-native-claude] launcher -> versions/{pointed}", file=sys.stderr)
+    pinned = pin_install_method_native(claude_json)
+    if pinned:
+        print(
+            "[reconcile-native-claude] set installMethod=native in "
+            f"{claude_json}",
+            file=sys.stderr,
+        )
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Embedded tests
+# --------------------------------------------------------------------------
+def _run_tests() -> int:
+    import shutil
+
+    failures: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    def mkhome() -> Path:
+        d = Path(tempfile.mkdtemp(prefix="reconcile-test-"))
+        return d
+
+    # 1. newest_version picks the highest semantic version.
+    h = mkhome()
+    vd = h / ".local" / "share" / "claude" / "versions"
+    vd.mkdir(parents=True)
+    for v in ("2.1.89", "2.1.206", "2.1.9", "not-a-version"):
+        (vd / v).write_text("x")
+    expect(
+        newest_version(vd) == "2.1.206",
+        f"newest_version should pick 2.1.206, got {newest_version(vd)!r}",
+    )
+
+    # 2. pre-release sorts below the same final release.
+    h2 = mkhome()
+    vd2 = h2 / ".local" / "share" / "claude" / "versions"
+    vd2.mkdir(parents=True)
+    (vd2 / "2.1.206-beta.1").write_text("x")
+    (vd2 / "2.1.206").write_text("x")
+    expect(
+        newest_version(vd2) == "2.1.206",
+        f"final release should outrank pre-release, got {newest_version(vd2)!r}",
+    )
+
+    # 3. repoint_launcher creates the symlink at the newest version.
+    pointed = repoint_launcher(h)
+    launcher = h / ".local" / "bin" / "claude"
+    expect(pointed == "2.1.206", f"repoint should return 2.1.206, got {pointed!r}")
+    expect(launcher.is_symlink(), "launcher should be a symlink")
+    expect(
+        os.path.realpath(launcher) == str((vd / "2.1.206").resolve()),
+        f"launcher should point at versions/2.1.206, got {os.path.realpath(launcher)!r}",
+    )
+
+    # 4. repoint is idempotent + re-points when a newer version appears.
+    (vd / "2.1.300").write_text("x")
+    pointed2 = repoint_launcher(h)
+    expect(pointed2 == "2.1.300", f"repoint should follow newest 2.1.300, got {pointed2!r}")
+    expect(
+        os.path.realpath(launcher) == str((vd / "2.1.300").resolve()),
+        "launcher should re-point at the newer 2.1.300",
+    )
+
+    # 5. no versions dir -> graceful None, no crash.
+    h3 = mkhome()
+    expect(repoint_launcher(h3) is None, "repoint should no-op when no versions dir")
+
+    # 6. pin_install_method_native flips global -> native, preserves keys.
+    h4 = mkhome()
+    cj = h4 / ".claude.json"
+    cj.write_text(json.dumps({"installMethod": "global", "autoUpdates": True, "foo": 1}))
+    expect(pin_install_method_native(cj) is True, "pin should report an update")
+    data = json.loads(cj.read_text())
+    expect(data["installMethod"] == "native", "installMethod should be native")
+    expect(
+        data["autoUpdatesProtectedForNative"] is True,
+        "autoUpdatesProtectedForNative should be True",
+    )
+    expect(data["foo"] == 1, "other keys must be preserved")
+    expect(data["autoUpdates"] is True, "autoUpdates should be preserved untouched")
+
+    # 7. pin is idempotent (second call reports no change).
+    expect(
+        pin_install_method_native(cj) is False,
+        "pin should no-op when already native",
+    )
+
+    # 8. missing / unparseable claude.json -> graceful no-op.
+    h5 = mkhome()
+    expect(
+        pin_install_method_native(h5 / ".claude.json") is False,
+        "pin should no-op on missing file",
+    )
+    bad = h5 / "bad.json"
+    bad.write_text("{not json")
+    expect(pin_install_method_native(bad) is False, "pin should no-op on bad json")
+
+    # 9. reconcile() end-to-end returns 0.
+    expect(reconcile(h) == 0, "reconcile should return 0")
+
+    # cleanup
+    for d in (h, h2, h3, h4, h5):
+        shutil.rmtree(d, ignore_errors=True)
+
+    if failures:
+        print("FAIL reconcile-native-claude")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print("PASS reconcile-native-claude (all tests passed)")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    home = Path(os.environ.get("HOME", "/home/hndrewaall"))
+    claude_json: Path | None = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--test":
+            return _run_tests()
+        elif a == "--home":
+            home = Path(argv[i + 1])
+            i += 2
+            continue
+        elif a == "--claude-json":
+            claude_json = Path(argv[i + 1])
+            i += 2
+            continue
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print(f"reconcile-native-claude: unknown argument {a!r}", file=sys.stderr)
+            return 2
+        i += 1
+    return reconcile(home, claude_json)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

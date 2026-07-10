@@ -114,6 +114,7 @@ test-dashboard:
 # <0.1s, all in-process against tmpdir HOMEs.
 test-trust-workspace:
 	python3 container/bin/trust-workspace.py --test
+	python3 container/bin/reconcile-native-claude --test
 
 # Run the claude-tmux env / mount passthrough tests (corporate CA bundle
 # forwarding, proxy passthrough, host hooks-dir bind-mount, set-but-missing
@@ -212,7 +213,7 @@ test-entrypoint:
 	container/tests/redeploy-self-recreate.test
 	container/tests/claude-event-queue-wired.test
 	container/tests/claude-bin-symlink-uid.test
-	container/tests/npm-install-as-uid-1000.test
+	container/tests/native-install-versions-volume.test
 	container/tests/xclip-shim.test
 	SKIP_LIVE_CLAUDE=1 container/tests/skill-restart-discovery.test
 

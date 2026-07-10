@@ -445,16 +445,16 @@ RUN mkdir -p /home/hndrewaall/.config \
 # documented native-install precedence (compose.yml volume notes
 # already describe this expectation; this ENV makes it actually true).
 #
-# `~/.npm-global/bin` is also on PATH right after `~/.local/bin`. The
-# Dockerfile installs @anthropic-ai/claude-code into this uid-1000-owned
-# npm prefix (see the npm-install RUN block below for the autoupdate-v2
-# rationale), so the baked claude entry point lives at
-# $HOME/.npm-global/bin/claude. The image also ships a /usr/bin/claude
-# symlink pointing at the same file (chowned -h to uid 1000) so
-# `docker compose exec claude-container claude ...` works even when the
-# operator's $PATH doesn't include $HOME/.npm-global/bin (e.g.
-# stripped-down shells). Within the entrypoint and tmux panes the
-# PATH-baked $HOME/.npm-global/bin/claude wins because it comes first.
+# The claude BINARY is installed via the NATIVE managed installer (see the
+# native-install RUN block below), which places the launcher at
+# $HOME/.local/bin/claude -> $HOME/.local/share/claude/versions/<ver>. That
+# `~/.local/bin` dir is FIRST on PATH so the native launcher (and any
+# volume-persisted self-update the entrypoint re-points it at) wins. The image
+# also ships a /usr/bin/claude symlink -> $HOME/.local/bin/claude (chowned -h
+# to uid 1000) so `docker compose exec claude-container claude ...` works even
+# when the operator's $PATH doesn't include $HOME/.local/bin (stripped-down
+# shells). `~/.npm-global/bin` remains on PATH for npm-managed DEPENDENCY CLIs
+# (npm is retained for deps only, never for claude-code itself).
 #
 # ENV PATH propagates to every child process the container ever spawns
 # — entrypoint.sh, every tmux pane it opens, every `docker compose
@@ -477,114 +477,86 @@ ENV PATH=/home/hndrewaall/.local/bin:/home/hndrewaall/.npm-global/bin:/usr/local
 # and tmux refuses to start with "directory has unsafe permissions".
 RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
 
-# Install Claude Code CLI globally as uid 1000 with a uid-1000-writable
-# npm prefix. Package name confirmed via `npm view` 2026-05-11.
+# Install Claude Code via the NATIVE managed installer (NOT npm).
 #
-# Why this shape (autoupdate-v2, 2026-05-15):
+# Operator directive (botchat 2026-07-10): "i dont want to use npm to install
+# claude-code ever if we can avoid it. imo npm should just be used to manage
+# deps." So the claude-code BINARY is installed + updated EXCLUSIVELY through
+# the native managed installer; npm is kept in the image only for actual
+# dependency management, never for @anthropic-ai/claude-code.
 #
-# The previous shape `npm install -g` as root → chown the install tree +
-# the /usr/bin/claude symlink to uid 1000 (PR #204) — sat at the boundary
-# of what works because Claude Code's in-process auto-updater calls `npm
-# install -g @anthropic-ai/claude-code@latest` as the interactive user
-# (uid 1000), and npm in that invocation honors its CONFIGURED prefix,
-# not the historical install location. With the image's npm using its
-# stock default of `/usr/local` as the prefix, every auto-update attempt
-# tried to write to `/usr/local/lib/node_modules/` (root-owned) and
-# failed with:
+# WHY NATIVE (the versions-volume self-updater design — #1158 root cause):
 #
-#   Insufficient permissions to install update
-#   Try running with sudo or fix npm permissions
+# The native installer (`curl -fsSL https://claude.ai/install.sh | bash`)
+# downloads the ~250MB platform binary and runs `claude install`, which lays
+# the install out as:
 #
-# (workbot v68 validation 2026-05-15). Chowning the original install
-# tree didn't help — npm wasn't trying to write there, it was trying to
-# write to its configured prefix.
+#   ~/.local/share/claude/versions/<ver>     the native binary (a FILE)
+#   ~/.local/bin/claude -> versions/<ver>     the launcher symlink
+#   ~/.claude.json: installMethod = "native"
 #
-# Fix: configure npm's prefix to a uid-1000-owned path under $HOME and
-# run the install as uid 1000 from the start. Both build-time AND
-# self-update-time installs land in the same place under the user's home
-# directory; no chown gymnastics, no /usr/lib vs /usr/local split, no
-# privilege-asymmetric writes. This is the canonical "unprivileged
-# npm-global" pattern documented at
-# https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally.
+# The compose stack backs ~/.local/share/claude with the
+# `claude-container-versions` named VOLUME. Docker copy-up seeds a fresh/empty
+# volume from this baked versions/<ver> on first launch, and the in-app
+# auto-updater (installMethod=native) writes NEW versions INTO that same
+# volume-backed dir. Because the volume PERSISTS across
+# `docker compose up --force-recreate`, an auto-updated version SURVIVES a
+# redeploy instead of rolling back to the baked floor.
 #
-# The /usr/bin/claude symlink stays — it's a stable entry point for
-# `docker compose exec claude-container claude ...` invocations that
-# don't pre-resolve $HOME's npm-global bindir on PATH. Chown -h on it
-# (PR #204) stays for the same reason: npm install upgrades unlink + relink
-# the symlink, so it has to be uid-1000-owned. The symlink now points
-# into the npm-global prefix under $HOME instead of /usr/lib/.
+# The prior regression: the image baked claude via `npm install -g` into the
+# EPHEMERAL ~/.npm-global (overlay upperdir, NOT volume-backed) and
+# ~/.claude.json carried installMethod=global. So the app ran from npm-global,
+# the auto-updater wrote npm-global updates (also ephemeral), the versions
+# volume sat empty and unused, and EVERY redeploy rolled the version back to
+# the Dockerfile-baked npm floor (#1158). Switching to the native installer +
+# installMethod=native puts updates on the persistent volume where they belong.
 #
-# Pre-create $HOME/.npm-global/{lib,bin} as uid 1000 so npm doesn't have
-# to mkdir them at install time (some npm versions race on parent dir
-# perms when the prefix path doesn't exist yet). The `npm config set
-# prefix` writes to /home/hndrewaall/.npmrc (the per-user npmrc), which
-# is uid-1000-owned.
+# Runtime reconciliation (see container/bin/reconcile-native-claude, invoked
+# from the entrypoint) handles the two things that do NOT live on the volume:
+# re-pointing the ephemeral ~/.local/bin/claude launcher at the NEWEST version
+# present in the volume (anti-rollback), and pinning installMethod=native in
+# the bind-mounted ~/.claude.json.
 #
-# `su - hndrewaall -c '...'` runs the whole install pipeline as uid 1000
-# with a login shell (so $HOME, $PATH etc. are set up correctly) without
-# permanently switching the Dockerfile's USER context — subsequent COPY
-# operations stay simple. The trailing `ln -sf` + `chown -h` recreate
-# the /usr/bin/claude entry point (was previously the npm-emitted symlink
-# into /usr/lib/; now an explicit ln to $HOME/.npm-global/bin/claude).
-# Chown -h flips the symlink's own ownership to uid 1000 so future
-# in-process `npm install -g` upgrades (which unlink+relink the symlink)
-# don't fail with EACCES on a root-owned symlink in /usr/bin/. PR #204's
-# rationale stands; only the target of the symlink changed.
-# Build-resilience hardening (2026-06-25), two parts on this layer:
+# Build-resilience: install.sh verifies the download's SHA256 against the
+# signed manifest before running `claude install`, so a truncated/corrupt
+# download fails the build here rather than shipping a broken binary. A
+# separate committed-layer smoke check below re-verifies the versioned binary
+# exists at native size + runs, mirroring the two-stage guard the npm path used.
 #
-#  1. npm fetch-retry / timeout config in the SAME `su` invocation so a
-#     transient registry stall fails-fast-and-retries (3 retries, bounded
-#     timeouts) instead of hanging the build indefinitely on a slow socket.
-#
-#  2. A two-stage smoke check: this layer ends with `claude --version`, then a
-#     SEPARATE committed-layer RUN below re-verifies the binary exists, is the
-#     ~230MB native binary (not a truncated stub), and runs (see next stanza).
-#
-# NO BuildKit `--mount=type=cache` on ~/.npm here.  An earlier iteration of
-# this layer (PR #433) wrapped the install in
-# `--mount=type=cache,target=/home/hndrewaall/.npm,...`.  That BROKE the build:
-# `@anthropic-ai/claude-code` ships its ~230MB native binary as a
-# platform-specific OPTIONAL dependency (`@anthropic-ai/claude-code-linux-arm64`)
-# that its `postinstall` (install.cjs) hardlinks into `bin/claude.exe`.  Under
-# the cache mount npm resolved the install in ~4s WITHOUT fetching that optional
-# native package ("added 2 packages in 4s"), so install.cjs found no native
-# binary, left the no-op stub, and the trailing `claude --version` died with
-# `claude: command not found` (build exit 127).  A clean install (no cache
-# mount) correctly downloads the native dep and produces the 236MB
-# bin/claude.exe.  The registry re-download is a non-issue: the OUTER Docker
-# layer cache already skips this RUN entirely on an unchanged Dockerfile, and a
-# poisoned/partial ~/.npm cache mount is exactly the failure mode that bit us.
-# So: no cache mount — correctness over a cache that breaks the install.
-RUN install -d -o 1000 -g 1000 /home/hndrewaall/.npm-global \
-                                /home/hndrewaall/.npm-global/lib \
-                                /home/hndrewaall/.npm-global/bin \
-    && su - hndrewaall -c 'npm config set prefix /home/hndrewaall/.npm-global \
-                            && npm config set fetch-retries 3 \
-                            && npm config set fetch-retry-maxtimeout 120000 \
-                            && npm config set fetch-timeout 300000 \
-                            && npm install -g @anthropic-ai/claude-code \
-                            && /home/hndrewaall/.npm-global/bin/claude --version' \
-    && ln -sf /home/hndrewaall/.npm-global/bin/claude /usr/bin/claude \
+# `su - hndrewaall -c '...'` runs the install as uid 1000 (HOME=/home/hndrewaall)
+# so the native tree + launcher land uid-1000-owned — the same uid the in-app
+# auto-updater runs as, so it can write new versions without privilege games.
+RUN su - hndrewaall -c 'set -e; \
+        curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh; \
+        bash /tmp/claude-install.sh latest; \
+        rm -f /tmp/claude-install.sh; \
+        "$HOME/.local/bin/claude" --version' \
+    && ln -sf /home/hndrewaall/.local/bin/claude /usr/bin/claude \
     && chown -h 1000:1000 /usr/bin/claude
 
-# Persistent-layer smoke check for the claude binary.  CRITICAL: this MUST be a
-# SEPARATE RUN from the install above.  The install layer's own `claude
-# --version` runs while any (former) cache mount is still attached and BEFORE
-# the layer is committed, so it can pass against transient state that does not
-# survive into the image (the exact gap that let PR #433 ship a broken image
-# despite "passing" its in-layer check).  This RUN executes against the
-# COMMITTED filesystem of the previous layer, so it verifies what actually
-# ships: (a) the symlink target resolves to a regular file, (b) it is the
-# ~230MB native binary, not a truncated <1MB stub, and (c) it executes and
-# prints a version.  Any failure exits non-zero and FAILS THE BUILD here.
+# Persistent-layer smoke check for the native claude install. CRITICAL: this
+# MUST be a SEPARATE RUN from the install above — the install layer's own
+# `claude --version` runs BEFORE the layer is committed, so it can pass against
+# transient state (the gap that let PR #433 ship a broken npm image). This RUN
+# executes against the COMMITTED filesystem, verifying what actually ships:
+# (a) the ~/.local/bin/claude launcher symlink resolves to a regular file under
+# the native versions/ dir, (b) that versioned binary is the ~250MB native
+# build (not a truncated stub), (c) /usr/bin/claude resolves, and (d) it
+# executes + prints a version. Any failure exits non-zero and FAILS THE BUILD.
 RUN set -e; \
-    BIN=/home/hndrewaall/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe; \
-    test -f "$BIN" || { echo "FATAL: claude native binary missing: $BIN" >&2; exit 1; }; \
+    LAUNCH=/home/hndrewaall/.local/bin/claude; \
+    test -L "$LAUNCH" || { echo "FATAL: native launcher missing: $LAUNCH" >&2; exit 1; }; \
+    BIN=$(readlink -f "$LAUNCH"); \
+    case "$BIN" in \
+        /home/hndrewaall/.local/share/claude/versions/*) : ;; \
+        *) echo "FATAL: launcher resolves to $BIN, not the native versions/ dir" >&2; exit 1 ;; \
+    esac; \
+    test -f "$BIN" || { echo "FATAL: native binary missing: $BIN" >&2; exit 1; }; \
     SZ=$(stat -c %s "$BIN"); \
-    [ "$SZ" -ge 1000000 ] || { echo "FATAL: claude binary is a $SZ-byte stub (expected ~230MB native binary)" >&2; exit 1; }; \
+    [ "$SZ" -ge 1000000 ] || { echo "FATAL: claude binary is a $SZ-byte stub (expected ~250MB native binary)" >&2; exit 1; }; \
     test -x /usr/bin/claude || { echo "FATAL: /usr/bin/claude not executable" >&2; exit 1; }; \
     su - hndrewaall -c 'claude --version' || { echo "FATAL: claude --version failed in committed layer" >&2; exit 1; }; \
-    echo "claude binary OK: ${SZ} bytes, --version passed"
+    echo "claude native binary OK: ${SZ} bytes at ${BIN}, --version passed"
 
 # Bake the claude-watch Rust binary in from stage 1. Glibc compatibility is
 # guaranteed because the builder is `rust:1-bookworm` and this stage is
@@ -1143,14 +1115,28 @@ RUN chmod +x /usr/local/bin/trust-workspace
 COPY container/bin/audit-hooks.py /usr/local/bin/audit-hooks
 RUN chmod +x /usr/local/bin/audit-hooks
 
-# cwsr — in-container self-restart for the claude CLI. Upgrades
-# @anthropic-ai/claude-code via npm-global and uses `tmux respawn-pane
-# -k` to roll the inner claude process WITHOUT requiring a host-side
-# `docker compose restart`. Operator workflow: a new claude version
-# ships; from inside the in-container tmux session (or from another
-# container shell via `docker compose exec`), run `cwsr` and the inner
-# pane swaps to the new version while the tmux session, MCP state, and
-# named-volume claude versions/ dir all survive.
+# reconcile-native-claude — entrypoint helper that makes the in-container
+# claude resolve to the NEWEST version persisted in the claude-container-versions
+# volume, and pins installMethod=native in ~/.claude.json. Run from
+# entrypoint.sh on every container start (see the entrypoint invocation). This
+# is what makes an auto-updated version SURVIVE a redeploy instead of rolling
+# back to the image-baked floor: the versions/ dir is volume-backed (persists),
+# but the ~/.local/bin/claude launcher symlink lives on the ephemeral overlay
+# and would otherwise reset to the baked version on recreate. Ships embedded
+# --test unit tests (run: reconcile-native-claude --test).
+COPY container/bin/reconcile-native-claude /usr/local/bin/reconcile-native-claude
+RUN chmod +x /usr/local/bin/reconcile-native-claude
+
+# cwsr — in-container self-restart for the claude CLI. Rolls the claude
+# BINARY via the NATIVE managed installer (`claude install <ver>`, which
+# writes into the volume-backed ~/.local/share/claude/versions/ dir — NOT
+# `npm install -g`) and uses `tmux respawn-pane -k` to roll the inner claude
+# process WITHOUT a host-side `docker compose restart`. Operator workflow: a
+# new claude version ships; from inside the in-container tmux session (or via
+# `docker compose exec`), run `cwsr` and the inner pane swaps to the new
+# version while the tmux session, MCP state, and the volume-backed versions/
+# dir all survive — and because the install lands on the volume, the roll
+# persists across a subsequent redeploy.
 COPY container/bin/cwsr /usr/local/bin/cwsr
 RUN chmod +x /usr/local/bin/cwsr
 

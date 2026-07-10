@@ -78,6 +78,30 @@ if [ ! -f "${_managed_link}" ] || [ ! -r "${_managed_link}" ]; then
 fi
 unset _managed_link _managed_src
 
+# Reconcile the native claude install against the versions VOLUME.
+#
+# claude-code is installed + updated via the NATIVE managed installer (see the
+# Dockerfile native-install block), which keeps versions under
+# ~/.local/share/claude/versions/<ver> — a path backed by the
+# claude-container-versions named volume, so in-app auto-updates PERSIST across
+# `docker compose up --force-recreate`. Two pieces do NOT live on the volume
+# and must be reconciled on every start, which reconcile-native-claude does:
+#
+#   1. Re-point the ephemeral ~/.local/bin/claude launcher at the NEWEST
+#      version present in the volume. Without this, a recreate resets the
+#      launcher to the image-baked version and the container ROLLS BACK even
+#      though the newer auto-updated binary is still in the volume (#1158).
+#   2. Pin installMethod=native in the bind-mounted ~/.claude.json (it may
+#      carry a stale installMethod=global from the prior npm era), so the
+#      in-app updater writes into the versions volume, not npm-global.
+#
+# Best-effort + fail-safe: the helper always exits 0 (missing versions dir /
+# read-only or absent ~/.claude.json are graceful no-ops), so `set -euo
+# pipefail` never aborts the entrypoint on it. `|| true` belt-and-suspenders.
+if [ -x /usr/local/bin/reconcile-native-claude ]; then
+    /usr/local/bin/reconcile-native-claude || true
+fi
+
 # Tell the in-container claude-watch where its config lives. The host's
 # ~/.config/ is NOT bind-mounted (only ~/.claude, ~/repos, $PWD per the
 # wrapper's "blast radius" header), so we ship a container-tailored config

@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Tests for the native-install / versions-volume wiring (replaces the old
+npm-install-as-uid-1000.test).
+
+Background (2026-07-10, #1158): claude-code is installed + auto-updated
+EXCLUSIVELY via the native managed installer, which keeps versions under
+~/.local/share/claude/versions/<ver>. That path is backed by the
+claude-container-versions named VOLUME (compose), so in-app auto-updates
+PERSIST across `docker compose up --force-recreate`. The prior npm-global
+shape (~/.npm-global) was on the EPHEMERAL overlay and rolled back on every
+redeploy -- the regression this fix reverses.
+
+This test asserts the file-level guarantees of the native shape from a
+build-wiring angle:
+
+  1. The Dockerfile must NOT `npm install -g @anthropic-ai/claude-code`
+     (npm is retained for deps only, never for claude-code).
+
+  2. The Dockerfile must NOT reference /usr/local/lib/node_modules as a
+     write target (npm's stock root-owned prefix -- irrelevant now, but a
+     stray reference would be a refactor smell).
+
+  3. The Dockerfile installs via the native installer targeting the
+     versions dir; PATH must have ~/.local/bin FIRST (the native launcher).
+
+  4. claude-watch's CONTAINER_CLAUDE_EXE_PREFIX in src/agent.rs is still a
+     valid literal and the daemon's PRIMARY match path is the native
+     versions dir (~/.local/share/claude/versions/). This is what lets the
+     daemon find the in-container claude PID once it runs from the native
+     install -- the design the pid-detection code was written for.
+
+Run:  ./native-install-versions-volume.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+AGENT_RS = REPO_ROOT / "src" / "agent.rs"
+
+NATIVE_VERSIONS_DIR = "/home/hndrewaall/.local/share/claude/versions"
+LOCAL_BIN = "/home/hndrewaall/.local/bin"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+expect(AGENT_RS.exists(), f"src/agent.rs missing at {AGENT_RS}")
+
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    df_no_comments = "\n".join(
+        line for line in df.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    # 1. No `npm install -g @anthropic-ai/claude-code` (build target).
+    npm_claude = re.search(
+        r"npm\s+install\s+-g\s+@anthropic-ai/claude-code\b", df_no_comments
+    )
+    expect(
+        npm_claude is None,
+        "Dockerfile: found `npm install -g @anthropic-ai/claude-code`. "
+        "claude-code must be installed via the native installer; npm is for "
+        "dependency management only (operator directive 2026-07-10).",
+    )
+
+    # 2. No /usr/local/lib/node_modules write target.
+    bad_usr_local = re.search(r"/usr/local/lib/node_modules\b", df_no_comments)
+    expect(
+        bad_usr_local is None,
+        "Dockerfile: must NOT reference /usr/local/lib/node_modules as a "
+        "write target (npm's stock root-owned prefix). Not used by the native "
+        "install; a stray reference is a refactor smell.",
+    )
+
+    # 3. Native installer + PATH has ~/.local/bin first.
+    native_install = re.search(r"claude\.ai/install\.sh", df_no_comments)
+    expect(
+        native_install is not None,
+        "Dockerfile: missing the native installer "
+        "(`https://claude.ai/install.sh`). claude-code must be installed "
+        "natively so versions land under the volume-backed "
+        f"{NATIVE_VERSIONS_DIR}.",
+    )
+    path_match = re.search(r"^ENV\s+PATH=([^\s]+)", df, re.MULTILINE)
+    expect(
+        path_match is not None,
+        "Dockerfile: missing `ENV PATH=...` directive.",
+    )
+    if path_match:
+        path_value = path_match.group(1)
+        expect(
+            path_value.split(":")[0] == LOCAL_BIN,
+            f"Dockerfile: PATH must have {LOCAL_BIN} FIRST so the native "
+            f"launcher wins. Found PATH={path_value!r}.",
+        )
+
+if AGENT_RS.exists():
+    rs = AGENT_RS.read_text(encoding="utf-8")
+
+    # 4a. CONTAINER_CLAUDE_EXE_PREFIX still exists as a valid literal.
+    const_match = re.search(
+        r'pub const CONTAINER_CLAUDE_EXE_PREFIX:\s*&str\s*=\s*"([^"]+)"',
+        rs,
+    )
+    expect(
+        const_match is not None,
+        "src/agent.rs: cannot find `pub const CONTAINER_CLAUDE_EXE_PREFIX: "
+        '&str = "..."`. Did the constant get renamed?',
+    )
+
+    # 4b. The daemon's PRIMARY match path is the native versions dir.
+    expect(
+        ".local/share/claude/versions" in rs,
+        "src/agent.rs: the native versions path "
+        "(`.local/share/claude/versions`) must be the daemon's primary claude "
+        "PID-match path. The native install runs claude from there, so this "
+        "is how the daemon finds the in-container claude PID.",
+    )
+
+
+if failures:
+    print("FAIL native-install-versions-volume.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS native-install-versions-volume.test")
+sys.exit(0)

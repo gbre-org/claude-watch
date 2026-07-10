@@ -773,29 +773,29 @@ container session should imitate.
 
 ## Self-update — `cwsr` rolls the inner `claude` without container restart
 
-When Anthropic ships a new `@anthropic-ai/claude-code` version, you do
-NOT need the operator to `docker compose restart` the whole container
-to pick it up. Run `cwsr` (in-container; baked at
-`/usr/local/bin/cwsr`) and the inner claude rolls in-place:
+claude-code updates via the NATIVE installer (NOT npm). When a new
+version ships, run `cwsr` (baked at `/usr/local/bin/cwsr`) and the
+inner claude rolls in-place via `claude install` — no full container
+restart:
 
 ```sh
-cwsr                    # npm install -g @latest, then respawn pane 0
-cwsr --version 2.1.150  # pin a specific npm version
+cwsr                    # claude install latest, then respawn pane 0
+cwsr --version 2.1.206  # install a specific native version
 cwsr --no-upgrade       # respawn current claude (rare; for testing)
 cwsr --upgrade-only     # install without rolling (operator can `cwsr --no-upgrade` later)
-cwsr --print            # dry-run; print planned NPM + TMUX argv
+cwsr --print            # dry-run; print planned INSTALL + TMUX argv
 ```
 
 What survives the roll: the tmux session (`claude-container:0.0`), the wrapping
-container, every MCP bridge that was up, the named-volume
+container, every MCP bridge that was up, the volume-backed
 `~/.local/share/claude/versions/` dir, the operator's tmux attach. What rolls:
-the claude process inside pane 0.
+the claude process inside pane 0. `claude install` writes to the
+volume-backed versions dir, so the roll SURVIVES a later redeploy.
 
 When you should run `cwsr`:
-- The operator says "upgrade to latest" or asks you to pick up a
-  specific version they reference.
-- You see (e.g. via `claude --version`) that the in-container version
-  has fallen behind a release the operator wants.
+- The operator says "upgrade to latest" or names a specific version.
+- You see (via `claude --version`) the in-container version has fallen
+  behind a release the operator wants.
 
 When `cwsr` is NOT the right tool:
 - Container itself is down — use `docker compose up -d` (or `cw --up`
@@ -806,9 +806,8 @@ When `cwsr` is NOT the right tool:
   inner process with whatever shape entrypoint.sh already chose. Ask
   the operator to `docker compose up -d --force-recreate` for those.
 
-The package name (`@anthropic-ai/claude-code`) and `npm install -g` are
-cross-platform (Linux, macOS, or Windows). The in-container npm runs as uid
-1000 against a writable global path, no sudo needed.
+The native installer runs as uid 1000 and writes to the volume-backed
+`~/.local/share/claude/versions/`, so updates persist. No npm, no sudo.
 
 ## Container redeploy (incl. self-redeploy from inside the container)
 
