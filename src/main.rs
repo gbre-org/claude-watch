@@ -597,8 +597,9 @@ enum WatcherAction {
     /// Per the cardinal rule, watchers can ONLY be started by Claude Code's
     /// main loop in its own process tree. `enable` therefore does NOT spawn
     /// the start_cmd; it only flips `enabled=true` in watchers.conf.
-    /// Run `watcher-ctl run <name>` (as a main-loop background task) or
-    /// `watcher-restart` afterwards to actually start the watcher.
+    /// Run `watcher-ctl run <name>` (as a main-loop background task)
+    /// afterwards to actually start the watcher — `watcher-restart` will
+    /// NOT (it only stops watchers).
     Enable {
         /// Watcher name
         name: String,

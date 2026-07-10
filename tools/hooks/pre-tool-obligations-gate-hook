@@ -576,9 +576,10 @@ def _watcher_state_recovery(why: str) -> str | None:
     column to pick the right canonical recovery command:
 
       - DUPLICATE present  =>  `watcher-restart` (the only command that
-        clears duplicate pollers/supervisors).
+        clears duplicate pollers/supervisors — it STOPS everything and
+        starts nothing), then `watcher-ctl run <name>` per watcher.
       - DOWN-only          =>  `watcher-ctl run <name>` (surgical), with
-        `watcher-restart` mentioned as a fallback.
+        `watcher-restart` mentioned only alongside its stop-only caveat.
 
     Returns None when the `why` text doesn't look like watcher-status
     output (e.g. it's the unread-sidecar narrative, or any other
@@ -600,7 +601,8 @@ def _watcher_state_recovery(why: str) -> str | None:
     if has_duplicate:
         return (
             "Recovery for DUPLICATE state: `watcher-restart` "
-            "(kills all watchers + cleans PID files; supervisors will respawn)."
+            "(STOPS all watchers + cleans PID files — it starts NOTHING), "
+            "then `watcher-ctl run <name>` for each enabled watcher."
         )
     # DOWN-only: name the offending watcher(s) so the surgical path is
     # one copy-paste away.
@@ -614,12 +616,15 @@ def _watcher_state_recovery(why: str) -> str | None:
     if down_names:
         names = " ".join(down_names)
         return (
-            "Recovery for DOWN state: `watcher-ctl run <name>` "
-            f"(e.g. {names}). Or `watcher-restart` to reset everything."
+            "Recovery for DOWN state: `watcher-ctl run <name>` for each "
+            f"DOWN watcher (e.g. {names}). Note: `watcher-restart` only "
+            "STOPS all watchers — after it, every watcher must still be "
+            "started with `watcher-ctl run`."
         )
     return (
-        "Recovery for DOWN state: `watcher-ctl run <name>`. "
-        "Or `watcher-restart` to reset everything."
+        "Recovery for DOWN state: `watcher-ctl run <name>` for each DOWN "
+        "watcher. Note: `watcher-restart` only STOPS all watchers — after "
+        "it, every watcher must still be started with `watcher-ctl run`."
     )
 
 
