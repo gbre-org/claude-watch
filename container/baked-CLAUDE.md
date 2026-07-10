@@ -835,7 +835,7 @@ before `make deploy-container`. The in-container `obligations`/`session-task`
 CLIs (+ `tools/obligations/*`) are BIND-MOUNTED from that clone and resolve via
 PATH BEFORE the baked `/usr/local/bin` copy, so a stale clone SHADOWS
 merged+baked Python-CLI fixes and the recreate just re-mounts stale code (only
-the compiled Rust daemon is truly baked). Prefer deploying from a current clone.
+the compiled Rust daemon is truly baked).
 
 `docker-compose.yml` sets `stop_grace_period: 15s`, sized to fit
 process-compose's graceful shutdown (each supervised process pins
