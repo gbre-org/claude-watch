@@ -1576,18 +1576,20 @@ def _eval_evaluator_predicate(params, tool_name, command_string, agent_id):
                         f"stdout_preview={stdout_text!r}"))
 
 
-def _eval_predicate(pred, tool_name, command_string, agent_id=None):
+def _eval_predicate(pred, tool_name, command_string, agent_id=None,
+                    agent_type=None):
     """Return (satisfied: bool, why: str). 'satisfied' True => obligation met,
     so the tool call is allowed. 'why' is human-readable diagnostics.
 
     For BAN-style predicates (no_pipe_pattern), satisfied=True means the regex
     did NOT match (i.e. the command is OK).
 
-    ``agent_id`` is the hook payload's ``agent_id`` field (empty/missing in
-    the main loop, non-empty inside a subagent). Threaded through so the
-    ``is_main_loop`` predicate -- and any future predicate that needs to
-    distinguish the main loop from subagents -- can read it. ``all_of``
-    forwards it to child predicates so the composition works at any depth.
+    ``agent_id`` is the hook payload's ``agent_id`` field; ``agent_type`` is
+    its ``agent_type`` field (the PRIMARY main-loop-vs-subagent signal -- see
+    ``_is_subagent_context``). Both are threaded through so the
+    ``is_main_loop`` predicate -- and any predicate that needs to distinguish
+    the main loop from subagents -- can read them. ``all_of`` forwards them
+    to child predicates so the composition works at any depth.
     """
     kind = pred.get("kind", "")
     params = pred.get("params", {}) or {}
@@ -2193,9 +2195,9 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
         #   - q-id status == "running" => ALLOW
         try:
             # Main-loop short-circuit: predicate does not apply.
-            if not _is_subagent_context(agent_id):
+            if not _is_subagent_context(agent_id, agent_type):
                 return (True, "predicate does not apply to main loop "
-                              "(no agent_id)")
+                              "(agent_type not a subagent)")
 
             # Resolve the binding file. Priority: explicit predicate
             # param > env override > default. Both the hook and the
@@ -2496,18 +2498,22 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
         )
 
     if kind == "is_main_loop":
-        # Satisfied iff the call is from the main loop (no agent_id).
+        # Satisfied iff the call is from the main loop. The main-loop-vs-
+        # subagent decision is delegated to _is_subagent_context, which keys
+        # on the hook payload's `agent_type` (PRIMARY) and falls back to the
+        # legacy `agent_id`-presence heuristic only when agent_type is absent.
         # negate=true flips: satisfied iff inside a subagent.
         negate = bool(params.get("negate", False))
-        in_main = not _is_subagent_context(agent_id)
+        in_main = not _is_subagent_context(agent_id, agent_type)
         ok = (not in_main) if negate else in_main
+        ctx = f"agent_type={agent_type!r} agent_id={agent_id!r}"
         if ok:
             if negate:
-                return (True, f"in subagent context (agent_id={agent_id!r})")
-            return (True, "in main-loop context (no agent_id)")
+                return (True, f"in subagent context ({ctx})")
+            return (True, f"in main-loop context ({ctx})")
         if negate:
-            return (False, "in main-loop context (expected subagent)")
-        return (False, f"in subagent context (agent_id={agent_id!r}); main-loop required")
+            return (False, f"in main-loop context ({ctx}); expected subagent")
+        return (False, f"in subagent context ({ctx}); main-loop required")
 
     if kind == "all_of":
         children = params.get("predicates", [])
@@ -2525,7 +2531,7 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
                 # the leaf default-open semantics).
                 return (True, f"all_of child {idx} has unknown kind {child_kind!r} (default-open)")
             ok, why = _eval_predicate(child, tool_name, command_string,
-                                       agent_id=agent_id)
+                                       agent_id=agent_id, agent_type=agent_type)
             if not ok:
                 # Scope-guard short-circuit: a failing is_main_loop child
                 # means "this obligation does not apply in the current
@@ -2623,7 +2629,7 @@ def _exempt_match(exempt_patterns, tool_name, command_string):
 
 
 def _universal_recovery_exempt_match(tool_name, command_string,
-                                     agent_id=None):
+                                     agent_id=None, agent_type=None):
     """Return (matched: bool, which: str|None) against
     ``UNIVERSAL_RECOVERY_EXEMPT_PATTERNS``.
 
@@ -2648,7 +2654,7 @@ def _universal_recovery_exempt_match(tool_name, command_string,
         UNIVERSAL_RECOVERY_EXEMPT_PATTERNS, tool_name, command_string,
     )
     if (matched and tool_name == "Bash"
-            and _is_subagent_context(agent_id)):
+            and _is_subagent_context(agent_id, agent_type)):
         subcmd = _session_task_queue_subcommand(command_string)
         if subcmd in SUBAGENT_BANNED_QUEUE_SUBCOMMANDS:
             # Subagent + mutating queue subcommand: do NOT let the floor
@@ -3070,18 +3076,83 @@ def cmd_prune(args):
 # ---------------------------------------------------------------------------
 
 
-def _is_subagent_context(agent_id):
+def _classify_agent_type(agent_type):
+    """Classify Claude Code's hook-payload ``agent_type`` string into
+    ``"main"`` / ``"subagent"`` / ``None``.
+
+    Mirrors Claude Code's own classifier:
+
+      - ``agent_type`` starts with ``repl_main_thread`` (the REPL main
+        loop, possibly suffixed e.g. ``repl_main_thread:outputStyle:...``)
+        or equals ``sdk``  -> ``"main"``
+      - ANY OTHER non-empty value -> ``"subagent"``. This covers BOTH the
+        legacy ``agent:<id>`` / ``hook_agent`` forms AND the CURRENT Claude
+        Code shape, where a spawned subagent reports its BARE subagent-type
+        slug as ``agent_type`` -- e.g. ``general-purpose``, ``Explore``,
+        ``Plan``, ``claude``, ``statusline-setup``, or a plugin agent like
+        ``claude-container:README``. (Empirically confirmed 2026-07-09: an
+        Agent(subagent_type="general-purpose") tool call arrives at the gate
+        with ``agent_type='general-purpose'``, NOT ``agent:<id>``.)
+      - empty / missing / non-str -> ``None`` (unknown; caller falls back
+        to the legacy ``agent_id``-presence heuristic)
+
+    RATIONALE for the "everything else is a subagent" default (was
+    previously an ``"auxiliary"`` bucket treated as NOT-a-subagent): the
+    ONLY context that should receive main-loop treatment is the genuine
+    REPL main thread / SDK driver. Bucketing bare subagent slugs as
+    ``"auxiliary"`` (=> ``is_main_loop`` True) made EVERY main-loop-scoped
+    gate fire INSIDE subagents -- most visibly the botchat mark-read gate,
+    which forced background agents to read + ack the operator's botchat DMs
+    (leaking operator<->main-loop chat into subagent context). Any
+    non-main, non-empty context that fires a tool call is effectively a
+    spawned agent and must NOT inherit main-loop gates. The subagent gates
+    it now falls under (``subagent_queue_item_running`` /
+    ``subagent_queue_mutating_banned``) default-open when there is no queue
+    binding for the agent, so a genuine one-off helper is never blackholed.
+    """
+    if not agent_type or not isinstance(agent_type, str):
+        return None
+    at = agent_type.strip()
+    if not at:
+        return None
+    if at.startswith("repl_main_thread") or at == "sdk":
+        return "main"
+    return "subagent"
+
+
+def _is_subagent_context(agent_id, agent_type=None):
     """Return True iff the caller is inside a subagent.
 
-    Per Claude Code's hook contract, the PreToolUse / PostToolUse JSON payload
-    carries an ``agent_id`` field ONLY when the tool call originates from
-    inside a subagent. Main-loop tool calls have no ``agent_id`` (or an empty
-    string). We accept both ``None`` and ``""`` as "main loop".
+    PRIMARY signal: the hook payload's ``agent_type`` string. As of Claude
+    Code 2.1.x the main loop runs as a first-class agent that DOES carry a
+    non-empty ``agent_id`` (the fork/teammate architecture), so the old
+    "non-empty ``agent_id`` => subagent" heuristic misfires and attributes
+    the MAIN LOOP a subagent context -- which made ``is_main_loop`` return
+    False for the dispatcher and tripped ``subagent_queue_mutating_banned``
+    on the main loop's own ``session-task queue done`` calls. We therefore
+    classify on ``agent_type`` first:
+
+      - ``agent_type`` classifies as ``"main"`` (REPL main thread / sdk)
+        => NOT a subagent (return False), regardless of ``agent_id``.
+      - ``agent_type`` classifies as ``"subagent"`` (ANY other non-empty
+        value -- legacy ``agent:<id>`` / ``hook_agent`` OR a current bare
+        subagent-type slug like ``general-purpose`` / ``Explore``) =>
+        subagent (True).
+
+    FALLBACK (``agent_type`` absent/unknown -- older Claude Code that did
+    not emit it, or direct CLI use without ``--agent-type``): the legacy
+    ``agent_id``-presence heuristic. There, a non-empty ``agent_id`` meant
+    a subagent and the main loop had none.
     """
+    cls = _classify_agent_type(agent_type)
+    if cls is not None:
+        return cls == "subagent"
+    # Legacy fallback: no agent_type signal -> infer from agent_id presence.
     return bool(agent_id) and isinstance(agent_id, str) and agent_id.strip() != ""
 
 
-def _check_core(tool_name, command_string, prune=True, agent_id=None):
+def _check_core(tool_name, command_string, prune=True, agent_id=None,
+                agent_type=None):
     """Pure check: returns (ok: bool, blocking: list). blocking is a list of
     {id, deny_message, predicate, why} dicts for any obligations that match
     the tool but are not currently satisfied.
@@ -3119,7 +3190,7 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
     # obligations is active. See UNIVERSAL_RECOVERY_EXEMPT_PATTERNS for
     # the rationale + the list.
     universal_hit, _universal_pat = _universal_recovery_exempt_match(
-        tool_name, command_string, agent_id=agent_id,
+        tool_name, command_string, agent_id=agent_id, agent_type=agent_type,
     )
     if universal_hit:
         return (True, [])
@@ -3153,7 +3224,7 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
             continue
         pred = ob.get("predicate", {}) or {}
         ok, why = _eval_predicate(pred, tool_name, command_string,
-                                   agent_id=agent_id)
+                                   agent_id=agent_id, agent_type=agent_type)
         if not ok:
             blocking.append({
                 "id": ob.get("id"),
@@ -3177,7 +3248,8 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
     return (len(blocking) == 0, blocking)
 
 
-def _inform_check_core(tool_name, command_string, agent_id=None):
+def _inform_check_core(tool_name, command_string, agent_id=None,
+                       agent_type=None):
     """Evaluate every active inform-mode obligation whose tool_pattern matches
     the tool that just completed. Returns a list of
     {id, deny_message, predicate, why} dicts for any whose predicate fails.
@@ -3196,7 +3268,7 @@ def _inform_check_core(tool_name, command_string, agent_id=None):
     # stale" advisory rather than re-surfacing what the caller is already
     # acting on. Mirrors _check_core's framework floor.
     universal_hit, _universal_pat = _universal_recovery_exempt_match(
-        tool_name, command_string, agent_id=agent_id,
+        tool_name, command_string, agent_id=agent_id, agent_type=agent_type,
     )
     if universal_hit:
         return []
@@ -3220,7 +3292,7 @@ def _inform_check_core(tool_name, command_string, agent_id=None):
             continue
         pred = ob.get("predicate", {}) or {}
         ok, why = _eval_predicate(pred, tool_name, command_string,
-                                   agent_id=agent_id)
+                                   agent_id=agent_id, agent_type=agent_type)
         if not ok:
             failing.append({
                 "id": ob.get("id"),
@@ -3235,6 +3307,7 @@ def cmd_check(args):
     ok, blocking = _check_core(
         args.tool, args.command_string or "",
         agent_id=getattr(args, "agent_id", None),
+        agent_type=getattr(args, "agent_type", None),
     )
     if args.json:
         print(json.dumps({"ok": ok, "blocking": blocking}, indent=2))
@@ -3330,6 +3403,7 @@ def cmd_inform_check(args):
     failing = _inform_check_core(
         args.tool, args.command_string or "",
         agent_id=getattr(args, "agent_id", None),
+        agent_type=getattr(args, "agent_type", None),
     )
     if args.json:
         print(json.dumps({"failing": failing}, indent=2))
@@ -3359,6 +3433,7 @@ def cmd_post_tool(args):
     failing = _inform_check_core(
         args.tool, args.command_string or "",
         agent_id=getattr(args, "agent_id", None),
+        agent_type=getattr(args, "agent_type", None),
     )
     if args.json:
         print(json.dumps({"removed": removed, "failing": failing}, indent=2))
@@ -3483,10 +3558,18 @@ def build_parser():
     p_chk.add_argument("--tool", required=True)
     p_chk.add_argument("--command-string", default="")
     p_chk.add_argument("--agent-id", default="",
-                       help="payload.agent_id from the hook, when present; "
-                            "non-empty value marks a subagent context. "
+                       help="payload.agent_id from the hook, when present. "
                             "Forwarded to the is_main_loop predicate (and "
-                            "any all_of containing it).")
+                            "any all_of containing it). LEGACY fallback "
+                            "signal only -- prefer --agent-type, which is "
+                            "authoritative.")
+    p_chk.add_argument("--agent-type", default="",
+                       help="payload.agent_type from the hook (e.g. "
+                            "'repl_main_thread'/'sdk' = main loop, "
+                            "'agent:<id>'/'hook_agent' = subagent). PRIMARY "
+                            "main-loop-vs-subagent signal for is_main_loop; "
+                            "the main loop now carries a non-empty agent_id "
+                            "too, so agent_id alone no longer distinguishes.")
     p_chk.add_argument("--json", action="store_true")
     p_chk.set_defaults(func=cmd_check)
 
@@ -3505,7 +3588,11 @@ def build_parser():
     p_inform.add_argument("--tool", required=True)
     p_inform.add_argument("--command-string", default="")
     p_inform.add_argument("--agent-id", default="",
-                          help="payload.agent_id from the hook (subagent bypass)")
+                          help="payload.agent_id from the hook (legacy "
+                               "fallback signal; prefer --agent-type)")
+    p_inform.add_argument("--agent-type", default="",
+                          help="payload.agent_type from the hook (primary "
+                               "main-loop-vs-subagent signal)")
     p_inform.add_argument("--json", action="store_true")
     p_inform.set_defaults(func=cmd_inform_check)
 
@@ -3516,7 +3603,11 @@ def build_parser():
     p_pt.add_argument("--tool", required=True)
     p_pt.add_argument("--command-string", default="")
     p_pt.add_argument("--agent-id", default="",
-                      help="payload.agent_id from the hook (subagent bypass)")
+                      help="payload.agent_id from the hook (legacy fallback "
+                           "signal; prefer --agent-type)")
+    p_pt.add_argument("--agent-type", default="",
+                      help="payload.agent_type from the hook (primary "
+                           "main-loop-vs-subagent signal)")
     p_pt.add_argument("--json", action="store_true")
     p_pt.set_defaults(func=cmd_post_tool)
 

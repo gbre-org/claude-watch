@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Tests for container/bin/cwsr — in-container self-restart for claude.
 
-Exercises argv-construction WITHOUT actually invoking npm or tmux by
+Exercises argv-construction WITHOUT actually invoking the native
+installer or tmux by
 using the `--print` debug hook (the script builds the planned NPM and
 TMUX commands and prints them, then exits 0). Tests run on any
 host with bash 3.2+; no docker / tmux / npm required.
 
 Coverage:
-  - Default invocation: `npm install -g @anthropic-ai/claude-code@latest`
+  - Default invocation: `claude install latest`
     + `tmux respawn-pane -k -t claude-container:0.0 exec claude`.
-  - --version pins the npm version in the install argv.
+  - --version pins the native version in the install argv.
   - CLAUDE_AUTO_CONTINUE / CLAUDE_SHIM_SETTINGS_PATH env vars appear in
     the rebuilt claude argv (so the self-restart preserves the same
     shape entrypoint.sh built at container startup).
-  - --no-upgrade drops the NPM line.
+  - --no-upgrade drops the INSTALL line.
   - --upgrade-only drops the TMUX line.
   - --no-upgrade + --upgrade-only = exit 2 (sanity-rejected no-op).
   - CWSR_SESSION env override changes the tmux pane target.
@@ -83,13 +84,13 @@ def expect(cond: bool, msg: str) -> None:
 
 
 def test_print_default() -> None:
-    """Default: prints both NPM and TMUX lines with @latest."""
+    """Default: prints both INSTALL and TMUX lines with `claude install latest`."""
     lines, _, _, _ = run_cwsr(["--print"])
-    npm = [l for l in lines if l.startswith("NPM:")]
+    install = [l for l in lines if l.startswith("INSTALL:")]
     tmux = [l for l in lines if l.startswith("TMUX:")]
     expect(
-        len(npm) == 1 and "claude-code@latest" in npm[0],
-        f"default: should print NPM line with @latest, got {lines!r}",
+        len(install) == 1 and "claude install latest" in install[0],
+        f"default: should print INSTALL line with `claude install latest`, got {lines!r}",
     )
     expect(
         len(tmux) == 1 and "respawn-pane -k -t claude-container:0.0" in tmux[0],
@@ -103,12 +104,12 @@ def test_print_default() -> None:
 
 
 def test_print_version_pin() -> None:
-    """--version pins npm install."""
-    lines, _, _, _ = run_cwsr(["--print", "--version", "2.1.150"])
-    npm = [l for l in lines if l.startswith("NPM:")][0]
+    """--version pins the native install target."""
+    lines, _, _, _ = run_cwsr(["--print", "--version", "2.1.206"])
+    install = [l for l in lines if l.startswith("INSTALL:")][0]
     expect(
-        "claude-code@2.1.150" in npm,
-        f"--version: should pin npm version, got {npm!r}",
+        "claude install 2.1.206" in install,
+        f"--version: should pin native version, got {install!r}",
     )
 
 
@@ -145,20 +146,20 @@ def test_print_with_shim_settings() -> None:
 
 
 def test_print_no_upgrade() -> None:
-    """--no-upgrade drops the NPM line."""
+    """--no-upgrade drops the INSTALL line."""
     lines, _, _, _ = run_cwsr(["--print", "--no-upgrade"])
-    npm = [l for l in lines if l.startswith("NPM:")]
+    install = [l for l in lines if l.startswith("INSTALL:")]
     tmux = [l for l in lines if l.startswith("TMUX:")]
-    expect(len(npm) == 0, f"--no-upgrade: NPM line should be absent, got {lines!r}")
+    expect(len(install) == 0, f"--no-upgrade: INSTALL line should be absent, got {lines!r}")
     expect(len(tmux) == 1, f"--no-upgrade: TMUX line should still print, got {lines!r}")
 
 
 def test_print_upgrade_only() -> None:
     """--upgrade-only drops the TMUX line."""
     lines, _, _, _ = run_cwsr(["--print", "--upgrade-only"])
-    npm = [l for l in lines if l.startswith("NPM:")]
+    install = [l for l in lines if l.startswith("INSTALL:")]
     tmux = [l for l in lines if l.startswith("TMUX:")]
-    expect(len(npm) == 1, f"--upgrade-only: NPM line should print, got {lines!r}")
+    expect(len(install) == 1, f"--upgrade-only: INSTALL line should print, got {lines!r}")
     expect(
         len(tmux) == 0, f"--upgrade-only: TMUX line should be absent, got {lines!r}"
     )

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """hostjob — run long host commands detached, then poll/wait for them.
 
 WHY THIS EXISTS

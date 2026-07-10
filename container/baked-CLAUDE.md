@@ -601,15 +601,14 @@ agent-msg send <agent-id> "<message text>"
 
 That appends the message to the subagent's inbox file at
 `~/.config/claude/agent-inbox/<agent-id>.json` and **auto-arms the
-gate-mode obligation idempotently** (registering one scoped to that agent if
-none exists yet). So a bare `send` both delivers AND blocks -- a separate
-`arm` is optional, and forgetting it no longer leaves the message
-delivered-but-non-blocking. The subagent's next non-exempt tool call is
-HARD-DENIED by the existing `pre-tool-obligations-gate-hook` (already wired
-by the entrypoint), with the message body in the deny banner.
+gate-mode obligation idempotently** (scoped to that agent). So a bare `send`
+both delivers AND blocks — a separate `arm` is optional. The subagent's next
+non-exempt tool call is HARD-DENIED by the existing
+`pre-tool-obligations-gate-hook` (already wired by the entrypoint), with the
+message body in the deny banner.
 
 **Don't know the agent id, only the QUEUE id?** The main loop usually
-knows the queue item, not the agent id — and GUESSING it misroutes
+knows the queue item, not the agent id — and GUESSING misroutes
 corrections. Resolve instead:
 
 ```sh
@@ -620,10 +619,15 @@ agent-msg whoami <agent-id>                    # reverse: q-id for an agent
 
 These read the `PostToolUse:Agent` arm hook's binding map
 (`~/.config/claude/agent-queue-bindings.json`, read defensively). A bound
-agent is **live** only while its inbox file exists; resolution requires
-EXACTLY ONE live agent and **errors loudly on zero or multiple** — never
-silently picks (so a duplicate-spawn or already-exited agent is a hard
-failure, not a misroute).
+agent is **live** iff its transcript JSONL exists
+(`.../subagents/agent-<id>.jsonl`), NOT whether it has an inbox yet (the
+inbox only appears on the first `send`, so an inbox check would refuse a
+live-but-never-messaged agent). Resolution is **deterministic**: prune dead
+bindings by transcript-liveness, then pick the **newest-registered** live one
+(so a sub-subagent inheriting the same `Queue item:` marker resolves to
+whichever is most recently running). It **errors only on ZERO bindings**, and
+default-opens (treat as live) when transcript resolution is impossible —
+delivering to a maybe-dead inbox is harmless, refusing a live agent is not.
 
 **As a subagent, when you see a deny banner that includes the message
 text, run:**
@@ -634,8 +638,8 @@ agent-msg ack <agent-id>           # flip every unread message to read
 ```
 
 After `ack` the inbox is empty, the gate stops firing, and your next
-tool call goes through. Message bodies persist on disk so you can
-re-read them later via `agent-msg inbox --all`.
+tool call goes through. Message bodies persist on disk — re-read them
+later via `agent-msg inbox --all`.
 
 Subcommand surface:
 
@@ -644,43 +648,38 @@ agent-msg list                    # show currently tracked agents
 agent-msg show <id>               # metadata for one agent
 agent-msg arm <id>                # main-loop-only: register inbox gate
 agent-msg disarm <id>             # main-loop-only: tear down gate
-agent-msg send <id> <text>        # main-loop-only: deliver a message (auto-arms the gate idempotently)
-agent-msg send --queue-id q-XXXX <text>   # resolve q-id -> single live agent, then send
-agent-msg resolve <q-id>          # main-loop: print the live agent id bound to a q-id
-agent-msg whoami <id>             # reverse lookup: print the q-id bound to an agent
+agent-msg send <id> <text>        # main-loop-only: deliver a message (auto-arms the gate)
+agent-msg send --queue-id q-XXXX <text>   # resolve q-id -> live agent, then send
+agent-msg resolve <q-id>          # main-loop: live agent id bound to a q-id
+agent-msg whoami <id>             # reverse: q-id bound to an agent
 agent-msg inbox <id>              # read inbox (default: unread only)
 agent-msg ack <id>                # subagent-side: clear unread
 agent-msg gc <id>                 # drop read messages older than TTL
 agent-msg gc-dead                 # sweep obligations for dead agents
 ```
 
-`agent-msg ack | inbox | gc | disarm | list | status | show` is on the
-exempt list of every gate (inbox gate itself, alert gate, dispatch
-gate) so the subagent can always reach its own inbox. `send` and
-`arm` are NOT exempt — those are main-loop operations.
+`agent-msg ack | inbox | gc | disarm | list | status | show` is on every
+gate's exempt list (inbox, alert, dispatch) so the subagent can always reach
+its own inbox. `send` and `arm` are NOT exempt — those are main-loop ops.
 
-The `pre-tool-obligations-gate-hook` and the `obligations` CLI it
-shells out to are baked at `/usr/local/bin/`, so the inbox gate
-operates even in stripped-down `docker run` containers without
-`~/repos/claude-watch` bind-mounted.
+The `pre-tool-obligations-gate-hook` and its `obligations` CLI are baked at
+`/usr/local/bin/`, so the inbox gate operates even in stripped-down `docker
+run` containers without `~/repos/claude-watch` bind-mounted.
 
 ### Channel 2: Claude Code's built-in agent-chat curses UI — user -> subagent
 
 The second channel is **the operator typing directly to a running
 subagent** via Claude Code's built-in interactive chat panel (a TUI
-released May 2026; not a CLI we ship). The operator opens the chat
-panel against a specific subagent and sends free-form text. That
-text arrives in the subagent's context as a user message, distinct
-from the original spawn prompt and distinct from `agent-msg` inbox
-deliveries.
+released May 2026; not a CLI we ship). Free-form text arrives in the
+subagent's context as a user message, distinct from the spawn prompt and
+from `agent-msg` inbox deliveries.
 
 Critically: **a curses-chat message can override the main loop's
-intent.** If the operator opens the chat panel and tells you to
-pivot, change scope, abandon the task, or surface state, that
-direction outranks the queue item / spawn prompt that brought you
-here. Treat it the same way you'd treat a direct DM from the operator
-on the host side (e.g. "stop the PR, audit X instead" -> pivot;
-"abandon" -> `session-task queue abandon <id> --reason "user-direct"`).
+intent.** If the operator tells you to pivot, change scope, abandon the
+task, or surface state, that direction outranks the queue item / spawn
+prompt that brought you here. Treat it like a direct DM from the operator
+(e.g. "stop the PR, audit X instead" -> pivot; "abandon" ->
+`session-task queue abandon <id> --reason "user-direct"`).
 
 If the curses-chat direction CONFLICTS with an `agent-msg` inbox
 message from the main loop, the curses-chat direction wins (it's the
@@ -697,11 +696,10 @@ main loop can reconcile.
     line**: Channel 2. Source: operator via curses-chat. Treat as
     direct user direction.
 
-Both channels are SYNCHRONOUS at the boundary: you receive them, you
-must process them before continuing. Don't poll your inbox between
-tool calls — the gate hook surfaces messages automatically. Don't
-ignore curses-chat messages — they're the operator talking to you
-directly.
+Both channels are SYNCHRONOUS at the boundary: process them before
+continuing. Don't poll your inbox between tool calls — the gate hook
+surfaces messages automatically. Don't ignore curses-chat messages —
+they're the operator talking to you directly.
 
 ### Subagent transcript: `agent-tail`
 
@@ -775,29 +773,29 @@ container session should imitate.
 
 ## Self-update — `cwsr` rolls the inner `claude` without container restart
 
-When Anthropic ships a new `@anthropic-ai/claude-code` version, you do
-NOT need the operator to `docker compose restart` the whole container
-to pick it up. Run `cwsr` (in-container; baked at
-`/usr/local/bin/cwsr`) and the inner claude rolls in-place:
+claude-code updates via the NATIVE installer (NOT npm). When a new
+version ships, run `cwsr` (baked at `/usr/local/bin/cwsr`) and the
+inner claude rolls in-place via `claude install` — no full container
+restart:
 
 ```sh
-cwsr                    # npm install -g @latest, then respawn pane 0
-cwsr --version 2.1.150  # pin a specific npm version
+cwsr                    # claude install latest, then respawn pane 0
+cwsr --version 2.1.206  # install a specific native version
 cwsr --no-upgrade       # respawn current claude (rare; for testing)
 cwsr --upgrade-only     # install without rolling (operator can `cwsr --no-upgrade` later)
-cwsr --print            # dry-run; print planned NPM + TMUX argv
+cwsr --print            # dry-run; print planned INSTALL + TMUX argv
 ```
 
 What survives the roll: the tmux session (`claude-container:0.0`), the wrapping
-container, every MCP bridge that was up, the named-volume
+container, every MCP bridge that was up, the volume-backed
 `~/.local/share/claude/versions/` dir, the operator's tmux attach. What rolls:
-the claude process inside pane 0.
+the claude process inside pane 0. `claude install` writes to the
+volume-backed versions dir, so the roll SURVIVES a later redeploy.
 
 When you should run `cwsr`:
-- The operator says "upgrade to latest" or asks you to pick up a
-  specific version they reference.
-- You see (e.g. via `claude --version`) that the in-container version
-  has fallen behind a release the operator wants.
+- The operator says "upgrade to latest" or names a specific version.
+- You see (via `claude --version`) the in-container version has fallen
+  behind a release the operator wants.
 
 When `cwsr` is NOT the right tool:
 - Container itself is down — use `docker compose up -d` (or `cw --up`
@@ -808,9 +806,8 @@ When `cwsr` is NOT the right tool:
   inner process with whatever shape entrypoint.sh already chose. Ask
   the operator to `docker compose up -d --force-recreate` for those.
 
-The package name (`@anthropic-ai/claude-code`) and `npm install -g` are
-cross-platform (Linux, macOS, or Windows). The in-container npm runs as uid
-1000 against a writable global path, no sudo needed.
+The native installer runs as uid 1000 and writes to the volume-backed
+`~/.local/share/claude/versions/`, so updates persist. No npm, no sudo.
 
 ## Container redeploy (incl. self-redeploy from inside the container)
 
@@ -1268,10 +1265,9 @@ class.
 
 ### Tier 1 — Ambient (info-only, context-inject only)
 
-Routine, non-actionable events: alerts that Andrew already gets push for,
-cron ticks, routine queue transitions (running/done/abandoned), workload-
-done, non-fatal claude-watch alerts, routine PR status (push/pending/
-mergeable), etc.
+Routine, non-actionable events: alerts that Andrew already gets push for, cron
+ticks, routine queue transitions (running/done/abandoned), workload-done,
+non-fatal claude-watch alerts, routine PR status (push/pending/mergeable), etc.
 
   - Routed by `event-ack ingest` into `ambient-context.json`.
   - Surfaced by the `user-prompt-ambient-inject-hook` (UserPromptSubmit) on
@@ -1281,23 +1277,20 @@ mergeable), etc.
 
 ### Tier 2 — Actionable (pending list + N-call gate)
 
-Events that demand a response within a reasonable window: torrent-
-completed (needs agent spawn), manual/request-fulfilled (needs requester
-DM), queue/queue-api-dead (needs respawn decision), fatal claude-watch
-alerts (CONTEXT CRITICALLY LOW, main pane crashed), PR CI failure /
-success, workbot-prompt, queue-stale-ready, slack-unread,
+Events that demand a response within a reasonable window: torrent-completed
+(agent spawn), manual/request-fulfilled (requester DM), queue/queue-api-dead
+(respawn), fatal claude-watch alerts (CONTEXT CRITICALLY LOW, main pane crashed),
+PR CI failure/success, workbot-prompt, queue-stale-ready, slack-unread,
 **claude-watch/heartbeat-tick**.
 
 > **`heartbeat-tick` — touch the heartbeat file.** Every ~5 min the
 > claude-watch daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick
 > [path=<FILE> interval_secs=…]`. When you see it, run **`touch <FILE>`** (the
-> path on the event line, e.g. `touch /var/run/claude/claude-heartbeat`). That
-> file is the daemon's wedge-detector: it watches the mtime and, if it goes
-> stale (~10 min), fires a "heartbeat stale" alert and may try to recover a
-> loop it thinks is wedged. The touch MUST come from you acting on the event
-> (it proves the loop is alive) — the daemon never touches the file itself. A
-> one-command self-service action; no agent spawn or `event-ack` needed, just
-> the `touch`.
+> path on the event line, e.g. `/var/run/claude/claude-heartbeat`). That file
+> is the daemon's wedge-detector: if its mtime goes stale (~10 min) the
+> daemon fires a "heartbeat stale" alert and may try to recover the loop. The
+> touch MUST come from you acting on the event (it proves the loop is alive);
+> the daemon never touches it. One command, no agent spawn.
 
   - Routed by `event-ack ingest` into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt
@@ -1306,15 +1299,17 @@ success, workbot-prompt, queue-stale-ready, slack-unread,
   - **Each `event-ack` transaction resets the counter to 0**, so the LLM gets
     a fresh N-call grace window after every ack.
   - The gate does NOT fire immediately on every actionable event — only after
-    the LLM has missed N consecutive triage opportunities (the q-2026-05-21-
-    856d refinement: "only TRULY actionable events go into pending, and the
-    gate escalates after N missed calls rather than firing immediately").
+    the LLM has missed N consecutive triage opportunities (only TRULY actionable
+    events go into pending; the gate escalates after N missed calls).
 
-### Tier 3 — Unknown (defaults to ambient)
+### Tier 3 — Unknown (defaults to ACTIONABLE — fail-LOUD)
 
-Any event whose source/tag pair doesn't match an `event-classify` rule falls
-through to the default tier (ambient). Conservative posture — unknown events
-become context, never block.
+A source/tag pair matching no `event-classify` rule now defaults to
+**actionable** (flipped from ambient): a brand-new event source must be handled
+or get a rule, never silently swallowed. Routine events are unaffected —
+ambient pairs (`cron/*`, `alertmanager/*`, `claude-watch/*`, queue
+transitions) have explicit rules above the catch-alls; only unmatched pairs hit
+this default.
 
 ### Event classification table
 

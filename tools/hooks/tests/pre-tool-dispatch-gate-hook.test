@@ -272,6 +272,15 @@ def test_baked_bash_exempt_patterns_allow():
             # Heartbeat-liveness touch (both watched paths).
             "touch /var/run/claude/heartbeat",
             "touch /var/run/claude/claude-heartbeat",
+            # botchat comms surface (operator DM channel) -- reading + replying
+            # is dispatcher bookkeeping, not an inline worker chain.
+            "botchat-unread-check --ids",
+            "botchat-history --limit 5",
+            "botchat-show 1132",
+            "botchat-wait --timeout 60",
+            "botchat-send --mark-read 1132 --ack 1132",
+            "/usr/local/bin/botchat-send --reply-to 1132 hi",
+            "/Users/x/repos/botchat/bin/botchat-history",
         ]
         for cmd in exempt_cmds:
             rc, out, _ = h.run_hook({"tool_name": "Bash",
