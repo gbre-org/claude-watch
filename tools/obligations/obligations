@@ -2593,12 +2593,39 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
         'Bash'                    => matches when tool_name == 'Bash'
         'Bash:<regex>'            => matches when tool_name=='Bash' AND
                                      command_string matches <regex>
+        'Bashcmd:<names>'         => matches when tool_name=='Bash' AND any
+                                     comma-separated command NAME in <names>
+                                     is the effective command HEAD (basename,
+                                     env/wrapper/path stripped) of a top-level
+                                     segment. AST-aware: a name mentioned only
+                                     inside a quoted arg / heredoc body does
+                                     NOT match, and a path-prefixed / sudo- /
+                                     env-wrapped invocation DOES.
         '<name>'                  => matches when tool_name == <name>
     """
     if not pattern or pattern == "*":
         return True
     if ":" in pattern:
         head, rest = pattern.split(":", 1)
+        if head == "Bashcmd":
+            # Command-NAME match (not regex). Only ever matches the Bash tool.
+            if tool_name != "Bash":
+                return False
+            names = {n.strip() for n in rest.split(",") if n.strip()}
+            if _shell_ast is not None:
+                try:
+                    return _shell_ast.command_name_present(
+                        command_string or "", names)
+                except _shell_ast.ShellParseError:
+                    pass  # fall through to fail-safe word-boundary match
+            # Fail-safe (module missing OR unparseable command): match the
+            # name as a whole word anywhere in the raw command. Conservative
+            # (may over-exempt on quoted mentions) but preserves the pre-AST
+            # behavior for the unparseable edge, per shell_ast's contract.
+            return any(
+                re.search(r"\b" + re.escape(n) + r"\b", command_string or "")
+                for n in names
+            )
         if tool_name != head:
             return False
         try:
