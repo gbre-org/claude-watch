@@ -284,8 +284,8 @@ Before firing **any** `Agent` tool call, you MUST first add a queue
 item via `session-task queue`. The queue serializes work touching
 overlapping scopes, and the in-container scope namespace is **shared
 with the host** — `repo:claude-watch` covers BOTH host- and
-container-side work on that repo. An agent that skips the queue can
-race host-side work, lose edits to a parallel agent, or stomp builds.
+container-side work on that repo. An agent skipping the queue can race
+host-side work, lose edits to a parallel agent, or stomp builds.
 
 **Scope: this governs every `Agent` call the MAIN LOOP dispatches —
 one queue item per main-loop-spawned agent, the queue being the main
@@ -335,21 +335,21 @@ The five-step protocol (mirrors the host `## Resume Actions` workflow):
 Quick reference: `session-task queue --help` for the full subcommand
 surface (`add | list | spawn-check | register | block | unblock |
 wedge | unwedge | done | abandon | show`).
-The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
-if it's not on PATH, the operator hasn't wired the bind-mount and you
-should flag that before spawning agents at all.
+The `session-task` CLI is bind-mounted via `~/repos/claude-watch`; if
+it's not on PATH, the operator hasn't wired the bind-mount — flag that
+before spawning agents at all.
 
 ### Parking on an external blocker — use `block`, not a fake `running`
 
 When an agent finishes all autonomous work and is parked on something
 OUTSIDE the system (awaiting CI, human greenlight, branch-protection
-toggle, a third-party API window), flip the item to `blocked` — do NOT
-leave it as a fake `running`. Flow: `register` (→running) →
+toggle, third-party API window), flip the item to `blocked` — do NOT
+leave it a fake `running`. Flow: `register` (→running) →
 `block <id> --reason "awaiting <X>"` (→blocked) → `unblock <id>` when
 the blocker clears (or `done` / `abandon`). `unblock` preserves
 `blocked_at` + `block_reason` as audit.
 
-`blocked` (system did its part, waiting on someone/something else) is
+`blocked` (system did its part, waiting on someone else) is
 distinct from `wedge` (the system itself is STUCK). Blocked items are
 labeled distinctly by the exporter and are EXEMPT from the
 WorkQueueOrphaned / running-without-owner alert. So `block` is the
