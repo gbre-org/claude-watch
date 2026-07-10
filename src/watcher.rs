@@ -729,7 +729,7 @@ pub fn exit_code_from_status(code: Option<i32>, signal: Option<i32>) -> i32 {
 ///
 /// **Cardinal rule (2026-05-01):** watchers can ONLY be started by Claude
 /// Code's main loop, in the main loop's process tree. `enable` therefore
-/// flips the config bit and stops there — the next `watcher-restart` /
+/// flips the config bit and stops there — the next `watcher-ctl run <name>` /
 /// session-resume run *by the main loop* is what actually spawns the
 /// watcher. We do NOT `nohup` (or any other supervisor mechanism) the
 /// start_cmd from this process: a daemon-spawned watcher would live in the
@@ -793,12 +793,12 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
 
     if enable {
         // Config-only flip. The main loop is responsible for spawning the
-        // watcher (e.g. via `watcher-restart` or a fresh
-        // `watcher-ctl run <name>` background task). We deliberately do not
+        // watcher (via a fresh `watcher-ctl run <name>` background task;
+        // `watcher-restart` only STOPS watchers). We deliberately do not
         // spawn it here — see the doc comment above.
         Ok(format!(
             "{}: enabled (config flipped — main loop must spawn via \
-             `watcher-ctl run {}` or `watcher-restart`)",
+             `watcher-ctl run {}`)",
             name, name
         ))
     } else {
@@ -1093,22 +1093,26 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
         // State-aware recovery suggestion. The footer is the canonical
         // place for an actionable next step; the per-row text above stays
         // pure status data so existing parsers (cron jobs, dashboards)
-        // don't have to filter prose. DUPLICATE always wins because
-        // `watcher-restart` is a superset fix (kills everything, lets
-        // supervisors respawn DOWN watchers from a clean slate); a per-
-        // watcher `watcher-ctl run <name>` wouldn't clear the duplicate
-        // pollers/supervisors.
+        // don't have to filter prose. DUPLICATE always wins because only
+        // `watcher-restart` clears duplicate pollers/supervisors (kills
+        // everything + cleans PID files) — but it STARTS nothing, so it
+        // must always be followed by `watcher-ctl run <name>` for each
+        // enabled watcher. A per-watcher `watcher-ctl run <name>` alone
+        // wouldn't clear the duplicates.
         if has_duplicate {
             out.push_str(
                 "Recovery for DUPLICATE state: `watcher-restart` \
-                 (kills all watchers + cleans PID files; supervisors will respawn).\n",
+                 (STOPS all watchers + cleans PID files — it starts NOTHING), \
+                 then `watcher-ctl run <name>` for each enabled watcher.\n",
             );
         } else if !down_names.is_empty() {
             // DOWN-only: per-watcher restart is the surgical fix.
             let names = down_names.join(" ");
             out.push_str(&format!(
-                "Recovery for DOWN state: `watcher-ctl run <name>` (e.g. {}). \
-                 Or `watcher-restart` to reset everything.\n",
+                "Recovery for DOWN state: `watcher-ctl run <name>` for each \
+                 DOWN watcher (e.g. {}). Note: `watcher-restart` only STOPS \
+                 all watchers — after it, every watcher must still be \
+                 started with `watcher-ctl run`.\n",
                 names
             ));
         }
@@ -1552,9 +1556,10 @@ mod tests {
     //
     // The footer must DIFFERENTIATE the recovery command by the failure
     // state. DUPLICATE => `watcher-restart` (the only thing that clears
-    // duplicate pollers/supervisors); DOWN-only => per-watcher
-    // `watcher-ctl run <name>` (surgical), with `watcher-restart` as a
-    // secondary option.
+    // duplicate pollers/supervisors) followed by `watcher-ctl run <name>`
+    // per watcher (watcher-restart STOPS everything and starts nothing);
+    // DOWN-only => per-watcher `watcher-ctl run <name>` (surgical), with
+    // `watcher-restart` mentioned only alongside its stop-only caveat.
 
     #[test]
     fn test_format_status_duplicate_suggests_watcher_restart() {
@@ -1578,6 +1583,15 @@ mod tests {
             output.contains("`watcher-restart`"),
             "expected the literal `watcher-restart` (backticks) as the \
              recovery command for DUPLICATE state, got:\n{}",
+            output
+        );
+        // watcher-restart only STOPS — the footer must spell out the
+        // mandatory `watcher-ctl run <name>` follow-up so the operator
+        // doesn't stop everything and restart nothing.
+        assert!(
+            output.contains("then `watcher-ctl run <name>` for each"),
+            "expected the `watcher-ctl run <name>` follow-up after \
+             watcher-restart in the DUPLICATE recovery line, got:\n{}",
             output
         );
         // DUPLICATE-only must NOT recommend `watcher-ctl run <name>` as
@@ -1615,20 +1629,23 @@ mod tests {
              example, got:\n{}",
             output
         );
-        // `watcher-restart` should still appear as a fallback.
+        // `watcher-restart` may be mentioned, but ONLY with the stop-only
+        // caveat — never as a command that restarts watchers by itself.
         assert!(
-            output.contains("`watcher-restart`"),
-            "expected `watcher-restart` mentioned as the fallback, got:\n{}",
+            output.contains("`watcher-restart` only STOPS"),
+            "expected `watcher-restart` mentioned with its stop-only \
+             caveat, got:\n{}",
             output
         );
     }
 
     #[test]
     fn test_format_status_mixed_down_and_duplicate_prefers_watcher_restart() {
-        // When DOWN and DUPLICATE coexist, `watcher-restart` is the
-        // superset fix (clears duplicates AND the supervisors will
-        // respawn the DOWN ones). The per-watcher `watcher-ctl run`
-        // path would still leave the duplicates in place, so the
+        // When DOWN and DUPLICATE coexist, `watcher-restart` (then
+        // `watcher-ctl run <name>` per watcher) is the superset fix:
+        // the stop pass clears the duplicates, and the per-watcher run
+        // pass covers the DOWN ones too. A per-watcher `watcher-ctl run`
+        // path alone would still leave the duplicates in place, so the
         // primary recommendation should be `watcher-restart`.
         let statuses = vec![
             down_status("claude-event-watch", 1),

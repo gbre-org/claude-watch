@@ -39,7 +39,9 @@
 #       explicitly to pin a pane (e.g. the container sets claude-container:0.0).
 #   CW_WATCHER_HEALTH_RESTART_HINT — operator-specific instruction appended
 #       to the alert telling the loop how to restart the watcher (default:
-#       "Restart the event watcher (watcher-restart) immediately.").
+#       "Start the event watcher NOW: run `watcher-ctl run
+#       claude-event-watch` as a background task. (`watcher-restart` will
+#       NOT do it — it only STOPS all watchers.)").
 #   CW_WATCHER_HEALTH_COOLDOWN_SECS — minimum seconds between injects while a
 #       stale window persists (default 600 = 10 min). 0 disables the
 #       cooldown (inject every tick that finds stale events).
@@ -102,7 +104,7 @@ set -euo pipefail
 QUEUE="${CLAUDE_EVENT_QUEUE:-$HOME/claude-events}"
 STALE_MIN="${CW_WATCHER_HEALTH_STALE_MIN:-2}"
 PANE="${CW_WATCHER_HEALTH_PANE:-}"
-RESTART_HINT="${CW_WATCHER_HEALTH_RESTART_HINT:-Restart the event watcher (watcher-restart) immediately.}"
+RESTART_HINT="${CW_WATCHER_HEALTH_RESTART_HINT:-Start the event watcher NOW: run \`watcher-ctl run claude-event-watch\` as a background task. (\`watcher-restart\` will NOT do it — it only STOPS all watchers.)}"
 COOLDOWN_SECS="${CW_WATCHER_HEALTH_COOLDOWN_SECS:-600}"
 
 STATE_DIR_DEFAULT="${CLAUDE_EVENT_STATE_DIR:-$HOME/.config/claude-events}"
