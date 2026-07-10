@@ -1108,6 +1108,18 @@ pub struct QueueCheckConfig {
     /// `for:15m`). The `--stale-heartbeat-min` CLI flag overrides per-run.
     #[serde(default = "default_queue_check_stale_heartbeat_min")]
     pub stale_heartbeat_min: u64,
+    /// Grace window (seconds) before a `running` item that has NO
+    /// active-agent binding is flagged ORPHANED (the never-spawned case).
+    /// A `running` item whose `registered_at` is older than this AND for
+    /// which `active-agents.json` carries no matching agent record is
+    /// treated as never-spawned / agent-died-without-a-transcript. Default
+    /// 150s covers normal agent-spawn latency (the active-agents cron runs
+    /// every 60s; 150s ≈ two-and-a-half ticks of headroom). The
+    /// `--no-binding-grace-secs` CLI flag overrides per-run. Workload /
+    /// hostjob-scoped items are exempt (their liveness is a progress
+    /// heartbeat, not an agent transcript).
+    #[serde(default = "default_queue_check_no_binding_grace_secs")]
+    pub no_binding_grace_secs: u64,
 }
 
 impl Default for QueueCheckConfig {
@@ -1115,6 +1127,7 @@ impl Default for QueueCheckConfig {
         Self {
             emit_events: default_queue_check_emit_events(),
             stale_heartbeat_min: default_queue_check_stale_heartbeat_min(),
+            no_binding_grace_secs: default_queue_check_no_binding_grace_secs(),
         }
     }
 }
@@ -1125,6 +1138,10 @@ fn default_queue_check_emit_events() -> bool {
 
 fn default_queue_check_stale_heartbeat_min() -> u64 {
     15
+}
+
+fn default_queue_check_no_binding_grace_secs() -> u64 {
+    150
 }
 
 /// Config for the daemon's cadence events. The daemon emits two periodic

@@ -9,12 +9,25 @@
 //!
 //! ## Conditions detected
 //!
-//!   * **orphaned** — a `running` item whose owning PID is set
-//!     (explicitly claimed via `register --pid` / `heartbeat --pid`) but
-//!     is no longer alive. `pid=null` items are trusted-alive by
-//!     convention (their liveness is the heartbeat / tmux pane, not an OS
-//!     PID) and are NEVER flagged orphaned here — matching the exporter's
-//!     `has_live_owner` treatment of pid-less items.
+//!   * **orphaned** — a `running` item that is no longer being worked,
+//!     detected in this precedence order:
+//!       1. **PID fast-path** — an explicitly-claimed owning PID
+//!          (`register --pid` / `heartbeat --pid`) that is no longer alive.
+//!       2. **active-agents join** — the fix for the historically-dead
+//!          orphan branch: `session-task register` sets `pid=None` on every
+//!          normal agent-spawn item, so the PID fast-path never fired for
+//!          them. We now read the cron-written `active-agents.json` and join
+//!          each `running` item on `queue_id` against agent transcript
+//!          liveness (the same join the work-queue-exporter already does):
+//!            - agent record present + transcript fresh → healthy.
+//!            - agent record present + transcript stale → orphaned
+//!              (died-after-spawn).
+//!            - NO agent record + `registered_at` older than the no-binding
+//!              grace window → orphaned (never-spawned). Workload/hostjob-
+//!              scoped items are exempt (their liveness is a progress
+//!              heartbeat, not an agent transcript). If the state file is
+//!              missing/unreadable the join is skipped (fail-open — never
+//!              orphan on an absent source; fall back to the stuck check).
 //!   * **stuck** — either:
 //!       - status `wedged` (an operator or recovery path flagged the item
 //!         as system-stuck — context-limit / prolonged-thinking /
@@ -59,6 +72,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `for:15m` window and sits an order of magnitude above healthy
 /// heartbeat cadences (e.g. `workload babysit` pats every 60 s).
 pub const DEFAULT_STALE_HEARTBEAT_MIN: u64 = 15;
+
+/// Default grace window (seconds) before a `running` item with NO
+/// active-agent binding is flagged orphaned (the never-spawned case).
+/// 150s ≈ two-and-a-half ticks of the 60s active-agents cron, comfortably
+/// past normal agent-spawn latency without false-positiving a
+/// just-registered item. Overridable via `[queue_check]
+/// no_binding_grace_secs` or `--no-binding-grace-secs`.
+pub const DEFAULT_NO_BINDING_GRACE_SECS: u64 = 150;
 
 /// Max number of ids to list inline in the human-readable `message`.
 pub const TOP_N: usize = 3;
@@ -115,13 +136,61 @@ pub struct QueueItem {
     #[serde(default)]
     pub description: Option<String>,
     /// Owning PID. `None` (JSON null / absent) means "no explicit PID
-    /// claimed" — trusted-alive, never flagged orphaned.
+    /// claimed" — trusted-alive, never flagged orphaned via the PID
+    /// fast-path (but still subject to the active-agents join below).
     #[serde(default)]
     pub pid: Option<i64>,
     #[serde(default)]
     pub last_heartbeat_at: Option<String>,
+    /// When the item transitioned to `running` (`register`). The age
+    /// reference for the never-spawned no-binding orphan grace window.
+    /// Falls back to `started_at` if absent.
+    #[serde(default)]
+    pub registered_at: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// Scope tokens (e.g. `["repo:ACME_ORG"]`, `["workload:stv-promote"]`).
+    /// Items whose scope carries a `workload:` / `hostjob:` token are
+    /// exempt from the no-binding orphan check — their liveness is a
+    /// progress heartbeat, not an agent transcript, so a missing agent
+    /// record is expected and NOT an orphan signal.
+    #[serde(default)]
+    pub scope: Vec<String>,
     #[serde(default)]
     pub wedged_reason: Option<String>,
+}
+
+/// Result of joining a `running` queue item against the cron-written
+/// `active-agents.json` (via the injected `agent_lookup` closure). Modeled
+/// as a closure so unit tests can drive every branch without a real state
+/// file, mirroring the existing `pid_alive` injected-closure pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentLiveness {
+    /// State loaded and a matching agent record exists AND its transcript
+    /// is fresh (`alive=true`). The item is healthy.
+    Alive,
+    /// State loaded and a matching agent record exists but its transcript
+    /// is stale (`alive=false`) — the agent died AFTER spawning. Orphaned
+    /// (died-after-spawn coverage).
+    Dead,
+    /// State loaded, but NO matching agent record for this qid — the
+    /// never-spawned / agent-died-without-a-transcript case. Orphaned only
+    /// once past the no-binding grace window (and only for
+    /// non-workload/hostjob items).
+    NoRecord,
+    /// active-agents state UNAVAILABLE (file missing / unreadable). The
+    /// join can't be trusted, so it never drives an orphan decision —
+    /// detection falls back to the legacy stale-heartbeat `stuck` path.
+    Unknown,
+}
+
+/// True iff any scope token marks this item as progress-heartbeat-tracked
+/// (a `workload:` or `hostjob:` run). Such items are exempt from the
+/// no-binding orphan check — they legitimately have no agent transcript.
+pub fn is_progress_tracked_scope(scope: &[String]) -> bool {
+    scope
+        .iter()
+        .any(|s| s.starts_with("workload:") || s.starts_with("hostjob:"))
 }
 
 /// One qualifying item plus the condition it triggered and a short
@@ -213,22 +282,50 @@ pub fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
 ///   * `already_emitted` — dedup state (per-(qid,condition) key).
 ///   * `now_epoch_secs` — current time.
 ///   * `stale_secs` — heartbeat-staleness threshold for `stuck`.
-///   * `pid_alive` — injected liveness probe (prod: `/proc/<pid>` check;
-///     tests: a fake). Called only for `running` items with an explicit
-///     positive PID.
+///   * `no_binding_grace_secs` — grace window before a `running` item with
+///     NO agent binding (the never-spawned case) is flagged orphaned.
+///   * `pid_alive` — injected PID liveness probe (prod: `/proc/<pid>`
+///     check; tests: a fake). Called only for `running` items with an
+///     explicit positive PID (the fast path).
+///   * `agent_lookup` — injected active-agents join: given a qid, returns
+///     `AgentLiveness` (Alive / Dead / NoRecord / Unknown). This is the
+///     fix for the dead-code orphan branch: `register` sets `pid=None` on
+///     every normal agent-spawn item, so the PID fast-path never fires for
+///     them — the transcript-liveness join is what actually detects a
+///     died / never-spawned agent.
+///
+/// ## Orphan detection order (per `running` item)
+///
+///   1. **PID fast-path** — explicit positive PID no longer alive →
+///      orphaned. Cheap; kept as-is for pid-claimed items (workload
+///      babysit, explicit `register --pid`).
+///   2. **Active-agents join** (`agent_lookup`):
+///        - `Alive`    → healthy, no flag.
+///        - `Dead`     → orphaned (died-after-spawn).
+///        - `NoRecord` → orphaned IFF `registered_at` age >
+///          `no_binding_grace_secs` AND the item is not
+///          workload/hostjob-scoped (never-spawned case, the q-b09f
+///          incident). Within grace → not-yet, stays silent.
+///        - `Unknown`  → state unavailable; skip the join (fall through
+///          to the stale-heartbeat `stuck` path). Never orphan on an
+///          unreadable state file (fail-open).
+///   3. **Stuck** — stale heartbeat (unchanged fallback).
 ///
 /// An item can match at most ONE condition per tick. Orphaned takes
 /// precedence over stuck (a dead owner is the stronger signal). `wedged`
 /// items are always `stuck` (they carry no live PID expectation).
-pub fn compute_qualifying<F>(
+pub fn compute_qualifying<F, G>(
     items: &[QueueItem],
     already_emitted: &State,
     now_epoch_secs: i64,
     stale_secs: i64,
+    no_binding_grace_secs: i64,
     mut pid_alive: F,
+    mut agent_lookup: G,
 ) -> Vec<Qualifying>
 where
     F: FnMut(i64) -> bool,
+    G: FnMut(&str) -> AgentLiveness,
 {
     let mut out: Vec<Qualifying> = Vec::new();
     for it in items {
@@ -258,7 +355,9 @@ where
             continue;
         }
 
-        // Orphaned: explicit positive PID that is no longer alive.
+        // 1. Orphaned fast-path: explicit positive PID that is no longer
+        //    alive. (Rare for normal agent items — `register` sets
+        //    pid=None — but kept for pid-claimed items like workloads.)
         if let Some(pid) = it.pid {
             if pid > 0 && !pid_alive(pid) {
                 push_unique(
@@ -273,7 +372,65 @@ where
             }
         }
 
-        // Stuck: stale heartbeat.
+        // 2. Orphaned via the active-agents transcript-liveness join. This
+        //    is the coverage the PID fast-path misses for pid-less items.
+        match agent_lookup(&it.id) {
+            AgentLiveness::Alive => {
+                // Healthy: transcript is fresh. Skip both orphan and stuck
+                // (a live agent needn't pat the queue heartbeat — only
+                // `workload babysit` does — so the stale-heartbeat stuck
+                // path would false-positive here).
+                continue;
+            }
+            AgentLiveness::Dead => {
+                push_unique(
+                    &mut out,
+                    already_emitted,
+                    it,
+                    &summary,
+                    Condition::Orphaned,
+                    "agent transcript stale (died after spawn)".to_string(),
+                );
+                continue;
+            }
+            AgentLiveness::NoRecord => {
+                // Never-spawned / no-transcript. Only orphan once past the
+                // grace window AND for non-progress-tracked items
+                // (workload/hostjob items legitimately have no agent).
+                if !is_progress_tracked_scope(&it.scope) {
+                    if let Some(reg) = it
+                        .registered_at
+                        .as_deref()
+                        .or(it.started_at.as_deref())
+                        .and_then(parse_iso_epoch_secs)
+                    {
+                        let age = now_epoch_secs - reg;
+                        if age >= no_binding_grace_secs {
+                            let age_min = (age / 60).max(0);
+                            push_unique(
+                                &mut out,
+                                already_emitted,
+                                it,
+                                &summary,
+                                Condition::Orphaned,
+                                format!(
+                                    "no agent binding {age_min} min after register (never spawned?)"
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                // Within grace, progress-tracked, or unparseable
+                // register-time → fall through to the stuck check.
+            }
+            AgentLiveness::Unknown => {
+                // State unavailable — don't trust the join. Fall through
+                // to the stale-heartbeat stuck path (legacy behaviour).
+            }
+        }
+
+        // 3. Stuck: stale heartbeat.
         if let Some(hb) = it
             .last_heartbeat_at
             .as_deref()
@@ -511,6 +668,41 @@ fn pid_is_alive(pid: i64) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Build the prod `agent_lookup` from the cron-written
+/// `active-agents.json` at `<state-dir>/active-agents.json`.
+///
+/// Returns a `(map, state_present)` pair. `map` is `queue_id ->
+/// AgentRecord`; `state_present` is false when the state file was missing
+/// or unparseable, in which case the returned closure yields
+/// `AgentLiveness::Unknown` for EVERY qid (fail-open — never orphan on an
+/// absent join source). When the state IS present, a qid with no record
+/// yields `NoRecord`, a fresh record `Alive`, a stale record `Dead`.
+fn build_agent_liveness(
+    state_dir: &Path,
+) -> (std::collections::HashMap<String, crate::active_agents::AgentRecord>, bool) {
+    let path = state_dir.join("active-agents.json");
+    match crate::active_agents::load_agent_state(&path) {
+        Some(state) => (crate::active_agents::agents_by_queue_id(&state), true),
+        None => (std::collections::HashMap::new(), false),
+    }
+}
+
+/// Map a `(map, present)` join result into an `AgentLiveness` for one qid.
+fn agent_liveness_for(
+    map: &std::collections::HashMap<String, crate::active_agents::AgentRecord>,
+    present: bool,
+    qid: &str,
+) -> AgentLiveness {
+    if !present {
+        return AgentLiveness::Unknown;
+    }
+    match map.get(qid) {
+        Some(rec) if rec.alive => AgentLiveness::Alive,
+        Some(_) => AgentLiveness::Dead,
+        None => AgentLiveness::NoRecord,
+    }
+}
+
 /// Resolve `[queue_check] emit_events` from config (default false). Any
 /// config-load failure → false (default-OFF, fail-closed for emission).
 fn config_emit_events() -> bool {
@@ -521,8 +713,14 @@ fn config_emit_events() -> bool {
 }
 
 /// CLI entry point. Returns the process exit code.
+///
+/// `no_binding_grace_secs` — grace window (seconds) before a `running`
+/// item with no active-agent binding is flagged orphaned (never-spawned
+/// case). Resolved by the caller: `--no-binding-grace-secs` CLI flag wins,
+/// else `[queue_check] no_binding_grace_secs`, else the built-in default.
 pub fn cmd_queue_check(
     stale_heartbeat_min: u64,
+    no_binding_grace_secs: u64,
     state_dir: Option<&str>,
     force_emit: bool,
     dry_run: bool,
@@ -554,8 +752,20 @@ pub fn cmd_queue_check(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let stale_secs = (stale_heartbeat_min as i64).saturating_mul(60);
+    let grace_secs = no_binding_grace_secs as i64;
 
-    let qualifying = compute_qualifying(&all_items, &pruned, now_epoch, stale_secs, pid_is_alive);
+    // Build the active-agents join once (reads <state-dir>/active-agents.json).
+    let (agent_map, state_present) = build_agent_liveness(&state_dir);
+
+    let qualifying = compute_qualifying(
+        &all_items,
+        &pruned,
+        now_epoch,
+        stale_secs,
+        grace_secs,
+        pid_is_alive,
+        |qid| agent_liveness_for(&agent_map, state_present, qid),
+    );
 
     // Always persist the pruned state (cleans up finished items).
     let mut next_state = pruned.clone();
@@ -691,11 +901,14 @@ mod tests {
             description: None,
             pid,
             last_heartbeat_at: last_heartbeat_at.map(|s| s.to_string()),
+            registered_at: None,
+            started_at: None,
+            scope: Vec::new(),
             wedged_reason: None,
         }
     }
 
-    // Liveness probes for tests.
+    // PID liveness probes for tests.
     fn all_dead(_pid: i64) -> bool {
         false
     }
@@ -703,11 +916,30 @@ mod tests {
         true
     }
 
+    // Agent-liveness lookups for tests.
+    /// Join source unavailable — inert (existing tests use this so the
+    /// active-agents branch is skipped and legacy pid/stuck logic runs).
+    fn no_agents(_qid: &str) -> AgentLiveness {
+        AgentLiveness::Unknown
+    }
+    fn all_agents_alive(_qid: &str) -> AgentLiveness {
+        AgentLiveness::Alive
+    }
+    fn all_agents_dead(_qid: &str) -> AgentLiveness {
+        AgentLiveness::Dead
+    }
+    fn all_agents_no_record(_qid: &str) -> AgentLiveness {
+        AgentLiveness::NoRecord
+    }
+
+    // Default grace window used by legacy tests (matches the const).
+    const GRACE: i64 = 150;
+
     #[test]
     fn orphaned_when_pid_dead() {
         let items = vec![item("q-1", "running", Some(4242), None)];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_dead);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].id, "q-1");
         assert_eq!(q[0].condition, Condition::Orphaned);
@@ -718,7 +950,7 @@ mod tests {
     fn not_orphaned_when_pid_alive() {
         let items = vec![item("q-1", "running", Some(4242), None)];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_alive);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_alive, no_agents);
         assert!(q.is_empty());
     }
 
@@ -728,8 +960,154 @@ mod tests {
         let hb = iso_n_min_ago(0);
         let items = vec![item("q-1", "running", None, Some(&hb))];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_dead);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
         assert!(q.is_empty());
+    }
+
+    // --- active-agents join (orphan detection via transcript liveness) ---
+
+    /// A `running`, pid-less item registered `reg_min_ago` minutes ago
+    /// with an optional scope. Models the normal agent-spawn flow where
+    /// `register` sets pid=None.
+    fn running_reg(id: &str, reg_min_ago: i64, scope: &[&str]) -> QueueItem {
+        let mut it = item(id, "running", None, None);
+        it.registered_at = Some(iso_n_min_ago(reg_min_ago));
+        it.scope = scope.iter().map(|s| s.to_string()).collect();
+        it
+    }
+
+    #[test]
+    fn agent_alive_is_healthy() {
+        // Live transcript → neither orphaned nor stuck, even with a stale
+        // queue heartbeat (a live agent needn't pat the queue heartbeat).
+        let mut it = running_reg("q-live", 30, &[]);
+        it.last_heartbeat_at = Some(iso_n_min_ago(30));
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_alive,
+        );
+        assert!(q.is_empty(), "{:?}", q);
+    }
+
+    #[test]
+    fn agent_dead_transcript_is_orphaned() {
+        // Record exists but transcript is stale → died-after-spawn orphan.
+        let it = running_reg("q-died", 30, &[]);
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_dead,
+        );
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, "q-died");
+        assert_eq!(q[0].condition, Condition::Orphaned);
+        assert!(q[0].detail.contains("died after spawn"), "{}", q[0].detail);
+    }
+
+    #[test]
+    fn no_binding_past_grace_is_orphaned() {
+        // No agent record + registered well past the grace window →
+        // never-spawned orphan (the q-b09f incident).
+        let it = running_reg("q-never", 10, &[]); // 10 min > 150s grace
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+        );
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, "q-never");
+        assert_eq!(q[0].condition, Condition::Orphaned);
+        assert!(q[0].detail.contains("no agent binding"), "{}", q[0].detail);
+    }
+
+    #[test]
+    fn no_binding_within_grace_not_yet() {
+        // No record but only just registered (within grace) → stay silent.
+        // registered 1 min ago, grace 150s (2.5 min).
+        let it = running_reg("q-fresh", 1, &[]);
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+        );
+        assert!(q.is_empty(), "{:?}", q);
+    }
+
+    #[test]
+    fn no_binding_workload_scope_exempt() {
+        // A workload-scoped item legitimately has no agent transcript —
+        // must NOT be flagged orphaned even long past the grace window.
+        let it = running_reg("q-wl", 60, &["workload:stv-promote"]);
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+        );
+        assert!(q.is_empty(), "{:?}", q);
+    }
+
+    #[test]
+    fn no_binding_hostjob_scope_exempt() {
+        let it = running_reg("q-hj", 60, &["hostjob:qc-build"]);
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+        );
+        assert!(q.is_empty(), "{:?}", q);
+    }
+
+    #[test]
+    fn agent_state_unknown_falls_back_to_stuck() {
+        // State unavailable (Unknown) → the join is skipped; a pid-less
+        // running item with a stale heartbeat still surfaces as STUCK via
+        // the legacy fallback (fail-open, no orphan on missing state).
+        let mut it = running_reg("q-fb", 30, &[]);
+        it.last_heartbeat_at = Some(iso_n_min_ago(30));
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, no_agents,
+        );
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].condition, Condition::Stuck);
+    }
+
+    #[test]
+    fn agent_state_unknown_no_false_orphan() {
+        // Unknown join + fresh heartbeat → nothing (never orphan on an
+        // unreadable state file).
+        let mut it = running_reg("q-fb2", 30, &[]);
+        it.last_heartbeat_at = Some(iso_n_min_ago(1));
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, no_agents,
+        );
+        assert!(q.is_empty(), "{:?}", q);
+    }
+
+    #[test]
+    fn pid_dead_fast_path_wins_over_agent_join() {
+        // Explicit dead PID short-circuits to Orphaned before the agent
+        // join is even consulted (the join here would say Alive).
+        let mut it = item("q-pid", "running", Some(4242), None);
+        it.registered_at = Some(iso_n_min_ago(30));
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_dead, all_agents_alive,
+        );
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].condition, Condition::Orphaned);
+        assert!(q[0].detail.contains("4242"));
+    }
+
+    #[test]
+    fn no_binding_no_register_time_falls_through() {
+        // NoRecord but registered_at/started_at unparseable → can't age
+        // the grace window, so fall through (no orphan). Fresh-ish
+        // heartbeat keeps it silent.
+        let mut it = item("q-nots", "running", None, Some(&iso_n_min_ago(1)));
+        it.registered_at = None;
+        it.started_at = None;
+        let now = Utc::now().timestamp();
+        let q = compute_qualifying(
+            &[it], &State::new(), now, 15 * 60, GRACE, all_alive, all_agents_no_record,
+        );
+        assert!(q.is_empty(), "{:?}", q);
     }
 
     #[test]
@@ -737,7 +1115,7 @@ mod tests {
         let mut it = item("q-w", "wedged", None, None);
         it.wedged_reason = Some("context-limit".to_string());
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&[it], &State::new(), now, 15 * 60, all_alive);
+        let q = compute_qualifying(&[it], &State::new(), now, 15 * 60, GRACE, all_alive, no_agents);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Stuck);
         assert!(q[0].detail.contains("context-limit"));
@@ -748,7 +1126,7 @@ mod tests {
         let hb = iso_n_min_ago(30); // 30 min old, threshold 15
         let items = vec![item("q-s", "running", None, Some(&hb))];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_alive);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_alive, no_agents);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Stuck);
         assert!(q[0].detail.contains("min"));
@@ -759,7 +1137,7 @@ mod tests {
         let hb = iso_n_min_ago(2);
         let items = vec![item("q-s", "running", None, Some(&hb))];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_alive);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_alive, no_agents);
         assert!(q.is_empty());
     }
 
@@ -769,7 +1147,7 @@ mod tests {
         let hb = iso_n_min_ago(30);
         let items = vec![item("q-1", "running", Some(9999), Some(&hb))];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_dead);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Orphaned);
     }
@@ -778,7 +1156,7 @@ mod tests {
     fn pending_items_ignored() {
         let items = vec![item("q-p", "pending", Some(1), None)];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_dead);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
         assert!(q.is_empty());
     }
 
@@ -786,7 +1164,7 @@ mod tests {
     fn completed_items_ignored() {
         let items = vec![item("q-c", "completed", Some(1), None)];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_dead);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
         assert!(q.is_empty());
     }
 
@@ -796,7 +1174,7 @@ mod tests {
         let mut state = State::new();
         state.insert("q-1::orphaned".to_string(), "2026-06-03T00:00:00Z".to_string());
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &state, now, 15 * 60, all_dead);
+        let q = compute_qualifying(&items, &state, now, 15 * 60, GRACE, all_dead, no_agents);
         assert!(q.is_empty());
     }
 
@@ -807,7 +1185,7 @@ mod tests {
         let mut state = State::new();
         state.insert("q-1::stuck".to_string(), "2026-06-03T00:00:00Z".to_string());
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &state, now, 15 * 60, all_dead);
+        let q = compute_qualifying(&items, &state, now, 15 * 60, GRACE, all_dead, no_agents);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].condition, Condition::Orphaned);
     }
@@ -820,7 +1198,7 @@ mod tests {
             item("q-orphan", "running", Some(8888), None),
         ];
         let now = Utc::now().timestamp();
-        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, all_dead);
+        let q = compute_qualifying(&items, &State::new(), now, 15 * 60, GRACE, all_dead, no_agents);
         assert_eq!(q.len(), 2);
         assert_eq!(q[0].condition, Condition::Orphaned);
         assert_eq!(q[1].condition, Condition::Stuck);
