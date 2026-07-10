@@ -40,6 +40,7 @@ Everything here is pure (no I/O, no shelling out) and stdlib-only.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -576,6 +577,42 @@ def command_present_as_head(cmd: str, target: str) -> bool:
     return any(_head_matches(seg, target) for seg in parsed.segments)
 
 
+def command_names(cmd: str) -> set:
+    """Set of effective command-head BASENAMES across all top-level segments.
+
+    For each top-level segment we strip leading ``VAR=val`` env-assignments
+    and wrapper words (``sudo`` / ``env`` / ``nohup`` / ``exec`` / ...) via
+    ``_strip_command_prefix``, then take the BASENAME of the resulting head
+    word. The basename step is what lets an absolute-path invocation like
+    ``/usr/local/bin/watcher-ctl run x`` match the plain name ``watcher-ctl``.
+
+    Occurrences of a name inside quoted arguments or heredoc bodies never
+    appear here (they were absorbed into a single data word during
+    tokenization, so they are never a segment HEAD).
+
+    Raises ``ShellParseError`` on parse failure (caller FAILS CLOSED to the
+    previous string-match behavior).
+    """
+    parsed = parse(cmd)
+    out = set()
+    for s in parsed.segments:
+        words = _strip_command_prefix(s.words)
+        if words:
+            out.add(os.path.basename(words[0]))
+    return out
+
+
+def command_name_present(cmd: str, targets) -> bool:
+    """True iff any effective command-head basename (see ``command_names``)
+    matches one of ``targets``.
+
+    ``targets`` is any iterable of command-name strings; empty / falsy
+    entries are ignored. Raises ``ShellParseError`` on parse failure.
+    """
+    tset = {t for t in (targets or []) if t}
+    return bool(command_names(cmd) & tset)
+
+
 def _head_matches(seg: Segment, target: str) -> bool:
     """Does this segment's command head equal ``target``?
 
@@ -889,6 +926,34 @@ def _run_tests() -> int:
        backgrounded_segment_heads("sleep 30 & echo hi") == ["sleep"])
     ok("backgrounded_segment_heads empty when no bg",
        backgrounded_segment_heads("echo hi") == [])
+
+    # --- command_names / command_name_present ---
+    ok("command_names: bare command",
+       command_names("watcher-ctl run signal") == {"watcher-ctl"})
+    ok("command_names: VAR=x prefix stripped",
+       command_names("FOO=bar watcher-ctl run") == {"watcher-ctl"})
+    ok("command_names: absolute path basenamed",
+       command_names("/usr/local/bin/watcher-ctl run") == {"watcher-ctl"})
+    ok("command_names: sudo wrapper stripped",
+       command_names("sudo watcher-ctl run") == {"watcher-ctl"})
+    ok("command_names: compound cd && watcher-ctl",
+       command_names("cd ~ && watcher-ctl run x") == {"cd", "watcher-ctl"})
+    ok("command_name_present: matched in compound",
+       command_name_present("cd ~ && watcher-ctl run x", ["watcher-ctl"]))
+    ok("command_name_present: arg-only mention NOT matched",
+       not command_name_present("echo watcher-ctl", ["watcher-ctl"]))
+    ok("command_name_present: quoted mention NOT matched",
+       not command_name_present("echo 'run watcher-ctl now'", ["watcher-ctl"]))
+    ok("command_name_present: heredoc body NOT matched",
+       not command_name_present(
+           "cat <<'EOF'\nwatcher-ctl run x\nEOF", ["watcher-ctl"]))
+    ok("command_name_present: env+path combined",
+       command_name_present(
+           "env FOO=1 /usr/local/bin/watcher-restart", ["watcher-restart"]))
+    ok("command_name_present: empty targets -> False",
+       not command_name_present("watcher-ctl run", []))
+    ok("command_name_present: multi-target hits second",
+       command_name_present("event-ack list", ["watcher-ctl", "event-ack"]))
 
     # --- parse-failure cases raise ShellParseError ---
     for bad in ("echo 'unterminated", 'echo "unterminated', "echo $(unbal"):
