@@ -1029,8 +1029,8 @@ see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
   [`cli-mcp-server`](https://github.com/MladenSU/cli-mcp-server) +
   [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) combo with an
   env-var-driven allow-list. Default (`CW_PROFILE=corp-dev`, conservative
-  read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, `$HOME`
-  boundary, 30s timeout (shell-operator gating: see `run_command` vs
+  read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, no path
+  boundary by default, 30s timeout (shell-operator gating: see `run_command` vs
   `run_script` below). `CW_PROFILE=corp-dev-trusted` widens it with
   host-scheduling tooling (see "Host-side scheduled tasks").
   **Reach for host-bash as a normal tool, not a last resort** — the supported

@@ -68,8 +68,12 @@
 #                      are gated behind CW_PROFILE=corp-dev-trusted.
 #   ALLOWED_FLAGS    — comma-separated flag whitelist, OR "all" to skip
 #                      flag filtering (still bounded by ALLOWED_COMMANDS).
-#   ALLOWED_DIR      — absolute path. The server refuses commands that
-#                      would resolve outside this tree. Default: $HOME.
+#   ALLOWED_DIR      — absolute path. cli-mcp-server refuses commands
+#                      that resolve outside this tree, and it is the cwd
+#                      for spawned commands. Default: "/" — DISABLES the
+#                      path boundary (the command allow-list stays the
+#                      safety floor). Narrow to $HOME or a subdir to
+#                      re-enable a boundary.
 #   COMMAND_TIMEOUT  — per-command wall-clock cap, seconds. Default: 30.
 #   MAX_COMMAND_LENGTH — max length (chars) of a single command string
 #                      cli-mcp-server accepts before truncating. Its own
@@ -219,7 +223,9 @@ DEFAULT_PORT=8766
 #     sort, uniq, wc
 #   - text munging: awk, sed, cut, tr, xargs, base64, jq, yq
 #     (sed/awk -i flags can write, but allow-list filters by command name
-#     not args; the ALLOWED_DIR fence still bounds writes to $HOME.)
+#     not args; with the default ALLOWED_DIR="/" the path fence is off,
+#     so the command allow-list is the operative bound — narrow
+#     ALLOWED_DIR to re-enable a write boundary.)
 #   - VCS / forge: git, gh
 #   - shell discovery: pwd, echo, which, env, printenv, hostname, uname,
 #     date, basename, dirname
@@ -238,6 +244,17 @@ DEFAULT_PORT=8766
 #   - rm, chmod, mv, cp — destructive / privilege-changing
 #   - crontab, launchctl, systemctl, schtasks — host scheduling
 DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,host,dig,nslookup,envchain,jenkins-builds"
+# ALLOWED_DIR is the cwd for spawned commands AND cli-mcp-server's path
+# boundary: it refuses commands referencing paths that resolve outside
+# this tree. Default "/" DISABLES the path boundary (every absolute path
+# is under "/", and relative paths resolve under it too) — the
+# working-directory fence bought little on a single-operator trusted host
+# and routinely rejected legitimate host paths outside $HOME (e.g. the
+# in-container home /home/hndrewaall/...). The COMMAND allow-list
+# (ALLOWED_COMMANDS) and shell-operator gate remain the real safety floor;
+# narrow ALLOWED_DIR to $HOME or a subdir via $MCP_HOST_BASH_CONFIG to
+# re-enable a boundary.
+DEFAULT_ALLOWED_DIR="/"
 DEFAULT_ALLOWED_FLAGS="all"
 DEFAULT_COMMAND_TIMEOUT=30
 # Max length (chars) of a single command string cli-mcp-server will
@@ -286,8 +303,10 @@ DEFAULT_ALLOW_SHELL_OPERATORS="false"
 #       (`docker rm`, `docker stop`, `docker kill`) alongside read-y
 #       ones (`docker ps`, `docker logs`); cli-mcp-server's allow-list
 #       is per-binary, not per-subcommand.
-#   ALLOWED_DIR stays the operator's $HOME by default (no /etc, no /usr,
-#   no /System) so the widening doesn't escape the home tree.
+#   ALLOWED_DIR defaults to "/" (path boundary disabled); the command
+#   allow-list, not a directory fence, bounds what the widened
+#   profile can touch. Narrow ALLOWED_DIR via $MCP_HOST_BASH_CONFIG
+#   if you want a home-tree fence back.
 #
 # Operators can override either profile's expanded list by setting
 # ALLOWED_COMMANDS explicitly in $MCP_HOST_BASH_CONFIG; that file is
@@ -422,7 +441,7 @@ fi
 # beyond the profile without editing this script.
 ALLOWED_COMMANDS="${ALLOWED_COMMANDS:-$PROFILE_ALLOWED_COMMANDS}"
 ALLOWED_FLAGS="${ALLOWED_FLAGS:-$DEFAULT_ALLOWED_FLAGS}"
-ALLOWED_DIR="${ALLOWED_DIR:-${HOME}}"
+ALLOWED_DIR="${ALLOWED_DIR:-$DEFAULT_ALLOWED_DIR}"
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-$DEFAULT_COMMAND_TIMEOUT}"
 MAX_COMMAND_LENGTH="${MAX_COMMAND_LENGTH:-$DEFAULT_MAX_COMMAND_LENGTH}"
 ALLOW_SHELL_OPERATORS="${ALLOW_SHELL_OPERATORS:-$DEFAULT_ALLOW_SHELL_OPERATORS}"
