@@ -130,7 +130,7 @@ the MCP server itself. That launcher already implements:
 - `mcp-proxy` + `cli-mcp-server` bootstrapping.
 - Trust profile (`CW_PROFILE=corp-dev` default; `corp-dev-trusted`
   widens for file mutation / scheduling / outbound bytes).
-- `ALLOWED_DIR` fence (default `$HOME`).
+- `ALLOWED_DIR` fence (default `/` — path boundary disabled; the command allow-list is the safety floor).
 - Optional bearer-auth shim (`mcp-proxy-auth-shim`) when
   `MCP_HOST_BASH_BEARER` is set.
 - Soft kill switch (`MCP_HOST_BASH_DISABLED=1`).
@@ -173,7 +173,7 @@ reason. See the comments in `.env.example` for the full surface.
 |---|---|---|
 | `MCP_HOST_BASH_BEARER` | empty | Defense-in-depth. The SSH tunnel encrypts the wire, but anyone else on the remote's loopback can also dial `localhost:$REMOTE_PORT` — the bearer is the layer that bounds access to callers with the secret. Generate with `head -c 32 /dev/urandom \| base64`. |
 | `CW_PROFILE` | `corp-dev` | Conservative read-y floor. Widen to `corp-dev-trusted` only if your remote-side Claude needs to mutate files / fire webhooks / manage containers on the Mac. |
-| `ALLOWED_DIR` | `$HOME` (in `mcp-host-bash`) | Narrow to e.g. `$HOME/personal-mcp-scratch` if you want to limit the blast radius. |
+| `ALLOWED_DIR` | `/` (in `mcp-host-bash` — path boundary disabled) | Set to `$HOME` or e.g. `$HOME/personal-mcp-scratch` to re-enable a directory fence / limit the blast radius. |
 | `PERSONAL_MCP_TUNNEL_ONLY` | unset | Set to `1` (equivalent to passing `--tunnel-only`) to run the wrapper in tunnel-only mode: open ONLY the reverse SSH tunnel and skip the status gate, the `mcp-host-bash` launch + listener probe, and the log tail. Use when `mcp-host-bash` is already running locally (the recommended split — the always-on compose-stack LaunchAgent owns the server) and you want the unattended/launchd shape. |
 | `MCP_HOST_BASH_LOG` | `~/.local/state/claude-container/mcp-host-bash.log` | The live log the default + `--enable` modes `tail -F` after the tunnel comes up. Kept in lockstep with `mcp-host-bash`'s own default so the follow tracks the real JSON-RPC + `run_command` traffic. Override if your launcher logs elsewhere. |
 

@@ -579,11 +579,13 @@ with pointers to where the choice landed in the shipped code.
    outbound bytes) can flip to `corp-dev-trusted`. Conservative floor,
    easy to widen.
 
-7. **`ALLOWED_DIR` default** — **`$HOME` (inherits from
-   `mcp-host-bash`)**. `.env.example` includes a commented-out
-   `ALLOWED_DIR` line with the narrow-blast-radius
-   (`$HOME/personal-mcp-scratch`) suggestion for operators who want
-   it; the default leaves `mcp-host-bash`'s `$HOME` floor in place.
+7. **`ALLOWED_DIR` default** — **`/` (inherits from
+   `mcp-host-bash` — path boundary DISABLED)**. `.env.example`
+   includes a commented-out `ALLOWED_DIR` line with the
+   narrow-blast-radius (`$HOME/personal-mcp-scratch`) suggestion for
+   operators who want a directory fence; the default leaves
+   `mcp-host-bash`'s open `/` in place (the command allow-list is the
+   safety floor).
 
 8. **Implementation PR sequence** — **collapsed into this PR**.
    Wrapper + `.env.example` + `.gitignore` + plist + READMEs +
