@@ -3078,18 +3078,37 @@ def cmd_prune(args):
 
 def _classify_agent_type(agent_type):
     """Classify Claude Code's hook-payload ``agent_type`` string into
-    ``"main"`` / ``"subagent"`` / ``"auxiliary"`` / ``None``.
+    ``"main"`` / ``"subagent"`` / ``None``.
 
-    Mirrors Claude Code's own classifier (the bundled ``AN()`` helper):
+    Mirrors Claude Code's own classifier:
 
       - ``agent_type`` starts with ``repl_main_thread`` (the REPL main
         loop, possibly suffixed e.g. ``repl_main_thread:outputStyle:...``)
         or equals ``sdk``  -> ``"main"``
-      - ``agent_type`` starts with ``agent:`` (a spawned subagent) or
-        equals ``hook_agent``  -> ``"subagent"``
-      - anything else non-empty -> ``"auxiliary"``
+      - ANY OTHER non-empty value -> ``"subagent"``. This covers BOTH the
+        legacy ``agent:<id>`` / ``hook_agent`` forms AND the CURRENT Claude
+        Code shape, where a spawned subagent reports its BARE subagent-type
+        slug as ``agent_type`` -- e.g. ``general-purpose``, ``Explore``,
+        ``Plan``, ``claude``, ``statusline-setup``, or a plugin agent like
+        ``claude-container:README``. (Empirically confirmed 2026-07-09: an
+        Agent(subagent_type="general-purpose") tool call arrives at the gate
+        with ``agent_type='general-purpose'``, NOT ``agent:<id>``.)
       - empty / missing / non-str -> ``None`` (unknown; caller falls back
         to the legacy ``agent_id``-presence heuristic)
+
+    RATIONALE for the "everything else is a subagent" default (was
+    previously an ``"auxiliary"`` bucket treated as NOT-a-subagent): the
+    ONLY context that should receive main-loop treatment is the genuine
+    REPL main thread / SDK driver. Bucketing bare subagent slugs as
+    ``"auxiliary"`` (=> ``is_main_loop`` True) made EVERY main-loop-scoped
+    gate fire INSIDE subagents -- most visibly the botchat mark-read gate,
+    which forced background agents to read + ack the operator's botchat DMs
+    (leaking operator<->main-loop chat into subagent context). Any
+    non-main, non-empty context that fires a tool call is effectively a
+    spawned agent and must NOT inherit main-loop gates. The subagent gates
+    it now falls under (``subagent_queue_item_running`` /
+    ``subagent_queue_mutating_banned``) default-open when there is no queue
+    binding for the agent, so a genuine one-off helper is never blackholed.
     """
     if not agent_type or not isinstance(agent_type, str):
         return None
@@ -3098,9 +3117,7 @@ def _classify_agent_type(agent_type):
         return None
     if at.startswith("repl_main_thread") or at == "sdk":
         return "main"
-    if at.startswith("agent:") or at == "hook_agent":
-        return "subagent"
-    return "auxiliary"
+    return "subagent"
 
 
 def _is_subagent_context(agent_id, agent_type=None):
@@ -3117,10 +3134,10 @@ def _is_subagent_context(agent_id, agent_type=None):
 
       - ``agent_type`` classifies as ``"main"`` (REPL main thread / sdk)
         => NOT a subagent (return False), regardless of ``agent_id``.
-      - ``agent_type`` classifies as ``"subagent"`` => subagent (True).
-      - ``agent_type`` classifies as ``"auxiliary"`` => treat as NOT a
-        subagent (e.g. statusline / one-off helper contexts must not be
-        gated as subagents).
+      - ``agent_type`` classifies as ``"subagent"`` (ANY other non-empty
+        value -- legacy ``agent:<id>`` / ``hook_agent`` OR a current bare
+        subagent-type slug like ``general-purpose`` / ``Explore``) =>
+        subagent (True).
 
     FALLBACK (``agent_type`` absent/unknown -- older Claude Code that did
     not emit it, or direct CLI use without ``--agent-type``): the legacy

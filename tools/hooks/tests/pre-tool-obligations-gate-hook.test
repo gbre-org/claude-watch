@@ -1375,6 +1375,32 @@ def main() -> int:
             rc == 0 and _is_deny(out),
             f"rc={rc} out={out}",
         ))
+
+        # --- Test 32f: BARE subagent-type slug -> deny (botchat-leak fix) -
+        # REGRESSION GUARD (2026-07-09): current Claude Code sends a spawned
+        # subagent's BARE subagent-type slug as `agent_type` (e.g.
+        # `general-purpose`), NOT the legacy `agent:<id>` form. The old
+        # classifier bucketed any such non-matching value as `"auxiliary"`
+        # and treated it as NOT-a-subagent, so `is_main_loop` returned True
+        # inside every subagent and ALL main-loop-scoped gates (most visibly
+        # the botchat mark-read gate) fired in subagents -- leaking operator
+        # botchat DMs into subagent context. The fix classifies ANY non-main
+        # non-empty agent_type as a subagent, so this must DENY.
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "a49674650e0dcafaa",
+                "agent_type": "general-purpose",      # bare slug, no `agent:`
+            },
+            env,
+        )
+        results.append(_check(
+            "32f. is_main_loop + bare subagent slug agent_type -> deny "
+            "(botchat-leak fix; subagent gating preserved)",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
         _run([str(CLI), "satisfy", ob_iml], env)
 
         # --- Test 33: is_main_loop {negate: true} = "is subagent" ---
