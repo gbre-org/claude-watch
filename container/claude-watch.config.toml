@@ -84,7 +84,17 @@ stale_minutes = 10
 # WorkQueueOrphaned/WorkQueueStuckSoft Prometheus alerts (no exporter or
 # Prometheus runs in-container). Single-emit per (qid,condition), ledger
 # at /var/lib/claude-watch/queue-check-state.json.
+#
+# Orphaned detection joins against the cron-written
+# /var/lib/claude-watch/active-agents.json: a running item whose agent
+# transcript went stale (died-after-spawn), or which has no agent record
+# at all and was registered more than no_binding_grace_secs ago
+# (never-spawned), is flagged orphaned. Workload/hostjob-scoped items are
+# exempt (their liveness is a progress heartbeat, not an agent transcript).
 emit_events = true
+# Grace window (seconds) before a running item with no active-agent binding
+# is flagged orphaned (never-spawned case). Default 150.
+no_binding_grace_secs = 150
 
 [alerts]
 initial_cooldown = 600

@@ -192,6 +192,11 @@ enum Commands {
         /// condition. Overrides `[queue_check] stale_heartbeat_min`.
         #[arg(long)]
         stale_heartbeat_min: Option<u64>,
+        /// Grace window (seconds) before a `running` item with NO
+        /// active-agent binding is flagged orphaned (the never-spawned
+        /// case). Overrides `[queue_check] no_binding_grace_secs`.
+        #[arg(long)]
+        no_binding_grace_secs: Option<u64>,
         /// Directory holding the per-emitter state file
         /// (`queue-check-state.json`). Falls back to
         /// `CLAUDE_WATCH_STATE_DIR` env var, then `/var/lib/claude-watch`.
@@ -1675,21 +1680,29 @@ async fn main() {
         }
         Some(Commands::QueueCheck {
             stale_heartbeat_min,
+            no_binding_grace_secs,
             state_dir,
             force_emit,
             dry_run,
         }) => {
-            // Resolve the stale-heartbeat threshold: explicit CLI flag wins,
-            // else the `[queue_check] stale_heartbeat_min` config value,
-            // else the built-in default. config load is best-effort (the
-            // subcommand must still run on a host without a config file).
+            // Resolve thresholds: explicit CLI flag wins, else the
+            // `[queue_check]` config value, else the built-in default.
+            // config load is best-effort (the subcommand must still run on
+            // a host without a config file). Load once for both knobs.
+            let cfg = config::try_load_config().ok();
             let stale_min = stale_heartbeat_min.unwrap_or_else(|| {
-                config::try_load_config()
+                cfg.as_ref()
                     .map(|c| c.queue_check.stale_heartbeat_min)
                     .unwrap_or(queue_check::DEFAULT_STALE_HEARTBEAT_MIN)
             });
+            let grace_secs = no_binding_grace_secs.unwrap_or_else(|| {
+                cfg.as_ref()
+                    .map(|c| c.queue_check.no_binding_grace_secs)
+                    .unwrap_or(queue_check::DEFAULT_NO_BINDING_GRACE_SECS)
+            });
             let code = queue_check::cmd_queue_check(
                 stale_min,
+                grace_secs,
                 state_dir.as_deref(),
                 force_emit,
                 dry_run,

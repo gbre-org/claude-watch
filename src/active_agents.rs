@@ -31,7 +31,7 @@
 //! local-path convention. This is the abstraction line the repo failed to
 //! hold in the first iteration of #53.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -160,16 +160,24 @@ pub fn find_active_subagents_dirs_in(
 pub const DEFAULT_AGENT_ALIVE_MAX_AGE_SECS: u64 = 120;
 
 /// Output shape for `claude-watch active-agents [--json]`.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+///
+/// `Deserialize` is derived (not just `Serialize`) so consumers inside
+/// this crate — notably `queue_check` — can read back the cron-written
+/// `active-agents.json` state file to join queue items against agent
+/// liveness, mirroring the Python `claude_agents.load_agent_state`
+/// helper the work-queue-exporter uses.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveAgents {
     /// Live PIDs of Claude Code subagent processes (children of the main
     /// Claude PID, minus watchers + own commands). Sorted ascending for a
     /// stable diff. Note: a subagent ONLY shows up here while it has an
     /// active child tool process (Bash, etc.); during pure model thinking
     /// it has no PID. Use `agents` for the full population.
+    #[serde(default)]
     pub subagents: Vec<u32>,
 
     /// Labels of currently-running workloads. Sorted ascending.
+    #[serde(default)]
     pub workloads: Vec<String>,
 
     /// Per-agent records, one per JSONL in the active session's
@@ -181,7 +189,7 @@ pub struct ActiveAgents {
 }
 
 /// One agent's liveness record.
-#[derive(Debug, Serialize, PartialEq, Eq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct AgentRecord {
     /// Agent ID (the `agent-XXXX` filename stem in the subagents dir).
     pub agent_id: String,
@@ -413,6 +421,47 @@ fn should_replace(existing: &AgentRecord, candidate: &AgentRecord) -> bool {
         (Some(a), Some(b)) => b < a,
         (None, None) => false,
     }
+}
+
+/// Read back the JSON written by `claude-watch active-agents
+/// --write-state` (cron writes it to `/var/lib/claude-watch/active-agents.json`;
+/// callers pass the resolved path so a `--state-dir` / `CLAUDE_WATCH_STATE_DIR`
+/// override stays in lockstep). Returns `None` on any failure (missing
+/// file, parse error) so callers treat the file as "no signal" (fail-open)
+/// rather than crashing a cron tick. This is the Rust twin of the Python
+/// `claude_agents.load_agent_state` the work-queue-exporter uses.
+pub fn load_agent_state(path: &Path) -> Option<ActiveAgents> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<ActiveAgents>(&raw).ok()
+}
+
+/// Build a `queue_id -> AgentRecord` map from a loaded state.
+///
+/// Dedup rule when the same `queue_id` appears on multiple records
+/// (rare — happens after a retry re-uses the same queue item): reuse the
+/// same policy as `should_replace` sans the queue-id rule (both records
+/// carry the same queue id by construction) — `alive` wins, then the
+/// fresher `jsonl_age_seconds`. Records without a `queue_id` are skipped.
+/// Mirrors the Python `claude_agents.agents_by_queue_id`.
+pub fn agents_by_queue_id(state: &ActiveAgents) -> HashMap<String, AgentRecord> {
+    let mut by_qid: HashMap<String, AgentRecord> = HashMap::new();
+    for rec in &state.agents {
+        let qid = match &rec.queue_id {
+            Some(q) if !q.is_empty() => q.clone(),
+            _ => continue,
+        };
+        match by_qid.get(&qid) {
+            None => {
+                by_qid.insert(qid, rec.clone());
+            }
+            Some(prev) => {
+                if should_replace(prev, rec) {
+                    by_qid.insert(qid, rec.clone());
+                }
+            }
+        }
+    }
+    by_qid
 }
 
 /// Production helper: ask tmux whether a pane id is alive.
@@ -1187,5 +1236,86 @@ mod tests {
         let existing = rec("x", Some("q-1"), true, Some(10));
         let candidate = rec("x", Some("q-1"), true, Some(10));
         assert!(!should_replace(&existing, &candidate));
+    }
+
+    // --- load_agent_state + agents_by_queue_id (queue_check join source) ---
+
+    #[test]
+    fn load_agent_state_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("active-agents.json");
+        let agents = ActiveAgents {
+            subagents: vec![1, 2],
+            workloads: vec!["wl".to_string()],
+            agents: vec![rec("a1", Some("q-1"), true, Some(5))],
+        };
+        std::fs::write(&path, serde_json::to_string(&agents).unwrap()).unwrap();
+        let loaded = load_agent_state(&path).expect("loaded");
+        assert_eq!(loaded, agents);
+    }
+
+    #[test]
+    fn load_agent_state_missing_is_none() {
+        assert!(load_agent_state(Path::new("/no/such/active-agents.json")).is_none());
+    }
+
+    #[test]
+    fn load_agent_state_bad_json_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("active-agents.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(load_agent_state(&path).is_none());
+    }
+
+    #[test]
+    fn load_agent_state_tolerates_extra_and_missing_keys() {
+        // Real writer includes all three keys; be lenient anyway.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("active-agents.json");
+        std::fs::write(
+            &path,
+            r#"{"agents":[{"agent_id":"a","queue_id":"q-9","alive":false,"jsonl_age_seconds":null}],"extra":1}"#,
+        )
+        .unwrap();
+        let loaded = load_agent_state(&path).expect("loaded");
+        assert!(loaded.subagents.is_empty());
+        assert!(loaded.workloads.is_empty());
+        assert_eq!(loaded.agents.len(), 1);
+        assert_eq!(loaded.agents[0].queue_id.as_deref(), Some("q-9"));
+        assert!(!loaded.agents[0].alive);
+    }
+
+    #[test]
+    fn agents_by_queue_id_maps_and_skips_none() {
+        let state = ActiveAgents {
+            subagents: vec![],
+            workloads: vec![],
+            agents: vec![
+                rec("a1", Some("q-1"), true, Some(5)),
+                rec("a2", None, true, Some(3)), // no queue id → skipped
+                rec("a3", Some("q-2"), false, Some(999)),
+            ],
+        };
+        let map = agents_by_queue_id(&state);
+        assert_eq!(map.len(), 2);
+        assert!(map["q-1"].alive);
+        assert!(!map["q-2"].alive);
+    }
+
+    #[test]
+    fn agents_by_queue_id_dedups_alive_wins() {
+        // Same queue id on two records (a retry) — alive one wins.
+        let state = ActiveAgents {
+            subagents: vec![],
+            workloads: vec![],
+            agents: vec![
+                rec("stale", Some("q-dup"), false, Some(500)),
+                rec("live", Some("q-dup"), true, Some(5)),
+            ],
+        };
+        let map = agents_by_queue_id(&state);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["q-dup"].agent_id, "live");
+        assert!(map["q-dup"].alive);
     }
 }
