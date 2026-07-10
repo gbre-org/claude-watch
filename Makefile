@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container sync-main-clone clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -563,6 +563,24 @@ COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 # without it still recreates cleanly (compose falls back to the project
 # `.env` if present, else the in-file defaults).
 DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
+
+# Sync the BIND-MOUNT SOURCE clone to origin/main (ff-only) — the activation
+# step for bind-mounted Python-CLI fixes. The compose bind-mount `${HOME}/repos/`
+# mounts the operator's MAIN CLONE (below), NOT whatever worktree built the
+# image, and the in-container obligations/session-task CLIs (+ tools/obligations/*)
+# resolve from it via PATH BEFORE the baked /usr/local/bin copy. So a stale main
+# clone SHADOWS merged+baked CLI fixes and `make deploy-container` alone won't
+# activate them (the recreate re-mounts the same stale clone). Run this before
+# deploying. Deliberately NOT a dependency of deploy-container — a target that
+# mutated the operator's working clone on every deploy is a bigger decision
+# (it could ff-fail on local commits); keep it explicit + opt-in. `--ff-only`
+# is safe: it refuses (non-zero) rather than clobbering divergent local work.
+CW_MAIN_CLONE := $(HOME)/repos/claude-watch
+sync-main-clone:
+	@echo "Syncing bind-mount source clone $(CW_MAIN_CLONE) to origin/main (ff-only)..."
+	@git -C "$(CW_MAIN_CLONE)" fetch origin
+	@git -C "$(CW_MAIN_CLONE)" merge --ff-only origin/main
+	@echo "Now at: $$(git -C "$(CW_MAIN_CLONE)" log -1 --oneline)"
 
 deploy-container: container-build
 	@cd examples/compose && \

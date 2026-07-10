@@ -812,75 +812,74 @@ The native installer runs as uid 1000 and writes to the volume-backed
 ## Container redeploy (incl. self-redeploy from inside the container)
 
 To redeploy: `make deploy-container` from the repo root (via host-bash).
-(`make redeploy` is a DEPRECATED ALIAS that still works; the rename
-distinguishes the Docker-container recreate from `deploy-systemd`, the
-host/systemd install.)
+(`make redeploy` is a DEPRECATED ALIAS; the rename distinguishes the
+Docker-container recreate from `deploy-systemd`, the host/systemd install.)
 Equivalent: `cd examples/compose && docker compose up -d --force-recreate claude-container`
 
 `make deploy-container` is a SINGLE `docker compose up -d --force-recreate
-claude-container`. That single-command shape makes it safe to run FROM
-INSIDE the container (self-redeploy): the in-container docker CLI hands
-ONE create+start request to the HOST docker daemon, which carries
-stop-old + start-new to completion even after the issuing container
-(and the shell that ran `make deploy-container`) is torn down. The
-daemon owns the operation — **no nohup, no disown, no `&`
-backgrounding, and NOT a `rm -sf && up -d` split** (the second command
-in a split never runs once the issuing container dies).
+claude-container`. That single-command shape makes it safe to run FROM INSIDE
+the container (self-redeploy): the daemon carries the recreate to completion
+even after the issuing container (and the shell that ran it) is torn down —
+**no nohup, no disown, no `&`, and NOT a `rm -sf && up -d` split** (the second
+command never runs once the issuing container dies).
 
-Why force-recreate no longer wedges: in-place recreate only stuck when a
-grandchild outlived process-compose's shutdown and pinned the container netns
-+ shared tmux-socket named volume. Chief offender was crond — `sudo -n
-/usr/sbin/cron` FORKED a root cron surviving SIGKILL of the sudo wrapper.
-Fixed at source: the Dockerfile sudoers carve-out disables `pam_session` +
-`pam_setcred` for the cron argv so sudo `execve()`s cron DIRECTLY (no
-orphan), and `cw-claude-watch-launch` `exec`s claude-watch. With clean
-teardown the old container releases the netns + named volumes before the
-fresh one starts.
+Why force-recreate no longer wedges: an in-place recreate only stuck when a
+grandchild outlived shutdown and pinned the netns + tmux-socket volume (chief
+offender: a `sudo -n /usr/sbin/cron` that FORKED a root cron surviving
+SIGKILL). Fixed at source: the sudoers carve-out disables
+`pam_session`/`pam_setcred` for the cron argv so sudo `execve()`s cron DIRECTLY
+(no orphan), and `cw-claude-watch-launch` `exec`s claude-watch.
+
+**A claude-watch redeploy MUST ALSO sync the bind-mount SOURCE clone
+`~/repos/claude-watch` to `origin/main`** — run `make sync-main-clone` (ff-only)
+before `make deploy-container`. The in-container `obligations`/`session-task`
+CLIs (+ `tools/obligations/*`) are BIND-MOUNTED from that clone and resolve via
+PATH BEFORE the baked `/usr/local/bin` copy, so a stale clone SHADOWS
+merged+baked Python-CLI fixes and the recreate just re-mounts stale code (only
+the compiled Rust daemon is truly baked). Prefer deploying from a current clone.
 
 `docker-compose.yml` sets `stop_grace_period: 15s`, sized to fit
 process-compose's graceful shutdown (each supervised process pins
-`shutdown.timeout: 3` in `container/process-compose.yml`). Do NOT pass
-a `-t`/timeout shorter than that total: it SIGKILLs PID 1
-(process-compose) mid-teardown.
+`shutdown.timeout: 3`). Do NOT pass a `-t`/timeout shorter than that total:
+it SIGKILLs PID 1 (process-compose) mid-teardown.
 
 This kills the current session. The next session starts with the new image
-and picks up via the resume prompt (claude-watch resume-injection fires
-"you've ALREADY been restarted — continue", and the entrypoint's
-`CLAUDE_AUTO_CONTINUE` resumes the prior conversation).
+and picks up via the resume prompt (claude-watch resume-injection + the
+entrypoint's `CLAUDE_AUTO_CONTINUE` resume the prior conversation).
 
-### Validating self-redeploy (end-to-end, from inside the container)
+### Validating self-redeploy (end-to-end, from the container)
 
-This is the acceptance test for "the workbot can redeploy itself". Run
-it FROM INSIDE the container session (host-bash to reach the host docker
-daemon is fine; the point is no MANUAL host step and no nohup):
+This is the acceptance test for "the workbot can redeploy itself". Run it
+FROM INSIDE the container session (host-bash to reach the host docker daemon
+is fine; the point is no MANUAL host step and no nohup):
 
-1. Drop a marker the NEW session can read back, then redeploy:
+1. Drop a marker the NEW session reads back, then redeploy:
 
    ```sh
    date -u +%s > /home/hndrewaall/.cache/claude-watch/redeploy-marker
-   make deploy-container   # single up -d --force-recreate; kills THIS session (alias: make redeploy)
+   make deploy-container   # single up -d --force-recreate; kills THIS session
    ```
 
 2. The container recreates host-side. The fresh entrypoint boots
-   process-compose → tmux → claude, and the resume prompt brings a NEW
-   session up automatically (no manual attach).
+   process-compose → tmux → claude; the resume prompt brings a NEW session
+   up automatically (no manual attach).
 
 3. In the NEW session, confirm it came back from the SAME redeploy:
 
    ```sh
    cat /home/hndrewaall/.cache/claude-watch/redeploy-marker   # the epoch you wrote
    docker compose -f examples/compose/docker-compose.yml ps claude-container
-   # ^ shows a fresh "Up <seconds>" uptime; the old container is gone.
+   # ^ fresh "Up <seconds>" uptime; the old container is gone.
    ```
 
-   The marker lives under the bind-mounted `~/.cache` / state path so
-   it survives the recreate. A readable marker + a fresh container
-   uptime + an active session = self-redeploy validated.
+   The marker lives under the bind-mounted `~/.cache` state path so it
+   survives the recreate. A readable marker + a fresh container uptime +
+   an active session = self-redeploy validated.
 
 4. Clean-shutdown spot-check (proves no orphaned cron pins the netns):
    after a graceful `docker stop`, a second `up -d --force-recreate` must
-   succeed with NO "address already in use" / netns-pinned wedge. If it
-   wedges, an orphan survived teardown.
+   succeed with NO "address already in use" wedge. If it wedges, an orphan
+   survived teardown.
 
 ## What is bind-mounted from the host
 
