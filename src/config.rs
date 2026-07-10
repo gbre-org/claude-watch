@@ -1318,8 +1318,9 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
 ///
 /// LAYERED merge (2026-06-11): instead of strict first-hit-wins, the
 /// loader builds a base layer from the FIRST existing path in
-/// [`$CLAUDE_WATCH_CONFIG`, `./config.toml`] and then overlays the user
-/// config at `~/.config/claude-watch/config.toml` on top, merging
+/// [`$CLAUDE_WATCH_CONFIG`, `./config.toml`, `/etc/claude-watch/config.toml`]
+/// and then overlays the user config at `~/.config/claude-watch/config.toml`
+/// on top, merging
 /// per-field. This makes a bind-mounted `~/.config/claude-watch`
 /// override actually take effect even when the baked image config (set
 /// via `$CLAUDE_WATCH_CONFIG`) always exists and would previously win
@@ -1329,11 +1330,24 @@ pub fn try_load_config() -> Result<Config, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let user_path = format!("{}/.config/claude-watch/config.toml", home);
 
-    // Base layer: first existing of $CLAUDE_WATCH_CONFIG, then ./config.toml.
-    // The user-config path is layered ON TOP of this (per-field override).
+    // Base layer: first existing of $CLAUDE_WATCH_CONFIG, then
+    // ./config.toml, then the well-known container path
+    // /etc/claude-watch/config.toml. The user-config path is layered ON
+    // TOP of this (per-field override).
+    //
+    // The /etc/claude-watch/config.toml fallback is defense-in-depth for
+    // cron jobs (e.g. `queue-check`): cron runs in a clean environment,
+    // so if $CLAUDE_WATCH_CONFIG isn't propagated into cron's env the
+    // loader would otherwise find no config and fall back to defaults
+    // (emit_events=false, fail-closed) — silently swallowing
+    // queue-stuck/queue-orphaned events. Default-searching the baked
+    // config path means the daemon finds the deployed config even without
+    // the env var. Precedence: $CLAUDE_WATCH_CONFIG and ./config.toml are
+    // still tried first, so this only kicks in when neither is present.
     let base_paths = [
         std::env::var("CLAUDE_WATCH_CONFIG").unwrap_or_default(),
         "config.toml".to_string(),
+        "/etc/claude-watch/config.toml".to_string(),
     ];
 
     // Read + ~-expand a path into a parsed toml::Value, or None if absent.

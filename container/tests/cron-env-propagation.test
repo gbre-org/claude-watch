@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """File-level test that the entrypoint propagates CLAUDE_EVENT_QUEUE
-(and HOME + PATH) into /etc/cron.d/00-env so cron jobs inherit the
-correct event spool path.
+(and HOME + PATH + CLAUDE_WATCH_CONFIG) into /etc/cron.d/00-env so cron
+jobs inherit the correct event spool path AND the daemon config path.
 
 Background: cron runs jobs in a clean environment — it does NOT inherit
 the container's exported env vars. Without explicit env-var propagation,
@@ -17,7 +17,10 @@ Asserts:
 
   1. entrypoint.sh writes /etc/cron.d/00-env when CLAUDE_EVENT_QUEUE
      is set, using `sudo -n tee`.
-  2. The generated file includes CLAUDE_EVENT_QUEUE, HOME, and PATH.
+  2. The generated file includes CLAUDE_EVENT_QUEUE, HOME, PATH, and
+     CLAUDE_WATCH_CONFIG (the last so the `queue-check` cron job's daemon
+     config loader finds the baked config and emit_events reads true
+     instead of its fail-closed false default).
   3. The file is chmod'd to 0644 (cron requirement).
   4. The write is conditional on CLAUDE_EVENT_QUEUE being non-empty
      (no-op when unset).
@@ -88,6 +91,16 @@ if ENTRYPOINT.is_file():
         "entrypoint.sh: /etc/cron.d/00-env must include PATH — cron "
         "jobs need the container's full PATH to find claude-event, "
         "session-task, and other tools.",
+    )
+    expect(
+        re.search(r'"CLAUDE_WATCH_CONFIG=', text) is not None,
+        "entrypoint.sh: /etc/cron.d/00-env must include "
+        "CLAUDE_WATCH_CONFIG — the `queue-check` cron job runs the "
+        "daemon config loader, which searches $CLAUDE_WATCH_CONFIG for "
+        "the baked /etc/claude-watch/config.toml (emit_events=true). "
+        "Without it in cron's clean env the loader finds no config, "
+        "emit_events reads its fail-closed default (false), and "
+        "queue-stuck/queue-orphaned events are never emitted.",
     )
 
     # 3. chmod 0644 after write.
