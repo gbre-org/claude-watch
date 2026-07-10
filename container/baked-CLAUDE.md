@@ -9,21 +9,19 @@ container starts with a load-bearing description of the runtime — what's
 real, what's a bind-mount, what doesn't work — without depending on host
 config the operator may not have wired up.
 
-It is **container-owned, not user-owned**: do not edit
-`/etc/claude-code/CLAUDE.md` from a session. Source of truth:
-`container/baked-CLAUDE.md` in the claude-watch repo; rebuild the image to
-pick up changes.
+It is **container-owned, not user-owned**: do not edit it from a session.
+Source of truth: `container/baked-CLAUDE.md` in the claude-watch repo;
+rebuild the image to pick up changes.
 
 ---
 
 ## Dispatcher, not worker — ABSOLUTE PRIORITY
 
 **Any operation that needs more than ONE tool call MUST be delegated to a
-subagent via the Task / Agent tool.**
+subagent via the Agent tool.**
 
-No Read→Edit→Bash→Edit sequences in the main session. If you find yourself
-reaching for a second tool call in the same turn, STOP and spawn an agent
-instead.
+No Read→Edit→Bash→Edit sequences in the main session. If you reach for a
+second tool call in the same turn, STOP and spawn an agent instead.
 
 Examples that are MUST-delegate:
 
@@ -41,14 +39,13 @@ Examples that are OK inline (single tool call):
 
 **Agents MUST be backgrounded — never foreground.** Always spawn with
 `run_in_background: true`. A foreground Agent call blocks this loop until the
-subagent finishes, which freezes everything the dispatcher must keep doing
-(babysit the queue, answer agent-chat, refresh the heartbeat, field
-claude-watch alerts) and makes a long subagent look like a wedged loop to the
-daemon. This is enforced: the `pre-agent-background-required-hook` PreToolUse
-gate DENIES any Agent spawn whose `run_in_background` isn't `true`. (Emergency
-override: env `AGENT_FOREGROUND_OK=1`, or put `FOREGROUND_AGENT_OK: <reason>`
-in the Agent prompt for a genuinely-must-block case.) After spawning, track
-the agent via the queue and `agent-msg`/`agent-tail`, not by blocking on it.
+subagent finishes, freezing everything the dispatcher must keep doing (babysit
+the queue, answer agent-chat, refresh the heartbeat, field claude-watch
+alerts) and making a long subagent look wedged to the daemon. Enforced: the
+`pre-agent-background-required-hook` PreToolUse gate DENIES any Agent spawn
+whose `run_in_background` isn't `true`. (Emergency override: env
+`AGENT_FOREGROUND_OK=1`, or `FOREGROUND_AGENT_OK: <reason>` in the Agent
+prompt.) After spawning, track via the queue and `agent-msg`/`agent-tail`.
 
 ## claude-watch alerts — STOP EVERYTHING — NON-NEGOTIABLE
 
@@ -59,19 +56,19 @@ alert.
 
 > **A claude-watch interruption LOOKS like a user rejection — it is NOT one.**
 > claude-watch intervenes via `tmux send-keys`, the same input channel a human
-> uses. When it preempts mid-generation it cancels the in-flight turn, so the
-> harness surfaces it like the user pressing Escape. **Do not read it as the
-> user being dissatisfied or telling you to stop.** It is the daemon forcing
-> attention to an urgent condition (context exhaustion, dead watcher, stalled
-> session). Read the injected `[CLAUDE-WATCH]` text as the instruction; attend
-> that condition, then RESUME the preempted work (after saving state per the
-> checklist below). Never silently abandon the original task.
+> uses; preempting mid-generation cancels the in-flight turn, so the harness
+> surfaces it like the user pressing Escape. **Do not read it as the user being
+> dissatisfied or telling you to stop.** It's the daemon forcing attention to
+> an urgent condition (context exhaustion, dead watcher, stalled session). Read
+> the injected `[CLAUDE-WATCH]` text as the instruction; attend it, then RESUME
+> the preempted work (after saving state per the checklist below). Never
+> silently abandon the original task.
 
-Compaction or context clearing doesn't kill background tasks but you LOSE
-HANDLES on them. Delaying the alert means the situation is WORSE when the
-hard clear comes (unpredictable context loss, no chance to save state). A
-controlled pause lets you save state cleanly via `session-task set` + commit
-+ log update before clearing.
+Compaction / context clearing doesn't kill background tasks but you LOSE
+HANDLES on them. Delaying the alert makes it WORSE when the hard clear comes
+(unpredictable context loss, no chance to save state); a controlled pause
+lets you save state cleanly via `session-task set` + commit + log update
+before clearing.
 
 When you see a `[CLAUDE-WATCH]` line:
 
@@ -79,7 +76,7 @@ When you see a `[CLAUDE-WATCH]` line:
 2. Update today's daily log if substantive activity has happened.
 3. `session-task set "what to continue doing"` with enough context for the
    next session.
-4. Self-clear if the alert says to.
+4. Self-clear if the alert says to (`self-clear`; see the Self-clear section).
 
 This rule has the same standing as the dispatcher rule: NON-NEGOTIABLE. The
 alert is the highest-priority message the session can receive.
@@ -205,28 +202,26 @@ If a job genuinely needs a host-side watcher / notifier, run it on the host
 The session has two execution tiers, and the default tier for substantive
 work is **not** the main loop:
 
-- **Agent tool calls** — semantic LLM work with bounded scope. Reading
+- **Agent tool calls** — semantic LLM work with bounded scope: reading
   multiple files, multi-file edits, running tests, shipping a PR,
-  investigating a bug, drafting prose with research, anything that
-  would chain more than ~1 tool call. Agents are subject to the
-  queue-protocol PreToolUse hook (see next section).
-- **Main loop** — dispatcher. Single bounded commands. Reads a
-  notification, classifies it, decides what to do, and **delegates**.
-  Validates the agent's return value. Composes the operator-facing
-  reply. That's it.
+  investigating a bug, anything that chains more than ~1 tool call. Agents
+  are subject to the queue-protocol PreToolUse hook (see next section).
+- **Main loop** — dispatcher. Single bounded commands. Reads a notification,
+  classifies it, **delegates**, validates the agent's return value, composes
+  the operator-facing reply. That's it.
 
 **Bias toward delegation.** Any operation that involves more than ~1 tool
-call, reads multiple files, makes multi-file edits, runs tests, or ships
-code through review → delegate it to an Agent, not inline in the main loop.
+call, reads multiple files, makes multi-file edits, runs tests, or ships code
+through review → delegate to an Agent, not inline in the main loop.
 
 Why delegate even when nothing forces it:
 
 - **Context is precious.** A subagent runs in its own context window —
-  large reads / test output / CI logs stay there; the main loop sees
-  only the final summary, never the tool results it can't get back.
+  large reads / test output / CI logs stay there; the main loop sees only
+  the final summary.
 - **Bounded failures recover cleanly.** If a subagent goes sideways, the
-  main loop abandons the queue item and retries from a clean slate;
-  inline failures leave half-finished work the operator sees.
+  main loop abandons the queue item and retries clean; inline failures leave
+  half-finished work.
 - **Parallelism.** While an agent works, the main loop handles inbound
   instead of blocking. Many in-flight subagents at once is healthy.
 - **The queue is the audit trail.** Each item records that the main loop
@@ -234,40 +229,35 @@ Why delegate even when nothing forces it:
 
 Tier choice in practice:
 
-- **Interpret / decide / multi-file edit / validate / ship a PR**
-  → Agent.
+- **Interpret / decide / multi-file edit / validate / ship a PR** → Agent.
 - **Single bounded command + check the result** → main loop.
-- **External wait** (CI run, long build, sleep-based poll) →
-  spawn an Agent that does the wait, not the main loop. The main
-  loop should never sit in a polling sleep loop.
+- **External wait** (CI run, long build, sleep-based poll) → spawn an Agent
+  that does the wait; the main loop must never sit in a polling sleep loop.
 
 **One concern per agent.** Each agent handles ONE task — never batch
 unrelated work into a single prompt. For 3 independent things, queue 3 items
 and spawn 3 agents. Batching means a failure on task 2 loses task 3, the
-audit trail is useless, and parallelizable work gets serialized. (The
-tell you're batching wrong: numbered sections for unrelated concerns.)
+audit trail is useless, and parallelizable work gets serialized. (Tell you're
+batching wrong: numbered sections for unrelated concerns.)
 
-If you're in the main loop and find yourself about to chain
-`Read` → `Edit` → `Edit` → `Bash` → `Bash`, **stop and queue an
-Agent for the whole sequence instead.** The PreToolUse queue-gate
-hook (next section) enforces "Agent spawns require a queue item"
-— this section enforces the upstream policy that the spawn should
-happen in the first place.
+If you're in the main loop and about to chain `Read` → `Edit` → `Edit` →
+`Bash` → `Bash`, **stop and queue an Agent for the whole sequence instead.**
+The PreToolUse queue-gate hook (next section) enforces "Agent spawns require
+a queue item"; this section enforces that the spawn should happen at all.
 
 ### Long blocking jobs → `workload run`, wait with `workload babysit`
 
-For long-running SYSTEM jobs (media-promote, rsync, ffmpeg, a remux,
-a big scan) the right tier is a **workload**, not an inline command and
-not an Agent that blocks: `workload run <label> -- <cmd>` launches the
-job in a detached tmux pane that survives `/clear` and emits a
-`workload-done` event when it finishes. The runner auto-creates its own
-queue item (`--scope workload:<label>`).
+For long-running SYSTEM jobs (media-promote, rsync, ffmpeg, a remux, a big
+scan) the right tier is a **workload**, not an inline command and not a
+blocking Agent: `workload run <label> -- <cmd>` launches the job in a detached
+tmux pane that survives `/clear` and emits a `workload-done` event when it
+finishes. The runner auto-creates its own queue item (`--scope
+workload:<label>`).
 
-When you need to WAIT for that workload to finish, **block in-process
-with `workload babysit` — never tight-poll with repeated `workload list`
-/ `workload log` calls across separate LLM turns** (that burns thousands
-of tokens per turn for zero progress; it's the exact failure mode babysit
-fixes):
+To WAIT for it, **block in-process with `workload babysit` — never tight-poll
+with repeated `workload list` / `workload log` across separate LLM turns**
+(that burns thousands of tokens per turn for zero progress; the exact failure
+mode babysit fixes):
 
 ```
 workload babysit <label> --qid q-XXXX [--heartbeat 60] [--max-block 540] [--poll 15]
@@ -278,16 +268,15 @@ workload babysit <label> --qid q-XXXX [--heartbeat 60] [--max-block 540] [--poll
 - Pats the bound queue item's heartbeat every `--heartbeat` seconds
   (default 60) so `last_heartbeat_at` stays fresh (never mistaken for
   orphaned/stuck).
-- **Returns 0** on `done (exit N)` (the workload's own rc is also
-  propagated as the process exit code).
+- **Returns 0** on `done (exit N)` (the workload's rc is propagated).
 - **Returns 75** (EX_TEMPFAIL) at `--max-block` seconds (default 540,
   under the Bash 600 s cap) if still running, printing
   `still-running ... — rerun to keep waiting`.
 
 **Pattern**: call `workload babysit`; on **exit 75 re-invoke it** to keep
 waiting. Each re-invocation is the only LLM-turn cost of the whole wait
-(≈ once per `--max-block`), versus a fresh turn per poll. Exit 1 = no such
-label; exit 2 = bad `--qid`.
+(≈ once per `--max-block`) vs a fresh turn per poll. Exit 1 = no such label;
+2 = bad `--qid`.
 
 ## Queue protocol — every Agent tool call
 
@@ -295,8 +284,8 @@ Before firing **any** `Agent` tool call, you MUST first add a queue
 item via `session-task queue`. The queue serializes work touching
 overlapping scopes, and the in-container scope namespace is **shared
 with the host** — `repo:claude-watch` covers BOTH host- and
-container-side work on that repo. An agent that skips the queue can
-race host-side work, lose edits to a parallel agent, or stomp builds.
+container-side work on that repo. An agent skipping the queue can race
+host-side work, lose edits to a parallel agent, or stomp builds.
 
 **Scope: this governs every `Agent` call the MAIN LOOP dispatches —
 one queue item per main-loop-spawned agent, the queue being the main
@@ -346,21 +335,21 @@ The five-step protocol (mirrors the host `## Resume Actions` workflow):
 Quick reference: `session-task queue --help` for the full subcommand
 surface (`add | list | spawn-check | register | block | unblock |
 wedge | unwedge | done | abandon | show`).
-The `session-task` CLI is bind-mounted in via `~/repos/claude-watch`;
-if it's not on PATH, the operator hasn't wired the bind-mount and you
-should flag that before spawning agents at all.
+The `session-task` CLI is bind-mounted via `~/repos/claude-watch`; if
+it's not on PATH, the operator hasn't wired the bind-mount — flag that
+before spawning agents at all.
 
 ### Parking on an external blocker — use `block`, not a fake `running`
 
 When an agent finishes all autonomous work and is parked on something
 OUTSIDE the system (awaiting CI, human greenlight, branch-protection
-toggle, a third-party API window), flip the item to `blocked` — do NOT
-leave it as a fake `running`. Flow: `register` (→running) →
+toggle, third-party API window), flip the item to `blocked` — do NOT
+leave it a fake `running`. Flow: `register` (→running) →
 `block <id> --reason "awaiting <X>"` (→blocked) → `unblock <id>` when
 the blocker clears (or `done` / `abandon`). `unblock` preserves
 `blocked_at` + `block_reason` as audit.
 
-`blocked` (system did its part, waiting on someone/something else) is
+`blocked` (system did its part, waiting on someone else) is
 distinct from `wedge` (the system itself is STUCK). Blocked items are
 labeled distinctly by the exporter and are EXEMPT from the
 WorkQueueOrphaned / running-without-owner alert. So `block` is the
@@ -773,41 +762,51 @@ container session should imitate.
 
 ## Self-update — `cwsr` rolls the inner `claude` without container restart
 
-claude-code updates via the NATIVE installer (NOT npm). When a new
-version ships, run `cwsr` (baked at `/usr/local/bin/cwsr`) and the
-inner claude rolls in-place via `claude install` — no full container
-restart:
+claude-code updates via the NATIVE installer (NOT npm). Run `cwsr` (baked at
+`/usr/local/bin/cwsr`) and the inner claude rolls in-place via `claude
+install` — no full container restart:
 
 ```sh
 cwsr                    # claude install latest, then respawn pane 0
 cwsr --version 2.1.206  # install a specific native version
 cwsr --no-upgrade       # respawn current claude (rare; for testing)
-cwsr --upgrade-only     # install without rolling (operator can `cwsr --no-upgrade` later)
+cwsr --upgrade-only     # install without rolling
 cwsr --print            # dry-run; print planned INSTALL + TMUX argv
 ```
 
-What survives the roll: the tmux session (`claude-container:0.0`), the wrapping
-container, every MCP bridge that was up, the volume-backed
-`~/.local/share/claude/versions/` dir, the operator's tmux attach. What rolls:
-the claude process inside pane 0. `claude install` writes to the
-volume-backed versions dir, so the roll SURVIVES a later redeploy.
+What survives the roll: the tmux session (`claude-container:0.0`), the
+container, every MCP bridge, the volume-backed
+`~/.local/share/claude/versions/` dir, the operator's tmux attach. What
+rolls: the claude process in pane 0. `claude install` writes to the
+volume-backed versions dir (uid 1000, no npm/sudo), so the roll SURVIVES a
+later redeploy.
 
-When you should run `cwsr`:
-- The operator says "upgrade to latest" or names a specific version.
-- You see (via `claude --version`) the in-container version has fallen
-  behind a release the operator wants.
+Run `cwsr` when the operator says "upgrade to latest"/names a version, or the
+in-container version (`claude --version`) has fallen behind. NOT the right
+tool when: the container is down (use `docker compose up -d` / `cw --up`); or
+you need to change an entrypoint-time env var (`CLAUDE_AUTO_CONTINUE`,
+`CLAUDE_CONTAINER_REWRITE_HOOKS`, …) — those are baked at container start, so
+ask the operator to `docker compose up -d --force-recreate`; cwsr only rolls
+the inner process.
 
-When `cwsr` is NOT the right tool:
-- Container itself is down — use `docker compose up -d` (or `cw --up`
-  from the host); that path installs the freshest baked version.
-- You need to change `CLAUDE_AUTO_CONTINUE`, `CLAUDE_CONTAINER_REWRITE_HOOKS`,
-  `CLAUDE_HOST_PROJECT_DIR`, or any other entrypoint-time env var —
-  those decisions are baked at container start; cwsr only rolls the
-  inner process with whatever shape entrypoint.sh already chose. Ask
-  the operator to `docker compose up -d --force-recreate` for those.
+## Self-clear — you CAN reset your OWN context (`self-clear` / `cw --clear`)
 
-The native installer runs as uid 1000 and writes to the volume-backed
-`~/.local/share/claude/versions/`, so updates persist. No npm, no sudo.
+A `/clear` is just keystrokes into the claude TUI, and you have a baked tool
+to inject them into your own pane — so YES, the session can clear its own
+context. Don't assume you can't. Two paths, both drive pane 0 via the same
+`tmux send-keys` channel as `cwsr` (self-clear resets CONTEXT; `cwsr` rolls
+the BINARY):
+
+- In-container: `self-clear` (baked `/usr/local/bin/self-clear`) interrupts
+  thinking, injects `/clear`, polls until it lands, then injects a resume
+  prompt (backgrounded). `--resume-prompt "<text>"` or `--no-resume`. Skill:
+  `/claude-container:self-clear`.
+- Externally: `cw --clear` (one-shot `docker compose exec <svc> self-clear`,
+  no attach) — the analog of externally firing `cwsr`; args after `--` pass
+  through.
+
+BEFORE clearing, SAVE STATE (a clear wipes all not in the resume prompt):
+commit + push, update the log, `session-task set`.
 
 ## Container redeploy (incl. self-redeploy from inside the container)
 
@@ -1029,8 +1028,8 @@ see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
   [`cli-mcp-server`](https://github.com/MladenSU/cli-mcp-server) +
   [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) combo with an
   env-var-driven allow-list. Default (`CW_PROFILE=corp-dev`, conservative
-  read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, `$HOME`
-  boundary, 30s timeout (shell-operator gating: see `run_command` vs
+  read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, no path
+  boundary by default, 30s timeout (shell-operator gating: see `run_command` vs
   `run_script` below). `CW_PROFILE=corp-dev-trusted` widens it with
   host-scheduling tooling (see "Host-side scheduled tasks").
   **Reach for host-bash as a normal tool, not a last resort** — the supported

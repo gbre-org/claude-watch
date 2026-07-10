@@ -22,8 +22,9 @@ Coverage:
   - Config-file override: ALLOWED_COMMANDS / ALLOWED_DIR etc. from the
     config file land in the argv's --env flags.
   - Default policy: ALLOWED_COMMANDS is conservative (no `bash` / `sh`),
-    ALLOWED_DIR is $HOME, COMMAND_TIMEOUT is 30, ALLOW_SHELL_OPERATORS
-    is false. Guards against accidental relaxation in future edits.
+    ALLOWED_DIR is "/" (path boundary disabled by default),
+    COMMAND_TIMEOUT is 30, ALLOW_SHELL_OPERATORS is false. Guards
+    against accidental relaxation in future edits.
   - MCP_HOST_BASH_DISABLED=1: refuses to start (--print-cmd flag means
     we still build the argv for inspection — but the live-launch path
     exits 0 before reaching exec).
@@ -175,8 +176,10 @@ def test_default_policy_conservative() -> None:
            f"default MAX_COMMAND_LENGTH should be 8192 (raised from "
            f"cli-mcp-server's 1024 default), got {max_len!r}")
     dir_ = find_env_value(lines, "ALLOWED_DIR")
-    expect(dir_ == "/tmp/fake-home-mcp-host-bash",
-           f"default ALLOWED_DIR should be $HOME, got {dir_!r}")
+    expect(dir_ == "/",
+           f"default ALLOWED_DIR should be '/' (path boundary "
+           f"disabled by default; the command allow-list stays the "
+           f"safety floor), got {dir_!r}")
 
 
 def test_port_override_space_form() -> None:

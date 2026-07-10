@@ -452,8 +452,12 @@ workload_heartbeat_max_age_secs = 60
 #
 # The `claude-watch queue-check` subcommand (run from cron) inspects the
 # session-task queue and detects:
-#   * ORPHANED — a `running` item whose explicitly-claimed owning PID is no
-#     longer alive (pid=null items are trusted-alive and never flagged).
+#   * ORPHANED — a `running` item that is no longer being worked, via:
+#       - an explicitly-claimed owning PID that is no longer alive, OR
+#       - the active-agents join: its agent transcript went stale
+#         (died-after-spawn), OR no agent record exists AND it was
+#         registered more than `no_binding_grace_secs` ago (never-spawned).
+#         Workload/hostjob-scoped items are exempt (progress-heartbeat).
 #   * STUCK    — a `wedged` item, OR a `running` item whose
 #     `last_heartbeat_at` is older than `stale_heartbeat_min`.
 # On detection it emits a `queue-orphaned` / `queue-stuck` claude-event
@@ -470,6 +474,14 @@ emit_events = false
 # 15 mirrors the deployed WorkQueueStuckSoft `for:15m` window. The
 # `--stale-heartbeat-min` CLI flag overrides this per-run.
 stale_heartbeat_min = 15
+# Grace window (seconds) before a `running` item with NO active-agent
+# binding is flagged ORPHANED (the never-spawned case). Reads the
+# cron-written active-agents.json to join queue items against agent
+# transcript liveness; an item with no matching record and registered_at
+# older than this is treated as never-spawned. Default 150s (~2.5 ticks of
+# the 60s active-agents cron). The `--no-binding-grace-secs` CLI flag
+# overrides per-run. Workload/hostjob-scoped items are exempt.
+no_binding_grace_secs = 150
 
 [hybrid]
 # Hybrid hooks + daemon-fallback tuning.
