@@ -291,8 +291,11 @@ Then from any host cwd:
 ```sh
 cw                  # attach to the running stack
 cw --up             # `docker compose up -d` first, then attach
+cw --clear          # EXTERNAL self-clear: /clear + resume, no attach
 cw --help           # usage
 ```
+
+`cw --clear` triggers an in-container **context reset** from the host without attaching — a one-shot `docker compose exec <svc> self-clear` that injects `/clear` + a resume prompt into the claude pane. It's the context-reset analog of externally firing `cwsr` (which rolls the inner claude binary): both drive pane 0 via the same `tmux send-keys` channel. Anything after `--` passes through to `self-clear`, e.g. `cw --clear -- --resume-prompt "resume X"` or `cw --clear -- --no-resume`. Capture anything the fresh session needs with `session-task set` first — the context is wiped a few seconds later.
 
 Under the hood `cw` resolves its own canonical path to find `examples/compose/`, then runs:
 

@@ -200,6 +200,107 @@ def test_bad_flag_exits_two() -> None:
 
 
 # ---------------------------------------------------------------------------
+# --clear (external self-clear) tests
+#
+# `cw --clear` runs a one-shot `docker compose exec <svc> self-clear [ARGS]`
+# to trigger an in-container context reset from the host WITHOUT attaching —
+# the context-reset analog of externally firing cwsr (which rolls the inner
+# binary). The --print-cmd hook builds that exec argv and prints it.
+# ---------------------------------------------------------------------------
+
+
+def test_clear_default_invocation() -> None:
+    """cw --clear => docker compose --project-directory <dir> exec
+    claude-container self-clear (one-shot, no -it, no tmux attach).
+
+    NOTE: `--print-cmd` is placed BEFORE `--clear` because `--clear`
+    consumes all remaining args as self-clear pass-through — cw's own
+    flags must precede it (matching real usage `cw --clear -- ARGS`)."""
+    lines, _, _, _ = run_cw(["--print-cmd", "--clear"])
+    expect("docker" == lines[0],
+           f"clear: argv[0] should be docker, got {lines[0]!r}")
+    expect("exec" in lines,
+           f"clear: argv should include 'exec', got {lines}")
+    expect("self-clear" in lines,
+           f"clear: argv should invoke self-clear, got {lines}")
+    exec_idx = lines.index("exec")
+    # exec <service> self-clear  — NO -it (self-clear forks + returns).
+    expect(lines[exec_idx + 1] == "claude-container",
+           f"clear: service should follow exec, got {lines}")
+    expect("-it" not in lines,
+           f"clear: one-shot exec should NOT include -it, got {lines}")
+    expect("attach-session" not in lines,
+           f"clear: --clear should NOT attach a tmux session, got {lines}")
+
+
+def test_clear_passthrough_args() -> None:
+    """cw --clear -- --resume-prompt X --no-resume => args forwarded to
+    self-clear verbatim, with the leading `--` separator dropped."""
+    lines, _, _, _ = run_cw(
+        ["--print-cmd", "--clear", "--", "--resume-prompt", "resume X",
+         "--no-resume"]
+    )
+    sc_idx = lines.index("self-clear")
+    tail = lines[sc_idx + 1:]
+    expect("--resume-prompt" in tail,
+           f"clear-passthrough: should forward --resume-prompt, got {tail}")
+    expect("resume X" in tail,
+           f"clear-passthrough: should forward the prompt value, got {tail}")
+    expect("--no-resume" in tail,
+           f"clear-passthrough: should forward --no-resume, got {tail}")
+    expect("--" not in tail,
+           f"clear-passthrough: the `--` separator should be dropped, "
+           f"got {tail}")
+
+
+def test_clear_passthrough_without_separator() -> None:
+    """cw --clear --no-resume (no `--`) still forwards the arg to
+    self-clear rather than treating it as a cw flag."""
+    lines, _, _, _ = run_cw(["--print-cmd", "--clear", "--no-resume"])
+    sc_idx = lines.index("self-clear")
+    tail = lines[sc_idx + 1:]
+    expect("--no-resume" in tail,
+           f"clear-passthrough-nosep: --no-resume should forward to "
+           f"self-clear, got {tail}")
+
+
+def test_clear_service_override() -> None:
+    """CW_SERVICE override applies to the --clear exec too."""
+    lines, _, _, _ = run_cw(
+        ["--print-cmd", "--clear"], env={"CW_SERVICE": "my-svc"}
+    )
+    exec_idx = lines.index("exec")
+    expect(lines[exec_idx + 1] == "my-svc",
+           f"clear-service-override: service should be my-svc, got {lines}")
+
+
+def test_clear_runs_via_docker_exec_hook() -> None:
+    """cw --clear executes the (mocked) inner exec exactly once and
+    propagates its rc — proving it's one-shot fire-and-return, not the
+    reconnect loop."""
+    with tempfile.TemporaryDirectory(prefix="cw-clear-") as d:
+        tmpdir = Path(d)
+        mock, counter = _write_mock("always_succeed", tmpdir)
+        _, _, _, rc = run_cw(
+            ["--clear"],
+            env={"CW_DOCKER_EXEC": str(mock)},
+            expect_rc=0,
+        )
+        expect(counter.read_text().strip() == "1",
+               f"clear-exec: mock should be called exactly once, "
+               f"got {counter.read_text().strip()!r}")
+
+
+def test_clear_help_mentions_clear() -> None:
+    """--help documents the --clear external self-clear path."""
+    _, stdout, _, _ = run_cw(["--help"], expect_rc=0)
+    expect("--clear" in stdout,
+           f"help: should document --clear, got {stdout!r}")
+    expect("self-clear" in stdout,
+           f"help: should mention self-clear, got {stdout!r}")
+
+
+# ---------------------------------------------------------------------------
 # Reconnect-loop tests
 #
 # These exercise the CW_DOCKER_EXEC test hook to inject a stateful mock
@@ -352,6 +453,12 @@ TESTS = [
     test_missing_compose_dir,
     test_help_exits_zero,
     test_bad_flag_exits_two,
+    test_clear_default_invocation,
+    test_clear_passthrough_args,
+    test_clear_passthrough_without_separator,
+    test_clear_service_override,
+    test_clear_runs_via_docker_exec_hook,
+    test_clear_help_mentions_clear,
     test_no_reconnect_propagates_failure,
     test_no_reconnect_passes_success,
     test_reconnect_on_transient_failure,
