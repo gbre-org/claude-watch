@@ -15,6 +15,14 @@
 #                       # (auto-reconnects across docker recreates)
 #   cw --up             # bring the compose stack up first, then attach
 #   cw --no-reconnect   # single-shot: exit when inner exec dies
+#   cw --clear [-- ARGS]# EXTERNAL self-clear: one-shot
+#                       # `docker compose exec <svc> self-clear ARGS`.
+#                       # Injects /clear + a resume prompt into the
+#                       # in-container claude pane WITHOUT attaching —
+#                       # the context-reset analog of externally firing
+#                       # `cwsr` (which rolls the inner claude binary).
+#                       # ARGS after `--` pass through to self-clear
+#                       # (e.g. --resume-prompt "...", --no-resume).
 #   cw --help           # show usage and exit
 #
 # Env var overrides:
@@ -59,6 +67,20 @@ Usage:
   cw --no-reconnect  Single-shot: exit immediately when the inner exec
                      dies (any rc), matching the old behavior. Useful
                      for CI / scripts that want one-shot semantics.
+  cw --clear [-- ARGS...]
+                     EXTERNAL self-clear: run `self-clear` inside the
+                     container (one-shot `docker compose exec`, no
+                     attach), which injects /clear + a resume prompt
+                     into the in-container claude pane. This is the
+                     context-reset analog of externally firing `cwsr`
+                     (which rolls the inner claude binary): same input
+                     channel (tmux send-keys into pane 0), triggered
+                     from the host without attaching. Anything after
+                     `--` is passed straight through to `self-clear`
+                     (e.g. `cw --clear -- --resume-prompt "resume X"`,
+                     `cw --clear -- --no-resume`). The context is wiped
+                     a few seconds later; capture state with
+                     `session-task set` first if it must survive.
   cw --help          Show this help and exit.
 
 Reconnect behavior:
@@ -99,6 +121,9 @@ EOF
 
 UP_FIRST=0
 RECONNECT=1
+CLEAR=0
+# Args passed through to the in-container `self-clear` after `cw --clear`.
+declare -a CLEAR_ARGS=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --help|-h)
@@ -112,6 +137,22 @@ while [ "$#" -gt 0 ]; do
         --no-reconnect)
             RECONNECT=0
             shift
+            ;;
+        --clear)
+            # EXTERNAL self-clear: everything AFTER --clear (an optional
+            # leading `--` separator is dropped) is forwarded verbatim to
+            # the in-container `self-clear` tool. We stop parsing cw's own
+            # flags here so a pass-through arg like `--no-resume` isn't
+            # mistaken for a cw flag.
+            CLEAR=1
+            shift
+            if [ "${1:-}" = "--" ]; then
+                shift
+            fi
+            while [ "$#" -gt 0 ]; do
+                CLEAR_ARGS+=("$1")
+                shift
+            done
             ;;
         --print-cmd)
             # Test-only hook: build the docker compose exec argv but
@@ -233,6 +274,39 @@ if [ "$UP_FIRST" = "1" ] && [ "$PRINT_CMD" = "0" ]; then
     else
         "${DOCKER_CMD[@]}" compose --project-directory "$CW_COMPOSE_DIR" up -d
     fi
+fi
+
+# -----------------------------------------------------------------------------
+# EXTERNAL self-clear (`cw --clear`). One-shot `docker compose exec <svc>
+# self-clear [ARGS...]` — no `-it` (self-clear forks + returns immediately,
+# so no TTY is needed) and no reconnect loop (it's fire-and-return, not a
+# long-lived attach). This is the host-side, non-attaching way to trigger an
+# in-container context reset: the symmetric counterpart to externally rolling
+# the inner claude binary with `cwsr`. Both drive pane 0 via the same
+# tmux-send-keys channel; --clear resets CONTEXT, cwsr rolls the BINARY.
+# `self-clear` is baked at /usr/local/bin/self-clear inside the image, so this
+# resolves without any bind-mount. Runs BEFORE the attach section and exits
+# with self-clear's own rc — `cw --clear` never falls through to an attach.
+# -----------------------------------------------------------------------------
+
+if [ "$CLEAR" = "1" ]; then
+    clear_argv=(
+        "${DOCKER_CMD[@]}" compose
+        --project-directory "$CW_COMPOSE_DIR"
+        exec "$SERVICE"
+        self-clear "${CLEAR_ARGS[@]+"${CLEAR_ARGS[@]}"}"
+    )
+    if [ "$PRINT_CMD" = "1" ]; then
+        printf '%s\n' "${clear_argv[@]}"
+        exit 0
+    fi
+    # Test-only hook (mirrors the attach path): CW_DOCKER_EXEC overrides the
+    # inner command so cw.test can assert clear behavior without docker.
+    if [ -n "${CW_DOCKER_EXEC:-}" ]; then
+        # shellcheck disable=SC2206
+        read -ra clear_argv <<< "$CW_DOCKER_EXEC"
+    fi
+    exec "${clear_argv[@]}"
 fi
 
 # -----------------------------------------------------------------------------
