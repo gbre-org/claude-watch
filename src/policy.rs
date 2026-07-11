@@ -2738,6 +2738,36 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     info!("auto-update: injecting /exit...");
     inject_dispatch::inject_to_agent(pane, "/exit").await;
 
+    // Step 2b: Dismiss the 2.1.x "Background work is running" exit dialog.
+    //
+    // Claude Code 2.1.x renders a "Background work is running" confirmation on
+    // the interactive `/exit` flow whenever a worktree is checked out OR
+    // background tasks are running (#1411). Our sessions always have
+    // backgrounded watchers, so the dialog ALWAYS eats the `/exit` submit and
+    // `wait_for_exit` below would time out, false-alarming "Claude Code
+    // crashed". Poll briefly for the dialog; if it appears, send a bare Enter
+    // to select the default-highlighted option 1 ("Exit anyway") — the right
+    // choice here, since the process is relaunching anyway and watchers restart
+    // fresh in the new session. Bounded short loop matching the file's polling
+    // idioms; if the dialog never shows (host / non-2.1.x claude), this is a
+    // no-op and we fall through to wait_for_exit unchanged.
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if let Some(out) = tmux::capture_pane(pane).await {
+                if tmux::background_work_exit_dialog_visible(&out) {
+                    info!(
+                        "auto-update: 'Background work is running' exit dialog detected, \
+                         sending Enter to select 'Exit anyway'"
+                    );
+                    tmux::send_keys(pane, &["Enter"]).await;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     // Step 3: Wait for Claude to exit
     info!("auto-update: waiting for Claude Code to exit...");
     if !tmux::wait_for_exit(pane, 45).await {
