@@ -198,12 +198,16 @@ pub struct AgentRecord {
     /// spawned without queue tracking (rare — agents from the spawn
     /// gate always include the marker).
     pub queue_id: Option<String>,
-    /// True iff JSONL was modified within the configured max-age window.
-    /// Subagents lack stable PIDs (they share the parent Claude PID),
-    /// so transcript-mtime is the canonical liveness signal.
+    /// True iff ANY of the agent's transcripts (an agent that outlived
+    /// a parent context reset has one per session — see
+    /// `collect_agent_records_merged`) was modified within the
+    /// configured max-age window. Subagents lack stable PIDs (they run
+    /// in-process, sharing the parent Claude PID), so transcript-mtime
+    /// is the canonical liveness signal.
     pub alive: bool,
-    /// Seconds since JSONL was last modified. None if metadata was
-    /// unreadable (treated as `alive=false`).
+    /// Seconds since the FRESHEST of the agent's transcripts was last
+    /// modified. None if metadata was unreadable (treated as
+    /// `alive=false`).
     pub jsonl_age_seconds: Option<u64>,
 }
 
@@ -355,23 +359,29 @@ pub fn collect_agent_records(
 }
 
 /// Collect agent records across MULTIPLE `subagents/` directories and
-/// merge by agent id.
+/// merge by agent id — FIELD-WISE, not whole-record.
 ///
-/// Merge policy (per agent id):
+/// Why field-wise: the same agent legitimately has one transcript per
+/// parent session. When the parent self-clears (context reset, same OS
+/// process) a surviving in-process agent keeps appending to a NEW
+/// continuation JSONL under the new session UUID — that transcript
+/// starts mid-stream and does NOT contain the `Queue item:` spawn
+/// marker; the marker only exists in the now-frozen pre-clear
+/// transcript. So the freshest liveness signal and the queue id live
+/// in DIFFERENT files. An earlier whole-record merge preferred the
+/// record that had a queue id, which silently replaced the live
+/// continuation record with the stale pre-clear one: a demonstrably
+/// working agent (tokens advancing) was reported `alive=false` with a
+/// 30-minute JSONL age. Field-wise merging fixes that class of bug:
 ///
-///  1. Prefer the record whose `queue_id` is `Some(_)` over one whose
-///     `queue_id` is `None`. This is the whole point of the merge: a
-///     post-restart continuation JSONL drops the spawn marker, but the
-///     pre-restart transcript still has it.
-///  2. Among records that BOTH have a queue id (or both have none),
-///     prefer `alive=true` over `alive=false`.
-///  3. Final tie-break: prefer the more-recent JSONL mtime (i.e. the
-///     smaller `jsonl_age_seconds`). `None` ages sort last.
+///  * `alive` — true if ANY transcript for the agent is fresh.
+///  * `jsonl_age_seconds` — the freshest (smallest) known age.
+///  * `queue_id` — any `Some` beats `None`; if two records disagree on
+///    a non-null queue id (rare), the livelier/fresher record's id wins.
 ///
-/// `dirs` is consumed front-to-back; the iteration order doesn't
-/// affect the result because the merge is symmetric on the comparison
-/// fields. Returned records are sorted by agent_id for stable diff,
-/// matching `collect_agent_records`.
+/// `dirs` order doesn't affect the result — the merge is commutative
+/// on the comparison fields. Returned records are sorted by agent_id
+/// for stable diff, matching `collect_agent_records`.
 pub fn collect_agent_records_merged(
     dirs: &[PathBuf],
     now: SystemTime,
@@ -385,9 +395,8 @@ pub fn collect_agent_records_merged(
                     by_id.insert(record.agent_id.clone(), record);
                 }
                 Some(existing) => {
-                    if should_replace(existing, &record) {
-                        by_id.insert(record.agent_id.clone(), record);
-                    }
+                    let merged = merge_records(existing, &record);
+                    by_id.insert(record.agent_id.clone(), merged);
                 }
             }
         }
@@ -397,30 +406,72 @@ pub fn collect_agent_records_merged(
     out
 }
 
-/// Pure: decide whether `candidate` should replace `existing` per the
-/// merge policy documented on `collect_agent_records_merged`.
-fn should_replace(existing: &AgentRecord, candidate: &AgentRecord) -> bool {
-    // Rule 1: non-null queue_id wins.
-    match (existing.queue_id.is_some(), candidate.queue_id.is_some()) {
-        (false, true) => return true,
-        (true, false) => return false,
-        _ => {}
+/// Pure: merge two records for the SAME agent id, field-wise, per the
+/// policy documented on `collect_agent_records_merged`.
+fn merge_records(a: &AgentRecord, b: &AgentRecord) -> AgentRecord {
+    debug_assert_eq!(a.agent_id, b.agent_id);
+    // Liveness: the agent is alive if ANY of its transcripts is fresh.
+    let alive = a.alive || b.alive;
+    // Age: freshest known. Unreadable (None) never beats a known age.
+    let jsonl_age_seconds = match (a.jsonl_age_seconds, b.jsonl_age_seconds) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    };
+    // Queue id: any Some beats None. Two conflicting Somes (rare —
+    // e.g. a follow-up prompt citing a different queue item): the
+    // livelier/fresher record's id wins.
+    let queue_id = match (&a.queue_id, &b.queue_id) {
+        (Some(q), None) => Some(q.clone()),
+        (None, Some(q)) => Some(q.clone()),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            if livelier(a, b) {
+                b.queue_id.clone()
+            } else {
+                a.queue_id.clone()
+            }
+        }
+    };
+    AgentRecord {
+        agent_id: a.agent_id.clone(),
+        queue_id,
+        alive,
+        jsonl_age_seconds,
     }
-    // Rule 2: alive wins.
+}
+
+/// Pure: true iff `candidate` is livelier than `existing` — alive wins,
+/// then the smaller (fresher) `jsonl_age_seconds`; `None` ages sort last.
+fn livelier(existing: &AgentRecord, candidate: &AgentRecord) -> bool {
     match (existing.alive, candidate.alive) {
         (false, true) => return true,
         (true, false) => return false,
         _ => {}
     }
-    // Rule 3: smaller jsonl_age_seconds (more recent) wins. None ages
-    // sort last (i.e. an unreadable-mtime record never wins this
-    // tiebreaker against a known one).
     match (existing.jsonl_age_seconds, candidate.jsonl_age_seconds) {
         (Some(_), None) => false,
         (None, Some(_)) => true,
         (Some(a), Some(b)) => b < a,
         (None, None) => false,
     }
+}
+
+/// Pure: decide whether `candidate` should replace `existing` when the
+/// same QUEUE ID maps to multiple distinct agent records (a retry that
+/// re-used the queue item). Whole-record choice is correct there —
+/// the records describe different agents, so field-mixing would be
+/// nonsense; we pick the one that best represents the queue item:
+/// a non-null queue id first (defensive; callers pre-filter), then
+/// the livelier record.
+fn should_replace(existing: &AgentRecord, candidate: &AgentRecord) -> bool {
+    match (existing.queue_id.is_some(), candidate.queue_id.is_some()) {
+        (false, true) => return true,
+        (true, false) => return false,
+        _ => {}
+    }
+    livelier(existing, candidate)
 }
 
 /// Read back the JSON written by `claude-watch active-agents
@@ -1032,6 +1083,83 @@ mod tests {
             Some("q-test-001"),
             "marker from older dir must survive merge",
         );
+    }
+
+    #[test]
+    fn merge_reports_alive_when_continuation_is_fresh_but_marker_transcript_is_stale() {
+        // Regression test for the 2026-07-11 incident: an in-process
+        // async agent survived the parent session's context reset and
+        // kept working for 35+ minutes. Its continuation JSONL (new
+        // session dir, no spawn marker) was being actively appended,
+        // but the merge preferred the marker-bearing pre-reset
+        // transcript WHOLESALE — so the tooling reported the agent
+        // "stale, age ~30min" while its token counter was visibly
+        // rising. The merged record must carry the marker AND the
+        // fresh liveness.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+
+        let id = "survivor1";
+        let older_jsonl = older.join(format!("agent-{}.jsonl", id));
+        let newer_jsonl = newer.join(format!("agent-{}.jsonl", id));
+
+        // Pre-reset transcript: has the marker, frozen 30 minutes ago.
+        write_marker_jsonl(&older_jsonl, "q-incident-001");
+        backdate(&older_jsonl, 30 * 60);
+        // Post-reset continuation: no marker, written seconds ago.
+        write_continuation_jsonl(&newer_jsonl);
+
+        // Order must not matter — assert both directions.
+        for dirs in [
+            vec![older.clone(), newer.clone()],
+            vec![newer.clone(), older.clone()],
+        ] {
+            let records =
+                collect_agent_records_merged(&dirs, SystemTime::now(), 120);
+            assert_eq!(records.len(), 1, "{:?}", records);
+            let r = &records[0];
+            assert_eq!(r.agent_id, id);
+            assert_eq!(
+                r.queue_id.as_deref(),
+                Some("q-incident-001"),
+                "queue id from the pre-reset transcript must survive",
+            );
+            assert!(
+                r.alive,
+                "agent with a fresh continuation transcript must report ALIVE \
+                 even though the marker transcript is stale",
+            );
+            assert!(
+                r.jsonl_age_seconds.unwrap_or(u64::MAX) < 120,
+                "age must come from the freshest transcript, got {:?}",
+                r.jsonl_age_seconds,
+            );
+        }
+    }
+
+    #[test]
+    fn merge_records_fieldwise_direct() {
+        // Unit-level check of the field-wise merge itself.
+        let stale_with_qid = rec("x", Some("q-1"), false, Some(1800));
+        let fresh_no_qid = rec("x", None, true, Some(5));
+        for (a, b) in [
+            (&stale_with_qid, &fresh_no_qid),
+            (&fresh_no_qid, &stale_with_qid),
+        ] {
+            let m = merge_records(a, b);
+            assert_eq!(m.queue_id.as_deref(), Some("q-1"));
+            assert!(m.alive);
+            assert_eq!(m.jsonl_age_seconds, Some(5));
+        }
+        // None ages never beat known ages.
+        let unknown_age = rec("x", None, false, None);
+        let m = merge_records(&stale_with_qid, &unknown_age);
+        assert_eq!(m.jsonl_age_seconds, Some(1800));
+        // Conflicting queue ids: livelier record's id wins.
+        let old_qid = rec("x", Some("q-old"), false, Some(900));
+        let new_qid = rec("x", Some("q-new"), true, Some(3));
+        let m = merge_records(&old_qid, &new_qid);
+        assert_eq!(m.queue_id.as_deref(), Some("q-new"));
     }
 
     #[test]

@@ -9,6 +9,11 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::active_agents::{
+    collect_agent_records_merged, find_active_subagents_dirs, AgentRecord,
+    DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS,
+};
+
 /// Built-in watcher command patterns — children matching these are
 /// classified as long-running watchers, NOT subagents. `watcher-ctl`
 /// covers the canonical supervisor form (`watcher-ctl run <name>`).
@@ -877,8 +882,12 @@ pub fn cmd_kill(target: &str, dry_run: bool) -> i32 {
     let pids = matches.get(&agent_id).cloned().unwrap_or_default();
 
     if pids.is_empty() {
-        println!("No running child processes found for this agent.");
-        println!("The agent may be between API calls (no active bash command).");
+        println!("No running child OS processes found for this agent.");
+        println!(
+            "The agent runs IN-PROCESS inside the main Claude Code process; it only \
+             has a visible child while a tool call is executing. If its transcript \
+             is still advancing it is alive and cannot be killed from outside."
+        );
         return 1;
     }
 
@@ -916,11 +925,84 @@ pub fn cmd_kill(target: &str, dry_run: bool) -> i32 {
                 );
             }
         } else {
-            println!("All processes confirmed dead.");
+            println!("All targeted OS processes confirmed dead.");
+            println!(
+                "Note: this kills the agent's CURRENT tool processes only — the \
+                 agent itself runs in-process and may continue with its next step."
+            );
         }
     }
 
     0
+}
+
+/// Liveness window used by `kill` / `kill-all` when checking for
+/// in-process agents that survived the process-tree sweep. Wider than
+/// the `active-agents` default (120s) on purpose: here a false
+/// negative means telling the operator "all dead" while an agent is
+/// still executing, so we err toward flagging anything whose
+/// transcript moved within the last 10 minutes and let the printed
+/// age disambiguate.
+pub const IN_PROCESS_SURVIVOR_WINDOW_SECS: u64 = 600;
+
+/// Find agents whose transcripts are still advancing. These are
+/// IN-PROCESS async agents: they execute inside the main Claude Code
+/// process's event loop, have no OS process of their own (a `ps`
+/// sweep only sees their transient tool children), cannot be killed
+/// from outside, and survive a context reset of the parent session.
+fn live_in_process_agents(window_secs: u64) -> Vec<AgentRecord> {
+    let now = std::time::SystemTime::now();
+    let dirs = find_active_subagents_dirs(now, DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS);
+    collect_agent_records_merged(&dirs, now, window_secs)
+        .into_iter()
+        .filter(|r| r.alive)
+        .collect()
+}
+
+/// Pure: render the loud in-process-survivor warning, or `None` when
+/// there is nothing to warn about.
+pub fn format_in_process_warning(live: &[AgentRecord], window_secs: u64) -> Option<String> {
+    if live.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\n{}\nWARNING: {} in-process agent(s) may still be running — cannot be\n\
+         killed from outside; they SURVIVE a context reset (/clear).\n",
+        "=".repeat(68),
+        live.len()
+    ));
+    for r in live {
+        let qid = r.queue_id.as_deref().unwrap_or("-");
+        let age = r
+            .jsonl_age_seconds
+            .map(|s| format!("{}s", s))
+            .unwrap_or_else(|| "?".to_string());
+        out.push_str(&format!(
+            "  {}  queue={}  last transcript write {} ago\n",
+            r.agent_id, qid, age
+        ));
+    }
+    out.push_str(&format!(
+        "Async subagents execute inside the main Claude Code process's event\n\
+         loop and have no OS process of their own — process-tree kills never\n\
+         reach them (transcript activity within the last {}s is the signal\n\
+         above). Only the owning Claude Code process can stop them, or a\n\
+         full restart of that process.\n{}",
+        window_secs,
+        "=".repeat(68)
+    ));
+    Some(out)
+}
+
+/// Check for in-process survivors and print the warning if any.
+/// Returns the number of live in-process agents found.
+fn report_in_process_survivors() -> usize {
+    let live = live_in_process_agents(IN_PROCESS_SURVIVOR_WINDOW_SECS);
+    if let Some(warning) = format_in_process_warning(&live, IN_PROCESS_SURVIVOR_WINDOW_SECS) {
+        println!("{}", warning);
+    }
+    live.len()
 }
 
 /// Run the `kill-all` command. Returns exit code.
@@ -942,7 +1024,11 @@ pub fn cmd_kill_all(dry_run: bool) -> i32 {
     let orphans = find_orphaned_agents(Some(claude_pid));
 
     if agent_children.is_empty() && orphans.is_empty() {
-        println!("No agent processes found.");
+        println!("No agent OS processes found.");
+        // An empty process list does NOT mean no agents are running:
+        // in-process async agents only surface an OS child while a
+        // tool call (Bash etc.) is in flight. Check transcripts.
+        report_in_process_survivors();
         return 0;
     }
 
@@ -965,6 +1051,7 @@ pub fn cmd_kill_all(dry_run: bool) -> i32 {
 
     if dry_run {
         println!("\nDry run — no processes killed.");
+        report_in_process_survivors();
         return 0;
     }
 
@@ -1000,8 +1087,12 @@ pub fn cmd_kill_all(dry_run: bool) -> i32 {
             );
         }
     } else {
-        println!("All confirmed dead.");
+        // Only claim what was actually verified: the OS processes we
+        // targeted. In-process async agents were never in that set.
+        println!("All targeted OS processes confirmed dead.");
     }
+
+    report_in_process_survivors();
 
     0
 }
@@ -1265,6 +1356,48 @@ mod tests {
         assert!(output.contains("test agent"));
         assert!(output.contains("RUNNING"));
         assert!(output.contains("1234"));
+    }
+
+    #[test]
+    fn test_format_in_process_warning_empty_is_none() {
+        assert!(format_in_process_warning(&[], IN_PROCESS_SURVIVOR_WINDOW_SECS).is_none());
+    }
+
+    #[test]
+    fn test_format_in_process_warning_lists_agents_and_is_loud() {
+        // Mirrors the 2026-07-11 incident shape: one in-process agent
+        // with a fresh transcript survived a context reset while
+        // kill-all reported "All confirmed dead". The warning must
+        // name the agent, its queue item, say it CANNOT be killed
+        // from outside, and say it survives a context reset.
+        let live = vec![
+            AgentRecord {
+                agent_id: "acb472bd50d4de7c4".to_string(),
+                queue_id: Some("q-2026-07-11-abcd".to_string()),
+                alive: true,
+                jsonl_age_seconds: Some(15),
+            },
+            AgentRecord {
+                agent_id: "a0000000000000000".to_string(),
+                queue_id: None,
+                alive: true,
+                jsonl_age_seconds: None,
+            },
+        ];
+        let w = format_in_process_warning(&live, 600).expect("warning");
+        assert!(w.contains("WARNING: 2 in-process agent(s) may still be running"));
+        assert!(w.contains("cannot be"));
+        assert!(w.contains("killed from outside"));
+        assert!(w.contains("SURVIVE a context reset"));
+        assert!(w.contains("acb472bd50d4de7c4"));
+        assert!(w.contains("queue=q-2026-07-11-abcd"));
+        assert!(w.contains("last transcript write 15s ago"));
+        // Unknown fields degrade gracefully.
+        assert!(w.contains("a0000000000000000"));
+        assert!(w.contains("queue=-"));
+        assert!(w.contains("last transcript write ? ago"));
+        // Window is surfaced so the operator can judge the ages.
+        assert!(w.contains("600s"));
     }
 
     #[test]
