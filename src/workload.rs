@@ -2335,23 +2335,12 @@ mod tests {
         // produce exactly one workload-done event with the right shape.
         let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
-        // SAFETY: lock above serializes against peer tests touching
-        // the same process-global env vars.
-        unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
-        }
+        // The shared guard (not a bare set_var) so we can't race
+        // event_bus tests into leaking events to the live queue.
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(tmp.path());
 
         let rc = cmd_emit_done("test-task", 0, "/tmp/foo.output", false, None);
         assert_eq!(rc, 0);
-
-        // Restore env first so any panic below doesn't leak.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
-        }
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
@@ -2379,18 +2368,9 @@ mod tests {
     fn cmd_emit_done_killed_marker() {
         let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
-        unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
-        }
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(tmp.path());
         let rc = cmd_emit_done("killed-task", -15, "/tmp/k.output", true, None);
         assert_eq!(rc, 0);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
-        }
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
@@ -2419,10 +2399,9 @@ mod tests {
         // PATH in CI) — that path is exercised in the stub-CLI test.
         let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(tmp.path());
         let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
         unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
             std::env::set_var("WORKLOAD_QUEUE_TRANSITION", "0");
         }
 
@@ -2436,10 +2415,6 @@ mod tests {
         assert_eq!(rc, 0);
 
         unsafe {
-            match prev_q {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
             match prev_t {
                 Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
                 None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
@@ -2469,7 +2444,7 @@ mod tests {
         // killed=false. SESSION_TASK_CLI overrides PATH lookup.
         let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(tmp.path());
         let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
         let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
 
@@ -2486,7 +2461,6 @@ mod tests {
         );
 
         unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
             std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
         }
@@ -2500,10 +2474,6 @@ mod tests {
         );
 
         unsafe {
-            match prev_q {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
             match prev_cli {
                 Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
                 None => std::env::remove_var("SESSION_TASK_CLI"),
@@ -2534,7 +2504,7 @@ mod tests {
         // exit code so post-mortem inspection is straightforward.
         let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(tmp.path());
         let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
         let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
 
@@ -2551,7 +2521,6 @@ mod tests {
         );
 
         unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
             std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
         }
@@ -2565,10 +2534,6 @@ mod tests {
         );
 
         unsafe {
-            match prev_q {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
             match prev_cli {
                 Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
                 None => std::env::remove_var("SESSION_TASK_CLI"),
@@ -2599,7 +2564,7 @@ mod tests {
         // mentioning the kill — symmetric with non-zero exit handling.
         let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(tmp.path());
         let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
         let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
 
@@ -2616,7 +2581,6 @@ mod tests {
         );
 
         unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
             std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
         }
@@ -2630,10 +2594,6 @@ mod tests {
         );
 
         unsafe {
-            match prev_q {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
             match prev_cli {
                 Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
                 None => std::env::remove_var("SESSION_TASK_CLI"),
@@ -2662,7 +2622,7 @@ mod tests {
         // entirely (regression safety + test-harness escape hatch).
         let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(tmp.path());
         let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
         let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
 
@@ -2679,7 +2639,6 @@ mod tests {
         );
 
         unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
             std::env::set_var("WORKLOAD_QUEUE_TRANSITION", "0");
         }
@@ -2693,10 +2652,6 @@ mod tests {
         );
 
         unsafe {
-            match prev_q {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
             match prev_cli {
                 Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
                 None => std::env::remove_var("SESSION_TASK_CLI"),
@@ -3716,7 +3671,7 @@ mod tests {
 
         let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(tmp.path());
         let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
         let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
 
@@ -3734,7 +3689,6 @@ mod tests {
         );
 
         unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
             std::env::set_var("SESSION_TASK_CLI", &stub_path);
             std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
         }
@@ -3802,10 +3756,6 @@ mod tests {
         }
 
         unsafe {
-            match prev_q {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
             match prev_cli {
                 Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
                 None => std::env::remove_var("SESSION_TASK_CLI"),

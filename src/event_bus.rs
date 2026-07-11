@@ -480,6 +480,69 @@ fn hostname_string() -> String {
     String::new()
 }
 
+/// Test-only support for tests (in ANY module of this crate) that need
+/// to redirect event emission away from the user's live queue.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static EVENT_QUEUE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// RAII guard that points `CLAUDE_EVENT_QUEUE` at a test directory
+    /// and restores the previous value on drop (including on panic).
+    ///
+    /// It holds a process-global mutex for its whole lifetime so
+    /// concurrent tests can never interleave their set/restore windows.
+    /// Without this, `cargo test`'s threaded runner could restore/remove
+    /// the var in test A while test B sits between its own set and emit —
+    /// B's emission then falls back to the user's LIVE event queue
+    /// (`~/claude-events/`). Not hypothetical: fixture events from this
+    /// suite (a "workload translate-book done", a heartbeat-tick with a
+    /// /custom/run path) were observed landing in the live queue and
+    /// churning the real event watcher. (nextest is immune — one process
+    /// per test — but plain `cargo test` is a supported runner and must
+    /// be safe too.) Every test that mutates `CLAUDE_EVENT_QUEUE` MUST
+    /// go through this guard.
+    pub(crate) struct EventQueueGuard {
+        prev: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EventQueueGuard {
+        pub(crate) fn set(path: &Path) -> Self {
+            let lock = EVENT_QUEUE_ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                // A poisoned lock only means another test panicked while
+                // holding it; the env var is still consistent because
+                // that test's guard restored it during unwind.
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("CLAUDE_EVENT_QUEUE");
+            // SAFETY: process-global env mutation, serialized by the
+            // lock held for the guard's whole lifetime.
+            unsafe {
+                std::env::set_var("CLAUDE_EVENT_QUEUE", path);
+            }
+            EventQueueGuard { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for EventQueueGuard {
+        fn drop(&mut self) {
+            // SAFETY: the lock field drops after this body, so we still
+            // hold it while restoring.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                    None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,19 +637,7 @@ mod tests {
         // Point CLAUDE_EVENT_QUEUE at a tempdir, emit, verify file lands
         // with valid JSON. Doesn't touch ~/claude-events/.
         let tmp = tempfile::tempdir().expect("tempdir");
-        // Save & restore env; tests in this binary run in parallel
-        // so be careful — we set + read + clean up in one shot.
-        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
-        // Safety: tests in this module are not racy w.r.t. each other
-        // because each call to emit() reads queue_dir() up-front before
-        // any sub-task spawns. Other tests in this module don't touch
-        // the env var.
-        // SAFETY: setting an env var in a test module — Rust 1.85+ flags
-        // this unsafe but our test threads do not concurrently mutate
-        // CLAUDE_EVENT_QUEUE.
-        unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
-        }
+        let _env = super::test_support::EventQueueGuard::set(tmp.path());
 
         let alert = ClaudeWatchAlert {
             alert_type: "prolonged-thinking",
@@ -597,14 +648,6 @@ mod tests {
             message: "prolonged thinking interrupt #1 fired",
         };
         emit(&alert);
-
-        // Restore env first so a panic below doesn't leak state.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
-        }
 
         // Verify exactly one file was created with the right tag and
         // that it parses as valid JSON with our expected fields.
@@ -713,12 +756,7 @@ mod tests {
     #[test]
     fn emit_workload_done_writes_file_with_correct_shape() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
-        // SAFETY: tests in this module don't concurrently mutate this var
-        // beyond the single set/restore window per test.
-        unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
-        }
+        let _env = super::test_support::EventQueueGuard::set(tmp.path());
 
         let ev = WorkloadDoneEvent {
             label: "translate-book",
@@ -728,13 +766,6 @@ mod tests {
             queue_id: None,
         };
         emit_workload_done(&ev);
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
-        }
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
@@ -786,12 +817,7 @@ mod tests {
     #[test]
     fn emit_cadence_writes_file_with_sanitized_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
-        // SAFETY: cadence tests in this module don't concurrently mutate
-        // this var beyond the single set/restore window per test.
-        unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
-        }
+        let _env = super::test_support::EventQueueGuard::set(tmp.path());
 
         let ev = CadenceEvent {
             tag: "memory-reminder",
@@ -801,13 +827,6 @@ mod tests {
             data: serde_json::json!({"interval_secs": 900}),
         };
         emit_cadence(&ev);
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
-        }
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
@@ -840,12 +859,7 @@ mod tests {
     #[test]
     fn emit_cadence_heartbeat_tick_writes_event() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
-        // SAFETY: nextest runs each test in its own process; the single
-        // set/restore window per test keeps this env mutation isolated.
-        unsafe {
-            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
-        }
+        let _env = super::test_support::EventQueueGuard::set(tmp.path());
 
         // Mirror the production call site in `main::run_daemon`, including a
         // NON-default configured heartbeat path so we prove the configured
@@ -859,13 +873,6 @@ mod tests {
             data: heartbeat_tick_data(configured_path, 300),
         };
         emit_cadence(&ev);
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
-                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
-            }
-        }
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
