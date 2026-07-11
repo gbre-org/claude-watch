@@ -245,6 +245,14 @@ pub async fn is_interactive_prompt(pane: &str) -> bool {
 ///     highlighted selection. A genuinely-idle prompt has the `❯` alone on
 ///     an otherwise-empty input line, never immediately followed by a
 ///     numbered option.
+///  4. The 2.1.x "Background work is running" exit-confirmation dialog
+///     (title "Background work is running" / body "…will stop when you
+///     exit"). Claude Code renders it on the interactive `/exit` flow when a
+///     worktree is checked out OR background tasks are running; suppressing
+///     an inject while it is up is harmless (same passive-viewer reasoning
+///     as (2)) and keeps this guard aware of the same dialog
+///     `policy::run_auto_update` explicitly dismisses. See
+///     `background_work_exit_dialog_visible`.
 ///
 /// ## Conservative bias
 ///
@@ -299,6 +307,56 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
                     return true;
                 }
             }
+        }
+    }
+
+    // (4) The 2.1.x "Background work is running" exit-confirmation dialog.
+    // Delegated to a shared detector so `policy::run_auto_update` can reuse
+    // the exact same signature it dismisses.
+    if background_work_exit_dialog_visible(pane_output) {
+        return true;
+    }
+
+    false
+}
+
+/// Pure function: does the pane show Claude Code's 2.1.x "Background work is
+/// running" exit-confirmation dialog?
+///
+/// Claude Code 2.1.207 renders this dialog ONLY on the interactive exit flow
+/// (`prompt_input_exit`), gated on `worktree != null OR
+/// runningBackgroundTasks > 0`. It looks like:
+///
+/// ```text
+///   Background work is running
+///   The following will stop when you exit:
+///   ❯ 1. Exit anyway
+///     2. Move to background and exit
+///     3. Stay
+/// ```
+///
+/// Our sessions always have backgrounded watchers, so the dialog ALWAYS
+/// renders when the daemon's auto-update injects `/exit` — it eats the
+/// `/exit` submit, `wait_for_exit` then times out, and the daemon
+/// false-alarms "Claude Code crashed". `run_auto_update` polls for this
+/// signature and sends a bare Enter (option 1 "Exit anyway" is default-
+/// highlighted) to get past it.
+///
+/// Match either the title line or the body line — both are stable literals
+/// emitted by Claude Code. Scoped to the recent tail so a scrollback mention
+/// (e.g. this doc read into a pane) doesn't trip it.
+pub(crate) fn background_work_exit_dialog_visible(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    for line in &lines[start..] {
+        let lower = line.trim().to_lowercase();
+        if lower.contains("background work is running") || lower.contains("will stop when you exit")
+        {
+            return true;
         }
     }
     false
@@ -2188,6 +2246,46 @@ mod tests {
         assert!(
             interactive_prompt_visible(output),
             "select-hint footer overlay must be matched (conservative bias)"
+        );
+    }
+
+    // background_work_exit_dialog_visible — the 2.1.x "Background work is
+    // running" exit-confirmation dialog (#1411). run_auto_update polls for
+    // this and sends Enter to select the default "Exit anyway"; the general
+    // inject-guard `interactive_prompt_visible` also matches it (signature 4).
+    #[test]
+    fn background_work_exit_dialog_matches_title() {
+        let output = "  Background work is running\n\
+                      \u{276f} 1. Exit anyway\n\
+                        2. Move to background and exit\n\
+                        3. Stay";
+        assert!(background_work_exit_dialog_visible(output));
+    }
+
+    #[test]
+    fn background_work_exit_dialog_matches_body_line() {
+        let output = "  Some box\n\
+                        The following will stop when you exit:\n\
+                      \u{276f} 1. Exit anyway";
+        assert!(background_work_exit_dialog_visible(output));
+    }
+
+    #[test]
+    fn background_work_exit_dialog_not_fired_on_idle() {
+        let output = "Claude Code is running\nTokens: 50000\n\u{276f} ";
+        assert!(!background_work_exit_dialog_visible(output));
+    }
+
+    #[test]
+    fn interactive_prompt_fires_on_background_work_exit_dialog() {
+        // Signature (4): the exit-confirmation dialog must suppress injects
+        // via the shared guard too, not just the auto-update poll.
+        let output = "  Background work is running\n\
+                        The following will stop when you exit:\n\
+                      \u{276f} 1. Exit anyway";
+        assert!(
+            interactive_prompt_visible(output),
+            "'Background work is running' exit dialog must be matched (signature 4)"
         );
     }
 
