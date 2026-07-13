@@ -320,6 +320,93 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
     false
 }
 
+/// Pure function: does the pane show a BLOCKING interactive question that is
+/// truly awaiting a human answer — an `AskUserQuestion` menu or a
+/// tool-permission confirmation — as opposed to a PASSIVE selector/viewer
+/// overlay (FleetView agent-view, Background-tasks viewer) that merely renders
+/// a `❯ … to select … Enter to view … Esc to close` footer?
+///
+/// This is a DELIBERATELY NARROWER sibling of `interactive_prompt_visible`.
+/// The broad detector is biased toward `true` because its original consumer
+/// (inject-suppression) treats a false positive as harmless — it only DELAYS a
+/// resume-inject. The `ask_question_monitor`
+/// (`policy::check_ask_question_stale`) has the OPPOSITE cost asymmetry: a
+/// false positive there fires a spurious `ask-question-stale` claude-event +
+/// pingme with NO real block behind it. In practice the main-loop pane
+/// frequently sits on the FleetView agent-view overlay (`❯ ● main` /
+/// `◯ general-purpose …`, footer `↑/↓ to select · Enter to view`) — a passive
+/// viewer, not a question — and `interactive_prompt_visible`'s signature (2)
+/// matched it, firing the false alarm the operator reported (2026-07-13).
+///
+/// A GENUINE blocking question is distinguished by one of:
+///   1. Explicit question / confirmation text (`Do you want to` /
+///      `Would you like to` / `Do you trust`).
+///   2. A `❯`-cursored NUMBERED option row (`❯ 1.` / `❯ 2.` …) — every real
+///      AskUserQuestion / permission menu renders numbered choices.
+///   3. A select-hint footer that CONFIRMS a pick — "to confirm" or
+///      "to submit". Passive viewers use "Enter to view" / "Esc to close"
+///      instead, which this detector deliberately does NOT match.
+///
+/// The `background_work_exit_dialog_visible` /exit dialog is intentionally
+/// excluded here: it is a distinct dialog `run_auto_update` dismisses, not an
+/// AskUserQuestion, so it must not trip the ask-question stale monitor.
+pub(crate) fn blocking_question_visible(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    for line in &lines[start..] {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+
+        // (1) Permission / confirmation question text.
+        if lower.contains("do you want to")
+            || lower.contains("would you like to")
+            || lower.contains("do you trust")
+        {
+            return true;
+        }
+
+        // (2) A `❯`-cursored numbered option row (`❯ 1.`, `❯ 2.`, …).
+        if let Some(rest) = trimmed.strip_prefix('\u{276f}') {
+            let rest = rest.trim_start();
+            let mut chars = rest.chars();
+            if let Some(c) = chars.next() {
+                if c.is_ascii_digit() && chars.next() == Some('.') {
+                    return true;
+                }
+            }
+        }
+
+        // (3) A CONFIRMING select-hint footer. Unlike
+        // `interactive_prompt_visible`, match ONLY "to confirm" / "to submit"
+        // — the footer a real question menu shows. Passive viewer footers
+        // ("Enter to view", "Esc to close") are deliberately NOT matched, so
+        // the FleetView agent-view / Background-tasks viewer overlays do not
+        // trip the stale-question alarm.
+        if lower.contains("to select")
+            && (lower.contains("to confirm") || lower.contains("to submit"))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Async wrapper: capture the pane and run `blocking_question_visible`. Used
+/// by the `ask_question_monitor` so a passive FleetView / Background-tasks
+/// viewer overlay on the main pane does NOT fire a spurious
+/// `ask-question-stale` alarm. See `blocking_question_visible`.
+pub async fn is_blocking_question(pane: &str) -> bool {
+    if let Some(out) = capture_pane(pane).await {
+        return blocking_question_visible(&out);
+    }
+    false
+}
+
 /// Pure function: does the pane show Claude Code's 2.1.x "Background work is
 /// running" exit-confirmation dialog?
 ///
@@ -2247,6 +2334,95 @@ mod tests {
             interactive_prompt_visible(output),
             "select-hint footer overlay must be matched (conservative bias)"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // blocking_question_visible — NARROW detector for the ask_question_monitor.
+    // Regression suite for the 2026-07-13 false-positive where the FleetView
+    // agent-view overlay footer ("↑/↓ to select · Enter to view") on the main
+    // pane tripped the broad `interactive_prompt_visible` and fired a spurious
+    // `ask-question-stale` alarm with no real AskUserQuestion pending.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn blocking_question_fires_on_permission_confirmation() {
+        let output = "\u{25cf} Bash(rm -rf /tmp/foo)\n\
+                      ─────────────\n\
+                      Do you want to proceed?\n\
+                      \u{276f} 1. Yes\n\
+                        2. No, and tell Claude what to do differently (esc)";
+        assert!(blocking_question_visible(output));
+    }
+
+    #[test]
+    fn blocking_question_fires_on_ask_user_question_menu() {
+        let output = "Which approach should I take?\n\
+                      \u{276f} 1. Refactor in place\n\
+                        2. Rewrite from scratch\n\
+                        3. Leave as-is\n\
+                      \u{2191}/\u{2193} to select \u{00b7} Enter to confirm \u{00b7} Esc to cancel";
+        assert!(blocking_question_visible(output));
+    }
+
+    #[test]
+    fn blocking_question_fires_on_cursored_numbered_option() {
+        let output = "Pick one:\n\u{276f} 1. Option A\n  2. Option B";
+        assert!(blocking_question_visible(output));
+    }
+
+    #[test]
+    fn blocking_question_not_fired_on_fleetview_agent_view_overlay() {
+        // THE reported false positive: the main-loop pane sits on the
+        // FleetView agent selector — a passive viewer, not a question. Its
+        // footer is "↑/↓ to select · Enter to view", and the `❯` rows are
+        // bullet-prefixed agent names (`❯ ● main`), never `❯ 1.`. Must NOT
+        // fire the stale-question alarm.
+        let output = "\u{276f} \n\
+                      ───────────────\n\
+                      -- INSERT -- \u{2191}/\u{2193} to select \u{00b7} Enter to view        413051 tokens\n\
+                      \u{276f} \u{25cf} main\n\
+                      \u{25ef} general-purpose  Add #1629 coverage… 1h 4m 0s\n\
+                      \u{25ef} general-purpose  Fix pr-watch stage…  56m 43s";
+        assert!(
+            !blocking_question_visible(output),
+            "FleetView agent-view overlay must NOT be treated as a blocking question"
+        );
+    }
+
+    #[test]
+    fn blocking_question_not_fired_on_background_tasks_viewer_overlay() {
+        // The Background-tasks viewer (ctrl+b) is a passive viewer with a
+        // "to select … Enter to view … Esc to close" footer and non-numbered
+        // `❯` rows. `interactive_prompt_visible` matches it (harmless there),
+        // but the stale-question monitor must NOT.
+        let output = "  Background tasks\n\
+                        4 active shells\n\
+                      \u{276f} watcher-ctl run alerts-watcher (running)\n\
+                      \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
+        assert!(
+            !blocking_question_visible(output),
+            "passive viewer overlay must NOT be treated as a blocking question"
+        );
+    }
+
+    #[test]
+    fn blocking_question_not_fired_on_bare_idle_prompt() {
+        let output = "\u{25cf} Brewed for 12s\n\
+                      ─────────────\n\
+                      \u{276f}\n\
+                      ─────────────\n\
+                      \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        assert!(!blocking_question_visible(output));
+    }
+
+    #[test]
+    fn blocking_question_not_fired_on_background_work_exit_dialog() {
+        // The /exit dialog is NOT an AskUserQuestion — run_auto_update handles
+        // it. It must not trip the stale-question monitor. (It has no numbered
+        // `❯ 1.` here and no confirming select-hint footer.)
+        let output = "  Background work is running\n\
+                        The following will stop when you exit:";
+        assert!(!blocking_question_visible(output));
     }
 
     // background_work_exit_dialog_visible — the 2.1.x "Background work is

@@ -3382,7 +3382,13 @@ async fn check_ask_question_stale(config: &Config, state: &mut State, pane: &str
         return;
     }
 
-    let interactive = tmux::is_interactive_prompt(pane).await;
+    // Use the NARROW blocking-question detector, NOT the broad
+    // `is_interactive_prompt` (which is biased toward true and matches passive
+    // FleetView / Background-tasks viewer overlays). A false positive here
+    // fires a spurious `ask-question-stale` alarm with no real block behind it
+    // (operator-reported false alarm, 2026-07-13). See
+    // `tmux::blocking_question_visible`.
+    let interactive = tmux::is_blocking_question(pane).await;
     let decision =
         ask_question_timer_step(state, cfg.enabled, cfg.stale_seconds, interactive, now);
 
