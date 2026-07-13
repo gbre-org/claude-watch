@@ -195,6 +195,40 @@ class QueueTest(unittest.TestCase):
         self._wait_terminal(label)
         self.mod.cmd_clean(type("A", (), {"label": label, "all": False})())
 
+    def test_description_carries_command_line(self):
+        # The queue-add DESCRIPTION (the q-site "Prompt" field) must carry the
+        # ACTUAL command line — shell-quoted, label-prefixed — not just the
+        # bare label. This is the durable surface: unlike <label>/status.json
+        # (removed by `hostjob clean`), the queue row survives, so the cmdline
+        # stays visible for finished jobs.
+        label = "desc-q"
+        rc = self.mod.cmd_run(
+            _RunArgs(label, ["echo", "HELLO WORLD", "--flag=x y"],
+                     no_queue=True))
+        self.assertEqual(rc, 0)
+        lines = self._shim_lines()
+        add_calls = [l for l in lines if l.startswith("queue add")]
+        self.assertEqual(len(add_calls), 1, lines)
+        # description positional = "<label>: <shell-quoted argv>"
+        self.assertIn("desc-q: echo", add_calls[0], add_calls[0])
+        # args with spaces are shell-quoted so they round-trip visibly.
+        self.assertIn("'HELLO WORLD'", add_calls[0], add_calls[0])
+        self.assertIn("'--flag=x y'", add_calls[0], add_calls[0])
+        # summary stays the compact "hostjob: <label>" (unchanged).
+        self.assertIn("--summary hostjob: %s" % label, add_calls[0])
+
+        self._wait_terminal(label)
+        self.mod.cmd_clean(type("A", (), {"label": label, "all": False})())
+
+    def test_describe_cmd_fallbacks(self):
+        # Empty / None cmd falls back to the bare label (never blocks queueing).
+        self.assertEqual(self.mod._describe_cmd("lbl", []), "lbl")
+        self.assertEqual(self.mod._describe_cmd("lbl", None), "lbl")
+        # Simple argv with no special chars is joined without quoting noise.
+        self.assertEqual(
+            self.mod._describe_cmd("lbl", ["make", "build"]), "lbl: make build"
+        )
+
     def test_list_shows_queue_id(self):
         label = "list-q"
         self.mod.cmd_run(_RunArgs(label, ["true"], no_queue=False))

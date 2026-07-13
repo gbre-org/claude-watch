@@ -57,6 +57,7 @@ import argparse
 import errno
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -174,7 +175,33 @@ def reconcile(label):
 # --------------------------------------------------------------------------
 # queue integration (host-side; fail-soft)
 # --------------------------------------------------------------------------
-def _register_queue_item(label, depends_on=None, register=True):
+def _describe_cmd(label, cmd):
+    """Build the queue-item DESCRIPTION for a hostjob: its real command line.
+
+    The queue row's ``description`` is what the q-site surfaces as the
+    prominent "Prompt" field (and what `session-task queue list` shows).
+    Historically hostjob passed the bare ``label`` here, so the Prompt field
+    showed only e.g. ``tenant-init-build`` — never the argv the runner
+    actually exec'd. We instead store a shell-quoted rendering of the argv,
+    prefixed with the label for scannability, so the ACTUAL cmdline is visible
+    in the durable queue record (which — unlike the ephemeral
+    ``<label>/status.json`` the runner also writes — survives `hostjob clean`
+    and finished-job cleanup).
+
+    Shape: ``<label>: <shell-quoted argv one-liner>`` (e.g.
+    ``tenant-init-build: make container-build --flag='x y'``). Fail-soft: on
+    any error, fall back to the bare label so a bad argv never blocks queueing.
+    """
+    try:
+        if not cmd:
+            return label
+        display = " ".join(shlex.quote(str(part)) for part in cmd)
+        return "%s: %s" % (label, display)
+    except Exception:
+        return label
+
+
+def _register_queue_item(label, cmd=None, depends_on=None, register=True):
     """Add (and optionally register) a session-task queue item for this hostjob.
 
     ALWAYS does `queue add` (scope hostjob:<label>, created-by hostjob,
@@ -182,6 +209,11 @@ def _register_queue_item(label, depends_on=None, register=True):
     `queue register <qid>` to claim the scope slot (serializes same-label
     work). When `register` is False, the `queue register` step is SKIPPED — the
     row stays `pending`: visible + dependable but NON-serializing.
+
+    ``cmd`` is the argv the hostjob will exec; it becomes the queue item's
+    DESCRIPTION (the q-site "Prompt" field) via ``_describe_cmd`` so the real
+    command line — not just the bare label — is visible in the durable queue
+    record. Passing ``None`` falls back to the bare label (legacy behavior).
 
     Returns the q-id string on success, or None if queue integration is
     unavailable or fails for any reason. NEVER raises — queue plumbing must
@@ -194,9 +226,10 @@ def _register_queue_item(label, depends_on=None, register=True):
         )
         return None
     scope = "hostjob:%s" % label
+    description = _describe_cmd(label, cmd)
     try:
         add_argv = [
-            st_bin, "queue", "add", label,
+            st_bin, "queue", "add", description,
             "--scope", scope,
             "--summary", "hostjob: %s" % label,
             "--created-by", "hostjob",
@@ -570,7 +603,8 @@ def cmd_run(args):
     # stays None if anything goes wrong.
     queue_id = _register_queue_item(
         label,
-        getattr(args, "depends_on", None),
+        cmd=cmd,
+        depends_on=getattr(args, "depends_on", None),
         register=not args.no_queue,
     )
 
