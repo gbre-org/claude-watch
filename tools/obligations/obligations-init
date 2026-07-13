@@ -473,6 +473,57 @@ def seed_agent_ack_pending(cli: str, *, dry_run: bool = False,
         "--json",
     ]
 
+    # Cross-gate deadlock-break: EXEMPT the botchat mark-read gate's OWN
+    # clearing commands from this (agent_ack_pending) gate. Without this,
+    # a completed-agent-awaiting-ack AND an unread inbound botchat message
+    # deadlock each other: the botchat gate blocks `agent-ack done` (its
+    # clearing command) while this gate blocks `botchat-send --mark-read`
+    # (the botchat gate's clearing command), so neither remedy can run and
+    # only `obligations override` breaks it. (Hit live 2026-07-13; Andrew
+    # botchat #1492: "update exemptions on both ends to mitigate deadlock
+    # going forward.") The reciprocal exempt (agent-ack CLIs in the botchat
+    # gate) lives in the operator manifest
+    # ~/repos/claude-config/obligations/botchat-mark-read.json.
+    #
+    # NB the evaluator's OWN internal _EXEMPT_RE (in eval-agent-ack-pending)
+    # already lists bare `botchat-send` etc., but that regex is ^\s*-anchored
+    # and so MISSES the botchat gate's canonical clearing invocation, which
+    # carries an env prefix + absolute path
+    # (`BOTCHAT_API_BASE=... /home/hndrewaall/repos/botchat/bin/botchat-send
+    # --mark-read <ids> --ack <ids>`). Row-level exempt_patterns are checked
+    # in _check_core BEFORE the predicate/evaluator runs, and the AST-aware
+    # `Bashcmd:` matcher strips env/wrapper/path to the effective command
+    # HEAD, so it catches ALL invocation shapes (bare, env-prefixed,
+    # path-prefixed). Mirrors the exempt forms in the botchat manifest.
+    # See memory feedback_wildcard_obligation_must_exempt_recovery_clis
+    # (same class: a gate must always exempt the CLIs that clear OTHER gates).
+    for exempt in (
+        # AST-aware command-head match (env/wrapper/path stripped) — the
+        # primary, invocation-shape-agnostic exempt. `botchat-ack` included
+        # for parity with the botchat manifest.
+        "Bashcmd:botchat-send,botchat-unread-check,botchat-history,"
+        "botchat-show,botchat-wait,botchat-ack",
+        # Legacy unanchored regex forms (understood by older bind-mounted
+        # obligations CLIs that treat `Bashcmd:` as an unknown head); the
+        # `Bash:<regex>` matcher uses re.search (unanchored), so an
+        # env-prefixed / path-prefixed invocation still matches. Kept
+        # alongside `Bashcmd:` for the same interim-compat reason the
+        # botchat manifest keeps both forms.
+        "Bash:botchat-send",
+        "Bash:botchat-unread-check",
+        "Bash:botchat-history",
+        "Bash:botchat-show",
+        "Bash:botchat-wait",
+        # host-bash MCP variants — the botchat clearing command sometimes
+        # runs via the host-bash MCP server (run_command / run_script),
+        # which presents as `mcp__host-bash__*`, NOT `Bash`.
+        "mcp__host-bash__run_command:botchat-send",
+        "mcp__host-bash__run_script:botchat-send",
+        "mcp__host-bash__run_command:botchat-unread-check",
+        "mcp__host-bash__run_script:botchat-unread-check",
+    ):
+        cmd.extend(["--exempt-tool-pattern", exempt])
+
     if dry_run:
         print("DRY-RUN: " + " ".join(cmd))
         return 0

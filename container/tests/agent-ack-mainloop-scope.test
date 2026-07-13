@@ -212,6 +212,78 @@ def test_subagent_queue_item_running_polarity_unchanged() -> None:
                f"in subagents); got {preds[0]}")
 
 
+# ---------------------------------------------------------------- 2b
+
+def test_agent_ack_exempts_botchat_clearing() -> None:
+    """Cross-gate deadlock-break regression: the agent_ack_pending seed MUST
+    exempt the botchat mark-read gate's clearing commands, so an unread
+    botchat message can be cleared even while an agent-ack is pending.
+
+    Without this, agent_ack_pending (blocking `botchat-send --mark-read`) and
+    the botchat mark-read gate (blocking `agent-ack done`) deadlock each other
+    -- only `obligations override` breaks it. Hit live 2026-07-13 (Andrew
+    botchat #1492). The reciprocal exempt (agent-ack CLIs in the botchat gate)
+    lives in the operator manifest claude-config/obligations/botchat-mark-read.json.
+
+    We assert both:
+      (a) the raw dry-run argv for agent_ack_pending carries an
+          `--exempt-tool-pattern Bashcmd:...botchat-send...` flag, AND
+      (b) the AST-aware matcher treats the botchat gate's CANONICAL clearing
+          invocation (env-prefixed + absolute-path botchat-send) as exempt --
+          the exact shape the evaluator's own ^-anchored regex misses.
+    """
+    proc = subprocess.run(
+        [sys.executable, str(OBLIGATIONS_INIT), "--force", "--dry-run"],
+        capture_output=True, text=True, timeout=30, check=False,
+        env=_env_with_cli_on_path(),
+    )
+    expect(proc.returncode == 0,
+           f"obligations-init --dry-run rc={proc.returncode}\n{proc.stderr}")
+    ack_line = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("DRY-RUN: ") and "agent_ack_pending" in line:
+            ack_line = line
+            break
+    expect(ack_line is not None,
+           "agent_ack_pending dry-run line not found")
+    if ack_line is None:
+        return
+    expect("--exempt-tool-pattern" in ack_line,
+           "agent_ack_pending must carry --exempt-tool-pattern flags")
+    expect("Bashcmd:botchat-send" in ack_line,
+           "agent_ack_pending must exempt botchat clearing via Bashcmd: "
+           f"(the AST-aware, invocation-shape-agnostic form); got:\n{ack_line}")
+
+    # (b) matcher-level: the canonical clearing invocation must be exempt.
+    if not OBLIGATIONS_CLI.exists():
+        print("  SKIP (b): obligations CLI not found for matcher import")
+        return
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(
+        "obl_cli_mod", str(OBLIGATIONS_CLI))
+    spec = importlib.util.spec_from_loader("obl_cli_mod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    exempts = [
+        "Bashcmd:botchat-send,botchat-unread-check,botchat-history,"
+        "botchat-show,botchat-wait,botchat-ack",
+        "Bash:botchat-send",
+    ]
+    canonical = ("BOTCHAT_API_BASE=http://host.docker.internal:8111 "
+                 "/home/hndrewaall/repos/botchat/bin/botchat-send "
+                 "--mark-read 1492 --ack 1492")
+    hit, _pat = mod._exempt_match(exempts, "Bash", canonical)
+    expect(hit,
+           "canonical env-prefixed + abspath botchat-send --mark-read must "
+           "be EXEMPT from agent_ack_pending (the shape the evaluator's own "
+           "^-anchored regex misses)")
+    # And an unrelated command must still be blocked (exempt list is narrow).
+    hit2, _p2 = mod._exempt_match(exempts, "Bash", "rm -rf /tmp/x")
+    expect(not hit2,
+           "unrelated command must NOT be exempted by the botchat exempt list")
+
+
 # ---------------------------------------------------------------- 3
 
 def test_e2e_agent_ack_gate_main_loop_only() -> None:
@@ -283,6 +355,7 @@ def main() -> int:
     tests = [
         test_main_loop_only_rows_wrapped_in_all_of,
         test_subagent_queue_item_running_polarity_unchanged,
+        test_agent_ack_exempts_botchat_clearing,
         test_e2e_agent_ack_gate_main_loop_only,
     ]
     for t in tests:
