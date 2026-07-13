@@ -660,6 +660,32 @@ def _shape(
     bindings: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     status = item.get("status", "unknown")
+    # Hostjob status reconciliation. A hostjob-bound item stuck `running` in
+    # queue.json (the reaper's fail-soft done/abandon flip never landed, or a
+    # later `hostjob clean` removed the terminal state dir) must render by its
+    # AUTHORITATIVE status.json state — the same source `hostjob list` reads —
+    # not the stale queue status. Otherwise finished hostjobs show forever in
+    # the running column (Andrew, botchat #1527). We only ever DEMOTE a
+    # `running` item to a terminal state; we never promote in the other
+    # direction. `is_reconciled_hostjob` records that we overrode the queue
+    # status so the front-end / consumers can tell. See
+    # ``_hostjob_effective_terminal``.
+    reconciled_hostjob_exit = ""
+    is_reconciled_hostjob = False
+    reconciled_errored_hostjob = False
+    if status == "running":
+        _hj_label = _extract_hostjob_label(item.get("scope") or [])
+        if _hj_label:
+            _hj_started = _parse_iso(
+                item.get("registered_at") or item.get("started_at")
+            )
+            _hj_age = (now - _hj_started).total_seconds() if _hj_started else None
+            _eff = _hostjob_effective_terminal(_hj_label, _hj_age)
+            if _eff is not None:
+                status = _eff["status"]
+                is_reconciled_hostjob = True
+                reconciled_errored_hostjob = bool(_eff.get("errored"))
+                reconciled_hostjob_exit = _eff.get("exit_code", "")
     created = _parse_iso(item.get("created_at"))
     started = _parse_iso(item.get("registered_at") or item.get("started_at"))
     completed = _parse_iso(item.get("completed_at"))
@@ -838,11 +864,21 @@ def _shape(
     # abandoned.
     shaped["is_errored_hostjob"] = False
     shaped["hostjob_exit_code"] = ""
+    # Surface whether the status shown was reconciled from the hostjob's own
+    # status.json (i.e. the queue said `running` but the job had finished).
+    shaped["is_reconciled_hostjob"] = is_reconciled_hostjob
     if status == "abandoned" and shaped["hostjob_label"]:
         m = _HOSTJOB_EXIT_RE.match((shaped["abandon_reason"] or "").strip())
         if m and m.group(1) != "0":
             shaped["is_errored_hostjob"] = True
             shaped["hostjob_exit_code"] = m.group(1)
+    # A running item reconciled to a terminal state via status.json won't have
+    # an `abandon_reason` to parse, so carry the exit-code / errored flag from
+    # the reconciliation directly.
+    if is_reconciled_hostjob:
+        shaped["hostjob_exit_code"] = reconciled_hostjob_exit
+        if reconciled_errored_hostjob:
+            shaped["is_errored_hostjob"] = True
     return shaped
 
 
@@ -882,6 +918,83 @@ def _extract_hostjob_label(scope: list[Any]) -> str:
             if _WORKLOAD_LABEL_RE.match(label):
                 return label
     return ""
+
+
+def _hostjob_effective_terminal(
+    label: str, running_age_seconds: float | None
+) -> dict[str, Any] | None:
+    """Consult a hostjob's own status.json to detect that a queue item still
+    marked ``running`` has in fact FINISHED.
+
+    The ``hostjob`` runner (`examples/compose/bin/hostjob`) records the
+    authoritative lifecycle in ``<HOSTJOB_LOG_DIR>/<label>/status.json`` — the
+    same file ``hostjob list`` reads to print ``done rc=N``. The reaper's flip
+    of the bound queue item to done/abandon on worker exit is only fail-soft,
+    so a dropped flip (or a later ``hostjob clean`` that removes the terminal
+    state dir) leaves the queue row stuck ``running`` forever and the minisite
+    renders it in the running column indefinitely. This helper recovers the
+    real terminal state at render time, mirroring the errored-hostjob recovery.
+
+    Returns ``None`` to KEEP the queue's ``running`` status — the job is still
+    running, or we cannot safely tell. Otherwise returns the corrected effective
+    status:
+
+        {"status": "done", "exit_code": "0"}                        # rc == 0
+        {"status": "abandoned", "errored": True, "exit_code": "N"}  # rc != 0 / crashed / unknown
+
+    Cross-container note: the minisite runs in a DIFFERENT PID namespace than
+    the host worker, so a recorded host pid is meaningless here — we deliberately
+    do NOT probe pid liveness. We rely only on status.json's EXPLICIT terminal
+    state, plus a cleaned (absent) state dir gated by the STARTING window so a
+    just-launched job — whose status.json lands a beat after the queue row
+    registers — is never mis-flipped. Fail-soft: any unexpected shape returns
+    ``None`` (keep running) rather than fabricating a terminal state.
+    """
+    if not label:
+        return None
+    sp = Path(HOSTJOB_LOG_DIR) / label / "status.json"
+    try:
+        with open(sp, "r", encoding="utf-8", errors="replace") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        # No state dir. Either the job finished and `hostjob clean` removed it
+        # (clean REFUSES to remove a still-running job, so an absent dir means
+        # it had reached a terminal state), or we're inside the launch race
+        # where the runner registers the queue row a beat before writing
+        # status.json. Gate on the starting window to exclude that race; beyond
+        # it, treat the job as finished-and-cleaned. The rc is unrecoverable, so
+        # present it as a plain done (no evidence of failure to justify errored).
+        if (
+            running_age_seconds is not None
+            and running_age_seconds > STARTING_WINDOW_SECONDS
+        ):
+            return {"status": "done", "exit_code": ""}
+        return None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict):
+        return None
+    hj_status = st.get("status")
+    if hj_status == "running":
+        # The runner still considers the worker live — trust the reaper to flip
+        # the queue item on exit. (We can't cross-namespace pid-check, so we do
+        # not second-guess an explicit `running`.)
+        return None
+    # Terminal per the runner: done / crashed / stopped.
+    rc = st.get("rc")
+    try:
+        rc_int: int | None = int(rc)
+    except (TypeError, ValueError):
+        rc_int = None
+    if hj_status == "done" and rc_int == 0:
+        return {"status": "done", "exit_code": "0"}
+    # Non-zero rc, crashed, stopped, or an unrecoverable rc => a failure the
+    # operator should see; render it like the errored-hostjob (abandoned) path.
+    return {
+        "status": "abandoned",
+        "errored": True,
+        "exit_code": "" if rc_int is None else str(rc_int),
+    }
 
 
 def _load_workload_script_capture(label: str) -> dict[str, Any] | None:
