@@ -4,8 +4,10 @@
 Covers:
 
   * `queue block <id> --reason ...` from running -> blocked
+  * `queue block <id> --reason ...` from pending -> blocked (no register
+    dance needed to park a freshly-added item on an external blocker)
   * `queue block` refuses without --reason
-  * `queue block` refuses on non-running statuses (pending, wedged,
+  * `queue block` refuses on non-(pending|running) statuses (wedged,
     blocked, done, abandoned)
   * `queue unblock <id>` from blocked -> running, refreshes heartbeat,
     preserves blocked_at + block_reason as audit
@@ -19,11 +21,10 @@ Covers:
   * `queue groups` reports blocked_count
   * `queue register` refuses to re-claim a blocked item
 
-State-machine coherence: only running -> blocked is allowed.
-pending -> blocked and wedged -> blocked are explicitly REJECTED so the
-state graph stays simple. pending items use `queue lock <scope>` for
-real-world-condition holds; wedged items must first `unwedge` (back to
-running) before they can transition to blocked.
+State-machine coherence: pending -> blocked and running -> blocked are
+both allowed. wedged -> blocked is explicitly REJECTED so the state graph
+stays simple -- wedged items must first `unwedge` (back to running)
+before they can transition to blocked.
 
 All tests run against a temp HOME so the live ~/.config/session/queue.json
 is never touched.
@@ -130,18 +131,44 @@ def test_block_empty_reason_refused():
         assert "reason is required" in r.stderr.lower()
 
 
-def test_block_refused_on_pending():
-    """A pending (unregistered) item cannot be blocked."""
+def test_block_pending_to_blocked():
+    """A pending (unregistered) item can be blocked directly.
+
+    Parking a freshly-added item on an external blocker should Just Work
+    -- no pointless register (-> running) -> block two-step. A pending
+    item never acquired the scope lock, so nothing to release; blocked_at
+    + block_reason are stamped exactly as for a running item.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         added = _add(env, "pending", ["repo:block-pending"], "--summary", "p")
         qid = added["id"]
-        # NOT registered.
-        r = _run(env, "queue", "block", qid, "--reason", "x", "--silent")
-        assert r.returncode != 0
-        assert "must be running" in r.stderr.lower()
+        # NOT registered -- still pending.
+        r = _run(env, "queue", "block", qid, "--reason",
+                 "awaiting human greenlight", "--silent", "--json",
+                 expect_exit=0)
+        out = json.loads(r.stdout)
+        assert out["status"] == "blocked"
+        assert out["block_reason"] == "awaiting human greenlight"
+        assert out["blocked_at"]
         shown = _show(env, qid)
-        assert shown["status"] == "pending"
+        assert shown["status"] == "blocked"
+        assert shown["block_reason"] == "awaiting human greenlight"
+
+
+def test_block_pending_releases_scope():
+    """A pending item blocked directly holds no scope, so a peer with an
+    overlapping scope can register + run (blocked is not in-flight)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        first = _add(env, "park pending", ["repo:block-scope-p"],
+                     "--summary", "p")
+        _run(env, "queue", "block", first["id"], "--reason",
+             "awaiting greenlight", "--silent", expect_exit=0)
+        # A peer in the SAME scope must now be free to register + run.
+        second = _add(env, "peer", ["repo:block-scope-p"], "--summary", "peer")
+        reg = _register(env, second["id"])
+        assert reg["status"] == "running"
 
 
 def test_block_refused_on_wedged():
@@ -161,7 +188,7 @@ def test_block_refused_on_wedged():
              "--silent", expect_exit=0)
         r = _run(env, "queue", "block", qid, "--reason", "x", "--silent")
         assert r.returncode != 0
-        assert "must be running" in r.stderr.lower()
+        assert "must be pending or running" in r.stderr.lower()
         shown = _show(env, qid)
         assert shown["status"] == "wedged"
 
@@ -177,7 +204,7 @@ def test_block_refused_on_already_blocked():
              "--silent", expect_exit=0)
         r = _run(env, "queue", "block", qid, "--reason", "second", "--silent")
         assert r.returncode != 0
-        assert "must be running" in r.stderr.lower()
+        assert "must be pending or running" in r.stderr.lower()
 
 
 def test_block_refused_on_done():
@@ -316,7 +343,7 @@ def test_block_on_running_still_transitions_regression():
         # And block is still refused on an already-blocked item (unchanged).
         r2 = _run(env, "queue", "block", qid, "--reason", "second", "--silent")
         assert r2.returncode != 0
-        assert "must be running" in r2.stderr.lower()
+        assert "must be pending or running" in r2.stderr.lower()
 
 
 # -------------------- unblock --------------------

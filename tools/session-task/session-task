@@ -4879,6 +4879,16 @@ def cmd_queue_block(args):
       * `blocked` -- no live agent expected by design. Exporter labels
                      this state separately so orphan-detection skips it.
 
+    Accepts BOTH pending and running as the pre-state:
+      * pending -> blocked -- a freshly-added item that is already parked
+                     on an external blocker. Common enough that forcing a
+                     register (-> running) -> block two-step is pure
+                     ceremony (register would briefly acquire the scope
+                     lock only for block to release it again). A pending
+                     item never held the lock, so nothing to release.
+      * running -> blocked -- an agent that did its autonomous work and is
+                     now parked; releases the scope lock it held.
+
     Recovery:
       * `queue unblock <id>` -- blocked -> running (blocker cleared)
       * `queue done <id>`    -- blocked -> done (work was actually
@@ -4886,12 +4896,10 @@ def cmd_queue_block(args):
       * `queue abandon <id>` -- blocked -> abandoned (operator gives up)
 
     Behavior:
-      * Item must exist and be in status=running. Any other status
-        (pending, wedged, blocked, done, abandoned) refuses. Pick a
-        coherent state machine: only running -> blocked is supported.
-        If you want to express "this item is parked before any work
-        starts", use `queue lock <scope>` (real-world-condition locks
-        on pending items).
+      * Item must exist and be in status=pending OR status=running. Any
+        other status (wedged, blocked, done, abandoned) refuses. Pick a
+        coherent state machine: pending/running -> blocked is supported;
+        wedged must first `unwedge` (back to running) before blocking.
       * `--reason TEXT` is REQUIRED -- a block without a reason defeats
         the operator-attention purpose. Common reasons:
           - "awaiting human greenlight"
@@ -4925,9 +4933,10 @@ def cmd_queue_block(args):
             fh.close()
             sys.exit(1)
         status = target.get("status")
-        if status != "running":
+        if status not in ("pending", "running"):
             print(
-                f"block refused: {args.id} status={status!r} (must be running)",
+                f"block refused: {args.id} status={status!r} "
+                f"(must be pending or running)",
                 file=sys.stderr,
             )
             fcntl.flock(fh, fcntl.LOCK_UN)
@@ -4940,7 +4949,10 @@ def cmd_queue_block(args):
         # Blocked RELEASES the scope lock: it no longer serializes, is no
         # longer head-eligible, and must not bridge scopes. _recompute_groups
         # (invoked by _recompute_group_heads) re-splits any component this
-        # item was bridging and clears its head flag.
+        # item was bridging and clears its head flag. A pending item never
+        # acquired the lock (register does that), so this is a no-op for it;
+        # a running item's lock is released here -- either way unblock
+        # re-acquires the scope exactly like a fresh register.
         _recompute_group_heads(items)
         updated = dict(target)
         _queue_write_and_unlock(fh, data)
@@ -5292,9 +5304,10 @@ def cmd_queue_set_block_reason(args):
     """Update the block_reason on an ALREADY-blocked item, in place.
 
     Motivation: `queue block <id> --reason ...` only transitions a
-    *running* item to blocked and REFUSES an already-blocked item (the
-    state machine allows only running -> blocked). So once an item is
-    blocked, the block_reason was frozen -- when the real-world situation
+    *pending* or *running* item to blocked and REFUSES an already-blocked
+    item (the state machine allows pending/running -> blocked). So once an
+    item is blocked, the block_reason was frozen -- when the real-world
+    situation
     evolved (e.g. "awaiting build #140" after #140 already landed and
     produced its verdict), the only way to refresh the reason was
     abandon + re-add, which destroys the item's identity + audit trail.
