@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import urllib.request
@@ -928,6 +929,52 @@ def _load_workload_script_capture(label: str) -> dict[str, Any] | None:
     if not isinstance(data.get("sha256"), str):
         return None
     return data
+
+
+def _load_hostjob_command(label: str) -> dict[str, Any] | None:
+    """Return a hostjob's launched command + cwd, or ``None``.
+
+    The ``hostjob`` runner (``examples/compose/bin/hostjob``) writes
+    ``<HOSTJOB_LOG_DIR>/<label>/status.json`` at launch (and updates it on
+    finish) with the exact argv it exec'd::
+
+        {"label": ..., "cmd": ["prog", "arg1", ...], "cwd": <str|null>, ...}
+
+    We surface ``cmd`` (the authoritative argv) so the minisite detail view
+    can show what a hostjob actually ran — the queue item's scope only
+    carries the bare label, not the command. Returns::
+
+        {"argv": ["prog", "arg1", ...],   # the raw argv list
+         "display": "prog arg1 ...",       # shell-quoted one-liner
+         "cwd": "<str>" | None}            # working dir, when recorded
+
+    Fail-soft — any error (bad label, missing/malformed status.json,
+    missing/empty ``cmd``) returns ``None`` so the modal simply omits the
+    "command" row (mirrors ``_load_workload_script_capture``).
+    """
+    if not _WORKLOAD_LABEL_RE.match(label):
+        return None
+    path = Path(HOSTJOB_LOG_DIR) / label / "status.json"
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cmd = data.get("cmd")
+    # cmd must be a non-empty list of strings (the argv hostjob exec'd).
+    if not isinstance(cmd, list) or not cmd:
+        return None
+    argv = [str(part) for part in cmd]
+    cwd = data.get("cwd")
+    return {
+        "argv": argv,
+        "display": " ".join(shlex.quote(part) for part in argv),
+        "cwd": cwd if isinstance(cwd, str) and cwd else None,
+    }
 
 
 def _render_payload() -> dict[str, Any]:
@@ -4124,6 +4171,15 @@ def api_queue_meta(qid: str) -> Any:
     if shaped["workload_label"]:
         script_capture = _load_workload_script_capture(shaped["workload_label"])
 
+    # Hostjob command — items launched by the `hostjob` runner carry only
+    # the bare label in scope, but the runner records the exact argv it
+    # exec'd in `<label>/status.json`. Surface it so the detail view shows
+    # what the hostjob actually ran (cmd/args + cwd). None for non-hostjob
+    # items and any read failure — the front-end then omits the row.
+    hostjob_command: dict[str, Any] | None = None
+    if shaped["hostjob_label"]:
+        hostjob_command = _load_hostjob_command(shaped["hostjob_label"])
+
     payload: dict[str, Any] = {
         "ok": True,
         "id": shaped["id"],
@@ -4149,6 +4205,7 @@ def api_queue_meta(qid: str) -> Any:
         "subagents": shaped.get("subagents", []),
         "workload_label": shaped["workload_label"],
         "hostjob_label": shaped["hostjob_label"],
+        "hostjob_command": hostjob_command,
         "age": shaped["age"],
         "age_label": shaped["age_label"],
         "runtime_seconds": runtime_seconds,
