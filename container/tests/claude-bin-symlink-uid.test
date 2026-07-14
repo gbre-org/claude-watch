@@ -67,15 +67,17 @@ if DOCKERFILE.exists():
     #    (`curl ... install.sh | bash`) or the download-then-run form
     #    (`... install.sh ...; bash ... install.sh`).
     native_install = re.search(
-        r"claude\.ai/install\.sh", df_no_comments
+        r"claude\.ai/install\.sh|claude-native-install[^\n]*CLAUDE_CODE_VERSION",
+        df_no_comments,
     )
     expect(
         native_install is not None,
-        "Dockerfile: missing the native installer (expected a "
-        "`https://claude.ai/install.sh` invocation). claude-code must be "
-        "installed via the native managed installer so versions land under "
-        "~/.local/share/claude/versions/ (the volume-backed path the in-app "
-        "auto-updater writes to), not via npm.",
+        "Dockerfile: missing the native installer (expected either a "
+        "`https://claude.ai/install.sh` invocation OR the cache-aware "
+        "`claude-native-install` helper keyed by CLAUDE_CODE_VERSION). "
+        "claude-code must be installed via the native managed installer so "
+        "versions land under ~/.local/share/claude/versions/ (the volume-backed "
+        "path the in-app auto-updater writes to), not via npm.",
     )
 
     # 2. The native install runs as uid 1000.
