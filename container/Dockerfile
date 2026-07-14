@@ -299,7 +299,13 @@ RUN mkdir -p /etc/cron.d/private \
 # Node.js via NodeSource (LTS 20.x) — Claude Code CLI requires Node >= 20.
 # Bookworm's apt nodejs is too old. In Phase 1+ this install path is replaced
 # by a bind-mount of the host's npm-global tree, so keep this layer minimal.
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+# Bounded fetch (--connect-timeout/--max-time/--retry + `timeout` backstop) so a
+# stalled NodeSource fetch fails fast + legibly instead of wedging the build.
+RUN timeout 180 curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 5 --retry-all-errors \
+        https://deb.nodesource.com/setup_20.x -o /tmp/nodesource_setup.sh \
+        || { echo "FATAL: NodeSource setup fetch failed/stalled (https://deb.nodesource.com/setup_20.x)" >&2; exit 1; } \
+    && bash /tmp/nodesource_setup.sh \
+    && rm -f /tmp/nodesource_setup.sh \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
@@ -351,8 +357,10 @@ RUN case "$(uname -m)" in \
         aarch64) PC_ARCH=arm64 ;; \
         *) echo "unsupported arch for process-compose: $(uname -m)" >&2; exit 1 ;; \
     esac \
-    && curl -fsSL "https://github.com/F1bonacc1/process-compose/releases/download/${PROCESS_COMPOSE_VERSION}/process-compose_linux_${PC_ARCH}.tar.gz" \
-        -o /tmp/process-compose.tar.gz \
+    && { timeout 240 curl -fsSL --connect-timeout 30 --max-time 180 --retry 3 --retry-delay 5 --retry-all-errors \
+            "https://github.com/F1bonacc1/process-compose/releases/download/${PROCESS_COMPOSE_VERSION}/process-compose_linux_${PC_ARCH}.tar.gz" \
+            -o /tmp/process-compose.tar.gz \
+         || { echo "FATAL: process-compose fetch failed/stalled (${PROCESS_COMPOSE_VERSION}, ${PC_ARCH})" >&2; exit 1; }; } \
     && tar -xzf /tmp/process-compose.tar.gz -C /usr/local/bin/ process-compose \
     && chmod +x /usr/local/bin/process-compose \
     && rm -f /tmp/process-compose.tar.gz \
@@ -517,20 +525,62 @@ RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
 # present in the volume (anti-rollback), and pinning installMethod=native in
 # the bind-mounted ~/.claude.json.
 #
-# Build-resilience: install.sh verifies the download's SHA256 against the
-# signed manifest before running `claude install`, so a truncated/corrupt
-# download fails the build here rather than shipping a broken binary. A
-# separate committed-layer smoke check below re-verifies the versioned binary
-# exists at native size + runs, mirroring the two-stage guard the npm path used.
+# Build-resilience + build-CACHING: this step used to be a bare
+#   curl -fsSL https://claude.ai/install.sh | bash
+# which RE-DOWNLOADS the ~250MB platform binary on EVERY image build (install.sh
+# always fetches `latest`, downloads the binary to a temp dir, then `rm`s it
+# after `claude install`). Two problems that repeatedly WEDGED the build:
+#   1. Every network fetch inside install.sh is a bare `curl -fsSL` — NO
+#      --connect-timeout / --max-time / --retry. A stalled/slow fetch inside the
+#      BuildKit sandbox (the 250MB binary is the fat one) hangs with zero output,
+#      for 20+ minutes, instead of failing fast.
+#   2. There is NO caching — the fat download repeats every build even when the
+#      claude-code version has not changed.
+#
+# FIX (operator directive, botchat #1534 — "stop re-downloading the full
+# installer every build; CACHE IT SMARTER"): the baked `claude-native-install`
+# helper (container/bin/claude-native-install, COPYd below) downloads the
+# versioned binary into a BuildKit `--mount=type=cache` download dir, keyed by
+# version+platform + SHA256-verified. On a cache HIT it SKIPS the fat download
+# entirely and just re-runs `<binary> install`. So the ~250MB fetch happens once
+# per claude-code VERSION, not once per build. The cache mount's contents never
+# land in the image layer, which is fine: `<binary> install` copies the binary
+# OUT of the cache into the real image filesystem
+# (~/.local/share/claude/versions/<ver>/) + lays the launcher (installMethod=native).
+#
+# CACHE-BUST semantics: the install layer's cache key includes the CLAUDE_CODE_VERSION
+# build-arg (ENV'd below). It defaults to `latest`, which resolves at build time to
+# the current concrete X.Y.Z; pin it to an exact version (--build-arg
+# CLAUDE_CODE_VERSION=2.1.207) to make the LAYER itself busts-only-on-change AND
+# reproducible. The download-cache mount is keyed by the resolved version+platform
+# filename, so even with `latest`, once a version is cached a rebuild re-uses it
+# (no re-download) until a newer version is published.
+#
+# Every fetch in the helper is bounded (--connect-timeout + --max-time + bounded
+# --retry, wrapped in `timeout` as a hard backstop) and emits a CLEAR,
+# URL-naming error on failure, so a wedge becomes a fast legible failure. The
+# helper also SHA256-verifies the download against the signed manifest, so a
+# truncated/corrupt binary fails the build here (the separate committed-layer
+# smoke check below re-verifies the installed binary).
 #
 # `su - hndrewaall -c '...'` runs the install as uid 1000 (HOME=/home/hndrewaall)
 # so the native tree + launcher land uid-1000-owned — the same uid the in-app
 # auto-updater runs as, so it can write new versions without privilege games.
-RUN su - hndrewaall -c 'set -e; \
-        curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh; \
-        bash /tmp/claude-install.sh latest; \
-        rm -f /tmp/claude-install.sh; \
-        "$HOME/.local/bin/claude" --version' \
+COPY container/bin/claude-native-install /usr/local/bin/claude-native-install
+RUN chmod 0755 /usr/local/bin/claude-native-install \
+    && chown 1000:1000 /usr/local/bin/claude-native-install
+# Pinnable at build time; defaults to `latest` (resolved to a concrete version
+# by the helper). Pass --build-arg CLAUDE_CODE_VERSION=X.Y.Z to pin + make the
+# layer reproducible / busts-only-on-change.
+ARG CLAUDE_CODE_VERSION=latest
+ENV CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION}
+# The BuildKit download cache lives at /opt/claude-dl-cache and is uid-1000-owned
+# so the `su - hndrewaall` install can read/write it. It's a cache mount, so its
+# contents persist across builds but never bake into the image layer.
+RUN --mount=type=cache,target=/opt/claude-dl-cache,uid=1000,gid=1000,sharing=locked \
+    su - hndrewaall -c "set -e; \
+        CLAUDE_DL_CACHE=/opt/claude-dl-cache /usr/local/bin/claude-native-install '${CLAUDE_CODE_VERSION}'; \
+        \"\$HOME/.local/bin/claude\" --version" \
     && ln -sf /home/hndrewaall/.local/bin/claude /usr/bin/claude \
     && chown -h 1000:1000 /usr/bin/claude
 
@@ -612,7 +662,9 @@ RUN case "$(uname -m)" in \
         aarch64) VSCODE_ARCH=arm64 ;; \
         *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
     esac \
-    && curl -fsSL "https://update.code.visualstudio.com/latest/cli-linux-${VSCODE_ARCH}/stable" -o /tmp/vscode_cli.tar.gz \
+    && { timeout 240 curl -fsSL --connect-timeout 30 --max-time 180 --retry 3 --retry-delay 5 --retry-all-errors \
+            "https://update.code.visualstudio.com/latest/cli-linux-${VSCODE_ARCH}/stable" -o /tmp/vscode_cli.tar.gz \
+         || { echo "FATAL: VS Code CLI fetch failed/stalled (cli-linux-${VSCODE_ARCH})" >&2; exit 1; }; } \
     && tar -xzf /tmp/vscode_cli.tar.gz -C /usr/local/bin/ code \
     && chmod +x /usr/local/bin/code \
     && rm -f /tmp/vscode_cli.tar.gz \
