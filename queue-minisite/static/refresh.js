@@ -746,13 +746,17 @@
     // rebuilt from state.sources (the global distinct created_by set).
     html += buildSourceFilterHTML(state.sources || []);
     html += `<span class="dot ${errorTxt ? 'dot-err' : 'dot-ok'}" title="${errorTxt ? 'fetch error' : 'live'}"></span>`;
+    // NOTE: the last-fetch clock (.ts) used to live inline here. It now
+    // lives inside the info-dropdown ("last fetch" row) so the topbar row
+    // is shorter and less likely to wrap on narrow viewports. Because
+    // .info-wrap is skipped by morphdom (see shouldSkipElement), the clock
+    // is updated directly in tick() like .cache-age — not via this rebuild.
     const tsAttrs = fetchedAt
       ? ` data-local-time-iso="${attr(fetchedAt)}" data-local-time-fmt="time" data-local-time-tooltip`
       : '';
     const tsText = fetchedAt
       ? `${esc(fetchedAt.substring(11, 19))}Z`
       : '—';
-    html += `<span class="ts" title="last fetch"${tsAttrs}>${tsText}</span>`;
 
     // Re-attach the existing info-wrap (so Info dropdown state survives).
     // We append a string sentinel that morphdom's DOM diff will replace
@@ -767,6 +771,7 @@
     html += `<div class="info-wrap">` +
       `<button type="button" id="info-toggle" class="info-btn" aria-haspopup="true" aria-expanded="false" aria-controls="info-dropdown" title="session info">ⓘ</button>` +
       `<div id="info-dropdown" class="info-dropdown" role="menu" aria-labelledby="info-toggle" hidden>` +
+      `<div class="info-row"><span class="info-label">last fetch</span><span class="info-value ts" title="last fetch"${tsAttrs}>${tsText}</span></div>` +
       `<div class="info-row"><span class="info-label">user</span><span class="info-value">—</span></div>` +
       `<div class="info-row"><span class="info-label">cache</span><span class="info-value"><span class="cache-age">${esc(cacheAge !== undefined && cacheAge !== null ? cacheAge : '?')}</span>s</span></div>` +
       `<div class="info-row"><span class="info-label">api</span><span class="info-value"><a href="/api/queue">/api/queue</a></span></div>` +
@@ -955,6 +960,25 @@
           (j.cache_age_seconds !== undefined && j.cache_age_seconds !== null)
             ? j.cache_age_seconds
             : '?';
+      }
+
+      // Update the last-fetch clock (.ts). It lives inside the
+      // morphdom-SKIPPED .info-wrap subtree now (moved out of the inline
+      // topbar row so that row doesn't wrap on narrow viewports), so the
+      // mergeTopbarMeta rebuild never touches it. Refresh its ISO attr
+      // directly; LocalTime.hydrate() below re-renders the displayed time.
+      const tsEl = document.querySelector('.info-dropdown .ts');
+      if (tsEl) {
+        const fetchedAt = j.fetched_at || '';
+        if (fetchedAt) {
+          tsEl.setAttribute('data-local-time-iso', fetchedAt);
+          tsEl.setAttribute('data-local-time-fmt', 'time');
+          // Fallback text (overwritten by hydrate on next line).
+          tsEl.textContent = `${fetchedAt.substring(11, 19)}Z`;
+        } else {
+          tsEl.removeAttribute('data-local-time-iso');
+          tsEl.textContent = '—';
+        }
       }
 
       if (window.LocalTime && typeof window.LocalTime.hydrate === 'function') {
