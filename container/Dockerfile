@@ -1184,6 +1184,21 @@ RUN chmod +x /usr/local/bin/audit-hooks
 COPY container/bin/reconcile-native-claude /usr/local/bin/reconcile-native-claude
 RUN chmod +x /usr/local/bin/reconcile-native-claude
 
+# snapshot-claude-config — entrypoint helper that decouples the churning
+# bind-mounted ~/.claude.json from the running claude. On a macOS Docker
+# host the operator's "devbar" app rewrites ~/.claude.json atomically
+# (write-temp + rename); on VirtioFS that invalidates the container's open
+# inode so the running claude reads a churned config and loses auth ->
+# repeated 401s, recoverable only by a recreate. This helper builds a tmpfs
+# "symlink farm" config dir (every ~/.claude/* entry symlinked back to the
+# live host dir, EXCEPT a real snapshot copy of .claude.json) which the
+# entrypoint points claude at via CLAUDE_CONFIG_DIR — so the top-level config
+# claude reads is decoupled from the churn. Opt-in via
+# CLAUDE_CONTAINER_SNAPSHOT_CONFIG=1; ships embedded --test unit tests
+# (run: snapshot-claude-config --test).
+COPY container/bin/snapshot-claude-config /usr/local/bin/snapshot-claude-config
+RUN chmod +x /usr/local/bin/snapshot-claude-config
+
 # cwsr — in-container self-restart for the claude CLI. Rolls the claude
 # BINARY via the NATIVE managed installer (`claude install <ver>`, which
 # writes into the volume-backed ~/.local/share/claude/versions/ dir — NOT

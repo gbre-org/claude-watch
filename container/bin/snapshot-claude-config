@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""snapshot-claude-config — decouple the churning top-level ~/.claude.json
+from the running in-container claude by building a tmpfs "symlink-farm"
+config dir and pointing claude at it via CLAUDE_CONFIG_DIR.
+
+WHY THIS EXISTS
+---------------
+On a macOS Docker host, the operator's Salesforce "devbar" app frequently
+REWRITES the host Claude config files that the container bind-mounts in
+(``~/.claude.json`` and ``~/.claude/settings.json``). devbar writes them
+atomically (write-temp + rename). On macOS Docker's VirtioFS / gRPC-FUSE
+bind-mount, that rename INVALIDATES the container's open inode, so the
+running ``claude`` intermittently reads a half-written / just-churned
+config. When it does, it can pick up
+
+    apiKeyHelper: "'/Applications/devbar.app/Contents/MacOS/devbar' auth claude"
+
+— a macOS Mach-O binary that cannot exec under Linux (exit 127) → no
+usable API key → repeated ``401 Authentication Error``. The ONLY recovery
+today is a full container recreate. This tool eliminates that recreate.
+
+THE MECHANISM (and why CLAUDE_CONFIG_DIR)
+-----------------------------------------
+Claude Code resolves its config from a SINGLE env knob, ``CLAUDE_CONFIG_DIR``
+(verified in the binary, versions/2.1.170):
+
+    config dir       = process.env.CLAUDE_CONFIG_DIR ?? join(homedir, ".claude")
+    top-level json   = join(process.env.CLAUDE_CONFIG_DIR || homedir, ".claude.json")
+
+There is NO narrower flag/env that relocates JUST the top-level
+``.claude.json`` — the same knob moves the whole config dir. A full
+relocation to a fresh dir would strand session transcripts, credentials,
+the presence-gate carrier, projects/, history, etc. (all normally under
+``~/.claude`` and expected to persist across a recreate).
+
+So we build a "symlink farm": a tmpfs dir where every entry of the live
+``~/.claude`` is a SYMLINK back to the host bind-mount (sessions, projects,
+history, .credentials.json, operator-present, commands, plugins, … all
+still resolve LIVE), EXCEPT the top-level ``.claude.json`` which is a real
+SNAPSHOT COPY taken once at container start. Pointing ``CLAUDE_CONFIG_DIR``
+at the farm means:
+
+  - claude reads the top-level config from the decoupled snapshot copy, so
+    a mid-session devbar rewrite of the host ``~/.claude.json`` can never
+    churn the file claude actually reads → no more intermittent 401.
+  - everything else (transcripts, credentials, presence carrier) still
+    round-trips to the live host dir through the symlinks, so session
+    persistence / resume / auth-env all keep working unchanged.
+
+INTENDED TRADE-OFF
+------------------
+Host edits to ``~/.claude.json`` STOP propagating LIVE into a running
+container — you ``--force-recreate`` to pick them up (the snapshot is
+retaken at entrypoint). That is the point: recreates are what we are
+eliminating, and a stable snapshot is worth losing live propagation of a
+file the operator rarely edits by hand.
+
+SETTINGS.JSON IS NOT SNAPSHOTTED HERE
+-------------------------------------
+The user-tier ``settings.json`` (which carries the poison apiKeyHelper) is
+already handled elsewhere and is intentionally left as a plain symlink:
+  - When CLAUDE_CONTAINER_REWRITE_HOOKS=1, the entrypoint launches claude
+    with ``--setting-sources project,local`` which DROPS the user tier
+    entirely (the sanitized shim at /tmp/claude-shim/settings.json replaces
+    it), so a churning user-tier settings.json is never read.
+  - The PROJECT-tier settings.json is neutralized by
+    generate-hooks-shim-settings' ``neutralize_poison_project_helper``
+    (writes apiKeyHelper:"" into the flagSettings shim, which outranks the
+    project tier and is itself churn-proof).
+Keeping settings.json a symlink here avoids duplicating that logic and
+keeps this tool's single responsibility crisp: decouple .claude.json.
+
+FAIL-SAFE
+---------
+Every step is guarded and the tool ALWAYS exits 0. On ANY error (missing
+source, un-writable dest, symlink failure) it does the best it can and the
+caller (entrypoint.sh) decides whether to export CLAUDE_CONFIG_DIR by
+checking that ``<dest>/.claude.json`` was actually produced. A failure just
+falls back to the current behaviour (claude reads the live host paths).
+
+Usage:
+  snapshot-claude-config [--src-dir DIR] [--src-json PATH] [--dest DIR]
+  snapshot-claude-config --test        # run the embedded unit tests
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+DEFAULT_SRC_DIR = "/home/hndrewaall/.claude"
+DEFAULT_SRC_JSON = "/home/hndrewaall/.claude.json"
+DEFAULT_DEST = "/tmp/claude-config"
+
+
+def _symlink_entry(src: Path, dst: Path) -> bool:
+    """Create/replace dst as a symlink -> src. Idempotent: if dst is
+    already the correct symlink, leave it. Returns True on success."""
+    try:
+        target = os.fspath(src)
+        if dst.is_symlink():
+            try:
+                if os.readlink(dst) == target:
+                    return True
+            except OSError:
+                pass
+            dst.unlink()
+        elif dst.exists():
+            # A real file/dir squatting the name — remove so the symlink
+            # wins (the farm is fully derived from the source each start).
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst, ignore_errors=True)
+            else:
+                dst.unlink()
+        os.symlink(target, dst)
+        return True
+    except OSError:
+        return False
+
+
+def _snapshot_json(src_json: Path, dst_json: Path) -> bool:
+    """Write dst_json as a decoupled snapshot of src_json.
+
+    - src_json present + valid JSON  -> byte-for-byte copy (preserve
+      everything claude wrote: oauthAccount, mcpServers, projects, …).
+    - src_json missing / unreadable  -> write a minimal ``{}`` so claude
+      has a writable top-level config at the relocated path.
+    Returns True if dst_json was written."""
+    dst_json.parent.mkdir(parents=True, exist_ok=True)
+    data: str | None = None
+    try:
+        raw = src_json.read_text(encoding="utf-8")
+        # Validate it parses; if it's mid-rewrite garbage we still want a
+        # usable file, so fall back to {} rather than copying corruption.
+        json.loads(raw)
+        data = raw
+    except (OSError, json.JSONDecodeError, ValueError):
+        data = None
+    if data is None:
+        data = "{}\n"
+    # Atomic write within the dest dir so a concurrent claude launch never
+    # sees a half-written snapshot.
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(dst_json.parent), prefix=".claude.json.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(data)
+            os.replace(tmp, dst_json)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def build_farm(src_dir: Path, src_json: Path, dest: Path) -> bool:
+    """Build the symlink farm at ``dest`` + snapshot ``.claude.json``.
+
+    Returns True iff the snapshot .claude.json was produced (the caller's
+    signal that CLAUDE_CONFIG_DIR is safe to export)."""
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"[snapshot-claude-config] cannot create {dest}: {e}", file=sys.stderr)
+        return False
+
+    linked = 0
+    if src_dir.is_dir():
+        try:
+            entries = sorted(p.name for p in src_dir.iterdir())
+        except OSError:
+            entries = []
+        for name in entries:
+            # ``.claude.json`` is a SIBLING of the dir, never inside it, so
+            # the loop can't collide — but guard anyway: the snapshot below
+            # owns that name in the dest.
+            if name == ".claude.json":
+                continue
+            if _symlink_entry(src_dir / name, dest / name):
+                linked += 1
+    else:
+        print(
+            f"[snapshot-claude-config] source dir {src_dir} absent; "
+            "farm will contain only the snapshot .claude.json",
+            file=sys.stderr,
+        )
+
+    ok = _snapshot_json(src_json, dest / ".claude.json")
+    if ok:
+        print(
+            f"[snapshot-claude-config] {dest}: {linked} symlink(s) -> {src_dir}, "
+            f"snapshot .claude.json from {src_json}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[snapshot-claude-config] FAILED to write {dest}/.claude.json — "
+            "caller should NOT set CLAUDE_CONFIG_DIR",
+            file=sys.stderr,
+        )
+    return ok
+
+
+# --------------------------------------------------------------------------
+# Embedded tests
+# --------------------------------------------------------------------------
+def _run_tests() -> int:
+    failures: list[str] = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    def mktmp() -> Path:
+        return Path(tempfile.mkdtemp(prefix="snapshot-cc-test-"))
+
+    # 1. Basic farm: dir entries become symlinks, .claude.json is a real copy.
+    root = mktmp()
+    src_dir = root / ".claude"
+    src_dir.mkdir()
+    (src_dir / "settings.json").write_text('{"apiKeyHelper": "poison"}')
+    (src_dir / "projects").mkdir()
+    (src_dir / "projects" / "p.jsonl").write_text("transcript")
+    (src_dir / "operator-present").write_text("")
+    src_json = root / ".claude.json"
+    src_json.write_text('{"numStartups": 5, "installMethod": "native"}')
+    dest = root / "dest"
+    ok = build_farm(src_dir, src_json, dest)
+    expect(ok, "build_farm should succeed on a normal source")
+    expect((dest / "settings.json").is_symlink(), "settings.json should be a symlink")
+    expect((dest / "projects").is_symlink(), "projects/ should be a symlink")
+    expect(
+        os.path.realpath(dest / "projects" / "p.jsonl")
+        == str((src_dir / "projects" / "p.jsonl").resolve()),
+        "transcript should resolve THROUGH the symlink to the live host dir",
+    )
+    # .claude.json is a REAL file (not a symlink) = decoupled snapshot.
+    cj = dest / ".claude.json"
+    expect(cj.exists() and not cj.is_symlink(),
+           "snapshot .claude.json should be a real (non-symlink) file")
+    expect(json.loads(cj.read_text())["numStartups"] == 5,
+           "snapshot should copy the top-level json content")
+
+    # 2. Decoupling: mutating the SOURCE .claude.json after the snapshot does
+    #    NOT change the snapshot (the whole point — churn can't reach it).
+    src_json.write_text('{"numStartups": 999, "apiKeyHelper": "devbar poison"}')
+    expect(json.loads(cj.read_text())["numStartups"] == 5,
+           "snapshot must be decoupled from later source rewrites")
+    expect("apiKeyHelper" not in json.loads(cj.read_text()),
+           "snapshot must not pick up a later-injected apiKeyHelper")
+
+    # 3. Idempotent re-run: symlinks stay valid, no crash, snapshot re-taken.
+    ok2 = build_farm(src_dir, src_json, dest)
+    expect(ok2, "re-run should still succeed")
+    expect((dest / "settings.json").is_symlink(),
+           "re-run should preserve symlinks")
+    expect(json.loads((dest / ".claude.json").read_text())["numStartups"] == 999,
+           "re-run should refresh the snapshot from the (now-updated) source")
+
+    # 4. Missing source .claude.json -> minimal {} snapshot, still succeeds.
+    root4 = mktmp()
+    sd4 = root4 / ".claude"
+    sd4.mkdir()
+    (sd4 / "x").write_text("y")
+    dest4 = root4 / "dest"
+    ok4 = build_farm(sd4, root4 / "nope.json", dest4)
+    expect(ok4, "missing source json should still produce a {} snapshot")
+    expect(json.loads((dest4 / ".claude.json").read_text()) == {},
+           "missing source json snapshot should be an empty object")
+
+    # 5. Corrupt (mid-rewrite) source json -> {} fallback, not corruption.
+    root5 = mktmp()
+    sd5 = root5 / ".claude"
+    sd5.mkdir()
+    sj5 = root5 / ".claude.json"
+    sj5.write_text('{"numStartups": 3, "half')   # truncated write
+    dest5 = root5 / "dest"
+    ok5 = build_farm(sd5, sj5, dest5)
+    expect(ok5, "corrupt source json should still succeed via {} fallback")
+    expect(json.loads((dest5 / ".claude.json").read_text()) == {},
+           "corrupt source json should snapshot as {} (never copy garbage)")
+
+    # 6. Absent source dir -> snapshot still written, farm just has the json.
+    root6 = mktmp()
+    sj6 = root6 / ".claude.json"
+    sj6.write_text("{}")
+    dest6 = root6 / "dest"
+    ok6 = build_farm(root6 / "no-such-dir", sj6, dest6)
+    expect(ok6, "absent source dir should not block the snapshot")
+    expect((dest6 / ".claude.json").exists(),
+           "snapshot .claude.json should exist even with no source dir")
+
+    # 7. A real file squatting a farm entry name is replaced by the symlink.
+    root7 = mktmp()
+    sd7 = root7 / ".claude"
+    sd7.mkdir()
+    (sd7 / "commands").mkdir()
+    dest7 = root7 / "dest"
+    dest7.mkdir()
+    (dest7 / "commands").write_text("stale real file")   # squatter
+    ok7 = build_farm(sd7, root7 / ".claude.json", dest7)
+    expect(ok7, "squatter case should still succeed")
+    expect((dest7 / "commands").is_symlink(),
+           "a squatting real entry should be replaced by the correct symlink")
+
+    for d in (root, root4, root5, root6, root7):
+        shutil.rmtree(d, ignore_errors=True)
+
+    if failures:
+        print("FAIL snapshot-claude-config")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print("PASS snapshot-claude-config (all tests passed)")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    src_dir = Path(os.environ.get("CLAUDE_SNAPSHOT_SRC_DIR", DEFAULT_SRC_DIR))
+    src_json = Path(os.environ.get("CLAUDE_SNAPSHOT_SRC_JSON", DEFAULT_SRC_JSON))
+    dest = Path(os.environ.get("CLAUDE_SNAPSHOT_DEST", DEFAULT_DEST))
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--test":
+            return _run_tests()
+        elif a == "--src-dir":
+            src_dir = Path(argv[i + 1]); i += 2; continue
+        elif a == "--src-json":
+            src_json = Path(argv[i + 1]); i += 2; continue
+        elif a == "--dest":
+            dest = Path(argv[i + 1]); i += 2; continue
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print(f"snapshot-claude-config: unknown argument {a!r}", file=sys.stderr)
+            return 2
+        i += 1
+    # Always exit 0 (fail-safe): the caller checks <dest>/.claude.json to
+    # decide whether to export CLAUDE_CONFIG_DIR.
+    build_farm(src_dir, src_json, dest)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

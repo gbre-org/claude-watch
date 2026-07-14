@@ -120,6 +120,18 @@ services:
       # silently no-op instead of spamming "Exec format error" on every
       # hook event. Off by default; Mac-host operators enable it via .env.
       CLAUDE_CONTAINER_REWRITE_HOOKS: ${CLAUDE_CONTAINER_REWRITE_HOOKS:-}
+      # CLAUDE_CONTAINER_SNAPSHOT_CONFIG — decouple the churning
+      # bind-mounted ~/.claude.json from the running claude. When "1",
+      # the entrypoint snapshots ~/.claude.json into a tmpfs symlink-farm
+      # config dir (/tmp/claude-config) and points claude at it via
+      # CLAUDE_CONFIG_DIR, so a host-side app that atomically rewrites
+      # ~/.claude.json mid-session (e.g. a macOS auth helper on VirtioFS,
+      # where the rename invalidates the container's open inode) can't
+      # churn the config claude actually reads -> no intermittent 401s /
+      # forced recreates. Trade-off: host ~/.claude.json edits stop
+      # propagating LIVE; --force-recreate to pick them up. Off by
+      # default; Mac-host operators bitten by the churn enable it via .env.
+      CLAUDE_CONTAINER_SNAPSHOT_CONFIG: ${CLAUDE_CONTAINER_SNAPSHOT_CONFIG:-}
       # CLAUDE_CONTAINER_OBLIGATIONS — wire the canonical obligations
       # gate hooks (pre-agent-queue-gate, pre-tool-obligations-gate,
       # post-tool-obligations-update, post-tool-mark-attachment-read)

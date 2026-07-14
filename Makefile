@@ -115,6 +115,7 @@ test-dashboard:
 test-trust-workspace:
 	python3 container/bin/trust-workspace.py --test
 	python3 container/bin/reconcile-native-claude --test
+	python3 container/bin/snapshot-claude-config --test
 
 # Run the claude-tmux env / mount passthrough tests (corporate CA bundle
 # forwarding, proxy passthrough, host hooks-dir bind-mount, set-but-missing

@@ -439,6 +439,54 @@ if [ -x /usr/local/bin/trust-workspace ]; then
     fi
 fi
 
+# CLAUDE_CONTAINER_SNAPSHOT_CONFIG — decouple the churning top-level
+# ~/.claude.json from the running claude (copy-on-start).
+#
+# On a macOS Docker host, the operator's "devbar" app frequently rewrites
+# the bind-mounted host ~/.claude.json (atomic write-temp + rename). On
+# VirtioFS / gRPC-FUSE that rename INVALIDATES the container's open inode,
+# so the running claude intermittently reads a half-written / just-churned
+# config and loses its auth context -> repeated `401 Authentication Error`,
+# recoverable today only by a full container recreate.
+#
+# When "1", snapshot-claude-config builds a tmpfs "symlink farm" config dir
+# at /tmp/claude-config: every ~/.claude/* entry (sessions, projects,
+# history, .credentials.json, operator-present, commands, plugins, …) is a
+# SYMLINK back to the live host dir so it still round-trips, EXCEPT the
+# top-level .claude.json which is a real SNAPSHOT COPY taken once here. We
+# then point claude at the farm via CLAUDE_CONFIG_DIR (the only knob claude
+# exposes to relocate config resolution — it moves both the dir AND the
+# top-level json; verified in the binary: config = CLAUDE_CONFIG_DIR ??
+# ~/.claude and top-json = join(CLAUDE_CONFIG_DIR||home, ".claude.json")).
+# The running claude then reads .claude.json from the decoupled snapshot, so
+# a mid-session devbar rewrite of the host file can never churn it.
+#
+# Must run AFTER reconcile-native-claude + trust-workspace (both write the
+# SOURCE ~/.claude.json) so the snapshot captures installMethod=native +
+# the trust flags. The auth env (ANTHROPIC_API_KEY + the SF model-gateway
+# ANTHROPIC_BASE_URL / *_BEDROCK_* / CLAUDE_CODE_USE_BEDROCK etc.) comes
+# from the process env + the shim's env block, NOT from .claude.json, so the
+# snapshot never touches it.
+#
+# Intended trade-off: host edits to ~/.claude.json stop propagating LIVE
+# into a running container — you --force-recreate to pick them up (the
+# snapshot is retaken at entrypoint). That is the point: recreates are what
+# this eliminates. Default OFF so existing operators / the public image see
+# no behaviour change; Mac-host operators bitten by the churn flip it on.
+#
+# Fail-safe: snapshot-claude-config always exits 0; we only export
+# CLAUDE_CONFIG_DIR when the snapshot .claude.json was actually produced, so
+# any failure falls back cleanly to reading the live host paths.
+if [ "${CLAUDE_CONTAINER_SNAPSHOT_CONFIG:-0}" = "1" ] \
+        && [ -x /usr/local/bin/snapshot-claude-config ]; then
+    _snapshot_dest="${CLAUDE_SNAPSHOT_DEST:-/tmp/claude-config}"
+    /usr/local/bin/snapshot-claude-config --dest "$_snapshot_dest" || true
+    if [ -f "${_snapshot_dest}/.claude.json" ]; then
+        export CLAUDE_CONFIG_DIR="$_snapshot_dest"
+    fi
+    unset _snapshot_dest
+fi
+
 cleanup() {
     # Best-effort cleanup before the script exits. process-compose (as
     # PID 1) handles the real signal-forwarding + child-reaping
