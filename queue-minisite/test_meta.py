@@ -146,6 +146,9 @@ class MetaEndpointTest(unittest.TestCase):
         cls.workload_dir = Path(cls.tmp) / "workloads"
         cls.workload_dir.mkdir(parents=True, exist_ok=True)
         os.environ["WORKLOAD_LOG_DIR"] = str(cls.workload_dir)
+        cls.hostjob_dir = Path(cls.tmp) / "hostjob"
+        cls.hostjob_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["HOSTJOB_LOG_DIR"] = str(cls.hostjob_dir)
         os.environ["SESSION_TASK_BIN"] = str(SESSION_TASK)
 
         sys.path.insert(0, str(HERE))
@@ -175,7 +178,18 @@ class MetaEndpointTest(unittest.TestCase):
             for p in self.workload_dir.iterdir():
                 if p.is_file():
                     p.unlink()
+        if self.hostjob_dir.exists():
+            for p in self.hostjob_dir.iterdir():
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                elif p.is_file():
+                    p.unlink()
         self.appmod._cache.fetched_at = 0.0
+
+    def _seed_hostjob_status(self, label: str, status: dict) -> None:
+        d = self.hostjob_dir / label
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "status.json").write_text(json.dumps(status))
 
     # ---------- 400 / 404 ----------
 
@@ -381,6 +395,91 @@ class MetaEndpointTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         p = r.get_json()
         self.assertIsNone(p["script_capture"])
+
+    # ---------- hostjob_command surfaced from status.json ----------
+
+    def test_hostjob_command_surfaced(self):
+        # Hostjob-bound items carry a `hostjob:<label>` scope. The runner
+        # records the exact argv it exec'd in <label>/status.json; the meta
+        # endpoint reads it and includes it as `hostjob_command`.
+        item = _add(self.env, self.queue_actual, "hj fixture", ["hostjob:test-hj-1"])
+        qid = item["id"]
+        self._seed_hostjob_status(
+            "test-hj-1",
+            {
+                "label": "test-hj-1",
+                "cmd": ["make", "container-build", "--flag=x y"],
+                "cwd": "/Users/x/repos/claude-watch",
+                "status": "running",
+            },
+        )
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertEqual(p["hostjob_label"], "test-hj-1")
+        self.assertIsNotNone(p["hostjob_command"])
+        self.assertEqual(
+            p["hostjob_command"]["argv"], ["make", "container-build", "--flag=x y"]
+        )
+        # display is shell-quoted so args with spaces round-trip visibly.
+        self.assertEqual(
+            p["hostjob_command"]["display"], "make container-build '--flag=x y'"
+        )
+        self.assertEqual(p["hostjob_command"]["cwd"], "/Users/x/repos/claude-watch")
+
+    def test_hostjob_command_null_when_status_missing(self):
+        # Hostjob item with no status.json on disk → key present, None.
+        item = _add(self.env, self.queue_actual, "hj no-status", ["hostjob:test-hj-2"])
+        qid = item["id"]
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertEqual(p["hostjob_label"], "test-hj-2")
+        self.assertIsNone(p["hostjob_command"])
+
+    def test_hostjob_command_null_for_non_hostjob_item(self):
+        # No `hostjob:` scope token → the loader is never invoked.
+        item = _add(self.env, self.queue_actual, "plain item", ["repo:test"])
+        qid = item["id"]
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertEqual(p["hostjob_label"], "")
+        self.assertIsNone(p["hostjob_command"])
+
+    def test_hostjob_command_rejects_malformed_status(self):
+        # Garbage status.json → fail-soft to None, no crash.
+        item = _add(self.env, self.queue_actual, "hj malformed", ["hostjob:test-hj-3"])
+        qid = item["id"]
+        d = self.hostjob_dir / "test-hj-3"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "status.json").write_text("{not valid json")
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertIsNone(p["hostjob_command"])
+
+    def test_hostjob_command_null_when_cmd_empty(self):
+        # status.json present but cmd missing/empty → None (nothing to show).
+        item = _add(self.env, self.queue_actual, "hj empty cmd", ["hostjob:test-hj-4"])
+        qid = item["id"]
+        self._seed_hostjob_status(
+            "test-hj-4", {"label": "test-hj-4", "cmd": [], "status": "running"}
+        )
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200)
+        p = r.get_json()
+        self.assertIsNone(p["hostjob_command"])
 
 
 if __name__ == "__main__":

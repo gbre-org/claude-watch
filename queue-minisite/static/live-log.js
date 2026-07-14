@@ -50,6 +50,7 @@
     runtime:    document.getElementById('log-meta-row-runtime'),
     times:      document.getElementById('log-meta-row-times'),
     scope:      document.getElementById('log-meta-row-scope'),
+    command:    document.getElementById('log-meta-row-command'),
     deps:       document.getElementById('log-meta-row-deps'),
     dependents: document.getElementById('log-meta-row-dependents'),
     by:         document.getElementById('log-meta-row-by'),
@@ -62,6 +63,7 @@
     runtime:    document.getElementById('log-meta-runtime'),
     times:      document.getElementById('log-meta-times'),
     scope:      document.getElementById('log-meta-scope'),
+    command:    document.getElementById('log-meta-command'),
     deps:       document.getElementById('log-meta-deps'),
     dependents: document.getElementById('log-meta-dependents'),
     by:         document.getElementById('log-meta-by'),
@@ -459,6 +461,7 @@
       // Hide the queue-only rows in subagent mode.
       setMetaRow('times', '');
       setMetaRow('scope', '');
+      setMetaRow('command', '');
       setMetaRow('deps', '');
       setMetaRow('dependents', '');
       setMetaRow('by', '');
@@ -520,6 +523,23 @@
       setMetaRow('scope', chips, true);
     } else {
       setMetaRow('scope', '');
+    }
+
+    // command — hostjob-bound items only. The runner records the exact
+    // argv it exec'd (plus cwd) in <label>/status.json; the backend
+    // surfaces it as { argv, display, cwd }. Render the shell-quoted
+    // one-liner in a <code> span, with a "(cwd <path>)" suffix when the
+    // job ran outside the default working dir. Non-hostjob items and
+    // read failures yield a null payload → row stays hidden.
+    const cmd = meta.hostjob_command || null;
+    if (cmd && typeof cmd.display === 'string' && cmd.display) {
+      let html = '<code class="log-meta-command-code">' + esc(cmd.display) + '</code>';
+      if (typeof cmd.cwd === 'string' && cmd.cwd) {
+        html += ' <span class="log-meta-command-cwd">(cwd ' + esc(cmd.cwd) + ')</span>';
+      }
+      setMetaRow('command', html, true);
+    } else {
+      setMetaRow('command', '');
     }
 
     // depends_on

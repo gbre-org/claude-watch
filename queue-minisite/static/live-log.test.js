@@ -58,6 +58,7 @@ const initialHTML = `<!doctype html>
           <div id="log-meta-row-runtime"></div>
           <div id="log-meta-row-times"></div>
           <div id="log-meta-row-scope"></div>
+          <div id="log-meta-row-command"></div>
           <div id="log-meta-row-deps"></div>
           <div id="log-meta-row-dependents"></div>
           <div id="log-meta-row-by"></div>
@@ -71,6 +72,7 @@ const initialHTML = `<!doctype html>
     <span id="log-meta-runtime"></span>
     <span id="log-meta-times"></span>
     <span id="log-meta-scope"></span>
+    <span id="log-meta-command"></span>
     <span id="log-meta-deps"></span>
     <span id="log-meta-dependents"></span>
     <span id="log-meta-by"></span>
@@ -998,6 +1000,65 @@ console.log('\napplyScriptCapture — truncated annotation');
   assert('truncated capture: header notes truncation',
     header.innerHTML.includes('truncated to 1 MiB'),
     'got: ' + header.innerHTML);
+}
+
+// hostjob command row — applyMetaSummary() surfaces the runner-recorded
+// argv (meta.hostjob_command) in the #log-meta-command row for
+// hostjob-bound items, and leaves it hidden otherwise. The template +
+// backend wiring is covered server-side in test_meta.py.
+console.log('\napplyMetaSummary — hostjob command row shown for hostjob items');
+{
+  const hooks = window.__liveLog;
+  hooks.resetMetaSummary();
+  const row = window.document.getElementById('log-meta-row-command');
+  const val = window.document.getElementById('log-meta-command');
+
+  hooks.applyMetaSummary({
+    ok: true,
+    status: 'running',
+    scope: ['hostjob:qsite-build'],
+    hostjob_command: {
+      argv: ['make', 'container-build', '--flag=x y'],
+      display: "make container-build '--flag=x y'",
+      cwd: '/Users/x/repos/claude-watch',
+    },
+  });
+
+  assert('hostjob command: row unhidden', row && row.hidden === false);
+  assert('hostjob command: shows shell-quoted display',
+    val && val.textContent.includes("make container-build '--flag=x y'"),
+    'got: ' + (val && val.textContent));
+  assert('hostjob command: shows cwd suffix',
+    val && val.textContent.includes('/Users/x/repos/claude-watch'),
+    'got: ' + (val && val.textContent));
+  hooks.resetMetaSummary();
+}
+
+console.log('\napplyMetaSummary — command row hidden for non-hostjob items');
+{
+  const hooks = window.__liveLog;
+  hooks.resetMetaSummary();
+  const row = window.document.getElementById('log-meta-row-command');
+
+  hooks.applyMetaSummary({
+    ok: true,
+    status: 'running',
+    scope: ['repo:test'],
+    hostjob_command: null,
+  });
+
+  assert('non-hostjob: command row hidden', row && row.hidden === true);
+  hooks.resetMetaSummary();
+}
+
+console.log('\ncommand row — template element IDs present');
+{
+  const templatePath = path.resolve(STATIC_DIR, '..', 'templates', 'index.html');
+  const tmpl = fs.readFileSync(templatePath, 'utf8');
+  assert('template has #log-meta-row-command',
+    tmpl.includes('id="log-meta-row-command"'));
+  assert('template has #log-meta-command',
+    tmpl.includes('id="log-meta-command"'));
 }
 
 console.log('\n--------------------------------------------------------------');
