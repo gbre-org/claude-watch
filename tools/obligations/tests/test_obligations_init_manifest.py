@@ -26,6 +26,8 @@ Run::
         pytest tools/obligations/tests/test_obligations_init_manifest.py -v
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import subprocess
@@ -193,3 +195,186 @@ def test_multiple_distinct_manifests_each_stay_single(tmp_path):
         "claude-config:other-gate [user-manifest]",
         "claude-config:presence-gate [user-manifest]",
     ], created_bys
+
+
+# ---------------------------------------------------------------------------
+# ADD-FIRST invariant (botchat #1697 root cause: the gate was left ABSENT).
+#
+# The prior order was satisfy-old-THEN-add. If the `add` transiently failed
+# AFTER the satisfy removed the prior row, the row was left ABSENT -- the
+# `tool_pattern:*` botchat mark-read gate then enforced NOTHING, so unread
+# inbound messages never blocked the main loop (msgs #1693/#1695 missed). The
+# fix adds the fresh row FIRST (with retry) and only removes OLD duplicates
+# once the new row is confirmed present, so there is never a zero-row window.
+# These tests drive `_apply_one_manifest` directly with a stubbed CLI so we
+# can force `add` failures deterministically.
+# ---------------------------------------------------------------------------
+
+def _load_init_module():
+    """Import the obligations-init script as a module (it has no .py suffix)."""
+    import importlib.util
+    spec = importlib.util.spec_from_loader(
+        "obligations_init_mod",
+        importlib.machinery.SourceFileLoader(
+            "obligations_init_mod", str(OBLIGATIONS_INIT)),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _botchat_like_spec():
+    """A tool_pattern:* evaluator gate shaped like the botchat mark-read gate."""
+    return {
+        "tool_pattern": "*",
+        "predicate": "all_of",
+        "params": {"predicates": [
+            {"kind": "is_main_loop", "params": {}},
+            {"kind": "evaluator", "params": {
+                "cmd": "/bin/true", "decision_mode": "exit_code",
+                "allow_on_zero_exit": True, "timeout_ms": 4000}},
+        ]},
+        "ttl": 0,
+        "enforcement": "gate",
+        "deny_msg": "Unread inbound botchat message(s).",
+        "created_by": "botchat:mark-read-gate",
+        "exempt_tool_patterns": ["Read", "Bash:botchat-send"],
+    }
+
+
+def test_add_first_never_leaves_gate_absent_on_transient_add_failure(
+        tmp_path, monkeypatch):
+    """If `add` fails transiently while a PRIOR row from this manifest is
+    present, the prior row MUST stay (gate stays armed) -- never satisfied out
+    from under a failed add. This is the core botchat #1697 invariant."""
+    mod = _load_init_module()
+    spec = _botchat_like_spec()
+    manifest_dir = tmp_path / "cfg"
+    manifest_dir.mkdir()
+    path = _write_manifest(manifest_dir, "botchat.json", spec)
+
+    # A prior incarnation of the same logical row (same signature).
+    prior = {
+        "id": "ob-prior-0001",
+        "tool_pattern": "*",
+        "predicate": {"kind": "all_of", "params": {}},
+        "created_by": "botchat:mark-read-gate [user-manifest]",
+    }
+
+    calls = {"satisfy": [], "add": 0}
+
+    def fake_run(argv, *a, **kw):
+        class R:
+            returncode = 0
+            stdout = "{}"
+            stderr = ""
+        # argv[1] is the subcommand.
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub == "add":
+            calls["add"] += 1
+            r = R(); r.returncode = 1; r.stderr = "simulated transient add failure"
+            return r
+        if sub == "satisfy":
+            calls["satisfy"].append(argv[2] if len(argv) > 2 else "")
+            return R()
+        if sub == "list":
+            # Reflect current state: prior row still present (never satisfied).
+            r = R(); r.stdout = json.dumps({"obligations": [prior]}); return r
+        return R()
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    rc = mod._apply_one_manifest(
+        "obligations", str(path), existing=[prior],
+        dry_run=False, verbose=False)
+
+    assert rc == 1, "a failed add must surface a non-zero rc"
+    assert calls["add"] >= 2, "add must be retried before giving up"
+    assert calls["satisfy"] == [], (
+        "on add failure the PRIOR row must NOT be satisfied -- the gate must "
+        f"stay armed; got satisfy calls {calls['satisfy']}"
+    )
+
+
+def test_add_first_then_removes_old_duplicate_on_success(tmp_path, monkeypatch):
+    """On a successful add, the OLD duplicate is removed (replace semantics),
+    but only AFTER the new row exists, and the new id is never satisfied."""
+    mod = _load_init_module()
+    spec = _botchat_like_spec()
+    manifest_dir = tmp_path / "cfg"
+    manifest_dir.mkdir()
+    path = _write_manifest(manifest_dir, "botchat.json", spec)
+
+    prior = {
+        "id": "ob-prior-0001",
+        "tool_pattern": "*",
+        "predicate": {"kind": "all_of", "params": {}},
+        "created_by": "botchat:mark-read-gate [user-manifest]",
+    }
+    new_row = {
+        "id": "ob-new-0002",
+        "tool_pattern": "*",
+        "predicate": {"kind": "all_of", "params": {}},
+        "created_by": "botchat:mark-read-gate [user-manifest]",
+    }
+
+    calls = {"satisfy": [], "add": 0}
+
+    def fake_run(argv, *a, **kw):
+        class R:
+            returncode = 0
+            stdout = "{}"
+            stderr = ""
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub == "add":
+            calls["add"] += 1
+            r = R(); r.stdout = json.dumps(new_row); return r
+        if sub == "satisfy":
+            calls["satisfy"].append(argv[2] if len(argv) > 2 else "")
+            return R()
+        if sub == "list":
+            # After add, both rows present (verify sees the signature live).
+            r = R(); r.stdout = json.dumps({"obligations": [prior, new_row]})
+            return r
+        return R()
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    rc = mod._apply_one_manifest(
+        "obligations", str(path), existing=[prior],
+        dry_run=False, verbose=False)
+
+    assert rc == 0, "successful add + verify must return 0"
+    assert calls["add"] == 1
+    assert calls["satisfy"] == ["ob-prior-0001"], (
+        "exactly the OLD duplicate is satisfied (never the new id); "
+        f"got {calls['satisfy']}"
+    )
+
+
+def test_verify_fails_loud_when_row_not_live_post_apply(tmp_path, monkeypatch):
+    """If, post-add, NO active row matches the signature (e.g. a concurrent
+    run satisfied it), _apply_one_manifest returns 1 -- fail loud, never a
+    silent un-armed gate."""
+    mod = _load_init_module()
+    spec = _botchat_like_spec()
+    manifest_dir = tmp_path / "cfg"
+    manifest_dir.mkdir()
+    path = _write_manifest(manifest_dir, "botchat.json", spec)
+
+    def fake_run(argv, *a, **kw):
+        class R:
+            returncode = 0
+            stdout = "{}"
+            stderr = ""
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub == "add":
+            r = R(); r.stdout = json.dumps({"id": "ob-new-0002"}); return r
+        if sub == "list":
+            # Verify re-list shows NOTHING matching (row vanished).
+            r = R(); r.stdout = json.dumps({"obligations": []}); return r
+        return R()
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    rc = mod._apply_one_manifest(
+        "obligations", str(path), existing=[],
+        dry_run=False, verbose=False)
+    assert rc == 1, "an un-armed gate post-apply must return a non-zero rc"
