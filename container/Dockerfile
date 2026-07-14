@@ -301,7 +301,8 @@ RUN mkdir -p /etc/cron.d/private \
 # by a bind-mount of the host's npm-global tree, so keep this layer minimal.
 # Bounded fetch (--connect-timeout/--max-time/--retry + `timeout` backstop) so a
 # stalled NodeSource fetch fails fast + legibly instead of wedging the build.
-RUN timeout 180 curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 --retry-delay 5 --retry-all-errors \
+RUN timeout 300 curl -fsSL --connect-timeout 30 --max-time 120 \
+        --speed-time 60 --speed-limit 1024 --retry 3 --retry-delay 5 --retry-all-errors \
         https://deb.nodesource.com/setup_20.x -o /tmp/nodesource_setup.sh \
         || { echo "FATAL: NodeSource setup fetch failed/stalled (https://deb.nodesource.com/setup_20.x)" >&2; exit 1; } \
     && bash /tmp/nodesource_setup.sh \
@@ -357,7 +358,9 @@ RUN case "$(uname -m)" in \
         aarch64) PC_ARCH=arm64 ;; \
         *) echo "unsupported arch for process-compose: $(uname -m)" >&2; exit 1 ;; \
     esac \
-    && { timeout 240 curl -fsSL --connect-timeout 30 --max-time 180 --retry 3 --retry-delay 5 --retry-all-errors \
+    && { timeout 900 curl -fsSL --connect-timeout 30 --max-time 420 \
+            --speed-time 60 --speed-limit 1024 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
             "https://github.com/F1bonacc1/process-compose/releases/download/${PROCESS_COMPOSE_VERSION}/process-compose_linux_${PC_ARCH}.tar.gz" \
             -o /tmp/process-compose.tar.gz \
          || { echo "FATAL: process-compose fetch failed/stalled (${PROCESS_COMPOSE_VERSION}, ${PC_ARCH})" >&2; exit 1; }; } \
@@ -662,7 +665,9 @@ RUN case "$(uname -m)" in \
         aarch64) VSCODE_ARCH=arm64 ;; \
         *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
     esac \
-    && { timeout 240 curl -fsSL --connect-timeout 30 --max-time 180 --retry 3 --retry-delay 5 --retry-all-errors \
+    && { timeout 900 curl -fsSL --connect-timeout 30 --max-time 420 \
+            --speed-time 60 --speed-limit 1024 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
             "https://update.code.visualstudio.com/latest/cli-linux-${VSCODE_ARCH}/stable" -o /tmp/vscode_cli.tar.gz \
          || { echo "FATAL: VS Code CLI fetch failed/stalled (cli-linux-${VSCODE_ARCH})" >&2; exit 1; }; } \
     && tar -xzf /tmp/vscode_cli.tar.gz -C /usr/local/bin/ code \
