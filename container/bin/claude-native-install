@@ -1,0 +1,165 @@
+#!/bin/bash
+# claude-native-install — cache-aware, fail-fast installer for the native
+# claude-code binary.
+#
+# WHY THIS EXISTS (build-caching, not just resilience):
+#   The upstream one-liner `curl -fsSL https://claude.ai/install.sh | bash`
+#   ALWAYS re-downloads the ~250MB platform binary on every build (install.sh
+#   fetches `latest`, downloads the binary to a temp dir, then `rm`s it after
+#   `claude install`). Inside a BuildKit sandbox that full re-download is the
+#   step that repeatedly WEDGED the image build (a stalled/slow network fetch
+#   with no timeout — bare `curl -fsSL`, no --connect-timeout / --max-time).
+#
+#   This helper fixes the ROOT problem: it downloads the versioned binary into
+#   a caller-provided cache dir (a BuildKit `--mount=type=cache` in the
+#   Dockerfile), keyed by version+platform, and SKIPS the download entirely on
+#   a cache hit (checksum-validated). So the huge fetch happens once per
+#   claude-code version, not once per image build. The subsequent
+#   `<binary> install` copies the binary OUT of the cache into the real image
+#   filesystem (~/.local/share/claude/versions/<ver>/), so the cache mount's
+#   ephemerality (its contents never land in the image layer) is irrelevant.
+#
+#   Every network fetch is bounded: --connect-timeout + --max-time + bounded
+#   --retry, wrapped in `timeout` as a hard backstop, with a CLEAR error that
+#   names the URL and what stalled. A wedge becomes a fast, legible failure
+#   instead of a 20-minute silent hang.
+#
+# USAGE: claude-native-install [VERSION_SPEC]
+#   VERSION_SPEC : stable | latest | X.Y.Z[-suffix]   (default: latest)
+# ENV:
+#   CLAUDE_DL_CACHE : dir to cache the downloaded binary (default /opt/claude-dl-cache)
+#
+# The version arg is meant to be plumbed from a Dockerfile ARG so the install
+# layer's cache key busts ONLY when the pinned version changes.
+
+set -euo pipefail
+
+VERSION_SPEC="${1:-latest}"
+CACHE_DIR="${CLAUDE_DL_CACHE:-/opt/claude-dl-cache}"
+BASE_URL="https://downloads.claude.ai/claude-code-releases"
+
+# Validate the version spec up front (mirrors install.sh's own check).
+if [[ ! "$VERSION_SPEC" =~ ^(stable|latest|[0-9]+\.[0-9]+\.[0-9]+(-[^[:space:]]+)?)$ ]]; then
+    echo "claude-native-install: FATAL: invalid version spec '$VERSION_SPEC' (want stable|latest|X.Y.Z)" >&2
+    exit 2
+fi
+
+# --- hardened fetch: bounded connect + a STALL detector + retries + a `timeout`
+# backstop + a clear, URL-naming error.
+#
+# The wedge this guards against is a STALLED connection (bytes stop moving), so
+# the primary guard is curl's --speed-limit/--speed-time: abort if throughput
+# drops below <speed_limit> bytes/sec for <speed_time> seconds. That aborts a
+# genuinely-stalled fetch fast WITHOUT killing a healthy-but-slow transfer. A
+# generous --max-time is a secondary absolute ceiling. --retry re-attempts
+# transient failures (incl. a tripped stall/timeout). The outer `timeout` is a
+# hard backstop sized to cover ALL retry attempts + delays (so it never
+# truncates a legitimate retry) — it only fires if curl itself wedges.
+#
+# args: $1=url $2=output(- for stdout) $3=connect-timeout $4=max-time
+#       $5=retries $6=retry-delay $7=speed-time(0=disable) $8=speed-limit
+fetch() {
+    local url="$1" out="${2:--}" connect="${3:-30}" maxt="${4:-120}"
+    local retries="${5:-3}" rdelay="${6:-5}" stime="${7:-0}" slimit="${8:-1024}"
+    # Backstop covers every attempt (retries+1) at up to max-time each, plus the
+    # inter-retry delays, plus 60s slack — so a real retry is never cut short.
+    local backstop=$(( (maxt + rdelay) * (retries + 1) + 60 ))
+    local rc=0
+    local -a speedargs=()
+    if [ "$stime" -gt 0 ]; then
+        speedargs=(--speed-time "$stime" --speed-limit "$slimit")
+    fi
+    echo "claude-native-install: fetching $url (connect=${connect}s max=${maxt}s retry=${retries} stall=${stime}s/${slimit}Bps backstop=${backstop}s)" >&2
+    if [ "$out" = "-" ]; then
+        timeout "$backstop" curl -fsSL \
+            --connect-timeout "$connect" --max-time "$maxt" "${speedargs[@]}" \
+            --retry "$retries" --retry-delay "$rdelay" --retry-all-errors \
+            "$url" || rc=$?
+    else
+        timeout "$backstop" curl -fsSL \
+            --connect-timeout "$connect" --max-time "$maxt" "${speedargs[@]}" \
+            --retry "$retries" --retry-delay "$rdelay" --retry-all-errors \
+            -o "$out" "$url" || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        case "$rc" in
+            124) echo "claude-native-install: FATAL: fetch of $url exceeded the ${backstop}s hard backstop (curl wedged)." >&2 ;;
+            28)  echo "claude-native-install: FATAL: fetch of $url timed out / stalled (curl 28) after all ${retries} retries." >&2 ;;
+            *)   echo "claude-native-install: FATAL: fetch of $url failed (curl exit $rc) after all ${retries} retries." >&2 ;;
+        esac
+        return "$rc"
+    fi
+}
+
+# --- platform detection (mirrors install.sh) ------------------------------------
+case "$(uname -m)" in
+    x86_64|amd64)  arch="x64" ;;
+    arm64|aarch64) arch="arm64" ;;
+    *) echo "claude-native-install: FATAL: unsupported architecture $(uname -m)" >&2; exit 2 ;;
+esac
+if [ -f /lib/libc.musl-x86_64.so.1 ] || [ -f /lib/libc.musl-aarch64.so.1 ] || ldd /bin/ls 2>&1 | grep -q musl; then
+    platform="linux-${arch}-musl"
+else
+    platform="linux-${arch}"
+fi
+
+# --- resolve the concrete version -----------------------------------------------
+if [[ "$VERSION_SPEC" =~ ^[0-9] ]]; then
+    version="$VERSION_SPEC"
+else
+    # 'stable'/'latest' → resolve to a concrete X.Y.Z so the cache key is stable.
+    # Tiny fetch: connect=20 max=60 retry=3 delay=5 (no stall detector needed).
+    version="$(fetch "$BASE_URL/$VERSION_SPEC" - 20 60 3 5)"
+    version="$(printf '%s' "$version" | tr -d '\r\n[:space:]')"
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        echo "claude-native-install: FATAL: '$VERSION_SPEC' did not resolve to a version (got: '$version'). Download service unreachable?" >&2
+        exit 1
+    fi
+fi
+echo "claude-native-install: resolved version spec '$VERSION_SPEC' -> $version ($platform)" >&2
+
+# --- checksum from the signed manifest ------------------------------------------
+manifest_json="$(fetch "$BASE_URL/$version/manifest.json" - 20 60 3 5)"
+if command -v jq >/dev/null 2>&1; then
+    checksum="$(printf '%s' "$manifest_json" | jq -r ".platforms[\"$platform\"].checksum // empty")"
+else
+    # pure-bash fallback (install.sh's own parser) when jq is not present yet.
+    norm="$(printf '%s' "$manifest_json" | tr -d '\n\r\t' | sed 's/ \+/ /g')"
+    if [[ $norm =~ \"$platform\"[^}]*\"checksum\"[[:space:]]*:[[:space:]]*\"([a-f0-9]{64})\" ]]; then
+        checksum="${BASH_REMATCH[1]}"
+    else
+        checksum=""
+    fi
+fi
+if [ -z "$checksum" ] || [[ ! "$checksum" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "claude-native-install: FATAL: platform $platform not found in manifest for $version" >&2
+    exit 1
+fi
+
+# --- cached download ------------------------------------------------------------
+mkdir -p "$CACHE_DIR"
+binary_path="$CACHE_DIR/claude-$version-$platform"
+if [ -f "$binary_path" ] && printf '%s  %s\n' "$checksum" "$binary_path" | sha256sum -c --status; then
+    echo "claude-native-install: cache HIT for $version ($platform) — skipping download of the ~250MB binary" >&2
+else
+    [ -f "$binary_path" ] && echo "claude-native-install: cached binary present but checksum mismatched — re-downloading" >&2
+    # Fat ~250MB download: connect=30, max=600/attempt, retry=3 delay=10, and a
+    # STALL detector (abort if <1KB/s for 60s) so a wedged connection fails fast
+    # while a healthy-but-slow transfer is allowed to finish. Cache-mounted, so
+    # a partial across builds resumes-by-retry on the next build.
+    fetch "$BASE_URL/$version/$platform/claude" "$binary_path" 30 600 3 10 60 1024
+    if ! printf '%s  %s\n' "$checksum" "$binary_path" | sha256sum -c --status; then
+        echo "claude-native-install: FATAL: checksum verification failed for $binary_path (expected $checksum)" >&2
+        rm -f "$binary_path"
+        exit 1
+    fi
+    echo "claude-native-install: downloaded + verified $binary_path" >&2
+fi
+chmod +x "$binary_path"
+
+# --- install (copies the binary OUT of the cache into ~/.local/share/claude/
+# versions/<ver>/ + lays the launcher; installMethod=native). No re-download:
+# the running binary installs itself. ------------------------------------------
+echo "claude-native-install: running '$binary_path install $version'..." >&2
+"$binary_path" install "$version"
+echo "claude-native-install: install complete for $version" >&2

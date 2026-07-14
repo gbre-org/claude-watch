@@ -85,11 +85,15 @@ if DOCKERFILE.exists():
     )
 
     # 3. Native installer + PATH has ~/.local/bin first.
-    native_install = re.search(r"claude\.ai/install\.sh", df_no_comments)
+    native_install = re.search(
+        r"claude\.ai/install\.sh|claude-native-install[^\n]*CLAUDE_CODE_VERSION",
+        df_no_comments,
+    )
     expect(
         native_install is not None,
-        "Dockerfile: missing the native installer "
-        "(`https://claude.ai/install.sh`). claude-code must be installed "
+        "Dockerfile: missing the native installer (either "
+        "`https://claude.ai/install.sh` OR the cache-aware "
+        "`claude-native-install` helper). claude-code must be installed "
         "natively so versions land under the volume-backed "
         f"{NATIVE_VERSIONS_DIR}.",
     )
