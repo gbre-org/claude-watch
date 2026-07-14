@@ -146,6 +146,51 @@ if restart_container.is_file():
         f"{text.splitlines()[0]!r}",
     )
 
+# 3c-2. deploy-container.md present + references `make deploy-container`
+#     (the backing operation) and the host-side execution requirement.
+#     This is the FULL force-recreate skill — distinct from restart.md
+#     (inner `claude` process roll via cwsr) and restart-container.md
+#     (process-tree restart of the SAME container); it is the ONLY one
+#     that picks up a rebuilt image / changed env / new mounts.
+deploy_container = SKILLS_DIR / "deploy-container.md"
+expect(
+    deploy_container.is_file(),
+    f"{deploy_container} missing — the FULL force-recreate deploy skill "
+    f"(make deploy-container / docker compose up -d --force-recreate) is "
+    f"distinct from restart-container.md and must ship as its own skill",
+)
+if deploy_container.is_file():
+    text_dc = deploy_container.read_text(encoding="utf-8")
+    expect(
+        len(text_dc) > 200,
+        f"{deploy_container} suspiciously short (<200 chars)",
+    )
+    expect(
+        "make deploy-container" in text_dc,
+        f"{deploy_container} should reference `make deploy-container` — the "
+        f"backing target (a single docker compose up -d --force-recreate) "
+        f"that recreates the container FROM the image",
+    )
+    expect(
+        "force-recreate" in text_dc,
+        f"{deploy_container} should reference `force-recreate` — the key "
+        f"behavioral difference from restart-container.md (which reuses the "
+        f"same container and does NOT pick up image / env / mount changes)",
+    )
+    expect(
+        "host-bash" in text_dc,
+        f"{deploy_container} should call out the host-side execution "
+        f"requirement (docker is NOT in the container; a raw in-container "
+        f"`make deploy-container` fails `docker: not found`) — the exact "
+        f"mistake that motivated baking this skill",
+    )
+    first_line = text_dc.splitlines()[0].lower()
+    expect(
+        "redeploy" in first_line or "recreate" in first_line,
+        f"{deploy_container} first line should describe the FULL redeploy / "
+        f"force-recreate, got: {text_dc.splitlines()[0]!r}",
+    )
+
 # 3d. self-clear.md present + references `self-clear` (the backing
 #     tool). self-clear injects /clear + a resume prompt into the
 #     Claude Code tmux pane for a clean CONTEXT reset — distinct from
