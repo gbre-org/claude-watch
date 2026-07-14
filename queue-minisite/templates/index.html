@@ -87,11 +87,6 @@
         </select>
       </label>
       <span class="dot {% if error %}dot-err{% else %}dot-ok{% endif %}" title="{{ 'fetch error' if error else 'live' }}"></span>
-      <span
-        class="ts"
-        title="last fetch"
-        {% if fetched_at %}data-local-time-iso="{{ fetched_at }}" data-local-time-fmt="time" data-local-time-tooltip{% endif %}
-      >{{ fetched_at[11:19] if fetched_at else '—' }}{% if fetched_at %}Z{% endif %}</span>
       <div class="info-wrap">
         <button
           type="button"
@@ -107,6 +102,13 @@
           role="menu"
           aria-labelledby="info-toggle"
           hidden>
+          <div class="info-row">
+            <span class="info-label">last fetch</span>
+            <span
+              class="info-value ts"
+              {% if fetched_at %}data-local-time-iso="{{ fetched_at }}" data-local-time-fmt="time" data-local-time-tooltip{% endif %}
+            >{{ fetched_at[11:19] if fetched_at else '—' }}{% if fetched_at %}Z{% endif %}</span>
+          </div>
           <div class="info-row">
             <span class="info-label">user</span>
             <span class="info-value">{% if user %}{{ user }}{% else %}&mdash;{% endif %}</span>

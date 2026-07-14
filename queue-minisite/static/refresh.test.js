@@ -50,9 +50,9 @@ const initialHTML = `<!doctype html>
     <span class="count count-running">1 running</span>
     <span class="count count-pending">2 pending</span>
     <span class="dot dot-ok"></span>
-    <span class="ts" data-local-time-iso="2026-05-01T20:00:00Z" data-local-time-fmt="time">20:00:00Z</span>
     <div class="info-wrap"><button id="info-toggle" class="info-btn">i</button>
       <div id="info-dropdown" class="info-dropdown" hidden>
+        <div class="info-row"><span class="info-label">last fetch</span><span class="info-value ts" data-local-time-iso="2026-05-01T20:00:00Z" data-local-time-fmt="time">20:00:00Z</span></div>
         <div class="info-row"><span class="info-label">user</span><span class="info-value">test@example.com</span></div>
         <div class="info-row"><span class="info-label">cache</span><span class="info-value"><span class="cache-age">1</span>s</span></div>
       </div>
