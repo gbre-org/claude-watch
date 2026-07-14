@@ -253,6 +253,21 @@ pub async fn is_interactive_prompt(pane: &str) -> bool {
 ///     as (2)) and keeps this guard aware of the same dialog
 ///     `policy::run_auto_update` explicitly dismisses. See
 ///     `background_work_exit_dialog_visible`.
+///  5. A `❯`-cursored FleetView agent-selector row (`❯ ● main`,
+///     `❯ ◯ general-purpose …`): the FleetView agent-view renders the
+///     currently-selected agent as the `❯` cursor followed by a status
+///     bullet (`●` running / `◯` idle) and the agent name — NOT a
+///     numbered option. This matters because the FleetView "↑/↓ to
+///     select · Enter to view" hint sits at the TOP of the agent box, so with
+///     a long agent list (plus the trailing bypass-permissions / token /
+///     version status lines) that footer scrolls ABOVE this 25-line tail scan
+///     and signature (2) misses it — letting a watcher-down / resume inject
+///     `send-keys` INTO the agent-view and clobber it (operator-reported,
+///     2026-07-13). The selected-agent cursor row is always at/near the
+///     bottom, so match it directly. Same conservative bias as (2): a false
+///     positive only DELAYS a resume-inject. (Deliberately NOT added to the
+///     narrower `blocking_question_visible` — the agent-view is a passive
+///     viewer, not a blocking question; see #485.)
 ///
 /// ## Conservative bias
 ///
@@ -297,13 +312,25 @@ pub(crate) fn interactive_prompt_visible(pane_output: &str) -> bool {
             return true;
         }
 
-        // (3) A `❯`-cursored numbered option row (`❯ 1.`, `❯ 2.`, …).
-        // The cursor char may be followed by spaces then `<digit>.`.
+        // (3) A `❯`-cursored numbered option row (`❯ 1.`, `❯ 2.`, …),
+        // or (5) a `❯`-cursored FleetView agent-selector row
+        // (`❯ ● main`, `❯ ◯ general-purpose …`) — the cursor
+        // followed by a status bullet (● running / ◯ idle) + agent name.
+        // The cursor char may be followed by spaces then `<digit>.` (3) or a
+        // bullet (5). A genuinely-idle prompt has the `❯` alone on an
+        // otherwise-empty input line, never immediately followed by a numbered
+        // option or a status bullet. See signature (5) in the doc comment for
+        // why the agent-view footer alone (signature (2)) is not enough.
         if let Some(rest) = trimmed.strip_prefix('\u{276f}') {
             let rest = rest.trim_start();
             let mut chars = rest.chars();
             if let Some(c) = chars.next() {
+                // (3) numbered option row (`❯ 1.`).
                 if c.is_ascii_digit() && chars.next() == Some('.') {
+                    return true;
+                }
+                // (5) FleetView agent-selector row (`❯ ● main` / `❯ ◯ …`).
+                if c == '\u{25cf}' || c == '\u{25ef}' {
                     return true;
                 }
             }
@@ -2333,6 +2360,64 @@ mod tests {
         assert!(
             interactive_prompt_visible(output),
             "select-hint footer overlay must be matched (conservative bias)"
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_fires_on_fleetview_agent_view() {
+        // THE 2026-07-13 bug: the main pane sits on the FleetView agent-view.
+        // The "↑/↓ to select · Enter to view" hint sits at the TOP of the
+        // agent box, so with a long agent list + trailing bypass-permissions /
+        // token / version status lines the footer scrolls ABOVE the 25-line
+        // tail scan and signature (2) misses it. The selected-agent cursor row
+        // (`❯ ● main`) is at/near the bottom — signature (5) must match it so
+        // a watcher-down / resume inject is SUPPRESSED instead of clobbering
+        // the agent-view.
+        let output = "\u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} Esc to close\n\
+                      \u{276f} \u{25cf} main\n\
+                        \u{25ef} general-purpose  Add #1629 coverage\u{2026} 1h 4m 0s\n\
+                        \u{25ef} general-purpose  Fix pr-watch stage\u{2026}  56m 43s\n\
+                        \u{25ef} general-purpose  Investigate flake\u{2026}   42m 10s\n\
+                        \u{25ef} general-purpose  Sync worklog docs\u{2026}   38m  2s\n\
+                        \u{25ef} general-purpose  Merge falcon-dev\u{2026}    31m 55s\n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      -- INSERT --\u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 background tasks   141197 tokens\n\
+                                                             current: 2.1.77 \u{00b7} latest: 2.1.\u{2026}";
+        assert!(
+            interactive_prompt_visible(output),
+            "FleetView agent-view (footer scrolled out) must be matched via the agent-selector cursor row (signature 5)"
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_fires_on_fleetview_agent_view_idle_bullet() {
+        // A FleetView agent-view whose SELECTED row is an idle agent
+        // (`❯ ◯ …`) rather than the running `main`. Signature (5) must
+        // still match the hollow-bullet cursor row.
+        let output = "\u{276f} \u{25ef} general-purpose  Some running task\u{2026} 12m 3s\n\
+                        \u{25cf} main\n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      -- INSERT --\u{23f5}\u{23f5} bypass permissions on   90000 tokens";
+        assert!(
+            interactive_prompt_visible(output),
+            "FleetView agent-view with idle-bullet selection must be matched (signature 5)"
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_bullet_row_needs_cursor() {
+        // A status bullet WITHOUT the `❯` cursor (e.g. a plain `● Bash(...)`
+        // tool-output line, or an unselected agent row) must NOT match
+        // signature (5) — only the `❯`-cursored selection row does.
+        let output = "\u{25cf} Bash(ls -la) running\n\
+                      \u{25ef} general-purpose  background task\u{2026}\n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      \u{276f}\n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      -- INSERT --\u{23f5}\u{23f5} bypass permissions on \u{00b7} esc to interrupt";
+        assert!(
+            !interactive_prompt_visible(output),
+            "a status bullet without the ❯ cursor must NOT be flagged (bare idle prompt below)"
         );
     }
 
