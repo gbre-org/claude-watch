@@ -883,11 +883,15 @@ def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
           "satisfied_by_cmd_regex": null              # optional (str)
         }
 
-    Idempotency: we REMOVE any pre-existing user-manifest row with the same
-    (created_by, tool_pattern, predicate) signature, then add the fresh row.
-    This makes re-applying a reworded / re-tuned manifest a replace, never a
-    duplicate -- and on every container start the manifest dir is the source
-    of truth. Returns 0 on success (added / replaced), 1 on hard failure.
+    Idempotency: we ADD the fresh row FIRST (with a retry), then REMOVE any
+    pre-existing user-manifest row with the same (created_by, tool_pattern,
+    predicate) signature. Add-first (not satisfy-first) guarantees the gate is
+    NEVER left absent by a transient `add` failure -- see the ADD-FIRST comment
+    below (botchat #1697 root cause). This makes re-applying a reworded /
+    re-tuned manifest a replace, never a duplicate -- and on every container
+    start the manifest dir is the source of truth. After applying, we VERIFY
+    an active row matches the signature (fail loud if the gate is un-armed).
+    Returns 0 on success (added / replaced + verified), 1 on hard failure.
     """
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -937,31 +941,12 @@ def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
     if enforcement not in ("gate", "inform"):
         enforcement = "gate"
 
-    # Replace-not-duplicate: drop any existing user-manifest row with the
-    # same signature before adding. (created_by here carries the marker, so
-    # the signature is computed against the marked form -- matching what
+    # The idempotency signature. (created_by here carries the marker, so the
+    # signature is computed against the marked form -- matching what
     # _existing_user_manifest_rows returns.) The signature normalizes the
     # predicate to its kind string via _manifest_row_signature, so the
     # manifest's predicate STRING matches the stored row's predicate DICT.
     sig = _manifest_row_signature(tool_pattern, predicate, created_by)
-    for ob in existing:
-        if _manifest_row_signature(
-                ob.get("tool_pattern", ""),
-                ob.get("predicate", ""),
-                ob.get("created_by", "")) == sig:
-            oid = ob.get("id")
-            if not oid:
-                continue
-            if dry_run:
-                print(f"DRY-RUN: {cli} satisfy {oid}  "
-                      f"(replace existing manifest row from {path})")
-            else:
-                try:
-                    subprocess.run([cli, "satisfy", str(oid)],
-                                   capture_output=True, text=True,
-                                   timeout=10, check=False)
-                except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                    pass
 
     cmd = [
         cli, "add",
@@ -989,32 +974,100 @@ def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
                 cmd.extend(["--exempt-tool-pattern", pat])
 
     if dry_run:
+        # Show the ADD first (matching the runtime ADD-then-satisfy-old order),
+        # then the satisfy of each pre-existing duplicate.
         print("DRY-RUN: " + " ".join(cmd))
+        for ob in existing:
+            if _manifest_row_signature(
+                    ob.get("tool_pattern", ""),
+                    ob.get("predicate", ""),
+                    ob.get("created_by", "")) == sig and ob.get("id"):
+                print(f"DRY-RUN: {cli} satisfy {ob['id']}  "
+                      f"(replace prior manifest row from {path})")
         return 0
 
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
-        print(f"obligations-init: manifest {path} add failed: {e}",
-              file=sys.stderr)
-        return 1
-    if proc.returncode != 0:
+    # ADD-FIRST, then remove OLD duplicates (never satisfy-then-add).
+    #
+    # BUGFIX (botchat #1697: missed msgs #1693/#1695): the previous order was
+    # satisfy-old-THEN-add, so if the `add` subprocess transiently failed
+    # (timeout under boot lock-contention, OSError) AFTER the satisfy removed
+    # the prior row, the gate was left ABSENT -- silently un-armed until the
+    # next obligations-init run. A `tool_pattern:*` gate (the botchat
+    # mark-read gate) that is absent enforces NOTHING, so unread inbound
+    # messages never block the main loop. Absence is the worst state for a
+    # gate; a transient duplicate is harmless (conjunction: two identical
+    # rows deny/allow identically) and gets collapsed on the next run. So we
+    # add the fresh row FIRST (with retry), and only once it is confirmed
+    # present do we satisfy the OLD duplicates -- there is never a window
+    # where zero rows match the signature.
+    new_id = None
+    add_err = ""
+    for attempt in (1, 2):
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            add_err = f"{type(e).__name__}: {e}"
+            continue
+        if proc.returncode != 0:
+            add_err = (f"rc={proc.returncode}"
+                       + (f"\n{proc.stderr}" if proc.stderr else ""))
+            continue
+        try:
+            new_id = json.loads(proc.stdout).get("id")
+        except (json.JSONDecodeError, ValueError):
+            new_id = None
+        add_err = ""
+        break
+    if add_err:
         print(f"obligations-init: manifest {path} obligations add failed "
-              f"rc={proc.returncode}", file=sys.stderr)
-        if proc.stderr:
-            print(proc.stderr, file=sys.stderr)
+              f"(after retry): {add_err}", file=sys.stderr)
+        # Do NOT satisfy the old duplicates: if a prior row from this manifest
+        # is still present it keeps the gate ARMED, which is strictly safer
+        # than removing it. Reworded params won't take effect until the add
+        # succeeds, but the invariant the gate protects stays enforced.
+        return 1
+
+    # Fresh row is in. NOW remove any OLD duplicate rows (same signature,
+    # different id) so a reworded / re-tuned manifest replaces rather than
+    # accumulates. The just-added id is excluded so we never satisfy it.
+    for ob in existing:
+        oid = ob.get("id")
+        if not oid or oid == new_id:
+            continue
+        if _manifest_row_signature(
+                ob.get("tool_pattern", ""),
+                ob.get("predicate", ""),
+                ob.get("created_by", "")) == sig:
+            try:
+                subprocess.run([cli, "satisfy", str(oid)],
+                               capture_output=True, text=True,
+                               timeout=10, check=False)
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+
+    # VERIFY the row is actually live post-apply (belt-and-suspenders: catches
+    # the case where a concurrent obligations-init satisfied our just-added id,
+    # or the add reported success but the row is not visible). Re-list and
+    # confirm at least one active row matches the signature; if none, the gate
+    # is UN-ARMED -- fail loud so the entrypoint's non-zero rc is visible.
+    live = _existing_user_manifest_rows(cli)
+    armed = any(
+        _manifest_row_signature(
+            ob.get("tool_pattern", ""),
+            ob.get("predicate", ""),
+            ob.get("created_by", "")) == sig
+        for ob in live
+    )
+    if not armed:
+        print(f"obligations-init: manifest {path} applied but NO active row "
+              f"matches its signature {sig} -- gate is UN-ARMED", file=sys.stderr)
         return 1
     if verbose:
-        try:
-            row = json.loads(proc.stdout)
-            print(f"user-manifest {os.path.basename(path)}: applied "
-                  f"id={row.get('id', '?')} tool={tool_pattern} "
-                  f"predicate={predicate}", file=sys.stderr)
-        except (json.JSONDecodeError, ValueError):
-            print(f"user-manifest {os.path.basename(path)}: applied "
-                  f"(rc={proc.returncode})", file=sys.stderr)
+        print(f"user-manifest {os.path.basename(path)}: applied + verified "
+              f"id={new_id or '?'} tool={tool_pattern} "
+              f"predicate={predicate}", file=sys.stderr)
     return 0
 
 
