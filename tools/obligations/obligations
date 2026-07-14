@@ -3150,32 +3150,68 @@ def _classify_agent_type(agent_type):
 def _is_subagent_context(agent_id, agent_type=None):
     """Return True iff the caller is inside a subagent.
 
-    PRIMARY signal: the hook payload's ``agent_type`` string. As of Claude
-    Code 2.1.x the main loop runs as a first-class agent that DOES carry a
-    non-empty ``agent_id`` (the fork/teammate architecture), so the old
-    "non-empty ``agent_id`` => subagent" heuristic misfires and attributes
-    the MAIN LOOP a subagent context -- which made ``is_main_loop`` return
-    False for the dispatcher and tripped ``subagent_queue_mutating_banned``
-    on the main loop's own ``session-task queue done`` calls. We therefore
-    classify on ``agent_type`` first:
+    FAIL-SAFE-TOWARD-SUBAGENT combinator. This function gates whether the
+    main-loop-only obligations (``all_of [is_main_loop, X]`` -- most visibly
+    the botchat mark-read gate) fire. The COSTLY failure is a FALSE main-loop
+    verdict inside a subagent: it leaks the operator<->main-loop botchat gate
+    into background agents (operator report, THIRD recurrence 2026-07-14,
+    botchat #1658/#1659). We therefore return "subagent" if EITHER signal
+    indicates a subagent, and "main loop" ONLY when BOTH signals are clean:
 
-      - ``agent_type`` classifies as ``"main"`` (REPL main thread / sdk)
-        => NOT a subagent (return False), regardless of ``agent_id``.
-      - ``agent_type`` classifies as ``"subagent"`` (ANY other non-empty
-        value -- legacy ``agent:<id>`` / ``hook_agent`` OR a current bare
-        subagent-type slug like ``general-purpose`` / ``Explore``) =>
-        subagent (True).
+        is_subagent  <=>  (agent_id present)  OR  (agent_type is a subagent)
 
-    FALLBACK (``agent_type`` absent/unknown -- older Claude Code that did
-    not emit it, or direct CLI use without ``--agent-type``): the legacy
-    ``agent_id``-presence heuristic. There, a non-empty ``agent_id`` meant
-    a subagent and the main loop had none.
+    Rationale for making ``agent_id`` AUTHORITATIVE (primary) again:
+
+      Claude Code's OWN PreToolUse/PostToolUse payload schema (verified in
+      the installed CLI, 2.1.209) documents ``agent_id`` as::
+
+        "Subagent identifier. Present ONLY when the hook fires from within a
+         subagent (e.g. a tool called by an AgentTool worker). Absent for the
+         main thread, even in --agent sessions. Use THIS field (not
+         agent_type) to distinguish subagent calls from main-thread calls."
+
+      i.e. Claude Code itself instructs: key on ``agent_id``, NOT
+      ``agent_type``. This REVERSES the assumption behind commit 691e0b7
+      (which believed the 2.1.x main loop carried a non-empty ``agent_id``);
+      on current Claude Code the main thread carries NO ``agent_id`` (the
+      internal ``XNn(ctx)`` helper returns ``void 0`` for ``agentType ===
+      'main'`` and for non-background contexts), so ``agent_id`` presence is
+      once again a clean subagent signal.
+
+    Why ``agent_type`` alone is UNRELIABLE (the actual regression root cause):
+
+      Claude Code builds the hook payload as
+      ``agent_type: ctx?.agentType ?? mainThreadAgentType`` -- when a
+      subagent's per-call context does NOT carry its own ``agentType``, the
+      field FALLS BACK to the MAIN THREAD's agent type (``repl_main_thread``
+      / ``sdk``). So a genuine subagent tool call can arrive with
+      ``agent_type='repl_main_thread'`` AND a non-empty ``agent_id``. The
+      previous "agent_type is PRIMARY, classify 'main' => NOT a subagent
+      regardless of agent_id" logic classified exactly THAT as the main loop
+      and fired the botchat gate inside the subagent -- the leak. Making
+      ``agent_id`` authoritative closes this hole structurally: whenever a
+      subagent id is present, no amount of ``agent_type`` fallback can flip
+      the verdict back to main-loop.
+
+    The ``agent_type``-subagent leg is retained (OR, not replaced) so that
+    IN-PROCESS teammates -- which ``XNn`` returns ``void 0`` agent_id for --
+    are still classified as subagents via their bare-slug ``agent_type``
+    (``general-purpose`` / ``Explore`` / ``claude`` / plugin slugs). Only the
+    clean main-loop case (NO agent_id AND agent_type is main/absent) yields
+    False.
+
+    Direct CLI use / tests with neither signal (agent_id empty, agent_type
+    empty/None) => False (main loop) -- the historical default.
     """
-    cls = _classify_agent_type(agent_type)
-    if cls is not None:
-        return cls == "subagent"
-    # Legacy fallback: no agent_type signal -> infer from agent_id presence.
-    return bool(agent_id) and isinstance(agent_id, str) and agent_id.strip() != ""
+    # Authoritative subagent signal: a non-empty agent_id is emitted by
+    # Claude Code ONLY inside a subagent (per its own payload schema). This
+    # can NEVER be overridden back to main-loop by an agent_type fallback.
+    if isinstance(agent_id, str) and agent_id.strip():
+        return True
+    # No agent_id. Fall to agent_type: a subagent slug (in-process teammate,
+    # legacy agent:<id>/hook_agent form) still marks a subagent. "main" or
+    # unknown/absent => not a subagent.
+    return _classify_agent_type(agent_type) == "subagent"
 
 
 def _check_core(tool_name, command_string, prune=True, agent_id=None,
