@@ -732,20 +732,24 @@ def main() -> int:
     tool_input = payload.get("tool_input", {})
     cmd_str = _short_command_string(tool_input, tool_name)
 
-    # Main-loop-vs-subagent detection. As of Claude Code 2.1.x the main loop
-    # runs as a first-class agent that ALSO carries a non-empty `agent_id`
-    # (the fork/teammate architecture), so `agent_id`-presence alone no longer
-    # distinguishes main loop from subagent -- it falsely attributed the MAIN
-    # LOOP a subagent context, which made `is_main_loop` return False for the
-    # dispatcher and tripped `subagent_queue_mutating_banned` on the main
-    # loop's own `session-task queue done` calls.
+    # Main-loop-vs-subagent detection. We forward BOTH `agent_id` and
+    # `agent_type` to the obligations CLI; the CLI's `_is_subagent_context`
+    # combines them FAIL-SAFE-TOWARD-SUBAGENT: a non-empty `agent_id` is
+    # AUTHORITATIVE for "subagent" (matching Claude Code's own payload schema,
+    # which documents `agent_id` as "Present ONLY when the hook fires from
+    # within a subagent ... Absent for the main thread ... Use THIS field, not
+    # agent_type, to distinguish subagent calls"), OR'd with an
+    # `agent_type`-subagent classification (so in-process teammates, which
+    # carry no agent_id, are still caught by their bare-slug agent_type).
     #
-    # The authoritative signal is `agent_type`: it starts with
-    # `repl_main_thread` (or is `sdk`) for the main loop, and starts with
-    # `agent:` (or is `hook_agent`) for a spawned subagent. We forward BOTH
-    # fields to the obligations CLI; the CLI's `_is_subagent_context` keys on
-    # `agent_type` (primary) and falls back to the `agent_id`-presence
-    # heuristic only when `agent_type` is absent (older Claude Code).
+    # Why NOT agent_type-primary (the recurring-leak root cause): Claude Code
+    # builds the payload as `agent_type: ctx?.agentType ?? mainThreadAgentType`
+    # -- a subagent whose per-call context lacks its own agentType gets the
+    # MAIN THREAD's agent_type (`repl_main_thread`/`sdk`) even though it carries
+    # a subagent `agent_id`. Keying on agent_type first then classified that as
+    # the main loop and fired the botchat mark-read gate INSIDE the subagent
+    # (operator reports #1232 / #1492 / #1658 / #1659). Making agent_id
+    # authoritative closes that hole structurally.
     # Defensive: coerce non-string / missing to "".
     raw_agent_id = payload.get("agent_id", "")
     agent_id = raw_agent_id.strip() if isinstance(raw_agent_id, str) else ""

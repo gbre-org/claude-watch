@@ -1316,44 +1316,74 @@ def main() -> int:
             f"rc={rc} out={out}",
         ))
 
-        # --- Test 32c: REGRESSION GUARD (gate-attribution bug) ----------
-        # Claude Code 2.1.x runs the MAIN LOOP as a first-class agent that
-        # ALSO carries a non-empty `agent_id` (fork/teammate architecture),
-        # while `agent_type` starts with `repl_main_thread`. The old
-        # detection ("non-empty agent_id => subagent") MISFIRED here: it
-        # attributed the main loop a subagent context, so `is_main_loop`
-        # FAILED and main-loop tool calls got DENIED. With the fix, the
-        # authoritative `agent_type` signal classifies this as main loop
-        # -> ALLOW even though `agent_id` is non-empty.
+        # --- Test 32c: MAIN LOOP => no agent_id => allow ---------------
+        # Claude Code's OWN PreToolUse payload schema (verified in the
+        # installed CLI, 2.1.209) documents `agent_id` as "Present ONLY when
+        # the hook fires from within a subagent ... Absent for the main
+        # thread, even in --agent sessions. Use THIS field (not agent_type)
+        # to distinguish subagent calls from main-thread calls." So a genuine
+        # main-loop call carries NO agent_id and agent_type=repl_main_thread
+        # => is_main_loop satisfied => ALLOW.
         rc, out, _err = _hook_pre(
             {
                 "tool_name": "Bash",
                 "tool_input": {"command": "ls"},
-                "agent_id": "a3031d61453b49849",       # main loop HAS an id now
-                "agent_type": "repl_main_thread",       # ...but type says main
+                "agent_id": "",                         # main loop: NO id
+                "agent_type": "repl_main_thread",
             },
             env,
         )
         results.append(_check(
-            "32c. is_main_loop + main-loop agent_type + non-empty agent_id "
-            "-> allow (agent_type authoritative; regression guard)",
+            "32c. is_main_loop + main-loop agent_type + NO agent_id "
+            "-> allow (agent_id authoritative; regression guard)",
             rc == 0 and _is_allow(out),
             f"rc={rc} out={out}",
         ))
 
-        # --- Test 32d: `sdk` agent_type also classifies as main loop ----
+        # --- Test 32d: `sdk` agent_type + no agent_id => main loop ------
         rc, out, _err = _hook_pre(
             {
                 "tool_name": "Bash",
                 "tool_input": {"command": "ls"},
-                "agent_id": "a3031d61453b49849",
+                "agent_id": "",
                 "agent_type": "sdk",
             },
             env,
         )
         results.append(_check(
-            "32d. is_main_loop + agent_type='sdk' -> allow",
+            "32d. is_main_loop + agent_type='sdk' + no agent_id -> allow",
             rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 32c2: THE RECURRING LEAK (agent_id present + main-type)
+        # REGRESSION GUARD (2026-07-14, operator reports botchat #1658/#1659,
+        # THIRD recurrence): Claude Code builds the payload as
+        # `agent_type: ctx?.agentType ?? mainThreadAgentType`, so a genuine
+        # SUBAGENT whose per-call context lacks its own agentType arrives with
+        # a non-empty subagent `agent_id` AND `agent_type='repl_main_thread'`
+        # (the MAIN thread's type, via fallback). The prior "agent_type is
+        # authoritative; classify 'main' => NOT a subagent regardless of
+        # agent_id" logic wrongly classified THIS as the main loop and fired
+        # the main-loop-only botchat mark-read gate inside the subagent -- the
+        # leak. With agent_id authoritative, a present agent_id => subagent =>
+        # is_main_loop FAILS => the gate is INACTIVE here => DENY (this raw
+        # is_main_loop ob fails for a subagent; the real botchat gate is
+        # all_of[is_main_loop, ...] which SCOPE-GUARD short-circuits to ALLOW
+        # -- exercised by test 322 below).
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "a3031d61453b49849",        # subagent id present
+                "agent_type": "repl_main_thread",        # ...but type fell back
+            },
+            env,
+        )
+        results.append(_check(
+            "32c2. is_main_loop + agent_id present + repl_main_thread "
+            "agent_type -> deny (subagent; agent_type fell back to main)",
+            rc == 0 and _is_deny(out),
             f"rc={rc} out={out}",
         ))
 
@@ -5006,32 +5036,35 @@ def main() -> int:
             ))
             _run([str(CLI), "satisfy", ob], env_sqmb)
 
-            # --- 321b: REGRESSION GUARD (the gate-attribution bug) --------
-            # The PRODUCTION symptom: in Claude Code 2.1.x the MAIN LOOP
-            # carries a non-empty `agent_id` (fork/teammate architecture) AND
-            # an `agent_type` of `repl_main_thread`. With the old "non-empty
-            # agent_id => subagent" detection the all_of's is_main_loop guard
-            # FAILED for the main loop, so `subagent_queue_mutating_banned`
-            # DENIED the dispatcher's own `session-task queue done` -- forcing
-            # a per-close `obligations override`. The fix keys on `agent_type`
-            # (authoritative), so this main-loop close is ALLOWED.
-            def _main_payload_with_id(command):
+            # --- 321b: REGRESSION GUARD (the recurring subagent-leak) -----
+            # Claude Code's OWN payload schema (2.1.209) documents `agent_id`
+            # as present ONLY inside a subagent and ABSENT for the main thread
+            # ("Use THIS field, not agent_type"). But its payload builder does
+            # `agent_type: ctx?.agentType ?? mainThreadAgentType`, so a genuine
+            # SUBAGENT whose per-call context lacks its own agentType arrives
+            # with a subagent `agent_id` AND `agent_type='repl_main_thread'`.
+            # The prior agent_type-authoritative logic classified THAT as the
+            # main loop and SKIPPED the subagent gate -> a subagent could
+            # mutate the queue (and, worse, the main-loop-only botchat gate
+            # fired in the subagent). With agent_id AUTHORITATIVE, a present
+            # agent_id => subagent => the mutating-queue ban is ENFORCED here.
+            def _leak_payload(command):
                 return {
                     "tool_name": "Bash",
                     "tool_input": {"command": command},
-                    "agent_id": "a3031d61453b49849",   # main loop now has one
-                    "agent_type": "repl_main_thread",   # ...but type = main
+                    "agent_id": "a3031d61453b49849",   # subagent id present
+                    "agent_type": "repl_main_thread",   # ...type fell back to main
                 }
 
             ob = _add_sqmb_ob()
             rc, out, _err = _hook_pre(
-                _main_payload_with_id("session-task queue done q-2026-06-28-7ceb"),
+                _leak_payload("session-task queue done q-2026-06-28-7ceb"),
                 env_sqmb)
             results.append(_check(
-                "321b. subagent_queue_mutating_banned: MAIN-LOOP `queue done` "
-                "with non-empty agent_id + repl_main_thread agent_type -> "
-                "ALLOW (regression guard for gate-attribution bug)",
-                rc == 0 and _is_allow(out),
+                "321b. subagent_queue_mutating_banned: SUBAGENT `queue done` "
+                "with agent_id + repl_main_thread agent_type (fallback) -> "
+                "DENY (agent_id authoritative; recurring-leak regression guard)",
+                rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
             _run([str(CLI), "satisfy", ob], env_sqmb)
