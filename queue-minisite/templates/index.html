@@ -667,6 +667,14 @@
               <span class="log-meta-label">scope</span>
               <span class="log-meta-value" id="log-meta-scope"></span>
             </div>
+            {# command — populated for hostjob-bound items from the runner's
+               recorded argv (<label>/status.json). Shows what the hostjob
+               actually ran (cmd/args + cwd). Hidden for non-hostjob items
+               and when the status file can't be read. #}
+            <div class="log-meta-row" id="log-meta-row-command" hidden>
+              <span class="log-meta-label">command</span>
+              <span class="log-meta-value" id="log-meta-command"></span>
+            </div>
             <div class="log-meta-row" id="log-meta-row-deps" hidden>
               <span class="log-meta-label">depends on</span>
               <span class="log-meta-value" id="log-meta-deps"></span>
