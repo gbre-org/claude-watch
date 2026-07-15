@@ -615,6 +615,129 @@ pub async fn dismiss_feedback_prompt(pane: &str) {
     }
 }
 
+/// Pure: parse the `#{pane_active},#{window_active}` output of a tmux
+/// `display-message` query into "is this pane fully FOREGROUND-selected?" —
+/// i.e. it is the active pane in its window AND its window is the active
+/// window in its session. Both flags must be `1`.
+///
+/// Returns `None` when the output is empty or malformed (missing a field),
+/// which the caller treats as "the tmux query failed — fall back to the
+/// current behavior and do NOT reselect".
+///
+/// Factored out so the selected-pane decision is unit-testable without a
+/// live tmux (`run_cmd*` have no mock seam — see the repo's other pure
+/// tmux predicates).
+pub(crate) fn parse_pane_selected(display_output: &str) -> Option<bool> {
+    let line = display_output.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.split(',');
+    let pane_active = parts.next()?.trim();
+    let window_active = parts.next()?.trim();
+    if pane_active.is_empty() || window_active.is_empty() {
+        return None;
+    }
+    Some(pane_active == "1" && window_active == "1")
+}
+
+/// Query tmux for whether `pane` is currently the FOREGROUND-selected pane
+/// (active pane in an active window). Returns `Some(true)` when it is,
+/// `Some(false)` when some OTHER pane/window is selected (e.g. a Claude Code
+/// agent-view pane), and `None` when the tmux query fails (pane gone, tmux
+/// error, unparseable) — the caller then falls back to the pre-existing
+/// behavior without reselecting.
+pub async fn is_pane_selected(pane: &str) -> Option<bool> {
+    let (out, ok) = run_cmd_any(
+        &[
+            "tmux",
+            "display-message",
+            "-t",
+            pane,
+            "-p",
+            "#{pane_active},#{window_active}",
+        ],
+        5,
+    )
+    .await;
+    if !ok {
+        return None;
+    }
+    parse_pane_selected(&out)
+}
+
+/// Pure: the ordered tmux commands that reselect `pane` as the foreground
+/// (active) pane — select its window FIRST (in case a different window is
+/// active), then the pane within that window. Factored out so the reselect
+/// contract (order + target) is unit-testable without a live tmux.
+pub(crate) fn reselect_pane_commands(pane: &str) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "tmux".to_string(),
+            "select-window".to_string(),
+            "-t".to_string(),
+            pane.to_string(),
+        ],
+        vec![
+            "tmux".to_string(),
+            "select-pane".to_string(),
+            "-t".to_string(),
+            pane.to_string(),
+        ],
+    ]
+}
+
+/// Ensure the MAIN-LOOP pane will receive the interrupt keystrokes we are
+/// about to send — reselect it as the active tmux pane if some OTHER pane is
+/// currently selected.
+///
+/// Andrew #1803 / #1804: "interrupts shouldnt be going to agents period. only
+/// main loop … cw should detect when agents are selected and use tmux to
+/// reselect main loop before interrupting." Modern Claude Code renders its
+/// FleetView agent views as SEPARATE tmux panes in the same window (see
+/// `find_dashboard_pane`'s pane_id/layout-churn notes). When an agent-view
+/// pane is the active one, an Escape blast can cancel that subagent's turn —
+/// exactly what must never happen. `pane` here is the configured main-loop
+/// pane (resolved from `[tmux].dashboard_pane`, e.g. `claude-container:0.0`,
+/// to its immutable `#{pane_id}` by `find_dashboard_pane`), so reselecting
+/// `pane` IS reselecting the configured main loop — no separate hardcoded
+/// target.
+///
+/// Best-effort and NON-FATAL: on a failed tmux active-pane query we log a
+/// warning and return WITHOUT reselecting; the caller proceeds to interrupt
+/// against `pane` regardless (its `send-keys` is already `-t`-targeted at
+/// `pane`, so the fallback is exactly the pre-fix behavior). We never crash
+/// the interrupt path.
+async fn reselect_main_loop_pane(pane: &str) {
+    match is_pane_selected(pane).await {
+        Some(true) => {
+            // Already the selected pane — nothing to do.
+            debug!(
+                pane = %pane,
+                "reselect_main_loop_pane: main-loop pane already selected; no reselect needed"
+            );
+        }
+        Some(false) => {
+            info!(
+                pane = %pane,
+                "reselect_main_loop_pane: a non-main pane is selected (agent-view?); \
+                 reselecting main-loop pane before interrupt (Andrew #1803/#1804)"
+            );
+            for argv in reselect_pane_commands(pane) {
+                let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let _ = run_cmd(&args, 5).await;
+            }
+        }
+        None => {
+            info!(
+                pane = %pane,
+                "reselect_main_loop_pane: tmux active-pane query failed; \
+                 proceeding with interrupt on configured pane (fallback)"
+            );
+        }
+    }
+}
+
 /// Actively interrupt Claude Code: rapid-fire Escape, periodically Ctrl-B x2.
 /// Returns true if idle state confirmed within `timeout_secs`. Returns false
 /// at the deadline; callers should still proceed with their inject (the
@@ -629,7 +752,25 @@ pub async fn dismiss_feedback_prompt(pane: &str) {
 /// short of a foreground bash command (those need Ctrl-C, not Escape).
 /// Idle confirmation requires two consecutive Idle reads 150ms apart to
 /// guard against transient state during the pane redraw.
+///
+/// BEFORE blasting any Escape, this GUARANTEES the interrupt lands on the
+/// main loop and never on a subagent, at BOTH layers where a subagent can be
+/// "selected" (Andrew #1803/#1804 — supersedes the #498 suppression approach):
+///   1. tmux-pane layer: `reselect_main_loop_pane` reselects `pane` (the
+///      configured main-loop pane) if a different tmux pane — e.g. a Claude
+///      Code agent-view pane — is currently the active one.
+///   2. Claude Code FleetView layer: `send_focus_main_keys` returns the
+///      in-pane FleetView selection to `main` (the same mechanism the inject
+///      path already uses). No-op when `[tmux].focus_main_keys` is empty
+///      (the default), so zero regression risk for setups not using it.
 pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
+    // Andrew #1803/#1804: an interrupt must ONLY ever land on the main loop.
+    // Reselect the main-loop tmux pane (if some other pane is active) and
+    // return Claude Code's in-pane FleetView selection to main BEFORE the
+    // Escape blast, so the interrupt can never cancel a subagent's turn.
+    reselect_main_loop_pane(pane).await;
+    send_focus_main_keys(pane).await;
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut escape_count: u32 = 0;
 
@@ -2150,6 +2291,58 @@ pub async fn healthcheck_brief() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Interrupt-only-hits-main-loop (Andrew #1803/#1804) ----
+
+    /// `parse_pane_selected`: both `#{pane_active}` and `#{window_active}`
+    /// must be `1` for the pane to count as foreground-selected. This is the
+    /// signal that decides whether `interrupt_and_wait` reselects the
+    /// main-loop pane before blasting Escape.
+    #[test]
+    fn parse_pane_selected_true_only_when_both_active() {
+        // Active pane in the active window — selected.
+        assert_eq!(parse_pane_selected("1,1"), Some(true));
+        // Active pane but a DIFFERENT window is active — not foreground.
+        assert_eq!(parse_pane_selected("1,0"), Some(false));
+        // Some OTHER pane is active in this window (e.g. an agent-view pane).
+        assert_eq!(parse_pane_selected("0,1"), Some(false));
+        assert_eq!(parse_pane_selected("0,0"), Some(false));
+        // Trailing newline / whitespace from tmux is tolerated.
+        assert_eq!(parse_pane_selected("1,1\n"), Some(true));
+        assert_eq!(parse_pane_selected(" 0 , 1 "), Some(false));
+    }
+
+    /// A failed / malformed tmux query yields `None` so the caller falls back
+    /// to the pre-fix behavior (interrupt without reselecting) rather than
+    /// guessing. Never crash the interrupt path.
+    #[test]
+    fn parse_pane_selected_none_on_malformed() {
+        assert_eq!(parse_pane_selected(""), None);
+        assert_eq!(parse_pane_selected("   "), None);
+        // Missing the second field.
+        assert_eq!(parse_pane_selected("1"), None);
+        // Present-but-empty second field.
+        assert_eq!(parse_pane_selected("1,"), None);
+    }
+
+    /// `reselect_pane_commands`: reselect must `select-window` BEFORE
+    /// `select-pane` (a different window may be active), and both must
+    /// target the passed-in (main-loop) pane spec.
+    #[test]
+    fn reselect_pane_commands_window_then_pane_targeting_main() {
+        let cmds = reselect_pane_commands("claude-container:0.0");
+        assert_eq!(cmds.len(), 2, "reselect = select-window then select-pane");
+        assert_eq!(
+            cmds[0],
+            vec!["tmux", "select-window", "-t", "claude-container:0.0"],
+            "must select the window FIRST (a different window may be active)"
+        );
+        assert_eq!(
+            cmds[1],
+            vec!["tmux", "select-pane", "-t", "claude-container:0.0"],
+            "must then select the pane within that window"
+        );
+    }
 
     /// Regression guard for the "alert text typed but never submitted"
     /// bug (operator-confirmed via screenshot, 2026-06-11). `inject_text`
