@@ -487,6 +487,77 @@ if [ "${CLAUDE_CONTAINER_SNAPSHOT_CONFIG:-0}" = "1" ] \
     unset _snapshot_dest
 fi
 
+# PROJECT-TIER devbar-hook leak fix ("option B: sanitize in the snapshot").
+#
+# The REWRITE_HOOKS=1 path below launches claude with
+# `--setting-sources project,local` to drop the bind-mounted host
+# ~/.claude/settings.json USER tier (whose bare cross-arch hooks hit
+# "Exec format error"). But when an operator ALSO bind-mounts host
+# ~/.claude at the in-container project-cwd path (so <cwd>/.claude's
+# absolute symlink resolves and project-tier slash commands load), that
+# SAME host settings.json becomes Claude Code's PROJECT tier — read RAW
+# from <cwd>/.claude/settings.json, bypassing the user-tier shim. Its
+# bare host hooks (e.g. a devbar `telemetry-usage-hook` Mach-O) then fire
+# on EVERY tool call and spam `PreToolUse/PostToolUse:Bash hook error:
+# ... Exec format error`. Unlike a scalar apiKeyHelper (neutralized via
+# flagSettings precedence in #407), HOOKS MERGE ADDITIVELY across tiers,
+# so the shim can't override the project-tier hooks — the poison tier
+# must not be read at all. And the PROJECT tier is cwd-bound: it reads
+# <cwd>/.claude/settings.json regardless of CLAUDE_CONFIG_DIR, so
+# relocating the config dir does NOT fix it (verified against 2.1.209:
+# CLAUDE_CONFIG_DIR + project,local still fires; user,local does not).
+#
+# Fix: when the snapshot farm is active (CLAUDE_CONFIG_DIR points at a
+# real dir with a settings.json), SANITIZE that farm's user-tier
+# settings.json in place — wrap every hook command in /usr/local/bin/
+# exec-hook (cross-arch hooks silent-no-op) and drop a non-runnable
+# apiKeyHelper — so the USER tier is safe to READ. The snapshot leaves
+# settings.json as a plain symlink to the poison host file; this replaces
+# it with a real sanitized copy (generate-hooks-shim-settings' atomic
+# os.replace clobbers the symlink; the host file is never mutated). We
+# then flip the launch to `--setting-sources user,local` (the sanitized
+# farm user tier REPLACES the poison project tier) + `--mcp-config
+# <cwd>/.mcp.json` (the project-tier .mcp.json is dropped with the
+# project tier, so re-supply it explicitly — MCP servers are auto-
+# approved by the shim's enableAllProjectMcpServers). Project-tier slash
+# commands still load because the farm's commands/ symlink resolves via
+# the user tier. Obligations gate hooks continue to come from the
+# --settings shim (flagSettings), which loads regardless of
+# --setting-sources.
+#
+# NOT injecting obligations into the farm copy (--inject-obligations 0):
+# the shim already carries them and both tiers would double-fire the
+# dispatch/alert counters. The farm copy only needs its host hooks
+# wrapped so they no-op instead of erroring.
+#
+# Fail-safe: on any failure CLAUDE_SHIM_SANITIZED_USER_FARM stays empty
+# and the CLAUDE_CMD block falls back to the existing
+# `--setting-sources project,local` behaviour (unchanged for non-snapshot
+# / non-Mac operators, who have no project-tier poison).
+CLAUDE_SHIM_SANITIZED_USER_FARM=""
+CLAUDE_MCP_CONFIG_PATH=""
+export CLAUDE_SHIM_SANITIZED_USER_FARM CLAUDE_MCP_CONFIG_PATH
+if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ] \
+        && [ -n "${CLAUDE_CONFIG_DIR:-}" ] \
+        && [ -f "${CLAUDE_CONFIG_DIR}/settings.json" ] \
+        && [ -x /usr/local/bin/generate-hooks-shim-settings ]; then
+    /usr/local/bin/generate-hooks-shim-settings \
+        --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
+        --output "${CLAUDE_CONFIG_DIR}/settings.json" \
+        --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
+        --inject-obligations 0 \
+        --mcp-autoapprove 0 \
+        --quiet && CLAUDE_SHIM_SANITIZED_USER_FARM=1
+    # Re-supply the project-tier MCP servers that dropping the project
+    # tier removes. generate-project-mcp-json (run above in the
+    # REWRITE_HOOKS block) writes <CLAUDE_HOST_PROJECT_DIR>/.mcp.json.
+    if [ -n "$CLAUDE_SHIM_SANITIZED_USER_FARM" ] \
+            && [ -n "${CLAUDE_HOST_PROJECT_DIR:-}" ] \
+            && [ -f "${CLAUDE_HOST_PROJECT_DIR}/.mcp.json" ]; then
+        CLAUDE_MCP_CONFIG_PATH="${CLAUDE_HOST_PROJECT_DIR}/.mcp.json"
+    fi
+fi
+
 cleanup() {
     # Best-effort cleanup before the script exits. process-compose (as
     # PID 1) handles the real signal-forwarding + child-reaping
@@ -574,8 +645,14 @@ fi
 # canonical source to inspect; bootstrap re-runs the same logic against
 # the same env vars at session-creation time.
 CLAUDE_CMD="exec claude"
-if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
+if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_FILTER_USER:-}" ] && [ -z "${CLAUDE_SHIM_SANITIZED_USER_FARM:-}" ]; then
     CLAUDE_CMD="exec claude --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+fi
+if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_FILTER_USER:-}" ] && [ -n "${CLAUDE_SHIM_SANITIZED_USER_FARM:-}" ]; then
+    CLAUDE_CMD="exec claude --setting-sources user,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+fi
+if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_SANITIZED_USER_FARM:-}" ] && [ -n "${CLAUDE_MCP_CONFIG_PATH:-}" ]; then
+    CLAUDE_CMD="$CLAUDE_CMD --mcp-config ${CLAUDE_MCP_CONFIG_PATH}"
 fi
 if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -z "${CLAUDE_SHIM_FILTER_USER:-}" ]; then
     CLAUDE_CMD="exec claude --settings ${CLAUDE_SHIM_SETTINGS_PATH}"

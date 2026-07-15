@@ -57,18 +57,33 @@ file the operator rarely edits by hand.
 
 SETTINGS.JSON IS NOT SNAPSHOTTED HERE
 -------------------------------------
-The user-tier ``settings.json`` (which carries the poison apiKeyHelper) is
-already handled elsewhere and is intentionally left as a plain symlink:
-  - When CLAUDE_CONTAINER_REWRITE_HOOKS=1, the entrypoint launches claude
-    with ``--setting-sources project,local`` which DROPS the user tier
-    entirely (the sanitized shim at /tmp/claude-shim/settings.json replaces
-    it), so a churning user-tier settings.json is never read.
-  - The PROJECT-tier settings.json is neutralized by
-    generate-hooks-shim-settings' ``neutralize_poison_project_helper``
-    (writes apiKeyHelper:"" into the flagSettings shim, which outranks the
-    project tier and is itself churn-proof).
-Keeping settings.json a symlink here avoids duplicating that logic and
-keeps this tool's single responsibility crisp: decouple .claude.json.
+This tool leaves ``settings.json`` as a plain SYMLINK to the live host
+file — it does NOT sanitize it. Two consumers act on that symlink AFTER
+this tool runs, in container/entrypoint.sh:
+  - The user tier is dropped by ``--setting-sources project,local`` /
+    replaced by the sanitized shim at /tmp/claude-shim/settings.json when
+    CLAUDE_CONTAINER_REWRITE_HOOKS=1, so a churning user-tier settings.json
+    is never read via the user tier.
+  - PROJECT-TIER devbar-hook leak: when an operator also bind-mounts host
+    ~/.claude at the project-cwd path, the SAME host settings.json becomes
+    Claude Code's PROJECT tier (read raw from <cwd>/.claude/settings.json,
+    which the user-tier shim can't sanitize and CLAUDE_CONFIG_DIR can't
+    relocate — the project tier is cwd-bound). Its bare cross-arch hooks
+    (a devbar Mach-O telemetry-usage-hook) then spam "Exec format error"
+    on every tool call. Because hooks MERGE additively across tiers, the
+    flagSettings shim can't override them (contrast the scalar apiKeyHelper,
+    neutralized via flagSettings precedence in #407). The entrypoint fixes
+    this ("option B: sanitize in the snapshot"): when this farm is active,
+    it runs generate-hooks-shim-settings to SANITIZE this farm's
+    settings.json IN PLACE (the atomic os.replace clobbers the symlink with
+    a real wrapped copy; the host file is never mutated), then flips the
+    launch to ``--setting-sources user,local`` (the sanitized farm user
+    tier replaces the poison project tier) + ``--mcp-config <cwd>/.mcp.json``
+    (re-supplying the MCP servers dropped with the project tier).
+Keeping settings.json a symlink here (rather than sanitizing it in this
+tool) keeps this tool's single responsibility crisp — decouple
+.claude.json — and lets the entrypoint own hook/tier sanitization where
+the launch flags that consume it are also built.
 
 FAIL-SAFE
 ---------

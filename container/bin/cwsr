@@ -141,8 +141,23 @@ fi
 # by the tmux server, which then exports them to every pane.
 build_claude_cmd() {
     local cmd="exec claude"
-    if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ]; then
+    if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -z "${CLAUDE_SHIM_SANITIZED_USER_FARM:-}" ]; then
         cmd="$cmd --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+    fi
+    # PROJECT-tier devbar-hook leak fix (mirror entrypoint.sh): when the
+    # snapshot farm's user-tier settings.json was sanitized in place
+    # (CLAUDE_SHIM_SANITIZED_USER_FARM=1, exported by entrypoint.sh), drop
+    # the cwd-bound poison PROJECT tier by switching to
+    # `--setting-sources user,local` and re-supply the project-tier MCP
+    # servers via --mcp-config. Without this a cwsr respawn would revert to
+    # `project,local` and the bare host hooks would spam "Exec format error"
+    # again. See container/entrypoint.sh's CLAUDE_SHIM_SANITIZED_USER_FARM
+    # block for the full rationale.
+    if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -n "${CLAUDE_SHIM_SANITIZED_USER_FARM:-}" ]; then
+        cmd="$cmd --setting-sources user,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
+        if [ -n "${CLAUDE_MCP_CONFIG_PATH:-}" ]; then
+            cmd="$cmd --mcp-config ${CLAUDE_MCP_CONFIG_PATH}"
+        fi
     fi
     # Mirror entrypoint.sh: append --plugin-dir for the baked container plugin
     # (skills + agents) when it's present. Without this, a cwsr respawn would

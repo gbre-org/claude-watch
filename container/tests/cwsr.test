@@ -145,6 +145,36 @@ def test_print_with_shim_settings() -> None:
     )
 
 
+def test_print_sanitized_user_farm() -> None:
+    """CLAUDE_SHIM_SANITIZED_USER_FARM=1 => the respawn switches to
+    --setting-sources user,local (drops the cwd-bound poison project tier)
+    and re-supplies MCP via --mcp-config. Mirrors entrypoint.sh's
+    PROJECT-tier devbar-hook leak fix so a cwsr respawn doesn't revert to
+    the leaking project,local shape."""
+    lines, _, _, _ = run_cwsr(
+        ["--print"],
+        env={
+            "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/shim.json",
+            "CLAUDE_SHIM_SANITIZED_USER_FARM": "1",
+            "CLAUDE_MCP_CONFIG_PATH": "/Users/me/repos/.mcp.json",
+        },
+    )
+    tmux = [l for l in lines if l.startswith("TMUX:")][0]
+    expect(
+        "--setting-sources user,local" in tmux,
+        f"sanitized farm: TMUX line should include --setting-sources "
+        f"user,local, got {tmux!r}",
+    )
+    expect(
+        "project,local" not in tmux,
+        f"sanitized farm: project tier MUST be dropped, got {tmux!r}",
+    )
+    expect(
+        "--mcp-config /Users/me/repos/.mcp.json" in tmux,
+        f"sanitized farm: TMUX line should include --mcp-config, got {tmux!r}",
+    )
+
+
 def test_print_no_upgrade() -> None:
     """--no-upgrade drops the INSTALL line."""
     lines, _, _, _ = run_cwsr(["--print", "--no-upgrade"])
@@ -248,6 +278,7 @@ TESTS = [
     test_print_version_pin,
     test_print_with_auto_continue,
     test_print_with_shim_settings,
+    test_print_sanitized_user_farm,
     test_print_no_upgrade,
     test_print_upgrade_only,
     test_conflicting_flags_rejected,

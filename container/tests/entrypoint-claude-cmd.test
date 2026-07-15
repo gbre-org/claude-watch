@@ -190,6 +190,82 @@ def test_set_shim_path_exact_form() -> None:
            f"exact form: expected {expected!r}, got {cmd!r}")
 
 
+def test_sanitized_user_farm_switches_to_user_local() -> None:
+    """PROJECT-tier devbar-hook leak fix: when the snapshot farm's
+    user-tier settings.json has been sanitized in place
+    (CLAUDE_SHIM_SANITIZED_USER_FARM=1), the launch flips from
+    `--setting-sources project,local` to `--setting-sources user,local`.
+    Dropping the project tier stops the cwd-bound host
+    <cwd>/.claude/settings.json (raw bare cross-arch hooks) from loading;
+    the sanitized farm now supplies the user tier."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
+        "CLAUDE_SHIM_SANITIZED_USER_FARM": "1",
+    }
+    cmd = run_block(BLOCK, env)
+    expect("--setting-sources user,local" in cmd,
+           f"sanitized farm: expected --setting-sources user,local, got {cmd!r}")
+    expect("project,local" not in cmd,
+           f"sanitized farm: project tier MUST be dropped (it re-reads the "
+           f"poison host settings.json), got {cmd!r}")
+    expect("--settings /tmp/claude-shim/settings.json" in cmd,
+           f"sanitized farm: shim (flagSettings) still loads for obligations, "
+           f"got {cmd!r}")
+
+
+def test_sanitized_user_farm_adds_mcp_config() -> None:
+    """When the sanitized farm switch is active AND a project .mcp.json
+    path is supplied, --mcp-config re-supplies the MCP servers that
+    dropping the project tier removed."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
+        "CLAUDE_SHIM_SANITIZED_USER_FARM": "1",
+        "CLAUDE_MCP_CONFIG_PATH": "/Users/me/repos/.mcp.json",
+    }
+    cmd = run_block(BLOCK, env)
+    expect("--mcp-config /Users/me/repos/.mcp.json" in cmd,
+           f"sanitized farm: expected --mcp-config, got {cmd!r}")
+    expect("--setting-sources user,local" in cmd,
+           f"sanitized farm + mcp: still user,local, got {cmd!r}")
+
+
+def test_sanitized_user_farm_mcp_config_absent_no_flag() -> None:
+    """No --mcp-config when the path env is unset (e.g. no
+    CLAUDE_HOST_PROJECT_DIR / no .mcp.json), even with the farm switch on."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
+        "CLAUDE_SHIM_SANITIZED_USER_FARM": "1",
+    }
+    cmd = run_block(BLOCK, env)
+    expect("--mcp-config" not in cmd,
+           f"no mcp path: --mcp-config should not appear, got {cmd!r}")
+
+
+def test_unsanitized_farm_keeps_project_local() -> None:
+    """Fail-safe: WITHOUT CLAUDE_SHIM_SANITIZED_USER_FARM (snapshot off /
+    sanitization failed), the launch keeps the existing
+    `--setting-sources project,local` behaviour unchanged — no user-tier
+    switch, no --mcp-config."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_FILTER_USER": "1",
+    }
+    cmd = run_block(BLOCK, env)
+    expect("--setting-sources project,local" in cmd,
+           f"unsanitized farm: must keep project,local, got {cmd!r}")
+    expect("user,local" not in cmd,
+           f"unsanitized farm: must NOT switch to user,local, got {cmd!r}")
+    expect("--mcp-config" not in cmd,
+           f"unsanitized farm: must NOT add --mcp-config, got {cmd!r}")
+
+
 def test_obligations_only_additive_no_filter() -> None:
     """Obligations-only path: CLAUDE_SHIM_SETTINGS_PATH set BUT
     CLAUDE_SHIM_FILTER_USER unset → claude loads the shim ADDITIVELY
@@ -395,6 +471,10 @@ TESTS = [
     test_set_shim_path_includes_setting_sources,
     test_set_shim_path_order,
     test_set_shim_path_exact_form,
+    test_sanitized_user_farm_switches_to_user_local,
+    test_sanitized_user_farm_adds_mcp_config,
+    test_sanitized_user_farm_mcp_config_absent_no_flag,
+    test_unsanitized_farm_keeps_project_local,
     test_obligations_only_additive_no_filter,
     test_plugin_dir_absent_no_flag,
     test_plugin_dir_present_appends_flag,
