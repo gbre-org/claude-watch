@@ -39,6 +39,11 @@
 #     appended to the consumed-event ring buffer log at
 #     $LOG_DIR/consumed.jsonl so `claude-event-tail` can show it after
 #     the fact.
+#   - Auto-ingest each delivered event through `event-ack ingest` (unless
+#     $CLAUDE_EVENT_WATCH_AUTO_INGEST=0), routing it into the event-must-act
+#     tier system so the event -> obligation rung of the alerting ladder
+#     arms WITHOUT the main loop having to run `event-ack ingest` by hand.
+#     Best-effort: a missing/failing event-ack CLI never breaks delivery.
 #   - Print the WATCHER EXITED restart banner at the end.
 #
 # The one-liner stdout shape is intentional — the main loop's bash-task view
@@ -284,6 +289,22 @@ maybe_rotate_log() {
     fi
 }
 
+# Whether to auto-ingest each delivered event through `event-ack ingest`
+# (routing it into the actionable pending-actions.json / ambient-context.json
+# tier so the event→obligation rung of the alerting ladder is armed WITHOUT
+# the main loop having to remember a manual `event-ack ingest` step). Default
+# ON; set CLAUDE_EVENT_WATCH_AUTO_INGEST=0 to disable (e.g. a host that runs
+# no event-must-act gate). Best-effort in all cases — a missing / failing
+# event-ack CLI never breaks event delivery. See the design note in
+# process_event's Python block.
+AUTO_INGEST="${CLAUDE_EVENT_WATCH_AUTO_INGEST:-1}"
+# Resolve the event-ack CLI ONCE (PATH lookup) so we don't re-search per
+# event. Empty when unavailable → auto-ingest silently degrades to a no-op.
+EVENT_ACK_CLI=""
+if [[ "$AUTO_INGEST" == "1" ]]; then
+    EVENT_ACK_CLI="$(command -v event-ack 2>/dev/null || true)"
+fi
+
 # Process one event file: print a single one-liner to stdout AND append
 # the compact JSON form to the log. We delegate JSON munging to Python so
 # we don't depend on jq being installed (it isn't on every system).
@@ -294,8 +315,8 @@ maybe_rotate_log() {
 process_event() {
     local f="$1"
     local log="$2"
-    python3 -u - "$f" "$log" <<'PYEOF'
-import json, os, sys
+    EVENT_ACK_CLI="$EVENT_ACK_CLI" python3 -u - "$f" "$log" <<'PYEOF'
+import json, os, subprocess, sys
 src, log = sys.argv[1], sys.argv[2]
 try:
     with open(src, "r", encoding="utf-8", errors="replace") as fp:
@@ -307,7 +328,10 @@ except Exception as e:
 
 source = str(ev.get("source", "unknown"))
 tag = str(ev.get("tag", "untagged"))
-message = str(ev.get("message", ""))
+# Full (untruncated) message for ingest/classify — the classifier keys on
+# substrings (e.g. "CI failure") that a 60-char truncation could cut off.
+full_message = str(ev.get("message", ""))
+message = full_message
 # Collapse whitespace; truncate at 60 chars + ellipsis.
 message = " ".join(message.split())
 if len(message) > 60:
@@ -344,6 +368,39 @@ try:
     os.write(fd, data)
 finally:
     os.close(fd)
+
+# --- Auto-ingest into the event-must-act tier system ----------------------
+# The delivery layer is the ONE chokepoint every event flows through exactly
+# once (the watcher drains + deletes each file), which makes it the right
+# place to route an event into `event-ack ingest`. Without this, the
+# event -> obligation rung of the alerting ladder (docs/concepts/
+# event-hierarchy.md) never arms automatically: `event-ack ingest` populates
+# pending-actions.json (actionable tier, which the event_must_act obligation
+# gates on) / ambient-context.json (the UserPromptSubmit inject), and NOTHING
+# else calls it. The main loop was expected to run `event-ack ingest` by hand
+# per event, so an orphaned/stuck queue item (or any actionable event) that
+# the loop didn't manually ingest sat silently — emitted + delivered, but
+# never arming the gate. Auto-ingesting here closes that gap for EVERY event
+# type, orphan/stuck included.
+#
+# Strictly best-effort: any failure (CLI missing, non-zero exit, timeout,
+# OSError) is swallowed so event DELIVERY — the watcher's core contract — is
+# never broken by an ingest hiccup. event-ack itself is default-open +
+# flock-guarded, and idempotent (add_pending dedups on key), so a re-ingest
+# across watcher restarts is harmless. We pass the FULL (untruncated) message
+# so event-classify's substring rules (e.g. "CI failure") match correctly.
+cli = os.environ.get("EVENT_ACK_CLI", "")
+if cli:
+    try:
+        subprocess.run(
+            [cli, "ingest", "--source", source, "--tag", tag,
+             "--message", full_message],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+    except Exception:
+        # Never let an ingest failure break event delivery.
+        pass
 PYEOF
 }
 
