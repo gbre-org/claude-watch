@@ -103,6 +103,42 @@ main {
   gap: 8px;
 }
 
+/* ------- collapsible header (botchat #1762) -------
+   A disclosure caret before the title folds the header controls (source
+   filter, liveness dot, info popup) away, leaving ONLY the title (LEFT) and
+   the count pills (RIGHT). Purely client-side, persisted in localStorage
+   (`qsite_header_collapsed`); restored flash-free by the <head> pre-paint
+   guard in index.html. Mirrors the pr-watch minisite's `header-collapsed`
+   pattern. */
+.topbar .title .header-toggle {
+  background: none;
+  border: none;
+  color: var(--fg-mute);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: transform 0.15s ease, color 0.15s ease;
+}
+.topbar .title .header-toggle:hover {
+  color: var(--fg-emph);
+  background: var(--bg);
+}
+/* Collapsed: chevron points right (▸ via a 90° rotation of ▾). */
+html.header-collapsed .topbar .title .header-toggle {
+  transform: rotate(-90deg);
+}
+/* When collapsed, hide the header controls — the source-filter, the liveness
+   dot, and the (i) info popup (which now carries the moved clock, #492). The
+   count pills stay visible (they are the at-a-glance state); the title +
+   caret stay on the left. */
+html.header-collapsed .topbar .source-filter-label,
+html.header-collapsed .topbar .dot,
+html.header-collapsed .topbar .info-wrap {
+  display: none;
+}
+
 .topbar .title .logo {
   width: 28px;
   height: 28px;

@@ -47,3 +47,46 @@
     else close();
   });
 })();
+
+// Collapsible header (botchat #1762).
+//
+// A disclosure caret before the title folds the header controls (source
+// filter, liveness dot, info popup) away, leaving only the title (left) and
+// the count pills (right). Purely client-side; the collapsed state is
+// persisted in localStorage (key `qsite_header_collapsed`) and restored
+// flash-free by the <head> pre-paint guard in index.html (which adds the
+// `header-collapsed` class to <html> before paint). Mirrors the pr-watch
+// minisite's `header-toggle` pattern.
+//
+// The class lives on <html> (not #topbar-meta), so the 5s refresh.js SPA
+// tick — which rebuilds #topbar-meta via morphdom — never disturbs the
+// collapsed state.
+(function () {
+  'use strict';
+
+  const KEY = 'qsite_header_collapsed';
+  const root = document.documentElement;
+  const btn = document.getElementById('header-toggle');
+  if (!btn) return;
+
+  function sync() {
+    const collapsed = root.classList.contains('header-collapsed');
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    btn.setAttribute(
+      'aria-label',
+      collapsed ? 'Expand header controls' : 'Collapse header controls'
+    );
+  }
+
+  sync(); // reflect the initial state applied by the <head> restore
+
+  btn.addEventListener('click', () => {
+    const collapsed = root.classList.toggle('header-collapsed');
+    try {
+      localStorage.setItem(KEY, collapsed ? '1' : '0');
+    } catch (e) {
+      /* localStorage unavailable — collapse still works for this session */
+    }
+    sync();
+  });
+})();

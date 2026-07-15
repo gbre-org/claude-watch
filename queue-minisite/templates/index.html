@@ -24,6 +24,21 @@
      <details> expansion, scroll position, or focus. Loaded ahead of refresh.js
      so the global `morphdom` is available before the first tick. #}
   <script src="{{ url_for('static', filename='vendor/morphdom-2.7.4.min.js') }}"></script>
+  {# COLLAPSIBLE HEADER (botchat #1762) — early restore. Apply the persisted
+     collapsed state to <html> DURING head parsing, before the body paints, so
+     a collapsed header never flashes open on load. Mirrors the pr-watch
+     minisite's `header-collapsed` pattern (its `prwatch_header_collapsed`
+     localStorage key + <head> pre-paint guard). The end-of-body handler in
+     info.js wires the caret toggle + keeps localStorage in sync. #}
+  <script>
+  (function () {
+    try {
+      if (localStorage.getItem("qsite_header_collapsed") === "1") {
+        document.documentElement.classList.add("header-collapsed");
+      }
+    } catch (e) { /* localStorage unavailable — default to expanded */ }
+  })();
+  </script>
 </head>
 <body>
   {#- ---------- RECURSIVE SUBAGENT NODE MACRO ----------
@@ -64,6 +79,15 @@
   {%- endmacro -%}
   <header class="topbar">
     <div class="title">
+      {#- HEADER COLLAPSE (botchat #1762): a caret button that folds the header
+          controls (source filter, liveness dot, info popup) down to a minimal
+          bar — only the title (LEFT) and the count pills (RIGHT) stay visible.
+          Pure client-side: toggles the `header-collapsed` class on <html> +
+          persists to localStorage (key `qsite_header_collapsed`). Mirrors the
+          pr-watch minisite's `header-toggle` pattern. Handler in info.js. -#}
+      <button type="button" id="header-toggle" class="header-toggle"
+              aria-expanded="true" aria-label="Collapse header controls"
+              title="Collapse or expand the header controls">&#9662;</button>
       {% if site_logo_url %}
         <img src="{{ site_logo_url }}" alt="" class="logo">
       {% elif site_logo_default %}
