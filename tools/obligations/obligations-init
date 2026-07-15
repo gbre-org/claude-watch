@@ -878,6 +878,7 @@ def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
           "deny_msg":      "...",                     # REQUIRED (str)
           "created_by":    "myrepo:presence-gate",         # optional (str)
           "mandatory":     false,                     # optional (bool)
+          "drain_before_dispatch": false,             # optional (bool)
           "exempt_tool_patterns": ["Bash:^foo"],      # optional (list[str])
           "satisfied_by_tool": null,                  # optional (str)
           "satisfied_by_cmd_regex": null              # optional (str)
@@ -961,6 +962,8 @@ def _apply_one_manifest(cli: str, path: str, *, existing: list[dict],
     ]
     if spec.get("mandatory"):
         cmd.append("--mandatory")
+    if spec.get("drain_before_dispatch"):
+        cmd.append("--drain-before-dispatch")
     sbt = spec.get("satisfied_by_tool")
     if isinstance(sbt, str) and sbt:
         cmd.extend(["--satisfied-by-tool", sbt])

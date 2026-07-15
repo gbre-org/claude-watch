@@ -535,6 +535,33 @@ def _session_task_queue_subcommand(command_string):
     return m.group(1) if m else None
 
 
+# MUTATING `session-task queue` subcommands the MAIN loop must not run while a
+# mandatory-drain gate (see `drain_before_dispatch`, below) is FIRING. These
+# are the task-DISPATCH / lifecycle-MUTATION verbs -- "managing task work". The
+# universal recovery floor (`Bash:^session-task\b`) allows EVERY session-task
+# command past every obligation so a wedged loop can always dispatch; but a
+# `drain_before_dispatch` gate temporarily carves THIS subset (plus `Agent`)
+# OUT of the floor so the loop MUST clear the gate (drain+ack botchat) before
+# spawning / managing task work. Once the gate is satisfied the full floor is
+# restored -- pure ORDERING, never a deadlock (the gate's own clear-path
+# stays unconditionally floored; see `_mandatory_drain_gate_firing`).
+#
+# NOTE what stays FLOORED even while the drain gate fires (so the loop can
+# always recover): read-only subcommands (status/spawn-check/show/list/scope/
+# groups/ready/banner/locks), `register` (the documented claim-the-slot /
+# rotated-q-id recovery verb -- and it cannot itself dispatch), and `heartbeat`
+# (liveness maintenance of ALREADY-running work, not new dispatch). This mirrors
+# SUBAGENT_BANNED_QUEUE_SUBCOMMANDS's exclusion of `register` for the same
+# reason. `reprioritize` is added here (it reorders the dispatch queue) though
+# it is absent from the subagent set.
+MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS = frozenset({
+    "add", "done", "abandon", "resurrect", "pop", "wedge", "unwedge",
+    "block", "unblock", "force-start", "promote", "set-summary",
+    "update-scope", "reprioritize", "depend", "prune", "lock", "unlock",
+    "migrate",
+})
+
+
 UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
     # The escape hatch itself. `obligations override` MUST always work --
     # it's the documented recovery for any deadlock scenario. Same for
@@ -2655,8 +2682,76 @@ def _exempt_match(exempt_patterns, tool_name, command_string):
     return (False, None)
 
 
+def _firing_drain_gates(data, now=None, agent_id=None, agent_type=None):
+    """Return the list of ACTIVE, gate-mode, ``drain_before_dispatch``
+    obligations that are CURRENTLY FIRING (predicate unsatisfied) for this
+    caller. Empty list => no drain gate is firing.
+
+    A ``drain_before_dispatch`` gate (the botchat mark-read gate is the case)
+    is a full-block ``tool_pattern:"*"`` operator gate that has an INDEPENDENT
+    clear-path (drain + ack botchat) declared in its own ``exempt_patterns``.
+    While it is firing, ``_universal_recovery_exempt_match`` uses these rows to:
+
+      1. ELEVATE each firing gate's ``exempt_patterns`` (its declared
+         CLEAR-PATH) into the framework floor, so the clear-path punches
+         through EVERY co-firing gate. Without this, a simultaneously-firing
+         ``queue_ready_unspawned`` / ``event_must_act`` (tool_pattern ``Bash``,
+         which does NOT exempt botchat CLIs) would block the very
+         ``botchat-send --mark-read`` that clears the drain gate -- a NEW
+         mutual deadlock. Elevating the clear-path preserves the invariant
+         "the loop can ALWAYS drain + ack botchat".
+      2. DROP the task-dispatch surface (``Agent`` +
+         MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS) from the floor, so the
+         loop MUST clear the gate before spawning / managing task work
+         (drain-first ordering).
+
+    Deadlock-safety: this NEVER keys on "any firing ``*`` gate" -- doing so
+    would deadlock the DISPATCH-RECOVERY gates (``queue_ready_unspawned`` /
+    ``stale_ready_queue_present`` / ``event_must_act``), whose ONLY clear-path
+    IS ``Agent`` / ``session-task`` dispatch (incident 2026-06-03). It fires
+    ONLY for rows that OPT IN via ``drain_before_dispatch: true`` -- i.e. gates
+    the operator has certified have a dispatch-independent clear-path. And it
+    only narrows the floor WHILE the gate is unsatisfied: once drained, the
+    full floor is restored, so this is pure ORDERING ("drain first"), never a
+    standing deadlock.
+
+    Evaluated against the SAME snapshot ``data`` the caller already read, so no
+    extra lock / re-read. Predicate is evaluated with NO command context
+    (tool="", command="") -- a drain gate's firing state (unread botchat)
+    depends only on external state, not the tool being checked. An active
+    override that bypasses the drain row makes it non-firing (the loop chose
+    the escape hatch); expired / inform-mode / non-opt-in rows are ignored.
+    """
+    if now is None:
+        now = _now()
+    active_ov = _active_override(data, now)
+    firing = []
+    for ob in data.get("obligations", []):
+        if not ob.get("drain_before_dispatch"):
+            continue
+        if _is_expired(ob, now):
+            continue
+        if ob.get("enforcement", "gate") == "inform":
+            continue
+        # An active override covering this row means the loop deliberately
+        # chose the escape hatch -- do not keep narrowing the floor.
+        if active_ov is not None and _override_bypasses_obligation(active_ov, ob):
+            continue
+        pred = ob.get("predicate", {}) or {}
+        # Evaluate the gate's OWN firing state independent of the tool being
+        # checked: a drain gate fires on external state (unread messages), so
+        # its satisfied/firing status must not depend on which tool call is
+        # currently being gated.
+        ok, _why = _eval_predicate(pred, "", "",
+                                   agent_id=agent_id, agent_type=agent_type)
+        if not ok:
+            firing.append(ob)
+    return firing
+
+
 def _universal_recovery_exempt_match(tool_name, command_string,
-                                     agent_id=None, agent_type=None):
+                                     agent_id=None, agent_type=None,
+                                     firing_drain_gates=None):
     """Return (matched: bool, which: str|None) against
     ``UNIVERSAL_RECOVERY_EXEMPT_PATTERNS``.
 
@@ -2672,14 +2767,43 @@ def _universal_recovery_exempt_match(tool_name, command_string,
     subcommand (``SUBAGENT_BANNED_QUEUE_SUBCOMMANDS``) is NOT floored -- it
     is carved out so the per-row ``subagent_queue_mutating_banned`` predicate
     gets to run and DENY. Read-only subcommands + ``register`` (recovery) are
-    still floored for everyone. The main-loop floor is left fully intact:
-    this NEVER narrows the recovery surface the main loop relies on.
+    still floored for everyone. The main-loop floor is otherwise left fully
+    intact.
+
+    MAIN-LOOP DRAIN CARVE-OUT: when ``drain_gate_firing`` is True (an active,
+    unsatisfied ``drain_before_dispatch`` gate -- the botchat mark-read gate),
+    the MAIN loop's task-DISPATCH surface (``Agent`` + the mutating
+    ``session-task queue`` subcommands in
+    MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS) is ALSO carved out of the floor
+    so the loop must clear the gate (drain + ack botchat) before spawning /
+    managing task work. Everything else the loop needs to RECOVER stays floored
+    unconditionally: read-only + `register` + `heartbeat` `session-task queue`
+    subcommands, `obligations`, watcher recovery, Read, ToolSearch, self-clear,
+    and (via the row's own exempt_patterns) the botchat read/ack CLIs. So the
+    loop can ALWAYS (a) drain+ack botchat, (b) run recovery / override; ONLY
+    new-task-dispatch is gated, and ONLY while the gate is unsatisfied.
 
     See ``UNIVERSAL_RECOVERY_EXEMPT_PATTERNS`` for the full rationale + list.
     """
     matched, which = _exempt_match(
         UNIVERSAL_RECOVERY_EXEMPT_PATTERNS, tool_name, command_string,
     )
+    # CLEAR-PATH ELEVATION: while any drain gate is firing, its own declared
+    # clear-path (exempt_patterns -- e.g. the botchat read/ack CLIs) is
+    # elevated into the framework floor, so it punches through EVERY co-firing
+    # gate (a simultaneously-firing queue_ready_unspawned / event_must_act,
+    # which does not exempt botchat CLIs, would otherwise block the very
+    # command that clears the drain gate). This is a PURE WIDENING of the floor
+    # -- it can only ALLOW more, never block -- so it cannot introduce a
+    # deadlock. Checked before the dispatch carve-out so an elevated clear-path
+    # command is never mistaken for dispatch.
+    if not matched and firing_drain_gates:
+        for _dg in firing_drain_gates:
+            ehit, epat = _exempt_match(
+                _dg.get("exempt_patterns") or [], tool_name, command_string,
+            )
+            if ehit:
+                return (True, epat)
     if (matched and tool_name == "Bash"
             and _is_subagent_context(agent_id, agent_type)):
         subcmd = _session_task_queue_subcommand(command_string)
@@ -2689,6 +2813,20 @@ def _universal_recovery_exempt_match(tool_name, command_string,
             # subagent_queue_mutating_banned can DENY. (The main loop keeps
             # the unconditional floor -- this branch requires agent_id.)
             return (False, None)
+    # MAIN-LOOP DRAIN CARVE-OUT: while a `drain_before_dispatch` gate is firing,
+    # drop the task-dispatch surface (Agent + mutating `session-task queue`
+    # subcommands) from the floor so the loop must clear the gate first. This
+    # is main-loop-only: a subagent that reached here already failed the
+    # subagent branch above, and drain gates are `all_of [is_main_loop, ...]`
+    # so they never fire in a subagent anyway.
+    if matched and firing_drain_gates and not _is_subagent_context(
+            agent_id, agent_type):
+        if tool_name == "Agent":
+            return (False, None)
+        if tool_name == "Bash":
+            subcmd = _session_task_queue_subcommand(command_string)
+            if subcmd in MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS:
+                return (False, None)
     return (matched, which)
 
 
@@ -2766,6 +2904,8 @@ def cmd_add(args):
             "satisfied_by": satisfied_by,
             "deny_message": args.deny_msg,
             "mandatory": mandatory,
+            "drain_before_dispatch": bool(
+                getattr(args, "drain_before_dispatch", False)),
         }
         data["obligations"].append(ob)
         _write_unlock(fh, data)
@@ -2835,7 +2975,10 @@ def cmd_list(args):
         )
         enforcement = ob.get("enforcement", "gate")
         mandatory_tag = " MANDATORY" if _is_obligation_mandatory(ob) else ""
-        print(f"  {ob.get('id')} [{when}] enforcement={enforcement}{mandatory_tag}")
+        drain_tag = " DRAIN-BEFORE-DISPATCH" if ob.get(
+            "drain_before_dispatch") else ""
+        print(f"  {ob.get('id')} [{when}] "
+              f"enforcement={enforcement}{mandatory_tag}{drain_tag}")
         print(f"    tool_pattern: {ob.get('tool_pattern')}")
         if ob.get("exempt_patterns"):
             print(f"    exempt_patterns: {ob['exempt_patterns']}")
@@ -3252,8 +3395,15 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None,
     # watcher recovery surface always work, no matter which combination of
     # obligations is active. See UNIVERSAL_RECOVERY_EXEMPT_PATTERNS for
     # the rationale + the list.
+    # `drain_before_dispatch` gates that are CURRENTLY firing: their declared
+    # clear-path is elevated into the floor AND the task-dispatch surface is
+    # dropped from it (see _universal_recovery_exempt_match). Same snapshot.
+    firing_drain = _firing_drain_gates(
+        data, now=now, agent_id=agent_id, agent_type=agent_type,
+    )
     universal_hit, _universal_pat = _universal_recovery_exempt_match(
         tool_name, command_string, agent_id=agent_id, agent_type=agent_type,
+        firing_drain_gates=firing_drain,
     )
     if universal_hit:
         return (True, [])
@@ -3560,6 +3710,22 @@ def build_parser():
                             "`stale_ready_queue_present`, including when "
                             "nested under `all_of`) are AUTO-mandatory and "
                             "ignore this flag.")
+    p_add.add_argument("--drain-before-dispatch", action="store_true",
+                       help="mark this as a MANDATORY-DRAIN gate: while it is "
+                            "FIRING (predicate unsatisfied), the MAIN loop's "
+                            "task-dispatch surface (the Agent tool + mutating "
+                            "`session-task queue` subcommands) is dropped from "
+                            "the universal recovery floor, so the loop MUST "
+                            "clear this gate before spawning / managing task "
+                            "work. Use ONLY for a full-block (tool_pattern:'*') "
+                            "gate that has a DISPATCH-INDEPENDENT clear-path "
+                            "(e.g. the botchat mark-read gate: drain + ack "
+                            "botchat). Never set it on a dispatch-RECOVERY gate "
+                            "(queue_ready_unspawned / stale_ready_queue_present "
+                            "/ event_must_act) whose only clear-path IS "
+                            "dispatch -- that would deadlock (incident "
+                            "2026-06-03). Recovery / override / read-only "
+                            "session-task / botchat read+ack stay floored.")
     p_add.add_argument("--json", action="store_true", help="emit JSON")
     p_add.set_defaults(func=cmd_add)
 
