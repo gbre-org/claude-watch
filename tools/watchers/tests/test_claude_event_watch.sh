@@ -63,6 +63,12 @@ QUEUE="$TMP/queue"
 LOG_DIR="$TMP/log"
 mkdir -p "$QUEUE" "$LOG_DIR"
 
+# Isolate the event-must-act state dir into the tempdir so auto-ingest (if a
+# real event-ack happens to be on PATH) never mutates the user's real
+# ~/.config/claude-events during the test run.
+export CLAUDE_EVENT_STATE_DIR="$TMP/event-state"
+mkdir -p "$CLAUDE_EVENT_STATE_DIR"
+
 # Pre-load one event into the queue
 python3 - "$QUEUE" <<'PYEOF'
 import json, sys, time
@@ -119,6 +125,108 @@ print('  log entry OK')
     echo "FAIL: consumed.jsonl content mismatch" >&2
     exit 1
 fi
+
+# --- Auto-ingest into the event-must-act tier system ---------------------
+# The watcher should route each delivered event through `event-ack ingest`
+# so the event->obligation rung arms without a manual main-loop step. We
+# provide a fake `event-ack` on PATH that records its args, and verify (a)
+# an actionable event (queue-orphaned) is ingested with the FULL message,
+# and (b) CLAUDE_EVENT_WATCH_AUTO_INGEST=0 disables it.
+AIQ="$TMP/aiq"; AILOG="$TMP/ailog"; FAKEBIN="$TMP/fakebin"
+mkdir -p "$AIQ" "$AILOG" "$FAKEBIN"
+INGEST_RECORD="$TMP/ingest-calls.log"
+cat >"$FAKEBIN/event-ack" <<FAKE
+#!/bin/bash
+# Fake event-ack: record ingest invocations for the test to inspect.
+printf '%s\n' "\$*" >>"$INGEST_RECORD"
+exit 0
+FAKE
+chmod +x "$FAKEBIN/event-ack"
+
+# (k) auto-ingest ON (default): an actionable orphan event is ingested.
+: >"$INGEST_RECORD"
+python3 - "$AIQ" <<'PYEOF'
+import json, sys, time
+q = sys.argv[1]
+ev = {"timestamp": time.time(), "source": "claude-watch",
+      "tag": "queue-orphaned",
+      "message": "1 queue item orphaned: q-2026-07-15-abcd",
+      "data": {"condition": "orphaned"}}
+with open(f"{q}/100_orphan.json", "w") as f:
+    json.dump(ev, f)
+PYEOF
+PATH="$FAKEBIN:$PATH" CLAUDE_EVENT_QUEUE="$AIQ" CLAUDE_EVENT_LOG_DIR="$AILOG" \
+    "$WATCHER" --debounce 0 >/dev/null 2>&1
+if [[ ! -s "$INGEST_RECORD" ]]; then
+    echo "FAIL: auto-ingest did not invoke event-ack for a delivered event" >&2
+    exit 1
+fi
+if ! grep -q 'ingest --source claude-watch --tag queue-orphaned' "$INGEST_RECORD"; then
+    echo "FAIL: auto-ingest passed wrong source/tag" >&2
+    cat "$INGEST_RECORD" >&2
+    exit 1
+fi
+# Full (untruncated) message must be forwarded so classify substring rules match.
+if ! grep -q 'q-2026-07-15-abcd' "$INGEST_RECORD"; then
+    echo "FAIL: auto-ingest did not forward the full message" >&2
+    cat "$INGEST_RECORD" >&2
+    exit 1
+fi
+echo "  auto-ingest: actionable event routed through event-ack ingest OK"
+
+# (l) auto-ingest OFF via env: event delivered but NOT ingested.
+: >"$INGEST_RECORD"
+python3 - "$AIQ" <<'PYEOF'
+import json, sys, time
+q = sys.argv[1]
+ev = {"timestamp": time.time(), "source": "manual", "tag": "smoke2",
+      "message": "no ingest please", "data": {}}
+with open(f"{q}/110_noingest.json", "w") as f:
+    json.dump(ev, f)
+PYEOF
+out=$(PATH="$FAKEBIN:$PATH" CLAUDE_EVENT_WATCH_AUTO_INGEST=0 \
+    CLAUDE_EVENT_QUEUE="$AIQ" CLAUDE_EVENT_LOG_DIR="$AILOG" \
+    "$WATCHER" --debounce 0 2>&1)
+if ! grep -q '^EVENT\[manual/smoke2\]' <<<"$out"; then
+    echo "FAIL: event not delivered with auto-ingest disabled" >&2
+    echo "$out" >&2
+    exit 1
+fi
+if [[ -s "$INGEST_RECORD" ]]; then
+    echo "FAIL: CLAUDE_EVENT_WATCH_AUTO_INGEST=0 should NOT ingest" >&2
+    cat "$INGEST_RECORD" >&2
+    exit 1
+fi
+echo "  auto-ingest: disabled via CLAUDE_EVENT_WATCH_AUTO_INGEST=0 OK"
+
+# (m) auto-ingest is best-effort: a FAILING event-ack must not break delivery.
+FAILBIN="$TMP/failbin"; mkdir -p "$FAILBIN"
+cat >"$FAILBIN/event-ack" <<'FAKE'
+#!/bin/bash
+echo "boom" >&2
+exit 1
+FAKE
+chmod +x "$FAILBIN/event-ack"
+python3 - "$AIQ" <<'PYEOF'
+import json, sys, time
+q = sys.argv[1]
+ev = {"timestamp": time.time(), "source": "manual", "tag": "smoke3",
+      "message": "delivery survives ingest failure", "data": {}}
+with open(f"{q}/120_failingest.json", "w") as f:
+    json.dump(ev, f)
+PYEOF
+out=$(PATH="$FAILBIN:$PATH" CLAUDE_EVENT_QUEUE="$AIQ" CLAUDE_EVENT_LOG_DIR="$AILOG" \
+    "$WATCHER" --debounce 0 2>&1)
+if ! grep -q '^EVENT\[manual/smoke3\]' <<<"$out"; then
+    echo "FAIL: a failing event-ack broke event delivery (must be best-effort)" >&2
+    echo "$out" >&2
+    exit 1
+fi
+if [[ -f "$AIQ/120_failingest.json" ]]; then
+    echo "FAIL: queue file not deleted after best-effort ingest failure" >&2
+    exit 1
+fi
+echo "  auto-ingest: best-effort — delivery survives a failing event-ack OK"
 
 # Test malformed event: should print a placeholder one-liner, NOT crash
 echo "not valid json" >"$QUEUE/200_bad.json"
