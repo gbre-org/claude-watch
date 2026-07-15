@@ -142,6 +142,45 @@ sets do not overlap form a deadlock. The universal recovery floor is
 the structural guarantee that the recovery surface always overlaps —
 no obligation author can accidentally close it off.
 
+## `drain_before_dispatch` — force drain before task-dispatch
+
+A full-block (`tool_pattern:"*"`) operator gate can opt in with
+`--drain-before-dispatch` (manifest key `drain_before_dispatch: true`) to
+FORCE the MAIN loop to clear the gate before it spawns or manages task
+work. The motivating case is the botchat mark-read gate: the loop should
+drain + ack operator messages BEFORE dispatching agents, not while messages
+sit unread.
+
+While such a gate is FIRING (its predicate unsatisfied), the framework floor
+adjusts two ways for MAIN-loop calls (`_universal_recovery_exempt_match`):
+
+  1. **Drops the task-dispatch surface** from the floor — the `Agent` tool +
+     the mutating `session-task queue` subcommands in
+     `MAIN_LOOP_DISPATCH_GATED_QUEUE_SUBCOMMANDS` (add/done/abandon/block/
+     unblock/reprioritize/depend/promote/…). Those fall through to per-row
+     evaluation, so the drain gate DENIES them. The loop MUST drain first.
+  2. **Elevates the firing gate's own `exempt_patterns`** (its declared
+     clear-path — e.g. the botchat read/ack CLIs) INTO the floor, so the
+     clear-path punches through EVERY co-firing gate. Without this, a
+     simultaneously-firing `queue_ready_unspawned` / `event_must_act` (which
+     doesn't exempt botchat CLIs) would block the very command that clears
+     the drain gate — a new deadlock.
+
+What stays floored the whole time (so recovery is never lost): read-only +
+`register` + `heartbeat` `session-task queue` subcommands, `obligations`,
+watcher recovery, `Read`, `ToolSearch`, `self-clear`, and the gate's own
+clear-path. So the loop can ALWAYS (a) drain+ack the gate, (b) run
+recovery / override; ONLY new-task-dispatch is gated, and ONLY while the
+gate is unsatisfied — pure ORDERING ("drain first"), never a standing
+deadlock. Once drained, the full floor is restored.
+
+Deadlock-safety (critical): this is STRICTLY OPT-IN. It NEVER keys on "any
+firing `*` gate". Set it ONLY on a gate with a DISPATCH-INDEPENDENT
+clear-path. NEVER set it on a dispatch-RECOVERY gate
+(`queue_ready_unspawned` / `stale_ready_queue_present` / `event_must_act`)
+whose only clear-path IS dispatch — that would deadlock (incident
+2026-06-03).
+
 ## State files
 
   - `~/.config/claude/obligations.json` (0600) — persistent state.
