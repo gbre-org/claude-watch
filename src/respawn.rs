@@ -292,6 +292,83 @@ pub fn count_active_subagents_with_versions_dir(versions_dir_override: Option<&s
     u32::try_from(agent_children).unwrap_or(u32::MAX)
 }
 
+/// Count subagents that are alive RIGHT NOW, combining two orthogonal
+/// signals so a subagent is seen whether or not it currently owns a child
+/// tool process:
+///
+///   1. `count_active_subagents_with_versions_dir` — the /proc child-process
+///      count. Sees a subagent ONLY while it has a live tool child (Bash,
+///      etc.). BLIND during pure model thinking: an in-process subagent
+///      (Claude Code >= 2.1.x runs subagents in the parent process, sharing
+///      its PID) that is between tool calls has NO child PID at all.
+///   2. JSONL transcript freshness — `active_agents::collect_with_max_age`
+///      scans the session's `subagents/` dir and marks an agent `alive` iff
+///      its transcript was written within `alive_max_age_secs`. Subagents
+///      write a JSONL frame on every model turn AND every tool call, so a
+///      transcript touched in the last `alive_max_age_secs` means the
+///      subagent is live even mid-thought (no child process required).
+///
+/// The count is the MAX of the two: signal (1) never over-reports, and
+/// signal (2) is the transcript-based backstop that catches the
+/// thinking-but-childless case. This is the fix for the recurring
+/// "claude-watch sends interrupts to a running agent" leak: the prolonged-
+/// thinking / context-warning / heartbeat-stale / auto-respawn suppression
+/// gates keyed on signal (1) alone, so a subagent doing a long generation
+/// (the exact case an Escape interrupt hurts) was counted as 0 and the
+/// daemon fired the turn-cancelling Escape into the shared pane, aborting
+/// the subagent's turn. See `active_agents::ActiveAgents::subagents` doc
+/// (the "ONLY shows up while it has an active child tool process" note) for
+/// why the /proc signal is structurally insufficient on its own.
+///
+/// `alive_max_age_secs` is the transcript-freshness window (typically
+/// `active_agents::DEFAULT_AGENT_ALIVE_MAX_AGE_SECS`, 120s — comfortable
+/// headroom for a long thinking pass without false-positive death).
+///
+/// Determinism for tests: when `versions_dir_override` is `Some(_)` (the
+/// test contract for "force the no-PID / fail-open path"), the JSONL scan
+/// is SKIPPED entirely and only the /proc count (which the override already
+/// forces to 0 via a non-existent versions dir) is returned. Production
+/// passes `None`, enabling the JSONL backstop.
+pub fn count_alive_subagents_with_versions_dir(
+    versions_dir_override: Option<&str>,
+    alive_max_age_secs: u64,
+) -> u32 {
+    let proc_count = count_active_subagents_with_versions_dir(versions_dir_override);
+    // Test / forced-fail-open path: skip the JSONL scan so unit tests that
+    // point at a non-existent versions dir stay hermetic (no dependency on
+    // the real ~/.claude/projects tree of the machine running the test).
+    if versions_dir_override.is_some() {
+        return proc_count;
+    }
+    let jsonl_alive = crate::active_agents::collect_with_max_age(alive_max_age_secs)
+        .agents
+        .iter()
+        .filter(|a| a.alive)
+        .count();
+    let jsonl_alive = u32::try_from(jsonl_alive).unwrap_or(u32::MAX);
+    combine_alive_counts(proc_count, jsonl_alive)
+}
+
+/// Pure combinator: the alive-subagent count is the MAX of the /proc
+/// child-process count and the JSONL-transcript alive count. MAX (not sum)
+/// so a subagent that BOTH owns a live child process AND has a fresh
+/// transcript is counted once, while a subagent visible via only one signal
+/// (the mid-thought case: fresh transcript, no child) is still counted.
+pub(crate) fn combine_alive_counts(proc_count: u32, jsonl_alive: u32) -> u32 {
+    proc_count.max(jsonl_alive)
+}
+
+/// Production convenience wrapper: `count_alive_subagents_with_versions_dir`
+/// with `None` (real versions dir) and the default transcript-freshness
+/// window. This is the call the daemon's interrupt / respawn suppression
+/// gates use.
+pub fn count_alive_subagents() -> u32 {
+    count_alive_subagents_with_versions_dir(
+        None,
+        crate::active_agents::DEFAULT_AGENT_ALIVE_MAX_AGE_SECS,
+    )
+}
+
 /// Result of an attempted respawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RespawnOutcome {
@@ -791,6 +868,48 @@ mod tests {
             "/nonexistent/claude/versions/test/path",
         ));
         assert_eq!(count, 0, "missing claude PID must yield 0 active subagents");
+    }
+
+    #[test]
+    fn count_alive_subagents_override_skips_jsonl_scan_and_is_hermetic() {
+        // Regression for the recurring "claude-watch interrupts a running
+        // subagent" leak. The interrupt/respawn suppression gates must use
+        // count_alive_subagents_with_versions_dir. When a versions-dir
+        // override is supplied (the test contract), the JSONL backstop is
+        // SKIPPED entirely so the value is fully determined by the /proc
+        // count — which the non-existent versions dir forces to 0. This
+        // proves the function is hermetic under the override (no dependency
+        // on the ~/.claude/projects tree of the machine running the test)
+        // AND that it never panics on the fail-open path.
+        let count = count_alive_subagents_with_versions_dir(
+            Some("/nonexistent/claude/versions/test/path"),
+            crate::active_agents::DEFAULT_AGENT_ALIVE_MAX_AGE_SECS,
+        );
+        assert_eq!(
+            count, 0,
+            "override path must skip JSONL scan and yield the /proc count (0 here)"
+        );
+    }
+
+    #[test]
+    fn count_alive_subagents_max_combines_proc_and_jsonl() {
+        // Document + pin the core combinator: the alive count is the MAX of
+        // the /proc child-process count and the JSONL-transcript alive count.
+        // This is what makes a subagent that is mid-THOUGHT (no child tool
+        // process → /proc count 0) still register as alive via a fresh
+        // transcript, so the daemon does NOT fire a turn-cancelling Escape
+        // into the shared pane. The MAX (not sum) avoids double-counting a
+        // subagent that BOTH has a live child AND a fresh transcript.
+        // THE mid-thought leak case: /proc sees 0 (no child), JSONL sees the
+        // live transcript → count must be > 0 so the interrupt is suppressed.
+        assert_eq!(
+            combine_alive_counts(0, 3),
+            3,
+            "jsonl-only alive (mid-thought subagent) must win over 0 proc — the leak fix"
+        );
+        assert_eq!(combine_alive_counts(2, 0), 2, "proc-only alive wins over 0 jsonl");
+        assert_eq!(combine_alive_counts(1, 1), 1, "MAX: no double-count when both see it");
+        assert_eq!(combine_alive_counts(0, 0), 0, "genuinely idle → 0 (interrupt allowed)");
     }
 
     #[test]

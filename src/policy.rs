@@ -1396,7 +1396,7 @@ async fn check_foreground_inner(
                         state.thinking_interrupt_count + 1,
                     );
                     let active_subagents =
-                        crate::respawn::count_active_subagents_with_versions_dir(None);
+                        crate::respawn::count_alive_subagents();
                     match obligation_escalation_decision(
                         state.thinking_obligation_armed_at.as_deref(),
                         config.general.obligation_dwell_secs,
@@ -3107,9 +3107,8 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
     versions_dir_override: Option<&str>,
 ) {
     use crate::respawn::{
-        count_active_subagents_with_versions_dir, evaluate_pane_unchanged,
-        execute_respawn_with_versions_dir, hash_pane_content, should_respawn, HangSignal,
-        RespawnOutcome,
+        evaluate_pane_unchanged, execute_respawn_with_versions_dir, hash_pane_content,
+        should_respawn, HangSignal, RespawnOutcome,
     };
 
     if !config.auto_respawn_on_hang.enabled {
@@ -3153,8 +3152,15 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
     // hung — it's legitimately waiting on agent work. Skip respawn.
     // We thread the same `versions_dir_override` so unit tests can force
     // the count to 0 (via a non-existent versions_dir → no claude PID
-    // detected → fail-open to 0). Production passes None.
-    let active_subagents = count_active_subagents_with_versions_dir(versions_dir_override);
+    // detected → fail-open to 0). Production passes None, which also
+    // enables the JSONL-transcript backstop so a subagent that is mid-
+    // THOUGHT (no child tool process, hence invisible to the /proc count)
+    // still suppresses the destructive respawn. See
+    // `respawn::count_alive_subagents_with_versions_dir`.
+    let active_subagents = crate::respawn::count_alive_subagents_with_versions_dir(
+        versions_dir_override,
+        crate::active_agents::DEFAULT_AGENT_ALIVE_MAX_AGE_SECS,
+    );
 
     debug!(
         active_count,
@@ -4150,7 +4156,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // fail-open (returns 0 when no Claude PID is detectable).
                     let workload_fresh = workload_heartbeat_suppresses_stuck(config);
                     let active_subagents =
-                        crate::respawn::count_active_subagents_with_versions_dir(None);
+                        crate::respawn::count_alive_subagents();
                     if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
                         let age_min = age / 60;
                         let reason = if workload_fresh {
@@ -4300,7 +4306,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         obligation_escalation_decision(
                             state.context_obligation_armed_at.as_deref(),
                             config.general.obligation_dwell_secs,
-                            crate::respawn::count_active_subagents_with_versions_dir(None),
+                            crate::respawn::count_alive_subagents(),
                             &now,
                         ),
                         ObligationDecision::ArmObligation | ObligationDecision::Hold
@@ -5087,7 +5093,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // failed" case the dwell must not re-delay). `dwell_secs`
                     // of 0 disables the gate (legacy same-cycle interrupt).
                     let wd_active_subagents =
-                        crate::respawn::count_active_subagents_with_versions_dir(None);
+                        crate::respawn::count_alive_subagents();
                     let wd_decision = watcher_down_obligation_decision(
                         escalation.is_some(),
                         state.watcher_down_obligation_armed_at.as_deref(),
@@ -5414,7 +5420,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // recomputed here (cheap /proc scan) since the detection-time
                 // value is out of scope at this fire site.
                 let hb_active_subagents =
-                    crate::respawn::count_active_subagents_with_versions_dir(None);
+                    crate::respawn::count_alive_subagents();
                 match obligation_escalation_decision(
                     state.heartbeat_obligation_armed_at.as_deref(),
                     config.general.obligation_dwell_secs,
