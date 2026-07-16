@@ -67,6 +67,21 @@
   }
 
   // ---------------------------------------------------------------------
+  // Relative-age token wrapper. Mirrors the Jinja template's
+  // `<span class="rel-age" data-rel-epoch="<unix seconds>">TEXT</span>`
+  // so the shared live-age ticker (static/rel-age.js) picks up
+  // refresh-rendered cards too. `age` is the server-rendered fallback
+  // string; `epoch` is the unix-seconds anchor (null/absent => no tick,
+  // just the static string). Must stay in lockstep with the template
+  // markup so a morphdom merge is a no-op on an unchanged item.
+  // ---------------------------------------------------------------------
+  function relAge(age, epoch) {
+    const hasEpoch = epoch !== null && epoch !== undefined && isFinite(epoch) && epoch > 0;
+    const dataAttr = hasEpoch ? ` data-rel-epoch="${attr(Math.round(epoch))}"` : '';
+    return `<span class="rel-age"${dataAttr}>${esc(age || '')}</span>`;
+  }
+
+  // ---------------------------------------------------------------------
   // Subagent-tree collapse persistence.
   //
   // The nested subagent tree (one .subagent-tree <details> per running card,
@@ -222,7 +237,7 @@
     html +=
       `<code class="subagent-id">${esc(sid.slice(0, 12))}</code>` +
       `<span class="subagent-label">${esc(sa.label || sid)}</span>` +
-      `<span class="subagent-age">${esc(sa.age || '')}</span>`;
+      `<span class="subagent-age">${relAge(sa.age, sa.age_epoch)}</span>`;
     const children = sa.children || [];
     if (children.length) {
       html += '<ul class="subagent-list subagent-children">' +
@@ -322,7 +337,7 @@
     const startedIso = it.started_at_iso || '';
     const ageLabel = (isStarting && !isWorkload && !isHostjob) ? 'registered' : 'running';
     let ageBlock = '';
-    ageBlock += `<span ${startedIso ? `data-local-time-iso="${attr(startedIso)}" data-local-time-title-only` : ''} title="${attr(startedIso)}">${esc(ageLabel)} ${esc(it.age)}</span>`;
+    ageBlock += `<span ${startedIso ? `data-local-time-iso="${attr(startedIso)}" data-local-time-title-only` : ''} title="${attr(startedIso)}">${esc(ageLabel)} ${relAge(it.age, it.age_epoch)}</span>`;
     ageBlock += '<span class="sep">·</span>';
     if (isHostjob) {
       ageBlock += `<span title="hostjob output tail for ${attr(hostjobLabel)}">hostjob ${esc(hostjobLabel)}</span>`;
@@ -333,7 +348,7 @@
     } else if (owner.mode === 'agent') {
       const aid = owner.agent_id || '';
       const aliveTxt = owner.alive ? 'alive' : 'STALE';
-      ageBlock += `<span title="claude-watch agent transcript mtime (${attr(aid)})">agent ${esc(aid.slice(0, 12))} ${esc(aliveTxt)} (${esc(owner.jsonl_age || '?')})</span>`;
+      ageBlock += `<span title="claude-watch agent transcript mtime (${attr(aid)})">agent ${esc(aid.slice(0, 12))} ${esc(aliveTxt)} (${relAge(owner.jsonl_age || '?', owner.jsonl_age_epoch)})</span>`;
     } else {
       ageBlock += '<span title="no matching agent record in claude-watch state">owner unknown</span>';
     }
@@ -415,7 +430,7 @@
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
 
     const blockedIso = it.blocked_at_iso || '';
-    let ageBlock = `<span ${blockedIso ? `data-local-time-iso="${attr(blockedIso)}" data-local-time-title-only` : ''} title="${attr(blockedIso)}">blocked ${esc(it.age)}</span>`;
+    let ageBlock = `<span ${blockedIso ? `data-local-time-iso="${attr(blockedIso)}" data-local-time-title-only` : ''} title="${attr(blockedIso)}">blocked ${relAge(it.age, it.age_epoch)}</span>`;
     if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
 
     let scope = '';
@@ -495,7 +510,7 @@
     head += `<button type="button" class="action-btn abandon-btn" data-action="abandon" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Remove this pending item from the queue">abandon</button>`;
 
     const createdIso = it.created_at_iso || '';
-    let ageBlock = `<span ${createdIso ? `data-local-time-iso="${attr(createdIso)}" data-local-time-title-only` : ''} title="${attr(createdIso)}">created ${esc(it.age)}</span>`;
+    let ageBlock = `<span ${createdIso ? `data-local-time-iso="${attr(createdIso)}" data-local-time-title-only` : ''} title="${attr(createdIso)}">created ${relAge(it.age, it.age_epoch)}</span>`;
     if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
 
     let scope = '';
@@ -574,7 +589,7 @@
 
     const anchorIso = isDone ? it.completed_at_iso : it.abandoned_at_iso;
     const anchorLabel = isDone ? 'completed' : (isErroredHostjob ? 'errored' : 'abandoned');
-    let ageBlock = `<span ${anchorIso ? `data-local-time-iso="${attr(anchorIso)}" data-local-time-title-only` : ''} title="${attr(anchorIso || '')}">${esc(anchorLabel)} ${esc(it.age)}</span>`;
+    let ageBlock = `<span ${anchorIso ? `data-local-time-iso="${attr(anchorIso)}" data-local-time-title-only` : ''} title="${attr(anchorIso || '')}">${esc(anchorLabel)} ${relAge(it.age, it.age_epoch)}</span>`;
     if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
 
     let reasonHtml = '';
@@ -1004,6 +1019,12 @@
       if (window.LocalTime && typeof window.LocalTime.hydrate === 'function') {
         try { window.LocalTime.hydrate(); } catch (_) { /* defensive */ }
       }
+      // Re-render live-ticking relative-age tokens on freshly-merged cards
+      // immediately (rather than waiting up to 1s for the standalone
+      // interval), so a card that just changed anchor shows the right age.
+      if (window.RelAge && typeof window.RelAge.tick === 'function') {
+        try { window.RelAge.tick(); } catch (_) { /* defensive */ }
+      }
     } catch (_) {
       // Network blip — try again next tick.
     }
@@ -1025,6 +1046,7 @@
   // production page never reads these but they exist so a smoke test can
   // exercise buildQueueDOM + the merge with synthetic JSON snapshots.
   window.__queueRefresh = {
+    relAge,
     buildQueueDOM,
     buildTopbarMetaDOM,
     buildSourceFilterHTML,
