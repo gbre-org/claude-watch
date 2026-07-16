@@ -1,5 +1,7 @@
 Redeploy the whole container with a FULL force-recreate FROM the image — `make deploy-container` (a single `docker compose up -d --force-recreate claude-container`), issued through the `host-bash` MCP bridge. This is the ONLY one of the three "restart" operations that picks up a REBUILT IMAGE, changed entrypoint-time env vars, or new / changed bind-mounts. Use it after `make container-build` or any compose / env / mount change.
 
+**NEVER trigger a redeploy via `/exit`, `cw --clear`, `self-clear`, or ANY session-context-clearing operation.** Those clear or KILL the SESSION — they do NOT recreate the container from the image, so none of them pick up a rebuilt image, a changed entrypoint-time env var, or a new / changed mount. Worse, `/exit` in particular can be fired by the claude-code auto-upgrader, and an `/exit`-driven recreate can boot-loop on `~/.local/bin/claude: not found` if the versions volume isn't yet populated. The ONLY correct redeploy path is `make deploy-container` issued via the `host-bash` MCP bridge — the HOST docker daemon owns the recreate. (This skill is the redeploy path; `/exit` / `cw --clear` / `self-clear` are NOT.)
+
 **SESSION-KILLING.** The recreate stops the old container and starts a fresh one from the image; the current Claude Code session ends with the old container. The next session resumes automatically via `CLAUDE_AUTO_CONTINUE` (the fresh entrypoint re-appends `--continue <value>`, so the prior conversation is picked back up). The single `up -d --force-recreate` is deliberately ONE host-daemon operation so it is safe to issue FROM INSIDE the container (self-redeploy): the HOST docker daemon owns the recreate and carries it to completion even after the issuing container (and the shell that ran `make deploy-container`) is torn down — so there is NO `&` / `nohup` / `disown`, and it is NOT split into a `down && up` (the second half would never run once the issuing container dies).
 
 **`docker` is NOT in the container — this MUST run HOST-SIDE.** Running `make deploy-container` inline in the in-container `Bash` tool fails with `docker: not found` (the in-container shell has no host `docker`). Issue it through the `host-bash` MCP bridge (`run_script`), or have the operator run it from their host shell. This is the exact mistake that motivated baking this skill — a main loop tried `make deploy-container` in-container and got `docker: not found`. Frame it honestly as "ran `make deploy-container` on the host via host-bash", not "I redeployed the container" — host-bash is a window to the host daemon.
@@ -52,13 +54,13 @@ c. **Sync the operator MAIN CLONE `~/repos/claude-watch` to `origin/main`** — 
 
    Do this even for a compiled-daemon-only change: the daemon IS baked (step b handles it), but the Python CLI surface is bind-mounted, so a current main clone is the only way bind-mounted fixes go live.
 
-d. **`make deploy-container`** — the single force-recreate. Run it FROM the durable build worktree so the freshly-built image + the correct `COMPOSE_BASE` are used. This KILLS the session:
+d. **`make deploy-container`** — the single force-recreate. Run it FROM the durable build worktree so the freshly-built image + the correct `COMPOSE_BASE` are used. Fire it via `hostjob` (mirroring step b's build) so the launch survives the host-bash 30s cap cleanly. This KILLS the session:
 
    ```bash
-   make -C /Users/hallandrew/repos/.worktrees/claude-watch/main deploy-container
+   hostjob run --label cw-deploy --cwd /Users/hallandrew/repos/.worktrees/claude-watch/main -- make deploy-container
    ```
 
-   (If you already ran `make container-build` in step b and want to skip the re-build the `deploy-container` dependency triggers, that's fine — an unchanged image rebuild is a fast no-op given BuildKit layer caching.) The host daemon carries the recreate to completion even after this session dies — no `&`, no `nohup`, no split.
+   NUANCE vs step b's `hostjob wait cw-build`: `make deploy-container` KILLS this session mid-run (the recreate tears down the issuing container), so — unlike the build — you will NOT get to `hostjob wait cw-deploy` it; the recreate ends this session first. Firing it via `hostjob` is exactly what lets the HOST daemon carry the recreate to completion even though the issuing session dies — the fresh session then resumes automatically via `CLAUDE_AUTO_CONTINUE`. (If you already ran `make container-build` in step b and want to skip the re-build the `deploy-container` dependency triggers, that's fine — an unchanged image rebuild is a fast no-op given BuildKit layer caching.) `make deploy-container` is still a SINGLE atomic host-daemon operation — no `&`, no `nohup`, no split; `hostjob` only detaches the launch so it outlives the 30s cap and this session's teardown.
 
 e. **Post-recreate validation** (in the FRESH session): confirm the container is freshly `Up` and the intended change is live. Good defaults:
 
@@ -90,6 +92,7 @@ Prefer `make deploy-container` (which encodes exactly this plus the `--env-file`
 
 ## Important
 
+- **NEVER redeploy via `/exit`, `cw --clear`, `self-clear`, or any session-context-clearing op.** Those clear/kill the SESSION — they do NOT recreate the container from the image, so they pick up NONE of an image / env-var / mount change; and an `/exit`-driven recreate (the claude-code auto-upgrader can fire `/exit`) can boot-loop on `~/.local/bin/claude: not found` before the versions volume is populated. The ONLY correct redeploy is `make deploy-container` via `host-bash` (the host daemon owns the recreate).
 - Issue every step via `host-bash` — the in-container shell has no `docker`. A raw `make deploy-container` in the in-container `Bash` tool fails `docker: not found`.
 - `make deploy-container` is a SINGLE atomic host-daemon operation (safe for self-redeploy) — never add `&` / `nohup` / `disown`, never split into `down && up`.
 - Restart is NOT recreate: `/claude-container:restart-container` reuses the SAME container (same image / env / mounts) and only re-runs the process tree. This skill recreates FROM the image and is the only one that picks up an image / env-var / mount change.
