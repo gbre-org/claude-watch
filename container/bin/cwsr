@@ -139,8 +139,21 @@ fi
 # non-empty, append --continue. Both flags are shape-stable across a
 # self-restart because the env vars are exported by entrypoint.sh and inherited
 # by the tmux server, which then exports them to every pane.
+# Launcher token for the respawned pane. Prefer the resilient
+# claude-relaunch-exec shim (waits for + repairs a dangling
+# ~/.local/bin/claude during a `claude install` download window instead of
+# dropping the pane to a dead `-sh: claude: not found` — the auto-update
+# boot-loop this fixes). Falls back to bare `claude` on the host / a pre-shim
+# image so nothing regresses. Env-overridable for tests.
+CLAUDE_RELAUNCH_EXEC="${CLAUDE_RELAUNCH_EXEC:-/usr/local/bin/claude-relaunch-exec}"
+if [ -n "$CLAUDE_RELAUNCH_EXEC" ] && [ -x "$CLAUDE_RELAUNCH_EXEC" ]; then
+    RESPAWN_LAUNCHER="$CLAUDE_RELAUNCH_EXEC"
+else
+    RESPAWN_LAUNCHER="claude"
+fi
+
 build_claude_cmd() {
-    local cmd="exec claude"
+    local cmd="exec $RESPAWN_LAUNCHER"
     if [ -n "${CLAUDE_SHIM_SETTINGS_PATH:-}" ] && [ -z "${CLAUDE_SHIM_SANITIZED_USER_FARM:-}" ]; then
         cmd="$cmd --setting-sources project,local --settings ${CLAUDE_SHIM_SETTINGS_PATH}"
     fi

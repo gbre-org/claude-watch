@@ -236,6 +236,40 @@ def test_plugin_dir_present_appends_flag() -> None:
         )
 
 
+def test_respawn_uses_relaunch_shim_when_present() -> None:
+    """When CLAUDE_RELAUNCH_EXEC points at an EXISTING executable, the respawn
+    launches via the resilient shim (`exec <shim>`) instead of bare `claude`,
+    so a `claude install` download window can't drop the pane to a dead
+    `-sh: claude: not found`."""
+    import tempfile as tf
+    with tf.TemporaryDirectory() as td:
+        shim = Path(td) / "claude-relaunch-exec"
+        shim.write_text("#!/bin/sh\nexec claude \"$@\"\n")
+        shim.chmod(0o755)
+        lines, _, _, _ = run_cwsr(
+            ["--print"], env={"CLAUDE_RELAUNCH_EXEC": str(shim)}
+        )
+        tmux = [l for l in lines if l.startswith("TMUX:")][0]
+        expect(
+            f"exec {shim}" in tmux,
+            f"shim-present: respawn should exec the shim, got {tmux!r}",
+        )
+
+
+def test_respawn_falls_back_to_bare_claude_without_shim() -> None:
+    """A non-existent CLAUDE_RELAUNCH_EXEC path falls back to bare `exec claude`
+    (host / pre-shim image) so nothing regresses off-container."""
+    lines, _, _, _ = run_cwsr(
+        ["--print"],
+        env={"CLAUDE_RELAUNCH_EXEC": "/nonexistent/claude-relaunch-exec"},
+    )
+    tmux = [l for l in lines if l.startswith("TMUX:")][0]
+    expect(
+        "exec claude" in tmux,
+        f"shim-absent: respawn should fall back to `exec claude`, got {tmux!r}",
+    )
+
+
 def test_session_override() -> None:
     """CWSR_SESSION env var changes the tmux pane target."""
     lines, _, _, _ = run_cwsr(["--print"], env={"CWSR_SESSION": "alt-sess"})
@@ -284,6 +318,8 @@ TESTS = [
     test_conflicting_flags_rejected,
     test_plugin_dir_absent_no_flag,
     test_plugin_dir_present_appends_flag,
+    test_respawn_uses_relaunch_shim_when_present,
+    test_respawn_falls_back_to_bare_claude_without_shim,
     test_session_override,
     test_help_exits_zero,
     test_bad_flag_exits_two,

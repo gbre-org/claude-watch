@@ -1184,6 +1184,21 @@ RUN chmod +x /usr/local/bin/audit-hooks
 COPY container/bin/reconcile-native-claude /usr/local/bin/reconcile-native-claude
 RUN chmod +x /usr/local/bin/reconcile-native-claude
 
+# claude-relaunch-exec — resilient launcher used by the claude-watch daemon's
+# pane RELAUNCH/RESTART path (src/policy.rs resolve_relaunch_bin) and by cwsr's
+# respawn. Fixes the auto-update BOOT-LOOP: after the in-container updater fires
+# `/exit`, `claude install` writes the new version into the volume-backed
+# ~/.local/share/claude/versions/<ver> dir and only THEN re-points the
+# ~/.local/bin/claude launcher — so during the download window the launcher is a
+# DANGLING symlink and a direct relaunch dies with `claude: not found`, dropping
+# the pane to a dead `-sh` that the relaunch/dead-process path re-fires against
+# (hot-spin ~10 iterations, manual recovery). This shim resolves the newest
+# ACTUALLY-PRESENT versions/<ver> binary (bypassing a dangling launcher),
+# repairs the launcher symlink, and polls with backoff for a runnable binary
+# before exec'ing it — turning the hot-spin into a bounded, self-healing wait.
+COPY container/bin/claude-relaunch-exec /usr/local/bin/claude-relaunch-exec
+RUN chmod +x /usr/local/bin/claude-relaunch-exec
+
 # snapshot-claude-config — entrypoint helper that decouples the churning
 # bind-mounted ~/.claude.json from the running claude. On a macOS Docker
 # host the operator's "devbar" app rewrites ~/.claude.json atomically
