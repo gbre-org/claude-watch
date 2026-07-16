@@ -474,6 +474,9 @@ def _classify_owner(
             "agent_id": agent.get("agent_id", ""),
             "jsonl_age_seconds": age,
             "jsonl_age": _humanize_age(age),
+            # Anchor epoch (unix seconds) the jsonl_age is measured FROM, so the
+            # live-ticking relative-age token can re-render it client-side.
+            "jsonl_age_epoch": (now.timestamp() - age) if age is not None else None,
             "is_starting": False,
         }
 
@@ -494,6 +497,7 @@ def _classify_owner(
         "agent_id": "",
         "jsonl_age_seconds": None,
         "jsonl_age": "?",
+        "jsonl_age_epoch": None,
         "is_starting": is_starting,
     }
 
@@ -804,6 +808,12 @@ def _shape(
         "age": _humanize_age(age_secs),
         "age_label": age_label,
         "age_seconds": age_secs,
+        # Epoch (unix seconds, or None) the visible age is measured FROM (the
+        # age_anchor). Drives the client-side live-ticking relative-age token
+        # (relative timestamps re-rendered on clock ticks, via UI): the
+        # server-rendered `age` string stays the no-JS fallback; a 1s interval
+        # rewrites it in place from (now - age_epoch). Mirrors _humanize_age.
+        "age_epoch": age_anchor.timestamp() if age_anchor else None,
         "has_archive": has_archive,
     }
 
@@ -2314,6 +2324,10 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
                 "queue_id": m.group(1) if m else "",
                 "age_seconds": age_seconds,
                 "age": _humanize_age(age_seconds),
+                # Transcript mtime as unix seconds — anchor for the live-ticking
+                # relative-age token (subagent-tree "age" re-renders on clock
+                # ticks client-side).
+                "age_epoch": mtime,
             }
         )
     out.sort(key=lambda r: r["age_seconds"])  # most-recently-active first
