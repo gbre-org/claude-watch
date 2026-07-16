@@ -737,6 +737,26 @@
     if (orphanCount) {
       html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
     }
+    // Density toggle pill (botchat #1944). MUST be rendered here too (not just
+    // in the Jinja template): mergeTopbarMeta rebuilds #topbar-meta every tick,
+    // so omitting it would let morphdom discard the server-rendered control on
+    // the first tick — same class of bug as the source filter. Its aria-pressed
+    // / data-density / label reflect the CURRENT html.density-compact state so
+    // the merge doesn't flap the button's visual state; info.js re-syncs it
+    // after each merge anyway (applyDensityButton). Click is a delegated
+    // handler in info.js, so it survives the rebuild.
+    {
+      const compact =
+        document.documentElement.classList.contains('density-compact');
+      html +=
+        `<span class="count density-control" title="Toggle a vertically-dense view — condenses each queue row so q-site lines up row-by-row with the pr-watch minisite in a side-by-side split. Persisted in your browser.">` +
+        `<span class="density-label">density</span>` +
+        `<button type="button" id="density-toggle" class="density-btn" ` +
+          `aria-pressed="${compact ? 'true' : 'false'}" ` +
+          `data-density="${compact ? 'compact' : 'comfortable'}">` +
+          `${compact ? 'compact' : 'comfortable'}</button>` +
+        `</span>`;
+    }
     // Source filter dropdown. MUST be rendered here too (not just in the
     // Jinja template): mergeTopbarMeta rebuilds #topbar-meta every tick,
     // so omitting it would let morphdom discard the server-rendered
