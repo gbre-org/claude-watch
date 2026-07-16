@@ -69,7 +69,7 @@
       title="Click to tail this subagent's live log">
       <code class="subagent-id">{{ sa.subagent_id[:12] }}</code>
       <span class="subagent-label">{{ sa.label }}</span>
-      <span class="subagent-age">{{ sa.age }}</span>
+      <span class="subagent-age"><span class="rel-age"{% if sa.age_epoch %} data-rel-epoch="{{ '%.0f' % sa.age_epoch }}"{% endif %}>{{ sa.age }}</span></span>
       {% if sa.children %}
         <ul class="subagent-list subagent-children">
           {% for child in sa.children %}{{ subagent_node(child) }}{% endfor %}
@@ -224,7 +224,7 @@
           <div class="age">
             <span
               {% if it.started_at_iso %}data-local-time-iso="{{ it.started_at_iso }}" data-local-time-title-only{% endif %}
-              title="{{ it.started_at_iso }}">{% if is_starting and not is_workload and not is_hostjob %}registered{% else %}running{% endif %} {{ it.age }}</span>
+              title="{{ it.started_at_iso }}">{% if is_starting and not is_workload and not is_hostjob %}registered{% else %}running{% endif %} <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
             <span class="sep">·</span>
             {% if is_hostjob %}
               <span title="hostjob output tail for {{ it.hostjob_label }}">hostjob {{ it.hostjob_label }}</span>
@@ -233,7 +233,7 @@
             {% elif is_starting %}
               <span class="agent-spawning" title="queue item registered, waiting for agent's first JSONL event"><span class="spinner" aria-hidden="true"></span>agent spawning…</span>
             {% elif owner.mode == 'agent' %}
-              <span title="claude-watch agent transcript mtime ({{ owner.agent_id }})">agent {{ owner.agent_id[:12] }} {{ 'alive' if owner.alive else 'STALE' }} ({{ owner.jsonl_age }})</span>
+              <span title="claude-watch agent transcript mtime ({{ owner.agent_id }})">agent {{ owner.agent_id[:12] }} {{ 'alive' if owner.alive else 'STALE' }} (<span class="rel-age"{% if owner.jsonl_age_epoch %} data-rel-epoch="{{ '%.0f' % owner.jsonl_age_epoch }}"{% endif %}>{{ owner.jsonl_age }}</span>)</span>
             {% else %}
               <span title="no matching agent record in claude-watch state">owner unknown</span>
             {% endif %}
@@ -318,7 +318,7 @@
           <div class="age">
             <span
               {% if it.blocked_at_iso %}data-local-time-iso="{{ it.blocked_at_iso }}" data-local-time-title-only{% endif %}
-              title="{{ it.blocked_at_iso }}">blocked {{ it.age }}</span>
+              title="{{ it.blocked_at_iso }}">blocked <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
             {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
           {% if it.scope %}
@@ -400,7 +400,7 @@
           <div class="age">
             <span
               {% if it.created_at_iso %}data-local-time-iso="{{ it.created_at_iso }}" data-local-time-title-only{% endif %}
-              title="{{ it.created_at_iso }}">created {{ it.age }}</span>
+              title="{{ it.created_at_iso }}">created <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
             {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
           {% if it.scope %}
@@ -452,7 +452,7 @@
           <div class="age">
             <span
               {% if it.completed_at_iso %}data-local-time-iso="{{ it.completed_at_iso }}" data-local-time-title-only{% endif %}
-              title="{{ it.completed_at_iso }}">completed {{ it.age }}</span>
+              title="{{ it.completed_at_iso }}">completed <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
             {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
           {% if it.description %}
@@ -503,7 +503,7 @@
           <div class="age">
             <span
               {% if it.abandoned_at_iso %}data-local-time-iso="{{ it.abandoned_at_iso }}" data-local-time-title-only{% endif %}
-              title="{{ it.abandoned_at_iso }}">{% if it.is_errored_hostjob %}errored{% else %}abandoned{% endif %} {{ it.age }}</span>
+              title="{{ it.abandoned_at_iso }}">{% if it.is_errored_hostjob %}errored{% else %}abandoned{% endif %} <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
             {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
           {% if it.description %}
@@ -773,6 +773,7 @@
   {% endif %}
 
   <script src="{{ url_for('static', filename='local-time.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='rel-age.js') }}" defer></script>
   <script src="{{ url_for('static', filename='refresh.js') }}" defer></script>
   <script src="{{ url_for('static', filename='action.js') }}" defer></script>
   <script src="{{ url_for('static', filename='depend.js') }}" defer></script>
