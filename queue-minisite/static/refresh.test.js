@@ -590,6 +590,29 @@ const gcNested = treeCardAfter &&
 assert('T19c: grandchild stays nested under child after refresh (no flatten)',
   !!gcNested);
 
+// === TEST 20: relative-age tokens are wrapped in a live-ticking .rel-age
+// span carrying data-rel-epoch (#1913). refresh.js' relAge() helper mirrors
+// the Jinja template markup so the shared rel-age.js ticker rewrites
+// refresh-rendered cards too. ===
+const relEpoch = Math.floor(Date.now() / 1000) - 125; // ~2m ago
+const relWithEpoch = refresh.relAge('2m ago', relEpoch);
+assert('T20a: relAge wraps the value in a .rel-age span',
+  /<span class="rel-age"[^>]*>2m ago<\/span>/.test(relWithEpoch), relWithEpoch);
+assert('T20b: relAge emits data-rel-epoch for a known epoch',
+  relWithEpoch.indexOf(`data-rel-epoch="${relEpoch}"`) !== -1, relWithEpoch);
+const relNoEpoch = refresh.relAge('?', null);
+assert('T20c: relAge omits data-rel-epoch when epoch is null (graceful, no tick)',
+  relNoEpoch.indexOf('data-rel-epoch') === -1 &&
+  /<span class="rel-age">\?<\/span>/.test(relNoEpoch), relNoEpoch);
+// A rendered running card exposes its age inside a .rel-age span (drives the
+// live tick) — assert the full render path emits it.
+const relState = JSON.parse(JSON.stringify(stateA));
+relState.running[0].age_epoch = relEpoch;
+const relFrag = refresh.buildQueueDOM(relState);
+const relSpan = relFrag.querySelector('#section-running .age .rel-age[data-rel-epoch]');
+assert('T20d: rendered running card carries a live-ticking .rel-age span',
+  !!relSpan, relSpan ? relSpan.outerHTML : 'no .rel-age[data-rel-epoch] in age block');
+
 console.log('---');
 if (failures) {
   console.error(`FAILED: ${failures} assertion(s)`);
