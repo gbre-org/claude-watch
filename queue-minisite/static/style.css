@@ -139,6 +139,41 @@ html.header-collapsed .topbar .info-wrap {
   display: none;
 }
 
+/* ------- density toggle control (botchat #1944) -------
+   A "density" pill in the topbar that flips the whole view between the
+   comfortable default and a vertically-DENSE (compact) layout. Mirrors the
+   pr-watch minisite's density toggle affordance (label + pill button, filled
+   when active), so the two minisites present the same control in a side-by-side
+   split. The pill lives in #topbar-meta, so refresh.js rebuilds it every tick
+   (buildTopbarMetaDOM) and info.js binds its click via delegation — same
+   morphdom-survival pattern as the source filter. When collapsed, hide it with
+   the other controls. */
+html.header-collapsed .topbar .density-control { display: none; }
+.count.density-control { gap: 6px; padding: 2px 8px; }
+.density-control .density-label {
+  color: var(--fg-mute);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.density-control .density-btn {
+  padding: 1px 8px;
+  border: 1px solid var(--link);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--link);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.density-control .density-btn:hover { background: var(--bg-alt); }
+/* When compact mode is active, fill the toggle so its state is obvious
+   (mirrors pr-watch's aria-pressed=true fill). */
+.density-control .density-btn[aria-pressed="true"] {
+  background: var(--link);
+  color: var(--bg);
+}
+
 .topbar .title .logo {
   width: 28px;
   height: 28px;
@@ -1681,3 +1716,116 @@ body.modal-open { overflow: hidden; }
   color: var(--fg-muted, #93a1a1);
   font-size: 0.72rem;
 }
+
+/* ==========================================================================
+ * COMPACT DENSITY (botchat #1944)
+ * --------------------------------------------------------------------------
+ * A vertically-dense option toggled via the topbar "density" control ->
+ * html.density-compact (persisted client-side in localStorage `qsite_density`,
+ * restored flash-free by the <head> pre-paint guard). Goal: condense each
+ * queue row so q-site ALIGNS ROW-BY-ROW with the pr-watch minisite's compact
+ * cards when the two are open side-by-side in a split view.
+ *
+ * These metrics are MIRRORED from the pr-watch compact card
+ * (minisite/static/style.css `body.density-compact .pr-card`): the same
+ * border-bottom row separators (no card border/shadow/radius/margin), the same
+ * 3px 6px padding, a ~22px min-height head, and the same condensed font sizes
+ * (id 0.82rem, pills 0.68rem, title/summary 0.76rem). Layered ON TOP of the
+ * base card styles above — comfortable density is entirely unaffected (all
+ * rules here are html.density-compact-scoped).
+ * ==========================================================================*/
+
+/* Widen + tighten the main column so a one-line row has room and rows pack
+   densely (mirrors pr-watch `body.density-compact main`). */
+html.density-compact main { max-width: 1400px; padding: 6px 10px 16px; }
+
+/* Tighten the section headings so a section boundary costs little vertical
+   space in the packed view. */
+html.density-compact .section-title { margin: 10px 4px 4px 4px; font-size: 0.82rem; }
+
+/* Each item becomes a tight bordered ROW: drop the card chrome (border,
+   radius, shadow, background, inter-card margin) in favour of a thin
+   bottom-border separator, exactly like the pr-watch compact card. Keep the
+   left status stripe (thinner) so the state colour still reads at a glance. */
+html.density-compact .item {
+  border: none;
+  border-bottom: 1px solid var(--line);
+  border-left: 3px solid var(--fg-mute);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  margin: 0;
+  /* 6px top/bottom pads the row to ~71px, matching the pr-watch compact
+     card's common two-line row height so the two minisites line up
+     row-for-row in a side-by-side split (botchat #1944). */
+  padding: 6px 6px 6px 8px;
+}
+/* Preserve the subtle state tints (they read as a faint left-edge + wash in
+   comfortable); in compact keep just the left-stripe colour, drop the wash so
+   rows stay visually flat/aligned. */
+html.density-compact .item.state-starting,
+html.density-compact .item.state-blocked,
+html.density-compact .item.state-errored,
+html.density-compact .item.orphan { background: transparent; }
+html.density-compact .item:hover { background: var(--bg-alt); }
+
+/* Head: one tight line. Mirror pr-watch's compact card-head (gap 8px,
+   min-height 22px) so the row height matches. */
+html.density-compact .item-head {
+  gap: 8px;
+  min-height: 22px;
+  margin-bottom: 2px;
+}
+html.density-compact .badge {
+  font-size: 0.62rem;
+  padding: 1px 6px;
+  letter-spacing: 0.03em;
+}
+html.density-compact .id { font-size: 0.76rem; padding: 1px 5px; }
+html.density-compact .prio { font-size: 0.7rem; }
+html.density-compact .action-btn { font-size: 0.68rem; padding: 1px 6px; }
+
+/* Summary: a single tight line (its own line, like pr-watch's compact title
+   row), truncated so a long summary never wraps the row taller. */
+html.density-compact .summary {
+  margin: 0;
+  font-size: 0.78rem;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Age line: keep (it carries the live running/agent signal) but shrink + tighten. */
+html.density-compact .age {
+  font-size: 0.7rem;
+  margin-top: 1px;
+  gap: 5px;
+}
+
+/* ELIDE the secondary, non-live detail in compact — same principle as
+   pr-watch hiding the full meta row + finished builds. The scope chips,
+   the italic description/blocker/abandon-reason line, and the collapsible
+   Prompt disclosure all drop out so each row stays ~2 short lines. The
+   subagent tree (the live spawn signal) is kept but condensed below. */
+html.density-compact .item .scope,
+html.density-compact .item > .description,
+html.density-compact .item > .prompt-toggle:not(.subagent-tree) { display: none; }
+
+/* Pending-item drag affordances: keep functional but shrink the handle + dep
+   badges so a pending row matches the running-row height. */
+html.density-compact .drag-handle { font-size: 0.8rem; }
+html.density-compact .dep-badge { font-size: 0.62rem; padding: 1px 5px; }
+
+/* Subagent tree: keep the LIVE signal (like pr-watch keeps its running build
+   row) but tighten it hard so an item with children stays compact. */
+html.density-compact .subagent-tree { margin-top: 2px; }
+html.density-compact .subagent-tree > .prompt-summary { font-size: 0.7rem; padding: 1px 0; }
+html.density-compact .subagent-list { margin: 1px 0; }
+html.density-compact .subagent-node {
+  padding: 1px 4px;
+  gap: 5px;
+}
+html.density-compact .subagent-node .subagent-id,
+html.density-compact .subagent-node .subagent-label,
+html.density-compact .subagent-node .subagent-age { font-size: 0.68rem; }
