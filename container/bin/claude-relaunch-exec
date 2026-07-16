@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# claude-relaunch-exec — resilient claude launcher for pane RELAUNCH / RESPAWN.
+#
+# WHY THIS EXISTS
+# ---------------
+# When the in-container auto-updater fires `/exit`, the claude-watch daemon
+# relaunches claude by typing a shell one-liner into the pane
+# (src/policy.rs build_relaunch_inject_cmd / restart_claude), and the
+# clean-restart fallback path (cwsr) also respawns pane 0. Both historically
+# ran `~/.local/bin/claude ...` directly.
+#
+# But `claude install` (native updater) writes the NEW version into the
+# volume-backed ~/.local/share/claude/versions/<ver> dir and only THEN
+# re-points the ~/.local/bin/claude launcher. During the download window the
+# launcher can be a DANGLING symlink (target versions/<ver> not written yet).
+# Running a dangling symlink dies with `~/.local/bin/claude: not found`, the
+# pane drops to a dead `-sh` prompt, and the daemon's relaunch/dead-process
+# path re-fires -- HOT-SPINNING "not found" until the download finishes
+# (operator-observed boot-loop, ~10 iterations, needed manual recovery).
+#
+# This shim converts that hot-spin into a bounded WAIT + self-repair:
+#   1. Resolve the newest ACTUALLY-PRESENT versions/<ver> runnable binary
+#      (bypasses a dangling launcher entirely) and repair the launcher
+#      symlink to point at it (mirrors reconcile-native-claude's repoint).
+#   2. If nothing is runnable yet (mid-download), POLL with backoff up to
+#      CLAUDE_RELAUNCH_MAX_WAIT seconds instead of exec'ing a missing path.
+#   3. exec the resolved binary with all passed args ("$@").
+#
+# Fail-safe: never aborts into a dead pane. If no runnable binary appears
+# within the ceiling, it falls back to a bare `claude` exec (preserving the
+# prior behavior as a last resort) so the pane still attempts a launch rather
+# than sitting at a raw shell.
+#
+# Env knobs (mostly for tests):
+#   CLAUDE_RELAUNCH_MAX_WAIT  ceiling seconds to wait for a runnable claude
+#                             (default 180).
+#   CLAUDE_RELAUNCH_POLL      poll interval seconds (default 3).
+#   CLAUDE_RELAUNCH_HOME      override HOME (default $HOME).
+
+# Deliberately NOT `set -e`: a transient failure in a probe must never abort
+# the shim into a dead pane. We poll and always end in an `exec`.
+set -uo pipefail
+
+HOME_DIR="${CLAUDE_RELAUNCH_HOME:-${HOME:-/home/hndrewaall}}"
+VERSIONS_DIR="$HOME_DIR/.local/share/claude/versions"
+LAUNCHER="$HOME_DIR/.local/bin/claude"
+MAX_WAIT="${CLAUDE_RELAUNCH_MAX_WAIT:-180}"
+POLL="${CLAUDE_RELAUNCH_POLL:-3}"
+
+log() { printf '[claude-relaunch-exec] %s\n' "$1" >&2; }
+
+# Print the absolute path of the newest PRESENT, runnable versions/<ver>
+# binary, or return non-zero if none is runnable yet. The native layout stores
+# versions/<ver> as the binary FILE itself; we also tolerate a
+# versions/<ver>/claude layout defensively.
+newest_runnable() {
+    [ -d "$VERSIONS_DIR" ] || return 1
+    local ver path
+    # Version-sorted, newest first. `sort -V` gives semantic ordering
+    # (2.1.9 < 2.1.206); `-r` reverses to newest-first.
+    for ver in $(ls -1 "$VERSIONS_DIR" 2>/dev/null | sort -Vr); do
+        path="$VERSIONS_DIR/$ver"
+        if [ -f "$path" ] && [ -x "$path" ]; then
+            printf '%s' "$path"
+            return 0
+        fi
+        if [ -d "$path" ] && [ -x "$path/claude" ]; then
+            printf '%s' "$path/claude"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Best-effort: re-point ~/.local/bin/claude at the newest present version so a
+# subsequent bare `claude` (elsewhere) also resolves. Never fatal.
+repair_launcher() {
+    local target="$1" bindir
+    bindir="$(dirname "$LAUNCHER")"
+    mkdir -p "$bindir" 2>/dev/null || return 0
+    ln -sfn "$target" "$LAUNCHER" 2>/dev/null || true
+}
+
+# Resolve a runnable claude RIGHT NOW, or return non-zero.
+resolve_now() {
+    local t
+    # 1) Newest present versioned binary -- bypasses a dangling launcher.
+    if t="$(newest_runnable)"; then
+        repair_launcher "$t"
+        printf '%s' "$t"
+        return 0
+    fi
+    # 2) The launcher symlink, iff it resolves to a runnable target.
+    if [ -x "$LAUNCHER" ]; then
+        printf '%s' "$LAUNCHER"
+        return 0
+    fi
+    # 3) claude on PATH (host / unknown layout).
+    if command -v claude >/dev/null 2>&1; then
+        command -v claude
+        return 0
+    fi
+    return 1
+}
+
+deadline=$(( $(date +%s) + MAX_WAIT ))
+CLAUDE=""
+waited=0
+while : ; do
+    if CLAUDE="$(resolve_now)" && [ -n "$CLAUDE" ]; then
+        break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        log "no runnable claude after ${MAX_WAIT}s; falling back to bare 'claude'"
+        CLAUDE="claude"
+        break
+    fi
+    if [ "$waited" -eq 0 ]; then
+        log "no runnable claude yet (auto-update download window?); waiting up to ${MAX_WAIT}s..."
+    fi
+    waited=1
+    sleep "$POLL"
+done
+
+log "launching: $CLAUDE $*"
+exec "$CLAUDE" "$@"

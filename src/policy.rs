@@ -921,11 +921,15 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
     // permanent permission-bypass mode. The harness's own gates
     // (obligations, queue, etc.) provide finer-grained safety than
     // per-tool prompts.
-    // Resolve `claude` to an absolute path so the relaunch survives a
-    // stripped-PATH pane shell (a fresh non-login `-sh` after /exit may not
-    // have the npm-global/native-install bin dir on $PATH). See
-    // `resolve_claude_bin` for the failure mode this guards against.
-    let claude_bin = resolve_claude_bin();
+    // Resolve the launcher for the relaunch argv. Prefers the
+    // `claude-relaunch-exec` shim (waits for + repairs a dangling
+    // ~/.local/bin/claude during the auto-update download window instead of
+    // hot-spinning "claude: not found"), falling back to an absolute claude
+    // path so the relaunch survives a stripped-PATH pane shell (a fresh
+    // non-login `-sh` after /exit may not have the native-install bin dir on
+    // $PATH). See `resolve_relaunch_bin` / `resolve_claude_bin` for the
+    // failure modes these guard against.
+    let claude_bin = resolve_relaunch_bin();
     let launch = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "restarting Claude Code with --resume");
         format!("{} --dangerously-skip-permissions --resume {}", claude_bin, sid)
@@ -2660,9 +2664,52 @@ fn resolve_claude_bin() -> String {
     "claude".to_string()
 }
 
+/// Resolve the launcher token for a pane RELAUNCH / RESTART argv.
+///
+/// Prefers the baked `claude-relaunch-exec` shim
+/// (`container/bin/claude-relaunch-exec`, installed at
+/// `/usr/local/bin/claude-relaunch-exec`) when it is present. That shim is
+/// the fix for the auto-update BOOT-LOOP: after the in-container updater
+/// fires `/exit`, `claude install` writes the new version into the
+/// volume-backed `~/.local/share/claude/versions/<ver>` dir and only THEN
+/// re-points the `~/.local/bin/claude` launcher symlink. During the download
+/// window the launcher is a DANGLING symlink, so a relaunch that runs
+/// `~/.local/bin/claude` directly dies with `claude: not found`, the pane
+/// drops to a dead `-sh` prompt, and the daemon's relaunch/dead-process path
+/// re-fires — HOT-SPINNING "not found" until the download finishes
+/// (operator-observed, ~10 iterations, needed manual recovery).
+///
+/// The shim converts that hot-spin into a bounded WAIT + self-repair: it
+/// resolves the newest ACTUALLY-PRESENT `versions/<ver>` binary (bypassing a
+/// dangling launcher), repairs the launcher symlink, and polls with backoff
+/// for a runnable binary before exec'ing it — so `/exit` leads to a clean
+/// restart instead of a boot-loop.
+///
+/// Precedence:
+///   1. `$CLAUDE_BIN` (operator override / test hook) when set + non-empty —
+///      wins so tests + explicit overrides stay deterministic.
+///   2. the `claude-relaunch-exec` shim when it exists on disk.
+///   3. `resolve_claude_bin()` (the prior direct-launcher behavior) — the
+///      host / pre-shim-image fallback so nothing regresses off-container.
+///
+/// Pure modulo env + filesystem existence checks; no I/O side effects.
+fn resolve_relaunch_bin() -> String {
+    if let Ok(bin) = std::env::var("CLAUDE_BIN") {
+        if !bin.is_empty() {
+            return bin;
+        }
+    }
+    let shim = std::env::var("CLAUDE_RELAUNCH_EXEC")
+        .unwrap_or_else(|_| "/usr/local/bin/claude-relaunch-exec".to_string());
+    if !shim.is_empty() && std::path::Path::new(&shim).exists() {
+        return shim;
+    }
+    resolve_claude_bin()
+}
+
 /// Pure modulo env + a filesystem existence check; no I/O side effects.
 fn build_relaunch_claude_argv(session_id: Option<&str>) -> String {
-    let mut cmd = resolve_claude_bin();
+    let mut cmd = resolve_relaunch_bin();
     if let Ok(shim) = std::env::var("CLAUDE_SHIM_SETTINGS_PATH") {
         if !shim.is_empty() {
             cmd.push_str(" --setting-sources project,local --settings ");
@@ -8960,6 +9007,40 @@ pane_unchanged_secs = 600
         );
 
         std::env::remove_var("CLAUDE_BIN");
+    }
+
+    #[test]
+    fn resolve_relaunch_bin_prefers_shim_but_env_override_wins() {
+        // (a) CLAUDE_BIN override wins over everything (test/operator hook).
+        std::env::set_var("CLAUDE_BIN", "/opt/custom/claude");
+        assert_eq!(resolve_relaunch_bin(), "/opt/custom/claude");
+        std::env::remove_var("CLAUDE_BIN");
+
+        // (b) With no override, an EXISTING shim path (pointed at via the
+        // CLAUDE_RELAUNCH_EXEC env hook) is preferred so relaunch waits for +
+        // repairs a dangling launcher instead of hot-spinning "not found".
+        // Point the hook at a file guaranteed to exist on any host.
+        let existing = if std::path::Path::new("/bin/sh").exists() {
+            "/bin/sh"
+        } else {
+            "/usr/bin/env"
+        };
+        std::env::set_var("CLAUDE_RELAUNCH_EXEC", existing);
+        assert_eq!(
+            resolve_relaunch_bin(),
+            existing,
+            "an existing shim path must be preferred over the direct launcher"
+        );
+
+        // (c) A NON-existent shim path falls back to resolve_claude_bin()'s
+        // result (bare or absolute claude token) — never a dead path.
+        std::env::set_var("CLAUDE_RELAUNCH_EXEC", "/nonexistent/claude-relaunch-exec");
+        let fell_back = resolve_relaunch_bin();
+        assert!(
+            fell_back == "claude" || fell_back.ends_with("/claude"),
+            "missing shim => fall back to a claude token: {fell_back}"
+        );
+        std::env::remove_var("CLAUDE_RELAUNCH_EXEC");
     }
 
     #[test]
