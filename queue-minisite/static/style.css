@@ -1755,7 +1755,10 @@ html.density-compact .item {
   background: transparent;
   box-shadow: none;
   margin: 0;
-  padding: 3px 6px 3px 8px;
+  /* 6px top/bottom pads the row to ~71px, matching the pr-watch compact
+     card's common two-line row height so the two minisites line up
+     row-for-row in a side-by-side split (botchat #1944). */
+  padding: 6px 6px 6px 8px;
 }
 /* Preserve the subtle state tints (they read as a faint left-edge + wash in
    comfortable); in compact keep just the left-stripe colour, drop the wash so
