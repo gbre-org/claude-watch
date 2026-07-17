@@ -59,6 +59,26 @@ or not found).
     `--force-enqueue` was needed to enqueue anyway. That default now
     soft-serializes, so the flag is a no-op for non-workload scopes.
 
+**`repo:<name>` scope validation** (2026-07-16): `queue add` and
+`queue update-scope` (add mode) REJECT (exit 1) a `repo:<name>` token whose
+`<name>` is not a directory in the configured repos dir. This stops the
+"invented scope name" failure mode where two agents meant to serialize on the
+same repo used different fabricated scope names (`repo:botchat-ui`,
+`repo:botchat-renderer`, ...) and silently failed to serialize.
+
+  * Repos dir is `$SESSION_TASK_REPOS_DIR` (default `~/repos`).
+  * **Only** the `repo:` prefix is validated — `resource:`, `path:`,
+    `hostjob:`, `file:`, `task:`, `*`, and all free-form tokens are
+    unrestricted.
+  * **Fail-open**: when the repos dir doesn't exist / isn't a directory, no
+    validation happens (allows stripped-down deploys and tmpdir test envs).
+  * Reject message names the bad token, the repos dir, and the valid repo
+    list, e.g. `scope 'repo:foo' invalid: no directory 'foo' in
+    /home/you/repos. Valid repos: bar, baz. (...)`.
+  * **Bypass** genuine edge cases (a repo not yet cloned, a scratch scope)
+    with `SESSION_TASK_REPOS_NO_VALIDATE=1`, or repoint
+    `SESSION_TASK_REPOS_DIR`.
+
 ## Files
 
 - `~/.config/session/queue.json` — queue state (Layer 2)

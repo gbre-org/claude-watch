@@ -285,6 +285,28 @@ FORCE_START_BUNDLE_DIR = Path(
     )
 )
 
+# Directory that `repo:<name>` scope tokens are validated against at
+# `queue add` time (added 2026-07-16). Andrew flagged (botchat #2043) that
+# the main loop kept INVENTING repo scope names that matched no real repo
+# dir (`repo:ACME_ORG-2421-classify`, `repo:botchat-ui`, ...), so two agents
+# meant to serialize on the same repo used different scope names and DIDN'T
+# serialize -- contributing to a merge/conflict mess. A `repo:<name>` token
+# must now name an actual directory living in this repos dir.
+#
+# Default `~/repos` (the standard homelab / container repos root). Override
+# via `SESSION_TASK_REPOS_DIR` for non-default deploys and for the tests
+# (which set HOME=tmpdir). Validation FAILS OPEN when this dir doesn't exist
+# or isn't a directory -- so a stripped-down deploy without a repos root, or
+# a test tmpdir with no `repos/` subdir, never gets spuriously blocked. Only
+# the `repo:` prefix is validated; every other scope namespace (`hostjob:`,
+# `resource:`, `path:`, free-form tokens, ...) stays unrestricted.
+SESSION_TASK_REPOS_DIR = Path(
+    os.environ.get(
+        "SESSION_TASK_REPOS_DIR",
+        str(Path.home() / "repos"),
+    )
+)
+
 
 # ---------------------------------------------------------------------------
 # Layer 1: resume-action.json (single "top-of-mind" slot)
@@ -852,6 +874,75 @@ def _normalize_token(tok):
         return tok
     # Unknown / untyped token: accept as-is (exact match).
     return tok
+
+
+def _list_valid_repos():
+    """Return the sorted list of directory names under SESSION_TASK_REPOS_DIR.
+
+    Returns None (distinct from an empty list) when the repos dir does not
+    exist or isn't a directory -- callers treat None as "can't validate,
+    fail open". Hidden dirs (leading '.') are excluded; they're never repo
+    working trees a `repo:` scope would name.
+    """
+    root = SESSION_TASK_REPOS_DIR
+    try:
+        if not root.is_dir():
+            return None
+        return sorted(
+            p.name
+            for p in root.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+    except OSError:
+        # Unreadable / permission error -> fail open (return None).
+        return None
+
+
+def _validate_repo_scope_tokens(tokens):
+    """Validate that every `repo:<name>` token names a real repos-dir dir.
+
+    Only the `repo:` prefix is checked; all other scope namespaces
+    (`resource:`, `path:`, `hostjob:`, `slack-mcp-*`, free-form, ...) pass
+    through untouched.
+
+    Fail-open cases (no error raised):
+      * SESSION_TASK_REPOS_DIR missing / not a dir / unreadable
+        (`_list_valid_repos()` is None) -- e.g. a stripped-down deploy or a
+        test tmpdir with no `repos/` subtree.
+      * `SESSION_TASK_REPOS_NO_VALIDATE` env var set to a non-empty,
+        non-"0" value (deliberate escape hatch for genuine edge cases:
+        a repo not yet cloned, a scratch scope, etc.).
+
+    Raises ValueError with an actionable message (naming the bad token, the
+    repos dir, and the valid repo list) on the first invalid `repo:` token.
+    """
+    bypass = os.environ.get("SESSION_TASK_REPOS_NO_VALIDATE", "").strip()
+    if bypass not in ("", "0"):
+        return
+    valid = _list_valid_repos()
+    if valid is None:
+        return  # can't validate -> fail open
+    valid_set = set(valid)
+    for tok in tokens or []:
+        if not isinstance(tok, str) or not tok.startswith("repo:"):
+            continue
+        name = tok[len("repo:"):].strip()
+        if not name:
+            # An empty repo:<> token is malformed regardless of the dir list.
+            raise ValueError(
+                f"scope {tok!r} invalid: empty repo name "
+                f"(use repo:<name> where <name> is a directory in "
+                f"{SESSION_TASK_REPOS_DIR})"
+            )
+        if name not in valid_set:
+            listing = ", ".join(valid) if valid else "(none)"
+            raise ValueError(
+                f"scope {tok!r} invalid: no directory {name!r} in "
+                f"{SESSION_TASK_REPOS_DIR}. Valid repos: {listing}. "
+                f"(If this is a genuine edge case -- e.g. a repo not yet "
+                f"cloned -- set SESSION_TASK_REPOS_NO_VALIDATE=1 to bypass, "
+                f"or point SESSION_TASK_REPOS_DIR at the right root.)"
+            )
 
 
 def _is_path_token(tok):
@@ -2560,6 +2651,21 @@ def cmd_queue_add(args):
         sys.exit(1)
     try:
         scope = [_normalize_token(t) for t in scope_split]
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Validate `repo:<name>` scope tokens against the configured repos dir.
+    # Andrew (botchat #2043): the main loop kept INVENTING repo scope names
+    # matching no real repo dir, so agents meant to serialize on the same
+    # repo used different scope names and DIDN'T serialize. A `repo:<name>`
+    # token must name an actual directory in SESSION_TASK_REPOS_DIR (default
+    # ~/repos). Only the `repo:` prefix is validated; fail-open when the
+    # repos dir is absent; bypass via SESSION_TASK_REPOS_NO_VALIDATE=1.
+    # ------------------------------------------------------------------
+    try:
+        _validate_repo_scope_tokens(scope)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
@@ -5205,6 +5311,16 @@ def cmd_queue_update_scope(args):
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Validate `repo:<name>` tokens against the configured repos dir when
+    # ADDING scope (not when removing -- you must be able to strip a stale
+    # invalid token). Same fail-open / bypass semantics as `queue add`.
+    if not getattr(args, "remove", False):
+        try:
+            _validate_repo_scope_tokens(tokens)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+
     fh, data = _queue_open_locked("rw")
     try:
         items = data["items"]
@@ -6346,7 +6462,9 @@ def build_parser():
             "values also accepted. Token types: "
             "file:<path> (prefix-match), "
             "repo:<name> (whole-repo claim -- overlaps any path:<name>/... "
-            "in the same repo), "
+            "in the same repo; <name> MUST be a directory in the repos dir "
+            "$SESSION_TASK_REPOS_DIR (default ~/repos) or the add is "
+            "rejected -- set SESSION_TASK_REPOS_NO_VALIDATE=1 to bypass), "
             "path:<repo>/<subdir> (sub-repo claim; siblings disjoint, "
             "prefix-match within the same repo), "
             "resource:<name>, book:<name>, agent-proto:<name>, "
