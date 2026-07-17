@@ -41,6 +41,22 @@ _EXEMPT_PATTERNS = [
     r"signal-history(\s|$)",
     r"signal-ack(\s|$)",
     r"signal-mark-read(\s|$)",
+    # botchat READ/ACK surface (operator DM channel). Andrew botchat #2049:
+    # "botchat read/ack should be exempt from all gates" -- reading /
+    # acking an operator botchat DM is loop bookkeeping (same role as
+    # signal-* / event-ack above), never inline worker behaviour, so it must
+    # not be blocked while ready-but-unspawned queue items exist. The
+    # read/inspect verbs (unread-check/history/show/wait) can never worsen
+    # queue state; the mark-read/ack CLEAR path is bookkeeping too. A BARE
+    # compose-to-Andrew (`botchat-send --to ... --body ...`) stays GATED --
+    # that is a SEND, so the send arm is arg-conditional (--mark-read/--ack
+    # only), mirroring eval-event-must-act / eval-agent-ack-pending and the
+    # botchat-mark-read manifest (#2047).
+    r"botchat-unread-check(\s|$)",
+    r"botchat-history(\s|$)",
+    r"botchat-show(\s|$)",
+    r"botchat-wait(\s|$)",
+    r"botchat-send\b[^&;|]*\s--(?:mark-read|ack)\b",
     r"/opt/claude-container/watchers/",
     r"pingme(\s|$)",
 ]

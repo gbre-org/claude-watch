@@ -150,6 +150,28 @@ _BASH_EXEMPT_PATTERNS = [
     # ack, gc, disarm); `send` and `arm` stay gated.
     r"^agent-msg\s+(?:inbox|ack|gc|disarm|list|show|status)(?:\s|$)",
     r"^/usr/local/bin/agent-msg\s+(?:inbox|ack|gc|disarm|list|show|status)(?:\s|$)",
+    # botchat READ/ACK surface (operator DM channel). Andrew botchat #2049:
+    # "botchat read/ack should be exempt from all gates" -- the main loop
+    # must ALWAYS be able to read + ack an operator botchat message even
+    # while a claude-watch alert is pending, without first clearing the
+    # alert (which repeatedly forced alert-clearing just to read a DM). The
+    # read/inspect verbs (unread-check/history/show/wait) can never worsen
+    # any gate's state, and the mark-read/ack CLEAR path is loop bookkeeping
+    # (the same role as agent-msg inbox/ack, already exempt above). Matches
+    # bare + PATH-resolved + the host-side ~/repos/botchat/bin/ absolute
+    # form. A BARE compose (`botchat-send --to ... --body ...`) is NOT
+    # exempt -- that's a SEND, not read/ack, so the send arm is
+    # arg-conditional (`--mark-read`/`--ack` only) and `[^&;|]*` keeps a
+    # compound command (`... && rm`) from smuggling through the exempt path,
+    # matching this gate's strict-on-compound contract. Mirrors the precise
+    # botchat exempt in ~/repos/claude-config/obligations/botchat-mark-read.json
+    # (#2047); see memory feedback_wildcard_obligation_must_exempt_recovery_clis.
+    r"^botchat-(?:unread-check|history|show|wait)(?:\s|$)",
+    r"^/usr/local/bin/botchat-(?:unread-check|history|show|wait)(?:\s|$)",
+    r"^\S*/botchat/bin/botchat-(?:unread-check|history|show|wait)(?:\s|$)",
+    r"^botchat-send\b[^&;|]*\s--(?:mark-read|ack)\b",
+    r"^/usr/local/bin/botchat-send\b[^&;|]*\s--(?:mark-read|ack)\b",
+    r"^\S*/botchat/bin/botchat-send\b[^&;|]*\s--(?:mark-read|ack)\b",
 ]
 _BASH_EXEMPT_RES = [re.compile(p) for p in _BASH_EXEMPT_PATTERNS]
 

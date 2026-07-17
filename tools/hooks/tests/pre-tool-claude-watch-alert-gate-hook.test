@@ -262,6 +262,47 @@ def test_alert_allows_read_tool():
         h.cleanup()
 
 
+def test_alert_allows_botchat_read_ack():
+    """Andrew botchat #2049: botchat READ/ACK must be exempt from the
+    claude-watch alert gate so the main loop can always read + ack an
+    operator DM without first clearing the alert. Read/inspect verbs are
+    always exempt; the send arm is arg-conditional (--mark-read/--ack
+    only). A BARE compose stays gated (it's a SEND, not read/ack)."""
+    h = Harness()
+    try:
+        h.add_alert()
+        for cmd in [
+            "botchat-unread-check --ids",
+            "botchat-history --limit 5",
+            "botchat-show 2049",
+            "botchat-wait --timeout 60",
+            "/usr/local/bin/botchat-unread-check",
+            "/home/hndrewaall/repos/botchat/bin/botchat-history",
+            "botchat-send --mark-read 2049 --ack 2049",
+            "/usr/local/bin/botchat-send --mark-read 2049",
+            "/home/hndrewaall/repos/botchat/bin/botchat-send --ack 2049",
+        ]:
+            rc, out, err = h.run_hook({"tool_name": "Bash",
+                                       "tool_input": {"command": cmd}})
+            check(_is_allow(out), f"botchat read/ack exempt: {cmd!r}",
+                  f"out={out}")
+        # A BARE compose-to-Andrew is a SEND, not read/ack -> still DENIED.
+        # The [^&;|]* guard on the send arm also ensures a compose that
+        # only tacks a mark-read on AFTER a separator (`compose && ... ack`)
+        # is denied: the exempt prefix must be the mark-read/ack itself, not
+        # a compose with an ack chained past a `&&`.
+        for cmd in [
+            "botchat-send --to andrew --body 'hi'",
+            "botchat-send --to andrew --body 'hi' && botchat-send --ack 2049",
+        ]:
+            rc, out, err = h.run_hook({"tool_name": "Bash",
+                                       "tool_input": {"command": cmd}})
+            check(_is_deny(out), f"botchat send still gated: {cmd!r}",
+                  f"out={out}")
+    finally:
+        h.cleanup()
+
+
 def test_alert_denies_other_tools():
     h = Harness()
     try:
@@ -561,6 +602,7 @@ def main() -> int:
         test_alert_allows_git_commit_and_push,
         test_alert_allows_obligations_list,
         test_alert_allows_read_tool,
+        test_alert_allows_botchat_read_ack,
         test_alert_denies_other_tools,
         test_multiple_alerts_persist,
         test_ack_cooldown_allows,
