@@ -894,6 +894,20 @@
     //     textContent with the server's UTC string, causing flicker.
     //   - When the iso hasn't changed, copy the rendered marker AND
     //     keep the live textContent.
+    //
+    // CRITICAL (botchat #2039): the queue-item age lines are `title-only`
+    // nodes — LocalTime only sets their `title` tooltip, NEVER their
+    // textContent. Their VISIBLE content is app markup: the label plus a
+    // nested live-ticking `<span class="rel-age" data-rel-epoch>` (#1913).
+    // Copying `fromEl.textContent` onto `toEl` for those nodes FLATTENS the
+    // nested rel-age span into a plain text node — so after the first 5s
+    // merge the ticker can no longer find `.rel-age[data-rel-epoch]` and the
+    // timestamp FREEZES (already-present cards froze; only freshly-inserted
+    // cards, which skip onBeforeElUpdated, kept ticking — the "some tick, some
+    // don't" symptom). So the textContent copy is gated to NON-title-only
+    // nodes (the info-dropdown last-fetch clock, where hydrate DOES own the
+    // textContent). Title-only nodes preserve only the tooltip, leaving the
+    // nested rel-age span intact for the ticker.
     if (fromEl.hasAttribute && fromEl.hasAttribute('data-local-time-iso')) {
       const fromIso = fromEl.getAttribute('data-local-time-iso');
       const toIso = toEl.getAttribute('data-local-time-iso');
@@ -901,7 +915,10 @@
       if (fromRendered && fromRendered === fromIso && fromIso === toIso) {
         // Already-hydrated node, iso unchanged — preserve.
         toEl.setAttribute('data-local-time-rendered', fromRendered);
-        toEl.textContent = fromEl.textContent;
+        if (!fromEl.hasAttribute('data-local-time-title-only')) {
+          // Non-title-only: LocalTime owns the textContent — preserve it.
+          toEl.textContent = fromEl.textContent;
+        }
         if (fromEl.title) toEl.title = fromEl.title;
       }
     }

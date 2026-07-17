@@ -178,8 +178,9 @@ const stateB = {
       depends_on: [],
       started_at_iso: '2026-05-01T19:55:00Z',
       age: '5m ago',
+      age_epoch: 1782071700,
       is_starting: false,
-      owner: { mode: 'agent', alive: true, agent_id: 'agent-aaaa', jsonl_age: '5s ago' },
+      owner: { mode: 'agent', alive: true, agent_id: 'agent-aaaa', jsonl_age: '5s ago', jsonl_age_epoch: 1782071995 },
     },
     {
       id: 'q-bbbb',
@@ -353,23 +354,58 @@ assert('T12: #info-dropdown stays visible after topbar merge (skipped)',
   $('#info-dropdown').hidden === false);
 
 // === TEST 13a: data-local-time-rendered preserved when iso unchanged ===
-// Stamp a localized hydration on the q-aaaa age span (mimicking what
-// LocalTime.hydrate() does), then run a merge with the same iso.
-const ageSpan = $('article[data-queue-id="q-aaaa"] .age span');
+// The queue-item age line is a `data-local-time-title-only` node: its VISIBLE
+// content is app markup (label + nested live-ticking `.rel-age[data-rel-epoch]`
+// span, #1913); LocalTime.hydrate() only sets its TITLE, never its textContent.
+// Stamp the hydration marker + tooltip (mimicking LocalTime.hydrate on a
+// title-only node), then run a merge with the same iso.
+const ageSpan = $('article[data-queue-id="q-aaaa"] .age span[data-local-time-iso]');
 if (ageSpan) {
-  ageSpan.setAttribute('data-local-time-iso', '2026-05-01T19:55:00Z');
-  ageSpan.setAttribute('data-local-time-rendered', '2026-05-01T19:55:00Z');
-  ageSpan.textContent = 'running 15:55:00';
+  ageSpan.setAttribute('data-local-time-rendered', ageSpan.getAttribute('data-local-time-iso'));
+  ageSpan.setAttribute('data-local-time-title-only', '');
+  ageSpan.title = '5/1/2026, 15:55:00';
+  const relBefore = ageSpan.querySelector('.rel-age[data-rel-epoch]');
   refresh.mergeQueueRoot(stateE);
-  const ageAfter = $('article[data-queue-id="q-aaaa"] .age span');
+  const ageAfter = $('article[data-queue-id="q-aaaa"] .age span[data-local-time-iso]');
   assert('T13a: data-local-time-rendered marker preserved unchanged-iso merge',
-    ageAfter && ageAfter.getAttribute('data-local-time-rendered') === '2026-05-01T19:55:00Z',
+    ageAfter && ageAfter.getAttribute('data-local-time-rendered') === ageAfter.getAttribute('data-local-time-iso'),
     ageAfter ? `attr=${ageAfter.getAttribute('data-local-time-rendered')}` : 'no element');
-  assert('T13b: hydrated textContent preserved unchanged-iso merge',
-    ageAfter && ageAfter.textContent === 'running 15:55:00',
-    ageAfter ? `text=${ageAfter.textContent}` : 'no element');
+  // REGRESSION (botchat #2039): the merge must NOT flatten the nested rel-age
+  // span into plain text on a title-only node — flattening removed the
+  // data-rel-epoch element the ticker keys on, freezing the timestamp after
+  // the first 5s refresh (some tick / some don't). The nested span must
+  // survive so rel-age.js keeps re-rendering "Xs ago".
+  const relAfter = ageAfter && ageAfter.querySelector('.rel-age[data-rel-epoch]');
+  assert('T13b: nested rel-age[data-rel-epoch] survives title-only merge (not flattened)',
+    !!relAfter && !!relBefore,
+    ageAfter ? `innerHTML=${ageAfter.innerHTML}` : 'no element');
+  // The tooltip (the one thing LocalTime owns on a title-only node) is preserved.
+  assert('T13c: tooltip preserved on title-only merge',
+    ageAfter && ageAfter.title === '5/1/2026, 15:55:00',
+    ageAfter ? `title=${ageAfter.title}` : 'no element');
 } else {
-  console.error('SKIP  T13a/b: .age span not found (page structure changed?)');
+  console.error('SKIP  T13a/b/c: title-only .age span not found (page structure changed?)');
+}
+
+// === TEST 13d: non-title-only node — LocalTime OWNS textContent, preserve it ===
+// The info-dropdown "last fetch" clock (.ts) is NOT title-only: hydrate replaces
+// its textContent with a localized string. On an unchanged-iso merge that
+// localized text must be preserved (the fix only skips the textContent copy for
+// title-only nodes). Build a standalone node and exercise onBeforeElUpdated via
+// a small morphdom merge.
+{
+  const host = document.createElement('div');
+  host.innerHTML = '<span class="ts" data-local-time-iso="2026-05-01T20:00:00Z" data-local-time-fmt="time" data-local-time-rendered="2026-05-01T20:00:00Z">16:00:00</span>';
+  const target = document.createElement('div');
+  target.innerHTML = '<span class="ts" data-local-time-iso="2026-05-01T20:00:00Z" data-local-time-fmt="time">20:00:00Z</span>';
+  dom.window.morphdom(host, target, {
+    onBeforeElUpdated: refresh.onBeforeElUpdated,
+    childrenOnly: true,
+  });
+  const tsAfter = host.querySelector('.ts');
+  assert('T13d: non-title-only clock preserves hydrated textContent across merge',
+    tsAfter && tsAfter.textContent === '16:00:00',
+    tsAfter ? `text=${tsAfter.textContent}` : 'no element');
 }
 
 // === TEST 14: action-modal user-input value preserved across merge ===
