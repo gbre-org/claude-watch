@@ -128,6 +128,38 @@ COMPLETED_FILE = Path.home() / ".config" / "session" / "completed-tasks.jsonl"
 QUEUE_FILE = Path.home() / ".config" / "session" / "queue.json"
 QUEUE_SCHEMA_VERSION = 2
 
+# --- hostjob reconciliation ------------------------------------------------
+# The `hostjob` detached runner (examples/compose/bin/hostjob) creates a
+# first-class queue row (scope `hostjob:<label>`, created-by `hostjob`) and,
+# on worker exit, its reaper flips that row done/abandon + emits a
+# `hostjob-done` claude-event. That flip is FAIL-SOFT: if `session-task` isn't
+# on the reaper's PATH, errors, or times out — or if a later `hostjob clean`
+# removes the terminal state dir before the flip lands — the row leaks stuck
+# `running` forever. The q-site minisite already compensates by reconciling at
+# RENDER time against the runner's authoritative `<HOSTJOB_LOG_DIR>/<label>/
+# status.json`; the CLI did NOT, so `queue list` showed the raw (stale) truth
+# while the web view looked clean — the exact web/CLI divergence Andrew hit
+# (botchat #2029, earlier #1527). We close the gap by reconciling the SHARED
+# store (queue.json) so BOTH views agree and the leak self-heals. See
+# `_reconcile_hostjob_rows`.
+#
+# HOSTJOB_LOG_DIR mirrors the runner's STATE_ROOT (default ~/.cache/hostjob);
+# overridable so the minisite / tests can point elsewhere.
+HOSTJOB_LOG_DIR = Path(
+    os.environ.get(
+        "HOSTJOB_LOG_DIR",
+        str(Path.home() / ".cache" / "hostjob"),
+    )
+)
+# A hostjob queue row registers a beat BEFORE the runner writes status.json,
+# so an absent state dir within this window means "just launched", not
+# "finished-and-cleaned". Beyond it, an absent dir => the job reached a
+# terminal state and was cleaned (clean REFUSES to remove a running job).
+# Mirrors the minisite's STARTING_WINDOW_SECONDS default (60s).
+HOSTJOB_STARTING_WINDOW_SECONDS = float(
+    os.environ.get("HOSTJOB_STARTING_WINDOW_SECONDS", "60")
+)
+
 # Queue item lifecycle states:
 #   pending    -- created but not yet claimed by a running agent
 #   running    -- claimed (via `register`) and actively being worked
@@ -3046,11 +3078,192 @@ def _print_add_conflict_banner(new_id, new_scope, running_conflicts):
     print(bar, file=sys.stderr)
 
 
+def _extract_hostjob_label(scope):
+    """Return the hostjob label from an item's scope, or None.
+
+    Hostjob rows carry a scope entry ``hostjob:<label>``. Only the first
+    match is honored. Mirrors the minisite's ``_extract_hostjob_label``.
+    """
+    for s in scope or []:
+        if isinstance(s, str) and s.startswith("hostjob:"):
+            return s[len("hostjob:"):]
+    return None
+
+
+def _hostjob_effective_terminal(label, running_age_seconds):
+    """Consult a hostjob's own status.json to detect a queue row still marked
+    ``running`` that has in fact FINISHED. Returns the corrected terminal
+    transition dict, or None to KEEP ``running``.
+
+        {"status": "done", "reason": None}                # rc == 0
+        {"status": "abandoned", "reason": "hostjob ..."}  # rc != 0 / crashed / cleaned
+
+    This is the CLI-side twin of the minisite's ``_hostjob_effective_terminal``
+    (queue-minisite/app.py). Same authoritative source (the runner's
+    ``<HOSTJOB_LOG_DIR>/<label>/status.json``, which ``hostjob list`` also
+    reads), same safety posture: we ONLY read status.json's EXPLICIT terminal
+    state (never probe pid liveness — the CLI may run in a different PID
+    namespace than the host worker), and an ABSENT state dir only reconciles
+    once the row is older than the starting window (so a just-launched job
+    whose status.json lands a beat after the row registers is never
+    mis-flipped). Fail-soft: any unexpected shape returns None (keep running).
+    """
+    if not label:
+        return None
+    sp = HOSTJOB_LOG_DIR / label / "status.json"
+    try:
+        with open(sp, "r", encoding="utf-8", errors="replace") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        # No state dir. Either finished + `hostjob clean`'d (clean REFUSES a
+        # running job, so an absent dir past the starting window means it
+        # reached terminal), or we're inside the launch race. Gate on the
+        # window to exclude the race. rc is unrecoverable => present as a
+        # plain `done` (no evidence of failure to justify abandoned).
+        if (
+            running_age_seconds is not None
+            and running_age_seconds > HOSTJOB_STARTING_WINDOW_SECONDS
+        ):
+            return {"status": "done", "reason": None}
+        return None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict):
+        return None
+    hj_status = st.get("status")
+    if hj_status == "running":
+        # The runner still considers the worker live — trust the reaper to
+        # flip on exit. (No cross-namespace pid check.)
+        return None
+    # Terminal per the runner: done / crashed / stopped.
+    rc = st.get("rc")
+    try:
+        rc_int = int(rc)
+    except (TypeError, ValueError):
+        rc_int = None
+    if hj_status == "done" and rc_int == 0:
+        return {"status": "done", "reason": None}
+    exit_str = "unknown" if rc_int is None else str(rc_int)
+    return {
+        "status": "abandoned",
+        "reason": "hostjob %s (status=%s exit=%s)" % (label, hj_status, exit_str),
+    }
+
+
+def _reconcile_hostjob_rows(items):
+    """Heal hostjob rows stuck ``running`` whose runner reports terminal.
+
+    Mutates ``items`` IN PLACE, transitioning each affected row to its
+    authoritative terminal status (done / abandoned) with the same field
+    stamps `cmd_queue_done`/`cmd_queue_abandon` write (``completed_at`` /
+    ``abandoned_at`` / ``abandon_reason``, ``group_head`` cleared, plus a
+    ``reconciled_hostjob`` provenance flag). Returns the list of
+    ``(id, new_status)`` tuples reconciled (possibly empty).
+
+    Called under the queue write-lock by mutating commands (`list` when it
+    can persist, plus a dedicated `reconcile-hostjobs` command) so the SHARED
+    queue.json is repaired — making the CLI and the render-time-reconciling
+    q-site agree, and stopping the leak at its durable source. NEVER raises;
+    any per-row error is skipped so one bad row can't block the sweep.
+    """
+    now = datetime.now(timezone.utc)
+    reconciled = []
+    for it in items:
+        try:
+            if it.get("status") != "running":
+                continue
+            label = _extract_hostjob_label(it.get("scope") or [])
+            if not label:
+                continue
+            started_iso = it.get("registered_at") or it.get("started_at")
+            age = None
+            if started_iso:
+                try:
+                    started = datetime.fromisoformat(started_iso)
+                    age = (now - started).total_seconds()
+                except (TypeError, ValueError):
+                    age = None
+            eff = _hostjob_effective_terminal(label, age)
+            if eff is None:
+                continue
+            it["status"] = eff["status"]
+            it["group_head"] = False
+            it["reconciled_hostjob"] = True
+            it["reconciled_hostjob_at"] = _fmt_ts()
+            if eff["status"] == "done":
+                it["completed_at"] = _fmt_ts()
+            else:
+                it["abandoned_at"] = _fmt_ts()
+                it["abandon_reason"] = eff.get("reason") or "hostjob finished (reconciled)"
+            reconciled.append((it.get("id"), eff["status"]))
+        except Exception:
+            continue
+    if reconciled:
+        _recompute_group_heads(items)
+    return reconciled
+
+
+def cmd_queue_reconcile_hostjobs(args):
+    """Sweep queue.json for stuck-`running` hostjob rows whose runner reports
+    terminal, and heal them in the shared store.
+
+    This is the durable, both-views-agree fix for the CLI/web divergence
+    (Andrew, botchat #2029): the q-site reconciles hostjob rows at render
+    time from the runner's status.json, but the CLI showed raw queue.json, so
+    finished-but-unflipped hostjobs lingered as `running` only in `queue
+    list`. Running this sweep transitions them to their real terminal state so
+    BOTH surfaces match. Safe to run on any host with the runner's
+    ``HOSTJOB_LOG_DIR`` visible (that's where status.json lives); on a host
+    without it, absent-dir rows past the starting window reconcile to `done`.
+    """
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        reconciled = _reconcile_hostjob_rows(items)
+        if reconciled:
+            _queue_write_and_unlock(fh, data)
+        else:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    if getattr(args, "json", False):
+        print(json.dumps(
+            [{"id": i, "status": s} for i, s in reconciled], indent=2))
+        return
+    if not reconciled:
+        print("no stuck hostjob rows to reconcile")
+        return
+    for i, s in reconciled:
+        print(f"reconciled {i} -> {s}")
+    print(f"reconciled {len(reconciled)} hostjob row(s)")
+
+
 def cmd_queue_list(args):
-    fh, data = _queue_open_locked("r")
+    fh, data = _queue_open_locked("rw")
     items = list(data["items"])
     locked_scopes = data.get("locked_scopes") or {}
-    _queue_unlock_readonly(fh)
+    # Self-heal hostjob rows stuck `running` whose runner reports terminal,
+    # BEFORE filtering/rendering, so `queue list` matches the render-time-
+    # reconciling q-site and the leak is durably repaired in the shared store
+    # (botchat #2029). Guarded so a reconcile failure never blocks listing:
+    # on error we release the lock read-only and render the raw items. When
+    # nothing changes we also release without a write (no spurious churn).
+    try:
+        reconciled = _reconcile_hostjob_rows(data["items"])
+        if reconciled:
+            _queue_write_and_unlock(fh, data)
+            items = list(data["items"])
+        else:
+            _queue_unlock_readonly(fh)
+    except Exception:
+        try:
+            _queue_unlock_readonly(fh)
+        except Exception:
+            pass
 
     # Filter
     if args.group:
@@ -6522,6 +6735,19 @@ def build_parser():
     q_list.add_argument("--group")
     q_list.add_argument("--json", action="store_true")
 
+    q_reconcile_hj = qsub.add_parser(
+        "reconcile-hostjobs",
+        help=(
+            "Heal hostjob rows stuck `running` whose runner reports terminal "
+            "(the reaper's fail-soft done/abandon flip was dropped, or a later "
+            "`hostjob clean` removed the state dir). Reconciles the shared "
+            "queue.json against the runner's status.json so `queue list` and "
+            "the q-site agree. Also runs automatically at the start of every "
+            "`queue list`."
+        ),
+    )
+    q_reconcile_hj.add_argument("--json", action="store_true")
+
     q_show = qsub.add_parser("show", help="Show item details")
     q_show.add_argument("id")
 
@@ -7012,6 +7238,7 @@ def main():
         qmap = {
             "add": cmd_queue_add,
             "list": cmd_queue_list,
+            "reconcile-hostjobs": cmd_queue_reconcile_hostjobs,
             "show": cmd_queue_show,
             "scope": cmd_queue_scope,
             "groups": cmd_queue_groups,
