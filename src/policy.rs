@@ -2759,6 +2759,119 @@ fn build_relaunch_inject_cmd(script_path: &str, launch: &str) -> String {
     format!("[ -f {p} ] && bash {p} || {{ {launch}; }}", p = script_path, launch = launch)
 }
 
+/// Container auto-update relaunch path: clean `tmux respawn-pane -k` via the
+/// configured `[auto_update] relaunch_command` (default `["cwsr",
+/// "--no-upgrade"]`) INSTEAD of the interactive `/exit` + shell-inject flow.
+///
+/// Sequence: run the relaunch command → wait for the claude binary to appear
+/// in the pane's process tree → wait for the idle prompt → inject the resume
+/// prompt → notify. Mirrors the tail of `run_auto_update` (Steps 7–10) but
+/// with the clean respawn as the PRIMARY relaunch rather than a fallback.
+///
+/// Caller has already interrupted + settled the pane (Step 1). This function
+/// is only reached when `relaunch_command` is non-empty, so it never runs on
+/// the host (empty default there → the `/exit` flow is used instead).
+async fn run_auto_update_clean_relaunch(
+    pane: &str,
+    old_version: &str,
+    new_version: &str,
+    config: &Config,
+) {
+    let relaunch_argv: Vec<&str> = config
+        .auto_update
+        .relaunch_command
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    info!(
+        relaunch_command = ?config.auto_update.relaunch_command,
+        "auto-update: using clean-relaunch path (no /exit) — respawning pane"
+    );
+    write_jsonl_log(
+        &config.general.log_file,
+        "auto_update_clean_relaunch",
+        serde_json::json!({
+            "relaunch_command": config.auto_update.relaunch_command,
+            "old_version": old_version,
+            "new_version": new_version,
+        }),
+    );
+
+    // Respawn the pane. cwsr --no-upgrade kills pane 0 and starts a fresh
+    // claude via `tmux respawn-pane -k`, reconstructing the entrypoint argv
+    // (settings shim, plugin-dir, --continue) itself. The install already
+    // landed on disk, so no upgrade step is needed here.
+    let (_out, ok) = crate::cmd::run_cmd_any(&relaunch_argv, 60).await;
+    if !ok {
+        warn!("auto-update: clean-relaunch command exited non-zero");
+    }
+
+    // Wait for the claude binary to come up in the pane process tree. This is
+    // the load-bearing gate: only inject the resume prompt once Claude is
+    // actually running, never into a raw shell.
+    info!("auto-update: waiting for Claude binary to start (clean-relaunch)...");
+    if !tmux::wait_for_claude_binary(pane, 120).await {
+        warn!(
+            "auto-update: claude binary not detected 120s after clean-relaunch -- \
+             ABORTING resume-inject (never type the prompt into a raw shell)"
+        );
+        write_jsonl_log(
+            &config.general.log_file,
+            "auto_update_failed",
+            serde_json::json!({"reason": "binary_not_found_after_clean_relaunch"}),
+        );
+        alert::notify(crate::event_bus::ClaudeWatchAlert {
+            alert_type: "auto-update-failed",
+            stuck_reason: "auto-update: claude binary never started after clean-relaunch (cwsr respawn); resume-inject aborted",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: crate::event_bus::Severity::High,
+            message: "claude-watch: auto-update FAILED — Claude did not restart after clean-relaunch (cwsr). Operator must relaunch manually.",
+        })
+        .await;
+        return;
+    }
+    info!("auto-update: Claude binary is up (clean-relaunch)");
+
+    // Wait for the idle prompt (best-effort — binary is confirmed up).
+    info!("auto-update: waiting for idle prompt (clean-relaunch)...");
+    if !tmux::wait_for_idle_prompt(pane, 90).await {
+        warn!("auto-update: prompt not found after 90s, injecting anyway (claude binary is up)");
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Inject the resume prompt (lands in the Claude TUI, never a raw shell).
+    info!("auto-update: injecting resume prompt (clean-relaunch)...");
+    inject_dispatch::inject_to_agent(pane, &config.auto_update.resume_prompt).await;
+
+    write_jsonl_log(
+        &config.general.log_file,
+        "auto_update_complete",
+        serde_json::json!({
+            "old_version": old_version,
+            "new_version": new_version,
+            "via": "clean_relaunch",
+        }),
+    );
+    let msg = format!(
+        "claude-watch: auto-update complete ({} → {}, clean-relaunch)",
+        old_version, new_version
+    );
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "auto-update-complete",
+        stuck_reason: "auto-update finished (clean-relaunch)",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::Low,
+        message: &msg,
+    })
+    .await;
+    info!(
+        "auto-update: complete ({} → {}, clean-relaunch)",
+        old_version, new_version
+    );
+}
+
 /// Execute the auto-update sequence: interrupt → /exit → wait → relaunch → resume.
 async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, config: &Config) {
     info!("auto-update: interrupting Claude Code...");
@@ -2780,6 +2893,30 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
 
     // Settle time after interruption
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Step 1b: CONTAINER clean-relaunch path (avoids the `/exit` WEDGE).
+    //
+    // When `[auto_update] relaunch_command` is configured (container default
+    // `["cwsr", "--no-upgrade"]`; EMPTY on the host / GB, which keeps the
+    // `/exit` flow below unchanged), relaunch Claude via that command's clean
+    // `tmux respawn-pane -k` instead of the interactive `/exit` +
+    // shell-inject dance. Inside the container `/exit` is unreliable: Claude
+    // Code 2.1.x pops a "Background work is running" confirmation whenever
+    // background watchers are running (they always are), the shell-injected
+    // `bash <relaunch_script>` one-liner is fragile (tmpfs-wiped script,
+    // dangling launcher during the `claude install` download window), and the
+    // failure mode cascades into "Claude Code crashed — auto-restarting"
+    // alert storms + eventual container recreates (operator botchat #2107).
+    // cwsr respawns pane 0 directly (no `/exit`, no dialog, no raw-shell
+    // inject) and reconstructs the correct claude argv from the entrypoint
+    // env vars — the same mechanism the Step-7 crash-recovery fallback below
+    // already trusts. The `claude install` write already landed the new
+    // version on disk (that mismatch is what triggered this run), so a bare
+    // respawn picks it up.
+    if !config.auto_update.relaunch_command.is_empty() {
+        run_auto_update_clean_relaunch(pane, old_version, new_version, config).await;
+        return;
+    }
 
     // Step 2: Inject /exit
     info!("auto-update: injecting /exit...");

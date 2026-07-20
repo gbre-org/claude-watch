@@ -188,6 +188,19 @@ cooldown = 300
 # installed) is detected and the restart nudge fires. The relaunch picks up
 # the new build because npm already atomically swapped the package symlink.
 enabled = true
+# CONTAINER relaunch path: relaunch via cwsr's clean `tmux respawn-pane -k`
+# instead of the interactive `/exit` + shell-inject flow. `/exit` is UNRELIABLE
+# in the container — Claude Code 2.1.x pops a "Background work is running"
+# confirmation whenever background watchers are running (always, here), and the
+# shell-injected `bash <relaunch_script>` one-liner is fragile (tmpfs-wiped
+# script, dangling ~/.local/bin/claude launcher during the `claude install`
+# download window). Those failures cascaded into "Claude Code crashed —
+# auto-restarting" alert storms + eventual container recreates (operator botchat
+# #2107). cwsr respawns pane 0 directly (no /exit, no dialog, no raw-shell
+# inject) and rebuilds the correct claude argv from the entrypoint env vars.
+# Empty on the HOST / GB deployment (the daemon default), so that proven
+# `/exit` relaunch flow is untouched there.
+relaunch_command = ["cwsr", "--no-upgrade"]
 
 [reauth]
 # Disabled — host push-notification integration. Phase 2+ work item.
