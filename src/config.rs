@@ -559,6 +559,28 @@ pub struct AutoUpdateConfig {
     /// Resume prompt injected after update restart
     #[serde(default = "default_update_resume_prompt")]
     pub resume_prompt: String,
+    /// Command + argv used to RELAUNCH Claude after an auto-update, INSTEAD
+    /// of the interactive `/exit` + shell-inject flow.
+    ///
+    /// Default: `[]` (empty) — the HOST / non-containerized deployment (GB)
+    /// keeps the proven `/exit` → wait-for-exit → shell-inject relaunch path
+    /// unchanged.
+    ///
+    /// Container deployments set this to `["cwsr", "--no-upgrade"]` so the
+    /// relaunch goes through `cwsr`'s clean `tmux respawn-pane -k` (the same
+    /// mechanism the crash-recovery fallback in `run_auto_update` already
+    /// uses). This AVOIDS the in-container `/exit` WEDGE: Claude Code 2.1.x
+    /// renders a "Background work is running" confirmation on the interactive
+    /// `/exit` flow whenever background tasks are running (our sessions always
+    /// have backgrounded watchers), and the subsequent shell-injected
+    /// `bash <relaunch_script>` one-liner is fragile (tmpfs-wiped script,
+    /// dangling `~/.local/bin/claude` during a `claude install` download
+    /// window) — historically cascading into "Claude Code crashed —
+    /// auto-restarting" alert storms and eventual container recreates. cwsr
+    /// respawns the pane directly (no `/exit`, no dialog, no shell-inject) and
+    /// reconstructs the correct claude argv from the entrypoint env vars.
+    #[serde(default = "default_auto_update_relaunch_command")]
+    pub relaunch_command: Vec<String>,
 }
 
 impl Default for AutoUpdateConfig {
@@ -568,6 +590,7 @@ impl Default for AutoUpdateConfig {
             check_minute: default_check_minute(),
             cooldown_hours: default_cooldown_hours(),
             resume_prompt: default_update_resume_prompt(),
+            relaunch_command: default_auto_update_relaunch_command(),
         }
     }
 }
@@ -664,6 +687,14 @@ fn default_check_minute() -> u32 {
 
 fn default_cooldown_hours() -> u64 {
     1
+}
+
+fn default_auto_update_relaunch_command() -> Vec<String> {
+    // Empty by default: the HOST (non-containerized, GB) deployment keeps the
+    // proven interactive `/exit` + shell-inject relaunch path. Container
+    // deployments set this to `["cwsr", "--no-upgrade"]` in their config.toml
+    // to relaunch via `tmux respawn-pane -k` and dodge the `/exit` wedge.
+    Vec::new()
 }
 
 fn default_update_resume_prompt() -> String {
@@ -1888,6 +1919,13 @@ cooldown = 300
         assert_eq!(config.auto_update.check_minute, 10);
         assert_eq!(config.auto_update.cooldown_hours, 1);
         assert_eq!(config.auto_update.resume_prompt, "resume");
+        // Default relaunch_command is EMPTY: the host/GB deployment keeps the
+        // interactive `/exit` relaunch. Containers opt into cwsr respawn via
+        // config.
+        assert!(
+            config.auto_update.relaunch_command.is_empty(),
+            "default auto_update.relaunch_command must be empty (host /exit path)"
+        );
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
         // Hybrid defaults (no [hybrid] in SAMPLE_CONFIG -> defaults applied)
@@ -2104,6 +2142,27 @@ cooldown = 300
         // reauth defaults should also be applied
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
+        // No [auto_update] section => relaunch_command defaults empty (host
+        // /exit path); containers opt in via their config.toml.
+        assert!(config.auto_update.relaunch_command.is_empty());
+    }
+
+    #[test]
+    fn test_auto_update_relaunch_command_override() {
+        // A container config that sets relaunch_command must parse it so the
+        // daemon relaunches via cwsr's clean respawn instead of `/exit`.
+        // SAMPLE_CONFIG already has an [auto_update] block; splice
+        // relaunch_command into it rather than append a duplicate section.
+        let cfg_str = SAMPLE_CONFIG.replace(
+            "resume_prompt = \"resume\"",
+            "resume_prompt = \"resume\"\nrelaunch_command = [\"cwsr\", \"--no-upgrade\"]",
+        );
+        let config = parse_config(&cfg_str).unwrap();
+        assert_eq!(
+            config.auto_update.relaunch_command,
+            vec!["cwsr".to_string(), "--no-upgrade".to_string()],
+            "container relaunch_command must round-trip"
+        );
     }
 
     #[test]
