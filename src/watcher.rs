@@ -203,7 +203,13 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
         }
     }
 
-    let pid_dir = crate::status::watcher_pid_dir();
+    // Scan ALL candidate pid dirs (not one env-resolved dir): watcher-ctl
+    // status runs in an interactive shell where `$XDG_RUNTIME_DIR` resolves the
+    // single-dir helper to `/run/user/<uid>`, which holds the flock-guard
+    // watchers' `.lock` files but NOT the `signal-wait-*` `.pid` files that
+    // `watcher_run` writes to `/var/run/claude` — a single-dir read reported
+    // those live watchers as DOWN. See `status::watcher_pidfile_liveness_multi`.
+    let pid_dirs = crate::status::watcher_pid_dirs();
 
     let mut results = Vec::with_capacity(entries.len());
     for (entry, joined_opt) in entries.iter().zip(joined.into_iter()) {
@@ -226,8 +232,11 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
         // --- UP/DOWN: pidfile liveness (NOT pgrep). Same model as the daemon.
         // min_count == 0 means "never DOWN" — preserve that opt-out so a
         // watcher explicitly opting out of liveness checks can't trip DOWN.
-        let (recorded_pid, pidfile_down) =
-            crate::status::watcher_pidfile_liveness(&pid_dir, &entry.name, entry.start_cmd.as_deref());
+        let (recorded_pid, pidfile_down) = crate::status::watcher_pidfile_liveness_multi(
+            &pid_dirs,
+            &entry.name,
+            entry.start_cmd.as_deref(),
+        );
         let is_down = entry.min_count != 0 && pidfile_down;
 
         // `count` reflects the single-instance pidfile model: 1 when the

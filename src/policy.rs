@@ -1683,6 +1683,10 @@ fn is_pid_alive(pid: u32) -> bool {
 /// Falls back to the signal-0 probe when `/proc/PID/stat` is unreadable (e.g.
 /// a non-Linux test host) so behaviour degrades to "exists?" rather than
 /// always-false.
+// dead_code allow: the watcher_monitor now calls `status::*_multi` directly, so
+// this thin delegator is retained only as a named re-export for the module's
+// tests / historical readers.
+#[allow(dead_code)]
 fn is_pid_genuinely_alive(pid: u32) -> bool {
     crate::status::is_pid_genuinely_alive(pid)
 }
@@ -1690,6 +1694,9 @@ fn is_pid_genuinely_alive(pid: u32) -> bool {
 /// Read `/proc/<pid>/cmdline` (NUL-separated argv) into a space-joined string.
 /// Returns `None` if the process is gone, the file is unreadable, or the
 /// cmdline is empty (e.g. a kernel thread). Used for watcher identity checks.
+// dead_code allow: see is_pid_genuinely_alive — retained delegator, the live
+// path is `status::watcher_pidfile_liveness_multi`.
+#[allow(dead_code)]
 fn read_proc_cmdline(pid: u32) -> Option<String> {
     crate::status::read_proc_cmdline(pid)
 }
@@ -1766,6 +1773,12 @@ pub fn watcher_is_down(
 ///      watcher_run spawn path).
 ///   2. `$XDG_RUNTIME_DIR` (matches the watcher's lockfile default).
 ///   3. `/var/run/claude` (final fallback — the baked container path).
+///
+/// Superseded by `status::watcher_pid_dirs()` (ALL candidates) — the daemon's
+/// watcher_monitor now scans every candidate dir, not this single env-resolved
+/// one. Retained as a named delegator.
+// dead_code allow: superseded single-dir resolver, no production caller.
+#[allow(dead_code)]
 pub(crate) fn watcher_pid_dir() -> String {
     crate::status::watcher_pid_dir()
 }
@@ -1784,6 +1797,12 @@ pub(crate) fn watcher_pid_dir() -> String {
 /// We prefer `<name>.lock` (always present for a live watcher in the container)
 /// and fall back to `<name>.pid`. Returns the first file that parses to a PID,
 /// or `None` if neither exists / parses.
+///
+/// Superseded by `status::collect_watcher_recorded_pids` (every dir × file,
+/// alive-preferring) — the lock-first single pick mis-selected a stale `.lock`
+/// over a fresh `.pid`. Retained as a named delegator for its tests.
+// dead_code allow: superseded single-pick reader, no production caller.
+#[allow(dead_code)]
 fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
     crate::status::read_watcher_recorded_pid(pid_dir, name)
 }
@@ -1803,6 +1822,10 @@ fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
 /// which DOES appear in the exec'd cmdline. This tolerates the exec-to-binary
 /// transform while still rejecting an obviously-unrelated recycled PID (whose
 /// cmdline won't contain the watcher's name stem).
+// dead_code allow: the identity check now runs inside
+// `status::watcher_pidfile_liveness_multi`; this delegator is retained for the
+// module's tests.
+#[allow(dead_code)]
 fn cmdline_matches_watcher(cmdline: &str, start_cmd: &str) -> bool {
     crate::status::cmdline_matches_watcher(cmdline, start_cmd)
 }
@@ -1832,6 +1855,10 @@ fn cmdline_matches_watcher(cmdline: &str, start_cmd: &str) -> bool {
 /// replacing the launcher's argv with the exec'd binary's argv defeats any
 /// `pgrep -f <launcher.sh>` match (this bug). Liveness comes ONLY from the
 /// pidfile the watcher itself maintains.
+// dead_code allow: `status::watcher_pidfile_liveness_multi` calls the pure
+// `status::pidfile_watcher_is_down` directly now; this delegator is retained
+// for the module's tests.
+#[allow(dead_code)]
 pub fn pidfile_watcher_is_down(
     recorded_pid: Option<u32>,
     pid_alive: bool,
@@ -4933,28 +4960,24 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // the `<name>.pid` written by `watcher_run`), probe it for genuine
             // (non-zombie) liveness, and verify cmdline identity (to reject a
             // recycled PID). All three survive the exec-to-binary transform.
-            let pid_dir = watcher_pid_dir();
-            let recorded_pid = read_watcher_recorded_pid(&pid_dir, &entry.name);
-            let pid_alive = recorded_pid.is_some_and(is_pid_genuinely_alive);
-            let cmdline_matches = match (recorded_pid, pid_alive, entry.start_cmd.as_deref()) {
-                // Live PID + a configured start_cmd → verify identity. A live
-                // PID with no start_cmd to compare against is treated as a
-                // match (we have nothing to reject it with, and the pidfile
-                // naming it is itself evidence).
-                (Some(pid), true, Some(start_cmd)) => match read_proc_cmdline(pid) {
-                    Some(cmdline) => cmdline_matches_watcher(&cmdline, start_cmd),
-                    None => false,
-                },
-                (Some(_), true, None) => true,
-                _ => false,
-            };
-            // The pidfile model is single-instance: a watcher is UP iff its
-            // pidfile names exactly one live matching process (the natural map
-            // of min_count==1). min_count==0 means "never DOWN" — preserve that
-            // edge so a watcher explicitly opted out of liveness checks can't
-            // trip the alert.
-            let down =
-                entry.min_count != 0 && pidfile_watcher_is_down(recorded_pid, pid_alive, cmdline_matches);
+            // Scan ALL candidate pid dirs and BOTH `.lock`/`.pid` files, not a
+            // single env-resolved dir + a lock-preferring pick. The daemon
+            // often runs WITHOUT `$XDG_RUNTIME_DIR`, so the single-dir helper
+            // resolved to `/var/run/claude`, where a flock-guard watcher's
+            // `.lock` can be STALE (its live lock moved to `/run/user/<uid>`),
+            // while the FRESH `.pid` naming the live poller sat right beside it
+            // — the old "prefer `.lock`" pick chose the dead pid and fired a
+            // false `watcher-down`. `watcher_pidfile_liveness_multi` reports UP
+            // iff ANY recorded pid (any dir, either file) is genuinely alive and
+            // cmdline-matches, so the live `.pid` wins. min_count==0 still means
+            // "never DOWN" (explicit opt-out).
+            let pid_dirs = status::watcher_pid_dirs();
+            let (recorded_pid, pidfile_down) = status::watcher_pidfile_liveness_multi(
+                &pid_dirs,
+                &entry.name,
+                entry.start_cmd.as_deref(),
+            );
+            let down = entry.min_count != 0 && pidfile_down;
             // "orphaned": a pidfile names a PID that is NOT a genuinely-alive
             // matching watcher (dead / zombie / recycled). Surfaced for
             // diagnostics — a stale pidfile is the pidfile-model analogue of
@@ -5008,7 +5031,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     .last_seen_running
                     .as_deref()
                     .and_then(elapsed_since);
-                let pidfile_age = status::watcher_runtime_file_age_secs(&pid_dir, &entry.name);
+                let pidfile_age = status::watcher_runtime_file_age_secs_multi(&pid_dirs, &entry.name);
                 if status::watcher_in_grace(last_seen_age, pidfile_age, grace_secs) {
                     continue;
                 }
