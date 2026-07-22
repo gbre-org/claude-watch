@@ -682,6 +682,25 @@ pub(crate) fn reset_suppression(state: &mut State) {
     state.first_suppression_at = None;
 }
 
+/// Pure predicate: is the configured event-consumer watcher among the
+/// missing watchers this cycle?
+///
+/// The event consumer (`[watcher_monitor].event_consumer_watcher_name`,
+/// e.g. `claude-event-watch`) is the process that DRAINS the
+/// `~/claude-events/` queue the quiet path writes into. When it is the
+/// down watcher, the quiet claude-event channel is a dead letter box: an
+/// event announcing its own death is enqueued into the very queue only it
+/// drains, so nothing ever surfaces it to the main loop (circular
+/// dependency -> silent watcher death). The watcher-down escalation must
+/// therefore use the OUT-OF-BAND tmux-inject path (send-keys into the
+/// pane) rather than deferring on the premise the claude-event will be
+/// picked up. Callers use this to force the active-turn suppression and
+/// obligation-dwell gates open for a consumer-down. An empty
+/// `consumer_name` (consumer unconfigured) is never "missing".
+pub(crate) fn consumer_watcher_missing(missing: &[String], consumer_name: &str) -> bool {
+    !consumer_name.is_empty() && missing.iter().any(|n| n == consumer_name)
+}
+
 /// Pure helper: filter the missing-watchers list before emitting a
 /// `watcher-down` claude-event, suppressing the event entirely when the
 /// only thing down is the event-consumer watcher.
@@ -5163,6 +5182,23 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // the cross-gate escalation kicks the inject through anyway if
         // the suppression run gets too long/persistent.
         if any_critical_missing && !effective_pane.is_empty() {
+            // The event-consumer watcher (claude-event-watch) is the process
+            // that DRAINS the ~/claude-events/ queue the quiet path writes to.
+            // When IT is the down watcher, the quiet claude-event channel is
+            // structurally dead: an event about its own death can never be
+            // surfaced (nothing is left to drain the queue). The two defer
+            // gates below — active-turn suppression and the obligation-dwell —
+            // both justify holding the loud tmux inject on the premise that the
+            // out-of-band claude-event STILL fires. That premise is FALSE for a
+            // consumer-down: the self-feedback guard filters the consumer out of
+            // the emit (-> None), so a busy dispatcher (always "actively
+            // turning", always with live subagents) gets ZERO notification and
+            // the watcher stays silently dead. So when the event consumer is
+            // among the missing watchers, force both gates open and fire a REAL
+            // tmux inject promptly — the pane is the only working out-of-band
+            // channel once the event consumer is gone. (Andrew: "your watchers
+            // are down but you aren't getting interrupted.")
+            let consumer_down = consumer_watcher_missing(&missing_names, &event_consumer_name);
             let should_inject = watcher_inject_due(
                 state.last_watcher_inject.as_deref(),
                 config.watcher_monitor.inject_cooldown,
@@ -5193,7 +5229,13 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // mid-turn → loop pivots to "restart watcher" → original ask
             // is abandoned half-finished — only happens if we keep
             // typing into the pane, so dropping the inject is enough.
-            let actively_turning = config.watcher_monitor.suppress_inject_when_active
+            // consumer_down bypasses active-turn suppression: the suppression
+            // path's only notification is the out-of-band claude-event, which
+            // is undeliverable+self-feedback-filtered when the consumer itself
+            // is down. Suppressing would mean total silence, so never suppress
+            // a consumer-down.
+            let actively_turning = !consumer_down
+                && config.watcher_monitor.suppress_inject_when_active
                 && main_loop_actively_turning(
                     state,
                     bashes,
@@ -5365,8 +5407,13 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // of 0 disables the gate (legacy same-cycle interrupt).
                     let wd_active_subagents =
                         crate::respawn::count_alive_subagents();
+                    // consumer_down forces immediate Escalate (like an active
+                    // suppression-escalation): the obligation-dwell would else
+                    // Hold indefinitely while background subagents stay alive,
+                    // and there is no working quiet channel to defer to when the
+                    // event consumer is the down watcher.
                     let wd_decision = watcher_down_obligation_decision(
-                        escalation.is_some(),
+                        escalation.is_some() || consumer_down,
                         state.watcher_down_obligation_armed_at.as_deref(),
                         config.general.obligation_dwell_secs,
                         wd_active_subagents,
@@ -5563,7 +5610,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     }
 
     // --- tmux healthcheck brief ---
-    let tmux_brief = tmux::healthcheck_brief().await;
+    let tmux_brief = tmux::healthcheck_brief(&config.tmux).await;
 
     // --- Log this check ---
     let log_msg = format!(
@@ -8433,6 +8480,59 @@ max_stuck_secs = {max_stuck}
             filter_consumer_for_event_emit(&affected, "claude-event-watch"),
             None
         );
+    }
+
+    // --- consumer_watcher_missing tests (silent-watcher-death fix) ---
+    //
+    // When the event consumer (claude-event-watch) is itself the down
+    // watcher, the quiet claude-event channel is a dead letter box (nothing
+    // drains the queue), so the escalation MUST take the out-of-band tmux
+    // inject path. `consumer_watcher_missing` is the predicate the inject
+    // block uses to force the suppression + obligation-dwell gates open.
+
+    #[test]
+    fn test_consumer_watcher_missing_present() {
+        let missing = vec![
+            "botchat-wait".to_string(),
+            "claude-event-watch".to_string(),
+        ];
+        assert!(consumer_watcher_missing(&missing, "claude-event-watch"));
+    }
+
+    #[test]
+    fn test_consumer_watcher_missing_absent() {
+        let missing = vec!["botchat-wait".to_string()];
+        assert!(!consumer_watcher_missing(&missing, "claude-event-watch"));
+    }
+
+    #[test]
+    fn test_consumer_watcher_missing_only_consumer() {
+        let missing = vec!["claude-event-watch".to_string()];
+        assert!(
+            consumer_watcher_missing(&missing, "claude-event-watch"),
+            "consumer-only down must be detected — this is the exact circular-\
+             dependency case that silently killed the watcher"
+        );
+    }
+
+    #[test]
+    fn test_consumer_watcher_missing_empty_list() {
+        let missing: Vec<String> = vec![];
+        assert!(!consumer_watcher_missing(&missing, "claude-event-watch"));
+    }
+
+    #[test]
+    fn test_consumer_watcher_missing_empty_consumer_name_never_matches() {
+        // Unconfigured consumer name -> never "missing" (avoid matching an
+        // empty entry / false positive).
+        let missing = vec!["claude-event-watch".to_string()];
+        assert!(!consumer_watcher_missing(&missing, ""));
+    }
+
+    #[test]
+    fn test_consumer_watcher_missing_custom_name() {
+        let missing = vec!["my-custom-consumer".to_string()];
+        assert!(consumer_watcher_missing(&missing, "my-custom-consumer"));
     }
 
     #[test]
