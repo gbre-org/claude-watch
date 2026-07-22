@@ -2281,11 +2281,101 @@ pub async fn detect_api_retry(pane: &str) -> bool {
     false
 }
 
-/// Run tmux healthcheck brief.
-pub async fn healthcheck_brief() -> String {
-    run_cmd(&["tmux-healthcheck", "--brief"], 5)
-        .await
-        .unwrap_or_else(|| "tmux-healthcheck: unavailable".to_string())
+/// Native, version-stable tmux healthcheck brief for the daemon's per-cycle
+/// log line.
+///
+/// HISTORY: this previously shelled out to an external `tmux-healthcheck
+/// --brief` binary that was NEVER shipped — it exists in neither the image
+/// nor any host install, so `run_cmd` always returned `None` and the daemon
+/// logged the literal fallback `tmux-healthcheck: unavailable` on EVERY
+/// cycle (observed in the live in-container log). The string is purely
+/// diagnostic (used only in the legacy log line + the `tmux_health` JSONL
+/// field — it gates NOTHING), but "unavailable" every cycle is actively
+/// misleading: it reads like a real tmux fault when tmux is perfectly
+/// healthy. Replace the phantom-binary call with an inline probe of the
+/// CONFIGURED dashboard session/pane.
+///
+/// Uses only subcommands + format variables that are stable across every
+/// tmux version in play (`has-session`, `list-panes -F "#{pane_id}"`,
+/// `display-message -p "#{pane_id}"` — all present since tmux 1.x, verified
+/// on the in-container 3.3a and the host 3.7b). It is deliberately
+/// command-NAME-independent (does not match `#{pane_current_command}`
+/// against "claude"), so it is unaffected by the native-installer pane-comm
+/// regression that PR #512 addressed elsewhere. Best-effort: any probe
+/// failure degrades to a descriptive brief rather than a hard error.
+pub async fn healthcheck_brief(config: &crate::config::TmuxConfig) -> String {
+    // No configured session -> report server reachability only. `list-panes
+    // -a` succeeds iff a tmux server is running and answering.
+    if config.dashboard_session.is_empty() {
+        let (_, ok) = run_cmd_any(&["tmux", "list-panes", "-a", "-F", "#{pane_id}"], 5).await;
+        return if ok {
+            "tmux: ok (server up, no dashboard_session configured)".to_string()
+        } else {
+            "tmux: no server / unreachable".to_string()
+        };
+    }
+
+    // Session existence.
+    let (_, session_ok) =
+        run_cmd_any(&["tmux", "has-session", "-t", &config.dashboard_session], 5).await;
+    if !session_ok {
+        return format!("tmux: session '{}' missing", config.dashboard_session);
+    }
+
+    // Pane count in the session (proxy for "panes exist"). Stable format var.
+    let (panes_out, panes_ok) = run_cmd_any(
+        &[
+            "tmux",
+            "list-panes",
+            "-s",
+            "-t",
+            &config.dashboard_session,
+            "-F",
+            "#{pane_id}",
+        ],
+        5,
+    )
+    .await;
+    let pane_count = if panes_ok {
+        panes_out.lines().filter(|l| !l.trim().is_empty()).count()
+    } else {
+        0
+    };
+
+    // Resolve the configured main-loop pane to its immutable pane_id
+    // (command-name-independent — mirrors find_dashboard_pane). This is the
+    // signal that actually matters: whether the daemon can target the pane
+    // it injects into.
+    let main_pane_ok = if config.dashboard_pane.is_empty() {
+        // No explicit pane configured -> session presence is enough.
+        panes_ok && pane_count > 0
+    } else {
+        let (_, ok) = run_cmd_any(
+            &[
+                "tmux",
+                "display-message",
+                "-t",
+                &config.dashboard_pane,
+                "-p",
+                "#{pane_id}",
+            ],
+            5,
+        )
+        .await;
+        ok
+    };
+
+    if main_pane_ok {
+        format!(
+            "tmux: ok (session={} panes={})",
+            config.dashboard_session, pane_count
+        )
+    } else {
+        format!(
+            "tmux: session={} up but main pane '{}' unresolved (panes={})",
+            config.dashboard_session, config.dashboard_pane, pane_count
+        )
+    }
 }
 
 #[cfg(test)]
