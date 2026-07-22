@@ -1847,12 +1847,22 @@ pub fn pidfile_watcher_is_down(
 ///
 /// Detached via setsid() so it survives a daemon restart, same as
 /// `spawn_deferred_clear`.
-fn spawn_immediate_clear(state: &mut State) {
+///
+/// Returns `true` iff the `self-clear` process was successfully spawned (or a
+/// prior clear child is still alive). Returns `false` when the spawn itself
+/// FAILED (e.g. `self-clear` not on PATH) — the caller must NOT then treat the
+/// wedge as recovering. NOTE: a successful SPAWN is not a successful CLEAR —
+/// `self-clear` daemonizes (double-forks) and drives `/clear` asynchronously,
+/// and can itself no-op if it can't find the pane (the native-installer
+/// regression). So even a `true` return only means "recovery was ATTEMPTED";
+/// the caller confirms the wedge actually cleared on a subsequent cycle via
+/// `detect_wedged` (see `wedged_clear_unverified`).
+fn spawn_immediate_clear(state: &mut State) -> bool {
     // Don't double-spawn if a deferred clear child is already running.
     if let Some(pid) = state.context_clear_child_pid {
         if is_pid_alive(pid) {
             debug!(pid, "self-clear child already running, skipping immediate spawn");
-            return;
+            return true;
         }
     }
 
@@ -1872,9 +1882,11 @@ fn spawn_immediate_clear(state: &mut State) {
         Ok(child) => {
             state.context_clear_child_pid = Some(child.id());
             info!(pid = child.id(), "spawned immediate self-clear (wedged recovery)");
+            true
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to spawn immediate self-clear");
+            false
         }
     }
 }
@@ -1926,6 +1938,19 @@ async fn handle_wedged_pane(
             );
             state.wedged_consecutive = 0;
         }
+        // Recovery CONFIRMED: a prior self-clear was fired and we now observe
+        // the wedge is gone. Only now is it honest to say recovery worked —
+        // the earlier fire-and-forget spawn was not itself proof (self-clear
+        // can silently no-op on a pane miss; the native-installer regression).
+        if state.wedged_clear_unverified {
+            info!("wedged pane recovery confirmed — self-clear cleared the wedge");
+            write_jsonl_log(
+                &config.general.log_file,
+                "wedged_clear_recovery_confirmed",
+                serde_json::json!({}),
+            );
+            state.wedged_clear_unverified = false;
+        }
         return false;
     };
 
@@ -1959,25 +1984,35 @@ async fn handle_wedged_pane(
                 }),
             );
         } else if !in_cooldown {
+            // Is this a RETRY? If the previous wedged self-clear was fired but
+            // never verified as recovered (`wedged_clear_unverified` still
+            // set), the prior clear DID NOT stick — the pane is still wedged a
+            // full cooldown later. That is the native-installer failure mode:
+            // self-clear couldn't find the pane and silently no-op'd, so the
+            // wedge persisted while the daemon assumed recovery. Escalate:
+            // louder (Critical) alert, and mark the log so it's diagnosable.
+            let is_retry = state.wedged_clear_unverified;
             warn!(
                 reason = %reason,
                 consecutive = state.wedged_consecutive,
+                retry = is_retry,
                 "wedged pane sustained — running self-clear immediately (no agent cooperation possible)"
             );
             write_jsonl_log(
                 &config.general.log_file,
-                "wedged_clear",
+                if is_retry { "wedged_clear_retry" } else { "wedged_clear" },
                 serde_json::json!({
                     "reason": reason.to_string(),
                     "consecutive": state.wedged_consecutive,
                     "tokens": tokens,
+                    "retry": is_retry,
                 }),
             );
             write_legacy_log(
                 &config.general.legacy_log_file,
                 &format!(
-                    "wedged pane ({reason}) — running self-clear (consecutive={})",
-                    state.wedged_consecutive,
+                    "wedged pane ({reason}) — running self-clear (consecutive={}, retry={})",
+                    state.wedged_consecutive, is_retry,
                 ),
             );
 
@@ -1992,23 +2027,52 @@ async fn handle_wedged_pane(
             )
             .await;
 
-            // Notify Andrew so he knows claude-watch had to step in.
-            let alert_msg = format!(
-                "claude-watch: agent wedged ({reason}) -- running self-clear",
-            );
+            // Fire the clear FIRST so we can report whether even the spawn
+            // succeeded. A failed spawn (self-clear not on PATH) means no
+            // recovery was even attempted — that warrants the loudest alert.
+            let spawned = spawn_immediate_clear(state);
+
+            // Notify Andrew so he knows claude-watch had to step in. Escalate
+            // severity when the prior clear didn't stick (retry) or the spawn
+            // itself failed — a plain first attempt stays High.
+            let (severity, alert_msg) = if !spawned {
+                (
+                    crate::event_bus::Severity::Critical,
+                    format!(
+                        "claude-watch: agent wedged ({reason}) -- self-clear spawn FAILED (recovery not attempted)"
+                    ),
+                )
+            } else if is_retry {
+                (
+                    crate::event_bus::Severity::Critical,
+                    format!(
+                        "claude-watch: agent STILL wedged ({reason}) after a prior self-clear -- retrying (previous clear did not stick)"
+                    ),
+                )
+            } else {
+                (
+                    crate::event_bus::Severity::High,
+                    format!("claude-watch: agent wedged ({reason}) -- running self-clear"),
+                )
+            };
             let wedged_reason = format!("wedged pane: {reason}");
             alert::notify(crate::event_bus::ClaudeWatchAlert {
                 alert_type: "wedged-pane",
                 stuck_reason: &wedged_reason,
                 stale_minutes: None,
                 affected_watchers: vec![],
-                severity: crate::event_bus::Severity::High,
+                severity,
                 message: &alert_msg,
             })
             .await;
 
-            spawn_immediate_clear(state);
-
+            // Mark the clear UNVERIFIED: recovery is only confirmed when a
+            // later cycle observes `detect_wedged` return None. Do NOT reset
+            // to a fake "recovered" state here — the fire-and-forget spawn is
+            // not proof the wedge cleared.
+            if spawned {
+                state.wedged_clear_unverified = true;
+            }
             state.last_wedged_clear = Some(now.to_string());
             state.wedged_clear_count += 1;
             state.wedged_clear_interrupts_total =
