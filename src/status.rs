@@ -630,18 +630,45 @@ pub(crate) fn prefer_configured_pane(config: &crate::config::TmuxConfig) -> bool
     !config.dashboard_session.is_empty()
 }
 
+/// True iff `comm` looks like a bare semver version string (`<n>.<n>.<n>`,
+/// optionally with more dot-separated numeric components), i.e. the tmux
+/// `pane_current_command` a NATIVE-installer claude presents (running as
+/// `~/.local/share/claude/versions/2.1.217`, tmux shows the basename
+/// `2.1.217`). Purely digits-and-dots with at least two dots keeps it from
+/// matching ordinary binary names.
+pub(crate) fn is_version_string_comm(comm: &str) -> bool {
+    let parts: Vec<&str> = comm.split('.').collect();
+    parts.len() >= 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Find the tmux pane running Claude Code.
 ///
-/// Primary: look for `pane_current_command == "claude"`.
-/// Fallback: check "bash"/"node" panes for Claude Code status bar content
-/// (handles wrapper scripts).
+/// Primary: look for `pane_current_command == "claude"` (legacy npm install)
+/// OR a bare semver version string like `2.1.217` (the NATIVE installer — see
+/// the comm-name note below).
+/// Fallback: content-check EVERY pane for Claude Code status-bar text.
+///
+/// ## Command-name independence (native-installer regression, PR #473 / c7ee999)
+///
+/// The claude-code NATIVE installer runs claude as
+/// `~/.local/share/claude/versions/<X.Y.Z>`, so a pane's
+/// `pane_current_command` is the VERSION STRING (e.g. `2.1.217`), NOT
+/// `claude`/`node`/`bash`. The old allow-list (`claude`, then only
+/// `bash`/`node` as content candidates) MISSED entirely on native-install
+/// hosts: `status --json` emitted no `pane`/`tokens` field, and `self-clear`'s
+/// pane detection failed so context-exhausted sessions never auto-recovered.
+/// Fix: accept a semver-shaped comm as a fast-path, and treat EVERY pane
+/// (regardless of comm) as a content-check candidate.
 ///
 /// NOTE: this is the CONFIG-IGNORANT auto-detect scan — it returns the FIRST
-/// `claude` pane in tmux's list, which is order/focus-dependent when more than
-/// one `claude` pane exists (e.g. the operator focusing a TUI agent-view
+/// matching pane in tmux's list, which is order/focus-dependent when more than
+/// one Claude Code pane exists (e.g. the operator focusing a TUI agent-view
 /// subagent). Daemon paths that inject MAIN-LOOP-SCOPED keystrokes must prefer
 /// `find_claude_pane_with_config` so the inject targets the configured fixed
-/// main-loop pane, never whichever `claude` pane happens to sort first. See
+/// main-loop pane, never whichever pane happens to sort first. See
 /// `find_claude_pane_with_config` for the focus-follows-inject bug it fixes.
 pub async fn find_claude_pane() -> Option<String> {
     let out = run_cmd(
@@ -661,12 +688,16 @@ pub async fn find_claude_pane() -> Option<String> {
     for line in out.lines() {
         let parts: Vec<&str> = line.splitn(2, ' ').collect();
         if parts.len() == 2 {
-            if parts[1] == "claude" {
+            // Unambiguous comm wins immediately: the legacy npm `claude`
+            // command, or the native installer's bare `<major>.<minor>.<patch>`
+            // version-string comm.
+            if parts[1] == "claude" || is_version_string_comm(parts[1]) {
                 return Some(parts[0].to_string());
             }
-            if parts[1] == "bash" || parts[1] == "node" {
-                candidates.push(parts[0].to_string());
-            }
+            // Every other pane is a content-check candidate — do NOT gate on
+            // comm name (a wrapper shell or an unexpected comm must not be
+            // excluded before the status-bar content check runs).
+            candidates.push(parts[0].to_string());
         }
     }
 
@@ -1960,6 +1991,25 @@ mod tests {
     }
 
     // --- extract_version_from_path tests ---
+
+    #[test]
+    fn test_is_version_string_comm() {
+        // Native-installer comm: bare semver version string.
+        assert!(is_version_string_comm("2.1.217"));
+        assert!(is_version_string_comm("2.1.77"));
+        assert!(is_version_string_comm("10.20.30"));
+        assert!(is_version_string_comm("1.2.3.4"));
+        // NOT version strings — ordinary comms / partials must be rejected so
+        // the fast-path only matches the native-installer pane.
+        assert!(!is_version_string_comm("claude"));
+        assert!(!is_version_string_comm("node"));
+        assert!(!is_version_string_comm("bash"));
+        assert!(!is_version_string_comm("2.1")); // only one dot
+        assert!(!is_version_string_comm("2.1.")); // trailing empty component
+        assert!(!is_version_string_comm("v2.1.7")); // non-digit prefix
+        assert!(!is_version_string_comm("2.1.7a")); // non-digit component
+        assert!(!is_version_string_comm(""));
+    }
 
     #[test]
     fn test_extract_version_simple() {

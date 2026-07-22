@@ -138,13 +138,122 @@ def run(cmd, timeout=10):
         return "", -1
 
 
+def _find_config_file():
+    """Locate claude-watch's config.toml.
+
+    Mirrors the base-layer search order of src/config.rs::try_load_config:
+    $CLAUDE_WATCH_CONFIG, ./config.toml, /etc/claude-watch/config.toml, then
+    the user overlay ~/.config/claude-watch/config.toml. Returns the first
+    existing path (used only to read the [tmux] dashboard pane/session), or
+    None.
+    """
+    candidates = [
+        os.environ.get("CLAUDE_WATCH_CONFIG", "").strip(),
+        "config.toml",
+        "/etc/claude-watch/config.toml",
+        str(Path(_HOME) / ".config" / "claude-watch" / "config.toml"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _read_dashboard_pane_config():
+    """Read [tmux] dashboard_pane / dashboard_session from cw's config.toml.
+
+    Returns (dashboard_pane, dashboard_session), each '' when unset/unreadable.
+    Prefers a real TOML parse (py3.11 tomllib); falls back to a [tmux]-scoped
+    line scan so a tomllib import failure or an exotic value elsewhere in the
+    file can never defeat resolution.
+    """
+    path = _find_config_file()
+    if not path:
+        return "", ""
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        tmux = data.get("tmux", {}) or {}
+        return (
+            str(tmux.get("dashboard_pane", "") or ""),
+            str(tmux.get("dashboard_session", "") or ""),
+        )
+    except Exception:
+        pass
+    # Fallback: naive line scan within the [tmux] section.
+    pane = sess = ""
+    in_tmux = False
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    in_tmux = line == "[tmux]"
+                    continue
+                if not in_tmux or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                # Strip inline comment + surrounding quotes.
+                val = val.split("#", 1)[0].strip().strip('"').strip("'")
+                if key == "dashboard_pane":
+                    pane = val
+                elif key == "dashboard_session":
+                    sess = val
+    except Exception:
+        pass
+    return pane, sess
+
+
+def _resolve_configured_pane():
+    """Resolve cw's configured main-loop pane to an immutable #{pane_id}.
+
+    COMMAND-NAME INDEPENDENT — mirrors src/tmux.rs::find_dashboard_pane, the
+    resolver the daemon itself uses. This is the fix for the native-installer
+    regression (PR #473 / c7ee999): claude now runs as
+    `~/.local/share/claude/versions/<X.Y.Z>`, so a pane's
+    `pane_current_command` is the VERSION STRING (`2.1.217`), never
+    `claude`/`node`/`bash`. Resolving the CONFIGURED pane spec (e.g.
+    `claude-container:0.0`) to its `#{pane_id}` sidesteps command-name
+    matching entirely. Returns the pane_id, or None if unconfigured /
+    unresolvable (session gone).
+    """
+    dashboard_pane, dashboard_session = _read_dashboard_pane_config()
+    if not dashboard_pane:
+        return None
+    # If a session is named, confirm it exists first (cheap guard — mirrors
+    # find_dashboard_pane's has-session check).
+    if dashboard_session:
+        _, rc = run(["tmux", "has-session", "-t", dashboard_session])
+        if rc != 0:
+            return None
+    out, rc = run(["tmux", "display-message", "-t", dashboard_pane, "-p", "#{pane_id}"])
+    if rc == 0 and out.strip():
+        return out.strip()
+    return None
+
+
 def find_claude_pane():
     """Find the Claude Code tmux pane dynamically.
 
-    Primary: claude-watch status --json (has pane field).
-    Fallback: direct tmux pane scan (handles claude-watch failures).
+    Detection must NOT depend on the pane's command name. The claude-code
+    NATIVE installer (PR #473 / c7ee999) runs claude as
+    `~/.local/share/claude/versions/<X.Y.Z>`, so tmux's
+    `pane_current_command` is the VERSION STRING (e.g. `2.1.217`), no longer
+    `claude`/`node`/`bash`. The old command-name allow-list therefore MISSED
+    on native-install hosts — the "self-clear isn't firing" regression.
+
+    Resolution order (command-name-INDEPENDENT paths first):
+      1. claude-watch status --json (has a pane field).
+      2. cw's configured [tmux] dashboard_pane/session, resolved to its
+         immutable #{pane_id} via tmux display-message (mirrors the daemon's
+         own src/tmux.rs::find_dashboard_pane).
+      3. Fallback tmux pane scan gated on the Claude Code status-bar CONTENT
+         (NOT the command name): every pane is a candidate, and the content
+         check confirms which one is Claude Code.
     """
-    # Primary: claude-watch
+    # Primary: claude-watch status --json.
     try:
         status_json, _ = run(["claude-watch", "status", "--json"])
         data = json.loads(status_json)
@@ -154,7 +263,18 @@ def find_claude_pane():
     except Exception:
         pass
 
-    # Fallback: scan tmux panes directly
+    # Secondary: cw's configured main-loop pane (command-name independent).
+    try:
+        configured = _resolve_configured_pane()
+        if configured:
+            return configured
+    except Exception:
+        pass
+
+    # Fallback: scan tmux panes directly. Do NOT gate on command name — the
+    # native installer's version-string command (`2.1.217`) would be rejected
+    # by any command allow-list. Treat every pane as a candidate and let the
+    # CONTENT check (status-bar tokens + a Claude Code indicator) confirm it.
     try:
         out, rc = run(["tmux", "list-panes", "-a", "-F",
                         "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}"])
@@ -165,12 +285,13 @@ def find_claude_pane():
         for line in out.strip().split("\n"):
             parts = line.split(" ", 1)
             if len(parts) == 2:
+                # Legacy npm install still exposes the literal `claude`
+                # command — an exact match is an unambiguous win.
                 if parts[1] == "claude":
                     return parts[0]
-                if parts[1] in ("bash", "node"):
-                    candidates.append(parts[0])
+                candidates.append(parts[0])
 
-        # Check bash/node candidates for Claude Code indicators
+        # Confirm each candidate via Claude Code status-bar content.
         for pane in candidates:
             content, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
             if rc == 0 and content and "tokens" in content:

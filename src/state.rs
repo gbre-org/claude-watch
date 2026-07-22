@@ -111,6 +111,16 @@ pub struct State {
     /// Total wedged-triggered self-clears (for metrics).
     #[serde(default)]
     pub wedged_clear_count: u32,
+    /// True while a wedged-triggered `self-clear` has been fired but the wedge
+    /// has NOT yet been observed to clear on a subsequent cycle. Set when
+    /// `spawn_immediate_clear` succeeds; cleared when `detect_wedged` later
+    /// returns `None` (recovery confirmed). While set, a further wedge fire is
+    /// treated as a RETRY (the prior clear did not stick) and escalated with a
+    /// louder alert — the daemon no longer treats a fire-and-forget spawn as
+    /// instant success (native-installer regression, PR #473 / c7ee999, made
+    /// `self-clear` silently no-op on comm-name pane misses).
+    #[serde(default)]
+    pub wedged_clear_unverified: bool,
     /// Number of consecutive check cycles where the pane has shown a MALFORMED
     /// tool-call signature (raw non-namespaced `<invoke>` / `<parameter>` tags
     /// rendered as assistant text). When this reaches
