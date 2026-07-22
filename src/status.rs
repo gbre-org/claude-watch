@@ -1025,6 +1025,16 @@ pub(crate) fn read_proc_cmdline(pid: u32) -> Option<String> {
 ///      watcher_run spawn path).
 ///   2. `$XDG_RUNTIME_DIR` (matches the watcher's lockfile default).
 ///   3. `/var/run/claude` (final fallback — the baked container path).
+///
+/// NOTE: this single-dir resolver is INHERENTLY env-dependent and returns just
+/// ONE directory, so it misses a watcher whose liveness file landed in a
+/// different candidate (the `signal-wait` `.pid` in `/var/run/claude` vs a
+/// reader whose `$XDG_RUNTIME_DIR` picked `/run/user/<uid>`). Production
+/// detection now uses [`watcher_pid_dirs`] + [`watcher_pidfile_liveness_multi`],
+/// which scan ALL candidates. Retained (with tests) as the primitive that
+/// documents the precedence.
+// dead_code allow: only test callers remain, invisible to the lib-only pass.
+#[allow(dead_code)]
 pub(crate) fn watcher_pid_dir() -> String {
     if let Ok(p) = std::env::var("CLAUDE_WATCH_PID_DIR") {
         if !p.trim().is_empty() {
@@ -1039,9 +1049,67 @@ pub(crate) fn watcher_pid_dir() -> String {
     "/var/run/claude".to_string()
 }
 
+/// Pure candidate-directory resolver: given the (optional) values of
+/// `$CLAUDE_WATCH_PID_DIR` and `$XDG_RUNTIME_DIR`, return the ORDERED,
+/// de-duplicated list of directories that may hold a watcher's liveness files,
+/// always ending with the `/var/run/claude` fallback.
+///
+/// Kept pure (params, not `std::env`) so it is hermetically testable.
+pub(crate) fn pid_dir_candidates(
+    claude_watch_pid_dir: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut push = |d: &str| {
+        let d = d.trim();
+        if !d.is_empty() && !dirs.iter().any(|e| e == d) {
+            dirs.push(d.to_string());
+        }
+    };
+    if let Some(p) = claude_watch_pid_dir {
+        push(p);
+    }
+    if let Some(p) = xdg_runtime_dir {
+        push(p);
+    }
+    push("/var/run/claude");
+    dirs
+}
+
+/// Every candidate directory that may hold a watcher's liveness files.
+///
+/// Watchers split across TWO write conventions that can land in DIFFERENT
+/// directories:
+///   * bash flock-guard watchers (`claude-event-watch`, `botchat-wait`) write
+///     `<name>.lock` to `$XDG_RUNTIME_DIR` (else `/var/run/claude`);
+///   * `watcher::watcher_run`-spawned pollers (`signal-wait-*`) write
+///     `<name>.pid` to `$CLAUDE_WATCH_PID_DIR` (else `/var/run/claude`) —
+///     `watcher::pid_dir()` IGNORES `$XDG_RUNTIME_DIR`.
+///
+/// A single env-resolved dir ([`watcher_pid_dir`]) therefore misses whichever
+/// convention landed elsewhere, and the miss is asymmetric between a process
+/// that HAS `$XDG_RUNTIME_DIR` (interactive `watcher-ctl status` → reads
+/// `/run/user/<uid>`, misses the `signal-wait` `.pid` in `/var/run/claude`) and
+/// one that does NOT (the daemon started without it → reads `/var/run/claude`,
+/// misses the `botchat-wait`/`claude-event-watch` `.lock` in
+/// `/run/user/<uid>`). Scanning ALL candidates makes liveness detection
+/// independent of which dir a given watcher wrote to and of the reader's own
+/// environment.
+pub(crate) fn watcher_pid_dirs() -> Vec<String> {
+    pid_dir_candidates(
+        std::env::var("CLAUDE_WATCH_PID_DIR").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
 /// Read a watcher PID file (`<name>.pid`) and return the recorded PID, if the
 /// file exists and contains a parseable integer. Whitespace is trimmed.
 /// `None` on missing / unreadable / non-numeric content.
+// Superseded in production by `collect_watcher_recorded_pids` (which scans
+// every candidate dir × {lock,pid}); retained as a tested single-dir/single-
+// file primitive. dead_code allow: only test callers remain, invisible to the
+// lib-only dead-code pass.
+#[allow(dead_code)]
 pub(crate) fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
     let path = format!("{}/{}.pid", pid_dir, name);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -1062,6 +1130,16 @@ pub(crate) fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
 /// We prefer `<name>.lock` (always present for a live watcher in the container)
 /// and fall back to `<name>.pid`. Returns the first file that parses to a PID,
 /// or `None` if neither exists / parses.
+///
+/// PITFALL that motivated [`collect_watcher_recorded_pids`]: the `.lock`
+/// preference is WRONG when the `.lock` is STALE (names a dead pid, left behind
+/// after a flock-guard watcher's live lock moved to another dir) while the
+/// `.pid` beside it is FRESH (names the live poller) — this returned the dead
+/// pid and produced a false-DOWN. Production now collects EVERY recorded pid
+/// and picks the alive one; this single-pick primitive is retained for its
+/// tests.
+// dead_code allow: only test callers remain, invisible to the lib-only pass.
+#[allow(dead_code)]
 pub(crate) fn read_watcher_recorded_pid(pid_dir: &str, name: &str) -> Option<u32> {
     let lock = format!("{}/{}.lock", pid_dir, name);
     if let Ok(content) = std::fs::read_to_string(&lock) {
@@ -1158,6 +1236,12 @@ pub(crate) fn pidfile_watcher_is_down(
 /// cmdline identity check). When `None`, a live recorded PID is accepted
 /// without an identity check (we have nothing to reject it with, and the
 /// pidfile naming it is itself evidence) — mirroring the daemon's behaviour.
+///
+/// Superseded in production by [`watcher_pidfile_liveness_multi`], which scans
+/// all candidate dirs and both files (fixing the split-dir + stale-`.lock`
+/// false-DOWN). Retained as the tested single-dir primitive.
+// dead_code allow: only test callers remain, invisible to the lib-only pass.
+#[allow(dead_code)]
 pub(crate) fn watcher_pidfile_liveness(
     pid_dir: &str,
     name: &str,
@@ -1175,6 +1259,95 @@ pub(crate) fn watcher_pidfile_liveness(
     };
     let down = pidfile_watcher_is_down(recorded_pid, pid_alive, cmdline_matches);
     (recorded_pid, down)
+}
+
+/// Every distinct PID recorded for `name` across ALL candidate pid dirs and
+/// BOTH liveness-file conventions (`<name>.lock` written by the bash flock
+/// guard, `<name>.pid` written by `watcher_run`). Order: for each dir in
+/// `dirs`, the `.lock` pid then the `.pid` pid; duplicates removed preserving
+/// first-seen order.
+///
+/// This replaces the single-file "prefer `.lock` over `.pid`" pick used by
+/// [`read_watcher_recorded_pid`]. That single pick mis-selected a STALE
+/// `.lock` (naming a dead pid, left behind when a flock-guard watcher's live
+/// lock moved to a different dir) over a FRESH `.pid` (naming the live poller)
+/// SITTING IN THE SAME DIRECTORY, producing a false-DOWN even though the live
+/// pid was recorded right next to the stale one. Collecting every recorded pid
+/// and letting the caller pick the one that is genuinely ALIVE fixes that.
+pub(crate) fn collect_watcher_recorded_pids(dirs: &[String], name: &str) -> Vec<u32> {
+    let mut pids: Vec<u32> = Vec::new();
+    for dir in dirs {
+        for suffix in ["lock", "pid"] {
+            let path = format!("{}/{}.{}", dir, name, suffix);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = content.trim().parse::<u32>() {
+                    if !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+    }
+    pids
+}
+
+/// Multi-directory / multi-file liveness: the watcher is UP iff ANY pid
+/// recorded for it (across all candidate dirs AND both `.lock`/`.pid` files) is
+/// genuinely alive and cmdline-matches the watcher. Returns `(pid, down)`:
+/// `pid` is the live matching pid when UP, otherwise the FIRST recorded pid
+/// seen (for stale→restart diagnostics / `orphaned`), else `None`.
+///
+/// This is the env-independent replacement for a single
+/// [`watcher_pidfile_liveness`] call keyed on one [`watcher_pid_dir`]. It fixes
+/// both halves of the split-brain false-DOWN:
+///   * a `.pid` in `/var/run/claude` is still found by a reader whose
+///     `$XDG_RUNTIME_DIR` resolved [`watcher_pid_dir`] to `/run/user/<uid>`
+///     (the interactive `signal-wait` DOWN case), and
+///   * a FRESH `.pid` naming a live poller wins over a STALE `.lock` naming a
+///     dead pid in the SAME dir (the daemon `botchat-wait`/`claude-event-watch`
+///     DOWN case), because liveness is decided over every recorded pid, not a
+///     single lock-preferring pick.
+///
+/// UP still requires a GENUINELY-alive, cmdline-matching process, so a watcher
+/// that is truly dead (all recorded pids dead / mismatched) still reports DOWN
+/// and triggers a legitimate restart.
+pub(crate) fn watcher_pidfile_liveness_multi(
+    dirs: &[String],
+    name: &str,
+    start_cmd: Option<&str>,
+) -> (Option<u32>, bool) {
+    let pids = collect_watcher_recorded_pids(dirs, name);
+    let first = pids.first().copied();
+    for pid in &pids {
+        let pid_alive = is_pid_genuinely_alive(*pid);
+        let cmdline_matches = match (pid_alive, start_cmd) {
+            (true, Some(sc)) => read_proc_cmdline(*pid)
+                .map(|cmdline| cmdline_matches_watcher(&cmdline, sc))
+                .unwrap_or(false),
+            // No start_cmd to compare against → a live recorded pid is itself
+            // evidence (mirrors the single-dir `watcher_pidfile_liveness`).
+            (true, None) => true,
+            (false, _) => false,
+        };
+        // Reuse the pure UP/DOWN decision so this multi path and the daemon's
+        // single-instance model stay in lockstep.
+        if !pidfile_watcher_is_down(Some(*pid), pid_alive, cmdline_matches) {
+            return (Some(*pid), false);
+        }
+    }
+    (first, true)
+}
+
+/// Youngest runtime-file age (seconds) for `name` across ALL candidate dirs —
+/// the multi-directory analogue of [`watcher_runtime_file_age_secs`]. Used by
+/// the daemon's grace window so a watcher whose freshest `.lock`/`.pid` was
+/// just rewritten in ANY candidate dir stays in-grace across the exit→restart
+/// gap, regardless of which dir that convention wrote to.
+#[allow(dead_code)] // sole non-test caller is the daemon's watcher_monitor (see watcher_runtime_file_age_secs)
+pub(crate) fn watcher_runtime_file_age_secs_multi(dirs: &[String], name: &str) -> Option<f64> {
+    dirs.iter()
+        .filter_map(|d| watcher_runtime_file_age_secs(d, name))
+        .fold(None, |acc, age| Some(acc.map_or(age, |cur: f64| cur.min(age))))
 }
 
 /// Age (seconds) since the most-recently-modified watcher runtime file
@@ -2355,5 +2528,160 @@ mod tests {
         // and "succeeds", so it is not a meaningful liveness probe — callers
         // that care special-case 0 themselves.)
         assert!(!is_pid_alive(u32::MAX - 1));
+    }
+
+    // -------------------------------------------------------------------
+    // Multi-dir / multi-file watcher liveness (2026-07 split-brain fix).
+    // Detection must find a watcher's liveness file no matter which
+    // candidate dir it landed in, and must prefer a FRESH live `.pid` over a
+    // STALE dead `.lock` sitting in the same dir. Regression: after a tmux
+    // restart put `$XDG_RUNTIME_DIR` in the session env, `signal-wait`'s
+    // `.pid` (written by watcher_run to /var/run/claude) was invisible to a
+    // reader that resolved to /run/user/<uid> → false-DOWN; and the daemon
+    // (no $XDG) picked a stale /var/run/claude `.lock` over the fresh `.pid`
+    // → false watcher-down.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn pid_dir_candidates_orders_and_dedups() {
+        // Both env vars distinct → both, then the fallback.
+        assert_eq!(
+            pid_dir_candidates(Some("/a"), Some("/b")),
+            vec!["/a".to_string(), "/b".to_string(), "/var/run/claude".to_string()]
+        );
+        // XDG only → XDG then fallback.
+        assert_eq!(
+            pid_dir_candidates(None, Some("/run/user/1000")),
+            vec!["/run/user/1000".to_string(), "/var/run/claude".to_string()]
+        );
+        // A value equal to the fallback is de-duplicated, not repeated.
+        assert_eq!(
+            pid_dir_candidates(Some("/var/run/claude"), None),
+            vec!["/var/run/claude".to_string()]
+        );
+        // Identical env values collapse to one entry.
+        assert_eq!(
+            pid_dir_candidates(Some("/x"), Some("/x")),
+            vec!["/x".to_string(), "/var/run/claude".to_string()]
+        );
+        // Empty / whitespace values are skipped.
+        assert_eq!(
+            pid_dir_candidates(Some(""), Some("   ")),
+            vec!["/var/run/claude".to_string()]
+        );
+        // Neither set → just the fallback.
+        assert_eq!(
+            pid_dir_candidates(None, None),
+            vec!["/var/run/claude".to_string()]
+        );
+    }
+
+    #[test]
+    fn collect_watcher_recorded_pids_gathers_lock_and_pid_across_dirs() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        // dir A: only a .lock; dir B: only a .pid.
+        std::fs::write(a.path().join("w.lock"), "111").unwrap();
+        std::fs::write(b.path().join("w.pid"), "222").unwrap();
+        let dirs = vec![
+            a.path().to_str().unwrap().to_string(),
+            b.path().to_str().unwrap().to_string(),
+        ];
+        assert_eq!(collect_watcher_recorded_pids(&dirs, "w"), vec![111, 222]);
+
+        // Within one dir, .lock is listed before .pid, and a pid repeated
+        // across files is de-duplicated (first-seen order preserved).
+        let c = tempfile::tempdir().unwrap();
+        std::fs::write(c.path().join("w.lock"), "333").unwrap();
+        std::fs::write(c.path().join("w.pid"), "333").unwrap();
+        let cdirs = vec![c.path().to_str().unwrap().to_string()];
+        assert_eq!(collect_watcher_recorded_pids(&cdirs, "w"), vec![333]);
+    }
+
+    #[test]
+    fn liveness_multi_finds_pid_in_a_second_dir() {
+        // The `signal-wait` regression: dir A (would-be $XDG_RUNTIME_DIR) holds
+        // NOTHING, dir B (/var/run/claude) holds the live `.pid`. A single-dir
+        // reader keyed on dir A saw DOWN; the multi reader finds the live pid
+        // in dir B → UP.
+        let empty = tempfile::tempdir().unwrap();
+        let withpid = tempfile::tempdir().unwrap();
+        std::fs::write(
+            withpid.path().join("signal-wait-group.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let dirs = vec![
+            empty.path().to_str().unwrap().to_string(),
+            withpid.path().to_str().unwrap().to_string(),
+        ];
+        let (pid, down) = watcher_pidfile_liveness_multi(&dirs, "signal-wait-group", None);
+        assert!(!down, "live .pid in the second dir must read as UP");
+        assert_eq!(pid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn liveness_multi_prefers_fresh_live_pid_over_stale_dead_lock() {
+        // The daemon `botchat-wait` regression: a STALE `.lock` (dead pid) and a
+        // FRESH `.pid` (live pid) coexist in the SAME dir. The old lock-first
+        // pick returned the dead pid → false-DOWN; the multi reader considers
+        // every recorded pid and picks the alive one → UP.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("botchat-wait.lock"), (u32::MAX - 1).to_string())
+            .unwrap();
+        std::fs::write(
+            dir.path().join("botchat-wait.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let dirs = vec![dir.path().to_str().unwrap().to_string()];
+        let (pid, down) = watcher_pidfile_liveness_multi(&dirs, "botchat-wait", None);
+        assert!(!down, "fresh live .pid must win over a stale dead .lock");
+        assert_eq!(pid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn liveness_multi_down_when_all_recorded_pids_dead() {
+        // A genuinely dead watcher: every recorded pid is dead → DOWN still
+        // fires (so a real restart is triggered). The first recorded pid is
+        // returned for diagnostics / `orphaned`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("w.lock"), (u32::MAX - 1).to_string()).unwrap();
+        std::fs::write(dir.path().join("w.pid"), (u32::MAX - 2).to_string()).unwrap();
+        let dirs = vec![dir.path().to_str().unwrap().to_string()];
+        let (pid, down) = watcher_pidfile_liveness_multi(&dirs, "w", None);
+        assert!(down, "all-dead recorded pids must read as DOWN");
+        assert_eq!(pid, Some(u32::MAX - 1), "first recorded pid surfaced for diagnostics");
+    }
+
+    #[test]
+    fn liveness_multi_none_when_no_pidfiles() {
+        // No liveness file anywhere → DOWN with no recorded pid.
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().to_str().unwrap().to_string()];
+        let (pid, down) = watcher_pidfile_liveness_multi(&dirs, "nope", None);
+        assert!(down);
+        assert_eq!(pid, None);
+    }
+
+    #[test]
+    fn runtime_file_age_multi_returns_youngest_across_dirs() {
+        let old_dir = tempfile::tempdir().unwrap();
+        let fresh_dir = tempfile::tempdir().unwrap();
+        // Backdate the file in old_dir well past any plausible young reading.
+        std::fs::write(old_dir.path().join("w.lock"), "1").unwrap();
+        filetime_set(
+            &old_dir.path().join("w.lock"),
+            SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        // Fresh file, just written.
+        std::fs::write(fresh_dir.path().join("w.pid"), "2").unwrap();
+        let dirs = vec![
+            old_dir.path().to_str().unwrap().to_string(),
+            fresh_dir.path().to_str().unwrap().to_string(),
+        ];
+        let age = watcher_runtime_file_age_secs_multi(&dirs, "w")
+            .expect("at least one runtime file exists");
+        assert!(age < 60.0, "must report the youngest (fresh) file's age, got {age}");
     }
 }
