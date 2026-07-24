@@ -1785,6 +1785,16 @@ html.density-compact .id { font-size: 0.76rem; padding: 1px 5px; }
 html.density-compact .prio { font-size: 0.7rem; }
 html.density-compact .action-btn { font-size: 0.68rem; padding: 1px 6px; }
 
+/* Cluster the pending-item action buttons (force start + abandon) TOGETHER
+   at the right edge instead of spreading them across the row. The base
+   .action-btn rule gives EVERY button `margin-left:auto`; with two buttons
+   in the flex head that splits the free space between them, so force-start
+   floats mid-row while abandon pins to the far right (botchat #2410). Drop
+   the auto-margin on any action-btn that FOLLOWS another: only the first
+   button then absorbs the free space (pushing the whole cluster right), and
+   the flex `gap` (8px, from .item-head) tidily spaces the two buttons. */
+html.density-compact .action-btn ~ .action-btn { margin-left: 0; }
+
 /* Summary: a single tight line (its own line, like pr-watch's compact title
    row), truncated so a long summary never wraps the row taller. */
 html.density-compact .summary {
