@@ -39,8 +39,16 @@ HOOK = HERE.parent / "pre-agent-queue-gate-hook"
 # running item, so we can't reuse the same scope across the three fixtures.
 import os as _os_for_scope
 _SCOPE_SUFFIX = f"hook-test-{_os_for_scope.getpid()}"
-TEST_SCOPE_RUNNING = f"repo:queue-gate-{_SCOPE_SUFFIX}-running"
-TEST_SCOPE_DONE = f"repo:queue-gate-{_SCOPE_SUFFIX}-done"
+_REPO_BASE = f"queue-gate-{_SCOPE_SUFFIX}"
+TEST_SCOPE_RUNNING = f"repo:{_REPO_BASE}-running"
+TEST_SCOPE_DONE = f"repo:{_REPO_BASE}-done"
+
+# The synthetic `repo:queue-gate-*` scopes above name no real ~/repos dir, so
+# the repo-scope dir validation (session-task, 2026-07-16) would reject
+# `queue add`. These fixtures deliberately use disjoint invented scopes to
+# avoid colliding with the live queue, so bypass that validation for the whole
+# test process. (The hook itself never validates; only `queue add` does.)
+os.environ["SESSION_TASK_REPOS_NO_VALIDATE"] = "1"
 
 # Collect ids we create so we can abandon them at exit.
 _created_ids: list[str] = []
@@ -162,6 +170,23 @@ def main() -> int:
     _queue_done(done_id)
     fake_id = "q-2026-01-01-nonexistent-xyz123"
 
+    # Scope/target-repo fixtures (botchat #2346). Two running items with
+    # DISJOINT repo scopes so they don't serialize against each other:
+    #   * mono_id scoped repo:<base>-mono   -> stands in for a monorepo claim
+    #   * spec_id scoped repo:<base>-mono-htmlpdf -> the specific sub-repo
+    # A prompt naming `regrello-sf/<base>-mono-htmlpdf` mismatches mono_id
+    # (over-broad) but is correctly covered by spec_id.
+    mono_repo = f"{_REPO_BASE}-mono"
+    spec_repo = f"{_REPO_BASE}-mono-htmlpdf"
+    mono_id = _queue_add(
+        "scope mismatch - monorepo scope", "scope mono", f"repo:{mono_repo}",
+    )
+    _queue_register(mono_id)
+    spec_id = _queue_add(
+        "scope mismatch - specific repo scope", "scope spec", f"repo:{spec_repo}",
+    )
+    _queue_register(spec_id)
+
     print("=== Core tests ===")
 
     # 1. Valid marker + running -> allow
@@ -276,6 +301,100 @@ def main() -> int:
     results.append(_check(
         "8. denial banner contains workflow hints",
         all(s in banner for s in ("BLOCKED", "Queue item: q-XXXX", "queue add", "queue register", "QUEUE_GATE_BYPASS")),
+        f"banner={banner!r}",
+    ))
+
+    print("=== Scope/target-repo mismatch tests (botchat #2346) ===")
+
+    # S1. Prompt targets the specific sub-repo but item scope claims the
+    # broader monorepo -> clear over-broad mismatch -> DENY.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Fix rendering in regrello-sf/{spec_repo}.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S1. prompt targets sub-repo, scope claims monorepo -> deny",
+        rc == 0 and _is_deny(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S2. Same prompt but the item is correctly scoped to the specific repo
+    # -> covered -> ALLOW.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Fix rendering in regrello-sf/{spec_repo}.\n\n"
+                f"Queue item: {spec_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S2. prompt target matches item scope -> allow",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S3. Default-open: prompt names NO clear target repo (generic prose) even
+    # though the item is scoped to a specific repo -> ALLOW.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                "Investigate the flaky test and write up findings.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S3. no clear target in prompt -> default-open allow",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S4. Default-open: prompt names TWO different target repos (ambiguous) ->
+    # ALLOW (can't pick a single clear target).
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Sync config from regrello-sf/{spec_repo} to "
+                f"hndrewaall/{_REPO_BASE}-running.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "S4. two target repos (ambiguous) -> default-open allow",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S5. Mismatch deny banner mentions the update-scope fix + both repos.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Edit ~/repos/{spec_repo}/src/render.ts.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    _rc, out, _err = _run_hook(payload)
+    banner = out.get("systemMessage", "")
+    results.append(_check(
+        "S5. mismatch banner names fix + target repo",
+        _is_deny(out)
+        and all(s in banner for s in ("scope/target", "update-scope", spec_repo)),
         f"banner={banner!r}",
     ))
 

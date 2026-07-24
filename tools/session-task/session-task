@@ -977,6 +977,176 @@ def _validate_repo_scope_tokens(tokens):
             )
 
 
+# ---------------------------------------------------------------------------
+# Add-time scope/target heuristic (botchat #2346, 2026-07-24)
+# ---------------------------------------------------------------------------
+#
+# Andrew flagged a distinct failure from the invented-scope-name bug the
+# repo-dir validator (`_validate_repo_scope_tokens`) already catches: a task
+# whose DESCRIPTION clearly names one repo but whose `--scope` claims a
+# DIFFERENT (real) repo. The concrete case: a task editing
+# `regrello-sf/regrello-html-to-pdf` was scoped `repo:regrello` (the monorepo)
+# -- both are real dirs, so the dir validator passed it -- but the scope is the
+# WRONG repo, over-serializing/racing independent per-repo work.
+#
+# This heuristic runs at `queue add` time: when the description/summary names a
+# SINGLE, unambiguous target repo (via a `regrello-sf/<repo>` / `~/repos/<repo>`
+# path, a `<repo> #<num>` PR reference, or a bare known-repo-dir name) and the
+# `--scope` does NOT include a matching `repo:<that>` (nor a `path:<that>/...`
+# nor `*`), we emit a loud stderr WARNING. It NEVER hard-rejects (Andrew:
+# "prefer warn-loudly over hard-reject at add-time if the heuristic could
+# misfire") -- the enforcing gate is spawn-time. It is deliberately
+# conservative: it only fires on a clear single target, and defers entirely
+# when the text is ambiguous (0 or >1 candidate repos).
+
+# Path-shaped mentions: `regrello-sf/<repo>`, `~/repos/<repo>`,
+# `/Users/.../repos/<repo>`, `hndrewaall/<repo>`. Captures the trailing repo
+# segment. We intentionally match a small set of known org/path prefixes rather
+# than any `a/b` (which would false-positive on prose like "and/or").
+_REPO_PATH_MENTION_RES = [
+    re.compile(r"regrello-sf/([A-Za-z0-9._-]+)"),
+    re.compile(r"hndrewaall/([A-Za-z0-9._-]+)"),
+    re.compile(r"(?:~|/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/repos/([A-Za-z0-9._-]+)"),
+    re.compile(r"repo:([A-Za-z0-9._-]+)"),
+]
+
+
+def _repo_scope_names(scope):
+    """Return the set of repo names claimed by `repo:` / `path:` scope tokens.
+
+    `repo:X` -> X; `path:X/...` -> X. Used to check whether the scope already
+    covers a heuristically-detected target repo.
+    """
+    names = set()
+    for tok in scope or []:
+        if not isinstance(tok, str):
+            continue
+        if tok.startswith("repo:"):
+            n = tok[len("repo:"):].strip()
+            if n:
+                names.add(n)
+        elif _is_path_token(tok):
+            n = _path_token_repo(tok)
+            if n:
+                names.add(n)
+    return names
+
+
+def _detect_target_repos(text, valid_repos):
+    """Detect repo dirs unambiguously named in free-text task description.
+
+    Returns the set of `valid_repos` names the text refers to. Only names that
+    are ACTUAL repo dirs (in `valid_repos`) count -- so a bare word that merely
+    looks like a repo but names no real dir is ignored (keeps the heuristic
+    from false-positiving on generic prose). Two detection modes:
+
+      1. Path/org-prefixed mentions (`regrello-sf/<repo>`, `~/repos/<repo>`,
+         `repo:<repo>`) -- strong signal, matched anywhere in the text.
+      2. Bare whole-word occurrence of a known repo dir name -- but ONLY for
+         "distinctive" names (contain a '-' or '_', or are >= 8 chars). A
+         short generic name like `config` or `p4` is too collision-prone with
+         ordinary prose to treat a bare mention as a target.
+
+    `valid_repos` is the list from `_list_valid_repos()` (None when the repos
+    dir is absent -> caller treats that as "can't detect", no warning).
+    """
+    if not text or not valid_repos:
+        return set()
+    valid_set = set(valid_repos)
+    found = set()
+
+    # Mode 1: path/org-prefixed + explicit repo: mentions. Strip trailing
+    # sentence punctuation (repo names may contain interior dots -- e.g.
+    # claude-watch.bak.v13 -- but never a trailing period).
+    for rx in _REPO_PATH_MENTION_RES:
+        for m in rx.finditer(text):
+            name = m.group(1).rstrip(".,;:!?)]}'\"")
+            if name in valid_set:
+                found.add(name)
+
+    # Mode 2: bare whole-word mentions of distinctive repo dir names.
+    for name in valid_set:
+        if len(name) < 8 and "-" not in name and "_" not in name:
+            # Too short/generic to trust a bare mention.
+            continue
+        if re.search(rf"(?<![A-Za-z0-9._-]){re.escape(name)}(?![A-Za-z0-9._-])", text):
+            found.add(name)
+
+    return found
+
+
+def _longest_repo_name(names):
+    """Pick the most-specific repo among a set (longest name wins).
+
+    When a monorepo-style name is a PREFIX of a more-specific sibling that is
+    ALSO present in the text (e.g. both `regrello` and `regrello-html-to-pdf`
+    matched), the longer/more-specific name is the intended target. Returns
+    None unless collapsing yields exactly one target.
+    """
+    names = set(names)
+    if not names:
+        return None
+    if len(names) == 1:
+        return next(iter(names))
+    # Collapse names that are a prefix (segment-wise) of another present name.
+    # `regrello` is subsumed by `regrello-html-to-pdf`; keep only maximal ones.
+    maximal = set(names)
+    for a in names:
+        for b in names:
+            if a != b and b.startswith(a + "-"):
+                maximal.discard(a)
+                break
+    if len(maximal) == 1:
+        return next(iter(maximal))
+    return None
+
+
+def _scope_target_mismatch_warning(scope, description, summary):
+    """Return a warning string if the text names one repo the scope misses.
+
+    Heuristic + non-brittle (botchat #2346): warns ONLY when
+      * the repos dir is available (else we can't tell real dirs from prose),
+      * the description/summary names exactly ONE unambiguous target repo dir,
+      * `*` is NOT in scope (a universal claim covers everything), and
+      * no `repo:<target>` / `path:<target>/...` token is in scope.
+
+    Returns None (no warning) on ANY ambiguity -- 0 targets, >1 irreducible
+    targets, missing repos dir. Never raises; purely advisory.
+    """
+    try:
+        if any(t == "*" for t in (scope or [])):
+            return None
+        valid = _list_valid_repos()
+        if not valid:
+            return None
+        text = " ".join(p for p in (description, summary) if p)
+        targets = _detect_target_repos(text, valid)
+        target = _longest_repo_name(targets)
+        if not target:
+            return None
+        claimed = _repo_scope_names(scope)
+        # Covered (no warning) when a claimed repo is EXACTLY the target or
+        # MORE specific than it (C == T, or C is a `T-...` sub-repo -- e.g.
+        # scope repo:regrello-typesense covers a bare "regrello" mention).
+        # A claimed repo that is LESS specific than the target (e.g. scope
+        # repo:regrello vs target regrello-html-to-pdf) is exactly the
+        # over-broad case we DO warn about, so it is not coverage.
+        if any(c == target or c.startswith(target + "-") for c in claimed):
+            return None
+        claimed_desc = ", ".join(sorted(f"repo:{c}" for c in claimed)) or "(no repo: scope)"
+        return (
+            f"scope/target mismatch: the task text names repo {target!r} "
+            f"but --scope claims {claimed_desc}. If this task operates on "
+            f"{target!r}, use `--scope repo:{target}` so it serializes with "
+            f"other {target!r} work (and doesn't over-serialize/race a "
+            f"different repo). If the scope is intentional, ignore this warning "
+            f"or pass an explicit `repo:{target}` alongside."
+        )
+    except Exception:
+        # Purely advisory -- never let a heuristic bug break `queue add`.
+        return None
+
+
 def _is_path_token(tok):
     return isinstance(tok, str) and tok.startswith(_PATH_TOKEN_PREFIX)
 
@@ -2802,6 +2972,17 @@ def cmd_queue_add(args):
             "'(no summary)'. Pass --summary \"~10 word headline\" next time.",
             file=sys.stderr,
         )
+
+    # ------------------------------------------------------------------
+    # Add-time scope/target-repo heuristic (botchat #2346). WARN (never
+    # reject) when the description/summary unambiguously names one repo the
+    # --scope doesn't cover. Catches the `regrello-sf/regrello-html-to-pdf`-
+    # named task scoped `repo:regrello` case; stays silent on ambiguous text.
+    # The enforcing gate is spawn-time (pre-agent-queue-gate-hook).
+    # ------------------------------------------------------------------
+    mismatch_warning = _scope_target_mismatch_warning(scope, args.description, summary)
+    if mismatch_warning:
+        print(f"warning: {mismatch_warning}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Soft-serialize on running scope conflict: if any currently-running
