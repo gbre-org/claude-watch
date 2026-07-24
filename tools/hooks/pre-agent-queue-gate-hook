@@ -78,6 +78,22 @@ AGENT_TOOL_NAMES = {"Agent", "Task"}
 # suffix). We stay permissive: 'q-' + one or more allowed chars.
 QUEUE_MARKER_RE = re.compile(r"Queue\s+item\s*:\s*(q-[0-9a-zA-Z][0-9a-zA-Z-]*)")
 
+# Target-repo extraction from the Agent prompt (scope/target enforcement,
+# botchat #2346). Prompts routinely name the repo the agent will operate on as
+# an org/path-prefixed reference. We only trust these PREFIXED forms in the
+# hook (never a bare word) so the extraction can't false-positive on prose --
+# the gate DENIES on a clear mismatch, so it must be conservative about what
+# counts as a "clear target".
+TARGET_REPO_RES = [
+    re.compile(r"ACME_ORG-sf/([A-Za-z0-9._-]+)"),
+    re.compile(r"hndrewaall/([A-Za-z0-9._-]+)"),
+    re.compile(r"(?:~|/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/repos/([A-Za-z0-9._-]+)"),
+    re.compile(r"repo:([A-Za-z0-9._-]+)"),
+]
+# Path segments that are NOT repo names (they follow the org/path prefix but
+# name a subtree/meta path, or are the worktree root). Excluded from targets.
+_NON_REPO_SEGMENTS = {".worktrees", ".git", ".", ".."}
+
 BYPASS_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 BYPASS_LOG_PATH = BYPASS_LOG_DIR / "queue-gate-bypass.log"
 
@@ -128,6 +144,26 @@ def _banner(specific_reason: str) -> str:
         "!!   2. session-task queue register <id>  ->  marks it running\n"
         "!!   3. Spawn agent with 'Queue item: q-XXXX' in the prompt\n"
         "!!   4. On completion: session-task queue done <id>\n"
+        "!!\n"
+        f"!! What was wrong: {specific_reason}\n"
+        "!!\n"
+        "!! Hook source: pre-agent-queue-gate-hook (claude-watch tools/hooks/)\n"
+        "!! Emergency bypass: set QUEUE_GATE_BYPASS=1 env var (logs)"
+    )
+
+
+def _scope_mismatch_banner(specific_reason: str) -> str:
+    return (
+        "!! BLOCKED: Agent spawn scope/target-repo mismatch\n"
+        "!!\n"
+        "!! The queue item's scope names a DIFFERENT repo than the one the\n"
+        "!! agent prompt targets. Spawning would over-serialize (or race)\n"
+        "!! independent per-repo work under the wrong scope lock.\n"
+        "!!\n"
+        "!! Fix:\n"
+        "!!   1. session-task queue update-scope <id> repo:<correct-repo>\n"
+        "!!      (and remove the wrong repo: token if needed --remove)\n"
+        "!!   2. Re-spawn the agent with the same 'Queue item: q-XXXX' marker\n"
         "!!\n"
         f"!! What was wrong: {specific_reason}\n"
         "!!\n"
@@ -281,11 +317,12 @@ def _record_pending_spawn(queue_id: str) -> None:
                 pass
 
 
-def _queue_status(queue_id: str) -> tuple[str | None, bool]:
-    """Return (status, found) for a queue item id.
+def _queue_status(queue_id: str) -> tuple[str | None, bool, list[str]]:
+    """Return (status, found, scope) for a queue item id.
 
     ``found=False`` means session-task queue show could not locate it.
     ``status`` is None when not found or when the JSON lacked a 'status' field.
+    ``scope`` is the item's scope token list (empty when absent/unparseable).
     """
     try:
         proc = subprocess.run(
@@ -298,23 +335,131 @@ def _queue_status(queue_id: str) -> tuple[str | None, bool]:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         # Tool missing or hung. Default-open: don't let a broken environment
         # block every Agent spawn.
-        return (None, False)
+        return (None, False, [])
 
     if proc.returncode != 0:
-        return (None, False)
+        return (None, False, [])
 
     try:
         data = json.loads(proc.stdout)
     except (json.JSONDecodeError, ValueError):
-        return (None, False)
+        return (None, False, [])
 
     if not isinstance(data, dict):
-        return (None, False)
+        return (None, False, [])
+
+    scope_raw = data.get("scope")
+    scope = [t for t in scope_raw if isinstance(t, str)] if isinstance(scope_raw, list) else []
 
     status = data.get("status")
     if isinstance(status, str):
-        return (status, True)
-    return (None, True)
+        return (status, True, scope)
+    return (None, True, scope)
+
+
+def _prompt_target_repos(prompt: str) -> set[str]:
+    """Extract org/path-prefixed repo references from the Agent prompt.
+
+    Only PREFIXED forms (`ACME_ORG-sf/<repo>`, `hndrewaall/<repo>`,
+    `~/repos/<repo>`, `/Users/x/repos/<repo>`, `repo:<name>`) count -- never a
+    bare word -- so the gate never invents a target from prose. Returns the set
+    of distinct repo names named. Segments that are clearly not repos (worktree
+    roots, `.git`) are dropped.
+    """
+    found: set[str] = set()
+    for rx in TARGET_REPO_RES:
+        for m in rx.finditer(prompt or ""):
+            # Repo names may contain interior dots (e.g. claude-watch.bak.v13)
+            # so '.' is in the char class -- but strip trailing sentence
+            # punctuation ('ACME_ORG-sf/foo.' at end of a sentence) which is
+            # never part of a real dir name.
+            name = m.group(1).rstrip(".,;:!?)]}'\"")
+            if name and name not in _NON_REPO_SEGMENTS:
+                found.add(name)
+    return found
+
+
+def _scope_repo_names(scope: list[str]) -> set[str]:
+    """Repo names claimed by `repo:` / `path:` tokens in a scope list."""
+    names: set[str] = set()
+    for tok in scope or []:
+        if not isinstance(tok, str):
+            continue
+        if tok.startswith("repo:"):
+            n = tok[len("repo:"):].strip()
+            if n:
+                names.add(n)
+        elif tok.startswith("path:"):
+            body = tok[len("path:"):].strip()
+            first = body.split("/", 1)[0].strip() if body else ""
+            if first:
+                names.add(first)
+    return names
+
+
+def _collapse_to_single_target(targets: set[str]) -> str | None:
+    """Collapse a target set to ONE most-specific repo, else None.
+
+    A monorepo-style prefix name (`ACME_ORG`) that is subsumed by a present
+    more-specific sibling (`ACME_ORG-html-to-pdf`) is dropped; if that yields
+    exactly one maximal name it's the clear target. Returns None on genuine
+    ambiguity (0, or >1 irreducible targets) so the gate defaults open.
+    """
+    targets = set(targets)
+    if len(targets) <= 1:
+        return next(iter(targets)) if targets else None
+    maximal = set(targets)
+    for a in targets:
+        for b in targets:
+            if a != b and b.startswith(a + "-"):
+                maximal.discard(a)
+                break
+    return next(iter(maximal)) if len(maximal) == 1 else None
+
+
+def _scope_target_mismatch(prompt: str, scope: list[str]) -> str | None:
+    """Return a deny-reason iff the prompt's CLEAR single target repo is not
+    covered by the queue item's scope. Default-open (None) on any ambiguity.
+
+    DENY only when ALL hold (an unambiguous, load-bearing mismatch):
+      * `*` is NOT in scope (a universal claim covers everything),
+      * the prompt names exactly ONE clear target repo (after collapsing
+        prefix/sub-repo pairs),
+      * the scope names at least one repo (`repo:`/`path:` token) -- if the
+        item has no repo scope at all (e.g. `resource:` / free-form only) we
+        can't judge intent, so default-open,
+      * no scoped repo covers the target (== target, or a `target-...`
+        sub-repo of it).
+
+    Every other case returns None (allow). Never raises.
+    """
+    try:
+        if any(t == "*" for t in (scope or [])):
+            return None
+        targets = _prompt_target_repos(prompt)
+        target = _collapse_to_single_target(targets)
+        if not target:
+            return None  # 0 or ambiguous >1 targets -> default-open
+        claimed = _scope_repo_names(scope)
+        if not claimed:
+            return None  # item has no repo scope to compare against
+        # Covered when a claimed repo is the target or MORE specific than it
+        # (claimed `target-...` sub-repo). A claimed repo LESS specific than
+        # the target (scope repo:ACME_ORG, target ACME_ORG-html-to-pdf) is the
+        # over-broad mismatch we deny on.
+        if any(c == target or c.startswith(target + "-") for c in claimed):
+            return None
+        claimed_desc = ", ".join(sorted(f"repo:{c}" for c in claimed))
+        return (
+            f"prompt targets repo {target!r} but queue item scope claims "
+            f"{claimed_desc} -- the item is scoped to a DIFFERENT repo than the "
+            f"agent will operate on. Re-scope the queue item to repo:{target} "
+            f"(session-task queue update-scope <id> repo:{target}) so it "
+            f"serializes with other {target!r} work, then re-spawn."
+        )
+    except Exception:
+        # Enforcement must never blackhole a legitimate spawn on a hook bug.
+        return None
 
 
 def main() -> int:
@@ -360,7 +505,7 @@ def main() -> int:
         return 0
 
     queue_id = match.group(1)
-    status, found = _queue_status(queue_id)
+    status, found, scope = _queue_status(queue_id)
 
     if not found:
         reason = (
@@ -376,6 +521,17 @@ def main() -> int:
             "(run `session-task queue register <id>` before spawning)"
         )
         print(json.dumps(_deny(reason, _banner(reason))))
+        return 0
+
+    # Scope/target-repo enforcement (botchat #2346). DENY only on a CLEAR,
+    # unambiguous mismatch: the prompt names exactly one target repo that the
+    # queue item's repo scope doesn't cover. Default-open on any ambiguity
+    # (no/multiple targets, no repo scope, parse failure) -- never blackhole a
+    # legitimate spawn. This is the ENFORCING half of the defense-in-depth pair
+    # (the add-time heuristic only warns).
+    mismatch = _scope_target_mismatch(prompt, scope)
+    if mismatch:
+        print(json.dumps(_deny(mismatch, _scope_mismatch_banner(mismatch))))
         return 0
 
     # Valid marker + running status -> allow. Record a pending-spawn

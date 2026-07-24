@@ -79,6 +79,31 @@ same repo used different fabricated scope names (`repo:botchat-ui`,
     with `SESSION_TASK_REPOS_NO_VALIDATE=1`, or repoint
     `SESSION_TASK_REPOS_DIR`.
 
+**Scope/target-repo mismatch heuristic** (2026-07-24, botchat #2346):
+distinct from the dir-validation above, this catches a task whose `--scope`
+names a REAL repo dir but a *different* one from the repo the task text clearly
+operates on (the canonical case: a task editing `ACME_ORG-sf/ACME_ORG-html-to-pdf`
+scoped `repo:ACME_ORG` — both real dirs, but the scope over-serializes/races
+independent per-repo work). At `queue add` time, when the description/summary
+names exactly ONE unambiguous target repo dir (via a `ACME_ORG-sf/<repo>` /
+`~/repos/<repo>` / `repo:<name>` mention, or a bare *distinctive* repo dir name)
+that the scope doesn't cover, `queue add` emits a loud stderr **warning** and
+still enqueues (rc 0).
+
+  * **Warn, never reject** — the heuristic prefers a false-negative to a
+    false-positive; the *enforcing* half is the spawn-time gate below.
+  * Stays silent on ambiguity: 0 targets, >1 irreducible targets, `*` in
+    scope, a short/generic bare name (`config`), or a missing repos dir.
+  * Coverage: a scoped repo that is the target or *more specific* than it
+    (`repo:ACME_ORG-typesense` covers a bare `ACME_ORG` mention) suppresses
+    the warning; a scoped repo *less specific* than the target
+    (`repo:ACME_ORG` vs target `ACME_ORG-html-to-pdf`) is the mismatch.
+
+The spawn-time enforcement lives in the `pre-agent-queue-gate-hook`
+(`tools/hooks/`): it extracts the Agent prompt's target repo (same prefixed
+forms) and **DENIES** the spawn on a clear mismatch with the queue item's repo
+scope, defaulting open on any ambiguity.
+
 ## Files
 
 - `~/.config/session/queue.json` — queue state (Layer 2)
