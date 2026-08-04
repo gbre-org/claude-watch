@@ -50,6 +50,12 @@ Usage:
                                                        # blocked-pending to running
     session-task queue promote <id>
     session-task queue set-summary <id> "text"   # edit one-line summary
+    session-task queue update <id> [--description TEXT | --desc-file FILE]
+                                   [--summary TEXT] [--scope TOK ...] [--force]
+                                   # edit a NOT-YET-SPAWNED item's task spec in
+                                   # place (description/summary/scope) instead
+                                   # of abandon+re-add; refuses if a LIVE agent
+                                   # is bound (override with --force)
     session-task queue set-block-reason <id> --reason TEXT  # update the
                                                  # block_reason on an already-
                                                  # blocked item, in place
@@ -2064,6 +2070,38 @@ def _agent_id_for_queue(queue_id):
         return None
     aid = best.get("agent_id")
     return aid if isinstance(aid, str) and aid else None
+
+
+def _live_agent_for_queue(queue_id):
+    """Return the agent_id of a LIVE spawned agent bound to ``queue_id``, else None.
+
+    Distinct from ``_agent_id_for_queue`` (which returns the best-ranked
+    record even when the agent is dead/stale): here we report an agent id
+    ONLY when the active-agents state marks it ``alive``. Used by
+    ``queue update`` to decide whether editing an item's task spec would be
+    futile — a LIVE agent is already executing against the old description,
+    so rewriting it in place is meaningless. A pending item (no binding) or a
+    registered-but-not-yet-spawned item (no live agent record) returns None
+    and is a valid update target.
+
+    Fails soft: a missing/unreadable state file yields None (treated as "no
+    live agent"), matching the rest of the archive/resurrect machinery. The
+    guard is therefore advisory when claude-watch state is unavailable; the
+    honest signal (a live agent) is what triggers the refusal.
+    """
+    state = _load_active_agents_state()
+    if not isinstance(state, dict):
+        return None
+    for rec in state.get("agents", []) or []:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("queue_id") != queue_id:
+            continue
+        if bool(rec.get("alive")):
+            aid = rec.get("agent_id")
+            if isinstance(aid, str) and aid:
+                return aid
+    return None
 
 
 def _find_agent_jsonl(agent_id):
@@ -5810,6 +5848,254 @@ def cmd_queue_set_summary(args):
     print(f"  new: {new_summary}")
 
 
+def cmd_queue_update(args):
+    """Edit a NOT-YET-SPAWNED item's task spec (description/summary/scope) in place.
+
+    Motivation (Andrew #2980): when requirements are clarified mid-flight,
+    the main loop was forced to `abandon` + re-`add` just to correct a task's
+    description/prompt -- which destroys the item's identity, audit trail,
+    dependency edges, and queue position. This gives a direct,
+    identity-preserving edit: `queue update <id> [--description ... |
+    --desc-file FILE] [--summary ...] [--scope ... --scope ...]`.
+
+    A superset of `set-summary` (summary only) and complementary to
+    `update-scope` (delta add/remove of scope tokens): `update` REPLACES the
+    description/summary and, when `--scope` is given, REPLACES the whole scope
+    list (like `queue add`). For incremental scope token add/remove keep using
+    `update-scope`.
+
+    GUARD -- refuse editing the spec of an item with a LIVE spawned agent:
+      * If a live agent is bound to the item (per claude-watch active-agents
+        state), editing its task spec is meaningless -- the agent is already
+        executing against the old description. Refuse (exit 2) unless
+        `--force` is passed (audited; the operator asserts they know the
+        agent will re-read the item, or is about to abandon it).
+      * done / abandoned items always refuse (exit 1) -- nothing to correct on
+        a finished item; there's no --force override for a terminal state.
+      * Valid targets: pending, registered-but-not-yet-spawned (status running
+        or wedged/blocked with NO live agent bound). The honest "already
+        spawned" signal is the live-agent binding, NOT status=running: the
+        main loop registers (-> running) BEFORE invoking the Agent tool, so a
+        just-registered item legitimately has no live agent yet.
+
+    Behavior:
+      * At least one of --description/--desc-file/--summary/--scope required.
+      * --description and --desc-file are mutually exclusive; --desc-file "-"
+        reads the new description from stdin.
+      * --summary must be non-empty when provided (mirrors set-summary).
+      * --scope replaces the scope list: normalized + deduped + repo-scope
+        validated exactly like `queue add` (bypass repo validation with
+        SESSION_TASK_REPOS_NO_VALIDATE=1). Group heads are recomputed so
+        readiness reflects the new scope; for group-aware incremental token
+        edits prefer `update-scope`.
+      * Pure metadata edit: no pingme, no claude-event (matches set-summary /
+        reprioritize). Records `spec_updated_at` for audit. The updated
+        description/summary WILL appear in the next register/done/abandon
+        pingme for this item.
+    """
+    have_desc = getattr(args, "description", None) is not None
+    have_desc_file = getattr(args, "desc_file", None) is not None
+    have_summary = getattr(args, "summary", None) is not None
+    have_scope = bool(getattr(args, "scope", None))
+
+    if have_desc and have_desc_file:
+        print(
+            "ERROR: --description and --desc-file are mutually exclusive",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not (have_desc or have_desc_file or have_summary or have_scope):
+        print(
+            "ERROR: nothing to update; pass at least one of "
+            "--description/--desc-file/--summary/--scope",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Resolve the new description text up front (before taking the lock).
+    new_description = None
+    if have_desc:
+        new_description = args.description
+    elif have_desc_file:
+        try:
+            if args.desc_file == "-":
+                new_description = sys.stdin.read()
+            else:
+                with open(args.desc_file, "r") as f:
+                    new_description = f.read()
+        except OSError as e:
+            print(f"ERROR: cannot read --desc-file {args.desc_file!r}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+    if new_description is not None:
+        new_description = new_description.strip()
+        if not new_description:
+            print("ERROR: description must be non-empty", file=sys.stderr)
+            sys.exit(1)
+
+    new_summary = None
+    if have_summary:
+        new_summary = (args.summary or "").strip()
+        if not new_summary:
+            print("ERROR: --summary must be non-empty", file=sys.stderr)
+            sys.exit(1)
+
+    # Normalize + validate a replacement scope list (same pipeline as add).
+    new_scope = None
+    if have_scope:
+        scope_split = []
+        seen_split = set()
+        for raw in args.scope:
+            for piece in raw.split(","):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                if piece in seen_split:
+                    continue
+                seen_split.add(piece)
+                scope_split.append(piece)
+        if not scope_split:
+            print("ERROR: --scope, when given, must name at least one token",
+                  file=sys.stderr)
+            sys.exit(1)
+        try:
+            new_scope = [_normalize_token(t) for t in scope_split]
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            _validate_repo_scope_tokens(new_scope)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        status = target.get("status")
+        if status in ("done", "abandoned"):
+            print(
+                f"update refused: {args.id} status={status!r} -- nothing to "
+                f"correct on a finished item (no --force override for a "
+                f"terminal state).",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        # GUARD: a LIVE spawned agent means the edit is futile.
+        live_agent = _live_agent_for_queue(args.id)
+        if live_agent and not getattr(args, "force", False):
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(
+                f"!! UPDATE REFUSED: {args.id} HAS A LIVE SPAWNED AGENT "
+                f"(agent={live_agent}).",
+                file=sys.stderr,
+            )
+            print(
+                "!! Editing the task spec of a running agent is meaningless -- "
+                "the agent",
+                file=sys.stderr,
+            )
+            print(
+                "!! is already executing against the current description.",
+                file=sys.stderr,
+            )
+            print("!!", file=sys.stderr)
+            print(
+                "!! To correct the spec: abandon the item, then re-add "
+                "(or re-register)", file=sys.stderr,
+            )
+            print(
+                f"!!   session-task queue abandon {args.id} --reason 'spec "
+                f"changed mid-flight'", file=sys.stderr,
+            )
+            print("!!", file=sys.stderr)
+            print(
+                "!! Override (audited) -- only if you KNOW the agent will "
+                "re-read the item", file=sys.stderr,
+            )
+            print(
+                "!! or you are about to abandon it: pass --force.",
+                file=sys.stderr,
+            )
+            print(bar, file=sys.stderr)
+            sys.exit(2)
+
+        changes = {}
+        if new_description is not None:
+            old_desc = target.get("description")
+            if new_description != old_desc:
+                changes["description"] = {"old": old_desc, "new": new_description}
+                target["description"] = new_description
+        if new_summary is not None:
+            old_sum = target.get("summary") or DEFAULT_SUMMARY
+            if new_summary != old_sum:
+                changes["summary"] = {"old": old_sum, "new": new_summary}
+                target["summary"] = new_summary
+        if new_scope is not None:
+            old_scope = list(target.get("scope") or [])
+            if new_scope != old_scope:
+                changes["scope"] = {"old": old_scope, "new": new_scope}
+                target["scope"] = new_scope
+
+        if not changes:
+            # All requested edits were identical to current values.
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(f"no-op: {args.id} already matches the requested spec")
+            return
+
+        target["spec_updated_at"] = _fmt_ts()
+        if new_scope is not None:
+            # Scope changed -> readiness ordering may shift; recompute heads.
+            _recompute_group_heads(items)
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {args.id} SPEC-UPDATED] fields={','.join(sorted(changes))}"
+        + (f" (--force over live agent {live_agent})" if live_agent else ""),
+        extra={
+            "source": "queue",
+            "event": "update",
+            "id": args.id,
+            "group_id": target.get("group_id"),
+            "fields": sorted(changes),
+            "forced_over_live_agent": bool(live_agent),
+        },
+    )
+
+    if getattr(args, "json", False):
+        print(json.dumps({"id": args.id, "changes": changes, "item": updated},
+                         indent=2))
+        return
+    print(f"updated: {args.id}")
+    for field in ("description", "summary", "scope"):
+        if field in changes:
+            print(f"  {field}:")
+            print(f"    old: {changes[field]['old']}")
+            print(f"    new: {changes[field]['new']}")
+    if live_agent:
+        print(f"  (--force applied over live agent {live_agent})")
+
+
 def cmd_queue_set_block_reason(args):
     """Update the block_reason on an ALREADY-blocked item, in place.
 
@@ -7241,6 +7527,55 @@ def build_parser():
     q_setsum.add_argument("id")
     q_setsum.add_argument("summary", help="New summary text (~10 words)")
 
+    q_update = qsub.add_parser(
+        "update",
+        help=(
+            "Edit a NOT-YET-SPAWNED item's task spec in place "
+            "(description/summary/scope) instead of abandon+re-add. Refuses "
+            "(exit 2) if a LIVE spawned agent is bound to the item unless "
+            "--force; refuses (exit 1) on done/abandoned items."
+        ),
+    )
+    q_update.add_argument("id")
+    q_update.add_argument(
+        "--description",
+        help=(
+            "New description / prompt text (replaces the existing one). "
+            "Mutually exclusive with --desc-file."
+        ),
+    )
+    q_update.add_argument(
+        "--desc-file",
+        help=(
+            "Read the new description from FILE (or '-' for stdin). Handy for "
+            "multi-line prompts that are awkward to pass on the command line. "
+            "Mutually exclusive with --description."
+        ),
+    )
+    q_update.add_argument(
+        "--summary",
+        help="New one-line (~10 word) summary. Must be non-empty when given.",
+    )
+    q_update.add_argument(
+        "--scope",
+        action="append",
+        help=(
+            "Replacement scope token(s) (repeatable; comma-separated values "
+            "also accepted). REPLACES the whole scope list, normalized + "
+            "deduped + repo-scope-validated like `queue add`. For incremental "
+            "add/remove of individual tokens use `update-scope` instead."
+        ),
+    )
+    q_update.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Override the live-spawned-agent guard (audited). Only if you KNOW "
+            "the agent will re-read the item or you are about to abandon it."
+        ),
+    )
+    q_update.add_argument("--json", action="store_true")
+
     q_setbr = qsub.add_parser(
         "set-block-reason",
         help=(
@@ -7440,6 +7775,7 @@ def main():
             "bump": cmd_queue_promote,
             "reprioritize": cmd_queue_reprioritize,
             "set-summary": cmd_queue_set_summary,
+            "update": cmd_queue_update,
             "set-block-reason": cmd_queue_set_block_reason,
             "update-scope": cmd_queue_update_scope,
             "depend": cmd_queue_depend,
