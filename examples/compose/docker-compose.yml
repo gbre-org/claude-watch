@@ -82,6 +82,14 @@ services:
     # pinned — which is what wedged `up --force-recreate` (a full
     # `down` tears the netns down so it papered over the leak).
     stop_grace_period: 15s
+    # Auto-recover after a host reboot / Docker Desktop restart. Without
+    # this key the service defaults to `restart: "no"`, so Docker leaves
+    # claude-container stopped after a laptop reboot while its siblings
+    # (queue-minisite / eichi-search / ttyd, all `restart: unless-stopped`)
+    # come back automatically — the workbot silently misses its own boot.
+    # `unless-stopped` restarts on daemon start + on crash, but honors an
+    # explicit `docker compose stop` (won't fight a deliberate takedown).
+    restart: unless-stopped
     depends_on:
       tmux-socket-init:
         condition: service_completed_successfully
