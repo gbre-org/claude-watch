@@ -670,6 +670,32 @@ The `claude-container` service does NOT pin a `user:` directive — it inherits 
 
 `queue-minisite` and `eichi-search` are designed to sit BEHIND an authentication proxy (oauth2-proxy, nginx `auth_request`, etc.). The included compose binds them directly to `localhost:8000` / `localhost:8001` with no gate — fine for local single-user dev, NOT fine for exposure on a public IP. Don't `-p 0.0.0.0:8000:8000` this without an auth layer in front.
 
+## Reboot recovery
+
+The `claude-container` service is declared `restart: unless-stopped`, so
+Docker Engine / Docker Desktop brings it (and its siblings) back
+automatically after a host reboot or a Docker daemon restart. If the
+container does NOT come back — or comes back broken (e.g. `executable
+not found`, or missing your operator override mounts) — recover with:
+
+```sh
+cd ~/repos/claude-watch && make deploy-container
+```
+
+`make deploy-container` is a single `docker compose up -d --force-recreate
+claude-container` that rebuilds the image AND re-merges the operator
+`docker-compose.override.yml`. That cures both failure modes: the
+stale-image `executable not found` case (rebuild picks up the current
+image) and the missing-override / bad-config case (recreate re-reads and
+re-applies the merged compose config — a plain `docker compose restart`
+does not).
+
+**Do NOT** reach for `docker compose down -v` to recover a reboot. The
+`-v` needlessly wipes the `claude-container-versions` named volume, which
+forces the in-container `claude` to re-download (~285 MB) on next start,
+and it does nothing to fix a stale image or a missing mount — the two
+actual reboot-recovery failure modes.
+
 ## Tear down
 
 ```sh
