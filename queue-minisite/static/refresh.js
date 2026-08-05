@@ -22,6 +22,11 @@
 //     gesture.
 //   - <details> open state is explicitly preserved: if the live element
 //     is open, we set the new element open before morphdom diffs them.
+//   - The five status sections are themselves <details class="queue-section">
+//     (foldable, botchat #843). Their open state can't ride the rule above
+//     (the renderer emits a static default, so a collapsed RUNNING would
+//     re-open every tick), so it is resolved from localStorage — falling
+//     back to the live element — in applySectionStateToEl.
 //   - Scroll position is window-level on this page (the .queue-list
 //     containers grow with content rather than scrolling internally), so
 //     no per-section scroll capture is needed — morphdom touches the
@@ -150,6 +155,114 @@
     if (!key) return;
     writeSubtreeStored(key, !!t.open);
   }, true);
+
+  // ---------------------------------------------------------------------
+  // Status-section fold state (botchat #843, 2026-08-05: "can you make the
+  // sections foldable").
+  //
+  // Each status section is a native <details class="queue-section"
+  // data-section-key="running|pending|blocked|done|abandoned">. Native
+  // details/summary means the toggle itself needs zero JS and is keyboard +
+  // AT accessible for free. What DOES need code is surviving the 5s
+  // morphdom merge: every tick rebuilds the section markup from scratch, so
+  // without explicit reconciliation the renderer's DEFAULT open/closed
+  // state would slam the operator's choice back every 5 seconds (the same
+  // failure mode the subagent-tree persistence above was written for).
+  //
+  // Reconciliation rules (applySectionStateToEl, called from
+  // onBeforeElUpdated with the live element in hand):
+  //   - stored '1' / '0' in localStorage  -> authoritative, applied.
+  //   - nothing stored (first visit, or storage unavailable/private mode)
+  //     -> mirror the LIVE element's current open state, so a fold made
+  //     this session still survives ticks even when persistence is dead.
+  // Defaults (used by the server's first paint and by the renderers below,
+  // never by the merge): RUNNING + PENDING open — the actionable work;
+  // BLOCKED / DONE / ABANDONED collapsed — 40+ parked/terminal rows are
+  // exactly the noise worth folding. The item count lives in the <summary>,
+  // so folding hides detail but never information.
+  // ---------------------------------------------------------------------
+  const SECTION_KEY_PREFIX = 'section:';
+  const SECTION_DEFAULT_OPEN = {
+    running: true,
+    pending: true,
+    blocked: false,
+    done: false,
+    abandoned: false,
+  };
+
+  function sectionDefaultOpen(key) {
+    return SECTION_DEFAULT_OPEN[key] === true;
+  }
+
+  function readSectionStored(key) {
+    if (!key) return null;
+    try {
+      return window.localStorage.getItem(SECTION_KEY_PREFIX + key);
+    } catch (_) {
+      return null; // private mode / disabled storage -> fall back
+    }
+  }
+
+  function writeSectionStored(key, isOpen) {
+    if (!key) return;
+    try {
+      window.localStorage.setItem(SECTION_KEY_PREFIX + key, isOpen ? '1' : '0');
+    } catch (_) { /* storage unavailable -> just don't persist */ }
+  }
+
+  // Apply fold state to a single .queue-section element.
+  //   el     — the element to mutate (during a merge this is the NEW node).
+  //   liveEl — optional live/on-page counterpart. When nothing is stored we
+  //            mirror its open state rather than the static default, so an
+  //            un-persisted fold isn't undone by the next tick.
+  function applySectionStateToEl(el, liveEl) {
+    if (!el || !el.getAttribute) return;
+    const key = el.getAttribute('data-section-key');
+    if (!key) return;
+    const stored = readSectionStored(key);
+    let open;
+    if (stored === '1') open = true;
+    else if (stored === '0') open = false;
+    else if (liveEl) open = !!liveEl.open;
+    else return; // no stored pref, no live node -> leave the default alone
+    if (open) el.setAttribute('open', '');
+    else el.removeAttribute('open');
+  }
+
+  // Apply STORED fold prefs to every section in the DOM. Deliberately a
+  // no-op for sections with no stored value: that leaves the server's (or
+  // the renderer's) default in place, which is what a first-time visitor
+  // and a freshly-materialized section both want.
+  function applySectionState() {
+    const secs = document.querySelectorAll('.queue-section[data-section-key]');
+    for (let i = 0; i < secs.length; i += 1) {
+      applySectionStateToEl(secs[i]);
+    }
+  }
+
+  // Persist on toggle. Delegated capturing listener (the <details> nodes are
+  // rebuilt every tick, so binding to the elements themselves would leak).
+  document.addEventListener('toggle', (ev) => {
+    const t = ev.target;
+    if (!t || !t.classList || !t.classList.contains('queue-section')) return;
+    const key = t.getAttribute && t.getAttribute('data-section-key');
+    if (!key) return;
+    writeSectionStored(key, !!t.open);
+  }, true);
+
+  // Markup helpers so the five renderers below stay in lockstep with the
+  // Jinja template (details wrapper + summary-wrapped <h2>).
+  function sectionOpenAttr(key) {
+    return sectionDefaultOpen(key) ? ' open' : '';
+  }
+  function sectionHead(key, label, countHtml) {
+    return (
+      `<details id="section-${key}" class="queue-section" ` +
+      `data-section-key="${key}"${sectionOpenAttr(key)}>` +
+      `<summary class="section-summary"><h2 class="section-title">${label} ` +
+      `<span class="section-count">${countHtml}</span></h2></summary>`
+    );
+  }
 
   // ---------------------------------------------------------------------
   // Source filter — filters the visible queue cards by their producer
@@ -625,10 +738,9 @@
     }
     body += items.map(renderRunningItem).join('');
     return (
-      `<section id="section-running">` +
-      `<h2 class="section-title">Running <span class="section-count">${esc(totals.running ?? items.length)}</span></h2>` +
+      sectionHead('running', 'Running', esc(totals.running ?? items.length)) +
       body +
-      '</section>'
+      '</details>'
     );
   }
 
@@ -647,10 +759,9 @@
     const items = state.blocked || [];
     if (!items.length) return '';
     return (
-      `<section id="section-blocked">` +
-      `<h2 class="section-title">Blocked <span class="section-count">${esc(totals.blocked ?? items.length)}</span></h2>` +
+      sectionHead('blocked', 'Blocked', esc(totals.blocked ?? items.length)) +
       items.map(renderBlockedItem).join('') +
-      '</section>'
+      '</details>'
     );
   }
 
@@ -663,10 +774,9 @@
     }
     body += items.map(renderPendingItem).join('');
     return (
-      `<section id="section-pending">` +
-      `<h2 class="section-title">Pending <span class="section-count">${esc(totals.pending ?? items.length)}</span></h2>` +
+      sectionHead('pending', 'Pending', esc(totals.pending ?? items.length)) +
       body +
-      '</section>'
+      '</details>'
     );
   }
 
@@ -679,10 +789,9 @@
     }
     body += items.map((it) => renderTerminalItem(it, 'done')).join('');
     return (
-      `<section id="section-done">` +
-      `<h2 class="section-title">Done <span class="section-count">${esc(items.length)} / ${esc(totals.done ?? 0)}</span></h2>` +
+      sectionHead('done', 'Done', `${esc(items.length)} / ${esc(totals.done ?? 0)}`) +
       body +
-      '</section>'
+      '</details>'
     );
   }
 
@@ -695,10 +804,10 @@
     }
     body += items.map((it) => renderTerminalItem(it, 'abandoned')).join('');
     return (
-      `<section id="section-abandoned">` +
-      `<h2 class="section-title">Abandoned <span class="section-count">${esc(items.length)} / ${esc(totals.abandoned ?? 0)}</span></h2>` +
+      sectionHead('abandoned', 'Abandoned',
+        `${esc(items.length)} / ${esc(totals.abandoned ?? 0)}`) +
       body +
-      '</section>'
+      '</details>'
     );
   }
 
@@ -865,7 +974,16 @@
     // default (the new node is always open, so the tree would re-expand on
     // every tick). applySubtreeStateToEl reads localStorage and sets/clears
     // `open` accordingly (default open when unset).
-    if (fromEl.classList && fromEl.classList.contains('subagent-tree')) {
+    // Status sections (.queue-section) are <details> too, and they need the
+    // same explicit treatment for the same reason: the renderer always emits
+    // the STATIC default (running/pending open, the rest closed), so the
+    // generic "preserve if live open" rule below could not express a
+    // user-COLLAPSED running section — it would spring open every 5s.
+    // applySectionStateToEl resolves localStorage first, then falls back to
+    // the live element's state. Must be checked BEFORE the generic branch.
+    if (fromEl.classList && fromEl.classList.contains('queue-section')) {
+      applySectionStateToEl(toEl, fromEl);
+    } else if (fromEl.classList && fromEl.classList.contains('subagent-tree')) {
       applySubtreeStateToEl(toEl);
     } else if (fromEl.tagName === 'DETAILS' && fromEl.open) {
       // Generic disclosures (Prompt blocks, etc.): if the live element is
@@ -1010,6 +1128,14 @@
       // newly-ADDED card whose tree morphdom inserted this tick.
       applySubtreeState();
 
+      // Re-apply STORED status-section fold state. onBeforeElUpdated already
+      // reconciled sections that existed before this tick; this covers a
+      // section morphdom just INSERTED (e.g. #section-blocked materializing
+      // when the first blocked item appears) — it would otherwise show the
+      // renderer default instead of the operator's saved choice. Sections
+      // with no stored pref are left untouched.
+      applySectionState();
+
       // Update the cache-age value inside the (skipped) info-dropdown so
       // it stays live without re-rendering the whole subtree.
       const cacheAgeEl = document.querySelector('.cache-age');
@@ -1058,6 +1184,11 @@
   // restored to collapsed; everything else stays expanded (the default).
   applySubtreeState();
 
+  // Same for the status sections: the server paints the STATIC defaults
+  // (running/pending open, blocked/done/abandoned collapsed); re-apply any
+  // fold the operator persisted on a previous visit.
+  applySectionState();
+
   // Don't fire the first tick immediately on load — the server-rendered
   // first paint is already correct. Schedule the recurring tick.
   setInterval(tick, REFRESH_MS);
@@ -1080,5 +1211,8 @@
     onBeforeElUpdated,
     applySubtreeState,
     applySubtreeStateToEl,
+    applySectionState,
+    applySectionStateToEl,
+    sectionDefaultOpen,
   };
 })();
