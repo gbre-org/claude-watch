@@ -471,16 +471,20 @@ assert('T15f: block_reason surfaced as description paragraph',
   !!reasonP && reasonP.textContent.includes('Waiting on q-13b9'));
 assert('T15g: blocked section count badge shows 1',
   blockedSection && blockedSection.querySelector('.section-count').textContent.trim() === '1');
-// Section ordering: running → blocked → pending → done → abandoned.
-// Verify #section-blocked comes after #section-running and before
-// #section-pending in document order.
+// Section ordering: running → pending → blocked → done → abandoned.
+// (BLOCKED moved below PENDING 2026-08-05, Andrew botchat #833 — blocked
+// items are parked on an external blocker and are the least actionable
+// live section, so they sit under the spawnable PENDING backlog but stay
+// above the terminal DONE / ABANDONED sections.)
+// Verify #section-blocked comes after #section-pending and before
+// #section-done in document order.
 const queueRoot = $('#queue-root');
 const sectionIds = Array.from(queueRoot.children)
   .filter((el) => el.tagName === 'SECTION')
   .map((el) => el.id);
-assert('T15h: section order is running → blocked → pending → done → abandoned',
+assert('T15h: section order is running → pending → blocked → done → abandoned',
   JSON.stringify(sectionIds) === JSON.stringify([
-    'section-running', 'section-blocked', 'section-pending', 'section-done', 'section-abandoned',
+    'section-running', 'section-pending', 'section-blocked', 'section-done', 'section-abandoned',
   ]),
   `got ${JSON.stringify(sectionIds)}`);
 
