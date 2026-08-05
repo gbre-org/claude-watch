@@ -312,57 +312,6 @@
       {% endfor %}
     </section>
 
-    {# ---------- BLOCKED ----------
-       Items the owning agent moved to status=blocked via
-       `session-task queue block <id> --reason ...`. The agent has done
-       its autonomous part and is parked on an external blocker (human
-       greenlight, branch-protection toggle, third-party API, etc.).
-       Distinct from RUNNING (no live agent expected — see Part 2 of the
-       blocked-state design) and from PENDING (already started, not
-       waiting to spawn). Rendered between RUNNING and PENDING so the
-       operator's eye lands on items that need their attention. #}
-    {% if blocked %}
-    <section id="section-blocked">
-      <h2 class="section-title">Blocked <span class="section-count">{{ totals.blocked }}</span></h2>
-      {% for it in blocked %}
-        <article
-          id="queue-{{ it.id }}"
-          class="item state-blocked"
-          data-queue-id="{{ it.id }}"
-          data-queue-status="blocked"
-          data-created-by="{{ it.created_by }}"
-          data-queue-summary="{{ it.summary }}"
-          data-queue-description="{{ it.description }}">
-          <header class="item-head">
-            <span class="badge state-blocked" title="parked on an external blocker; no live agent expected">blocked</span>
-            {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
-            <span class="id">{{ it.id }}</span>
-            <span class="prio" title="priority">p{{ it.priority }}</span>
-          </header>
-          <p class="summary">{{ it.summary }}</p>
-          {% if it.block_reason %}<p class="description"><strong>blocker:</strong> {{ it.block_reason }}</p>{% endif %}
-          <div class="age">
-            <span
-              {% if it.blocked_at_iso %}data-local-time-iso="{{ it.blocked_at_iso }}" data-local-time-title-only{% endif %}
-              title="{{ it.blocked_at_iso }}">blocked <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
-            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
-          </div>
-          {% if it.scope %}
-            <div class="scope">
-              {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
-            </div>
-          {% endif %}
-          {% if it.description %}
-            <details class="prompt-toggle">
-              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
-              <pre class="prompt-body">{{ it.description }}</pre>
-            </details>
-          {% endif %}
-        </article>
-      {% endfor %}
-    </section>
-    {% endif %}
-
     {# ---------- PENDING ---------- #}
     <section id="section-pending">
       <h2 class="section-title">Pending <span class="section-count">{{ totals.pending }}</span></h2>
@@ -443,6 +392,62 @@
         </article>
       {% endfor %}
     </section>
+
+    {# ---------- BLOCKED ----------
+       Items the owning agent moved to status=blocked via
+       `session-task queue block <id> --reason ...`. The agent has done
+       its autonomous part and is parked on an external blocker (human
+       greenlight, branch-protection toggle, third-party API, etc.).
+       Distinct from RUNNING (no live agent expected — see Part 2 of the
+       blocked-state design) and from PENDING (already started, not
+       waiting to spawn). Rendered BELOW PENDING (Andrew, botchat #833,
+       2026-08-05: "update q site so that blocked shows below pending").
+       Blocked items are the least actionable of the live sections — they
+       are parked on someone else — so the operator's eye should land on
+       RUNNING then the spawnable PENDING backlog before the parked pile.
+       Still ABOVE the terminal DONE / ABANDONED sections, since blocked
+       items are live queue state. #}
+    {% if blocked %}
+    <section id="section-blocked">
+      <h2 class="section-title">Blocked <span class="section-count">{{ totals.blocked }}</span></h2>
+      {% for it in blocked %}
+        <article
+          id="queue-{{ it.id }}"
+          class="item state-blocked"
+          data-queue-id="{{ it.id }}"
+          data-queue-status="blocked"
+          data-created-by="{{ it.created_by }}"
+          data-queue-summary="{{ it.summary }}"
+          data-queue-description="{{ it.description }}">
+          <header class="item-head">
+            <span class="badge state-blocked" title="parked on an external blocker; no live agent expected">blocked</span>
+            {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
+            <span class="id">{{ it.id }}</span>
+            <span class="prio" title="priority">p{{ it.priority }}</span>
+          </header>
+          <p class="summary">{{ it.summary }}</p>
+          {% if it.block_reason %}<p class="description"><strong>blocker:</strong> {{ it.block_reason }}</p>{% endif %}
+          <div class="age">
+            <span
+              {% if it.blocked_at_iso %}data-local-time-iso="{{ it.blocked_at_iso }}" data-local-time-title-only{% endif %}
+              title="{{ it.blocked_at_iso }}">blocked <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
+            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+          </div>
+          {% if it.scope %}
+            <div class="scope">
+              {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
+            </div>
+          {% endif %}
+          {% if it.description %}
+            <details class="prompt-toggle">
+              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
+              <pre class="prompt-body">{{ it.description }}</pre>
+            </details>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </section>
+    {% endif %}
 
     {# ---------- DONE (recent) ---------- #}
     <section id="section-done">
