@@ -276,6 +276,44 @@ html.header-collapsed .topbar .density-control { display: none; }
 
 /* ------- section ------- */
 
+/* Foldable status sections (botchat #843). Each section is a native
+   <details class="queue-section"> whose <summary> wraps the existing
+   .section-title <h2>. We suppress the native disclosure marker (it would
+   sit awkwardly beside a block-level heading) and draw our own caret inside
+   the title, so the heading + count keep their exact former appearance and
+   the caret reads as part of the label. */
+.queue-section > summary.section-summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.queue-section > summary.section-summary::-webkit-details-marker {
+  display: none;
+}
+.queue-section > summary.section-summary::marker {
+  content: '';
+}
+.queue-section > summary.section-summary .section-title::before {
+  content: '\25B8'; /* ▸ collapsed */
+  display: inline-block;
+  width: 1em;
+  margin-right: 2px;
+  color: var(--fg-mute);
+  font-size: 0.9em;
+}
+.queue-section[open] > summary.section-summary .section-title::before {
+  content: '\25BE'; /* ▾ expanded */
+}
+.queue-section > summary.section-summary:hover .section-title {
+  color: var(--fg);
+}
+/* Keyboard focus lands on the <summary>; make that obvious. */
+.queue-section > summary.section-summary:focus-visible {
+  outline: 2px solid var(--accent, #268bd2);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 .section-title {
   margin: 18px 4px 8px 4px;
   font-size: 0.95rem;

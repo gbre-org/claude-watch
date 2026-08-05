@@ -59,17 +59,17 @@ const initialHTML = `<!doctype html>
     </div>
   </div>
   <main id="queue-root">
-    <section id="section-running">
-      <h2 class="section-title">Running <span class="section-count">1</span></h2>
+    <details id="section-running" class="queue-section" data-section-key="running" open>
+      <summary class="section-summary"><h2 class="section-title">Running <span class="section-count">1</span></h2></summary>
       <article id="queue-q-aaaa" class="item state-running drop-zone log-clickable" data-queue-id="q-aaaa" data-queue-status="running" data-queue-starting="0" data-queue-summary="alpha" data-queue-description="" data-agent-id="agent-aaaa" data-log-mode="live" tabindex="0" role="button">
         <header class="item-head"><span class="badge state-running">running</span><span class="id">q-aaaa</span><span class="prio" title="priority">p3</span><button type="button" class="action-btn stop-btn" data-action="stop" data-id="q-aaaa" data-summary="alpha">stop</button></header>
         <p class="summary">alpha</p>
         <div class="age"><span>running 5m ago</span></div>
         <details class="prompt-toggle"><summary class="prompt-summary">Prompt (10 chars)</summary><pre class="prompt-body">test promp</pre></details>
       </article>
-    </section>
-    <section id="section-pending">
-      <h2 class="section-title">Pending <span class="section-count">2</span></h2>
+    </details>
+    <details id="section-pending" class="queue-section" data-section-key="pending" open>
+      <summary class="section-summary"><h2 class="section-title">Pending <span class="section-count">2</span></h2></summary>
       <article id="queue-q-bbbb" class="item state-pending drop-zone draggable ready" draggable="true" data-queue-id="q-bbbb" data-queue-status="pending" data-queue-summary="beta">
         <header class="item-head"><span class="badge state-pending">pending</span><span class="badge ghead">ready</span><span class="id">q-bbbb</span><span class="prio" title="priority">p4</span><span class="drag-handle">☰</span><button type="button" class="action-btn abandon-btn" data-action="abandon" data-id="q-bbbb" data-summary="beta">abandon</button></header>
         <p class="summary">beta</p>
@@ -80,21 +80,29 @@ const initialHTML = `<!doctype html>
         <p class="summary">gamma</p>
         <div class="age"><span>created 1m ago</span></div>
       </article>
-    </section>
-    <section id="section-done">
-      <h2 class="section-title">Done <span class="section-count">0 / 0</span></h2>
+    </details>
+    <details id="section-done" class="queue-section" data-section-key="done">
+      <summary class="section-summary"><h2 class="section-title">Done <span class="section-count">0 / 0</span></h2></summary>
       <div class="empty-mini">No completed items.</div>
-    </section>
-    <section id="section-abandoned">
-      <h2 class="section-title">Abandoned <span class="section-count">0 / 0</span></h2>
+    </details>
+    <details id="section-abandoned" class="queue-section" data-section-key="abandoned">
+      <summary class="section-summary"><h2 class="section-title">Abandoned <span class="section-count">0 / 0</span></h2></summary>
       <div class="empty-mini">No abandoned items.</div>
-    </section>
+    </details>
   </main>
   <div id="action-modal" data-no-morph hidden></div>
   <div id="log-modal" data-no-morph hidden></div>
 </body></html>`;
 
-const dom = new JSDOM(initialHTML, { runScripts: 'dangerously' });
+// `url` is required for a usable window.localStorage: on the default
+// about:blank (opaque) origin jsdom throws SecurityError on every access.
+// The section-fold persistence (see TEST 21) reads/writes localStorage, and
+// while refresh.js degrades gracefully when storage is unavailable, we want
+// the real storage path under test.
+const dom = new JSDOM(initialHTML, {
+  runScripts: 'dangerously',
+  url: 'https://queue.test/',
+});
 
 // Inject morphdom + refresh into the jsdom context.
 const morphdomScript = dom.window.document.createElement('script');
@@ -479,8 +487,10 @@ assert('T15g: blocked section count badge shows 1',
 // Verify #section-blocked comes after #section-pending and before
 // #section-done in document order.
 const queueRoot = $('#queue-root');
+// Sections are <details class="queue-section"> since the foldable-sections
+// change (botchat #843) — filter on the class, not the tag name.
 const sectionIds = Array.from(queueRoot.children)
-  .filter((el) => el.tagName === 'SECTION')
+  .filter((el) => el.classList.contains('queue-section'))
   .map((el) => el.id);
 assert('T15h: section order is running → pending → blocked → done → abandoned',
   JSON.stringify(sectionIds) === JSON.stringify([
@@ -652,6 +662,119 @@ const relFrag = refresh.buildQueueDOM(relState);
 const relSpan = relFrag.querySelector('#section-running .age .rel-age[data-rel-epoch]');
 assert('T20d: rendered running card carries a live-ticking .rel-age span',
   !!relSpan, relSpan ? relSpan.outerHTML : 'no .rel-age[data-rel-epoch] in age block');
+
+// === TEST 21: foldable status sections (botchat #843) ===
+//
+// Each status section is a native <details class="queue-section">. The
+// hazard this test exists for: the renderer emits a STATIC default open/
+// closed state every 5s tick, so without explicit reconciliation in
+// onBeforeElUpdated a section the operator folded would spring back open
+// (and one they expanded would slam shut) on the next refresh.
+//
+// Covered:
+//   a. renderer defaults — running/pending open, blocked/done/abandoned
+//      collapsed.
+//   b. the item count stays inside the <summary>, so a collapsed section
+//      still reports how much it is hiding.
+//   c. a stored fold pref (localStorage `section:<key>`) is applied to the
+//      live DOM and SURVIVES a morphdom merge, in both directions.
+//   d. with NO stored pref (storage disabled / private mode) the merge
+//      falls back to the live element's state — a fold made this session is
+//      still not undone by a tick.
+//   e. a section morphdom materializes mid-session (blocked appearing)
+//      picks up the stored pref via applySectionState().
+const foldState = JSON.parse(JSON.stringify(stateA));
+foldState.totals.blocked = 1;
+foldState.blocked = [{
+  id: 'q-fold1',
+  summary: 'parked on a human greenlight',
+  description: '',
+  scope: [],
+  group_head: false,
+  priority: 3,
+  created_by: 'main-loop',
+  block_reason: 'waiting on Andrew',
+  blocked_at_iso: '2026-05-01T19:50:00Z',
+  age: '10m ago',
+}];
+
+const foldFrag = refresh.buildQueueDOM(foldState);
+const defaults = {
+  'section-running': true,
+  'section-pending': true,
+  'section-blocked': false,
+  'section-done': false,
+  'section-abandoned': false,
+};
+Object.keys(defaults).forEach((id) => {
+  const el = foldFrag.querySelector(`#${id}`);
+  const want = defaults[id];
+  assert(`T21a: ${id} renders as a foldable <details> default-${want ? 'open' : 'collapsed'}`,
+    !!el && el.tagName === 'DETAILS' &&
+    el.classList.contains('queue-section') && el.hasAttribute('open') === want,
+    el ? `tag=${el.tagName} open=${el.hasAttribute('open')}` : 'section missing');
+});
+const collapsedCount = foldFrag.querySelector('#section-blocked > summary .section-count');
+assert('T21b: collapsed section keeps its item count in the summary',
+  !!collapsedCount && collapsedCount.textContent.trim() === '1',
+  collapsedCount ? collapsedCount.textContent : 'no .section-count in summary');
+
+// Normalize the live DOM to the fold state (materializes #section-blocked).
+refresh.mergeQueueRoot(foldState);
+
+// (c) stored prefs win and survive a merge, in both directions.
+const store = dom.window.localStorage;
+store.clear();
+store.setItem('section:running', '0');  // operator folded RUNNING
+store.setItem('section:done', '1');     // operator expanded DONE
+refresh.applySectionState();
+assert('T21c1: stored pref collapses #section-running on the live DOM',
+  !$('#section-running').open);
+assert('T21c2: stored pref expands #section-done on the live DOM',
+  !!$('#section-done').open);
+refresh.mergeQueueRoot(foldState);
+refresh.mergeQueueRoot(foldState); // a second tick must not flap it either
+assert('T21c3: folded #section-running stays folded across morphdom merges',
+  !$('#section-running').open);
+assert('T21c4: expanded #section-done stays expanded across morphdom merges',
+  !!$('#section-done').open);
+assert('T21c5: section identity preserved across the merge (not re-created)',
+  $('#section-running').tagName === 'DETAILS' &&
+  !!$('#section-running article[data-queue-id="q-aaaa"]'));
+
+// (d) no stored pref + storage unavailable -> merge mirrors the live state.
+const realGetItem = store.getItem.bind(store);
+const realSetItem = store.setItem.bind(store);
+store.clear();
+store.getItem = () => { throw new Error('storage denied'); };
+store.setItem = () => { throw new Error('storage denied'); };
+$('#section-pending').open = false;   // fold made this session, unpersistable
+$('#section-abandoned').open = true;  // expanded this session
+refresh.mergeQueueRoot(foldState);
+assert('T21d1: session fold survives a merge even with localStorage unavailable',
+  !$('#section-pending').open);
+assert('T21d2: session expand survives a merge even with localStorage unavailable',
+  !!$('#section-abandoned').open);
+store.getItem = realGetItem;
+store.setItem = realSetItem;
+
+// (e) a section that morphdom INSERTS mid-session picks up the stored pref
+// (this is what tick() calls applySectionState() for).
+store.clear();
+const noBlocked = JSON.parse(JSON.stringify(foldState));
+noBlocked.blocked = [];
+noBlocked.totals.blocked = 0;
+refresh.mergeQueueRoot(noBlocked);
+assert('T21e1: #section-blocked removed when blocked empties',
+  !$('#section-blocked'));
+store.setItem('section:blocked', '1'); // operator prefers blocked expanded
+refresh.mergeQueueRoot(foldState);
+assert('T21e2: freshly-materialized #section-blocked renders default-collapsed',
+  !!$('#section-blocked') && !$('#section-blocked').open);
+refresh.applySectionState();
+assert('T21e3: applySectionState() applies the stored pref to the new section',
+  !!$('#section-blocked') && !!$('#section-blocked').open);
+store.clear();
 
 console.log('---');
 if (failures) {
