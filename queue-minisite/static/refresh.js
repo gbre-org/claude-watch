@@ -703,19 +703,25 @@
   }
 
   function buildQueueDOM(state) {
-    // Build a detached <main> with the four sections in order. The merge
+    // Build a detached <main> with the five sections in order. The merge
     // target is the live <main id="queue-root"> so we wrap in the same
     // tag + id.
     // Section order MUST match templates/index.html:
-    //   RUNNING → BLOCKED → PENDING → DONE → ABANDONED.
-    // The previous version (q-2026-05-20-db66) omitted BLOCKED entirely,
-    // so the first refresh tick after page load discarded the server-
-    // rendered #section-blocked: "BLOCKED 1" → vanishes after ~5s.
+    //   RUNNING → PENDING → BLOCKED → DONE → ABANDONED.
+    // BLOCKED moved below PENDING 2026-08-05 (Andrew, botchat #833) —
+    // blocked items are parked on an external blocker and are the least
+    // actionable live section, so they sit under the spawnable PENDING
+    // backlog but still above the terminal DONE / ABANDONED sections.
+    // If this order drifts from the Jinja template, morphdom re-orders
+    // the sections on the first 5s tick and the page visibly jumps.
+    // The pre-2026-05-20 version (q-2026-05-20-db66) omitted BLOCKED
+    // entirely, so the first refresh tick after page load discarded the
+    // server-rendered #section-blocked: "BLOCKED 1" → vanishes after ~5s.
     const html =
       `<main id="queue-root">` +
       renderRunningSection(state) +
-      renderBlockedSection(state) +
       renderPendingSection(state) +
+      renderBlockedSection(state) +
       renderDoneSection(state) +
       renderAbandonedSection(state) +
       '</main>';
