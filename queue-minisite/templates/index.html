@@ -185,9 +185,22 @@
 
   <main id="queue-root">
 
-    {# ---------- RUNNING ---------- #}
-    <section id="section-running">
-      <h2 class="section-title">Running <span class="section-count">{{ totals.running }}</span></h2>
+    {# ---------- RUNNING ----------
+       Every status section is a native <details class="queue-section">
+       disclosure (Andrew, botchat #843, 2026-08-05: "can you make the
+       sections foldable"). Native details/summary is deliberate: it needs
+       no JS to toggle, is keyboard + screen-reader accessible for free,
+       and — critically — survives the 5s morphdom merge, because the
+       `open` attribute is reconciled explicitly in refresh.js'
+       onBeforeElUpdated (applySectionStateToEl). The heading stays a real
+       <h2> INSIDE the <summary> (spec-valid: summary accepts one heading
+       element) so heading navigation and the existing .section-title CSS
+       both keep working, and the item count stays visible while collapsed.
+       DEFAULT OPEN: running + pending (actionable). Collapsed by default:
+       blocked / done / abandoned. The operator's own toggles persist in
+       localStorage under `section:<key>` — see refresh.js. #}
+    <details id="section-running" class="queue-section" data-section-key="running" open>
+      <summary class="section-summary"><h2 class="section-title">Running <span class="section-count">{{ totals.running }}</span></h2></summary>
       {% if not running %}
         <div class="empty-mini">No running items.</div>
       {% endif %}
@@ -310,11 +323,11 @@
           {% endif %}
         </article>
       {% endfor %}
-    </section>
+    </details>
 
     {# ---------- PENDING ---------- #}
-    <section id="section-pending">
-      <h2 class="section-title">Pending <span class="section-count">{{ totals.pending }}</span></h2>
+    <details id="section-pending" class="queue-section" data-section-key="pending" open>
+      <summary class="section-summary"><h2 class="section-title">Pending <span class="section-count">{{ totals.pending }}</span></h2></summary>
       {% if not pending %}
         <div class="empty-mini">No pending items.</div>
       {% endif %}
@@ -391,7 +404,7 @@
           {% endif %}
         </article>
       {% endfor %}
-    </section>
+    </details>
 
     {# ---------- BLOCKED ----------
        Items the owning agent moved to status=blocked via
@@ -408,8 +421,8 @@
        Still ABOVE the terminal DONE / ABANDONED sections, since blocked
        items are live queue state. #}
     {% if blocked %}
-    <section id="section-blocked">
-      <h2 class="section-title">Blocked <span class="section-count">{{ totals.blocked }}</span></h2>
+    <details id="section-blocked" class="queue-section" data-section-key="blocked">
+      <summary class="section-summary"><h2 class="section-title">Blocked <span class="section-count">{{ totals.blocked }}</span></h2></summary>
       {% for it in blocked %}
         <article
           id="queue-{{ it.id }}"
@@ -446,12 +459,12 @@
           {% endif %}
         </article>
       {% endfor %}
-    </section>
+    </details>
     {% endif %}
 
     {# ---------- DONE (recent) ---------- #}
-    <section id="section-done">
-      <h2 class="section-title">Done <span class="section-count">{{ done_recent|length }} / {{ totals.done }}</span></h2>
+    <details id="section-done" class="queue-section" data-section-key="done">
+      <summary class="section-summary"><h2 class="section-title">Done <span class="section-count">{{ done_recent|length }} / {{ totals.done }}</span></h2></summary>
       {% if not done_recent %}
         <div class="empty-mini">No completed items.</div>
       {% endif %}
@@ -494,11 +507,11 @@
           {% endif %}
         </article>
       {% endfor %}
-    </section>
+    </details>
 
     {# ---------- ABANDONED (recent) ---------- #}
-    <section id="section-abandoned">
-      <h2 class="section-title">Abandoned <span class="section-count">{{ abandoned_recent|length }} / {{ totals.abandoned }}</span></h2>
+    <details id="section-abandoned" class="queue-section" data-section-key="abandoned">
+      <summary class="section-summary"><h2 class="section-title">Abandoned <span class="section-count">{{ abandoned_recent|length }} / {{ totals.abandoned }}</span></h2></summary>
       {% if not abandoned_recent %}
         <div class="empty-mini">No abandoned items.</div>
       {% endif %}
@@ -545,7 +558,7 @@
           {% endif %}
         </article>
       {% endfor %}
-    </section>
+    </details>
   </main>
 
   {# ---------- ACTION CONFIRMATION MODAL (stop / abandon — hidden by default) ---------- #}
