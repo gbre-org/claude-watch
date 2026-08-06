@@ -1134,9 +1134,23 @@ def _render_payload() -> dict[str, Any]:
     #   done      — most-recently-completed first
     #   abandoned — most-recently-abandoned first
     running.sort(key=lambda a: (-(a["age_seconds"] or 0)))
-    # Blocked order: oldest-blocked first (longest-waiting external blocker
-    # is the most likely to need operator attention).
-    blocked.sort(key=lambda a: (-(a["age_seconds"] or 0)))
+    # Blocked order: most-recently-ADDED first (Andrew, 2026-08-05). With 45+
+    # parked items the previous oldest-first order buried tonight's blockers
+    # under items shelved weeks ago, making the section unreadable — the
+    # recently-parked ones are the ones still in the operator's head.
+    #
+    # Key is `created_at` (when the item entered the queue), NOT `blocked_at`
+    # (when it was parked) — the request was explicitly "date added", and the
+    # two genuinely differ (an item can sit pending for minutes or days before
+    # being blocked). Both fields are present on every queue item, so this is
+    # the asked-for key, not a substitute. Note this is a deliberate departure
+    # from `age_seconds`, which for a blocked item anchors on `blocked_at`
+    # (see `_shape`) — sorting on it would silently sort by date-blocked.
+    #
+    # ISO-8601 string compare is safe here (session-task writes uniform
+    # `+00:00`-suffixed timestamps) and matches how the done / abandoned
+    # sections already sort. Items missing `created_at` sort last.
+    blocked.sort(key=lambda a: a.get("created_at_iso") or "", reverse=True)
     # Pending order:
     #   1. ready_now=True items first (operator can spawn now)
     #   2. then non-ready group-heads (FIFO leader, blocked by deps)
