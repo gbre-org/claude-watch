@@ -97,6 +97,23 @@ pub async fn process_pids(pattern: &str) -> Vec<u32> {
         .collect()
 }
 
+/// Linux caps `/proc/PID/comm` at 15 characters plus the NUL terminator, so a
+/// longer program name is silently truncated there (a watcher named
+/// `claude-event-watch` reports `claude-event-wa`). Any comparison against a
+/// configured/derived program name has to allow for that truncation or it will
+/// never match a real watcher.
+const COMM_MAX_LEN: usize = 15;
+
+/// Interpreter / wrapper program names that legitimately appear in
+/// `/proc/PID/comm` for a watcher whose real identity is an argument rather
+/// than the executable — e.g. a shell script invoked as
+/// `bash /path/to/watcher` gets `comm == "bash"`. These are the ONLY comms for
+/// which we fall back to inspecting argv (see [`pattern_matches_argv_tokens`]),
+/// because on their own they say nothing about what the process is.
+const INTERPRETER_COMMS: &[&str] = &[
+    "bash", "sh", "dash", "zsh", "ksh", "python", "python3", "perl", "ruby", "env", "stdbuf",
+];
+
 /// Get PIDs of `watcher-ctl run <name>` supervisor processes.
 ///
 /// `pgrep -f "watcher-ctl run <name>"` would also pick up the shell wrappers
@@ -131,6 +148,210 @@ fn is_supervisor_comm(pid: u32) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Program names a genuine poller for this watcher may report in
+/// `/proc/PID/comm`.
+///
+/// Derived from the entry itself, so no watcher name is hard-coded:
+///   * the basename of `start_cmd`'s first token (`signal-wait --tag dm` ->
+///     `signal-wait`), plus that basename with a launcher-script suffix
+///     stripped (`claude-event-watch.sh` -> `claude-event-watch`), because the
+///     launcher `exec`s the bare binary;
+///   * the same two derivations from the last path segment of `pattern`, but
+///     ONLY when the pattern looks path-like (`bin/claude-event-watch` ->
+///     `claude-event-watch`). A pattern that is a bare flag fragment
+///     (`--tag dm`) yields nothing here.
+///
+/// Returns an empty vec when nothing plausible can be derived — callers treat
+/// that as "cannot filter" and fall back to the unfiltered list, so a config
+/// shape we do not understand can never cause a false DOWN.
+pub(crate) fn expected_poller_comms(pattern: &str, start_cmd: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim();
+        // A name with whitespace is not a program name, and a name that is
+        // pure punctuation (`--tag`) is a flag, not an executable.
+        if s.is_empty()
+            || s.contains(char::is_whitespace)
+            || s.starts_with('-')
+            || !s.chars().any(|c| c.is_alphanumeric())
+        {
+            return;
+        }
+        if !out.iter().any(|e| e == s) {
+            out.push(s.to_string());
+        }
+    };
+
+    if let Some(cmd) = start_cmd {
+        if let Some(tok) = cmd.split_whitespace().next() {
+            let base = tok.rsplit('/').next().unwrap_or(tok);
+            push(base);
+            push(crate::status::strip_script_suffix(base));
+        }
+    }
+
+    // Only treat the pattern as a path when it actually contains a separator;
+    // otherwise `--tag dm` would contribute the nonsense name `--tag dm`.
+    if pattern.contains('/') {
+        if let Some(seg) = pattern.rsplit('/').next() {
+            push(seg);
+            push(crate::status::strip_script_suffix(seg));
+        }
+    }
+
+    out
+}
+
+/// Does `comm` name one of `expected`, allowing for the kernel's 15-character
+/// truncation of `/proc/PID/comm`?
+pub(crate) fn comm_matches_expected(comm: &str, expected: &[String]) -> bool {
+    let comm = comm.trim();
+    if comm.is_empty() {
+        return false;
+    }
+    expected.iter().any(|e| {
+        e == comm
+            // Truncated form: the kernel kept only the first 15 bytes.
+            || (comm.len() >= COMM_MAX_LEN && e.len() > comm.len() && e.starts_with(comm))
+    })
+}
+
+/// Does `pattern` occur in `argv` as a run of WHOLE ARGUMENTS (allowing the
+/// first to match at a `/` path boundary), rather than as a bare substring
+/// anywhere in the command line?
+///
+/// This is the discriminator that a plain `pgrep -f` lacks. `pgrep -f` matches
+/// the pattern anywhere in the SPACE-JOINED command line, so a process that
+/// merely *quotes* the pattern inside one of its arguments — a scratch test
+/// script, a message being drafted that names the watcher — counts as a live
+/// poller. Requiring whole-argument (or path-suffix) alignment keeps the
+/// genuine `bash /home/u/bin/claude-event-watch --quiet 10` and rejects
+/// `some-tool --message "restart bin/claude-event-watch please"`.
+///
+/// `argv` MUST be the real NUL-separated argument vector, not a space-joined
+/// rendering of it: joining destroys the argument boundaries that make this
+/// check meaningful, and a quoted mention would then look like its own token.
+pub(crate) fn pattern_matches_argv_tokens(argv: &[String], pattern: &str) -> bool {
+    let pat: Vec<&str> = pattern.split_whitespace().collect();
+    if pat.is_empty() {
+        return false;
+    }
+    if argv.len() < pat.len() {
+        return false;
+    }
+    for start in 0..=(argv.len() - pat.len()) {
+        // The first pattern token may be the whole argument, or a suffix of it
+        // at a `/` boundary (`bin/claude-event-watch` inside
+        // `/home/u/bin/claude-event-watch`). The boundary requirement is what
+        // rejects the same text appearing mid-argument.
+        let head_ok =
+            argv[start] == pat[0] || argv[start].ends_with(&format!("/{}", pat[0]));
+        if !head_ok {
+            continue;
+        }
+        if pat[1..]
+            .iter()
+            .enumerate()
+            .all(|(i, p)| argv[start + 1 + i] == *p)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read `/proc/PID/cmdline` as the real NUL-separated argument vector.
+/// `None` when the process is gone or the file is unreadable; empty arguments
+/// (and the trailing NUL) are dropped.
+fn pid_argv(pid: u32) -> Option<Vec<String>> {
+    let data = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    let argv: Vec<String> = data
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    if argv.is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
+}
+
+/// Pure decision: given a candidate's `/proc` facts, is it really a poller for
+/// this watcher, or a `pgrep -f` false positive?
+///
+/// `comm`/`cmdline` are `None` when the corresponding `/proc` file could not be
+/// read (process already gone, or a non-Linux host). A missing `comm` is
+/// treated as "cannot filter" and accepted, so the check can only ever remove
+/// processes we can positively identify as something else.
+pub(crate) fn is_poller_candidate(
+    comm: Option<&str>,
+    argv: Option<&[String]>,
+    pattern: &str,
+    expected: &[String],
+) -> bool {
+    // Nothing derivable from the config -> no filtering (preserve old
+    // behaviour rather than risk a false DOWN).
+    if expected.is_empty() {
+        return true;
+    }
+    let comm = match comm {
+        Some(c) if !c.trim().is_empty() => c.trim(),
+        // Unreadable comm: keep the candidate.
+        _ => return true,
+    };
+    if comm_matches_expected(comm, expected) {
+        return true;
+    }
+    // The watcher may legitimately be running under an interpreter, in which
+    // case comm names the interpreter and argv names the watcher. Accept only
+    // when the pattern lines up with whole argv tokens.
+    if INTERPRETER_COMMS.contains(&comm) {
+        return match argv {
+            Some(a) => pattern_matches_argv_tokens(a, pattern),
+            None => true,
+        };
+    }
+    false
+}
+
+/// Get PIDs of live POLLER processes for a watcher entry.
+///
+/// This is [`process_pids`] (a raw `pgrep -f`) plus a `/proc/PID/comm` filter,
+/// the same shape [`supervisor_pids`] already applied to supervisors and which
+/// the poller side was missing. Without it, `pgrep -f <pattern>` counts every
+/// process whose command line merely CONTAINS the pattern text — and the
+/// resulting phantom "duplicate poller" is not cosmetic:
+///   * `watcher_run` refuses to start a watcher when it sees >= 1 live poller,
+///     so a phantom match blocks a legitimate start;
+///   * `watcher_restart` and `watcher_toggle` SIGTERM everything on this list,
+///     so a phantom match means killing an unrelated process.
+pub async fn poller_pids(pattern: &str, start_cmd: Option<&str>) -> Vec<u32> {
+    let candidates = process_pids(pattern).await;
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let expected = expected_poller_comms(pattern, start_cmd);
+    if expected.is_empty() {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|pid| {
+            let comm = read_proc_comm(*pid);
+            let argv = pid_argv(*pid);
+            is_poller_candidate(comm.as_deref(), argv.as_deref(), pattern, &expected)
+        })
+        .collect()
+}
+
+/// Read `/proc/PID/comm`, trimmed. `None` on any I/O error.
+fn read_proc_comm(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Load watcher entries from the primary config and an optional extra config,
@@ -186,7 +407,9 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
         }
         let pattern = entry.pattern.clone();
         let name = entry.name.clone();
-        let poller_h = tokio::spawn(async move { process_pids(&pattern).await });
+        let start_cmd = entry.start_cmd.clone();
+        let poller_h =
+            tokio::spawn(async move { poller_pids(&pattern, start_cmd.as_deref()).await });
         let sup_h = tokio::spawn(async move { supervisor_pids(&name).await });
         handles.push(Some((poller_h, sup_h)));
     }
@@ -615,7 +838,11 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
         Some(pid) => pid_is_alive(pid) && pid_matches_watcher(pid, start_cmd),
         None => false,
     };
-    let live_poller_count = process_pids(&entry.pattern).await.len() as u32;
+    // Comm-filtered: a raw `pgrep -f` here counted any process that merely
+    // mentioned the pattern and refused a legitimate start.
+    let live_poller_count = poller_pids(&entry.pattern, entry.start_cmd.as_deref())
+        .await
+        .len() as u32;
 
     if run_guard_should_skip(recorded_pid_alive, live_poller_count) {
         let where_ = if recorded_pid_alive {
@@ -766,6 +993,7 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
     let new_val = if enable { "true" } else { "false" };
     let mut found = false;
     let mut target_pattern = String::new();
+    let mut target_start_cmd = String::new();
     let mut output_lines = Vec::new();
 
     for line in content.lines() {
@@ -780,6 +1008,7 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
             target_pattern = parts[1].to_string();
             let min_count = parts.get(2).unwrap_or(&"1");
             let start_cmd = parts.get(4).unwrap_or(&"");
+            target_start_cmd = start_cmd.trim().to_string();
             output_lines.push(format!(
                 "{}|{}|{}|{}|{}",
                 parts[0], parts[1], min_count, new_val, start_cmd
@@ -811,8 +1040,14 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
             name, name
         ))
     } else {
-        // Kill matching processes
-        let pids = process_pids(&target_pattern).await;
+        // Kill matching processes. Comm-filtered — an unfiltered `pgrep -f`
+        // here would SIGTERM any process that merely mentions the pattern.
+        let start_cmd_opt = if target_start_cmd.is_empty() {
+            None
+        } else {
+            Some(target_start_cmd.as_str())
+        };
+        let pids = poller_pids(&target_pattern, start_cmd_opt).await;
         if !pids.is_empty() {
             let count = pids.len();
             for pid in &pids {
@@ -850,7 +1085,74 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
 // (the daemon) never touches the watcher process directly.
 // ---------------------------------------------------------------------------
 
+/// Read every live PID's parent PID from `/proc/PID/stat`.
+///
+/// `/proc/PID/stat` is `pid (comm) state ppid ...`, and `comm` may itself
+/// contain spaces and parentheses, so we split after the LAST `)`.
+fn read_ppid_map() -> Vec<(u32, u32)> {
+    let dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        let pid: u32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let stat = match std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let close = match stat.rfind(')') {
+            Some(i) => i,
+            None => continue,
+        };
+        let mut fields = stat[close + 1..].split_whitespace();
+        let _state = fields.next();
+        if let Some(ppid) = fields.next().and_then(|p| p.parse::<u32>().ok()) {
+            out.push((pid, ppid));
+        }
+    }
+    out
+}
+
+/// Pure helper: every transitive descendant of `roots`, given a `(pid, ppid)`
+/// edge list. Roots themselves are NOT included. Cycle-safe (a pid is only
+/// ever expanded once) and does not descend from pid 0/1.
+pub(crate) fn descendants_of(roots: &[u32], ppid_map: &[(u32, u32)]) -> Vec<u32> {
+    let mut found: Vec<u32> = Vec::new();
+    let mut frontier: Vec<u32> = roots.to_vec();
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid) in ppid_map {
+            if *ppid != parent || *pid <= 1 {
+                continue;
+            }
+            if roots.contains(pid) || found.contains(pid) {
+                continue;
+            }
+            found.push(*pid);
+            frontier.push(*pid);
+        }
+    }
+    found
+}
+
 /// Kill all enabled watcher processes and clean PID files.
+///
+/// Also kills each watcher's DESCENDANTS. A watcher's blocking child (for the
+/// event watcher, `inotifywait`) does not carry the watcher's own argv, so it
+/// never matched the configured `pattern` and survived a restart as an orphan
+/// — running on its own timeout, holding whatever file descriptors it
+/// inherited. That is why "stop, then immediately start" could be refused by a
+/// singleton lock with no live watcher behind it. Descendants are enumerated
+/// BEFORE anything is signalled: once the parent dies its children are
+/// reparented to init and are no longer reachable from the watcher's PID.
 pub async fn watcher_restart(config_path: &str, extra_config_path: Option<&str>) -> String {
     let entries = load_entries(config_path, extra_config_path);
     let mut total = 0u32;
@@ -860,14 +1162,30 @@ pub async fn watcher_restart(config_path: &str, extra_config_path: Option<&str>)
         if !entry.enabled {
             continue;
         }
-        let pids = process_pids(&entry.pattern).await;
+        // Comm-filtered so a process that merely quotes the pattern in an
+        // argument is not signalled.
+        let pids = poller_pids(&entry.pattern, entry.start_cmd.as_deref()).await;
         if !pids.is_empty() {
+            // Snapshot the tree first — see the note on this function.
+            let children = descendants_of(&pids, &read_ppid_map());
             let count = pids.len() as u32;
             for pid in &pids {
                 let _ = run_cmd_any(&["kill", &pid.to_string()], 5).await;
             }
-            messages.push(format!("Killed {} {} process(es)", count, entry.name));
-            total += count;
+            for pid in &children {
+                let _ = run_cmd_any(&["kill", &pid.to_string()], 5).await;
+            }
+            if children.is_empty() {
+                messages.push(format!("Killed {} {} process(es)", count, entry.name));
+            } else {
+                messages.push(format!(
+                    "Killed {} {} process(es) + {} child process(es)",
+                    count,
+                    entry.name,
+                    children.len()
+                ));
+            }
+            total += count + children.len() as u32;
         }
     }
 
@@ -1167,6 +1485,192 @@ pub fn rewrite_config_toggle(content: &str, name: &str, enable: bool) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- poller comm filter ------------------------------------------------
+    //
+    // The duplicate-poller check used a raw `pgrep -f <pattern>`, which matches
+    // the pattern ANYWHERE in a process's joined command line. Any process that
+    // merely quoted the pattern therefore counted as a live production poller:
+    // it blocked `watcher-ctl run` (which refuses to start when it sees a live
+    // poller) and it was signalled by restart/disable. These tests pin the comm
+    // filter that removes those false positives without ever removing a real
+    // watcher.
+
+    fn comms(pattern: &str, start: Option<&str>) -> Vec<String> {
+        expected_poller_comms(pattern, start)
+    }
+
+    #[test]
+    fn test_expected_comms_from_start_cmd_basename() {
+        let e = comms("bin/claude-event-watch", Some("claude-event-watch --quiet 10"));
+        assert!(e.contains(&"claude-event-watch".to_string()), "got {:?}", e);
+    }
+
+    #[test]
+    fn test_expected_comms_strip_launcher_suffix() {
+        // The `.sh` launcher `exec`s the bare binary, so BOTH names are valid.
+        let e = comms("/opt/watchers/cew.sh", Some("/opt/watchers/cew.sh"));
+        assert!(e.contains(&"cew.sh".to_string()), "got {:?}", e);
+        assert!(e.contains(&"cew".to_string()), "got {:?}", e);
+    }
+
+    #[test]
+    fn test_expected_comms_ignores_flag_shaped_pattern() {
+        // `--tag dm` is not a program name; it must not be derived as one.
+        let e = comms("--tag dm", Some("signal-wait --dm --tag dm"));
+        assert_eq!(e, vec!["signal-wait".to_string()], "got {:?}", e);
+    }
+
+    #[test]
+    fn test_expected_comms_empty_when_nothing_derivable() {
+        // No start_cmd and a non-path pattern -> nothing to filter on. Callers
+        // must then fall back to the unfiltered list rather than guess.
+        assert!(comms("--tag dm", None).is_empty());
+    }
+
+    #[test]
+    fn test_comm_matches_allows_kernel_truncation() {
+        // Linux truncates /proc/PID/comm to 15 chars: the real watcher reports
+        // `claude-event-wa`. A strict equality check would never match it.
+        let e = vec!["claude-event-watch".to_string()];
+        assert!(comm_matches_expected("claude-event-wa", &e));
+        assert!(comm_matches_expected("claude-event-watch", &e));
+        // A short unrelated comm must NOT be accepted as a truncation.
+        assert!(!comm_matches_expected("bash", &e));
+        assert!(!comm_matches_expected("claude", &e));
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_pattern_matches_argv_tokens_whole_token_and_path_suffix() {
+        assert!(pattern_matches_argv_tokens(
+            &argv(&["/bin/bash", "/home/u/bin/claude-event-watch", "--quiet", "10"]),
+            "bin/claude-event-watch"
+        ));
+        // A multi-token pattern must line up across consecutive arguments.
+        assert!(pattern_matches_argv_tokens(
+            &argv(&["signal-wait", "--dm", "--tag", "dm", "--quiet", "12"]),
+            "--tag dm"
+        ));
+    }
+
+    #[test]
+    fn test_pattern_matches_argv_tokens_rejects_mid_argument_mention() {
+        // The exact false-positive shape: the pattern appears inside a single
+        // quoted argument (a drafted message, a scratch test) rather than as
+        // the program being run.
+        assert!(!pattern_matches_argv_tokens(
+            &argv(&["some-tool", "--message", "restart bin/claude-event-watch please"]),
+            "bin/claude-event-watch"
+        ));
+        // Same text, not at a path boundary.
+        assert!(!pattern_matches_argv_tokens(
+            &argv(&["bash", "-c", "echo=bin/claude-event-watch"]),
+            "bin/claude-event-watch"
+        ));
+        // A multi-token pattern quoted inside ONE argument must not match.
+        // This is precisely what a space-joined cmdline would have accepted.
+        assert!(!pattern_matches_argv_tokens(
+            &argv(&["some-tool", "--message", "use --tag dm for direct messages"]),
+            "--tag dm"
+        ));
+    }
+
+    #[test]
+    fn test_is_poller_candidate_accepts_real_watcher() {
+        let e = comms("bin/claude-event-watch", Some("claude-event-watch --quiet 10"));
+        // Shebang launch: kernel sets comm from the script name (truncated).
+        assert!(is_poller_candidate(
+            Some("claude-event-wa"),
+            Some(&argv(&["/bin/bash", "/home/u/bin/claude-event-watch", "--quiet", "10"])),
+            "bin/claude-event-watch",
+            &e
+        ));
+    }
+
+    #[test]
+    fn test_is_poller_candidate_accepts_interpreter_launch() {
+        // `bash /path/to/watcher` -> comm is the interpreter, identity is argv.
+        let e = comms("bin/claude-event-watch", Some("claude-event-watch --quiet 10"));
+        assert!(is_poller_candidate(
+            Some("bash"),
+            Some(&argv(&["bash", "/home/u/bin/claude-event-watch", "--quiet", "10"])),
+            "bin/claude-event-watch",
+            &e
+        ));
+    }
+
+    #[test]
+    fn test_is_poller_candidate_rejects_unrelated_process_quoting_pattern() {
+        let e = comms("bin/claude-event-watch", Some("claude-event-watch --quiet 10"));
+        // A message-sending tool whose argument names the watcher. Rejected
+        // on comm alone -- it is not the watcher and not an interpreter.
+        assert!(!is_poller_candidate(
+            Some("signal-send"),
+            Some(&argv(&["signal-send", "--dm", "andrew", "restart bin/claude-event-watch now"])),
+            "bin/claude-event-watch",
+            &e
+        ));
+        // An interpreter whose argument merely quotes the pattern: rejected on
+        // argument-boundary alignment.
+        assert!(!is_poller_candidate(
+            Some("bash"),
+            Some(&argv(&["bash", "-c", "sleep 60 # bin/claude-event-watch"])),
+            "bin/claude-event-watch",
+            &e
+        ));
+    }
+
+    #[test]
+    fn test_is_poller_candidate_fails_open_without_proc_facts() {
+        // The filter may only ever REMOVE processes we can positively identify
+        // as something else. Unknown comm, or nothing derivable from config,
+        // must keep the candidate so we can never invent a false DOWN.
+        let e = comms("bin/claude-event-watch", Some("claude-event-watch"));
+        assert!(is_poller_candidate(None, None, "bin/claude-event-watch", &e));
+        assert!(is_poller_candidate(Some(""), None, "bin/claude-event-watch", &e));
+        assert!(is_poller_candidate(Some("anything"), None, "--tag dm", &[]));
+        // Interpreter comm with an unreadable argv is also kept.
+        assert!(is_poller_candidate(Some("bash"), None, "bin/claude-event-watch", &e));
+    }
+
+    // --- restart descendant reaping ---------------------------------------
+    //
+    // A watcher's blocking child (`inotifywait`) carries its own argv, so it
+    // never matched the watcher's configured pattern and outlived a restart as
+    // an orphan running on its own timeout.
+
+    #[test]
+    fn test_descendants_of_collects_transitive_children() {
+        // 100 -> 200 -> 300, plus an unrelated 400.
+        let map = vec![(100, 1), (200, 100), (300, 200), (400, 1)];
+        let mut d = descendants_of(&[100], &map);
+        d.sort();
+        assert_eq!(d, vec![200, 300]);
+    }
+
+    #[test]
+    fn test_descendants_of_excludes_roots_and_survives_cycles() {
+        // A malformed/cyclic ppid map must terminate, not spin.
+        let map = vec![(100, 200), (200, 100)];
+        assert_eq!(descendants_of(&[100], &map), vec![200]);
+        // A pid that is itself a root is never reported as a descendant.
+        let d = descendants_of(&[100, 200], &map);
+        assert!(d.is_empty(), "roots must not be reported as descendants: {:?}", d);
+    }
+
+    #[test]
+    fn test_descendants_of_never_collects_pid_0_or_1() {
+        let map = vec![(1, 0), (2, 1), (100, 1)];
+        // Root 1 would otherwise sweep every reparented process on the box.
+        let d = descendants_of(&[1], &map);
+        assert!(d.contains(&2) && d.contains(&100));
+        // But pid 0/1 themselves are never collected.
+        assert!(!d.contains(&1) && !d.contains(&0));
+    }
 
     #[test]
     fn test_format_list_basic() {

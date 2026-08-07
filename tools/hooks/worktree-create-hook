@@ -228,46 +228,61 @@ def _prune_stale_cache(cache_dir: Path = CACHE_DIR, ttl: int = 60) -> None:
         pass
 
 
-def _extract_prompt(payload: dict) -> str:
-    """Best-effort extraction of the Agent prompt from a hook payload.
+def _extract_prompt_with_source(payload: dict) -> tuple[str, str]:
+    """Best-effort extraction of the Agent prompt, plus WHERE it came from.
 
     Order:
       1. Cache file written by pre-agent-worktree-isolation-hook keyed by
          session_id. TTL: 30s.
       2. Legacy inlined tool_input.prompt / payload.prompt.
       3. Transcript-scan fallback.
+
+    The source label matters for diagnosis. This hook and the Agent-spawn
+    isolation gate are supposed to reach the same verdict on the same prompt,
+    but only the gate reads the prompt straight out of the tool call it is
+    gating. Every other branch here is INDIRECT -- a cache keyed on a
+    session_id the payload may not carry, or a scan of the most recently
+    modified transcript on the machine. When those two hooks disagree, the
+    first thing you need to know is whether they were even looking at the same
+    text, and a bare "no opted-in repo in prompt" line cannot tell you that.
     """
     if not isinstance(payload, dict):
-        return ""
+        return "", "no-payload"
 
     session_id = payload.get("session_id")
     if isinstance(session_id, str) and session_id:
         cached = _read_prompt_cache(session_id)
         if cached:
             _prune_stale_cache()
-            return cached
+            return cached, "session-cache"
 
     tool_input = payload.get("tool_input")
     if isinstance(tool_input, dict):
         p = tool_input.get("prompt")
         if isinstance(p, str) and p:
-            return p
+            return p, "tool_input.prompt"
     p = payload.get("prompt")
     if isinstance(p, str) and p:
-        return p
+        return p, "payload.prompt"
 
     transcript = payload.get("transcript_path")
     if isinstance(transcript, str) and transcript:
         try:
             p = _scan_transcript_for_latest_agent_prompt(Path(transcript))
             if p:
-                return p
+                return p, "transcript_path-scan"
         except (OSError, ValueError):
             pass
     try:
-        return _scan_latest_project_transcript()
+        p = _scan_latest_project_transcript()
+        return p, ("latest-transcript-scan" if p else "not-found")
     except (OSError, ValueError):
-        return ""
+        return "", "not-found"
+
+
+def _extract_prompt(payload: dict) -> str:
+    """Backwards-compatible wrapper: prompt only."""
+    return _extract_prompt_with_source(payload)[0]
 
 
 def _scan_latest_project_transcript() -> str:
@@ -371,14 +386,22 @@ def handle_create(
     """Decide + (maybe) allocate a worktree. Returns the stdout payload."""
     if opted_in is None:
         opted_in = _load_opted_in_repos()
-    prompt = _extract_prompt(payload)
+    prompt, prompt_source = _extract_prompt_with_source(payload)
     match = _find_opted_in(prompt, opted_in)
     if match is None:
+        # Record WHERE the prompt came from and which keys the payload
+        # actually carried. Without this a passthrough here is
+        # indistinguishable from "the prompt genuinely did not name an
+        # opted-in repo", and the pair (gate says yes / allocator says no) is
+        # undiagnosable after the fact.
         _log({
             "event": "create",
             "decision": "passthrough",
             "reason": "no opted-in repo in prompt",
             "debug_prompt_len": len(prompt),
+            "prompt_source": prompt_source,
+            "payload_keys": sorted(k for k in payload if isinstance(k, str)),
+            "opted_in_keys": [k for k, _p, _u in opted_in],
         })
         return ""
 

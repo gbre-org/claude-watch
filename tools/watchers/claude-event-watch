@@ -224,13 +224,32 @@ mkdir -p "$LOG_DIR"
 # only if we'd locked before it; we deliberately lock AFTER, so there is no
 # self-conflict.
 #
-# Lockfile path mirrors the self-clear watcher's convention: override via
-# $CLAUDE_EVENT_WATCH_LOCK, else $XDG_RUNTIME_DIR/claude-event-watch.lock,
-# else /var/run/claude/claude-event-watch.lock. The override lets tests
-# isolate so a real running watcher on the host can't make the test see a
-# held lock (and vice-versa).
-LOCKFILE="${CLAUDE_EVENT_WATCH_LOCK:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/claude-event-watch.lock}}"
-LOCKFILE="${LOCKFILE:-/var/run/claude/claude-event-watch.lock}"
+# CRITICAL — the lock fd MUST be closed in every long-lived child.
+# An flock lives on the OPEN FILE DESCRIPTION, not on the fd number, so a
+# child that inherits fd $LOCK_FD shares the same description and therefore
+# keeps holding the lock after the parent is gone. `inotifywait` is the child
+# that matters: it can outlive a killed parent by up to $INOTIFY_TIMEOUT
+# seconds, during which a freshly-started watcher sees the lock still held and
+# refuses with "already running" even though no watcher is actually alive.
+# That is the stop-then-immediately-start refusal loop. bash has no way to set
+# close-on-exec on a redirected fd, so every child that can outlive us gets an
+# explicit `9>&-` close redirection at its call site (see `inotifywait` and
+# `sleep` below). Do NOT unlink the lockfile as a "recovery" — unlinking makes
+# a fresh inode while the old description is still locked, which lets two
+# watchers run at once.
+#
+# Lockfile path is deliberately ENV-INDEPENDENT. It used to prefer
+# $XDG_RUNTIME_DIR, which meant the resolved path depended on who invoked the
+# watcher: an interactive shell has it set (so the lock landed in the per-user
+# runtime dir) while a service/cron context does not (so the lock landed in the
+# fixed dir). Two invocations in different contexts therefore locked two
+# DIFFERENT files and the singleton guard silently allowed two live watchers.
+# The default is now one fixed path for every caller. $CLAUDE_EVENT_WATCH_LOCK
+# remains the sole override, so tests can isolate from a real running watcher
+# on the host (and vice-versa).
+LOCK_DIR="/var/run/claude"
+LOCKFILE="${CLAUDE_EVENT_WATCH_LOCK:-$LOCK_DIR/claude-event-watch.lock}"
+mkdir -p "$(dirname "$LOCKFILE")" 2>/dev/null || true
 if command -v flock >/dev/null 2>&1; then
     # Read any existing holder pid FIRST, before we open the fd for write —
     # opening with `9>` truncates the file, which would otherwise wipe the
@@ -436,7 +455,9 @@ collect_burst() {
         # Sleep up to QUIET_SECONDS, but never overshoot the hard cap.
         local remaining=$(( DEBOUNCE_SECONDS - waited ))
         local nap=$(( QUIET_SECONDS < remaining ? QUIET_SECONDS : remaining ))
-        sleep "$nap"
+        # `9>&-`: same reason as the inotifywait call — do not let the
+        # singleton lock leak into a child that can outlive us.
+        sleep "$nap" 9>&-
         waited=$(( waited + nap ))
 
         local now_count
@@ -523,8 +544,14 @@ while true; do
 
     # Block for new events, but with a timeout so the loop re-scans and a
     # gap-event can never sit unconsumed beyond one window.
+    # `9>&-` closes the inherited flock fd in the CHILD only. Without it
+    # inotifywait shares our locked open file description and keeps the
+    # singleton lock held for up to $INOTIFY_TIMEOUT seconds after this
+    # watcher is killed — so the very next `watcher-ctl run` is refused by a
+    # lock whose only holder is an orphan. The parent's own fd 9 is
+    # untouched, so our lock is still held for as long as WE live.
     inotifywait -q -t "$INOTIFY_TIMEOUT" -e create -e moved_to \
-        --include '\.json$' "$QUEUE_DIR" >/dev/null 2>&1
+        --include '\.json$' "$QUEUE_DIR" >/dev/null 2>&1 9>&-
     rc=$?
     # rc=0: event fired → loop re-checks catch-up (drains). rc=2: timeout →
     # loop re-checks catch-up (catches any gap-event). Any other rc is a real

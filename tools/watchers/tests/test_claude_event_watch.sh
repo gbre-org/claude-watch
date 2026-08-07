@@ -494,7 +494,101 @@ else
         echo "  NOTE: 1st watcher did not self-exit on release within 10s; killed it (inotify wakeup race on this runner) — singleton assertion already verified" >&2
     fi
     echo "  singleton: real concurrent 2nd watcher refused while 1st blocks OK"
+
+    # (i2) REGRESSION: the singleton lock fd must NOT leak into the
+    # inotifywait child.
+    #
+    # An flock is held by the OPEN FILE DESCRIPTION, so a child that inherits
+    # the lock fd keeps the lock alive after the parent dies. inotifywait is
+    # spawned with a timeout, so an orphaned one held the singleton lock for
+    # up to that timeout — and every `watcher-ctl run` issued in that window
+    # was refused with "already running (pid ...)" by a lock whose only holder
+    # was an orphan. That is the stop-then-immediately-start refusal loop.
+    #
+    # Two assertions, both pinning the same fact:
+    #   1. structural (Linux only) — inotifywait's fd table has no fd pointing
+    #      at the lockfile;
+    #   2. behavioural — SIGKILL the parent (no cleanup path runs), leave the
+    #      orphan alive, and a fresh instance must still acquire the lock.
+    IQ="$TMP/iq"; ILOG="$TMP/ilog"; ILOCK="$TMP/inherit.lock"
+    mkdir -p "$IQ" "$ILOG"
+    CLAUDE_EVENT_QUEUE="$IQ" CLAUDE_EVENT_LOG_DIR="$ILOG" \
+        CLAUDE_EVENT_WATCH_LOCK="$ILOCK" "$WATCHER" --debounce 0 >"$TMP/inherit.out" 2>&1 &
+    INHERIT=$!
+    BG_PIDS+=("$INHERIT")
+    # Let it acquire the lock and arm inotifywait.
+    sleep 2
+
+    # Locate the inotifywait child of this watcher. The watcher may have
+    # re-exec'd under stdbuf, so search descendants rather than direct
+    # children only.
+    ino_pid=""
+    if [[ -d /proc ]]; then
+        for _try in 1 2 3 4 5; do
+            for cand in $(pgrep -P "$INHERIT" 2>/dev/null || true) \
+                        $(pgrep -f 'inotifywait .*'"$IQ" 2>/dev/null || true); do
+                [[ -r "/proc/$cand/comm" ]] || continue
+                if [[ "$(cat "/proc/$cand/comm" 2>/dev/null)" == inotifywait* ]]; then
+                    ino_pid="$cand"; break
+                fi
+            done
+            [[ -n "$ino_pid" ]] && break
+            sleep 1
+        done
+    fi
+
+    if [[ -n "$ino_pid" && -d "/proc/$ino_pid/fd" ]]; then
+        leaked=""
+        for fd in "/proc/$ino_pid/fd"/*; do
+            [[ -e "$fd" ]] || continue
+            tgt="$(readlink "$fd" 2>/dev/null || true)"
+            if [[ "$tgt" == "$ILOCK" ]]; then
+                leaked="$fd -> $tgt"
+                break
+            fi
+        done
+        if [[ -n "$leaked" ]]; then
+            echo "FAIL: inotifywait inherited the singleton lock fd ($leaked)" >&2
+            kill "$INHERIT" 2>/dev/null || true
+            exit 1
+        fi
+        echo "  singleton: lock fd not inherited by inotifywait OK"
+    else
+        echo "  SKIP: could not locate the inotifywait child — fd-table check skipped" >&2
+    fi
+
+    # Behavioural half: SIGKILL the parent so no shell cleanup can run, then
+    # confirm the (still-alive) orphan does not keep the lock held.
+    kill -9 "$INHERIT" 2>/dev/null || true
+    reap_within "$INHERIT" 5 >/dev/null 2>&1 || true
+    if [[ -n "$ino_pid" ]] && ! kill -0 "$ino_pid" 2>/dev/null; then
+        echo "  NOTE: inotifywait orphan already gone; orphan-lock assertion is weaker on this runner" >&2
+    fi
+    write_event "$IQ" "100_after_kill.json" "after kill"
+    set +e
+    after_out=$(CLAUDE_EVENT_QUEUE="$IQ" CLAUDE_EVENT_LOG_DIR="$ILOG" \
+        CLAUDE_EVENT_WATCH_LOCK="$ILOCK" "$WATCHER" --debounce 0 2>&1)
+    after_rc=$?
+    set -e
+    kill "$ino_pid" 2>/dev/null || true
+    if (( after_rc == 3 )) || grep -q 'already running' <<<"$after_out"; then
+        echo "FAIL: restart refused after the parent was killed — the lock is still held by an orphaned child" >&2
+        echo "$after_out" >&2
+        exit 1
+    fi
+    echo "  singleton: fresh instance acquires the lock right after a SIGKILLed parent OK"
 fi
+
+# (i3) The lockfile default must not depend on the caller's environment.
+# It used to prefer $XDG_RUNTIME_DIR, so an interactive caller and a
+# service/cron caller resolved DIFFERENT lockfiles and the singleton guard
+# allowed two live watchers. Assert the script no longer consults it.
+# Comments may still explain the old behaviour, so only CODE lines count.
+if grep -v '^[[:space:]]*#' "$WATCHER" | grep -q 'XDG_RUNTIME_DIR'; then
+    echo "FAIL: watcher lock path still references \$XDG_RUNTIME_DIR (env-dependent lock path)" >&2
+    exit 1
+fi
+echo "  singleton: lock path is env-independent OK"
 
 # (j) tty-warning path: when stdout is a tty the watcher must WARN (not fail).
 # We can't easily give the subprocess a real tty here without a pty helper, so

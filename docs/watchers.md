@@ -54,6 +54,12 @@ For that ONE watcher only, the in-container `cw-watcher-health-check` cron
 - The watcher's own fd-based **flock singleton guard** makes that relaunch a
   guaranteed **no-op whenever a real watcher is alive** (it exits 3 on a held
   lock), so the cron can only ever win when the bus is genuinely unconsumed.
+  That guarantee depends on both launchers resolving the **same lockfile**,
+  which is why the lock path is a fixed location and is never derived from the
+  caller's environment: cron runs without the per-user runtime directory that
+  an interactive/main-loop launch has, so an environment-derived path would put
+  the two launchers on two different locks and let both watchers run at once —
+  exactly the outcome the guard exists to prevent.
 - It **self-corrects**: once the bus drains, the next main-loop restart cycle
   re-parents a fresh in-tree watcher; a cron-parented-but-alive consumer for a
   few minutes is strictly better than a blind bus.
