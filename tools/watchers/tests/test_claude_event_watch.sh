@@ -59,6 +59,14 @@ reap_within() {  # <pid> <max_seconds>
     return 0
 }
 
+# Isolate the singleton lock for the WHOLE suite. Without this, every
+# invocation below that does not name its own lockfile competes for the
+# watcher's real default path — so a genuine watcher running on the host (or
+# the CI image lacking write access to the default lock directory) decides
+# whether the suite passes. Individual tests still override this per-invocation
+# where they need two instances to contend on a specific file.
+export CLAUDE_EVENT_WATCH_LOCK="$TMP/default.lock"
+
 QUEUE="$TMP/queue"
 LOG_DIR="$TMP/log"
 mkdir -p "$QUEUE" "$LOG_DIR"

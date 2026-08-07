@@ -247,9 +247,31 @@ mkdir -p "$LOG_DIR"
 # The default is now one fixed path for every caller. $CLAUDE_EVENT_WATCH_LOCK
 # remains the sole override, so tests can isolate from a real running watcher
 # on the host (and vice-versa).
-LOCK_DIR="/var/run/claude"
-LOCKFILE="${CLAUDE_EVENT_WATCH_LOCK:-$LOCK_DIR/claude-event-watch.lock}"
-mkdir -p "$(dirname "$LOCKFILE")" 2>/dev/null || true
+#
+# The fallback below is NOT a reintroduction of that bug: it is selected by
+# what the FILESYSTEM allows and by our uid, never by an inherited environment
+# variable, so every invocation by the same user on the same host still
+# resolves the same file. It exists because the primary directory needs root to
+# create, and an unprivileged environment (a CI runner, a dev checkout) would
+# otherwise be unable to take the lock at all.
+LOCK_PRIMARY="/var/run/claude/claude-event-watch.lock"
+LOCK_FALLBACK="/tmp/claude-event-watch-$(id -u 2>/dev/null || echo 0).lock"
+if [[ -n "${CLAUDE_EVENT_WATCH_LOCK:-}" ]]; then
+    LOCKFILE="$CLAUDE_EVENT_WATCH_LOCK"
+    mkdir -p "$(dirname "$LOCKFILE")" 2>/dev/null || true
+elif mkdir -p "$(dirname "$LOCK_PRIMARY")" 2>/dev/null &&
+     : >>"$LOCK_PRIMARY" 2>/dev/null; then
+    LOCKFILE="$LOCK_PRIMARY"
+else
+    LOCKFILE="$LOCK_FALLBACK"
+fi
+# The fallback lives in a world-writable directory, so refuse a lockfile that
+# someone else owns rather than silently sharing (or being denied) a lock we do
+# not control. Harmless for the primary path, which lives in a private dir.
+if [[ -e "$LOCKFILE" && ! -O "$LOCKFILE" ]]; then
+    echo "claude-event-watch: lockfile $LOCKFILE is not owned by this user — refusing to use it" >&2
+    exit 1
+fi
 if command -v flock >/dev/null 2>&1; then
     # Read any existing holder pid FIRST, before we open the fd for write —
     # opening with `9>` truncates the file, which would otherwise wipe the
