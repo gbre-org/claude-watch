@@ -1150,92 +1150,84 @@ This session runs inside an isolated container. Strengths and limits:
 
 - **Strong fit**: writing code in `${CLAUDE_HOST_PROJECT_DIR}`, talking to
   APIs the operator bridged in (corp gateways via host-mcp-server, off-the-
-  shelf MCP servers, the Anthropic API). All TLS chains terminate at the
+  shelf MCP servers, the Anthropic API). TLS chains terminate at the
   in-container Node / Python; corporate-CA bundles forward through
   `NODE_EXTRA_CA_CERTS` etc. when the operator wires them up.
-- **Weak fit**: anything needing the host's full toolchain, the host's
-  keychain, or commands not on the `host-bash` allow-list — use `host-bash`
-  (when available) for those; its allow-list is intentionally conservative.
-- **Not in scope**: managing services on the host itself. To restart a host
-  daemon, edit host cron, or touch a host service, ask the operator on their
-  host session; the container is a code-writing sandbox, not a host-admin
-  tool.
+- **Weak fit**: anything needing the host's full toolchain, keychain, or
+  commands off the `host-bash` allow-list — use `host-bash` (when available);
+  its allow-list is intentionally conservative.
+- **Not in scope**: managing host services. To restart a host daemon, edit
+  host cron, or touch a host service, ask the operator on their host session;
+  the container is a code-writing sandbox, not a host-admin tool.
+
+## CI retrigger — push an empty commit, NEVER a PR comment
+
+Retrigger CI on a PR (regrello / SFCI) with an EMPTY COMMIT
+(`git commit --allow-empty -m "retrigger CI" && git push`), NEVER the
+`Jenkins test this please` PR comment — off-convention, litters the PR with
+automation noise. Triage is agent work, not script work: a detector script
+emits an event; an agent makes the judgment call.
 
 ## Semantic search — query eichi before grepping
 
-The container has access to [eichi](https://github.com/hndrewaall/eichi), a
-local sqlite-vec + sentence-transformers semantic search index. Use it as the
-**default first lookup** for open-ended recall questions ("where is X", "what
-did we decide about Y").
+[eichi](https://github.com/hndrewaall/eichi) is a local sqlite-vec +
+sentence-transformers semantic index — the **default first lookup** for
+open-ended recall ("where is X", "what did we decide about Y").
 
-Decision tree:
-
-1. **Concept-level question** (fuzzy, semantic) -> query eichi first.
-2. **Exact-string question** (function name, error code, config key) ->
-   `grep -r` or code search.
-3. **Structured data** (metrics, timestamps, statuses) -> domain tool
-   (Prometheus, DB query, etc.).
-
-If eichi returns no results or all `[distant]` scores, THEN fall back to grep
-— not before.
+Decision tree: **concept-level / fuzzy question** -> eichi first;
+**exact-string** (function name, error code, config key) -> `grep -r` / code
+search; **structured data** (metrics, timestamps, statuses) -> domain tool
+(Prometheus, DB query). If eichi returns nothing or all `[distant]` scores,
+THEN fall back to grep — not before.
 
 ### How to invoke
 
-**From inside the container** (web API — the CLI venv is host-only):
+**Inside the container** (web API — the CLI venv is host-only):
 
 ```sh
 curl -s "http://eichi-search:8000/api/search?q=alerting+tiers&k=5" | jq .
 ```
 
-(The `eichi-search` compose container also serves a browser UI at
-`http://localhost:8001/` as a fallback.)
-
-Query params: `q` (required), `k` (top-K, default 20), `source`
-(filter tag), `added_since` (duration: `1d`, `7d`, `30d`), `retrieval`
-(`hybrid`|`vector`|`bm25`).
+Query params: `q` (required), `k` (top-K, default 20), `source` (filter
+tag), `added_since` (`1d`/`7d`/`30d`), `retrieval` (`hybrid`|`vector`|`bm25`).
 
 **From the host** (via `host-bash`, if the CLI venv is bootstrapped):
 
 ```sh
 # host-bash run_command:
-eichi query "alerting tier design decisions" -k 5   # also: --added-since 7d, --sort added
+eichi query "alerting tier design decisions" -k 5   # also --added-since 7d, --sort added
 eichi stats        # last-indexed timestamp / corpus size
 eichi ls           # what's indexed
 ```
 
 ### Interpreting results
 
-Each result has a human-readable score label: `[strong]` > `[moderate]` >
-`[weak]` > `[distant]`. Treat `[distant]` as noise unless the query is highly
-specialized. Results also carry a source tag (`[file]`, `[obsidian]`, etc.)
-and a timestamp.
+Each result has a score label: `[strong]` > `[moderate]` > `[weak]` >
+`[distant]`. Treat `[distant]` as noise unless the query is highly
+specialized; results also carry a source tag and timestamp.
 
 ### When to re-index
 
 The operator maintains the index via `eichi index <path>` on the host
-(delta-only, idempotent). If `eichi stats` shows `last indexed at` is stale
-vs. recent corpus activity, flag it to the operator — re-indexing is host-side
-(the container reads the index read-only via the bind-mounted DB at
-`~/.local/share/eichi/index.db`).
+(delta-only, idempotent). If `eichi stats` shows `last indexed at` stale vs.
+recent corpus activity, flag it — re-indexing is host-side (container reads
+the index read-only via the bind-mounted DB at `~/.local/share/eichi/index.db`).
 
 ## Quick reference for common in-container surprises
 
 - **`claude` resumes a prior conversation**: when `CLAUDE_AUTO_CONTINUE` is
-  set, the entrypoint appends `--continue <value>`. Default unset (bare
-  `claude`).
+  set the entrypoint appends `--continue <value>`. Default unset.
 - **`session-task`, `claude-event` on PATH**: only when the operator
-  bind-mounts `~/repos/claude-watch` (the example compose does). Missing
-  bind-mount = these two CLIs are unavailable (expected for a stripped-down
-  `docker run`). (`obligations`, `agent-msg`, `agent-tail` are baked at
-  `/usr/local/bin/` so they're always available; bind-mounted source wins on
-  PATH when present.)
+  bind-mounts `~/repos/claude-watch` (the example compose does); else these
+  two are unavailable (expected for a stripped-down `docker run`).
+  (`obligations`, `agent-msg`, `agent-tail` are baked at `/usr/local/bin/` so
+  always available; bind-mounted source wins on PATH when present.)
 - **Permission denied writing into `${HOME}/.local/share/claude/`**: the
   in-container claude's auto-update path, backed by a named volume
-  (`claude-container-versions`); should Just Work after the one-shot
-  Dockerfile chown. If not, check the named volume is mounted and uid 1000
-  owns it.
+  (`claude-container-versions`); should Just Work after the one-shot Dockerfile
+  chown. Else check the volume is mounted and uid 1000 owns it.
 - **`tmux` session is `claude-container:0.0`** — not `dashboard:main` like a
-  typical host install. claude-watch's in-container config pins this name.
+  typical host install; claude-watch's in-container config pins it.
 
 ## Event response protocol — tier model
 
