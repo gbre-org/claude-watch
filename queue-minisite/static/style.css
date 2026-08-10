@@ -1332,6 +1332,20 @@ body.modal-open { overflow: hidden; }
 
 .log-event > .log-headline::-webkit-details-marker { display: none; }
 
+/* EXPANDED-LOG MODE (botchat #3343): when #log-modal carries
+ * data-log-expanded="true", each event row's <details> is rendered open
+ * (see live-log.js renderEvent) so full bodies stream by. We also let the
+ * headline WRAP instead of ellipsis-truncating so the summary line isn't
+ * clipped mid-sentence — the whole point is "see a lot more detail". The
+ * indented body already shows normally when the row is open. Collapsed
+ * mode (data-log-expanded="false" / absent) keeps the one-line nowrap
+ * ellipsis headline. */
+.log-modal[data-log-expanded="true"] .log-event > .log-headline {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
 .log-event > .log-headline::before {
   content: "▸";
   display: inline-block;

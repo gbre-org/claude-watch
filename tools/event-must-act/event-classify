@@ -195,6 +195,22 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("*", "slack-unread", None, ACTIONABLE,
         "Slack DM unread; needs read+reply."),
 
+    # comment-triage-needed -> pr-watch's bot-comment-triage DETECTOR (botchat
+    # #3337/3339) found a PR with un-collapsed bot/automation issue-comments.
+    # The producer makes NO triage judgment; this event tells the main loop to
+    # dispatch a triage AGENT to review/collapse/act on those comments. The
+    # producer emits source="cron" (pr-watch runs under launchd/cron), so this
+    # row MUST precede the ("cron", "*") ambient catch-all below or it would be
+    # swallowed as routine cron context.
+    ("cron", "comment-triage-needed", None, ACTIONABLE,
+        "PR has un-collapsed bot comments; dispatch a triage agent to "
+        "review/collapse them (pr-watch detector, botchat #3337/3339)."),
+    # Back-compat: a future producer emitting the same tag under a different
+    # source still routes actionable.
+    ("*", "comment-triage-needed", None, ACTIONABLE,
+        "PR has un-collapsed bot comments; dispatch a triage agent "
+        "(pr-watch detector, botchat #3337/3339)."),
+
     # --- AMBIENT ----------------------------------------------------------
     #
     # Info-only: surface in next UserPromptSubmit context, no gate.
@@ -395,6 +411,10 @@ def _self_test() -> int:
         (("manual", "workbot-prompt", ""), ACTIONABLE),
         (("queue", "queue-stale-ready", ""), ACTIONABLE),
         (("manual", "slack-unread", ""), ACTIONABLE),
+        # comment-triage-needed: pr-watch bot-comment detector. Emitted under
+        # source="cron"; MUST route actionable (win over cron/* ambient).
+        (("cron", "comment-triage-needed", ""), ACTIONABLE),
+        (("manual", "comment-triage-needed", ""), ACTIONABLE),
         # heartbeat-tick is actionable (touch the file), and must win over
         # the claude-watch/* ambient catch-all below it.
         (("claude-watch", "heartbeat-tick", "heartbeat tick"), ACTIONABLE),

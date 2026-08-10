@@ -97,6 +97,29 @@ jobs:
         run: cargo nextest run -E 'binary(~e2e_)' --retries 2
         timeout-minutes: 5
 
+  queue-minisite-tests:
+    name: Queue-minisite Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        # `make test-queue-minisite` runs each suite through
+        # `uv run --with flask`, so uv is the only prerequisite — no
+        # checked-in venv, no repo-level requirements file.
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run queue-minisite end-to-end suites
+        # These suites were local-only, so minisite PRs could merge on a
+        # "green" CI that never executed a single one of their assertions.
+        # Each test_*.py boots the Flask app in-process against a tempdir
+        # queue.json; the make target runs every file and fails the job on
+        # the first non-zero exit.
+        run: make test-queue-minisite
+        timeout-minutes: 10
+
   container-shell-tests:
     name: Container shell + shim tests
     runs-on: ubuntu-latest

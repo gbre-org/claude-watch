@@ -141,6 +141,90 @@
     });
   }
 
+  // --- Expanded-log mode (botchat #3343) ---------------------------------
+  // Each transcript event renders as a <details class="log-event"> whose
+  // <summary> is a one-line, ellipsis-truncated headline and whose body
+  // holds the full content (text, tool args, tool-result preview, meta
+  // disclosures). By default those <details> render CLOSED, so the modal
+  // is a stream of one-liners you click to expand. Andrew wanted a mode
+  // that shows "a lot more detail fly by" without clicking — so we add an
+  // "expanded" toggle (DEFAULT ON) that:
+  //   1. renders every NEW event row already-open (full body visible), and
+  //   2. lets the headline wrap instead of ellipsis-truncating (via the
+  //      `data-log-expanded` attribute on the modal → CSS).
+  // Collapsed mode (toggle OFF) restores the prior one-liner behavior.
+  //
+  // Nested disclosures INSIDE a body (e.g. "full input", a huge tool
+  // result's "click to expand") stay collapsed even in expanded mode —
+  // that keeps the detail bounded so a multi-hundred-KB tool result
+  // doesn't blow up the DOM; you still see the 4-line preview + far more
+  // per row than the collapsed one-liner.
+  //
+  // Persisted per-viewer in localStorage (key
+  // `queue-minisite.logExpanded`); default-ON when unset (mirrors the
+  // metadata-toggle storage guard against private-mode / disabled
+  // storage). `logExpanded` is the live in-memory flag renderEvent reads.
+  const expandBtn = document.getElementById('log-modal-expand');
+  const LOG_EXPAND_STORAGE_KEY = 'queue-minisite.logExpanded';
+  let logExpanded = true;
+
+  function readLogExpandedStored() {
+    try {
+      const v = window.localStorage.getItem(LOG_EXPAND_STORAGE_KEY);
+      if (v === '1' || v === 'true') return true;
+      if (v === '0' || v === 'false') return false;
+      return null;
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function writeLogExpandedStored(isOn) {
+    try {
+      window.localStorage.setItem(LOG_EXPAND_STORAGE_KEY, isOn ? '1' : '0');
+    } catch (_e) {
+      /* private mode / quota / disabled — degrade to session-only */
+    }
+  }
+
+  // Reflect the current logExpanded flag onto the modal attribute (drives
+  // CSS headline-wrap) and the toggle button's aria-pressed / label.
+  function reflectLogExpanded() {
+    if (modal) modal.setAttribute('data-log-expanded', logExpanded ? 'true' : 'false');
+    if (expandBtn) expandBtn.setAttribute('aria-pressed', logExpanded ? 'true' : 'false');
+  }
+
+  // Apply the persisted-or-default state on modal open. Default ON when
+  // unset — Andrew asked for expanded "on by default". Does NOT re-open
+  // rows itself (the stream is empty at open time); renderEvent honors
+  // `logExpanded` for every row it appends thereafter.
+  function setLogExpandedInitialState() {
+    const stored = readLogExpandedStored();
+    logExpanded = (stored === null) ? true : stored;
+    reflectLogExpanded();
+  }
+
+  // Open (or close) every already-rendered event row to match the new
+  // flag — so flipping the toggle mid-stream re-renders the whole
+  // backlog, not just future lines. Only top-level `.log-event` rows are
+  // touched; nested body disclosures keep their own state.
+  function applyLogExpandedToExistingRows() {
+    if (!streamEl) return;
+    const rows = streamEl.querySelectorAll('details.log-event');
+    rows.forEach((d) => { d.open = logExpanded; });
+  }
+
+  if (expandBtn) {
+    expandBtn.addEventListener('click', () => {
+      logExpanded = !logExpanded;
+      writeLogExpandedStored(logExpanded);
+      reflectLogExpanded();
+      applyLogExpandedToExistingRows();
+      // Keep the newest line in view when expanding a bottom-pinned stream.
+      if (autoscroll && streamEl) streamEl.scrollTop = streamEl.scrollHeight;
+    });
+  }
+
   let triggerEl = null;
   let evtSource = null;
   let autoscroll = true;
@@ -1505,8 +1589,13 @@
         tsHtml +
         labelHtml +
         '<span class="log-headline-text">' + headlineText + '</span>';
+      // Expanded mode (default ON, botchat #3343): render each row
+      // already-open so the full body streams by without a click. The
+      // toggle flips `logExpanded`; applyLogExpandedToExistingRows()
+      // re-opens/closes the backlog when the viewer switches mid-stream.
+      const openAttr = logExpanded ? ' open' : '';
       html =
-        '<details class="log-event">' +
+        '<details class="log-event"' + openAttr + '>' +
         '<summary class="log-headline">' + headlineHtml + '</summary>' +
         '<div class="log-event-body">' + out.body + '</div>' +
         '</details>';
@@ -1588,6 +1677,11 @@
     }
     summaryEl.textContent = summary;
     streamEl.innerHTML = '';
+    // Re-sync the expanded-log flag from localStorage on every open (so a
+    // toggle made in another tab is honored, and the default-ON applies
+    // for first-time viewers). Must run BEFORE the stream fills so the
+    // first events render at the right open-state.
+    setLogExpandedInitialState();
     // Fresh modal — no prior workload row to replace.
     lastTransientRow = null;
     // Cancel any prior polling state (modal can be re-opened on a
@@ -2109,6 +2203,14 @@
     setMetaToggleInitialState,
     readMetaToggleStored,
     writeMetaToggleStored,
+    // Expanded-log-mode hooks (botchat #3343). Tests drive the
+    // default-ON logic + the per-row open-state via these.
+    setLogExpandedInitialState,
+    readLogExpandedStored,
+    writeLogExpandedStored,
+    applyLogExpandedToExistingRows,
+    getLogExpanded: () => logExpanded,
+    setLogExpanded: (v) => { logExpanded = !!v; reflectLogExpanded(); },
     // Modal keybind hooks — exposed so a jsdom test can drive the
     // scroll/jump primitives without dispatching synthetic keydowns
     // through the global listener.

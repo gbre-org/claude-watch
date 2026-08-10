@@ -40,9 +40,12 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-_DEFAULT_SESSION_TASK = (
-    HERE.parent.parent / "claude-watch" / "tools" / "session-task" / "session-task"
-)
+# Repo-root relative: queue-minisite/ lives inside the claude-watch
+# checkout, so the CLI is a sibling under tools/. (The old form went
+# up two levels and back down through a hardcoded "claude-watch"
+# directory name, which only resolved when the checkout happened to
+# be named that — it broke in worktrees and renamed clones.)
+_DEFAULT_SESSION_TASK = HERE.parent / "tools" / "session-task" / "session-task"
 SESSION_TASK = Path(os.environ.get("SESSION_TASK_BIN", str(_DEFAULT_SESSION_TASK)))
 
 
