@@ -53,8 +53,16 @@ test-obligations-init:
 # so no checked-in venv is needed. SESSION_TASK_BIN pins the CLI under
 # test to THIS checkout, which keeps the suites correct in worktrees and
 # renamed clones.
+#
+# The in-tree tools/ dirs go on PATH ahead of everything else because the
+# app's force-start path reaches the obligations CLI through
+# `shutil.which("obligations")` and NO-OPS SILENTLY when it is missing.
+# Resolving it from the checkout means the suites test this tree's CLIs
+# rather than whatever happens to be installed in the developer's ~/bin
+# (and gives a machine with nothing installed the same result as CI).
 test-queue-minisite:
 	@set -e; \
+	export PATH="$(CURDIR)/tools/session-task:$(CURDIR)/tools/obligations:$(CURDIR)/tools/claude-event:$$PATH"; \
 	for f in queue-minisite/test_*.py; do \
 		echo "==> $$f"; \
 		SESSION_TASK_BIN="$(CURDIR)/tools/session-task/session-task" \
