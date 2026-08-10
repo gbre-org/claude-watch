@@ -263,6 +263,7 @@ or ops repo and call into these tools as primitives.
 make test                # all Rust tests in parallel
 make test-session-task   # session-task pytest suite
 make test-hooks          # obligations + queue PreToolUse hook tests
+make test-queue-minisite # queue-minisite Flask end-to-end suites
 make test-agent-msg      # agent-msg embedded --test (38 cases)
 make test-claude-event   # claude-event + claude-event-tail unit tests
 make test-watchers       # claude-event-watch fast-path + self-clear config

@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container sync-main-clone clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-queue-minisite test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container sync-main-clone clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -41,6 +41,33 @@ test-session-task:
 # a tempdir HOME so the live ~/.config/claude/obligations.json is untouched.
 test-obligations-init:
 	uv run --python 3.11 --with pytest pytest tools/obligations/tests/ -v
+
+# Run the queue-minisite end-to-end suites (queue-minisite/test_*.py).
+# Each file is a standalone unittest script that boots the Flask app
+# in-process against a tempdir-rooted queue.json, so the live
+# ~/.config/session/queue.json is never touched. They rewrite os.environ
+# and drop `app` from sys.modules at class setup, so every file gets its
+# OWN interpreter instead of sharing one pytest session.
+#
+# uv supplies flask (pinned to the version the container image installs)
+# so no checked-in venv is needed. SESSION_TASK_BIN pins the CLI under
+# test to THIS checkout, which keeps the suites correct in worktrees and
+# renamed clones.
+#
+# The in-tree tools/ dirs go on PATH ahead of everything else because the
+# app's force-start path reaches the obligations CLI through
+# `shutil.which("obligations")` and NO-OPS SILENTLY when it is missing.
+# Resolving it from the checkout means the suites test this tree's CLIs
+# rather than whatever happens to be installed in the developer's ~/bin
+# (and gives a machine with nothing installed the same result as CI).
+test-queue-minisite:
+	@set -e; \
+	export PATH="$(CURDIR)/tools/session-task:$(CURDIR)/tools/obligations:$(CURDIR)/tools/claude-event:$$PATH"; \
+	for f in queue-minisite/test_*.py; do \
+		echo "==> $$f"; \
+		SESSION_TASK_BIN="$(CURDIR)/tools/session-task/session-task" \
+			uv run --python 3.12 --with flask==3.0.3 python "$$f"; \
+	done
 
 # Run the obligations / hooks Python tests. These are self-contained
 # scripts (not pytest), so we just exec them directly. Each runs against
