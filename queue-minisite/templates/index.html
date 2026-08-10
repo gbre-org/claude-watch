@@ -543,7 +543,12 @@
             {% endif %}
           </header>
           <p class="summary">{{ it.summary }}</p>
-          {% if it.abandon_reason %}<p class="description">{{ it.abandon_reason }}</p>{% endif %}
+          {# Labelled like the BLOCKED card's `blocker:` line. Unlabelled, this
+             read as the item's own task blurb (same bare .description markup),
+             so the one record of WHY the item died was invisible in plain
+             sight — botchat #939. The .abandon-reason class also keeps it out
+             of the compact-density elision; see style.css. #}
+          {% if it.abandon_reason %}<p class="description abandon-reason"><strong>reason:</strong> {{ it.abandon_reason }}</p>{% endif %}
           <div class="age">
             <span
               {% if it.abandoned_at_iso %}data-local-time-iso="{{ it.abandoned_at_iso }}" data-local-time-title-only{% endif %}
