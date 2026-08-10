@@ -43,15 +43,18 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-# A realistic reason: multi-sentence, ~1000 chars. Modelled on the real
-# q-2026-08-10-1d9b abandonment.
+# A realistic reason: multi-sentence prose at the length these actually run
+# to in practice. Reasons are free text and routinely reach ~1000 chars, which
+# is the whole reason truncation is not an option here.
 LONG_REASON = (
-    "ANSWERED by q-2026-08-10-89f0 before it could spawn. That agent already "
-    "performed the headless render Andrew asked for (983-word BBC article, "
-    "clean 200, no DataDome) plus a live get_text A/B, proving the failure is "
-    "Instapaper's server-side extractor, not entitlement. Running this "
-    "separately would burn additional renders against a sensitive profile for "
-    "information already in hand."
+    "ANSWERED by q-2026-08-10-89f0 before this item could spawn. That agent "
+    "had already run the exact probe this task was going to run, and its "
+    "transcript carries the A/B comparison plus a clean reproduction, so the "
+    "question this item existed to answer is settled. Re-running it would "
+    "repeat expensive work against a rate-limited dependency for an answer "
+    "already in hand, and would risk tripping the same backoff that made the "
+    "original investigation slow. Superseded rather than failed: no follow-up "
+    "is required beyond reading the other item's findings."
 )
 
 
