@@ -131,8 +131,11 @@ function assertEventShape(prefix, line) {
   assert(prefix + ' has <summary.log-headline>', !!headline);
   const body = details.querySelector('.log-event-body');
   assert(prefix + ' has <.log-event-body>', !!body);
-  // Closed by default.
-  assert(prefix + ' <details> closed by default', !details.hasAttribute('open'));
+  // Open by default: expanded-log mode (botchat #3343) ships default-ON,
+  // and live-log.js initializes `logExpanded = true`, so renderEvent
+  // stamps `open` on every new row. (Collapsed one-liner behavior is
+  // covered by static/log-expanded.test.js, which drives the flag OFF.)
+  assert(prefix + ' <details> open by default (expanded mode)', details.hasAttribute('open'));
   return { details, headline, body };
 }
 
