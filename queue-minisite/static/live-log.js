@@ -975,6 +975,10 @@
       label: 'USER',
       headline: headlinePreview(text, 100),
       body: bodyOrExpandable(text, 240, 100, 'text') + metaDisclosure(rec),
+      // Headline is just a truncated prefix of the body text — mark the
+      // row so CSS hides the duplicate preview once it's open (dedupe,
+      // botchat #3363). See renderEvent + style.css.
+      headlineRedundant: true,
     };
   }
 
@@ -1009,6 +1013,10 @@
       label: 'ASSISTANT',
       headline: headlinePreview(headlineText, 100),
       body: body + metaDisclosure(rec),
+      // Headline previews the first text/thinking block — a truncated
+      // prefix of the body. Mark redundant so the open row shows the
+      // content once (dedupe, botchat #3363).
+      headlineRedundant: true,
     };
   }
 
@@ -1030,6 +1038,9 @@
       label: 'THINKING',
       headline: headlinePreview(text, 100),
       body: bodyOrExpandable(text, 320, 120, 'thinking') + metaDisclosure(rec),
+      // Headline is a truncated prefix of the thinking body — mark
+      // redundant so the open row reads once (dedupe, botchat #3363).
+      headlineRedundant: true,
     };
   }
 
@@ -1232,6 +1243,14 @@
       label: isErr ? 'RESULT (err)' : 'RESULT',
       headline: headline,
       body: html,
+      // Headline is `[idShort] <first line of body>` — a truncated prefix
+      // of the result body, which then repeats in full below. Mark the row
+      // redundant so CSS hides the duplicate headline preview once it's
+      // open (dedupe, botchat #3363/#3380). The [idShort] chip + timestamp
+      // + label stay in the summary; the body carries the text ONCE. Unlike
+      // tool_use (headline = Name(args), a DISTINCT summary), tool_result's
+      // headline adds nothing the body doesn't already show.
+      headlineRedundant: true,
     };
   }
 
@@ -1594,8 +1613,21 @@
       // toggle flips `logExpanded`; applyLogExpandedToExistingRows()
       // re-opens/closes the backlog when the viewer switches mid-stream.
       const openAttr = logExpanded ? ' open' : '';
+      // Dedupe (botchat #3363): rows whose body is just a fuller rendering
+      // of the same text the headline previews (ASSISTANT / THINKING / USER
+      // — headline is a truncated prefix of the body) are marked
+      // data-headline-redundant. CSS then hides the duplicate headline
+      // preview once the row is OPEN, so the body shows the content ONCE
+      // (the timestamp + label chip stay in the summary). We keep the
+      // headline text in the DOM — collapsed one-liners still need it, and
+      // the expand/collapse toggle only flips [open], letting CSS react
+      // without a re-render. tool_use rows (headline = Name(args), body =
+      // full args) are NOT marked — those genuinely differ. tool_result
+      // rows ARE marked (headline = a truncated body prefix, #3380). See
+      // style.css `.log-event[open][data-headline-redundant]`.
+      const redundantAttr = out.headlineRedundant ? ' data-headline-redundant' : '';
       html =
-        '<details class="log-event"' + openAttr + '>' +
+        '<details class="log-event"' + openAttr + redundantAttr + '>' +
         '<summary class="log-headline">' + headlineHtml + '</summary>' +
         '<div class="log-event-body">' + out.body + '</div>' +
         '</details>';
