@@ -23,9 +23,12 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-_DEFAULT_SESSION_TASK = (
-    HERE.parent.parent / "claude-watch" / "tools" / "session-task" / "session-task"
-)
+# Repo-root relative: queue-minisite/ lives inside the claude-watch
+# checkout, so the CLI is a sibling under tools/. (The old form went
+# up two levels and back down through a hardcoded "claude-watch"
+# directory name, which only resolved when the checkout happened to
+# be named that — it broke in worktrees and renamed clones.)
+_DEFAULT_SESSION_TASK = HERE.parent / "tools" / "session-task" / "session-task"
 SESSION_TASK = Path(os.environ.get("SESSION_TASK_BIN", str(_DEFAULT_SESSION_TASK)))
 
 
@@ -109,11 +112,15 @@ class DependEndpointTest(unittest.TestCase):
         self.assertEqual(body["depends_on"], [self.a_id])
         self.assertFalse(body["ready_now"])
 
-        # Verify queue.json mutation.
+        # Verify queue.json mutation. Deps are persisted as `task:<id>`
+        # scope tokens (canonical since 2026-05-08); the legacy
+        # `depends_on` list is migrated away on read and stripped on the
+        # next write, so it must NOT be what we assert on disk.
         with open(self.queue_actual) as f:
             data = json.load(f)
         b = next(it for it in data["items"] if it["id"] == self.b_id)
-        self.assertEqual(b["depends_on"], [self.a_id])
+        self.assertIn(f"task:{self.a_id}", b.get("scope") or [])
+        self.assertFalse(b.get("depends_on"))
 
     def test_self_dep_rejected_400(self):
         r = self.client.post(
@@ -155,10 +162,13 @@ class DependEndpointTest(unittest.TestCase):
         self.assertEqual(body["depends_on"], [])
         self.assertTrue(body["ready_now"])
 
+        # The edge is gone from the persisted representation too: no
+        # `task:<a>` scope token, and no legacy `depends_on` remnant.
         with open(self.queue_actual) as f:
             data = json.load(f)
         b = next(it for it in data["items"] if it["id"] == self.b_id)
-        self.assertEqual(b["depends_on"], [])
+        self.assertNotIn(f"task:{self.a_id}", b.get("scope") or [])
+        self.assertFalse(b.get("depends_on"))
 
     def test_cross_group_dep_works(self):
         # b depends on a (repo:b -> repo:a, different groups)

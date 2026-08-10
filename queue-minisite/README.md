@@ -81,15 +81,26 @@ brand identity lives outside the public image.
 
 ## Tests
 
+Run the whole suite the way CI does — from the repo root, one
+interpreter per file, flask supplied by `uv`:
+
+```bash
+make test-queue-minisite
+```
+
+A single file, without the make wrapper:
+
 ```bash
 cd queue-minisite
 python3 -m venv .venv
 .venv/bin/pip install flask gunicorn
-python3 test_meta.py
-python3 test_depend.py
-python3 test_force_start.py
-python3 test_workload_archive.py
+.venv/bin/python test_depend.py
 ```
 
 Tests spawn the Flask app in-process against a tempdir-rooted queue.json
-and a vendored `session-task` (auto-located under `../tools/session-task/`).
+and a vendored `session-task` (auto-located under `../tools/session-task/`;
+override with `SESSION_TASK_BIN`). Each file gets its own process because
+they rewrite `os.environ` and reload the `app` module at class setup.
+
+These suites run in CI (`Queue-minisite Python tests` job) and gate
+merges to `main`.

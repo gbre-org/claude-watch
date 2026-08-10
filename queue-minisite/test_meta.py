@@ -25,9 +25,12 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-_DEFAULT_SESSION_TASK = (
-    HERE.parent.parent / "claude-watch" / "tools" / "session-task" / "session-task"
-)
+# Repo-root relative: queue-minisite/ lives inside the claude-watch
+# checkout, so the CLI is a sibling under tools/. (The old form went
+# up two levels and back down through a hardcoded "claude-watch"
+# directory name, which only resolved when the checkout happened to
+# be named that — it broke in worktrees and renamed clones.)
+_DEFAULT_SESSION_TASK = HERE.parent / "tools" / "session-task" / "session-task"
 SESSION_TASK = Path(os.environ.get("SESSION_TASK_BIN", str(_DEFAULT_SESSION_TASK)))
 
 
@@ -36,6 +39,13 @@ def _add(env: dict, queue_actual: Path, desc: str, scopes: list[str]) -> dict:
            "--summary", desc, "--json"]
     for s in scopes:
         cmd.extend(["--scope", s])
+    # `queue add` refuses a hand-written `workload:` scope — in real use
+    # the workload runner creates those rows itself. These tests only
+    # need a workload-shaped ROW to exercise the minisite's rendering,
+    # so take the documented escape hatch rather than standing up a
+    # real workload runner.
+    if any(s.startswith("workload:") for s in scopes):
+        cmd.append("--force-enqueue")
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=15)
     if r.returncode != 0:
         raise RuntimeError(f"add failed: {r.stderr}")
