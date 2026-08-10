@@ -1116,8 +1116,10 @@ console.log('\nheadline dedupe (botchat #3363) — data-headline-redundant marki
       details && details.hasAttribute('data-headline-redundant'));
   }
 
-  // TOOL rows keep both parts — headline (Name(args)) and body (full
+  // TOOL_USE keeps both parts — headline (Name(args)) and body (full
   // input / command / result) carry DIFFERENT content, so NOT redundant.
+  // TOOL_RESULT differs: its headline is `[idShort] <first body line>` — a
+  // truncated prefix of the body — so it IS redundant (dedupe #3380).
   const toolUse = render({
     type: 'event', kind: 'tool_use',
     rec: { timestamp: '2026-08-10T17:37:26.000Z',
@@ -1138,8 +1140,16 @@ console.log('\nheadline dedupe (botchat #3363) — data-headline-redundant marki
   });
   {
     const details = toolResult.querySelector('details.log-event');
-    assert('TOOL_RESULT row NOT marked redundant',
-      details && !details.hasAttribute('data-headline-redundant'));
+    // #3380: tool_result headline (`[<id>] <first body line>`) is a
+    // truncated body prefix, so the row IS marked redundant.
+    assert('TOOL_RESULT row marked data-headline-redundant',
+      details && details.hasAttribute('data-headline-redundant'));
+    // The body still carries the full result text (read once via the body).
+    assert('TOOL_RESULT body still shows full result text',
+      details && details.querySelector('.log-event-body').textContent.includes('drwxr-xr-x'));
+    // Headline preview still in the DOM for the collapsed one-liner.
+    assert('TOOL_RESULT headline preview still in DOM',
+      details && details.querySelector('.log-headline-text').textContent.includes('total 0'));
   }
 }
 
