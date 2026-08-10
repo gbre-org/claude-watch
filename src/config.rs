@@ -260,10 +260,32 @@ pub struct FreshClearConfig {
     /// which derails the active task.
     #[serde(default = "default_fresh_clear_active_window_secs")]
     pub active_window_secs: u64,
+    /// Window (seconds) after a DETECTED context clear during which a pane
+    /// sitting idle BELOW `min_tokens` still gets a resume inject.
+    ///
+    /// Why this exists: `[min_tokens, max_tokens)` cannot see the state a
+    /// pane is actually in right after a `/clear`. Claude Code reports
+    /// **0 tokens** at the post-clear prompt and only publishes a token
+    /// count once the first turn completes — at which point the always-
+    /// loaded preamble has already pushed it far ABOVE `max_tokens` in a
+    /// single step. So the window is jumped clean over and no resume is
+    /// ever injected. The `bashes == 0` requirement compounds it:
+    /// background shells survive a `/clear`, so a session with any
+    /// long-running background command reads as busy forever.
+    ///
+    /// This gate keys on a clear the daemon actually OBSERVED plus pane
+    /// idleness instead, and deliberately ignores the background-shell
+    /// count. `0` disables it. Default: 300 (5 min).
+    #[serde(default = "default_post_clear_window_secs")]
+    pub post_clear_window_secs: u64,
 }
 
 fn default_suppress_when_active() -> bool {
     true
+}
+
+fn default_post_clear_window_secs() -> u64 {
+    300
 }
 
 fn default_fresh_clear_active_window_secs() -> u64 {
@@ -764,6 +786,23 @@ pub struct ContextMonitorConfig {
     /// rapid retriggering if /clear takes a moment to land.
     #[serde(default = "default_wedged_cooldown")]
     pub wedged_cooldown: u64,
+    /// Hard arm-to-fire deadline (seconds) for the two-phase context-low
+    /// obligation. The normal escalation gate ALSO requires zero live
+    /// subagents, on the theory that interrupting would kill healthy
+    /// in-flight work. That theory inverts at the context wall: a main loop
+    /// that is about to hit (or has hit) the hard context limit cannot make
+    /// progress OR usefully supervise its subagents, and on a busy dispatcher
+    /// the subagent count is essentially never zero — so the obligation stays
+    /// ARMED forever and the auto-clear never fires. Once the obligation has
+    /// been armed this long, escalate regardless of the subagent count.
+    /// `0` disables the deadline (legacy behaviour: wait indefinitely for a
+    /// quiet moment). Default: 300 (5 min).
+    #[serde(default = "default_context_max_armed_secs")]
+    pub max_armed_secs: u64,
+}
+
+fn default_context_max_armed_secs() -> u64 {
+    300
 }
 
 fn default_wedged_detection_enabled() -> bool {
@@ -923,6 +962,21 @@ pub struct HybridConfig {
     /// often needs a few turns to hit a stopping point before restarting.
     #[serde(default = "default_version_fallback_secs")]
     pub version_fallback_secs: u64,
+    /// Hard ceiling (seconds) on how long the context fallback may keep
+    /// deferring to the hook, measured from the FIRST cycle on which the
+    /// context threshold was crossed — not from the last hook fire.
+    ///
+    /// `context_fallback_secs` is a grace window measured against the most
+    /// recent `context_high` hook fire, and that hook re-fires on every turn
+    /// while context stays high. So on a loop that keeps taking turns the
+    /// grace window is refreshed faster than it can expire and the daemon
+    /// defers FOREVER — observed deferring continuously from 92.8% context
+    /// all the way to the hard limit. This ceiling is anchored to the
+    /// threshold crossing instead, so a loop that keeps working but never
+    /// actually clears still gets the fallback. `0` disables the ceiling
+    /// (legacy behaviour). Default: 600 (10 min).
+    #[serde(default = "default_context_fallback_max_secs")]
+    pub context_fallback_max_secs: u64,
 }
 
 impl Default for HybridConfig {
@@ -931,8 +985,13 @@ impl Default for HybridConfig {
             enabled: default_hybrid_enabled(),
             context_fallback_secs: default_context_fallback_secs(),
             version_fallback_secs: default_version_fallback_secs(),
+            context_fallback_max_secs: default_context_fallback_max_secs(),
         }
     }
+}
+
+fn default_context_fallback_max_secs() -> u64 {
+    600
 }
 
 fn default_hybrid_enabled() -> bool {

@@ -349,6 +349,179 @@ pub(crate) fn obligation_escalation_decision(
     }
 }
 
+/// Context-low escalation decision: [`obligation_escalation_decision`] plus a
+/// hard arm-to-fire DEADLINE.
+///
+/// The base gate only escalates when `active_subagents == 0`, so that a
+/// turn-cancelling interrupt never lands on top of healthy in-flight subagent
+/// work. That trade is right for most rungs and exactly backwards for this
+/// one. Context-low is the rung whose whole job is to rescue a loop that is
+/// about to run out of context, and on a dispatcher that keeps subagents in
+/// flight the count is essentially never zero — so the obligation arms once
+/// and then HOLDS forever, re-emitting the same "auto-clear pending" alert
+/// every cycle while the context keeps climbing into the hard wall. Waiting
+/// for a quiet moment is not a recovery strategy when the thing being waited
+/// on is the very loop that is stuck.
+///
+/// So: once the obligation has been armed for `max_armed_secs`, escalate
+/// regardless of the subagent count. The dwell gate still applies for the
+/// normal case; this is purely a ceiling on how long ARMED can last.
+/// `max_armed_secs == 0` disables the deadline (legacy behaviour).
+///
+/// Real incident (2026-08-10): armed at 97.7% context with one subagent live,
+/// held for every one of the ~26 cycles that followed, and never fired.
+pub(crate) fn context_escalation_decision(
+    armed_at: Option<&str>,
+    dwell_secs: u64,
+    active_subagents: u32,
+    max_armed_secs: u64,
+    now: &str,
+) -> ObligationDecision {
+    let base = obligation_escalation_decision(armed_at, dwell_secs, active_subagents, now);
+    if max_armed_secs == 0 || base != ObligationDecision::Hold {
+        return base;
+    }
+    let overdue = armed_at
+        .and_then(elapsed_since)
+        .is_some_and(|e| e >= max_armed_secs as f64);
+    if overdue {
+        ObligationDecision::Escalate
+    } else {
+        base
+    }
+}
+
+/// May the context fallback still defer to the `context_high` hook?
+///
+/// `should_defer_to_hook` measures its grace window from the LAST hook fire,
+/// and the hook re-fires on every turn while context stays high — so on a loop
+/// that keeps taking turns the window is refreshed faster than it can expire
+/// and the daemon defers forever. This ceiling is anchored to the FIRST cycle
+/// on which the threshold was seen crossed instead, which nothing can refresh
+/// short of the context actually coming down.
+///
+/// Returns `true` while deferral is still permitted. `max_defer_secs == 0`
+/// disables the ceiling (legacy behaviour). An unset `first_seen_at` (the
+/// crossing has not been recorded yet) permits deferral — this cycle records
+/// it and the clock starts from here.
+pub(crate) fn context_hook_defer_allowed(
+    first_seen_at: Option<&str>,
+    max_defer_secs: u64,
+) -> bool {
+    if max_defer_secs == 0 {
+        return true;
+    }
+    match first_seen_at.and_then(elapsed_since) {
+        Some(elapsed) => elapsed < max_defer_secs as f64,
+        None => true,
+    }
+}
+
+/// Is a post-clear resume inject due?
+///
+/// Covers the blind spot between the two gates that are supposed to notice an
+/// idle session:
+///   * the fresh-/clear gate wants `tokens` inside `[min_tokens, max_tokens)`,
+///     but Claude Code reports **0 tokens** at a post-clear prompt and only
+///     publishes a count once the first turn completes — by which point the
+///     always-loaded preamble has already carried it far above `max_tokens`.
+///     The window is stepped clean over, never sampled;
+///   * the fresh-external-session gate handles `tokens == 0`, but only when
+///     `bashes == 0`, and background shells SURVIVE a `/clear`.
+///
+/// A session cleared by hand with a long-running background command therefore
+/// sits at an empty prompt indefinitely with nothing to nudge it. (When the
+/// daemon drives the clear itself the resume prompt comes from the `self-clear`
+/// child, which is why this gap only shows up on operator-driven clears.)
+///
+/// This gate keys on a clear the daemon actually OBSERVED (`last_context_clear`
+/// within `window_secs`) plus pane idleness, and deliberately ignores the
+/// background-shell count. `already_injected_for` latches it to one inject per
+/// observed clear.
+///
+/// Fires iff ALL hold:
+///   * `window_secs > 0` (gate enabled),
+///   * `tokens < fresh_min_tokens` — below the fresh-/clear window, so this
+///     cannot double up with that gate,
+///   * `!daemon_clear_recent` — the daemon's own `self-clear` child injects a
+///     resume prompt itself once the clear lands, so a daemon-driven clear is
+///     already covered and firing here too would just double up,
+///   * a clear was observed within `window_secs`,
+///   * we have not already injected for that same clear,
+///   * `idle && !interactive` — the prompt is up and no menu is awaiting the
+///     operator (a resume inject leads with Escape and would cancel it),
+///   * `idle_checks >= checks_required` — debounced, same as fresh-/clear.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn post_clear_resume_due(
+    tokens: u64,
+    fresh_min_tokens: u64,
+    last_context_clear: Option<&str>,
+    window_secs: u64,
+    already_injected_for: Option<&str>,
+    daemon_clear_recent: bool,
+    idle: bool,
+    interactive: bool,
+    idle_checks: u32,
+    checks_required: u32,
+) -> bool {
+    if window_secs == 0
+        || tokens >= fresh_min_tokens
+        || daemon_clear_recent
+        || !idle
+        || interactive
+    {
+        return false;
+    }
+    let Some(cleared_at) = last_context_clear else {
+        return false;
+    };
+    if already_injected_for == Some(cleared_at) {
+        return false;
+    }
+    if !elapsed_since(cleared_at).is_some_and(|e| e < window_secs as f64) {
+        return false;
+    }
+    idle_checks >= checks_required
+}
+
+/// Watcher-down active-turn verdict, with the two cases where the premise of
+/// the suppression is false folded in.
+///
+/// The suppression holds the loud tmux inject on the theory that (a) the loop
+/// is making progress and (b) the out-of-band claude-event still reaches the
+/// operator. `consumer_down` falsifies (b) — already handled at the fire site
+/// and kept here so the whole verdict is one testable expression.
+///
+/// `pane_wedged` falsifies (a), and is the addition. `main_loop_actively_turning`
+/// treats `bashes > 0` as unconditional, untimed proof of activity. A pane at
+/// the context wall renders a spinner and keeps its background shells listed
+/// ("2 shells still running"), so `bashes` stays pinned above zero and the
+/// gate reads a session that cannot execute a single tool call as maximally
+/// busy — and holds the inject for as long as the wedge lasts. Busy is exactly
+/// the wrong signal from a wedged pane: the wedge IS the not-making-progress
+/// condition. Note the operator-tunable suppression-run caps
+/// (`suppression.max_consecutive_suppressions` / `max_suppression_window_secs`)
+/// are the only other bound here, and a deployment may legitimately set them
+/// very high — so this must not rely on them.
+///
+/// Real incident (2026-08-10): 14 consecutive `watcher-down inject suppressed:
+/// main loop actively turning` cycles with `bashes=2` against a pane that had
+/// been at the hard context limit for ten minutes. It only broke out when a
+/// SECOND watcher — the event consumer, which bypasses the gate — also died.
+pub(crate) fn watcher_down_actively_turning(
+    state: &State,
+    bashes: u64,
+    suppress_enabled: bool,
+    window_secs: u64,
+    consumer_down: bool,
+    pane_wedged: bool,
+) -> bool {
+    if consumer_down || pane_wedged {
+        return false;
+    }
+    suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
+}
+
 /// Watcher-down two-phase decision: like [`obligation_escalation_decision`],
 /// but an active cross-gate suppression-escalation (`suppression_escalated`)
 /// FORCES `Escalate`. A capped suppression run is exactly the "lower rung
@@ -1686,12 +1859,6 @@ async fn check_foreground_inner(
     }
 }
 
-/// Check if a PID is still alive (signal 0 probe). Delegates to the shared
-/// helper in `status` so the daemon and CLI share one implementation.
-fn is_pid_alive(pid: u32) -> bool {
-    crate::status::is_pid_alive(pid)
-}
-
 /// Check if a PID is genuinely alive — i.e. exists AND is not a zombie
 /// (`<defunct>`). `pgrep` still lists zombies because they linger in the
 /// process table until reaped, so a plain `kill -0` probe (or a raw `pgrep`
@@ -1702,12 +1869,61 @@ fn is_pid_alive(pid: u32) -> bool {
 /// Falls back to the signal-0 probe when `/proc/PID/stat` is unreadable (e.g.
 /// a non-Linux test host) so behaviour degrades to "exists?" rather than
 /// always-false.
-// dead_code allow: the watcher_monitor now calls `status::*_multi` directly, so
-// this thin delegator is retained only as a named re-export for the module's
-// tests / historical readers.
-#[allow(dead_code)]
 fn is_pid_genuinely_alive(pid: u32) -> bool {
     crate::status::is_pid_genuinely_alive(pid)
+}
+
+/// Is the recorded `self-clear` child STILL RUNNING (as opposed to finished,
+/// gone, or finished-but-unreaped)?
+///
+/// Both clear-spawn paths short-circuit on "a clear child is already running"
+/// so they don't stack two `/clear` drivers on one pane. That guard used the
+/// bare `is_pid_alive` (a signal-0 / `/proc` existence probe), which is TRUE
+/// for a ZOMBIE.
+///
+/// And the children are always zombies. The daemon spawns `self-clear`
+/// detached and drops the `Child` handle without ever `wait()`ing, so every
+/// clear child it has ever spawned stays in the process table as `<defunct>`
+/// for the rest of the daemon's lifetime, with `context_clear_child_pid` still
+/// pointing at it. Net effect: the FIRST self-clear of a daemon lifetime
+/// poisons every later one. Every subsequent attempt hits the guard, logs
+/// "child already running", returns `true` — meaning "recovery attempted" —
+/// and spawns NOTHING.
+///
+/// Real incident (2026-08-10): the pane hit the hard context limit and the
+/// wedged-pane detector fired three times over 10 minutes, each logging
+/// "wedged pane sustained — running self-clear immediately" and alerting.
+/// Not one of them spawned a clear: the recorded pid was a zombie from a
+/// successful clear four hours earlier. The pane sat at the wall until the
+/// operator typed `/clear` by hand.
+///
+/// Two fixes, both needed:
+///   * reap the child if it is ours, so the zombie stops existing at all;
+///   * judge liveness with `is_pid_genuinely_alive`, which rejects state `Z`,
+///     so an unreapable zombie (daemon restarted since the spawn — the pid is
+///     no longer our child, `waitpid` gives `ECHILD`) still reads as finished.
+fn clear_child_is_running(pid: u32) -> bool {
+    reap_clear_child(pid);
+    is_pid_genuinely_alive(pid)
+}
+
+/// Best-effort non-blocking reap of a `self-clear` child we spawned.
+///
+/// `WNOHANG` so a still-running child is left alone (returns `StillAlive`).
+/// `ECHILD` — the pid is not our child, e.g. the daemon restarted since the
+/// spawn — is expected and ignored; `clear_child_is_running`'s zombie-aware
+/// liveness check covers that case.
+fn reap_clear_child(pid: u32) {
+    use nix::sys::wait::{waitpid, WaitPidFlag};
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    match waitpid(nix::unistd::Pid::from_raw(raw), Some(WaitPidFlag::WNOHANG)) {
+        Ok(nix::sys::wait::WaitStatus::StillAlive) => {}
+        Ok(status) => debug!(pid, ?status, "reaped self-clear child"),
+        Err(nix::errno::Errno::ECHILD) => {}
+        Err(e) => debug!(pid, error = %e, "waitpid on self-clear child failed"),
+    }
 }
 
 /// Read `/proc/<pid>/cmdline` (NUL-separated argv) into a space-joined string.
@@ -1905,11 +2121,17 @@ pub fn pidfile_watcher_is_down(
 /// `detect_wedged` (see `wedged_clear_unverified`).
 fn spawn_immediate_clear(state: &mut State) -> bool {
     // Don't double-spawn if a deferred clear child is already running.
+    // `clear_child_is_running` reaps + rejects zombies: a finished-but-
+    // unreaped child MUST NOT be mistaken for a live one, or this guard
+    // silently disables wedged-pane recovery for the daemon's whole lifetime.
     if let Some(pid) = state.context_clear_child_pid {
-        if is_pid_alive(pid) {
+        if clear_child_is_running(pid) {
             debug!(pid, "self-clear child already running, skipping immediate spawn");
             return true;
         }
+        // Finished (or never ours). Drop the stale handle so we don't
+        // re-probe a recycled pid on a later cycle.
+        state.context_clear_child_pid = None;
     }
 
     // SAFETY: setsid() is async-signal-safe and we call it before exec.
@@ -2139,12 +2361,14 @@ async fn handle_wedged_pane(
 /// The child sleeps for the grace period, then checks if tokens are still high.
 /// If so, it runs `self-clear` to force a context clear.
 fn spawn_deferred_clear(config: &Config, state: &mut State) {
-    // If there's already a living child, skip
+    // If there's already a living child, skip. Same zombie hazard as the
+    // immediate path — see `clear_child_is_running`.
     if let Some(pid) = state.context_clear_child_pid {
-        if is_pid_alive(pid) {
+        if clear_child_is_running(pid) {
             debug!(pid, "deferred self-clear child already running");
             return;
         }
+        state.context_clear_child_pid = None;
     }
 
     let grace = config.context_monitor.grace_period;
@@ -2238,8 +2462,11 @@ pub(crate) fn maybe_reset_context_clear(
     }
 
     // Context-low condition has cleared (tokens below the fresh threshold) —
-    // disarm the two-phase obligation so the next crossing re-arms.
+    // disarm the two-phase obligation so the next crossing re-arms, and end
+    // the threshold episode so the hook-deferral ceiling restarts from the
+    // NEXT crossing rather than staying permanently expired.
     state.context_obligation_armed_at = None;
+    state.context_threshold_first_seen_at = None;
 
     // Path 1: we triggered the clear and it landed (tokens dropped). Reset
     // the in-flight flag + child-pid bookkeeping so the next threshold
@@ -2257,6 +2484,11 @@ pub(crate) fn maybe_reset_context_clear(
         state.context_clear_triggered = false;
         state.context_clear_child_pid = None;
         state.last_context_clear = Some(now.to_string());
+        // Daemon-driven clear: the `self-clear` child injects its own resume
+        // prompt, so mark this clear as already handled and keep the
+        // post-clear resume gate (which exists for OPERATOR-driven clears)
+        // from injecting a second one on top of it.
+        state.post_clear_resume_injected_for = Some(now.to_string());
         return;
     }
 
@@ -4243,6 +4475,92 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         check_reauth(config, state, &effective_pane).await;
     }
 
+    // --- Post-clear resume detection ---
+    //
+    // Covers the blind spot BELOW the fresh-/clear token window. A pane that
+    // has just been cleared reports tokens=0 and only publishes a real count
+    // once the first turn lands — by which point the always-loaded preamble
+    // has already carried it past `max_tokens`, so `[min_tokens, max_tokens)`
+    // is stepped over and never sampled. The fresh-external-session gate does
+    // handle tokens=0, but only with `bashes == 0`, and background shells
+    // survive a `/clear`. Between them, an operator-driven `/clear` on a
+    // session with a background command running gets NO resume inject at all
+    // and sits at an empty prompt indefinitely. (Daemon-driven clears are
+    // unaffected — the `self-clear` child injects its own resume prompt.)
+    //
+    // Deliberately does NOT consult `bashes`: surviving background shells are
+    // exactly the case this exists for. Positive evidence of a clear the
+    // daemon OBSERVED plus an idle prompt is what authorises the inject, and
+    // `post_clear_resume_injected_for` latches it to one inject per clear.
+    if !effective_pane.is_empty()
+        && config.fresh_clear.post_clear_window_secs > 0
+        && tokens < config.fresh_clear.min_tokens
+        && state.last_context_clear.is_some()
+        && state.post_clear_resume_injected_for != state.last_context_clear
+    {
+        // A clear the DAEMON drove is already covered: the `self-clear` child
+        // polls until the clear lands and then injects its own resume prompt.
+        // Only operator-driven clears need this gate.
+        let daemon_clear_recent = state
+            .last_wedged_clear
+            .as_deref()
+            .and_then(elapsed_since)
+            .is_some_and(|e| e < config.fresh_clear.post_clear_window_secs as f64)
+            || state
+                .context_clear_child_pid
+                .is_some_and(clear_child_is_running);
+        let idle = tmux::is_idle(&effective_pane).await;
+        // Only consulted when idle already holds, to avoid a second pane
+        // capture on the common not-idle path (same shape as the gates above).
+        let interactive = idle && tmux::is_interactive_prompt(&effective_pane).await;
+        if idle && !interactive {
+            state.post_clear_idle_checks = state.post_clear_idle_checks.saturating_add(1);
+        } else {
+            state.post_clear_idle_checks = 0;
+        }
+        if post_clear_resume_due(
+            tokens,
+            config.fresh_clear.min_tokens,
+            state.last_context_clear.as_deref(),
+            config.fresh_clear.post_clear_window_secs,
+            state.post_clear_resume_injected_for.as_deref(),
+            daemon_clear_recent,
+            idle,
+            interactive,
+            state.post_clear_idle_checks,
+            config.fresh_clear.detections_required,
+        ) {
+            info!(
+                tokens,
+                bashes,
+                idle_checks = state.post_clear_idle_checks,
+                "post-clear idle pane detected -- injecting resume"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "post_clear_resume_inject",
+                serde_json::json!({
+                    "tokens": tokens,
+                    "bashes": bashes,
+                    "last_context_clear": state.last_context_clear,
+                    "idle_checks": state.post_clear_idle_checks,
+                }),
+            );
+            tmux::dismiss_feedback_prompt(&effective_pane).await;
+            inject_dispatch::inject_to_agent(&effective_pane, &config.alerts.resume_prompt).await;
+            state.post_clear_resume_injected_for = state.last_context_clear.clone();
+            state.post_clear_idle_checks = 0;
+            state.fresh_clear_resume_inject_interrupts_total = state
+                .fresh_clear_resume_inject_interrupts_total
+                .saturating_add(1);
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        }
+    } else {
+        state.post_clear_idle_checks = 0;
+    }
+
     // --- Fresh /clear detection ---
     if tokens >= config.fresh_clear.min_tokens
         && tokens < config.fresh_clear.max_tokens
@@ -4556,11 +4874,36 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 };
 
                 if can_trigger {
+                    // Record when this threshold episode STARTED. The hook
+                    // grace window below is measured from the last hook
+                    // fire, which the hook refreshes every turn; this
+                    // timestamp is the thing that can't be refreshed and so
+                    // is what the deferral ceiling is anchored to.
+                    if state.context_threshold_first_seen_at.is_none() {
+                        state.context_threshold_first_seen_at = Some(now.clone());
+                    }
                     // Hybrid gate: if a recent context_high hook fired the
                     // reminder, give Claude a grace window to self-act
                     // before we tmux-inject a warning + schedule the
-                    // deferred clear.
+                    // deferred clear. Bounded by context_fallback_max_secs
+                    // since the crossing — without that ceiling a loop that
+                    // keeps taking turns re-arms the grace window forever and
+                    // the fallback never runs (2026-08-10: deferred every
+                    // cycle from 92.8% context to the hard limit).
+                    let defer_allowed = context_hook_defer_allowed(
+                        state.context_threshold_first_seen_at.as_deref(),
+                        config.hybrid.context_fallback_max_secs,
+                    );
+                    if !defer_allowed {
+                        debug!(
+                            tokens,
+                            pct,
+                            max_secs = config.hybrid.context_fallback_max_secs,
+                            "context hook-deferral ceiling reached — no longer deferring to hook"
+                        );
+                    }
                     let hook_deferred = config.hybrid.enabled
+                        && defer_allowed
                         && should_defer_to_hook(
                             ReminderType::ContextHigh,
                             config.hybrid.context_fallback_secs as f64,
@@ -4597,10 +4940,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             }),
                         );
                     } else if matches!(
-                        obligation_escalation_decision(
+                        context_escalation_decision(
                             state.context_obligation_armed_at.as_deref(),
                             config.general.obligation_dwell_secs,
                             crate::respawn::count_alive_subagents(),
+                            config.context_monitor.max_armed_secs,
                             &now,
                         ),
                         ObligationDecision::ArmObligation | ObligationDecision::Hold
@@ -5234,13 +5578,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // is undeliverable+self-feedback-filtered when the consumer itself
             // is down. Suppressing would mean total silence, so never suppress
             // a consumer-down.
-            let actively_turning = !consumer_down
-                && config.watcher_monitor.suppress_inject_when_active
-                && main_loop_actively_turning(
-                    state,
-                    bashes,
-                    config.watcher_monitor.active_window_secs,
-                );
+            // pane_wedged is the other premise-falsifier: `bashes > 0` counts
+            // as untimed proof of activity, and a wedged pane keeps its
+            // background shells listed forever, so without this the gate reads
+            // a session that cannot run a single tool call as permanently busy.
+            // `wedged_consecutive` is refreshed by handle_wedged_pane earlier
+            // in this same cycle.
+            let actively_turning = watcher_down_actively_turning(
+                state,
+                bashes,
+                config.watcher_monitor.suppress_inject_when_active,
+                config.watcher_monitor.active_window_secs,
+                consumer_down,
+                state.wedged_consecutive > 0,
+            );
             // Cross-gate escalation backstop (2026-04-28 q-2026-04-28-2449):
             // if the suppression run has been long/persistent enough, force
             // the inject regardless of `actively_turning`. Catches the
@@ -7144,6 +7495,256 @@ cooldown = 300
             effective_global_cooldown_secs(u64::MAX, u64::MAX, 1800, u32::MAX),
             1800
         );
+    }
+
+    // --- 2026-08-10 context-limit deadlock regression tests ---
+    //
+    // The incident, in one line each: the pane hit the hard context limit and
+    // rode there for ~25 minutes while the daemon armed, alerted, and never
+    // once injected a clear. Every assertion below fails against the
+    // pre-fix code.
+
+    #[test]
+    fn context_escalation_fires_despite_live_subagents_after_deadline() {
+        // THE deadlock. Armed well past the dwell, but subagents are live, so
+        // the base gate says Hold — and said Hold on every one of the ~26
+        // cycles the real incident ran for, at 97.7% context. With an
+        // arm-to-fire deadline the clear fires anyway.
+        let armed = (Utc::now() - chrono::Duration::seconds(400)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            obligation_escalation_decision(Some(&armed), 90, 1, &now),
+            ObligationDecision::Hold,
+            "base gate holds forever while any subagent is live"
+        );
+        assert_eq!(
+            context_escalation_decision(Some(&armed), 90, 1, 300, &now),
+            ObligationDecision::Escalate,
+            "armed past max_armed_secs must fire regardless of subagent count"
+        );
+    }
+
+    #[test]
+    fn context_escalation_holds_before_deadline() {
+        // The deadline is a ceiling, not a bypass: inside it the subagent
+        // protection still applies.
+        let armed = (Utc::now() - chrono::Duration::seconds(100)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            context_escalation_decision(Some(&armed), 90, 1, 300, &now),
+            ObligationDecision::Hold
+        );
+    }
+
+    #[test]
+    fn context_escalation_deadline_zero_is_legacy_behaviour() {
+        let armed = (Utc::now() - chrono::Duration::seconds(9999)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            context_escalation_decision(Some(&armed), 90, 1, 0, &now),
+            ObligationDecision::Hold
+        );
+    }
+
+    #[test]
+    fn context_escalation_deadline_does_not_skip_the_arm_phase() {
+        // An unarmed obligation must still ARM first (emit the pending alert
+        // + event) rather than jumping straight to a turn-cancelling interrupt.
+        let now = Utc::now().to_rfc3339();
+        assert_eq!(
+            context_escalation_decision(None, 90, 3, 300, &now),
+            ObligationDecision::ArmObligation
+        );
+    }
+
+    #[test]
+    fn context_hook_defer_ceiling_expires_from_the_crossing() {
+        // The per-fire grace window is measured from the last hook fire and
+        // the hook re-fires every turn, so it can never expire on a working
+        // loop. The ceiling is anchored to the threshold crossing, which
+        // nothing refreshes.
+        let recent = (Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        let ancient = (Utc::now() - chrono::Duration::seconds(900)).to_rfc3339();
+        assert!(context_hook_defer_allowed(Some(&recent), 600));
+        assert!(
+            !context_hook_defer_allowed(Some(&ancient), 600),
+            "15 min past the crossing must stop deferring to the hook"
+        );
+        // Ceiling disabled -> always defer (legacy behaviour).
+        assert!(context_hook_defer_allowed(Some(&ancient), 0));
+        // Crossing not recorded yet -> permitted; this cycle records it.
+        assert!(context_hook_defer_allowed(None, 600));
+    }
+
+    #[test]
+    fn watcher_down_wedged_pane_is_not_actively_turning() {
+        // `bashes > 0` is untimed proof of activity, and a wedged pane keeps
+        // its background shells listed indefinitely — so the suppression gate
+        // read a session that could not run a single tool call as maximally
+        // busy, for 14 consecutive cycles.
+        let mut state = State::default();
+        state.last_active_at = Some(Utc::now().to_rfc3339());
+        let bashes = 2;
+        assert!(
+            main_loop_actively_turning(&state, bashes, 30),
+            "leftover background shells read as active"
+        );
+        assert!(
+            watcher_down_actively_turning(&state, bashes, true, 30, false, false),
+            "healthy busy pane: suppression still applies"
+        );
+        assert!(
+            !watcher_down_actively_turning(&state, bashes, true, 30, false, true),
+            "wedged pane must never count as actively turning"
+        );
+        // The pre-existing consumer-down bypass is unaffected.
+        assert!(!watcher_down_actively_turning(
+            &state, bashes, true, 30, true, false
+        ));
+    }
+
+    #[test]
+    fn post_clear_resume_fires_at_zero_tokens_with_background_shells() {
+        // A pane at the post-clear prompt reports tokens=0 — below the
+        // fresh-/clear window's min_tokens — and keeps its surviving
+        // background shells, so neither existing gate can see it.
+        let (tokens, bashes) = (0u64, 2u64);
+        let (min_tokens, max_tokens) = (2000u64, 5000u64);
+
+        // Pin the blind spot both pre-existing gates leave. Fresh-/clear
+        // wants the token window AND zero background shells:
+        assert!(
+            !(tokens >= min_tokens && tokens < max_tokens && bashes == 0),
+            "fresh-/clear gate cannot see a post-clear pane"
+        );
+        // ...and the fresh-external-session gate is behind `tokens == 0 &&
+        // bashes == 0`, which surviving background shells defeat:
+        assert!(
+            !(tokens == 0 && bashes == 0),
+            "fresh-session gate cannot see a post-clear pane with live shells"
+        );
+
+        let cleared = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        assert!(post_clear_resume_due(
+            tokens,          // 0 at the post-clear prompt
+            min_tokens,      // fresh_clear.min_tokens
+            Some(&cleared),  // clear the daemon observed
+            300,             // post_clear_window_secs
+            None,            // not yet injected for this clear
+            false,           // operator-driven clear, not a daemon self-clear
+            true,            // idle
+            false,           // no interactive menu
+            2,               // idle checks
+            2,               // detections_required
+        ));
+    }
+
+    #[test]
+    fn post_clear_resume_defers_to_daemon_self_clear() {
+        // `self-clear` injects its own resume prompt once the clear lands, so
+        // a daemon-driven clear must not also draw an inject from here.
+        let cleared = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        assert!(!post_clear_resume_due(
+            0,
+            2000,
+            Some(&cleared),
+            300,
+            None,
+            true, // daemon_clear_recent
+            true,
+            false,
+            2,
+            2
+        ));
+    }
+
+    #[test]
+    fn post_clear_resume_latches_to_one_inject_per_clear() {
+        let cleared = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        assert!(
+            !post_clear_resume_due(
+                0,
+                2000,
+                Some(&cleared),
+                300,
+                Some(&cleared), // already injected for this same clear
+                false,
+                true,
+                false,
+                5,
+                2
+            ),
+            "must not re-inject every cycle while the pane sits idle"
+        );
+    }
+
+    #[test]
+    fn post_clear_resume_respects_its_guards() {
+        let cleared = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        let stale = (Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+        let due = |tokens, last, idle, interactive, checks, window| {
+            post_clear_resume_due(
+                tokens,
+                2000,
+                last,
+                window,
+                None,
+                false,
+                idle,
+                interactive,
+                checks,
+                2,
+            )
+        };
+        // Inside the fresh-/clear window -> that gate owns it, not this one.
+        assert!(!due(3000, Some(&cleared), true, false, 2, 300));
+        // No observed clear -> no positive evidence, no inject.
+        assert!(!due(0, None, true, false, 2, 300));
+        // Clear too old -> the window has closed.
+        assert!(!due(0, Some(&stale), true, false, 2, 300));
+        // Not idle -> mid-turn, do not preempt.
+        assert!(!due(0, Some(&cleared), false, false, 2, 300));
+        // Interactive menu on screen -> the inject's leading Escape would
+        // cancel the operator's question.
+        assert!(!due(0, Some(&cleared), true, true, 2, 300));
+        // Not debounced yet.
+        assert!(!due(0, Some(&cleared), true, false, 1, 300));
+        // Gate disabled.
+        assert!(!due(0, Some(&cleared), true, false, 2, 0));
+    }
+
+    #[test]
+    fn zombie_clear_child_does_not_block_recovery() {
+        // The guard that stops two clear drivers stacking on one pane used a
+        // bare existence probe, which is true for a zombie — and the daemon
+        // never reaps its detached clear children, so the first successful
+        // clear of a daemon lifetime left a permanent `<defunct>` pid in
+        // `context_clear_child_pid` that silently disabled every later
+        // recovery. Spawn a child, let it exit, do NOT reap it, and assert the
+        // liveness judgement used by the guard sees it as finished.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn probe child");
+        let pid = child.id();
+        // Wait for exit WITHOUT reaping via the Child handle, so the process
+        // is genuinely a zombie at the moment we probe it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if matches!(
+                std::fs::read_to_string(format!("/proc/{pid}/stat")),
+                Ok(ref s) if s.rsplit(')').next().is_some_and(|t| t.trim_start().starts_with('Z'))
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !clear_child_is_running(pid),
+            "a finished (zombie or reaped) clear child must not read as running"
+        );
+        // clear_child_is_running reaps, so this second wait is a no-op or an
+        // ECHILD — either way it must not hang the test.
+        let _ = child.try_wait();
     }
 
     // --- obligation_escalation_decision tests ---

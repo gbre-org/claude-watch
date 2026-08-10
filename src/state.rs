@@ -99,6 +99,27 @@ pub struct State {
     /// Last observed token count (for detecting external clears)
     #[serde(default)]
     pub last_seen_tokens: Option<u64>,
+    /// RFC3339 timestamp of the FIRST check cycle on which the context
+    /// threshold was seen crossed in the current episode. Anchors the hard
+    /// ceiling on hook-deferral (`hybrid.context_fallback_max_secs`): the
+    /// per-fire grace window is measured against the last hook fire, which
+    /// the hook itself refreshes on every turn, so it can never expire on a
+    /// loop that keeps working. Cleared whenever the context-low condition
+    /// clears. Transient.
+    #[serde(default)]
+    pub context_threshold_first_seen_at: Option<String>,
+    /// `last_context_clear` value we have ALREADY injected a post-clear
+    /// resume for. Latches the post-clear resume gate to one inject per
+    /// observed clear (a `/clear` sits idle for many check cycles, and the
+    /// gate deliberately does not consult the background-shell count, so it
+    /// would otherwise re-fire every cycle). Transient.
+    #[serde(default)]
+    pub post_clear_resume_injected_for: Option<String>,
+    /// Consecutive check cycles the pane has been observed idle inside the
+    /// post-clear window. Debounces the post-clear resume gate the same way
+    /// `consecutive_fast_detections` debounces the fresh-/clear gate.
+    #[serde(default)]
+    pub post_clear_idle_checks: u32,
     /// Number of consecutive check cycles where the pane has shown a "wedged"
     /// pattern (context limit reached / persistent rate limit). When this
     /// reaches `context_monitor.wedged_consecutive`, claude-watch runs
