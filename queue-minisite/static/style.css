@@ -1366,6 +1366,25 @@ body.modal-open { overflow: hidden; }
   color: var(--fg);
 }
 
+/* DEDUPE (botchat #3363): for ASSISTANT / THINKING / USER rows the
+ * headline preview is just a truncated prefix of the body text, so an
+ * OPEN row renders the same content twice (headline + body). Rows whose
+ * body merely re-renders the headlined text are stamped
+ * data-headline-redundant by renderEvent; once such a row is [open] we
+ * hide the duplicate headline preview and let the full body carry the
+ * text ONCE. The timestamp + label chip stay in the summary so the row
+ * is still identifiable and clickable to re-collapse.
+ *
+ * Gated on [open] (NOT data-log-expanded) so it applies whether the row
+ * opened via expanded-mode default-ON or a manual click in collapsed
+ * mode — in both cases the body is visible and the preview is redundant.
+ * A CLOSED row keeps its one-line ellipsis headline (compact mode is
+ * unchanged). TOOL rows are never marked (headline = Name(args), body =
+ * full args/result differ), so they always show both. */
+.log-event[open][data-headline-redundant] > .log-headline .log-headline-text {
+  display: none;
+}
+
 /* When opened, the body sits indented under the headline so the
  * visual hierarchy reads top-down (headline → details). Slight
  * top-margin separates it from the headline row. */
