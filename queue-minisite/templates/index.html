@@ -687,6 +687,20 @@
             class="log-toggle-btn"
             aria-pressed="true"
             title="Auto-scroll to newest events">auto-scroll</button>
+          {# EXPANDED-LOG TOGGLE (botchat #3343): flips the transcript
+             between a stream of one-line headlines (OFF) and fully-
+             expanded rows that show much more detail per event without a
+             click (ON). Default ON — Andrew wanted to "see a lot more
+             detail fly by". Handler + localStorage persistence
+             (queue-minisite.logExpanded) live in live-log.js; the
+             data-log-expanded attribute it sets on #log-modal drives the
+             headline-wrap CSS. #}
+          <button
+            type="button"
+            id="log-modal-expand"
+            class="log-toggle-btn"
+            aria-pressed="true"
+            title="Expanded mode — show full detail per event instead of one-line summaries">expanded</button>
           <button
             type="button"
             id="log-modal-close"
