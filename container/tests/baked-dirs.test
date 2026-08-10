@@ -222,6 +222,57 @@ if self_clear.is_file():
         f"(inject /clear + resume), got: {text.splitlines()[0]!r}",
     )
 
+# 3e. distill.md present — the distillation metaskill. Structured
+#     superset of the terse host /generalize one-liner; must reference
+#     /generalize (the relationship it supersedes/sits-beside) and the
+#     four-phase IDENTIFY/CHOOSE/DRAFT/PLACE workflow.
+distill = SKILLS_DIR / "distill.md"
+expect(
+    distill.is_file(),
+    f"{distill} missing — the distillation metaskill (turn completed work "
+    f"into reusable skills/agent-prompts/CLI-tools/memories) must ship as "
+    f"its own skill",
+)
+if distill.is_file():
+    text = distill.read_text(encoding="utf-8")
+    expect(len(text) > 200, f"{distill} suspiciously short (<200 chars)")
+    expect(
+        "/generalize" in text,
+        f"{distill} should reference `/generalize` — distill is the "
+        f"structured superset of that terse one-liner and must explain the "
+        f"relationship (supersede / wrap / sit beside)",
+    )
+    expect(
+        "IDENTIFY" in text and "CHOOSE" in text
+        and "DRAFT" in text and "PLACE" in text,
+        f"{distill} should codify the four-phase workflow "
+        f"(IDENTIFY -> CHOOSE -> DRAFT -> PLACE)",
+    )
+
+# 3f. pr-comment-triage.md present — first worked instance of distill.
+#     Must reference the governing memory + the minimizeComment collapse
+#     mechanism + the draft-never-auto-post rule.
+pr_triage = SKILLS_DIR / "pr-comment-triage.md"
+expect(
+    pr_triage.is_file(),
+    f"{pr_triage} missing — the PR comment-triage skill (first worked "
+    f"instance of the distill metaskill) must ship as its own skill",
+)
+if pr_triage.is_file():
+    text = pr_triage.read_text(encoding="utf-8")
+    expect(len(text) > 200, f"{pr_triage} suspiciously short (<200 chars)")
+    expect(
+        "minimizeComment" in text,
+        f"{pr_triage} should reference the `minimizeComment` GraphQL mutation "
+        f"— the reversible collapse mechanism (collapse, not delete)",
+    )
+    expect(
+        "feedback_pr_comment_triage_act_or_collapse" in text,
+        f"{pr_triage} should reference the governing memory "
+        f"`feedback_pr_comment_triage_act_or_collapse` (source of truth for "
+        f"the triage rules)",
+    )
+
 # 3b. edit-host-mounts.md present + references host-bash and the
 #     override file. The skill is the canonical way to generate /
 #     update the operator's docker-compose.override.yml.
