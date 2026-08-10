@@ -436,6 +436,18 @@ html.header-collapsed .topbar .density-control { display: none; }
   font-style: italic;
 }
 
+/* Abandonment reason (botchat #939). Real reasons run to ~1000 chars of
+   multi-sentence prose, and a long italic run is markedly harder to read, so
+   the reason body drops back to roman while the `reason:` label stays bold.
+   No clamping/ellipsis: this is the only record of why the item died, and a
+   truncated reason with no way to reach the rest is worse than none. */
+.description.abandon-reason {
+  font-style: normal;
+  word-break: break-word;
+}
+
+.description.abandon-reason > strong { font-style: normal; }
+
 .age {
   font-size: 0.82rem;
   color: var(--fg-mute);
@@ -1859,6 +1871,13 @@ html.density-compact .age {
 html.density-compact .item .scope,
 html.density-compact .item > .description,
 html.density-compact .item > .prompt-toggle:not(.subagent-tree) { display: none; }
+
+/* ...with one exception: the abandonment reason. Eliding a task description
+   in compact costs nothing (the Prompt disclosure still carries it), but the
+   reason has no second home — hiding it deletes the only answer to "why did
+   this die?" from the page. Higher specificity than the blanket hide above,
+   and ordered after it. */
+html.density-compact .item > .description.abandon-reason { display: block; }
 
 /* Pending-item drag affordances: keep functional but shrink the handle + dep
    badges so a pending row matches the running-row height. */
