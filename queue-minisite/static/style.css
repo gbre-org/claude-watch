@@ -1379,8 +1379,10 @@ body.modal-open { overflow: hidden; }
  * opened via expanded-mode default-ON or a manual click in collapsed
  * mode — in both cases the body is visible and the preview is redundant.
  * A CLOSED row keeps its one-line ellipsis headline (compact mode is
- * unchanged). TOOL rows are never marked (headline = Name(args), body =
- * full args/result differ), so they always show both. */
+ * unchanged). tool_use rows are never marked (headline = Name(args) vs
+ * body = full args differ). tool_result IS marked — its headline is just
+ * a truncated prefix of the body (#3380) — so its duplicate preview hides
+ * on open too. */
 .log-event[open][data-headline-redundant] > .log-headline .log-headline-text {
   display: none;
 }

@@ -1243,6 +1243,14 @@
       label: isErr ? 'RESULT (err)' : 'RESULT',
       headline: headline,
       body: html,
+      // Headline is `[idShort] <first line of body>` — a truncated prefix
+      // of the result body, which then repeats in full below. Mark the row
+      // redundant so CSS hides the duplicate headline preview once it's
+      // open (dedupe, botchat #3363/#3380). The [idShort] chip + timestamp
+      // + label stay in the summary; the body carries the text ONCE. Unlike
+      // tool_use (headline = Name(args), a DISTINCT summary), tool_result's
+      // headline adds nothing the body doesn't already show.
+      headlineRedundant: true,
     };
   }
 
@@ -1613,8 +1621,9 @@
       // (the timestamp + label chip stay in the summary). We keep the
       // headline text in the DOM — collapsed one-liners still need it, and
       // the expand/collapse toggle only flips [open], letting CSS react
-      // without a re-render. TOOL rows (headline = Name(args), body = full
-      // args/result) are NOT marked, so they keep both parts. See
+      // without a re-render. tool_use rows (headline = Name(args), body =
+      // full args) are NOT marked — those genuinely differ. tool_result
+      // rows ARE marked (headline = a truncated body prefix, #3380). See
       // style.css `.log-event[open][data-headline-redundant]`.
       const redundantAttr = out.headlineRedundant ? ' data-headline-redundant' : '';
       html =
