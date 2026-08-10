@@ -705,9 +705,12 @@
     let ageBlock = `<span ${anchorIso ? `data-local-time-iso="${attr(anchorIso)}" data-local-time-title-only` : ''} title="${attr(anchorIso || '')}">${esc(anchorLabel)} ${relAge(it.age, it.age_epoch)}</span>`;
     if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
 
+    // Must stay byte-identical in intent to templates/index.html — morphdom
+    // replaces the server's first paint with this markup after ~5s, so a
+    // label that exists only in the template silently disappears.
     let reasonHtml = '';
     if (!isDone && it.abandon_reason) {
-      reasonHtml = `<p class="description">${esc(it.abandon_reason)}</p>`;
+      reasonHtml = `<p class="description abandon-reason"><strong>reason:</strong> ${esc(it.abandon_reason)}</p>`;
     }
 
     let prompt = '';
