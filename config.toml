@@ -82,6 +82,20 @@ max_tokens = 5000
 detections_required = 2
 # Cooldown between fast-path alerts (seconds)
 cooldown = 120
+# Window (seconds) after an OBSERVED context clear during which an idle pane
+# sitting BELOW min_tokens still gets a resume inject.
+#
+# The [min_tokens, max_tokens) window cannot see the state a pane is actually
+# in right after a /clear: Claude Code reports 0 tokens at the post-clear
+# prompt and only publishes a count once the first turn lands, by which point
+# the always-loaded preamble has carried it far above max_tokens in one step —
+# so the window is stepped over and never sampled. The other gate that does
+# handle tokens=0 requires bashes == 0, and background shells survive a
+# /clear. Between them an operator-driven /clear on a session with a
+# background command running gets no resume at all. This gate keys on a clear
+# the daemon actually observed plus pane idleness, and ignores the
+# background-shell count. 0 disables it.
+post_clear_window_secs = 300
 
 [heartbeat]
 # Minutes before heartbeat is considered stale.
@@ -266,6 +280,15 @@ compact_trigger_percent = 5
 grace_period = 300
 # Minimum interval between context clear triggers (seconds)
 cooldown = 300
+# Hard arm-to-fire deadline (seconds) for the two-phase context-low
+# obligation. Normal escalation also requires ZERO live subagents, so that an
+# interrupt never cancels healthy in-flight work — but on a dispatcher that
+# keeps subagents in flight that count is essentially never zero, and the
+# obligation then stays ARMED forever while context climbs into the hard wall.
+# Waiting for a quiet moment is not a recovery strategy when the loop you are
+# waiting on is the stuck one. After this long armed, fire regardless of the
+# subagent count. 0 disables the deadline (wait indefinitely).
+max_armed_secs = 300
 
 [malformed_tool_call]
 # Detect MALFORMED tool calls — the model emitting raw, NON-namespaced
@@ -498,6 +521,13 @@ enabled = true
 # Grace window after a context_high hook fire before the daemon forces
 # `/clear` via tmux. Default 5 minutes.
 context_fallback_secs = 300
+# Hard ceiling (seconds) on hook-deferral, measured from the FIRST cycle on
+# which the context threshold was crossed rather than from the last hook fire.
+# context_fallback_secs alone cannot expire on a busy loop: the context_high
+# hook re-fires every turn, refreshing the grace window faster than it runs
+# down, so the daemon defers forever and the fallback never runs. Anchoring to
+# the crossing gives it a real bound. 0 disables the ceiling.
+context_fallback_max_secs = 600
 # Grace window after a version_update hook fire before the daemon runs
 # `claude update`. Default 15 minutes — Claude often needs a few turns to
 # hit a stopping point before restarting.
