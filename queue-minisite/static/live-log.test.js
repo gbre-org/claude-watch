@@ -1064,6 +1064,95 @@ console.log('\ncommand row — template element IDs present');
     tmpl.includes('id="log-meta-command"'));
 }
 
+console.log('\nheadline dedupe (botchat #3363) — data-headline-redundant marking');
+{
+  // ASSISTANT / THINKING / USER rows: the headline preview is a truncated
+  // prefix of the body, so an OPEN row would read the same text twice. We
+  // mark those rows with data-headline-redundant; CSS hides the duplicate
+  // headline preview once the row is [open] (jsdom doesn't compute CSS, so
+  // we assert the DOM contract that drives the rule). TOOL rows genuinely
+  // differ (headline = Name(args), body = full args/result) and must NOT
+  // be marked — both parts stay visible.
+  const dupText = 'I need ~382 B of trims (plus margin). Let me condense verbose prose ' +
+    'in the eichi section without losing facts, then insert the new section.';
+
+  const assistant = render({
+    type: 'event', kind: 'assistant',
+    rec: { timestamp: '2026-08-10T17:37:23.000Z',
+      message: { content: [{ type: 'text', text: dupText }] } },
+  });
+  {
+    const details = assistant.querySelector('details.log-event');
+    assert('ASSISTANT row marked data-headline-redundant',
+      details && details.hasAttribute('data-headline-redundant'));
+    // The full body still carries the text (read once via the body).
+    assert('ASSISTANT body still shows full text',
+      details && details.querySelector('.log-event-body').textContent.includes('condense verbose prose'));
+    // The headline preview is still present in the DOM (needed for the
+    // collapsed one-liner) — CSS hides it only when [open].
+    assert('ASSISTANT headline preview still in DOM',
+      details && details.querySelector('.log-headline-text').textContent.includes('I need ~382 B'));
+  }
+
+  const thinking = render({
+    type: 'event', kind: 'thinking',
+    rec: { timestamp: '2026-08-10T17:37:24.000Z',
+      message: { content: [{ type: 'thinking', thinking: dupText }] } },
+  });
+  {
+    const details = thinking.querySelector('details.log-event');
+    assert('THINKING row marked data-headline-redundant',
+      details && details.hasAttribute('data-headline-redundant'));
+  }
+
+  const user = render({
+    type: 'event', kind: 'user',
+    rec: { timestamp: '2026-08-10T17:37:25.000Z',
+      message: { content: 'Please dedupe this view, it reads twice.' } },
+  });
+  {
+    const details = user.querySelector('details.log-event');
+    assert('USER row marked data-headline-redundant',
+      details && details.hasAttribute('data-headline-redundant'));
+  }
+
+  // TOOL_USE keeps both parts — headline (Name(args)) and body (full
+  // input / command / result) carry DIFFERENT content, so NOT redundant.
+  // TOOL_RESULT differs: its headline is `[idShort] <first body line>` — a
+  // truncated prefix of the body — so it IS redundant (dedupe #3380).
+  const toolUse = render({
+    type: 'event', kind: 'tool_use',
+    rec: { timestamp: '2026-08-10T17:37:26.000Z',
+      message: { content: [{ type: 'tool_use', id: 'toolu_x1', name: 'Bash',
+        input: { command: 'ls -la /tmp', description: 'List temp files' } }] } },
+  });
+  {
+    const details = toolUse.querySelector('details.log-event');
+    assert('TOOL_USE row NOT marked redundant',
+      details && !details.hasAttribute('data-headline-redundant'));
+  }
+
+  const toolResult = render({
+    type: 'event', kind: 'tool_result',
+    rec: { timestamp: '2026-08-10T17:37:27.000Z',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_x1',
+        content: 'total 0\ndrwxr-xr-x  ...\n' }] } },
+  });
+  {
+    const details = toolResult.querySelector('details.log-event');
+    // #3380: tool_result headline (`[<id>] <first body line>`) is a
+    // truncated body prefix, so the row IS marked redundant.
+    assert('TOOL_RESULT row marked data-headline-redundant',
+      details && details.hasAttribute('data-headline-redundant'));
+    // The body still carries the full result text (read once via the body).
+    assert('TOOL_RESULT body still shows full result text',
+      details && details.querySelector('.log-event-body').textContent.includes('drwxr-xr-x'));
+    // Headline preview still in the DOM for the collapsed one-liner.
+    assert('TOOL_RESULT headline preview still in DOM',
+      details && details.querySelector('.log-headline-text').textContent.includes('total 0'));
+  }
+}
+
 console.log('\n--------------------------------------------------------------');
 if (failures) {
   console.error(failures + ' assertion(s) failed.');
