@@ -122,11 +122,6 @@ class DependEndpointTest(unittest.TestCase):
         self.assertIn(f"task:{self.a_id}", b.get("scope") or [])
         self.assertFalse(b.get("depends_on"))
 
-    def test_ci_gate_sabotage_check(self):
-        # TEMPORARY: proves the new CI job actually fails the build.
-        # Reverted in the next commit.
-        self.assertEqual(1, 2, "deliberate failure: CI gate sabotage check")
-
     def test_self_dep_rejected_400(self):
         r = self.client.post(
             "/api/queue/depend",
