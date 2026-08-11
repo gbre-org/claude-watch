@@ -2370,11 +2370,23 @@ def _registering_subagent_agent_id(queue_id, *, freshness_secs=600):
     # Newest-first: the invoking agent's transcript was just written, so it
     # sorts first and short-circuits the scan on the common path.
     entries.sort(key=lambda e: e[0], reverse=True)
+    # Read only the TAIL of each candidate. The reference we care about (the
+    # register tool_use frame, plus any recent inbox/agent-msg read that
+    # cited the rotated id) is always among the most-recent writes, so a
+    # bounded tail suffices AND keeps this off the critical path even when a
+    # transcript is huge (gomorrah transcripts routinely exceed 100MB, per
+    # _find_transcripts_for_queue_marker). needle is ASCII, so a mid-char
+    # seek can't corrupt a match within the window.
+    tail_bytes = 512 * 1024
     for _mt, aid, f in entries:
         try:
-            with open(f, "r", encoding="utf-8", errors="replace") as fh:
-                if any(queue_id in line for line in fh):
-                    return aid
+            size = f.stat().st_size
+            with open(f, "rb") as fh:
+                if size > tail_bytes:
+                    fh.seek(size - tail_bytes)
+                chunk = fh.read()
+            if queue_id in chunk.decode("utf-8", errors="replace"):
+                return aid
         except OSError:
             continue
     return None

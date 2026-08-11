@@ -223,6 +223,48 @@ def test_main_loop_register_leaves_owner_unset():
         assert "agent_id" not in shown
 
 
+def test_large_transcript_matches_recent_tail():
+    """The register frame is the newest write: a reference at the END of a
+    large (>512KB) transcript is found (bounded tail read)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        item = _add(env, "work", ["repo:foo"])
+        qid = item["id"]
+        sub = Path(env["CLAUDE_AGENTS_JSONL_ROOT"]) / "sess-big" / "subagents"
+        sub.mkdir(parents=True, exist_ok=True)
+        path = sub / "abig000000000000".join(("agent-", ".jsonl"))
+        # ~1MB of junk, then the register reference as the final line.
+        path.write_text(
+            ("x" * 1_000_000)
+            + "\n"
+            + json.dumps({"cmd": f"session-task queue register {qid}"})
+            + "\n"
+        )
+        os.utime(path, (time.time(), time.time()))
+        _run(env, "queue", "register", qid)
+        assert _show(env, qid)["agent_id"] == "abig000000000000"
+
+
+def test_reference_only_in_far_head_is_not_matched():
+    """A qid reference only in the far HEAD of a large transcript (outside
+    the recent-tail window) does not attribute the owner — we key on recent
+    references, and the invoker's register frame is always in the tail."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        item = _add(env, "work", ["repo:foo"])
+        qid = item["id"]
+        sub = Path(env["CLAUDE_AGENTS_JSONL_ROOT"]) / "sess-head" / "subagents"
+        sub.mkdir(parents=True, exist_ok=True)
+        path = sub / "ahead00000000000".join(("agent-", ".jsonl"))
+        # qid at the very top, then >512KB of junk pushing it out of the tail.
+        path.write_text(
+            json.dumps({"cmd": f"register {qid}"}) + "\n" + ("y" * 700_000)
+        )
+        os.utime(path, (time.time(), time.time()))
+        _run(env, "queue", "register", qid)
+        assert "agent_id" not in _show(env, qid)
+
+
 def test_missing_transcript_root_is_safe():
     """No transcript tree at all: register still succeeds, owner unset."""
     with tempfile.TemporaryDirectory() as tmp:
