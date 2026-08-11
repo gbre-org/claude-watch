@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-queue-minisite test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container sync-main-clone clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-queue-minisite test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size test-install-host-skills build deploy deploy-systemd install install-hooks install-skills compose-up compose-down compose-build container-build bootstrap redeploy deploy-container sync-main-clone clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -198,6 +198,15 @@ test-claude-md-size:
 test-install-hooks:
 	scripts/git-hooks/tests/install-hooks.test
 
+# Tests for scripts/install-host-skills.sh + its Makefile wiring: the
+# skills/ (deployment-agnostic) vs container/skills/ (container-only) split,
+# the `cw-` host prefix, absolute in-tree symlinks, idempotency, dry-run, the
+# refuse-to-clobber rules for the operator-managed destination dir, and
+# own-links-only pruning. Also guards the shipped skills against private-path
+# leakage. Runs against throwaway tmpdirs — never touches ~/.claude.
+test-install-host-skills:
+	scripts/tests/install-host-skills.test
+
 # Run the entrypoint CLAUDE_CMD construction tests. Extracts the
 # CLAUDE_CMD-building shell block from container/entrypoint.sh by regex
 # and exercises it in a fresh `bash -c` subshell against a matrix of
@@ -356,9 +365,38 @@ test-ttyd-paste-handler:
 build:
 	cargo build --release
 
+# Install this repo's deployment-agnostic skills (skills/*.md) into the host
+# Claude Code commands dir as `cw-`-prefixed slash commands (`/cw-<name>`).
+#
+# The prefix is the HOST analogue of the container's `claude-container` plugin
+# namespace: in either deployment mode, a skill that came from this repo is
+# visibly namespaced. Claude Code derives a user-level command's name from the
+# FILENAME, so a filename prefix needs no plugin manifest and no change to how
+# the operator launches `claude` — which matters, because on a host deploy this
+# Makefile does not control the `claude` argv.
+#
+# Container-only skills (the ones that recreate / restart the container, edit
+# its bind-mounts, or reference in-container-only paths) deliberately stay in
+# container/skills/ and are NEVER installed here — they cannot work on a
+# non-container host.
+#
+# Deliberately conservative: the destination is normally managed by a separate,
+# operator-private config repo full of hand-written skills, so the installer
+# owns only the paths it created. It never overwrites a regular file or a
+# symlink pointing outside skills/, and only prunes its own dangling links.
+# Idempotent; `-n` for a dry run. Override the destination with
+# CLAUDE_COMMANDS_DIR (default ~/.claude/commands).
+install-skills:
+	@scripts/install-host-skills.sh
+
 # Build + restart systemd service (HOST / systemd install — NOT used in the
 # Docker-container setup; see `deploy-container` for that).
-deploy-systemd: build
+#
+# Depends on install-skills so a host deploy always re-asserts the repo's
+# skills — otherwise a skill added here is invisible on the host until someone
+# remembers to hand-install it (exactly how /distill shipped for weeks as a
+# container-only command).
+deploy-systemd: build install-skills
 	sudo systemctl restart claude-watch
 
 # DEPRECATED alias — kept so any docs / muscle-memory invoking `make deploy`

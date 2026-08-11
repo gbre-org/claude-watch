@@ -44,8 +44,8 @@ Common combinations — distilling one session often yields SEVERAL artifacts:
 
 ### (c) DRAFT the artifact in the right format
 
-- **Skill** → a Markdown file, first line = the prompt-injection summary (what shows in listings), then `## Steps` / `## Important` / `## When NOT to use`. Match the tone of the siblings in this dir (short, punchy, in-container paths). See the [container/skills/ README](README.md) for the shape.
-- **Agent-prompt template** → a Markdown file with a `## Prompt` fenced block containing the parameterized body (`{{VAR}}` placeholders), plus `## Scope` and `## Used by`. Match `~/repos/claude-config/agent-prompts/*.md` (e.g. `ci-check-and-update.md`).
+- **Skill** → a Markdown file, first line = the prompt-injection summary (what shows in listings), then `## Steps` / `## Important` / `## When NOT to use`. Match the tone of the siblings in this dir (short, punchy). See the [skills/ README](README.md) for the shape and for the shared-vs-container-only split.
+- **Agent-prompt template** → a Markdown file with a `## Prompt` fenced block containing the parameterized body (`{{VAR}}` placeholders), plus `## Scope` and `## Used by`. Agent-prompts live in the operator's own private config repo (a per-operator `agent-prompts/` dir), not here.
 - **CLI tool** → follow the repo's existing tool conventions (Rust for low-level helpers per `feedback_rust_not_c_for_lowlevel`; Python via `uv` for higher-level). Baked container tools live in `container/bin/`; host tools under `~/repos/<tool>/`.
 - **Memory** → a `feedback_*` (preference/correction) or `reference_*` (fact/how-to) file in the memory dir, with the generic-but-personal guidance (not work-state). Back every correction with a memory per `feedback_always_save_corrections`.
 
@@ -53,9 +53,10 @@ Draft it FULLY — a stub is not a distillation. The test: could a fresh session
 
 ### (d) PLACE it — note where it lives + how it's invoked
 
-- **Container skill** → `container/skills/<name>.md` in the claude-watch repo → baked to `/opt/claude-container/skills/` + the plugin `commands/` dir → invoked as `/claude-container:<name>`. Requires container-build + force-recreate to go live (NOT `cwsr`). See the [README](README.md) "How to add a new skill".
-- **Host skill** → `~/.claude/commands/<name>.md` → invoked as `/<name>`.
-- **Agent-prompt** → `~/repos/claude-config/agent-prompts/<name>.md` (a SEPARATE repo — its own commit + host-only push). Referenced by skills / spawned via the Agent tool.
+- **Shared claude-watch skill** (works in BOTH deployment modes) → `skills/<name>.md` in the claude-watch repo → installed on the host by `make install-skills` as `~/.claude/commands/cw-<name>.md`, invoked `/cw-<name>`; ALSO baked into the container image, invoked `/claude-container:<name>`. See the [skills/ README](README.md).
+- **Container-only claude-watch skill** → `container/skills/<name>.md` → baked to `/opt/claude-container/skills/` + the plugin `commands/` dir → invoked as `/claude-container:<name>`. Requires container-build + force-recreate to go live (NOT `cwsr`). See the [container/skills/ README](../container/skills/README.md) "How to add a new skill".
+- **Operator-private host skill** (not shippable in a public repo — names private paths, personal services, work accounts) → the operator's own `commands/` dir, symlinked into `~/.claude/commands/<name>.md` → invoked as `/<name>`.
+- **Agent-prompt** → the operator's private config repo, under its `agent-prompts/<name>.md` (a SEPARATE repo — its own commit + host-only push). Referenced by skills / spawned via the Agent tool.
 - **CLI tool** → baked (`container/bin/`, needs rebuild) or host (`~/repos/<tool>/`); note the PATH + any launchd/cron wiring.
 - **Memory** → the project memory dir; add an index line to `MEMORY.md`.
 
@@ -64,7 +65,7 @@ State the path AND the invocation in your report so the artifact is discoverable
 ## Important
 
 - **Don't force-bake.** Drafting a container skill/tool does NOT deploy it — baked artifacts need container-build + force-recreate, which is the operator's call. Draft the file, open a draft PR (`/cw-pr` for claude-watch), and report; let the operator decide when to rebuild.
-- **Cross-repo artifacts = separate commits.** A session often produces a claude-watch skill AND a claude-config agent-prompt AND a memory — three different repos/paths, three commits. Flag each explicitly; don't assume one PR covers all.
+- **Cross-repo artifacts = separate commits.** A session often produces a claude-watch skill AND an agent-prompt in the operator's private config repo AND a memory — three different repos/paths, three commits. Flag each explicitly; don't assume one PR covers all.
 - **One artifact per concern.** If the session yielded three unrelated reusable pieces, draft three artifacts — don't cram them into one mega-skill.
 - **The first instance of this metaskill was `/pr-comment-triage`** — the PR-comment triage workflow distilled from a session that hand-wrote the same sweep brief three times. Use it as the worked reference for what "good distillation" looks like: a skill (the triage workflow) + an agent-prompt (the sweep brief) + a referenced memory (`feedback_pr_comment_triage_act_or_collapse`).
 
