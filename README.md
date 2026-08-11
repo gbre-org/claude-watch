@@ -187,12 +187,14 @@ claude-watch ships a **hybrid model** that pairs conversational reminders
 
 ### Installing the hooks
 
-See [`skills/setup-hooks.md`](skills/setup-hooks.md). Summary:
+See [`skills/setup-hooks.md`](skills/setup-hooks.md), installed as the
+`/cw-setup-hooks` slash command by `make install-skills` (see
+[Skills](#skills)). Summary:
 
 ```
-/setup-claude-watch-hooks install                # global ~/.claude/settings.json
-/setup-claude-watch-hooks --scope project install  # .claude/settings.json
-/setup-claude-watch-hooks uninstall
+/cw-setup-hooks install                  # global ~/.claude/settings.json
+/cw-setup-hooks --scope project install  # .claude/settings.json
+/cw-setup-hooks uninstall
 ```
 
 ### Tuning
@@ -270,9 +272,34 @@ make test-watchers       # claude-event-watch fast-path + self-clear config
 
 make build               # release build
 make install             # build + copy daemon + tools into $BIN_DIR (default ~/bin/)
-make deploy-systemd      # build + systemctl restart (host/systemd install)
+make deploy-systemd      # build + install skills + systemctl restart (host/systemd install)
+make install-skills      # install skills/ as /cw-<name> slash commands (dep of deploy-systemd)
 make install-hooks       # install the git pre-commit hook (warnings + tests)
+make test-install-host-skills  # tests for the skills installer + its Makefile wiring
 ```
+
+### Skills
+
+Slash commands ship in two dirs, and everything from this repo is **prefixed**
+so it is always distinguishable from a skill you wrote yourself:
+
+| Dir | Scope | Host deploy | Container |
+| --- | --- | --- | --- |
+| [`skills/`](skills/) | works in any deployment | `make install-skills` links each into your Claude Code commands dir → `/cw-<name>` | baked → `/claude-container:<name>` |
+| [`container/skills/`](container/skills/) | needs the container (drives its lifecycle / mounts / in-container paths) | never installed | baked → `/claude-container:<name>` |
+
+`make install-skills` is a dependency of `make deploy-systemd`, so a host
+deploy always re-asserts the repo's skills rather than drifting from them. It
+installs absolute-path symlinks back into the tree (in-tree edits are live
+immediately), is idempotent, and is deliberately conservative about the
+destination — which is typically managed by your own dotfiles repo: it never
+overwrites a regular file or a symlink pointing outside `skills/`, and only
+prunes its own dangling links. Run
+`scripts/install-host-skills.sh -n` for a dry run, or `--help` for the flags
+(`--dest`, `--prefix`, or the `CLAUDE_COMMANDS_DIR` env var).
+
+See [`skills/README.md`](skills/README.md) for the full split and for how to
+add one.
 
 > **Deploy gotcha — `make deploy-systemd` and `make install` update DIFFERENT
 > copies of the daemon.** `make deploy-systemd` (formerly `make deploy`, still

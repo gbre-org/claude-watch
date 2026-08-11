@@ -1332,12 +1332,13 @@ RUN chmod +x /usr/local/bin/claude-event-watch
 #
 # Wiring shape:
 #
-#   container/skills/   -> /opt/claude-container/skills/   (canonical bake path,
+#   skills/             -> /opt/claude-container/skills/   (canonical bake path,
 #                                                       documented for inspection)
 #                       -> /opt/claude-container/plugin/commands/
 #                                                      (where Claude Code's
 #                                                       plugin loader reads
 #                                                       slash commands)
+#   container/skills/   -> the SAME two targets (merged on top)
 #   container/agents/   -> /opt/claude-container/agents/   (canonical bake path)
 #                       -> /opt/claude-container/plugin/agents/
 #                                                      (plugin loader reads
@@ -1359,6 +1360,20 @@ RUN chmod +x /usr/local/bin/claude-event-watch
 # operator to think about the plugin layout. Watchers do NOT land in the
 # plugin dir because they aren't slash commands or agents — they're
 # shell scripts the agent runs via the Bash tool with run_in_background.
+#
+# TWO skill sources merge into the same bake targets:
+#   - skills/            deployment-agnostic; ALSO installed on a host deploy
+#                        by `make install-skills` as /cw-<name>.
+#   - container/skills/  container-only (drive the container's own lifecycle /
+#                        mounts, or reference in-container-only paths). Never
+#                        installed on a host.
+# Both land in the plugin dir, so in the container every claude-watch skill is
+# reachable as /claude-container:<name> regardless of which dir it came from.
+# The names are disjoint by construction (a skill lives in exactly one dir);
+# `skills/` is copied FIRST so a same-named container file would win, matching
+# "the container-specific variant is the more specific one".
+COPY skills/ /opt/claude-container/skills/
+COPY skills/ /opt/claude-container/plugin/commands/
 COPY container/skills/ /opt/claude-container/skills/
 COPY container/skills/ /opt/claude-container/plugin/commands/
 COPY container/agents/ /opt/claude-container/agents/

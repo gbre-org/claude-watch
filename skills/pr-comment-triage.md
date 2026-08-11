@@ -8,8 +8,8 @@ pr-watch surfaces PR issue-comments (comments on the PR conversation, not just r
 
 ## Scope
 
-- **PRs updated within the last ~24h**, from the pr-watch tracked set (`~/repos/pr-watch/pr-watch list`, or the runtime `tracked.json`). Don't sweep the whole backlog — recency bounds the work.
-- claude-watch PRs use the `hndrewaall` gh account; regrello PRs use `hallandrew_sfemu`. Target per-call via `GH_CONFIG_DIR` — NEVER `gh auth switch` (`feedback_gh_config_dir_isolation`).
+- **PRs updated within the last ~24h**, from the pr-watch tracked set (`pr-watch list`, or the runtime `tracked.json`). Don't sweep the whole backlog — recency bounds the work.
+- **Multiple gh accounts:** personal and work PRs typically authenticate as different GitHub users. Select the right one **per call** with `GH_CONFIG_DIR=<that account's gh config dir>` — NEVER `gh auth switch`, which mutates global state and races any concurrent agent.
 
 ## Steps
 
@@ -49,10 +49,11 @@ pr-watch surfaces PR issue-comments (comments on the PR conversation, not just r
 
 ## Dispatching a sweep
 
-For a multi-PR sweep, delegate to an agent using the reusable template
-`~/repos/claude-config/agent-prompts/pr-comment-triage-sweep.md` (parameterized
-by PR set + account). Queue it (`session-task queue`, scope the relevant repo)
-and spawn per the 5-step protocol.
+For a multi-PR sweep, delegate to an agent using a reusable
+`pr-comment-triage-sweep` agent-prompt template kept in the operator's own
+private config repo (parameterized by PR set + account). Queue it
+(`session-task queue`, scope the relevant repo) and spawn per the 5-step
+protocol.
 
 ## Related
 
