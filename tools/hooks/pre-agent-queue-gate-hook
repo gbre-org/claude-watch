@@ -53,6 +53,12 @@ Decision protocol:
 Emergency bypass: set ``QUEUE_GATE_BYPASS=1`` in the environment. Bypass
 events are logged to ``~/.config/claude/queue-gate-bypass.log`` for later
 auditing.
+
+Configuration: ``CLAUDE_REPO_ORGS`` (comma/whitespace-separated) lists the
+git-forge orgs whose repos the scope/target check should recognise in
+``<org>/<repo>`` form, e.g. ``CLAUDE_REPO_ORGS="acme-sf,acme-labs"``. The
+upstream project's own org is always recognised; unset means "defaults only",
+which simply makes the target check quieter (it defaults open).
 """
 
 from __future__ import annotations
@@ -78,18 +84,51 @@ AGENT_TOOL_NAMES = {"Agent", "Task"}
 # suffix). We stay permissive: 'q-' + one or more allowed chars.
 QUEUE_MARKER_RE = re.compile(r"Queue\s+item\s*:\s*(q-[0-9a-zA-Z][0-9a-zA-Z-]*)")
 
-# Target-repo extraction from the Agent prompt (scope/target enforcement,
-# botchat #2346). Prompts routinely name the repo the agent will operate on as
-# an org/path-prefixed reference. We only trust these PREFIXED forms in the
-# hook (never a bare word) so the extraction can't false-positive on prose --
-# the gate DENIES on a clear mismatch, so it must be conservative about what
-# counts as a "clear target".
-TARGET_REPO_RES = [
-    re.compile(r"regrello-sf/([A-Za-z0-9._-]+)"),
-    re.compile(r"hndrewaall/([A-Za-z0-9._-]+)"),
-    re.compile(r"(?:~|/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/repos/([A-Za-z0-9._-]+)"),
-    re.compile(r"repo:([A-Za-z0-9._-]+)"),
-]
+# Git-forge orgs whose repos are referred to as `<org>/<repo>` in prompts.
+# CONFIGURABLE, never hardcoded to a particular user's employer/client: set
+# ``CLAUDE_REPO_ORGS`` to a comma/whitespace-separated list (e.g.
+# ``CLAUDE_REPO_ORGS="acme-sf,acme-labs"``) to teach the extractor about the
+# orgs this deploy actually works in. The upstream project's own org is always
+# recognised so a default install still resolves `<owner>/<repo>` references.
+DEFAULT_REPO_ORGS = ("hndrewaall",)
+_ORG_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _repo_orgs() -> list[str]:
+    """Configured `<org>/<repo>` prefixes, defaults included.
+
+    Tokens that aren't plausible org names are ignored rather than fatal --
+    this hook gates every Agent spawn, so a typo'd env var must never break
+    dispatch.
+    """
+    orgs = set(DEFAULT_REPO_ORGS)
+    for tok in re.split(r"[,\s]+", os.environ.get("CLAUDE_REPO_ORGS", "")):
+        tok = tok.strip()
+        if tok and _ORG_TOKEN_RE.match(tok):
+            orgs.add(tok)
+    return sorted(orgs)
+
+
+def _build_target_repo_res() -> list[re.Pattern]:
+    """Target-repo extraction patterns for the Agent prompt.
+
+    Scope/target enforcement (botchat #2346). Prompts routinely name the repo
+    the agent will operate on as an org/path-prefixed reference. We only trust
+    these PREFIXED forms in the hook (never a bare word) so the extraction
+    can't false-positive on prose -- the gate DENIES on a clear mismatch, so it
+    must be conservative about what counts as a "clear target".
+    """
+    res = [
+        re.compile(re.escape(org) + r"/([A-Za-z0-9._-]+)") for org in _repo_orgs()
+    ]
+    res.append(
+        re.compile(r"(?:~|/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/repos/([A-Za-z0-9._-]+)")
+    )
+    res.append(re.compile(r"repo:([A-Za-z0-9._-]+)"))
+    return res
+
+
+TARGET_REPO_RES = _build_target_repo_res()
 # Path segments that are NOT repo names (they follow the org/path prefix but
 # name a subtree/meta path, or are the worktree root). Excluded from targets.
 _NON_REPO_SEGMENTS = {".worktrees", ".git", ".", ".."}
@@ -360,18 +399,18 @@ def _queue_status(queue_id: str) -> tuple[str | None, bool, list[str]]:
 def _prompt_target_repos(prompt: str) -> set[str]:
     """Extract org/path-prefixed repo references from the Agent prompt.
 
-    Only PREFIXED forms (`regrello-sf/<repo>`, `hndrewaall/<repo>`,
-    `~/repos/<repo>`, `/Users/x/repos/<repo>`, `repo:<name>`) count -- never a
-    bare word -- so the gate never invents a target from prose. Returns the set
-    of distinct repo names named. Segments that are clearly not repos (worktree
-    roots, `.git`) are dropped.
+    Only PREFIXED forms (`<configured-org>/<repo>`, `~/repos/<repo>`,
+    `/Users/x/repos/<repo>`, `repo:<name>`) count -- never a bare word -- so
+    the gate never invents a target from prose. Returns the set of distinct
+    repo names named. Segments that are clearly not repos (worktree roots,
+    `.git`) are dropped.
     """
     found: set[str] = set()
     for rx in TARGET_REPO_RES:
         for m in rx.finditer(prompt or ""):
             # Repo names may contain interior dots (e.g. claude-watch.bak.v13)
             # so '.' is in the char class -- but strip trailing sentence
-            # punctuation ('regrello-sf/foo.' at end of a sentence) which is
+            # punctuation ('some-org/foo.' at end of a sentence) which is
             # never part of a real dir name.
             name = m.group(1).rstrip(".,;:!?)]}'\"")
             if name and name not in _NON_REPO_SEGMENTS:
@@ -400,8 +439,8 @@ def _scope_repo_names(scope: list[str]) -> set[str]:
 def _collapse_to_single_target(targets: set[str]) -> str | None:
     """Collapse a target set to ONE most-specific repo, else None.
 
-    A monorepo-style prefix name (`regrello`) that is subsumed by a present
-    more-specific sibling (`regrello-html-to-pdf`) is dropped; if that yields
+    A monorepo-style prefix name (`platform`) that is subsumed by a present
+    more-specific sibling (`platform-html-to-pdf`) is dropped; if that yields
     exactly one maximal name it's the clear target. Returns None on genuine
     ambiguity (0, or >1 irreducible targets) so the gate defaults open.
     """
@@ -445,7 +484,7 @@ def _scope_target_mismatch(prompt: str, scope: list[str]) -> str | None:
             return None  # item has no repo scope to compare against
         # Covered when a claimed repo is the target or MORE specific than it
         # (claimed `target-...` sub-repo). A claimed repo LESS specific than
-        # the target (scope repo:regrello, target regrello-html-to-pdf) is the
+        # the target (scope repo:platform, target platform-html-to-pdf) is the
         # over-broad mismatch we deny on.
         if any(c == target or c.startswith(target + "-") for c in claimed):
             return None

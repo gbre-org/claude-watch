@@ -14,6 +14,10 @@ Also verifies:
   - Allowed Agent spawn writes a pending-spawn record (closes the
     cron-cadence race with the `force_started_unspawned` predicate).
   - Denied Agent spawn does NOT write a pending-spawn record.
+  - Scope/target-repo mismatch denies, and the `<org>/<repo>` prefixes it
+    matches on come from `CLAUDE_REPO_ORGS` (config) rather than being
+    hardcoded -- unsetting it drops the target, the built-in default org
+    keeps working without it.
 
 Uses the real session-task queue tool. We create test queue items with
 disjoint scopes (repo:queue-gate-hook-test) to avoid colliding with the
@@ -50,6 +54,13 @@ TEST_SCOPE_DONE = f"repo:{_REPO_BASE}-done"
 # test process. (The hook itself never validates; only `queue add` does.)
 os.environ["SESSION_TASK_REPOS_NO_VALIDATE"] = "1"
 
+# The `<org>/<repo>` prefixes the scope/target check recognises are
+# CONFIGURATION (`CLAUDE_REPO_ORGS`), not baked-in literals. Declare a
+# synthetic org for the fixtures; S6 below flips it off to prove the config is
+# what drives the matcher (and that an unknown org can't invent a target).
+_TEST_ORG = "acme-sf"
+os.environ["CLAUDE_REPO_ORGS"] = _TEST_ORG
+
 # Collect ids we create so we can abandon them at exit.
 _created_ids: list[str] = []
 
@@ -57,7 +68,13 @@ _created_ids: list[str] = []
 def _run_hook(payload: dict, extra_env: dict | None = None) -> tuple[int, dict, str]:
     env = os.environ.copy()
     if extra_env:
-        env.update(extra_env)
+        # A None value means "unset this variable for the child" (used to turn
+        # CLAUDE_REPO_ORGS off and prove the org list is config-driven).
+        for k, v in extra_env.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
     proc = subprocess.run(
         [str(HOOK)],
         input=json.dumps(payload),
@@ -174,7 +191,7 @@ def main() -> int:
     # DISJOINT repo scopes so they don't serialize against each other:
     #   * mono_id scoped repo:<base>-mono   -> stands in for a monorepo claim
     #   * spec_id scoped repo:<base>-mono-htmlpdf -> the specific sub-repo
-    # A prompt naming `regrello-sf/<base>-mono-htmlpdf` mismatches mono_id
+    # A prompt naming `<org>/<base>-mono-htmlpdf` mismatches mono_id
     # (over-broad) but is correctly covered by spec_id.
     mono_repo = f"{_REPO_BASE}-mono"
     spec_repo = f"{_REPO_BASE}-mono-htmlpdf"
@@ -312,7 +329,7 @@ def main() -> int:
         "tool_name": "Agent",
         "tool_input": {
             "prompt": (
-                f"Fix rendering in regrello-sf/{spec_repo}.\n\n"
+                f"Fix rendering in {_TEST_ORG}/{spec_repo}.\n\n"
                 f"Queue item: {mono_id}\n"
             ),
         },
@@ -330,7 +347,7 @@ def main() -> int:
         "tool_name": "Agent",
         "tool_input": {
             "prompt": (
-                f"Fix rendering in regrello-sf/{spec_repo}.\n\n"
+                f"Fix rendering in {_TEST_ORG}/{spec_repo}.\n\n"
                 f"Queue item: {spec_id}\n"
             ),
         },
@@ -366,7 +383,7 @@ def main() -> int:
         "tool_name": "Agent",
         "tool_input": {
             "prompt": (
-                f"Sync config from regrello-sf/{spec_repo} to "
+                f"Sync config from {_TEST_ORG}/{spec_repo} to "
                 f"hndrewaall/{_REPO_BASE}-running.\n\n"
                 f"Queue item: {mono_id}\n"
             ),
@@ -396,6 +413,43 @@ def main() -> int:
         _is_deny(out)
         and all(s in banner for s in ("scope/target", "update-scope", spec_repo)),
         f"banner={banner!r}",
+    ))
+
+    # S6. The org list is CONFIG, not baked in: the exact S1 payload that
+    # denies with CLAUDE_REPO_ORGS set must default-open once the org is no
+    # longer configured (no `<org>/<repo>` pattern -> no clear target).
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Fix rendering in {_TEST_ORG}/{spec_repo}.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload, extra_env={"CLAUDE_REPO_ORGS": None})
+    results.append(_check(
+        "S6. unconfigured org prefix yields no target -> default-open allow",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # S7. A `<repo>` reference under the built-in default org still resolves
+    # with CLAUDE_REPO_ORGS unset -- the default must not depend on the env.
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": (
+                f"Fix rendering in hndrewaall/{spec_repo}.\n\n"
+                f"Queue item: {mono_id}\n"
+            ),
+        },
+    }
+    rc, out, _err = _run_hook(payload, extra_env={"CLAUDE_REPO_ORGS": None})
+    results.append(_check(
+        "S7. default org prefix still resolves without CLAUDE_REPO_ORGS",
+        rc == 0 and _is_deny(out),
+        f"rc={rc} out={out}",
     ))
 
     print("=== Pending-spawn sidecar tests ===")
