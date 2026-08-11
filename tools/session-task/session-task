@@ -2277,6 +2277,109 @@ def _find_transcripts_for_queue_marker(queue_id, *, freshness_secs=24 * 60 * 60)
     return [p for _, p in hits]
 
 
+def _registering_subagent_agent_id(queue_id, *, freshness_secs=600):
+    """Best-effort resolve the agent_id of the subagent invoking ``register``.
+
+    Owner-attribution fix (#3615/#3617). The spawn-time
+    ``post-tool-agent-arm-hook`` (PostToolUse:Agent) binds
+    ``agent_id -> queue_id`` only for the ORIGINAL spawn marker. When an
+    agent is RESUMED onto a ROTATED queue id (e.g. a d6cb -> e8cd rebind)
+    via a mid-flight ``session-task queue register``, no PostToolUse:Agent
+    hook re-fires, so the new item never gets an owner and the dashboard
+    reports "owner unknown" though the agent is actively running it. This
+    resolves the invoking subagent so ``register`` can stamp the item's
+    true owner.
+
+    Mechanism (same transcript layout as ``_find_agent_jsonl`` /
+    ``_find_transcripts_for_queue_marker``): Claude Code flushes the
+    assistant tool_use frame -- which literally contains the
+    ``session-task queue register <queue_id>`` command string -- into the
+    subagent's JSONL transcript BEFORE the Bash tool executes. So at
+    register time the freshly-modified subagent transcript already
+    references this brand-new queue id, and the ONLY subagent transcript
+    referencing it is the current agent's (the main loop that created the
+    id runs in the top-level session, NOT under a ``subagents/`` dir). We
+    scan recently-modified subagent transcripts newest-first and return the
+    agent_id of the first one whose contents mention the id.
+
+    Returns None (a SAFE no-op for the caller) when:
+      * invoked from the MAIN LOOP -- its transcript is not under a
+        ``subagents/`` dir, so nothing matches -> no stamp;
+      * a genuine FIRST spawn -- the agent does not exist yet at register
+        time, so no transcript references the id -> no stamp (the arm-hook
+        will bind it after the Agent tool returns);
+      * the transcript root is missing / unreadable.
+
+    Cost is bounded by ``freshness_secs`` (only transcripts touched within
+    that window are content-scanned; the invoking agent's transcript was
+    touched ~now, so newest-first ordering makes it the first hit). Never
+    raises -- fail-soft to None so a resolver hiccup can never wedge a
+    register.
+    """
+    if not isinstance(queue_id, str) or not re.match(
+        r"^q-[a-z0-9-]{4,64}$", queue_id
+    ):
+        return None
+    root = CLAUDE_AGENTS_JSONL_ROOT
+    try:
+        if not root.is_dir():
+            return None
+    except OSError:
+        return None
+    now = datetime.now(timezone.utc).timestamp()
+    name_re = re.compile(r"^agent-([a-z0-9-]{4,64})\.jsonl$")
+    # Same two-level walk as _find_transcripts_for_queue_marker:
+    #   <root>/<session-uuid>/subagents/agent-<id>.jsonl
+    #   <root>/<host-token>/<session-uuid>/subagents/agent-<id>.jsonl
+    candidate_roots = [root]
+    try:
+        for child in root.iterdir():
+            if child.is_dir():
+                candidate_roots.append(child)
+    except OSError:
+        return None
+    entries = []  # (mtime, agent_id, path)
+    seen = set()
+    for d in candidate_roots:
+        try:
+            sessions = list(d.iterdir())
+        except OSError:
+            continue
+        for sess in sessions:
+            sub = sess / "subagents"
+            try:
+                if not sub.is_dir():
+                    continue
+                files = list(sub.iterdir())
+            except OSError:
+                continue
+            for f in files:
+                if f in seen:
+                    continue
+                seen.add(f)
+                m = name_re.match(f.name)
+                if not m:
+                    continue
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                if now - st.st_mtime > freshness_secs:
+                    continue
+                entries.append((st.st_mtime, m.group(1), f))
+    # Newest-first: the invoking agent's transcript was just written, so it
+    # sorts first and short-circuits the scan on the common path.
+    entries.sort(key=lambda e: e[0], reverse=True)
+    for _mt, aid, f in entries:
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                if any(queue_id in line for line in fh):
+                    return aid
+        except OSError:
+            continue
+    return None
+
+
 def _archive_agent_transcript(item, *, reason="done"):
     """Best-effort archive of the spawning subagent's JSONL transcript.
 
@@ -4777,6 +4880,24 @@ def cmd_queue_register(args):
                 "at": target["started_at"],
                 "note": args.note,
             })
+        # Owner attribution for resumed/rebound items (#3615/#3617). The
+        # spawn-time arm-hook binds an agent_id only for the ORIGINAL spawn
+        # marker; an agent RESUMED onto a rotated id via a mid-flight
+        # register otherwise leaves the new item ownerless ("owner unknown"
+        # on the dashboard though it is actively running). Stamp the
+        # invoking subagent's agent_id so the item carries its true owner.
+        # SAFE no-op for main-loop registers: resolution yields None (the
+        # main-loop transcript is not under a subagents/ dir), and we NEVER
+        # clobber an existing binding with null -- an unresolved owner
+        # leaves any prior agent_id intact.
+        resolved_aid = getattr(args, "agent_id", None)
+        resolved_aid = resolved_aid.strip() if isinstance(resolved_aid, str) else None
+        if not resolved_aid:
+            resolved_aid = _registering_subagent_agent_id(args.id)
+        if resolved_aid and target.get("agent_id") != resolved_aid:
+            target["agent_id"] = resolved_aid
+            target["agent_id_source"] = "register"
+            target["agent_id_stamped_at"] = target["started_at"]
         _recompute_group_heads(items)
         registered = dict(target)
         _queue_write_and_unlock(fh, data)
@@ -7336,6 +7457,18 @@ def build_parser():
                             help="Do not fail if the item is already running.")
     q_register.add_argument("--note",
                             help="Freeform note (e.g. spawned agent id) recorded on the item.")
+    q_register.add_argument(
+        "--agent-id",
+        default=None,
+        help=(
+            "Explicitly stamp the owning subagent's agent_id on the item "
+            "(owner attribution for resumed/rebound items, #3615/#3617). "
+            "When omitted, register best-effort resolves the invoking "
+            "subagent from its live JSONL transcript; a main-loop register "
+            "resolves to nothing and leaves the owner unset. Never clobbers "
+            "an existing agent_id with an empty value."
+        ),
+    )
     q_register.add_argument("--json", action="store_true")
     q_register.add_argument(
         "--pid",
