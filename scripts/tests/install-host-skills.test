@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Tests for scripts/install-host-skills.sh and its Makefile wiring.
+
+Background: this repo ships skills in two dirs.
+
+  - `skills/`           — deployment-agnostic. Installed on a HOST deploy as
+                          `~/.claude/commands/cw-<name>.md` (invoked
+                          `/cw-<name>`) AND baked into the container image
+                          (invoked `/claude-container:<name>`).
+  - `container/skills/`  — container-only (they drive the container itself:
+                          recreate it, restart it, edit its bind-mounts, or
+                          reference in-container-only paths). Never installed
+                          on a host.
+
+The `cw-` filename prefix is the host analogue of the container's
+`claude-container` plugin namespace: whichever mode you are in, a skill that
+came from THIS repo is visibly prefixed.
+
+The destination dir is normally managed by a DIFFERENT (operator-private)
+repo full of hand-written skills, so the installer must own exactly the paths
+it created and nothing else. These tests pin that contract:
+
+  1. `skills/` exists, holds at least one skill, and every `*.md` in it is
+     non-empty.
+  2. Container-only skills are NOT in `skills/` (they'd get installed on
+     hosts where they cannot work).
+  3. Public-repo hygiene: no private-path sentinels in either skills dir.
+  4. The installer links every `skills/*.md` except README.md into the dest
+     as `cw-<name>.md`, as an ABSOLUTE symlink back into the source tree.
+  5. It is idempotent (second run == first run, same links, exit 0).
+  6. `--dry-run` touches nothing.
+  7. It refuses to overwrite a REGULAR FILE at a `cw-*` path (operator-owned)
+     and still exits 0 (a deploy must not be blocked by one clash).
+  8. It refuses to overwrite a `cw-*` SYMLINK pointing outside `skills/`.
+  9. It leaves unrelated (non-`cw-`) files in the dest completely alone.
+ 10. It PRUNES its own dangling links (skill renamed/deleted upstream) but
+     never prunes a `cw-*` link owned by someone else.
+ 11. Makefile: `install-skills` invokes the script, and `deploy-systemd`
+     depends on it so a host deploy cannot drift from the repo's skills.
+
+Run:  ./scripts/tests/install-host-skills.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "install-host-skills.sh"
+SKILLS_DIR = REPO_ROOT / "skills"
+CONTAINER_SKILLS_DIR = REPO_ROOT / "container" / "skills"
+MAKEFILE = REPO_ROOT / "Makefile"
+
+# Substrings that must never appear in a skill shipped from this PUBLIC repo.
+# Deliberately excludes "/home/<user>" — the container documents its own
+# in-image home path legitimately.
+PRIVATE_SENTINELS = [
+    "/mnt/Raiden",
+    "/mnt/Scorpion",
+    "ADHPrivate",
+    "~/repos/claude-config",
+    "~/repos/server-config",
+    "~/repos/pr-watch",
+]
+
+failures: list[str] = []
+
+
+def check(cond: bool, msg: str) -> None:
+    if cond:
+        print(f"  ok: {msg}")
+    else:
+        print(f"  FAIL: {msg}")
+        failures.append(msg)
+
+
+def run_installer(dest: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [str(SCRIPT), "--dest", str(dest), *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def dest_state(dest: Path) -> dict[str, str]:
+    """Map of entry name -> 'link:<target>' or 'file' for the whole dest dir."""
+    state: dict[str, str] = {}
+    for p in sorted(dest.iterdir()):
+        state[p.name] = f"link:{os.readlink(p)}" if p.is_symlink() else "file"
+    return state
+
+
+def expected_links() -> dict[str, Path]:
+    return {
+        f"cw-{p.name}": p
+        for p in sorted(SKILLS_DIR.glob("*.md"))
+        if p.name != "README.md"
+    }
+
+
+# --- 1. skills/ shape --------------------------------------------------
+print("skills/ dir shape")
+check(SKILLS_DIR.is_dir(), f"{SKILLS_DIR} exists")
+skill_files = sorted(p for p in SKILLS_DIR.glob("*.md") if p.name != "README.md")
+check(len(skill_files) > 0, "skills/ ships at least one skill")
+check(
+    (SKILLS_DIR / "README.md").is_file()
+    and (SKILLS_DIR / "README.md").stat().st_size > 0,
+    "skills/README.md exists and is non-empty",
+)
+for p in skill_files:
+    check(p.stat().st_size > 200, f"{p.name} is a real skill body (>200 bytes)")
+
+# --- 2. container-only skills stay out of skills/ ----------------------
+print("container-only skills are split out")
+CONTAINER_ONLY = [
+    "deploy-container.md",
+    "restart-container.md",
+    "edit-host-mounts.md",
+    "claude-code-restart.md",
+    "self-clear.md",
+    "start-watchers.md",
+]
+for name in CONTAINER_ONLY:
+    check(
+        (CONTAINER_SKILLS_DIR / name).is_file(),
+        f"container/skills/{name} still lives in the container-only dir",
+    )
+    check(
+        not (SKILLS_DIR / name).exists(),
+        f"skills/{name} absent — it cannot work on a non-container host",
+    )
+
+# --- 3. public-repo hygiene -------------------------------------------
+print("no private-path leakage in shipped skills")
+for d in (SKILLS_DIR, CONTAINER_SKILLS_DIR):
+    for p in sorted(d.glob("*.md")):
+        text = p.read_text(encoding="utf-8")
+        for sentinel in PRIVATE_SENTINELS:
+            check(
+                sentinel not in text,
+                f"{p.relative_to(REPO_ROOT)} free of private-path sentinel {sentinel!r}",
+            )
+
+# --- 4-10. installer behaviour ----------------------------------------
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+
+    # 6. dry-run touches nothing (dest does not even exist yet)
+    print("--dry-run")
+    dest = tmp / "dry"
+    r = run_installer(dest, "--dry-run")
+    check(r.returncode == 0, "--dry-run exits 0")
+    check(not dest.exists(), "--dry-run did not create the destination dir")
+    check("[dry-run]" in r.stdout, "--dry-run announces the planned operations")
+
+    # 4. fresh install
+    print("fresh install")
+    dest = tmp / "fresh"
+    r = run_installer(dest)
+    check(r.returncode == 0, f"fresh install exits 0 (stderr={r.stderr.strip()!r})")
+    exp = expected_links()
+    got = dest_state(dest)
+    check(set(got) == set(exp), f"dest holds exactly {sorted(exp)}")
+    for name, src in exp.items():
+        target = dest / name
+        check(target.is_symlink(), f"{name} installed as a symlink")
+        if target.is_symlink():
+            link = os.readlink(target)
+            check(Path(link).is_absolute(), f"{name} -> absolute path")
+            check(
+                Path(link) == src,
+                f"{name} -> {src.relative_to(REPO_ROOT)} (in-tree edits go live)",
+            )
+        check(target.resolve().is_file(), f"{name} resolves to a real file")
+    check(
+        "README.md" not in "".join(got),
+        "README.md is not installed as a skill",
+    )
+
+    # 5. idempotent
+    print("idempotency")
+    before = dest_state(dest)
+    r2 = run_installer(dest)
+    check(r2.returncode == 0, "second run exits 0")
+    check(dest_state(dest) == before, "second run leaves the dest byte-identical")
+
+    # 7/8/9/10. conservatism about paths it does not own
+    print("does not clobber paths it does not own")
+    dest = tmp / "shared"
+    dest.mkdir()
+    first_skill = f"cw-{skill_files[0].name}"
+
+    # an operator-owned REGULAR FILE sitting on one of our names
+    (dest / first_skill).write_text("operator's own skill\n", encoding="utf-8")
+    # an operator-owned cw-* SYMLINK pointing somewhere else entirely
+    foreign_src = tmp / "foreign.md"
+    foreign_src.write_text("foreign\n", encoding="utf-8")
+    os.symlink(foreign_src, dest / "cw-not-ours.md")
+    # an unrelated, unprefixed operator skill
+    (dest / "promote.md").write_text("operator's promote skill\n", encoding="utf-8")
+
+    r = run_installer(dest)
+    check(r.returncode == 0, "exits 0 despite a name clash (deploy is not blocked)")
+    check(
+        (dest / first_skill).is_file() and not (dest / first_skill).is_symlink(),
+        f"{first_skill}: operator's regular file left intact",
+    )
+    check(
+        (dest / first_skill).read_text(encoding="utf-8") == "operator's own skill\n",
+        f"{first_skill}: operator's content unmodified",
+    )
+    check("SKIP" in r.stderr, "the skip is reported on stderr, not silent")
+    check(
+        os.readlink(dest / "cw-not-ours.md") == str(foreign_src),
+        "cw-not-ours.md: foreign symlink not re-pointed",
+    )
+    check(
+        (dest / "promote.md").read_text(encoding="utf-8")
+        == "operator's promote skill\n",
+        "unrelated unprefixed operator skill untouched",
+    )
+    if len(skill_files) > 1:
+        second = f"cw-{skill_files[1].name}"
+        check(
+            (dest / second).is_symlink(),
+            f"{second}: the non-clashing skills still installed",
+        )
+
+    # 10. pruning: only our own dangling links go
+    print("pruning")
+    dest = tmp / "prune"
+    r = run_installer(dest)
+    check(r.returncode == 0, "install for prune fixture exits 0")
+    # simulate a skill renamed/deleted upstream: a link into skills/ whose
+    # target no longer exists
+    os.symlink(SKILLS_DIR / "gone-upstream.md", dest / "cw-gone-upstream.md")
+    # a foreign dangling cw-* link — NOT ours, must survive
+    os.symlink(tmp / "nowhere.md", dest / "cw-foreign-dangling.md")
+    r = run_installer(dest)
+    check(r.returncode == 0, "prune run exits 0")
+    check(
+        not (dest / "cw-gone-upstream.md").is_symlink(),
+        "our dangling link (source removed upstream) is pruned",
+    )
+    check(
+        (dest / "cw-foreign-dangling.md").is_symlink(),
+        "a dangling cw-* link pointing outside skills/ is NOT pruned",
+    )
+    check(
+        set(dest_state(dest)) == set(expected_links()) | {"cw-foreign-dangling.md"},
+        "prune run converges on our links plus the foreign one",
+    )
+
+# --- 11. Makefile wiring ----------------------------------------------
+print("Makefile wiring")
+mk = MAKEFILE.read_text(encoding="utf-8")
+
+install_skills = re.search(
+    r"^install-skills:.*?\n((?:\t.*\n|\n(?=\t))*)", mk, re.MULTILINE
+)
+check(install_skills is not None, "Makefile defines an `install-skills` target")
+if install_skills:
+    body = install_skills.group(1)
+    check(
+        "scripts/install-host-skills.sh" in body,
+        "install-skills runs scripts/install-host-skills.sh",
+    )
+
+deploy = re.search(r"^deploy-systemd:(.*)$", mk, re.MULTILINE)
+check(deploy is not None, "Makefile defines `deploy-systemd`")
+if deploy:
+    deps = deploy.group(1).split()
+    check(
+        "install-skills" in deps,
+        "deploy-systemd depends on install-skills (host deploy cannot drift)",
+    )
+
+check(
+    re.search(r"^\.PHONY:.*\binstall-skills\b", mk, re.MULTILINE) is not None,
+    "install-skills is declared .PHONY",
+)
+
+print()
+if failures:
+    print(f"FAIL install-host-skills ({len(failures)} failure(s))")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+print("PASS install-host-skills (all tests passed)")

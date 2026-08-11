@@ -139,6 +139,14 @@ jobs:
       - name: Run install-hooks (core.hooksPath + worktree) tests
         run: make test-install-hooks
 
+      # Skills installer: the skills/ (any deployment) vs container/skills/
+      # (container-only) split, the `cw-` host prefix, and the
+      # refuse-to-clobber / prune-only-our-own rules for the operator-managed
+      # commands dir. Also guards every shipped skill against private-path
+      # leakage — this repo is public. Runs against tmpdirs only.
+      - name: Run host-skills installer tests
+        run: make test-install-host-skills
+
       - name: Run claude-tmux env passthrough + fail-loud warning tests
         run: make test-claude-tmux-env
 

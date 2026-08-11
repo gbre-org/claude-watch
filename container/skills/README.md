@@ -1,6 +1,20 @@
 # container/skills/
 
-Slash-command source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each file is one skill that the in-container `claude` process can invoke as `/<plugin>:<name>` (the plugin name is `claude-container`, set by `/opt/claude-container/plugin/.claude-plugin/plugin.json`).
+**CONTAINER-ONLY** slash-command source files baked into the [claude-container](https://github.com/hndrewaall/claude-watch/tree/main/container) image. Each file is one skill that the in-container `claude` process can invoke as `/<plugin>:<name>` (the plugin name is `claude-container`, set by `/opt/claude-container/plugin/.claude-plugin/plugin.json`).
+
+## This dir vs. the shared [`skills/`](../../skills/) dir
+
+The repo has two skill dirs, and picking the wrong one has real consequences:
+
+| | [`skills/`](../../skills/) (repo root) | `container/skills/` (here) |
+| --- | --- | --- |
+| Scope | works in ANY deployment | needs the container to exist |
+| Host deploy | installed by `make install-skills` (a dep of `make deploy-systemd`) as `/cw-<name>` | **never installed** |
+| Container | baked; `/claude-container:<name>` | baked; `/claude-container:<name>` |
+
+A skill belongs **here** only if it drives the container's own lifecycle (recreate / restart / roll the inner `claude`), edits its bind-mounts or compose shape, or depends on in-container-only paths (`/opt/claude-container/...`), the in-container tmux pane, or the `host-bash` MCP bridge. Anything that would still make sense on a machine with no container belongs in [`skills/`](../../skills/) instead — otherwise it is invisible on host deploys, which is exactly how the `distill` metaskill sat container-only for weeks.
+
+Everything from this repo is prefixed in **both** modes — `claude-container:` via the plugin namespace here, `cw-` via a filename prefix on the host — so a claude-watch skill is always distinguishable from one the operator wrote themselves.
 
 ## What goes here
 
@@ -10,12 +24,12 @@ Slash-command source files baked into the [claude-container](https://github.com/
 
 ## How they get baked in
 
-The Dockerfile copies this directory into the image at two paths:
+The Dockerfile copies this directory — and the shared [`skills/`](../../skills/) dir alongside it — into the image at two paths:
 
 1. `/opt/claude-container/skills/` — canonical bake path; documented for operators who want to inspect what shipped with their image (e.g. `ls /opt/claude-container/skills/`).
 2. `/opt/claude-container/plugin/commands/` — the path Claude Code's plugin loader actually reads. The Dockerfile populates this dir at build time and the entrypoint launches `claude` with `--plugin-dir /opt/claude-container/plugin`, so every baked skill becomes discoverable as `/claude-container:<name>` in the in-container session.
 
-The two paths share contents (the Dockerfile copies `container/skills/` into both). Operators reading `/opt/claude-container/skills/` see the same files Claude Code actually loads.
+The two paths share contents (the Dockerfile copies both source dirs into both targets). Operators reading `/opt/claude-container/skills/` see the same files Claude Code actually loads — the merge of the shared and container-only sets.
 
 ## How a fresh container session discovers them
 
@@ -29,6 +43,7 @@ Listings: ask the agent "list available skills" — the plugin's commands show u
 
 ## How to add a new skill
 
+0. **First decide which dir.** If the skill would still make sense with no container present, it goes in [`skills/`](../../skills/), not here — see the table at the top.
 1. Drop `container/skills/<name>.md` in this dir. Match the existing tone — short, punchy, references in-container paths (not host paths).
 2. (Optional) Add a test in `container/tests/` asserting the file exists at the baked path. The skeleton in [`container/tests/baked-dirs.test`](../tests/baked-dirs.test) already covers `claude-code-restart.md`, `restart-container.md`, and `start-watchers.md` — extend it for new skills.
 3. Rebuild the image (`make compose-build` from the repo root, or `docker compose build claude-container` from `examples/compose/`).
@@ -47,5 +62,6 @@ Listings: ask the agent "list available skills" — the plugin's commands show u
 - [`deploy-container.md`](deploy-container.md) — FULL force-recreate redeploy via `make deploy-container` (a single `docker compose up -d --force-recreate claude-container`, issued through host-bash): the ONLY one of the three that picks up a REBUILT IMAGE, changed entrypoint-time env vars, or new / changed bind-mounts. Documents the host-side-execution requirement (`docker` is not in the container), the build-worktree + `container-build` + main-clone-sync sequence, and the `COMPOSE_FILE` base+override discovery gotcha. Distinct from `restart-container.md` (same container, process-tree restart) and `claude-code-restart.md` (inner-process roll).
 - [`start-watchers.md`](start-watchers.md) — discover and launch any baked container-scoped watchers (today: none; the dir is a stub for phase-2 watcher integrations).
 - [`self-clear.md`](self-clear.md) — trigger a clean CONTEXT reset of the in-container Claude Code session via `self-clear`: inject `/clear` into pane 0, poll tmux until the clear completes, then inject a resume prompt — a PROGRAMMATIC context reset that doesn't wait on the daemon's resume-injection path. Distinct from `claude-code-restart.md` (rolls the inner `claude` binary) and `restart-container.md` (restarts the container) — self-clear changes neither, only the conversation context.
-- [`distill.md`](distill.md) — the DISTILLATION METASKILL: take a completed piece of work (a transcript, finished session, or repeated agent pattern) and systematically distill it into a reusable artifact via IDENTIFY → CHOOSE → DRAFT → PLACE. The structured superset of the terse host `/generalize` one-liner — adds the decision-tree for artifact type (skill / agent-prompt / CLI tool / memory), format, and placement. Sits BESIDE `/generalize` (quick nudge) as the full workflow.
-- [`pr-comment-triage.md`](pr-comment-triage.md) — triage the accumulated bot + human comments on recently-updated tracked PRs: classify each comment by CONTENT (never author), collapse bare-status bot noise via `minimizeComment` GraphQL (OUTDATED, reversible), keep real signal visible, and DRAFT (never auto-post) human replies. Scope = PRs updated within ~24h. The first worked instance of `distill.md`; governed by memory `feedback_pr_comment_triage_act_or_collapse`; dispatches via the `agent-prompts/pr-comment-triage-sweep.md` template.
+- [`edit-host-mounts.md`](edit-host-mounts.md) — probe the host (via the `host-bash` MCP bridge) for bind-mount candidates — gh CLI token, gitconfig, ssh-agent socket, extra repo roots — and write / update the operator's `~/.config/claude-container/docker-compose.override.yml`. Re-runnable: parses the existing override, proposes adds / removes / changes, confirms, then writes — never blows the file away.
+
+Deployment-agnostic skills — `distill`, `pr-comment-triage`, `setup-hooks` — moved to the shared [`skills/`](../../skills/) dir. They are still baked here and still invoked `/claude-container:<name>` in the container; they are ALSO installed on host deploys as `/cw-<name>`. See [`skills/README.md`](../../skills/README.md).
