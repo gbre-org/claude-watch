@@ -149,7 +149,7 @@ pub struct QueueItem {
     pub registered_at: Option<String>,
     #[serde(default)]
     pub started_at: Option<String>,
-    /// Scope tokens (e.g. `["repo:ACME_ORG"]`, `["workload:stv-promote"]`).
+    /// Scope tokens (e.g. `["repo:claude-watch"]`, `["workload:stv-promote"]`).
     /// Items whose scope carries a `workload:` / `hostjob:` token are
     /// exempt from the no-binding orphan check — their liveness is a
     /// progress heartbeat, not an agent transcript, so a missing agent

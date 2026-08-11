@@ -326,7 +326,7 @@ FORCE_START_BUNDLE_DIR = Path(
 # Directory that `repo:<name>` scope tokens are validated against at
 # `queue add` time (added 2026-07-16). Andrew flagged (botchat #2043) that
 # the main loop kept INVENTING repo scope names that matched no real repo
-# dir (`repo:ACME_ORG-2421-classify`, `repo:botchat-ui`, ...), so two agents
+# dir (`repo:platform-2421-classify`, `repo:botchat-ui`, ...), so two agents
 # meant to serialize on the same repo used different scope names and DIDN'T
 # serialize -- contributing to a merge/conflict mess. A `repo:<name>` token
 # must now name an actual directory living in this repos dir.
@@ -991,12 +991,12 @@ def _validate_repo_scope_tokens(tokens):
 # repo-dir validator (`_validate_repo_scope_tokens`) already catches: a task
 # whose DESCRIPTION clearly names one repo but whose `--scope` claims a
 # DIFFERENT (real) repo. The concrete case: a task editing
-# `ACME_ORG-sf/ACME_ORG-html-to-pdf` was scoped `repo:ACME_ORG` (the monorepo)
+# `<org>/platform-html-to-pdf` was scoped `repo:platform` (the monorepo)
 # -- both are real dirs, so the dir validator passed it -- but the scope is the
 # WRONG repo, over-serializing/racing independent per-repo work.
 #
 # This heuristic runs at `queue add` time: when the description/summary names a
-# SINGLE, unambiguous target repo (via a `ACME_ORG-sf/<repo>` / `~/repos/<repo>`
+# SINGLE, unambiguous target repo (via an `<org>/<repo>` / `~/repos/<repo>`
 # path, a `<repo> #<num>` PR reference, or a bare known-repo-dir name) and the
 # `--scope` does NOT include a matching `repo:<that>` (nor a `path:<that>/...`
 # nor `*`), we emit a loud stderr WARNING. It NEVER hard-rejects (Andrew:
@@ -1005,16 +1005,44 @@ def _validate_repo_scope_tokens(tokens):
 # conservative: it only fires on a clear single target, and defers entirely
 # when the text is ambiguous (0 or >1 candidate repos).
 
-# Path-shaped mentions: `ACME_ORG-sf/<repo>`, `~/repos/<repo>`,
-# `/Users/.../repos/<repo>`, `hndrewaall/<repo>`. Captures the trailing repo
-# segment. We intentionally match a small set of known org/path prefixes rather
-# than any `a/b` (which would false-positive on prose like "and/or").
-_REPO_PATH_MENTION_RES = [
-    re.compile(r"ACME_ORG-sf/([A-Za-z0-9._-]+)"),
-    re.compile(r"hndrewaall/([A-Za-z0-9._-]+)"),
-    re.compile(r"(?:~|/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/repos/([A-Za-z0-9._-]+)"),
-    re.compile(r"repo:([A-Za-z0-9._-]+)"),
-]
+# Git-forge orgs whose repos get referred to as `<org>/<repo>` in task text.
+# CONFIGURABLE, never hardcoded to a particular user's employer/client: set
+# `CLAUDE_REPO_ORGS` to a comma/whitespace-separated list (e.g.
+# `CLAUDE_REPO_ORGS="acme-sf,acme-labs"`). The upstream project's own org is
+# always recognised so a default install still resolves `<owner>/<repo>`.
+DEFAULT_REPO_ORGS = ("hndrewaall",)
+_ORG_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _repo_orgs():
+    """Configured `<org>/<repo>` prefixes, defaults included.
+
+    Implausible tokens are ignored rather than fatal -- a typo'd env var must
+    never break `queue add`.
+    """
+    orgs = set(DEFAULT_REPO_ORGS)
+    for tok in re.split(r"[,\s]+", os.environ.get("CLAUDE_REPO_ORGS", "")):
+        tok = tok.strip()
+        if tok and _ORG_TOKEN_RE.match(tok):
+            orgs.add(tok)
+    return sorted(orgs)
+
+
+def _build_repo_path_mention_res():
+    """Path-shaped mentions: `<org>/<repo>`, `~/repos/<repo>`,
+    `/Users/.../repos/<repo>`, `repo:<name>`. Captures the trailing repo
+    segment. We intentionally match a small set of known org/path prefixes
+    rather than any `a/b` (which would false-positive on prose like "and/or").
+    """
+    res = [re.compile(re.escape(org) + r"/([A-Za-z0-9._-]+)") for org in _repo_orgs()]
+    res.append(
+        re.compile(r"(?:~|/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/repos/([A-Za-z0-9._-]+)")
+    )
+    res.append(re.compile(r"repo:([A-Za-z0-9._-]+)"))
+    return res
+
+
+_REPO_PATH_MENTION_RES = _build_repo_path_mention_res()
 
 
 def _repo_scope_names(scope):
@@ -1046,7 +1074,7 @@ def _detect_target_repos(text, valid_repos):
     looks like a repo but names no real dir is ignored (keeps the heuristic
     from false-positiving on generic prose). Two detection modes:
 
-      1. Path/org-prefixed mentions (`ACME_ORG-sf/<repo>`, `~/repos/<repo>`,
+      1. Path/org-prefixed mentions (`<org>/<repo>`, `~/repos/<repo>`,
          `repo:<repo>`) -- strong signal, matched anywhere in the text.
       2. Bare whole-word occurrence of a known repo dir name -- but ONLY for
          "distinctive" names (contain a '-' or '_', or are >= 8 chars). A
@@ -1085,7 +1113,7 @@ def _longest_repo_name(names):
     """Pick the most-specific repo among a set (longest name wins).
 
     When a monorepo-style name is a PREFIX of a more-specific sibling that is
-    ALSO present in the text (e.g. both `ACME_ORG` and `ACME_ORG-html-to-pdf`
+    ALSO present in the text (e.g. both `platform` and `platform-html-to-pdf`
     matched), the longer/more-specific name is the intended target. Returns
     None unless collapsing yields exactly one target.
     """
@@ -1095,7 +1123,7 @@ def _longest_repo_name(names):
     if len(names) == 1:
         return next(iter(names))
     # Collapse names that are a prefix (segment-wise) of another present name.
-    # `ACME_ORG` is subsumed by `ACME_ORG-html-to-pdf`; keep only maximal ones.
+    # `platform` is subsumed by `platform-html-to-pdf`; keep only maximal ones.
     maximal = set(names)
     for a in names:
         for b in names:
@@ -1133,9 +1161,9 @@ def _scope_target_mismatch_warning(scope, description, summary):
         claimed = _repo_scope_names(scope)
         # Covered (no warning) when a claimed repo is EXACTLY the target or
         # MORE specific than it (C == T, or C is a `T-...` sub-repo -- e.g.
-        # scope repo:ACME_ORG-typesense covers a bare "ACME_ORG" mention).
+        # scope repo:platform-typesense covers a bare "platform" mention).
         # A claimed repo that is LESS specific than the target (e.g. scope
-        # repo:ACME_ORG vs target ACME_ORG-html-to-pdf) is exactly the
+        # repo:platform vs target platform-html-to-pdf) is exactly the
         # over-broad case we DO warn about, so it is not coverage.
         if any(c == target or c.startswith(target + "-") for c in claimed):
             return None
@@ -3014,8 +3042,8 @@ def cmd_queue_add(args):
     # ------------------------------------------------------------------
     # Add-time scope/target-repo heuristic (botchat #2346). WARN (never
     # reject) when the description/summary unambiguously names one repo the
-    # --scope doesn't cover. Catches the `ACME_ORG-sf/ACME_ORG-html-to-pdf`-
-    # named task scoped `repo:ACME_ORG` case; stays silent on ambiguous text.
+    # --scope doesn't cover. Catches the `<org>/platform-html-to-pdf`-named
+    # task scoped `repo:platform` case; stays silent on ambiguous text.
     # The enforcing gate is spawn-time (pre-agent-queue-gate-hook).
     # ------------------------------------------------------------------
     mismatch_warning = _scope_target_mismatch_warning(scope, args.description, summary)
