@@ -53,8 +53,9 @@ Self-tests: ``event-classify --self-test``. Embedded suite covers
 every entry in ``CLASSIFICATIONS`` plus a "no match -> default"
 case, an excluded-takes-precedence-over-ambient case, and the
 message-substring conditional rule (``pr-status-change`` is
-actionable iff the message contains "CI failure"/"CI success",
-ambient otherwise).
+actionable iff the message contains "CI failure"/"CI success"/
+"mergeable=conflicting" [a merge CONFLICT], ambient otherwise —
+incl. a conflict RESOLUTION "mergeable=mergeable (was: conflicting)").
 """
 
 from __future__ import annotations
@@ -143,13 +144,22 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "Fatal claude-watch alert (context/crash/main pane); needs "
         "immediate action."),
 
-    # pr-status-change is conditionally actionable (CI failure / CI
-    # success demand attention; "new push" / "CI pending" / "mergeable"
-    # are routine context).
+    # pr-status-change is conditionally actionable: a CI outcome (CI
+    # failure / CI success) OR a merge CONFLICT (pr-watch emits
+    # "mergeable=conflicting" on a tracked PR going CONFLICTING/DIRTY)
+    # demands attention. "new push" / "CI pending" / a conflict
+    # RESOLUTION ("mergeable=mergeable (was: conflicting)") are routine
+    # context and stay ambient via the catch-all below. Matching the
+    # PRECISE token "mergeable=conflicting" (the NEW value in pr-watch's
+    # `mergeable={new} (was: {old})` message) is deliberate: it fires
+    # only when a PR BECOMES conflicting, never when one is resolved —
+    # so it doesn't flood on benign transitions. (botchat #3583/#2936:
+    # merge conflicts sat unnoticed because they routed ambient.)
     ("*", "pr-status-change",
-        _contains_any("CI failure", "CI success"),
+        _contains_any("CI failure", "CI success", "mergeable=conflicting"),
         ACTIONABLE,
-        "PR status change with CI outcome; needs investigation/merge."),
+        "PR status change with CI outcome or merge CONFLICT "
+        "(mergeable=conflicting); needs investigation/merge."),
 
     # workbot-prompt -> needs dispatch (legacy v1 actionable tag).
     ("*", "workbot-prompt", None, ACTIONABLE,
@@ -278,9 +288,10 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("queue", "queue-abandoned", None, AMBIENT,
         "Queue item abandoned; context only."),
 
-    # Routine PR status changes: "new push", "CI pending", "mergeable".
-    # The conditional ACTIONABLE rule above catches CI failure/success;
-    # this catches everything else.
+    # Routine PR status changes: "new push", "CI pending", conflict
+    # RESOLUTION, plain "mergeable". The conditional ACTIONABLE rule
+    # above catches CI failure/success AND merge CONFLICT
+    # (mergeable=conflicting); this catches everything else.
     ("*", "pr-status-change", None, AMBIENT,
         "Routine PR status (push/pending/mergeable); context only."),
 
@@ -447,6 +458,19 @@ def _self_test() -> int:
         (("manual", "pr-status-change", "new push to branch"), AMBIENT),
         (("manual", "pr-status-change", "CI pending"), AMBIENT),
         (("manual", "pr-status-change", "mergeable"), AMBIENT),
+        # Merge CONFLICT is actionable: pr-watch emits
+        # "PR <name>: mergeable=conflicting (was: <old>)" when a tracked
+        # PR goes CONFLICTING/DIRTY. The operator must resolve it.
+        # (botchat #3583/#2936: conflicts sat unnoticed as ambient.)
+        (("cron", "pr-status-change",
+          "PR foo/bar#12: mergeable=conflicting (was: mergeable)"),
+            ACTIONABLE),
+        # Conflict RESOLUTION stays ambient (good news, no action) — the
+        # precise "mergeable=conflicting" token does NOT match
+        # "mergeable=mergeable (was: conflicting)", so it does not flood.
+        (("cron", "pr-status-change",
+          "PR foo/bar#12: mergeable=mergeable (was: conflicting)"),
+            AMBIENT),
 
         # Ambient: alertmanager
         (("alertmanager", "alert-firing", ""), AMBIENT),
