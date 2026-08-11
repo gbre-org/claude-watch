@@ -50,6 +50,11 @@ HERE = Path(__file__).resolve().parent
 CONTAINER_DIR = HERE.parent
 
 SKILLS_DIR = CONTAINER_DIR / "skills"
+# Deployment-agnostic skills live at the repo root in skills/. They are baked
+# into the image alongside container/skills/ (so they're still
+# /claude-container:<name> here) AND installed on a host deploy as /cw-<name>.
+# Container-ONLY skills stay in container/skills/. See skills/README.md.
+SHARED_SKILLS_DIR = CONTAINER_DIR.parent / "skills"
 AGENTS_DIR = CONTAINER_DIR / "agents"
 WATCHERS_DIR = CONTAINER_DIR / "watchers"
 PLUGIN_JSON = CONTAINER_DIR / "plugin" / ".claude-plugin" / "plugin.json"
@@ -226,7 +231,9 @@ if self_clear.is_file():
 #     superset of the terse host /generalize one-liner; must reference
 #     /generalize (the relationship it supersedes/sits-beside) and the
 #     four-phase IDENTIFY/CHOOSE/DRAFT/PLACE workflow.
-distill = SKILLS_DIR / "distill.md"
+#     Deployment-agnostic → lives in the shared skills/ dir, so it is
+#     BOTH baked here and installed on a host deploy as /cw-distill.
+distill = SHARED_SKILLS_DIR / "distill.md"
 expect(
     distill.is_file(),
     f"{distill} missing — the distillation metaskill (turn completed work "
@@ -251,8 +258,9 @@ if distill.is_file():
 
 # 3f. pr-comment-triage.md present — first worked instance of distill.
 #     Must reference the governing memory + the minimizeComment collapse
-#     mechanism + the draft-never-auto-post rule.
-pr_triage = SKILLS_DIR / "pr-comment-triage.md"
+#     mechanism + the draft-never-auto-post rule. Deployment-agnostic →
+#     shared skills/ dir (baked here AND installed as /cw-pr-comment-triage).
+pr_triage = SHARED_SKILLS_DIR / "pr-comment-triage.md"
 expect(
     pr_triage.is_file(),
     f"{pr_triage} missing — the PR comment-triage skill (first worked "
@@ -419,6 +427,26 @@ if DOCKERFILE.is_file():
             f"Dockerfile missing `COPY [container/]{src} {dst}` — required "
             f"to bake the {src.rstrip('/')} dir into the image at {dst}",
         )
+
+    # 8b. BOTH skill sources must be baked, explicitly. The regex above
+    #     tolerates either prefix, so it would still pass if one of the two
+    #     dirs stopped being copied — and the failure mode is silent: a
+    #     shared skill would simply vanish from the in-container session
+    #     while still working on the host. Pin each source separately.
+    for src in ("skills/", "container/skills/"):
+        for dst in ("/opt/claude-container/skills/",
+                    "/opt/claude-container/plugin/commands/"):
+            pat = re.compile(
+                rf"^\s*COPY\s+{re.escape(src)}\s+{re.escape(dst)}\s*$",
+                re.MULTILINE,
+            )
+            expect(
+                pat.search(df) is not None,
+                f"Dockerfile missing `COPY {src} {dst}` — both the shared "
+                f"skills/ dir and the container-only container/skills/ dir "
+                f"must bake into {dst} so every claude-watch skill is "
+                f"reachable as /claude-container:<name>",
+            )
 
 # 9. baked-CLAUDE.md session-start checklist references the new dirs.
 expect(BAKED.is_file(), f"{BAKED} missing")
