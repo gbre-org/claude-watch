@@ -2,7 +2,7 @@
 """Tests for `repo:<name>` scope validation in `queue add` / `queue update-scope`.
 
 Context (botchat #2043, 2026-07-16): the main loop kept INVENTING repo
-scope names that matched no real repo dir (`repo:ACME_ORG-2421-classify`,
+scope names that matched no real repo dir (`repo:platform-2421-classify`,
 `repo:botchat-ui`, `repo:botchat-renderer`, ...). Two agents meant to
 serialize on the SAME repo used different invented scope names, so they
 didn't serialize -- contributing to a merge/conflict mess. Fix: at add
@@ -37,7 +37,7 @@ from pathlib import Path
 SESSION_TASK = Path(__file__).resolve().parent.parent / "session-task"
 
 
-def _env_for_tmp(tmp, *, make_repos=("claude-watch", "ACME_ORG")):
+def _env_for_tmp(tmp, *, make_repos=("claude-watch", "platform")):
     """Build a test env with HOME=tmp and an optional repos/ subtree.
 
     Pass make_repos=None to leave the repos dir ABSENT (fail-open case).
@@ -86,7 +86,7 @@ def test_invalid_repo_scope_rejected():
         assert "no directory 'botchat-ui'" in r.stderr
         assert "repos" in r.stderr
         assert "claude-watch" in r.stderr  # valid list surfaced
-        assert "ACME_ORG" in r.stderr
+        assert "platform" in r.stderr
 
 
 def test_non_repo_scopes_are_free_form():
@@ -132,7 +132,7 @@ def test_bypass_env_var_zero_does_not_bypass():
 
 def test_repos_dir_override():
     with tempfile.TemporaryDirectory() as tmp:
-        env = _env_for_tmp(tmp)  # repos/claude-watch + repos/ACME_ORG
+        env = _env_for_tmp(tmp)  # repos/claude-watch + repos/platform
         alt = Path(tmp) / "altroot"
         (alt / "myproj").mkdir(parents=True)
         env["SESSION_TASK_REPOS_DIR"] = str(alt)
@@ -165,7 +165,7 @@ def test_hidden_dirs_not_valid_repos():
 def test_update_scope_add_validates():
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
-        r = _add(env, "seed", ["repo:ACME_ORG"])
+        r = _add(env, "seed", ["repo:platform"])
         qid = json.loads(r.stdout)["id"]
         # Adding an invalid repo token via update-scope is rejected.
         r2 = _run(env, "queue", "update-scope", qid, "repo:ghost")
@@ -180,7 +180,7 @@ def test_update_scope_remove_not_validated():
     """--remove must work even for an (invalid) token, to strip stale ones."""
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
-        r = _add(env, "seed", ["repo:ACME_ORG"])
+        r = _add(env, "seed", ["repo:platform"])
         qid = json.loads(r.stdout)["id"]
         # Removing a token that isn't a valid repo must not be blocked by
         # validation (no-op or removal, but never an add-time reject).
