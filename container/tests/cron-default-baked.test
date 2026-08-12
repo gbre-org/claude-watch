@@ -226,21 +226,51 @@ if DOCKERFILE.is_file():
     )
 
     # 6. cw-watcher-health-check baked.
-    expect(
-        re.search(
-            r"COPY\s+tools/event-must-act/cw-watcher-health-check\s+"
-            r"/usr/local/bin/cw-watcher-health-check",
-            df,
-        )
-        is not None,
-        "Dockerfile must COPY tools/event-must-act/cw-watcher-health-check "
-        "to /usr/local/bin/cw-watcher-health-check. Without this the "
-        "watcher health check cron entry has no script to run.",
+    #    #539 consolidated the per-file COPY/chmod layers into
+    #    multi-source COPY + multi-target `RUN chmod +x` blocks (to stay
+    #    under overlay2's 128-layer image-depth limit). The real
+    #    invariant is "cw-watcher-health-check lands under /usr/local/bin/
+    #    AND is chmod +x", NOT a specific single-target COPY/chmod syntax.
+    #    Collapse `\`-line-continuations first, then accept EITHER the
+    #    per-file form OR a consolidated multi-source/-target form; still
+    #    fail if the script is genuinely not baked or not made executable.
+    df_collapsed = re.sub(r"\\\n\s*", " ", df)
+    # (a) per-file COPY landing at the explicit path, OR
+    # (b) consolidated multi-source COPY into the /usr/local/bin/ dir
+    #     (trailing dir target, so per-file `.../<name>` targets don't
+    #     match here — those are covered by (a)).
+    copy_per_file = re.search(
+        r"COPY\s+tools/event-must-act/cw-watcher-health-check\s+"
+        r"/usr/local/bin/cw-watcher-health-check\b",
+        df_collapsed,
+    )
+    copy_consolidated = re.search(
+        r"COPY\s+(?:\S+\s+)*tools/event-must-act/cw-watcher-health-check\s+"
+        r"(?:\S+\s+)*/usr/local/bin/\s*$",
+        df_collapsed,
+        re.MULTILINE,
     )
     expect(
-        re.search(r"chmod\s+\+x\s+/usr/local/bin/cw-watcher-health-check", df)
+        copy_per_file is not None or copy_consolidated is not None,
+        "Dockerfile must bake tools/event-must-act/cw-watcher-health-check "
+        "into /usr/local/bin/ — via either a per-file `COPY "
+        "tools/event-must-act/cw-watcher-health-check "
+        "/usr/local/bin/cw-watcher-health-check` line or a consolidated "
+        "multi-source `COPY tools/... /usr/local/bin/` listing it. Without "
+        "this the watcher health check cron entry has no script to run.",
+    )
+    # chmod: accept a dedicated per-file chmod OR a consolidated
+    # multi-target `RUN chmod +x ... /usr/local/bin/cw-watcher-health-check`
+    # (other targets may precede this path on the same logical line).
+    expect(
+        re.search(
+            r"RUN\s+chmod\s+\+x\s+[^\n]*/usr/local/bin/cw-watcher-health-check\b",
+            df_collapsed,
+        )
         is not None,
-        "Dockerfile must chmod +x /usr/local/bin/cw-watcher-health-check.",
+        "Dockerfile must `chmod +x /usr/local/bin/cw-watcher-health-check` "
+        "(per-file or as one target of a consolidated multi-target `RUN "
+        "chmod +x` block) — without the +x bit the cron entry can't exec it.",
     )
 
 
