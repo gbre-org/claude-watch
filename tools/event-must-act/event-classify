@@ -221,6 +221,24 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "PR has un-collapsed bot comments; dispatch a triage agent "
         "(pr-watch detector, botchat #3337/3339)."),
 
+    # comment-triage-STUCK -> ESCALATED fallback (Andrew botchat #3610). The
+    # pr-watch detector re-emits ``comment-triage-needed`` on a dwell while a
+    # backlog stays live, and the loop is pressed to ACK each one — but an ack is
+    # not a RESOLUTION. When the un-triaged count fails to DROP across several
+    # consecutive emissions (the loop ack-looped "residual" without progress),
+    # the detector escalates to this distinct, louder tag. It routes actionable
+    # (like comment-triage-needed) but signals that a plain residual-ack is no
+    # longer sufficient: the loop must force a real resolution (collapse/answer
+    # so the count drops) or explicitly ping the operator. The producer emits
+    # source="cron", so this row MUST precede the ("cron", "*") ambient catch-all.
+    ("cron", "comment-triage-STUCK", None, ACTIONABLE,
+        "PR comment-triage is STUCK (un-triaged count not dropping across "
+        "cycles); force a real resolution or ping the operator — a residual-ack "
+        "is no longer sufficient (pr-watch escalation, botchat #3610)."),
+    ("*", "comment-triage-STUCK", None, ACTIONABLE,
+        "PR comment-triage is STUCK (no progress); force a resolution or ping "
+        "the operator (pr-watch escalation, botchat #3610)."),
+
     # --- AMBIENT ----------------------------------------------------------
     #
     # Info-only: surface in next UserPromptSubmit context, no gate.
@@ -426,6 +444,10 @@ def _self_test() -> int:
         # source="cron"; MUST route actionable (win over cron/* ambient).
         (("cron", "comment-triage-needed", ""), ACTIONABLE),
         (("manual", "comment-triage-needed", ""), ACTIONABLE),
+        # comment-triage-STUCK: escalated fallback (#3610). Distinct tag, still
+        # actionable, and MUST win over cron/* ambient.
+        (("cron", "comment-triage-STUCK", ""), ACTIONABLE),
+        (("manual", "comment-triage-STUCK", ""), ACTIONABLE),
         # heartbeat-tick is actionable (touch the file), and must win over
         # the claude-watch/* ambient catch-all below it.
         (("claude-watch", "heartbeat-tick", "heartbeat tick"), ACTIONABLE),

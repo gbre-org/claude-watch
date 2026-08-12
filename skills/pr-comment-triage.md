@@ -47,6 +47,22 @@ pr-watch surfaces PR issue-comments (comments on the PR conversation, not just r
 - **Never auto-post.** Human-facing replies are drafted for review. Code fixes follow normal PR conventions (push OK for claude-watch; ASK for work repos per `feedback_never_open_pr_unprompted`).
 - Retrigger convention is unchanged: empty-commit, NOT comments (`feedback_auto_retry_flakes`).
 
+## Escalation: `comment-triage-STUCK` (fallback gate, botchat #3610)
+
+The detector re-emits `comment-triage-needed` on a dwell while a backlog stays
+live. Acking those events is NOT the same as resolving them: if the loop
+ack-loops "residual" cycle after cycle without the un-triaged count ever
+DROPPING, the detector escalates — after ~5 consecutive no-progress emissions it
+emits the distinct, louder `comment-triage-STUCK` event (still actionable) and
+sends an operator Pushover ping. When you see `comment-triage-STUCK`, a plain
+residual-ack is no longer acceptable: you must either **make real progress so
+the un-triaged count drops** (collapse the bot noise / answer or resolve the
+human comment/thread — which self-heals the escalation on the next poll) or, if
+the backlog genuinely cannot be resolved autonomously, **explicitly surface it to
+Andrew** (a botchat ping) rather than acking it again. The count-drop is what the
+detector measures, so partial collapses that actually shrink the backlog reset
+the stuck counter.
+
 ## Dispatching a sweep
 
 For a multi-PR sweep, delegate to an agent using a reusable
