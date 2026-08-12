@@ -15,8 +15,14 @@ This test asserts:
      `make install`).
   2. Each is an executable script (#!/usr/bin/env python3 shebang
      plus chmod +x in the repo).
-  3. The Dockerfile contains COPY lines for all four hook scripts
-     targeting /usr/local/bin/<name>.
+  3. The Dockerfile bakes every hook script into /usr/local/bin/ —
+     via either a per-file `COPY tools/hooks/<name>
+     /usr/local/bin/<name>` line OR a consolidated multi-source
+     `COPY tools/hooks/<a> tools/hooks/<b> ... /usr/local/bin/`
+     line (dir target). The invariant is "the source appears in a
+     COPY that lands it under /usr/local/bin/", not a specific COPY
+     syntax — a layer-consolidation refactor (fewer image layers)
+     must not fail this check.
   4. The Dockerfile chmod's all four after copy (so they actually
      execute inside the container).
   5. The entrypoint runs generate-hooks-shim-settings with
@@ -111,18 +117,45 @@ for name in OBLIGATIONS_HOOK_NAMES:
             f"COPY preserves source perms; chmod +x in-tree",
         )
 
-# 3. Dockerfile COPY lines for each obligations hook.
+# 3. Dockerfile bakes each obligations hook into /usr/local/bin/.
+#    Two accepted forms (the real invariant is "the source lands under
+#    /usr/local/bin/", NOT a specific COPY syntax):
+#      a) per-file:      COPY tools/hooks/<name> /usr/local/bin/<name>
+#      b) consolidated:  COPY tools/hooks/<a> \
+#                             tools/hooks/<name> \
+#                             ... \
+#                             /usr/local/bin/          (dir target)
+#    Form (b) — a single multi-source COPY into the /usr/local/bin/
+#    directory — collapses many per-file COPY layers into one (image
+#    depth is bounded by overlay2's 128-layer limit). Collapse `\`
+#    line-continuations to a single logical line before matching so the
+#    multi-source form is seen whole (mirrors the section-4 approach).
 expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
 df = DOCKERFILE.read_text(encoding="utf-8") if DOCKERFILE.is_file() else ""
+df_lines = re.sub(r"\\\n\s*", " ", df) if df else ""
 for name in OBLIGATIONS_HOOK_NAMES:
-    pat = re.compile(
-        rf"^\s*COPY\s+tools/hooks/{re.escape(name)}\s+/usr/local/bin/{re.escape(name)}\s*$",
+    # (a) per-file COPY landing at the explicit /usr/local/bin/<name> path.
+    per_file = re.compile(
+        rf"^\s*COPY\s+tools/hooks/{re.escape(name)}\s+/usr/local/bin/{re.escape(name)}\b",
+        re.MULTILINE,
+    )
+    # (b) consolidated multi-source COPY: tools/hooks/<name> appears among
+    #     the sources of a COPY whose destination is the /usr/local/bin/
+    #     directory (trailing token, so per-file `.../<name>` targets don't
+    #     match here — they're covered by (a)).
+    consolidated = re.compile(
+        rf"^\s*COPY\s+(?:\S+\s+)*tools/hooks/{re.escape(name)}\s+(?:\S+\s+)*"
+        rf"/usr/local/bin/\s*$",
         re.MULTILINE,
     )
     expect(
-        pat.search(df) is not None,
-        f"Dockerfile missing `COPY tools/hooks/{name} /usr/local/bin/{name}` "
-        f"— obligations gate hook will not be baked into the image",
+        per_file.search(df_lines) is not None
+        or consolidated.search(df_lines) is not None,
+        f"Dockerfile does not bake tools/hooks/{name} into /usr/local/bin/ "
+        f"— expected either `COPY tools/hooks/{name} /usr/local/bin/{name}` "
+        f"or a consolidated multi-source `COPY tools/hooks/... "
+        f"/usr/local/bin/` listing {name}; obligations gate hook will not "
+        f"be baked into the image",
     )
 
 # 4. The Dockerfile chmod's the obligations hooks.
