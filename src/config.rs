@@ -513,6 +513,28 @@ pub struct WatcherMonitorConfig {
     /// (every instantaneous DOWN trips the gate, the pre-grace behaviour).
     #[serde(default = "default_watcher_health_grace_secs")]
     pub health_grace_secs: u64,
+    /// Clean-exit grace (seconds) for block-print-exit watchers. A watcher
+    /// that follows the fire-and-exit contract (blocks, prints its pending
+    /// batch, then `exit 0`) writes a `<name>.exit` marker immediately before
+    /// that deliberate exit. When such a marker is FRESHER than the watcher's
+    /// pidfile (proof the CURRENTLY-recorded instance exited cleanly, not a
+    /// previous one) AND younger than this window, the daemon treats the
+    /// watcher as "cleanly exited, restart pending on a live main loop" and
+    /// does NOT count a miss -- eliminating the `WATCHER(S) DOWN` flapping that
+    /// occurred whenever the (alive but busy) main loop took longer than
+    /// `grace_secs` to restart the watcher after a delivery.
+    ///
+    /// Genuine-down detection is preserved: a CRASH writes no fresh marker, so
+    /// the marker stays OLDER than the freshly-rewritten pidfile and DOWN fires
+    /// normally; a DEAD SESSION's marker ages past this window (and the
+    /// heartbeat-stale / dead_process monitors independently catch a dead
+    /// session), so a watcher that stays down is still surfaced.
+    ///
+    /// Default: 600s (10 min), aligned with the heartbeat-stale window so a
+    /// genuinely dead session is caught by heartbeat-stale at ~the same time.
+    /// Set to 0 to disable (pure `grace_secs`-only behaviour).
+    #[serde(default = "default_watcher_clean_exit_grace_secs")]
+    pub clean_exit_grace_secs: u64,
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -566,6 +588,16 @@ fn default_watcher_health_grace_secs() -> u64 {
     // cancelling whole batches of unrelated tool calls. Only a SUSTAINED outage
     // (> 3min) is a real failure worth gating on.
     180
+}
+
+fn default_watcher_clean_exit_grace_secs() -> u64 {
+    // KNOB #5 (clean-exit grace for block-print-exit watchers). A watcher that
+    // delivered its batch and exited 0 leaves a `<name>.exit` marker; while
+    // that marker is fresher than the pidfile and younger than this window the
+    // daemon does not count a miss (restart is pending on the live main loop).
+    // 600s absorbs a busy-but-alive loop's restart latency and aligns with the
+    // heartbeat-stale window so a genuinely dead session is still caught.
+    600
 }
 
 #[derive(Debug, Deserialize, Clone)]

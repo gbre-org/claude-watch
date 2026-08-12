@@ -5398,6 +5398,39 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 if status::watcher_in_grace(last_seen_age, pidfile_age, grace_secs) {
                     continue;
                 }
+                // Clean-exit grace: a block-print-exit watcher writes a
+                // `<name>.exit` marker immediately before its deliberate
+                // `exit 0` (after delivering its batch). When that marker is
+                // FRESHER than the pidfile (so the currently-recorded instance
+                // exited cleanly, not a previous one) AND younger than
+                // clean_exit_grace_secs, the watcher is in the benign "delivered
+                // + awaiting restart on the live main loop" state — do NOT count
+                // a miss. This kills the WATCHER(S) DOWN flapping that fired
+                // whenever the (alive but busy) main loop took longer than
+                // grace_secs to restart after a delivery. A CRASH leaves the
+                // marker OLDER than the freshly-rewritten pidfile (still DOWN),
+                // and a DEAD SESSION's marker ages past the window (heartbeat-
+                // stale / dead_process independently catch a dead session), so
+                // genuine-down detection is preserved. 0 disables (legacy).
+                let clean_exit_grace = config.watcher_monitor.clean_exit_grace_secs as f64;
+                if clean_exit_grace > 0.0 {
+                    let clean_exit_age =
+                        status::watcher_clean_exit_age_secs_multi(&pid_dirs, &entry.name);
+                    if status::watcher_cleanly_exited_recently(
+                        clean_exit_age,
+                        pidfile_age,
+                        clean_exit_grace,
+                    ) {
+                        debug!(
+                            watcher = %entry.name,
+                            clean_exit_age = ?clean_exit_age,
+                            pidfile_age = ?pidfile_age,
+                            clean_exit_grace,
+                            "watcher cleanly exited (block-print-exit) — restart pending, not counting a miss"
+                        );
+                        continue;
+                    }
+                }
                 health.consecutive_missing += 1;
                 // Log after 3 consecutive misses (~30s at 10s interval)
                 if health.consecutive_missing == 3 {
