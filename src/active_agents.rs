@@ -111,27 +111,10 @@ pub fn find_active_subagents_dirs_in(
             if !subagents.is_dir() {
                 continue;
             }
-            // Score this subagents dir by the most-recent mtime of any
-            // file in it. Empty dirs (no agents yet) get the dir's own
-            // mtime so they still register as "this session".
-            let mut newest = match std::fs::metadata(&subagents)
-                .ok()
-                .and_then(|m| m.modified().ok())
-            {
+            let newest = match dir_newest_mtime(&subagents) {
                 Some(t) => t,
                 None => continue,
             };
-            if let Ok(children) = std::fs::read_dir(&subagents) {
-                for child in children.flatten() {
-                    if let Ok(meta) = child.metadata() {
-                        if let Ok(mt) = meta.modified() {
-                            if mt > newest {
-                                newest = mt;
-                            }
-                        }
-                    }
-                }
-            }
             // Apply the freshness window. Future-dated mtimes (clock
             // skew) always pass. Negative durations from
             // `duration_since` indicate the file is NEWER than `now`,
@@ -150,6 +133,28 @@ pub fn find_active_subagents_dirs_in(
     // front-to-back.
     hits.sort_by(|a, b| b.0.cmp(&a.0));
     hits.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Most-recent mtime of anything in `dir` — the dir's own mtime, or a
+/// contained file's mtime when that is newer. An empty dir (a session
+/// that has not spawned an agent yet) therefore still scores as "this
+/// session" rather than dropping out.
+///
+/// Returns `None` only when the directory itself has no readable mtime.
+pub fn dir_newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = std::fs::metadata(dir).ok().and_then(|m| m.modified().ok())?;
+    if let Ok(children) = std::fs::read_dir(dir) {
+        for child in children.flatten() {
+            if let Ok(meta) = child.metadata() {
+                if let Ok(mt) = meta.modified() {
+                    if mt > newest {
+                        newest = mt;
+                    }
+                }
+            }
+        }
+    }
+    Some(newest)
 }
 
 /// Default JSONL-mtime "alive" window. An agent transcript that hasn't

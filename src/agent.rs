@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::active_agents::{
-    collect_agent_records_merged, find_active_subagents_dirs, AgentRecord,
-    DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS,
+    collect_agent_records_merged, dir_newest_mtime, find_active_subagents_dirs, AgentRecord,
+    DEFAULT_AGENT_ALIVE_MAX_AGE_SECS, DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS,
 };
 
 /// Built-in watcher command patterns — children matching these are
@@ -46,30 +46,6 @@ pub fn extra_watcher_patterns() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Claude tasks base directory PARENT (per-uid).
-///
-/// Claude Code writes per-session task output files under
-/// `/tmp/claude-<uid>/<project-slug>/<session-uuid>/tasks/`. The
-/// project slug is derived from the cwd at session start, with `/`
-/// replaced by `-` (e.g. `/home/alice` -> `-home-alice`). We compute
-/// the slug at runtime from `$HOME` so the same binary works on any
-/// account without a hardcoded path.
-const CLAUDE_TASKS_PARENT: &str = "/tmp/claude-1000";
-
-/// Compute the project-slug-derived tasks base for the current user.
-///
-/// Returns e.g. `/tmp/claude-1000/-home-alice` for `$HOME=/home/alice`.
-/// Defaults to `/tmp/claude-1000/-home-user` if `$HOME` is unset (which
-/// keeps prior behavior in test environments).
-pub fn claude_tasks_base() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
-    let slug: String = home
-        .chars()
-        .map(|c| if c == '/' { '-' } else { c })
-        .collect();
-    format!("{}/{}", CLAUDE_TASKS_PARENT, slug)
 }
 
 /// A child process of Claude Code.
@@ -339,78 +315,71 @@ pub fn parse_ps_output(output: &str) -> Vec<ChildProcess> {
         .collect()
 }
 
-/// Find the active Claude Code session directory (most recently modified .output file).
-pub fn find_session_dir() -> Option<PathBuf> {
-    find_session_dir_in(&claude_tasks_base())
+/// One `subagents/` directory the resolver considered, with the age of
+/// its most recent write. Surfaced in the `list` header so the answer
+/// is auditable — the operator can see WHICH sessions were read and how
+/// fresh each one is, instead of trusting an unlabelled agent table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedSession {
+    /// Session UUID (the directory name above `subagents/`).
+    pub session_id: String,
+    /// Absolute path to the `subagents/` directory.
+    pub path: PathBuf,
+    /// Seconds since the newest write anywhere in that directory.
+    pub age_secs: u64,
 }
 
-/// Testable version with configurable base path.
-pub fn find_session_dir_in(base: &str) -> Option<PathBuf> {
-    let base_path = Path::new(base);
-    let mut best_dir: Option<PathBuf> = None;
-    let mut best_mtime: f64 = 0.0;
+/// Resolve every recently-active `subagents/` directory, newest first.
+///
+/// Agent transcripts live under
+/// `~/.claude/projects/<project-slug>/<session-uuid>/subagents/`. The
+/// session UUID there is the TRANSCRIPT session, which is NOT the same
+/// UUID as the task-output session directory under
+/// `/tmp/claude-<uid>/<project-slug>/<session-uuid>/tasks/`: a context
+/// reset (`/clear`) starts a new transcript session while task output
+/// keeps landing under the pre-reset directory. Resolving the
+/// transcript directory by joining the task directory's UUID therefore
+/// reads the PREVIOUS session's agents — every one of them long
+/// finished — while the agents that are actually running write into a
+/// directory the join never visits. That is exactly the failure this
+/// resolver exists to prevent, so we scan the projects tree directly
+/// and never consult the task-output tree at all.
+///
+/// Multiple directories are returned on purpose: an agent that outlives
+/// a context reset has one transcript per session, and only the merge
+/// across them carries both the spawn metadata (older transcript) and
+/// the current liveness (newer transcript).
+pub fn resolve_agent_dirs(now: std::time::SystemTime) -> Vec<ScannedSession> {
+    let dirs = find_active_subagents_dirs(now, DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS);
+    dirs.into_iter().map(|p| describe_session(&p, now)).collect()
+}
 
-    let entries = match std::fs::read_dir(base_path) {
-        Ok(e) => e,
-        Err(_) => return None,
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        // Session IDs are UUIDs (36 chars with dashes)
-        if name_str.len() != 36 || !name_str.contains('-') {
-            continue;
-        }
-        if !entry.path().is_dir() {
-            continue;
-        }
-
-        let tasks_path = entry.path().join("tasks");
-        if !tasks_path.is_dir() {
-            continue;
-        }
-
-        if let Ok(task_entries) = std::fs::read_dir(&tasks_path) {
-            for f in task_entries.flatten() {
-                if f.file_name().to_string_lossy().ends_with(".output") {
-                    if let Ok(meta) = f.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            let mt = mtime
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs_f64();
-                            if mt > best_mtime {
-                                best_mtime = mt;
-                                best_dir = Some(entry.path());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+/// Pure-ish: build a `ScannedSession` for one `subagents/` directory.
+fn describe_session(path: &Path, now: std::time::SystemTime) -> ScannedSession {
+    let session_id = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let age_secs = dir_newest_mtime(path)
+        .and_then(|mt| now.duration_since(mt).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    ScannedSession {
+        session_id,
+        path: path.to_path_buf(),
+        age_secs,
     }
-
-    best_dir
 }
 
-/// Find the subagents directory for a session.
-pub fn find_subagents_dir(session_dir: &Path) -> Option<PathBuf> {
-    let session_id = session_dir.file_name()?.to_string_lossy().to_string();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
-    let projects_base = PathBuf::from(home).join(".claude").join("projects");
-
-    let entries = std::fs::read_dir(&projects_base).ok()?;
-    for entry in entries.flatten() {
-        let subagents = entry.path().join(&session_id).join("subagents");
-        if subagents.is_dir() {
-            return Some(subagents);
-        }
-    }
-    None
-}
-
-/// Load agent metadata from JSONL files in the subagents directory.
+/// Load agent metadata for one `subagents/` directory.
+///
+/// Keyed on the UNION of `agent-<id>.jsonl` and `agent-<id>.meta.json`,
+/// not on the meta file alone: an agent that outlives a context reset
+/// keeps appending to a continuation transcript under the NEW session
+/// directory, and that directory gets no `.meta.json` (the spawn record
+/// stays with the original session). Keying on meta files alone would
+/// drop exactly the agents that are still running.
 pub fn load_agents(subagents_dir: &Path) -> HashMap<String, AgentInfo> {
     let mut agents = HashMap::new();
 
@@ -419,23 +388,33 @@ pub fn load_agents(subagents_dir: &Path) -> HashMap<String, AgentInfo> {
         Err(_) => return agents,
     };
 
+    let mut ids: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let fname = entry.file_name().to_string_lossy().to_string();
-        if !fname.ends_with(".meta.json") {
-            continue;
-        }
-
-        let agent_id = fname
-            .strip_prefix("agent-")
-            .unwrap_or(&fname)
+        let stem = match fname.strip_prefix("agent-") {
+            Some(rest) => rest,
+            None => continue,
+        };
+        let id = match stem
             .strip_suffix(".meta.json")
-            .unwrap_or(&fname)
-            .to_string();
+            .or_else(|| stem.strip_suffix(".jsonl"))
+        {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => continue,
+        };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
 
-        let meta_path = entry.path();
+    for agent_id in ids {
+        let meta_path = subagents_dir.join(format!("agent-{}.meta.json", agent_id));
         let jsonl_path = subagents_dir.join(format!("agent-{}.jsonl", agent_id));
 
-        // Read meta
+        // Read meta. Absent (continuation transcript) or corrupt both
+        // land on the "unknown" placeholder, which the cross-directory
+        // merge then replaces with the real spawn metadata when another
+        // session dir has it.
         let meta: AgentMeta = std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|content| serde_json::from_str(&content).ok())
@@ -470,6 +449,78 @@ pub fn load_agents(subagents_dir: &Path) -> HashMap<String, AgentInfo> {
     }
 
     agents
+}
+
+/// Load agents across several `subagents/` directories and merge by
+/// agent id, field-wise.
+///
+/// Same rationale as the record merge in `active_agents`: after a
+/// context reset the freshest transcript and the spawn metadata live in
+/// DIFFERENT session directories, so a whole-record "newest dir wins"
+/// would report a running agent as `unknown/unknown`, and a
+/// "metadata dir wins" would report it with an hours-old transcript
+/// timestamp. Merging per field keeps both halves.
+pub fn load_agents_merged(dirs: &[PathBuf]) -> HashMap<String, AgentInfo> {
+    let mut merged: HashMap<String, AgentInfo> = HashMap::new();
+    for dir in dirs {
+        for (id, info) in load_agents(dir) {
+            match merged.remove(&id) {
+                None => {
+                    merged.insert(id, info);
+                }
+                Some(existing) => {
+                    merged.insert(id, merge_agent_info(existing, info));
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// True when a meta field carries real spawn metadata rather than the
+/// placeholder written for a transcript with no `.meta.json`.
+fn is_known_meta(value: &str) -> bool {
+    !value.is_empty() && value != "unknown"
+}
+
+/// Pure: merge two `AgentInfo`s for the SAME agent id.
+///
+///  * `jsonl_mtime` / `jsonl_path` / `last_bash_cmd` — from the FRESHEST
+///    transcript (that is the one still being appended to). A fresher
+///    transcript with no Bash call yet falls back to the older one's
+///    command rather than showing nothing.
+///  * `description` / `agent_type` — real metadata beats the "unknown"
+///    placeholder; when both are real the fresher record wins.
+pub fn merge_agent_info(a: AgentInfo, b: AgentInfo) -> AgentInfo {
+    let (fresh, stale) = if b.jsonl_mtime >= a.jsonl_mtime {
+        (b, a)
+    } else {
+        (a, b)
+    };
+
+    let description = if is_known_meta(&fresh.description) {
+        fresh.description.clone()
+    } else if is_known_meta(&stale.description) {
+        stale.description.clone()
+    } else {
+        fresh.description.clone()
+    };
+    let agent_type = if is_known_meta(&fresh.agent_type) {
+        fresh.agent_type.clone()
+    } else if is_known_meta(&stale.agent_type) {
+        stale.agent_type.clone()
+    } else {
+        fresh.agent_type.clone()
+    };
+    let last_bash_cmd = fresh.last_bash_cmd.clone().or(stale.last_bash_cmd);
+
+    AgentInfo {
+        description,
+        agent_type,
+        last_bash_cmd,
+        jsonl_path: fresh.jsonl_path,
+        jsonl_mtime: fresh.jsonl_mtime,
+    }
 }
 
 /// Extract the most recent Bash command from a JSONL file.
@@ -642,79 +693,181 @@ pub fn find_orphaned_agents(claude_pid: Option<u32>) -> Vec<ChildProcess> {
     orphans
 }
 
+/// An agent whose transcript was written within this many seconds is
+/// reported LIVE. Matches the `active-agents` liveness window: subagents
+/// run in-process (no PID of their own) and append to their transcript
+/// on every tool call and model turn, so transcript freshness is the
+/// only liveness signal there is.
+pub const LIST_LIVE_WINDOW_SECS: u64 = DEFAULT_AGENT_ALIVE_MAX_AGE_SECS;
+
+/// Agents whose transcript is older than this are hidden from the
+/// default listing (a count is still printed, and `--all` shows them).
+/// One hour keeps "running now" and "finished a moment ago" in view
+/// without burying them under a day of completed work — the failure this
+/// listing exists to avoid is a wall of plausible stale rows.
+pub const LIST_RECENT_WINDOW_SECS: u64 = 3600;
+
+/// Everything `format_list` needs. Grouped into a struct because the
+/// renderer now reports its own inputs (which sessions were scanned,
+/// what "now" is) so the output can be audited rather than trusted.
+pub struct ListView<'a> {
+    pub claude_pid: u32,
+    /// Sessions the resolver read, newest first.
+    pub sessions: &'a [ScannedSession],
+    pub agents: &'a HashMap<String, AgentInfo>,
+    pub matches: &'a HashMap<String, Vec<u32>>,
+    pub unmatched: &'a [ChildProcess],
+    pub watcher_children: &'a [ChildProcess],
+    /// Seconds since the epoch, injected so tests are deterministic.
+    pub now_epoch: f64,
+    pub live_window_secs: u64,
+    pub recent_window_secs: u64,
+    /// Show watcher processes AND agents older than the recency window.
+    pub show_all: bool,
+}
+
+/// Render a duration in seconds compactly (`45s`, `12m`, `8.3h`).
+fn fmt_age(secs: f64) -> String {
+    let s = secs.max(0.0);
+    if s < 120.0 {
+        format!("{:.0}s", s)
+    } else if s < 7200.0 {
+        format!("{:.0}m", s / 60.0)
+    } else {
+        format!("{:.1}h", s / 3600.0)
+    }
+}
+
 /// Format the `list` command output. Returns the formatted string.
-pub fn format_list(
-    claude_pid: u32,
-    agents: &HashMap<String, AgentInfo>,
-    matches: &HashMap<String, Vec<u32>>,
-    unmatched: &[ChildProcess],
-    watcher_children: &[ChildProcess],
-    show_all: bool,
-) -> String {
-    let mut out = format!("Claude Code PID: {}\n", claude_pid);
+pub fn format_list(view: &ListView) -> String {
+    let mut out = format!("Claude Code PID: {}\n", view.claude_pid);
 
-    if !agents.is_empty() {
-        out.push_str(&format!("\n=== Agents ({}) ===", agents.len()));
+    // Provenance header: which transcript directories produced the rows
+    // below, and how fresh each one is. Without this a stale answer is
+    // indistinguishable from a current one.
+    out.push_str(&format!(
+        "Subagent transcript dirs scanned: {}\n",
+        view.sessions.len()
+    ));
+    for s in view.sessions {
+        out.push_str(&format!(
+            "  {}  last write {} ago  ({})\n",
+            s.session_id,
+            fmt_age(s.age_secs as f64),
+            s.path.display()
+        ));
+    }
 
-        let mut sorted_agents: Vec<_> = agents.iter().collect();
-        sorted_agents.sort_by_key(|(id, _)| (*id).clone());
+    if !view.agents.is_empty() {
+        // Newest transcript first: whatever is running now sorts to the
+        // top, and finished work sinks.
+        let mut sorted_agents: Vec<_> = view.agents.iter().collect();
+        sorted_agents.sort_by(|(a_id, a), (b_id, b)| {
+            b.jsonl_mtime
+                .partial_cmp(&a.jsonl_mtime)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a_id.cmp(b_id))
+        });
 
-        for (agent_id, info) in sorted_agents {
-            let pids = matches
-                .get(agent_id.as_str())
-                .or_else(|| matches.get(agent_id));
-            let age = if info.jsonl_mtime > 0.0 {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64();
-                now - info.jsonl_mtime
+        let age_of = |info: &AgentInfo| -> Option<f64> {
+            if info.jsonl_mtime > 0.0 {
+                Some((view.now_epoch - info.jsonl_mtime).max(0.0))
             } else {
-                0.0
-            };
+                None
+            }
+        };
 
-            let (status, pid_str) = match pids {
-                Some(p) if !p.is_empty() => (
-                    "RUNNING".to_string(),
+        let live_count = sorted_agents
+            .iter()
+            .filter(|(_, info)| age_of(info).is_some_and(|a| a <= view.live_window_secs as f64))
+            .count();
+
+        out.push_str(&format!(
+            "\n=== Agents ({} total, {} live) ===",
+            view.agents.len(),
+            live_count
+        ));
+
+        let mut hidden = 0usize;
+        for (agent_id, info) in sorted_agents {
+            let pids = view.matches.get(agent_id.as_str()).filter(|p| !p.is_empty());
+            let age = age_of(info);
+            let live = age.is_some_and(|a| a <= view.live_window_secs as f64);
+            let recent = age.is_some_and(|a| a <= view.recent_window_secs as f64);
+
+            if !view.show_all && !live && !recent && pids.is_none() {
+                hidden += 1;
+                continue;
+            }
+
+            let (status, pid_str) = match (pids, live) {
+                (Some(p), _) => (
+                    "RUNNING (tool process)".to_string(),
                     p.iter()
                         .map(|p| p.to_string())
                         .collect::<Vec<_>>()
                         .join(", "),
                 ),
-                _ => ("no child process".to_string(), "-".to_string()),
+                // No OS child, but the transcript is still advancing:
+                // an in-process agent between tool calls. Reporting that
+                // as "no child process" is what made live agents look
+                // dead.
+                (None, true) => ("LIVE (in-process, no child)".to_string(), "-".to_string()),
+                (None, false) => ("idle — no child process".to_string(), "-".to_string()),
             };
+
+            let age_str = match age {
+                Some(a) => format!("{} ago", fmt_age(a)),
+                None => "unknown (no transcript)".to_string(),
+            };
+            let session = info
+                .jsonl_path
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
 
             out.push_str(&format!("\n\n  {}", agent_id));
             out.push_str(&format!("\n    Description: {}", info.description));
             out.push_str(&format!("\n    Type: {}", info.agent_type));
             out.push_str(&format!("\n    Status: {}", status));
             out.push_str(&format!("\n    PIDs: {}", pid_str));
-            out.push_str(&format!("\n    Last JSONL write: {:.0}s ago", age));
+            out.push_str(&format!("\n    Last JSONL write: {}", age_str));
+            out.push_str(&format!("\n    Session: {}", session));
             if let Some(ref cmd) = info.last_bash_cmd {
                 let preview: String = cmd.chars().take(100).collect();
                 out.push_str(&format!("\n    Last command: {}", preview));
             }
         }
 
-        if !unmatched.is_empty() {
+        if hidden > 0 {
+            out.push_str(&format!(
+                "\n\n({} agent(s) idle for more than {} hidden, use --all to show)",
+                hidden,
+                fmt_age(view.recent_window_secs as f64)
+            ));
+        }
+
+        if !view.unmatched.is_empty() {
             out.push_str(&format!(
                 "\n\n=== Unmatched child processes ({}) ===",
-                unmatched.len()
+                view.unmatched.len()
             ));
-            for child in unmatched {
+            for child in view.unmatched {
                 let eval_cmd = extract_eval_command(&child.cmd);
                 let preview: String = eval_cmd.chars().take(120).collect();
                 out.push_str(&format!("\n  PID {}: {}", child.pid, preview));
             }
         }
     } else {
-        out.push_str("\nNo agent metadata found.");
-        if !unmatched.is_empty() {
+        out.push_str("\nNo agent metadata found in the scanned session(s).");
+        if !view.unmatched.is_empty() {
             out.push_str(&format!(
                 "\n\n=== Non-watcher child processes ({}) ===",
-                unmatched.len()
+                view.unmatched.len()
             ));
-            for child in unmatched {
+            for child in view.unmatched {
                 let eval_cmd = extract_eval_command(&child.cmd);
                 let preview: String = eval_cmd.chars().take(120).collect();
                 out.push_str(&format!("\n  PID {}: {}", child.pid, preview));
@@ -722,17 +875,17 @@ pub fn format_list(
         }
     }
 
-    if !show_all {
+    if !view.show_all {
         out.push_str(&format!(
             "\n\n({} watcher processes hidden, use --all to show)",
-            watcher_children.len()
+            view.watcher_children.len()
         ));
     } else {
         out.push_str(&format!(
             "\n\n=== Watchers ({}) ===",
-            watcher_children.len()
+            view.watcher_children.len()
         ));
-        for child in watcher_children {
+        for child in view.watcher_children {
             let eval_cmd = extract_eval_command(&child.cmd);
             let preview: String = eval_cmd.chars().take(100).collect();
             out.push_str(&format!("\n  PID {}: {}", child.pid, preview));
@@ -742,12 +895,32 @@ pub fn format_list(
     out
 }
 
+/// Message printed (to stderr) when no transcript directory could be
+/// resolved. Exposed so the test suite can assert the tool fails loudly
+/// instead of printing a confident, possibly-stale table.
+pub fn unresolved_sessions_message() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "<unset>".to_string());
+    format!(
+        "agent: no Claude Code subagent transcript directory written in the last {}h \
+         found under {}/.claude/projects/*/<session-uuid>/subagents/.\n\
+         Refusing to print an agent list: with no resolvable session, every row shown \
+         would be a guess about which agents exist and whether they are alive.",
+        DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS / 3600,
+        home
+    )
+}
+
+/// Exit code used when the tool cannot determine which session's agents
+/// it is looking at. Distinct from 1 ("no Claude Code process") so a
+/// caller can tell "nothing is running" from "I don't know".
+pub const EXIT_UNRESOLVED_SESSION: i32 = 2;
+
 /// Run the `list` command. Returns exit code.
 pub fn cmd_list(show_all: bool) -> i32 {
     let claude_pid = match find_claude_pid() {
         Some(pid) => pid,
         None => {
-            println!("No Claude Code process found.");
+            eprintln!("agent list: no Claude Code process found.");
             return 1;
         }
     };
@@ -764,35 +937,37 @@ pub fn cmd_list(show_all: bool) -> i32 {
         .cloned()
         .collect();
 
-    let session_dir = find_session_dir();
-    let subagents_dir = session_dir.as_ref().and_then(|d| find_subagents_dir(d));
-    let agents = subagents_dir
-        .as_ref()
-        .map(|d| load_agents(d))
-        .unwrap_or_default();
-
-    if !agents.is_empty() {
-        let (matches, unmatched) = match_agent_to_pid(&agents, &agent_children);
-        let output = format_list(
-            claude_pid,
-            &agents,
-            &matches,
-            &unmatched,
-            &watcher_children,
-            show_all,
-        );
-        println!("{}", output);
-    } else {
-        let output = format_list(
-            claude_pid,
-            &agents,
-            &HashMap::new(),
-            &agent_children,
-            &watcher_children,
-            show_all,
-        );
-        println!("{}", output);
+    let now = std::time::SystemTime::now();
+    let sessions = resolve_agent_dirs(now);
+    if sessions.is_empty() {
+        // Fail loudly. The previous behaviour — silently falling back to
+        // whatever directory a stale path-join happened to hit — printed
+        // a table that looked exactly like a correct one.
+        eprintln!("{}", unresolved_sessions_message());
+        return EXIT_UNRESOLVED_SESSION;
     }
+
+    let dirs: Vec<PathBuf> = sessions.iter().map(|s| s.path.clone()).collect();
+    let agents = load_agents_merged(&dirs);
+    let (matches, unmatched) = match_agent_to_pid(&agents, &agent_children);
+    let now_epoch = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let view = ListView {
+        claude_pid,
+        sessions: &sessions,
+        agents: &agents,
+        matches: &matches,
+        unmatched: &unmatched,
+        watcher_children: &watcher_children,
+        now_epoch,
+        live_window_secs: LIST_LIVE_WINDOW_SECS,
+        recent_window_secs: LIST_RECENT_WINDOW_SECS,
+        show_all,
+    };
+    println!("{}", format_list(&view));
 
     0
 }
@@ -832,13 +1007,17 @@ pub fn cmd_kill(target: &str, dry_run: bool) -> i32 {
         return 0;
     }
 
-    // Target is an agent ID (or prefix)
-    let session_dir = find_session_dir();
-    let subagents_dir = session_dir.as_ref().and_then(|d| find_subagents_dir(d));
-    let agents = subagents_dir
-        .as_ref()
-        .map(|d| load_agents(d))
-        .unwrap_or_default();
+    // Target is an agent ID (or prefix). Same resolution as `list` —
+    // both used to key the transcript directory off the task-output
+    // session UUID, which silently pointed at the pre-context-reset
+    // session's agents.
+    let sessions = resolve_agent_dirs(std::time::SystemTime::now());
+    if sessions.is_empty() {
+        eprintln!("{}", unresolved_sessions_message());
+        return EXIT_UNRESOLVED_SESSION;
+    }
+    let dirs: Vec<PathBuf> = sessions.iter().map(|s| s.path.clone()).collect();
+    let agents = load_agents_merged(&dirs);
 
     let matching: Vec<&String> = agents
         .keys()
@@ -1318,6 +1497,49 @@ mod tests {
         assert_eq!(unmatched.len(), 1);
     }
 
+    /// Fixed epoch for renderer tests so ages are deterministic.
+    const TEST_NOW: f64 = 1_800_000_000.0;
+
+    fn test_session(id: &str, age_secs: u64) -> ScannedSession {
+        ScannedSession {
+            session_id: id.to_string(),
+            path: PathBuf::from(format!("/tmp/projects/slug/{}/subagents", id)),
+            age_secs,
+        }
+    }
+
+    fn agent_info(desc: &str, mtime: f64) -> AgentInfo {
+        AgentInfo {
+            description: desc.to_string(),
+            agent_type: "general".to_string(),
+            last_bash_cmd: Some("cargo test".to_string()),
+            jsonl_path: PathBuf::from("/tmp/projects/slug/sess-a/subagents/agent-x.jsonl"),
+            jsonl_mtime: mtime,
+        }
+    }
+
+    fn view<'a>(
+        sessions: &'a [ScannedSession],
+        agents: &'a HashMap<String, AgentInfo>,
+        matches: &'a HashMap<String, Vec<u32>>,
+        unmatched: &'a [ChildProcess],
+        watchers: &'a [ChildProcess],
+        show_all: bool,
+    ) -> ListView<'a> {
+        ListView {
+            claude_pid: 9999,
+            sessions,
+            agents,
+            matches,
+            unmatched,
+            watcher_children: watchers,
+            now_epoch: TEST_NOW,
+            live_window_secs: LIST_LIVE_WINDOW_SECS,
+            recent_window_secs: LIST_RECENT_WINDOW_SECS,
+            show_all,
+        }
+    }
+
     #[test]
     fn test_format_list_no_agents() {
         let agents = HashMap::new();
@@ -1327,35 +1549,113 @@ mod tests {
             cmd: "some-cmd".to_string(),
         }];
         let watchers = vec![];
+        let sessions = vec![test_session("sess-a", 5)];
 
-        let output = format_list(9999, &agents, &matches, &unmatched, &watchers, false);
+        let output = format_list(&view(
+            &sessions, &agents, &matches, &unmatched, &watchers, false,
+        ));
         assert!(output.contains("Claude Code PID: 9999"));
         assert!(output.contains("No agent metadata found"));
         assert!(output.contains("PID 1234"));
+        // Provenance is always printed, even with no agents.
+        assert!(output.contains("Subagent transcript dirs scanned: 1"));
+        assert!(output.contains("sess-a"));
     }
 
     #[test]
     fn test_format_list_with_agents() {
         let mut agents = HashMap::new();
-        agents.insert(
-            "abc123".to_string(),
-            AgentInfo {
-                description: "test agent".to_string(),
-                agent_type: "general".to_string(),
-                last_bash_cmd: Some("cargo test".to_string()),
-                jsonl_path: PathBuf::from("/tmp/test.jsonl"),
-                jsonl_mtime: 0.0,
-            },
-        );
+        agents.insert("abc123".to_string(), agent_info("test agent", TEST_NOW));
         let mut matches = HashMap::new();
         matches.insert("abc123".to_string(), vec![1234u32]);
+        let sessions = vec![test_session("sess-a", 5)];
 
-        let output = format_list(9999, &agents, &matches, &[], &[], false);
-        assert!(output.contains("=== Agents (1) ==="));
+        let output = format_list(&view(&sessions, &agents, &matches, &[], &[], false));
+        assert!(output.contains("=== Agents (1 total, 1 live) ==="));
         assert!(output.contains("abc123"));
         assert!(output.contains("test agent"));
         assert!(output.contains("RUNNING"));
         assert!(output.contains("1234"));
+    }
+
+    #[test]
+    fn test_format_list_marks_in_process_agent_live_without_child_pid() {
+        // The incident shape: an agent mid-work has no OS child between
+        // tool calls. It must NOT read as dead.
+        let mut agents = HashMap::new();
+        agents.insert(
+            "live1".to_string(),
+            agent_info("mid-work agent", TEST_NOW - 20.0),
+        );
+        let matches = HashMap::new();
+        let sessions = vec![test_session("sess-a", 20)];
+
+        let output = format_list(&view(&sessions, &agents, &matches, &[], &[], false));
+        assert!(output.contains("=== Agents (1 total, 1 live) ==="));
+        assert!(output.contains("LIVE (in-process, no child)"));
+        assert!(!output.contains("idle — no child process"));
+    }
+
+    #[test]
+    fn test_format_list_hides_stale_agents_unless_all() {
+        let mut agents = HashMap::new();
+        agents.insert("live1".to_string(), agent_info("live", TEST_NOW - 10.0));
+        agents.insert("old1".to_string(), agent_info("old", TEST_NOW - 30_000.0));
+        let matches = HashMap::new();
+        let sessions = vec![test_session("sess-a", 10)];
+
+        let out = format_list(&view(&sessions, &agents, &matches, &[], &[], false));
+        assert!(out.contains("live1"));
+        assert!(!out.contains("old1"));
+        assert!(out.contains("1 agent(s) idle for more than"));
+
+        let out_all = format_list(&view(&sessions, &agents, &matches, &[], &[], true));
+        assert!(out_all.contains("old1"));
+        assert!(out_all.contains("idle — no child process"));
+    }
+
+    #[test]
+    fn test_format_list_sorts_newest_transcript_first() {
+        let mut agents = HashMap::new();
+        agents.insert("older".to_string(), agent_info("older", TEST_NOW - 900.0));
+        agents.insert("newer".to_string(), agent_info("newer", TEST_NOW - 10.0));
+        let matches = HashMap::new();
+        let sessions = vec![test_session("sess-a", 10)];
+
+        let out = format_list(&view(&sessions, &agents, &matches, &[], &[], false));
+        assert!(out.find("newer").unwrap() < out.find("older").unwrap());
+    }
+
+    #[test]
+    fn test_merge_agent_info_keeps_meta_and_freshest_transcript() {
+        // After a context reset the spawn metadata is in the OLD
+        // session's dir and the live transcript is in the NEW one.
+        let spawn = AgentInfo {
+            description: "real description".to_string(),
+            agent_type: "general-purpose".to_string(),
+            last_bash_cmd: Some("old cmd".to_string()),
+            jsonl_path: PathBuf::from("/p/old/subagents/agent-x.jsonl"),
+            jsonl_mtime: 1000.0,
+        };
+        let continuation = AgentInfo {
+            description: "unknown".to_string(),
+            agent_type: "unknown".to_string(),
+            last_bash_cmd: Some("new cmd".to_string()),
+            jsonl_path: PathBuf::from("/p/new/subagents/agent-x.jsonl"),
+            jsonl_mtime: 2000.0,
+        };
+
+        for (a, b) in [
+            (spawn.clone(), continuation.clone()),
+            (continuation.clone(), spawn.clone()),
+        ] {
+            let m = merge_agent_info(a, b);
+            assert_eq!(m.description, "real description");
+            assert_eq!(m.agent_type, "general-purpose");
+            assert_eq!(m.jsonl_mtime, 2000.0);
+            assert_eq!(m.last_bash_cmd.as_deref(), Some("new cmd"));
+            assert_eq!(m.jsonl_path, PathBuf::from("/p/new/subagents/agent-x.jsonl"));
+        }
     }
 
     #[test]
