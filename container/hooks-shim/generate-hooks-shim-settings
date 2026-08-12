@@ -686,12 +686,32 @@ def main(argv: list[str]) -> int:
              "Empty / unset (default) = legacy drop/empty. Falls back to "
              "CW_APIKEY_WRAPPER env var.",
     )
+    p.add_argument(
+        "--force-apikey-wrapper",
+        default=os.environ.get("CW_FORCE_APIKEY_WRAPPER", ""),
+        help="When truthy (not '' / '0') AND --apikey-wrapper is itself "
+             "runnable here, SET apiKeyHelper to the wrapper even when "
+             "NEITHER the user- nor project-tier carried a (poison) helper "
+             "to rewrite. Root cause this fixes: with apiKeyHelper "
+             "absent/null the container-claude prefers a snapshotted "
+             "claude.ai OAuth credential over ANTHROPIC_API_KEY + "
+             "ANTHROPIC_BASE_URL, routing inference through the operator's "
+             "personal subscription instead of the corp model gateway "
+             "(frozen budget tile, personal quota 429s). An explicitly-set "
+             "apiKeyHelper in this flagSettings tier outranks every lower "
+             "tier and the OAuth fallback, so the wrapper's emitted "
+             "(corp gateway / devbar) key wins. Only forces when the "
+             "effective helper is still falsy, so a genuine poison-rewrite "
+             "is never clobbered. Default off. Falls back to "
+             "CW_FORCE_APIKEY_WRAPPER env var.",
+    )
     args = p.parse_args(argv)
     patterns = parse_patterns(args.shim_patterns)
     inject_obligations = args.inject_obligations.strip() not in ("", "0")
     obligations_only = bool(args.obligations_only)
     mcp_autoapprove = args.mcp_autoapprove.strip() not in ("", "0")
     apikey_wrapper = (args.apikey_wrapper or "").strip()
+    force_apikey_wrapper = (args.force_apikey_wrapper or "").strip() not in ("", "0")
     if apikey_wrapper and not target_runnable_here(apikey_wrapper):
         if not args.quiet:
             print(
@@ -797,6 +817,32 @@ def main(argv: list[str]) -> int:
                     "outranks projectSettings); falling back to env-based auth",
                     file=sys.stderr,
                 )
+        # FORCE the wrapper when requested and nothing above wired a helper.
+        # sanitize/neutralize only fire when the source tiers actually carry
+        # a POISON (non-runnable) apiKeyHelper. When the host settings.json
+        # has NO apiKeyHelper at all (the common case), the effective helper
+        # is still absent/null here -- and Claude Code then prefers a
+        # snapshotted claude.ai OAuth credential over ANTHROPIC_API_KEY +
+        # ANTHROPIC_BASE_URL, routing inference through the operator's
+        # personal subscription instead of the corp gateway. Forcing the
+        # (container-runnable) wrapper into this flagSettings tier makes
+        # Claude Code call it for the key, which the wrapper resolves to a
+        # corp gateway / devbar key -- overriding the OAuth fallback. Gated
+        # on the effective helper still being falsy so a poison-rewrite
+        # above is never clobbered.
+        if force_apikey_wrapper and apikey_wrapper:
+            existing = rewritten.get("apiKeyHelper")
+            if not (isinstance(existing, str) and existing.strip()):
+                rewritten = dict(rewritten)
+                rewritten["apiKeyHelper"] = apikey_wrapper
+                if not args.quiet:
+                    print(
+                        "generate-hooks-shim-settings: forced apiKeyHelper "
+                        f"-> {apikey_wrapper} (no source helper present; "
+                        "flagSettings tier overrides the OAuth fallback so "
+                        "inference routes through the corp gateway key)",
+                        file=sys.stderr,
+                    )
     if inject_obligations:
         rewritten = inject_obligations_hooks(rewritten)
 
