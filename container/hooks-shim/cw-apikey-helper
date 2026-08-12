@@ -15,8 +15,8 @@
 #
 # The container config-seed rewrites that poison apiKeyHelper to point at
 # THIS wrapper instead (see generate-hooks-shim-settings --apikey-wrapper,
-# wired from entrypoint.sh). The wrapper's contract: print exactly ONE
-# usable key to stdout, FAST, and NEVER hang claude's auth.
+# wired from entrypoint.sh). The wrapper's contract: print a usable,
+# FRESH key to stdout when it can, FAST, and NEVER hang claude's auth.
 #
 # STRATEGY (in order):
 #   0. Serve a still-fresh key cached from a prior successful host-call
@@ -28,14 +28,21 @@
 #      to allow-list devbar in the mcp-host-bash server
 #      (CLAUDE_HOOK_BRIDGE_BINS / ALLOWED_COMMANDS) -- otherwise the
 #      bridge rejects the command fast and we fall through.
-#   2. Fallback (the PRIMARY guarantee): print $ANTHROPIC_API_KEY, the key
-#      the container was launched with. This is what makes auth reliable
-#      today; the host-call in (1) is a rotation enhancement layered on
-#      top, never a dependency.
 #
-# Exit is ALWAYS 0. If neither path yields a key we still exit 0 with
-# empty stdout so claude logs no "apiKeyHelper failed" and falls through
-# to its own env-based auth resolution.
+# NO $ANTHROPIC_API_KEY FALLBACK (deliberately removed):
+#   The wrapper used to fall back to printing $ANTHROPIC_API_KEY when the
+#   host-call yielded nothing. That was dropped: when the container also
+#   has a claude.ai login, emitting an env/gateway key here makes Claude
+#   Code warn "Both claude.ai and ANTHROPIC_API_KEY set - auth may not
+#   work as expected" and can steer auth to the wrong credential. Worse,
+#   $ANTHROPIC_API_KEY is the launch-time key and can be STALE on a
+#   long-lived container -- exactly the staleness this wrapper exists to
+#   avoid. So when we can't mint a fresh key we emit NOTHING and let
+#   Claude Code resolve auth on its own (its normal claude.ai login).
+#
+# Exit is ALWAYS 0. If no fresh key is available we exit 0 with empty
+# stdout so claude logs no "apiKeyHelper failed" and simply falls through
+# to its own (claude.ai login) auth resolution -- never a stale env key.
 #
 # Config knobs (all optional, sane defaults):
 #   CW_APIKEY_HOST_CALL           1 (default) to attempt the host-call; 0 disables.
@@ -85,10 +92,6 @@ if [ "$HOST_CALL_ENABLED" = "1" ] \
   fi
 fi
 
-# 2) fallback: the launch-time env key -- the reliable guarantee
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  emit "$ANTHROPIC_API_KEY"
-fi
-
-# nothing to emit; exit 0 so claude falls through to its own env auth
+# No fresh key available. Emit NOTHING and exit 0 so claude falls through
+# to its own claude.ai-login auth -- never a stale $ANTHROPIC_API_KEY.
 exit 0
