@@ -140,5 +140,67 @@ class HelpTest(unittest.TestCase):
         self.assertIn("--resume-prompt", proc.stdout)
 
 
+class FleetViewDetectionTest(unittest.TestCase):
+    """Pure-function tests for the FleetView-awareness helpers added with the
+    FleetView-aware navigation fix. No live tmux needed."""
+
+    def setUp(self):
+        self.mod = _import_self_clear()
+
+    def test_agent_view_selected_agent_row(self):
+        pane = "\n".join([
+            "  ● main",
+            "❯ ◯ general-purpose  running a search",
+            "  ↑/↓ to select · Enter to view",
+        ])
+        self.assertTrue(self.mod._fleetview_agent_view_visible(pane))
+        self.assertFalse(self.mod._main_loop_prompt_visible(pane))
+
+    def test_agent_view_footer_hint(self):
+        pane = "some output\n  ← for agents\n"
+        self.assertTrue(self.mod._fleetview_agent_view_visible(pane))
+
+    def test_main_loop_prompt_detected(self):
+        pane = "\n".join([
+            "⏺ done",
+            "❯ ",
+            "  bypass permissions on · 123k tokens",
+        ])
+        self.assertTrue(self.mod._main_loop_prompt_visible(pane))
+        self.assertFalse(self.mod._fleetview_agent_view_visible(pane))
+
+    def test_numbered_option_is_not_main_prompt(self):
+        pane = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n"
+        self.assertFalse(self.mod._main_loop_prompt_visible(pane))
+
+    def test_read_focus_main_keys_from_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.toml"
+            cfg.write_text('[tmux]\nfocus_main_keys = ["Right", "Left"]\n')
+            saved = os.environ.get("CLAUDE_WATCH_CONFIG")
+            os.environ["CLAUDE_WATCH_CONFIG"] = str(cfg)
+            try:
+                self.assertEqual(self.mod._read_focus_main_keys(), ["Right", "Left"])
+            finally:
+                if saved is None:
+                    os.environ.pop("CLAUDE_WATCH_CONFIG", None)
+                else:
+                    os.environ["CLAUDE_WATCH_CONFIG"] = saved
+
+    def test_read_focus_main_keys_default_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "config.toml"
+            cfg.write_text('[tmux]\nfocus_main_keys = []\n')
+            saved = os.environ.get("CLAUDE_WATCH_CONFIG")
+            os.environ["CLAUDE_WATCH_CONFIG"] = str(cfg)
+            try:
+                self.assertEqual(self.mod._read_focus_main_keys(), [])
+            finally:
+                if saved is None:
+                    os.environ.pop("CLAUDE_WATCH_CONFIG", None)
+                else:
+                    os.environ["CLAUDE_WATCH_CONFIG"] = saved
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

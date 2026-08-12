@@ -206,6 +206,55 @@ def _read_dashboard_pane_config():
     return pane, sess
 
 
+def _read_focus_main_keys():
+    """Read [tmux].focus_main_keys from cw's config.toml.
+
+    Returns the list of tmux send-keys key names the daemon sends to return
+    Claude Code's in-pane FleetView selection to the MAIN conversation before an
+    inject (mirrors src/tmux.rs::send_focus_main_keys / TmuxConfig.focus_main_keys).
+    self-clear sends the same keys so its OWN interrupt / detection / clear
+    choreography lands on the main loop, not on a background agent that happens
+    to be SELECTED in FleetView. Returns [] when unset/unreadable (the default,
+    a no-op on setups that don't configure the knob).
+    """
+    path = _find_config_file()
+    if not path:
+        return []
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        tmux = data.get("tmux", {}) or {}
+        keys = tmux.get("focus_main_keys", []) or []
+        return [str(k).strip() for k in keys if str(k).strip()]
+    except Exception:
+        pass
+    # Fallback: naive line scan within [tmux] for `focus_main_keys = [...]`.
+    # Handles the common double-quoted form (e.g. `["Right", "Right"]`); the
+    # tomllib path above is the primary parser.
+    import re
+    in_tmux = False
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    in_tmux = line == "[tmux]"
+                    continue
+                if (not in_tmux or line.startswith("#")
+                        or not line.startswith("focus_main_keys")):
+                    continue
+                body = line.split("#", 1)[0]
+                m = re.search(r"\[(.*)\]", body)
+                if not m:
+                    return []
+                pairs = re.findall(r'"([^"]*)"', m.group(1))
+                return [p.strip() for p in pairs if p.strip()]
+    except Exception:
+        pass
+    return []
+
+
 def _resolve_configured_pane():
     """Resolve cw's configured main-loop pane to an immutable #{pane_id}.
 
@@ -384,6 +433,134 @@ def wait_for_idle(pane, timeout=60, poll_interval=0.5):
     return False
 
 
+# ---------------------------------------------------------------------------
+# FleetView awareness: return keyboard focus to the MAIN loop before injecting.
+#
+# Claude Code's FleetView (multi-agent TUI) can leave the pane showing a
+# background agent's view, or with a background agent SELECTED in the in-pane
+# agent selector. Keystrokes then land on that agent instead of the main loop.
+# Before self-clear interrupts, injects /clear, or injects the resume prompt, we
+# navigate back to the main-loop prompt and verify via capture-pane. Mirrors the
+# daemon's own approach in src/tmux.rs (reselect_main_loop_pane +
+# send_focus_main_keys + the interactive_prompt_visible agent-view signatures).
+# ---------------------------------------------------------------------------
+
+_FLEETVIEW_CURSOR = "❯"   # the prompt / selection cursor
+_FLEETVIEW_RUN = "●"      # agent running bullet
+_FLEETVIEW_IDLE = "◯"     # agent idle bullet
+
+
+def _fleetview_agent_view_visible(pane_text):
+    """Pure: does the captured pane show a FleetView agent-view / selector?
+
+    Mirrors src/tmux.rs::interactive_prompt_visible signature (5) plus the
+    FleetView footer hints. Matches any of:
+      * a cursor row whose first glyph after the cursor is a status bullet
+        (selected-agent rows: cursor + running/idle bullet + agent name) that
+        FleetView renders in its agent-view;
+      * a FleetView footer hint (an "... for agents" affordance, or a
+        "to select" line that also says "to view" / "Enter to" -- the
+        passive-viewer footer, NOT a genuine blocking question).
+    Used to decide whether we still need to navigate back to the main loop.
+    """
+    lines = pane_text.splitlines()
+    tail = lines[-25:] if len(lines) > 25 else lines
+    for raw in tail:
+        t = raw.strip()
+        low = t.lower()
+        if "for agents" in low:
+            return True
+        if "to select" in low and ("to view" in low or "enter to" in low):
+            return True
+        if t.startswith(_FLEETVIEW_CURSOR):
+            rest = t[len(_FLEETVIEW_CURSOR):].lstrip()
+            if rest[:1] in (_FLEETVIEW_RUN, _FLEETVIEW_IDLE):
+                return True
+    return False
+
+
+def _main_loop_prompt_visible(pane_text):
+    """Pure: does the captured pane look like the MAIN-LOOP input prompt?
+
+    True when a cursor prompt line is present that is NOT a FleetView
+    agent-selector row (cursor + running/idle bullet) and NOT a numbered option
+    row (cursor + "1."), AND no FleetView agent-view markers appear in the tail.
+    Positive confirmation that an inject will land on the main conversation.
+    """
+    if _fleetview_agent_view_visible(pane_text):
+        return False
+    lines = pane_text.splitlines()
+    tail = lines[-15:] if len(lines) > 15 else lines
+    for raw in tail:
+        t = raw.strip()
+        if t.startswith(_FLEETVIEW_CURSOR):
+            rest = t[len(_FLEETVIEW_CURSOR):].lstrip()
+            if rest[:1] in (_FLEETVIEW_RUN, _FLEETVIEW_IDLE):
+                continue
+            if len(rest) >= 2 and rest[0].isdigit() and rest[1] == ".":
+                continue
+            return True
+    return False
+
+
+def _return_focus_to_main(pane):
+    """Best-effort: return keyboard focus to the MAIN loop before sending keys.
+
+    Two layers, mirroring src/tmux.rs::interrupt_and_wait:
+      1. tmux-pane layer: make the resolved main-loop pane the ACTIVE tmux pane
+         (select-pane). Modern Claude Code renders FleetView agent views as
+         SEPARATE tmux panes; if an agent-view pane is active, an Escape blast or
+         typed text could hit that subagent (Andrew #1803/#1804). Selecting the
+         already-active pane is a harmless no-op.
+      2. FleetView in-pane layer: send the configured [tmux].focus_main_keys to
+         return the in-pane FleetView selection to main (Andrew #270/#288/#291).
+         No-op when the knob is empty (the default).
+    Config-INDEPENDENT for layer 1 -- it works even with focus_main_keys unset.
+    """
+    run(["tmux", "select-pane", "-t", pane])
+    for key in _read_focus_main_keys():
+        run(["tmux", "send-keys", "-t", pane, key])
+        time.sleep(0.15)
+
+
+def ensure_main_loop_focus(pane, max_attempts=3):
+    """Return FleetView focus to the main loop and VERIFY via capture-pane.
+
+    Sends the return-to-main sequence (_return_focus_to_main), then confirms the
+    pane is no longer showing a FleetView agent-view. If it still is, sends an
+    Escape (best-effort collapse of the agent-view overlay) and retries.
+
+    Returns True once no agent-view is visible (safe to inject), or False if it
+    could not confirm after max_attempts. On False it logs a LOUD warning so a
+    misfire is visible in the log rather than a silent inject into an agent --
+    the caller still proceeds best-effort (a fully-skipped clear when context is
+    critical is worse than a flagged attempt, and the pane reselect + focus keys
+    have already been sent).
+    """
+    for attempt in range(1, max_attempts + 1):
+        _return_focus_to_main(pane)
+        time.sleep(0.3)
+        out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+        if rc != 0 or not out:
+            log(f"  ensure_main_loop_focus: capture failed "
+                f"(attempt {attempt}/{max_attempts})")
+            continue
+        if not _fleetview_agent_view_visible(out):
+            log(f"  ensure_main_loop_focus: main-loop focus confirmed "
+                f"(attempt {attempt}/{max_attempts})")
+            return True
+        log(f"  ensure_main_loop_focus: FleetView agent-view still visible "
+            f"(attempt {attempt}/{max_attempts}); sending Escape to collapse")
+        run(["tmux", "send-keys", "-t", pane, "Escape"])
+        time.sleep(0.3)
+    log("  WARNING: ensure_main_loop_focus could NOT confirm the main-loop "
+        "prompt after navigation -- FleetView may still have a background agent "
+        "selected. Proceeding best-effort (pane reselect + focus_main_keys "
+        "already sent). If /clear lands on an agent, set [tmux].focus_main_keys "
+        "in config.toml.")
+    return False
+
+
 def interrupt_and_wait(pane, timeout=60, poll_interval=0.5):
     """Actively interrupt Claude Code and wait for idle prompt.
 
@@ -393,6 +570,11 @@ def interrupt_and_wait(pane, timeout=60, poll_interval=0.5):
 
     Returns True if idle confirmed, False on timeout.
     """
+    # FleetView-aware: return keyboard focus to the MAIN loop (pane reselect +
+    # configured focus_main_keys) BEFORE the Escape blast, so an interrupt can
+    # never cancel a background agent's turn (mirrors src/tmux.rs).
+    _return_focus_to_main(pane)
+
     deadline = time.time() + timeout
     escape_count = 0
     while time.time() < deadline:
@@ -482,6 +664,12 @@ def child_main(pane, args):
     log(f"START: pane={pane}, timeout={args.timeout}, delay={args.delay}")
     log(f"  pane state: {capture_pane_text(pane)}")
 
+    # FleetView-aware: return keyboard focus to the MAIN loop before ANY
+    # keystrokes, so the interrupt / /clear / resume injections all land on the
+    # main conversation and never on a background agent selected in FleetView.
+    if not ensure_main_loop_focus(pane):
+        log("  proceeding despite unconfirmed main-loop focus (see WARNING above)")
+
     # Actively interrupt thinking by sending Escape and verifying via tmux.
     idle_ok = interrupt_and_wait(pane, timeout=args.timeout)
     log(f"  interrupt_and_wait: {'idle confirmed' if idle_ok else 'TIMEOUT'}")
@@ -543,6 +731,11 @@ def child_main(pane, args):
     # Dismiss the session feedback prompt if present.
     # Claude Code v2.1.70+ shows "How is Claude doing this session?" after /clear.
     # This prompt intercepts keystrokes and must be dismissed before resume inject.
+    # Re-assert main-loop focus before the resume inject: a fresh post-/clear
+    # session starts on main, but re-selecting is cheap + idempotent and guards
+    # against a FleetView re-selection during the /clear poll window.
+    ensure_main_loop_focus(pane)
+
     dismiss_feedback_prompt(pane)
 
     if not wait_for_idle(pane, timeout=30):
