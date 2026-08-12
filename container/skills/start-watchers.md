@@ -1,3 +1,7 @@
+---
+name: start-watchers
+description: "Start the in-container session-scoped background watchers under /opt/claude-container/watchers/ (block-print-exit contract) — step 7 of the session-start checklist"
+---
 Start the in-container background watchers documented under `/opt/claude-container/watchers/`. Watchers are **session-scoped `run_in_background` tasks** following the block-print-exit contract — this skill is the canonical launcher and is step 7 of the session-start checklist. (A container-level `cw-watcher-supervisor` used to own this lifecycle; it was removed — the session owns watchers now.)
 
 ## Current state — watchers are session-scoped

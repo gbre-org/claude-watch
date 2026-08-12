@@ -1,3 +1,7 @@
+---
+name: deploy-container
+description: "Full force-recreate redeploy of the container from its image via make deploy-container (host-bash) — the only restart that picks up a rebuilt image, changed env vars, or new bind-mounts"
+---
 Redeploy the whole container with a FULL force-recreate FROM the image — `make deploy-container` (a single `docker compose up -d --force-recreate claude-container`), issued through the `host-bash` MCP bridge. This is the ONLY one of the three "restart" operations that picks up a REBUILT IMAGE, changed entrypoint-time env vars, or new / changed bind-mounts. Use it after `make container-build` or any compose / env / mount change.
 
 **NEVER trigger a redeploy via `/exit`, `cw --clear`, `self-clear`, or ANY session-context-clearing operation.** Those clear or KILL the SESSION — they do NOT recreate the container from the image, so none of them pick up a rebuilt image, a changed entrypoint-time env var, or a new / changed mount. Worse, `/exit` in particular can be fired by the claude-code auto-upgrader, and an `/exit`-driven recreate can boot-loop on `~/.local/bin/claude: not found` if the versions volume isn't yet populated. The ONLY correct redeploy path is `make deploy-container` issued via the `host-bash` MCP bridge — the HOST docker daemon owns the recreate. (This skill is the redeploy path; `/exit` / `cw --clear` / `self-clear` are NOT.)

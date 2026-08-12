@@ -1,3 +1,7 @@
+---
+name: self-clear
+description: "Clean CONTEXT reset of the in-container Claude Code session — inject /clear then a resume prompt via the baked self-clear tool; changes neither the binary nor the container"
+---
 Trigger a clean context reset of the in-container Claude Code session — inject `/clear` followed by a resume prompt — via the baked `/usr/local/bin/self-clear` tool. This wipes the conversation context and bootstraps a fresh session that immediately picks up the resume prompt, WITHOUT waiting on the claude-watch daemon's own resume-injection path to fire.
 
 **YES, you CAN self-clear.** A `/clear` is just keystrokes typed into the claude TUI, and the session has a first-class, tested tool for injecting them into its own pane (`claude-container:0.0`) — the SAME `tmux send-keys` input channel `cwsr` uses to roll the binary and the claude-watch daemon uses for interruptions. If you ever think "I can't clear my own context," that is wrong: run `self-clear` in-container (this skill), or trigger it EXTERNALLY from the host with `cw --clear` (the context-reset analog of externally firing `cwsr`).

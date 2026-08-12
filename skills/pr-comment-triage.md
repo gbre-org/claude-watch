@@ -1,3 +1,9 @@
+---
+name: pr-comment-triage
+description: "Triage accumulated bot + human comments on recently-updated tracked PRs: classify each by content, collapse bot noise, keep real signal, and DRAFT (never auto-post) human replies"
+argument-hint: "[PR number or repo hint]"
+allowed-tools: ["Bash", "Read", "Grep"]
+---
 Triage the accumulated bot + human comments on recently-updated tracked PRs: pull each PR's comment state, classify every comment by CONTENT (never by author), then ACT — collapse bare-status bot noise, KEEP real signal visible, and DRAFT (never auto-post) any human-facing reply. Scope is PRs updated within the last ~24h. Collapse, don't delete. This is agent work, not a script — the judgment of signal-vs-noise is the whole point.
 
 **Governing memory: `feedback_pr_comment_triage_act_or_collapse`.** Read it — it is the source of truth for the rules below (Andrew botchat #3328–#3354, 2026-08-10). Two load-bearing corrections it encodes: (1) triage = ACT if appropriate, not merely collapse; (2) do NOT post replies autonomously — DRAFT them for Andrew to review.
