@@ -243,7 +243,7 @@ DEFAULT_PORT=8766
 #   - bash, sh, zsh, fish — arbitrary script exec
 #   - rm, chmod, mv, cp — destructive / privilege-changing
 #   - crontab, launchctl, systemctl, schtasks — host scheduling
-DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,host,dig,nslookup,envchain,jenkins-builds"
+DEFAULT_ALLOWED_COMMANDS="ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,host,dig,nslookup,envchain,jenkins-builds,devbar"
 # ALLOWED_DIR is the cwd for spawned commands AND cli-mcp-server's path
 # boundary: it refuses commands referencing paths that resolve outside
 # this tree. Default "/" DISABLES the path boundary (every absolute path
