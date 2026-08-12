@@ -164,6 +164,15 @@ health_grace_secs = 180
 # inject_cooldown: seconds between successive loud watcher-down injects (in-pane
 # RE-FIRE throttle, NOT initial detection latency). 300 = one nag per 5 min max.
 inject_cooldown = 300
+# clean_exit_grace_secs (KNOB #5): claude-event-watch writes a `<name>.exit`
+# marker right before its deliberate exit-0 after delivering a batch. While the
+# marker is FRESHER than the pidfile (current instance exited cleanly) and
+# younger than this window, the daemon does NOT count a miss — killing the
+# WATCHER(S) DOWN flap during the busy-loop restart gap. Genuine down is
+# preserved: a crash writes no fresh marker (marker older than the rewritten
+# pidfile → DOWN fires); a dead session's marker ages past the window and
+# heartbeat-stale / dead_process catch it independently. 0 disables.
+clean_exit_grace_secs = 600
 
 [context_monitor]
 enabled = true

@@ -256,6 +256,17 @@ grace_secs = 180
 # all its cycles on watcher churn instead of work. 180s matches grace_secs so
 # only a SUSTAINED outage (down > 3min) trips the health gate.
 health_grace_secs = 180
+# clean_exit_grace_secs (KNOB #5): the block-print-exit watcher writes a
+# `<name>.exit` marker right before its deliberate exit-0 after delivering a
+# batch. While that marker is FRESHER than the pidfile (proof the current
+# instance exited cleanly) and younger than this window, the daemon does NOT
+# count a miss — so the WATCHER(S) DOWN flap during a busy-but-alive loop's
+# restart gap stops, WITHOUT masking a real down: a crash writes no fresh
+# marker (marker stays older than the freshly-rewritten pidfile → DOWN fires),
+# and a dead session's marker ages past this window (heartbeat-stale /
+# dead_process catch a dead session independently). 600s aligns with the
+# heartbeat-stale window. 0 disables (pure grace_secs behaviour).
+clean_exit_grace_secs = 600
 
 [context_monitor]
 # Enable context usage monitoring and deferred self-clear

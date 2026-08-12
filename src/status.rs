@@ -1417,6 +1417,69 @@ pub(crate) fn watcher_in_grace(
         || pidfile_age.is_some_and(|e| e < grace_secs)
 }
 
+/// Age (seconds) since the freshest clean-exit marker (`<name>.exit`) for
+/// `name` across ALL candidate dirs, or `None` if no marker exists.
+///
+/// A block-print-exit watcher writes this marker (via `date > <name>.exit`)
+/// immediately before its DELIBERATE `exit 0`, i.e. after it has blocked,
+/// collected a batch, printed it, and emitted the restart banner. The marker is
+/// therefore proof that a watcher instance exited CLEANLY (delivered its
+/// payload), as opposed to crashing or never starting. The daemon's
+/// watcher-monitor pairs this age with the pidfile age (see
+/// [`watcher_cleanly_exited_recently`]) to keep a cleanly-exited watcher in
+/// grace across the delivery->restart gap without masking a real crash.
+///
+/// Pure-ish: filesystem stats only, no `pgrep` / `/proc`.
+#[allow(dead_code)] // sole non-test caller is the daemon's watcher_monitor (lib-only dead-code false positive)
+pub(crate) fn watcher_clean_exit_age_secs_multi(dirs: &[String], name: &str) -> Option<f64> {
+    let now = SystemTime::now();
+    dirs.iter()
+        .filter_map(|d| {
+            let path = format!("{}/{}.exit", d, name);
+            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            // Clamp a future-dated mtime (clock skew) to 0 so skew can't
+            // manufacture a stale reading (mirrors watcher_runtime_file_age).
+            Some(
+                now.duration_since(mtime)
+                    .map(|x| x.as_secs_f64())
+                    .unwrap_or(0.0),
+            )
+        })
+        .fold(None, |acc, age| Some(acc.map_or(age, |cur: f64| cur.min(age))))
+}
+
+/// Pure decision: is the watcher in the benign "cleanly exited, restart
+/// pending" state?
+///
+/// Returns `true` iff the clean-exit marker (`clean_exit_age`) is:
+///   1. FRESHER than the watcher's pidfile (`clean_exit_age < pidfile_age`) —
+///      so it was written by the CURRENTLY-recorded instance (the pidfile is
+///      rewritten on every restart, so a marker predating it belongs to a
+///      previous instance and the current one did NOT exit cleanly), AND
+///   2. younger than `clean_exit_grace_secs`.
+///
+/// Why the pidfile comparison is load-bearing (crash preservation): if a
+/// watcher is restarted and then CRASHES without a clean exit, its pidfile is
+/// fresh (rewritten at restart) but the newest `.exit` marker is from the
+/// PREVIOUS clean exit — older than the pidfile. `clean_exit_age < pidfile_age`
+/// is then false, so a crash-after-restart still reports DOWN promptly rather
+/// than being masked for the whole grace window.
+///
+/// A missing pidfile (`pidfile_age == None`) means the watcher never recorded a
+/// live PID — treated as not-cleanly-exited (return `false`) so a stray marker
+/// alone can never suppress DOWN.
+#[allow(dead_code)] // sole non-test caller is the daemon's watcher_monitor (lib-only dead-code false positive)
+pub(crate) fn watcher_cleanly_exited_recently(
+    clean_exit_age: Option<f64>,
+    pidfile_age: Option<f64>,
+    clean_exit_grace_secs: f64,
+) -> bool {
+    match (clean_exit_age, pidfile_age) {
+        (Some(ce), Some(pf)) => ce < pf && ce < clean_exit_grace_secs,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1560,6 +1623,73 @@ mod tests {
         assert!(watcher_in_grace(Some(10.0), None, grace));
         // Fresh pidfile alone keeps it in grace (the new anchor).
         assert!(watcher_in_grace(None, Some(10.0), grace));
+    }
+
+    // --- clean-exit grace (block-print-exit flap fix) tests ---
+
+    #[test]
+    fn clean_exit_recent_true_when_marker_fresher_than_pidfile_and_young() {
+        // The benign case: the watcher delivered + exited 0 AFTER its last
+        // restart (marker fresher than pidfile) and recently (within window).
+        // clean_exit_age = 20s, pidfile_age = 90s (restart 90s ago, exited 20s
+        // ago), window = 600 -> in clean-exit grace.
+        assert!(watcher_cleanly_exited_recently(Some(20.0), Some(90.0), 600.0));
+    }
+
+    #[test]
+    fn clean_exit_recent_false_when_marker_older_than_pidfile_crash_case() {
+        // Crash-after-restart: pidfile fresh (restart 10s ago) but the newest
+        // marker is from a PREVIOUS clean exit (120s ago) -> marker OLDER than
+        // pidfile -> NOT clean-exited, so DOWN still fires promptly.
+        assert!(!watcher_cleanly_exited_recently(Some(120.0), Some(10.0), 600.0));
+    }
+
+    #[test]
+    fn clean_exit_recent_false_when_marker_past_window_dead_session_case() {
+        // Dead session: watcher exited cleanly, never restarted. The marker is
+        // fresher than the (also stale) pidfile but has aged past the window ->
+        // NOT graced, so a sustained down is still surfaced.
+        assert!(!watcher_cleanly_exited_recently(Some(700.0), Some(900.0), 600.0));
+    }
+
+    #[test]
+    fn clean_exit_recent_false_when_no_pidfile_or_no_marker() {
+        // No pidfile anchor -> never suppress (a stray marker alone can't gate).
+        assert!(!watcher_cleanly_exited_recently(Some(5.0), None, 600.0));
+        // No marker at all -> not clean-exited.
+        assert!(!watcher_cleanly_exited_recently(None, Some(5.0), 600.0));
+        assert!(!watcher_cleanly_exited_recently(None, None, 600.0));
+    }
+
+    #[test]
+    fn clean_exit_age_multi_reads_marker_and_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().to_str().unwrap().to_string()];
+        // No marker yet.
+        assert_eq!(watcher_clean_exit_age_secs_multi(&dirs, "cew"), None);
+        // Fresh marker -> young age.
+        std::fs::write(dir.path().join("cew.exit"), "1786518000").unwrap();
+        let age = watcher_clean_exit_age_secs_multi(&dirs, "cew")
+            .expect("a just-written .exit marker must yield Some(age)");
+        assert!(age >= 0.0 && age < 5.0, "fresh marker should be young, got {age}");
+    }
+
+    #[test]
+    fn clean_exit_age_multi_takes_youngest_across_dirs() {
+        let old_dir = tempfile::tempdir().unwrap();
+        let fresh_dir = tempfile::tempdir().unwrap();
+        std::fs::write(old_dir.path().join("cew.exit"), "1").unwrap();
+        filetime_set(
+            &old_dir.path().join("cew.exit"),
+            SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        std::fs::write(fresh_dir.path().join("cew.exit"), "2").unwrap();
+        let dirs = vec![
+            old_dir.path().to_str().unwrap().to_string(),
+            fresh_dir.path().to_str().unwrap().to_string(),
+        ];
+        let age = watcher_clean_exit_age_secs_multi(&dirs, "cew").unwrap();
+        assert!(age < 60.0, "must report youngest marker's age, got {age}");
     }
 
     // --- parse_status_bar tests ---
