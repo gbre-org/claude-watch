@@ -276,6 +276,44 @@ CLAUDE_SHIM_SETTINGS_PATH=""
 # (host hooks load via user tier, shim only adds the obligations gates).
 CLAUDE_SHIM_FILTER_USER=""
 export CLAUDE_SHIM_FILTER_USER
+# Container apiKeyHelper WRAPPER. When the bind-mounted host settings.json
+# carries an `apiKeyHelper` pointing at a host-native binary (e.g. the macOS
+# devbar app), that helper can't exec under Linux -> exit 127 -> claude can't
+# auth -> dead on every inference, recurring on every recreate. The generator
+# below rewrites such a poison helper to point at THIS baked, container-
+# runnable wrapper instead of dropping it: the wrapper prints a usable key
+# (a FRESH key from the host devbar via the host-bash bridge when reachable,
+# else $ANTHROPIC_API_KEY), restoring gateway-token rotation while guaranteeing
+# env-key auth. Container-only: nothing here touches the host settings.json.
+# Empty (wrapper missing / not executable) => the generator falls back to its
+# legacy drop/empty behaviour, so this can never wire a broken helper.
+_apikey_wrapper="${CW_APIKEY_WRAPPER:-/usr/local/bin/cw-apikey-helper}"
+if [ ! -x "$_apikey_wrapper" ]; then
+    _apikey_wrapper=""
+fi
+# FORCE-WIRE the wrapper (default on). #543 only REWROTE a poison (host-
+# native) apiKeyHelper; when the bind-mounted host settings.json carries NO
+# apiKeyHelper at all (the common case), the effective helper stays null and
+# the container-claude prefers a SNAPSHOTTED claude.ai OAuth credential over
+# ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL -- routing inference through the
+# operator's personal subscription instead of the corp gateway (frozen budget
+# tile, personal quota 429s). Forcing the wrapper into the flagSettings tier
+# makes claude call it for the key (a corp gateway / devbar key), overriding
+# the OAuth fallback. Safe for operators without a gateway: the wrapper emits
+# NOTHING when it can't mint a key, so claude falls through to normal auth.
+# Override with CW_FORCE_APIKEY_WRAPPER=0. No-op when the wrapper is missing.
+_apikey_force="${CW_FORCE_APIKEY_WRAPPER:-1}"
+if [ -z "$_apikey_wrapper" ]; then
+    _apikey_force="0"
+fi
+# When force-wiring, let the wrapper fall back to $ANTHROPIC_API_KEY (the corp
+# virtual key, gateway-routed via ANTHROPIC_BASE_URL) if the devbar host-call
+# is unreachable -- guaranteeing the gateway key wins over OAuth. The wrapper
+# keeps this OFF by default (preserves #543's no-fallback contract for the
+# poison-rewrite-only use case). Override with CW_APIKEY_ENV_FALLBACK.
+if [ "$_apikey_force" != "0" ]; then
+    export CW_APIKEY_ENV_FALLBACK="${CW_APIKEY_ENV_FALLBACK:-1}"
+fi
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
     # Project-tier settings file. When an operator bind-mounts host
@@ -300,6 +338,8 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
         --output "$CLAUDE_SHIM_SETTINGS_PATH" \
         --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
         --neutralize-project-apikeyhelper "$_project_settings" \
+        --apikey-wrapper "$_apikey_wrapper" \
+        --force-apikey-wrapper "$_apikey_force" \
         --inject-obligations "$CLAUDE_CONTAINER_OBLIGATIONS" || true
     unset _project_settings
     CLAUDE_SHIM_FILTER_USER=1
@@ -557,6 +597,8 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ] \
         --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
         --output "${CLAUDE_CONFIG_DIR}/settings.json" \
         --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
+        --apikey-wrapper "$_apikey_wrapper" \
+        --force-apikey-wrapper "$_apikey_force" \
         --inject-obligations 0 \
         --mcp-autoapprove 0 \
         --quiet && CLAUDE_SHIM_SANITIZED_USER_FARM=1

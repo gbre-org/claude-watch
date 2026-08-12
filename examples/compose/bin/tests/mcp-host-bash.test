@@ -315,7 +315,7 @@ EXPECTED_DEFAULT_ALLOWED = (
     "ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,"
     "wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,"
     "hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,"
-    "host,dig,nslookup,envchain,jenkins-builds"
+    "host,dig,nslookup,envchain,jenkins-builds,devbar"
 )
 
 
