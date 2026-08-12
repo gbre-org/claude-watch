@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+#
+# cw-apikey-helper — container-only apiKeyHelper wrapper.
+#
+# WHY THIS EXISTS
+#
+# On a macOS Docker host the operator's ~/.claude/settings.json carries an
+# `apiKeyHelper` pointing at a host-native binary, e.g. devbar:
+#   "'/Applications/devbar.app/Contents/MacOS/devbar' auth claude"
+# That helper prints the current Anthropic / SF model-gateway key AND
+# devbar ROTATES it. Inside this Linux container the host binary can't
+# exec (Mach-O -> exit 127), so claude gets no key and dies on every
+# inference -- recurring on every recreate because the container seeds
+# its config from the host settings.json.
+#
+# The container config-seed rewrites that poison apiKeyHelper to point at
+# THIS wrapper instead (see generate-hooks-shim-settings --apikey-wrapper,
+# wired from entrypoint.sh). The wrapper's contract: print a usable,
+# FRESH key to stdout when it can, FAST, and NEVER hang claude's auth.
+#
+# STRATEGY (in order):
+#   0. Serve a still-fresh key cached from a prior successful host-call
+#      (bounded by CW_APIKEY_CACHE_TTL) so bursty calls skip the bridge.
+#   1. Best-effort: fetch a FRESH key from the host devbar (which rotates
+#      the gateway token) via the host-bash MCP bridge (exec-hook-bridge),
+#      under a HARD timeout. Only attempted when the bridge is wired
+#      (CLAUDE_HOST_HOOK_BRIDGE=1); it additionally requires the operator
+#      to allow-list devbar in the mcp-host-bash server
+#      (CLAUDE_HOOK_BRIDGE_BINS / ALLOWED_COMMANDS) -- otherwise the
+#      bridge rejects the command fast and we fall through.
+#
+# $ANTHROPIC_API_KEY FALLBACK (OPT-IN, default OFF):
+#   By default the wrapper does NOT fall back to $ANTHROPIC_API_KEY when the
+#   host-call yields nothing: on a container that ALSO has a claude.ai login,
+#   emitting an env/gateway key makes Claude Code warn "Both claude.ai and
+#   ANTHROPIC_API_KEY set - auth may not work as expected"; and the env key
+#   can be STALE on a long-lived container (the staleness this wrapper
+#   exists to avoid). So by default we emit NOTHING and let Claude Code
+#   resolve auth on its own.
+#
+#   BUT when CW_APIKEY_ENV_FALLBACK=1 (set by entrypoint.sh whenever the
+#   wrapper is FORCE-wired -- see --force-apikey-wrapper), the opposite is
+#   desired: the whole point of force-wiring is to STEER auth to the corp
+#   gateway key and AWAY from a snapshotted claude.ai OAuth credential
+#   (which Claude Code otherwise prefers when apiKeyHelper is absent,
+#   freezing the budget tile and 429ing the personal quota). In that mode
+#   the "Both ... set" warning is the DESIRED outcome, and emitting the env
+#   key ($ANTHROPIC_API_KEY -- the corp virtual key, which routes through
+#   the gateway via ANTHROPIC_BASE_URL) guarantees the gateway key wins even
+#   when the devbar host-call is momentarily unreachable. The fresh-devbar
+#   path (strategy 1) is still preferred (it rotates the token); the env key
+#   is only a last-resort fallback under this opt-in.
+#
+# Exit is ALWAYS 0. If no fresh key is available we exit 0 with empty
+# stdout so claude logs no "apiKeyHelper failed" and simply falls through
+# to its own (claude.ai login) auth resolution -- never a stale env key.
+#
+# Config knobs (all optional, sane defaults):
+#   CW_APIKEY_HOST_CALL           1 (default) to attempt the host-call; 0 disables.
+#   CW_APIKEY_HOST_CALL_TIMEOUT   hard timeout seconds for the host-call (default 3).
+#   CW_APIKEY_DEVBAR_PATH         host path to the devbar binary.
+#   CW_APIKEY_BRIDGE              path to exec-hook-bridge.
+#   CW_APIKEY_CACHE_TTL           seconds a host-call key is reused (default 60; 0 disables).
+#   CW_APIKEY_CACHE_FILE          cache file path.
+#   CW_APIKEY_ENV_FALLBACK        1 to emit $ANTHROPIC_API_KEY as a last-resort
+#                                 fallback when the host-call yields nothing
+#                                 (default 0; entrypoint sets 1 under force-wire).
+set -u
+
+HOST_CALL_ENABLED="${CW_APIKEY_HOST_CALL:-1}"
+HOST_CALL_TIMEOUT="${CW_APIKEY_HOST_CALL_TIMEOUT:-3}"
+DEVBAR_PATH="${CW_APIKEY_DEVBAR_PATH:-/Applications/devbar.app/Contents/MacOS/devbar}"
+BRIDGE="${CW_APIKEY_BRIDGE:-/usr/local/bin/exec-hook-bridge}"
+CACHE_TTL="${CW_APIKEY_CACHE_TTL:-60}"
+CACHE_FILE="${CW_APIKEY_CACHE_FILE:-${TMPDIR:-/tmp}/cw-apikey-helper.cache}"
+ENV_FALLBACK="${CW_APIKEY_ENV_FALLBACK:-0}"
+
+emit() { printf '%s\n' "$1"; exit 0; }
+
+looks_like_key() {
+  case "$1" in
+    sk-*) [ "${#1}" -ge 8 ] && return 0 ;;
+  esac
+  return 1
+}
+
+# 0) still-fresh cache from a prior successful host-call?
+if [ "$CACHE_TTL" -gt 0 ] 2>/dev/null && [ -f "$CACHE_FILE" ]; then
+  now="$(date +%s 2>/dev/null || echo 0)"
+  mtime="$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)"
+  age=$(( now - mtime ))
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$CACHE_TTL" ]; then
+    cached="$(head -n1 "$CACHE_FILE" 2>/dev/null)"
+    looks_like_key "$cached" && emit "$cached"
+  fi
+fi
+
+# 1) best-effort FRESH key from host devbar via the host-bash bridge
+if [ "$HOST_CALL_ENABLED" = "1" ] \
+    && [ "${CLAUDE_HOST_HOOK_BRIDGE:-0}" = "1" ] \
+    && [ -x "$BRIDGE" ]; then
+  fresh="$(timeout "${HOST_CALL_TIMEOUT}s" "$BRIDGE" "$DEVBAR_PATH" auth claude </dev/null 2>/dev/null)"
+  fresh="$(printf '%s' "$fresh" | tr -d '\r' | grep -m1 '^sk-' || true)"
+  if looks_like_key "$fresh"; then
+    ( umask 077; printf '%s\n' "$fresh" > "$CACHE_FILE" ) 2>/dev/null || true
+    emit "$fresh"
+  fi
+fi
+
+# 2) opt-in last-resort fallback: emit $ANTHROPIC_API_KEY (the corp virtual
+#    key; routes through the gateway via ANTHROPIC_BASE_URL). Only when
+#    force-wired (CW_APIKEY_ENV_FALLBACK=1) so the emitted key deliberately
+#    overrides a snapshotted claude.ai OAuth credential.
+if [ "$ENV_FALLBACK" = "1" ]; then
+  envkey="${ANTHROPIC_API_KEY:-}"
+  looks_like_key "$envkey" && emit "$envkey"
+fi
+
+# No fresh key available (and no opt-in env fallback). Emit NOTHING and exit
+# 0 so claude falls through to its own auth -- never a stale env key.
+exit 0
