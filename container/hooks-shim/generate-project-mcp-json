@@ -121,6 +121,31 @@ with a stdio→HTTP wrapper such as `mcp-proxy`, `mcphost`, or the
 upstream `@modelcontextprotocol/sdk` server-side helpers, or a
 hand-rolled shim. See container/README.md for operator setup notes.
 
+SYNTHESIS FROM THE BRIDGE MAP (durability against ~/.claude.json churn)
+
+The bridge map is not only used to REWRITE matching source entries — it
+is also used to SYNTHESIZE any bridged server that is ABSENT from the
+source. This is load-bearing: the in-container claude-code owns and
+rewrites the mutable `~/.claude.json`, and has been observed to DROP a
+server entry entirely (e.g. host-bash). Pre-synthesis, a dropped server
+simply vanished from the generated `.mcp.json` because only
+already-present entries were ever rewritten. Now every bridge NAME that
+isn't emitted from the source is synthesized as an HTTP entry (same
+shape as a rewrite, honoring --bearer-env), so the bridged set is always
+present regardless of what `~/.claude.json` contains.
+
+BAKED BASELINE BRIDGE MAP (--baseline-bridge / CLAUDE_MCP_BASELINE_BRIDGE)
+
+The operator's `CLAUDE_MCP_HTTP_BRIDGE` env var lives in their private
+`deploy.env`, which is NOT committed to the cw repo. To make the in-tree
+bridged set part of cw-COMMITTED / baked config, `--baseline-bridge`
+points at a JSON object (`{"<name>": "<url>"}`) committed under
+`container/hooks-shim/` and copied to `/usr/local/bin` by the Dockerfile.
+It is merged UNDER the operator's env/flag bridge map (operator wins per
+key) and then rewritten/synthesized like any other bridge entry — so
+host-bash + mcp-adaptor are guaranteed present even if the operator never
+sets `CLAUDE_MCP_HTTP_BRIDGE` and even if `~/.claude.json` lists neither.
+
 BEARER-AUTH HEADER AUTO-INJECT (--bearer-env)
 
 When the host-side mcp-host-bash launcher is fronted by
@@ -324,6 +349,61 @@ def parse_http_bridge(raw: str | None) -> dict[str, str]:
     return out
 
 
+def load_baseline_bridge(path: Path | None, quiet: bool) -> dict[str, str]:
+    """Read a committed/baked baseline bridge map (JSON object of
+    ``{"<mcp-server-name>": "<http-url>"}``) and return it as a
+    {name: url} dict.
+
+    WHY THIS EXISTS
+
+    The operator's ``CLAUDE_MCP_HTTP_BRIDGE`` env var lives in their
+    private ``deploy.env`` — it is NOT committed to the cw repo, so a
+    fresh deploy that forgets to set it silently loses every bridged
+    MCP server. Baking a baseline map INTO the image (committed under
+    ``container/hooks-shim/`` and copied to ``/usr/local/bin`` by the
+    Dockerfile) makes the in-tree bridged set (host-bash, mcp-adaptor)
+    part of cw-committed config: it is merged UNDER the operator's env /
+    flag map (operator wins per key) and then synthesized into the
+    output regardless of what the mutable ``~/.claude.json`` contains.
+
+    Returns {} for a missing / empty / unparseable file or a None path
+    (graceful no-op — a bad baseline must never break container start).
+    Non-string names or non-string/empty URLs are dropped.
+    """
+    if path is None:
+        return {}
+    if not path.exists():
+        if not quiet:
+            print(
+                f"generate-project-mcp-json: baseline-bridge {path} does not "
+                f"exist; no baked bridge map.",
+                file=sys.stderr,
+            )
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(
+            f"generate-project-mcp-json: failed to parse baseline-bridge "
+            f"{path}: {e}; skipping.",
+            file=sys.stderr,
+        )
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for name, url in data.items():
+        if not isinstance(name, str) or not isinstance(url, str):
+            continue
+        name = name.strip()
+        url = url.strip()
+        if not name or not url:
+            continue
+        out[name] = url
+    return out
+
+
 def rewrite_to_http(definition: dict, url: str, bearer_env: str | None = None) -> dict:
     """Return a fresh definition dict in Claude Code's HTTP MCP
     transport shape, pointing at `url`. Drops stdio-specific fields
@@ -402,6 +482,12 @@ def wrap_mcp_servers(
     When `bearer_env` names a non-empty env var, the http-bridged
     entries also get an `Authorization: Bearer ${<bearer_env>}` header
     injected. See rewrite_to_http for the precise semantics.
+
+    Finally, every bridge NAME not already emitted from `servers` is
+    SYNTHESIZED as an HTTP entry (built from an empty definition). This
+    guarantees bridged servers are present even when absent from the
+    source `~/.claude.json` — the durability fix that decouples the
+    bridged set from that mutable file.
     """
     bridge = http_bridge or {}
     wrapped: dict = {}
@@ -417,6 +503,19 @@ def wrap_mcp_servers(
         if isinstance(cmd, str):
             new_def["command"] = wrap_command(cmd, patterns)
         wrapped[name] = new_def
+
+    # Synthesize an HTTP entry for every bridge NAME not already emitted
+    # from the source servers. This is what makes the bridged set
+    # (host-bash, mcp-adaptor, ...) derive from the COMMITTED bridge map
+    # rather than the mutable ~/.claude.json: the in-container claude-code
+    # rewrites ~/.claude.json and can DROP a server entry entirely, which
+    # pre-synthesis meant that bridged server silently VANISHED from the
+    # generated .mcp.json (only entries already present in the source were
+    # ever rewritten). Synthesizing from the bridge map guarantees every
+    # bridged server is always present regardless of ~/.claude.json churn.
+    for name, url in bridge.items():
+        if name not in wrapped:
+            wrapped[name] = rewrite_to_http({}, url, bearer_env)
     return wrapped
 
 
@@ -508,6 +607,21 @@ def main(argv: list[str]) -> int:
              "'host-mcp-server=http://host.docker.internal:8765/mcp'.",
     )
     p.add_argument(
+        "--baseline-bridge",
+        default=os.environ.get("CLAUDE_MCP_BASELINE_BRIDGE", ""),
+        help="Path to a committed/baked baseline bridge map: a JSON "
+             "object of {\"<mcp-server-name>\": \"<http-url>\"}. Each "
+             "entry is merged UNDER --http-bridge / CLAUDE_MCP_HTTP_BRIDGE "
+             "(the operator's env/flag map wins on key collision) and then "
+             "synthesized into the output as an HTTP entry even when the "
+             "server is absent from --mcp-input. This is how the in-tree "
+             "bridged MCP set (host-bash, mcp-adaptor) stays part of "
+             "cw-committed config, independent of the mutable ~/.claude.json "
+             "AND of whether the operator set CLAUDE_MCP_HTTP_BRIDGE. Falls "
+             "back to CLAUDE_MCP_BASELINE_BRIDGE env var if the flag isn't "
+             "given. Empty / unset / missing file = no baked baseline.",
+    )
+    p.add_argument(
         "--bearer-env",
         default="CLAUDE_HOST_HOOK_BRIDGE_BEARER",
         help="Name of the env var that holds the bearer token for "
@@ -529,7 +643,15 @@ def main(argv: list[str]) -> int:
     )
     args = p.parse_args(argv)
     patterns = parse_patterns(args.shim_patterns)
-    http_bridge = parse_http_bridge(args.http_bridge)
+    operator_bridge = parse_http_bridge(args.http_bridge)
+    baseline_path = args.baseline_bridge.strip() if args.baseline_bridge else ""
+    baseline_bridge = load_baseline_bridge(
+        Path(baseline_path) if baseline_path else None, args.quiet
+    )
+    # Baked baseline is the FLOOR; the operator's env/flag map overrides
+    # per key (so an operator can repoint a URL or add servers, but can
+    # never accidentally drop the committed in-tree bridged set).
+    http_bridge = {**baseline_bridge, **operator_bridge}
     # Resolve the bearer-env knob. Empty string explicitly disables the
     # auto-inject regardless of which env vars are populated.
     bearer_env = args.bearer_env or None
@@ -559,17 +681,22 @@ def main(argv: list[str]) -> int:
     project_key = derive_project_key(out_dir)
     servers = load_mcp_servers(Path(args.mcp_input), project_key, args.quiet)
 
-    if not servers:
+    # Compute the final server set BEFORE deciding whether there's
+    # anything to write: even with zero source servers, a non-empty
+    # bridge map (operator env/flag OR baked baseline) synthesizes
+    # HTTP entries we DO want written.
+    wrapped = wrap_mcp_servers(servers, patterns, http_bridge, bearer_env)
+
+    if not wrapped:
         if not args.quiet:
             print(
                 f"generate-project-mcp-json: no mcpServers found in "
-                f"{args.mcp_input} (top-level or projects[{project_key!r}]); "
-                f"nothing to write.",
+                f"{args.mcp_input} (top-level or projects[{project_key!r}]) "
+                f"and no bridge map to synthesize; nothing to write.",
                 file=sys.stderr,
             )
         return 0
 
-    wrapped = wrap_mcp_servers(servers, patterns, http_bridge, bearer_env)
     content = render(wrapped)
     out_path = out_dir_path / ".mcp.json"
 

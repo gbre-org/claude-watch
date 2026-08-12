@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Tests for the committed/baked baseline MCP bridge map.
+
+WHY THIS EXISTS
+
+The container's project-tier `.mcp.json` is generated at start by
+generate-project-mcp-json from the SOURCE `mcpServers` in the mutable
+`~/.claude.json` (bind-mounted). The in-container claude-code owns and
+rewrites that file and has been observed to DROP a server entry entirely
+(host-bash), which — pre-fix — silently removed that server from the
+generated `.mcp.json` because only already-present entries were rewritten.
+
+The durability fix bakes an in-tree baseline bridge map
+(container/hooks-shim/baseline-mcp-bridge.json) into the image and has
+generate-project-mcp-json SYNTHESIZE an HTTP entry for every bridged name
+not present in the source. That makes the in-tree bridged MCP set
+(host-bash, mcp-adaptor) part of cw-COMMITTED config, independent of the
+mutable ~/.claude.json AND of whether the operator set
+CLAUDE_MCP_HTTP_BRIDGE in their private deploy.env.
+
+This test asserts:
+
+  1. container/hooks-shim/baseline-mcp-bridge.json exists and is a valid
+     JSON object of {"<name>": "<http-url>"}.
+  2. It includes the in-tree bridged set that regressed (host-bash,
+     mcp-adaptor), each pointed at an http(s) URL.
+  3. The Dockerfile COPYs it to /usr/local/bin/baseline-mcp-bridge.json.
+  4. The entrypoint passes --baseline-bridge to generate-project-mcp-json
+     defaulting to the baked path.
+  5. examples/compose/docker-compose.yml exposes CLAUDE_MCP_BASELINE_BRIDGE
+     so operators can override the baked path.
+
+Run:  ./baked-mcp-bridge-baseline.test
+
+No external dependencies beyond Python 3.8+ stdlib.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+BASELINE = CONTAINER_DIR / "hooks-shim" / "baseline-mcp-bridge.json"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+COMPOSE = REPO_ROOT / "examples" / "compose" / "docker-compose.yml"
+
+# The in-tree bridged set that must always be present (host-bash was the
+# server that regressed when ~/.claude.json was rewritten; mcp-adaptor
+# only survived by luck).
+REQUIRED_BRIDGE_NAMES = ["host-bash", "mcp-adaptor"]
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# 1. Baseline file exists + parses as a {str: str} object.
+expect(BASELINE.is_file(), f"{BASELINE} missing — the baked baseline bridge map")
+baseline: dict = {}
+if BASELINE.is_file():
+    try:
+        baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+    except Exception as e:
+        expect(False, f"{BASELINE} is not valid JSON: {e}")
+    expect(
+        isinstance(baseline, dict),
+        f"{BASELINE} should be a JSON object of {{name: url}}, got "
+        f"{type(baseline).__name__}",
+    )
+    for name, url in (baseline.items() if isinstance(baseline, dict) else []):
+        expect(
+            isinstance(name, str) and isinstance(url, str) and bool(url),
+            f"{BASELINE}: entry {name!r}={url!r} must be str->non-empty-str",
+        )
+
+# 2. Required in-tree bridged names present, each an http(s) URL.
+for name in REQUIRED_BRIDGE_NAMES:
+    url = baseline.get(name) if isinstance(baseline, dict) else None
+    expect(
+        isinstance(url, str) and url.startswith(("http://", "https://")),
+        f"{BASELINE}: required bridged server {name!r} missing or not an "
+        f"http(s) URL (got {url!r}) — the container would lose it whenever "
+        f"~/.claude.json drops it",
+    )
+
+# 3. Dockerfile COPYs the baseline into /usr/local/bin.
+expect(DOCKERFILE.is_file(), f"Dockerfile missing at {DOCKERFILE}")
+df = DOCKERFILE.read_text(encoding="utf-8") if DOCKERFILE.is_file() else ""
+copy_pat = re.compile(
+    r"^\s*COPY\s+container/hooks-shim/baseline-mcp-bridge\.json\s+"
+    r"/usr/local/bin/baseline-mcp-bridge\.json\s*$",
+    re.MULTILINE,
+)
+expect(
+    copy_pat.search(df) is not None,
+    "Dockerfile missing `COPY container/hooks-shim/baseline-mcp-bridge.json "
+    "/usr/local/bin/baseline-mcp-bridge.json` — the baseline won't be baked "
+    "into the image",
+)
+
+# 4. Entrypoint passes --baseline-bridge (defaulting to the baked path) to
+#    generate-project-mcp-json.
+expect(ENTRYPOINT.is_file(), f"entrypoint.sh missing at {ENTRYPOINT}")
+if ENTRYPOINT.is_file():
+    ep = ENTRYPOINT.read_text(encoding="utf-8")
+    expect(
+        "--baseline-bridge" in ep,
+        "entrypoint.sh should pass --baseline-bridge to "
+        "generate-project-mcp-json — otherwise the baked baseline is never "
+        "consulted",
+    )
+    expect(
+        "/usr/local/bin/baseline-mcp-bridge.json" in ep,
+        "entrypoint.sh should default --baseline-bridge to the baked path "
+        "/usr/local/bin/baseline-mcp-bridge.json",
+    )
+
+# 5. Compose exposes CLAUDE_MCP_BASELINE_BRIDGE so operators can override.
+if COMPOSE.is_file():
+    yml = COMPOSE.read_text(encoding="utf-8")
+    expect(
+        "CLAUDE_MCP_BASELINE_BRIDGE" in yml,
+        "examples/compose/docker-compose.yml should list "
+        "CLAUDE_MCP_BASELINE_BRIDGE in the claude-container environment "
+        "block so operators can override the baked baseline path",
+    )
+
+
+if failures:
+    print("FAIL baked-mcp-bridge-baseline.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS baked-mcp-bridge-baseline.test")
+sys.exit(0)
