@@ -19,6 +19,7 @@ Run:  ./exec-hook.test
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import struct
@@ -48,11 +49,13 @@ def run_shim(
     *args: str,
     tmpdir: str | None = None,
     extra_env: dict | None = None,
+    stdin: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run exec-hook against `target` with the given args.
 
     Pass target=None to invoke with no argv (exercises the usage path).
     `extra_env` overlays additional env vars (used by bridge tests).
+    `stdin` is fed to the process (used by the devbar-analytics-spool tests).
     """
     env = os.environ.copy()
     if tmpdir is not None:
@@ -69,6 +72,7 @@ def run_shim(
         capture_output=True,
         text=True,
         timeout=10,
+        input=stdin,
     )
 
 
@@ -299,6 +303,109 @@ def test_missing_target_bridge_on_invokes_bridge() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Devbar ai-analytics capture spool intercept (approach B)
+#
+# exec-hook execs the adjacent devbar-analytics-spool helper for the exact
+# `devbar ai-analytics capture` target, BEFORE the missing-file / bridge
+# path (which would drop the hook's stdin). These tests confirm the gate
+# fires only for that target+args and that the payload lands in the spool
+# dir with container->host paths rewritten.
+# ---------------------------------------------------------------------------
+
+
+def _spool_files(spool_dir: str) -> list[Path]:
+    d = Path(spool_dir)
+    if not d.exists():
+        return []
+    return [p for p in d.iterdir() if p.is_file() and p.suffix == ".json"]
+
+
+def _devbar_env(spool_dir: str) -> dict:
+    # Fully specify the spool env; unset the bridge so the intercept path is
+    # the only thing under test regardless of the ambient container env.
+    return {
+        "HOME": "/home/hndrewaall",
+        "CLAUDE_DEVBAR_ANALYTICS_SPOOL_DIR": spool_dir,
+        "CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos",
+        "CLAUDE_HOST_HOOK_BRIDGE": "0",
+    }
+
+
+def test_devbar_analytics_spooled() -> None:
+    """devbar ai-analytics capture -> payload spooled with rewritten paths."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({
+            "hook_event_name": "Stop",
+            "transcript_path": "/home/hndrewaall/.claude/projects/x/s.jsonl",
+        })
+        # A nonexistent /...devbar path mirrors the real container case (the
+        # host app isn't bind-mounted). basename is what the gate keys on.
+        r = run_shim(
+            "/Applications/devbar.app/Contents/MacOS/devbar",
+            "ai-analytics", "capture",
+            tmpdir=td, extra_env=_devbar_env(spool), stdin=payload,
+        )
+        expect(r.returncode == 0,
+               f"devbar-spool: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        files = _spool_files(spool)
+        expect(len(files) == 1,
+               f"devbar-spool: expected 1 spool file, got {len(files)}; stderr:\n{r.stderr}")
+        if files:
+            obj = json.loads(files[0].read_text())
+            expect(obj["transcript_path"] == "/Users/hallandrew/.claude/projects/x/s.jsonl",
+                   f"devbar-spool: transcript_path not rewritten: {obj['transcript_path']}")
+
+
+def test_devbar_wrong_args_not_spooled() -> None:
+    """devbar with non-capture args (e.g. `auth claude`) is NOT spooled."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        r = run_shim(
+            "/Applications/devbar.app/Contents/MacOS/devbar",
+            "auth", "claude",
+            tmpdir=td, extra_env=_devbar_env(spool), stdin="{}",
+        )
+        expect(r.returncode == 0,
+               f"devbar-wrong-args: expected exit 0, got {r.returncode}")
+        expect(_spool_files(spool) == [],
+               f"devbar-wrong-args: should NOT spool, got {_spool_files(spool)}")
+
+
+def test_non_devbar_not_spooled() -> None:
+    """A non-`devbar` target with the same args is NOT spooled."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        mach = Path(td) / "telemetry-hook"
+        write_mach_o_stub(mach)
+        r = run_shim(
+            str(mach), "ai-analytics", "capture",
+            tmpdir=td, extra_env=_devbar_env(spool), stdin="{}",
+        )
+        expect(r.returncode == 0,
+               f"non-devbar: expected exit 0, got {r.returncode}")
+        expect(_spool_files(spool) == [],
+               f"non-devbar: should NOT spool, got {_spool_files(spool)}")
+
+
+def test_devbar_spool_disabled_not_spooled() -> None:
+    """CLAUDE_DEVBAR_ANALYTICS_SPOOL=0 disables the intercept."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        env = _devbar_env(spool)
+        env["CLAUDE_DEVBAR_ANALYTICS_SPOOL"] = "0"
+        r = run_shim(
+            "/Applications/devbar.app/Contents/MacOS/devbar",
+            "ai-analytics", "capture",
+            tmpdir=td, extra_env=env, stdin=json.dumps({"x": 1}),
+        )
+        expect(r.returncode == 0,
+               f"devbar-disabled: expected exit 0, got {r.returncode}")
+        expect(_spool_files(spool) == [],
+               f"devbar-disabled: should NOT spool, got {_spool_files(spool)}")
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -315,6 +422,10 @@ TESTS = [
     test_mach_o_bridge_off_silent_noop,
     test_mach_o_bridge_on_invokes_bridge,
     test_missing_target_bridge_on_invokes_bridge,
+    test_devbar_analytics_spooled,
+    test_devbar_wrong_args_not_spooled,
+    test_non_devbar_not_spooled,
+    test_devbar_spool_disabled_not_spooled,
 ]
 
 for t in TESTS:

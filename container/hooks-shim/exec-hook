@@ -83,6 +83,20 @@
 #
 # See container/hooks-shim/exec-hook-bridge for the full bridge
 # protocol, env-var surface, and degraded-mode behaviour.
+#
+# DEVBAR AI-ANALYTICS SPOOL (approach B)
+#
+# One hook target gets special handling BEFORE the magic-byte / bridge
+# logic: `devbar ai-analytics capture`. devbar reads its event payload
+# from stdin, but the host-bash bridge above has no stdin support
+# (cli-mcp-server run_command drops it), so bridging that hook silently
+# loses every container ai-analytics event. Instead, for THIS target
+# only, exec-hook hands off to `devbar-analytics-spool`, which writes the
+# stdin payload (with container->host path prefixes rewritten) into a
+# spool dir on the shared ~/.claude mount for a host-side launchd drainer
+# to feed to the real host devbar. Gated to the exact target + args, and
+# disableable via CLAUDE_DEVBAR_ANALYTICS_SPOOL=0. See
+# container/hooks-shim/devbar-analytics-spool for the full contract.
 
 set -u
 
@@ -159,6 +173,58 @@ resolve_bridge_helper() {
     return 1
 }
 
+# Locate the devbar-analytics-spool helper. Same probe order + fallback
+# philosophy as resolve_bridge_helper: adjacent (dev tree), then the two
+# baked image locations. Absent helper => caller falls through to the
+# normal exec-hook path (bridge / no-op).
+resolve_spool_helper() {
+    local self_dir
+    self_dir="$(dirname "$0" 2>/dev/null || echo /usr/local/bin)"
+    local candidate
+    for candidate in \
+            "${self_dir}/devbar-analytics-spool" \
+            "/usr/local/bin/devbar-analytics-spool" \
+            "/usr/local/lib/claude-hooks-shim/devbar-analytics-spool"; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Intercept the `devbar ai-analytics capture` hook and spool its stdin
+# payload instead of bridging it (the bridge drops stdin). Gated strictly:
+# the target basename must be `devbar` AND the first two args must be
+# `ai-analytics capture`. Disable with CLAUDE_DEVBAR_ANALYTICS_SPOOL=0.
+#
+# Returns 1 (no match / disabled / helper missing) so the caller continues
+# with the normal magic-byte + bridge path; on a match it `exec`s the
+# spool helper (with the hook's stdin passed through) and never returns.
+maybe_spool_devbar_analytics() {
+    local target="$1"
+    shift
+    if [ "${CLAUDE_DEVBAR_ANALYTICS_SPOOL:-1}" = "0" ]; then
+        return 1
+    fi
+    if [ "$(basename -- "$target" 2>/dev/null)" != "devbar" ]; then
+        return 1
+    fi
+    if [ "${1:-}" != "ai-analytics" ] || [ "${2:-}" != "capture" ]; then
+        return 1
+    fi
+    local spooler
+    if ! spooler="$(resolve_spool_helper)"; then
+        # Helper not installed — fall through to the normal path so the
+        # session keeps working (payload still lost, but no worse than
+        # before this feature existed).
+        return 1
+    fi
+    # exec replaces the shell with the spooler so stdin / exit code pass
+    # through cleanly and this never returns.
+    exec "$spooler" "$target" "$@"
+}
+
 # Try to bridge the call to the host via host-bash MCP. Only invoked
 # from the Mach-O / unknown-format branch when CLAUDE_HOST_HOOK_BRIDGE=1.
 #
@@ -184,6 +250,13 @@ maybe_bridge_to_host() {
     # ours and stdin / signals pass through cleanly.
     exec "$bridge" "$target" "$@"
 }
+
+# Devbar ai-analytics capture gets special stdin-preserving handling BEFORE
+# any magic-byte / missing-file / bridge logic (the target is a host-only
+# Mach-O that doesn't exist in the container, so it would otherwise hit the
+# missing-file -> bridge path that drops stdin). On a match this exec's the
+# spool helper and never returns; otherwise it's a no-op and we continue.
+maybe_spool_devbar_analytics "$TARGET" "$@"
 
 # Magic-byte sniff. ELF = 0x7F 'E' 'L' 'F'. Mach-O 32/64 + fat variants
 # have a small set of magic values (0xFEEDFACE / 0xFEEDFACF, plus reverse
