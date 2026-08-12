@@ -540,9 +540,15 @@ enum TaskAction {
 #[derive(Subcommand)]
 enum AgentAction {
     /// List agents and their processes
+    ///
+    /// Reports every agent whose transcript is live or recently written,
+    /// across all recently-active sessions, and names the session each
+    /// row came from. Exits 2 (without printing a table) when no session
+    /// can be resolved — a listing that cannot be trusted is worse than
+    /// no listing.
     #[command(alias = "ls")]
     List {
-        /// Also show watcher processes
+        /// Also show watcher processes and long-idle agents
         #[arg(long, short)]
         all: bool,
     },
