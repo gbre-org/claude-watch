@@ -95,7 +95,16 @@ falls back to the current behaviour (claude reads the live host paths).
 
 Usage:
   snapshot-claude-config [--src-dir DIR] [--src-json PATH] [--dest DIR]
+                         [--neutralize-oauth]
   snapshot-claude-config --test        # run the embedded unit tests
+
+``--neutralize-oauth`` (or env ``CW_SNAPSHOT_NEUTRALIZE_OAUTH=1``, default
+off) strips the personal claude.ai OAuth from the snapshot: ``oauthAccount``
+is removed from the ``.claude.json`` snapshot and ``.credentials.json`` is
+materialized as a REAL copy with ``claudeAiOauth`` removed (``mcpOAuth``
+preserved) instead of a live symlink. This stops Claude Code from
+preferring a personal OAuth identity over a wired apiKeyHelper /
+ANTHROPIC_API_KEY corp-gateway key (the "frozen gateway spend" bug).
 """
 
 from __future__ import annotations
@@ -137,11 +146,17 @@ def _symlink_entry(src: Path, dst: Path) -> bool:
         return False
 
 
-def _snapshot_json(src_json: Path, dst_json: Path) -> bool:
+def _snapshot_json(
+    src_json: Path, dst_json: Path, neutralize_oauth: bool = False
+) -> bool:
     """Write dst_json as a decoupled snapshot of src_json.
 
     - src_json present + valid JSON  -> byte-for-byte copy (preserve
       everything claude wrote: oauthAccount, mcpServers, projects, …).
+      When ``neutralize_oauth`` is set, the top-level ``oauthAccount`` key
+      is STRIPPED and the object re-serialized (NOT a byte copy), so Claude
+      Code can't prefer a personal claude.ai OAuth identity over the wired
+      apiKeyHelper / ANTHROPIC_API_KEY corp-gateway path.
     - src_json missing / unreadable  -> write a minimal ``{}`` so claude
       has a writable top-level config at the relocated path.
     Returns True if dst_json was written."""
@@ -151,8 +166,14 @@ def _snapshot_json(src_json: Path, dst_json: Path) -> bool:
         raw = src_json.read_text(encoding="utf-8")
         # Validate it parses; if it's mid-rewrite garbage we still want a
         # usable file, so fall back to {} rather than copying corruption.
-        json.loads(raw)
-        data = raw
+        obj = json.loads(raw)
+        if neutralize_oauth and isinstance(obj, dict) and "oauthAccount" in obj:
+            # Drop the personal OAuth account marker + re-serialize so the
+            # snapshot no longer advertises a claude.ai identity.
+            obj.pop("oauthAccount", None)
+            data = json.dumps(obj, indent=2) + "\n"
+        else:
+            data = raw
     except (OSError, json.JSONDecodeError, ValueError):
         data = None
     if data is None:
@@ -176,8 +197,60 @@ def _snapshot_json(src_json: Path, dst_json: Path) -> bool:
     return True
 
 
-def build_farm(src_dir: Path, src_json: Path, dest: Path) -> bool:
+def _snapshot_credentials(src: Path, dst: Path) -> bool:
+    """Write dst as a REAL (non-symlink) copy of the ``.credentials.json``
+    at ``src`` with the top-level ``claudeAiOauth`` block REMOVED, while
+    PRESERVING ``mcpOAuth`` (MCP-server OAuth tokens must keep working).
+
+    Stripping ``claudeAiOauth`` stops Claude Code from falling back to a
+    personal claude.ai OAuth token instead of the wired apiKeyHelper /
+    ANTHROPIC_API_KEY corp gateway. Written atomically within the dest dir.
+
+    No-op returning False if ``src`` is missing / unreadable / corrupt (the
+    caller then falls back to a live symlink — fail-safe)."""
+    try:
+        raw = src.read_text(encoding="utf-8")
+        obj = json.loads(raw)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(obj, dict):
+        return False
+    obj.pop("claudeAiOauth", None)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # If a symlink is squatting the dest name (prior run / farm-derived),
+    # remove it so os.replace lands a real file, not a followed symlink.
+    try:
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+    except OSError:
+        pass
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(dst.parent), prefix=".credentials.json.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(obj, indent=2) + "\n")
+            os.replace(tmp, dst)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def build_farm(
+    src_dir: Path, src_json: Path, dest: Path, neutralize_oauth: bool = False
+) -> bool:
     """Build the symlink farm at ``dest`` + snapshot ``.claude.json``.
+
+    When ``neutralize_oauth`` is set, the snapshot ``.claude.json`` has its
+    ``oauthAccount`` stripped and ``.credentials.json`` is materialized as a
+    real OAuth-neutralized copy (``claudeAiOauth`` removed, ``mcpOAuth``
+    kept) instead of a live symlink — so a personal claude.ai OAuth
+    credential can't override the wired apiKeyHelper / corp gateway key.
 
     Returns True iff the snapshot .claude.json was produced (the caller's
     signal that CLAUDE_CONFIG_DIR is safe to export)."""
@@ -199,7 +272,16 @@ def build_farm(src_dir: Path, src_json: Path, dest: Path) -> bool:
             # owns that name in the dest.
             if name == ".claude.json":
                 continue
-            if _symlink_entry(src_dir / name, dest / name):
+            done = False
+            if neutralize_oauth and name == ".credentials.json":
+                # Real, OAuth-neutralized copy instead of a live symlink so
+                # a personal claudeAiOauth token can't be read back through
+                # the farm. On failure (corrupt/unreadable src) fall through
+                # to a symlink — fail-safe: a live symlink beats no entry.
+                if _snapshot_credentials(src_dir / name, dest / name):
+                    linked += 1
+                    done = True
+            if not done and _symlink_entry(src_dir / name, dest / name):
                 linked += 1
     else:
         print(
@@ -208,7 +290,7 @@ def build_farm(src_dir: Path, src_json: Path, dest: Path) -> bool:
             file=sys.stderr,
         )
 
-    ok = _snapshot_json(src_json, dest / ".claude.json")
+    ok = _snapshot_json(src_json, dest / ".claude.json", neutralize_oauth=neutralize_oauth)
     if ok:
         print(
             f"[snapshot-claude-config] {dest}: {linked} symlink(s) -> {src_dir}, "
@@ -326,7 +408,70 @@ def _run_tests() -> int:
     expect((dest7 / "commands").is_symlink(),
            "a squatting real entry should be replaced by the correct symlink")
 
-    for d in (root, root4, root5, root6, root7):
+    # 8. neutralize_oauth: oauthAccount stripped from the .claude.json
+    #    snapshot; everything else preserved.
+    root8 = mktmp()
+    sd8 = root8 / ".claude"
+    sd8.mkdir()
+    sj8 = root8 / ".claude.json"
+    sj8.write_text(json.dumps({
+        "numStartups": 7,
+        "oauthAccount": {"accountUuid": "abc", "emailAddress": "me@example.com"},
+        "installMethod": "native",
+    }))
+    dest8 = root8 / "dest"
+    ok8 = build_farm(sd8, sj8, dest8, neutralize_oauth=True)
+    expect(ok8, "neutralize_oauth build_farm should succeed")
+    cj8 = json.loads((dest8 / ".claude.json").read_text())
+    expect("oauthAccount" not in cj8,
+           "neutralize_oauth should strip oauthAccount from the json snapshot")
+    expect(cj8.get("numStartups") == 7 and cj8.get("installMethod") == "native",
+           "neutralize_oauth should preserve all other top-level json keys")
+    expect((dest8 / ".claude.json").exists()
+           and not (dest8 / ".claude.json").is_symlink(),
+           "neutralize_oauth json snapshot should still be a real file")
+
+    # 9. neutralize_oauth: .credentials.json becomes a REAL copy with
+    #    claudeAiOauth removed but mcpOAuth preserved (NOT a symlink).
+    root9 = mktmp()
+    sd9 = root9 / ".claude"
+    sd9.mkdir()
+    (sd9 / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {"accessToken": "tok", "refreshToken": "r"},
+        "mcpOAuth": {"some-server": {"accessToken": "keep-me"}},
+    }))
+    dest9 = root9 / "dest"
+    ok9 = build_farm(sd9, root9 / ".claude.json", dest9, neutralize_oauth=True)
+    expect(ok9, "neutralize_oauth build_farm (creds) should succeed")
+    cred9_path = dest9 / ".credentials.json"
+    expect(cred9_path.exists() and not cred9_path.is_symlink(),
+           "neutralized .credentials.json should be a real file, not a symlink")
+    cred9 = json.loads(cred9_path.read_text())
+    expect("claudeAiOauth" not in cred9,
+           "neutralize_oauth should strip claudeAiOauth from the creds snapshot")
+    expect(cred9.get("mcpOAuth", {}).get("some-server", {}).get("accessToken")
+           == "keep-me",
+           "neutralize_oauth must PRESERVE mcpOAuth in the creds snapshot")
+
+    # 10. Default-off (neutralize_oauth=False): NO change — .credentials.json
+    #     stays a symlink and oauthAccount stays in the json snapshot.
+    root10 = mktmp()
+    sd10 = root10 / ".claude"
+    sd10.mkdir()
+    (sd10 / ".credentials.json").write_text(json.dumps(
+        {"claudeAiOauth": {"accessToken": "tok"}}))
+    sj10 = root10 / ".claude.json"
+    sj10.write_text(json.dumps(
+        {"numStartups": 1, "oauthAccount": {"accountUuid": "abc"}}))
+    dest10 = root10 / "dest"
+    ok10 = build_farm(sd10, sj10, dest10)   # default neutralize_oauth=False
+    expect(ok10, "default-off build_farm should succeed")
+    expect((dest10 / ".credentials.json").is_symlink(),
+           "default-off should leave .credentials.json a symlink")
+    expect("oauthAccount" in json.loads((dest10 / ".claude.json").read_text()),
+           "default-off should preserve oauthAccount in the json snapshot")
+
+    for d in (root, root4, root5, root6, root7, root8, root9, root10):
         shutil.rmtree(d, ignore_errors=True)
 
     if failures:
@@ -338,10 +483,17 @@ def _run_tests() -> int:
     return 0
 
 
+def _env_truthy(val: str | None) -> bool:
+    return str(val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main(argv: list[str]) -> int:
     src_dir = Path(os.environ.get("CLAUDE_SNAPSHOT_SRC_DIR", DEFAULT_SRC_DIR))
     src_json = Path(os.environ.get("CLAUDE_SNAPSHOT_SRC_JSON", DEFAULT_SRC_JSON))
     dest = Path(os.environ.get("CLAUDE_SNAPSHOT_DEST", DEFAULT_DEST))
+    # Default OFF: strip personal claude.ai OAuth from the snapshot so the
+    # wired apiKeyHelper / corp gateway key wins. Flag overrides the env.
+    neutralize_oauth = _env_truthy(os.environ.get("CW_SNAPSHOT_NEUTRALIZE_OAUTH", "0"))
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -353,6 +505,8 @@ def main(argv: list[str]) -> int:
             src_json = Path(argv[i + 1]); i += 2; continue
         elif a == "--dest":
             dest = Path(argv[i + 1]); i += 2; continue
+        elif a == "--neutralize-oauth":
+            neutralize_oauth = True; i += 1; continue
         elif a in ("-h", "--help"):
             print(__doc__)
             return 0
@@ -362,7 +516,7 @@ def main(argv: list[str]) -> int:
         i += 1
     # Always exit 0 (fail-safe): the caller checks <dest>/.claude.json to
     # decide whether to export CLAUDE_CONFIG_DIR.
-    build_farm(src_dir, src_json, dest)
+    build_farm(src_dir, src_json, dest, neutralize_oauth=neutralize_oauth)
     return 0
 
 

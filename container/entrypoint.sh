@@ -532,7 +532,15 @@ fi
 if [ "${CLAUDE_CONTAINER_SNAPSHOT_CONFIG:-0}" = "1" ] \
         && [ -x /usr/local/bin/snapshot-claude-config ]; then
     _snapshot_dest="${CLAUDE_SNAPSHOT_DEST:-/tmp/claude-config}"
-    /usr/local/bin/snapshot-claude-config --dest "$_snapshot_dest" || true
+    # Neutralize personal claude.ai OAuth in the snapshot when we've
+    # force-wired the apiKeyHelper AND have a corp gateway key present:
+    # otherwise the snapshotted oauthAccount / claudeAiOauth would make
+    # Claude Code prefer the operator's personal subscription over the
+    # wired ANTHROPIC_API_KEY (gateway spend stays frozen). Default off
+    # (byte-copy snapshot) for operators without a gateway. Operator can
+    # force via CW_SNAPSHOT_NEUTRALIZE_OAUTH.
+    CW_SNAPSHOT_NEUTRALIZE_OAUTH="${CW_SNAPSHOT_NEUTRALIZE_OAUTH:-$([ "$_apikey_force" != 0 ] && [ -n "${ANTHROPIC_API_KEY:-}" ] && echo 1 || echo 0)}" \
+        /usr/local/bin/snapshot-claude-config --dest "$_snapshot_dest" || true
     if [ -f "${_snapshot_dest}/.claude.json" ]; then
         export CLAUDE_CONFIG_DIR="$_snapshot_dest"
     fi
