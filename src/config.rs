@@ -455,6 +455,30 @@ pub struct WatcherMonitorConfig {
     /// watcher-down INJECT is suppressed. Default: 30.
     #[serde(default = "default_active_window_secs")]
     pub active_window_secs: u64,
+    /// Per-watcher CAP (seconds) on the active-turn suppression of the
+    /// watcher-down inject. `suppress_inject_when_active` drops the in-pane
+    /// preemption while the main loop is actively turning, on the theory the
+    /// out-of-band claude-event still reaches the operator. But during a
+    /// long sustained active-turn stretch that suppression can persist
+    /// indefinitely — a real incident (2026-08-12): `botchat-wait` (the
+    /// operator comms channel) stayed down ~6 min with the inject suppressed
+    /// the whole time, so the operator's messages never reached the session
+    /// and he had to escalate manually.
+    ///
+    /// Once a watcher has been CONTINUOUSLY down (`WatcherState.down_since`)
+    /// at least this many seconds, the active-turn suppression is OVERRIDDEN
+    /// and the inject is FORCED even mid-turn — a comms watcher down this long
+    /// outweighs not interrupting an active turn. This is a PER-WATCHER bound,
+    /// deliberately INDEPENDENT of the shared `[suppression]` window backstop
+    /// (`max_suppression_window_secs`), which is tuned very high (86400) to
+    /// tolerate the chronically-flapping surface-and-exit event consumer and
+    /// therefore no longer bounds the honest watcher-down case. The forced
+    /// inject is still throttled by `inject_cooldown`, so a genuinely-dead
+    /// watcher re-injects at most once per cooldown window (no storm). 0
+    /// disables the cap (legacy: rely solely on the shared window backstop).
+    /// Default: 180 (3 min).
+    #[serde(default = "default_watcher_max_suppress_secs")]
+    pub max_suppress_secs: u64,
     /// Grace period (seconds) after `last_seen_running` during which a
     /// missing watcher is NOT counted toward `consecutive_missing`. Short-
     /// lived watchers (e.g. a `*-wait` watcher that exits when an event
@@ -513,6 +537,28 @@ pub struct WatcherMonitorConfig {
     /// (every instantaneous DOWN trips the gate, the pre-grace behaviour).
     #[serde(default = "default_watcher_health_grace_secs")]
     pub health_grace_secs: u64,
+    /// Clean-exit grace (seconds) for block-print-exit watchers. A watcher
+    /// that follows the fire-and-exit contract (blocks, prints its pending
+    /// batch, then `exit 0`) writes a `<name>.exit` marker immediately before
+    /// that deliberate exit. When such a marker is FRESHER than the watcher's
+    /// pidfile (proof the CURRENTLY-recorded instance exited cleanly, not a
+    /// previous one) AND younger than this window, the daemon treats the
+    /// watcher as "cleanly exited, restart pending on a live main loop" and
+    /// does NOT count a miss -- eliminating the `WATCHER(S) DOWN` flapping that
+    /// occurred whenever the (alive but busy) main loop took longer than
+    /// `grace_secs` to restart the watcher after a delivery.
+    ///
+    /// Genuine-down detection is preserved: a CRASH writes no fresh marker, so
+    /// the marker stays OLDER than the freshly-rewritten pidfile and DOWN fires
+    /// normally; a DEAD SESSION's marker ages past this window (and the
+    /// heartbeat-stale / dead_process monitors independently catch a dead
+    /// session), so a watcher that stays down is still surfaced.
+    ///
+    /// Default: 600s (10 min), aligned with the heartbeat-stale window so a
+    /// genuinely dead session is caught by heartbeat-stale at ~the same time.
+    /// Set to 0 to disable (pure `grace_secs`-only behaviour).
+    #[serde(default = "default_watcher_clean_exit_grace_secs")]
+    pub clean_exit_grace_secs: u64,
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -543,6 +589,16 @@ fn default_active_window_secs() -> u64 {
     30
 }
 
+fn default_watcher_max_suppress_secs() -> u64 {
+    // 3 min. An actively-turning main loop may legitimately defer a
+    // watcher-down inject briefly (the out-of-band claude-event still fires),
+    // but a comms watcher (e.g. botchat-wait) continuously down longer than
+    // this MUST surface even mid-turn — Andrew: "make it not work for more
+    // than 3 min at a time". Independent of the shared [suppression] window
+    // backstop, which is tuned very high to tolerate the flapping consumer.
+    180
+}
+
 fn default_watcher_event_threshold() -> u32 {
     3
 }
@@ -566,6 +622,16 @@ fn default_watcher_health_grace_secs() -> u64 {
     // cancelling whole batches of unrelated tool calls. Only a SUSTAINED outage
     // (> 3min) is a real failure worth gating on.
     180
+}
+
+fn default_watcher_clean_exit_grace_secs() -> u64 {
+    // KNOB #5 (clean-exit grace for block-print-exit watchers). A watcher that
+    // delivered its batch and exited 0 leaves a `<name>.exit` marker; while
+    // that marker is fresher than the pidfile and younger than this window the
+    // daemon does not count a miss (restart is pending on the live main loop).
+    // 600s absorbs a busy-but-alive loop's restart latency and aligns with the
+    // heartbeat-stale window so a genuinely dead session is still caught.
+    600
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1635,6 +1701,70 @@ cooldown = 300
         let config = parse_config(config_no_tmux).expect("should parse without [tmux] section");
         assert_eq!(config.tmux.dashboard_pane, "");
         assert_eq!(config.tmux.dashboard_session, "");
+        // focus_main_keys defaults to EMPTY (the FleetView return-to-main step
+        // is a no-op unless the operator sets it).
+        assert!(config.tmux.focus_main_keys.is_empty());
+    }
+
+    #[test]
+    fn test_tmux_focus_main_keys_parsed() {
+        // A [tmux] focus_main_keys array deserializes into the config field
+        // that BOTH run_daemon and the one-shot `claude-watch inject` CLI path
+        // read before calling tmux::set_focus_main_keys. Guards the wiring the
+        // CLI inject handler now relies on (previously daemon-only).
+        let cfg_str = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[tmux]
+focus_main_keys = ["Right", "Right"]
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 120
+check_interval = 10
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(cfg_str).expect("should parse with focus_main_keys");
+        assert_eq!(config.tmux.focus_main_keys, vec!["Right", "Right"]);
     }
 
     #[test]

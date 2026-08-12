@@ -69,6 +69,26 @@ def expect(cond: bool, msg: str) -> None:
         failures.append(msg)
 
 
+def first_content_line(text: str) -> str:
+    """First non-empty body line, skipping any leading YAML frontmatter.
+
+    Skill markdowns carry a `--- name/description ---` frontmatter block
+    (required for Claude Code plugin-command discoverability); the
+    human-readable opening line lives just below it. The first-line
+    assertions below target that opening line, not the `---` fence.
+    """
+    lines = text.splitlines()
+    i = 0
+    if lines and lines[0].strip() == "---":
+        i = 1
+        while i < len(lines) and lines[i].strip() != "---":
+            i += 1
+        i += 1  # skip the closing fence
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return lines[i] if i < len(lines) else ""
+
+
 # 1. The three top-level dirs exist.
 for d in (SKILLS_DIR, AGENTS_DIR, WATCHERS_DIR):
     expect(d.is_dir(), f"directory missing: {d}")
@@ -107,11 +127,11 @@ if restart.is_file():
     # process to pick up a new binary version" — the container variant
     # mirrors that intent. Sanity-check the opening line carries the
     # same idea so operators aren't confused about scope.
-    first_line = text.splitlines()[0].lower()
+    first_line = first_content_line(text).lower()
     expect(
         "restart" in first_line and "claude" in first_line.lower(),
         f"{restart} first line should describe restarting the in-container "
-        f"claude process (host parity), got: {text.splitlines()[0]!r}",
+        f"claude process (host parity), got: {first_content_line(text)!r}",
     )
 
 # 3c. restart-container.md present + references `docker compose restart`
@@ -143,12 +163,12 @@ if restart_container.is_file():
         f"entrypoint.sh -> obligations-init, RE-SEEDING obligations (the "
         f"key behavioral difference from the inner-process restart.md)",
     )
-    first_line = text.splitlines()[0].lower()
+    first_line = first_content_line(text).lower()
     expect(
         "restart" in first_line and "container" in first_line,
         f"{restart_container} first line should describe restarting the "
         f"CONTAINER (not just the inner claude process), got: "
-        f"{text.splitlines()[0]!r}",
+        f"{first_content_line(text)!r}",
     )
 
 # 3c-2. deploy-container.md present + references `make deploy-container`
@@ -189,11 +209,11 @@ if deploy_container.is_file():
         f"`make deploy-container` fails `docker: not found`) — the exact "
         f"mistake that motivated baking this skill",
     )
-    first_line = text_dc.splitlines()[0].lower()
+    first_line = first_content_line(text_dc).lower()
     expect(
         "redeploy" in first_line or "recreate" in first_line,
         f"{deploy_container} first line should describe the FULL redeploy / "
-        f"force-recreate, got: {text_dc.splitlines()[0]!r}",
+        f"force-recreate, got: {first_content_line(text_dc)!r}",
     )
 
 # 3d. self-clear.md present + references `self-clear` (the backing
@@ -220,11 +240,11 @@ if self_clear.is_file():
         f"baked at /usr/local/bin/self-clear). Without it the skill has no "
         f"backing tool.",
     )
-    first_line = text.splitlines()[0].lower()
+    first_line = first_content_line(text).lower()
     expect(
         "clear" in first_line and "context" in first_line,
         f"{self_clear} first line should describe a clean CONTEXT reset "
-        f"(inject /clear + resume), got: {text.splitlines()[0]!r}",
+        f"(inject /clear + resume), got: {first_content_line(text)!r}",
     )
 
 # 3e. distill.md present — the distillation metaskill. Structured

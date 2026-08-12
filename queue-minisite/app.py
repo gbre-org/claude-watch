@@ -480,6 +480,54 @@ def _classify_owner(
             "is_starting": False,
         }
 
+    # No agent record keyed on THIS queue id. Before falling through to the
+    # spawn-race / orphaned disambiguation, honor an owner stamped on the
+    # item by `session-task queue register` (#3615/#3617). A subagent
+    # RESUMED onto a rotated queue id (d6cb -> e8cd rebind) keeps its
+    # ORIGINAL spawn marker, so claude-watch's active-agents map still keys
+    # it under the OLD qid and `agent_by_qid.get(iid)` misses it — yet the
+    # agent is alive and running THIS item. The register-time stamp records
+    # the true owner; recover its liveness from the same state via any
+    # record carrying that agent_id (the rebound agent is present in the
+    # map under its old qid), so the dashboard shows the owner instead of
+    # "owner unknown".
+    stamped_aid = item.get("agent_id")
+    if isinstance(stamped_aid, str) and stamped_aid:
+        rec = next(
+            (
+                r
+                for r in agent_by_qid.values()
+                if isinstance(r, dict) and r.get("agent_id") == stamped_aid
+            ),
+            None,
+        )
+        if rec is not None:
+            age = rec.get("jsonl_age_seconds")
+            return {
+                "mode": "agent",
+                "alive": bool(rec.get("alive")),
+                "agent_id": stamped_aid,
+                "jsonl_age_seconds": age,
+                "jsonl_age": _humanize_age(age),
+                "jsonl_age_epoch": (now.timestamp() - age)
+                if age is not None
+                else None,
+                "is_starting": False,
+            }
+        # Owner known (stamped) but not resolvable in active-agents state
+        # (state stale, or the agent is between transcript writes). Surface
+        # the KNOWN owner rather than "owner unknown"; leave alive=None so
+        # no orphan badge fires on an ambiguous liveness signal.
+        return {
+            "mode": "agent",
+            "alive": None,
+            "agent_id": stamped_aid,
+            "jsonl_age_seconds": None,
+            "jsonl_age": "?",
+            "jsonl_age_epoch": None,
+            "is_starting": False,
+        }
+
     # No agent record yet — could be (a) spawn race (STARTING) or
     # (b) genuinely orphaned / agent-state-stale (owner unknown).
     # Disambiguate via registered_at recency.

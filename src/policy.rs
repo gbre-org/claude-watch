@@ -835,6 +835,32 @@ pub(crate) fn should_escalate_suppression(
     None
 }
 
+/// Pure predicate: has a down watcher been CONTINUOUSLY down long enough that
+/// the active-turn suppression of its inject must be OVERRIDDEN and the inject
+/// FORCED this cycle, even though the main loop is actively turning?
+///
+/// `max_down_secs` is the longest continuous-down duration (seconds) among the
+/// watchers currently in the inject path (derived from each
+/// `WatcherState.down_since`). Returns true iff the cap is enabled
+/// (`max_suppress_secs > 0`) AND that longest run has met/exceeded it.
+///
+/// This is a PER-WATCHER bound, deliberately independent of the shared
+/// cross-gate suppression window (`should_escalate_suppression`): the shared
+/// window is tuned very high (`[suppression].max_suppression_window_secs` =
+/// 86400) to tolerate the chronically-flapping surface-and-exit event consumer,
+/// which would otherwise force a destructive inject storm — so it no longer
+/// bounds the HONEST watcher-down case. This cap re-bounds that case (e.g.
+/// `botchat-wait`, the operator comms channel) at 3 min so a down comms watcher
+/// can never be silently suppressed for longer than the cap while the main loop
+/// is busy. The forced inject remains throttled by `inject_cooldown`, so a
+/// genuinely-dead watcher re-injects at most once per cooldown window.
+pub(crate) fn watcher_down_suppression_capped(
+    max_down_secs: Option<u64>,
+    max_suppress_secs: u64,
+) -> bool {
+    max_suppress_secs > 0 && max_down_secs.is_some_and(|d| d >= max_suppress_secs)
+}
+
 /// Record that a suppression-gate fired and was suppressed (the `actively_
 /// turning` path took the "skip the inject" branch). Increments the shared
 /// counter and stamps `first_suppression_at` on the 0 -> 1 transition.
@@ -5297,6 +5323,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         }
         let mut any_critical_missing = false;
         let mut missing_names: Vec<String> = Vec::new();
+        // Longest continuous-down duration (seconds) among the watchers that
+        // reach the inject path this cycle, from each `WatcherState.down_since`.
+        // Feeds the per-watcher watcher-down suppression cap below.
+        let mut max_down_secs: Option<u64> = None;
         // Pull config values into locals once to avoid borrow-checker
         // friction when we both mutate `state.watcher_health` and read
         // `config` later in the same scope.
@@ -5354,6 +5384,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     consecutive_missing: 0,
                     enabled: entry.enabled,
                     event_emitted_at: None,
+                    down_since: None,
                 });
 
             if !down {
@@ -5362,6 +5393,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // Recovery clears the quiet-path bookkeeping so the next
                 // failure starts a fresh quiet-path episode.
                 health.event_emitted_at = None;
+                // Recovery also clears the continuous-down clock so the
+                // per-watcher suppression cap (`max_suppress_secs`) measures
+                // only the CURRENT outage, not a prior one.
+                health.down_since = None;
             } else {
                 // Grace period: if the watcher was seen running within the
                 // configured grace_secs, don't count this as a miss. Short-
@@ -5398,7 +5433,49 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 if status::watcher_in_grace(last_seen_age, pidfile_age, grace_secs) {
                     continue;
                 }
+                // Clean-exit grace: a block-print-exit watcher writes a
+                // `<name>.exit` marker immediately before its deliberate
+                // `exit 0` (after delivering its batch). When that marker is
+                // FRESHER than the pidfile (so the currently-recorded instance
+                // exited cleanly, not a previous one) AND younger than
+                // clean_exit_grace_secs, the watcher is in the benign "delivered
+                // + awaiting restart on the live main loop" state — do NOT count
+                // a miss. This kills the WATCHER(S) DOWN flapping that fired
+                // whenever the (alive but busy) main loop took longer than
+                // grace_secs to restart after a delivery. A CRASH leaves the
+                // marker OLDER than the freshly-rewritten pidfile (still DOWN),
+                // and a DEAD SESSION's marker ages past the window (heartbeat-
+                // stale / dead_process independently catch a dead session), so
+                // genuine-down detection is preserved. 0 disables (legacy).
+                let clean_exit_grace = config.watcher_monitor.clean_exit_grace_secs as f64;
+                if clean_exit_grace > 0.0 {
+                    let clean_exit_age =
+                        status::watcher_clean_exit_age_secs_multi(&pid_dirs, &entry.name);
+                    if status::watcher_cleanly_exited_recently(
+                        clean_exit_age,
+                        pidfile_age,
+                        clean_exit_grace,
+                    ) {
+                        debug!(
+                            watcher = %entry.name,
+                            clean_exit_age = ?clean_exit_age,
+                            pidfile_age = ?pidfile_age,
+                            clean_exit_grace,
+                            "watcher cleanly exited (block-print-exit) — restart pending, not counting a miss"
+                        );
+                        continue;
+                    }
+                }
                 health.consecutive_missing += 1;
+                // Stamp the continuous-down clock on the first genuine
+                // (past-grace) miss of this outage. It is read by the
+                // per-watcher watcher-down suppression cap
+                // (`max_suppress_secs`) to force the inject once this specific
+                // watcher has been down too long, independent of the shared
+                // cross-gate suppression window. Cleared on recovery above.
+                if health.down_since.is_none() {
+                    health.down_since = Some(now.clone());
+                }
                 // Log after 3 consecutive misses (~30s at 10s interval)
                 if health.consecutive_missing == 3 {
                     warn!(
@@ -5477,6 +5554,17 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     WatcherDownAction::InjectFallback => {
                         any_critical_missing = true;
                         missing_names.push(entry.name.clone());
+                        // Track how long THIS watcher has been continuously
+                        // down for the per-watcher suppression cap.
+                        if let Some(d) = health
+                            .down_since
+                            .as_deref()
+                            .and_then(elapsed_since)
+                            .map(|e| e as u64)
+                        {
+                            max_down_secs =
+                                Some(max_down_secs.map_or(d, |m: u64| m.max(d)));
+                        }
                     }
                 }
             }
@@ -5603,6 +5691,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 config.suppression.max_consecutive_suppressions,
                 config.suppression.max_suppression_window_secs,
             );
+            // Per-watcher watcher-down suppression cap (2026-08-12 incident:
+            // botchat-wait, the operator comms channel, stayed down ~6 min with
+            // the inject suppressed the whole time because the main loop was
+            // continuously active). The SHARED suppression window backstop above
+            // can't fix this without re-introducing the destructive claude-event-
+            // watch storm (that's exactly why it was tuned to 86400). So bound
+            // suppression PER-WATCHER: once any down watcher's own continuous-down
+            // clock (`down_since`) exceeds `max_suppress_secs` (default 180 = 3
+            // min), force the inject regardless of `actively_turning`. Still
+            // throttled by `inject_cooldown`, so no storm.
+            let down_cap_exceeded = watcher_down_suppression_capped(
+                max_down_secs,
+                config.watcher_monitor.max_suppress_secs,
+            );
             if should_inject && !api_retrying {
                 let missing_list = missing_names.join(", ");
                 let watcher_reason = format!(
@@ -5611,7 +5713,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     missing_list,
                 );
 
-                if actively_turning && escalation.is_none() {
+                if actively_turning && escalation.is_none() && !down_cap_exceeded {
                     // Suppression path: still emit the structured
                     // claude-event (out-of-band notify) and log it,
                     // but do NOT interrupt or inject into the pane.
@@ -5764,7 +5866,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // and there is no working quiet channel to defer to when the
                     // event consumer is the down watcher.
                     let wd_decision = watcher_down_obligation_decision(
-                        escalation.is_some() || consumer_down,
+                        escalation.is_some() || consumer_down || down_cap_exceeded,
                         state.watcher_down_obligation_armed_at.as_deref(),
                         config.general.obligation_dwell_secs,
                         wd_active_subagents,
@@ -5846,6 +5948,27 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                                 "reason": reason.as_str(),
                                 "consecutive_suppressions": state.consecutive_suppressions,
                                 "first_suppression_at": state.first_suppression_at,
+                                "missing": missing_names,
+                            }),
+                        );
+                    } else if down_cap_exceeded && actively_turning {
+                        // Per-watcher cap forced the inject past active-turn
+                        // suppression (the shared escalation did NOT fire). Log
+                        // distinctly so the "down comms watcher surfaced despite
+                        // a busy main loop" case is greppable.
+                        warn!(
+                            missing = %missing_list,
+                            max_down_secs = ?max_down_secs,
+                            max_suppress_secs = config.watcher_monitor.max_suppress_secs,
+                            "watcher-down inject forced: watcher down past per-watcher suppression cap — overriding main-loop-active suppression"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "watcher_down_suppression_capped",
+                            serde_json::json!({
+                                "site": "watcher_monitor",
+                                "max_down_secs": max_down_secs,
+                                "max_suppress_secs": config.watcher_monitor.max_suppress_secs,
                                 "missing": missing_names,
                             }),
                         );
@@ -8573,6 +8696,72 @@ cooldown = 300
         );
     }
 
+    // --- Per-watcher watcher-down suppression cap tests (2026-08-12) ---
+    //
+    // Real incident: botchat-wait (operator comms) stayed down ~6 min with
+    // the watcher-down inject suppressed the whole time because the main loop
+    // was continuously active. The shared cross-gate window backstop above
+    // can't fix it without re-introducing the claude-event-watch storm (why
+    // it's tuned very high). `watcher_down_suppression_capped` is the
+    // independent per-watcher bound: once a watcher's own continuous-down
+    // clock exceeds `max_suppress_secs` (default 180 = 3 min), force the
+    // inject regardless of active-turn suppression.
+
+    #[test]
+    fn test_watcher_down_cap_fires_when_down_exceeds_threshold() {
+        // Watcher continuously down 200s, cap 180s: force the inject.
+        assert!(watcher_down_suppression_capped(Some(200), 180));
+    }
+
+    #[test]
+    fn test_watcher_down_cap_fires_at_exact_threshold() {
+        // Boundary is >= so exactly at the cap forces the inject. This is
+        // the incident-fix guarantee: a comms watcher down for the full
+        // 3 min surfaces even mid-turn.
+        assert!(watcher_down_suppression_capped(Some(180), 180));
+    }
+
+    #[test]
+    fn test_watcher_down_cap_holds_below_threshold() {
+        // Down only 179s: still under the cap, normal active-turn
+        // suppression continues to hold the inject this cycle.
+        assert!(!watcher_down_suppression_capped(Some(179), 180));
+    }
+
+    #[test]
+    fn test_watcher_down_cap_disabled_when_zero() {
+        // max_suppress_secs=0 disables the cap entirely (escape hatch:
+        // fall back to the shared window backstop only). Even a watcher
+        // down for a day must NOT force via this path.
+        assert!(!watcher_down_suppression_capped(Some(86400), 0));
+    }
+
+    #[test]
+    fn test_watcher_down_cap_no_down_data_never_fires() {
+        // No down-duration data (no watcher reached the inject path with a
+        // stamped down_since) → the cap can't fire. Fail-safe: absence of a
+        // clock never fabricates a force-inject.
+        assert!(!watcher_down_suppression_capped(None, 180));
+    }
+
+    #[test]
+    fn test_watcher_down_cap_independent_of_shared_suppression_counter() {
+        // The whole point of this cap: it does NOT consult
+        // consecutive_suppressions / first_suppression_at, so it stays
+        // effective even when the shared backstop is neutered (the 10000 /
+        // 86400 tuning that tolerates the flapping event consumer). A state
+        // with a pristine shared counter (would NOT escalate) still force-
+        // injects via the per-watcher clock.
+        let state = State::default();
+        assert_eq!(
+            should_escalate_suppression(&state, 10000, 86400),
+            None,
+            "shared backstop must not escalate here"
+        );
+        // ...but the per-watcher cap does, from the down-duration alone.
+        assert!(watcher_down_suppression_capped(Some(240), 180));
+    }
+
     // --- Regression test for the cooldown-bump bug (2026-04-28) ---
     //
     // Pre-fix, the watcher_monitor suppression path bumped
@@ -9201,6 +9390,7 @@ max_stuck_secs = {max_stuck}
             consecutive_missing: 5,
             enabled: true,
             event_emitted_at: Some("2026-04-28T12:00:00+00:00".to_string()),
+            down_since: None,
         };
         // Mirror the recovery branch:
         health.last_seen_running = Some("2026-04-28T12:05:00+00:00".to_string());

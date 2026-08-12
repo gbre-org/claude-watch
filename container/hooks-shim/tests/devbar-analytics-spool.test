@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Tests for container/hooks-shim/devbar-analytics-spool.
+
+Covers the stdin -> path-rewritten JSON -> atomic spool-file behaviour that
+approach B relies on. Runs directly on Linux (no container needed). Each case
+uses its own tmp spool dir + a fully-specified env so the container's ambient
+CLAUDE_* env never leaks into the result.
+
+Coverage:
+  - Basic spool: JSON stdin -> exactly one .json file, valid JSON, no .tmp.
+  - Path rewrite (derived map): transcript_path + cwd container prefixes
+    rewritten to host prefixes derived from CLAUDE_HOST_PROJECT_DIR.
+  - Prefix boundary: `/home/hndrewaall/.claude` does NOT rewrite a sibling
+    like `/home/hndrewaall/.claude-backup`.
+  - Explicit CLAUDE_DEVBAR_ANALYTICS_PATH_MAP merges over / overrides derived.
+  - Non-JSON payload -> literal-replace fallback still spools.
+  - Empty stdin -> no file, exit 0.
+  - CLAUDE_DEVBAR_ANALYTICS_SPOOL=0 -> no file, exit 0.
+  - No derivable host map (no CLAUDE_HOST_* env) -> spooled unrewritten.
+
+Run:  ./devbar-analytics-spool.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "devbar-analytics-spool"
+
+if not SCRIPT.exists():
+    print(f"FAIL: cannot locate devbar-analytics-spool at {SCRIPT}", file=sys.stderr)
+    sys.exit(2)
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+        print(f"  -> FAIL: {msg}")
+
+
+# A fixed container HOME so the derived container-side prefixes are stable
+# regardless of the test runner's real $HOME.
+CONTAINER_HOME = "/home/hndrewaall"
+
+
+def run_spool(
+    payload: str,
+    spool_dir: str,
+    *,
+    extra_env: dict | None = None,
+    clear_env: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run devbar-analytics-spool with `payload` on stdin.
+
+    clear_env=True builds a minimal env (PATH + HOME + spool dir) so ambient
+    CLAUDE_* vars can't perturb the result; extra_env overlays on top.
+    """
+    if clear_env:
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": CONTAINER_HOME,
+            "CLAUDE_DEVBAR_ANALYTICS_SPOOL_DIR": spool_dir,
+        }
+    else:
+        env = os.environ.copy()
+        env["HOME"] = CONTAINER_HOME
+        env["CLAUDE_DEVBAR_ANALYTICS_SPOOL_DIR"] = spool_dir
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [str(SCRIPT), "/Applications/devbar.app/Contents/MacOS/devbar",
+         "ai-analytics", "capture"],
+        input=payload,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def spool_files(spool_dir: str) -> list[Path]:
+    d = Path(spool_dir)
+    if not d.exists():
+        return []
+    return sorted(p for p in d.iterdir() if p.is_file() and p.suffix == ".json")
+
+
+def tmp_files(spool_dir: str) -> list[Path]:
+    d = Path(spool_dir)
+    if not d.exists():
+        return []
+    return [p for p in d.iterdir() if p.name.startswith(".") and p.name.endswith(".tmp")]
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+def test_basic_spool_valid_json() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({"hook_event_name": "Stop", "session_id": "abc"})
+        r = run_spool(payload, spool, extra_env={"CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos"})
+        expect(r.returncode == 0, f"basic: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        files = spool_files(spool)
+        expect(len(files) == 1, f"basic: expected exactly 1 spool file, got {len(files)}")
+        if files:
+            obj = json.loads(files[0].read_text())
+            expect(obj.get("session_id") == "abc", f"basic: payload roundtrip broken: {obj}")
+        expect(tmp_files(spool) == [], f"basic: leftover .tmp files: {tmp_files(spool)}")
+
+
+def test_path_rewrite_derived_map() -> None:
+    """transcript_path + cwd rewritten from container -> host prefixes."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({
+            "transcript_path": f"{CONTAINER_HOME}/.claude/projects/foo/sess.jsonl",
+            "cwd": f"{CONTAINER_HOME}/repos/claude-watch",
+            "unrelated": "/home/hndrewaall/.local/state/keep-me",
+        })
+        r = run_spool(payload, spool, extra_env={"CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos"})
+        expect(r.returncode == 0, f"rewrite: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        files = spool_files(spool)
+        expect(len(files) == 1, f"rewrite: expected 1 file, got {len(files)}")
+        if files:
+            obj = json.loads(files[0].read_text())
+            expect(obj["transcript_path"] == "/Users/hallandrew/.claude/projects/foo/sess.jsonl",
+                   f"rewrite: transcript_path not rewritten: {obj['transcript_path']}")
+            expect(obj["cwd"] == "/Users/hallandrew/repos/claude-watch",
+                   f"rewrite: cwd not rewritten: {obj['cwd']}")
+            # .local is NOT in the default map -> left untouched.
+            expect(obj["unrelated"] == "/home/hndrewaall/.local/state/keep-me",
+                   f"rewrite: unmapped prefix was touched: {obj['unrelated']}")
+
+
+def test_prefix_boundary_no_false_match() -> None:
+    """A sibling dir sharing a prefix substring is not rewritten."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({"p": f"{CONTAINER_HOME}/.claude-backup/x"})
+        r = run_spool(payload, spool, extra_env={"CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos"})
+        files = spool_files(spool)
+        if files:
+            obj = json.loads(files[0].read_text())
+            expect(obj["p"] == f"{CONTAINER_HOME}/.claude-backup/x",
+                   f"boundary: sibling prefix wrongly rewritten: {obj['p']}")
+
+
+def test_explicit_path_map_override() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({"transcript_path": f"{CONTAINER_HOME}/.claude/t.jsonl",
+                              "custom": "/data/in/thing"})
+        r = run_spool(payload, spool, extra_env={
+            "CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos",
+            "CLAUDE_DEVBAR_ANALYTICS_PATH_MAP": "/data/in=/host/out",
+        })
+        files = spool_files(spool)
+        expect(len(files) == 1, f"explicit-map: expected 1 file, got {len(files)}")
+        if files:
+            obj = json.loads(files[0].read_text())
+            # derived map still applies
+            expect(obj["transcript_path"] == "/Users/hallandrew/.claude/t.jsonl",
+                   f"explicit-map: derived entry lost: {obj['transcript_path']}")
+            # explicit entry added
+            expect(obj["custom"] == "/host/out/thing",
+                   f"explicit-map: explicit entry not applied: {obj['custom']}")
+
+
+def test_non_json_payload_literal_fallback() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = f"not json but has {CONTAINER_HOME}/.claude/x in it"
+        r = run_spool(payload, spool, extra_env={"CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos"})
+        expect(r.returncode == 0, f"non-json: expected exit 0, got {r.returncode}")
+        files = spool_files(spool)
+        expect(len(files) == 1, f"non-json: expected 1 file, got {len(files)}")
+        if files:
+            text = files[0].read_text()
+            expect("/Users/hallandrew/.claude/x" in text,
+                   f"non-json: literal replace not applied: {text!r}")
+
+
+def test_empty_stdin_no_file() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        r = run_spool("", spool, extra_env={"CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos"})
+        expect(r.returncode == 0, f"empty: expected exit 0, got {r.returncode}")
+        expect(spool_files(spool) == [], f"empty: should write no file, got {spool_files(spool)}")
+
+
+def test_disabled_no_file() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({"x": 1})
+        r = run_spool(payload, spool, extra_env={
+            "CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos",
+            "CLAUDE_DEVBAR_ANALYTICS_SPOOL": "0",
+        })
+        expect(r.returncode == 0, f"disabled: expected exit 0, got {r.returncode}")
+        expect(spool_files(spool) == [], f"disabled: should write no file, got {spool_files(spool)}")
+
+
+def test_no_host_env_spools_unrewritten() -> None:
+    """No CLAUDE_HOST_* env -> empty map -> payload spooled as-is."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({"transcript_path": f"{CONTAINER_HOME}/.claude/t.jsonl"})
+        r = run_spool(payload, spool)  # clear_env, no CLAUDE_HOST_* set
+        expect(r.returncode == 0, f"no-host-env: expected exit 0, got {r.returncode}")
+        files = spool_files(spool)
+        expect(len(files) == 1, f"no-host-env: expected 1 file, got {len(files)}")
+        if files:
+            obj = json.loads(files[0].read_text())
+            expect(obj["transcript_path"] == f"{CONTAINER_HOME}/.claude/t.jsonl",
+                   f"no-host-env: path should be unrewritten: {obj['transcript_path']}")
+
+
+def test_config_dir_relocated_prefix_rewrite() -> None:
+    """CLAUDE_CONFIG_DIR relocated off $HOME (e.g. /tmp/claude-config) is
+    rewritten to {host_home}/.claude — the real container shape where the
+    transcript_path prefix is NOT {home}/.claude."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({
+            "transcript_path": "/tmp/claude-config/projects/foo/sess.jsonl",
+            # {home}/.claude entry still applies alongside the config-dir entry
+            "other": f"{CONTAINER_HOME}/.claude/projects/bar/x.jsonl",
+        })
+        r = run_spool(payload, spool, extra_env={
+            "CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos",
+            "CLAUDE_CONFIG_DIR": "/tmp/claude-config",
+        })
+        expect(r.returncode == 0, f"config-dir: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
+        files = spool_files(spool)
+        expect(len(files) == 1, f"config-dir: expected 1 file, got {len(files)}")
+        if files:
+            obj = json.loads(files[0].read_text())
+            expect(obj["transcript_path"] == "/Users/hallandrew/.claude/projects/foo/sess.jsonl",
+                   f"config-dir: transcript_path not rewritten: {obj['transcript_path']}")
+            expect(obj["other"] == "/Users/hallandrew/.claude/projects/bar/x.jsonl",
+                   f"config-dir: {{home}}/.claude entry lost: {obj['other']}")
+
+
+def test_config_dir_equal_home_claude_no_dup() -> None:
+    """When CLAUDE_CONFIG_DIR == {home}/.claude, no separate/duplicate entry is
+    needed and the normal {home}/.claude rewrite still works."""
+    with tempfile.TemporaryDirectory() as td:
+        spool = os.path.join(td, "spool")
+        payload = json.dumps({"transcript_path": f"{CONTAINER_HOME}/.claude/t.jsonl"})
+        r = run_spool(payload, spool, extra_env={
+            "CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos",
+            "CLAUDE_CONFIG_DIR": f"{CONTAINER_HOME}/.claude",
+        })
+        files = spool_files(spool)
+        expect(len(files) == 1, f"config-dir-eq: expected 1 file, got {len(files)}")
+        if files:
+            obj = json.loads(files[0].read_text())
+            expect(obj["transcript_path"] == "/Users/hallandrew/.claude/t.jsonl",
+                   f"config-dir-eq: path not rewritten: {obj['transcript_path']}")
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+TESTS = [
+    test_basic_spool_valid_json,
+    test_path_rewrite_derived_map,
+    test_prefix_boundary_no_false_match,
+    test_explicit_path_map_override,
+    test_non_json_payload_literal_fallback,
+    test_empty_stdin_no_file,
+    test_disabled_no_file,
+    test_no_host_env_spools_unrewritten,
+    test_config_dir_relocated_prefix_rewrite,
+    test_config_dir_equal_home_claude_no_dup,
+]
+
+for t in TESTS:
+    print(f"--- {t.__name__}")
+    try:
+        t()
+        print(f"PASS  {t.__name__}")
+    except Exception as e:
+        failures.append(f"{t.__name__}: unexpected exception: {e}")
+        print(f"FAIL  {t.__name__}: unexpected exception: {e}")
+
+if failures:
+    print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+    for f in failures:
+        print(f"  - {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"\nAll {len(TESTS)} tests passed.")

@@ -1287,6 +1287,273 @@ def test_project_apikeyhelper_env_var_supplies_path() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# apiKeyHelper WRAPPER rewrite (--apikey-wrapper / CW_APIKEY_WRAPPER)
+# ---------------------------------------------------------------------------
+#
+# When --apikey-wrapper points at a container-runnable helper, a poison
+# (non-runnable) apiKeyHelper is REWRITTEN to that wrapper instead of being
+# dropped (USER tier) / emptied (PROJECT tier). Strictly gated: if the
+# wrapper itself is not runnable here, we fall back to the legacy behaviour.
+
+
+def _run_helper_wrapper(
+    input_path: str,
+    output_path: str,
+    wrapper: str,
+    project_settings_path: str | None = None,
+    use_env: bool = False,
+    force: bool | None = None,
+    force_via_env: bool = False,
+) -> tuple[str, str]:
+    cmd = [
+        str(SCRIPT), "--input", input_path, "--output", output_path,
+        "--quiet", "--inject-obligations", "0", "--mcp-autoapprove", "0",
+    ]
+    if project_settings_path is not None:
+        cmd += ["--neutralize-project-apikeyhelper", project_settings_path]
+    env = dict(os.environ)
+    env.pop("CLAUDE_SHIM_PATTERNS", None)
+    env.pop("CLAUDE_CONTAINER_OBLIGATIONS", None)
+    env.pop("CLAUDE_SHIM_OBLIGATIONS_ONLY", None)
+    env.pop("CLAUDE_MCP_AUTOAPPROVE", None)
+    env.pop("CLAUDE_PROJECT_SETTINGS_PATH", None)
+    env.pop("CW_APIKEY_WRAPPER", None)
+    env.pop("CW_FORCE_APIKEY_WRAPPER", None)
+    if use_env:
+        env["CW_APIKEY_WRAPPER"] = wrapper
+    else:
+        cmd += ["--apikey-wrapper", wrapper]
+    if force is not None:
+        if force_via_env:
+            env["CW_FORCE_APIKEY_WRAPPER"] = "1" if force else "0"
+        else:
+            cmd += ["--force-apikey-wrapper", "1" if force else "0"]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"helper exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout, result.stderr
+
+
+def _make_runnable_wrapper(td: Path) -> Path:
+    wrapper = td / "cw-apikey-helper"
+    wrapper.write_text("#!/bin/sh\nprintf '%s\\n' \"$ANTHROPIC_API_KEY\"\n")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_apikeyhelper_rewritten_to_wrapper_when_macho() -> None:
+    """A poison USER-tier Mach-O helper is REWRITTEN to a runnable wrapper
+    (not dropped) when --apikey-wrapper is supplied."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        macho = td / "helper-macho"
+        macho.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        macho.chmod(0o755)
+        wrapper = _make_runnable_wrapper(td)
+        write_json(inp, {"apiKeyHelper": f"{macho} auth claude"})
+        _run_helper_wrapper(str(inp), str(out), str(wrapper))
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == str(wrapper),
+            f"wrapper: Mach-O user helper should be rewritten to wrapper, "
+            f"got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_apikeyhelper_wrapper_ignored_when_wrapper_not_runnable() -> None:
+    """When the wrapper path is itself not runnable here, fall back to the
+    legacy DROP (never wire a broken helper)."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        macho = td / "helper-macho"
+        macho.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        macho.chmod(0o755)
+        # A Mach-O "wrapper" is not runnable on Linux => guard rejects it.
+        bad_wrapper = td / "bad-wrapper"
+        bad_wrapper.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        bad_wrapper.chmod(0o755)
+        write_json(inp, {"apiKeyHelper": f"{macho} auth claude"})
+        _run_helper_wrapper(str(inp), str(out), str(bad_wrapper))
+        result = load_output(out)
+        expect(
+            "apiKeyHelper" not in result,
+            f"wrapper: non-runnable wrapper should fall back to drop, "
+            f"got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_apikeyhelper_wrapper_noop_when_user_helper_runnable() -> None:
+    """A runnable USER-tier helper is left VERBATIM even when a wrapper is
+    supplied (the wrapper only replaces a poison helper)."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        elf = td / "helper-elf"
+        elf.write_bytes(b"\x7fELF" + b"\x00" * 32)
+        elf.chmod(0o755)
+        wrapper = _make_runnable_wrapper(td)
+        cmd = f"{elf} auth claude"
+        write_json(inp, {"apiKeyHelper": cmd})
+        _run_helper_wrapper(str(inp), str(out), str(wrapper))
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == cmd,
+            f"wrapper: runnable user helper should be kept verbatim, "
+            f"got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_project_apikeyhelper_rewritten_to_wrapper() -> None:
+    """A poison PROJECT-tier helper is REWRITTEN to the wrapper (instead of
+    apiKeyHelper="") when --apikey-wrapper is supplied."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        proj = td / "proj-settings.json"
+        wrapper = _make_runnable_wrapper(td)
+        write_json(inp, {"hooks": {}})
+        write_json(proj, {
+            "apiKeyHelper": "'/Applications/devbar.app/Contents/MacOS/devbar' auth claude",
+        })
+        _run_helper_wrapper(str(inp), str(out), str(wrapper),
+                            project_settings_path=str(proj))
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == str(wrapper),
+            f"wrapper: poison project helper should be rewritten to wrapper, "
+            f"got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_apikeyhelper_wrapper_from_env_var() -> None:
+    """CW_APIKEY_WRAPPER env var supplies the wrapper when the flag is absent."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        macho = td / "helper-macho"
+        macho.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        macho.chmod(0o755)
+        wrapper = _make_runnable_wrapper(td)
+        write_json(inp, {"apiKeyHelper": f"{macho} auth"})
+        _run_helper_wrapper(str(inp), str(out), str(wrapper), use_env=True)
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == str(wrapper),
+            f"wrapper: CW_APIKEY_WRAPPER env var should supply wrapper, "
+            f"got {result.get('apiKeyHelper')!r}",
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# FORCE-wire the wrapper (--force-apikey-wrapper / CW_FORCE_APIKEY_WRAPPER)
+# ---------------------------------------------------------------------------
+#
+# The frozen-spend fix: when NEITHER tier carries a poison helper to rewrite,
+# force-wire SETS apiKeyHelper to the (runnable) wrapper anyway so the
+# container-claude routes auth through the wrapper's corp gateway key instead
+# of preferring a snapshotted claude.ai OAuth credential (which it does when
+# apiKeyHelper is null). Strictly gated: never clobbers a runnable helper,
+# never wires a non-runnable wrapper, off by default.
+
+
+def test_apikeyhelper_forced_when_no_source_helper() -> None:
+    """No apiKeyHelper anywhere + force on + runnable wrapper => apiKeyHelper
+    is SET to the wrapper (the frozen-spend fix)."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        wrapper = _make_runnable_wrapper(td)
+        write_json(inp, {"hooks": {}})
+        _run_helper_wrapper(str(inp), str(out), str(wrapper), force=True)
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == str(wrapper),
+            f"force: apiKeyHelper should be forced to wrapper when no source "
+            f"helper present, got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_apikeyhelper_not_forced_by_default() -> None:
+    """Without force (default), a missing source helper stays absent -- the
+    legacy behaviour is preserved for the poison-rewrite-only use case."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        wrapper = _make_runnable_wrapper(td)
+        write_json(inp, {"hooks": {}})
+        _run_helper_wrapper(str(inp), str(out), str(wrapper))
+        result = load_output(out)
+        expect(
+            "apiKeyHelper" not in result,
+            f"force: without --force-apikey-wrapper, absent helper should stay "
+            f"absent, got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_apikeyhelper_force_does_not_clobber_runnable_helper() -> None:
+    """Force must NOT overwrite a genuine runnable USER-tier helper."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        elf = td / "helper-elf"
+        elf.write_bytes(b"\x7fELF" + b"\x00" * 32)
+        elf.chmod(0o755)
+        wrapper = _make_runnable_wrapper(td)
+        cmd = f"{elf} auth claude"
+        write_json(inp, {"apiKeyHelper": cmd})
+        _run_helper_wrapper(str(inp), str(out), str(wrapper), force=True)
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == cmd,
+            f"force: runnable helper must be kept verbatim, "
+            f"got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_apikeyhelper_force_noop_when_wrapper_not_runnable() -> None:
+    """Force with a non-runnable wrapper must NOT wire a broken helper."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        bad_wrapper = td / "bad-wrapper"
+        bad_wrapper.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        bad_wrapper.chmod(0o755)
+        write_json(inp, {"hooks": {}})
+        _run_helper_wrapper(str(inp), str(out), str(bad_wrapper), force=True)
+        result = load_output(out)
+        expect(
+            "apiKeyHelper" not in result,
+            f"force: non-runnable wrapper must not be wired, "
+            f"got {result.get('apiKeyHelper')!r}",
+        )
+
+
+def test_apikeyhelper_force_via_env_var() -> None:
+    """CW_FORCE_APIKEY_WRAPPER=1 env var enables force when the flag is absent."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        inp, out = td / "in.json", td / "out.json"
+        wrapper = _make_runnable_wrapper(td)
+        write_json(inp, {"hooks": {}})
+        _run_helper_wrapper(str(inp), str(out), str(wrapper),
+                            force=True, force_via_env=True)
+        result = load_output(out)
+        expect(
+            result.get("apiKeyHelper") == str(wrapper),
+            f"force: CW_FORCE_APIKEY_WRAPPER env var should enable force, "
+            f"got {result.get('apiKeyHelper')!r}",
+        )
+
+
 TESTS = [
     test_no_hooks_key_passthrough,
     test_empty_hooks_dict_passthrough,
@@ -1336,6 +1603,16 @@ TESTS = [
     test_project_apikeyhelper_noop_when_project_file_missing,
     test_project_apikeyhelper_user_drop_and_project_neutralize_coexist,
     test_project_apikeyhelper_env_var_supplies_path,
+    test_apikeyhelper_rewritten_to_wrapper_when_macho,
+    test_apikeyhelper_wrapper_ignored_when_wrapper_not_runnable,
+    test_apikeyhelper_wrapper_noop_when_user_helper_runnable,
+    test_project_apikeyhelper_rewritten_to_wrapper,
+    test_apikeyhelper_wrapper_from_env_var,
+    test_apikeyhelper_forced_when_no_source_helper,
+    test_apikeyhelper_not_forced_by_default,
+    test_apikeyhelper_force_does_not_clobber_runnable_helper,
+    test_apikeyhelper_force_noop_when_wrapper_not_runnable,
+    test_apikeyhelper_force_via_env_var,
 ]
 
 for t in TESTS:

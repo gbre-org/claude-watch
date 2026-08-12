@@ -1,3 +1,7 @@
+---
+name: edit-host-mounts
+description: "Probe the host for bind-mount candidates (gh token, gitconfig, ssh-agent socket, repo roots) and write/update the operator's docker-compose.override.yml — re-runnable, never clobbers"
+---
 Probe the host for bind-mount candidates (gh CLI token, gitconfig, ssh-agent socket, work-private bare-repo paths, etc.) and write / update the operator's `~/.config/claude-container/docker-compose.override.yml` (the stable config-dir location the deploy wires `COMPOSE_FILE` at) with the detected mounts. Re-runnable: parses the existing override (if any), proposes adds / removes / changes, confirms with the operator, then writes — never blows the file away.
 
 ## When to invoke

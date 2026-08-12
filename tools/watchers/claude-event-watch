@@ -306,6 +306,28 @@ print_restart_banner() {
     echo "===="
 }
 
+# Clean-exit marker. Written immediately before this watcher's DELIBERATE
+# `exit 0` (after it has blocked, collected a batch, and printed it), the
+# `<name>.exit` file tells the claude-watch daemon's watcher-monitor that THIS
+# instance exited CLEANLY and a restart is pending — so the normal
+# delivery->restart gap on a busy-but-alive main loop is NOT mistaken for a
+# crash / genuine WATCHER(S) DOWN. The daemon keys off the marker's mtime and
+# requires it to be FRESHER than the pidfile (so a crash-after-restart, which
+# writes no new marker, still fires DOWN) and younger than
+# [watcher_monitor].clean_exit_grace_secs. The marker lives beside the lockfile
+# so it lands in a directory the daemon scans (/var/run/claude by default); its
+# basename is the fixed `<name>.exit` the daemon reads (NOT the uid-suffixed
+# fallback lock basename). Content is the exit epoch, for humans only.
+#
+# STRICTLY best-effort: a write failure (read-only dir, etc.) must never break
+# event delivery — the watcher's core contract. On the fallback lock path
+# (/tmp, unprivileged non-container hosts) the marker lands where the daemon
+# does not scan, harmlessly degrading to the pre-existing grace_secs behaviour.
+CLEAN_EXIT_MARKER="$(dirname "$LOCKFILE")/claude-event-watch.exit"
+write_clean_exit_marker() {
+    date +%s >"$CLEAN_EXIT_MARKER" 2>/dev/null || true
+}
+
 # Rotate consumed.jsonl when it exceeds LOG_MAX_LINES. Keeps last N rotations
 # (consumed.jsonl.1 .. consumed.jsonl.N). Cheap line-count check before each
 # append batch.
@@ -560,6 +582,12 @@ while true; do
     if find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null | grep -q .; then
         collect_burst
         print_pending || true
+        # Mark THIS instance as a clean block-print-exit BEFORE announcing the
+        # restart, so the daemon sees the marker the moment we exit (see
+        # write_clean_exit_marker). Only the deliberate exit-0 delivery path
+        # writes it; error exits (lock refused, inotify error, bad args) do NOT,
+        # so a crash is never mislabelled as a clean exit.
+        write_clean_exit_marker
         print_restart_banner
         exit 0
     fi

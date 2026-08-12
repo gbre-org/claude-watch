@@ -1,3 +1,7 @@
+---
+name: claude-code-restart
+description: "Restart the in-container Claude Code process (inner `claude`) via cwsr to pick up a new binary version — rolls the binary only, NOT the container, and does not clear context"
+---
 Restart the in-container Claude Code process to pick up a new binary version. This restarts CLAUDE CODE (the inner `claude` process), NOT the container — it does NOT clear context; it fully exits the inner `claude` process and respawns it inside the same tmux pane via `cwsr`.
 
 **This rolls the Claude Code binary only — NOT the container.** It does NOT re-run `entrypoint.sh`, does NOT re-seed obligations, does NOT pick up new bind-mounts / changed entrypoint-time env vars / freshly-baked skills. For an actual CONTAINER restart (re-run entrypoint, re-seed obligations, pick up a rebuilt image), use the sibling `/claude-container:restart-container` skill instead.
