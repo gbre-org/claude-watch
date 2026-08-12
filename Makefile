@@ -160,13 +160,16 @@ test-cron-toggle:
 # cross-arch hooks — ELF passthrough, Mach-O / unknown / missing no-op,
 # dedup flag file), the generate-hooks-shim-settings rewrite tests
 # (container-local settings.json with every hook command wrapped in
-# /usr/local/bin/exec-hook), AND the generate-project-mcp-json tests
+# /usr/local/bin/exec-hook), the generate-project-mcp-json tests
 # (project-tier .mcp.json with MCP server commands wrapped, the v21
-# follow-up fix). All run directly on Linux against synthetic inputs;
-# no container needed.
+# follow-up fix), AND the devbar-analytics-spool tests (stdin-preserving
+# spool + container->host path rewrite for the `devbar ai-analytics
+# capture` hook, approach B). All run directly on Linux against synthetic
+# inputs; no container needed.
 test-hooks-shim:
 	container/hooks-shim/tests/exec-hook.test
 	container/hooks-shim/tests/exec-hook-bridge.test
+	container/hooks-shim/tests/devbar-analytics-spool.test
 	container/hooks-shim/tests/generate-hooks-shim-settings.test
 	container/hooks-shim/tests/generate-project-mcp-json.test
 
