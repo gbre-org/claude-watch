@@ -49,6 +49,7 @@ def run_helper(
     env_patterns: str | None = None,
     http_bridge: str | None = None,
     env_http_bridge: str | None = None,
+    baseline_bridge: str | None = None,
     bearer_env: str | None = None,
     bearer_value: str | None = None,
 ) -> tuple[str, str]:
@@ -59,11 +60,17 @@ def run_helper(
         cmd += ["--shim-patterns", patterns]
     if http_bridge is not None:
         cmd += ["--http-bridge", http_bridge]
+    if baseline_bridge is not None:
+        cmd += ["--baseline-bridge", baseline_bridge]
     if bearer_env is not None:
         cmd += ["--bearer-env", bearer_env]
     env = dict(os.environ)
     env.pop("CLAUDE_SHIM_PATTERNS", None)
     env.pop("CLAUDE_MCP_HTTP_BRIDGE", None)
+    # Isolate from any baked/env baseline bridge map so existing tests see
+    # exactly the source servers (individual tests opt into a baseline via
+    # the baseline_bridge param).
+    env.pop("CLAUDE_MCP_BASELINE_BRIDGE", None)
     # Always start from a clean slate for the default bearer env var.
     # Individual tests opt into setting it via `bearer_value`.
     env.pop("CLAUDE_HOST_HOOK_BRIDGE_BEARER", None)
@@ -819,8 +826,10 @@ def test_http_bridge_empty_no_rewrite() -> None:
         )
 
 
-def test_http_bridge_unknown_name_no_rewrite() -> None:
-    """A name in the bridge that doesn't match any mcpServer is ignored."""
+def test_http_bridge_unknown_name_synthesized() -> None:
+    """A bridge name that doesn't match any source mcpServer is now
+    SYNTHESIZED as an http entry (durability fix), while the existing
+    source servers keep their stdio + exec-hook shape."""
     with tempfile.TemporaryDirectory() as td:
         inp = Path(td) / ".claude.json"
         write_json(inp, _mcp_input_for_bridge())
@@ -832,14 +841,216 @@ def test_http_bridge_unknown_name_no_rewrite() -> None:
             http_bridge="nonexistent=http://host.docker.internal:9000/mcp",
         )
         out = load_output(project)
-        # Both servers keep their stdio + exec-hook shape.
+        # The absent bridged server is synthesized.
+        syn = out["mcpServers"].get("nonexistent")
+        expect(
+            isinstance(syn, dict) and syn.get("type") == "http",
+            f"synthesize: nonexistent should be synthesized as http, got {syn!r}",
+        )
+        expect(
+            isinstance(syn, dict)
+            and syn.get("url") == "http://host.docker.internal:9000/mcp",
+            f"synthesize: nonexistent url wrong, got {syn!r}",
+        )
+        # Source servers keep their stdio + exec-hook shape.
         for name in ("host-mcp-server", "chrome-devtools"):
             entry = out["mcpServers"][name]
             expect(
                 entry.get("type") != "http",
-                f"unknown-bridge-name: {name} should NOT be http, "
+                f"synthesize: {name} should NOT be http, "
                 f"got type={entry.get('type')!r}",
             )
+
+
+def test_http_bridge_synthesizes_absent_server() -> None:
+    """The canonical durability case: a bridged server (host-bash)
+    absent from ~/.claude.json is still synthesized into the output,
+    while a present-but-unbridged server is untouched."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        # Source has ONLY chrome-devtools — no host-bash entry at all.
+        write_json(inp, {
+            "mcpServers": {
+                "chrome-devtools": {
+                    "command": "npx",
+                    "args": ["-y", "chrome-devtools-mcp@latest"],
+                },
+            },
+        })
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="host-bash=http://host.docker.internal:8766/mcp",
+        )
+        out = load_output(project)
+        hb = out["mcpServers"].get("host-bash")
+        expect(
+            isinstance(hb, dict) and hb.get("type") == "http",
+            f"synthesize-absent: host-bash should be synthesized as http, got {hb!r}",
+        )
+        expect(
+            isinstance(hb, dict)
+            and hb.get("url") == "http://host.docker.internal:8766/mcp",
+            f"synthesize-absent: host-bash url wrong, got {hb!r}",
+        )
+        for k in ("command", "args", "env", "transport"):
+            expect(
+                k not in hb,
+                f"synthesize-absent: stdio key {k!r} should be absent, got {hb!r}",
+            )
+        # The present unbridged server is untouched.
+        cd = out["mcpServers"].get("chrome-devtools")
+        expect(
+            isinstance(cd, dict) and cd.get("command") == f"{EXEC_HOOK} npx",
+            f"synthesize-absent: chrome-devtools should keep stdio + wrapping, got {cd!r}",
+        )
+
+
+def test_http_bridge_synthesizes_with_no_source_servers() -> None:
+    """Even with ZERO source servers, a non-empty bridge map causes the
+    .mcp.json to be written with the synthesized entries (no longer a
+    no-op)."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {}})
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge=(
+                "host-bash=http://host.docker.internal:8766/mcp"
+                ":mcp-adaptor=http://host.docker.internal:8765/mcp"
+            ),
+        )
+        expect(
+            (project / ".mcp.json").exists(),
+            "synthesize-no-source: .mcp.json should be written from bridge map alone",
+        )
+        out = load_output(project)
+        for name, url in (
+            ("host-bash", "http://host.docker.internal:8766/mcp"),
+            ("mcp-adaptor", "http://host.docker.internal:8765/mcp"),
+        ):
+            entry = out["mcpServers"].get(name)
+            expect(
+                isinstance(entry, dict)
+                and entry.get("type") == "http"
+                and entry.get("url") == url,
+                f"synthesize-no-source: {name} should be http {url}, got {entry!r}",
+            )
+
+
+def test_baseline_bridge_file_synthesizes_and_merges() -> None:
+    """A committed/baked baseline bridge file synthesizes its servers into
+    the output even when absent from --http-bridge and ~/.claude.json."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {}})
+        baseline = Path(td) / "baseline.json"
+        with baseline.open("w", encoding="utf-8") as f:
+            json.dump({
+                "host-bash": "http://host.docker.internal:8766/mcp",
+                "mcp-adaptor": "http://host.docker.internal:8765/mcp",
+            }, f)
+        project = Path(td) / "project"
+        project.mkdir()
+        # No --http-bridge at all: baseline alone drives synthesis.
+        run_helper(str(inp), str(project), baseline_bridge=str(baseline))
+        out = load_output(project)
+        for name, url in (
+            ("host-bash", "http://host.docker.internal:8766/mcp"),
+            ("mcp-adaptor", "http://host.docker.internal:8765/mcp"),
+        ):
+            entry = out["mcpServers"].get(name)
+            expect(
+                isinstance(entry, dict)
+                and entry.get("type") == "http"
+                and entry.get("url") == url,
+                f"baseline-file: {name} should be http {url}, got {entry!r}",
+            )
+
+
+def test_baseline_bridge_operator_overrides() -> None:
+    """The operator's --http-bridge wins over the baked baseline on a
+    key collision (operator can repoint a URL); baseline-only keys still
+    appear."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {}})
+        baseline = Path(td) / "baseline.json"
+        with baseline.open("w", encoding="utf-8") as f:
+            json.dump({
+                "host-bash": "http://host.docker.internal:8766/mcp",
+                "mcp-adaptor": "http://host.docker.internal:8765/mcp",
+            }, f)
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            baseline_bridge=str(baseline),
+            http_bridge="host-bash=http://host.docker.internal:9999/override",
+        )
+        out = load_output(project)
+        hb = out["mcpServers"].get("host-bash")
+        expect(
+            isinstance(hb, dict)
+            and hb.get("url") == "http://host.docker.internal:9999/override",
+            f"baseline-override: operator URL should win, got {hb!r}",
+        )
+        # baseline-only key still present.
+        ma = out["mcpServers"].get("mcp-adaptor")
+        expect(
+            isinstance(ma, dict)
+            and ma.get("url") == "http://host.docker.internal:8765/mcp",
+            f"baseline-override: baseline-only mcp-adaptor should remain, got {ma!r}",
+        )
+
+
+def test_baseline_bridge_missing_file_is_noop() -> None:
+    """A missing baseline file is a graceful no-op (no crash), and with no
+    other bridge + no source servers nothing is written."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {}})
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            baseline_bridge=str(Path(td) / "does-not-exist.json"),
+        )
+        expect(
+            not (project / ".mcp.json").exists(),
+            "baseline-missing: no file should be written",
+        )
+
+
+def test_synthesized_entry_gets_bearer_header() -> None:
+    """A synthesized bridged entry honors --bearer-env just like a
+    rewritten one."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / ".claude.json"
+        write_json(inp, {"mcpServers": {}})
+        project = Path(td) / "project"
+        project.mkdir()
+        run_helper(
+            str(inp),
+            str(project),
+            http_bridge="host-bash=http://host.docker.internal:8766/mcp",
+            bearer_value="s3cr3t",
+        )
+        out = load_output(project)
+        hb = out["mcpServers"].get("host-bash")
+        expect(
+            isinstance(hb, dict)
+            and hb.get("headers", {}).get("Authorization")
+            == "Bearer ${CLAUDE_HOST_HOOK_BRIDGE_BEARER}",
+            f"synthesize-bearer: Authorization header should be injected, got {hb!r}",
+        )
 
 
 def test_http_bridge_env_var_supplies_value() -> None:
@@ -1293,7 +1504,13 @@ TESTS = [
     test_http_bridge_leaves_other_servers_alone,
     test_http_bridge_multiple_servers_colon_separated,
     test_http_bridge_empty_no_rewrite,
-    test_http_bridge_unknown_name_no_rewrite,
+    test_http_bridge_unknown_name_synthesized,
+    test_http_bridge_synthesizes_absent_server,
+    test_http_bridge_synthesizes_with_no_source_servers,
+    test_baseline_bridge_file_synthesizes_and_merges,
+    test_baseline_bridge_operator_overrides,
+    test_baseline_bridge_missing_file_is_noop,
+    test_synthesized_entry_gets_bearer_header,
     test_http_bridge_env_var_supplies_value,
     test_http_bridge_flag_overrides_env_var,
     test_http_bridge_preserves_http_specific_keys,
