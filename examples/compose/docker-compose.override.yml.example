@@ -73,6 +73,39 @@ services:
       # BASE docker-compose.yml, so it is ALWAYS present even on a base-only
       # deploy. Do NOT re-add it here (a duplicate is harmless — docker
       # concatenates volume lists — but the template should not carry it).
+
+      # ----------------------------------------------------------------
+      # OPT-IN: neutralize personal claude.ai OAuth on $HOME/.claude
+      # (CW_NEUTRALIZE_HOME_CLAUDE_OAUTH — follow-up to #550).
+      #
+      # Symptom this fixes: inference routes through your personal Max
+      # OAuth instead of the corp gateway virtual key, so gateway spend
+      # (and the devbar budget tile that reads LiteLLM user.spend) stays
+      # frozen even though CLAUDE_CONTAINER_SNAPSHOT_CONFIG + #550 are on.
+      # Cause: Claude Code reads the OAuth token from the bind-mounted
+      # host $HOME/.claude/.credentials.json, which the #550 snapshot
+      # (CLAUDE_CONFIG_DIR only) never neutralizes.
+      #
+      # To enable, do ALL of these together (see the matching env keys in
+      # .env / the base compose):
+      #   1. Remap the host ~/.claude mount TARGET to a staging path by
+      #      setting  CLAUDE_HOST_CLAUDE_MOUNT_TARGET=/mnt/host-claude
+      #      and      CLAUDE_HOST_CLAUDE_STAGING=/mnt/host-claude
+      #   2. Make /home/hndrewaall/.claude a tmpfs so the entrypoint farms
+      #      a fresh neutralized copy into it (add a service-level tmpfs;
+      #      see the `tmpfs:` block outside/after this `volumes:` list).
+      #   3. Turn the fix on:  CW_NEUTRALIZE_HOME_CLAUDE_OAUTH=1
+      # The entrypoint then symlinks sessions/projects/history back to the
+      # staging mount (they still persist to the host) and materializes a
+      # REAL .credentials.json with claudeAiOauth stripped + mcpOAuth kept.
+      # Fail-safe: it only farms when $HOME/.claude is EMPTY (the tmpfs) —
+      # a populated dir means a direct host bind-mount and is left ALONE.
+      # ----------------------------------------------------------------
+    # tmpfs is a SERVICE-level key (sibling of `volumes:`, 4-space indent).
+    # Uncomment to make $HOME/.claude a fresh tmpfs for the OAuth-neutralize
+    # opt-in above:
+    # tmpfs:
+    #   - /home/hndrewaall/.claude
       # gh CLI token storage. RW so an in-container `gh auth login`
       # (token refresh, scope upgrade) propagates back to the host.
       # - "${HOME}/.config/gh:/home/hndrewaall/.config/gh:rw"

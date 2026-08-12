@@ -95,7 +95,7 @@ falls back to the current behaviour (claude reads the live host paths).
 
 Usage:
   snapshot-claude-config [--src-dir DIR] [--src-json PATH] [--dest DIR]
-                         [--neutralize-oauth]
+                         [--neutralize-oauth] [--no-top-json]
   snapshot-claude-config --test        # run the embedded unit tests
 
 ``--neutralize-oauth`` (or env ``CW_SNAPSHOT_NEUTRALIZE_OAUTH=1``, default
@@ -242,7 +242,11 @@ def _snapshot_credentials(src: Path, dst: Path) -> bool:
 
 
 def build_farm(
-    src_dir: Path, src_json: Path, dest: Path, neutralize_oauth: bool = False
+    src_dir: Path,
+    src_json: Path,
+    dest: Path,
+    neutralize_oauth: bool = False,
+    snapshot_top_json: bool = True,
 ) -> bool:
     """Build the symlink farm at ``dest`` + snapshot ``.claude.json``.
 
@@ -290,6 +294,17 @@ def build_farm(
             file=sys.stderr,
         )
 
+    if not snapshot_top_json:
+        # Home-dir farm mode: .claude.json is a SIBLING of the dir (at
+        # $HOME/.claude.json), owned by the separate CLAUDE_CONFIG_DIR
+        # snapshot — do NOT write one inside this dir. Success is the farm
+        # itself (symlinks + any neutralized .credentials.json copy).
+        print(
+            f"[snapshot-claude-config] {dest}: {linked} symlink(s) -> {src_dir} "
+            "(home-farm, no top-level .claude.json snapshot)",
+            file=sys.stderr,
+        )
+        return True
     ok = _snapshot_json(src_json, dest / ".claude.json", neutralize_oauth=neutralize_oauth)
     if ok:
         print(
@@ -471,7 +486,59 @@ def _run_tests() -> int:
     expect("oauthAccount" in json.loads((dest10 / ".claude.json").read_text()),
            "default-off should preserve oauthAccount in the json snapshot")
 
-    for d in (root, root4, root5, root6, root7, root8, root9, root10):
+    # 11. Home-dir farm (snapshot_top_json=False, neutralize_oauth=True):
+    #     symlinks for normal entries, a REAL neutralized .credentials.json,
+    #     and NO dest/.claude.json is written (it is a sibling handled by the
+    #     separate CLAUDE_CONFIG_DIR snapshot). This is the $HOME/.claude
+    #     neutralization path — closes the gap where Claude Code reads the
+    #     OAuth token from $HOME/.claude/.credentials.json despite
+    #     CLAUDE_CONFIG_DIR pointing at an already-neutralized farm.
+    root11 = mktmp()
+    staging = root11 / "staging"          # read-only host ~/.claude stand-in
+    staging.mkdir()
+    (staging / "settings.json").write_text('{"x":1}')
+    (staging / "projects").mkdir()
+    (staging / "projects" / "t.jsonl").write_text("transcript")
+    (staging / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {"accessToken": "personal-max-token"},
+        "mcpOAuth": {"srv": {"accessToken": "keep-mcp"}},
+    }))
+    homefarm = root11 / "home-claude"     # tmpfs $HOME/.claude stand-in
+    ok11 = build_farm(staging, root11 / "unused.json", homefarm,
+                      neutralize_oauth=True, snapshot_top_json=False)
+    expect(ok11, "home-farm build should succeed")
+    expect(not (homefarm / ".claude.json").exists(),
+           "home-farm must NOT write a .claude.json inside the dir")
+    expect((homefarm / "settings.json").is_symlink()
+           and (homefarm / "projects").is_symlink(),
+           "home-farm should symlink normal entries to the staging source")
+    expect(os.path.realpath(homefarm / "projects" / "t.jsonl")
+           == str((staging / "projects" / "t.jsonl").resolve()),
+           "home-farm transcripts must resolve THROUGH the symlink to staging")
+    credp = homefarm / ".credentials.json"
+    expect(credp.exists() and not credp.is_symlink(),
+           "home-farm .credentials.json must be a REAL neutralized copy")
+    cred11 = json.loads(credp.read_text())
+    expect("claudeAiOauth" not in cred11,
+           "home-farm must strip claudeAiOauth from .credentials.json")
+    expect(cred11.get("mcpOAuth", {}).get("srv", {}).get("accessToken") == "keep-mcp",
+           "home-farm must PRESERVE mcpOAuth in .credentials.json")
+
+    # 12. Home-dir farm without --neutralize-oauth leaves .credentials.json a
+    #     symlink (only OAuth neutralization materializes a real copy).
+    root12 = mktmp()
+    st12 = root12 / "staging"; st12.mkdir()
+    (st12 / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "t"}}))
+    hf12 = root12 / "home-claude"
+    ok12 = build_farm(st12, root12 / "unused.json", hf12,
+                      neutralize_oauth=False, snapshot_top_json=False)
+    expect(ok12, "home-farm (no neutralize) should succeed")
+    expect((hf12 / ".credentials.json").is_symlink(),
+           "home-farm without neutralize should leave .credentials.json a symlink")
+    expect(not (hf12 / ".claude.json").exists(),
+           "home-farm (no neutralize) must still not write a .claude.json")
+
+    for d in (root, root4, root5, root6, root7, root8, root9, root10, root11, root12):
         shutil.rmtree(d, ignore_errors=True)
 
     if failures:
@@ -494,6 +561,7 @@ def main(argv: list[str]) -> int:
     # Default OFF: strip personal claude.ai OAuth from the snapshot so the
     # wired apiKeyHelper / corp gateway key wins. Flag overrides the env.
     neutralize_oauth = _env_truthy(os.environ.get("CW_SNAPSHOT_NEUTRALIZE_OAUTH", "0"))
+    snapshot_top_json = True
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -507,6 +575,8 @@ def main(argv: list[str]) -> int:
             dest = Path(argv[i + 1]); i += 2; continue
         elif a == "--neutralize-oauth":
             neutralize_oauth = True; i += 1; continue
+        elif a == "--no-top-json":
+            snapshot_top_json = False; i += 1; continue
         elif a in ("-h", "--help"):
             print(__doc__)
             return 0
@@ -516,7 +586,13 @@ def main(argv: list[str]) -> int:
         i += 1
     # Always exit 0 (fail-safe): the caller checks <dest>/.claude.json to
     # decide whether to export CLAUDE_CONFIG_DIR.
-    build_farm(src_dir, src_json, dest, neutralize_oauth=neutralize_oauth)
+    build_farm(
+        src_dir,
+        src_json,
+        dest,
+        neutralize_oauth=neutralize_oauth,
+        snapshot_top_json=snapshot_top_json,
+    )
     return 0
 
 

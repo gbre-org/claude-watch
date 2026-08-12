@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""End-to-end test for the $HOME/.claude OAuth-neutralization follow-up to
+#550 (CW_NEUTRALIZE_HOME_CLAUDE_OAUTH).
+
+Background
+---------
+#550 (CW_SNAPSHOT_NEUTRALIZE_OAUTH) strips the personal claude.ai OAuth ONLY
+from the CLAUDE_CONFIG_DIR snapshot farm (/tmp/claude-config). But Claude Code
+(observed v2.1.229) still authenticates with the personal Max OAuth even with
+CLAUDE_CONFIG_DIR pointing at that neutralized farm and the corp gateway key
+approved — it reads the OAuth token from the bind-mounted host
+$HOME/.claude/.credentials.json, which #550 never touches. Inference then
+routes through personal Max OAuth, the corp gateway virtual-key spend stays
+frozen, and the devbar budget tile (which reads LiteLLM user.spend — and
+team-key inference DOES increment user.spend, verified) never moves.
+
+The fix farms $HOME/.claude the same way the CLAUDE_CONFIG_DIR snapshot does:
+symlink every entry back to a read-write staging mount of host ~/.claude
+(sessions/projects/history still persist), EXCEPT .credentials.json which is a
+REAL copy with claudeAiOauth stripped + mcpOAuth preserved. It is exposed via
+`snapshot-claude-config --neutralize-oauth --no-top-json` and wired into the
+entrypoint behind CW_NEUTRALIZE_HOME_CLAUDE_OAUTH (default OFF, fail-safe,
+never mutates a populated $HOME/.claude).
+
+This test exercises the ACTUAL CLI end-to-end (as the entrypoint invokes it)
+against tmpdirs, and asserts the entrypoint wiring + host-mutation safety
+guard exist.
+
+Run:  ./neutralize-home-claude-oauth.test
+
+No external dependencies beyond Python 3.8+ stdlib.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+SNAPSHOT_BIN = CONTAINER_DIR / "bin" / "snapshot-claude-config"
+ENTRYPOINT = CONTAINER_DIR / "entrypoint.sh"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+# --------------------------------------------------------------------------
+# 1. End-to-end CLI run, exactly as the entrypoint invokes it.
+# --------------------------------------------------------------------------
+expect(SNAPSHOT_BIN.is_file(), f"snapshot-claude-config missing at {SNAPSHOT_BIN}")
+
+if SNAPSHOT_BIN.is_file():
+    root = Path(tempfile.mkdtemp(prefix="neutralize-home-oauth-"))
+    staging = root / "staging"          # rw host ~/.claude stand-in
+    staging.mkdir()
+    (staging / "settings.json").write_text('{"hooks":{}}')
+    (staging / "projects").mkdir()
+    (staging / "projects" / "s.jsonl").write_text("transcript-line")
+    (staging / "operator-present").write_text("")
+    (staging / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "personal-max-token",
+            "refreshToken": "r",
+            "subscriptionType": "max",
+        },
+        "mcpOAuth": {"some-server": {"accessToken": "keep-this-mcp-token"}},
+    }))
+    home = root / "home-claude"         # tmpfs $HOME/.claude stand-in (empty)
+    home.mkdir()
+
+    r = subprocess.run(
+        [
+            sys.executable, str(SNAPSHOT_BIN),
+            "--src-dir", str(staging),
+            "--dest", str(home),
+            "--neutralize-oauth",
+            "--no-top-json",
+        ],
+        capture_output=True, text=True,
+    )
+    expect(r.returncode == 0,
+           f"CLI must exit 0 (fail-safe); got {r.returncode}, stderr={r.stderr!r}")
+
+    # 1a. .credentials.json is a REAL file (not a symlink) with the personal
+    #     OAuth stripped and mcpOAuth preserved.
+    cred = home / ".credentials.json"
+    expect(cred.exists() and not cred.is_symlink(),
+           "farmed $HOME/.claude/.credentials.json must be a REAL copy, not a "
+           "symlink back to the live host OAuth")
+    if cred.exists():
+        obj = json.loads(cred.read_text())
+        expect("claudeAiOauth" not in obj,
+               "personal claudeAiOauth must be stripped from the farmed creds")
+        expect(obj.get("mcpOAuth", {}).get("some-server", {}).get("accessToken")
+               == "keep-this-mcp-token",
+               "mcpOAuth tokens MUST be preserved (MCP-server auth must keep "
+               "working)")
+
+    # 1b. Normal entries stay symlinks that resolve THROUGH to the staging
+    #     source, so sessions/projects/history still persist to the host.
+    expect((home / "settings.json").is_symlink(),
+           "settings.json must remain a symlink to the staging source")
+    expect((home / "projects").is_symlink(),
+           "projects/ must remain a symlink so transcripts persist to the host")
+    expect(os.path.realpath(home / "projects" / "s.jsonl")
+           == str((staging / "projects" / "s.jsonl").resolve()),
+           "a transcript must resolve through the symlink to the live staging "
+           "dir (write-persistence preserved)")
+
+    # 1c. NO top-level .claude.json is written inside the home dir — it is a
+    #     SIBLING ($HOME/.claude.json) owned by the CLAUDE_CONFIG_DIR snapshot.
+    expect(not (home / ".claude.json").exists(),
+           "home-farm must NOT write a .claude.json inside $HOME/.claude "
+           "(--no-top-json)")
+
+    # 1d. Idempotent re-run against the now-farmed dir still succeeds and keeps
+    #     the neutralized creds a real file.
+    r2 = subprocess.run(
+        [sys.executable, str(SNAPSHOT_BIN), "--src-dir", str(staging),
+         "--dest", str(home), "--neutralize-oauth", "--no-top-json"],
+        capture_output=True, text=True,
+    )
+    expect(r2.returncode == 0, "re-run should still exit 0")
+    expect(cred.exists() and not cred.is_symlink(),
+           "re-run should keep .credentials.json a real neutralized file")
+
+    import shutil
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# 2. Entrypoint wiring: gated, fail-safe, host-mutation-guarded.
+# --------------------------------------------------------------------------
+expect(ENTRYPOINT.is_file(), f"entrypoint.sh missing at {ENTRYPOINT}")
+
+if ENTRYPOINT.is_file():
+    ep = ENTRYPOINT.read_text(encoding="utf-8")
+
+    expect("CW_NEUTRALIZE_HOME_CLAUDE_OAUTH" in ep,
+           "entrypoint must gate the home-farm behind "
+           "CW_NEUTRALIZE_HOME_CLAUDE_OAUTH")
+    # Default OFF: the gate compares to "1" with a :-0 default.
+    expect('"${CW_NEUTRALIZE_HOME_CLAUDE_OAUTH:-0}" = "1"' in ep,
+           "the home-farm must default OFF (${CW_NEUTRALIZE_HOME_CLAUDE_OAUTH:-0} "
+           '= "1") so operators who do not opt in see zero behaviour change')
+    # Invokes the CLI with the neutralization + no-top-json flags.
+    expect("--neutralize-oauth" in ep and "--no-top-json" in ep,
+           "entrypoint must call snapshot-claude-config with --neutralize-oauth "
+           "--no-top-json for the home-farm")
+    # Host-mutation safety guard: only farm into an EMPTY $HOME/.claude (the
+    # opt-in tmpfs). A NON-empty $HOME/.claude is the operator's live rw
+    # bind-mount and MUST NOT be written into.
+    expect('-z "$(ls -A "$_home_claude"' in ep,
+           "entrypoint must ONLY farm when $HOME/.claude is EMPTY (the opt-in "
+           "tmpfs) — never mutate a populated live host bind-mount")
+    # Requires the staging mount to be present + non-empty before farming.
+    expect('-n "$(ls -A "$_hc_staging"' in ep,
+           "entrypoint must require the staging source to be present + "
+           "non-empty (graceful degrade when absent)")
+
+
+if failures:
+    print("FAIL neutralize-home-claude-oauth.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS neutralize-home-claude-oauth.test")
+sys.exit(0)
