@@ -886,6 +886,20 @@ COPY container/hooks-shim/exec-hook-bridge /usr/local/lib/claude-hooks-shim/exec
 RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook-bridge \
     && ln -s /usr/local/lib/claude-hooks-shim/exec-hook-bridge /usr/local/bin/exec-hook-bridge
 
+# devbar-analytics-spool — stdin-preserving handler for the ONE hook target
+# `devbar ai-analytics capture` (approach B). The host-bash bridge above has
+# no stdin support (cli-mcp-server run_command drops it), so bridging devbar's
+# ai-analytics capture hook silently loses every container event. exec-hook
+# execs THIS helper for that target instead: it writes the stdin payload (with
+# container->host path prefixes rewritten) into a spool dir on the shared
+# ~/.claude mount, where a host-side launchd drainer feeds it to the real host
+# devbar. Gated to the exact target+args and disableable via
+# CLAUDE_DEVBAR_ANALYTICS_SPOOL=0. See container/hooks-shim/devbar-analytics-spool
+# for the full contract + config knobs.
+COPY container/hooks-shim/devbar-analytics-spool /usr/local/lib/claude-hooks-shim/devbar-analytics-spool
+RUN chmod +x /usr/local/lib/claude-hooks-shim/devbar-analytics-spool \
+    && ln -s /usr/local/lib/claude-hooks-shim/devbar-analytics-spool /usr/local/bin/devbar-analytics-spool
+
 # claude-mcp-settings-shim — make bare `claude mcp ...` report the TRUTH.
 # The interactive session launches with `--setting-sources project,local
 # --settings $CLAUDE_SHIM_SETTINGS_PATH`, whose shim settings.json carries
