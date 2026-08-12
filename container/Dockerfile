@@ -936,6 +936,17 @@ RUN chmod +x /usr/local/bin/generate-hooks-shim-settings
 COPY container/hooks-shim/generate-project-mcp-json /usr/local/bin/generate-project-mcp-json
 RUN chmod +x /usr/local/bin/generate-project-mcp-json
 
+# baseline-mcp-bridge.json — committed/baked baseline bridge map read by
+# generate-project-mcp-json (via --baseline-bridge, wired in entrypoint.sh).
+# Makes the in-tree bridged MCP set (host-bash, mcp-adaptor) part of
+# cw-committed config: it is merged UNDER the operator's
+# CLAUDE_MCP_HTTP_BRIDGE and synthesized into the generated .mcp.json even
+# when the server is absent from the mutable ~/.claude.json AND when the
+# operator never set CLAUDE_MCP_HTTP_BRIDGE. This is the durability fix so
+# the container's MCP set no longer depends on the mutable ~/.claude.json.
+COPY container/hooks-shim/baseline-mcp-bridge.json /usr/local/bin/baseline-mcp-bridge.json
+RUN chmod 0644 /usr/local/bin/baseline-mcp-bridge.json
+
 # Obligations gate hook scripts — bake the canonical PreToolUse +
 # PostToolUse hook scripts from tools/hooks/ into /usr/local/bin/ so
 # the in-container claude can install the obligations gate even when

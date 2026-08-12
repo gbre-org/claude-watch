@@ -401,11 +401,23 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
         # passed), but the explicit flag here makes the contract
         # visible to anyone scanning the entrypoint without grepping
         # into the helper.
+        #
+        # --baseline-bridge points at the committed/baked baseline bridge
+        # map (container/hooks-shim/baseline-mcp-bridge.json, copied to
+        # /usr/local/bin by the Dockerfile). Its entries are merged UNDER
+        # CLAUDE_MCP_HTTP_BRIDGE (operator wins per key) and then
+        # synthesized into the generated .mcp.json even when the server is
+        # absent from the mutable ~/.claude.json. This is what makes the
+        # in-tree bridged set (host-bash, mcp-adaptor) part of cw-committed
+        # config, independent of ~/.claude.json churn and of whether the
+        # operator set CLAUDE_MCP_HTTP_BRIDGE. Override the baked path via
+        # CLAUDE_MCP_BASELINE_BRIDGE if a downstream image relocates it.
         /usr/local/bin/generate-project-mcp-json \
             --mcp-input "${HOME:-/home/hndrewaall}/.claude.json" \
             --output-dir "$CLAUDE_HOST_PROJECT_DIR" \
             --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
-            --http-bridge "${CLAUDE_MCP_HTTP_BRIDGE:-}" || true
+            --http-bridge "${CLAUDE_MCP_HTTP_BRIDGE:-}" \
+            --baseline-bridge "${CLAUDE_MCP_BASELINE_BRIDGE:-/usr/local/bin/baseline-mcp-bridge.json}" || true
     fi
 fi
 export CLAUDE_SHIM_SETTINGS_PATH

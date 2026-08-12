@@ -170,7 +170,21 @@ services:
       # etc.) that owns the actual MCP binary. Unset / empty = no
       # rewriting (default). Example:
       #   host-mcp-server=http://host.docker.internal:8765/mcp
+      #
+      # NB: bridged servers are also SYNTHESIZED into the generated
+      # .mcp.json even when absent from ~/.claude.json (which the
+      # in-container claude-code rewrites and can drop entries from), and
+      # a committed/baked baseline bridge map
+      # (container/hooks-shim/baseline-mcp-bridge.json) is merged UNDER
+      # this value so the in-tree set (host-bash, mcp-adaptor) is always
+      # present regardless of whether this var is set. See
+      # generate-project-mcp-json.
       CLAUDE_MCP_HTTP_BRIDGE: ${CLAUDE_MCP_HTTP_BRIDGE:-}
+      # CLAUDE_MCP_BASELINE_BRIDGE — override path to the committed/baked
+      # baseline bridge map (JSON {name:url}). Default (unset) uses the
+      # image-baked /usr/local/bin/baseline-mcp-bridge.json. Rarely set;
+      # only needed if a downstream image relocates the baked file.
+      CLAUDE_MCP_BASELINE_BRIDGE: ${CLAUDE_MCP_BASELINE_BRIDGE:-}
       # CLAUDE_HOST_HOOK_BRIDGE — when "1", exec-hook hands every Mach-O
       # / wrong-arch hook off to /usr/local/bin/exec-hook-bridge instead
       # of silently no-op'ing. The bridge marshals the call across the
