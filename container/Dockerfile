@@ -870,8 +870,6 @@ RUN chmod 0644 /etc/profile.d/claude-tools.sh \
 # See container/hooks-shim/exec-hook for the full magic-byte table,
 # dedup mechanism, and the future-scope IPC-forwarder TODO.
 COPY container/hooks-shim/exec-hook /usr/local/lib/claude-hooks-shim/exec-hook
-RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
-    && ln -s /usr/local/lib/claude-hooks-shim/exec-hook /usr/local/bin/exec-hook
 
 # exec-hook-bridge — host-bash MCP bridge invoked by exec-hook when
 # the operator opts in via CLAUDE_HOST_HOOK_BRIDGE=1. Marshals
@@ -883,8 +881,6 @@ RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
 # brings the session down. See container/hooks-shim/exec-hook-bridge
 # for the full protocol + env-var surface.
 COPY container/hooks-shim/exec-hook-bridge /usr/local/lib/claude-hooks-shim/exec-hook-bridge
-RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook-bridge \
-    && ln -s /usr/local/lib/claude-hooks-shim/exec-hook-bridge /usr/local/bin/exec-hook-bridge
 
 # devbar-analytics-spool — stdin-preserving handler for the ONE hook target
 # `devbar ai-analytics capture` (approach B). The host-bash bridge above has
@@ -897,8 +893,6 @@ RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook-bridge \
 # CLAUDE_DEVBAR_ANALYTICS_SPOOL=0. See container/hooks-shim/devbar-analytics-spool
 # for the full contract + config knobs.
 COPY container/hooks-shim/devbar-analytics-spool /usr/local/lib/claude-hooks-shim/devbar-analytics-spool
-RUN chmod +x /usr/local/lib/claude-hooks-shim/devbar-analytics-spool \
-    && ln -s /usr/local/lib/claude-hooks-shim/devbar-analytics-spool /usr/local/bin/devbar-analytics-spool
 
 # claude-mcp-settings-shim — make bare `claude mcp ...` report the TRUTH.
 # The interactive session launches with `--setting-sources project,local
@@ -920,7 +914,15 @@ RUN chmod +x /usr/local/lib/claude-hooks-shim/devbar-analytics-spool \
 # other subcommand execs the real claude verbatim. Surgical: only `mcp`,
 # only when the caller hasn't already supplied the flags.
 COPY container/hooks-shim/claude-mcp-settings-shim /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim
-RUN chmod +x /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim \
+# Consolidated chmod + symlinks for the four hooks-shim helpers above (one
+# layer instead of four, to stay under the overlay2 128-layer image-depth limit).
+RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
+             /usr/local/lib/claude-hooks-shim/exec-hook-bridge \
+             /usr/local/lib/claude-hooks-shim/devbar-analytics-spool \
+             /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim \
+    && ln -s /usr/local/lib/claude-hooks-shim/exec-hook /usr/local/bin/exec-hook \
+    && ln -s /usr/local/lib/claude-hooks-shim/exec-hook-bridge /usr/local/bin/exec-hook-bridge \
+    && ln -s /usr/local/lib/claude-hooks-shim/devbar-analytics-spool /usr/local/bin/devbar-analytics-spool \
     && ln -s /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim /usr/local/lib/claude-hooks-shim/claude
 
 # generate-hooks-shim-settings — entrypoint-side companion to exec-hook.
@@ -934,7 +936,6 @@ RUN chmod +x /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim \
 # rewrite logic and the embedded test suite at
 # container/hooks-shim/tests/generate-hooks-shim-settings.test.
 COPY container/hooks-shim/generate-hooks-shim-settings /usr/local/bin/generate-hooks-shim-settings
-RUN chmod +x /usr/local/bin/generate-hooks-shim-settings
 
 # generate-project-mcp-json — sibling helper that writes a project-tier
 # .mcp.json into CLAUDE_HOST_PROJECT_DIR. Claude Code v2.1.141 does NOT
@@ -948,7 +949,6 @@ RUN chmod +x /usr/local/bin/generate-hooks-shim-settings
 # v21 workbot validation surfaced this; embedded tests at
 # container/hooks-shim/tests/generate-project-mcp-json.test.
 COPY container/hooks-shim/generate-project-mcp-json /usr/local/bin/generate-project-mcp-json
-RUN chmod +x /usr/local/bin/generate-project-mcp-json
 
 # baseline-mcp-bridge.json — committed/baked baseline bridge map read by
 # generate-project-mcp-json (via --baseline-bridge, wired in entrypoint.sh).
@@ -989,11 +989,12 @@ RUN chmod 0644 /usr/local/bin/baseline-mcp-bridge.json
 # ~/bin/ on the host). Baking them at the container's
 # /usr/local/bin/ ensures the obligations gate fires inside the
 # container regardless of host state.
-COPY tools/hooks/pre-agent-queue-gate-hook /usr/local/bin/pre-agent-queue-gate-hook
-COPY tools/hooks/pre-agent-background-required-hook /usr/local/bin/pre-agent-background-required-hook
-COPY tools/hooks/pre-tool-obligations-gate-hook /usr/local/bin/pre-tool-obligations-gate-hook
-COPY tools/hooks/post-tool-obligations-update-hook /usr/local/bin/post-tool-obligations-update-hook
-COPY tools/hooks/post-tool-mark-attachment-read-hook /usr/local/bin/post-tool-mark-attachment-read-hook
+COPY tools/hooks/pre-agent-queue-gate-hook \
+     tools/hooks/pre-agent-background-required-hook \
+     tools/hooks/pre-tool-obligations-gate-hook \
+     tools/hooks/post-tool-obligations-update-hook \
+     tools/hooks/post-tool-mark-attachment-read-hook \
+     /usr/local/bin/
 # post-tool-agent-arm-hook -- writes agent_id -> queue_id bindings to
 # ~/.config/claude/agent-queue-bindings.json on every successful async-
 # launched Agent spawn. Companion to the `subagent_queue_item_running`
@@ -1087,7 +1088,9 @@ RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/obligations \
             /usr/local/bin/obligations-init \
             /usr/local/bin/agent-msg \
-            /usr/local/bin/agent-tail
+            /usr/local/bin/agent-tail \
+            /usr/local/bin/generate-hooks-shim-settings \
+            /usr/local/bin/generate-project-mcp-json
 
 # eval-no-grep-watcher-output — obligations evaluator script that DENIES
 # Bash commands which pipe task/watcher output files through grep/sed/awk/
@@ -1095,7 +1098,6 @@ RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
 # a default obligation row by obligations-init (evaluator predicate,
 # decision_mode=exit_code, stdin_field=tool_input.command).
 COPY container/bin/eval-no-grep-watcher-output /usr/local/bin/eval-no-grep-watcher-output
-RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output
 
 # eval-event-must-act — obligations evaluator (q-2026-05-21-856d
 # refinement) that escalates over N consecutive non-exempt Bash tool
@@ -1109,7 +1111,6 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output
 # on a separate obligation row (signal-wait-* watcher + signal-send
 # ack-gate path, NOT migrated to this gate per Andrew 2026-05-21).
 COPY tools/event-must-act/eval-event-must-act /usr/local/bin/eval-event-must-act
-RUN chmod +x /usr/local/bin/eval-event-must-act
 
 # eval-agent-ack-pending — obligations evaluator that blocks Bash tool
 # calls while completed agents await acknowledgment by the main loop.
@@ -1120,21 +1121,18 @@ RUN chmod +x /usr/local/bin/eval-event-must-act
 # non-exempt calls while pending-ack entries exist. Default-open on
 # missing/corrupt state.
 COPY container/bin/eval-agent-ack-pending /usr/local/bin/eval-agent-ack-pending
-RUN chmod +x /usr/local/bin/eval-agent-ack-pending
 
 # eval-queue-ready-unspawned — obligations evaluator that blocks Bash tool
 # calls when session-task queue has items with status=pending and
 # ready_now=true. Forces the main loop to spawn agents for ready work
 # before doing anything else. Default-open on errors.
 COPY container/bin/eval-queue-ready-unspawned /usr/local/bin/eval-queue-ready-unspawned
-RUN chmod +x /usr/local/bin/eval-queue-ready-unspawned
 
 # agent-ack — CLI to manage the agent completion acknowledgment state.
 # Subcommands: register, done, list, clear, status. Manages the state
 # file at ~/.config/claude/agent-ack-pending.json used by the
 # eval-agent-ack-pending evaluator.
 COPY container/bin/agent-ack /usr/local/bin/agent-ack
-RUN chmod +x /usr/local/bin/agent-ack
 
 # event-ack — CLI to manage the four-tier claude-event response surface.
 # Manages ~/.config/claude-events/{pending-actions,tool-call-counter,
@@ -1146,7 +1144,6 @@ RUN chmod +x /usr/local/bin/agent-ack
 # Signal-tagged events are excluded by classification (the Signal-DM
 # ack-gate stays on its existing per-thread obligation path).
 COPY tools/event-must-act/event-ack /usr/local/bin/event-ack
-RUN chmod +x /usr/local/bin/event-ack
 
 # event-classify — data-driven source/tag -> tier classifier (ambient
 # / actionable / excluded). Owns the CLASSIFICATIONS table that maps
@@ -1154,7 +1151,6 @@ RUN chmod +x /usr/local/bin/event-ack
 # appending to the table. Used by event-ack ingest + by the main loop
 # (event-classify --source X --tag Y) when manually triaging events.
 COPY tools/event-must-act/event-classify /usr/local/bin/event-classify
-RUN chmod +x /usr/local/bin/event-classify
 
 # user-prompt-ambient-inject-hook — UserPromptSubmit hook that drains
 # the ambient event queue on every prompt and emits the queued events
@@ -1165,7 +1161,6 @@ RUN chmod +x /usr/local/bin/event-classify
 # signal-distinct (NOT touched by this refactor; stays on signal-wait-
 # watcher + signal-send ack-gate), unknown (defaults to ambient).
 COPY tools/event-must-act/user-prompt-ambient-inject-hook /usr/local/bin/user-prompt-ambient-inject-hook
-RUN chmod +x /usr/local/bin/user-prompt-ambient-inject-hook
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
@@ -1180,7 +1175,6 @@ RUN chmod +x /usr/local/bin/user-prompt-ambient-inject-hook
 # embedded `--test` mode (11 unit tests, including the Linux file-bind-mount
 # EBUSY fallback path).
 COPY container/bin/trust-workspace.py /usr/local/bin/trust-workspace
-RUN chmod +x /usr/local/bin/trust-workspace
 
 # audit-hooks — per-hook fate audit for the host's bind-mounted
 # ~/.claude/settings.json. Walks every command, reports ok-elf /
@@ -1195,7 +1189,6 @@ RUN chmod +x /usr/local/bin/trust-workspace
 # runs the self-tests; integrated into container/tests/audit-hooks.test
 # for the make-test loop.
 COPY container/bin/audit-hooks.py /usr/local/bin/audit-hooks
-RUN chmod +x /usr/local/bin/audit-hooks
 
 # reconcile-native-claude — entrypoint helper that makes the in-container
 # claude resolve to the NEWEST version persisted in the claude-container-versions
@@ -1207,7 +1200,6 @@ RUN chmod +x /usr/local/bin/audit-hooks
 # and would otherwise reset to the baked version on recreate. Ships embedded
 # --test unit tests (run: reconcile-native-claude --test).
 COPY container/bin/reconcile-native-claude /usr/local/bin/reconcile-native-claude
-RUN chmod +x /usr/local/bin/reconcile-native-claude
 
 # claude-relaunch-exec — resilient launcher used by the claude-watch daemon's
 # pane RELAUNCH/RESTART path (src/policy.rs resolve_relaunch_bin) and by cwsr's
@@ -1222,7 +1214,6 @@ RUN chmod +x /usr/local/bin/reconcile-native-claude
 # repairs the launcher symlink, and polls with backoff for a runnable binary
 # before exec'ing it — turning the hot-spin into a bounded, self-healing wait.
 COPY container/bin/claude-relaunch-exec /usr/local/bin/claude-relaunch-exec
-RUN chmod +x /usr/local/bin/claude-relaunch-exec
 
 # snapshot-claude-config — entrypoint helper that decouples the churning
 # bind-mounted ~/.claude.json from the running claude. On a macOS Docker
@@ -1237,7 +1228,6 @@ RUN chmod +x /usr/local/bin/claude-relaunch-exec
 # CLAUDE_CONTAINER_SNAPSHOT_CONFIG=1; ships embedded --test unit tests
 # (run: snapshot-claude-config --test).
 COPY container/bin/snapshot-claude-config /usr/local/bin/snapshot-claude-config
-RUN chmod +x /usr/local/bin/snapshot-claude-config
 
 # cwsr — in-container self-restart for the claude CLI. Rolls the claude
 # BINARY via the NATIVE managed installer (`claude install <ver>`, which
@@ -1250,10 +1240,8 @@ RUN chmod +x /usr/local/bin/snapshot-claude-config
 # dir all survive — and because the install lands on the volume, the roll
 # persists across a subsequent redeploy.
 COPY container/bin/cwsr /usr/local/bin/cwsr
-RUN chmod +x /usr/local/bin/cwsr
 
 COPY container/bin/mcp-reconnect /usr/local/bin/mcp-reconnect
-RUN chmod +x /usr/local/bin/mcp-reconnect
 
 # xclip — cross-host clipboard image-paste shim.
 #
@@ -1292,7 +1280,6 @@ RUN chmod +x /usr/local/bin/mcp-reconnect
 # that needs the real binary for non-claude callers can apt-get
 # install xclip and set XCLIP_SHIM=disabled.
 COPY container/bin/xclip /usr/local/bin/xclip
-RUN chmod +x /usr/local/bin/xclip
 
 # self-clear — fresh-context-injection helper that the in-container
 # claude-watch daemon shells out to when its policy module decides to
@@ -1319,7 +1306,6 @@ RUN chmod +x /usr/local/bin/xclip
 # container build (whose context is container/) end up running the
 # same bytes.
 COPY container/bin/self-clear /usr/local/bin/self-clear
-RUN chmod +x /usr/local/bin/self-clear
 
 # cw-watcher-health-check — cron-driven dead-watcher detector.
 # Checks for unconsumed events in the queue dir older than 2 min;
@@ -1327,7 +1313,6 @@ RUN chmod +x /usr/local/bin/self-clear
 # via send-keys (bypasses the event system, which is broken if
 # events are accumulating). Fired by the */2 cron entry in cw-default.
 COPY tools/event-must-act/cw-watcher-health-check /usr/local/bin/cw-watcher-health-check
-RUN chmod +x /usr/local/bin/cw-watcher-health-check
 
 # cw-cron-run + cw-cron-toggle — toggle baked cron.d entries without sudo.
 # cw-cron-run is the flag-file exec-wrapper prefixed in front of every
@@ -1337,16 +1322,37 @@ RUN chmod +x /usr/local/bin/cw-watcher-health-check
 # operator CLI that flips those flag files. No sudoers change required.
 # See docs/cron-toggle.md.
 COPY container/bin/cw-cron-run /usr/local/bin/cw-cron-run
-RUN chmod +x /usr/local/bin/cw-cron-run
 COPY container/bin/cw-cron-toggle /usr/local/bin/cw-cron-toggle
-RUN chmod +x /usr/local/bin/cw-cron-toggle
 
 # claude-event-watch — the canonical block-print-exit event watcher.
 # Session runs this as a `run_in_background` task; it blocks on inotifywait,
 # prints pending events, and exits. Baked so it's on PATH without depending
 # on the ~/repos bind-mount.
 COPY tools/watchers/claude-event-watch /usr/local/bin/claude-event-watch
-RUN chmod +x /usr/local/bin/claude-event-watch
+# Consolidated chmod for the runtime helper CLIs / evaluators / watchers
+# COPY'd above (one layer instead of ~21, to stay under the overlay2
+# 128-layer image-depth limit that the per-file `RUN chmod` pattern blew past).
+RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
+             /usr/local/bin/eval-event-must-act \
+             /usr/local/bin/eval-agent-ack-pending \
+             /usr/local/bin/eval-queue-ready-unspawned \
+             /usr/local/bin/agent-ack \
+             /usr/local/bin/event-ack \
+             /usr/local/bin/event-classify \
+             /usr/local/bin/user-prompt-ambient-inject-hook \
+             /usr/local/bin/trust-workspace \
+             /usr/local/bin/audit-hooks \
+             /usr/local/bin/reconcile-native-claude \
+             /usr/local/bin/claude-relaunch-exec \
+             /usr/local/bin/snapshot-claude-config \
+             /usr/local/bin/cwsr \
+             /usr/local/bin/mcp-reconnect \
+             /usr/local/bin/xclip \
+             /usr/local/bin/self-clear \
+             /usr/local/bin/cw-watcher-health-check \
+             /usr/local/bin/cw-cron-run \
+             /usr/local/bin/cw-cron-toggle \
+             /usr/local/bin/claude-event-watch
 
 # Baked skills / agents / watchers — three top-level dirs in the repo
 # (container/skills/, container/agents/, container/watchers/) that ship
