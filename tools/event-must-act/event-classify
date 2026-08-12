@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from typing import Callable
 
@@ -98,6 +99,22 @@ def _contains_any(*needles: str) -> Callable[[str], bool]:
         m = msg or ""
         return any(n in m for n in needles)
     return _pred
+
+
+def _unresolved_comments_pending(msg: str) -> bool:
+    """True iff a pr-status-change message reports a NONZERO count of
+    unresolved review comments. pr-watch emits
+    ``PR <name>: <N> unresolved comment(s) (was: <old>)`` whenever the
+    number of unresolved *human review conversations* on a tracked PR
+    changes. A nonzero N means real review feedback is waiting on the
+    author -> actionable; a drop to ``0 unresolved comment(s)`` is a
+    RESOLUTION (all threads resolved) and stays ambient via the catch-all
+    -- mirroring the merge-conflict-resolution stance. DISTINCT from the
+    ``comment-triage-needed`` tag (un-collapsed BOT/automation comments);
+    here it is human review threads riding the same ``pr-status-change``
+    tag. (botchat #3879.)"""
+    m = re.search(r"(\d+)\s+unresolved comment", msg or "")
+    return m is not None and int(m.group(1)) > 0
 
 
 CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] = [
@@ -160,6 +177,24 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         ACTIONABLE,
         "PR status change with CI outcome or merge CONFLICT "
         "(mergeable=conflicting); needs investigation/merge."),
+
+    # pr-status-change ALSO fires for UNRESOLVED REVIEW COMMENTS: pr-watch
+    # emits "PR <name>: <N> unresolved comment(s) (was: <old>)" when the
+    # number of unresolved human review conversations on a tracked PR
+    # changes. A NONZERO count is actionable -- real review feedback is
+    # waiting on the author -- while a drop to "0 unresolved comment(s)" is
+    # a resolution and stays ambient via the catch-all below (same stance as
+    # a merge-conflict RESOLUTION). Distinct from comment-triage-needed
+    # (un-collapsed BOT comments); both are actionable but keyed differently.
+    # These were previously swallowed as ambient because the CI/merge-conflict
+    # predicate above does not match them. (botchat #3879: unresolved-comment
+    # events for regrello #2936/#2942/#2944/#3064/#2938/#2941/#2933 routed
+    # ambient and sat unnoticed.)
+    ("*", "pr-status-change",
+        _unresolved_comments_pending,
+        ACTIONABLE,
+        "PR has unresolved review comment(s) (nonzero count); needs "
+        "author response/resolution."),
 
     # workbot-prompt -> needs dispatch (legacy v1 actionable tag).
     ("*", "workbot-prompt", None, ACTIONABLE,
@@ -492,6 +527,21 @@ def _self_test() -> int:
         # "mergeable=mergeable (was: conflicting)", so it does not flood.
         (("cron", "pr-status-change",
           "PR foo/bar#12: mergeable=mergeable (was: conflicting)"),
+            AMBIENT),
+
+        # Unresolved review comments (botchat #3879): a NONZERO count is
+        # actionable (real review feedback waiting on the author); these were
+        # previously swallowed as ambient by the CI/merge-conflict predicate.
+        # A drop to 0 is a resolution -> ambient (like a conflict resolution).
+        # Note nonzero-not-increase: 5 -> 1 still has unresolved threads.
+        (("cron", "pr-status-change",
+          "PR regrello-sf/regrello#2936: 3 unresolved comment(s) (was: 0)"),
+            ACTIONABLE),
+        (("cron", "pr-status-change",
+          "PR foo/bar#12: 1 unresolved comment(s) (was: 5)"),
+            ACTIONABLE),
+        (("cron", "pr-status-change",
+          "PR foo/bar#12: 0 unresolved comment(s) (was: 3)"),
             AMBIENT),
 
         # Ambient: alertmanager
