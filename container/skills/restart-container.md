@@ -1,3 +1,7 @@
+---
+name: restart-container
+description: "Restart the whole container via docker compose restart (host-bash) — re-runs entrypoint and re-seeds obligations WITHOUT recreating from the image; session-killing"
+---
 Restart the whole CONTAINER (not just the inner Claude Code process) via `docker compose restart claude-container`, issued through the `host-bash` MCP bridge. This restarts the container's process tree — re-running `entrypoint.sh`, which re-runs `obligations-init` (RE-SEEDS the baked + bind-mounted obligation rows) and clears in-container process state — WITHOUT recreating the container from its image. It is lighter than a force-recreate: it does NOT pick up a rebuilt image, changed entrypoint-time env vars, or new bind-mounts.
 
 **SESSION-KILLING.** The restart kills PID 1 (process-compose) and with it the inner `claude` process; the current Claude Code session ends. The next session resumes automatically via `CLAUDE_AUTO_CONTINUE` (the entrypoint re-appends `--continue <value>` to the in-container claude invocation, so the prior conversation is picked back up).

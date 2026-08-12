@@ -1,3 +1,9 @@
+---
+name: distill
+description: "Distill completed work into a reusable artifact (skill / agent-prompt / CLI tool / memory) via IDENTIFY -> CHOOSE -> DRAFT -> PLACE"
+argument-hint: "[topic hint]"
+allowed-tools: ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+---
 Distill a completed piece of work — a transcript, a finished session, or a pattern you just hand-rolled for the 2nd or 3rd time — into a REUSABLE ARTIFACT (a skill, an agent-prompt template, a CLI tool, or a memory). This is the structured, four-phase superset of the terse `/generalize` nudge: `/generalize` says "generalize this and document it"; `/distill` gives you the decision-tree for WHAT to build, in WHAT format, and WHERE it lives.
 
 **Use this when you catch yourself repeating.** The trigger is recognition: "I've now written this same sweep brief three times", "this decision-tree keeps recurring", "I keep re-deriving this gotcha". Distillation converts that ad-hoc repetition into a first-class, invocable artifact so the next occurrence is one command, not a re-derivation.
