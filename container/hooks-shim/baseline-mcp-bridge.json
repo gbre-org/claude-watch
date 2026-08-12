@@ -1,0 +1,4 @@
+{
+  "host-bash": "http://host.docker.internal:8766/mcp",
+  "mcp-adaptor": "http://host.docker.internal:8765/mcp"
+}
