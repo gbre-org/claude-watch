@@ -315,7 +315,7 @@ EXPECTED_DEFAULT_ALLOWED = (
     "ls,cat,pwd,git,gh,head,tail,grep,find,echo,jq,yq,make,awk,sed,cut,tr,"
     "wc,xargs,which,printenv,env,sort,uniq,diff,file,stat,base64,uname,"
     "hostname,date,basename,dirname,node,npm,yarn,python,python3,pip,ping,"
-    "host,dig,nslookup,envchain,jenkins-builds"
+    "host,dig,nslookup,envchain,jenkins-builds,devbar"
 )
 
 
@@ -427,6 +427,13 @@ def test_default_excludes_destructive_and_scheduling() -> None:
             f"default must NOT include container mgmt tool {forbidden!r} "
             f"(only in corp-dev-trusted); got {cmd_list}",
         )
+    # Arbitrary detached exec — `hostjob run -- <cmd>` runs any host
+    # command (equivalent to `bash -c`), so the wrapper is trusted-only.
+    expect(
+        "hostjob" not in cmd_list,
+        f"default must NOT include arbitrary-exec wrapper 'hostjob' "
+        f"(only in corp-dev-trusted); got {cmd_list}",
+    )
 
 
 def test_cw_profile_trusted_widens() -> None:
@@ -468,6 +475,7 @@ def test_cw_profile_trusted_widens() -> None:
         "lsb_release",
         "docker",
         "docker-compose",
+        "hostjob",
     ]:
         expect(
             extra in cmd_list,

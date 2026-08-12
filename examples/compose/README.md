@@ -353,7 +353,7 @@ Setup (one-time, four steps):
 
 Security: the launcher applies a `cli-mcp-server` allow-list by default that covers the read-y / observation / standard-dev-tool surface — file inspection (`ls`, `cat`, `head`, `tail`, `grep`, `find`, `file`, `stat`, `diff`, `sort`, `uniq`, `wc`), text munging (`awk`, `sed`, `cut`, `tr`, `xargs`, `base64`, `jq`, `yq`), VCS / forge (`git`, `gh`), shell discovery (`pwd`, `echo`, `which`, `env`, `printenv`, `hostname`, `uname`, `date`, `basename`, `dirname`), language toolchains (`node`, `npm`, `yarn`, `python`, `python3`, `pip`, `make`), corp-dev binaries (`envchain`, `jenkins-builds`), and read-y network probes (`ping`, `host`, `dig`, `nslookup`). Plus `ALLOWED_DIR=/` (path boundary DISABLED by default — the command allow-list, not a directory fence, is the safety floor; narrow to `$HOME` or a subdir to re-enable), `COMMAND_TIMEOUT=30`, `MAX_COMMAND_LENGTH=8192` (raised from cli-mcp-server's 1024 default so longer commands aren't truncated), `ALLOW_SHELL_OPERATORS=false`. Override per-host via `~/.config/claude-container/mcp-host-bash.env` (plain `KEY=VALUE` lines). Audit log at `~/.local/state/claude-container/mcp-host-bash.log`. Soft kill switch: `MCP_HOST_BASH_DISABLED=1` in the launcher's shell env. See the `host-bash` block in [`.env.example`](.env.example) for the full security write-up — `run_command` is a privilege escalation, keep the allow-list tight.
 
-**Trust profile** (`CW_PROFILE`): set `CW_PROFILE=corp-dev-trusted` in the launcher's shell env to opt into a wider allow-list that adds host-scheduling tooling — `crontab` (Linux + macOS), `launchctl` (macOS launchd), `systemctl` (Linux systemd user units), `schtasks` / `powershell` / `pwsh` (Windows Task Scheduler), `sw_vers` / `lsb_release` (extra OS detection), file mutation (`tee`, `mkdir`, `chmod`, `cp`, `mv`, `rm`), outbound bytes (`curl`, `wget`, `scp`), key/cert tooling (`openssl`, `ssh-keygen`), and container management (`docker`, `docker-compose`). Default unset (`corp-dev`) keeps the read-y dev-tooling floor described above. Use the trusted profile when you want the in-container claude to wire periodic claude-event jobs on the host (cron / launchd / systemd timers / Task Scheduler), push artifacts off-host, or recreate the compose stack from inside its own session (`docker compose up -d --force-recreate <svc>`, `docker compose exec <svc> ...`) — see the "Host-side scheduled tasks" section in `container/baked-CLAUDE.md` for the workflow. Note: `docker` / `docker-compose` are trusted-only because the binary covers destructive subcommands (`docker rm`, `docker stop`, `docker kill`) alongside read-y ones (`docker ps`, `docker logs`); cli-mcp-server's allow-list is per-binary, not per-subcommand. Operator's explicit `ALLOWED_COMMANDS` in `~/.config/claude-container/mcp-host-bash.env` always wins over the profile default.
+**Trust profile** (`CW_PROFILE`): set `CW_PROFILE=corp-dev-trusted` in the launcher's shell env to opt into a wider allow-list that adds host-scheduling tooling — `crontab` (Linux + macOS), `launchctl` (macOS launchd), `systemctl` (Linux systemd user units), `schtasks` / `powershell` / `pwsh` (Windows Task Scheduler), `sw_vers` / `lsb_release` (extra OS detection), file mutation (`tee`, `mkdir`, `chmod`, `cp`, `mv`, `rm`), outbound bytes (`curl`, `wget`, `scp`), key/cert tooling (`openssl`, `ssh-keygen`), container management (`docker`, `docker-compose`), and the detached long-command runner (`hostjob`, see below). Default unset (`corp-dev`) keeps the read-y dev-tooling floor described above. Use the trusted profile when you want the in-container claude to wire periodic claude-event jobs on the host (cron / launchd / systemd timers / Task Scheduler), push artifacts off-host, or recreate the compose stack from inside its own session (`docker compose up -d --force-recreate <svc>`, `docker compose exec <svc> ...`) — see the "Host-side scheduled tasks" section in `container/baked-CLAUDE.md` for the workflow. Note: `docker` / `docker-compose` are trusted-only because the binary covers destructive subcommands (`docker rm`, `docker stop`, `docker kill`) alongside read-y ones (`docker ps`, `docker logs`); cli-mcp-server's allow-list is per-binary, not per-subcommand. Operator's explicit `ALLOWED_COMMANDS` in `~/.config/claude-container/mcp-host-bash.env` always wins over the profile default.
 
 ### `hostjob` — run host commands past the 30s host-bash cap
 
@@ -373,31 +373,39 @@ streams its output to a per-job log, and records a `status.json` that flips to
 for completion across several short `run_command` calls, each of which returns
 well under the 30s cap.
 
-`python3` **is** on the host-bash allow-list (bare `hostjob` is not), so the
-in-container agent invokes it as a `python3` script with an absolute path —
-one clean argv per call, no shell operators (host-bash forbids
+`hostjob` is on the host-bash allow-list under **`CW_PROFILE=corp-dev-trusted`**
+(it runs arbitrary host commands, so it lives with the other trusted-only
+tooling, not the read-y default), and the launcher prepends its own directory
+to `PATH`, so the in-container agent invokes it as **bare `hostjob`** — one
+clean argv per call, no shell operators (host-bash forbids
 `&&` / `|` / `;` / redirection):
 
 ```sh
 # Launch a long command detached:
-python3 <path>/hostjob run --label build -- make container-build
+hostjob run --label build -- make container-build
 
 # Block up to ~25s, then exit 75 ("still running") so the caller re-invokes;
 # exits 0 once the job is done:
-python3 <path>/hostjob wait build
+hostjob wait build
 
 # One-shot status + log tail (no blocking):
-python3 <path>/hostjob poll build --tail 60
+hostjob poll build --tail 60
 
 # Enumerate known jobs:
-python3 <path>/hostjob list
+hostjob list
 
 # Stop a running job (SIGTERM, grace, then SIGKILL; recycled-pid guarded):
-python3 <path>/hostjob stop build      # or --all
+hostjob stop build      # or --all
 
 # Remove finished job state (refuses while still running):
-python3 <path>/hostjob clean --label build      # or --all
+hostjob clean --label build      # or --all
 ```
+
+If a stale `mcp-host-bash` process predates this wiring (bare `hostjob`
+rejected with `Security violation: Command 'hostjob' is not allowed`, or not
+found on `PATH`), restart the launcher to pick up the allow-list + `PATH`
+change; until then fall back to the absolute form `python3 <path>/hostjob ...`
+(`python3` is always on the allow-list).
 
 Typical flow: `run` the command once, then `wait` in a loop — each `wait`
 returns 0 (done) or 75 (still running, re-invoke to keep waiting), mirroring

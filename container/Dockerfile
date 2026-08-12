@@ -914,15 +914,28 @@ COPY container/hooks-shim/devbar-analytics-spool /usr/local/lib/claude-hooks-shi
 # other subcommand execs the real claude verbatim. Surgical: only `mcp`,
 # only when the caller hasn't already supplied the flags.
 COPY container/hooks-shim/claude-mcp-settings-shim /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim
+
+# cw-apikey-helper — container-only apiKeyHelper WRAPPER (see
+# container/hooks-shim/cw-apikey-helper). The entrypoint's
+# generate-hooks-shim-settings --apikey-wrapper rewrites a poison host-native
+# apiKeyHelper (e.g. macOS devbar, which can't exec under Linux -> 127 -> dead
+# auth) to point at this baked path instead of dropping it. The wrapper prints
+# a usable key: a FRESH key from the host devbar via the host-bash bridge when
+# reachable (restoring gateway-token rotation), else $ANTHROPIC_API_KEY. It is
+# hard-timeboxed with a guaranteed env-key fallback so it can never hang or
+# 127 claude's auth. Symlinked to /usr/local/bin/cw-apikey-helper below.
+COPY container/hooks-shim/cw-apikey-helper /usr/local/lib/claude-hooks-shim/cw-apikey-helper
 # Consolidated chmod + symlinks for the four hooks-shim helpers above (one
 # layer instead of four, to stay under the overlay2 128-layer image-depth limit).
 RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
              /usr/local/lib/claude-hooks-shim/exec-hook-bridge \
              /usr/local/lib/claude-hooks-shim/devbar-analytics-spool \
              /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim \
+             /usr/local/lib/claude-hooks-shim/cw-apikey-helper \
     && ln -s /usr/local/lib/claude-hooks-shim/exec-hook /usr/local/bin/exec-hook \
     && ln -s /usr/local/lib/claude-hooks-shim/exec-hook-bridge /usr/local/bin/exec-hook-bridge \
     && ln -s /usr/local/lib/claude-hooks-shim/devbar-analytics-spool /usr/local/bin/devbar-analytics-spool \
+    && ln -s /usr/local/lib/claude-hooks-shim/cw-apikey-helper /usr/local/bin/cw-apikey-helper \
     && ln -s /usr/local/lib/claude-hooks-shim/claude-mcp-settings-shim /usr/local/lib/claude-hooks-shim/claude
 
 # generate-hooks-shim-settings — entrypoint-side companion to exec-hook.
