@@ -303,6 +303,14 @@ DEFAULT_ALLOW_SHELL_OPERATORS="false"
 #       (`docker rm`, `docker stop`, `docker kill`) alongside read-y
 #       ones (`docker ps`, `docker logs`); cli-mcp-server's allow-list
 #       is per-binary, not per-subcommand.
+#     * `hostjob` — the detached host-command runner shipped beside this
+#       launcher (examples/compose/bin/hostjob). It runs ARBITRARY host
+#       commands past the 30s cap (`hostjob run -- <cmd>`), so it is a
+#       full exec escalation (equivalent to `bash -c`) and belongs with
+#       the other trusted-only tooling, NOT the read-y default. This
+#       launcher also prepends its own dir to PATH (see below) so the
+#       in-container agent invokes it as bare `hostjob`, not an absolute
+#       `python .../bin/hostjob` spelling.
 #   ALLOWED_DIR defaults to "/" (path boundary disabled); the command
 #   allow-list, not a directory fence, bounds what the widened
 #   profile can touch. Narrow ALLOWED_DIR via $MCP_HOST_BASH_CONFIG
@@ -313,7 +321,7 @@ DEFAULT_ALLOW_SHELL_OPERATORS="false"
 # sourced AFTER the profile defaults are applied, so the operator's
 # value wins. Setting CW_PROFILE to an unknown name logs a warning
 # and falls back to the conservative default.
-TRUSTED_EXTRAS="sw_vers,lsb_release,crontab,launchctl,systemctl,schtasks,powershell,pwsh,mkdir,tee,chmod,cp,mv,rm,curl,wget,scp,openssl,ssh-keygen,docker,docker-compose"
+TRUSTED_EXTRAS="sw_vers,lsb_release,crontab,launchctl,systemctl,schtasks,powershell,pwsh,mkdir,tee,chmod,cp,mv,rm,curl,wget,scp,openssl,ssh-keygen,docker,docker-compose,hostjob"
 
 # Honor XDG-ish locations on macOS too (just paths, not the spec itself).
 MCP_HOST_BASH_CONFIG="${MCP_HOST_BASH_CONFIG:-${HOME}/.config/claude-container/mcp-host-bash.env}"
@@ -447,6 +455,26 @@ MAX_COMMAND_LENGTH="${MAX_COMMAND_LENGTH:-$DEFAULT_MAX_COMMAND_LENGTH}"
 ALLOW_SHELL_OPERATORS="${ALLOW_SHELL_OPERATORS:-$DEFAULT_ALLOW_SHELL_OPERATORS}"
 
 # -----------------------------------------------------------------------------
+# Put sibling host tools (notably `hostjob`) on PATH for served commands
+#
+# `hostjob` ships in this same directory (examples/compose/bin/) alongside
+# the launcher. mcp-proxy spawns cli-mcp-server as a child that INHERITS
+# this process's environment, and the run_script auth-shim is exec'd
+# directly by this script — both resolve the requested command NAME against
+# their inherited PATH. Prepending our own dir lets the in-container agent
+# invoke bare `hostjob ...` instead of spelling an absolute
+# `python .../bin/hostjob ...`. This only makes the NAME resolvable; the
+# ALLOWED_COMMANDS allow-list (hostjob is corp-dev-trusted only) remains the
+# real exec gate.
+# -----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+case ":${PATH}:" in
+    *":${SCRIPT_DIR}:"*) ;;
+    *) PATH="${SCRIPT_DIR}:${PATH}" ;;
+esac
+export PATH
+
+# -----------------------------------------------------------------------------
 # Build the exec argv
 #
 # We launch mcp-proxy as the foreground process; it spawns cli-mcp-server
@@ -566,7 +594,7 @@ done
 # back to a PATH lookup (handles a `make install` deployment).
 SHIM_BIN=""
 if [ -n "$BEARER" ]; then
-    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    script_dir="$SCRIPT_DIR"
     if [ -x "$script_dir/mcp-proxy-auth-shim" ]; then
         SHIM_BIN="$script_dir/mcp-proxy-auth-shim"
     elif command -v mcp-proxy-auth-shim >/dev/null 2>&1; then
