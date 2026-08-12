@@ -131,7 +131,7 @@ services:
       # CLAUDE_CONTAINER_SNAPSHOT_CONFIG — decouple the churning
       # bind-mounted ~/.claude.json from the running claude. When "1",
       # the entrypoint snapshots ~/.claude.json into a tmpfs symlink-farm
-      # config dir (/tmp/claude-config) and points claude at it via
+      # config dir (/run/claude/config) and points claude at it via
       # CLAUDE_CONFIG_DIR, so a host-side app that atomically rewrites
       # ~/.claude.json mid-session (e.g. a macOS auth helper on VirtioFS,
       # where the rename invalidates the container's open inode) can't
@@ -150,14 +150,14 @@ services:
       # .credentials.json (claudeAiOauth stripped, mcpOAuth preserved) — so no
       # live OAuth is on any path Claude Code reads and it falls back to the
       # wired apiKeyHelper / ANTHROPIC_API_KEY gateway key. Default OFF; opt in
-      # by ALSO setting CLAUDE_HOST_CLAUDE_MOUNT_TARGET=/mnt/host-claude (above)
-      # and CLAUDE_HOST_CLAUDE_STAGING=/mnt/host-claude. Fail-safe: the
+      # by ALSO setting CLAUDE_HOST_CLAUDE_MOUNT_TARGET=/run/host-claude (above)
+      # and CLAUDE_HOST_CLAUDE_STAGING=/run/host-claude. Fail-safe: the
       # entrypoint only farms when $HOME/.claude is EMPTY (never mutates a
       # populated live host bind-mount).
       CW_NEUTRALIZE_HOME_CLAUDE_OAUTH: ${CW_NEUTRALIZE_HOME_CLAUDE_OAUTH:-}
       # Where the entrypoint reads the host ~/.claude from when farming
       # $HOME/.claude (must match CLAUDE_HOST_CLAUDE_MOUNT_TARGET). Default
-      # /mnt/host-claude when unset in the entrypoint.
+      # /run/host-claude when unset in the entrypoint.
       CLAUDE_HOST_CLAUDE_STAGING: ${CLAUDE_HOST_CLAUDE_STAGING:-}
       # CLAUDE_CONTAINER_OBLIGATIONS — wire the canonical obligations
       # gate hooks (pre-agent-queue-gate, pre-tool-obligations-gate,
@@ -346,7 +346,7 @@ services:
       # The mount TARGET defaults to /home/hndrewaall/.claude (direct — the
       # historical behaviour). To enable the $HOME/.claude OAuth-neutralization
       # follow-up to #550 (see CW_NEUTRALIZE_HOME_CLAUDE_OAUTH below), remap the
-      # target to a STAGING path (e.g. /mnt/host-claude) so the entrypoint can
+      # target to a STAGING path (e.g. /run/host-claude) so the entrypoint can
       # farm a neutralized $HOME/.claude from it. Keep :rw — sessions/projects/
       # history are symlinked back to this staging mount and must persist.
       - "${CLAUDE_HOST_CONFIG_DIR:-${HOME}/.claude}:${CLAUDE_HOST_CLAUDE_MOUNT_TARGET:-/home/hndrewaall/.claude}:rw"
@@ -529,6 +529,17 @@ services:
     # and let docker resolve "" -> empty working-dir flag (which Docker
     # treats as the image default).
     working_dir: ${CLAUDE_HOST_PROJECT_DIR:-/workspace}
+    # Writable runtime tmpfs for the relocated Claude config-dir + hook shim,
+    # moved off /tmp onto /run. /run is root-owned so uid-1000 cannot write it
+    # directly; this tmpfs (default mode 1777, like /tmp) hosts:
+    #   /run/claude/config — CLAUDE_CONFIG_DIR snapshot farm (when
+    #                        CLAUDE_CONTAINER_SNAPSHOT_CONFIG=1)
+    #   /run/claude/shim   — the generated sanitized settings.json (when
+    #                        CLAUDE_CONTAINER_REWRITE_HOOKS=1)
+    # Unconditional: the shim path is used by every REWRITE_HOOKS operator, so
+    # this mount must always be present or the shim write falls back to no-shim.
+    tmpfs:
+      - /run/claude
     stdin_open: true
     tty: true
 

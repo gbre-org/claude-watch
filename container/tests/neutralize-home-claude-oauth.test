@@ -5,7 +5,7 @@
 Background
 ---------
 #550 (CW_SNAPSHOT_NEUTRALIZE_OAUTH) strips the personal claude.ai OAuth ONLY
-from the CLAUDE_CONFIG_DIR snapshot farm (/tmp/claude-config). But Claude Code
+from the CLAUDE_CONFIG_DIR snapshot farm (/run/claude/config). But Claude Code
 (observed v2.1.229) still authenticates with the personal Max OAuth even with
 CLAUDE_CONFIG_DIR pointing at that neutralized farm and the corp gateway key
 approved — it reads the OAuth token from the bind-mounted host
@@ -166,6 +166,31 @@ if ENTRYPOINT.is_file():
     expect('-n "$(ls -A "$_hc_staging"' in ep,
            "entrypoint must require the staging source to be present + "
            "non-empty (graceful degrade when absent)")
+    # Config-dir + shim moved off /tmp onto /run (uid-1000-writable via the
+    # base compose /run/claude tmpfs).
+    expect("/run/claude/config" in ep and "/tmp/claude-config" not in ep,
+           "entrypoint config-dir default must be /run/claude/config (not /tmp)")
+    expect("/run/claude/shim/settings.json" in ep and "/tmp/claude-shim" not in ep,
+           "entrypoint shim default must be /run/claude/shim (not /tmp)")
+    expect("/run/host-claude" in ep,
+           "entrypoint home-farm staging default must be /run/host-claude")
+
+# --------------------------------------------------------------------------
+# 3. snapshot-claude-config default dest + base compose /run/claude tmpfs.
+# --------------------------------------------------------------------------
+if SNAPSHOT_BIN.is_file():
+    snap = SNAPSHOT_BIN.read_text(encoding="utf-8")
+    expect('DEFAULT_DEST = "/run/claude/config"' in snap,
+           "snapshot-claude-config DEFAULT_DEST must be /run/claude/config")
+
+COMPOSE = CONTAINER_DIR.parent / "examples" / "compose" / "docker-compose.yml"
+if COMPOSE.is_file():
+    comp = COMPOSE.read_text(encoding="utf-8")
+    expect("- /run/claude" in comp,
+           "base docker-compose.yml must mount a writable tmpfs at /run/claude "
+           "(config-dir + shim live there; /run is root-owned)")
+    expect("/tmp/claude-config" not in comp and "/tmp/claude-shim" not in comp,
+           "base compose must not reference the old /tmp claude paths")
 
 
 if failures:

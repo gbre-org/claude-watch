@@ -112,7 +112,7 @@ if [ "$already_has_setting_sources" -eq 0 ]; then
 fi
 # Layer the shim settings (which carries enableAllProjectMcpServers:true)
 # only if it exists and the caller didn't already pass --settings.
-shim_path="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
+shim_path="${CLAUDE_SHIM_SETTINGS_PATH:-/run/claude/shim/settings.json}"
 if [ "$already_has_settings" -eq 0 ] && [ -f "$shim_path" ]; then
     inject+=(--settings "$shim_path")
 fi
