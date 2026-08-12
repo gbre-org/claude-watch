@@ -389,8 +389,10 @@ def target_runnable_here(path: str) -> bool:
     return False
 
 
-def sanitize_api_key_helper(settings: dict) -> tuple[dict, str | None]:
-    """Drop `apiKeyHelper` when its target binary is not runnable here.
+def sanitize_api_key_helper(
+    settings: dict, wrapper: str | None = None
+) -> tuple[dict, str | None]:
+    """Rewrite/drop `apiKeyHelper` when its target binary is not runnable here.
 
     Returns (new_settings, dropped_command_or_None). The input is not
     mutated. When the key is absent or its target IS runnable in this
@@ -408,12 +410,20 @@ def sanitize_api_key_helper(settings: dict) -> tuple[dict, str | None]:
     if target_runnable_here(target):
         return settings, None
     out = dict(settings)
-    out.pop("apiKeyHelper", None)
+    if wrapper:
+        # Point apiKeyHelper at a baked, container-runnable wrapper that
+        # emits a usable key (fresh host devbar key when reachable, else
+        # $ANTHROPIC_API_KEY). Strictly better than dropping the key: the
+        # wrapper guarantees env-key auth AND restores devbar token
+        # rotation, without ever exec'ing the host-native binary.
+        out["apiKeyHelper"] = wrapper
+    else:
+        out.pop("apiKeyHelper", None)
     return out, helper
 
 
 def neutralize_poison_project_helper(
-    settings: dict, project_settings_path: str | None
+    settings: dict, project_settings_path: str | None, wrapper: str | None = None
 ) -> tuple[dict, str | None]:
     """Neutralize a cross-arch / missing `apiKeyHelper` that the PROJECT
     tier (``<cwd>/.claude/settings.json``) would otherwise contribute.
@@ -477,11 +487,18 @@ def neutralize_poison_project_helper(
         # shebang helper, or a bare PATH command) is left alone.
         return settings, None
     out = dict(settings)
-    # Empty string in the flagSettings tier => Claude Code treats it as
-    # "no helper" and falls back to env-based auth (ANTHROPIC_API_KEY,
-    # Bedrock/Vertex, OAuth). It overrides the poison project helper via
-    # flagSettings > projectSettings precedence.
-    out["apiKeyHelper"] = ""
+    if wrapper:
+        # A baked, container-runnable wrapper in the flagSettings tier
+        # overrides the poison project helper via flagSettings >
+        # projectSettings precedence, and emits a usable key (fresh host
+        # devbar key when reachable, else $ANTHROPIC_API_KEY).
+        out["apiKeyHelper"] = wrapper
+    else:
+        # Empty string in the flagSettings tier => Claude Code treats it as
+        # "no helper" and falls back to env-based auth (ANTHROPIC_API_KEY,
+        # Bedrock/Vertex, OAuth). It overrides the poison project helper via
+        # flagSettings > projectSettings precedence.
+        out["apiKeyHelper"] = ""
     return out, helper
 
 
@@ -652,11 +669,58 @@ def main(argv: list[str]) -> int:
              "container ships with project MCP servers auto-approved "
              "without operator opt-in.",
     )
+    p.add_argument(
+        "--apikey-wrapper",
+        default=os.environ.get("CW_APIKEY_WRAPPER", ""),
+        help="Path to a baked, container-runnable apiKeyHelper WRAPPER "
+             "(e.g. /usr/local/bin/cw-apikey-helper). When set AND a "
+             "non-runnable (Mach-O / missing) apiKeyHelper is detected in "
+             "the USER tier (sanitize) or PROJECT tier (neutralize), the "
+             "output apiKeyHelper is REWRITTEN to this wrapper instead of "
+             "being dropped / emptied. The wrapper emits a usable key "
+             "(fresh host devbar key when reachable via the host-bash "
+             "bridge, else $ANTHROPIC_API_KEY), restoring gateway-token "
+             "rotation while guaranteeing env-key auth. Strictly gated: if "
+             "the wrapper path is not itself runnable here, we fall back to "
+             "the legacy drop/empty behaviour (never wire a broken helper). "
+             "Empty / unset (default) = legacy drop/empty. Falls back to "
+             "CW_APIKEY_WRAPPER env var.",
+    )
+    p.add_argument(
+        "--force-apikey-wrapper",
+        default=os.environ.get("CW_FORCE_APIKEY_WRAPPER", ""),
+        help="When truthy (not '' / '0') AND --apikey-wrapper is itself "
+             "runnable here, SET apiKeyHelper to the wrapper even when "
+             "NEITHER the user- nor project-tier carried a (poison) helper "
+             "to rewrite. Root cause this fixes: with apiKeyHelper "
+             "absent/null the container-claude prefers a snapshotted "
+             "claude.ai OAuth credential over ANTHROPIC_API_KEY + "
+             "ANTHROPIC_BASE_URL, routing inference through the operator's "
+             "personal subscription instead of the corp model gateway "
+             "(frozen budget tile, personal quota 429s). An explicitly-set "
+             "apiKeyHelper in this flagSettings tier outranks every lower "
+             "tier and the OAuth fallback, so the wrapper's emitted "
+             "(corp gateway / devbar) key wins. Only forces when the "
+             "effective helper is still falsy, so a genuine poison-rewrite "
+             "is never clobbered. Default off. Falls back to "
+             "CW_FORCE_APIKEY_WRAPPER env var.",
+    )
     args = p.parse_args(argv)
     patterns = parse_patterns(args.shim_patterns)
     inject_obligations = args.inject_obligations.strip() not in ("", "0")
     obligations_only = bool(args.obligations_only)
     mcp_autoapprove = args.mcp_autoapprove.strip() not in ("", "0")
+    apikey_wrapper = (args.apikey_wrapper or "").strip()
+    force_apikey_wrapper = (args.force_apikey_wrapper or "").strip() not in ("", "0")
+    if apikey_wrapper and not target_runnable_here(apikey_wrapper):
+        if not args.quiet:
+            print(
+                "generate-hooks-shim-settings: apiKeyHelper wrapper "
+                f"{apikey_wrapper!r} is not runnable in this container; "
+                "falling back to dropping/emptying apiKeyHelper.",
+                file=sys.stderr,
+            )
+        apikey_wrapper = ""
 
     in_path = Path(args.input)
     out_path = Path(args.output)
@@ -708,14 +772,24 @@ def main(argv: list[str]) -> int:
         # the bind-mounted settings.json). Only the rewrite path carries
         # the host's top-level keys through; obligations-only emits a bare
         # hooks dict with no apiKeyHelper to begin with.
-        rewritten, dropped_helper = sanitize_api_key_helper(rewritten)
+        rewritten, dropped_helper = sanitize_api_key_helper(
+            rewritten, apikey_wrapper
+        )
         if dropped_helper and not args.quiet:
-            print(
-                "generate-hooks-shim-settings: dropped apiKeyHelper "
-                f"(target not runnable in this container): {dropped_helper!r} "
-                "-- falling back to env-based auth",
-                file=sys.stderr,
-            )
+            if apikey_wrapper:
+                print(
+                    "generate-hooks-shim-settings: rewrote apiKeyHelper "
+                    f"(target not runnable in this container): {dropped_helper!r} "
+                    f"-> {apikey_wrapper}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "generate-hooks-shim-settings: dropped apiKeyHelper "
+                    f"(target not runnable in this container): {dropped_helper!r} "
+                    "-- falling back to env-based auth",
+                    file=sys.stderr,
+                )
         # Neutralize a poison PROJECT-tier apiKeyHelper too. When an
         # operator bind-mounts host ~/.claude at the project-cwd path, the
         # same settings.json becomes Claude Code's PROJECT tier (read raw,
@@ -724,16 +798,51 @@ def main(argv: list[str]) -> int:
         # touching the host file. Strictly gated on a detected poison
         # (non-runnable) project helper -- no-op otherwise.
         rewritten, neutralized = neutralize_poison_project_helper(
-            rewritten, args.neutralize_project_apikeyhelper
+            rewritten, args.neutralize_project_apikeyhelper, apikey_wrapper
         )
         if neutralized and not args.quiet:
-            print(
-                "generate-hooks-shim-settings: neutralized PROJECT-tier "
-                f"apiKeyHelper (target not runnable in this container): "
-                f"{neutralized!r} -- shim sets apiKeyHelper=\"\" (flagSettings "
-                "outranks projectSettings); falling back to env-based auth",
-                file=sys.stderr,
-            )
+            if apikey_wrapper:
+                print(
+                    "generate-hooks-shim-settings: neutralized PROJECT-tier "
+                    f"apiKeyHelper (target not runnable in this container): "
+                    f"{neutralized!r} -- shim sets apiKeyHelper={apikey_wrapper} "
+                    "(flagSettings outranks projectSettings)",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "generate-hooks-shim-settings: neutralized PROJECT-tier "
+                    f"apiKeyHelper (target not runnable in this container): "
+                    f"{neutralized!r} -- shim sets apiKeyHelper=\"\" (flagSettings "
+                    "outranks projectSettings); falling back to env-based auth",
+                    file=sys.stderr,
+                )
+        # FORCE the wrapper when requested and nothing above wired a helper.
+        # sanitize/neutralize only fire when the source tiers actually carry
+        # a POISON (non-runnable) apiKeyHelper. When the host settings.json
+        # has NO apiKeyHelper at all (the common case), the effective helper
+        # is still absent/null here -- and Claude Code then prefers a
+        # snapshotted claude.ai OAuth credential over ANTHROPIC_API_KEY +
+        # ANTHROPIC_BASE_URL, routing inference through the operator's
+        # personal subscription instead of the corp gateway. Forcing the
+        # (container-runnable) wrapper into this flagSettings tier makes
+        # Claude Code call it for the key, which the wrapper resolves to a
+        # corp gateway / devbar key -- overriding the OAuth fallback. Gated
+        # on the effective helper still being falsy so a poison-rewrite
+        # above is never clobbered.
+        if force_apikey_wrapper and apikey_wrapper:
+            existing = rewritten.get("apiKeyHelper")
+            if not (isinstance(existing, str) and existing.strip()):
+                rewritten = dict(rewritten)
+                rewritten["apiKeyHelper"] = apikey_wrapper
+                if not args.quiet:
+                    print(
+                        "generate-hooks-shim-settings: forced apiKeyHelper "
+                        f"-> {apikey_wrapper} (no source helper present; "
+                        "flagSettings tier overrides the OAuth fallback so "
+                        "inference routes through the corp gateway key)",
+                        file=sys.stderr,
+                    )
     if inject_obligations:
         rewritten = inject_obligations_hooks(rewritten)
 

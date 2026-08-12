@@ -173,6 +173,17 @@ inject_cooldown = 300
 # pidfile → DOWN fires); a dead session's marker ages past the window and
 # heartbeat-stale / dead_process catch it independently. 0 disables.
 clean_exit_grace_secs = 600
+# max_suppress_secs (per-watcher watcher-down suppression CAP), 2026-08-12.
+# active-turn suppression drops the in-pane watcher-down inject while the main
+# loop is busy (the out-of-band claude-event still fires). Bug: during a long
+# active-turn stretch that suppression persisted indefinitely — botchat-wait
+# (operator comms) stayed down ~6 min with the inject suppressed, so the
+# operator's messages never reached the session. The shared [suppression]
+# window backstop can't fix it alone (tuned high to tolerate the flapping
+# surface-and-exit claude-event-watch). So bound suppression PER-WATCHER: once
+# any watcher's own continuous-down clock exceeds this, FORCE the inject even
+# mid-turn. Still throttled by inject_cooldown (no storm). 0 disables. 180 = 3min.
+max_suppress_secs = 180
 
 [context_monitor]
 enabled = true
