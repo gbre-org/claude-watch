@@ -1569,6 +1569,17 @@ async fn run_inject(
     slash_command: bool,
     json: bool,
 ) -> i32 {
+    // Wire the FleetView focus-to-main key sequence into the tmux module's
+    // process-global BEFORE injecting. `run_daemon` does this at startup, but a
+    // one-shot `claude-watch inject` (cwsr, mcp-reconnect, self-clear, etc.)
+    // never initialized `FOCUS_MAIN_KEYS` — so `send_focus_main_keys` inside
+    // `inject_and_verify` was a silent no-op for every CLI caller, and an inject
+    // could land on a selected FleetView background agent instead of `main`
+    // (Andrew #270/#288/#291; latent gap surfaced by the #545 self-clear work).
+    // Graceful: if no config resolves, the global stays EMPTY (no-op) as before.
+    if let Ok(cfg) = config::try_load_config() {
+        tmux::set_focus_main_keys(cfg.tmux.focus_main_keys.clone());
+    }
     let pane = resolve_inject_pane(pane_flag).await;
     let submit = !no_submit;
     let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command).await;

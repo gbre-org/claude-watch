@@ -1701,6 +1701,70 @@ cooldown = 300
         let config = parse_config(config_no_tmux).expect("should parse without [tmux] section");
         assert_eq!(config.tmux.dashboard_pane, "");
         assert_eq!(config.tmux.dashboard_session, "");
+        // focus_main_keys defaults to EMPTY (the FleetView return-to-main step
+        // is a no-op unless the operator sets it).
+        assert!(config.tmux.focus_main_keys.is_empty());
+    }
+
+    #[test]
+    fn test_tmux_focus_main_keys_parsed() {
+        // A [tmux] focus_main_keys array deserializes into the config field
+        // that BOTH run_daemon and the one-shot `claude-watch inject` CLI path
+        // read before calling tmux::set_focus_main_keys. Guards the wiring the
+        // CLI inject handler now relies on (previously daemon-only).
+        let cfg_str = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[tmux]
+focus_main_keys = ["Right", "Right"]
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 120
+check_interval = 10
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(cfg_str).expect("should parse with focus_main_keys");
+        assert_eq!(config.tmux.focus_main_keys, vec!["Right", "Right"]);
     }
 
     #[test]
