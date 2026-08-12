@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+#
+# cw-apikey-helper — container-only apiKeyHelper wrapper.
+#
+# WHY THIS EXISTS
+#
+# On a macOS Docker host the operator's ~/.claude/settings.json carries an
+# `apiKeyHelper` pointing at a host-native binary, e.g. devbar:
+#   "'/Applications/devbar.app/Contents/MacOS/devbar' auth claude"
+# That helper prints the current Anthropic / SF model-gateway key AND
+# devbar ROTATES it. Inside this Linux container the host binary can't
+# exec (Mach-O -> exit 127), so claude gets no key and dies on every
+# inference -- recurring on every recreate because the container seeds
+# its config from the host settings.json.
+#
+# The container config-seed rewrites that poison apiKeyHelper to point at
+# THIS wrapper instead (see generate-hooks-shim-settings --apikey-wrapper,
+# wired from entrypoint.sh). The wrapper's contract: print exactly ONE
+# usable key to stdout, FAST, and NEVER hang claude's auth.
+#
+# STRATEGY (in order):
+#   0. Serve a still-fresh key cached from a prior successful host-call
+#      (bounded by CW_APIKEY_CACHE_TTL) so bursty calls skip the bridge.
+#   1. Best-effort: fetch a FRESH key from the host devbar (which rotates
+#      the gateway token) via the host-bash MCP bridge (exec-hook-bridge),
+#      under a HARD timeout. Only attempted when the bridge is wired
+#      (CLAUDE_HOST_HOOK_BRIDGE=1); it additionally requires the operator
+#      to allow-list devbar in the mcp-host-bash server
+#      (CLAUDE_HOOK_BRIDGE_BINS / ALLOWED_COMMANDS) -- otherwise the
+#      bridge rejects the command fast and we fall through.
+#   2. Fallback (the PRIMARY guarantee): print $ANTHROPIC_API_KEY, the key
+#      the container was launched with. This is what makes auth reliable
+#      today; the host-call in (1) is a rotation enhancement layered on
+#      top, never a dependency.
+#
+# Exit is ALWAYS 0. If neither path yields a key we still exit 0 with
+# empty stdout so claude logs no "apiKeyHelper failed" and falls through
+# to its own env-based auth resolution.
+#
+# Config knobs (all optional, sane defaults):
+#   CW_APIKEY_HOST_CALL           1 (default) to attempt the host-call; 0 disables.
+#   CW_APIKEY_HOST_CALL_TIMEOUT   hard timeout seconds for the host-call (default 3).
+#   CW_APIKEY_DEVBAR_PATH         host path to the devbar binary.
+#   CW_APIKEY_BRIDGE              path to exec-hook-bridge.
+#   CW_APIKEY_CACHE_TTL           seconds a host-call key is reused (default 60; 0 disables).
+#   CW_APIKEY_CACHE_FILE          cache file path.
+set -u
+
+HOST_CALL_ENABLED="${CW_APIKEY_HOST_CALL:-1}"
+HOST_CALL_TIMEOUT="${CW_APIKEY_HOST_CALL_TIMEOUT:-3}"
+DEVBAR_PATH="${CW_APIKEY_DEVBAR_PATH:-/Applications/devbar.app/Contents/MacOS/devbar}"
+BRIDGE="${CW_APIKEY_BRIDGE:-/usr/local/bin/exec-hook-bridge}"
+CACHE_TTL="${CW_APIKEY_CACHE_TTL:-60}"
+CACHE_FILE="${CW_APIKEY_CACHE_FILE:-${TMPDIR:-/tmp}/cw-apikey-helper.cache}"
+
+emit() { printf '%s\n' "$1"; exit 0; }
+
+looks_like_key() {
+  case "$1" in
+    sk-*) [ "${#1}" -ge 8 ] && return 0 ;;
+  esac
+  return 1
+}
+
+# 0) still-fresh cache from a prior successful host-call?
+if [ "$CACHE_TTL" -gt 0 ] 2>/dev/null && [ -f "$CACHE_FILE" ]; then
+  now="$(date +%s 2>/dev/null || echo 0)"
+  mtime="$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)"
+  age=$(( now - mtime ))
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$CACHE_TTL" ]; then
+    cached="$(head -n1 "$CACHE_FILE" 2>/dev/null)"
+    looks_like_key "$cached" && emit "$cached"
+  fi
+fi
+
+# 1) best-effort FRESH key from host devbar via the host-bash bridge
+if [ "$HOST_CALL_ENABLED" = "1" ] \
+    && [ "${CLAUDE_HOST_HOOK_BRIDGE:-0}" = "1" ] \
+    && [ -x "$BRIDGE" ]; then
+  fresh="$(timeout "${HOST_CALL_TIMEOUT}s" "$BRIDGE" "$DEVBAR_PATH" auth claude </dev/null 2>/dev/null)"
+  fresh="$(printf '%s' "$fresh" | tr -d '\r' | grep -m1 '^sk-' || true)"
+  if looks_like_key "$fresh"; then
+    ( umask 077; printf '%s\n' "$fresh" > "$CACHE_FILE" ) 2>/dev/null || true
+    emit "$fresh"
+  fi
+fi
+
+# 2) fallback: the launch-time env key -- the reliable guarantee
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  emit "$ANTHROPIC_API_KEY"
+fi
+
+# nothing to emit; exit 0 so claude falls through to its own env auth
+exit 0

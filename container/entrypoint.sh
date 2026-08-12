@@ -276,6 +276,21 @@ CLAUDE_SHIM_SETTINGS_PATH=""
 # (host hooks load via user tier, shim only adds the obligations gates).
 CLAUDE_SHIM_FILTER_USER=""
 export CLAUDE_SHIM_FILTER_USER
+# Container apiKeyHelper WRAPPER. When the bind-mounted host settings.json
+# carries an `apiKeyHelper` pointing at a host-native binary (e.g. the macOS
+# devbar app), that helper can't exec under Linux -> exit 127 -> claude can't
+# auth -> dead on every inference, recurring on every recreate. The generator
+# below rewrites such a poison helper to point at THIS baked, container-
+# runnable wrapper instead of dropping it: the wrapper prints a usable key
+# (a FRESH key from the host devbar via the host-bash bridge when reachable,
+# else $ANTHROPIC_API_KEY), restoring gateway-token rotation while guaranteeing
+# env-key auth. Container-only: nothing here touches the host settings.json.
+# Empty (wrapper missing / not executable) => the generator falls back to its
+# legacy drop/empty behaviour, so this can never wire a broken helper.
+_apikey_wrapper="${CW_APIKEY_WRAPPER:-/usr/local/bin/cw-apikey-helper}"
+if [ ! -x "$_apikey_wrapper" ]; then
+    _apikey_wrapper=""
+fi
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
     CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
     # Project-tier settings file. When an operator bind-mounts host
@@ -300,6 +315,7 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
         --output "$CLAUDE_SHIM_SETTINGS_PATH" \
         --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
         --neutralize-project-apikeyhelper "$_project_settings" \
+        --apikey-wrapper "$_apikey_wrapper" \
         --inject-obligations "$CLAUDE_CONTAINER_OBLIGATIONS" || true
     unset _project_settings
     CLAUDE_SHIM_FILTER_USER=1
@@ -557,6 +573,7 @@ if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ] \
         --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
         --output "${CLAUDE_CONFIG_DIR}/settings.json" \
         --shim-patterns "${CLAUDE_SHIM_PATTERNS:-}" \
+        --apikey-wrapper "$_apikey_wrapper" \
         --inject-obligations 0 \
         --mcp-autoapprove 0 \
         --quiet && CLAUDE_SHIM_SANITIZED_USER_FARM=1
