@@ -423,6 +423,22 @@ pub struct WatcherState {
     /// inject as a fallback). Cleared on recovery (count >= min_count).
     #[serde(default)]
     pub event_emitted_at: Option<String>,
+    /// RFC3339 timestamp when this watcher began its CURRENT continuous
+    /// past-grace down run: stamped on the 0 -> 1 `consecutive_missing`
+    /// transition and cleared the moment the watcher is seen running again.
+    ///
+    /// Distinct from the SHARED cross-gate suppression clock
+    /// (`State.first_suppression_at`): this measures how long THIS specific
+    /// watcher has itself been continuously down, independent of the shared
+    /// suppression counter (which is polluted by the other gates and is tuned
+    /// very high — `[suppression].max_suppression_window_secs` = 86400 — to
+    /// tolerate the chronically-flapping surface-and-exit event consumer).
+    /// The per-watcher watcher-down force-inject cap
+    /// (`[watcher_monitor].max_suppress_secs`) reads this so an honest
+    /// down comms watcher (e.g. `botchat-wait`) can never be silently
+    /// suppressed for longer than the cap while the main loop is busy.
+    #[serde(default)]
+    pub down_since: Option<String>,
     // NOTE: `last_auto_restart_at` was removed 2026-05-01 along with the
     // daemon-side auto-restart path (cardinal rule: watchers must be
     // spawned by the main loop). Older state files containing the field
@@ -559,6 +575,7 @@ mod tests {
                 consecutive_missing: 0,
                 enabled: true,
                 event_emitted_at: None,
+                down_since: None,
             },
         );
 
