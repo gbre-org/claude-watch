@@ -303,10 +303,13 @@ def drain_ambient(state_dir: Path) -> list[dict]:
 
 # --- Ingest (classify + route) --------------------------------------------
 
-def _classify(source: str, tag: str, message: str) -> dict:
+def _classify(source: str, tag: str, message: str,
+              shipped_tier: str | None = None) -> dict:
     """Shell out to event-classify, with a Python-side fallback if the
     CLI is missing (tests / stripped containers). Both paths return
-    {'tier': str, 'reason': str}."""
+    {'tier': str, 'reason': str}. ``shipped_tier`` is the PRODUCER-shipped
+    tier (from the event's ``data.tier``); when present it takes precedence
+    over the consumer-side classifier table (see event-classify)."""
     cli = shutil.which("event-classify")
     if cli is None:
         # Sibling lookup (when running from source tree).
@@ -317,22 +320,25 @@ def _classify(source: str, tag: str, message: str) -> dict:
     if cli is None:
         # Last-ditch: import the module in-process. Since event-classify
         # is a script (not a package), use exec on its source.
-        return _classify_inline(source, tag, message)
+        return _classify_inline(source, tag, message, shipped_tier)
     try:
+        cmd = [cli, "--source", source, "--tag", tag,
+               "--message", message, "--json"]
+        if shipped_tier:
+            cmd += ["--tier", shipped_tier]
         proc = subprocess.run(
-            [cli, "--source", source, "--tag", tag,
-             "--message", message, "--json"],
-            capture_output=True, text=True, timeout=5, check=False,
+            cmd, capture_output=True, text=True, timeout=5, check=False,
         )
         if proc.returncode == 0 and proc.stdout.strip():
             return json.loads(proc.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError,
             json.JSONDecodeError, ValueError):
         pass
-    return _classify_inline(source, tag, message)
+    return _classify_inline(source, tag, message, shipped_tier)
 
 
-def _classify_inline(source: str, tag: str, message: str) -> dict:
+def _classify_inline(source: str, tag: str, message: str,
+                     shipped_tier: str | None = None) -> dict:
     """Fallback path: load event-classify's CLASSIFICATIONS table by
     exec'ing the file in a private namespace, then call classify()."""
     here = Path(__file__).resolve().parent
@@ -343,17 +349,20 @@ def _classify_inline(source: str, tag: str, message: str) -> dict:
     try:
         ns: dict = {"__name__": "__inline__"}
         exec(sibling.read_text(), ns)
-        return ns["classify"](source, tag, message)
+        return ns["classify"](source, tag, message,
+                              shipped_tier=shipped_tier)
     except Exception as exc:  # noqa: BLE001
         return {"tier": "ambient",
                 "reason": f"fallback-error: {exc}"}
 
 
 def ingest(state_dir: Path, source: str, tag: str,
-           message: str) -> dict:
+           message: str, shipped_tier: str | None = None) -> dict:
     """Classify event and route to pending or ambient. Excluded
-    events are no-op (Signal stays on its own gate)."""
-    cls = _classify(source, tag, message)
+    events are no-op (Signal stays on its own gate). ``shipped_tier`` is the
+    producer-shipped tier (event ``data.tier``); it takes precedence over the
+    consumer-side table (see event-classify)."""
+    cls = _classify(source, tag, message, shipped_tier)
     tier = cls.get("tier", "ambient")
     if tier == "excluded":
         return {"routed": "excluded", "tier": tier,
@@ -390,6 +399,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--source", required=True)
     sp.add_argument("--tag", required=True)
     sp.add_argument("--message", default="")
+    sp.add_argument("--tier", "--priority", dest="tier", default=None,
+                    help="Producer-SHIPPED tier (actionable|ambient|excluded) "
+                         "from the event's data.tier; takes precedence over "
+                         "the consumer-side classifier table.")
 
     sp = sub.add_parser("add", help="Add a pending actionable entry.")
     sp.add_argument("key")
@@ -509,7 +522,8 @@ def main(argv: list[str] | None = None) -> int:
         return _self_test()
 
     if args.cmd == "ingest":
-        res = ingest(state_dir, args.source, args.tag, args.message)
+        res = ingest(state_dir, args.source, args.tag, args.message,
+                     shipped_tier=args.tier)
         print(json.dumps(res))
         return 0
 
@@ -654,6 +668,25 @@ def _self_test() -> int:
         # pending count still 1 (the prior torrent), ambient still 1.
         if len(snap["pending"]) != 1 or snap["ambient_queued"] != 1:
             fail(f"signal exclusion leaked: {snap}")
+
+        # 11b. Producer-SHIPPED tier routes actionable even when the message
+        # alone would classify ambient (botchat #3879: pr-watch stamps
+        # data.tier=actionable on its unresolved-comment events). Routed by the
+        # shipped tier, NOT a message regex.
+        clear_pending(sd)
+        ingest(sd, "cron", "pr-status-change",
+               "PR foo/bar#12: 3 unresolved comment(s) (was: 0)",
+               shipped_tier="actionable")
+        snap = list_state(sd)
+        if len(snap["pending"]) != 1:
+            fail(f"shipped-tier actionable ingest: {snap}")
+        # Same event with NO shipped tier -> ambient (consumer catch-all).
+        ambient_before = snap["ambient_queued"]
+        ingest(sd, "cron", "pr-status-change",
+               "PR foo/bar#12: 4 unresolved comment(s) (was: 3)")
+        snap = list_state(sd)
+        if snap["ambient_queued"] != ambient_before + 1:
+            fail(f"unstamped unresolved-comment should be ambient: {snap}")
 
         # 12. Drain ambient -> empties queue + returns events.
         events = drain_ambient(sd)

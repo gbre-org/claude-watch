@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from typing import Callable
 
@@ -101,20 +100,20 @@ def _contains_any(*needles: str) -> Callable[[str], bool]:
     return _pred
 
 
-def _unresolved_comments_pending(msg: str) -> bool:
-    """True iff a pr-status-change message reports a NONZERO count of
-    unresolved review comments. pr-watch emits
-    ``PR <name>: <N> unresolved comment(s) (was: <old>)`` whenever the
-    number of unresolved *human review conversations* on a tracked PR
-    changes. A nonzero N means real review feedback is waiting on the
-    author -> actionable; a drop to ``0 unresolved comment(s)`` is a
-    RESOLUTION (all threads resolved) and stays ambient via the catch-all
-    -- mirroring the merge-conflict-resolution stance. DISTINCT from the
-    ``comment-triage-needed`` tag (un-collapsed BOT/automation comments);
-    here it is human review threads riding the same ``pr-status-change``
-    tag. (botchat #3879.)"""
-    m = re.search(r"(\d+)\s+unresolved comment", msg or "")
-    return m is not None and int(m.group(1)) > 0
+def _normalize_shipped_tier(value: str | None) -> str | None:
+    """Coerce a PRODUCER-SHIPPED tier value to a canonical routing tier, or
+    None if absent/invalid. Accepts actionable/ambient/excluded
+    (case-insensitive, surrounding whitespace tolerated). Anything else -- an
+    empty string, a severity word like "high"/"urgent" (the distinct top-level
+    claude-event `priority` field), or a typo -- returns None so the event
+    falls through to the consumer-side table rather than being silently
+    mis-routed. UNKNOWN is not a routing tier and is treated as absent."""
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    if v in (ACTIONABLE, AMBIENT, EXCLUDED):
+        return v
+    return None
 
 
 CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] = [
@@ -177,24 +176,6 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         ACTIONABLE,
         "PR status change with CI outcome or merge CONFLICT "
         "(mergeable=conflicting); needs investigation/merge."),
-
-    # pr-status-change ALSO fires for UNRESOLVED REVIEW COMMENTS: pr-watch
-    # emits "PR <name>: <N> unresolved comment(s) (was: <old>)" when the
-    # number of unresolved human review conversations on a tracked PR
-    # changes. A NONZERO count is actionable -- real review feedback is
-    # waiting on the author -- while a drop to "0 unresolved comment(s)" is
-    # a resolution and stays ambient via the catch-all below (same stance as
-    # a merge-conflict RESOLUTION). Distinct from comment-triage-needed
-    # (un-collapsed BOT comments); both are actionable but keyed differently.
-    # These were previously swallowed as ambient because the CI/merge-conflict
-    # predicate above does not match them. (botchat #3879: unresolved-comment
-    # events for regrello #2936/#2942/#2944/#3064/#2938/#2941/#2933 routed
-    # ambient and sat unnoticed.)
-    ("*", "pr-status-change",
-        _unresolved_comments_pending,
-        ACTIONABLE,
-        "PR has unresolved review comment(s) (nonzero count); needs "
-        "author response/resolution."),
 
     # workbot-prompt -> needs dispatch (legacy v1 actionable tag).
     ("*", "workbot-prompt", None, ACTIONABLE,
@@ -375,6 +356,7 @@ def _match_pattern(pattern: str, value: str) -> bool:
 
 
 def classify(source: str, tag: str, message: str = "",
+             shipped_tier: str | None = None,
              default_tier: str = ACTIONABLE) -> dict:
     """Return a dict with keys 'tier' and 'reason'. First matching
     rule wins; falls back to ``default_tier`` if no rule matches.
@@ -392,12 +374,39 @@ def classify(source: str, tag: str, message: str = "",
     src = source or ""
     tg = tag or ""
     msg = message or ""
+
+    def _rule_matches(src_pat, tag_pat, pred):
+        return (_match_pattern(src_pat, src)
+                and _match_pattern(tag_pat, tg)
+                and (pred is None or pred(msg)))
+
+    # (0) EXCLUDED consumer policy is ABSOLUTE: a producer-shipped tier must
+    # never be able to un-exclude a signal event ("too mission critical to risk
+    # on new shared infra" -- the EXCLUDED rules are ordered first for exactly
+    # this reason). Excluded matches therefore win even over a shipped tier.
     for src_pat, tag_pat, pred, tier, reason in CLASSIFICATIONS:
-        if not _match_pattern(src_pat, src):
-            continue
-        if not _match_pattern(tag_pat, tg):
-            continue
-        if pred is not None and not pred(msg):
+        if tier == EXCLUDED and _rule_matches(src_pat, tag_pat, pred):
+            return {"tier": EXCLUDED, "reason": reason,
+                    "matched": f"{src_pat}/{tag_pat}"}
+
+    # (a) Honor a PRODUCER-SHIPPED tier when present + valid. Self-describing
+    # events carry their own routing (e.g. pr-watch stamps data.tier=actionable
+    # on nonzero-unresolved-comment events, botchat #3879), so per-PRODUCER
+    # knowledge lives with the producer -- NOT as a per-tag catalog in this
+    # central classifier.
+    st = _normalize_shipped_tier(shipped_tier)
+    if st is not None:
+        return {"tier": st,
+                "reason": f"producer-shipped tier ({st}) honored",
+                "matched": "shipped-tier"}
+
+    # (b) Consumer-side policy table (first match wins). Holds genuine
+    # consumer-side overrides (alertmanager/* -> ambient "Andrew gets push";
+    # routine cron/queue transitions -> ambient) plus a shrinking set of legacy
+    # per-tag rules to be migrated to shipped-priority over time. Excluded rules
+    # were already handled in (0) above and cannot re-match here.
+    for src_pat, tag_pat, pred, tier, reason in CLASSIFICATIONS:
+        if not _rule_matches(src_pat, tag_pat, pred):
             continue
         return {"tier": tier, "reason": reason,
                 "matched": f"{src_pat}/{tag_pat}"}
@@ -419,6 +428,13 @@ def main() -> int:
     p.add_argument("--message", default="",
                    help="Event message body (used by message-conditional "
                         "rules like pr-status-change).")
+    p.add_argument("--tier", "--priority", dest="tier", default=None,
+                   help="Producer-SHIPPED tier (actionable|ambient|"
+                        "excluded). When present + valid it takes "
+                        "precedence over the consumer-side table (except an "
+                        "absolute EXCLUDED match). Self-describing events "
+                        "set this so per-producer knowledge stays with the "
+                        "producer, not this classifier.")
     p.add_argument("--default", default=ACTIONABLE, choices=sorted(VALID_TIERS),
                    help="Tier to return when no rule matches "
                         f"(default: {ACTIONABLE} — unknown pairs fail LOUD "
@@ -448,6 +464,7 @@ def main() -> int:
         return 2
 
     result = classify(args.source, args.tag, args.message,
+                      shipped_tier=args.tier,
                       default_tier=args.default)
     if args.json:
         out = {"source": args.source, "tag": args.tag,
@@ -529,21 +546,6 @@ def _self_test() -> int:
           "PR foo/bar#12: mergeable=mergeable (was: conflicting)"),
             AMBIENT),
 
-        # Unresolved review comments (botchat #3879): a NONZERO count is
-        # actionable (real review feedback waiting on the author); these were
-        # previously swallowed as ambient by the CI/merge-conflict predicate.
-        # A drop to 0 is a resolution -> ambient (like a conflict resolution).
-        # Note nonzero-not-increase: 5 -> 1 still has unresolved threads.
-        (("cron", "pr-status-change",
-          "PR regrello-sf/regrello#2936: 3 unresolved comment(s) (was: 0)"),
-            ACTIONABLE),
-        (("cron", "pr-status-change",
-          "PR foo/bar#12: 1 unresolved comment(s) (was: 5)"),
-            ACTIONABLE),
-        (("cron", "pr-status-change",
-          "PR foo/bar#12: 0 unresolved comment(s) (was: 3)"),
-            AMBIENT),
-
         # Ambient: alertmanager
         (("alertmanager", "alert-firing", ""), AMBIENT),
         (("alertmanager", "alert-resolved", ""), AMBIENT),
@@ -619,12 +621,56 @@ def _self_test() -> int:
         failures.append(f"  explicit-ambient override: expected="
                         f"{AMBIENT} actual={res4['tier']}")
 
+    # --- Shipped-priority precedence (botchat #3879 redesign) ---------------
+    # A PRODUCER-SHIPPED tier wins over the consumer-side table. This is how
+    # pr-watch's unresolved-comment events now route actionable -- via the
+    # SHIPPED tier, NOT a message regex in this file.
+    r = classify("cron", "pr-status-change",
+                 "PR foo/bar#12: 3 unresolved comment(s) (was: 0)",
+                 shipped_tier="actionable")
+    if r["tier"] != ACTIONABLE or r["matched"] != "shipped-tier":
+        failures.append(f"  shipped actionable: expected actionable/shipped-tier "
+                        f"got {r['tier']}/{r['matched']}")
+
+    # A shipped tier overrides even an existing consumer-table rule (here a
+    # routine 'new push' the table would otherwise call ambient).
+    r = classify("manual", "pr-status-change", "new push to branch",
+                 shipped_tier="ambient")
+    if r["tier"] != AMBIENT or r["matched"] != "shipped-tier":
+        failures.append(f"  shipped ambient override: got "
+                        f"{r['tier']}/{r['matched']}")
+
+    # An INVALID / severity-style shipped value ("high") is IGNORED -> fall
+    # through to the consumer table (routine push stays ambient), never
+    # mis-routed on a bad stamp.
+    r = classify("manual", "pr-status-change", "new push to branch",
+                 shipped_tier="high")
+    if r["tier"] != AMBIENT or r["matched"] == "shipped-tier":
+        failures.append(f"  invalid shipped ignored: got "
+                        f"{r['tier']}/{r['matched']}")
+
+    # No shipped tier -> pure consumer-table behavior (UNCHANGED). The reverted
+    # #552 regex is GONE: an unresolved-comment message with NO shipped tier now
+    # classifies ambient via the catch-all (routing comes from the producer
+    # stamp, not this file).
+    r = classify("cron", "pr-status-change",
+                 "PR foo/bar#12: 3 unresolved comment(s) (was: 0)")
+    if r["tier"] != AMBIENT:
+        failures.append(f"  unstamped unresolved-comment: expected ambient "
+                        f"(regex reverted) got {r['tier']}")
+
+    # EXCLUDED is ABSOLUTE: a producer must not be able to un-exclude signal.
+    r = classify("manual", "signal-dm-inbound", "from alice",
+                 shipped_tier="actionable")
+    if r["tier"] != EXCLUDED:
+        failures.append(f"  shipped cannot un-exclude signal: got {r['tier']}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         return 1
-    print(f"OK: {len(cases) + 4} cases pass.")
+    print(f"OK: {len(cases) + 9} cases pass.")
     return 0
 
 
