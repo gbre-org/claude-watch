@@ -300,18 +300,48 @@ def test_gate_hook_denies_when_session_task_missing() -> None:
 
 
 def test_dockerfile_bakes_hook_at_expected_path() -> None:
-    """The Dockerfile must COPY the gate hook to the path we asserted
-    above. If a future refactor moves the bake target without also
-    updating the shim helper's OBLIGATIONS_HOOKS, the wiring breaks
-    silently; this test catches drift between the two.
+    """The Dockerfile must bake the gate hook into /usr/local/bin/. If a
+    future refactor moves the bake target without also updating the shim
+    helper's OBLIGATIONS_HOOKS, the wiring breaks silently; this test
+    catches drift between the two.
+
+    Two accepted COPY forms (the real invariant is "the source lands under
+    /usr/local/bin/", NOT a specific COPY syntax):
+      a) per-file:      COPY tools/hooks/<name> /usr/local/bin/<name>
+      b) consolidated:  COPY tools/hooks/<a> \\
+                             tools/hooks/<name> \\
+                             ... \\
+                             /usr/local/bin/          (dir target)
+    Form (b) -- a single multi-source COPY into the /usr/local/bin/
+    directory -- collapses many per-file COPY layers into one to stay
+    under overlay2's 128-layer image-depth limit (PR #539). Collapse
+    `\\` line-continuations first so the multi-source form is seen whole.
     """
     dockerfile = CONTAINER_DIR / "Dockerfile"
     text = dockerfile.read_text(encoding="utf-8")
+    collapsed = re.sub(r"\\\n\s*", " ", text)
+    name = "pre-agent-queue-gate-hook"
+    # (a) per-file COPY landing at the explicit /usr/local/bin/<name> path.
+    per_file = re.compile(
+        rf"^\s*COPY\s+tools/hooks/{re.escape(name)}\s+"
+        rf"{re.escape(EXPECTED_BAKED_HOOK_PATH)}\b",
+        re.MULTILINE,
+    )
+    # (b) consolidated multi-source COPY: tools/hooks/<name> appears among
+    #     the sources of a COPY whose destination is the /usr/local/bin/
+    #     directory (trailing token).
+    consolidated = re.compile(
+        rf"^\s*COPY\s+(?:\S+\s+)*tools/hooks/{re.escape(name)}\s+(?:\S+\s+)*"
+        rf"/usr/local/bin/\s*$",
+        re.MULTILINE,
+    )
     expect(
-        f"COPY tools/hooks/pre-agent-queue-gate-hook {EXPECTED_BAKED_HOOK_PATH}"
-        in text,
-        f"Dockerfile must COPY the gate hook to "
-        f"{EXPECTED_BAKED_HOOK_PATH} so the shim's emitted "
+        per_file.search(collapsed) is not None
+        or consolidated.search(collapsed) is not None,
+        f"Dockerfile must bake the gate hook into /usr/local/bin/ "
+        f"(either `COPY tools/hooks/{name} {EXPECTED_BAKED_HOOK_PATH}` "
+        f"or a consolidated multi-source `COPY tools/hooks/... "
+        f"/usr/local/bin/` listing {name}) so the shim's emitted "
         "settings.json points at a real file. Drift between the "
         "Dockerfile COPY target and the shim helper's emitted "
         "command silently disables the gate.",
