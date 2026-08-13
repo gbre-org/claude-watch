@@ -328,7 +328,11 @@ test-load-bearer-from-keychain:
 # on-demand remote-access pattern. Uses --print-cmd to verify argv
 # construction without invoking ssh / mcp-host-bash. Covers env-file
 # loading, required-key enforcement, default ssh hardening options,
-# PERSONAL_MCP_SSH_EXTRA passthrough, soft kill switch. 17 cases, <1s.
+# PERSONAL_MCP_SSH_EXTRA passthrough, soft kill switch, and the
+# `restart` verb (reap a wedged half-up stack, restart both pieces,
+# verify each, exit 4 naming whichever did not come back; launchd
+# units are driven with kickstart -k via a stand-in launchctl).
+# 32 cases, ~15s (the restart cases start real stand-in processes).
 test-personal-mcp-host:
 	examples/personal-mac-mcp-host/tests/personal-mcp-host.test
 
