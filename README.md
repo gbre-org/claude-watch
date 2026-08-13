@@ -130,6 +130,12 @@ owner-orphan ladder; the FAST first-line signal is the in-tree
 [`monitoring/prometheus/README.md`](monitoring/prometheus/README.md) and
 `config.toml [queue_check]`).
 
+The Grafana **dashboard JSON** for those same metrics is version-controlled on
+the same terms, in [`monitoring/dashboards/`](monitoring/dashboards/). It is a
+source of record to copy or symlink from — deliberately not something live:
+never bind-mount a checkout of this repo as a Grafana dashboards volume, since
+the file provisioner deletes every dashboard not present in that directory.
+
 ## Architecture
 
 ```
