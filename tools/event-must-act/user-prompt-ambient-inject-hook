@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook -- inject ambient claude-events into next prompt.
+"""UserPromptSubmit hook -- inject ambient claude-events + operator presence.
 
 This is the **ambient** (info-only) tier of the four-tier event model
 introduced in q-2026-05-21-856d. Events classified as ``ambient`` by
@@ -8,15 +8,38 @@ introduced in q-2026-05-21-856d. Events classified as ``ambient`` by
 pending-actions list. This hook drains the queue at UserPromptSubmit
 time and prints the queued events as additional context.
 
+On top of the ambient queue, this hook ALSO surfaces **operator
+presence** as a one-line context prefix on every user prompt. Presence
+is otherwise only readable indirectly -- it gates ``AskUserQuestion`` via
+the ``file_mtime_within`` presence-gate obligation and feeds the
+exporter/dashboard -- but was never injected as readable context for the
+main loop. The line reports whether the operator-presence carrier file's
+mtime is fresh (PRESENT) or stale (AWAY), e.g.::
+
+    operator: PRESENT (last seen 3s ago)
+    operator: AWAY (last seen 4m ago)
+
+The carrier path + freshness threshold are auto-discovered from the
+presence-gate obligation row (``file_mtime_within`` predicate) so this
+line stays aligned with whatever the operator's gate actually enforces;
+env overrides (``CLAUDE_PRESENCE_CARRIER`` / ``CLAUDE_PRESENCE_MAX_AGE_SECS``)
+and sensible defaults (carrier ``/run/claude-presence/operator-present``
+then ``~/.claude/operator-present``; threshold 90s) back it up.
+
 Claude Code's UserPromptSubmit hook contract treats stdout as
 **additional context** appended to the next user prompt. No deny,
-no block, no gate -- the LLM just sees the ambient events as
-context on its next turn.
+no block, no gate -- the LLM just sees the ambient events + presence
+line as context on its next turn.
 
 Default-open posture:
-  - Missing ``event-ack`` CLI -> silent no-op.
+  - Missing ``event-ack`` CLI -> silent no-op for the ambient portion.
   - Drain subprocess error -> silent no-op + log.
-  - Empty ambient queue -> no output (no context added).
+  - Empty ambient queue -> no ambient output.
+  - Presence not configured (no gate row / env) and no default carrier
+    file present -> presence line omitted (no noise on non-presence
+    deployments).
+  - Carrier configured but missing/unreadable -> ``operator: UNKNOWN
+    (no carrier)``.
 
 Wiring (generated into the container settings.json by
 generate-hooks-shim-settings)::
@@ -56,10 +79,25 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 ERR_LOG_PATH = ERR_LOG_DIR / "ambient-inject-hook-errors.log"
+
+# --- Operator presence config ---------------------------------------------
+# Freshness threshold when not discoverable from the presence-gate row. 90s
+# matches the deployed presence-gate obligation manifest
+# (file_mtime_within max_age_secs: 90); no dedicated presence-latency work
+# item is committed in-repo, so 90s is the aligned default.
+PRESENCE_DEFAULT_MAX_AGE = 90.0
+# Default carrier candidates, in precedence order: the relocated carrier
+# (compose override, RO bind) then the in-$HOME default.
+PRESENCE_DEFAULT_CANDIDATES = (
+    "/run/claude-presence/operator-present",
+    "~/.claude/operator-present",
+)
+OBLIGATIONS_STATE = Path(os.path.expanduser("~/.config/claude/obligations.json"))
 
 
 def _log(payload: dict) -> None:
@@ -109,21 +147,142 @@ def _drain() -> str:
     return proc.stdout or ""
 
 
+# --- Operator presence -----------------------------------------------------
+
+def _iter_predicates(pred):
+    """Yield every predicate node, descending into ``all_of`` children."""
+    if not isinstance(pred, dict):
+        return
+    yield pred
+    params = pred.get("params") or {}
+    if isinstance(params, dict):
+        for child in params.get("predicates") or []:
+            yield from _iter_predicates(child)
+
+
+def _presence_from_obligation():
+    """Discover the presence carrier ``(path, max_age_secs)`` from the
+    presence-gate obligation row so the injected line auto-aligns with
+    whatever the operator's ``file_mtime_within`` gate enforces. Returns
+    ``(path, max_age)`` or ``None`` if no such row / unreadable state."""
+    try:
+        data = json.loads(OBLIGATIONS_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    best = None
+    for ob in data.get("obligations", []) if isinstance(data, dict) else []:
+        created_by = str(ob.get("created_by", "")).lower()
+        for pred in _iter_predicates(ob.get("predicate")):
+            if pred.get("kind") != "file_mtime_within":
+                continue
+            params = pred.get("params") or {}
+            path = params.get("path")
+            max_age = params.get("max_age_secs")
+            if not path or max_age is None:
+                continue
+            try:
+                max_age = float(max_age)
+            except (TypeError, ValueError):
+                continue
+            # Prefer a row that self-identifies as the presence gate;
+            # otherwise fall back to any operator-presence carrier.
+            if "presence" in created_by or "operator-present" in str(path):
+                return (str(path), max_age)
+            if best is None:
+                best = (str(path), max_age)
+    return best
+
+
+def _resolve_carrier():
+    """Return ``(path | None, max_age_secs, configured)``. ``configured`` is
+    True when the carrier came from an explicit source (env var or the
+    presence-gate obligation row) rather than a fallback default-candidate
+    probe -- it controls whether a missing carrier reports UNKNOWN vs is
+    omitted entirely."""
+    env_path = os.environ.get("CLAUDE_PRESENCE_CARRIER")
+    if env_path:
+        env_age = os.environ.get("CLAUDE_PRESENCE_MAX_AGE_SECS")
+        try:
+            age = float(env_age) if env_age else PRESENCE_DEFAULT_MAX_AGE
+        except ValueError:
+            age = PRESENCE_DEFAULT_MAX_AGE
+        return (env_path, age, True)
+    ob = _presence_from_obligation()
+    if ob is not None:
+        return (ob[0], ob[1], True)
+    # Not explicitly configured: probe default candidates, use only if one
+    # actually exists (stay silent on deployments without presence wiring).
+    for cand in PRESENCE_DEFAULT_CANDIDATES:
+        if os.path.exists(os.path.expanduser(cand)):
+            return (cand, PRESENCE_DEFAULT_MAX_AGE, False)
+    return (None, PRESENCE_DEFAULT_MAX_AGE, False)
+
+
+def _humanize_age(seconds: float) -> str:
+    """Human-readable elapsed time: ``3s``, ``4m``, ``1m5s``, ``1h2m``."""
+    s = int(seconds)
+    if s < 0:
+        s = 0
+    if s < 60:
+        return f"{s}s"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m}m" if sec == 0 else f"{m}m{sec}s"
+    h, m = divmod(m, 60)
+    return f"{h}h" if m == 0 else f"{h}h{m}m"
+
+
+def _presence_line() -> str:
+    """Compose the operator-presence context line, or ``''`` to omit.
+
+    - PRESENT: carrier mtime within ``max_age_secs``.
+    - AWAY: carrier exists but its mtime is stale.
+    - UNKNOWN (no carrier): a carrier is configured (env/gate row) but the
+      file is missing/unreadable.
+    - ``''`` (omit): presence not configured and no default carrier file
+      exists -- stay silent rather than inject noise on every prompt.
+    """
+    path, max_age, configured = _resolve_carrier()
+    if path is None:
+        return ""
+    full = os.path.expanduser(str(path))
+    try:
+        age = time.time() - os.stat(full).st_mtime
+    except OSError:
+        return "operator: UNKNOWN (no carrier)" if configured else ""
+    dur = _humanize_age(age)
+    state = "PRESENT" if age <= max_age else "AWAY"
+    return f"operator: {state} (last seen {dur} ago)"
+
+
 def main() -> int:
     # Read the UserPromptSubmit payload (we don't actually need any field
-    # from it; we drain unconditionally). Best-effort parse so a broken
+    # from it; we emit unconditionally). Best-effort parse so a broken
     # payload doesn't blackhole context injection.
     try:
         json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         pass
 
+    lines: list[str] = []
+
+    # Operator presence first (point-in-time state read, not a queued
+    # event) -- best-effort; never let it suppress the ambient drain.
+    try:
+        presence = _presence_line()
+    except Exception as exc:  # noqa: BLE001
+        _log({"kind": "presence-exception", "exc": str(exc)})
+        presence = ""
+    if presence:
+        lines.append(presence)
+
     text = _drain().strip()
     if text:
-        # Print to stdout -- Claude Code appends this to the prompt
-        # context. Wrap in a clear marker so the LLM knows the
-        # provenance (ambient events, no action required).
-        print(text)
+        lines.append(text)
+
+    if lines:
+        # Print to stdout -- Claude Code appends this to the prompt context.
+        print("\n".join(lines))
     return 0
 
 
