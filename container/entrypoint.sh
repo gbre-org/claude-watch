@@ -315,7 +315,7 @@ if [ "$_apikey_force" != "0" ]; then
     export CW_APIKEY_ENV_FALLBACK="${CW_APIKEY_ENV_FALLBACK:-1}"
 fi
 if [ "${CLAUDE_CONTAINER_REWRITE_HOOKS:-0}" = "1" ]; then
-    CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
+    CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/run/claude/shim/settings.json}"
     # Project-tier settings file. When an operator bind-mounts host
     # ~/.claude at the project-cwd path (so the cwd's .claude symlink
     # resolves + project-tier slash commands load), that host
@@ -352,7 +352,7 @@ elif [ "$CLAUDE_CONTAINER_OBLIGATIONS" = "1" ]; then
     # hook-fire, inject-signal-context-hook, etc.) along with the
     # cross-arch ones. This path is the right shape for Linux hosts
     # (no Mach-O pain) that still want the gates wired.
-    CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/tmp/claude-shim/settings.json}"
+    CLAUDE_SHIM_SETTINGS_PATH="${CLAUDE_SHIM_SETTINGS_PATH:-/run/claude/shim/settings.json}"
     /usr/local/bin/generate-hooks-shim-settings \
         --input "${HOME:-/home/hndrewaall}/.claude/settings.json" \
         --output "$CLAUDE_SHIM_SETTINGS_PATH" \
@@ -491,6 +491,62 @@ if [ -x /usr/local/bin/trust-workspace ]; then
     fi
 fi
 
+# CW_NEUTRALIZE_HOME_CLAUDE_OAUTH — close the $HOME/.claude OAuth read-path
+# gap left by CW_SNAPSHOT_NEUTRALIZE_OAUTH (#550).
+#
+# #550 neutralizes the personal claude.ai OAuth ONLY in the CLAUDE_CONFIG_DIR
+# snapshot farm (/run/claude/config). But Claude Code (observed on v2.1.229)
+# still authenticates with the personal Max OAuth even with CLAUDE_CONFIG_DIR
+# pointing at that neutralized farm and the corp gateway key approved — it
+# reads the OAuth token from the bind-mounted host $HOME/.claude/.credentials
+# .json, which #550 never touches. Result: inference routes through personal
+# Max OAuth, gateway (virtual-key) spend stays frozen, and the devbar budget
+# tile never moves (it reads LiteLLM user.spend, which team-key inference DOES
+# increment — verified — so the ONLY thing missing is getting inference back
+# onto the gateway key).
+#
+# This step farms $HOME/.claude the same way the CLAUDE_CONFIG_DIR snapshot
+# does: symlink every entry back to a READ-WRITE staging mount of the host
+# ~/.claude (so sessions/projects/history still persist to the host), EXCEPT
+# .credentials.json which becomes a REAL copy with claudeAiOauth stripped and
+# mcpOAuth preserved (reusing snapshot-claude-config --neutralize-oauth). With
+# no live claudeAiOauth on ANY path Claude Code reads, it falls back through
+# the documented precedence to the wired apiKeyHelper / ANTHROPIC_API_KEY corp
+# gateway key.
+#
+# OPT-IN + FAIL-SAFE (default OFF -> zero behaviour change for every operator
+# who doesn't enable it). To enable, the operator points the host ~/.claude
+# bind at a staging path (CLAUDE_HOST_CLAUDE_STAGING, default /run/host-claude,
+# rw) and makes /home/hndrewaall/.claude a tmpfs, then sets
+# CW_NEUTRALIZE_HOME_CLAUDE_OAUTH=1 (see the override example). We ONLY farm
+# when the staging dir is present + non-empty AND $HOME/.claude is EMPTY: an
+# EMPTY $HOME/.claude is the tmpfs the opt-in compose provides; a NON-empty one
+# is the operator's live rw bind-mounted host ~/.claude, and writing symlinks
+# into it would corrupt the host login — so we skip (fail-safe) and leave the
+# current behaviour untouched. Runs BEFORE the CLAUDE_CONFIG_DIR snapshot so
+# that snapshot then sources the already-neutralized $HOME/.claude.
+if [ "${CW_NEUTRALIZE_HOME_CLAUDE_OAUTH:-0}" = "1" ] \
+        && [ -x /usr/local/bin/snapshot-claude-config ]; then
+    _home_claude="${HOME:-/home/hndrewaall}/.claude"
+    _hc_staging="${CLAUDE_HOST_CLAUDE_STAGING:-/run/host-claude}"
+    if [ -d "$_hc_staging" ] && [ -n "$(ls -A "$_hc_staging" 2>/dev/null)" ] \
+            && [ -d "$_home_claude" ] && [ -z "$(ls -A "$_home_claude" 2>/dev/null)" ]; then
+        snapshot-claude-config \
+            --src-dir "$_hc_staging" \
+            --dest "$_home_claude" \
+            --neutralize-oauth \
+            --no-top-json || true
+        echo "[entrypoint] CW_NEUTRALIZE_HOME_CLAUDE_OAUTH: farmed $_home_claude" \
+             "from $_hc_staging (personal claude.ai OAuth neutralized;" \
+             "mcpOAuth + sessions preserved)" >&2
+    else
+        echo "[entrypoint] CW_NEUTRALIZE_HOME_CLAUDE_OAUTH=1 but staging" \
+             "($_hc_staging) absent/empty or $_home_claude not empty —" \
+             "skipping home-farm (fail-safe, no host mutation)" >&2
+    fi
+    unset _home_claude _hc_staging
+fi
+
 # CLAUDE_CONTAINER_SNAPSHOT_CONFIG — decouple the churning top-level
 # ~/.claude.json from the running claude (copy-on-start).
 #
@@ -502,7 +558,7 @@ fi
 # recoverable today only by a full container recreate.
 #
 # When "1", snapshot-claude-config builds a tmpfs "symlink farm" config dir
-# at /tmp/claude-config: every ~/.claude/* entry (sessions, projects,
+# at /run/claude/config: every ~/.claude/* entry (sessions, projects,
 # history, .credentials.json, operator-present, commands, plugins, …) is a
 # SYMLINK back to the live host dir so it still round-trips, EXCEPT the
 # top-level .claude.json which is a real SNAPSHOT COPY taken once here. We
@@ -531,7 +587,7 @@ fi
 # any failure falls back cleanly to reading the live host paths.
 if [ "${CLAUDE_CONTAINER_SNAPSHOT_CONFIG:-0}" = "1" ] \
         && [ -x /usr/local/bin/snapshot-claude-config ]; then
-    _snapshot_dest="${CLAUDE_SNAPSHOT_DEST:-/tmp/claude-config}"
+    _snapshot_dest="${CLAUDE_SNAPSHOT_DEST:-/run/claude/config}"
     # Neutralize personal claude.ai OAuth in the snapshot when we've
     # force-wired the apiKeyHelper AND have a corp gateway key present:
     # otherwise the snapshotted oauthAccount / claudeAiOauth would make

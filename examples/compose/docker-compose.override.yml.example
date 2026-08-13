@@ -73,6 +73,59 @@ services:
       # BASE docker-compose.yml, so it is ALWAYS present even on a base-only
       # deploy. Do NOT re-add it here (a duplicate is harmless — docker
       # concatenates volume lists — but the template should not carry it).
+
+      # ----------------------------------------------------------------
+      # OPT-IN: neutralize personal claude.ai OAuth on $HOME/.claude
+      # (CW_NEUTRALIZE_HOME_CLAUDE_OAUTH — follow-up to #550).
+      #
+      # Symptom this fixes: inference routes through your personal Max
+      # OAuth instead of the corp gateway virtual key, so gateway spend
+      # (and the devbar budget tile that reads LiteLLM user.spend) stays
+      # frozen even though CLAUDE_CONTAINER_SNAPSHOT_CONFIG + #550 are on.
+      # Cause: Claude Code reads the OAuth token from the bind-mounted
+      # host $HOME/.claude/.credentials.json, which the #550 snapshot
+      # (CLAUDE_CONFIG_DIR only) never neutralizes.
+      #
+      # To enable, do ALL of these together (matching env keys in .env):
+      #   1. RELOCATE the operator-present presence carrier OUT of ~/.claude
+      #      (see the presence block below): with anything nested under
+      #      /home/hndrewaall/.claude, the tmpfs is non-empty and the farm
+      #      SKIPS. The carrier moves to a host path outside ~/.claude,
+      #      mounted RO at /run/claude-presence/operator-present, and the
+      #      presence-gate obligation manifest + host presence-detector are
+      #      pointed at the new path (see DEPLOY NOTES in the PR).
+      #   2. Remap the host ~/.claude mount TARGET to the staging path:
+      #      CLAUDE_HOST_CLAUDE_MOUNT_TARGET=/run/host-claude
+      #      CLAUDE_HOST_CLAUDE_STAGING=/run/host-claude
+      #      (kept :rw so symlinked sessions/projects still persist to host.)
+      #   3. Make /home/hndrewaall/.claude a tmpfs (see the `tmpfs:` block
+      #      below) so the entrypoint farms a fresh neutralized copy into it.
+      #   4. Turn the fix on:  CW_NEUTRALIZE_HOME_CLAUDE_OAUTH=1
+      # The entrypoint then symlinks sessions/projects/history back to the
+      # staging mount (they still persist to the host) and materializes a
+      # REAL .credentials.json with claudeAiOauth stripped + mcpOAuth kept.
+      # Fail-safe: it only farms when $HOME/.claude is EMPTY (the tmpfs) —
+      # a populated dir means a direct host bind-mount and is left ALONE.
+      #
+      # Presence carrier relocation (step 1). The carrier must stay a file
+      # the SESSION cannot write (anti-spoof): keep it a RO bind from a host
+      # path the container reaches ONLY through this mount. Host source lives
+      # OUTSIDE ~/.claude (so it does not repopulate the farm tmpfs), e.g.
+      # ~/.config/claude-container/presence/operator-present, written solely
+      # by the host presence-detector LaunchAgent (repoint it there).
+      # - "${HOME}/.config/claude-container/presence/operator-present:/run/claude-presence/operator-present:ro"
+      # Then set the presence-gate obligation path to the new location:
+      #   $CLAUDE_HOST_OBLIGATIONS_DIR/presence-gate.json  "path":
+      #     "/run/claude-presence/operator-present"
+      # and REMOVE any legacy `.../operator-present:/home/hndrewaall/.claude/
+      # operator-present:ro` mount (it would repopulate the tmpfs -> farm skip).
+      # ----------------------------------------------------------------
+    # tmpfs is a SERVICE-level key (sibling of `volumes:`, 4-space indent).
+    # NOTE: /run/claude (config-dir + shim) is a tmpfs in the BASE compose
+    # already; ONLY /home/hndrewaall/.claude needs adding here (for the
+    # OAuth-neutralize opt-in). Uncomment:
+    # tmpfs:
+    #   - /home/hndrewaall/.claude
       # gh CLI token storage. RW so an in-container `gh auth login`
       # (token refresh, scope upgrade) propagates back to the host.
       # - "${HOME}/.config/gh:/home/hndrewaall/.config/gh:rw"

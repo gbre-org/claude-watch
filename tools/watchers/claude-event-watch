@@ -454,10 +454,23 @@ finally:
 # so event-classify's substring rules (e.g. "CI failure") match correctly.
 cli = os.environ.get("EVENT_ACK_CLI", "")
 if cli:
+    # Forward a PRODUCER-SHIPPED tier (data.tier = actionable|ambient|excluded)
+    # so self-describing events route by their own priority rather than a
+    # per-tag rule in event-classify (botchat #3879). `data` was reassigned to
+    # the log bytes above, so re-read the tier straight from the event dict.
+    _ev_data = ev.get("data")
+    _shipped_tier = None
+    if isinstance(_ev_data, dict):
+        _t = _ev_data.get("tier")
+        if isinstance(_t, str) and _t.strip():
+            _shipped_tier = _t.strip()
     try:
+        _ingest_cmd = [cli, "ingest", "--source", source, "--tag", tag,
+                       "--message", full_message]
+        if _shipped_tier:
+            _ingest_cmd += ["--tier", _shipped_tier]
         subprocess.run(
-            [cli, "ingest", "--source", source, "--tag", tag,
-             "--message", full_message],
+            _ingest_cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=5, check=False,
         )

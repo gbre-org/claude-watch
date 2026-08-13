@@ -52,7 +52,7 @@ compose stack already exports — no personal paths are baked in:
 
 where:
   container_home = $HOME                              (e.g. /home/hndrewaall)
-  container_config = $CLAUDE_CONFIG_DIR               (e.g. /tmp/claude-config,
+  container_config = $CLAUDE_CONFIG_DIR               (e.g. /run/claude/config,
                    set when Claude's config dir is relocated off $HOME; maps to
                    the SAME bind-mounted files the host sees under
                    {host_home}/.claude)
@@ -83,7 +83,7 @@ CONFIG KNOBS (env)
                                       inputs to the default map derivation
                                       (see PATH REWRITE above).
   CLAUDE_CONFIG_DIR                   container Claude config dir when relocated
-                                      off $HOME (e.g. /tmp/claude-config); its
+                                      off $HOME (e.g. /run/claude/config); its
                                       prefix is mapped to {host_home}/.claude so
                                       transcript_path stays host-openable.
 
@@ -144,12 +144,12 @@ def derive_default_map() -> dict[str, str]:
         host_claude = f"{host_home}/.claude"
         mapping[f"{home}/.claude"] = host_claude
         # Claude's config dir is often relocated off $HOME via CLAUDE_CONFIG_DIR
-        # (e.g. /tmp/claude-config), so transcript_path and friends arrive with
+        # (e.g. /run/claude/config), so transcript_path and friends arrive with
         # THAT prefix, not {home}/.claude. It still points at the SAME
         # bind-mounted files the host sees under {host_home}/.claude (identical
         # projects/<slug>/<session>.jsonl tail), so map it there too -- otherwise
         # container-originated rows land host-side with an unopenable
-        # /tmp/claude-config/... transcript_path.
+        # /run/claude/config/... transcript_path.
         config_dir = _strip_trailing_slash(os.environ.get("CLAUDE_CONFIG_DIR", ""))
         if config_dir and config_dir != f"{home}/.claude":
             mapping[config_dir] = host_claude

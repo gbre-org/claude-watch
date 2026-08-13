@@ -100,6 +100,22 @@ def _contains_any(*needles: str) -> Callable[[str], bool]:
     return _pred
 
 
+def _normalize_shipped_tier(value: str | None) -> str | None:
+    """Coerce a PRODUCER-SHIPPED tier value to a canonical routing tier, or
+    None if absent/invalid. Accepts actionable/ambient/excluded
+    (case-insensitive, surrounding whitespace tolerated). Anything else -- an
+    empty string, a severity word like "high"/"urgent" (the distinct top-level
+    claude-event `priority` field), or a typo -- returns None so the event
+    falls through to the consumer-side table rather than being silently
+    mis-routed. UNKNOWN is not a routing tier and is treated as absent."""
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    if v in (ACTIONABLE, AMBIENT, EXCLUDED):
+        return v
+    return None
+
+
 CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] = [
     # --- EXCLUDED (NOT TOUCHED BY THIS REFACTOR) --------------------------
     #
@@ -340,6 +356,7 @@ def _match_pattern(pattern: str, value: str) -> bool:
 
 
 def classify(source: str, tag: str, message: str = "",
+             shipped_tier: str | None = None,
              default_tier: str = ACTIONABLE) -> dict:
     """Return a dict with keys 'tier' and 'reason'. First matching
     rule wins; falls back to ``default_tier`` if no rule matches.
@@ -357,12 +374,39 @@ def classify(source: str, tag: str, message: str = "",
     src = source or ""
     tg = tag or ""
     msg = message or ""
+
+    def _rule_matches(src_pat, tag_pat, pred):
+        return (_match_pattern(src_pat, src)
+                and _match_pattern(tag_pat, tg)
+                and (pred is None or pred(msg)))
+
+    # (0) EXCLUDED consumer policy is ABSOLUTE: a producer-shipped tier must
+    # never be able to un-exclude a signal event ("too mission critical to risk
+    # on new shared infra" -- the EXCLUDED rules are ordered first for exactly
+    # this reason). Excluded matches therefore win even over a shipped tier.
     for src_pat, tag_pat, pred, tier, reason in CLASSIFICATIONS:
-        if not _match_pattern(src_pat, src):
-            continue
-        if not _match_pattern(tag_pat, tg):
-            continue
-        if pred is not None and not pred(msg):
+        if tier == EXCLUDED and _rule_matches(src_pat, tag_pat, pred):
+            return {"tier": EXCLUDED, "reason": reason,
+                    "matched": f"{src_pat}/{tag_pat}"}
+
+    # (a) Honor a PRODUCER-SHIPPED tier when present + valid. Self-describing
+    # events carry their own routing (e.g. pr-watch stamps data.tier=actionable
+    # on nonzero-unresolved-comment events, botchat #3879), so per-PRODUCER
+    # knowledge lives with the producer -- NOT as a per-tag catalog in this
+    # central classifier.
+    st = _normalize_shipped_tier(shipped_tier)
+    if st is not None:
+        return {"tier": st,
+                "reason": f"producer-shipped tier ({st}) honored",
+                "matched": "shipped-tier"}
+
+    # (b) Consumer-side policy table (first match wins). Holds genuine
+    # consumer-side overrides (alertmanager/* -> ambient "Andrew gets push";
+    # routine cron/queue transitions -> ambient) plus a shrinking set of legacy
+    # per-tag rules to be migrated to shipped-priority over time. Excluded rules
+    # were already handled in (0) above and cannot re-match here.
+    for src_pat, tag_pat, pred, tier, reason in CLASSIFICATIONS:
+        if not _rule_matches(src_pat, tag_pat, pred):
             continue
         return {"tier": tier, "reason": reason,
                 "matched": f"{src_pat}/{tag_pat}"}
@@ -384,6 +428,13 @@ def main() -> int:
     p.add_argument("--message", default="",
                    help="Event message body (used by message-conditional "
                         "rules like pr-status-change).")
+    p.add_argument("--tier", "--priority", dest="tier", default=None,
+                   help="Producer-SHIPPED tier (actionable|ambient|"
+                        "excluded). When present + valid it takes "
+                        "precedence over the consumer-side table (except an "
+                        "absolute EXCLUDED match). Self-describing events "
+                        "set this so per-producer knowledge stays with the "
+                        "producer, not this classifier.")
     p.add_argument("--default", default=ACTIONABLE, choices=sorted(VALID_TIERS),
                    help="Tier to return when no rule matches "
                         f"(default: {ACTIONABLE} — unknown pairs fail LOUD "
@@ -413,6 +464,7 @@ def main() -> int:
         return 2
 
     result = classify(args.source, args.tag, args.message,
+                      shipped_tier=args.tier,
                       default_tier=args.default)
     if args.json:
         out = {"source": args.source, "tag": args.tag,
@@ -569,12 +621,56 @@ def _self_test() -> int:
         failures.append(f"  explicit-ambient override: expected="
                         f"{AMBIENT} actual={res4['tier']}")
 
+    # --- Shipped-priority precedence (botchat #3879 redesign) ---------------
+    # A PRODUCER-SHIPPED tier wins over the consumer-side table. This is how
+    # pr-watch's unresolved-comment events now route actionable -- via the
+    # SHIPPED tier, NOT a message regex in this file.
+    r = classify("cron", "pr-status-change",
+                 "PR foo/bar#12: 3 unresolved comment(s) (was: 0)",
+                 shipped_tier="actionable")
+    if r["tier"] != ACTIONABLE or r["matched"] != "shipped-tier":
+        failures.append(f"  shipped actionable: expected actionable/shipped-tier "
+                        f"got {r['tier']}/{r['matched']}")
+
+    # A shipped tier overrides even an existing consumer-table rule (here a
+    # routine 'new push' the table would otherwise call ambient).
+    r = classify("manual", "pr-status-change", "new push to branch",
+                 shipped_tier="ambient")
+    if r["tier"] != AMBIENT or r["matched"] != "shipped-tier":
+        failures.append(f"  shipped ambient override: got "
+                        f"{r['tier']}/{r['matched']}")
+
+    # An INVALID / severity-style shipped value ("high") is IGNORED -> fall
+    # through to the consumer table (routine push stays ambient), never
+    # mis-routed on a bad stamp.
+    r = classify("manual", "pr-status-change", "new push to branch",
+                 shipped_tier="high")
+    if r["tier"] != AMBIENT or r["matched"] == "shipped-tier":
+        failures.append(f"  invalid shipped ignored: got "
+                        f"{r['tier']}/{r['matched']}")
+
+    # No shipped tier -> pure consumer-table behavior (UNCHANGED). The reverted
+    # #552 regex is GONE: an unresolved-comment message with NO shipped tier now
+    # classifies ambient via the catch-all (routing comes from the producer
+    # stamp, not this file).
+    r = classify("cron", "pr-status-change",
+                 "PR foo/bar#12: 3 unresolved comment(s) (was: 0)")
+    if r["tier"] != AMBIENT:
+        failures.append(f"  unstamped unresolved-comment: expected ambient "
+                        f"(regex reverted) got {r['tier']}")
+
+    # EXCLUDED is ABSOLUTE: a producer must not be able to un-exclude signal.
+    r = classify("manual", "signal-dm-inbound", "from alice",
+                 shipped_tier="actionable")
+    if r["tier"] != EXCLUDED:
+        failures.append(f"  shipped cannot un-exclude signal: got {r['tier']}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
         for f in failures:
             print(f, file=sys.stderr)
         return 1
-    print(f"OK: {len(cases) + 4} cases pass.")
+    print(f"OK: {len(cases) + 9} cases pass.")
     return 0
 
 

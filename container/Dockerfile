@@ -57,7 +57,23 @@ FROM rust:1-bookworm AS claude-watch-builder
 
 WORKDIR /build
 
+# COPY the working tree from the build context (the repo root). The
+# .dockerignore at the repo root prunes target/, __pycache__/, .git/,
+# editor swap files, etc. — only the source files Cargo + the rest of
+# the multi-stage build actually need land in this layer. The layer is
+# invalidated when any non-ignored file changes, which matches "I want
+# to rebuild whenever I edit Rust source" without requiring a
+# hand-drafted SHA arg per build.
+COPY . /build
+
 # Build-time git identity for the `claude_watch_build_info` Prometheus gauge.
+# PLACEMENT: these ARGs change every commit, so they sit LATE — after the
+# `COPY . /build` above and immediately before the `cargo build` below,
+# mirroring the GIT_SHA ARG at the very end of this file. A volatile ARG
+# invalidates its own layer PLUS every layer after it; keeping it here means
+# only the final build layer re-runs per commit (the expensive dependency
+# compile is preserved by the BuildKit cache mounts on the RUN below), never
+# the earlier builder-stage layers.
 #
 # build.rs stamps CW_GIT_COMMIT / CW_GIT_PR into the binary. It prefers live
 # git, but `.dockerignore` prunes `.git/` from this build context (see the
@@ -72,15 +88,6 @@ ARG CW_BUILD_COMMIT=
 ARG CW_BUILD_PR=
 ENV CW_BUILD_COMMIT=${CW_BUILD_COMMIT} \
     CW_BUILD_PR=${CW_BUILD_PR}
-
-# COPY the working tree from the build context (the repo root). The
-# .dockerignore at the repo root prunes target/, __pycache__/, .git/,
-# editor swap files, etc. — only the source files Cargo + the rest of
-# the multi-stage build actually need land in this layer. The layer is
-# invalidated when any non-ignored file changes, which matches "I want
-# to rebuild whenever I edit Rust source" without requiring a
-# hand-drafted SHA arg per build.
-COPY . /build
 
 # claude-watch's Cargo.toml has `profile.release = { strip = true, lto = true }`,
 # so the resulting binary is already stripped + LTO-optimised.
@@ -114,14 +121,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # --- Stage 2: runtime image ------------------------------------------------
 FROM debian:bookworm-slim
 
-# Reproducibility tag — the build wrapper / Makefile target passes
-# --build-arg GIT_SHA=$(git rev-parse HEAD) so `docker inspect IMAGE
-# --format '{{ index .Config.Labels "claude_watch_sha" }}'` reports the
-# exact local revision baked into this image. Default empty so a bare
-# `docker build .` (no wrapper, no SHA passed) still produces a working
-# image — the LABEL just reads as an empty string in that case.
-ARG GIT_SHA=
-LABEL claude_watch_sha="${GIT_SHA}"
+# NOTE: the `GIT_SHA` reproducibility ARG + LABEL are declared at the
+# VERY END of this file, NOT here. GIT_SHA changes every commit; an ARG
+# consumed by a LABEL invalidates that layer AND every layer after it, so
+# placing it before the apt/curl/npm/COPY layers cold-rebuilt the entire
+# runtime stage on every build. At the end it only busts the final trivial
+# metadata layer, leaving the expensive layers cached.
 
 # Non-interactive apt and consistent locale for a tmux-driven UI.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -943,7 +948,7 @@ RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
 # entrypoint runs this helper to generate a container-local copy of
 # ~/.claude/settings.json with every hook command wrapped in
 # /usr/local/bin/exec-hook, then launches claude with `--settings
-# /tmp/claude-shim/settings.json`. The output file overrides the host
+# /run/claude/shim/settings.json`. The output file overrides the host
 # settings.json's hooks for the in-container session without mutating the
 # host file. See container/hooks-shim/generate-hooks-shim-settings for the
 # rewrite logic and the embedded test suite at
@@ -1464,6 +1469,15 @@ RUN chmod +x /usr/local/bin/claude-tmux-entrypoint
 # Drop privileges before runtime — root in a bind-mounted layout breaks host perms.
 USER hndrewaall
 WORKDIR /workspace
+
+# Reproducibility tag — the build wrapper / Makefile target passes
+# --build-arg GIT_SHA=$(git rev-parse HEAD) so `docker inspect IMAGE
+# --format '{{ index .Config.Labels "claude_watch_sha" }}'` reports the
+# exact local revision baked into this image. Default empty so a bare
+# `docker build .` (no wrapper, no SHA passed) still produces a working
+# image — the LABEL just reads as an empty string in that case.
+ARG GIT_SHA=
+LABEL claude_watch_sha="${GIT_SHA}"
 
 # process-compose as PID 1 (escalation past tini's threshold). The
 # binary forwards SIGTERM/SIGINT to all supervised processes, reaps

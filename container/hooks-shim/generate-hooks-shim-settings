@@ -25,7 +25,7 @@ This helper produces a container-local copy of settings.json with
 every hook command wrapped, so the operator doesn't have to mutate
 the host file. It is invoked by container/entrypoint.sh when
 CLAUDE_CONTAINER_REWRITE_HOOKS=1 is set. The generated file lives at
-$OUTPUT_PATH (default /tmp/claude-shim/settings.json, uid 1000
+$OUTPUT_PATH (default /run/claude/shim/settings.json, uid 1000
 writable). The entrypoint then launches claude with
 `--settings $OUTPUT_PATH` so Claude Code merges the rewritten hooks
 on top of its normal user/project/local cascade.
@@ -595,7 +595,7 @@ def main(argv: list[str]) -> int:
     )
     p.add_argument(
         "--output", "-o",
-        default=os.environ.get("CLAUDE_SHIM_OUTPUT", "/tmp/claude-shim/settings.json"),
+        default=os.environ.get("CLAUDE_SHIM_OUTPUT", "/run/claude/shim/settings.json"),
         help="Path to write the rewritten settings.json to. Created with "
              "0600 perms; parent dir created if missing.",
     )

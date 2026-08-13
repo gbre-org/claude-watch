@@ -233,6 +233,7 @@ test-entrypoint:
 	container/tests/baked-obligations-hooks.test
 	container/tests/baked-mcp-bridge-baseline.test
 	container/tests/config-dir-uid-1000.test
+	container/tests/neutralize-home-claude-oauth.test
 	container/tests/claude-code-dir-uid-1000.test
 	container/tests/queue-gate-wired.test
 	container/tests/claude-watch-alert-gate-wired.test
