@@ -31,7 +31,27 @@ fn main() {
     let mut pr = git_output(&["log", "-1", "--format=%s"])
         .and_then(|subject| parse_pr_number(&subject).map(|n| n.to_string()));
 
-    // 2. Fall back to build-arg-injected env vars (container image build).
+    // 2. Fall back to a build-context stamp FILE (container image build).
+    //    `container/Dockerfile` writes `.build-commit` / `.build-pr` from the
+    //    `--build-arg` values into the crate root inside the SAME `cargo build`
+    //    RUN. Reading a source-tree file (with `rerun-if-changed` below) is
+    //    robust against the BuildKit `type=cache` mount on `/build/target`,
+    //    which persists build.rs's fingerprint AND its cached rustc-env output
+    //    across image builds: the file is rewritten every build so its mtime is
+    //    always newer than the cached fingerprint, forcing cargo to re-run
+    //    build.rs and restamp. `rerun-if-env-changed` alone did NOT force a
+    //    re-run here — the stale build-script output in the persisted target
+    //    mount was reused, so `claude_watch_build_info` read commit="unknown"
+    //    even on a clean layer-cache-pruned rebuild.
+    if commit.is_none() {
+        commit = read_stamp_file(".build-commit");
+    }
+    if pr.is_none() {
+        pr = read_stamp_file(".build-pr");
+    }
+
+    // 3. Fall back to build-arg-injected env vars (bare `docker build`, or a
+    //    host `cargo build` with the vars exported). Kept as a secondary path.
     if commit.is_none() {
         commit = build_env("CW_BUILD_COMMIT");
     }
@@ -39,7 +59,7 @@ fn main() {
         pr = build_env("CW_BUILD_PR");
     }
 
-    // 3. Final fallbacks.
+    // 4. Final fallbacks.
     let commit = commit.unwrap_or_else(|| "unknown".into());
     let pr = pr.unwrap_or_default();
 
@@ -53,6 +73,14 @@ fn main() {
     if let Some(head_ref) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
         println!("cargo:rerun-if-changed=.git/{}", head_ref);
     }
+    // Restamp when the container build-context stamp files change. The
+    // Dockerfile rewrites these every image build, so their mtime is always
+    // newer than the build-script fingerprint cached in the persisted
+    // `/build/target` mount — this is what reliably forces a build.rs re-run
+    // across separate image builds (the `rerun-if-env-changed` directives
+    // below do not, given that cache mount).
+    println!("cargo:rerun-if-changed=.build-commit");
+    println!("cargo:rerun-if-changed=.build-pr");
     // Restamp when the build-arg-injected stamp changes (container builds).
     println!("cargo:rerun-if-env-changed=CW_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=CW_BUILD_PR");
@@ -68,6 +96,17 @@ fn git_output(args: &[&str]) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+/// Read a build-context stamp file (e.g. `.build-commit`) from the crate root,
+/// treating a missing file or empty / whitespace-only contents as absent so a
+/// bare `docker build` (no stamp file, or an empty one) cleanly falls through
+/// to the env var and then "unknown".
+fn read_stamp_file(path: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        _ => None,
     }
 }
 
