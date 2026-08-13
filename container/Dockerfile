@@ -111,10 +111,22 @@ ENV CW_BUILD_COMMIT=${CW_BUILD_COMMIT} \
 # `sharing=locked` serialises concurrent builds sharing the cache (safe if two
 # builds run at once); the cache is keyed per-target so it survives across
 # rebuilds of this stage.
+# Write the host-computed build identity to stamp FILES in the crate root
+# BEFORE `cargo build`, so build.rs reads them via `include`-style file reads
+# with `cargo:rerun-if-changed`. This is what makes the commit stamp survive
+# the `--mount=type=cache,target=/build/target` cache mount: that mount
+# persists build.rs's fingerprint + cached rustc-env output across image
+# builds, so `rerun-if-env-changed=CW_BUILD_COMMIT` alone did NOT force a
+# re-run (a stale build-script output was reused → commit="unknown"). The
+# stamp files are rewritten every build (fresh mtime > the cached fingerprint),
+# which forces cargo to re-run build.rs and restamp. Writing them in the SAME
+# RUN keeps them outside the cache mount (crate root /build is un-mounted).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release \
+    printf '%s' "${CW_BUILD_COMMIT}" > /build/.build-commit \
+    && printf '%s' "${CW_BUILD_PR}" > /build/.build-pr \
+    && cargo build --release \
     && cp /build/target/release/claude-watch /build/claude-watch \
     && /build/claude-watch --help >/dev/null
 
