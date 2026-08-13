@@ -57,7 +57,23 @@ FROM rust:1-bookworm AS claude-watch-builder
 
 WORKDIR /build
 
+# COPY the working tree from the build context (the repo root). The
+# .dockerignore at the repo root prunes target/, __pycache__/, .git/,
+# editor swap files, etc. — only the source files Cargo + the rest of
+# the multi-stage build actually need land in this layer. The layer is
+# invalidated when any non-ignored file changes, which matches "I want
+# to rebuild whenever I edit Rust source" without requiring a
+# hand-drafted SHA arg per build.
+COPY . /build
+
 # Build-time git identity for the `claude_watch_build_info` Prometheus gauge.
+# PLACEMENT: these ARGs change every commit, so they sit LATE — after the
+# `COPY . /build` above and immediately before the `cargo build` below,
+# mirroring the GIT_SHA ARG at the very end of this file. A volatile ARG
+# invalidates its own layer PLUS every layer after it; keeping it here means
+# only the final build layer re-runs per commit (the expensive dependency
+# compile is preserved by the BuildKit cache mounts on the RUN below), never
+# the earlier builder-stage layers.
 #
 # build.rs stamps CW_GIT_COMMIT / CW_GIT_PR into the binary. It prefers live
 # git, but `.dockerignore` prunes `.git/` from this build context (see the
@@ -72,15 +88,6 @@ ARG CW_BUILD_COMMIT=
 ARG CW_BUILD_PR=
 ENV CW_BUILD_COMMIT=${CW_BUILD_COMMIT} \
     CW_BUILD_PR=${CW_BUILD_PR}
-
-# COPY the working tree from the build context (the repo root). The
-# .dockerignore at the repo root prunes target/, __pycache__/, .git/,
-# editor swap files, etc. — only the source files Cargo + the rest of
-# the multi-stage build actually need land in this layer. The layer is
-# invalidated when any non-ignored file changes, which matches "I want
-# to rebuild whenever I edit Rust source" without requiring a
-# hand-drafted SHA arg per build.
-COPY . /build
 
 # claude-watch's Cargo.toml has `profile.release = { strip = true, lto = true }`,
 # so the resulting binary is already stripped + LTO-optimised.
