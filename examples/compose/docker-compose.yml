@@ -531,7 +531,9 @@ services:
     working_dir: ${CLAUDE_HOST_PROJECT_DIR:-/workspace}
     # Writable runtime tmpfs for the relocated Claude config-dir + hook shim,
     # moved off /tmp onto /run. /run is root-owned so uid-1000 cannot write it
-    # directly; this tmpfs (default mode 1777, like /tmp) hosts:
+    # directly; this tmpfs MUST be mode=1777 (docker tmpfs defaults to 755 —
+    # NOT 1777; only /tmp is 1777 by OS convention) so the uid-1000 entrypoint
+    # can create the dirs below. hosts:
     #   /run/claude/config — CLAUDE_CONFIG_DIR snapshot farm (when
     #                        CLAUDE_CONTAINER_SNAPSHOT_CONFIG=1)
     #   /run/claude/shim   — the generated sanitized settings.json (when
@@ -539,7 +541,7 @@ services:
     # Unconditional: the shim path is used by every REWRITE_HOOKS operator, so
     # this mount must always be present or the shim write falls back to no-shim.
     tmpfs:
-      - /run/claude
+      - /run/claude:mode=1777
     stdin_open: true
     tty: true
 
