@@ -172,8 +172,13 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_USERS_DEFAULT_THEME: "dark"
     volumes:
-      - "./grafana/provisioning:/etc/grafana/provisioning:ro"
-      - "./grafana/dashboards:/var/lib/grafana/dashboards:ro"
+      # Dashboards + provisioning are sourced from the andrew-sf-tools
+      # repo (its monitoring/ tree is the durable source of truth), NOT
+      # from a transient in-repo/worktree path -- so they survive a
+      # `docker compose down -v` and a claude-watch worktree cleanup.
+      # Override the repo location with SF_TOOLS_DIR.
+      - "${SF_TOOLS_DIR:-${HOME}/repos/andrew-sf-tools}/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "${SF_TOOLS_DIR:-${HOME}/repos/andrew-sf-tools}/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro"
       - "grafana-data:/var/lib/grafana"
     ports:
       - "3000:3000"
