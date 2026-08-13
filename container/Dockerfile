@@ -114,14 +114,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # --- Stage 2: runtime image ------------------------------------------------
 FROM debian:bookworm-slim
 
-# Reproducibility tag — the build wrapper / Makefile target passes
-# --build-arg GIT_SHA=$(git rev-parse HEAD) so `docker inspect IMAGE
-# --format '{{ index .Config.Labels "claude_watch_sha" }}'` reports the
-# exact local revision baked into this image. Default empty so a bare
-# `docker build .` (no wrapper, no SHA passed) still produces a working
-# image — the LABEL just reads as an empty string in that case.
-ARG GIT_SHA=
-LABEL claude_watch_sha="${GIT_SHA}"
+# NOTE: the `GIT_SHA` reproducibility ARG + LABEL are declared at the
+# VERY END of this file, NOT here. GIT_SHA changes every commit; an ARG
+# consumed by a LABEL invalidates that layer AND every layer after it, so
+# placing it before the apt/curl/npm/COPY layers cold-rebuilt the entire
+# runtime stage on every build. At the end it only busts the final trivial
+# metadata layer, leaving the expensive layers cached.
 
 # Non-interactive apt and consistent locale for a tmux-driven UI.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -1464,6 +1462,15 @@ RUN chmod +x /usr/local/bin/claude-tmux-entrypoint
 # Drop privileges before runtime — root in a bind-mounted layout breaks host perms.
 USER hndrewaall
 WORKDIR /workspace
+
+# Reproducibility tag — the build wrapper / Makefile target passes
+# --build-arg GIT_SHA=$(git rev-parse HEAD) so `docker inspect IMAGE
+# --format '{{ index .Config.Labels "claude_watch_sha" }}'` reports the
+# exact local revision baked into this image. Default empty so a bare
+# `docker build .` (no wrapper, no SHA passed) still produces a working
+# image — the LABEL just reads as an empty string in that case.
+ARG GIT_SHA=
+LABEL claude_watch_sha="${GIT_SHA}"
 
 # process-compose as PID 1 (escalation past tini's threshold). The
 # binary forwards SIGTERM/SIGINT to all supervised processes, reaps
