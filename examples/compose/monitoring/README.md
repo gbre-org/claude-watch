@@ -55,6 +55,16 @@ The optional `grafana` profile brings up a Grafana instance with:
    stat (`sum(claude_code_tokens_month_to_date)`) that resets on the 1st.
    Requires the `node-exporter` profile (daemon textfile metrics).
 
+   **LiteLLM Token Spend dashboard** — provisioned from
+   `grafana/dashboards/litellm-spend.json` (uid `litellm-spend`). Shows the
+   operator's LiteLLM-gateway **dollar** spend and their team's aggregate
+   spend: headline tiles (my monthly spend, monthly-budget-used gauge, team
+   MTD spend, my key's lifetime spend, team-budget-used gauge, team member
+   count, scrape health + freshness) plus two time-series (my monthly spend
+   over time; team + key spend over time). Requires the `litellm-spend`
+   profile (see below) or the host LaunchAgent feeding `litellm_*` metrics
+   into Prometheus.
+
 3. **Datasource** — auto-provisioned pointing at the `prometheus` service in
    this stack (UID `prometheus`, so the dashboard JSON's datasource refs resolve
    without manual setup).
@@ -73,6 +83,7 @@ three places, and this stack wires up all three:
 | `work-queue-exporter` (`exporters/work-queue-exporter/`) | HTTP `/metrics` | 9099 | `worktask_queue_*` | `queue.json` + `active-agents.json` |
 | `claude-events-exporter` (`exporters/claude-events-exporter/`) | HTTP `/metrics` | 9103 | `claude_events_*` | `~/claude-events/` spool |
 | `claude-watch` daemon (`claude-watch metrics`, `src/metrics.rs`) | **node-exporter textfile** | 9100 | `claude_watch_*`, `claude_code_*` | `~/.config/claude-watch/state.json` -> writes `.prom` |
+| `litellm-spend-exporter` (`exporters/litellm-spend-exporter/`) — OPTIONAL, `litellm-spend` profile | HTTP `/metrics` | 9104 | `litellm_*_spend_dollars`, `litellm_team_*` | LiteLLM gateway `/user/info`, `/key/info`, `/team/info` (EXTERNAL, needs a key) |
 
 The two Python exporters are HTTP scrape targets and are built + run by this
 compose file (from the in-repo Dockerfiles). The daemon is different: it only
@@ -103,6 +114,77 @@ by setting `CW_EXPORTER_HOST=host.docker.internal` and editing
 `prometheus.yml`'s targets to the host-gateway address — the `prometheus` and
 `alertmanager` services already declare `host.docker.internal:host-gateway`
 (matching the sibling stack's pattern).
+
+## LiteLLM token-spend exporter (`litellm-spend` profile / host LaunchAgent)
+
+`exporters/litellm-spend-exporter/` polls the SF **LiteLLM gateway**
+(`eng-ai-model-gateway`, the same gateway Claude Code authenticates against)
+and exposes token spend in **dollars**:
+
+| Metric | Source field |
+|---|---|
+| `litellm_user_spend_dollars{user}` | `/user/info` `user_info.spend` (current **month**) |
+| `litellm_user_max_budget_dollars{user}` / `litellm_user_budget_reset_timestamp_seconds{user}` | monthly budget + reset |
+| `litellm_key_spend_dollars{key_name,key_hash}` | `/key/info` `info.spend` (**lifetime**) |
+| `litellm_team_spend_dollars{team,team_id}` | `/team/info` `team_info.spend` (team aggregate) |
+| `litellm_team_max_budget_dollars` / `litellm_team_budget_reset_timestamp_seconds` / `litellm_team_members` | team budget + roster size |
+| `litellm_spend_scrape_success` / `_duration_seconds` / `_last_scrape_timestamp_seconds` | scrape health |
+
+**Auth / role caveat.** A gateway key with role `internal_user_viewer` can
+read ITS OWN `/user/info`, `/key/info`, and its team's `/team/info`
+(aggregate), but **cannot** read another user's `/user/info` (403) nor the
+admin `/global/spend` routes — so a **per-member** breakdown is not available
+at this role; the **team aggregate** is. Note also which key you feed it:
+some keys can read `/user/info` (the team key), while others (e.g. the one
+`devbar auth claude` returns) only satisfy `/key/info` — with those, only
+`litellm_key_spend_dollars` populates. Timescale: `/user/info` spend is the
+current **calendar month**; `/key/info` spend is **lifetime** — don't
+cross-check one against the other.
+
+The exporter caches upstream reads for `SCRAPE_TTL_SECONDS` (default 60) so
+repeated Prometheus scrapes don't blow the gateway rpm limit. Offline unit
+tests (recorded fixtures, no network) live in
+`test_litellm_spend_exporter.py`.
+
+### Run it in this stack (Docker, opt-in profile)
+
+```bash
+CW_LITELLM_API_KEY=sk-... docker compose --profile litellm-spend up -d
+```
+
+It's gated behind its own profile (like `grafana` / `node-exporter`) because
+it talks to an EXTERNAL gateway and needs both a key and the corp CA. The
+service mounts `CW_CA_BUNDLE` (default the Homebrew CA bundle) as the exporter
+container's `SSL_CERT_FILE` so it trusts the gateway's corp-signed cert. See
+`.env.example` for `CW_LITELLM_*` / `CW_CA_BUNDLE`. Never commit a real key.
+
+### Run it host-native (macOS LaunchAgent)
+
+`exporters/litellm-spend-exporter/launchagent/` ships a `KeepAlive`
+LaunchAgent (`com.claude-watch.litellm-spend-exporter`, serving
+`:9104/metrics`):
+
+```bash
+cd exporters/litellm-spend-exporter/launchagent
+./install.sh          # builds a venv, renders the plist, bootstraps the agent
+```
+
+Drop a `/user/info`-capable gateway key at
+`~/.config/claude-watch/litellm-spend.key` for user + team metrics (otherwise
+only `litellm_key_spend_dollars` populates via the `devbar auth claude`
+fallback). To scrape a host LaunchAgent from a Prometheus running in this
+stack, set `CW_EXPORTER_HOST=host.docker.internal` and point the
+`litellm-spend-exporter` job's target at `host.docker.internal:9104`.
+
+**Dismantle:**
+
+```bash
+cd exporters/litellm-spend-exporter/launchagent && ./uninstall.sh
+# equivalently:
+launchctl bootout gui/$(id -u)/com.claude-watch.litellm-spend-exporter
+rm -f ~/Library/LaunchAgents/com.claude-watch.litellm-spend-exporter.plist
+rm -rf ~/.local/share/claude-watch/litellm-spend-venv   # optional: drop the venv
+```
 
 ## Alert rules — DERIVED FROM THE DOCS, not pre-existing
 

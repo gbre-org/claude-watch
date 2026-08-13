@@ -75,6 +75,44 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------
+  # litellm-spend-exporter — OPTIONAL (profile: litellm-spend). Polls the
+  # LiteLLM gateway spend endpoints and exposes litellm_*_spend_dollars on
+  # :9104/metrics. Unlike the two file-reading exporters above, this one
+  # talks to the EXTERNAL SF eng-ai-model-gateway over TLS, so it needs the
+  # gateway key (CW_LITELLM_API_KEY — a key that can read /user/info; the
+  # team key) and the corp CA bundle mounted in so it trusts the gateway
+  # cert. Gated behind its own profile so the default stack (and operators
+  # on other gateways) are unaffected. Enable with:
+  #   CW_LITELLM_API_KEY=sk-... docker compose --profile litellm-spend up -d
+  # For host-native running instead, see
+  # exporters/litellm-spend-exporter/launchagent/ (LaunchAgent).
+  # ---------------------------------------------------------------------
+  litellm-spend-exporter:
+    build:
+      context: ../../..
+      dockerfile: exporters/litellm-spend-exporter/Dockerfile
+    image: claude-watch-litellm-spend-exporter:dev
+    profiles: ["litellm-spend"]
+    environment:
+      PORT: "9104"
+      LITELLM_BASE_URL: "${CW_LITELLM_BASE_URL:-https://eng-ai-model-gateway.sfproxy.devx-preprod.aws-esvc1-useast2.aws.sfdc.cl}"
+      # A gateway key that can read /user/info (the team key). Without it,
+      # only litellm_key_spend_dollars populates. Never commit a real key.
+      LITELLM_API_KEY: "${CW_LITELLM_API_KEY:-}"
+      # Optional: pin the user email; default auto-derives from /key/info.
+      LITELLM_USER_ID: "${CW_LITELLM_USER_ID:-}"
+      SCRAPE_TTL_SECONDS: "60"
+      # Trust the corp CA so the exporter can reach the SF gateway over TLS.
+      SSL_CERT_FILE: /etc/ssl/corp-ca.pem
+    volumes:
+      - "${CW_CA_BUNDLE:-/opt/homebrew/etc/ca-certificates/cert.pem}:/etc/ssl/corp-ca.pem:ro"
+    expose:
+      - "9104"
+    ports:
+      - "9104:9104"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
   # prometheus — scrapes the two exporters (+ node-exporter when enabled)
   # and evaluates the starter alert rules.
   # ---------------------------------------------------------------------

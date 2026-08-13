@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-watch.litellm-spend-exporter</string>
+    <!-- ProgramArguments[0] is the descriptively-named wrapper (NOT
+         python3 directly) so the macOS "App Background Activity" prompt keys
+         on a meaningful basename. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>@WRAPPER@</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:@HOME@/.local/bin</string>
+        <key>PORT</key>
+        <string>9104</string>
+        <key>LITELLM_BASE_URL</key>
+        <string>@BASE_URL@</string>
+        <!-- Key sourcing (see README): env here (empty) -> LITELLM_API_KEY_FILE
+             -> LITELLM_API_KEY_CMD. The file default resolves to a key that can
+             read /user/info; the devbar cmd fallback yields key_spend only. -->
+        <key>LITELLM_API_KEY_FILE</key>
+        <string>@HOME@/.config/claude-watch/litellm-spend.key</string>
+        <key>LITELLM_API_KEY_CMD</key>
+        <string>devbar auth claude</string>
+        <key>SCRAPE_TTL_SECONDS</key>
+        <string>60</string>
+        <!-- macOS Python must trust the corp CA to reach the SF gateway. -->
+        <key>SSL_CERT_FILE</key>
+        <string>@CA_BUNDLE@</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/litellm-spend-exporter.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/litellm-spend-exporter.log</string>
+</dict>
+</plist>

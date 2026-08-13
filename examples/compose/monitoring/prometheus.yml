@@ -58,6 +58,16 @@ scrape_configs:
         labels:
           source: claude-events-exporter
 
+  # litellm-spend-exporter (:9104) — litellm_*_spend_dollars metrics.
+  # Only up when the `litellm-spend` compose profile is enabled (or when the
+  # host LaunchAgent runs it — set CW_EXPORTER_HOST=host.docker.internal and
+  # swap the target). Shows as a down target until then; harmless.
+  - job_name: litellm-spend-exporter
+    static_configs:
+      - targets: ["litellm-spend-exporter:9104"]
+        labels:
+          source: litellm-spend-exporter
+
   # node-exporter (:9100) — surfaces the claude-watch daemon's textfile
   # metrics (claude_watch_* / claude_code_*) written by `claude-watch
   # metrics` into the textfile-collector dir. Only present when the
