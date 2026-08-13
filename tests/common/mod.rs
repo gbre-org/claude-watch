@@ -556,18 +556,21 @@ resume_prompt = "resume"
         format!("{}:{}", self.mock_bin_dir.display(), current_path)
     }
 
-    /// Build the daemon binary and return the path.
+    /// Path to the daemon binary under test.
+    ///
+    /// Cargo builds every bin target before running an integration test and
+    /// passes the path in `CARGO_BIN_EXE_<name>`, so the binary already exists
+    /// and is guaranteed to match this exact test build.
+    ///
+    /// Do NOT shell out to `cargo build` here. `.config/nextest.toml` sets
+    /// `test-threads = "num-cpus"`, so every test that spawns a daemon would
+    /// race for cargo's target-directory file lock; each loser stalls for the
+    /// full duration of the winner's build. Whenever anything made that build
+    /// non-trivial, the daemon-driven tests inflated 5-9x while tests that
+    /// never spawn a daemon stayed identical, taking the suite from ~85s to
+    /// past the 5-minute CI step limit.
     pub fn daemon_binary() -> PathBuf {
-        // Build in test mode — use CARGO_MANIFEST_DIR to find the project root
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let status = Command::new("cargo")
-            .args(["build"])
-            .current_dir(manifest_dir)
-            .status()
-            .expect("cargo build");
-        assert!(status.success(), "cargo build failed");
-
-        PathBuf::from(format!("{}/target/debug/claude-watch", manifest_dir))
+        PathBuf::from(env!("CARGO_BIN_EXE_claude-watch"))
     }
 
     /// Run the daemon for a specified number of check cycles, then kill it.
