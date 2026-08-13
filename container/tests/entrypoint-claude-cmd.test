@@ -178,13 +178,13 @@ def test_set_shim_path_exact_form() -> None:
     (FILTER_USER=1)."""
     env = {
         "PATH": "/usr/bin:/bin",
-        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/run/claude/shim/settings.json",
         "CLAUDE_SHIM_FILTER_USER": "1",
     }
     cmd = run_block(BLOCK, env)
     expected = (
         "exec claude --setting-sources project,local "
-        "--settings /tmp/claude-shim/settings.json"
+        "--settings /run/claude/shim/settings.json"
     )
     expect(cmd == expected,
            f"exact form: expected {expected!r}, got {cmd!r}")
@@ -200,7 +200,7 @@ def test_sanitized_user_farm_switches_to_user_local() -> None:
     the sanitized farm now supplies the user tier."""
     env = {
         "PATH": "/usr/bin:/bin",
-        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/run/claude/shim/settings.json",
         "CLAUDE_SHIM_FILTER_USER": "1",
         "CLAUDE_SHIM_SANITIZED_USER_FARM": "1",
     }
@@ -210,7 +210,7 @@ def test_sanitized_user_farm_switches_to_user_local() -> None:
     expect("project,local" not in cmd,
            f"sanitized farm: project tier MUST be dropped (it re-reads the "
            f"poison host settings.json), got {cmd!r}")
-    expect("--settings /tmp/claude-shim/settings.json" in cmd,
+    expect("--settings /run/claude/shim/settings.json" in cmd,
            f"sanitized farm: shim (flagSettings) still loads for obligations, "
            f"got {cmd!r}")
 
@@ -221,7 +221,7 @@ def test_sanitized_user_farm_adds_mcp_config() -> None:
     dropping the project tier removed."""
     env = {
         "PATH": "/usr/bin:/bin",
-        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/run/claude/shim/settings.json",
         "CLAUDE_SHIM_FILTER_USER": "1",
         "CLAUDE_SHIM_SANITIZED_USER_FARM": "1",
         "CLAUDE_MCP_CONFIG_PATH": "/Users/me/repos/.mcp.json",
@@ -238,7 +238,7 @@ def test_sanitized_user_farm_mcp_config_absent_no_flag() -> None:
     CLAUDE_HOST_PROJECT_DIR / no .mcp.json), even with the farm switch on."""
     env = {
         "PATH": "/usr/bin:/bin",
-        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/run/claude/shim/settings.json",
         "CLAUDE_SHIM_FILTER_USER": "1",
         "CLAUDE_SHIM_SANITIZED_USER_FARM": "1",
     }
@@ -254,7 +254,7 @@ def test_unsanitized_farm_keeps_project_local() -> None:
     switch, no --mcp-config."""
     env = {
         "PATH": "/usr/bin:/bin",
-        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/run/claude/shim/settings.json",
         "CLAUDE_SHIM_FILTER_USER": "1",
     }
     cmd = run_block(BLOCK, env)
@@ -279,13 +279,13 @@ def test_obligations_only_additive_no_filter() -> None:
     pain."""
     env = {
         "PATH": "/usr/bin:/bin",
-        "CLAUDE_SHIM_SETTINGS_PATH": "/tmp/claude-shim/settings.json",
+        "CLAUDE_SHIM_SETTINGS_PATH": "/run/claude/shim/settings.json",
     }
     cmd = run_block(BLOCK, env)
     expect("--setting-sources" not in cmd,
            f"obligations-only: --setting-sources should NOT appear "
            f"(we want the user tier to keep loading), got {cmd!r}")
-    expect("--settings /tmp/claude-shim/settings.json" in cmd,
+    expect("--settings /run/claude/shim/settings.json" in cmd,
            f"obligations-only: --settings should still load the shim "
            f"additively, got {cmd!r}")
 

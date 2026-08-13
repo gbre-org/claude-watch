@@ -227,19 +227,19 @@ def test_no_host_env_spools_unrewritten() -> None:
 
 
 def test_config_dir_relocated_prefix_rewrite() -> None:
-    """CLAUDE_CONFIG_DIR relocated off $HOME (e.g. /tmp/claude-config) is
+    """CLAUDE_CONFIG_DIR relocated off $HOME (e.g. /run/claude/config) is
     rewritten to {host_home}/.claude — the real container shape where the
     transcript_path prefix is NOT {home}/.claude."""
     with tempfile.TemporaryDirectory() as td:
         spool = os.path.join(td, "spool")
         payload = json.dumps({
-            "transcript_path": "/tmp/claude-config/projects/foo/sess.jsonl",
+            "transcript_path": "/run/claude/config/projects/foo/sess.jsonl",
             # {home}/.claude entry still applies alongside the config-dir entry
             "other": f"{CONTAINER_HOME}/.claude/projects/bar/x.jsonl",
         })
         r = run_spool(payload, spool, extra_env={
             "CLAUDE_HOST_PROJECT_DIR": "/Users/hallandrew/repos",
-            "CLAUDE_CONFIG_DIR": "/tmp/claude-config",
+            "CLAUDE_CONFIG_DIR": "/run/claude/config",
         })
         expect(r.returncode == 0, f"config-dir: expected exit 0, got {r.returncode}; stderr:\n{r.stderr}")
         files = spool_files(spool)

@@ -943,7 +943,7 @@ RUN chmod +x /usr/local/lib/claude-hooks-shim/exec-hook \
 # entrypoint runs this helper to generate a container-local copy of
 # ~/.claude/settings.json with every hook command wrapped in
 # /usr/local/bin/exec-hook, then launches claude with `--settings
-# /tmp/claude-shim/settings.json`. The output file overrides the host
+# /run/claude/shim/settings.json`. The output file overrides the host
 # settings.json's hooks for the in-container session without mutating the
 # host file. See container/hooks-shim/generate-hooks-shim-settings for the
 # rewrite logic and the embedded test suite at

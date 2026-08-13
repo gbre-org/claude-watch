@@ -301,7 +301,7 @@ loop enqueued at spawn, not a fresh per-nested-agent item.)
 this container** when `CLAUDE_CONTAINER_OBLIGATIONS=1` (the default).
 Baked at `/usr/local/bin/pre-agent-queue-gate-hook` and wired into
 Claude Code's PreToolUse cascade via the entrypoint-generated
-`/tmp/claude-shim/settings.json` (matcher `"Agent"`). Any `Agent` call
+`/run/claude/shim/settings.json` (matcher `"Agent"`). Any `Agent` call
 lacking a `Queue item: q-XXXX` marker in its prompt — or carrying an
 unknown / non-`running` queue id — is HARD-DENIED at dispatch, exactly
 like on the host; the model gets the deny banner back as a permission
@@ -1102,7 +1102,7 @@ don't spam the log every event).
 When `CLAUDE_CONTAINER_REWRITE_HOOKS=1`, the entrypoint generates a
 container-local copy of `~/.claude/settings.json` with every hook command
 wrapped in `exec-hook` and launches claude with `--setting-sources
-project,local --settings /tmp/claude-shim/settings.json` so the host file is
+project,local --settings /run/claude/shim/settings.json` so the host file is
 never mutated.
 
 **Realistic hook fate inside the container** (per hook event type):

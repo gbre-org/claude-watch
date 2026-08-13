@@ -61,7 +61,7 @@ This tool leaves ``settings.json`` as a plain SYMLINK to the live host
 file — it does NOT sanitize it. Two consumers act on that symlink AFTER
 this tool runs, in container/entrypoint.sh:
   - The user tier is dropped by ``--setting-sources project,local`` /
-    replaced by the sanitized shim at /tmp/claude-shim/settings.json when
+    replaced by the sanitized shim at /run/claude/shim/settings.json when
     CLAUDE_CONTAINER_REWRITE_HOOKS=1, so a churning user-tier settings.json
     is never read via the user tier.
   - PROJECT-TIER devbar-hook leak: when an operator also bind-mounts host
@@ -118,7 +118,7 @@ from pathlib import Path
 
 DEFAULT_SRC_DIR = "/home/hndrewaall/.claude"
 DEFAULT_SRC_JSON = "/home/hndrewaall/.claude.json"
-DEFAULT_DEST = "/tmp/claude-config"
+DEFAULT_DEST = "/run/claude/config"
 
 
 def _symlink_entry(src: Path, dst: Path) -> bool:
