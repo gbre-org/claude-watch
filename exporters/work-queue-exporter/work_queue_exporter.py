@@ -130,7 +130,12 @@ from prometheus_client import (
 
 # Shared loader / dedup logic — lives in claude_agents.py alongside this
 # exporter in claude-watch/exporters/work-queue-exporter/.
-from claude_agents import agents_by_queue_id, load_agent_state
+from claude_agents import (
+    agents_by_agent_id,
+    agents_by_queue_id,
+    load_agent_queue_bindings,
+    load_agent_state,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("work-queue-exporter")
@@ -172,6 +177,20 @@ HOSTJOB_SCOPE_PREFIX = "hostjob:"
 # WorkQueueOrphaned alert's own `for: 5m` adds further dwell on top.
 ORPHAN_HEARTBEAT_STALE_SECONDS = int(
     os.environ.get("ORPHAN_HEARTBEAT_STALE_SECONDS", "600")
+)
+# Path to the arm-hook agent_id -> queue_id bindings file
+# (`~/.config/claude/agent-queue-bindings.json` on the host, written by
+# post-tool-agent-arm-hook the instant the main loop spawns an Agent).
+# Bind-mounted read-only. Consulted to attribute an owner to a running item
+# the moment it is spawned -- BEFORE claude-watch's active-agents poller
+# (60s) publishes a transcript record -- so a genuinely-owned item is never
+# mistaken for a never-spawned orphan during the poll-lag window (the false
+# WorkQueueOrphaned this closes). A running item with NO binding AND no agent
+# record still falls through to the never-spawned orphan path. Override for
+# tests.
+AGENT_QUEUE_BINDINGS_PATH = os.environ.get(
+    "AGENT_QUEUE_BINDINGS_JSON",
+    "/queue-home/.config/claude/agent-queue-bindings.json",
 )
 
 REG = CollectorRegistry()
@@ -379,11 +398,14 @@ def _parse_ts(s):
 
 
 def _load_agent_state_with_mtime():
-    """Read claude-watch's active-agents JSON and return ({qid: rec}, mtime).
+    """Read active-agents JSON: return ({qid: rec}, {agent_id: rec}, mtime).
 
-    Wraps the shared `claude_agents.load_agent_state` + `agents_by_queue_id`
-    so the file mtime can be exposed as its own gauge (used to alert when
-    claude-watch stops publishing the state file).
+    Wraps the shared `claude_agents` helpers (`agents_by_queue_id` +
+    `agents_by_agent_id`) so the file mtime can be exposed as its own gauge
+    (used to alert when claude-watch stops publishing the state file). The
+    by-agent_id map lets us resolve the liveness of an owner discovered via
+    the arm-hook bindings, whose agent may be keyed under a different queue
+    id in active-agents.
     """
     try:
         st = os.stat(AGENT_STATE_PATH)
@@ -391,7 +413,7 @@ def _load_agent_state_with_mtime():
     except OSError:
         mtime = 0.0
     state = load_agent_state(AGENT_STATE_PATH)
-    return agents_by_queue_id(state), mtime
+    return agents_by_queue_id(state), agents_by_agent_id(state), mtime
 
 
 def collect():
@@ -406,8 +428,11 @@ def collect():
         c_scrape_errors.inc()
         return
 
-    agent_by_qid, agent_mtime = _load_agent_state_with_mtime()
+    agent_by_qid, agent_by_aid, agent_mtime = _load_agent_state_with_mtime()
     g_agent_state_mtime.set(agent_mtime)
+    # Arm-hook owner bindings (queue_id -> agent_id). The earliest +
+    # authoritative "this item is owned" signal; see AGENT_QUEUE_BINDINGS_PATH.
+    owner_bindings = load_agent_queue_bindings(AGENT_QUEUE_BINDINGS_PATH)
 
     items = data.get("items", [])
     # Top-level locked_scopes dict: {scope_token: {reason, locked_at, ...}}
@@ -538,33 +563,69 @@ def collect():
                         id=iid, summary=summary, agent_id=aid, status=status,
                     ).set(age)
             elif status == "running":
-                # Never-spawned / abandoned-without-binding orphan -- a
-                # `running` item whose Agent was never fired has NO agent
-                # record at all (vs died-after-spawn, which has a record
-                # with alive=0 handled above). Without this branch such an
-                # item emits no has_live_owner series, so the
-                # WorkQueueOrphaned {status=running} == 0 alert matches
-                # nothing and never fires. Fall back to heartbeat
-                # staleness -- if the item has not heartbeat in
-                # ORPHAN_HEARTBEAT_STALE_SECONDS, flag it orphaned with
-                # agent_id empty (the empty agent_id distinguishes a
-                # no-binding orphan from a died-after-spawn one). ONLY
-                # `running` -- `blocked` items legitimately have no live
-                # agent by design. A fresh or unparseable heartbeat stays
-                # SILENT to preserve no-false-alert on a just-spawned
-                # item. No g_agent_jsonl_age is emitted -- no transcript.
-                hb_ts = _parse_ts(
-                    it.get("last_heartbeat_at")
-                    or it.get("registered_at")
-                    or it.get("started_at")
-                )
-                if hb_ts is not None:
-                    hb_age = (now - hb_ts).total_seconds()
-                    if hb_age >= ORPHAN_HEARTBEAT_STALE_SECONDS:
+                # No active-agents record keyed on this queue id. Before the
+                # never-spawned orphan fallback, honor an arm-hook binding: a
+                # bound queue id was DEFINITIVELY spawned (the PostToolUse
+                # arm-hook fired synchronously at spawn), so it is OWNED even
+                # while active-agents (60s poll) has not yet -- or no longer --
+                # keys it under this qid (spawn-to-poll lag, or a
+                # SendMessage-rotated qid whose transcript marker still points
+                # at the ORIGINAL id). Resolve the bound agent's liveness by
+                # agent_id so a live owner never trips WorkQueueOrphaned.
+                bound_aid = owner_bindings.get(iid)
+                if bound_aid:
+                    brec = agent_by_aid.get(bound_aid)
+                    if brec is not None:
+                        alive = 1 if brec.get("alive") else 0
                         g_has_live_owner.labels(
-                            id=iid, summary=summary, agent_id="",
+                            id=iid, summary=summary, agent_id=bound_aid,
                             status="running",
-                        ).set(0)
+                        ).set(alive)
+                        age = brec.get("jsonl_age_seconds")
+                        if age is not None:
+                            g_agent_jsonl_age.labels(
+                                id=iid, summary=summary, agent_id=bound_aid,
+                                status="running",
+                            ).set(age)
+                    else:
+                        # Owner known (bound) but not resolvable in
+                        # active-agents (poll lag / between transcript writes).
+                        # A binding PROVES an agent was spawned; presume alive
+                        # (emit 1) rather than false-alert on an ambiguous
+                        # liveness signal. If it genuinely died, active-agents
+                        # publishes alive=0 for this agent_id and the branch
+                        # above flips it to 0.
+                        g_has_live_owner.labels(
+                            id=iid, summary=summary, agent_id=bound_aid,
+                            status="running",
+                        ).set(1)
+                else:
+                    # Never-spawned / abandoned-without-binding orphan -- a
+                    # `running` item whose Agent was never fired has NO agent
+                    # record AND no binding (vs died-after-spawn, which has a
+                    # record with alive=0 handled above). Without this branch
+                    # such an item emits no has_live_owner series, so the
+                    # WorkQueueOrphaned {status=running} == 0 alert matches
+                    # nothing and never fires. Fall back to heartbeat
+                    # staleness -- if the item has not heartbeat in
+                    # ORPHAN_HEARTBEAT_STALE_SECONDS, flag it orphaned with
+                    # agent_id empty (the empty agent_id distinguishes a
+                    # no-binding orphan from a died-after-spawn one). ONLY
+                    # `running` -- `blocked` items legitimately have no live
+                    # agent by design. A fresh or unparseable heartbeat stays
+                    # SILENT to preserve no-false-alert on a just-spawned item.
+                    hb_ts = _parse_ts(
+                        it.get("last_heartbeat_at")
+                        or it.get("registered_at")
+                        or it.get("started_at")
+                    )
+                    if hb_ts is not None:
+                        hb_age = (now - hb_ts).total_seconds()
+                        if hb_age >= ORPHAN_HEARTBEAT_STALE_SECONDS:
+                            g_has_live_owner.labels(
+                                id=iid, summary=summary, agent_id="",
+                                status="running",
+                            ).set(0)
 
         # Ready-stuck / locked-age gauges.
         # A pending group-head may be intentionally held by a scope lock

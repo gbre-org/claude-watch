@@ -42,7 +42,7 @@ def load_exporter(env):
     """Reload the exporter module under a fresh env so module-level
     config constants pick up our overrides."""
     saved = {}
-    for k in ("PORT", "QUEUE_JSON", "AGENT_STATE_JSON"):
+    for k in ("PORT", "QUEUE_JSON", "AGENT_STATE_JSON", "AGENT_QUEUE_BINDINGS_JSON"):
         saved[k] = os.environ.get(k)
     for k, v in env.items():
         os.environ[k] = v
@@ -79,6 +79,20 @@ def write_agent_state(path, agents, *, subagents=None, workloads=None):
     }
     with open(path, "w") as f:
         json.dump(payload, f)
+
+
+def write_bindings(path, qid_to_aid):
+    """Write an arm-hook agent-queue-bindings.json (agent_id -> record).
+
+    Input is a queue_id -> agent_id map (the owner relation); we emit the
+    on-disk shape post-tool-agent-arm-hook writes, keyed by agent_id with a
+    monotonically-increasing registered_at so newest-wins is deterministic.
+    """
+    bindings = {}
+    for i, (qid, aid) in enumerate(qid_to_aid.items()):
+        bindings[aid] = {"queue_id": qid, "registered_at": 1000 + i}
+    with open(path, "w") as f:
+        json.dump({"bindings": bindings}, f)
 
 
 def find_sample(mod, metric_name, label_filters):
@@ -845,6 +859,99 @@ def run_scenarios():
         v is None,
         "expected None, got " + repr(v),
     )
+
+    # ---- Scenario 20: arm-hook binding + live agent under a DIFFERENT qid.
+    # A running item whose owning Agent is bound (arm-hook wrote a
+    # queue_id -> agent_id binding) but whose active-agents record is keyed
+    # under the agent's ORIGINAL spawn qid (not this item's qid) -- e.g. a
+    # SendMessage-rotated qid, or active-agents lag. Without the binding
+    # consult this item has NO record for its qid + a stale heartbeat, so it
+    # would false-orphan (has_live_owner=0). The binding resolves the owner
+    # by agent_id and reflects its LIVE flag: has_live_owner=1, no orphan.
+    print("\nScenario 20: bound owner (live) under a different qid -> owned, no orphan")
+    bpath = os.path.join(tmpdir, "bindings-s20.json")
+    stale_iso = (datetime.now(timezone.utc) - timedelta(seconds=1200)).isoformat()
+    item = make_running_item("q-bind20", "bound live different qid")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-b20", "queue_id": "q-orig20",
+        "alive": True, "jsonl_age_seconds": 7,
+    }])
+    write_bindings(bpath, {"q-bind20": "agent-b20"})
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": bpath})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind20", "agent_id": "agent-b20"},
+    )
+    check("S20 bound live owner has_live_owner == 1", v == 1.0, "got " + repr(v))
+    age = find_sample(
+        mod, "worktask_queue_item_agent_jsonl_age_seconds",
+        {"id": "q-bind20", "agent_id": "agent-b20"},
+    )
+    check("S20 bound owner jsonl_age emitted", age == 7.0, "got " + repr(age))
+    v_empty = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind20", "agent_id": ""},
+    )
+    check("S20 no false empty-agent orphan series", v_empty is None,
+          "expected None, got " + repr(v_empty))
+
+    # ---- Scenario 21: bound owner whose transcript went STALE (died).
+    # Binding resolves to an agent_id whose active-agents record is alive=0:
+    # a genuine died-after-spawn orphan -> has_live_owner=0 WITH the agent_id.
+    print("\nScenario 21: bound owner (dead transcript) -> orphan with agent_id")
+    bpath = os.path.join(tmpdir, "bindings-s21.json")
+    item = make_running_item("q-bind21", "bound dead")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-b21", "queue_id": "q-orig21",
+        "alive": False, "jsonl_age_seconds": 900,
+    }])
+    write_bindings(bpath, {"q-bind21": "agent-b21"})
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": bpath})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind21", "agent_id": "agent-b21"},
+    )
+    check("S21 bound dead owner has_live_owner == 0", v == 0.0, "got " + repr(v))
+
+    # ---- Scenario 22: bound owner NOT resolvable in active-agents.
+    # A binding proves an agent was spawned, but no active-agents record
+    # carries that agent_id yet (poll lag / between transcript writes). Even
+    # with a stale heartbeat we presume alive (emit 1) rather than
+    # false-orphan -- the honest "owner known, liveness ambiguous" posture.
+    # Contrast S19a (NO binding + stale -> 0).
+    print("\nScenario 22: bound owner unresolved in active-agents -> presume alive")
+    bpath = os.path.join(tmpdir, "bindings-s22.json")
+    item = make_running_item("q-bind22", "bound unresolved")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    write_bindings(bpath, {"q-bind22": "agent-b22"})
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": bpath})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind22", "agent_id": "agent-b22"},
+    )
+    check("S22 bound-unresolved presume alive has_live_owner == 1", v == 1.0,
+          "got " + repr(v))
+    v_empty = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-bind22", "agent_id": ""},
+    )
+    check("S22 no false empty-agent orphan series", v_empty is None,
+          "expected None, got " + repr(v_empty))
 
     print()
     if failures:

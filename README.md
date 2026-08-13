@@ -117,6 +117,19 @@ claude-watch provides the surfaces; wire external alerting to them as
 appropriate. See [`CLAUDE.md`](CLAUDE.md) for guidance on when to reach for
 each tier (and when NOT to).
 
+That said, claude-watch DOES version-control the canonical Prometheus
+recording + alert **rule definitions** for its own metrics (the daemon
+doesn't *run* Prometheus, but the rules encode claude-watch semantics, so
+they live next to the exporters that emit the metrics rather than being
+re-derived in each deployment). See
+[`monitoring/prometheus/`](monitoring/prometheus/) — any stack (the local
+compose, gomorrah, a hosted Prometheus) should symlink/copy that file. The
+`WorkQueueOrphaned` rule is the SLOW **escalation** stage of the two-stage
+owner-orphan ladder; the FAST first-line signal is the in-tree
+`claude-watch queue-check` `queue-orphaned` claude-event (see
+[`monitoring/prometheus/README.md`](monitoring/prometheus/README.md) and
+`config.toml [queue_check]`).
+
 ## Architecture
 
 ```
