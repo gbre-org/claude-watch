@@ -279,6 +279,56 @@ cd examples/personal-mac-mcp-host
 # Bridge stays up until Ctrl-C, the tunnel breaks, or you reboot.
 ```
 
+### Recovering a broken bridge — `restart`
+
+```sh
+./personal-mcp-host.sh restart
+```
+
+One command puts the **whole** stack back: it reaps whatever is left of
+the MCP host **and** the reverse SSH tunnel, restarts both in dependency
+order, verifies each one is answering again, and exits — 0 if both came
+back, 4 with a message naming the piece that didn't. It does not hold
+anything in the foreground and does not tail; it is a control verb, not
+a supervisor.
+
+Reach for it when the bridge has gone sideways and you don't want to
+work out *which* half died. The case it was written for: the MCP
+server's stdio child dies on a broken pipe while its parent keeps
+`127.0.0.1:$MCP_LOCAL_PORT` bound, so the port still accepts connections
+— a status probe calls that healthy — while every call through it fails.
+`restart` therefore never trusts the probe: it reaps unconditionally,
+whether the pieces are up, down, or half-up, including a stale process
+that inherited the listening socket from a parent that already died.
+
+What it actually does:
+
+| Step | Behaviour |
+|---|---|
+| Reap tunnel | SIGTERM → SIGKILL every `ssh` whose argv carries `$REMOTE_PORT:127.0.0.1:$MCP_LOCAL_PORT`, then confirms none remain. Network-facing piece first. |
+| Reap MCP host | Same escalation on whatever holds `127.0.0.1:$MCP_LOCAL_PORT` (found via `lsof`, else `ss`), then a second sweep for a child that inherited the socket. |
+| Start MCP host | `launchctl kickstart -k` if a bootstrapped unit owns it (that relaunches it with launchd's environment — e.g. a Keychain-sourced bearer this script can't reproduce); otherwise launches `mcp-host-bash` detached. |
+| Verify MCP host | Polls for a real TCP connect. Fails (exit 4) rather than opening a tunnel to a dead server. |
+| Start tunnel | Kickstarts the owning unit, or starts `ssh -N -R` detached. Skipped if a bundled unit already reopened it. |
+| Verify tunnel | Waits for an `ssh` carrying the forward spec, then re-checks the **same pid** after a settle window. Since the argv sets `ExitOnForwardFailure=yes`, an ssh that failed to bind `$REMOTE_PORT` on the remote exits within a second or two — surviving the settle is evidence the bind took, not merely that a restart was issued. |
+
+Verification is deliberately local-only: the recommended `authorized_keys`
+hardening below restricts the tunnel key to port-forwarding with no
+shell, so the script cannot run a confirming `lsof` on the remote — and
+shouldn't want a second, less-restricted credential just to self-check.
+
+Knobs (all optional): `PERSONAL_MCP_RESTART_TIMEOUT` (default 45s per
+piece — generous because launchd's `ThrottleInterval` can delay a
+respawn), `PERSONAL_MCP_TUNNEL_SETTLE` (default 3s),
+`PERSONAL_MCP_TUNNEL_LOG`, and `PERSONAL_MCP_HOST_LABEL` /
+`PERSONAL_MCP_TUNNEL_LABEL` / `PERSONAL_MCP_SERVER_LABEL` if you renamed
+a LaunchAgent. `--restart` is an accepted alias for the verb.
+
+`restart` always covers **both** pieces; `--tunnel-only` does not narrow
+it (that flag describes what a long-running supervisor invocation
+manages, and this isn't one). To restart just the tunnel, kickstart the
+tunnel unit directly.
+
 ### Recommended split — always-on MCP + on-demand tunnel-only LaunchAgent
 
 Run the MCP server full-time via the compose-stack LaunchAgent and
@@ -367,6 +417,8 @@ plist changes".
 | `MCP_LOCAL_PORT` already bound on the Mac | "mcp-host-bash exited before binding" | `lsof -nP -iTCP:$MCP_LOCAL_PORT -sTCP:LISTEN`; clear the stale PID, or pick a new port. |
 | Mac sleeps / wifi drops | `ServerAliveInterval` fires; SSH exits within ~90s | Under launchd, `KeepAlive` respawns the wrapper when the network is back. Interactively, the wrapper itself exits and you re-run it. |
 | `mcp-host-bash` deps missing | "cannot find required binaries on PATH" from `mcp-host-bash` | Run `examples/compose/bin/install-host-deps` once. |
+| MCP server's stdio child died on a broken pipe | Port still accepts connections, but every remote call fails | `./personal-mcp-host.sh restart` — it reaps the wedged process rather than trusting the port probe, then brings both pieces back. |
+| Don't know which half broke | Remote can't reach the Mac | `./personal-mcp-host.sh restart`. Exit 4 names the piece that didn't come back. |
 
 For LaunchAgent-specific failures, see
 [`launchd/README.md`](launchd/README.md) "Troubleshooting".
@@ -383,7 +435,13 @@ make test-personal-mcp-install       # install.sh path-substitution tests
 
 The first uses `personal-mcp-host.sh --print-cmd`, which builds the
 planned `ssh` argv but prints it one-per-line instead of executing —
-no `mcp-host-bash` / `ssh` invocation needed. The second parses the
+no `mcp-host-bash` / `ssh` invocation needed. Its `restart` cases go
+further and run the real thing against stand-in processes: a wedged
+"server" holding `MCP_LOCAL_PORT`, a stale `ssh` carrying the
+reverse-forward spec, and a fake `launchctl` that reports which units
+are bootstrapped and starts their stand-ins — so the reap, the
+kickstart routing, and the exit-4 failure paths are all exercised
+without macOS. The second parses the
 plist via Python's stdlib `plistlib` and verifies the labels / paths
 / KeepAlive / RunAtLoad shapes. The third runs `install.sh` in
 `--print-cmd` / temp-`HOME` dry-run style and asserts the rendered

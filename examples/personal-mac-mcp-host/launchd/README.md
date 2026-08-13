@@ -275,6 +275,57 @@ To stop the server too, stop it directly (`MCP_HOST_BASH_DISABLED`, its
 own LaunchAgent, or kill whatever `lsof -nP -iTCP:$MCP_LOCAL_PORT
 -sTCP:LISTEN` reports).
 
+## 4b. Recover a wedged bridge (`restart`)
+
+When the bridge is broken and you'd rather not work out *which* half
+died — or which of `bootout` / `kickstart` / a manual `kill` applies to
+whichever unit you installed:
+
+```sh
+cd examples/personal-mac-mcp-host
+./personal-mcp-host.sh restart
+```
+
+It reaps whatever is left of the MCP host **and** the reverse SSH
+tunnel, brings both back, verifies each one is answering again, and
+exits 0 — or exits 4 with a message naming the piece that didn't come
+back. It is idempotent: run it whether the stack is up, down, or
+half-up.
+
+It works *with* launchd rather than around it. Any of the three units
+below that is bootstrapped gets `launchctl kickstart -k` (SIGKILL the
+running instance, then start), so the relaunch happens with launchd's
+own environment — including a Keychain-sourced `MCP_HOST_BASH_BEARER`,
+which a hand-launch could not reproduce:
+
+| Label | Piece |
+|---|---|
+| `org.gbre.claude-watch.mcp-host-bash` | always-on MCP server (compose stack) |
+| `org.gbre.personal-mcp.tunnel` | tunnel-only unit |
+| `org.gbre.personal-mcp.host` | bundled unit (both pieces) |
+
+Labels that aren't bootstrapped are skipped, and anything no unit owns
+is started directly, detached. Override
+`PERSONAL_MCP_SERVER_LABEL` / `PERSONAL_MCP_TUNNEL_LABEL` /
+`PERSONAL_MCP_HOST_LABEL` if you renamed a unit.
+
+Two things it deliberately does NOT do:
+
+- **Trust the port probe.** The failure it exists for is an MCP server
+  whose stdio child died on a broken pipe while the parent kept
+  `$MCP_LOCAL_PORT` bound — the port answers, so a status check calls it
+  healthy. `restart` reaps unconditionally, including a child that
+  inherited the listening socket from a parent that already died.
+- **Treat "kickstarted" as "working".** The MCP host must accept a real
+  TCP connect, and the tunnel's `ssh` must still be alive after a settle
+  window — with `ExitOnForwardFailure=yes`, an ssh that couldn't bind
+  `$REMOTE_PORT` on the remote exits within a second or two, so
+  surviving the settle is what proves the remote-side bind took.
+
+If the tunnel is the piece that fails, `$REMOTE_PORT` still bound on the
+remote by a stale forward is the usual cause — see "Wrapper exits with
+'ssh exit code N'" in Troubleshooting below.
+
 ## 5. Pick up plist changes
 
 `launchd` snapshots the plist contents at `bootstrap` time. Editing
