@@ -38,7 +38,29 @@
     <string>org.gbre.personal-mcp.host</string>
 
     <!--
-      ProgramArguments: absolute path to personal-mcp-host.sh.
+      ProgramArguments: absolute path to personal-mcp-host.sh, invoked
+      with the enable flag so the wrapper BRINGS THE MCP SERVER UP and
+      then opens the tunnel — the "one unit owns both pieces" shape this
+      template is for. The literal flag is the second ProgramArguments
+      entry below.
+
+      That flag is load-bearing, not decoration. With a bare argv the
+      wrapper runs its DEFAULT mode, which only status-GATES on the MCP
+      server already listening: if nothing is on
+      127.0.0.1:$MCP_LOCAL_PORT it prints the "re-run with the enable
+      flag" error and exits 3. Under KeepAlive=true that exit is just
+      another respawn, so a bare-argv unit degrades into a
+      ThrottleInterval-paced restart loop that never starts anything. If
+      you want the status-gated shape, you want the tunnel-only unit
+      (org.gbre.personal-mcp.tunnel.plist) plus an always-on MCP server,
+      not this one.
+
+      Note on respawns: this mode starts mcp-host-bash DETACHED, so it
+      OUTLIVES the wrapper. When KeepAlive respawns this unit after the
+      tunnel drops, the still-running server keeps the port and the
+      duplicate launcher the respawn starts exits with "address already
+      in use" — expected noise in the .err.log; the reopened tunnel
+      connects to the original server.
 
       Replace /PATH/TO/REPO with the absolute path to your local
       claude-watch checkout (no `~`, no `${HOME}`).
@@ -46,6 +68,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/PATH/TO/REPO/examples/personal-mac-mcp-host/personal-mcp-host.sh</string>
+        <string>--enable</string>
     </array>
 
     <!--

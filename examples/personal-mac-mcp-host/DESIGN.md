@@ -59,9 +59,14 @@ the MacBook controls the tunnel lifecycle (`launchctl load` to open it,
 The wrapper supports two shapes, with one LaunchAgent template each:
 
 - **Bundled** (`org.gbre.personal-mcp.host.plist`, wrapper invoked with
-  no flag). One unit owns BOTH `mcp-host-bash` and the reverse SSH
-  tunnel. Kickstart it → both come up; bootout → both go down. Fewest
-  moving parts.
+  `--enable`). One unit owns BOTH `mcp-host-bash` and the reverse SSH
+  tunnel. Kickstart it → both come up. Bootout tears the tunnel down;
+  the MCP server is started detached and keeps listening, so the next
+  kickstart reconnects instead of cold-starting. Fewest moving parts.
+
+  The flag is required, not cosmetic: the wrapper's no-flag default is
+  a status GATE that starts nothing and exits 3 when the server is
+  down, which `KeepAlive` would turn into a restart loop.
 
 - **Recommended split — MCP always-on locally, remote access
   on-demand** (`org.gbre.personal-mcp.tunnel.plist`, wrapper invoked
@@ -365,12 +370,17 @@ Key behaviors:
     <key>Label</key>
     <string>org.gbre.personal-mcp.host</string>
 
-    <!-- ProgramArguments: absolute path to personal-mcp-host.sh.
+    <!-- ProgramArguments: absolute path to personal-mcp-host.sh, plus
+         the enable flag so the wrapper starts the MCP server before
+         opening the tunnel (its no-flag default only status-gates and
+         exits 3). Note XML comments cannot contain a double hyphen,
+         which is why the flag is spelled out in prose here.
          Replace /PATH/TO/REPO. launchd does NOT expand `~` or
          `${HOME}` in plist values. -->
     <key>ProgramArguments</key>
     <array>
         <string>/PATH/TO/REPO/examples/personal-mac-mcp-host/personal-mcp-host.sh</string>
+        <string>--enable</string>
     </array>
 
     <!-- EnvironmentVariables: minimal. PATH is the only thing the
