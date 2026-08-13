@@ -130,6 +130,12 @@ owner-orphan ladder; the FAST first-line signal is the in-tree
 [`monitoring/prometheus/README.md`](monitoring/prometheus/README.md) and
 `config.toml [queue_check]`).
 
+[`monitoring/grafana/`](monitoring/grafana/) is the same idea for the
+presentation side: a pinned, Solarized-themed Grafana **image** (Dockerfile +
+theme + a couple of usability patches), with no dashboards or datasources baked
+in, so several deployments can share one build instead of each forking a copy
+that drifts. See [`monitoring/grafana/README.md`](monitoring/grafana/README.md).
+
 ## Architecture
 
 ```
