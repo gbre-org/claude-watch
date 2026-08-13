@@ -338,8 +338,9 @@ test-personal-mcp-host:
 # personal-mcp-host.sh. Structural validation only (plistlib + plutil
 # when available); does NOT invoke launchctl. Covers
 # RunAtLoad=false enforcement (this is the on-demand pattern, NOT
-# auto-start), Label / paths / EnvironmentVariables shape, README
-# walkthrough coverage. 22 cases, <1s.
+# auto-start), Label / paths / EnvironmentVariables shape, the per-mode
+# ProgramArguments flags (bundled passes --enable, tunnel-only passes
+# --tunnel-only), README walkthrough coverage. 26 cases, <1s.
 test-personal-mcp-host-plist:
 	examples/personal-mac-mcp-host/tests/launchd-plist.test
 

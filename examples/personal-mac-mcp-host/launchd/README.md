@@ -10,7 +10,7 @@ with `launchctl bootout` when they're done.
 | Template | Mode | What it starts |
 |---|---|---|
 | `org.gbre.personal-mcp.tunnel.plist` | tunnel-only (`--tunnel-only`) | ONLY the reverse SSH tunnel. Assumes `mcp-host-bash` is already running locally. **Recommended.** |
-| `org.gbre.personal-mcp.host.plist` | bundled (no flag) | `mcp-host-bash` AND the tunnel together. Simpler alternative. |
+| `org.gbre.personal-mcp.host.plist` | bundled (`--enable`) | `mcp-host-bash` AND the tunnel together. Simpler alternative. |
 
 **Recommended split — MCP always-on locally, remote access on-demand.**
 Run `mcp-host-bash` full-time via the
@@ -104,6 +104,22 @@ The installer is idempotent — re-run it any time (e.g. after moving your
 checkout) and it overwrites the installed plist with freshly-resolved
 paths.
 
+Two things to know when re-running over an existing install:
+
+- **Re-running only rewrites the file.** `launchd` is still running the
+  copy it snapshotted at `bootstrap` time, so a re-install changes
+  nothing until you `bootout` + `bootstrap` again — see
+  [step 5](#5-pick-up-plist-changes). This bites specifically if you
+  installed the bundled unit before it gained its `--enable` argument:
+  the registered unit keeps the old bare argv, and its
+  status-gate exit 3 keeps looping under `KeepAlive`, until you
+  re-bootstrap.
+- **It overwrites the installed plist wholesale.** Any hand edits you
+  made to the copy under `~/Library/LaunchAgents/` are lost. Keep
+  operator config in the sibling `.env` (the wrapper re-reads it on
+  every start) rather than in the installed plist, or re-apply the edits
+  after each re-install.
+
 ### What it does under the hood (manual fallback)
 
 If you'd rather do it by hand, the installer is equivalent to:
@@ -165,14 +181,42 @@ When you want to grant your remote Claude access to this Mac:
 launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
 ```
 
-That fires `personal-mcp-host.sh`, which:
+That fires `personal-mcp-host.sh --enable` (the flag is baked into the
+unit's `ProgramArguments`), which:
 
-1. Starts `mcp-host-bash --port $MCP_LOCAL_PORT` in the background.
-2. Waits for `127.0.0.1:$MCP_LOCAL_PORT` to enter `LISTEN`.
+1. Starts `mcp-host-bash --port $MCP_LOCAL_PORT` **detached** — in its
+   own session, so it outlives the wrapper.
+2. Waits for `127.0.0.1:$MCP_LOCAL_PORT` to enter `LISTEN`. If it never
+   binds, the wrapper exits non-zero rather than exposing a tunnel to a
+   server that isn't there.
 3. Opens the reverse SSH tunnel
    (`ssh -N -R $REMOTE_PORT:127.0.0.1:$MCP_LOCAL_PORT`).
-4. Holds both children open. If either dies, the wrapper exits
-   non-zero and `KeepAlive` respawns the whole thing.
+4. Tails the live MCP host log in the foreground. That tail is what
+   holds the unit in the `running` state; the tunnel is the piece being
+   watched. If the tunnel dies, the wrapper tears down and exits
+   non-zero, and `KeepAlive` respawns the unit.
+
+Two consequences of the detached start worth knowing before you read
+the logs:
+
+- **Stopping the unit does not stop the MCP server.** A `bootout` /
+  `kill TERM` tears down the tunnel and the tail only. The server keeps
+  listening on `127.0.0.1:$MCP_LOCAL_PORT` until you stop it yourself.
+- **A `KeepAlive` respawn logs a harmless bind failure.** The respawned
+  wrapper tries to start `mcp-host-bash` again, the original is still
+  holding the port, so the duplicate exits with an "address already in
+  use" `FATAL` in `~/Library/Logs/personal-mcp-host.err.log`. The
+  reopened tunnel connects to the original server, so the bridge works;
+  the line is noise, not a failure to chase.
+
+Why `--enable` and not a bare argv: without the flag the wrapper runs
+its default **status-gate** mode, which does not start anything — it
+probes the port and, finding nothing, prints the "re-run with
+`--enable`" error and exits 3. Under `KeepAlive=true` that exit is just
+another respawn, so a bare-argv bundled unit becomes a
+`ThrottleInterval`-paced restart loop that never brings the bridge up.
+The status-gated shape belongs to the
+[tunnel-only unit](#tunnel-only-unit) plus an always-on MCP server.
 
 Confirm the tunnel is up from the remote side:
 
@@ -222,15 +266,34 @@ A plain `launchctl kill TERM` does **not** stop the unit — `KeepAlive`
 respawns it within `ThrottleInterval`. Use `bootout` or the soft kill
 switch.
 
+Either way, for the **bundled** unit "tear the bridge down" means the
+tunnel, not the server: `--enable` starts `mcp-host-bash` detached, so
+it survives the wrapper's exit and keeps listening on
+`127.0.0.1:$MCP_LOCAL_PORT`. That is the intended split — stopping the
+unit revokes remote access without cold-starting the server next time.
+To stop the server too, stop it directly (`MCP_HOST_BASH_DISABLED`, its
+own LaunchAgent, or kill whatever `lsof -nP -iTCP:$MCP_LOCAL_PORT
+-sTCP:LISTEN` reports).
+
 ## 5. Pick up plist changes
 
 `launchd` snapshots the plist contents at `bootstrap` time. Editing
-the plist after that does NOT take effect until you re-bootstrap:
+the plist — or re-running `install.sh` over it — does NOT take effect
+until you re-bootstrap:
 
 ```sh
 launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
 launchctl bootstrap gui/$(id -u) \
     ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+```
+
+Run exactly this after updating a checkout in which the bundled unit
+gained its `--enable` argument (re-run `./install.sh --bundled` first so
+the file on disk is current). Confirm the registered unit picked it up:
+
+```sh
+launchctl print gui/$(id -u)/org.gbre.personal-mcp.host | grep -A3 arguments
+# should list personal-mcp-host.sh followed by --enable
 ```
 
 `.env` changes are different — the wrapper sources the file on every
@@ -351,6 +414,29 @@ actually listening on `$MCP_LOCAL_PORT`.
 - Plist file owned by the operator (`stat -f '%Su' <path>`).
 - Mode `0644` or stricter. `chmod 0644 ~/Library/LaunchAgents/<file>`
   if `bootstrap` complains.
+
+### Bundled unit restart-loops with "host MCP service is NOT running"
+
+`~/Library/Logs/personal-mcp-host.err.log` fills with that message
+every `ThrottleInterval`, and `launchctl print` shows `last exit code
+= 3`. The registered unit is invoking the wrapper with a bare argv, so
+it runs the default status-gate mode: it never starts `mcp-host-bash`,
+finds nothing on the port, and exits 3 — which `KeepAlive` treats as
+just another respawn.
+
+The bundled template passes `--enable` for exactly this reason. If your
+installed copy predates that, refresh it and re-bootstrap:
+
+```sh
+cd examples/personal-mac-mcp-host
+./install.sh --bundled
+launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl bootstrap gui/$(id -u) \
+    ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+```
+
+(Re-installing alone is not enough — `launchd` runs the snapshot it
+took at `bootstrap` time. See [step 5](#5-pick-up-plist-changes).)
 
 ### Wrapper exits with "missing .env"
 

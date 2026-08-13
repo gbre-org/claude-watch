@@ -33,7 +33,8 @@ corresponding LaunchAgent templates:
 
 - **Bundled (simpler alternative) — one command brings up both.** Run
   `personal-mcp-host.sh --enable` (or the bundled
-  `org.gbre.personal-mcp.host.plist`, `RunAtLoad=false`). The wrapper
+  `org.gbre.personal-mcp.host.plist`, `RunAtLoad=false`, whose
+  `ProgramArguments` pass that same `--enable`). The wrapper
   brings `mcp-host-bash` up AND opens the tunnel from one invocation.
   The MCP service is started **detached** (its own session) so it
   PERSISTS: a Ctrl-C / stop tears down only the tunnel + log tail and
@@ -59,7 +60,7 @@ examples/personal-mac-mcp-host/
 ├── personal-mcp-host.sh                      # wrapper: mcp-host-bash + ssh tunnel (or tunnel-only)
 ├── install.sh                                # one-command LaunchAgent installer (path substitution)
 ├── launchd/
-│   ├── org.gbre.personal-mcp.host.plist      # bundled LaunchAgent (mcp-host-bash + tunnel, RunAtLoad=false)
+│   ├── org.gbre.personal-mcp.host.plist      # bundled LaunchAgent (--enable: mcp-host-bash + tunnel, RunAtLoad=false)
 │   ├── org.gbre.personal-mcp.tunnel.plist    # tunnel-only LaunchAgent (tunnel only, RunAtLoad=false)
 │   └── README.md                             # launchctl install walkthrough
 └── tests/
@@ -329,10 +330,12 @@ launchctl bootstrap gui/$(id -u) \
     ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
 # Registers the unit. Doesn't fire it (RunAtLoad=false).
 
-# Per-session: start (brings up mcp-host-bash AND the tunnel)
+# Per-session: start (the unit runs the wrapper with --enable, so it
+# brings up mcp-host-bash AND the tunnel)
 launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
 
-# Per-session: stop
+# Per-session: stop. Tears down the tunnel; the detached mcp-host-bash
+# keeps listening (that's the point — no cold start on the next grant).
 launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
 
 # OR: leave registered + soft-disable
@@ -344,6 +347,12 @@ launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
 Prefer to do it by hand? The "what it does under the hood" subsection of
 [`launchd/README.md`](launchd/README.md) keeps the manual
 `cp` + editor + `mkdir -p ~/Library/Logs` steps as a fallback.
+
+Already have this unit installed from an older checkout? Re-running
+`install.sh` rewrites the file but does not touch the copy `launchd`
+snapshotted at `bootstrap` time — `bootout` + `bootstrap` to pick up
+plist changes. See [`launchd/README.md`](launchd/README.md) "Pick up
+plist changes".
 
 ## Failure modes
 
