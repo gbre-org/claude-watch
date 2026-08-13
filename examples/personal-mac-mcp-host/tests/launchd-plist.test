@@ -6,7 +6,8 @@ on-demand reverse-tunnelled MCP host bridge.
 Two templates are validated with the SAME structural checks:
 
   - org.gbre.personal-mcp.host.plist    — bundled: launches both
-    mcp-host-bash AND the reverse SSH tunnel.
+    mcp-host-bash AND the reverse SSH tunnel. Invokes the wrapper
+    with `--enable`.
   - org.gbre.personal-mcp.tunnel.plist  — tunnel-only: launches ONLY
     the reverse SSH tunnel (mcp-host-bash assumed already running
     locally, e.g. the always-on compose-stack LaunchAgent). Invokes
@@ -27,10 +28,13 @@ Coverage (run against BOTH plists):
   - `WorkingDirectory`, `StandardOutPath`, `StandardErrorPath`,
     `ThrottleInterval`, `ProcessType` all present + sane.
 
-Plus tunnel-only specific checks:
+Plus mode-specific checks:
   - The tunnel plist passes `--tunnel-only` in ProgramArguments.
+  - The bundled plist passes `--enable` (without it the wrapper only
+    status-gates and exits 3 when the server is down, which KeepAlive
+    turns into a restart loop).
   - README walkthrough hits the major operator steps + references both
-    Labels.
+    Labels + documents the bundled unit's `--enable` argv.
 
 Run:  ./launchd-plist.test
 """
@@ -336,6 +340,54 @@ def test_tunnel_plist_passes_tunnel_only_flag() -> None:
     )
 
 
+def test_host_plist_passes_enable_flag() -> None:
+    """The bundled template MUST invoke the wrapper with `--enable`.
+
+    That flag is what makes the unit start `mcp-host-bash` before
+    opening the tunnel — the whole point of the "one unit owns both
+    pieces" shape. With a bare argv the wrapper runs its DEFAULT
+    status-gate mode instead: it starts nothing, finds nothing
+    listening on the MCP port, and exits 3. Because the unit sets
+    `KeepAlive=true`, launchd treats that as just another exit and
+    respawns, so a bare-argv bundled unit degrades into a
+    ThrottleInterval-paced restart loop that never brings the bridge
+    up. Pin the flag so a future edit can't silently drop it.
+
+    The tunnel-only template must NOT pass it — that unit deliberately
+    leaves the MCP server's lifecycle alone."""
+    host_pa = load(PLIST).get("ProgramArguments") or []
+    expect(
+        "--enable" in host_pa,
+        f"{PLIST.name}: ProgramArguments must include `--enable` so the "
+        f"unit actually starts mcp-host-bash; a bare argv runs the "
+        f"status-gate mode, which exits 3 and restart-loops under "
+        f"KeepAlive. Got {host_pa!r}",
+    )
+    tunnel_pa = load(TUNNEL_PLIST).get("ProgramArguments") or []
+    expect(
+        "--enable" not in tunnel_pa,
+        f"{TUNNEL_PLIST.name}: tunnel-only unit must NOT pass `--enable` "
+        f"(it does not manage the MCP server's lifecycle); "
+        f"got {tunnel_pa!r}",
+    )
+
+
+def test_readme_documents_bundled_enable_flag() -> None:
+    """The launchd README's per-session walkthrough describes what the
+    bundled unit does when kickstarted. That description is only true
+    because the plist passes `--enable`, so the README has to name the
+    flag — this is the exact pair that drifted apart before."""
+    if not LAUNCHD_README.exists():
+        return
+    body = LAUNCHD_README.read_text()
+    expect(
+        "--enable" in body,
+        "launchd/README.md must document the bundled unit's `--enable` "
+        "argv — the step-3 walkthrough ('starts mcp-host-bash, then the "
+        "tunnel') is only accurate with it",
+    )
+
+
 def test_tunnel_plist_distinct_log_paths() -> None:
     """The two units run side by side; their log paths must differ so
     they don't clobber each other."""
@@ -465,11 +517,15 @@ tests = [
     test_throttle_interval_reasonable,
     test_process_type_present,
     test_no_disallowed_top_level_keys,
+    test_tunnel_plist_passes_tunnel_only_flag,
+    test_host_plist_passes_enable_flag,
+    test_tunnel_plist_distinct_log_paths,
     test_wrapper_exists_and_executable,
     test_readme_exists,
     test_readme_references_label,
     test_readme_documents_required_steps,
     test_readme_documents_on_demand_pattern,
+    test_readme_documents_bundled_enable_flag,
     test_main_readme_links_to_launchd,
 ]
 

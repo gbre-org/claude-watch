@@ -21,7 +21,8 @@
   If you instead want a single unit that owns BOTH the MCP server and
   the tunnel, use the bundled template
   org.gbre.personal-mcp.host.plist (same directory) — it invokes the
-  wrapper in bundled mode (no tunnel-only flag).
+  wrapper with the enable flag, which brings mcp-host-bash up before
+  opening the tunnel.
 
   This is a TEMPLATE — you MUST search/replace the placeholders before
   bootstrapping:
