@@ -63,6 +63,7 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 # Shared loader / dedup logic — see claude_agents.py alongside this file.
 from claude_agents import agents_by_queue_id as _agents_by_qid
 from claude_agents import load_agent_state as _load_state
+from claude_agents import load_agent_queue_bindings as _agents_bindings_by_qid
 
 QUEUE_PATH = os.environ.get("QUEUE_JSON", "/queue/queue.json")
 AGENT_STATE_PATH = os.environ.get(
@@ -438,10 +439,24 @@ def _load_agent_queue_bindings() -> dict[str, str]:
     return out
 
 
+def _load_owner_bindings_by_qid() -> dict[str, str]:
+    """queue_id -> agent_id from the arm-hook bindings file (newest wins).
+
+    Inverse of ``_load_agent_queue_bindings`` (which returns agent_id ->
+    queue_id for the subagent tree). Used by ``_classify_owner`` to attribute
+    an owner to a running item the instant it is spawned -- before
+    claude-watch's active-agents poller keys a transcript record under its
+    queue id. Fail-soft (delegates to the shared helper, which returns {} on
+    any read/parse error).
+    """
+    return _agents_bindings_by_qid(AGENT_QUEUE_BINDINGS_PATH)
+
+
 def _classify_owner(
     item: dict[str, Any],
     now: datetime,
     agent_by_qid: dict[str, dict[str, Any]],
+    owner_bindings: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Compute owner liveness for a running item — mirrors work-queue-exporter.
 
@@ -522,6 +537,52 @@ def _classify_owner(
             "mode": "agent",
             "alive": None,
             "agent_id": stamped_aid,
+            "jsonl_age_seconds": None,
+            "jsonl_age": "?",
+            "jsonl_age_epoch": None,
+            "is_starting": False,
+        }
+
+    # Still unresolved via active-agents (by qid) and the register-time
+    # stamp. Consult the arm-hook bindings (queue_id -> agent_id): a bound
+    # qid was DEFINITIVELY spawned by the main loop's Agent tool -- the
+    # PostToolUse arm-hook wrote the binding synchronously at spawn -- so it
+    # is OWNED even while claude-watch's active-agents poller (60s) has not
+    # yet keyed a transcript record under this qid. That spawn-to-poll gap is
+    # exactly what previously surfaced as a spurious "owner unknown". Recover
+    # liveness from any active-agents record carrying that agent_id (the same
+    # join the stamped-owner path uses above); when none resolves, surface the
+    # KNOWN owner with alive=None (owner attributed, liveness ambiguous -- no
+    # orphan badge).
+    if owner_bindings is None:
+        owner_bindings = _load_owner_bindings_by_qid()
+    bound_aid = owner_bindings.get(iid)
+    if bound_aid:
+        rec = next(
+            (
+                r
+                for r in agent_by_qid.values()
+                if isinstance(r, dict) and r.get("agent_id") == bound_aid
+            ),
+            None,
+        )
+        if rec is not None:
+            age = rec.get("jsonl_age_seconds")
+            return {
+                "mode": "agent",
+                "alive": bool(rec.get("alive")),
+                "agent_id": bound_aid,
+                "jsonl_age_seconds": age,
+                "jsonl_age": _humanize_age(age),
+                "jsonl_age_epoch": (now.timestamp() - age)
+                if age is not None
+                else None,
+                "is_starting": False,
+            }
+        return {
+            "mode": "agent",
+            "alive": None,
+            "agent_id": bound_aid,
             "jsonl_age_seconds": None,
             "jsonl_age": "?",
             "jsonl_age_epoch": None,
@@ -711,6 +772,7 @@ def _shape(
     agent_by_qid: dict[str, dict[str, Any]],
     items: list[dict[str, Any]] | None = None,
     bindings: dict[str, str] | None = None,
+    owner_bindings: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     status = item.get("status", "unknown")
     # Hostjob status reconciliation. A hostjob-bound item stuck `running` in
@@ -866,7 +928,7 @@ def _shape(
     }
 
     if status == "running":
-        owner = _classify_owner(item, now, agent_by_qid)
+        owner = _classify_owner(item, now, agent_by_qid, owner_bindings)
         shaped["owner"] = owner
         # Surface STARTING as a top-level boolean for the template +
         # API consumers. STARTING items count as running for the
@@ -1157,13 +1219,19 @@ def _render_payload() -> dict[str, Any]:
     # pass (not per item) and threaded into _shape so the subagent-tree
     # builder doesn't re-stat the bindings file for every running item.
     bindings = _load_agent_queue_bindings()
+    # queue_id -> agent_id (arm-hook), so _classify_owner can attribute an
+    # owner to a just-spawned running item before active-agents publishes it.
+    owner_bindings = _load_owner_bindings_by_qid()
 
     running, pending, blocked, done, abandoned = [], [], [], [], []
     for it in items:
         # Pass the full items list so _shape can compute ready_now
         # (depends_on resolution requires the full graph) and decorate
         # depends_on_status per-edge.
-        s = _shape(it, now, agent_by_qid, items=items, bindings=bindings)
+        s = _shape(
+            it, now, agent_by_qid, items=items, bindings=bindings,
+            owner_bindings=owner_bindings,
+        )
         st = s["status"]
         if st == "running":
             running.append(s)

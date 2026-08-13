@@ -46,6 +46,7 @@ to stdlib.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 DEFAULT_AGENT_STATE_PATH = "/var/lib/claude-watch/active-agents.json"
@@ -119,3 +120,96 @@ def agent_for_queue(
     """One-shot helper: load state file, return the record for `queue_id`."""
     state = load_agent_state(path)
     return agents_by_queue_id(state).get(queue_id)
+
+
+def agents_by_agent_id(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map agent_id -> agent record from a loaded state dict.
+
+    Companion to ``agents_by_queue_id``. Where the queue-id map answers
+    "which agent owns this queue item (by the transcript-parsed marker)",
+    this map answers "what is the liveness of THIS agent_id" -- the join
+    needed to resolve an owner discovered via the arm-hook bindings file
+    (agent_id -> queue_id), whose agent may be keyed in active-agents under
+    a DIFFERENT (original-spawn) queue id than the one we are asking about.
+
+    Dedup rule mirrors ``agents_by_queue_id``: live > stale; among same
+    liveness, smaller jsonl_age_seconds wins. Records without an agent_id
+    are skipped.
+    """
+    by_aid: dict[str, dict[str, Any]] = {}
+    for rec in state.get("agents", []):
+        if not isinstance(rec, dict):
+            continue
+        aid = rec.get("agent_id")
+        if not aid:
+            continue
+        prev = by_aid.get(aid)
+        if prev is None:
+            by_aid[aid] = rec
+            continue
+        prev_alive = bool(prev.get("alive"))
+        rec_alive = bool(rec.get("alive"))
+        if rec_alive and not prev_alive:
+            by_aid[aid] = rec
+            continue
+        if rec_alive == prev_alive:
+            prev_age = prev.get("jsonl_age_seconds")
+            rec_age = rec.get("jsonl_age_seconds")
+            if rec_age is not None and (prev_age is None or rec_age < prev_age):
+                by_aid[aid] = rec
+    return by_aid
+
+
+_QUEUE_ID_RE = re.compile(r"^q-[a-z0-9-]{4,64}$")
+
+
+def load_agent_queue_bindings(path: str) -> dict[str, str]:
+    """Map queue_id -> agent_id from the arm-hook bindings file.
+
+    ``post-tool-agent-arm-hook`` (PostToolUse:Agent) writes
+    ``{"bindings": {"<agent_id>": {"queue_id": "q-XXXX",
+    "registered_at": <epoch>, ...}}}`` the instant the main loop spawns an
+    Agent -- BEFORE claude-watch's active-agents poller (60s cadence) has
+    published a transcript-derived record for it. It is therefore the
+    earliest AND most authoritative owner signal: an item carrying a
+    binding is definitively OWNED even while active-agents shows no record
+    keyed under its queue id (spawn-to-poll lag, or a SendMessage-rotated
+    queue id whose transcript marker still points at the original id).
+
+    Returns a queue_id -> agent_id map. When several agents bound the same
+    queue id over the item's life (a re-register / retry), the NEWEST
+    binding (largest ``registered_at``) wins -- that is the current owner.
+    Fail-soft: missing file, unreadable, bad JSON, or an unexpected shape
+    all yield ``{}`` so a missing mount degrades to the legacy behaviour.
+    """
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    bindings = data.get("bindings")
+    if not isinstance(bindings, dict):
+        return {}
+    best: dict[str, tuple[float, str]] = {}
+    for aid, rec in bindings.items():
+        if not isinstance(aid, str) or not aid:
+            continue
+        if isinstance(rec, dict):
+            qid = rec.get("queue_id")
+            reg = rec.get("registered_at")
+        elif isinstance(rec, str):
+            qid, reg = rec, None
+        else:
+            continue
+        if not isinstance(qid, str) or not _QUEUE_ID_RE.match(qid):
+            continue
+        try:
+            reg_f = float(reg) if reg is not None else 0.0
+        except (TypeError, ValueError):
+            reg_f = 0.0
+        prev = best.get(qid)
+        if prev is None or reg_f >= prev[0]:
+            best[qid] = (reg_f, aid)
+    return {qid: aid for qid, (_reg, aid) in best.items()}
