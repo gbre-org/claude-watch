@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 // Shared, dependency-free PR-subject parser. Included verbatim so the build
@@ -66,24 +67,62 @@ fn main() {
     println!("cargo:rustc-env=CW_GIT_COMMIT={}", commit);
     println!("cargo:rustc-env=CW_GIT_PR={}", pr);
 
-    // Restamp when HEAD moves (new commit / branch switch). `.git/HEAD` covers
-    // branch changes; the file HEAD points at (e.g. refs/heads/main) covers new
-    // commits on the current branch.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Some(head_ref) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
-        println!("cargo:rerun-if-changed=.git/{}", head_ref);
+    // Restamp when HEAD moves (new commit / branch switch), and when the
+    // container build-context stamp files change.
+    //
+    // Only paths that EXIST are emitted. Cargo treats a missing
+    // `rerun-if-changed` path as perpetually "changed", so a single absent
+    // path re-runs this build script — and therefore recompiles and relinks
+    // the whole crate — on EVERY `cargo build`, forever. Every candidate
+    // below is routinely absent: `.build-commit` / `.build-pr` are gitignored
+    // and only ever written inside the container build, `.git` is a FILE (not
+    // a directory) in a linked git worktree, and `refs/heads/<branch>` does
+    // not exist as a loose ref once refs have been packed.
+    for path in rerun_paths() {
+        println!("cargo:rerun-if-changed={}", path);
     }
-    // Restamp when the container build-context stamp files change. The
-    // Dockerfile rewrites these every image build, so their mtime is always
-    // newer than the build-script fingerprint cached in the persisted
-    // `/build/target` mount — this is what reliably forces a build.rs re-run
-    // across separate image builds (the `rerun-if-env-changed` directives
-    // below do not, given that cache mount).
-    println!("cargo:rerun-if-changed=.build-commit");
-    println!("cargo:rerun-if-changed=.build-pr");
     // Restamp when the build-arg-injected stamp changes (container builds).
     println!("cargo:rerun-if-env-changed=CW_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=CW_BUILD_PR");
+}
+
+/// Collect the `rerun-if-changed` paths that actually exist on disk.
+///
+/// Git paths are resolved with `git rev-parse --git-path`, which is
+/// worktree-aware: in a linked worktree `.git` is a file pointing elsewhere,
+/// so a hardcoded `.git/HEAD` is both wrong and absent there.
+///
+/// The existence filter is the important part — see the caller.
+fn rerun_paths() -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    // HEAD itself covers branch switches.
+    if let Some(head) = git_output(&["rev-parse", "--git-path", "HEAD"]) {
+        candidates.push(head);
+    }
+    // The ref HEAD points at (e.g. refs/heads/main) covers new commits on the
+    // current branch while it is a loose ref; `packed-refs` covers the same
+    // once that ref has been packed away.
+    if let Some(head_ref) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git_output(&["rev-parse", "--git-path", &head_ref]) {
+            candidates.push(path);
+        }
+    }
+    if let Some(packed) = git_output(&["rev-parse", "--git-path", "packed-refs"]) {
+        candidates.push(packed);
+    }
+
+    // Container build-context stamps. The Dockerfile rewrites these every
+    // image build, so when they ARE present their mtime is always newer than
+    // the build-script fingerprint cached in the persisted `/build/target`
+    // mount — that is what forces a re-run and restamp across image builds.
+    candidates.push(".build-commit".to_string());
+    candidates.push(".build-pr".to_string());
+
+    candidates
+        .into_iter()
+        .filter(|p| Path::new(p).exists())
+        .collect()
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
