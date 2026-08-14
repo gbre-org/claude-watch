@@ -149,9 +149,12 @@ or anything else PATH-resolvable. The supervisor execs it directly via
 `tokio::process::Command::new(args[0]).args(&args[1..])`.
 
 The supervisor expects the watcher to be on `$PATH` (or installed via
-`make install`, which copies `tools/watchers/<name>` into `$BIN_DIR`,
+`make install`, which symlinks `tools/watchers/<name>` into `$BIN_DIR`,
 default `~/bin/`). The convention in this repo is that `tools/watchers/`
-contents are mirrored into `~/bin/` by `make install`.
+contents are mirrored into `~/bin/` by `make install` — as absolute-path
+symlinks back into the checkout, so in-tree edits take effect without a
+re-install. The list is explicit in the `install` target, so add your new
+watcher there.
 
 ### Registering with `watchers.conf`
 
@@ -532,8 +535,8 @@ Watchers ship with two test layers:
   outside CI (run manually or as a `#[ignore]`-gated cargo test).
 
 Wire new test files into `make test-watchers` (host) or
-`make test-container` (container) so the pre-commit hook + CI catch
-regressions.
+`make test-entrypoint` (container — it runs the `container/tests/`
+suites) so the pre-commit hook + CI catch regressions.
 
 ## Pointers
 

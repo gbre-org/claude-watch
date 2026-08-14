@@ -26,7 +26,7 @@ Native install (build from source):
 
 ```bash
 make build                  # cargo build --release
-make install                # copies daemon + tools into $BIN_DIR (default ~/bin)
+make install                # daemon copied + tool scripts symlinked into $BIN_DIR (default ~/bin)
 make install-hooks          # opt-in: warning-free build + unit-tests pre-commit gate
 ```
 
@@ -285,12 +285,12 @@ make test                # all Rust tests in parallel
 make test-session-task   # session-task pytest suite
 make test-hooks          # obligations + queue PreToolUse hook tests
 make test-queue-minisite # queue-minisite Flask end-to-end suites
-make test-agent-msg      # agent-msg embedded --test (38 cases)
+make test-agent-msg      # agent-msg embedded --test suite
 make test-claude-event   # claude-event + claude-event-tail unit tests
 make test-watchers       # claude-event-watch fast-path + self-clear config
 
 make build               # release build
-make install             # build + copy daemon + tools into $BIN_DIR (default ~/bin/)
+make install             # build; copy daemon + symlink tool scripts into $BIN_DIR (default ~/bin/)
 make deploy-systemd      # build + install skills + systemctl restart (host/systemd install)
 make install-skills      # install skills/ as /cw-<name> slash commands (dep of deploy-systemd)
 make install-hooks       # install the git pre-commit hook (warnings + tests)
