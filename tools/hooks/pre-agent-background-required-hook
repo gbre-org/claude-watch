@@ -1,14 +1,35 @@
 #!/usr/bin/env python3
-"""PreToolUse hook for the Agent tool -- require run_in_background: true.
+"""PreToolUse hook for the Agent tool -- reject explicitly-foreground spawns.
 
-The Claude Code harness runs the ``Agent`` tool FOREGROUND (synchronous,
-blocking the whole main loop until the sub-agent finishes) unless the spawn
-explicitly passes ``run_in_background: true``. A foreground agent defeats the
-"main loop is a dispatcher, not a worker" model -- the loop can't service
-watchers, queue events, or anything else while it blocks. This hook makes
-background-spawning a hard invariant: any ``Agent`` call whose
-``tool_input.run_in_background`` is not ``true`` is DENIED with a banner
-telling the operator to re-spawn with ``run_in_background: true``.
+Historically the Claude Code harness ran the ``Agent`` tool FOREGROUND
+(synchronous, blocking the whole main loop until the sub-agent finishes)
+unless the spawn explicitly passed ``run_in_background: true``. A foreground
+agent defeats the "main loop is a dispatcher, not a worker" model -- the loop
+can't service watchers, queue events, or anything else while it blocks. This
+hook existed to make background-spawning a hard invariant.
+
+**Newer harness builds dropped ``run_in_background`` from the Agent tool
+schema entirely and background subagents natively** ("Subagents run in the
+background; you'll be notified when one completes"). On those builds the
+operator cannot express the value this hook used to demand, so requiring it
+denied *every* spawn -- 100%, not just the foreground ones -- and forced the
+main loop to do all work inline, which is the exact opposite of the invariant
+being protected. Observed 2026-08-13 on two independent deployments (host
+main loop + workbot container) and confirmed across a full process restart.
+
+**A guard whose satisfying condition the caller can no longer express is not
+a guard, it is a wall.** So the check is now capability-aware, keyed on
+whether the caller's schema has the parameter at all:
+
+- ``run_in_background`` ABSENT from ``tool_input`` -> ALLOW. Either the
+  harness has no such parameter (it backgrounds natively -- nothing to
+  guard), or it does and the operator omitted it, in which case the harness
+  default applies. Not distinguishable from inside the hook, and on current
+  builds the first case is the real one.
+- ``run_in_background`` present and truthy -> ALLOW (explicitly backgrounded).
+- ``run_in_background`` present and FALSY -> DENY. This is the only case that
+  still means what the original check meant: a harness that offers the
+  parameter, and a caller that explicitly opted into blocking the main loop.
 
 Decision protocol (matches the other PreToolUse hooks in this directory):
 - Exit 0 with empty JSON ``{}`` -> allow silently.
@@ -69,16 +90,20 @@ def _deny(reason: str, banner: str) -> dict:
 
 def _banner() -> str:
     return (
-        "!! BLOCKED: Agent spawn without run_in_background: true\n"
+        "!! BLOCKED: Agent spawn with run_in_background explicitly false\n"
         "!!\n"
-        "!! The Agent tool runs FOREGROUND by default -- it blocks the entire\n"
-        "!! main loop until the sub-agent finishes. The main loop is a\n"
-        "!! dispatcher, not a worker: it must stay free to service watchers,\n"
-        "!! queue events, and context-warnings while agents run.\n"
+        "!! A foreground agent blocks the entire main loop until the\n"
+        "!! sub-agent finishes. The main loop is a dispatcher, not a worker:\n"
+        "!! it must stay free to service watchers, queue events, and\n"
+        "!! context-warnings while agents run.\n"
         "!!\n"
-        "!! Fix: re-spawn the Agent tool call with\n"
+        "!! Fix: drop the parameter, or re-spawn with\n"
         "!!     run_in_background: true\n"
         "!! You'll be notified when the agent completes.\n"
+        "!!\n"
+        "!! NOTE: omitting run_in_background entirely is ALLOWED -- newer\n"
+        "!! harness builds have no such parameter and background subagents\n"
+        "!! natively. Only an explicit false reaches this banner.\n"
         "!!\n"
         "!! Genuinely need a blocking foreground agent? Add this line to the\n"
         "!! prompt (audited):\n"
@@ -151,6 +176,13 @@ def _evaluate(payload: dict) -> dict:
         prompt = ""
     session_id = payload.get("session_id")
 
+    # Capability check FIRST: if the caller's schema has no run_in_background
+    # parameter at all, there is nothing to demand. Newer harness builds
+    # dropped it and background subagents natively; demanding an
+    # inexpressible value would deny 100% of spawns. See module docstring.
+    if "run_in_background" not in tool_input:
+        return _allow()
+
     # Already background -> allow.
     if _truthy_background(tool_input.get("run_in_background")):
         return _allow()
@@ -167,7 +199,7 @@ def _evaluate(payload: dict) -> dict:
         return _allow()
 
     return _deny(
-        "Agent spawned foreground (run_in_background not true) -- blocks the main loop.",
+        "Agent spawned with run_in_background explicitly false -- blocks the main loop.",
         _banner(),
     )
 
@@ -206,22 +238,44 @@ def _run_tests() -> int:
         return d.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
 
     check("non-agent allowed", _evaluate({"tool_name": "Bash", "tool_input": {}}) == {})
-    check("agent fg denied", is_deny(_evaluate(
-        {"tool_name": "Agent", "tool_input": {"prompt": "do x", "subagent_type": "general-purpose"}})))
+
+    # Capability case: the current harness's Agent schema has NO
+    # run_in_background parameter, so a normal spawn carries only
+    # prompt/subagent_type/description. Demanding the absent key here is what
+    # denied 100% of spawns on 2026-08-13; it must ALLOW.
+    check("agent without rib key allowed (schema lacks the param)", _evaluate(
+        {"tool_name": "Agent", "tool_input": {
+            "prompt": "do x", "subagent_type": "general-purpose",
+            "description": "do x"}}) == {})
+    check("agent empty input allowed", _evaluate(
+        {"tool_name": "Agent", "tool_input": {}}) == {})
+    check("task without rib key allowed", _evaluate(
+        {"tool_name": "Task", "tool_input": {}}) == {})
+
+    # The residual guard: an explicit falsy value still means the caller had
+    # the parameter available and chose to block the loop.
     check("agent rib=false denied", is_deny(_evaluate(
         {"tool_name": "Agent", "tool_input": {"run_in_background": False}})))
+    check("agent rib='false' denied", is_deny(_evaluate(
+        {"tool_name": "Agent", "tool_input": {"run_in_background": "false"}})))
+    check("agent rib=None denied", is_deny(_evaluate(
+        {"tool_name": "Agent", "tool_input": {"run_in_background": None}})))
+
     check("agent rib=true allowed", _evaluate(
         {"tool_name": "Agent", "tool_input": {"run_in_background": True}}) == {})
     check("agent rib='true' allowed", _evaluate(
         {"tool_name": "Agent", "tool_input": {"run_in_background": "true"}}) == {})
-    check("task fg denied", is_deny(_evaluate(
-        {"tool_name": "Task", "tool_input": {}})))
+
+    # Bypasses still work on the one case that can still deny.
     check("marker bypass allowed", _evaluate(
-        {"tool_name": "Agent", "tool_input": {"prompt": "FOREGROUND_AGENT_OK: ci-wait shim"}}) == {})
+        {"tool_name": "Agent", "tool_input": {
+            "run_in_background": False,
+            "prompt": "FOREGROUND_AGENT_OK: ci-wait shim"}}) == {})
     os.environ[BYPASS_ENV] = "1"
     try:
         check("env bypass allowed", _evaluate(
-            {"tool_name": "Agent", "tool_input": {"prompt": "x"}}) == {})
+            {"tool_name": "Agent", "tool_input": {
+                "run_in_background": False, "prompt": "x"}}) == {})
     finally:
         del os.environ[BYPASS_ENV]
     check("malformed allowed", _evaluate("not a dict") == {})

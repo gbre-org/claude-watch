@@ -37,15 +37,16 @@ Examples that are OK inline (single tool call):
 - A single Edit when the change is one localized hunk and you've already
   read the file in a prior turn
 
-**Agents MUST be backgrounded — never foreground.** Always spawn with
-`run_in_background: true`. A foreground Agent call blocks this loop until the
-subagent finishes, freezing everything the dispatcher must keep doing (babysit
-the queue, answer agent-chat, refresh the heartbeat, field claude-watch
-alerts) and making a long subagent look wedged to the daemon. Enforced: the
-`pre-agent-background-required-hook` PreToolUse gate DENIES any Agent spawn
-whose `run_in_background` isn't `true`. (Emergency override: env
-`AGENT_FOREGROUND_OK=1`, or `FOREGROUND_AGENT_OK: <reason>` in the Agent
-prompt.) After spawning, track via the queue and `agent-msg`/`agent-tail`.
+**Agents MUST be backgrounded — never foreground.** A foreground Agent call
+blocks this loop until the subagent finishes, freezing everything the
+dispatcher must keep doing (babysit the queue, answer agent-chat, refresh the
+heartbeat, field claude-watch alerts) and making a long subagent look wedged
+to the daemon. If your Agent schema has `run_in_background`, pass `true`;
+newer builds dropped it and background natively, so just spawn. Enforced:
+`pre-agent-background-required-hook` DENIES an explicitly-falsy
+`run_in_background`, allows absence. (Override: env
+`AGENT_FOREGROUND_OK=1`, or `FOREGROUND_AGENT_OK: <reason>`.) After
+spawning, track via the queue and `agent-msg`/`agent-tail`.
 
 ## claude-watch alerts — STOP EVERYTHING — NON-NEGOTIABLE
 
