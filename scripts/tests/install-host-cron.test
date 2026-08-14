@@ -50,6 +50,10 @@ What's covered:
  10. Makefile wiring: `install-cron` invokes the script, `deploy-systemd`
      depends on `install` (single-binary identity), and both new targets are
      .PHONY.
+ 11. The three in-tree sources that each name a daemon binary path — the
+     shipped systemd unit's ExecStart, the installer's default @CW_BIN@, and
+     the Makefile `install` recipe — agree with each other. See the long
+     comment on that section for exactly what this does and does NOT prove.
 
 Run:  ./scripts/tests/install-host-cron.test
 """
@@ -67,6 +71,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FRAGMENT = REPO_ROOT / "cron.d" / "cw-host"
 INSTALLER = REPO_ROOT / "scripts" / "install-host-cron.sh"
 MAKEFILE = REPO_ROOT / "Makefile"
+SERVICE_UNIT = REPO_ROOT / "claude-watch.service"
 
 # Substrings that must never appear in a file shipped from this PUBLIC repo.
 PRIVATE_SENTINELS = [
@@ -295,6 +300,143 @@ for target in ("install-cron", "test-install-host-cron"):
         re.search(rf"^\.PHONY:.*\b{target}\b", mk, re.MULTILINE) is not None,
         f"{target} is declared .PHONY",
     )
+
+# -----------------------------------------------------------------------------
+print("11. Shipped unit, installer default, and Makefile agree on the binary")
+# -----------------------------------------------------------------------------
+# WHAT THIS SECTION PROVES — AND, MORE IMPORTANTLY, WHAT IT DOES NOT
+#
+# The failure this guards against: cron and the systemd service exec DIFFERENT
+# claude-watch binaries. `claude_watch_build_info` is emitted from compile-time
+# constants, so the gauge describes whichever binary cron execs — not "the
+# running daemon". When the two drift, the metric keeps updating every minute,
+# nothing errors, and a dashboard confidently displays a build that is not the
+# one serving. That happened for two days in Aug 2026 and showed a 35-commit-
+# stale build; the only symptom was the number being wrong.
+#
+# THIS TEST RUNS IN CI, WHERE THERE IS NO DEPLOYMENT. There is no
+# /etc/cron.d/cw-host, no installed systemd unit, no running daemon, and no
+# built binary. So the ONLY thing assertable here is that the artifacts this
+# repo SHIPS are internally consistent — i.e. that a from-scratch install using
+# the shipped unit plus the shipped installer defaults would land both cron and
+# the service on one binary.
+#
+# It therefore does NOT prove, and must not be read as proving:
+#   - that any particular host's /etc/cron.d/cw-host matches that host's unit;
+#   - that the installed unit matches the in-tree claude-watch.service (an
+#     operator can edit ExecStart= in /etc/systemd/system and never re-run
+#     anything in this repo);
+#   - that the running daemon execs either path;
+#   - that claude_watch_build_info currently reports the truth anywhere.
+#
+# Post-install hand edits on a live host remain uncovered by anything in-repo.
+# The closest thing to coverage there is install-host-cron.sh's own runtime
+# cross-check of the resolved binary against `systemctl show -p ExecStart`,
+# which only fires when someone actually re-runs the installer. Detecting drift
+# that appears AFTER install needs something running on the host (compare the
+# unit's ExecStart to the cron row, or have the daemon and the metrics emitter
+# each report their own build id and alert on disagreement) — deliberately out
+# of scope for a repo-local test, because a repo-local test cannot see a host.
+#
+# What it does catch is the template-level version of the same mistake: someone
+# repointing ExecStart= at the $BIN_DIR copy, or changing the installer's
+# @CW_BIN@ default, and shipping a repo whose two halves disagree by
+# construction.
+
+check(SERVICE_UNIT.is_file(), "claude-watch.service exists in-tree")
+unit_text = SERVICE_UNIT.read_text() if SERVICE_UNIT.is_file() else ""
+
+# --- source A: the shipped unit's ExecStart -----------------------------------
+exec_match = re.search(r"^\s*ExecStart\s*=\s*(\S+)", unit_text, re.MULTILINE)
+check(exec_match is not None, "claude-watch.service defines ExecStart=")
+unit_exec = exec_match.group(1) if exec_match else ""
+
+# --- source B: what the installer's OWN DEFAULT resolves @CW_BIN@ to ----------
+# No --bin here on purpose: overriding it would make this test assert only that
+# sed works. --force so an unbuilt tree (the CI case) still renders, and --dest
+# into a tmpdir so nothing can point at the real /etc/cron.d even by accident;
+# -n writes nothing regardless.
+cron_bin = ""
+with tempfile.TemporaryDirectory() as td:
+    r = run([str(INSTALLER), "-n", "--force", "--dest", str(Path(td) / "cw-host")])
+    check(r.returncode == 0, f"default-render exits 0 (got {r.returncode}: {r.stderr[-300:]})")
+    default_rows = cron_rows(r.stdout)
+    check(len(default_rows) >= 2, "default render produced cron rows")
+
+    # Field layout of an /etc/cron.d row: 5 schedule fields, USER, then command.
+    # cron_rows() is intentionally loose (section 3 wants commented rows too),
+    # so it also picks up prose from the header; narrow to rows whose command
+    # is an absolute path to a file named claude-watch. If a future edit made
+    # the rendered path relative, or stopped naming the daemon, no row would
+    # survive this filter and the count check below fails loudly rather than
+    # passing vacuously on an empty set.
+    daemon_rows = [
+        f
+        for f in (row.split() for row in default_rows)
+        if len(f) > 6 and f[6].startswith("/") and Path(f[6]).name == "claude-watch"
+    ]
+    check(
+        len(daemon_rows) >= 2,
+        f"default render has absolute claude-watch cron rows (got {len(daemon_rows)})",
+    )
+    bins = {f[6] for f in daemon_rows}
+    check(len(bins) == 1, f"every cron row execs ONE binary (got {sorted(bins)})")
+    cron_bin = next(iter(bins)) if len(bins) == 1 else ""
+
+# The installer must resolve the binary inside the checkout it was run from.
+# If this fails, the default was changed to something outside the repo (~/bin,
+# /usr/local/bin, ...) — which is precisely the drift being guarded against.
+cron_rel = ""
+if cron_bin:
+    try:
+        cron_rel = str(Path(cron_bin).resolve().relative_to(REPO_ROOT.resolve()))
+    except ValueError:
+        cron_rel = ""
+    check(
+        bool(cron_rel),
+        f"installer's default @CW_BIN@ resolves inside the checkout (got {cron_bin})",
+    )
+
+# --- A vs B ------------------------------------------------------------------
+# Both sides are derived live, so this is a real comparison rather than each
+# being matched against the same hard-coded literal. The unit's path carries a
+# checkout prefix (systemd's %h + the conventional clone location) that CI
+# cannot know, so agreement is asserted on the checkout-relative tail.
+if cron_rel and unit_exec:
+    check(
+        unit_exec.endswith("/" + cron_rel),
+        f"unit ExecStart and cron template name the same checkout-relative "
+        f"binary (unit={unit_exec}, cron={cron_rel})",
+    )
+
+# --- C: the Makefile's install recipe ----------------------------------------
+# `install` copies FROM target/release/ TO $(BIN_DIR). Both cron and the unit
+# must name the copied-FROM path; naming the copied-TO path is the exact bug
+# (that copy is refreshed on its own schedule and is what went stale).
+copy = re.search(
+    r"^\s*@?install\s+-m\s+0755\s+(\S+)\s+(\S+)\s*$", mk, re.MULTILINE
+)
+check(copy is not None, "Makefile install recipe copies the daemon binary")
+if copy and cron_rel:
+    copied_from, copied_to = copy.group(1), copy.group(2)
+    check(
+        cron_rel == copied_from,
+        f"cron template names the build output `install` copies FROM "
+        f"({cron_rel} vs {copied_from})",
+    )
+    # $(BIN_DIR)/claude-watch with BIN_DIR ?= $(HOME)/bin is the on-PATH copy;
+    # expressed home-relative it is bin/claude-watch. The unit uses systemd's
+    # %h for the same home, so the two are comparable after stripping.
+    bin_dir = re.search(r"^BIN_DIR\s*\?=\s*(\S+)", mk, re.MULTILINE)
+    check(bin_dir is not None, "Makefile defines a BIN_DIR default")
+    if bin_dir and unit_exec.startswith("%h/"):
+        on_path_copy = copied_to.replace("$(BIN_DIR)", bin_dir.group(1))
+        on_path_rel = on_path_copy.replace("$(HOME)/", "")
+        check(
+            unit_exec[len("%h/"):] != on_path_rel,
+            f"unit ExecStart is NOT the on-PATH $BIN_DIR copy (both are "
+            f"{on_path_rel})",
+        )
 
 # -----------------------------------------------------------------------------
 print()
