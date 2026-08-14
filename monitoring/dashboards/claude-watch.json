@@ -765,7 +765,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 33
+        "y": 21
       },
       "datasource": {
         "type": "prometheus",
@@ -1548,7 +1548,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 33
       },
       "datasource": {
         "type": "prometheus",
@@ -1609,7 +1609,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 29
+        "y": 37
       },
       "datasource": {
         "type": "prometheus",
@@ -1670,7 +1670,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 21
+        "y": 29
       },
       "datasource": {
         "type": "prometheus",
@@ -1759,7 +1759,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 37
+        "y": 25
       },
       "datasource": {
         "type": "prometheus",
