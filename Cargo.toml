@@ -1,3 +1,11 @@
+[workspace]
+# The root package (claude-watch, the tmux-monitor daemon) is an implicit
+# member; mcp-host-bash-server is the host-side single-process MCP server that
+# replaces the mcp-proxy + cli-mcp-server + auth-shim chain. Keeping it a
+# separate member keeps axum/hyper out of the daemon's dependency tree.
+members = ["crates/mcp-host-bash-server"]
+resolver = "2"
+
 [package]
 name = "claude-watch"
 version = "0.1.0"
