@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-queue-minisite test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size test-install-host-skills build deploy deploy-systemd install install-hooks install-skills compose-up compose-down compose-build container-build bootstrap redeploy deploy-container sync-main-clone clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-obligations-init test-queue-minisite test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-hostjob test-launchd-plist install-mcp-host-bash-server test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size test-install-host-skills build deploy deploy-systemd install install-hooks install-skills compose-up compose-down compose-build container-build bootstrap redeploy deploy-container sync-main-clone clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -266,14 +266,12 @@ test-entrypoint:
 test-cw:
 	examples/compose/bin/tests/cw.test
 
-# Run the mcp-host-bash host-shim tests (examples/compose/bin/mcp-host-bash —
-# uvx mcp-proxy + uvx cli-mcp-server launcher that fronts a generic
-# "run a bash command on the host" MCP server for the in-container claude
-# via CLAUDE_MCP_HTTP_BRIDGE). Uses the script's --print-cmd debug hook to
-# verify argv construction + default-policy floor + config-file overrides
-# without requiring uvx / mcp-proxy / cli-mcp-server. 11 cases, <1s.
-test-mcp-host-bash:
-	examples/compose/bin/tests/mcp-host-bash.test
+# Build + install the host-side host-bash MCP server
+# (crates/mcp-host-bash-server) to ~/bin, re-signing on macOS. This is the
+# single-process replacement for the old mcp-host-bash launcher + mcp-proxy +
+# cli-mcp-server + mcp-proxy-auth-shim chain. See that crate's Makefile.
+install-mcp-host-bash-server:
+	$(MAKE) -C crates/mcp-host-bash-server install
 
 # Run the hostjob tests (examples/compose/bin/hostjob — the detached
 # host-job runner that lets an in-container agent launch host commands
@@ -290,21 +288,6 @@ test-hostjob:
 		examples/compose/bin/tests/test_hostjob_stop.py
 
 
-# Tests for examples/compose/bin/mcp-proxy-auth-shim — the bearer-token
-# reverse proxy that fronts mcp-proxy. Spins up an in-process fake
-# upstream + the shim as a subprocess, drives requests through urllib,
-# and asserts the auth gate + header passthrough behavior. 14 cases,
-# ~2s (each subprocess boot adds ~100ms; otherwise CPU-light).
-test-mcp-proxy-auth-shim:
-	examples/compose/bin/tests/mcp-proxy-auth-shim.test
-
-# Tests for examples/compose/bin/install-host-deps — the static
-# installer for mcp-proxy + cli-mcp-server. Exercises the uv → pip
-# fallback path (TLS-only) by injecting a fake uv via PATH so we
-# never actually fetch from PyPI. 10 cases, <1s.
-test-install-host-deps:
-	examples/compose/bin/tests/install-host-deps.test
-
 # Tests for examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist
 # — the macOS LaunchAgent template that persistently auto-starts
 # mcp-host-bash on operator-login. File-level structural validation
@@ -313,16 +296,6 @@ test-install-host-deps:
 # 21 cases, <1s.
 test-launchd-plist:
 	examples/compose/bin/tests/launchd-plist.test
-
-# Tests for examples/compose/bin/load-bearer-from-keychain — the
-# macOS-only Keychain wrapper that fetches the bearer from the user's
-# login Keychain and exec's mcp-host-bash. Mocks the `security` CLI
-# and mcp-host-bash via PATH override so the suite runs on Linux CI.
-# Covers Keychain hit / miss / empty / non-macOS / unknown failure,
-# plist-plaintext fallback, argv passthrough, secret-leak invariants,
-# special-char round-trip, custom service-name. 12 cases, <1s.
-test-load-bearer-from-keychain:
-	examples/compose/bin/tests/load-bearer-from-keychain.test
 
 # Tests for examples/personal-mac-mcp-host/personal-mcp-host.sh — the
 # wrapper that spawns mcp-host-bash + the reverse SSH tunnel for the

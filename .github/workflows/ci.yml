@@ -171,9 +171,6 @@ jobs:
       - name: Run cw host-shim tests
         run: make test-cw
 
-      - name: Run mcp-host-bash host-shim tests
-        run: make test-mcp-host-bash
-
       - name: Install uv (for hostjob + session-task tests)
         # test-hostjob shells out to `uv run --python 3.11 ...`; without
         # uv on PATH that step dies with exit 127. Install once here and
@@ -188,17 +185,8 @@ jobs:
       - name: Run hostjob detached-runner tests
         run: make test-hostjob
 
-      - name: Run mcp-proxy-auth-shim bearer-auth tests
-        run: make test-mcp-proxy-auth-shim
-
-      - name: Run install-host-deps shim tests
-        run: make test-install-host-deps
-
       - name: Run launchd plist tests
         run: make test-launchd-plist
-
-      - name: Run load-bearer-from-keychain wrapper tests
-        run: make test-load-bearer-from-keychain
 
       - name: Run personal-mcp-host wrapper tests
         run: make test-personal-mcp-host
