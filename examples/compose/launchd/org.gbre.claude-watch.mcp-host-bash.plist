@@ -1,17 +1,26 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent for the host-side mcp-host-bash launcher.
+  LaunchAgent for the host-side mcp-host-bash-server.
 
-  This is a TEMPLATE — you MUST search/replace the placeholders before
+  mcp-host-bash-server is the single self-contained Rust binary that
+  serves the `host-bash` MCP surface (run_command / run_script /
+  show_security_rules) over streamable-HTTP, doing bearer auth and the
+  allow-list policy in-process. Build + install it once with:
+
+      make install-mcp-host-bash-server
+
+  from the repo root — that compiles crates/mcp-host-bash-server and
+  copies the binary to ~/bin/mcp-host-bash-server (re-signed on macOS).
+  There is no PyPI dependency and no separate installer step.
+
+  This is a TEMPLATE — you MUST search/replace the placeholder before
   loading it into launchd:
 
-    /PATH/TO/REPO   absolute path to your local claude-watch checkout
-                    (no `~`, no `${HOME}` — launchd does NOT expand
-                    either in plist values; use the literal path).
     /PATH/TO/HOME   absolute path to your home directory
-                    (e.g. /Users/yourname). Same rule — no `~` / no
-                    `${HOME}` in plist values.
+                    (e.g. /Users/yourname). launchd does NOT expand
+                    `~` or `${HOME}` in plist values; use the literal
+                    path.
 
   See examples/compose/launchd/README.md for the full installation
   walkthrough. Do not load this file straight from the repo with
@@ -19,12 +28,12 @@
   (launchd refuses to follow symlinks or load files outside that
   directory).
 
-  Why a LaunchAgent and not a LaunchDaemon: mcp-host-bash runs as the
-  operator's user (it dials cli-mcp-server which exec's commands under
-  the operator's $HOME, $PATH, login keychain, etc.) and binds a
-  loopback port that the docker-desktop VM reaches through
-  host.docker.internal. None of that requires root, and a LaunchDaemon
-  would invert the trust model.
+  Why a LaunchAgent and not a LaunchDaemon: the server runs as the
+  operator's user (its run_command / run_script exec under the
+  operator's $HOME, $PATH, login keychain, etc.) and binds a loopback
+  port that the docker-desktop VM reaches through host.docker.internal.
+  None of that requires root, and a LaunchDaemon would invert the trust
+  model.
 -->
 <plist version="1.0">
 <dict>
@@ -32,48 +41,30 @@
     <string>org.gbre.claude-watch.mcp-host-bash</string>
 
     <!--
-      ProgramArguments: full argv launchd will exec. Default points at
-      the `load-bearer-from-keychain` wrapper, which fetches the bearer
-      from the macOS login Keychain (service:
-      `claude-watch.mcp-host-bash`, account: `$USER`) and then exec's
-      `examples/compose/bin/mcp-host-bash`. The wrapper is the
-      preferred path on macOS — it keeps the secret out of this plist
-      file and out of any backup that captures `~/Library/LaunchAgents`.
-
-      Bootstrap (one-time, see launchd/README.md "Step 0"):
-        security add-generic-password -s claude-watch.mcp-host-bash \
-                                      -a "$USER" -w
-      (interactive prompt; doesn't leak via shell history).
-
-      Operators who don't want the Keychain hop can point this directly
-      at `examples/compose/bin/mcp-host-bash` and stash the bearer in
-      `EnvironmentVariables.MCP_HOST_BASH_BEARER` below — that path
-      still works (and was the v50 default). The wrapper falls back to
-      whatever's already in the env when the Keychain entry is missing,
-      so a populated EnvironmentVariables value plus the wrapper is also
-      valid; the Keychain entry just supersedes it when present.
-
-      Replace /PATH/TO/REPO with the absolute path to your local
-      claude-watch checkout (no `~`, no `${HOME}`). Append
-      `<dash><dash>port N` after the script path if you want a
-      non-default port.
+      ProgramArguments: full argv launchd will exec. Points at the
+      mcp-host-bash-server binary installed to ~/bin by
+      `make install-mcp-host-bash-server`. Replace /PATH/TO/HOME with
+      the absolute path to your home directory (no `~`, no `${HOME}`).
+      Append `<dash><dash>port N` after the binary path if you want a
+      non-default port (default 8766).
     -->
     <key>ProgramArguments</key>
     <array>
-        <string>/PATH/TO/REPO/examples/compose/bin/load-bearer-from-keychain</string>
+        <string>/PATH/TO/HOME/bin/mcp-host-bash-server</string>
     </array>
 
     <!--
       EnvironmentVariables: every key is OPTIONAL. launchd does not
       inherit your interactive shell's environment (no .zshrc / .bash_profile
-      sourcing), so anything mcp-host-bash needs to see has to be
-      declared here OR sourced from the operator config file at
+      sourcing), so anything the server needs to see has to be declared
+      here OR sourced from the operator config file at
       ${HOME}/.config/claude-container/mcp-host-bash.env (which the
-      launcher itself sources at startup).
+      server reads at startup). Values in that .env file WIN over the
+      process environment declared here.
 
-      - MCP_HOST_BASH_BIND: host address mcp-proxy listens on. Default
+      - MCP_HOST_BASH_BIND: host address the server listens on. Default
         (omit or set to 127.0.0.1) binds loopback only — safe floor. To
-        allow a Linux Docker bridge-net container to reach the launcher
+        allow a Linux Docker bridge-net container to reach the server
         via host.docker.internal, set this to `0.0.0.0` AND pair with
         MCP_HOST_BASH_BEARER (below). macOS Docker Desktop reaches
         loopback through host.docker.internal NAT, so the default Just
@@ -81,75 +72,49 @@
         shell-exec surface to every reachable caller — do not run that
         in production.
 
-      - MCP_HOST_BASH_BEARER: shared-secret bearer token. INTENTIONALLY
-        ABSENT from the default EnvironmentVariables block — the
-        default ProgramArguments[0] above invokes the
-        `load-bearer-from-keychain` wrapper, which reads the bearer
-        from the macOS login Keychain (service:
-        claude-watch.mcp-host-bash, account: $USER) and exports it
-        before exec'ing the launcher.
-
-        Bootstrap (one-time, interactive prompt — doesn't leak via
-        shell history):
-
-            security add-generic-password -s claude-watch.mcp-host-bash \
-                                          -a "$USER" -w
-
-        OPT-OUT to plist plaintext: point ProgramArguments[0] at
-        examples/compose/bin/mcp-host-bash directly (skipping the
-        wrapper) AND add MCP_HOST_BASH_BEARER here as a <string> entry.
-        The launcher itself reads MCP_HOST_BASH_BEARER from its env
-        regardless of how it got there, so the plist-plaintext path
-        still works — it's just no longer the default.
-
-        When set (via Keychain wrapper OR plist plaintext OR shell
-        env), the launcher fronts mcp-proxy with mcp-proxy-auth-shim,
-        which validates `Authorization: Bearer <token>` on every
-        request and forwards only authenticated requests to mcp-proxy
-        on an internal loopback port. Required when MCP_HOST_BASH_BIND
-        is non-loopback. Generate once + keep out of version control:
+      - MCP_HOST_BASH_BEARER: shared-secret bearer token. Set it EITHER
+        in ${HOME}/.config/claude-container/mcp-host-bash.env OR here as
+        a <string> entry inside EnvironmentVariables (below). The server
+        validates `Authorization: Bearer <token>` on every request
+        in-process and rejects anything that doesn't match. Required
+        when MCP_HOST_BASH_BIND is non-loopback. Generate once + keep
+        out of version control:
 
             head -c 32 /dev/urandom | base64
 
         The same secret must be set as CLAUDE_HOST_HOOK_BRIDGE_BEARER
         in the docker-compose .env file (the in-container exec-hook
-        bridge reads it from there). Default empty = no shim, no auth
-        (matches pre-bearer-auth launcher behavior).
+        bridge reads it from there). Empty / unset = no auth (matches
+        the pre-bearer-auth behavior — safe only on a loopback bind).
 
       - CW_PROFILE: trust profile selector. Unset / `corp-dev` keeps
         the read-y default allow-list. `corp-dev-trusted` widens to
         include host scheduling, file mutation, outbound bytes, key/cert
-        tooling, and container management. See the launcher script
-        header for the full surface.
+        tooling, and container management. See the server's
+        show_security_rules output for the full surface.
 
       - ALLOW_SHELL_OPERATORS: `true` lets the in-container claude
         chain commands with pipes / `&&` / redirects. Default `false`.
         Leave the default unless you specifically need it.
 
       - MAX_COMMAND_LENGTH: max length (chars) of a single command
-        string cli-mcp-server will accept before truncating. Its own
-        hardcoded default is 1024, which clips many legitimate commands
-        the in-container claude issues; the launcher defaults to 8192.
-        Raise / lower here or in the operator config file.
+        string the server will accept. Default 8192. Raise / lower here
+        or in the operator config file.
 
       - SSL_CERT_FILE / REQUESTS_CA_BUNDLE: corporate CA bundle for
-        operators behind a TLS MITM proxy. mcp-host-bash itself does
-        NOT make outbound HTTPS calls (the static install via
-        install-host-deps already happened), but downstream `run_command`
-        invocations of curl / git / pip etc. need this to validate
-        the corp chain. Match the absolute path you'd set in your
-        interactive shell.
+        operators behind a TLS MITM proxy. The server itself makes no
+        outbound HTTPS calls, but downstream `run_command` invocations
+        of curl / git / pip etc. need this to validate the corp chain.
+        Match the absolute path you'd set in your interactive shell.
 
       - CLAUDE_HOOK_BRIDGE_BINS: comma-separated basenames of host
         hook binaries the in-container exec-hook bridge is allowed
         to invoke via run_command. e.g. `telemetry-hook,corp-trace-hook`.
         Layered on top of CW_PROFILE.
 
-      - PATH: launchd starts with a minimal PATH. The launcher needs
-        to find `mcp-proxy` and `cli-mcp-server`, both of which
-        install-host-deps drops into ${HOME}/.local/bin/. If your
-        operator config doesn't set PATH separately, declare it here
-        so the pre-flight binary check passes.
+      - PATH: launchd starts with a minimal PATH. Declare one that adds
+        ${HOME}/.local/bin so any host CLIs the server's run_command
+        invocations rely on resolve.
 
       Replace /PATH/TO/HOME with your home directory (e.g.
       /Users/yourname) — no `~`, no `${HOME}` in plist values.
@@ -162,46 +127,25 @@
           routes via NAT to host loopback). Set to 0.0.0.0 to expose
           beyond loopback for Linux Docker bridge-net containers —
           PAIR with MCP_HOST_BASH_BEARER (below) so the public port is
-          gated by the auth shim.
+          gated by the in-process bearer check.
         -->
         <key>MCP_HOST_BASH_BIND</key>
         <string>127.0.0.1</string>
 
         <!--
-          MCP_HOST_BASH_BEARER is INTENTIONALLY ABSENT from this template.
-          The default ProgramArguments above invokes
-          `load-bearer-from-keychain`, which fetches the bearer from the
-          macOS login Keychain (service: claude-watch.mcp-host-bash,
-          account: $USER) and exports MCP_HOST_BASH_BEARER before exec'ing
-          the launcher. The plist therefore never has to carry the secret
-          in plaintext.
+          MCP_HOST_BASH_BEARER: shared-secret bearer token. Left ABSENT
+          from this template so the default is a loopback-only, no-auth
+          bind. Set it here as a <string> entry OR in
+          ${HOME}/.config/claude-container/mcp-host-bash.env (the .env
+          value wins). The server validates `Authorization: Bearer
+          <token>` in-process on every request. Required for any
+          non-loopback bind. Generate once with
+          `head -c 32 /dev/urandom | base64` and mirror the same value
+          into CLAUDE_HOST_HOOK_BRIDGE_BEARER in the docker-compose
+          .env file. Example:
 
-          Bootstrap (one-time):
-            security add-generic-password -s claude-watch.mcp-host-bash \
-                                          -a "$USER" -w
-          (interactive prompt; doesn't leak via shell history).
-
-          OPT-OUT (operators who prefer plist plaintext): point
-          ProgramArguments[0] at examples/compose/bin/mcp-host-bash
-          (skip the wrapper) AND add MCP_HOST_BASH_BEARER as a <string>
-          entry inside this EnvironmentVariables dict. The launcher
-          itself reads MCP_HOST_BASH_BEARER from its env regardless of
-          how it got there, so the plist-plaintext path still works —
-          it's just no longer the default.
-
-          HYBRID: keep load-bearer-from-keychain in ProgramArguments AND
-          set MCP_HOST_BASH_BEARER here. The Keychain entry wins when
-          present; the plist value is the fallback when the Keychain
-          entry is missing. Useful while migrating from the plaintext
-          path to Keychain.
-
-          The host-side mcp-proxy-auth-shim validates
-          `Authorization: Bearer <token>` on every request — generate
-          the secret once with `head -c 32 /dev/urandom | base64` and
-          mirror the same value into CLAUDE_HOST_HOOK_BRIDGE_BEARER in
-          the docker-compose .env file. Required for any non-loopback
-          bind; empty / unset = no shim, no auth (matches the
-          pre-bearer-auth launcher behavior).
+            <key>MCP_HOST_BASH_BEARER</key>
+            <string>...your base64 secret...</string>
         -->
 
         <key>CW_PROFILE</key>
@@ -211,10 +155,8 @@
         <string>false</string>
 
         <!--
-          MAX_COMMAND_LENGTH: max single-command length (chars) before
-          cli-mcp-server truncates. Default 8192 (launcher raises it from
-          cli-mcp-server's 1024 hardcoded default). Omit to inherit the
-          launcher default.
+          MAX_COMMAND_LENGTH: max single-command length (chars) the
+          server accepts. Default 8192. Omit to inherit the default.
         -->
         <key>MAX_COMMAND_LENGTH</key>
         <string>8192</string>
@@ -248,30 +190,25 @@
 
     <!--
       ThrottleInterval: minimum seconds between (re)spawns. launchd's
-      default is 10s; bumping to 30s gives the launcher more room to
-      bootstrap before another KeepAlive cycle if the previous run
-      died early (e.g. install-host-deps not run yet, port already
-      bound). Tune down if you're actively debugging.
+      default is 10s; bumping to 30s gives the server room to bind
+      before another KeepAlive cycle if the previous run died early
+      (e.g. port already bound). Tune down if you're actively debugging.
     -->
     <key>ThrottleInterval</key>
     <integer>30</integer>
 
     <!--
-      WorkingDirectory: cwd launchd sets before exec'ing the launcher.
-      The launcher itself is cwd-agnostic, but a sensible cwd helps if
-      operator config files use relative paths. Replace /PATH/TO/HOME.
+      WorkingDirectory: cwd launchd sets before exec'ing the server.
+      The server is cwd-agnostic, but a sensible cwd helps if operator
+      config files use relative paths. Replace /PATH/TO/HOME.
     -->
     <key>WorkingDirectory</key>
     <string>/PATH/TO/HOME</string>
 
     <!--
       StandardOutPath / StandardErrorPath: launchd captures the
-      launcher's stdout / stderr. The launcher already mirrors stderr
-      into ${HOME}/.local/state/claude-container/mcp-host-bash.log
-      via tee, so these are mostly a launchd-side mirror for triage
-      from `launchctl print`.
-
-      Replace /PATH/TO/HOME. Pre-create the parent dir
+      server's stdout / stderr (the startup banner + tracing lines go
+      to stderr). Replace /PATH/TO/HOME. Pre-create the parent dir
       (~/Library/Logs/) once — launchd auto-creates the file but not
       the directory.
     -->
@@ -283,9 +220,9 @@
 
     <!--
       ProcessType=Interactive: launchd schedules at the same priority
-      as a foreground shell. The launcher fronts a low-latency MCP
-      bridge that the in-container claude dials synchronously, so it
-      should not be backgrounded by the standard `Background` class.
+      as a foreground shell. The server is a low-latency MCP bridge the
+      in-container claude dials synchronously, so it should not be
+      backgrounded by the standard `Background` class.
     -->
     <key>ProcessType</key>
     <string>Interactive</string>
