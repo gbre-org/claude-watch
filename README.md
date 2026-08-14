@@ -26,7 +26,7 @@ Native install (build from source):
 
 ```bash
 make build                  # cargo build --release
-make install                # copies daemon + tools into $BIN_DIR (default ~/bin)
+make install                # daemon copied + tool scripts symlinked into $BIN_DIR (default ~/bin)
 make install-hooks          # opt-in: warning-free build + unit-tests pre-commit gate
 ```
 
@@ -285,12 +285,12 @@ make test                # all Rust tests in parallel
 make test-session-task   # session-task pytest suite
 make test-hooks          # obligations + queue PreToolUse hook tests
 make test-queue-minisite # queue-minisite Flask end-to-end suites
-make test-agent-msg      # agent-msg embedded --test (38 cases)
+make test-agent-msg      # agent-msg embedded --test suite
 make test-claude-event   # claude-event + claude-event-tail unit tests
 make test-watchers       # claude-event-watch fast-path + self-clear config
 
 make build               # release build
-make install             # build + copy daemon + tools into $BIN_DIR (default ~/bin/)
+make install             # build; copy daemon + symlink tool scripts into $BIN_DIR (default ~/bin/)
 make deploy-systemd      # build + install skills + systemctl restart (host/systemd install)
 make install-skills      # install skills/ as /cw-<name> slash commands (dep of deploy-systemd)
 make install-hooks       # install the git pre-commit hook (warnings + tests)
@@ -320,18 +320,85 @@ prunes its own dangling links. Run
 See [`skills/README.md`](skills/README.md) for the full split and for how to
 add one.
 
-> **Deploy gotcha — `make deploy-systemd` and `make install` update DIFFERENT
-> copies of the daemon.** `make deploy-systemd` (formerly `make deploy`, still
-> a working deprecated alias) rebuilds and `systemctl restart`s
-> the service, whose `ExecStart` runs the binary out of `target/release/`
-> directly — it does **not** refresh `$BIN_DIR/claude-watch` (default
-> `~/bin/claude-watch`). But that `$BIN_DIR` copy is the CLI invoked as
-> `claude-watch ...` on the operator's `PATH` — including the `workload`
-> subcommands (`workload run` / `babysit` / ...) that agents and the main
-> loop call. When you ship a change to a CLI subcommand, run **`make
-> install`** (or `make install` *and* `make deploy-systemd`) so both the running
-> service and the on-PATH CLI pick up the new binary. A `deploy-systemd`-only roll
-> leaves the CLI stale and the new subcommand "not found".
+> **A host/systemd deploy has TWO daemon binaries — and `make deploy-systemd`
+> now refreshes both.** The service's `ExecStart` runs the binary out of
+> `target/release/` directly, while `$BIN_DIR/claude-watch` (default
+> `~/bin/claude-watch`) is the CLI invoked as `claude-watch ...` on the
+> operator's `PATH` — including the `workload` subcommands (`workload run` /
+> `babysit` / ...) that agents and the main loop call. `deploy-systemd` used to
+> depend on `build` alone, so it rebuilt and restarted the service and left the
+> `$BIN_DIR` copy frozen at whenever `make install` last ran; the CLI then
+> silently ran old code, and a new subcommand came back "not found". It now
+> depends on `install`, so one deploy refreshes both from the same build.
+>
+> Two things follow from the daemon being a **copy** rather than a symlink
+> (every *script* tool in `$BIN_DIR` is an absolute symlink back into the tree,
+> so script edits are live immediately — but a compiled artifact has nothing to
+> live-edit):
+>
+> - Don't "fix" the two-binary situation by symlinking `$BIN_DIR/claude-watch`
+>   into `target/release/`. `cargo clean` or a profile switch leaves that link
+>   dangling, so the on-PATH CLI *disappears* instead of merely going stale, and
+>   the next `make install` replaces it with a copy again anyway.
+> - Anything that must report the *running daemon's* identity has to exec the
+>   service's binary, not the `$BIN_DIR` copy. `claude_watch_build_info` is
+>   emitted from compile-time constants, so it describes whichever binary the
+>   caller execs — which is why [`cron.d/cw-host`](cron.d/cw-host) points at the
+>   `ExecStart` path (see [Host cron](#host-cron)).
+
+### Host cron
+
+Some of claude-watch's jobs are cron-driven rather than daemon-driven: the
+Prometheus metrics emit and the `active-agents` state file that the
+work-queue exporter and the queue mini-site read. The container bakes those
+rows into its image as `container/cron.d/cw-default`, where every path is
+fixed by the image.
+
+A host deployment can't bake them, because it has no fixed install prefix —
+the binary lives wherever you cloned the repo, under whatever account runs the
+daemon. So the host fragment ships **parameterized**, at
+[`cron.d/cw-host`](cron.d/cw-host), and an installer substitutes the
+deployment-specific values:
+
+```sh
+scripts/install-host-cron.sh -n     # dry run: print the rendered file
+make install-cron                   # render + install to /etc/cron.d/cw-host
+scripts/install-host-cron.sh --help # all flags
+```
+
+| Placeholder      | Default                                | Override        |
+| ---------------- | -------------------------------------- | --------------- |
+| `@CW_USER@`      | current user                           | `--user`        |
+| `@CW_HOME@`      | `$HOME` (only used to extend `PATH`)   | `--home`        |
+| `@CW_BIN@`       | `<repo>/target/release/claude-watch`   | `--bin`         |
+| `@CW_STATE_DIR@` | `/var/lib/claude-watch`                | `--state-dir`   |
+
+`@CW_BIN@` defaults to the checkout's release build because that is what the
+systemd unit's `ExecStart` runs — and since `claude_watch_build_info` is
+compiled *into* the binary, the gauge describes whichever binary **cron**
+execs. Point cron at the `$BIN_DIR` copy instead and the metric silently
+reports that copy's commit rather than the running daemon's, with nothing
+failing loudly. The installer cross-checks the resolved path against the
+installed unit's `ExecStart` and warns on a mismatch.
+
+`install-cron` is deliberately **not** a dependency of `deploy-systemd`: it
+needs root, and a deploy must not silently rewrite the host's crontab. Run it
+at setup and again only when the fragment changes; cron re-reads `/etc/cron.d`
+on its next minute tick, so there is nothing to restart. Entries in
+`/etc/cron.d` must be regular root-owned 0644 files — cron skips symlinks and
+non-root files with `WRONG FILE OWNER` — so the installer copies rather than
+links.
+
+Two optional rows (the stale-ready and stuck/orphaned queue watchdogs, both of
+which the container bakes) ship commented out, so installing the fragment
+can't silently add event emitters to a host that already runs an equivalent
+out-of-tree watchdog. Placeholders are substituted in commented rows too, so
+they're ready to enable in place.
+
+For cron-driven `claude-event` emissions that are specific to *your*
+deployment rather than to claude-watch itself, see
+[`examples/cron/`](examples/cron/) (host) and
+[`examples/cron/private-example/`](examples/cron/private-example/) (container).
 
 ### Pre-commit hook
 
