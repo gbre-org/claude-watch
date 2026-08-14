@@ -96,6 +96,7 @@ claude-watch provides the surfaces; external alerting wires INTO them.
 ## Build & Test
 
 ```bash
+make help              # index of every target, grouped by build / deploy surface
 make test              # all tests in parallel (nextest if available, else cargo test)
 make test-unit         # unit + fixture tests only (~0.1s)
 make test-e2e          # e2e tmux tests only (~10s)
