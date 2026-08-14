@@ -77,10 +77,9 @@
       need from the operator's interactive shell has to be declared
       here or in the sibling .env (which the wrapper sources).
 
-      The PATH below adds ${HOME}/.local/bin so mcp-host-bash can find
-      mcp-proxy / cli-mcp-server (both installed there by
-      examples/compose/bin/install-host-deps). Extend if your tooling
-      lives elsewhere.
+      The PATH below adds ${HOME}/.local/bin so the host CLIs that
+      mcp-host-bash-server's run_command invocations rely on resolve.
+      Extend if your tooling lives elsewhere.
 
       Replace /PATH/TO/HOME with your home directory (e.g.
       /Users/yourname) — no `~`, no `${HOME}`.

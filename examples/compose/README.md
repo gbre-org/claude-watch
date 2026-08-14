@@ -306,9 +306,9 @@ docker compose --project-directory <examples/compose> exec -it claude-container 
 
 `tmux new-session -A` attaches if the session exists and creates it otherwise — same resilient pattern the `ttyd` service uses. The compose dir, service name, and tmux session name are all overridable via `CW_COMPOSE_DIR` / `CW_SERVICE` / `CW_SESSION`.
 
-### `mcp-host-bash` — generic "run a bash command on the host" MCP server
+### `mcp-host-bash-server` — generic "run a bash command on the host" MCP server
 
-When the in-container `claude` needs to drive operations the container itself can't reach (corp git pushes, host-only CLIs, scripts under the operator's `$HOME`), the repo bundles a host-side launcher at [`examples/compose/bin/mcp-host-bash`](bin/mcp-host-bash). It runs `mcp-proxy` + `cli-mcp-server` (both off-the-shelf PyPI packages, statically installed once via [`examples/compose/bin/install-host-deps`](bin/install-host-deps) — no per-launch PyPI fetch, no TLS / corp-CA fragility at launch) and surfaces a single `run_command` tool inside the container via `CLAUDE_MCP_HTTP_BRIDGE`.
+When the in-container `claude` needs to drive operations the container itself can't reach (corp git pushes, host-only CLIs, scripts under the operator's `$HOME`), the repo ships a single self-contained host-side server, the Rust crate [`crates/mcp-host-bash-server`](../../crates/mcp-host-bash-server). It speaks streamable-HTTP directly, does bearer auth and the allow-list policy in-process (no upstream hop), and surfaces `run_command` / `run_script` / `show_security_rules` tools inside the container via `CLAUDE_MCP_HTTP_BRIDGE`.
 
 Setup (one-time, four steps):
 
@@ -320,28 +320,26 @@ Setup (one-time, four steps):
 
    `--scope user` writes to the top-level `mcpServers` block, which is what `generate-project-mcp-json` reads first. Bare `claude mcp add` (no `--scope`) defaults to **project** scope and writes under `projects["<cwd>"].mcpServers` instead. The helper now also reads that project-scoped block when `CLAUDE_HOST_PROJECT_DIR` matches the cwd, so either invocation works, but `--scope user` is the simpler operator path — the entry survives running `claude mcp add` from any cwd, and won't accidentally end up under a one-off cwd that doesn't match `CLAUDE_HOST_PROJECT_DIR`.
 
-2. Install the host-side dependencies once (idempotent — `uv tool install <pkg>` is a no-op if the version is already current; re-run with `--upgrade` to force a refresh):
+2. Build + install the server once (from the repo root):
 
    ```sh
-   examples/compose/bin/install-host-deps
+   make install-mcp-host-bash-server
    ```
 
-   This runs `uv tool install mcp-proxy cli-mcp-server`, dropping shims into `~/.local/bin/`. Subsequent launches of `mcp-host-bash` exec those binaries directly — no PyPI round-trip per start. Corp-CA users: set `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `UV_NATIVE_TLS=1` once in your shell before running the installer; the launcher never touches PyPI so you won't see TLS errors at start-up.
+   This compiles `crates/mcp-host-bash-server` and copies the release binary to `~/bin/mcp-host-bash-server` (re-signed in place on macOS so Gatekeeper doesn't SIGKILL it). No PyPI dependency, no separate installer, no per-launch fetch. Re-run it any time to pick up a new build. It builds and runs on macOS and Linux alike.
 
-   **pip fallback (TLS-only).** uv ships a bundled rustls trust store (`webpki-roots`) that occasionally lags real CA rotations — uv 0.11.x in late 2026 was missing GlobalSign Atlas R3 2025 Q4, the actual chain pypi.org rotated to, so `uv tool install` failed with `invalid peer certificate: UnknownIssuer` even with `UV_NATIVE_TLS=1` / `SSL_CERT_FILE` / `--system-certs` set. When `install-host-deps` detects that specific failure mode in uv's stderr, it automatically falls back to `pip install --user --upgrade <pkg>`. pip uses the system Python's TLS implementation (Secure Transport on macOS, OpenSSL elsewhere) and respects the system trust store, which sidesteps the bundled-roots regression. Both install paths land binaries on `~/.local/bin/`, so the launcher's `command -v` pre-flight works either way. The fallback is TLS-scoped on purpose: a generic uv failure (network down, package not found, permissions) is propagated as-is so it doesn't get masked.
-
-3. Start the host-side adapter (foreground / tmux / launchd):
+3. Start the host-side server (foreground / tmux / launchd):
 
    ```sh
-   examples/compose/bin/mcp-host-bash
+   ~/bin/mcp-host-bash-server
    ```
 
-   Default port `8766`. The launcher binds `127.0.0.1` by default (loopback only — `run_command` is a host-shell privilege escalator, so the safe floor is "no LAN / sibling-container / sibling-uid exposure"). macOS Docker Desktop's `host.docker.internal` NAT routes loopback for the default network setup, so the safe default Just Works for the typical Mac compose stack. Linux Docker bridge-net containers that can't reach host loopback have two options:
+   Default port `8766`. The server binds `127.0.0.1` by default (loopback only — `run_command` is a host-shell privilege escalator, so the safe floor is "no LAN / sibling-container / sibling-uid exposure"). macOS Docker Desktop's `host.docker.internal` NAT routes loopback for the default network setup, so the safe default Just Works for the typical Mac compose stack. Linux Docker bridge-net containers that can't reach host loopback have two options:
 
-   - Set `MCP_HOST_BASH_BIND=0.0.0.0` in the launcher's shell env (or in the launchd plist's `EnvironmentVariables`) to expose beyond loopback. **Pair with bearer-token auth** (see the host-bash block in [`.env.example`](.env.example)) when widening — bare `0.0.0.0` without auth exposes the host shell-exec surface to every reachable caller.
+   - Set `MCP_HOST_BASH_BIND=0.0.0.0` in the server's shell env (or in the launchd plist's `EnvironmentVariables`) to expose beyond loopback. **Pair with bearer-token auth** (see the host-bash block in [`.env.example`](.env.example)) when widening — bare `0.0.0.0` without auth exposes the host shell-exec surface to every reachable caller.
    - OR run the container with `--network host` so it shares the host netns and can dial `127.0.0.1:8766` directly.
 
-   Run `mcp-host-bash --help` for the full surface. If the launcher complains about missing `mcp-proxy` / `cli-mcp-server` on PATH, re-run step 2 (or add `~/.local/bin` to your PATH).
+   Run `~/bin/mcp-host-bash-server --print-config` to dump the effective policy + bind and exit without listening.
 
 4. Set `CLAUDE_MCP_HTTP_BRIDGE` in `.env` to include `host-bash` (combine with other bridged servers via `:`):
 
@@ -351,13 +349,13 @@ Setup (one-time, four steps):
 
    Rebuild + restart the container (`docker compose down && docker compose up -d`). Inside the container, `claude mcp list` should show `host-bash: Connected`.
 
-Security: the launcher applies a `cli-mcp-server` allow-list by default that covers the read-y / observation / standard-dev-tool surface — file inspection (`ls`, `cat`, `head`, `tail`, `grep`, `find`, `file`, `stat`, `diff`, `sort`, `uniq`, `wc`), text munging (`awk`, `sed`, `cut`, `tr`, `xargs`, `base64`, `jq`, `yq`), VCS / forge (`git`, `gh`), shell discovery (`pwd`, `echo`, `which`, `env`, `printenv`, `hostname`, `uname`, `date`, `basename`, `dirname`), language toolchains (`node`, `npm`, `yarn`, `python`, `python3`, `pip`, `make`), corp-dev binaries (`envchain`, `jenkins-builds`), and read-y network probes (`ping`, `host`, `dig`, `nslookup`). Plus `ALLOWED_DIR=/` (path boundary DISABLED by default — the command allow-list, not a directory fence, is the safety floor; narrow to `$HOME` or a subdir to re-enable), `COMMAND_TIMEOUT=30`, `MAX_COMMAND_LENGTH=8192` (raised from cli-mcp-server's 1024 default so longer commands aren't truncated), `ALLOW_SHELL_OPERATORS=false`. Override per-host via `~/.config/claude-container/mcp-host-bash.env` (plain `KEY=VALUE` lines). Audit log at `~/.local/state/claude-container/mcp-host-bash.log`. Soft kill switch: `MCP_HOST_BASH_DISABLED=1` in the launcher's shell env. See the `host-bash` block in [`.env.example`](.env.example) for the full security write-up — `run_command` is a privilege escalation, keep the allow-list tight.
+Security: the server applies an allow-list by default that covers the read-y / observation / standard-dev-tool surface — file inspection (`ls`, `cat`, `head`, `tail`, `grep`, `find`, `file`, `stat`, `diff`, `sort`, `uniq`, `wc`), text munging (`awk`, `sed`, `cut`, `tr`, `xargs`, `base64`, `jq`, `yq`), VCS / forge (`git`, `gh`), shell discovery (`pwd`, `echo`, `which`, `env`, `printenv`, `hostname`, `uname`, `date`, `basename`, `dirname`), language toolchains (`node`, `npm`, `yarn`, `python`, `python3`, `pip`, `make`), corp-dev binaries (`envchain`, `jenkins-builds`), and read-y network probes (`ping`, `host`, `dig`, `nslookup`). Plus `ALLOWED_DIR=/` (path boundary DISABLED by default — the command allow-list, not a directory fence, is the safety floor; narrow to `$HOME` or a subdir to re-enable), `COMMAND_TIMEOUT=30`, `MAX_COMMAND_LENGTH=8192`, `ALLOW_SHELL_OPERATORS=false`. Override per-host via `~/.config/claude-container/mcp-host-bash.env` (plain `KEY=VALUE` lines). Soft kill switch: `MCP_HOST_BASH_DISABLED=1` in the server's shell env. See the `host-bash` block in [`.env.example`](.env.example) for the full security write-up — `run_command` is a privilege escalation, keep the allow-list tight.
 
-**Trust profile** (`CW_PROFILE`): set `CW_PROFILE=corp-dev-trusted` in the launcher's shell env to opt into a wider allow-list that adds host-scheduling tooling — `crontab` (Linux + macOS), `launchctl` (macOS launchd), `systemctl` (Linux systemd user units), `schtasks` / `powershell` / `pwsh` (Windows Task Scheduler), `sw_vers` / `lsb_release` (extra OS detection), file mutation (`tee`, `mkdir`, `chmod`, `cp`, `mv`, `rm`), outbound bytes (`curl`, `wget`, `scp`), key/cert tooling (`openssl`, `ssh-keygen`), container management (`docker`, `docker-compose`), and the detached long-command runner (`hostjob`, see below). Default unset (`corp-dev`) keeps the read-y dev-tooling floor described above. Use the trusted profile when you want the in-container claude to wire periodic claude-event jobs on the host (cron / launchd / systemd timers / Task Scheduler), push artifacts off-host, or recreate the compose stack from inside its own session (`docker compose up -d --force-recreate <svc>`, `docker compose exec <svc> ...`) — see the "Host-side scheduled tasks" section in `container/baked-CLAUDE.md` for the workflow. Note: `docker` / `docker-compose` are trusted-only because the binary covers destructive subcommands (`docker rm`, `docker stop`, `docker kill`) alongside read-y ones (`docker ps`, `docker logs`); cli-mcp-server's allow-list is per-binary, not per-subcommand. Operator's explicit `ALLOWED_COMMANDS` in `~/.config/claude-container/mcp-host-bash.env` always wins over the profile default.
+**Trust profile** (`CW_PROFILE`): set `CW_PROFILE=corp-dev-trusted` in the server's shell env to opt into a wider allow-list that adds host-scheduling tooling — `crontab` (Linux + macOS), `launchctl` (macOS launchd), `systemctl` (Linux systemd user units), `schtasks` / `powershell` / `pwsh` (Windows Task Scheduler), `sw_vers` / `lsb_release` (extra OS detection), file mutation (`tee`, `mkdir`, `chmod`, `cp`, `mv`, `rm`), outbound bytes (`curl`, `wget`, `scp`), key/cert tooling (`openssl`, `ssh-keygen`), container management (`docker`, `docker-compose`), and the detached long-command runner (`hostjob`, see below). Default unset (`corp-dev`) keeps the read-y dev-tooling floor described above. Use the trusted profile when you want the in-container claude to wire periodic claude-event jobs on the host (cron / launchd / systemd timers / Task Scheduler), push artifacts off-host, or recreate the compose stack from inside its own session (`docker compose up -d --force-recreate <svc>`, `docker compose exec <svc> ...`) — see the "Host-side scheduled tasks" section in `container/baked-CLAUDE.md` for the workflow. Note: `docker` / `docker-compose` are trusted-only because the binary covers destructive subcommands (`docker rm`, `docker stop`, `docker kill`) alongside read-y ones (`docker ps`, `docker logs`); the allow-list is per-binary, not per-subcommand. Operator's explicit `ALLOWED_COMMANDS` in `~/.config/claude-container/mcp-host-bash.env` always wins over the profile default.
 
 ### `hostjob` — run host commands past the 30s host-bash cap
 
-`mcp-host-bash` enforces a hard `COMMAND_TIMEOUT` (default **30s**, see the
+`mcp-host-bash-server` enforces a hard `COMMAND_TIMEOUT` (default **30s**, see the
 security note above) on every `run_command`, and its allow-list deliberately
 omits `sleep`, `nohup`, `bash`, and `&`-backgrounding. That's the right floor
 for a host-shell privilege escalator, but it means the in-container `claude`
@@ -401,9 +399,9 @@ hostjob stop build      # or --all
 hostjob clean --label build      # or --all
 ```
 
-If a stale `mcp-host-bash` process predates this wiring (bare `hostjob`
+If a stale `mcp-host-bash-server` process predates this wiring (bare `hostjob`
 rejected with `Security violation: Command 'hostjob' is not allowed`, or not
-found on `PATH`), restart the launcher to pick up the allow-list + `PATH`
+found on `PATH`), restart the server to pick up the allow-list + `PATH`
 change; until then fall back to the absolute form `python3 <path>/hostjob ...`
 (`python3` is always on the allow-list).
 
@@ -432,8 +430,8 @@ State lives under `~/.cache/hostjob/<label>/` (`log` + `status.json`), plus
 `~/.cache/hostjob/broker.json` for broker liveness; the script is pure-stdlib
 Python and stores nothing outside `$HOME`. It is a generic primitive — it
 encodes knowledge of host-bash's own 30s constraint and nothing
-application-specific — which is why it ships here alongside the `mcp-host-bash`
-launcher rather than out-of-tree.
+application-specific — which is why it ships here alongside the
+`mcp-host-bash-server` rather than out-of-tree.
 
 (Complementary, not a replacement: raising `COMMAND_TIMEOUT` lets *everyday*
 commands run a little longer without `hostjob`, but `hostjob` is still the
@@ -713,6 +711,6 @@ docker compose down -v           # also nuke the claude-container-versions volum
 
 The bind-mounted host state under `~/.claude`, `~/.config/session`, `~/.local/share/eichi`, etc. is untouched by `down` — only named volumes go.
 
-## Persistent macOS auto-start for `mcp-host-bash`
+## Persistent macOS auto-start for `mcp-host-bash-server`
 
-For operators who want `mcp-host-bash` to stay running across logouts and reboots without manually respawning it after each one, the repo ships a macOS `launchd` LaunchAgent template at [`launchd/org.gbre.claude-watch.mcp-host-bash.plist`](launchd/org.gbre.claude-watch.mcp-host-bash.plist). See [`launchd/README.md`](launchd/README.md) for the full install walkthrough (copy into `~/Library/LaunchAgents/`, edit absolute paths + `EnvironmentVariables`, `launchctl bootstrap`, verify with `launchctl print` + `lsof -i :8766`, and the bootout / re-bootstrap flow for picking up changes).
+For operators who want `mcp-host-bash-server` to stay running across logouts and reboots without manually respawning it after each one, the repo ships a macOS `launchd` LaunchAgent template at [`launchd/org.gbre.claude-watch.mcp-host-bash.plist`](launchd/org.gbre.claude-watch.mcp-host-bash.plist). See [`launchd/README.md`](launchd/README.md) for the full install walkthrough (`make install-mcp-host-bash-server`, copy the plist into `~/Library/LaunchAgents/`, edit absolute paths + `EnvironmentVariables`, `launchctl bootstrap`, verify with `launchctl print` + `lsof -i :8766`, and the bootout / re-bootstrap flow for picking up changes).

@@ -222,10 +222,10 @@ services:
       CLAUDE_HOST_HOOK_BRIDGE_FORWARD_ENV: ${CLAUDE_HOST_HOOK_BRIDGE_FORWARD_ENV:-}
       # CLAUDE_HOST_HOOK_BRIDGE_BEARER — shared-secret bearer token
       # the bridge sends as `Authorization: Bearer <token>` on every
-      # POST. Must match MCP_HOST_BASH_BEARER on the host launcher
+      # POST. Must match MCP_HOST_BASH_BEARER on the host server
       # side (see examples/compose/.env.example). Empty / unset =
-      # no Authorization header sent. Required when the host launcher
-      # is running behind mcp-proxy-auth-shim.
+      # no Authorization header sent. Required when the host server
+      # enforces bearer auth.
       CLAUDE_HOST_HOOK_BRIDGE_BEARER: ${CLAUDE_HOST_HOOK_BRIDGE_BEARER:-}
       # Host-project-dir signal — read by the entrypoint's
       # trust-workspace pre-seed so the workspace at the bind-mounted

@@ -76,11 +76,11 @@
       operator's interactive shell has to be declared here or in the
       sibling .env (which the wrapper sources).
 
-      Tunnel-only mode does NOT launch mcp-host-bash, so it does not
-      strictly need ~/.local/bin on PATH for mcp-proxy / cli-mcp-server.
-      It IS kept here for parity with the bundled template and so the
-      `ssh` binary resolves regardless of where it lives. Extend if your
-      tooling lives elsewhere.
+      Tunnel-only mode does NOT launch mcp-host-bash-server, so it does
+      not strictly need ~/.local/bin on PATH. It IS kept here for parity
+      with the bundled template and so the `ssh` binary resolves
+      regardless of where it lives. Extend if your tooling lives
+      elsewhere.
 
       Replace /PATH/TO/HOME with your home directory (e.g.
       /Users/yourname) — no `~`, no `${HOME}`.

@@ -35,21 +35,20 @@ Label `org.gbre.personal-mcp.tunnel` for `org.gbre.personal-mcp.host`.
 
 LaunchAgent (under `~/Library/LaunchAgents/`, scope `gui/$(id -u)`).
 The wrapper exec's `ssh` with the operator's private key, exec's
-`mcp-host-bash` which dials `cli-mcp-server` under the operator's
-`$HOME` / `$PATH` / login keychain, and opens an outbound TCP
-connection. None of that needs root, and a LaunchDaemon would invert
-the trust model.
+`mcp-host-bash-server` whose run_command / run_script run under the
+operator's `$HOME` / `$PATH` / login keychain, and opens an outbound
+TCP connection. None of that needs root, and a LaunchDaemon would
+invert the trust model.
 
 ## 0. Prereqs
 
 - macOS (this is a `launchd` plist; Linux operators use `systemd`
   user units — not covered here).
-- A working `mcp-host-bash` launcher. Either:
-  1. The compose-stack launcher works on this host (you ran
-     `examples/compose/bin/install-host-deps` and interactively
-     verified `examples/compose/bin/mcp-host-bash` once), OR
-  2. Your custom `mcp-host-bash` binary lives somewhere else and you
-     point `MCP_HOST_BASH_BIN` at it in the sibling `.env`.
+- A working `mcp-host-bash-server` binary. Either:
+  1. You built + installed it (`make install-mcp-host-bash-server`
+     from the repo root drops it at `~/bin/mcp-host-bash-server`), OR
+  2. Your custom `mcp-host-bash-server` binary lives somewhere else
+     and you point `MCP_HOST_BASH_BIN` at it in the sibling `.env`.
 - An interactive run of `personal-mcp-host.sh` succeeded once. That
   proves your `.env`, your SSH key, and the remote-side reverse-port
   bind all work BEFORE you wrap any of it in `launchd`:
@@ -496,15 +495,14 @@ copy the template (`cp .env.example .env`) and fill it in, or set
 `PERSONAL_MCP_ENV_FILE=/absolute/path/to/.env` in the plist's
 `EnvironmentVariables` dict.
 
-### Wrapper exits with "mcp-host-bash not found"
+### Wrapper exits with "mcp-host-bash-server not found"
 
 Two common causes:
 
-1. `examples/compose/bin/install-host-deps` was never run. Run it once.
-2. The plist's `PATH` doesn't include `~/.local/bin` (or wherever
-   your shims actually live). `which mcp-proxy` from your interactive
-   shell tells you the real path; mirror it in the plist or set
-   `MCP_HOST_BASH_BIN` in `.env` to point at your custom launcher.
+1. The binary was never built. Run `make install-mcp-host-bash-server`
+   from the repo root once — it drops it at `~/bin/mcp-host-bash-server`.
+2. Your binary lives somewhere `~/bin` isn't. Set `MCP_HOST_BASH_BIN`
+   in `.env` to its absolute path.
 
 ### Wrapper exits with "ssh exit code N"
 
@@ -533,9 +531,9 @@ underlying launcher's stderr in
 
 - `MCP_LOCAL_PORT` already owned by a stale prior instance. `lsof
   -nP -iTCP:$MCP_LOCAL_PORT -sTCP:LISTEN` to find the prior PID.
-- `mcp-proxy` / `cli-mcp-server` not on the LaunchAgent's `PATH`
-  (see above — the plist `PATH` must include the dir holding the
-  static binaries).
+- A bad operator config under
+  `~/.config/claude-container/mcp-host-bash.env` (the server reads it
+  at startup) — check the server's stderr in the log named above.
 
 ### Env-var inheritance differs from your interactive shell
 
