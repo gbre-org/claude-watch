@@ -269,8 +269,8 @@ def test_mcp_host_bash_bin_block_contains_port() -> None:
         )
         if len(mcp) >= 3:
             expect(
-                mcp[0].endswith("/mcp-host-bash"),
-                f"MCP_HOST_BASH_BIN[0] should end in /mcp-host-bash; got {mcp[0]!r}",
+                mcp[0].endswith("/mcp-host-bash-server"),
+                f"MCP_HOST_BASH_BIN[0] should end in /mcp-host-bash-server; got {mcp[0]!r}",
             )
             expect(
                 mcp[1] == "--port",
@@ -900,9 +900,25 @@ def test_enable_ctrlc_leaves_host_service_running() -> None:
             # pressing Ctrl-C in their terminal.
             os.write(master, b"\x03")
 
-            try:
-                proc.wait(timeout=12)
-            except subprocess.TimeoutExpired:
+            # Drain the PTY WHILE waiting for the wrapper to exit. The
+            # wrapper writes its teardown banner to the slave PTY on the
+            # way out; if we block in proc.wait() without reading the
+            # master, a full PTY output buffer stalls those writes and the
+            # wrapper never reaches its `exit` — a write-deadlock that
+            # bites on macOS, whose PTY buffer is smaller than Linux's.
+            exit_deadline = time.time() + 12
+            while time.time() < exit_deadline:
+                r, _, _ = select.select([master], [], [], 0.3)
+                if r:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        chunk = b""
+                    if chunk:
+                        buf += chunk
+                if proc.poll() is not None:
+                    break
+            if proc.poll() is None:
                 os.killpg(os.getpgid(proc.pid), 9)
                 proc.wait(timeout=5)
                 failures.append("--enable: wrapper did not exit after Ctrl-C")

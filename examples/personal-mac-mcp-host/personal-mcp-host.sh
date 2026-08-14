@@ -7,14 +7,15 @@
 # Brings up the operator's on-demand "remote-access" MCP server in two
 # pieces:
 #
-#   1. mcp-host-bash --port $MCP_LOCAL_PORT
-#      Reuses the existing launcher under
-#      examples/compose/bin/mcp-host-bash, which spawns mcp-proxy +
-#      cli-mcp-server with the cw-profile allow-list, optional
-#      mcp-proxy-auth-shim bearer auth, and logs to the standard
-#      ~/.local/state/claude-container/mcp-host-bash.log path. We do
-#      not duplicate that surface — operators who've already set up
-#      the compose stack are already configured for it.
+#   1. mcp-host-bash-server --port $MCP_LOCAL_PORT
+#      Reuses the single self-contained Rust binary from
+#      crates/mcp-host-bash-server (installed to ~/bin/mcp-host-bash-server
+#      via `make install-mcp-host-bash-server`). It serves the host-bash
+#      MCP surface over streamable-HTTP with in-process bearer auth and
+#      the cw-profile allow-list, and reads operator config from
+#      ~/.config/claude-container/mcp-host-bash.env. We do not duplicate
+#      that surface — operators who've already set up the compose stack
+#      are already configured for it.
 #
 #   2. ssh -N -R $REMOTE_PORT:127.0.0.1:$MCP_LOCAL_PORT ... $REMOTE_USER@$REMOTE_HOST
 #      A reverse-forward SSH tunnel: the MacBook dials out to
@@ -30,8 +31,8 @@
 # Operating modes
 #
 #   Default (no flags) — STATUS-GATED tunnel + log tail. The wrapper
-#   first checks whether the host MCP service (mcp-proxy /
-#   cli-mcp-server, the thing listening on 127.0.0.1:$MCP_LOCAL_PORT) is
+#   first checks whether the host MCP service (mcp-host-bash-server,
+#   the thing listening on 127.0.0.1:$MCP_LOCAL_PORT) is
 #   actually up by attempting a TCP connect to the port:
 #
 #     - RED (service NOT up): print a clear error explaining the host
@@ -184,14 +185,15 @@
 #
 # Optional env vars
 #
-#   MCP_HOST_BASH_BIN          override path to the mcp-host-bash launcher.
-#                              Default: ../compose/bin/mcp-host-bash relative
-#                              to this script.
+#   MCP_HOST_BASH_BIN          override path to the mcp-host-bash-server binary.
+#                              Default: `mcp-host-bash-server` on PATH, else
+#                              ~/bin/mcp-host-bash-server (where
+#                              `make install-mcp-host-bash-server` puts it).
 #   MCP_HOST_BASH_BEARER       shared-secret bearer token (recommended). Forwarded
-#                              to mcp-host-bash, which fronts mcp-proxy with the
-#                              auth shim. Generate once:
+#                              to mcp-host-bash-server, which validates it
+#                              in-process. Generate once:
 #                                head -c 32 /dev/urandom | base64
-#   CW_PROFILE                 trust profile for mcp-host-bash. Default `corp-dev`
+#   CW_PROFILE                 trust profile for mcp-host-bash-server. Default `corp-dev`
 #                              (read-y floor). Set `corp-dev-trusted` to widen.
 #   ALLOWED_DIR                fence run_command to this dir. Unset here =>
 #                              mcp-host-bash's default "/" applies (path
@@ -321,9 +323,9 @@ while [ "$#" -gt 0 ]; do
         --print-cmd)
             # Test-only: build the planned ssh argv but print it
             # (one-per-line) instead of executing. Also skips the
-            # mcp-host-bash launch + listener probe so the test runs
-            # on hosts that don't have mcp-proxy / cli-mcp-server
-            # installed. In tunnel-only mode the MCP_HOST_BASH_BIN:
+            # mcp-host-bash-server launch + listener probe so the test
+            # runs on hosts that don't have the binary installed. In
+            # tunnel-only mode the MCP_HOST_BASH_BIN:
             # block is omitted (the wrapper does not manage the MCP
             # server's lifecycle).
             PRINT_CMD=1
@@ -377,8 +379,9 @@ fi
 : "${MCP_LOCAL_PORT:?MCP_LOCAL_PORT not set in $env_file}"
 : "${SSH_KEY_PATH:?SSH_KEY_PATH not set in $env_file}"
 
-# Resolve mcp-host-bash. Default: sibling repo path relative to this script.
-MCP_HOST_BASH_BIN="${MCP_HOST_BASH_BIN:-${script_dir}/../compose/bin/mcp-host-bash}"
+# Resolve mcp-host-bash-server. Default: the binary on PATH, else the
+# ~/bin install location `make install-mcp-host-bash-server` writes to.
+MCP_HOST_BASH_BIN="${MCP_HOST_BASH_BIN:-$(command -v mcp-host-bash-server 2>/dev/null || echo "${HOME}/bin/mcp-host-bash-server")}"
 
 # launchd labels `restart` consults, in the shapes this directory ships.
 # Each is probed with `launchctl print`; whichever ones are bootstrapped
@@ -523,16 +526,15 @@ fi
 
 if [ "$ENABLE" = "1" ] && [ ! -x "$MCP_HOST_BASH_BIN" ]; then
     cat >&2 <<EOF
-personal-mcp-host: mcp-host-bash not found / not executable: $MCP_HOST_BASH_BIN
+personal-mcp-host: mcp-host-bash-server not found / not executable: $MCP_HOST_BASH_BIN
 
-Set MCP_HOST_BASH_BIN in $env_file to the absolute path of your
-checkout's examples/compose/bin/mcp-host-bash, or run the bundled
-installer once to populate the static binaries it depends on:
+Build + install it once from the repo root:
 
-    ../compose/bin/install-host-deps
+    make install-mcp-host-bash-server
 
-If your mcp-host-bash launcher lives outside this checkout, point
-MCP_HOST_BASH_BIN at it directly.
+That drops the binary at ~/bin/mcp-host-bash-server. If your
+mcp-host-bash-server binary lives elsewhere, set MCP_HOST_BASH_BIN in
+$env_file to its absolute path.
 EOF
     exit 1
 fi
@@ -658,8 +660,8 @@ cleanup() {
 trap 'shutting_down=1; cleanup' TERM INT
 
 # -----------------------------------------------------------------------------
-# Listener probe — same shape as examples/compose/bin/mcp-host-bash's
-# wait_for_listener.
+# Listener probe — poll until the MCP server's loopback port enters
+# LISTEN (or the child dies / shutdown fires).
 #
 # Returns:
 #   0   port is in LISTEN, TCP connect succeeded
@@ -1233,19 +1235,17 @@ if [ "$ENABLE" = "1" ]; then
     wait_for_listener 127.0.0.1 "$MCP_LOCAL_PORT" 15 || probe_rc=$?
     case "$probe_rc" in
         0)
-            echo "personal-mcp-host: mcp-host-bash listening on 127.0.0.1:$MCP_LOCAL_PORT" >&2
+            echo "personal-mcp-host: mcp-host-bash-server listening on 127.0.0.1:$MCP_LOCAL_PORT" >&2
             ;;
         2)
             cat >&2 <<EOF
-personal-mcp-host: FATAL: mcp-host-bash exited before binding 127.0.0.1:$MCP_LOCAL_PORT.
+personal-mcp-host: FATAL: mcp-host-bash-server exited before binding 127.0.0.1:$MCP_LOCAL_PORT.
        Common causes:
-         - install-host-deps was never run (mcp-proxy / cli-mcp-server
-           missing from PATH).
          - $MCP_LOCAL_PORT already owned by a stale prior instance —
            lsof -nP -iTCP:$MCP_LOCAL_PORT -sTCP:LISTEN
          - bad operator config under
            ~/.config/claude-container/mcp-host-bash.env
-       Check the launcher's stderr above for the underlying error.
+       Check the server's stderr above for the underlying error.
 EOF
             cleanup_exit_code=1
             cleanup
@@ -1255,7 +1255,7 @@ EOF
             ;;
         *)
             cat >&2 <<EOF
-personal-mcp-host: FATAL: mcp-host-bash did not bind 127.0.0.1:$MCP_LOCAL_PORT
+personal-mcp-host: FATAL: mcp-host-bash-server did not bind 127.0.0.1:$MCP_LOCAL_PORT
        within 15s. The process is still running but has not opened the
        listen socket. Check
        $MCP_HOST_BASH_LOG for upstream stderr.
@@ -1305,6 +1305,6 @@ personal-mcp-host: host MCP service is NOT running.
 
            $rerun_cmd
 
-       (Or start mcp-host-bash some other way, then re-run with no flags.)
+       (Or start mcp-host-bash-server some other way, then re-run with no flags.)
 EOF
 exit 3

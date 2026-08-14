@@ -76,10 +76,10 @@ examples/personal-mac-mcp-host/
    ────────────────────────────────────────────────────────────────
        personal-mcp-host.sh
                 │
-                ├──► mcp-host-bash --port $MCP_LOCAL_PORT
-                │       (examples/compose/bin/mcp-host-bash:
-                │        mcp-proxy + cli-mcp-server + optional
-                │        bearer-auth shim, bound to 127.0.0.1)
+                ├──► mcp-host-bash-server --port $MCP_LOCAL_PORT
+                │       (~/bin/mcp-host-bash-server: single Rust
+                │        binary, streamable-HTTP + in-process bearer
+                │        auth, bound to 127.0.0.1)
                 │
                 └──► ssh -N -R $REMOTE_PORT:127.0.0.1:$MCP_LOCAL_PORT \
                          $REMOTE_USER@$REMOTE_HOST
@@ -123,17 +123,19 @@ ssh-copy-id -i ~/.ssh/id_personal_mcp_tunnel.pub $REMOTE_USER@$REMOTE_HOST
 # on-demand auto-restart (see launchd/README.md).
 ```
 
-## Reuse of the compose-stack launcher
+## Reuse of the compose-stack server
 
-`personal-mcp-host.sh` exec's `examples/compose/bin/mcp-host-bash` for
-the MCP server itself. That launcher already implements:
+`personal-mcp-host.sh` exec's `mcp-host-bash-server` (the single Rust
+binary from [`../../crates/mcp-host-bash-server`](../../crates/mcp-host-bash-server))
+for the MCP server itself. That binary already implements:
 
-- `mcp-proxy` + `cli-mcp-server` bootstrapping.
+- The streamable-HTTP `host-bash` surface (`run_command` / `run_script`
+  / `show_security_rules`) in one process — no upstream hop, no PyPI
+  dependency.
 - Trust profile (`CW_PROFILE=corp-dev` default; `corp-dev-trusted`
   widens for file mutation / scheduling / outbound bytes).
 - `ALLOWED_DIR` fence (default `/` — path boundary disabled; the command allow-list is the safety floor).
-- Optional bearer-auth shim (`mcp-proxy-auth-shim`) when
-  `MCP_HOST_BASH_BEARER` is set.
+- In-process bearer auth when `MCP_HOST_BASH_BEARER` is set.
 - Soft kill switch (`MCP_HOST_BASH_DISABLED=1`).
 
 Operators who've already set up the compose stack are already
@@ -141,15 +143,15 @@ configured for this directory — you only need to add the tunnel
 config (the keys in `.env.example`) on top of what's already in
 `~/.config/claude-container/mcp-host-bash.env`.
 
-If you haven't set up the compose stack: install the host-side
-binaries once via:
+If you haven't built the server yet, build + install it once from the
+repo root:
 
 ```sh
-examples/compose/bin/install-host-deps
+make install-mcp-host-bash-server
 ```
 
-That drops `mcp-proxy` and `cli-mcp-server` into `~/.local/bin/` (one
-static install — subsequent launches are offline).
+That drops the binary at `~/bin/mcp-host-bash-server` (re-signed on
+macOS). Point `MCP_HOST_BASH_BIN` in `.env` at it if it lives elsewhere.
 
 ## Configuration
 
@@ -416,7 +418,7 @@ plist changes".
 | Remote unreachable | `Connection timed out` / `Could not resolve hostname` | Verify network + DNS. Try plain `ssh $REMOTE_USER@$REMOTE_HOST` from the Mac. |
 | `MCP_LOCAL_PORT` already bound on the Mac | "mcp-host-bash exited before binding" | `lsof -nP -iTCP:$MCP_LOCAL_PORT -sTCP:LISTEN`; clear the stale PID, or pick a new port. |
 | Mac sleeps / wifi drops | `ServerAliveInterval` fires; SSH exits within ~90s | Under launchd, `KeepAlive` respawns the wrapper when the network is back. Interactively, the wrapper itself exits and you re-run it. |
-| `mcp-host-bash` deps missing | "cannot find required binaries on PATH" from `mcp-host-bash` | Run `examples/compose/bin/install-host-deps` once. |
+| `mcp-host-bash-server` not installed | "mcp-host-bash-server not found / not executable" | Run `make install-mcp-host-bash-server` from the repo root once. |
 | MCP server's stdio child died on a broken pipe | Port still accepts connections, but every remote call fails | `./personal-mcp-host.sh restart` — it reaps the wedged process rather than trusting the port probe, then brings both pieces back. |
 | Don't know which half broke | Remote can't reach the Mac | `./personal-mcp-host.sh restart`. Exit 4 names the piece that didn't come back. |
 
@@ -460,7 +462,7 @@ is the maintainer's local check before merging.
 - [`DESIGN.md`](DESIGN.md) — architecture, alternatives considered.
 - [`launchd/README.md`](launchd/README.md) — LaunchAgent install
   walkthrough.
-- [`../compose/bin/mcp-host-bash`](../compose/bin/mcp-host-bash) —
-  the MCP server launcher this wrapper exec's.
+- [`../../crates/mcp-host-bash-server`](../../crates/mcp-host-bash-server) —
+  the MCP server binary this wrapper exec's.
 - [`../compose/launchd/README.md`](../compose/launchd/README.md) —
   persistent (always-on) LaunchAgent for the compose-stack shape.

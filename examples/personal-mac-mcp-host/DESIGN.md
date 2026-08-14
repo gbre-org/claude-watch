@@ -7,6 +7,17 @@
 > `tests/`. See [`README.md`](README.md) for operator setup; this file
 > is the architectural record (why reverse-SSH, alternatives
 > considered, why the always-on-MCP + on-demand-tunnel split).
+>
+> **Note on the MCP server:** the sketches below predate the host-bash
+> refactor and describe the retired `mcp-proxy` + `cli-mcp-server` +
+> auth-shim chain. The MCP server is now the single self-contained Rust
+> binary `mcp-host-bash-server` (crate
+> [`../../crates/mcp-host-bash-server`](../../crates/mcp-host-bash-server),
+> installed to `~/bin/mcp-host-bash-server` via
+> `make install-mcp-host-bash-server`); it does bearer auth in-process,
+> so there is no separate proxy, allow-list server, or Keychain wrapper.
+> The reverse-SSH tunnel rationale — the actual subject of this doc —
+> is unaffected.
 
 ## Goal
 
@@ -29,10 +40,10 @@ Concretely, the operator wants:
    reaches the MacBook's MCP server.
 4. The MacBook side committable to a public repo (this directory),
    with operator-specific secrets in a `.gitignore`d `.env`.
-5. Reuse of the existing `examples/compose/bin/mcp-host-bash` launcher
-   (already shipped in this repo) for the MCP server itself —
-   `cli-mcp-server` + `mcp-proxy` + bearer-token auth shim. No new MCP
-   server implementation needed.
+5. Reuse of the existing `mcp-host-bash-server` binary (already shipped
+   in this repo, crate `crates/mcp-host-bash-server`) for the MCP server
+   itself — streamable-HTTP with in-process bearer auth + allow-list. No
+   new MCP server implementation needed.
 
 ## Why this is *not* the workbot pattern
 
@@ -160,11 +171,9 @@ examples/personal-mac-mcp-host/
 [claude-watch CLAUDE.md naming convention](../../CLAUDE.md) for
 operator-owned launchd Labels and plist filenames.
 
-**Reuse:** the wrapper *exec's* the existing
-`examples/compose/bin/mcp-host-bash` launcher — we don't duplicate the
-MCP-server bootstrapping. Operators who've already run
-`examples/compose/bin/install-host-deps` (puts `mcp-proxy` and
-`cli-mcp-server` into `~/.local/bin/`) are already set up for the
+**Reuse:** the wrapper *exec's* the `mcp-host-bash-server` binary — we
+don't duplicate the MCP-server implementation. Operators who've already
+built it (`make install-mcp-host-bash-server`) are set up for the
 server side; this directory only adds the tunnel.
 
 ## `.env.example` (sketch)
@@ -491,7 +500,7 @@ sshd-level change needed if the operator's existing config is stock.
 | SSH key wrong / revoked | Respawn loop; ssh `Permission denied (publickey)` in stderr log | Check `authorized_keys` on remote; verify key path in `.env`. |
 | Remote port already bound | Respawn loop; ssh `remote port forwarding failed` in stderr log | `ssh remote 'lsof -i :$REMOTE_PORT'`; pick a different `REMOTE_PORT` in `.env`. |
 | Remote DNS / network down | Respawn loop; ssh connection-timeout in stderr log | Verify `REMOTE_HOST` reachability with a plain `ssh` test. |
-| Local `mcp-host-bash` deps missing | Respawn loop; "cannot find required binaries on PATH" in stderr log | Run `../compose/bin/install-host-deps` once. |
+| `mcp-host-bash-server` not installed | Respawn loop; "mcp-host-bash-server not found / not executable" in stderr log | Run `make install-mcp-host-bash-server` from the repo root once. |
 | MacBook sleeps / wifi drops | `ServerAliveInterval` triggers SSH exit within ~90s; launchd respawns | Tunnel reconnects when network is back. No operator action needed. |
 
 `KeepAlive=true` + `ThrottleInterval=30` means any failure surfaces as
@@ -548,11 +557,11 @@ launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
 The questions surfaced in the original design doc are answered below,
 with pointers to where the choice landed in the shipped code.
 
-1. **Reuse vs. duplicate `mcp-host-bash`** — **Reuse**.
-   `personal-mcp-host.sh` exec's `../compose/bin/mcp-host-bash`
-   (configurable via `MCP_HOST_BASH_BIN` for operators whose launcher
+1. **Reuse vs. duplicate the MCP server** — **Reuse**.
+   `personal-mcp-host.sh` exec's the `mcp-host-bash-server` binary
+   (configurable via `MCP_HOST_BASH_BIN` for operators whose binary
    lives elsewhere). Avoids duplicating the cw-profile / allow-list /
-   bearer-shim surface; operators who've already set up the compose
+   bearer-auth surface; operators who've already set up the compose
    stack are pre-configured for this directory.
 
 2. **`launchctl bootout` vs. soft kill switch** — **Both supported**.
@@ -565,12 +574,11 @@ with pointers to where the choice landed in the shipped code.
 
 3. **Bearer token storage** — **`.env` plaintext (phase 1)**. The
    shipped code reads `MCP_HOST_BASH_BEARER` from the sibling `.env`
-   and exports it for `mcp-host-bash` (which already implements the
-   shim). The Keychain hop modelled on `load-bearer-from-keychain` is
-   deliberately out of scope for this PR — left as future work; a
-   later PR can drop in a Keychain wrapper without changing the
-   wrapper's contract (it reads the env var regardless of how it got
-   there).
+   and exports it for `mcp-host-bash-server` (which validates it
+   in-process). A Keychain-sourced bearer is deliberately out of scope
+   for this PR — left as future work; a later PR can drop in a Keychain
+   wrapper without changing the wrapper's contract (it reads the env
+   var regardless of how it got there).
 
 4. **`tunnel.sh` separate from `personal-mcp-host.sh`** — **No**.
    Single combined wrapper (YAGNI; the design doc anticipated this).
@@ -606,13 +614,11 @@ with pointers to where the choice landed in the shipped code.
 
 ## Future work
 
-- **macOS Keychain bearer hop.** A `load-bearer-from-keychain`-style
-  wrapper for `personal-mcp-host.sh` would let operators keep the
-  bearer out of `.env` entirely. Shape: a small `bin/` script that
-  fetches the bearer via `security find-generic-password -w`,
-  exports it, then exec's `personal-mcp-host.sh`. The compose-stack
-  Keychain wrapper at `../compose/bin/load-bearer-from-keychain` is
-  the model. Out of scope for this PR.
+- **macOS Keychain bearer hop.** A Keychain-sourcing wrapper for
+  `personal-mcp-host.sh` would let operators keep the bearer out of
+  `.env` entirely. Shape: a small `bin/` script that fetches the bearer
+  via `security find-generic-password -w`, exports it, then exec's
+  `personal-mcp-host.sh`. Out of scope for this PR.
 
 - **Split `tunnel.sh` from `personal-mcp-host.sh`.** Would let
   advanced operators run only the tunnel (pointing at a different
