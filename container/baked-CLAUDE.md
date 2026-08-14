@@ -1023,10 +1023,9 @@ see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
   job (`mcp-proxy`, `mcphost`, etc.); the container only rewrites the
   in-container `.mcp.json`. Full surface in
   [container/README.md](/opt/claude-container/container/README.md#blast-radius).
-- **`host-bash`** — generic "run a safe command on the host" MCP server,
-  an off-the-shelf
-  [`cli-mcp-server`](https://github.com/MladenSU/cli-mcp-server) +
-  [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) combo with an
+- **`host-bash`** — generic "run a safe command on the host" MCP server:
+  the single self-contained `mcp-host-bash-server` binary (bearer auth +
+  allow-list in-process), with an
   env-var-driven allow-list. Default (`CW_PROFILE=corp-dev`, conservative
   read-only): `ls,cat,pwd,git,gh,head,tail,grep,find,echo`, no path
   boundary by default, 30s timeout (shell-operator gating: see `run_command` vs
@@ -1034,15 +1033,15 @@ see "Hooks" below) and instead writes a project-tier `.mcp.json` inside
   host-scheduling tooling (see "Host-side scheduled tasks").
   **Reach for host-bash as a normal tool, not a last resort** — the supported
   way to do host-side work from the container. Not listed by `/mcp` => operator
-  hasn't wired the launcher
-  ([examples/compose/bin/mcp-host-bash](/opt/claude-container/examples/compose/bin)).
+  hasn't installed the server
+  ([examples/compose/README.md](/opt/claude-container/examples/compose/README.md)).
 
   **Boundary discipline**: host-bash is a *window* to the host. Report "I ran X
   on the host via host-bash", not "I ran X" / "I'm on the host" — the
   in-container claude orchestrates, the host shell executes.
 
   **`run_command` vs `run_script` — pick by quoting; NEVER base64-ferry.** Two
-  tools. `run_command` runs the string through cli-mcp-server's allow-list
+  tools. `run_command` runs the string through the server's allow-list
   tokenizer; top-level operators (`|`, `;`, `&&`, `>`, `2>&1`) between separate
   commands work (`ALLOW_SHELL_OPERATORS=true` on a typical host), but the
   tokenizer splits on those chars **without respecting quotes**, so an operator
@@ -1124,10 +1123,10 @@ event, is worse). If your team requires telemetry from container sessions:
    path the host config references (coordinate with the hook's owning team).
 2. **Enable the host-bash bridge** (`CLAUDE_HOST_HOOK_BRIDGE=1`): exec-hook
    hands every Mach-O / wrong-arch hook off to `exec-hook-bridge`, which
-   marshals the call across the host-bash MCP server (`mcp-host-bash` at
-   `host.docker.internal:8766/mcp`) so the REAL host binary runs with the same
+   marshals the call across the host-bash MCP server
+   (`host.docker.internal:8766/mcp`) so the REAL host binary runs with the same
    env + args and its exit code propagates back. The operator must also add
-   the hook basename to the `mcp-host-bash` allow-list via
+   the hook basename to the `mcp-host-bash-server` allow-list via
    `CLAUDE_HOOK_BRIDGE_BINS=telemetry-hook` (comma-separated for many). Bridge
    failures (host-bash unreachable, allow-list reject) fall back to the
    silent-no-op contract — a misconfigured bridge never brings the session

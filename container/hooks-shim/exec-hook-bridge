@@ -118,10 +118,10 @@ ENVIRONMENT
   CLAUDE_HOST_HOOK_BRIDGE_BEARER
                               — bearer token sent as
                                 `Authorization: Bearer <token>` on every
-                                request, when the host launcher is
-                                running behind mcp-proxy-auth-shim. Must
+                                request, when the host server enforces
+                                bearer auth. Must
                                 match MCP_HOST_BASH_BEARER on the host
-                                launcher side. Empty / unset = no
+                                server side. Empty / unset = no
                                 Authorization header sent (works against
                                 a launcher that doesn't have a bearer
                                 configured; gets 401-rejected by a
@@ -230,10 +230,10 @@ def bearer_header() -> dict[str, str]:
     """Return `{"Authorization": "Bearer <token>"}` if
     CLAUDE_HOST_HOOK_BRIDGE_BEARER is set, else empty dict.
 
-    The shim on the host side (mcp-proxy-auth-shim) validates this
-    header on every request when the launcher is configured with
-    MCP_HOST_BASH_BEARER. If the host launcher is running WITHOUT
-    bearer auth (older deployments / loopback-only setups), the
+    mcp-host-bash-server on the host side validates this
+    header on every request when configured with
+    MCP_HOST_BASH_BEARER. If the host server is running WITHOUT
+    bearer auth (loopback-only setups), the
     header is harmless — mcp-proxy ignores it. If the host launcher
     is running WITH bearer auth and we don't send the header, the
     shim 401's us and the bridge falls back to no-op (the standard
