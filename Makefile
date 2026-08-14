@@ -3,7 +3,8 @@
 # This repo has SIX deployment / build surfaces and the targets below are
 # grouped accordingly. `make help` prints the index.
 #
-#   1. host + systemd  : build -> install-skills -> deploy-systemd
+#   1. host + systemd  : install -> install-skills -> deploy-systemd
+#                        (+ install-cron once, for the host cron fragment)
 #   2. host $PATH CLIs : install (daemon copied, scripts symlinked)
 #   3. container image : container-build / compose-build
 #   4. compose stack   : bootstrap, compose-up/down, deploy-container
@@ -23,11 +24,12 @@
 .PHONY: test-self-clear test-watchers test-dashboard test-trust-workspace
 .PHONY: test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links
 .PHONY: test-claude-md-size test-install-hooks test-install-host-skills
+.PHONY: test-install-host-cron
 .PHONY: test-entrypoint test-cw test-hostjob test-launchd-plist
 .PHONY: test-personal-mcp-host test-personal-mcp-host-plist
 .PHONY: test-personal-mcp-install test-ttyd-paste-handler
 # Build / install / host-deploy targets
-.PHONY: build install install-hooks install-skills deploy deploy-systemd
+.PHONY: build install install-hooks install-skills install-cron deploy deploy-systemd
 .PHONY: install-mcp-host-bash-server
 # Container / compose targets
 .PHONY: bootstrap compose-build compose-up compose-down
@@ -273,6 +275,16 @@ test-install-hooks: ## Tests for the install-hooks target (core.hooksPath)
 test-install-host-skills: ## Tests for the host-skills installer + its wiring
 	scripts/tests/install-host-skills.test
 
+# Tests for cron.d/cw-host + scripts/install-host-cron.sh: that the shipped
+# fragment is fully parameterized (no operator paths in a public repo), that
+# every placeholder it uses is one the installer substitutes, that rendering
+# resolves all of them, and the refuse-to-install guards. Also pins the
+# single-binary-identity wiring the fragment depends on: deploy-systemd must
+# depend on `install`, or the $BIN_DIR copy goes stale again. Tmpdirs only —
+# never touches /etc/cron.d.
+test-install-host-cron: ## Tests for the host-cron fragment + its installer
+	scripts/tests/install-host-cron.test
+
 # The container image's static-assertion suite: ~30 scripts that check the
 # entrypoint's runtime behaviour and that the Dockerfile actually baked what
 # the deployment contract assumes (hooks wired, gates wired, dirs present,
@@ -435,6 +447,23 @@ build: ## cargo build --release
 install-skills: ## Install skills/ as /cw-<name> host slash commands
 	@scripts/install-host-skills.sh
 
+# Render + install the HOST cron fragment (cron.d/cw-host) into /etc/cron.d.
+#
+# The container bakes its crontab into the image (container/cron.d/cw-default);
+# this is the host equivalent. It can't be baked, because a host deployment has
+# no fixed install prefix — the fragment therefore ships @PLACEHOLDER@s and the
+# installer fills them in from the local checkout (binary path, user, home,
+# state dir), each overridable. That also keeps one operator's home path out of
+# this public repo, and lets a second deployment consume the same fragment.
+#
+# Deliberately NOT a dependency of deploy-systemd: it needs root, and a deploy
+# must not silently rewrite the host's crontab. Run it once at setup (and again
+# only when the fragment changes); cron re-reads /etc/cron.d on the next tick,
+# so there is nothing to restart. `-n` for a dry run that prints the rendered
+# file and writes nothing; `--help` for all flags.
+install-cron: ## Render + install cron.d/cw-host into /etc/cron.d (needs root)
+	@scripts/install-host-cron.sh
+
 # Build + restart systemd service (HOST / systemd install — NOT used in the
 # Docker-container setup; see `deploy-container` for that).
 #
@@ -442,7 +471,19 @@ install-skills: ## Install skills/ as /cw-<name> host slash commands
 # skills — otherwise a skill added here is invisible on the host until someone
 # remembers to hand-install it (exactly how /distill shipped for weeks as a
 # container-only command).
-deploy-systemd: build install-skills ## Host/systemd deploy: build + skills + restart
+#
+# Depends on `install` (which itself depends on `build`) for the SAME reason,
+# one layer down: a host/systemd deployment has TWO claude-watch binaries on
+# disk — the service's ExecStart runs target/release/ directly, while the
+# on-PATH CLI is the $(BIN_DIR) copy that `install` places. This target used to
+# depend on `build` alone, so a deploy rebuilt + restarted the service and left
+# the $(BIN_DIR) copy frozen at whenever `make install` last ran. The two then
+# drifted, silently: `claude-watch <subcommand>` on PATH kept running old code,
+# and any cron/tooling pointed at the copy reported that copy's compiled-in
+# build identity rather than the running daemon's. Depending on `install` makes
+# one deploy refresh both from the same build. Do NOT instead symlink
+# $(BIN_DIR)/claude-watch into target/release/ — see the install policy below.
+deploy-systemd: install install-skills ## Host/systemd deploy: build + install + skills + restart
 	sudo systemctl restart claude-watch
 
 # DEPRECATED alias — kept so any docs / muscle-memory invoking `make deploy`
@@ -464,6 +505,15 @@ deploy: deploy-systemd
 #   - The claude-watch Rust daemon is a build artifact, so it's a real
 #     file copy from target/release/ into $(BIN_DIR). Re-running `make
 #     install` after `make build` refreshes it.
+#
+#     WHY A COPY AND NOT A SYMLINK (this has been "fixed" the wrong way
+#     before): a symlink into target/release/ dangles the moment anyone
+#     runs `cargo clean` or switches profile, which makes the on-PATH CLI
+#     vanish rather than merely go stale — and `make install` would put
+#     the copy back on the next run anyway. The copy is right; what was
+#     wrong is that it used to go stale, because `deploy-systemd` did not
+#     depend on this target. It now does, so a host deploy refreshes this
+#     copy and restarts the service from the same build.
 #   - Every other tool is a script (Python / shell). Those install as
 #     ABSOLUTE-PATH symlinks back to the source under tools/, so editing
 #     a script in-tree is immediately reflected in $(BIN_DIR) without

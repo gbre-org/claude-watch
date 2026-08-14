@@ -103,8 +103,10 @@ make test-e2e          # e2e tmux tests only (~10s)
 make test-live         # live e2e tests (spawn real Claude Code, ~1-2 min each)
 make test-verbose      # all tests with stdout/stderr visible
 make build             # release build
-make deploy-systemd    # release build + install skills + systemctl restart (host/systemd; `make deploy` is a deprecated alias)
+make deploy-systemd    # build + install + install-skills + systemctl restart (host/systemd; `make deploy` is a deprecated alias)
+make install           # daemon COPY + tool symlinks into $BIN_DIR (dep of deploy-systemd, so the on-PATH CLI can't go stale)
 make install-skills    # install skills/ as /cw-<name> commands (dep of deploy-systemd; container/skills/ stays container-only)
+make install-cron      # render cron.d/cw-host into /etc/cron.d (needs root; NOT a dep of deploy-systemd)
 make install-hooks     # install git pre-commit hook
 ```
 

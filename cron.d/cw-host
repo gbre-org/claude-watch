@@ -1,0 +1,113 @@
+# claude-watch default cron entries — HOST / systemd deployment.
+#
+# This is the host analogue of container/cron.d/cw-default. Same jobs, same
+# reasons; the only difference is that a host deployment has no fixed install
+# prefix, so every deployment-specific value in this file is a @PLACEHOLDER@
+# that gets substituted at INSTALL time.
+#
+# Install it with:
+#
+#     scripts/install-host-cron.sh              # render + install to /etc/cron.d
+#     scripts/install-host-cron.sh -n           # dry run: print the rendered file
+#     scripts/install-host-cron.sh --help       # all flags
+#
+# The installer resolves every placeholder from the local checkout (and lets
+# you override each one), so this file itself stays free of any one operator's
+# paths, usernames, or home directory. That is deliberate: this repo is public,
+# and a second deployment (a different host, a different user, a different
+# checkout location) must be able to consume this same fragment unmodified.
+#
+# ---------------------------------------------------------------------------
+# Placeholders
+# ---------------------------------------------------------------------------
+#
+#   @CW_USER@       the user each job runs as. /etc/cron.d/ rows carry a USER
+#                   column between the schedule and the command (user crontabs
+#                   do not) — the cron daemon runs as root and setuid's into
+#                   this account.
+#   @CW_HOME@       that user's home directory. Only used to extend PATH; every
+#                   command below is invoked by absolute path, because cron
+#                   does NO variable expansion in the command field.
+#   @CW_BIN@        absolute path to the claude-watch binary. See the hard rule
+#                   below — this MUST be the same file the service execs.
+#   @CW_STATE_DIR@  writable state dir (default /var/lib/claude-watch). Must be
+#                   writable by @CW_USER@; consumers read from it.
+#
+# ---------------------------------------------------------------------------
+# HARD RULE: @CW_BIN@ must be the binary the daemon itself runs
+# ---------------------------------------------------------------------------
+#
+# `claude_watch_build_info{version,commit,pr}` is emitted from COMPILE-TIME
+# constants baked into the binary, so the gauge describes whichever binary CRON
+# EXECS — never "whatever is running as the service". If cron and the service
+# exec two different files, the build-identity gauge silently describes the
+# wrong one, and nothing fails loudly: the metric keeps updating every minute
+# with a stale commit.
+#
+# A host/systemd deployment can easily end up with two claude-watch binaries:
+#
+#   - the service's ExecStart, which runs the release build inside the
+#     checkout (`<repo>/target/release/claude-watch`); and
+#   - the on-PATH CLI copy that `make install` places in $BIN_DIR (~/bin by
+#     default). The daemon is a build artifact, so `make install` copies it
+#     rather than symlinking it the way it symlinks the script tools.
+#
+# Those two drift apart the moment one is refreshed without the other. Point
+# this file at the FIRST one — the service's ExecStart path — which is exactly
+# what `install-host-cron.sh` resolves by default.
+#
+# Do NOT "fix" the drift by symlinking $BIN_DIR/claude-watch into
+# target/release/: `cargo clean` (or a profile change) leaves that link
+# dangling and the on-PATH CLI simply disappears, and the next `make install`
+# replaces the link with a copy again anyway. The supported fix is that
+# `make deploy-systemd` depends on `install`, so a host deploy refreshes the
+# $BIN_DIR copy and restarts the service from the same build.
+#
+# No fallback path is offered on purpose: if @CW_BIN@ is missing, the daemon is
+# down too, and a silent fallback to a second binary would just re-create the
+# drift this file exists to prevent.
+#
+# ---------------------------------------------------------------------------
+# PATH
+# ---------------------------------------------------------------------------
+#
+# Cron's default PATH is minimal (/usr/bin:/bin). Set an explicit one so
+# /usr/local/bin and the user's own bin dir are reachable by anything the jobs
+# below shell out to.
+PATH=/usr/local/bin:/usr/bin:/bin:@CW_HOME@/bin
+
+# Emit Prometheus-style metrics every minute into the node-exporter textfile
+# collector dir. stderr goes to syslog under the `claude-watch-metrics` tag.
+* * * * *   @CW_USER@ @CW_BIN@ metrics 2>&1 | logger -t claude-watch-metrics
+
+# Publish the active-agents JSON state file (queue_id + alive per subagent)
+# every minute. Consumers: the work-queue exporter (has_live_owner gauge), the
+# queue mini-site (owner-status column), and any queue watchdog cron.
+#
+# Same single-binary rule as the metrics line above: this writes state that the
+# daemon's own view is compared against, so it must not be produced by a stale
+# snapshot carrying an older state schema.
+* * * * *   @CW_USER@ @CW_BIN@ active-agents --json --write-state @CW_STATE_DIR@/active-agents.json > /dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# Optional jobs (commented out — enable per deployment)
+# ---------------------------------------------------------------------------
+#
+# The container bakes these two as well. They are left commented here because a
+# host deployment may already run an equivalent out-of-tree watchdog, and
+# installing this fragment must not silently add event emitters to a host that
+# did not ask for them. Uncomment whichever the deployment wants; the installer
+# substitutes placeholders in commented rows too, so they are ready to enable
+# in place.
+#
+# Stale-ready queue-item watchdog: every 5 minutes, scan for pending queue
+# items that have been ready past the threshold and emit ONE aggregated
+# `queue-stale-ready` event per qualifying tick (single-emit per queue id).
+#*/5 * * * *  @CW_USER@ @CW_BIN@ stale-ready-check > /dev/null 2>&1
+#
+# Stuck / orphaned queue-item watchdog: every 5 minutes, emit `queue-orphaned`
+# / `queue-stuck` events for running items whose owner PID is dead or whose
+# heartbeat has gone stale. Emission is gated behind `[queue_check]
+# emit_events` in config.toml (default false), so this runs the detector but
+# stays silent until that toggle is flipped on.
+#*/5 * * * *  @CW_USER@ @CW_BIN@ queue-check > /dev/null 2>&1
