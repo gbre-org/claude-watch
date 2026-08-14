@@ -147,6 +147,15 @@ jobs:
       - name: Run host-skills installer tests
         run: make test-install-host-skills
 
+      # Host cron fragment + its installer: that cron.d/cw-host is fully
+      # parameterized (this repo is public, and a second deployment must be
+      # able to consume the same fragment), that rendering resolves every
+      # placeholder, and that deploy-systemd depends on `install` so the
+      # $BIN_DIR daemon copy cannot drift from the one the service runs.
+      # Tmpdirs only — never touches /etc/cron.d.
+      - name: Run host-cron installer tests
+        run: make test-install-host-cron
+
       - name: Run claude-tmux env passthrough + fail-loud warning tests
         run: make test-claude-tmux-env
 
