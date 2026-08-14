@@ -64,18 +64,13 @@ fn unique_token(prefix: &str) -> String {
     format!("{}-{}-{}", prefix, std::process::id(), n)
 }
 
-/// Resolve a directory inside `target/debug/` for the daemon binary so we
-/// don't have to re-build inside the test (the common harness already
-/// rebuilds via `Self::daemon_binary()`).
+/// Path to the daemon binary under test.
+///
+/// Cargo has already built it and handed us the path in
+/// `CARGO_BIN_EXE_<name>`. See `tests/common/mod.rs::daemon_binary` for why
+/// invoking `cargo build` from inside a test is not an option.
 fn daemon_binary() -> PathBuf {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let status = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .status()
-        .expect("cargo build");
-    assert!(status.success(), "cargo build failed");
-    PathBuf::from(format!("{}/target/debug/claude-watch", manifest_dir))
+    PathBuf::from(env!("CARGO_BIN_EXE_claude-watch"))
 }
 
 /// Count processes matching a pgrep pattern.

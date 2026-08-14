@@ -18,3 +18,8 @@ examples/compose/docker-compose.override.yml
 # `.env.example` is the canonical template; the real `.env` must NOT be
 # committed.
 examples/compose/.env
+
+# Build-identity stamp files written into the crate root inside
+# container/Dockerfile's cargo-build RUN (see build.rs). Never committed.
+.build-commit
+.build-pr
