@@ -69,6 +69,85 @@ Bounded set, NOT Turing-complete:
     inside `all_of` returns satisfied=True, i.e. "this rule does not
     apply in the current context").
 
+## `satisfied_by` — auto-clearing an obligation
+
+An obligation may carry a `satisfied_by` block. After every tool call the
+PostToolUse hook asks the CLI to remove any obligation whose `satisfied_by`
+matches what just ran:
+
+```json
+"satisfied_by": {
+  "tool_pattern": "Bash",
+  "command_pattern": "^watcher-ctl run signal-wait-dm"
+}
+```
+
+`command_pattern` is a regex over the Bash **command string**.
+
+### Matching a file's contents (`file_arg_flags`)
+
+A command string is the wrong place to look when the payload is not in the
+command. Some CLIs take their input as `--file <path>` — sometimes because
+piping into them is forbidden and an inline `"line1\nline2"` argument would
+write a literal backslash-n rather than a newline, so any multi-line input
+*must* go through a file. For those, the content the obligation cares about
+never appears in the command string, the pattern can never match, and a
+genuine action cannot clear its own gate.
+
+`file_arg_flags` opts that obligation into also searching the named file:
+
+```json
+"satisfied_by": {
+  "tool_pattern": "Bash:^mysender",
+  "command_pattern": "delivered:",
+  "file_arg_flags": ["-F", "--file"]
+}
+```
+
+```
+obligations add ... \
+  --satisfied-by-tool 'Bash:^mysender' \
+  --satisfied-by-cmd-regex 'delivered:' \
+  --satisfied-by-file-flag=-F --satisfied-by-file-flag=--file
+```
+
+(Use the `=` spelling — a bare `--satisfied-by-file-flag -F` makes argparse
+read `-F` as an option of its own.)
+
+Semantics:
+
+  - **Additive, never looser.** The command string is checked first and an
+    old-style match still satisfies on its own. The regex is unchanged; the
+    only difference is that it gets a second haystack.
+  - **`--satisfied-by-file-flag` requires `--satisfied-by-cmd-regex`** (the
+    CLI exits 2 otherwise). Without a pattern there is nothing to find in
+    the file, so the obligation would clear on the mere *shape* of the
+    command — any file-carrying invocation at all. That is worse than the
+    bug this exists to fix.
+  - Both `-F path` and `--file=path` spellings are recognised.
+  - Paths are lifted from the **shell AST**, not scraped with a regex: a
+    flag that appears inside a quoted argument or a heredoc body is data,
+    not a flag.
+
+Every failure mode declines to match, cheaply — reading a path lifted out
+of a command string is a file read driven by matched text, so it fails
+closed:
+
+  - a word carrying unexpanded shell syntax (`$VAR`, backticks, globs) is
+    not a resolvable path — we decline rather than guess which file ran;
+  - relative paths are declined (the tool's working directory is not ours
+    to assume);
+  - the file must exist and be a **regular** file — directories, FIFOs,
+    device nodes and sockets are refused, and the open uses `O_NONBLOCK` so
+    a FIFO can never park the matcher;
+  - files over 256 KiB are declined outright rather than partially read;
+  - at most 4 files are consulted per command.
+
+**A missing file is not a match.** Staged scratch files are often
+short-lived and unlinked as soon as the command finishes; if the file is
+gone by match time the obligation simply stays. "The evidence is gone" must
+never read as "satisfied".
+
 ## Enforcement modes
 
   - `gate` (default): PreToolUse hook DENIES the matching tool call when
