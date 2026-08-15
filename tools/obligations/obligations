@@ -29,7 +29,13 @@ State: ``~/.config/claude/obligations.json`` (0600), schema:
           "created_by": "...",
           "satisfied_by": {
             "tool_pattern": "Bash",
-            "command_pattern": "^watcher-ctl run signal-wait-dm"
+            "command_pattern": "^watcher-ctl run signal-wait-dm",
+            # optional: flags whose ARGUMENT is a path. When present, the
+            # command_pattern is ALSO matched against those files' contents,
+            # so a command that hands its payload over as a file (rather
+            # than inline) can still auto-satisfy. Missing / unreadable /
+            # oversized / non-regular files never count as a match.
+            "file_arg_flags": ["-F", "--file"]
           } | null,
           "deny_message": "..."
         }
@@ -374,6 +380,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -2861,12 +2868,28 @@ def cmd_add(args):
     now = _now()
     expires_at = now + ttl if ttl > 0 else None
 
+    file_arg_flags = [f for f in (getattr(args, "satisfied_by_file_flag", None)
+                                  or []) if f]
+    if file_arg_flags and not args.satisfied_by_cmd_regex:
+        # Refused deliberately. Without a regex there is nothing to look for
+        # in the file, so the obligation would clear on the mere SHAPE of the
+        # command ("this tool ran with a file argument") -- i.e. on any
+        # unrelated file-carrying invocation. That is looser than the bug
+        # this flag exists to fix.
+        print("ERROR: --satisfied-by-file-flag requires "
+              "--satisfied-by-cmd-regex (the pattern is the anchor searched "
+              "inside the file; without one, any file-carrying command would "
+              "satisfy the obligation)", file=sys.stderr)
+        return 2
+
     satisfied_by = None
     if args.satisfied_by_tool or args.satisfied_by_cmd_regex:
         satisfied_by = {
             "tool_pattern": args.satisfied_by_tool or "*",
             "command_pattern": args.satisfied_by_cmd_regex or "",
         }
+        if file_arg_flags:
+            satisfied_by["file_arg_flags"] = file_arg_flags
 
     # Normalize the exempt patterns list. argparse with action="append"
     # leaves None when the flag was never passed.
@@ -3536,6 +3559,184 @@ def cmd_check(args):
 
 
 # ---------------------------------------------------------------------------
+# satisfied_by: matching the BODY of a file passed as a command argument
+# ---------------------------------------------------------------------------
+#
+# `satisfied_by.command_pattern` is a regex over the Bash command STRING.
+# That is the right anchor when the thing being asserted is visible in the
+# command itself. It is the WRONG anchor when the payload lives in a file
+# that the command merely names -- e.g. a sender CLI whose multi-line input
+# must be handed over as `--file <path>` because piping into it is banned
+# and an inline "line1\nline2" argument would write a literal backslash-n.
+# In that shape the real content never appears in the command string, so a
+# genuine action can never auto-satisfy its own obligation and a hard gate
+# stays standing until a human clears it by hand.
+#
+# `satisfied_by.file_arg_flags` is the opt-in fix: a list of option flags
+# (e.g. ["-F", "--file"]) whose ARGUMENT is a path. When set, the regex is
+# ALSO tried against the contents of those files. It is strictly additive --
+# a command-string match still satisfies on its own, and the anchor still
+# has to be found in real text somewhere. We never relax the pattern.
+#
+# Reading a path lifted out of a command string is a file read driven by
+# matched text, so every step below fails CLOSED (no match) and cheaply:
+#
+#   * paths come from the shell AST, never a regex scrape, so a path-looking
+#     token inside a quoted argument or a heredoc body is not a path;
+#   * a word carrying unexpanded shell syntax ($VAR, `cmd`, globs) is not a
+#     resolvable path -- we decline rather than guess;
+#   * relative paths are declined (the tool's cwd is not ours to assume);
+#   * the file must exist and be a REGULAR file; directories, FIFOs, device
+#     nodes and sockets are refused, and the open is O_NONBLOCK so a FIFO
+#     can never park the matcher;
+#   * oversized files are declined outright rather than partially read, so
+#     the behaviour does not depend on where the cap happens to fall;
+#   * at most a few files are consulted per command.
+#
+# A file that is MISSING at match time -- the common case, since staged
+# scratch files are deliberately short-lived and often auto-unlinked --
+# yields NO match. "The evidence is gone" must never read as "satisfied".
+
+# Max bytes of a named file we are willing to read for a satisfied_by match.
+# Files larger than this are declined outright (no partial read): the
+# regex is operator-supplied and we do not want to hand an unbounded
+# haystack to a potentially backtracking pattern.
+SATISFIED_BY_FILE_MAX_BYTES = 256 * 1024
+
+# Max number of distinct files consulted for a single command.
+SATISFIED_BY_FILE_MAX_FILES = 4
+
+# Shell syntax that means "this word is not a literal path". A word
+# containing any of these was going to be expanded by the shell before the
+# real command ever saw it, so whatever we would read is not what ran.
+_UNRESOLVABLE_PATH_CHARS = ("$", "`", "*", "?", "[", "]", "\n")
+
+
+def _file_arg_paths(command_string, flags):
+    """Resolve the path arguments of ``flags`` out of ``command_string``.
+
+    Returns a list of absolute path strings, in command order, deduplicated,
+    capped at ``SATISFIED_BY_FILE_MAX_FILES``. Returns ``[]`` on any parse
+    failure or when nothing resolvable is found -- callers treat an empty
+    list as "no file evidence", never as a match.
+
+    Both ``-F path`` (two words) and ``--file=path`` (one word) are
+    recognised. Path words are taken from the parsed shell AST, so a flag
+    that merely appears inside a quoted argument or a heredoc body is not a
+    flag.
+    """
+    flagset = {f for f in (flags or []) if isinstance(f, str) and f}
+    if not flagset or not command_string:
+        return []
+    if _shell_ast is None:
+        return []
+    try:
+        parsed = _shell_ast.parse(command_string)
+    except Exception:  # noqa: BLE001 -- unparseable => no file evidence
+        return []
+
+    out = []
+    seen = set()
+    for seg in parsed.segments:
+        words = list(seg.words)
+        i = 0
+        while i < len(words):
+            w = words[i]
+            raw = None
+            if w in flagset and i + 1 < len(words):
+                raw = words[i + 1]
+                i += 1
+            else:
+                for f in flagset:
+                    if f.startswith("--") and w.startswith(f + "="):
+                        raw = w[len(f) + 1:]
+                        break
+            i += 1
+            if not raw:
+                continue
+            p = _resolve_literal_path(raw)
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+                if len(out) >= SATISFIED_BY_FILE_MAX_FILES:
+                    return out
+    return out
+
+
+def _resolve_literal_path(word):
+    """Return an absolute path for ``word``, or None if it isn't one.
+
+    Declines anything that still carries shell syntax (so it was never a
+    literal path in the first place) and anything relative (we do not know
+    the tool's working directory, and guessing it would be a file read at an
+    address we invented).
+    """
+    if not isinstance(word, str) or not word:
+        return None
+    if any(c in word for c in _UNRESOLVABLE_PATH_CHARS):
+        return None
+    if word.startswith("~"):
+        expanded = os.path.expanduser(word)
+        if expanded.startswith("~"):  # unknown user => unresolved
+            return None
+        word = expanded
+    if not word.startswith("/"):
+        return None
+    return os.path.normpath(word)
+
+
+def _read_file_for_match(path):
+    """Read ``path`` for satisfied_by matching, or return None.
+
+    None means "no usable evidence here" and is returned for every failure
+    mode: missing, unreadable, not a regular file, too large, or any
+    unexpected OS error. None NEVER counts as a match.
+    """
+    fd = None
+    try:
+        # O_NONBLOCK so opening a FIFO cannot park the matcher waiting for a
+        # writer. We fstat the OPEN descriptor (not the path) so the regular
+        # -file check applies to what we actually read.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_size > SATISFIED_BY_FILE_MAX_BYTES:
+            return None
+        data = os.read(fd, SATISFIED_BY_FILE_MAX_BYTES)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _satisfied_by_pattern_matches(patt, command_string, file_arg_flags):
+    """True iff ``patt`` is found in the command string OR in the body of a
+    file named by one of ``file_arg_flags`` in that command.
+
+    The command-string check is unchanged and comes first, so this is purely
+    additive: nothing that matched before stops matching.
+    """
+    if patt.search(command_string or ""):
+        return True
+    for path in _file_arg_paths(command_string, file_arg_flags):
+        body = _read_file_for_match(path)
+        if body is None:
+            continue
+        if patt.search(body):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: post-tool-satisfy  -- called by PostToolUse hook
 # ---------------------------------------------------------------------------
 
@@ -3556,18 +3757,24 @@ def _satisfy_by_completion(tool_name, command_string):
                 continue
             sb_tool_pat = sb.get("tool_pattern") or "*"
             sb_cmd_pat = sb.get("command_pattern") or ""
+            sb_file_flags = sb.get("file_arg_flags") or []
+            if not isinstance(sb_file_flags, list):
+                sb_file_flags = []
             # tool_pattern check uses our standard matcher
             if not _tool_pattern_matches(sb_tool_pat, tool_name, command_string):
                 kept.append(ob)
                 continue
-            # command_pattern is a regex match against command_string
+            # command_pattern is a regex matched against command_string and
+            # -- when file_arg_flags is set -- against the body of the files
+            # that command names. See _satisfied_by_pattern_matches.
             if sb_cmd_pat:
                 try:
                     patt = re.compile(sb_cmd_pat)
                 except re.error:
                     kept.append(ob)
                     continue
-                if not patt.search(command_string or ""):
+                if not _satisfied_by_pattern_matches(
+                        patt, command_string, sb_file_flags):
                     kept.append(ob)
                     continue
             removed_ids.append(ob.get("id"))
@@ -3696,6 +3903,15 @@ def build_parser():
                        help="tool_pattern for auto-satisfy")
     p_add.add_argument("--satisfied-by-cmd-regex", default=None,
                        help="command regex for auto-satisfy")
+    p_add.add_argument("--satisfied-by-file-flag", action="append",
+                       default=None, metavar="FLAG",
+                       help="option flag (e.g. -F, --file) whose ARGUMENT is a "
+                            "path; --satisfied-by-cmd-regex is then ALSO "
+                            "matched against that file's contents, so a "
+                            "command that hands its payload over as a file "
+                            "can auto-satisfy. Repeatable. Requires "
+                            "--satisfied-by-cmd-regex (a file body with no "
+                            "anchor to find would be no anchor at all).")
     p_add.add_argument("--created-by", default="manual",
                        help="audit string (e.g. 'main-loop', 'andrew')")
     p_add.add_argument("--mandatory", action="store_true",
