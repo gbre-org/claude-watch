@@ -52,6 +52,7 @@ Known job-names (one per `cw-default` entry):
 | `stale-ready-check` | `claude-watch stale-ready-check` (stale-ready watchdog) |
 | `queue-check` | `claude-watch queue-check` (orphaned/stuck watchdog) |
 | `watcher-health-check` | `cw-watcher-health-check` (dead-event-watcher [CLAUDE-WATCH] injector) |
+| `session-rotate` | `session-task queue rotate` (daily queue-logs prune + completed-tasks.jsonl roll) |
 
 ### Silence the incident job right now
 
