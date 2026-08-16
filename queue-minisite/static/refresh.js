@@ -182,10 +182,18 @@
   // so folding hides detail but never information.
   // ---------------------------------------------------------------------
   const SECTION_KEY_PREFIX = 'section:';
+  // WEDGED / QUARANTINED / OTHER default OPEN: all three are
+  // attention-required by construction (the first two still HOLD THEIR SCOPE
+  // while nobody works them; the third is a status this UI doesn't recognise),
+  // so folding them by default would re-create a softer version of the bug
+  // they were added to fix.
   const SECTION_DEFAULT_OPEN = {
     running: true,
+    wedged: true,
+    quarantined: true,
     pending: true,
     blocked: false,
+    other: true,
     done: false,
     abandoned: false,
   };
@@ -578,6 +586,166 @@
     );
   }
 
+  // Shared card fragments for the scope-holding + fallback sections. Kept as
+  // helpers so the three renderers below can't drift from each other.
+  function renderScope(it) {
+    if (!it.scope || !it.scope.length) return '';
+    return '<div class="scope">' +
+      it.scope.map((s) => `<span class="chip">${esc(s)}</span>`).join('') +
+      '</div>';
+  }
+
+  function renderPrompt(it) {
+    if (!it.description) return '';
+    return '<details class="prompt-toggle">' +
+      `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
+      `<pre class="prompt-body">${esc(it.description)}</pre>` +
+      '</details>';
+  }
+
+  // Exit commands for a scope-holding state. MUST mirror the exit_cmd() Jinja
+  // macro in templates/index.html: this markup replaces the server's paint on
+  // the first 5s tick, so an affordance present only in the template silently
+  // disappears — the same way the whole BLOCKED section once did
+  // (q-2026-05-20-db66).
+  //
+  // Commands, not one-click buttons, on purpose: every exit is an assertion
+  // about whether a process is still alive, and that judgement is exactly
+  // what the quarantine state exists to stop the system from making on an
+  // inference. The copy button (static/copy-cmd.js) removes the typing, not
+  // the decision.
+  function renderExitList(exits) {
+    const rows = exits.map(([cmd, note]) => (
+      '<li class="exit">' +
+      `<code class="exit-cmd">${esc(cmd)}</code>` +
+      `<button type="button" class="copy-cmd-btn" data-copy="${attr(cmd)}" ` +
+      `title="Copy this command" aria-label="Copy command: ${attr(cmd)}">copy</button>` +
+      `<span class="exit-note">${esc(note)}</span>` +
+      '</li>'
+    )).join('');
+    return (
+      '<div class="exits"><span class="exits-label">exits</span>' +
+      `<ul class="exit-list">${rows}</ul></div>`
+    );
+  }
+
+  function renderWedgedItem(it) {
+    // Markup MUST mirror the WEDGED block in templates/index.html.
+    //
+    // `wedged` items were dropped entirely by the old bucketing (no branch
+    // matched, no else existed), so a stuck agent's row vanished from the UI
+    // while it kept holding its scope.
+    let head = '<span class="badge state-wedged" title="was running; the owning agent is stuck. Still holds its scope.">wedged</span>';
+    if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
+    head += `<span class="id">${esc(it.id)}</span>`;
+    head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+
+    const iso = it.wedged_at_iso || '';
+    let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">wedged ${relAge(it.age, it.age_epoch)}</span>`;
+    if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
+
+    let reasonHtml = '';
+    if (it.wedged_reason) {
+      reasonHtml = `<p class="description abandon-reason"><strong>wedge:</strong> ${esc(it.wedged_reason)}</p>`;
+    }
+
+    const exits = renderExitList([
+      [`session-task queue unwedge ${it.id}`,
+        'the agent recovered — back to running'],
+      [`session-task queue abandon ${it.id} --reason "..."`,
+        'give up — quarantines the item (scope stays held) unless you pass --confirmed-dead'],
+    ]);
+
+    return (
+      `<article id="queue-${attr(it.id)}" class="item state-wedged" data-queue-id="${attr(it.id)}" data-queue-status="wedged" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}">` +
+      `<header class="item-head">${head}</header>` +
+      `<p class="summary">${esc(it.summary)}</p>` +
+      reasonHtml +
+      `<div class="age">${ageBlock}</div>` +
+      renderScope(it) +
+      exits +
+      renderPrompt(it) +
+      '</article>'
+    );
+  }
+
+  function renderQuarantinedItem(it) {
+    // Markup MUST mirror the QUARANTINED block in templates/index.html.
+    //
+    // A quarantined item is an abandon that could NOT be proven safe: the
+    // owning process may still be alive, so the scope stays locked and the
+    // item waits on a human. Dropping it from the render (the old behavior)
+    // meant the operator saw the work vanish while every later spawn on that
+    // scope was refused with no visible cause.
+    let head = '<span class="badge state-quarantined" title="abandoned without evidence the agent is gone — the scope is STILL HELD. Needs an operator decision.">quarantined</span>';
+    if (it.quarantined_from) {
+      head += `<span class="badge quarantined-from" title="status the item held when it was quarantined">from ${esc(it.quarantined_from)}</span>`;
+    }
+    if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
+    head += `<span class="id">${esc(it.id)}</span>`;
+    head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+
+    const iso = it.quarantined_at_iso || '';
+    let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">quarantined ${relAge(it.age, it.age_epoch)}</span>`;
+    if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
+
+    let reasonHtml = '';
+    if (it.quarantine_reason) {
+      reasonHtml = `<p class="description abandon-reason"><strong>quarantine:</strong> ${esc(it.quarantine_reason)}</p>`;
+    }
+    reasonHtml += '<p class="description scope-held"><strong>scope still held.</strong> ' +
+      'No agent is working this item, and no peer can spawn into its scope until the quarantine ends.</p>';
+
+    // Three exits, descending evidential strength — same order the CLI
+    // prints, so the two surfaces can't tell the operator different stories.
+    const exits = renderExitList([
+      [`session-task queue done ${it.id}`,
+        'the agent came back and finished — strongest evidence it was alive'],
+      [`session-task queue resurrect ${it.id}`,
+        'respawn a replacement — old row goes terminal, new row carries the same scope'],
+      [`session-task queue release ${it.id} --reason "..."`,
+        'you assert the process is gone — terminal, frees the scope'],
+    ]);
+
+    return (
+      `<article id="queue-${attr(it.id)}" class="item state-quarantined" data-queue-id="${attr(it.id)}" data-queue-status="quarantined" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}">` +
+      `<header class="item-head">${head}</header>` +
+      `<p class="summary">${esc(it.summary)}</p>` +
+      reasonHtml +
+      `<div class="age">${ageBlock}</div>` +
+      renderScope(it) +
+      exits +
+      renderPrompt(it) +
+      '</article>'
+    );
+  }
+
+  function renderOtherItem(it) {
+    // Fallback card for a status with no declared section. Renders ONLY
+    // fields every queue item is guaranteed to have, so it cannot break on a
+    // status whose extra fields this code has never seen. Markup MUST mirror
+    // the OTHER block in templates/index.html.
+    const status = it.status || 'unknown';
+    let head = `<span class="badge state-other" title="unrecognised status — this UI has no section for it">${esc(status)}</span>`;
+    if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
+    head += `<span class="id">${esc(it.id)}</span>`;
+    head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+
+    const iso = it.created_at_iso || '';
+    let ageBlock = `<span ${iso ? `data-local-time-iso="${attr(iso)}" data-local-time-title-only` : ''} title="${attr(iso)}">created ${relAge(it.age, it.age_epoch)}</span>`;
+    if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
+
+    return (
+      `<article id="queue-${attr(it.id)}" class="item state-other" data-queue-id="${attr(it.id)}" data-queue-status="${attr(status)}" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}">` +
+      `<header class="item-head">${head}</header>` +
+      `<p class="summary">${esc(it.summary)}</p>` +
+      `<div class="age">${ageBlock}</div>` +
+      renderScope(it) +
+      renderPrompt(it) +
+      '</article>'
+    );
+  }
+
   function renderPendingItem(it) {
     // Markup MUST mirror the pending block in templates/index.html. Any
     // drift will cause morphdom to flap on every tick (server's first
@@ -768,6 +936,58 @@
     );
   }
 
+  // WEDGED / QUARANTINED / OTHER sections. Like BLOCKED, the Jinja template
+  // wraps each in `{% if ... %}`, so an empty section is ABSENT from the
+  // server's paint — these renderers must return '' rather than an empty
+  // wrapper or morphdom would re-create the section every tick.
+  function renderWedgedSection(state) {
+    const totals = state.totals || {};
+    const items = state.wedged || [];
+    if (!items.length) return '';
+    return (
+      sectionHead('wedged', 'Wedged', esc(totals.wedged ?? items.length)) +
+      items.map(renderWedgedItem).join('') +
+      '</details>'
+    );
+  }
+
+  function renderQuarantinedSection(state) {
+    const totals = state.totals || {};
+    const items = state.quarantined || [];
+    if (!items.length) return '';
+    return (
+      sectionHead('quarantined', 'Quarantined',
+        esc(totals.quarantined ?? items.length)) +
+      items.map(renderQuarantinedItem).join('') +
+      '</details>'
+    );
+  }
+
+  function renderOtherSection(state) {
+    // The fallback bucket: every item whose status has no declared section.
+    // This section is the structural half of the fix — without it, a status
+    // added to the queue tomorrow would vanish here exactly the way `wedged`
+    // and `quarantined` did, and nothing in the UI would say so.
+    const totals = state.totals || {};
+    const items = state.other || [];
+    if (!items.length) return '';
+    const count = totals.other ?? items.length;
+    const statuses = (state.unknown_statuses || []).join(', ');
+    const note = '<div class="section-note">' +
+      `${esc(count)} item${count === 1 ? '' : 's'} with a status this UI has no section for` +
+      (statuses ? ` (${esc(statuses)})` : '') +
+      '. They are shown here rather than hidden. Add the status to ' +
+      '<code>STATUS_SECTION</code> in <code>app.py</code>, plus a section in ' +
+      '<code>templates/index.html</code> and <code>static/refresh.js</code>, ' +
+      'to give it a first-class view.</div>';
+    return (
+      sectionHead('other', 'Other', esc(count)) +
+      note +
+      items.map(renderOtherItem).join('') +
+      '</details>'
+    );
+  }
+
   function renderPendingSection(state) {
     const totals = state.totals || {};
     const items = state.pending || [];
@@ -815,15 +1035,20 @@
   }
 
   function buildQueueDOM(state) {
-    // Build a detached <main> with the five sections in order. The merge
+    // Build a detached <main> with the sections in order. The merge
     // target is the live <main id="queue-root"> so we wrap in the same
     // tag + id.
     // Section order MUST match templates/index.html:
-    //   RUNNING → PENDING → BLOCKED → DONE → ABANDONED.
-    // BLOCKED moved below PENDING 2026-08-05 (Andrew, botchat #833) —
-    // blocked items are parked on an external blocker and are the least
-    // actionable live section, so they sit under the spawnable PENDING
-    // backlog but still above the terminal DONE / ABANDONED sections.
+    //   RUNNING → WEDGED → QUARANTINED → PENDING → BLOCKED → OTHER
+    //   → DONE → ABANDONED.
+    // WEDGED + QUARANTINED sit directly under RUNNING because they ARE
+    // in-flight items that still HOLD THEIR SCOPE — a pending item in the
+    // same scope cannot spawn until one of them ends, so they have to be read
+    // before the pending backlog. BLOCKED moved below PENDING 2026-08-05
+    // (Andrew, botchat #833) — blocked items are parked on someone else and
+    // hold nothing. OTHER (the unrecognised-status fallback) sits above the
+    // terminal sections so a status this UI doesn't know about still lands in
+    // the live half of the page.
     // If this order drifts from the Jinja template, morphdom re-orders
     // the sections on the first 5s tick and the page visibly jumps.
     // The pre-2026-05-20 version (q-2026-05-20-db66) omitted BLOCKED
@@ -832,8 +1057,11 @@
     const html =
       `<main id="queue-root">` +
       renderRunningSection(state) +
+      renderWedgedSection(state) +
+      renderQuarantinedSection(state) +
       renderPendingSection(state) +
       renderBlockedSection(state) +
+      renderOtherSection(state) +
       renderDoneSection(state) +
       renderAbandonedSection(state) +
       '</main>';
@@ -866,7 +1094,24 @@
     if (startingCount) {
       html += `<span class="count count-starting" title="registered but agent not yet emitting events">${esc(startingCount)} starting</span>`;
     }
+    // Scope-holding attention states + the unrecognised-status fallback.
+    // These MUST be rendered here as well as in the Jinja template: this
+    // subtree is rebuilt every tick, so a pill that exists only server-side is
+    // discarded after ~5s. (The `blocked` pill was in exactly that state
+    // before this change — server-rendered, then silently dropped.)
+    if (totals.wedged) {
+      html += `<span class="count count-wedged" title="in-flight items whose owning agent is stuck — still holding their scope">${esc(totals.wedged)} wedged</span>`;
+    }
+    if (totals.quarantined) {
+      html += `<span class="count count-quarantined" title="abandoned without evidence the agent is gone — STILL HOLDING their scope, waiting on an operator decision">${esc(totals.quarantined)} quarantined</span>`;
+    }
+    if (totals.blocked) {
+      html += `<span class="count count-blocked" title="items parked on an external blocker (human greenlight, third-party API, etc.) — NOT alert candidates">${esc(totals.blocked)} blocked</span>`;
+    }
     html += `<span class="count count-pending" title="pending items">${esc(totals.pending ?? 0)} pending</span>`;
+    if (totals.other) {
+      html += `<span class="count count-other" title="items whose status this UI does not recognise — rendered in the fallback section rather than hidden">${esc(totals.other)} unrecognised</span>`;
+    }
     if (orphanCount) {
       html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
     }

@@ -11,6 +11,44 @@ Designed to sit BEHIND an upstream auth proxy (oauth2-proxy, nginx
 control — it trusts the `X-Auth-Request-Email` header for display only.
 Do not expose it to the public internet without a gate.
 
+## Status sections (and why none may be silently dropped)
+
+Items are bucketed into sections from a single table, `STATUS_SECTION` in
+`app.py`. Section order is RUNNING → WEDGED → QUARANTINED → PENDING →
+BLOCKED → OTHER → DONE → ABANDONED.
+
+`WEDGED` and `QUARANTINED` sit directly under RUNNING because they are
+in-flight items that **still hold their scope**: a pending peer in the same
+scope cannot start until one of them ends.
+
+* **wedged** — was running, the owning agent is stuck. Card shows the wedge
+  reason and the two ways out (`queue unwedge`, `queue abandon`).
+* **quarantined** — `queue abandon` was called on a scope-owning item without
+  positive evidence the process is gone, so the scope stays locked and the
+  item waits on a human. Card shows the quarantine reason, the fact that the
+  scope is still held, and the three exits in descending order of evidence
+  (`queue done`, `queue resurrect`, `queue release --reason ...`).
+
+The exits are shown as copyable commands rather than one-click buttons on
+purpose: each is an assertion about whether a process is still alive, and that
+judgement is exactly what the quarantine state exists to stop the system from
+making on an inference.
+
+**OTHER is the structural guarantee.** Bucketing previously used a hardcoded
+if/elif chain with no `else`, so any status it didn't name was dropped —
+no row, no count, no log line. `wedged` and `quarantined` were both invisible
+that way. Anything whose status has no declared section (including a missing
+or null status) now lands in OTHER, which renders the raw status verbatim and
+logs a one-time warning, so a status added to `session-task` tomorrow shows up
+immediately instead of disappearing. Giving it a first-class section means
+adding it to `STATUS_SECTION` plus a section in `templates/index.html` and
+`static/refresh.js` — an upgrade, never a prerequisite for visibility.
+
+Every section must exist in **both** renderers. The 5s morphdom refresh
+rebuilds `#queue-root` from `static/refresh.js`, so a section present only in
+the Jinja template flashes on first paint and vanishes on the first tick.
+`test_status_sections.py` and `test_foldable_sections.py` pin that parity.
+
 ## Done view (archive union)
 
 The **Done** section does NOT source solely from the `done` items still

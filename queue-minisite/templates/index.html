@@ -87,6 +87,31 @@
       {% endif %}
     </li>
   {%- endmacro -%}
+  {#- ---------- EXIT-COMMAND MACRO ----------
+      Renders ONE way out of a scope-holding state as a copyable command plus
+      a plain-English note on what it asserts. Used by the WEDGED and
+      QUARANTINED cards.
+
+      Rendering the state without the exits is only half a fix: a quarantined
+      item is *waiting on a human decision*, so the card has to answer "what
+      do I do about it?", not just "this exists". The commands are shown
+      rather than wired to one-click buttons on purpose — each exit is an
+      assertion about whether a process is alive, which is exactly the
+      judgement the quarantine state exists to stop the system from making on
+      an inference. The copy button removes the transcription work without
+      removing the decision.
+
+      MUST stay in step with renderExitList() in static/refresh.js — the 5s
+      morphdom merge replaces this markup with the JS version, so an
+      affordance that exists only here disappears after one tick. -#}
+  {%- macro exit_cmd(cmd, note) -%}
+    <li class="exit">
+      <code class="exit-cmd">{{ cmd }}</code>
+      <button type="button" class="copy-cmd-btn" data-copy="{{ cmd }}"
+              title="Copy this command" aria-label="Copy command: {{ cmd }}">copy</button>
+      <span class="exit-note">{{ note }}</span>
+    </li>
+  {%- endmacro -%}
   <header class="topbar">
     <div class="title">
       {#- HEADER COLLAPSE (botchat #1762): a caret button that folds the header
@@ -108,7 +133,10 @@
     <div class="meta" id="topbar-meta">
       <span class="count count-running" title="running items">{{ totals.running }} running</span>
       {% if starting_count %}<span class="count count-starting" title="registered but agent not yet emitting events">{{ starting_count }} starting</span>{% endif %}
+      {% if totals.wedged %}<span class="count count-wedged" title="in-flight items whose owning agent is stuck — still holding their scope">{{ totals.wedged }} wedged</span>{% endif %}
+      {% if totals.quarantined %}<span class="count count-quarantined" title="abandoned without evidence the agent is gone — STILL HOLDING their scope, waiting on an operator decision">{{ totals.quarantined }} quarantined</span>{% endif %}
       {% if totals.blocked %}<span class="count count-blocked" title="items parked on an external blocker (human greenlight, third-party API, etc.) — NOT alert candidates">{{ totals.blocked }} blocked</span>{% endif %}
+      {% if totals.other %}<span class="count count-other" title="items whose status this UI does not recognise — rendered in the fallback section rather than hidden">{{ totals.other }} unrecognised</span>{% endif %}
       <span class="count count-pending" title="pending items">{{ totals.pending }} pending</span>
       {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
       {#- DENSITY TOGGLE (botchat #1944): a "density" pill that flips the whole
@@ -325,6 +353,131 @@
       {% endfor %}
     </details>
 
+    {# ---------- WEDGED ----------
+       Items flipped to `wedged` by `session-task queue wedge <id> --reason
+       ...`: the item was running and the owning agent is stuck
+       (context-limit, prolonged thinking, stale heartbeat). It STILL OWNS
+       ITS SCOPE, so peers cannot spawn into the same scope while it sits
+       here — which is exactly why it must be visible. Before this section
+       existed the row matched no branch of the render bucketing and was
+       dropped, so a wedge looked like the work had simply vanished while it
+       silently kept the scope locked.
+       Rendered directly under RUNNING (it IS a running item, just stuck) and
+       DEFAULT OPEN — a wedge is attention-required by construction. #}
+    {% if wedged %}
+    <details id="section-wedged" class="queue-section" data-section-key="wedged" open>
+      <summary class="section-summary"><h2 class="section-title">Wedged <span class="section-count">{{ totals.wedged }}</span></h2></summary>
+      {% for it in wedged %}
+        <article
+          id="queue-{{ it.id }}"
+          class="item state-wedged"
+          data-queue-id="{{ it.id }}"
+          data-queue-status="wedged"
+          data-created-by="{{ it.created_by }}"
+          data-queue-summary="{{ it.summary }}"
+          data-queue-description="{{ it.description }}">
+          <header class="item-head">
+            <span class="badge state-wedged" title="was running; the owning agent is stuck. Still holds its scope.">wedged</span>
+            {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
+            <span class="id">{{ it.id }}</span>
+            <span class="prio" title="priority">p{{ it.priority }}</span>
+          </header>
+          <p class="summary">{{ it.summary }}</p>
+          {% if it.wedged_reason %}<p class="description abandon-reason"><strong>wedge:</strong> {{ it.wedged_reason }}</p>{% endif %}
+          <div class="age">
+            <span
+              {% if it.wedged_at_iso %}data-local-time-iso="{{ it.wedged_at_iso }}" data-local-time-title-only{% endif %}
+              title="{{ it.wedged_at_iso }}">wedged <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
+            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+          </div>
+          {% if it.scope %}
+            <div class="scope">
+              {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
+            </div>
+          {% endif %}
+          <div class="exits">
+            <span class="exits-label">exits</span>
+            <ul class="exit-list">
+              {{ exit_cmd('session-task queue unwedge ' ~ it.id, 'the agent recovered — back to running') }}
+              {{ exit_cmd('session-task queue abandon ' ~ it.id ~ ' --reason "..."', 'give up — quarantines the item (scope stays held) unless you pass --confirmed-dead') }}
+            </ul>
+          </div>
+          {% if it.description %}
+            <details class="prompt-toggle">
+              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
+              <pre class="prompt-body">{{ it.description }}</pre>
+            </details>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </details>
+    {% endif %}
+
+    {# ---------- QUARANTINED ----------
+       `queue abandon` was called on an item that OWNED ITS SCOPE without
+       positive evidence the owning process is gone. The item is NOT
+       terminal and it KEEPS the scope lock — the whole point is that we do
+       not know whether the agent is alive, so we do not release. That makes
+       it the single most operator-actionable state in the queue, and it was
+       invisible here: the row hit no bucketing branch and was dropped, so
+       the work looked gone while the next spawn on that scope kept getting
+       refused for a reason the UI never showed.
+       DEFAULT OPEN, above PENDING: a quarantined item blocks pending work in
+       the same scope, so it has to be read first. #}
+    {% if quarantined %}
+    <details id="section-quarantined" class="queue-section" data-section-key="quarantined" open>
+      <summary class="section-summary"><h2 class="section-title">Quarantined <span class="section-count">{{ totals.quarantined }}</span></h2></summary>
+      {% for it in quarantined %}
+        <article
+          id="queue-{{ it.id }}"
+          class="item state-quarantined"
+          data-queue-id="{{ it.id }}"
+          data-queue-status="quarantined"
+          data-created-by="{{ it.created_by }}"
+          data-queue-summary="{{ it.summary }}"
+          data-queue-description="{{ it.description }}">
+          <header class="item-head">
+            <span class="badge state-quarantined" title="abandoned without evidence the agent is gone — the scope is STILL HELD. Needs an operator decision.">quarantined</span>
+            {% if it.quarantined_from %}<span class="badge quarantined-from" title="status the item held when it was quarantined">from {{ it.quarantined_from }}</span>{% endif %}
+            {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
+            <span class="id">{{ it.id }}</span>
+            <span class="prio" title="priority">p{{ it.priority }}</span>
+          </header>
+          <p class="summary">{{ it.summary }}</p>
+          {% if it.quarantine_reason %}<p class="description abandon-reason"><strong>quarantine:</strong> {{ it.quarantine_reason }}</p>{% endif %}
+          <p class="description scope-held"><strong>scope still held.</strong> No agent is working this item, and no peer can spawn into its scope until the quarantine ends.</p>
+          <div class="age">
+            <span
+              {% if it.quarantined_at_iso %}data-local-time-iso="{{ it.quarantined_at_iso }}" data-local-time-title-only{% endif %}
+              title="{{ it.quarantined_at_iso }}">quarantined <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
+            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+          </div>
+          {% if it.scope %}
+            <div class="scope">
+              {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
+            </div>
+          {% endif %}
+          {# The three exits, in descending order of evidential strength —
+             same ordering the CLI prints, so the two surfaces agree. #}
+          <div class="exits">
+            <span class="exits-label">exits</span>
+            <ul class="exit-list">
+              {{ exit_cmd('session-task queue done ' ~ it.id, 'the agent came back and finished — strongest evidence it was alive') }}
+              {{ exit_cmd('session-task queue resurrect ' ~ it.id, 'respawn a replacement — old row goes terminal, new row carries the same scope') }}
+              {{ exit_cmd('session-task queue release ' ~ it.id ~ ' --reason "..."', 'you assert the process is gone — terminal, frees the scope') }}
+            </ul>
+          </div>
+          {% if it.description %}
+            <details class="prompt-toggle">
+              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
+              <pre class="prompt-body">{{ it.description }}</pre>
+            </details>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </details>
+    {% endif %}
+
     {# ---------- PENDING ---------- #}
     <details id="section-pending" class="queue-section" data-section-key="pending" open>
       <summary class="section-summary"><h2 class="section-title">Pending <span class="section-count">{{ totals.pending }}</span></h2></summary>
@@ -444,6 +597,63 @@
             <span
               {% if it.blocked_at_iso %}data-local-time-iso="{{ it.blocked_at_iso }}" data-local-time-title-only{% endif %}
               title="{{ it.blocked_at_iso }}">blocked <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
+            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+          </div>
+          {% if it.scope %}
+            <div class="scope">
+              {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
+            </div>
+          {% endif %}
+          {% if it.description %}
+            <details class="prompt-toggle">
+              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
+              <pre class="prompt-body">{{ it.description }}</pre>
+            </details>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </details>
+    {% endif %}
+
+    {# ---------- OTHER (unrecognised status) ----------
+       The fallback bucket, and the actual point of this whole section set.
+       Every status with no declared section lands here instead of being
+       dropped, so a status added to session-task tomorrow shows up as a
+       visible (if unstyled) row on the very first render rather than being
+       silently eaten the way `wedged` and `quarantined` were. The card is
+       deliberately generic: it renders only fields every queue item has, so
+       it cannot break on a status whose extra fields we've never seen.
+       DEFAULT OPEN — an unrecognised status is either new work this UI hasn't
+       caught up with or a corrupt row, and both want eyes on them. #}
+    {% if other %}
+    <details id="section-other" class="queue-section" data-section-key="other" open>
+      <summary class="section-summary"><h2 class="section-title">Other <span class="section-count">{{ totals.other }}</span></h2></summary>
+      <div class="section-note">
+        {{ totals.other }} item{{ '' if totals.other == 1 else 's' }} with a status this UI has no section for
+        ({{ unknown_statuses|join(', ') }}). They are shown here rather than hidden.
+        Add the status to <code>STATUS_SECTION</code> in <code>app.py</code>, plus a section in
+        <code>templates/index.html</code> and <code>static/refresh.js</code>, to give it a first-class view.
+      </div>
+      {% for it in other %}
+        <article
+          id="queue-{{ it.id }}"
+          class="item state-other"
+          data-queue-id="{{ it.id }}"
+          data-queue-status="{{ it.status }}"
+          data-created-by="{{ it.created_by }}"
+          data-queue-summary="{{ it.summary }}"
+          data-queue-description="{{ it.description }}">
+          <header class="item-head">
+            <span class="badge state-other" title="unrecognised status — this UI has no section for it">{{ it.status }}</span>
+            {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
+            <span class="id">{{ it.id }}</span>
+            <span class="prio" title="priority">p{{ it.priority }}</span>
+          </header>
+          <p class="summary">{{ it.summary }}</p>
+          <div class="age">
+            <span
+              {% if it.created_at_iso %}data-local-time-iso="{{ it.created_at_iso }}" data-local-time-title-only{% endif %}
+              title="{{ it.created_at_iso }}">created <span class="rel-age"{% if it.age_epoch %} data-rel-epoch="{{ '%.0f' % it.age_epoch }}"{% endif %}>{{ it.age }}</span></span>
             {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
           </div>
           {% if it.scope %}
@@ -843,5 +1053,6 @@
   <script src="{{ url_for('static', filename='info.js') }}" defer></script>
   <script src="{{ url_for('static', filename='live-log.js') }}" defer></script>
   <script src="{{ url_for('static', filename='keyboard.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='copy-cmd.js') }}" defer></script>
 </body>
 </html>

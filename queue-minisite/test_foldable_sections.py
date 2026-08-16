@@ -14,9 +14,12 @@ proves the fold survives a merge). All three must agree: if the template
 drifts, morphdom re-renders the section from the JS renderer's markup and the
 template's version is discarded within 5 seconds.
 
-Defaults pinned here: RUNNING + PENDING open (actionable work), BLOCKED /
-DONE / ABANDONED collapsed (parked + terminal noise). Operator toggles are
-persisted client-side in localStorage under ``section:<key>``.
+Defaults pinned here: RUNNING + WEDGED + QUARANTINED + PENDING + OTHER open,
+BLOCKED / DONE / ABANDONED collapsed. WEDGED and QUARANTINED still HOLD THEIR
+SCOPE while nobody works them, and OTHER holds rows whose status this UI does
+not recognise — all three are attention-required by construction, so folding
+them by default would hide exactly what they exist to surface. Operator
+toggles are persisted client-side in localStorage under ``section:<key>``.
 
 Run::
 
@@ -39,8 +42,11 @@ HERE = Path(__file__).resolve().parent
 # key -> default-open?
 SECTION_DEFAULTS = {
     "running": True,
+    "wedged": True,
+    "quarantined": True,
     "pending": True,
     "blocked": False,
+    "other": True,
     "done": False,
     "abandoned": False,
 }
@@ -94,6 +100,20 @@ class FoldableSectionsTest(unittest.TestCase):
             _item("q-run1", "running"),
             _item("q-pen1", "pending"),
             _item("q-blk1", "blocked", block_reason="waiting on a human"),
+            _item(
+                "q-wed1",
+                "wedged",
+                wedged_at="2026-06-01T00:02:00+00:00",
+                wedged_reason="context_limit",
+            ),
+            _item(
+                "q-qua1",
+                "quarantined",
+                quarantined_at="2026-06-01T00:03:00+00:00",
+                quarantine_reason="presumed dead",
+            ),
+            # Unrecognised status -> the always-visible fallback section.
+            _item("q-oth1", "some-future-state"),
             _item("q-don1", "done"),
             _item("q-aba1", "abandoned"),
         ]
@@ -113,7 +133,7 @@ class FoldableSectionsTest(unittest.TestCase):
         return m.group(0)
 
     def test_every_section_is_a_details_disclosure(self):
-        """All five status sections render as .queue-section <details>."""
+        """Every status section renders as a .queue-section <details>."""
         html = self._html()
         for key in SECTION_DEFAULTS:
             tag = self._open_tag(html, key)
@@ -153,12 +173,18 @@ class FoldableSectionsTest(unittest.TestCase):
     def test_items_live_inside_their_section(self):
         """Each card is nested in its section, so folding actually hides it."""
         html = self._html()
-        order = ["running", "pending", "blocked", "done", "abandoned"]
+        order = [
+            "running", "wedged", "quarantined", "pending", "blocked",
+            "other", "done", "abandoned",
+        ]
         bounds = [html.index(f'<details id="section-{k}"') for k in order]
         expected = {
             "running": "q-run1",
+            "wedged": "q-wed1",
+            "quarantined": "q-qua1",
             "pending": "q-pen1",
             "blocked": "q-blk1",
+            "other": "q-oth1",
             "done": "q-don1",
             "abandoned": "q-aba1",
         }
@@ -167,13 +193,23 @@ class FoldableSectionsTest(unittest.TestCase):
             end = bounds[i + 1] if i + 1 < len(bounds) else len(html)
             self.assertIn(expected[key], html[start:end], f"section-{key}")
 
-    def test_section_order_unchanged(self):
-        """RUNNING → PENDING → BLOCKED → DONE → ABANDONED (botchat #833)."""
+    def test_section_order(self):
+        """RUNNING → WEDGED → QUARANTINED → PENDING → BLOCKED → OTHER →
+        DONE → ABANDONED.
+
+        PENDING stays above BLOCKED (botchat #833). WEDGED + QUARANTINED sit
+        directly under RUNNING because they ARE in-flight items that still
+        hold their scope — a pending peer in the same scope cannot start until
+        one of them ends, so they have to be read first. OTHER stays in the
+        live half of the page, above the terminal sections."""
         html = self._html()
         found = re.findall(r'<details id="section-([a-z]+)"', html)
         self.assertEqual(
             found,
-            ["running", "pending", "blocked", "done", "abandoned"],
+            [
+                "running", "wedged", "quarantined", "pending", "blocked",
+                "other", "done", "abandoned",
+            ],
         )
 
     def test_renderer_and_template_agree_on_defaults(self):
