@@ -551,6 +551,71 @@ PASTE_EVENT_HANDLER_JS = """<script id="paste-event-handler-injected">
 """
 
 
+# JS: report the browser colour-scheme to the server so Claude Code's TUI
+# theme can follow it. The autodark swap above recolours the *terminal*
+# (xterm.js). This block additionally POSTs "dark"/"light" to the
+# clipboard-upload sidecar's /theme-report endpoint (q- dynamic-theme),
+# which writes it to a shared file; the in-container cw-theme-sync daemon
+# then injects `/config theme=<x>` so the CLAUDE-CODE TUI theme (not just
+# the terminal colours) tracks the browser. Fires on initial load and on
+# every prefers-color-scheme change; only POSTs on an actual change, and
+# re-arms on a failed POST so a transient error self-heals on the next flip.
+THEME_REPORT_JS = """<script id="theme-report-injected">
+(function() {
+    'use strict';
+    var REPORT_URL = '/theme-report';
+    var last = null;
+    var timer = null;
+
+    function current() {
+        try {
+            return window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark' : 'light';
+        } catch (e) { return 'dark'; }
+    }
+
+    function report() {
+        var t = current();
+        if (t === last) return;   // debounce: only report real changes
+        last = t;
+        try {
+            fetch(REPORT_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ theme: t }),
+                keepalive: true
+            }).then(function(resp) {
+                if (!resp || !resp.ok) { last = null; }  // re-arm on failure
+            }).catch(function() { last = null; });
+        } catch (e) { last = null; }
+    }
+
+    // Coalesce bursts (e.g. an OS toggle firing multiple mql events).
+    function schedule() {
+        if (timer) { clearTimeout(timer); }
+        timer = setTimeout(report, 300);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', schedule);
+    } else {
+        schedule();
+    }
+
+    try {
+        var mql = window.matchMedia('(prefers-color-scheme: dark)');
+        var onChange = function() { schedule(); };
+        if (mql.addEventListener) {
+            mql.addEventListener('change', onChange);
+        } else if (mql.addListener) {
+            mql.addListener(onChange);
+        }
+    } catch (e) { /* noop */ }
+})();
+</script>
+"""
+
+
 def inject(html: str) -> str:
     """Inject CSS + JS into the <head> of ttyd's bundled HTML.
 
@@ -568,7 +633,7 @@ def inject(html: str) -> str:
             "inject-autodark.py: '</head>' marker not found in input HTML"
         )
     injected = (
-        CSS + JS + PASTE_INTERCEPT_JS + PASTE_TOAST_STYLE
+        CSS + JS + THEME_REPORT_JS + PASTE_INTERCEPT_JS + PASTE_TOAST_STYLE
         + PASTE_EVENT_HANDLER_JS + marker
     )
     # Replace only the FIRST occurrence (xterm.js's inline JS may
@@ -600,6 +665,7 @@ def main() -> int:
     # explicitly NOT in this list. The toast surface keeps its
     # `cw-paste-image-toast` id (used by PASTE_EVENT_HANDLER_JS).
     for needle in ("autodark-injected", "prefers-color-scheme",
+                   "theme-report-injected",
                    "paste-intercept-injected",
                    "paste-toast-injected-style",
                    "cw-paste-image-toast",
