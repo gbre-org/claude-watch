@@ -131,6 +131,28 @@ def test_bashcmd_multiple_names():
     assert m(pat, "Bash", "something-else") is False
 
 
+def test_bashcmd_glob_matches_family():
+    # A whole command family can be named without enumerating it.
+    assert m("Bashcmd:botchat-*", "Bash", "botchat-history --unread") is True
+    assert m("Bashcmd:botchat-*", "Bash", "botchat-show 2008") is True
+    assert m("Bashcmd:botchat-*", "Bash", "signal-history") is False
+
+
+def test_bashcmd_glob_still_head_only():
+    # The glob is only ever tested against a real command HEAD -- a mention
+    # as an argument or inside a quoted string never matches.
+    assert m("Bashcmd:botchat-*", "Bash", "grep botchat-show f") is False
+    assert m(
+        "Bashcmd:botchat-*", "Bash", "grep -n 'botchat-show' Dockerfile | head"
+    ) is False
+
+
+def test_bashcmd_glob_failsafe_on_unparseable():
+    # Unparseable => word-boundary fallback, glob translated to \S*.
+    assert m("Bashcmd:botchat-*", "Bash", "botchat-show 'unterminated") is True
+    assert m("Bashcmd:botchat-*", "Bash", "echo 'unterminated") is False
+
+
 def test_bashcmd_failsafe_on_unparseable():
     # Unterminated quote => ShellParseError => fail-safe word-boundary match.
     # The command is unparseable AND does contain the name as a word, so the
