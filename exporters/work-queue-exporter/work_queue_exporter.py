@@ -449,9 +449,13 @@ def collect():
     g_locked_age.clear()
     g_progress_age.clear()
 
+    # Seeded so every known status reports a 0 series rather than
+    # disappearing. `quarantined` = abandoned on a guess that the agent
+    # died, still holding its scope lock; it is NOT terminal, so a
+    # long-lived one is something an operator should be able to alert on.
     status_counts = {
         "pending": 0, "running": 0, "wedged": 0, "blocked": 0,
-        "done": 0, "abandoned": 0,
+        "quarantined": 0, "done": 0, "abandoned": 0,
     }
     priority_counts = {}
     group_counts = {}

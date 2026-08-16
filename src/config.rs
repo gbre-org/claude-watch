@@ -816,7 +816,7 @@ fn default_update_resume_prompt() -> String {
     // 2026-05-15: q-6477 PR #203 sat green-and-unmerged for ~30 min
     // post-restart until WorkQueueOrphaned fired; this prompt makes
     // that recovery deterministic instead of alert-driven.
-    "You have ALREADY been restarted — this message was injected by claude-watch AFTER the restart completed, so do NOT restart again. Begin post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id>` (reason: agent orphaned across restart). Then resume normal dispatch.".to_string()
+    "You have ALREADY been restarted — this message was injected by claude-watch AFTER the restart completed, so do NOT restart again. Begin post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id> --confirmed-dead --reason 'agent orphaned across restart'` (--confirmed-dead because the restart demonstrably killed in-process agents; a bare abandon quarantines instead, holding the scope). Then resume normal dispatch.".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -94,7 +94,12 @@ def test_full_lifecycle_add_register_done():
 
 
 def test_abandon_with_reason():
-    """abandon records the reason on the item."""
+    """abandon records the reason on the item.
+
+    A registered item quarantines first (the caller is guessing that its
+    agent died), so the reason has to survive both hops: onto the
+    quarantine, then onto the terminal row when the operator releases it.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
         added = _add(env, "to abandon", ["repo:abandon"],
@@ -104,8 +109,29 @@ def test_abandon_with_reason():
         _run(env, "queue", "abandon", qid, "--reason", "bored", check=True)
 
         shown = _show(env, qid)
+        assert shown["status"] == "quarantined"
+        assert shown["quarantine_reason"] == "bored"
+
+        _run(env, "queue", "release", qid, check=True)
+        shown = _show(env, qid)
         assert shown["status"] == "abandoned"
-        assert shown["abandon_reason"] == "bored"
+        assert "bored" in shown["abandon_reason"]
+
+
+def test_abandon_confirmed_dead_is_terminal_immediately():
+    """With positive evidence of exit, abandon still goes straight to done-with."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        added = _add(env, "reaped", ["repo:abandon-cd"],
+                     "--summary", "reaped")
+        qid = added["id"]
+        _run(env, "queue", "register", qid, check=True)
+        _run(env, "queue", "abandon", qid, "--confirmed-dead", "--reason",
+             "rc=7", check=True)
+
+        shown = _show(env, qid)
+        assert shown["status"] == "abandoned"
+        assert shown["abandon_reason"] == "rc=7"
 
 
 def test_overlapping_scopes_share_group():
