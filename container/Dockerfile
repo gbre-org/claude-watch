@@ -1337,6 +1337,15 @@ COPY container/bin/xclip /usr/local/bin/xclip
 # same bytes.
 COPY container/bin/self-clear /usr/local/bin/self-clear
 
+# cw-theme-sync — make Claude Code's TUI theme follow the browser theme.
+# Long-lived process-compose process (see container/process-compose.yml):
+# watches the theme-report file the clipboard-upload sidecar writes on the
+# shared volume and injects `/config theme=<dark|light>` into the claude
+# pane when idle. The "auto" theme only auto-detects the terminal
+# background at STARTUP, so it can't follow a live browser theme flip
+# without this. Disable via CLAUDE_CONTAINER_THEME_SYNC_DISABLED=true.
+COPY container/bin/cw-theme-sync /usr/local/bin/cw-theme-sync
+
 # cw-watcher-health-check — cron-driven dead-watcher detector.
 # Checks for unconsumed events in the queue dir older than 2 min;
 # if any exist, injects a [CLAUDE-WATCH] alert into the tmux pane
@@ -1379,6 +1388,7 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
              /usr/local/bin/mcp-reconnect \
              /usr/local/bin/xclip \
              /usr/local/bin/self-clear \
+             /usr/local/bin/cw-theme-sync \
              /usr/local/bin/cw-watcher-health-check \
              /usr/local/bin/cw-cron-run \
              /usr/local/bin/cw-cron-toggle \

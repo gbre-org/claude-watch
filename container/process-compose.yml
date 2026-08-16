@@ -173,3 +173,29 @@ processes:
       signal: 15
       timeout: 3
     disabled: ${CLAUDE_CONTAINER_CRON_DISABLED:-false}
+
+  cw-theme-sync:
+    description: >-
+      Make Claude Code's TUI theme follow the browser/ttyd colour scheme.
+      Watches the theme-report file the clipboard-upload sidecar writes
+      (browser prefers-color-scheme -> POST /theme-report -> shared file)
+      and injects `/config theme=<dark|light>` into the claude pane when it
+      is idle. See container/bin/cw-theme-sync for the full rationale
+      (Claude Code's "auto" theme only probes the terminal background at
+      STARTUP, so it can't follow a live browser theme flip on its own).
+    command: /usr/local/bin/cw-theme-sync
+    depends_on:
+      setup-tmux-session:
+        condition: process_completed_successfully
+    availability:
+      restart: on_failure
+      backoff_seconds: 5
+      max_restarts: 0  # 0 == unlimited
+    # SIGTERM then SIGKILL after 3s — same fast-teardown backstop as the
+    # other long-running processes so process-compose finishes shutdown
+    # inside docker's stop_grace_period. The daemon is a plain poll loop
+    # with no children, so SIGTERM reaches it directly.
+    shutdown:
+      signal: 15
+      timeout: 3
+    disabled: ${CLAUDE_CONTAINER_THEME_SYNC_DISABLED:-false}

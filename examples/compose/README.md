@@ -515,6 +515,51 @@ If you don't want the autodark behavior, drop the `-I /usr/local/share/ttyd/inde
 line from `ttyd.command` in `docker-compose.yml`. ttyd will then serve
 its upstream bundled HTML unchanged.
 
+### Dynamic Claude Code TUI theme (follows the browser)
+
+The autodark block above recolours the **terminal** (xterm.js background +
+ANSI palette). That is separate from Claude Code's own `theme` setting,
+which controls how the **TUI** itself renders (diffs, syntax, selection,
+etc.). Claude Code's `theme: "auto"` picks light vs dark by probing the
+terminal background colour — but **only once, at process startup**. So a
+browser opened in dark mode statically gets a dark TUI, yet flipping the
+OS/browser colour scheme *while a session is live* leaves the TUI theme
+stuck. (This is the "theme switching doesn't work dynamically" wall.)
+
+The dynamic-theme wiring fixes the live case by explicitly re-setting the
+theme on every change instead of relying on startup auto-detect:
+
+1. **Browser** — the patched `index.html` (`ttyd/inject-autodark.py`,
+   `theme-report-injected` block) watches `prefers-color-scheme` and, on
+   load and on every change, POSTs `{"theme":"dark"|"light"}` to
+   `/theme-report` (debounced; re-arms on a failed POST).
+2. **Sidecar** — the `clipboard-upload` service's `POST /theme-report`
+   route atomically writes the value to `/host-clipboard/theme` on the
+   shared volume (override with `THEME_DEST_PATH`).
+3. **Daemon** — `cw-theme-sync` inside `claude-container` (a
+   process-compose process) watches that file and, when the pane is
+   **idle**, injects `/config theme=<dark|light>` into the Claude Code
+   tmux pane. `/config key=value` is a non-interactive slash command that
+   hot-applies the theme and re-renders without a restart.
+
+The inject is idle-gated (it never sends an Escape, so a theme toggle
+can't interrupt an in-flight turn — a busy pane just defers the swap
+until idle), coalescing (a rapid flip only applies the final theme),
+idempotent, and serialised with `self-clear` on the same `tmux send-keys`
+lock. It persists an explicit `theme` into the Claude Code settings file,
+overriding `"auto"` — intended, since a browser is now driving the theme.
+
+Requirements + knobs:
+
+- Needs the **clipboard-upload sidecar** deployed (it hosts the
+  `/theme-report` route) and `claude-container` mounting the
+  `host-clipboard` volume (the same volume the image-paste feature uses —
+  see below). Without the sidecar/volume, `cw-theme-sync` simply idles
+  (the report file never appears) and does nothing.
+- Disable with `CLAUDE_CONTAINER_THEME_SYNC_DISABLED=true`.
+- Tune via `CW_THEME_FILE`, `CW_THEME_PANE`, `CW_THEME_POLL_SECS`
+  (see `container/bin/cw-theme-sync`).
+
 ### Image paste from the browser clipboard
 
 Claude Code's `chat:imagePaste` action expects to read a PNG from the host

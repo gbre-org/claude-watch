@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""cw-theme-sync -- make Claude Code's TUI theme follow the browser theme.
+
+WHY THIS EXISTS (the "Reasons" a naive approach fails)
+------------------------------------------------------
+The ttyd browser terminal already flips xterm.js's *terminal colours*
+(background / ANSI palette) to match `prefers-color-scheme` -- see
+examples/compose/ttyd/inject-autodark.py. Claude Code's `theme` setting,
+when left at "auto", picks light vs dark by probing the terminal's
+background colour AT PROCESS STARTUP. So a browser started in dark mode
+statically gets a dark Claude TUI. But "auto" is resolved ONCE, at
+startup: Claude Code does NOT re-probe the terminal background when it
+changes mid-session, so flipping the browser/OS colour scheme while a
+session is live leaves the TUI theme stuck. That is the "it doesn't work
+dynamically" wall.
+
+THE MECHANISM
+-------------
+Explicit re-set instead of relying on startup auto-detect:
+
+  browser (prefers-color-scheme change)
+    -> POST /theme-report  (clipboard-upload sidecar, examples/compose)
+    -> sidecar atomically writes "dark"/"light" to CW_THEME_FILE
+       (default /host-clipboard/theme, on the shared volume)
+    -> THIS daemon (running inside claude-container) notices the file
+       change and injects `/config theme=<dark|light>` into the Claude
+       Code tmux pane.
+
+`/config` is a NON-INTERACTIVE slash command (Claude Code >= ~2.1;
+`supportsNonInteractive`, `argumentHint:"key=value"`): `/config
+theme=dark` sets the theme by key and hot-applies + re-renders WITHOUT a
+restart, so the swap is live. (Side effect: it persists an explicit
+`theme` value into the settings file, overriding "auto" -- intended: we
+are taking over theme control while a browser drives it.)
+
+DESIGN NOTES
+------------
+  * Idle-gated, NON-interrupting. We only inject when the pane shows an
+    idle prompt (the cursor glyph). We NEVER send an Escape blast -- the
+    user's browser theme toggle must not cancel the model's in-flight
+    turn. If the pane is busy the desired theme is remembered and applied
+    on a later poll once the pane goes idle.
+  * Debounced / coalescing. We always inject the CURRENT file value, so a
+    rapid light->dark->light flip only results in the final theme.
+  * Idempotent. We track the last theme we injected and skip no-op
+    re-injects.
+  * Serialised with self-clear. Both drive `tmux send-keys` on the same
+    pane; interleaved keystrokes corrupt each other. We take the same
+    non-blocking flock self-clear uses, held only around the single
+    inject, and skip-this-cycle (retry next poll) if it's contended.
+  * Dependency-free. Pure mtime poll (no inotify), tiny cost; theme
+    changes are rare.
+
+Configuration (env, all optional):
+  CW_THEME_FILE            theme report file to watch
+                           (default /host-clipboard/theme)
+  CW_THEME_PANE            tmux pane target (default: auto-resolve via
+                           `claude-watch status --json`, else
+                           claude-container:0.0)
+  CW_THEME_POLL_SECS       mtime poll interval (default 1.5)
+  CW_THEME_IDLE_POLL_SECS  how often to re-check idle while a change is
+                           pending (default 2.0)
+  CW_THEME_LOG             log path (default
+                           $XDG_STATE_HOME/claude-watch/theme-sync.log
+                           or /var/log/claude-watch/theme-sync.log)
+  CW_THEME_LOCK            send-keys coordination lock (default matches
+                           self-clear: $XDG_RUNTIME_DIR/claude-self-clear.lock
+                           or /var/run/claude/claude-self-clear.lock)
+
+Runs as a long-lived process under process-compose (see
+container/process-compose.yml). Disable with
+CLAUDE_CONTAINER_THEME_SYNC_DISABLED=true.
+"""
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Browser reports one of these; map straight onto Claude Code theme keys.
+# We keep it to the two base themes the browser's prefers-color-scheme can
+# express; a user who wants the daltonized / ansi variants sets `theme`
+# explicitly and would not run this daemon.
+VALID = ("dark", "light")
+
+_HOME = os.path.expanduser("~")
+
+
+def _env(name, default):
+    v = os.environ.get(name, "").strip()
+    return v if v else default
+
+
+def _default_log_file():
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    if state_home:
+        return str(Path(state_home) / "claude-watch" / "theme-sync.log")
+    return "/var/log/claude-watch/theme-sync.log"
+
+
+def _default_lock_file():
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return str(Path(runtime) / "claude-self-clear.lock")
+    return "/var/run/claude/claude-self-clear.lock"
+
+
+THEME_FILE = _env("CW_THEME_FILE", "/host-clipboard/theme")
+POLL_SECS = float(_env("CW_THEME_POLL_SECS", "1.5"))
+IDLE_POLL_SECS = float(_env("CW_THEME_IDLE_POLL_SECS", "2.0"))
+LOG_FILE = _env("CW_THEME_LOG", _default_log_file())
+LOCK_FILE = _env("CW_THEME_LOCK", _default_lock_file())
+
+
+def log(msg):
+    line = f"[{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}] {msg}"
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def run(cmd, timeout=10):
+    """Run a subprocess; return (stdout, rc). Never raises."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.returncode
+    except Exception:
+        return "", -1
+
+
+def resolve_pane():
+    """Resolve the Claude Code tmux pane.
+
+    Command-name INDEPENDENT: the native installer runs claude as a
+    version-string command, so we never match on command name. Prefer
+    `claude-watch status --json` (authoritative), then the env override,
+    then the conventional container pane. `claude-watch inject` does its
+    own resolution too, but we need a concrete pane for the idle check.
+    """
+    env_pane = os.environ.get("CW_THEME_PANE", "").strip()
+    if env_pane:
+        return env_pane
+    try:
+        out, _ = run(["claude-watch", "status", "--json"])
+        data = json.loads(out)
+        pane = data.get("pane") or data.get("pane_id")
+        if pane:
+            return pane
+    except Exception:
+        pass
+    return "claude-container:0.0"
+
+
+def is_idle(pane):
+    """True when the pane shows an idle input prompt cursor.
+
+    Mirrors self-clear's is_idle. We only inject when idle so a theme
+    toggle never interrupts an in-flight turn.
+    """
+    out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+    if rc != 0 or not out:
+        return False
+    for line in out.strip().split("\n")[-15:]:
+        if "❯" in line:  # the prompt cursor
+            return True
+    return False
+
+
+def read_theme():
+    """Read + validate the reported theme; return 'dark'/'light' or None."""
+    try:
+        val = Path(THEME_FILE).read_text(encoding="utf-8").strip().lower()
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log(f"read error: {e}")
+        return None
+    if val in VALID:
+        return val
+    if val:
+        log(f"ignoring unrecognised theme value {val!r} (want one of {VALID})")
+    return None
+
+
+def inject_theme(pane, theme):
+    """Inject `/config theme=<theme>` as a slash command. Returns True on
+    a verified submit.
+
+    Serialised with self-clear via the shared non-blocking flock: if
+    self-clear (or a prior inject) holds it, skip and retry next cycle.
+    """
+    try:
+        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as e:
+        log(f"lock open failed ({e}); injecting without send-keys lock")
+        lock_fd = None
+    if lock_fd is not None:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            log("send-keys lock contended (self-clear active?); retry next cycle")
+            os.close(lock_fd)
+            return False
+    try:
+        cmd = [
+            "claude-watch", "inject",
+            "--pane", pane,
+            "--slash-command",
+            "--submit", f"/config theme={theme}",
+        ]
+        out, rc = run(cmd, timeout=30)
+        if rc == 0:
+            log(f"injected /config theme={theme} (verified)")
+            return True
+        if rc == 3:
+            log(f"inject /config theme={theme}: submit NOT verified (rc=3); retry")
+        else:
+            log(f"inject /config theme={theme} failed rc={rc} out={out!r}; retry")
+        return False
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+
+
+def main():
+    try:
+        Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    if _env("CLAUDE_CONTAINER_THEME_SYNC_DISABLED", "false").lower() in (
+        "1", "true", "yes",
+    ):
+        log("CLAUDE_CONTAINER_THEME_SYNC_DISABLED set; exiting 0 (disabled)")
+        return 0
+
+    log(f"START: watching {THEME_FILE} (poll {POLL_SECS}s), lock={LOCK_FILE}")
+
+    applied = None          # last theme we successfully injected
+    desired = None          # last theme read from the file (may await idle)
+    last_mtime = None
+
+    while True:
+        try:
+            mtime = os.path.getmtime(THEME_FILE)
+        except OSError:
+            mtime = None
+        if mtime != last_mtime:
+            last_mtime = mtime
+            val = read_theme()
+            if val and val != desired:
+                log(f"theme reported: {val}")
+                desired = val
+
+        if desired and desired != applied:
+            pane = resolve_pane()
+            if is_idle(pane):
+                if inject_theme(pane, desired):
+                    applied = desired
+                time.sleep(POLL_SECS)
+                continue
+            time.sleep(min(IDLE_POLL_SECS, POLL_SECS))
+            continue
+
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
