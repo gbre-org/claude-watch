@@ -71,7 +71,7 @@ detections_required = 2
 cooldown = 120
 
 [heartbeat]
-stale_minutes = 10
+stale_minutes = 20
 
 [queue_check]
 # Enable in-tree stuck/orphaned queue-item detection events. The cron
