@@ -154,8 +154,20 @@ def _queue_done(qid: str) -> None:
 def _cleanup() -> None:
     for qid in _created_ids:
         # Try abandon (covers pending + running); done already went through above.
+        #
+        # --confirmed-dead is REQUIRED here: plain `abandon` on a running
+        # item QUARANTINES it rather than terminating it, so the row (and
+        # its scope lock) survives teardown and the suite leaks a
+        # quarantined `queue-gate-hook-test-*` row on every run. These rows
+        # were never dispatched to an agent -- the fixture registered them
+        # itself -- so "the process is gone" is not an assumption here, it
+        # is the setup. That is exactly the knowledge the flag is for.
+        # The liveness guard still runs (no --force): if claude-watch ever
+        # did report a live agent for one of these ids, the abandon refuses
+        # rather than silently forcing.
         subprocess.run(
-            ["session-task", "queue", "abandon", qid, "--reason", "hook test cleanup"],
+            ["session-task", "queue", "abandon", qid,
+             "--reason", "hook test cleanup", "--confirmed-dead"],
             capture_output=True, text=True, timeout=5, check=False,
         )
 
