@@ -776,6 +776,97 @@ assert('T21e3: applySectionState() applies the stored pref to the new section',
   !!$('#section-blocked') && !!$('#section-blocked').open);
 store.clear();
 
+// === TEST 22: WEDGED / QUARANTINED / OTHER sections ===
+// Same class of bug as TEST 15, two more instances plus the general fix.
+// buildQueueDOM used to emit only running/pending/blocked/done/abandoned, and
+// app.py's bucketing dropped anything that matched no branch — so `wedged` and
+// `quarantined` rows were invisible on BOTH paints, and any future status
+// would have been too. `quarantined` is the worst case: the item still HOLDS
+// ITS SCOPE, so the work looks like it vanished while the next spawn on that
+// scope keeps getting refused.
+const stateJ = JSON.parse(JSON.stringify(stateI));
+stateJ.wedged = [{
+  id: 'q-wed1',
+  summary: 'stuck agent',
+  description: '',
+  scope: ['repo:example'],
+  group_head: false,
+  status: 'wedged',
+  priority: 3,
+  created_by: 'main-loop',
+  wedged_reason: 'context_limit',
+  wedged_at_iso: '2026-08-10T12:00:00Z',
+  age: '2h ago',
+}];
+stateJ.quarantined = [{
+  id: 'q-qua1',
+  summary: 'presumed dead, scope held',
+  description: '',
+  scope: ['repo:example'],
+  group_head: false,
+  status: 'quarantined',
+  priority: 3,
+  created_by: 'main-loop',
+  quarantine_reason: 'no output for 40m',
+  quarantined_from: 'running',
+  quarantined_at_iso: '2026-08-11T09:00:00Z',
+  age: '1h ago',
+}];
+stateJ.other = [{
+  id: 'q-oth1',
+  summary: 'status this UI has never seen',
+  description: '',
+  scope: [],
+  group_head: false,
+  status: 'hibernating',
+  priority: 3,
+  created_by: 'main-loop',
+  created_at_iso: '2026-08-12T09:00:00Z',
+  age: '30m ago',
+}];
+stateJ.unknown_statuses = ['hibernating'];
+stateJ.totals = Object.assign({}, stateJ.totals, {
+  wedged: 1, quarantined: 1, other: 1,
+});
+refresh.mergeQueueRoot(stateJ);
+
+assert('T22a: #section-wedged rendered', !!$('#section-wedged'));
+assert('T22b: #section-quarantined rendered', !!$('#section-quarantined'));
+assert('T22c: #section-other rendered (unrecognised status is NOT dropped)',
+  !!$('#section-other'));
+assert('T22d: wedged card present with its reason',
+  !!$('article[data-queue-id="q-wed1"]') &&
+  $('#section-wedged').textContent.includes('context_limit'));
+assert('T22e: quarantined card shows reason + origin status',
+  $('#section-quarantined').textContent.includes('no output for 40m') &&
+  $('#section-quarantined').textContent.includes('from running'));
+assert('T22f: quarantined card says the scope is still held',
+  $('#section-quarantined').textContent.includes('scope still held'));
+const quarText = $('#section-quarantined').textContent;
+['session-task queue done q-qua1',
+ 'session-task queue resurrect q-qua1',
+ 'session-task queue release q-qua1 --reason'].forEach((cmd) => {
+  assert(`T22g: quarantined card offers "${cmd}"`, quarText.includes(cmd));
+});
+assert('T22h: exit commands carry a copy button with the exact command',
+  !!$('#section-quarantined').querySelector(
+    'button.copy-cmd-btn[data-copy="session-task queue done q-qua1"]'));
+assert('T22i: unrecognised status is rendered verbatim on the fallback card',
+  !!$('article[data-queue-id="q-oth1"]') &&
+  $('#section-other').textContent.includes('hibernating'));
+// ...and they disappear cleanly when the states empty (no stale wrapper).
+const stateK = JSON.parse(JSON.stringify(stateJ));
+stateK.wedged = [];
+stateK.quarantined = [];
+stateK.other = [];
+stateK.unknown_statuses = [];
+stateK.totals.wedged = 0;
+stateK.totals.quarantined = 0;
+stateK.totals.other = 0;
+refresh.mergeQueueRoot(stateK);
+assert('T22k: empty scope-holding + fallback sections are removed',
+  !$('#section-wedged') && !$('#section-quarantined') && !$('#section-other'));
+
 console.log('---');
 if (failures) {
   console.error(`FAILED: ${failures} assertion(s)`);

@@ -22,6 +22,9 @@
   --starting:  #cb4b16; /* orange — queue-running but no agent yet */
   --pending:   #b58900; /* yellow */
   --blocked:   #d33682; /* magenta — parked on external blocker */
+  --wedged:    #cb4b16; /* orange — in-flight but stuck; still holds scope */
+  --quarantined: #dc322f; /* red — scope held, liveness unknown, needs a human */
+  --other:     #268bd2; /* blue — status this UI has no section for */
   --done:      #859900; /* green */
   --abandoned: #93a1a1; /* base1 */
   --orphan:    #dc322f; /* red */
@@ -44,6 +47,9 @@
     --starting:  #cb4b16;
     --pending:   #b58900;
     --blocked:   #d33682;
+    --wedged:    #cb4b16;
+    --quarantined: #dc322f;
+    --other:     #268bd2;
     --done:      #859900;
     --abandoned: #586e75;
     --orphan:    #dc322f;
@@ -205,6 +211,9 @@ html.header-collapsed .topbar .density-control { display: none; }
 .count-running  { color: var(--running);  border-color: var(--running); }
 .count-starting { color: var(--starting); border-color: var(--starting); }
 .count-blocked  { color: var(--blocked);  border-color: var(--blocked); }
+.count-wedged   { color: var(--wedged);   border-color: var(--wedged); }
+.count-quarantined { color: var(--quarantined); border-color: var(--quarantined); }
+.count-other    { color: var(--other);    border-color: var(--other); }
 .count-pending  { color: var(--pending);  border-color: var(--pending); }
 .count-orphan   { color: var(--orphan);   border-color: var(--orphan); }
 
@@ -357,6 +366,13 @@ html.header-collapsed .topbar .density-control { display: none; }
 .item.state-running   { border-left-color: var(--running); }
 .item.state-starting  { border-left-color: var(--starting); background: color-mix(in srgb, var(--starting) 6%, var(--bg-alt)); }
 .item.state-blocked   { border-left-color: var(--blocked); background: color-mix(in srgb, var(--blocked) 6%, var(--bg-alt)); }
+/* Scope-holding attention states. Both are tinted (not faded like the
+   terminal states) because the work is NOT over: the item still owns its
+   scope, so a pending peer in the same scope cannot start until it ends. */
+.item.state-wedged      { border-left-color: var(--wedged); background: color-mix(in srgb, var(--wedged) 7%, var(--bg-alt)); }
+.item.state-quarantined { border-left-color: var(--quarantined); background: color-mix(in srgb, var(--quarantined) 7%, var(--bg-alt)); }
+/* Unrecognised status — visible and clearly flagged, deliberately plain. */
+.item.state-other       { border-left-color: var(--other); background: color-mix(in srgb, var(--other) 6%, var(--bg-alt)); }
 .item.state-pending   { border-left-color: var(--pending); }
 .item.state-pending.ready { border-left-color: var(--ready); }
 .item.state-done      { border-left-color: var(--done); opacity: 0.75; }
@@ -414,6 +430,17 @@ html.header-collapsed .topbar .density-control { display: none; }
 .badge.state-abandoned { background: var(--abandoned); }
 .badge.state-errored   { background: var(--orphan); }
 .badge.state-orphan    { background: var(--orphan); }
+.badge.state-wedged      { background: var(--wedged); }
+.badge.state-quarantined { background: var(--quarantined); }
+.badge.state-other       { background: var(--other); }
+/* "from running" / "from wedged" — the status the item held when it was
+   quarantined. Outlined rather than filled so it reads as a qualifier on the
+   quarantined badge next to it, not a second state. */
+.badge.quarantined-from {
+  background: transparent;
+  color: var(--quarantined);
+  border: 1px solid var(--quarantined);
+}
 .badge.ghead {
   background: transparent;
   color: var(--ready);
@@ -447,6 +474,99 @@ html.header-collapsed .topbar .density-control { display: none; }
 }
 
 .description.abandon-reason > strong { font-style: normal; }
+
+/* "scope still held" line on a quarantined card. This is the consequence the
+   operator most needs and the one the old UI never showed at all: no agent is
+   working the item, and nothing else can start in its scope either. */
+.description.scope-held {
+  font-style: normal;
+  color: var(--quarantined);
+}
+
+/* ------- exit commands (wedged / quarantined cards) -------
+   The ways OUT of a scope-holding state, rendered as copyable commands with a
+   one-line note on what each one asserts. Showing the state without the exits
+   leaves the operator knowing something is stuck but not what to do about it,
+   which is most of the problem these sections were added to solve. */
+.exits {
+  margin: 8px 0 4px 0;
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+}
+
+.exits-label {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-mute);
+  margin-bottom: 6px;
+}
+
+.exit-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.exit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.exit-cmd {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  color: var(--fg-emph);
+  background: var(--bg-alt);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 2px 6px;
+  word-break: break-all;
+}
+
+.exit-note {
+  font-size: 0.8rem;
+  color: var(--fg-mute);
+}
+
+.copy-cmd-btn {
+  font: inherit;
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  background: var(--bg-alt);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.copy-cmd-btn:hover { color: var(--fg-emph); border-color: var(--fg-mute); }
+
+/* Explainer at the top of the OTHER (unrecognised status) section. */
+.section-note {
+  margin: 0 0 10px 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--other);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--other) 6%, var(--bg-alt));
+  color: var(--fg);
+  font-size: 0.85rem;
+}
+
+.section-note code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
 
 .age {
   font-size: 0.82rem;
@@ -1913,6 +2033,13 @@ html.density-compact .item > .prompt-toggle:not(.subagent-tree) { display: none;
    this die?" from the page. Higher specificity than the blanket hide above,
    and ordered after it. */
 html.density-compact .item > .description.abandon-reason { display: block; }
+
+/* Same exception for the quarantine consequence line. A quarantined item is
+   waiting on a human decision; a compact view that hides "scope still held"
+   reproduces the original bug in miniature — the row is present but says
+   nothing you can act on. (The .exits block is not covered by the blanket
+   hide above, so the ways out survive compact density as-is.) */
+html.density-compact .item > .description.scope-held { display: block; }
 
 /* Pending-item drag affordances: keep functional but shrink the handle + dep
    badges so a pending row matches the running-row height. */

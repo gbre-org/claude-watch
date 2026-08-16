@@ -178,6 +178,91 @@ RECENT_ABANDONED_LIMIT = int(os.environ.get("RECENT_ABANDONED_LIMIT", "20"))
 # bug-detection signal we don't want to swallow.
 STARTING_WINDOW_SECONDS = float(os.environ.get("STARTING_WINDOW_SECONDS", "60"))
 
+# ---------------------------------------------------------------------------
+# Status -> section registry (the "no status may go invisible" rule)
+# ---------------------------------------------------------------------------
+#
+# The render pass used to bucket items with a hardcoded if/elif chain and
+# SILENTLY DROP anything that matched no branch. That is a bug factory, not a
+# bug: every status added to the queue after the chain was written became
+# invisible in the UI the moment it shipped, with no error, no count, and no
+# empty-section placeholder to hint that rows were being eaten.
+#
+# Two statuses were already being eaten this way:
+#
+#   * ``wedged``      — an in-flight item whose owning agent is stuck. It
+#                       still OWNS ITS SCOPE.
+#   * ``quarantined`` — ``queue abandon`` was called on a scope-owning item
+#                       without positive evidence the process is gone. It
+#                       still OWNS ITS SCOPE and is waiting on a human to
+#                       pick one of three exits.
+#
+# Both are exactly the rows an operator must see: the work looks like it
+# vanished while the scope stays locked and the next spawn on that scope is
+# refused for a reason the UI never explains.
+#
+# The fix is structural rather than two more hardcoded branches. Bucketing is
+# table-driven from ``STATUS_SECTION`` and anything unrecognised falls into
+# ``SECTION_UNKNOWN_KEY`` — a section that always renders (and logs a warning
+# once per unseen status) — so a status added tomorrow shows up as an
+# unstyled-but-VISIBLE row instead of disappearing. Adding a first-class
+# section for a new status then becomes a presentation upgrade, never a
+# prerequisite for it being visible at all.
+SECTION_UNKNOWN_KEY = "other"
+
+# status (as written by session-task) -> payload/section key. Every value here
+# must have a matching section in templates/index.html AND in
+# static/refresh.js' buildQueueDOM — see the mirroring note in refresh.js.
+STATUS_SECTION: dict[str, str] = {
+    "running": "running",
+    "wedged": "wedged",
+    "quarantined": "quarantined",
+    "pending": "pending",
+    "blocked": "blocked",
+    "done": "done",
+    "abandoned": "abandoned",
+}
+
+# Payload keys for the live (non-capped) sections, in render order. Kept as a
+# tuple so the payload, the totals map and the tests all read from one list.
+SECTION_KEYS: tuple[str, ...] = (
+    "running",
+    "wedged",
+    "quarantined",
+    "pending",
+    "blocked",
+    "done",
+    "abandoned",
+    SECTION_UNKNOWN_KEY,
+)
+
+# Statuses we've already warned about, so an unrecognised status logs once per
+# process rather than once per render tick (the page refreshes every 5s).
+_warned_unknown_statuses: set[str] = set()
+
+
+def _note_unknown_status(status: str) -> None:
+    """Log (once per process) that a queue status has no declared section.
+
+    Deliberately non-fatal: the row still renders in the fallback section.
+    The log line is the second half of the guarantee — the operator sees the
+    row, and whoever maintains this file sees that a section is missing.
+    """
+    if status in _warned_unknown_statuses:
+        return
+    _warned_unknown_statuses.add(status)
+    try:
+        app.logger.warning(
+            "queue item has unrecognised status %r — rendering it in the "
+            "'%s' fallback section. Add it to STATUS_SECTION (app.py) plus a "
+            "section in templates/index.html and static/refresh.js to give "
+            "it a first-class view.",
+            status,
+            SECTION_UNKNOWN_KEY,
+        )
+    except Exception:  # pragma: no cover — logging must never break a render
+        pass
+
 # Path to the vendored session-task script inside the container. Same
 # Python-stdlib-only implementation as the in-repo
 # tools/session-task/session-task; copied in at Docker build time. See Dockerfile.
@@ -915,6 +1000,12 @@ def _shape(
     owner_bindings: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     status = item.get("status", "unknown")
+    # Normalize to a non-empty string. A missing / null / non-string status is
+    # itself an "unrecognised status" and must route to the fallback section
+    # rather than silently comparing unequal to every branch below and
+    # vanishing (that is the exact failure this file is being fixed for).
+    if not isinstance(status, str) or not status.strip():
+        status = "unknown"
     # Hostjob status reconciliation. A hostjob-bound item stuck `running` in
     # queue.json (the reaper's fail-soft done/abandon flip never landed, or a
     # later `hostjob clean` removed the terminal state dir) must render by its
@@ -947,11 +1038,23 @@ def _shape(
     abandoned = _parse_iso(item.get("abandoned_at"))
 
     blocked_at = _parse_iso(item.get("blocked_at"))
+    # `wedged_at` / `quarantined_at` are stamped by `session-task queue wedge`
+    # and by the quarantining branch of `queue abandon`. Both are PRESERVED on
+    # the row after recovery (unwedge / quarantine release) for post-mortem, so
+    # they are only ever read while the item is actually in that status.
+    wedged_at = _parse_iso(item.get("wedged_at"))
+    quarantined_at = _parse_iso(item.get("quarantined_at"))
 
     # Pick the most-relevant "age anchor" for the visible age string.
     if status == "running" and started:
         age_anchor = started
         age_label = "running"
+    elif status == "wedged" and wedged_at:
+        age_anchor = wedged_at
+        age_label = "wedged"
+    elif status == "quarantined" and quarantined_at:
+        age_anchor = quarantined_at
+        age_label = "quarantined"
     elif status == "blocked" and blocked_at:
         age_anchor = blocked_at
         age_label = "blocked"
@@ -1048,6 +1151,16 @@ def _shape(
         "created_by": item.get("created_by", ""),
         "abandon_reason": item.get("abandon_reason", ""),
         "block_reason": item.get("block_reason", ""),
+        # Why the item is wedged / quarantined. Both are operator- (or
+        # reaper-) supplied free text and are the ONLY record of why the row
+        # is parked in a scope-holding state, so they render on the card the
+        # same way `blocker:` / `reason:` already do.
+        "wedged_reason": item.get("wedged_reason", "") or "",
+        "quarantine_reason": item.get("quarantine_reason", "") or "",
+        # The status the item held when it was quarantined ("running" or
+        # "wedged"). Surfaced so the operator can tell a quarantined healthy
+        # runner from a quarantined wedge without opening the CLI.
+        "quarantined_from": item.get("quarantined_from", "") or "",
         "depends_on": depends_on,
         "depends_on_status": depends_on_status,
         "created_at_iso": item.get("created_at", ""),
@@ -1055,6 +1168,8 @@ def _shape(
         "completed_at_iso": item.get("completed_at", ""),
         "abandoned_at_iso": item.get("abandoned_at", ""),
         "blocked_at_iso": item.get("blocked_at", ""),
+        "wedged_at_iso": item.get("wedged_at", "") or "",
+        "quarantined_at_iso": item.get("quarantined_at", "") or "",
         "age": _humanize_age(age_secs),
         "age_label": age_label,
         "age_seconds": age_secs,
@@ -1366,7 +1481,14 @@ def _render_payload() -> dict[str, Any]:
     # owner to a just-spawned running item before active-agents publishes it.
     owner_bindings = _load_owner_bindings_by_qid()
 
-    running, pending, blocked, done, abandoned = [], [], [], [], []
+    # Table-driven bucketing. EVERY shaped item lands in exactly one bucket:
+    # a declared status goes to its section, anything else goes to the
+    # always-rendered fallback. The previous if/elif chain had no else, so an
+    # undeclared status was dropped on the floor — see the STATUS_SECTION
+    # block at the top of this file for why that class of bug matters more
+    # than the two instances that motivated the fix.
+    buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in SECTION_KEYS}
+    unknown_statuses: set[str] = set()
     for it in items:
         # Pass the full items list so _shape can compute ready_now
         # (depends_on resolution requires the full graph) and decorate
@@ -1376,16 +1498,21 @@ def _render_payload() -> dict[str, Any]:
             owner_bindings=owner_bindings,
         )
         st = s["status"]
-        if st == "running":
-            running.append(s)
-        elif st == "blocked":
-            blocked.append(s)
-        elif st == "pending":
-            pending.append(s)
-        elif st == "done":
-            done.append(s)
-        elif st == "abandoned":
-            abandoned.append(s)
+        key = STATUS_SECTION.get(st)
+        if key is None:
+            key = SECTION_UNKNOWN_KEY
+            unknown_statuses.add(st)
+            _note_unknown_status(st)
+        buckets[key].append(s)
+
+    running = buckets["running"]
+    wedged = buckets["wedged"]
+    quarantined = buckets["quarantined"]
+    pending = buckets["pending"]
+    blocked = buckets["blocked"]
+    done = buckets["done"]
+    abandoned = buckets["abandoned"]
+    other = buckets[SECTION_UNKNOWN_KEY]
 
     # Order:
     #   running   — oldest-running first (most concerning)
@@ -1410,6 +1537,18 @@ def _render_payload() -> dict[str, Any]:
     # `+00:00`-suffixed timestamps) and matches how the done / abandoned
     # sections already sort. Items missing `created_at` sort last.
     blocked.sort(key=lambda a: a.get("created_at_iso") or "", reverse=True)
+    # Wedged / quarantined: newest event first. Both are attention-required
+    # states that still hold their scope, and the freshest one is the one the
+    # operator is most likely reasoning about right now. Items missing the
+    # stamp sort last, same convention as every other section here.
+    wedged.sort(key=lambda a: a.get("wedged_at_iso") or "", reverse=True)
+    quarantined.sort(
+        key=lambda a: a.get("quarantined_at_iso") or "", reverse=True
+    )
+    # Fallback bucket: newest-added first. No status-specific stamp exists by
+    # definition (we don't know what the status means), so `created_at` is the
+    # only field guaranteed to be there.
+    other.sort(key=lambda a: a.get("created_at_iso") or "", reverse=True)
     # Pending order:
     #   1. ready_now=True items first (operator can spawn now)
     #   2. then non-ready group-heads (FIFO leader, blocked by deps)
@@ -1506,18 +1645,30 @@ def _render_payload() -> dict[str, Any]:
 
     return {
         "running": running,
+        "wedged": wedged,
+        "quarantined": quarantined,
         "blocked": blocked,
         "pending": pending,
         "done_recent": done_recent,
         "abandoned_recent": abandoned_recent,
+        # Fallback bucket — every item whose status has no declared section.
+        # Always present in the payload (empty list when there are none) so a
+        # consumer can tell "nothing unrecognised" from "key missing".
+        SECTION_UNKNOWN_KEY: other,
+        # The distinct unrecognised statuses seen this render, for consumers
+        # (and tests) that want the names without walking the rows.
+        "unknown_statuses": sorted(unknown_statuses),
         "sources": sources,
         "totals": {
             "running": len(running),
+            "wedged": len(wedged),
+            "quarantined": len(quarantined),
             "blocked": len(blocked),
             "pending": len(pending),
             # Union of live queue.json done items + archive-only history.
             "done": done_total,
             "abandoned": len(abandoned),
+            SECTION_UNKNOWN_KEY: len(other),
         },
         "orphan_count": orphan_count,
         "starting_count": starting_count,
