@@ -11,6 +11,23 @@ Designed to sit BEHIND an upstream auth proxy (oauth2-proxy, nginx
 control — it trusts the `X-Auth-Request-Email` header for display only.
 Do not expose it to the public internet without a gate.
 
+## Done view (archive union)
+
+The **Done** section does NOT source solely from the `done` items still
+resident in `queue.json`. It UNIONs those live items with the persistent
+append-only completed-tasks archive (`completed-tasks.jsonl` — the record
+`session-task` writes on every queue done/abandon), deduped by queue id
+(the live `queue.json` entry wins over its archive echo). This makes the
+view **reset-proof**: a `queue.json` corruption/reset wipes the live done
+tail, but the historical record survives in the archive and keeps
+rendering. Only DONE rows are pulled from the archive (abandon / merge /
+block / … lifecycle rows are dropped). The rendered card list is capped at
+`RECENT_DONE_LIMIT` (newest first); the section header's `N / M` count
+reports `M` as the full union total. The archive path defaults to a
+sibling of `QUEUE_JSON` (`COMPLETED_TASKS_JSONL` overrides it) and is
+parsed once per file change (cached on mtime/size), so the growing archive
+adds no per-request cost.
+
 ## Layout
 
 | Path | Purpose |

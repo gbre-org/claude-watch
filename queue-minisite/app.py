@@ -66,6 +66,19 @@ from claude_agents import load_agent_state as _load_state
 from claude_agents import load_agent_queue_bindings as _agents_bindings_by_qid
 
 QUEUE_PATH = os.environ.get("QUEUE_JSON", "/queue/queue.json")
+# Persistent completed-tasks archive (append-only history log). session-task
+# appends one JSON line per queue done/abandon here (see `log_completed` in
+# tools/session-task/session-task). The DONE view UNIONs this archive with the
+# done items still resident in queue.json, so the view (a) survives a
+# queue.json reset — which wipes the live done tail, the root cause of the
+# empty "DONE 0/0" section — and (b) reflects the FULL completion history, not
+# just whatever items happen to still be in queue.json. Default: sibling of
+# QUEUE_PATH (both live under ~/.config/session, already bind-mounted rw), so
+# no new mount is required; override via COMPLETED_TASKS_JSONL.
+COMPLETED_TASKS_PATH = os.environ.get(
+    "COMPLETED_TASKS_JSONL",
+    os.path.join(os.path.dirname(QUEUE_PATH), "completed-tasks.jsonl"),
+)
 AGENT_STATE_PATH = os.environ.get(
     "AGENT_STATE_JSON", "/agents-state/active-agents.json"
 )
@@ -305,6 +318,133 @@ class _Cache:
 
 
 _cache = _Cache()
+
+
+@dataclass
+class _ArchiveCache:
+    # DONE entries parsed from completed-tasks.jsonl, newest-first + deduped.
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    mtime: float = -1.0
+    size: int = -1
+
+
+_archive_cache = _ArchiveCache()
+
+# Strips the `[queue <id>]` / `[queue <id> abandoned]` layer prefix that
+# session-task prepends to the archived task string, so we render the bare
+# task text (matching session-task's own `_entry_display_task`).
+_QUEUE_LAYER_PREFIX_RE = re.compile(r"^\[queue [^\]]+\]\s*")
+
+
+def _load_completed_done_entries() -> list[dict[str, Any]]:
+    """Parse the completed-tasks archive, returning DONE rows newest-first.
+
+    Each returned dict: ``{"id", "completed_at", "task", "group_id"}`` with
+    ``task`` already stripped of the ``[queue <id>]`` prefix. Only DONE rows
+    are returned — abandon / merge / block / resurrect / etc. rows (which
+    carry a non-``done`` ``event`` field) and legacy abandon rows (whose
+    ``[queue <id> abandoned]`` marker lives inside the prefix) are dropped;
+    this feeds the DONE section only.
+
+    Cached on the file's ``(mtime, size)``: a ~4600-line (and growing)
+    archive is parsed once per change, not once per request. Newest-first by
+    ``completed_at`` and deduped by id (last-writer-wins — an id can recur if
+    a q-id is re-created + re-completed). Fail-soft: any stat/read/parse error
+    yields the last good cache (or an empty list).
+    """
+    try:
+        st = os.stat(COMPLETED_TASKS_PATH)
+    except OSError:
+        return []
+    if _archive_cache.mtime == st.st_mtime and _archive_cache.size == st.st_size:
+        return _archive_cache.entries
+
+    entries: list[dict[str, Any]] = []
+    try:
+        with open(
+            COMPLETED_TASKS_PATH, "r", encoding="utf-8", errors="replace"
+        ) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                # DONE only. A structured `event` other than "done" marks a
+                # non-completion lifecycle row (abandon/merge/block/…).
+                event = row.get("event")
+                if event and event != "done":
+                    continue
+                task = row.get("task", "") or ""
+                # Legacy abandon rows predate the `event` field: the marker
+                # lives INSIDE the `[queue <id> abandoned]` prefix (before the
+                # first "]"), so we only look there — never in the free-text
+                # body, which could legitimately contain the word "abandoned".
+                head = task.split("]", 1)[0]
+                if "abandoned" in head:
+                    continue
+                qid = row.get("id")
+                if not isinstance(qid, str) or not qid:
+                    continue
+                entries.append(
+                    {
+                        "id": qid,
+                        "completed_at": row.get("completed_at")
+                        or row.get("abandoned_at")
+                        or "",
+                        "task": _QUEUE_LAYER_PREFIX_RE.sub("", task),
+                        "group_id": row.get("group_id", "") or "",
+                    }
+                )
+    except OSError:
+        return _archive_cache.entries
+
+    # Newest-first (uniform `+00:00`-suffixed ISO strings compare correctly).
+    entries.sort(key=lambda e: e.get("completed_at") or "", reverse=True)
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for e in entries:
+        if e["id"] in seen:
+            continue
+        seen.add(e["id"])
+        deduped.append(e)
+
+    _archive_cache.entries = deduped
+    _archive_cache.mtime = st.st_mtime
+    _archive_cache.size = st.st_size
+    return deduped
+
+
+def _shape_archived_done(entry: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """Shape an archive-only completed task into a DONE card dict.
+
+    The archive row is sparse (id, completed_at, task, group_id). We
+    synthesize a minimal queue-item and run it through the shared ``_shape``
+    so every field the template / refresh.js reads for a done item exists and
+    the card renders identically to a live queue.json done item. Marked
+    ``from_archive=True`` (sourced from history, no live queue entry); no
+    transcript path survives in the archive, so ``has_archive`` is False and
+    the View-log button is simply absent.
+    """
+    completed_at = entry.get("completed_at") or ""
+    synthetic = {
+        "id": entry.get("id", ""),
+        "status": "done",
+        "completed_at": completed_at,
+        # No created/registered timestamp survives in the archive; anchor
+        # created_at on completion so age math + created_at_iso stay sane.
+        "created_at": completed_at,
+        "group_id": entry.get("group_id", ""),
+        "description": entry.get("task", "") or "",
+        "summary": entry.get("task", "") or "",
+    }
+    shaped = _shape(synthetic, now, {}, items=None)
+    shaped["from_archive"] = True
+    return shaped
 
 
 def _empty_queue() -> dict[str, Any]:
@@ -925,6 +1065,9 @@ def _shape(
         # rewrites it in place from (now - age_epoch). Mirrors _humanize_age.
         "age_epoch": age_anchor.timestamp() if age_anchor else None,
         "has_archive": has_archive,
+        # True only for done cards synthesized from the completed-tasks
+        # archive (no live queue.json entry). Live items are always False.
+        "from_archive": False,
     }
 
     if status == "running":
@@ -1293,7 +1436,39 @@ def _render_payload() -> dict[str, Any]:
         reverse=True,
     )
 
-    done_recent = done[:RECENT_DONE_LIMIT]
+    # Merge the DONE section with the persistent completed-tasks archive so
+    # the view survives a queue.json reset (which wipes the live done tail —
+    # the root cause of the empty "DONE 0/0" section) and reflects the FULL
+    # completion history. Dedup by queue id: a queue.json done item WINS over
+    # its archive echo (the live item carries richer state — scope, owner,
+    # log_archive_path/View-log). The archive supplies everything ELSE, incl.
+    # everything from before the reset.
+    queue_ids = {
+        it.get("id")
+        for it in items
+        if isinstance(it, dict) and isinstance(it.get("id"), str)
+    }
+    archive_only = [
+        e for e in _load_completed_done_entries() if e["id"] not in queue_ids
+    ]
+    done_total = len(done) + len(archive_only)
+
+    # Build the capped recent window by interleaving the (already sorted)
+    # queue-done and archive-only streams by completion time, newest-first.
+    # Only the archive rows that actually make the window are shaped — the
+    # archive is large, so shaping every historical row would be wasteful.
+    # The sort key is (iso, kind) — it never touches the payload objects, so
+    # identical timestamps can't trigger a dict comparison.
+    merged: list[tuple[str, int, Any]] = []
+    for s in done:
+        merged.append((s.get("completed_at_iso") or "", 0, s))
+    for e in archive_only:
+        merged.append((e.get("completed_at") or "", 1, e))
+    merged.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    done_recent = [
+        payload if kind == 0 else _shape_archived_done(payload, now)
+        for _iso, kind, payload in merged[:RECENT_DONE_LIMIT]
+    ]
     abandoned_recent = abandoned[:RECENT_ABANDONED_LIMIT]
 
     # Orphan tally drives the header pill. STARTING items (no agent
@@ -1340,7 +1515,8 @@ def _render_payload() -> dict[str, Any]:
             "running": len(running),
             "blocked": len(blocked),
             "pending": len(pending),
-            "done": len(done),
+            # Union of live queue.json done items + archive-only history.
+            "done": done_total,
             "abandoned": len(abandoned),
         },
         "orphan_count": orphan_count,
