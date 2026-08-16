@@ -17,7 +17,8 @@ State: ``~/.config/claude/obligations.json`` (0600), schema:
           "exempt_patterns": ["Bash:^watcher-ctl run", "Read"],  # optional
           "predicate": {
             "kind": "file_mtime_within" | "env_present" | "queue_status"
-                  | "file_exists" | "no_pipe_pattern" | "marker_file_present"
+                  | "file_exists" | "no_pipe_pattern" | "no_output_consumed"
+                  | "marker_file_present"
                   | "watchers_healthy" | "is_main_loop" | "all_of"
                   | ...,
             "params": {...}
@@ -108,6 +109,31 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         or heredoc body does not false-positive-deny. Parse failure falls
         back (fail-closed) to matching the raw command string. (Always
         satisfied for non-Bash tools.)
+
+        PREFER ``no_output_consumed`` for any "do not filter <tool>'s
+        output" rule. A regex over a command string cannot tell a real
+        pipe from a pipe character inside a quoted argument, nor a command
+        that RUNS from a command NAME that merely appears as an argument,
+        so such a regex is always either leaky or over-firing (usually
+        both).
+  - no_output_consumed: {commands, redirect_mode?, include_substitution?}
+        BAN-style, fully AST-based: for Bash commands, satisfied UNLESS a
+        command whose head matches one of ``commands`` has its stdout
+        CONSUMED -- piped into another command, redirected away, or
+        captured by a ``$(...)`` substitution. ``commands`` is a list of
+        command-name specs; each is a literal name (``botchat-show``) or a
+        glob naming a family (``botchat-*``). Matching is against the
+        effective command HEAD (basename, env / wrapper / path stripped),
+        so ``grep -n 'botchat-show' Dockerfile | head`` and
+        ``echo 'botchat-send' | wc -l`` are ALLOWED while
+        ``botchat-show 2008 | head`` and ``botchat-history > /dev/null``
+        are DENIED.
+        ``redirect_mode``: "devnull" (default -- only ``> /dev/null``
+        counts), "any" (any stdout redirection counts), or "none".
+        ``include_substitution`` (default true): a ``$(...)`` / backtick
+        capture counts as consumption.
+        FAIL-CLOSED: an unparseable command is DENIED (with the override
+        hint), never allowed. (Always satisfied for non-Bash tools.)
   - marker_file_present: {path, negate?}
         alias of file_exists for "you owe X" trackers
   - process_alive: {pid_file}
@@ -634,6 +660,7 @@ VALID_PREDICATE_KINDS = {
     "env_present",
     "queue_status",
     "no_pipe_pattern",
+    "no_output_consumed",
     "marker_file_present",
     "process_alive",
     "process_in_pgrep",
@@ -1610,6 +1637,81 @@ def _eval_evaluator_predicate(params, tool_name, command_string, agent_id):
                         f"stdout_preview={stdout_text!r}"))
 
 
+# Appended to every no_output_consumed denial so the escape hatch is always
+# one copy-paste away (the gate is deliberately fail-closed, so an operator
+# who hits a genuine false positive must not have to go hunting).
+OVERRIDE_HINT = ('bypass with: obligations override "<reason>" '
+                 "--duration 5m")
+
+
+def _eval_no_output_consumed(params, tool_name, command_string):
+    """BAN-style predicate: deny when a named command's OUTPUT is consumed.
+
+    Returns ``(satisfied, why)`` like every other predicate: satisfied=True
+    means nothing forbidden was found, so the call is allowed.
+
+    This is the AST replacement for expressing "never filter <tool>'s
+    output" as a ``no_pipe_pattern`` regex. A regex over the raw command
+    string cannot distinguish:
+
+      * a REAL pipe from a ``|`` inside a quoted argument or heredoc body
+        (over-firing: ``grep -n 'botchat-show' Dockerfile | head`` denied
+        even though no botchat command runs), nor
+      * an exhaustively-enumerated consumer list from the ones the author
+        forgot (leaking: a pattern written for ``| tail -N`` / ``| head
+        -N`` silently permitted bare ``| head``, ``| grep``, ``| jq`` and
+        ``> /dev/null``).
+
+    Asking the AST "is this command's stdout consumed?" needs no consumer
+    enumeration at all, and only ever inspects real command heads.
+
+    FAIL-CLOSED: an unparseable command is DENIED (with the override hint).
+    An unparseable command is precisely where a hidden violation would
+    live, so it must not be waved through.
+    """
+    commands = params.get("commands") or []
+    if isinstance(commands, str):
+        commands = [c.strip() for c in commands.split(",") if c.strip()]
+    commands = [c for c in commands if isinstance(c, str) and c]
+    if not commands:
+        return (True, "no commands configured (allow)")
+    if tool_name not in ("Bash",):
+        return (True, f"tool {tool_name} is not Bash (predicate N/A)")
+    cmd = command_string or ""
+    redirect_mode = str(params.get("redirect_mode", "devnull"))
+    if redirect_mode not in ("devnull", "any", "none"):
+        redirect_mode = "devnull"
+    include_substitution = bool(params.get("include_substitution", True))
+
+    if _shell_ast is None:
+        # The gate cannot answer its question without the parser. Denying a
+        # narrow command family beats silently un-enforcing the rule.
+        return (False,
+                "shell_ast parser unavailable -- cannot verify that "
+                f"{commands} output is unfiltered (fail-closed); "
+                + OVERRIDE_HINT)
+    try:
+        reasons = _shell_ast.output_consumed_by(
+            cmd, commands,
+            redirect_mode=redirect_mode,
+            include_substitution=include_substitution,
+        )
+    except _shell_ast.ShellParseError as e:
+        return (False,
+                f"command could not be parsed ({e}) -- refusing to guess "
+                "whether its output is filtered (fail-closed); "
+                + OVERRIDE_HINT)
+    except Exception as e:  # noqa: BLE001 -- a helper bug must not un-gate
+        return (False,
+                f"shell_ast raised {type(e).__name__}: {e} (fail-closed); "
+                + OVERRIDE_HINT)
+    if reasons:
+        return (False, "; ".join(reasons) + " -- read the full output "
+                "instead (if it is too verbose, fix the tool); "
+                + OVERRIDE_HINT)
+    return (True, f"no output of {commands} is piped/redirected/captured")
+
+
 def _eval_predicate(pred, tool_name, command_string, agent_id=None,
                     agent_type=None):
     """Return (satisfied: bool, why: str). 'satisfied' True => obligation met,
@@ -1732,6 +1834,9 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
                     f"command matches forbidden pattern /{regex}/ "
                     "(raw string fallback)")
         return (True, f"command does not match /{regex}/ (raw string fallback)")
+
+    if kind == "no_output_consumed":
+        return _eval_no_output_consumed(params, tool_name, command_string)
 
     if kind == "process_alive":
         pid_file = params.get("pid_file")
@@ -2621,6 +2726,28 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
 # ---------------------------------------------------------------------------
 
 
+def _bashcmd_name_fallback_re(name):
+    """Word-boundary regex for a ``Bashcmd:`` name in the no-AST fallback.
+
+    Literal names get ``\\bNAME\\b``. A glob (``botchat-*``) is translated
+    piecewise so the fallback keeps the same reach as the AST matcher:
+    ``*`` -> ``\\S*``, ``?`` -> ``\\S``. A trailing ``\\b`` is only added
+    when the pattern ends in a literal character (``\\S*\\b`` would never
+    match at end-of-token).
+    """
+    out = ["\\b"]
+    for ch in name:
+        if ch == "*":
+            out.append(r"\S*")
+        elif ch == "?":
+            out.append(r"\S")
+        else:
+            out.append(re.escape(ch))
+    if name and name[-1] not in ("*", "?"):
+        out.append("\\b")
+    return "".join(out)
+
+
 def _tool_pattern_matches(pattern, tool_name, command_string):
     """A tool_pattern is one of:
         '*'                       => matches every tool
@@ -2634,7 +2761,10 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
                                      segment. AST-aware: a name mentioned only
                                      inside a quoted arg / heredoc body does
                                      NOT match, and a path-prefixed / sudo- /
-                                     env-wrapped invocation DOES.
+                                     env-wrapped invocation DOES. A name may
+                                     be a glob naming a whole command family
+                                     ('botchat-*'); the glob is still only
+                                     ever tested against a real command head.
         '<name>'                  => matches when tool_name == <name>
     """
     if not pattern or pattern == "*":
@@ -2656,8 +2786,10 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
             # name as a whole word anywhere in the raw command. Conservative
             # (may over-exempt on quoted mentions) but preserves the pre-AST
             # behavior for the unparseable edge, per shell_ast's contract.
+            # Glob names are translated to an equivalent word-boundary
+            # regex so `Bashcmd:botchat-*` degrades the same way.
             return any(
-                re.search(r"\b" + re.escape(n) + r"\b", command_string or "")
+                re.search(_bashcmd_name_fallback_re(n), command_string or "")
                 for n in names
             )
         if tool_name != head:

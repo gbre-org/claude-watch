@@ -3157,6 +3157,75 @@ def main() -> int:
             _run([str(CLI), "satisfy", ob_pp], env_p)
 
         # ---------------------------------------------------------------
+        # Tests 74n1-74n10: no_output_consumed predicate (end-to-end).
+        #
+        # The "never filter <tool>'s output" rule used to be a
+        # no_pipe_pattern REGEX over the raw command string, which both
+        # LEAKED (a pattern written for `| tail -N` / `| head -N` let bare
+        # `| head`, `| grep`, `| jq` and `> /dev/null` straight through)
+        # and OVER-FIRED (any command that merely MENTIONED the tool name
+        # while piping was denied). no_output_consumed asks the AST "is
+        # this command's stdout consumed?" instead: no consumer list to
+        # keep exhaustive, and only real command HEADS are inspected.
+        #
+        # Registered exactly as an operator would: an AST-aware
+        # `Bashcmd:<glob>` tool_pattern paired with the AST predicate, so
+        # BOTH halves of the gate are structural.
+        # ---------------------------------------------------------------
+        with tempfile.TemporaryDirectory(prefix="obligations-nooutput-") as td_n:
+            tmpdir_n = Path(td_n)
+            env_n, _ob_n = _make_isolated_env(tmpdir_n)
+            _pipe = chr(124)
+            ob_nc = _add_ob(
+                env_n,
+                tool_pattern="Bashcmd:botchat-*",
+                predicate="no_output_consumed",
+                params={"commands": ["botchat-*"]},
+                ttl=0,
+                deny_msg="never filter botchat output -- fix the tool instead",
+            )
+
+            def _nc(name, command, expect_deny):
+                rc, out, _err = _hook_pre(
+                    {"tool_name": "Bash", "tool_input": {"command": command}},
+                    env_n,
+                )
+                good = _is_deny(out) if expect_deny else _is_allow(out)
+                results.append(_check(
+                    name, rc == 0 and good, f"rc={rc} out={out}"))
+
+            # DENY: output genuinely consumed. The dash-less forms are the
+            # ones the old regex silently permitted.
+            _nc("74n1. output_consumed: bare " + _pipe + " head -> deny",
+                "botchat-show 2008 " + _pipe + " head", True)
+            _nc("74n2. output_consumed: " + _pipe + " grep -> deny",
+                "botchat-history " + _pipe + " grep foo", True)
+            _nc("74n3. output_consumed: > /dev/null -> deny",
+                "botchat-show 2007-2008 > /dev/null", True)
+            _nc("74n4. output_consumed: dash-flag head -> deny",
+                "botchat-show 2008 " + _pipe + " head -20", True)
+
+            # ALLOW: the name appears only as an argument / string, so no
+            # gated command runs. These are the over-fire cases.
+            _nc("74n5. output_consumed: bare invocation -> allow",
+                "botchat-show 2008", False)
+            _nc("74n6. output_consumed: id range -> allow",
+                "botchat-show 2018-2024", False)
+            _nc("74n7. output_consumed: name as grep ARG -> allow",
+                "grep -n 'botchat-show' Dockerfile " + _pipe + " head", False)
+            _nc("74n8. output_consumed: name in echo string -> allow",
+                "echo 'botchat-send' " + _pipe + " wc -l", False)
+
+            # FAIL-CLOSED: unparseable command -> deny, not allow.
+            _nc("74n9. output_consumed: unparseable -> deny (fail-closed)",
+                "botchat-show 'unterminated " + _pipe + " head", True)
+
+            # Unrelated command -> allow (no regression).
+            _nc("74n10. output_consumed: unrelated command -> allow",
+                "ls -la /tmp", False)
+            _run([str(CLI), "satisfy", ob_nc], env_n)
+
+        # ---------------------------------------------------------------
         # Tests 75-88: stale_ready_queue_present predicate.
         #
         # Each test starts with a clean obligations sandbox and a custom

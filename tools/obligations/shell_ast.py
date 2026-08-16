@@ -11,8 +11,17 @@ message text merely *mentioned* ``| signal-send`` (a payload to ``cat`` /
 ``signal-stage``), or a queue description that *described* a forbidden
 pattern, false-positive-DENIED even though nothing forbidden would run.
 
+A regex is also structurally blind in the other direction: it cannot tell
+a command that RUNS from a command NAME that merely appears as an
+argument, and a "don't pipe X into a filter" regex has to ENUMERATE the
+filters -- an enumeration that is always incomplete (a pattern written
+for ``| tail -N`` / ``| head -N`` silently permitted bare ``| head``,
+``| grep``, ``| jq`` and ``> /dev/null``). ``output_consumed_by`` below
+inverts the question -- "is this command's stdout consumed?" -- which
+needs no enumeration at all.
+
 This module parses a Bash command string into a small structural model --
-just enough to answer three questions the gates actually care about:
+just enough to answer the questions the gates actually care about:
 
   * What are the top-level command segments (split on REAL pipes /
     ``&&`` / ``||`` / ``;`` / ``&`` / newlines, ignoring those operators
@@ -22,12 +31,17 @@ just enough to answer three questions the gates actually care about:
     ``watcher-ctl run`` an actual command node?".
   * Are there any REAL top-level compound / background / pipe operators
     (so the watcher-ctl-bare guard can refuse a non-bare invocation)?
+  * Where does a segment's STDOUT go -- into a pipe, into a redirection
+    target, or into a ``$(...)`` capture (the ``output_consumed_by``
+    query behind the ``no_output_consumed`` predicate)?
 
 Deliberately NOT a full bash grammar. It is a tokenizer + a top-level
 operator splitter that is quote/heredoc/escape aware. It does not expand
-variables, does not descend into ``$(...)`` command substitution bodies
-to find nested pipelines, and does not model redirections beyond skipping
-their target tokens. The design contract is:
+variables and models redirections only far enough to attribute them to a
+segment and classify them as stdout-affecting or not. It does not descend
+into ``$(...)`` command substitution bodies while splitting top-level
+structure (``output_consumed_by`` re-parses substitution bodies
+explicitly when asked). The design contract is:
 
   * Eliminate FALSE POSITIVES (forbidden text inside quoted/heredoc data
     must NOT match) without introducing FALSE NEGATIVES (a real forbidden
@@ -40,6 +54,7 @@ Everything here is pure (no I/O, no shelling out) and stdlib-only.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -67,6 +82,36 @@ _REDIR_CHARS = ("<", ">")
 
 
 @dataclass
+class Redirect:
+    """One redirection attached to a segment.
+
+    ``fd`` is the explicit file-descriptor prefix as written (``"2"`` in
+    ``2>err``) or ``None`` when the redirection carried no fd digits.
+    ``op`` is the redirection operator (``">"``, ``">>"``, ``"<"``,
+    ``">&"``, ``"&>"``, ...). ``target`` is the (quote-stripped) target
+    word -- a filename or an fd like ``1``.
+    """
+
+    fd: Optional[str] = None
+    op: str = ""
+    target: str = ""
+
+    def affects_stdout(self) -> bool:
+        """True iff this redirection sends the command's STDOUT somewhere.
+
+        Covers the default-fd forms (``> f``, ``>> f``, ``>&2``), the
+        explicit ``1> f`` form, and the both-streams ``&> f`` / ``&>> f``
+        forms. An input redirection or an explicit non-1 fd (``2> f``)
+        does NOT affect stdout.
+        """
+        if not self.op.startswith((">", "&>")):
+            return False
+        if self.op.startswith("&>"):
+            return True
+        return self.fd in (None, "", "1")
+
+
+@dataclass
 class Segment:
     """One top-level command segment (one pipeline stage / one statement).
 
@@ -75,11 +120,18 @@ class Segment:
     that preceded this segment in the command (``""`` for the first
     segment); ``op_after`` is the operator that follows it (``""`` for the
     last). Operators are one of ``"|" "&&" "||" ";" "&" "\\n"``.
+    ``redirects`` holds the segment's redirections in source order.
     """
 
     words: List[str] = field(default_factory=list)
     op_before: str = ""
     op_after: str = ""
+    redirects: List[Redirect] = field(default_factory=list)
+
+    def stdout_redirect_targets(self) -> List[str]:
+        """Targets of every redirection on this segment that captures
+        stdout (see ``Redirect.affects_stdout``)."""
+        return [r.target for r in self.redirects if r.affects_stdout()]
 
     @property
     def head(self) -> str:
@@ -119,11 +171,13 @@ class ParsedCommand:
 # ---------------------------------------------------------------------------
 #
 # We walk the string once, tracking quote state, escapes, and heredoc
-# bodies. We emit a flat token stream of two kinds:
-#   ("word", <text>)   -- a shell word (with quotes resolved/stripped)
-#   ("op",   <text>)   -- a top-level operator (| & && || ; \n)
-# Redirection operators and their target tokens are consumed but not
-# emitted (they are neither command heads nor splitting operators).
+# bodies. We emit a flat token stream of three kinds:
+#   ("word",  <text>)     -- a shell word (with quotes resolved/stripped)
+#   ("op",    <text>)     -- a top-level operator (| & && || ; \n)
+#   ("redir", <Redirect>) -- a redirection (operator + fd + target), which
+#                            is NOT a command head and NOT a splitting
+#                            operator, but IS where a segment's stdout can
+#                            go, so it attaches to the segment.
 #
 # Heredocs: when we see ``<<`` (optionally ``<<-``) we read the delimiter
 # word, then everything up to a line whose content equals the delimiter is
@@ -139,8 +193,9 @@ def _is_op_char(c: str) -> bool:
 def tokenize(cmd: str) -> List[tuple]:
     """Return a flat ``[(kind, text), ...]`` token stream.
 
-    ``kind`` is ``"word"`` or ``"op"``. Raises ``ShellParseError`` on
-    unbalanced quotes or an unterminated heredoc-delimiter read.
+    ``kind`` is ``"word"``, ``"op"``, or ``"redir"`` (whose payload is a
+    ``Redirect``, not a string). Raises ``ShellParseError`` on unbalanced
+    quotes or an unterminated heredoc-delimiter read.
     """
     tokens: List[tuple] = []
     i = 0
@@ -279,19 +334,26 @@ def tokenize(cmd: str) -> List[tuple]:
             continue
 
         # Other redirections: ``>`` ``>>`` ``<`` ``2>`` ``&>`` ``>&`` etc.
-        # We skip the operator and its target token so the target file
-        # isn't read as a command head and ``2>&1`` isn't read as ``&``.
+        # We consume the operator and its target token so the target file
+        # isn't read as a command head and ``2>&1`` isn't read as ``&``,
+        # and emit a ("redir", Redirect) token so callers can ask where a
+        # segment's STDOUT went (``> /dev/null`` is output consumption
+        # just as much as a pipe is).
+        #
+        # A leading fd-number like ``2>file`` / ``1>&2`` is part of the
+        # redirection, not a word: if the in-progress word is all digits
+        # we pull it off as the fd instead of flushing it as an argument.
         if c in _REDIR_CHARS:
+            fd = None
+            pending = "".join(cur)
+            if word_started and pending.isdigit():
+                fd = pending
+                cur = []
+                word_started = False
             flush_word()
-            i = _skip_redirection(cmd, i)
+            op_text, target, i = _read_redirection(cmd, i)
+            tokens.append(("redir", Redirect(fd=fd, op=op_text, target=target)))
             continue
-
-        # A leading fd-number redirection like ``2>file`` / ``2>&1``: if
-        # the current word is all digits and the next char starts a
-        # redirection, treat the digits as an fd and skip the redirection.
-        if c in (">", "<"):
-            # handled above; kept for clarity
-            pass
 
         # Newline: statement separator AND heredoc-body trigger.
         if c == "\n":
@@ -311,6 +373,16 @@ def tokenize(cmd: str) -> List[tuple]:
 
         # Operators: |, ||, &, &&, ;
         if _is_op_char(c):
+            # ``&>`` / ``&>>`` are BOTH-STREAMS redirections, not a
+            # background ``&`` followed by a redirection. Route them to the
+            # redirection reader so ``cmd &>/dev/null`` is not mistaken for
+            # a backgrounded command.
+            if c == "&" and i + 1 < n and cmd[i + 1] == ">":
+                flush_word()
+                op_text, target, i = _read_redirection(cmd, i)
+                tokens.append(("redir", Redirect(fd=None, op=op_text,
+                                                 target=target)))
+                continue
             flush_word()
             two = cmd[i:i + 2]
             if two in _TWO_CHAR_OPS:
@@ -434,39 +506,62 @@ def _read_heredoc_delim(cmd: str, k: int):
     return "".join(buf), k
 
 
-def _skip_redirection(cmd: str, i: int) -> int:
-    """Skip a redirection operator + its target token at index i (which
-    points at ``<`` or ``>``). Returns index just past the target."""
+def _read_redirection(cmd: str, i: int):
+    """Read a redirection operator + its target token at index i (which
+    points at ``<``, ``>`` or the ``&`` of ``&>``).
+
+    Returns ``(op, target, new_index)`` where ``op`` is the operator text
+    (``">"``, ``">>"``, ``">&"``, ``"&>"``, ``"<"``, ...), ``target`` is
+    the quote-stripped target word (``""`` when the redirection has no
+    target token, e.g. a trailing ``>``), and ``new_index`` points just
+    past the target.
+    """
     n = len(cmd)
-    # consume the operator chars: > >> < &> >& and an optional leading fd
-    # already handled by the caller stripping the word; here we just eat
-    # > / < / & / digits that form the operator.
+    # consume the operator chars: > >> < &> >& (a leading fd, if any, was
+    # already pulled off by the caller).
+    op_start = i
     while i < n and cmd[i] in (">", "<", "&"):
         i += 1
+    op_text = cmd[op_start:i]
     # ``>&1`` / ``>&2`` -- the fd target may directly follow with no space
     while i < n and cmd[i] in (" ", "\t"):
         i += 1
     # consume the target token (a filename or fd) up to whitespace/operator
+    buf: List[str] = []
     while i < n and cmd[i] not in (" ", "\t", "\n", "|", "&", ";", "<", ">"):
         if cmd[i] == "'":
             end = cmd.find("'", i + 1)
             if end == -1:
                 raise ShellParseError("unterminated quote in redirection target")
+            buf.append(cmd[i + 1:end])
             i = end + 1
             continue
         if cmd[i] == '"':
             j = i + 1
+            inner: List[str] = []
             while j < n and cmd[j] != '"':
                 if cmd[j] == "\\":
+                    if j + 1 < n:
+                        inner.append(cmd[j + 1])
                     j += 2
                     continue
+                inner.append(cmd[j])
                 j += 1
             if j >= n:
                 raise ShellParseError("unterminated quote in redirection target")
+            buf.append("".join(inner))
             i = j + 1
             continue
+        buf.append(cmd[i])
         i += 1
-    return i
+    return op_text, "".join(buf), i
+
+
+def _skip_redirection(cmd: str, i: int) -> int:
+    """Backwards-compatible wrapper: skip a redirection, return the index
+    just past its target."""
+    _op, _target, new_i = _read_redirection(cmd, i)
+    return new_i
 
 
 def _match_paren(cmd: str, open_idx: int) -> int:
@@ -519,34 +614,40 @@ def parse(cmd: str) -> ParsedCommand:
 
     segments: List[Segment] = []
     cur_words: List[str] = []
+    cur_redirs: List[Redirect] = []
     op_before = ""
 
     def close(op_after: str):
-        nonlocal cur_words, op_before
-        seg = Segment(words=cur_words, op_before=op_before, op_after=op_after)
+        nonlocal cur_words, cur_redirs, op_before
+        seg = Segment(words=cur_words, op_before=op_before, op_after=op_after,
+                      redirects=cur_redirs)
         segments.append(seg)
         cur_words = []
+        cur_redirs = []
         op_before = op_after
 
     for kind, text in tokens:
         if kind == "word":
             cur_words.append(text)
+        elif kind == "redir":
+            cur_redirs.append(text)
         else:  # op
             # Newlines that are pure separators between blank statements
             # shouldn't create spurious empty segments unless they carry
             # structure. We DO record them so has_top_level_operator is
             # accurate, but collapse runs of separators around empty
             # segments.
-            if not cur_words and not segments and text == "\n":
+            if not cur_words and not cur_redirs and not segments and text == "\n":
                 # leading blank line -- ignore
                 continue
             close(text)
 
     # final segment (no trailing operator)
-    seg = Segment(words=cur_words, op_before=op_before, op_after="")
+    seg = Segment(words=cur_words, op_before=op_before, op_after="",
+                  redirects=cur_redirs)
     # Avoid a trailing empty segment created by a terminal operator with no
     # following command (e.g. ``cmd ;``) unless it's the only segment.
-    if seg.words or not segments:
+    if seg.words or seg.redirects or not segments:
         segments.append(seg)
 
     return ParsedCommand(segments=segments)
@@ -606,11 +707,147 @@ def command_name_present(cmd: str, targets) -> bool:
     """True iff any effective command-head basename (see ``command_names``)
     matches one of ``targets``.
 
-    ``targets`` is any iterable of command-name strings; empty / falsy
-    entries are ignored. Raises ``ShellParseError`` on parse failure.
+    ``targets`` is any iterable of command-name specs; each may be a
+    literal name or a glob (``botchat-*``) -- see ``name_matches``. Empty /
+    falsy entries are ignored. Raises ``ShellParseError`` on parse failure.
     """
-    tset = {t for t in (targets or []) if t}
-    return bool(command_names(cmd) & tset)
+    specs = [t for t in (targets or []) if t]
+    if not specs:
+        return False
+    names = command_names(cmd)
+    return any(name_matches(n, s) for n in names for s in specs)
+
+
+def name_matches(name: str, spec: str) -> bool:
+    """Does a command-head BASENAME match a name spec?
+
+    A spec is either a literal name (``botchat-show``) or a glob
+    (``botchat-*``, matched with ``fnmatch``). Globs are what let a whole
+    command FAMILY be named without enumerating it -- and, unlike a raw
+    substring regex over the command line, a glob here is only ever tested
+    against a real command HEAD, never against argument or string data.
+    """
+    if not name or not spec:
+        return False
+    if any(ch in spec for ch in "*?["):
+        return fnmatch.fnmatchcase(name, spec)
+    return name == spec
+
+
+DEVNULL_TARGETS = ("/dev/null",)
+
+
+def output_consumed_by(cmd: str, name_specs, *,
+                       redirect_mode: str = "devnull",
+                       include_substitution: bool = True) -> List[str]:
+    """Return human-readable reasons a named command's OUTPUT is consumed.
+
+    This is the AST answer to "is this invocation filtering / discarding
+    the tool's output?" -- the question a raw regex over the command
+    string cannot answer, because the regex can neither tell a real pipe
+    from a pipe character inside a quoted argument, nor tell a command
+    that RUNS from a command NAME that merely appears as an argument.
+
+    A segment counts as "output consumed" when its effective command head
+    (basename, env / wrapper / path stripped) matches one of
+    ``name_specs`` (literal or glob -- see ``name_matches``) AND:
+
+      * the segment is the LHS of a real top-level pipe (``op_after ==
+        "|"``), i.e. its stdout feeds another command; or
+      * the segment redirects its stdout, per ``redirect_mode``:
+        ``"devnull"`` (default) counts only ``> /dev/null``; ``"any"``
+        counts any stdout redirection; ``"none"`` counts none; or
+      * (when ``include_substitution``) the command runs inside a
+        ``$(...)`` / backtick command substitution, whose entire purpose
+        is to capture stdout.
+
+    Occurrences inside quoted arguments or heredoc bodies are never
+    segment heads, so ``grep -n 'botchat-show' Dockerfile | head`` and
+    ``echo 'botchat-send' | wc -l`` return ``[]``.
+
+    Returns an empty list when nothing is consumed. Raises
+    ``ShellParseError`` on parse failure -- callers gating on this MUST
+    fail closed (deny), because an unparseable command is exactly where a
+    hidden violation would live.
+    """
+    specs = [s for s in (name_specs or []) if s]
+    if not specs:
+        return []
+    parsed = parse(cmd)
+    reasons: List[str] = []
+    for seg in parsed.segments:
+        words = _strip_command_prefix(seg.words)
+        if include_substitution:
+            reasons.extend(_substitution_reasons(seg.words, specs,
+                                                 redirect_mode))
+        if not words:
+            continue
+        head = os.path.basename(words[0])
+        if not any(name_matches(head, s) for s in specs):
+            continue
+        if seg.op_after == "|":
+            reasons.append(f"`{head}` output is piped into another command")
+        for target in seg.stdout_redirect_targets():
+            if redirect_mode == "none":
+                break
+            if redirect_mode == "any" or target in DEVNULL_TARGETS:
+                reasons.append(
+                    f"`{head}` stdout is redirected to {target or '<file>'}")
+    return reasons
+
+
+def _substitution_reasons(words: List[str], specs: List[str],
+                          redirect_mode: str) -> List[str]:
+    """Reasons drawn from ``$(...)`` / backtick substitutions inside
+    ``words``. A command substitution captures stdout by definition, so a
+    matching command HEAD anywhere inside one counts as consumed."""
+    out: List[str] = []
+    for word in words:
+        for inner in _substitution_bodies(word):
+            try:
+                heads = command_names(inner)
+            except ShellParseError:
+                # An unparseable substitution body is reported as a
+                # consumption reason of its own: callers fail closed.
+                out.append("unparseable command substitution "
+                           f"`{inner[:60]}`")
+                continue
+            for head in heads:
+                if any(name_matches(head, s) for s in specs):
+                    out.append(
+                        f"`{head}` output is captured by a command "
+                        "substitution")
+            # Nested structure inside the substitution (a pipe, a
+            # redirect) is caught by recursing with the same rules.
+            out.extend(output_consumed_by(inner, specs,
+                                          redirect_mode=redirect_mode,
+                                          include_substitution=False))
+    return out
+
+
+def _substitution_bodies(word: str) -> List[str]:
+    """Extract the bodies of ``$( ... )`` and `` `...` `` constructs from a
+    single (already quote-stripped) word."""
+    bodies: List[str] = []
+    i = 0
+    n = len(word)
+    while i < n:
+        if word.startswith("$(", i):
+            end = _match_paren(word, i + 1)
+            if end == -1:
+                break
+            bodies.append(word[i + 2:end])
+            i = end + 1
+            continue
+        if word[i] == "`":
+            end = word.find("`", i + 1)
+            if end == -1:
+                break
+            bodies.append(word[i + 1:end])
+            i = end + 1
+            continue
+        i += 1
+    return bodies
 
 
 def _head_matches(seg: Segment, target: str) -> bool:
@@ -954,6 +1191,104 @@ def _run_tests() -> int:
        not command_name_present("watcher-ctl run", []))
     ok("command_name_present: multi-target hits second",
        command_name_present("event-ack list", ["watcher-ctl", "event-ack"]))
+
+    # --- output_consumed_by: the AST answer to "is output being filtered?" ---
+    # These cases are exactly the ones the raw-string regex got WRONG: it
+    # missed bare `| head` / `| grep` / `> /dev/null` (a gate with a hole
+    # that reads as enforced), and it over-fired on any command that merely
+    # MENTIONED the tool name while piping.
+    BC = ["botchat-*"]
+
+    def consumed(c, specs=None, **kw):
+        return output_consumed_by(c, specs or BC, **kw)
+
+    # DENY side -- output really is consumed.
+    ok("pipe into head -> consumed", consumed("botchat-show 2008 | head"))
+    ok("pipe into grep -> consumed", consumed("botchat-history | grep foo"))
+    ok("pipe into tail -n 5 -> consumed",
+       consumed("botchat-show 2008 | tail -n 5"))
+    ok("dash-flag head -> consumed", consumed("botchat-history | head -20"))
+    ok("redirect to /dev/null -> consumed",
+       consumed("botchat-show 2007-2008 > /dev/null"))
+    ok("redirect to /dev/null (1>) -> consumed",
+       consumed("botchat-show 2008 1>/dev/null"))
+    ok("both-streams &>/dev/null -> consumed",
+       consumed("botchat-show 2008 &>/dev/null"))
+    ok("pipe in a compound statement -> consumed",
+       consumed("date && botchat-history | wc -l"))
+    ok("env-prefixed + absolute path still consumed",
+       consumed("BOTCHAT_API_BASE=x /home/u/repos/botchat/bin/botchat-show 1 "
+                "| jq ."))
+    ok("command substitution captures output -> consumed",
+       consumed("msg=$(botchat-show 2008)"))
+    ok("literal (non-glob) spec still works",
+       consumed("botchat-show 2008 | head", ["botchat-show"]))
+
+    # ALLOW side -- nothing is consumed.
+    ok("bare show -> not consumed", not consumed("botchat-show 2008"))
+    ok("bare range -> not consumed", not consumed("botchat-show 2018-2024"))
+    ok("name only as an ARGUMENT to grep -> not consumed",
+       not consumed("grep -n 'botchat-show' Dockerfile | head"))
+    ok("name inside a double-quoted arg -> not consumed",
+       not consumed('grep -n "botchat-show" Dockerfile | head'))
+    ok("name inside a piped echo string -> not consumed",
+       not consumed("echo 'botchat-send' | wc -l"))
+    ok("name in a heredoc body -> not consumed",
+       not consumed("cat <<'EOF'\nbotchat-show 1 | head\nEOF"))
+    ok("botchat on pipe RHS (its own stdout free) -> not consumed",
+       not consumed("cat draft.txt | botchat-send -F -"))
+    ok("&& after botchat is not consumption",
+       not consumed("botchat-show 2008 && echo done"))
+    ok("stderr-only redirect is not stdout consumption",
+       not consumed("botchat-show 2008 2>/dev/null"))
+    ok("redirect to a real file allowed under devnull mode",
+       not consumed("botchat-show 2008 > out.txt"))
+    ok("redirect to a real file DENIED under redirect_mode=any",
+       consumed("botchat-show 2008 > out.txt", redirect_mode="any"))
+    ok("redirect_mode=none ignores /dev/null",
+       not consumed("botchat-show 2008 > /dev/null", redirect_mode="none"))
+    ok("substitution ignored when include_substitution=False",
+       not consumed("msg=$(botchat-show 2008)", include_substitution=False))
+    ok("non-matching command piped -> not consumed",
+       not consumed("signal-history | head"))
+    ok("empty specs -> never consumed",
+       not output_consumed_by("botchat-show 1 | head", []))
+
+    # Reasons are human-readable and name the head.
+    r = consumed("botchat-show 2008 | head")
+    ok("reason mentions the command head",
+       any("botchat-show" in x for x in r), repr(r))
+
+    # Same predicate reused for the signal-history no-filter rule.
+    ok("signal-history | head -> consumed",
+       output_consumed_by("signal-history --dm andrew | head",
+                          ["signal-history"]))
+    ok("signal-history --tail flag is NOT a pipe",
+       not output_consumed_by("signal-history --dm andrew --tail 20",
+                              ["signal-history"]))
+
+    # Parse failure must RAISE so the caller can fail closed.
+    try:
+        output_consumed_by("botchat-show 'unterminated | head", BC)
+        ok("unparseable command raises for output_consumed_by", False,
+           "no exception")
+    except ShellParseError:
+        ok("unparseable command raises for output_consumed_by", True)
+
+    # --- glob support in command_name_present ---
+    ok("command_name_present: glob matches family",
+       command_name_present("botchat-history --unread", ["botchat-*"]))
+    ok("command_name_present: glob does not match arg mention",
+       not command_name_present("grep botchat-show f", ["botchat-*"]))
+
+    # --- redirect modelling ---
+    ok("2>&1 does not register as a stdout redirect",
+       parse("foo 2>&1").segments[0].stdout_redirect_targets() == [])
+    ok("> out.txt registers as a stdout redirect",
+       parse("foo > out.txt").segments[0].stdout_redirect_targets()
+       == ["out.txt"])
+    ok("&>/dev/null is a redirect, not a background &",
+       not has_real_compound_operator("foo &>/dev/null"))
 
     # --- parse-failure cases raise ShellParseError ---
     for bad in ("echo 'unterminated", 'echo "unterminated', "echo $(unbal"):

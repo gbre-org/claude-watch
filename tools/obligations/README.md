@@ -43,7 +43,22 @@ Bounded set, NOT Turing-complete:
   - `file_exists {path, negate?}` — file present (or absent if negate)
   - `env_present {var, value?}` — env var set, optionally to a specific value
   - `queue_status {id, status}` — `session-task queue show <id>` reports given status
-  - `no_pipe_pattern {regex}` — Bash command does NOT match regex
+  - `no_pipe_pattern {regex}` — Bash command does NOT match regex (applied to
+    a structure-only rendering of the command, so quoted-string / heredoc data
+    can't trip it). For "never filter this tool's output" rules prefer
+    `no_output_consumed` below — a regex has to enumerate every consumer, and
+    the enumeration is always incomplete.
+  - `no_output_consumed {commands, redirect_mode?, include_substitution?}` —
+    fully AST-based BAN. Denies when a command whose effective HEAD matches
+    one of `commands` (literal names, or globs naming a family such as
+    `botchat-*`) has its stdout CONSUMED: piped into another command,
+    redirected away (`redirect_mode`: `devnull` default, `any`, or `none`),
+    or captured by a `$(...)` substitution (`include_substitution`, default
+    true). A name that appears only as an argument or inside a quoted string
+    / heredoc body is not a command head and never matches, so
+    `grep -n 'botchat-show' Dockerfile | head` is allowed while
+    `botchat-show 2008 | head` is denied. Unparseable command → DENY
+    (fail-closed), with the `obligations override` hint in the `why`.
   - `marker_file_present {path, negate?}` — alias of `file_exists`
   - `process_alive {pid_file}` — pid_file contains a live PID
   - `process_in_pgrep {pattern}` — `pgrep -f <pattern>` returns a match

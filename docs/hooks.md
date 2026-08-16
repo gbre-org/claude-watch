@@ -160,7 +160,8 @@ surface).
 | `marker_file_present {path, negate?}` | alias of `file_exists` |
 | `env_present {var, value?}` | env var set (and optionally equals value) |
 | `queue_status {id, status}` | queue item in expected state |
-| `no_pipe_pattern {regex}` | BAN regex against Bash command |
+| `no_pipe_pattern {regex}` | BAN regex against Bash command (matched against a structure-only rendering, so quoted/heredoc data can't trip it). Prefer `no_output_consumed` for "don't filter this tool's output" rules. |
+| `no_output_consumed {commands, redirect_mode?, include_substitution?}` | BAN, fully AST-based — deny when a command whose HEAD matches `commands` (literal names or globs like `botchat-*`) has its stdout piped, redirected (`redirect_mode`: `devnull` default / `any` / `none`), or captured by `$(...)`. A mention as an argument or inside a string never matches. Unparseable command → DENY (fail-closed). |
 | `process_alive {pid_file}` | PID in file is alive |
 | `process_in_pgrep {pattern}` | pattern matches via `pgrep -f` |
 | `watchers_healthy {}` | `watcher-status --unhealthy-only` is empty |
