@@ -255,6 +255,46 @@ class ForceStartEndpointTest(unittest.TestCase):
             if prior is not None:
                 os.environ["OBLIGATIONS_FORCE_START"] = prior
 
+    # -------------------------------------------------------------- 6
+    def test_stale_session_task_bin_returns_clear_error(self):
+        """When SESSION_TASK_BIN is not OPENABLE, force-start must return an
+        ACTIONABLE 500 rather than the opaque "session-task force-start
+        failed" the raw rc=2 subprocess would produce.
+
+        This is the exact production failure mode Andrew hit (#4386): the
+        container bind-mounted session-task as a SINGLE FILE, so when the
+        host script was replaced via atomic rename the mount went stale
+        (pointed at the now-unlinked inode) and ``python3 /app/session-task
+        ...`` died with ENOENT. The preflight turns that into a diagnostic
+        naming the stale mount; the durable fix is the directory bind mount
+        in docker-compose.yml.
+        """
+        missing = str(Path(self.tmp) / "gone" / "session-task")
+        orig = self.appmod.SESSION_TASK_BIN
+        self.appmod.SESSION_TASK_BIN = missing
+        try:
+            r = self.client.post(
+                f"/api/queue/{self.blocked_id}/force-start",
+                json={"reason": "operator-decided"},
+            )
+            self.assertEqual(r.status_code, 500, r.get_data(as_text=True))
+            body = r.get_json()
+            self.assertFalse(body.get("ok"))
+            err = body.get("error", "")
+            self.assertIn("not readable", err)
+            self.assertIn("stale", err.lower())
+            self.assertEqual(body.get("session_task_bin"), missing)
+
+            # No half-promotion: the item stays pending, untouched.
+            with open(self.queue_actual) as f:
+                data = json.load(f)
+            item = next(
+                it for it in data["items"] if it["id"] == self.blocked_id
+            )
+            self.assertEqual(item["status"], "pending")
+        finally:
+            self.appmod.SESSION_TASK_BIN = orig
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

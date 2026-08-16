@@ -285,6 +285,54 @@ _QUEUE_MARKER_RE = re.compile(r"Queue item:\s*(q-[a-z0-9-]{4,64})")
 # need to allow paragraphs.
 _MAX_REASON_LEN = 500
 
+
+def _session_task_preflight() -> "tuple[Any, int] | None":
+    """Verify ``SESSION_TASK_BIN`` is actually OPENABLE before shelling out.
+
+    The script reaches the container via a docker-compose bind mount. A
+    SINGLE-FILE bind mount binds the source *inode* at container start; when
+    the host file is later replaced via atomic rename — which is exactly how
+    ``tools/session-task/session-task`` is edited, deployed, and how a git
+    checkout lands it — the container's mount keeps pointing at the now-
+    UNLINKED inode. The path still lists via ``ls`` (the mount dentry
+    survives) but ``open()`` fails with ENOENT, so ``python3
+    /app/session-task ...`` dies with rc=2 and every write endpoint
+    (force-start, abandon, depend) fails opaquely as "session-task <op>
+    failed". This preflight converts that into an actionable diagnostic.
+
+    The DURABLE fix is bind-mounting the containing DIRECTORY rather than the
+    file (a directory mount resolves the filename fresh on each ``open()``,
+    so atomic-rename replacement is picked up transparently) — see the
+    queue-minisite service in ``examples/compose/docker-compose.yml``. This
+    preflight is defense-in-depth so a future stale mount is diagnosable
+    instead of silent.
+
+    Returns ``None`` when the binary is readable, else an
+    ``(json_response, status_code)`` tuple the caller returns directly.
+    """
+    try:
+        with open(SESSION_TASK_BIN, "rb"):
+            pass
+    except OSError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": (
+                        f"session-task binary is not readable at "
+                        f"{SESSION_TASK_BIN!r}: {exc}. This usually means the "
+                        f"bind-mounted script went stale (host file replaced "
+                        f"via atomic rename after the container started) — "
+                        f"recreate the queue-minisite container to refresh "
+                        f"the mount."
+                    ),
+                    "session_task_bin": SESSION_TASK_BIN,
+                }
+            ),
+            500,
+        )
+    return None
+
 # Errored-hostjob detection. The `hostjob` runner (`examples/compose/bin/hostjob`) flips
 # its queue item to `abandoned` with `abandon_reason = "hostjob exit <N>"`
 # when the host worker exits NON-ZERO (see the reaper's `finalize_queue`).
@@ -1799,6 +1847,10 @@ def _do_abandon(
             404,
         )
 
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
+
     try:
         proc = subprocess.run(
             [
@@ -1968,6 +2020,10 @@ def api_queue_force_start(queue_id: str) -> Any:
             ),
             404,
         )
+
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
 
     try:
         proc = subprocess.run(
@@ -2144,6 +2200,10 @@ def api_queue_depend() -> Any:
     # Shell out to session-task — the canonical writer holds the
     # fcntl.flock on queue.json, so we never race with concurrent
     # writes from the host CLI or other endpoint hits.
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
+
     try:
         proc = subprocess.run(
             [
@@ -2244,6 +2304,10 @@ def api_queue_depend_remove(queue_id: str) -> Any:
             jsonify({"ok": False, "error": "invalid or missing 'target_id'"}),
             400,
         )
+
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
 
     try:
         proc = subprocess.run(
