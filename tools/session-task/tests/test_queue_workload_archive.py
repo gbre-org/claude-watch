@@ -169,8 +169,14 @@ def test_done_archives_workload_output_and_stamps_path():
         assert archive.read_bytes() == src.read_bytes()
 
 
-def test_abandon_archives_workload_output():
-    """queue abandon archives a workload-bound item — Stop button code path."""
+def test_reaper_abandon_archives_workload_output():
+    """queue abandon archives a workload-bound item — the reaper's code path.
+
+    `--confirmed-dead` is what the workload reaper passes: it holds the
+    wrapped command's exit code, so it OBSERVED the process terminate
+    rather than inferring it, and goes straight to terminal. A bare abandon
+    would quarantine instead (covered below).
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
 
@@ -186,8 +192,46 @@ def test_abandon_archives_workload_output():
         _stamp_workload_output(env, label, ["partial output before stop"])
 
         _run(env, "queue", "register", qid)
+        _run(env, "queue", "abandon", qid, "--confirmed-dead",
+             "--reason", "workload exited non-zero rc=7")
+
+        shown = _show(env, qid)
+        assert shown["status"] == "abandoned"
+        assert shown.get("log_archive_path") == f"{qid}.workload.txt"
+        archive = Path(env["QUEUE_LOG_ARCHIVE_DIR"]) / shown["log_archive_path"]
+        assert archive.is_file()
+
+
+def test_stop_button_abandon_quarantines_then_archives_on_release():
+    """The UI Stop button has no exit code, so it quarantines first.
+
+    Pressing Stop does not kill anything — the owning agent is denied at
+    its next tool call because the queue id left `running`. Whether it
+    actually stopped is unknown at that moment, so the scope stays held
+    and the archive waits for the release, when we know.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        label = "stopped-workload"
+        item = _add(
+            env,
+            "workload stopped from the UI",
+            [f"workload:{label}"],
+            "--summary",
+            "wkl-stop",
+        )
+        qid = item["id"]
+        _stamp_workload_output(env, label, ["partial output before stop"])
+
+        _run(env, "queue", "register", qid)
         _run(env, "queue", "abandon", qid, "--reason", "test stop")
 
+        shown = _show(env, qid)
+        assert shown["status"] == "quarantined"
+        assert "log_archive_path" not in shown
+
+        _run(env, "queue", "release", qid, "--reason", "confirmed stopped")
         shown = _show(env, qid)
         assert shown["status"] == "abandoned"
         assert shown.get("log_archive_path") == f"{qid}.workload.txt"

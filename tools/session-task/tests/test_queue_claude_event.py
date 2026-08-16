@@ -289,7 +289,11 @@ def test_abandon_emits_queue_abandoned_event():
                   "abandon test summary")
         d1 = json.loads(r1.stdout)
         _run(env, "queue", "register", d1["id"], "--json", check=True)
-        _run(env, "queue", "abandon", d1["id"], "--reason",
+        # `--confirmed-dead` because a bare abandon of a REGISTERED item now
+        # quarantines it (emitting `queue-quarantined`) rather than going
+        # terminal. This test covers the terminal event; the quarantine
+        # event has its own coverage below.
+        _run(env, "queue", "abandon", d1["id"], "--confirmed-dead", "--reason",
              "agent crashed in testing", check=True)
 
         calls = _read_shim_log(ev_log)
@@ -302,6 +306,49 @@ def test_abandon_emits_queue_abandoned_event():
         assert parsed["data"]["reason"] == "agent crashed in testing"
         assert "elapsed_sec" in parsed["data"]
         assert int(parsed["data"]["elapsed_sec"]) >= 0
+
+
+def test_abandon_without_evidence_emits_queue_quarantined_event():
+    """A bare abandon of a running item is a QUARANTINE, not a completion.
+
+    It must emit its own tag: consumers that react to `queue-abandoned` by
+    treating the scope as free would otherwise be told the exact untruth
+    the quarantine exists to prevent.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_dir = Path(tmp) / "bin"
+        ev_log = Path(tmp) / "claude-event.log"
+        _install_fake_claude_event(bin_dir, ev_log)
+        _install_fake_pingme(bin_dir)
+        env = _env_for_tmp(tmp, bin_dir=bin_dir)
+
+        r1 = _add(env, "quarantine-test", ["repo:ce-quarantine"],
+                  "--summary", "quarantine test summary")
+        d1 = json.loads(r1.stdout)
+        _run(env, "queue", "register", d1["id"], "--json", check=True)
+        _run(env, "queue", "abandon", d1["id"], "--reason",
+             "no output file, presumed dead", check=True)
+
+        calls = _read_shim_log(ev_log)
+        assert len(calls) == 1, calls
+        parsed = _parse_claude_event_argv(calls[0])
+        assert parsed["source"] == "queue"
+        assert parsed["tag"] == "queue-quarantined"
+        assert parsed["data"]["queue_id"] == d1["id"]
+        assert parsed["data"]["prior_status"] == "running"
+        assert parsed["data"]["reason"] == "no output file, presumed dead"
+        assert parsed["data"]["quarantined_at"]
+
+        # Releasing it then emits the ordinary terminal event, so anything
+        # downstream that only knows `queue-abandoned` still sees the scope
+        # free at the moment it actually IS free.
+        _run(env, "queue", "release", d1["id"], "--reason", "checked",
+             check=True)
+        calls = _read_shim_log(ev_log)
+        assert len(calls) == 2, calls
+        parsed = _parse_claude_event_argv(calls[1])
+        assert parsed["tag"] == "queue-abandoned"
+        assert parsed["data"]["quarantine_released_by"] == "operator"
 
 
 # ---------------------------------------------------------------------------
@@ -395,8 +442,8 @@ def test_abandon_is_idempotent_on_already_abandoned():
         d1 = json.loads(r1.stdout)
         _run(env, "queue", "register", d1["id"], "--json", check=True)
 
-        _run(env, "queue", "abandon", d1["id"], "--reason", "first reason",
-             check=True)
+        _run(env, "queue", "abandon", d1["id"], "--confirmed-dead",
+             "--reason", "first reason", check=True)
 
         # Snapshot persisted state after first abandon so we can verify
         # the second call doesn't mutate it.
@@ -408,8 +455,8 @@ def test_abandon_is_idempotent_on_already_abandoned():
         assert first_reason == "first reason"
 
         # Second abandon — different reason, must NOT clobber state.
-        r2 = _run(env, "queue", "abandon", d1["id"], "--reason",
-                  "second reason (should be ignored)")
+        r2 = _run(env, "queue", "abandon", d1["id"], "--confirmed-dead",
+                  "--reason", "second reason (should be ignored)")
         assert r2.returncode == 0, (
             f"second abandon should exit 0; got rc={r2.returncode}\n"
             f"stdout={r2.stdout}\nstderr={r2.stderr}"
@@ -488,6 +535,7 @@ def _all_tests():
         test_register_does_not_emit_queue_running_event,
         test_done_emits_queue_done_event_with_elapsed_sec,
         test_abandon_emits_queue_abandoned_event,
+        test_abandon_without_evidence_emits_queue_quarantined_event,
         test_failing_claude_event_does_not_block_queue_op,
         test_env_var_suppresses_claude_event,
         test_abandon_is_idempotent_on_already_abandoned,

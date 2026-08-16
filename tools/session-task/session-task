@@ -31,7 +31,15 @@ Usage:
     session-task queue groups [--json]
     session-task queue ready [--json]
     session-task queue done <id>
-    session-task queue abandon <id> [--reason TEXT]
+    session-task queue abandon <id> [--reason TEXT] [--confirmed-dead [--force]]
+                                    # running/wedged -> QUARANTINED (scope
+                                    # stays locked); pending/blocked ->
+                                    # abandoned. --confirmed-dead skips
+                                    # quarantine, for callers with an actual
+                                    # exit code.
+    session-task queue release <id> [--reason TEXT] [--force] [--json]
+                                    # quarantined -> abandoned; frees the
+                                    # scope. THE unwedge command.
     session-task queue resurrect <old-id> [--reason TEXT] [--summary TEXT]
                                           [--keep-old] [--from-transcript PATH]
                                           [--created-by WHO] [--json]
@@ -115,6 +123,17 @@ Spawn gating (2026-04-17):
     other running item has overlapping scope (cross-group conflict).
     This is the one enforcement point. Bypassing it == operating outside
     the queue, which Andrew has flagged as a rule violation.
+
+Abandoning a live scope (quarantine):
+    `queue abandon` on a running/wedged item does NOT free its scope. It
+    moves the item to `quarantined`, which still blocks a spawn on that
+    scope, because "the agent looks dead" is an inference and inferences
+    have been wrong (an agent presumed dead ran another ~48 minutes while
+    a replacement redid its work; a duplicate reached a user). End a
+    quarantine with `queue done` (the agent finished), `queue resurrect`
+    (respawn a replacement -- scope carries over, so a genuinely dead
+    agent costs no extra step) or `queue release` (you assert it's gone).
+    See the "Quarantine" comment block below for the full rationale.
 """
 
 import argparse
@@ -199,8 +218,68 @@ HOSTJOB_STARTING_WINDOW_SECONDS = float(
 #                 Set via `queue block <id> --reason ...`. Cleared via
 #                 `queue unblock <id>` (back to running), `queue done <id>`
 #                 (work was actually complete) or `queue abandon <id>`.
+#   quarantined -- `queue abandon` was called on an item that OWNED ITS
+#                 SCOPE (running/wedged) without positive evidence that the
+#                 owning process is gone. NOT terminal, and it KEEPS the
+#                 scope lock. See the "Quarantine" block below for the full
+#                 rationale. Cleared via `queue done <id>` (the agent came
+#                 back and finished — the strongest possible proof it was
+#                 alive), `queue release <id>` (operator asserts it's gone)
+#                 or `queue resurrect <id>` (respawn a replacement).
 #   done       -- terminal: completed successfully
 #   abandoned  -- terminal: gave up (with optional reason)
+#
+# --------------------------------------------------------------------------
+# Quarantine: why `abandon` on a live-scope item is NOT terminal
+# --------------------------------------------------------------------------
+#
+# `queue abandon` used to free the scope immediately. The caller decides to
+# abandon on an INFERENCE about liveness — "no output file", "stale mtime",
+# "no child process", "it's been quiet too long" — none of which observe the
+# process exiting. Silence is not death.
+#
+# Incident: an agent was declared dead and abandoned. It was in fact still
+# running and worked for another ~48 minutes. Because abandon freed the
+# scope, a replacement was spawned for the same work; both agents finished
+# and both wrote. Most of the outputs happened to dedupe on an exact-match
+# key, but one pair disagreed on that key and a user-visible duplicate
+# escaped. The scope lock existed precisely to prevent that, and an
+# inference dissolved it.
+#
+# So: an abandon of a scope-owning item moves it to `quarantined`, which
+# still holds the scope (it is in RUNNING_STATUSES and SERIALIZING_STATUSES)
+# but is rendered distinctly everywhere so a human can tell "presumed dead"
+# from "known alive". Three ways out, in descending order of evidential
+# strength:
+#
+#   1. `queue done <id>` -- the agent itself reported completion. This is
+#      proof it was alive, and it is exactly the case the incident missed.
+#   2. `queue resurrect <id>` -- the operator wants a replacement. Resurrect
+#      abandons the old row (terminal) and creates a new one carrying the
+#      same scope, so the respawn path for a genuinely-dead agent needs no
+#      extra step and no manual unwedging.
+#   3. `queue release <id>` -- an explicit operator assertion that the
+#      process is gone. Terminal `abandoned`.
+#
+# `queue abandon --confirmed-dead` skips quarantine outright, for callers
+# that hold POSITIVE evidence of exit rather than an inference. The workload
+# reaper is the canonical one: it reads the wrapped command's exit code, so
+# it knows the process terminated. Do NOT pass it because an agent "looks"
+# dead.
+#
+# Both `release` and `--confirmed-dead` consult claude-watch's active-agents
+# state, but only in the direction that is sound: a LIVE agent record
+# REFUSES the release (positive evidence of life). The ABSENCE of a record
+# authorizes nothing — that absence is the same weak inference that caused
+# the incident. `--force` overrides the refusal for an operator who knows
+# better than the state file.
+#
+# Deliberately NOT implemented: a quarantine auto-expiry timer. A timer is
+# another inference that the agent is dead, and inference is the bug — a TTL
+# that fires while the agent is alive reproduces the incident exactly, just
+# later. The unwedge story does not need one: `resurrect` is the same
+# command the respawn path already uses, and `release` is one line. Both are
+# printed on the abandon output and in `queue list`.
 #
 # Three distinct status sets, each scoping a DIFFERENT question. Conflating
 # them is the historical source of the "blocked item holds its scope" class
@@ -209,14 +288,16 @@ HOSTJOB_STARTING_WINDOW_SECONDS = float(
 # items -- see SERIALIZING_STATUSES below).
 #
 #   RUNNING_STATUSES = items that OWN A SLOT (a peer cannot spawn into the
-#   same scope while one of these is live). `running` + `wedged`: a wedge is
-#   transient and the agent still holds the scope. `blocked` is EXCLUDED --
+#   same scope while one of these is live). `running` + `wedged` +
+#   `quarantined`: a wedge is transient and the agent still holds the scope;
+#   a quarantined item MIGHT still hold it (that is the entire point — we do
+#   not know, so we do not release). `blocked` is EXCLUDED --
 #   `queue block` RELEASES the scope lock (blocked items are exempt from the
 #   orphaned-running alert), so a blocked item must not own a slot.
 #
 #   SERIALIZING_STATUSES = items that PARTICIPATE IN SCOPE SERIALIZATION:
 #   they form groups (connected components over overlapping scope) and gate
-#   readiness. `pending` + `running` + `wedged`. `blocked` is EXCLUDED here
+#   readiness. `pending` + `running` + `wedged` + `quarantined`. `blocked` is EXCLUDED here
 #   too -- a blocked item must NOT connect (bridge) otherwise-independent
 #   scopes into one serialization group, and must NOT make a same-group peer
 #   not-ready. This is the set that group formation (`_group_ids_overlapping`,
@@ -230,9 +311,13 @@ HOSTJOB_STARTING_WINDOW_SECONDS = float(
 #   "can still edit deps" gate (`queue depend`). `blocked` IS included here
 #   -- a parked item is still something the operator wants to see and can
 #   still be unblocked / re-deped. Visibility != scope-holding.
-ACTIVE_STATUSES = ("pending", "running", "wedged", "blocked")
-SERIALIZING_STATUSES = ("pending", "running", "wedged")
-RUNNING_STATUSES = ("running", "wedged")
+ACTIVE_STATUSES = ("pending", "running", "wedged", "blocked", "quarantined")
+SERIALIZING_STATUSES = ("pending", "running", "wedged", "quarantined")
+RUNNING_STATUSES = ("running", "wedged", "quarantined")
+
+# Terminal (non-recoverable) statuses. `quarantined` is deliberately NOT
+# here: it is a holding state, not an outcome.
+TERMINAL_STATUSES = ("done", "abandoned")
 
 # Agent-transcript archive directory. At queue-done / queue-abandon time the
 # spawning subagent's JSONL transcript (if locatable) is copied here so it
@@ -3839,8 +3924,9 @@ def cmd_queue_list(args):
     is_tty = sys.stdout.isatty()
     RED = "\033[31m" if is_tty else ""
     YELLOW = "\033[33m" if is_tty else ""
+    MAGENTA = "\033[35m" if is_tty else ""
     RESET = "\033[0m" if is_tty else ""
-    print(f"{'ID':22} {'GROUP':14} {'ST':8} {'PR':3} {'H':1} {'SCOPE'}")
+    print(f"{'ID':22} {'GROUP':14} {'ST':11} {'PR':3} {'H':1} {'SCOPE'}")
     for it in items:
         status = it.get("status")
         if status == "wedged":
@@ -3849,6 +3935,12 @@ def cmd_queue_list(args):
         elif status == "blocked":
             head_mark = "~"
             color, color_reset = YELLOW, RESET
+        elif status == "quarantined":
+            # `?` because that is exactly what a quarantine means: we do
+            # NOT know whether the agent is alive. Magenta so it can't be
+            # confused with a wedge (red) or a block (yellow).
+            head_mark = "?"
+            color, color_reset = MAGENTA, RESET
         else:
             head_mark = "*" if it.get("group_head") else " "
             color, color_reset = "", ""
@@ -3863,7 +3955,7 @@ def cmd_queue_list(args):
             desc = desc[:77] + "..."
         print(
             f"{color}{it['id']:22} {it.get('group_id',''):14} "
-            f"{it.get('status',''):8} {it.get('priority',5):<3} {head_mark} "
+            f"{it.get('status',''):11} {it.get('priority',5):<3} {head_mark} "
             f"{scope_str}{color_reset}"
         )
         print(f"  summary: {summary}")
@@ -3875,6 +3967,20 @@ def cmd_queue_list(args):
             print(f"  wedged : {it.get('wedged_reason')}")
         if status == "blocked" and it.get("block_reason"):
             print(f"  blocked: {it.get('block_reason')}")
+        if status == "quarantined":
+            # A quarantine is the one state where the operator MUST be told
+            # what it means (scope still held) and how to end it — the whole
+            # failure mode being fixed was someone assuming the scope was
+            # free.
+            print(
+                f"  QUARANTINED (presumed dead, SCOPE STILL HELD) at "
+                f"{it.get('quarantined_at') or '?'}: "
+                f"{it.get('quarantine_reason') or '(no reason given)'}"
+            )
+            print(
+                f"  release: queue done {it['id']} | queue resurrect "
+                f"{it['id']} | queue release {it['id']} --reason '...'"
+            )
 
 
 def cmd_queue_show(args):
@@ -4022,8 +4128,17 @@ def cmd_queue_done(args):
             fh.close()
             return
         started_at = target.get("started_at")
+        # A `done` from a quarantined item is the case the quarantine exists
+        # for: the agent someone presumed dead came back and finished. That
+        # is the strongest possible evidence it was alive, so it clears the
+        # quarantine outright — and the stamps below make the near-miss
+        # visible in the audit trail rather than silently healing it.
+        was_quarantined = target.get("status") == "quarantined"
         target["status"] = "done"
         target["completed_at"] = _fmt_ts()
+        if was_quarantined:
+            target["quarantine_released_at"] = target["completed_at"]
+            target["quarantine_released_by"] = "agent-completed"
         target["group_head"] = False
         # Archive the spawning subagent's transcript (or workload output,
         # for workload-bound items) while we still have the lock. Best-
@@ -4078,11 +4193,17 @@ def cmd_queue_done(args):
             "summary": _item_summary(target),
             "elapsed_sec": elapsed_sec,
             "created_by": target.get("created_by", ""),
+            "was_quarantined": was_quarantined,
         },
         priority="low",
         silent=getattr(args, "silent", False),
     )
 
+    if was_quarantined:
+        print(
+            f"NOTE: {args.id} was QUARANTINED (presumed dead) and completed "
+            f"anyway. Quarantine cleared.",
+        )
     print(f"done: {args.id}")
     if next_head:
         print(f"next in group {target['group_id']}: {next_head['id']} ({next_head['description'][:60]})")
@@ -4091,6 +4212,47 @@ def cmd_queue_done(args):
 
 
 def cmd_queue_abandon(args):
+    """Give up on a queue item.
+
+    Two outcomes, decided by whether the item currently OWNS ITS SCOPE and
+    whether the caller holds positive evidence that the owning process is
+    gone (see the Quarantine block at the top of this file):
+
+      * pending / blocked item, or `--confirmed-dead` -> terminal
+        `abandoned`, scope released. A pending item never had an agent; a
+        blocked item already released its scope lock; `--confirmed-dead`
+        means the caller watched the process exit.
+      * running / wedged item without `--confirmed-dead` -> `quarantined`.
+        NOT terminal, scope STILL HELD. The caller inferred death; an
+        inference must not dissolve the lock that prevents duplicate work.
+
+    `--confirmed-dead` REFUSES (exit 1) when claude-watch reports a live
+    agent bound to this id — evidence of life overrides the caller's claim.
+    `--force` overrides that refusal. Note the asymmetry is deliberate:
+    the absence of an agent record authorizes nothing.
+    """
+    confirmed_dead = bool(getattr(args, "confirmed_dead", False))
+    force = bool(getattr(args, "force", False))
+
+    # Liveness guard for --confirmed-dead. Read BEFORE taking the queue
+    # lock: _live_agent_for_queue may shell out to `claude-watch
+    # active-agents` and we don't want that under the flock.
+    if confirmed_dead and not force:
+        live_agent = _live_agent_for_queue(args.id)
+        if live_agent:
+            print(
+                f"ERROR: --confirmed-dead refused for {args.id}: "
+                f"claude-watch reports agent {live_agent} is still ALIVE.",
+                file=sys.stderr,
+            )
+            print(
+                "  The agent is running. Let it finish (it will `queue done`),"
+                " or drop --confirmed-dead to quarantine the item instead,"
+                " or pass --force if you know the state file is wrong.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     fh, data = _queue_open_locked("rw")
     try:
         items = data["items"]
@@ -4107,29 +4269,80 @@ def cmd_queue_abandon(args):
         # `queue-abandoned` claude-event, duplicate pingme, or a clobbered
         # `abandoned_at` timestamp + `abandon_reason`. Same exit code as
         # `cmd_queue_done` (0) so the caller treats it as success.
-        if target["status"] in ("done", "abandoned"):
+        if target["status"] in TERMINAL_STATUSES:
             print(f"already {target['status']}: {args.id}")
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             return
+
+        prior_status = target["status"]
+
+        # Already quarantined: idempotent no-op unless the caller now has
+        # positive evidence of death, in which case fall through to the
+        # terminal path (that IS the release-with-evidence case).
+        if prior_status == "quarantined" and not confirmed_dead:
+            print(f"already quarantined: {args.id}")
+            print(f"  quarantined_at: {target.get('quarantined_at')}")
+            print(f"  reason        : {target.get('quarantine_reason') or '(none)'}")
+            print("  release it with one of:")
+            print(f"    session-task queue done {args.id}          "
+                  f"# the agent came back and finished")
+            print(f"    session-task queue resurrect {args.id}     "
+                  f"# respawn a replacement (scope carries over)")
+            print(f"    session-task queue release {args.id} --reason '...'"
+                  f"  # you know it's gone")
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            return
+
+        # The quarantine decision. Scope-owning statuses only; a pending
+        # item never had an agent and a blocked item already released its
+        # lock, so neither can produce the duplicate-work failure mode.
+        quarantine = prior_status in RUNNING_STATUSES and not confirmed_dead
         started_at = target.get("started_at")
-        target["status"] = "abandoned"
-        target["abandoned_at"] = _fmt_ts()
-        if args.reason:
-            target["abandon_reason"] = args.reason
-        target["group_head"] = False
-        # Archive the spawning subagent's transcript or workload output
-        # (if any). Pending items abandoned before spawn won't have a
-        # record — the helper silently skips that case.
-        archive_path = _archive_for_item(target, reason="abandon")
-        if archive_path:
-            target["log_archive_path"] = archive_path
-        _recompute_group_heads(items)
-        _queue_write_and_unlock(fh, data)
+        if quarantine:
+            target["status"] = "quarantined"
+            target["quarantined_at"] = _fmt_ts()
+            target["quarantine_reason"] = args.reason or ""
+            target["quarantined_from"] = prior_status
+            # group_head stays as-is: the item still owns the slot, so it
+            # is still the in-flight head of its group.
+            #
+            # The transcript is deliberately NOT archived here. Archiving is
+            # a terminal-transition act; a quarantined agent may still be
+            # writing to its transcript. The archive happens at `release` /
+            # `done` / `resurrect` time, once we actually know.
+            _recompute_group_heads(items)
+            _queue_write_and_unlock(fh, data)
+        else:
+            if confirmed_dead:
+                target["death_evidence"] = (
+                    "operator --force (liveness state overridden)"
+                    if force else "caller asserted --confirmed-dead"
+                )
+            target["status"] = "abandoned"
+            target["abandoned_at"] = _fmt_ts()
+            if args.reason:
+                target["abandon_reason"] = args.reason
+            target["group_head"] = False
+            # Archive the spawning subagent's transcript or workload output
+            # (if any). Pending items abandoned before spawn won't have a
+            # record — the helper silently skips that case.
+            archive_path = _archive_for_item(target, reason="abandon")
+            if archive_path:
+                target["log_archive_path"] = archive_path
+            _recompute_group_heads(items)
+            _queue_write_and_unlock(fh, data)
     except Exception:
         fcntl.flock(fh, fcntl.LOCK_UN)
         fh.close()
         raise
+
+    if quarantine:
+        _emit_quarantine_notifications(
+            target, args, started_at=started_at, prior_status=prior_status,
+        )
+        return
 
     log_completed(
         f"[queue {target['id']} abandoned] {target['description']}"
@@ -4182,6 +4395,237 @@ def cmd_queue_abandon(args):
     print(f"abandoned: {args.id}")
 
 
+def _emit_quarantine_notifications(target, args, *, started_at, prior_status):
+    """Log / pingme / claude-event for an abandon that landed in quarantine.
+
+    Kept out of ``cmd_queue_abandon``'s lock block so a notification failure
+    can never leave the queue file locked.
+    """
+    reason_str = args.reason if args.reason else "no reason given"
+    elapsed = _elapsed_minutes(started_at)
+    elapsed_sec = _elapsed_seconds(started_at)
+    elapsed_str = f"{elapsed}m" if elapsed is not None else "unknown"
+    qid = target["id"]
+
+    log_completed(
+        f"[queue {qid} QUARANTINED] {target.get('description','')}"
+        + (f" (reason: {args.reason})" if args.reason else ""),
+        extra={
+            "source": "queue",
+            "event": "quarantine",
+            "id": qid,
+            "group_id": target.get("group_id"),
+            "reason": args.reason,
+            "prior_status": prior_status,
+        },
+    )
+
+    # Quarantine is an attention-required state: it holds a scope lock
+    # against work the operator probably wants to re-spawn. Normal priority
+    # (not high) — this is "look at this soon", not "the system is broken".
+    _pingme_notify(
+        title=f"queue QUARANTINED: {qid}",
+        message=(
+            f"{_item_summary(target)}\n"
+            f"elapsed: {elapsed_str} "
+            f"| reason: {reason_str} "
+            f"| scope: {','.join(target.get('scope', []))}"
+        ),
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    _claude_event_notify(
+        tag="queue-quarantined",
+        message=(
+            f"queue QUARANTINED: {qid} ({_item_summary(target)}) "
+            f"-- scope still held, reason: {reason_str}"
+        ),
+        data={
+            "queue_id": qid,
+            "group_id": target.get("group_id"),
+            "scope": target.get("scope", []),
+            "summary": _item_summary(target),
+            "elapsed_sec": elapsed_sec,
+            "reason": args.reason or "",
+            "prior_status": prior_status,
+            "quarantined_at": target.get("quarantined_at"),
+            "created_by": target.get("created_by", ""),
+        },
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    print(f"quarantined: {qid} (was {prior_status})")
+    print("  THE SCOPE IS STILL HELD. A replacement agent cannot be")
+    print("  registered on this scope until the quarantine is released.")
+    print(f"  scope: {','.join(target.get('scope', []))}")
+    print("  Release it with one of:")
+    print(f"    session-task queue done {qid}"
+          "                 # the agent came back and finished")
+    print(f"    session-task queue resurrect {qid}"
+          "            # respawn a replacement (carries the scope over)")
+    print(f"    session-task queue release {qid} --reason '...'"
+          "  # you know the process is gone")
+
+
+def cmd_queue_release(args):
+    """Release a quarantined item to terminal `abandoned`, freeing its scope.
+
+    This is the explicit operator assertion that the presumed-dead process
+    really is gone. It is the answer to "how do I unwedge a quarantine" and
+    is intentionally a single command with no ceremony beyond a reason.
+
+    Behavior:
+      * Item must exist and be `quarantined`. Any other status refuses
+        (exit 1) with a pointer to the right command for that status.
+      * REFUSES (exit 1) when claude-watch reports a LIVE agent bound to
+        this id. A live agent is positive evidence the quarantine is doing
+        its job. `--force` overrides for the case where the operator knows
+        the state file is wrong.
+      * Note the asymmetry: the ABSENCE of an agent record is NOT treated
+        as evidence of death, because that inference is precisely what the
+        quarantine exists to stop trusting. Absence just means the guard
+        has nothing to say, and the operator's explicit call carries it.
+      * On success: status=abandoned with `abandon_reason` carrying the
+        quarantine reason forward, `quarantine_released_at` /
+        `quarantine_released_by` stamped, the transcript archived, and the
+        usual `queue-abandoned` claude-event emitted so downstream
+        consumers see the same terminal event they always did.
+    """
+    if not getattr(args, "force", False):
+        live_agent = _live_agent_for_queue(args.id)
+        if live_agent:
+            print(
+                f"ERROR: release refused for {args.id}: claude-watch reports "
+                f"agent {live_agent} is still ALIVE.",
+                file=sys.stderr,
+            )
+            print(
+                "  That is the quarantine working. Let the agent finish (it "
+                "will `queue done`), or pass --force if you know the "
+                "active-agents state is wrong.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        status = target.get("status")
+        if status != "quarantined":
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                f"release refused: {args.id} status={status!r} "
+                f"(must be quarantined)",
+                file=sys.stderr,
+            )
+            if status in TERMINAL_STATUSES:
+                print("  hint: the item is already terminal; nothing holds "
+                      "its scope.", file=sys.stderr)
+            elif status in RUNNING_STATUSES:
+                print(f"  hint: use `session-task queue abandon {args.id} "
+                      f"--reason '...'` to quarantine it first.",
+                      file=sys.stderr)
+            sys.exit(1)
+
+        quarantined_at = target.get("quarantined_at")
+        prior_reason = target.get("quarantine_reason") or ""
+        released_by = "operator --force" if getattr(args, "force", False) \
+            else "operator"
+        now = _fmt_ts()
+        target["status"] = "abandoned"
+        target["abandoned_at"] = now
+        target["quarantine_released_at"] = now
+        target["quarantine_released_by"] = released_by
+        reason_bits = [b for b in (prior_reason, args.reason) if b]
+        target["abandon_reason"] = (
+            "quarantine released: " + ("; ".join(reason_bits) or "no reason given")
+        )
+        target["group_head"] = False
+        # Terminal now, so the transcript archive that `abandon` deferred
+        # happens here.
+        archive_path = _archive_for_item(target, reason="abandon")
+        if archive_path:
+            target["log_archive_path"] = archive_path
+        _recompute_group_heads(items)
+        next_head = _group_head(items, target.get("group_id"))
+        started_at = target.get("started_at")
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']} abandoned] {target.get('description','')} "
+        f"(quarantine released: {target['abandon_reason']})",
+        extra={
+            "source": "queue",
+            "event": "abandon",
+            "id": target["id"],
+            "group_id": target.get("group_id"),
+            "reason": target["abandon_reason"],
+            "quarantine_released_by": released_by,
+        },
+    )
+
+    elapsed = _elapsed_minutes(started_at)
+    elapsed_sec = _elapsed_seconds(started_at)
+    elapsed_str = f"{elapsed}m" if elapsed is not None else "unknown"
+    _pingme_notify(
+        title=f"queue abandoned: {target['id']}",
+        message=(
+            f"{_item_summary(target)}\n"
+            f"elapsed: {elapsed_str} "
+            f"| reason: {target['abandon_reason']} "
+            f"| scope: {','.join(target.get('scope', []))}"
+        ),
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    # Same terminal lifecycle event `abandon` always emitted, so downstream
+    # consumers (main-loop handler, dashboards) need no changes. The extra
+    # quarantine_* keys let anyone who cares tell the two paths apart.
+    _claude_event_notify(
+        tag="queue-abandoned",
+        message=(
+            f"queue abandoned: {target['id']} ({_item_summary(target)}) "
+            f"-- quarantine released by {released_by}"
+        ),
+        data={
+            "queue_id": target["id"],
+            "group_id": target.get("group_id"),
+            "scope": target.get("scope", []),
+            "summary": _item_summary(target),
+            "elapsed_sec": elapsed_sec,
+            "reason": target["abandon_reason"],
+            "quarantined_at": quarantined_at,
+            "quarantine_released_by": released_by,
+            "created_by": target.get("created_by", ""),
+        },
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    if getattr(args, "json", False):
+        print(json.dumps(target, indent=2))
+        return
+    print(f"released: {args.id} (quarantine -> abandoned, scope freed)")
+    print(f"  released_by: {released_by}")
+    if next_head:
+        print(f"next in group {target.get('group_id')}: {next_head['id']} "
+              f"({next_head.get('description','')[:60]})")
+
+
 # ---------------------------------------------------------------------------
 # Resurrect (recover a queue item whose owning agent died mid-flight).
 # ---------------------------------------------------------------------------
@@ -4230,14 +4674,21 @@ def cmd_queue_resurrect(args):
         sys.exit(1)
 
     status = old.get("status")
-    # Spec: refuse unless status in running/wedged. Done/abandoned/blocked/
-    # pending items should NOT be resurrected — `queue add` is the right
-    # tool for a re-run from scratch, and a blocked item still owns its
-    # scope so the operator must unblock first.
-    if status not in ("running", "wedged"):
+    # Spec: refuse unless the item OWNS ITS SCOPE (running / wedged /
+    # quarantined). Done/abandoned/blocked/pending items should NOT be
+    # resurrected — `queue add` is the right tool for a re-run from scratch,
+    # and a blocked item still owns its scope so the operator must unblock
+    # first.
+    #
+    # `quarantined` is included deliberately: resurrect IS the respawn path
+    # for an agent that really did die, and requiring a separate release
+    # first would turn every genuine death into a two-step manual unwedge.
+    # Resurrect abandons the old row and carries its scope to the new one,
+    # so the lock is never dropped in between.
+    if status not in RUNNING_STATUSES:
         print(
             f"ERROR: resurrect refused: {args.id} status={status!r} "
-            f"(must be running or wedged).",
+            f"(must be running, wedged or quarantined).",
             file=sys.stderr,
         )
         print(
@@ -4356,7 +4807,7 @@ def cmd_queue_resurrect(args):
                 file=sys.stderr,
             )
             sys.exit(1)
-        if old_live.get("status") not in ("running", "wedged"):
+        if old_live.get("status") not in RUNNING_STATUSES:
             cur = old_live.get("status")
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
@@ -4466,6 +4917,12 @@ def cmd_queue_resurrect(args):
         # resurrect lifecycle.
         old_abandoned = False
         if not args.keep_old:
+            if old_live.get("status") == "quarantined":
+                # Resurrecting is the operator choosing "respawn it", which
+                # is also a decision that the old agent is not coming back.
+                # Record how the quarantine ended.
+                old_live["quarantine_released_at"] = ts_iso
+                old_live["quarantine_released_by"] = f"resurrect ({new_id})"
             old_live["status"] = "abandoned"
             old_live["abandoned_at"] = ts_iso
             old_live["abandon_reason"] = (
@@ -4811,6 +5268,22 @@ def _spawn_check(items, item, locked_scopes=None):
             + ", ".join(c["id"] for c in same_group_running)
         )
 
+    # Quarantined blockers get their own line. Without it the operator reads
+    # "overlaps running item(s)", goes looking for a live agent, finds none,
+    # and concludes the queue is stale — which is how the scope lock gets
+    # talked away. Name the state and name the exit.
+    quarantined = [c for c in conflicts if c.get("status") == "quarantined"]
+    if quarantined:
+        reasons.append(
+            "blocked by QUARANTINED item(s) {ids}: an earlier abandon "
+            "presumed the agent dead WITHOUT proof, so the scope is still "
+            "held. Resolve with `queue resurrect <id>` (respawn) or "
+            "`queue release <id> --reason ...` (you know it's gone) -- "
+            "do NOT spawn a second agent on this scope.".format(
+                ids=", ".join(c["id"] for c in quarantined),
+            )
+        )
+
     return (len(reasons) == 0, reasons, conflicts)
 
 
@@ -4973,6 +5446,37 @@ def cmd_queue_register(args):
             wr = target.get("wedged_reason")
             if wr:
                 print(f"!! WEDGED REASON: {wr}", file=sys.stderr)
+            print(bar, file=sys.stderr)
+            sys.exit(2)
+
+        if target.get("status") == "quarantined":
+            # A quarantined item was abandoned on an INFERENCE that its
+            # agent died. It still owns its scope precisely because that
+            # inference might be wrong. Re-registering it in place would
+            # re-create the double-spawn the quarantine exists to prevent.
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(f"!! REGISTER REFUSED: {args.id} IS QUARANTINED.",
+                  file=sys.stderr)
+            print("!! IT WAS ABANDONED ON A GUESS THAT ITS AGENT DIED, AND IT",
+                  file=sys.stderr)
+            print("!! STILL HOLDS THE SCOPE. THE AGENT MAY STILL BE WORKING.",
+                  file=sys.stderr)
+            print("!! RESOLVE THE QUARANTINE FIRST:", file=sys.stderr)
+            print(f"!!   session-task queue resurrect {args.id}"
+                  "        # respawn a replacement (scope carries over)",
+                  file=sys.stderr)
+            print(f"!!   session-task queue release {args.id} --reason '...'"
+                  "  # you know the process is gone",
+                  file=sys.stderr)
+            qr = target.get("quarantine_reason")
+            if qr:
+                print(f"!! QUARANTINE REASON: {qr}", file=sys.stderr)
+            print(f"!! QUARANTINED AT   : {target.get('quarantined_at')}",
+                  file=sys.stderr)
             print(bar, file=sys.stderr)
             sys.exit(2)
 
@@ -7575,10 +8079,122 @@ def build_parser():
         help="Suppress the pingme lifecycle notification for this operation.",
     )
 
-    q_abandon = qsub.add_parser("abandon", help="Mark item abandoned")
+    q_abandon = qsub.add_parser(
+        "abandon",
+        help=(
+            "Give up on an item. A pending/blocked item goes terminal "
+            "(abandoned). A running/wedged item goes to QUARANTINED and "
+            "KEEPS its scope, because 'the agent looks dead' is a guess -- "
+            "release it with `queue done` / `queue resurrect` / "
+            "`queue release`."
+        ),
+        description=(
+            "Give up on a queue item.\n\n"
+            "Outcome depends on whether the item currently owns its scope:\n"
+            "  pending / blocked        -> terminal `abandoned` (no agent "
+            "could be running)\n"
+            "  running / wedged         -> `quarantined`: NOT terminal, and "
+            "the scope stays\n"
+            "                              LOCKED so no replacement agent "
+            "can be spawned on it.\n\n"
+            "Why: abandoning is normally decided by inference -- no output "
+            "file, stale\n"
+            "mtime, 'no child process'. None of those observe the process "
+            "exiting. An\n"
+            "agent once presumed dead kept working for another ~48 minutes "
+            "while a\n"
+            "replacement redid the same work; both wrote, and a duplicate "
+            "reached a user.\n"
+            "A guess must not dissolve the lock that prevents that.\n\n"
+            "Ending a quarantine (all three are one command, none needs a "
+            "maintainer):\n"
+            "  session-task queue done <id>       the agent came back and "
+            "finished\n"
+            "  session-task queue resurrect <id>  respawn a replacement; "
+            "scope carries over,\n"
+            "                                     so a genuinely dead agent "
+            "needs no extra step\n"
+            "  session-task queue release <id>    you assert the process is "
+            "gone (terminal)\n\n"
+            "Pass --confirmed-dead ONLY with positive evidence of exit (an "
+            "exit code, a\n"
+            "reaped process). It skips quarantine entirely. 'It looks dead' "
+            "is not evidence."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     q_abandon.add_argument("id")
     q_abandon.add_argument("--reason")
     q_abandon.add_argument(
+        "--confirmed-dead", action="store_true",
+        help=(
+            "Skip quarantine and go straight to terminal `abandoned`. For "
+            "callers holding POSITIVE evidence the process exited (an exit "
+            "code, a reaped child) -- not for 'it looks dead'. Refuses if "
+            "claude-watch reports a live agent for this id (override with "
+            "--force)."
+        ),
+    )
+    q_abandon.add_argument(
+        "--force", action="store_true",
+        help=(
+            "With --confirmed-dead: proceed even though claude-watch "
+            "reports a live agent bound to this id. Use only when you know "
+            "the active-agents state is wrong."
+        ),
+    )
+    q_abandon.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme lifecycle notification for this operation.",
+    )
+
+    q_release = qsub.add_parser(
+        "release",
+        help=(
+            "Release a QUARANTINED item to terminal `abandoned`, freeing "
+            "its scope. The operator's explicit 'the process really is "
+            "gone' -- this is how you unwedge a quarantine."
+        ),
+        description=(
+            "Release a quarantined queue item: status -> abandoned, scope "
+            "freed.\n\n"
+            "`queue abandon` on a running/wedged item quarantines it "
+            "instead of freeing\n"
+            "the scope, because the caller was inferring death rather than "
+            "observing it.\n"
+            "`release` is the explicit operator assertion that ends that "
+            "state.\n\n"
+            "It REFUSES when claude-watch reports a live agent bound to the "
+            "id -- that is\n"
+            "positive evidence of life and it beats your assertion. "
+            "--force overrides.\n"
+            "The reverse does NOT hold: the absence of an agent record "
+            "authorizes nothing,\n"
+            "because that inference is exactly what the quarantine exists "
+            "to stop trusting.\n\n"
+            "If you want the work redone rather than dropped, use "
+            "`queue resurrect <id>`\n"
+            "instead -- it carries the scope to a fresh item without ever "
+            "unlocking it."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    q_release.add_argument("id")
+    q_release.add_argument(
+        "--reason",
+        help="Why you believe the process is gone. Appended to the "
+             "quarantine reason on the terminal row.",
+    )
+    q_release.add_argument(
+        "--force", action="store_true",
+        help="Release even though claude-watch reports a live agent for "
+             "this id.",
+    )
+    q_release.add_argument(
+        "--json", action="store_true",
+        help="Print the updated item as JSON.",
+    )
+    q_release.add_argument(
         "--silent", action="store_true",
         help="Suppress the pingme lifecycle notification for this operation.",
     )
@@ -7586,7 +8202,7 @@ def build_parser():
     q_resurrect = qsub.add_parser(
         "resurrect",
         help=(
-            "Recover an orphaned running/wedged item by extracting its "
+            "Recover an orphaned running/wedged/quarantined item by extracting its "
             "original spawn prompt from the dead agent's JSONL transcript "
             "and creating a NEW queue item with the same scope/summary/"
             "priority/depends_on. Abandons the old item (default; "
@@ -8114,6 +8730,7 @@ def main():
             "ready": cmd_queue_ready,
             "done": cmd_queue_done,
             "abandon": cmd_queue_abandon,
+            "release": cmd_queue_release,
             "resurrect": cmd_queue_resurrect,
             "pop": cmd_queue_pop,
             "register": cmd_queue_register,

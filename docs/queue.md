@@ -59,7 +59,8 @@ session-task queue pop [--id <id>]        # mark next/specific as running
 session-task queue spawn-check <id>       # rc=0 if clear, rc=2 if blocked
 session-task queue register <id>          # atomic ready→running
 session-task queue done <id>              # mark completed
-session-task queue abandon <id> [--reason R]
+session-task queue abandon <id> [--reason R] [--confirmed-dead [--force]]
+session-task queue release <id> [--reason R] [--force]  # quarantine -> abandoned
 session-task queue promote <id>           # raise priority
 session-task queue set-summary <id> "..."
 session-task queue prune                  # drop completed/abandoned
@@ -97,6 +98,52 @@ blocked) — only when it exits 0 may you `register` and spawn.
 
 Emergency bypass: `QUEUE_GATE_BYPASS=1` env var (audited to
 `~/.config/claude/queue-gate-bypass.log`).
+
+### Abandoning a live scope: quarantine
+
+`queue abandon` does **not** free the scope of an item that currently owns
+one. A `running` / `wedged` item moves to **`quarantined`**: not terminal,
+and still holding its scope lock so no replacement can register on it. A
+`pending` or `blocked` item still goes straight to `abandoned` — neither can
+have a live agent behind it.
+
+Why: abandoning is decided by *inference* — no output file, stale mtime, "no
+child process", it has been quiet too long. None of those observe the process
+exiting. An agent that was presumed dead and abandoned kept running for
+another ~48 minutes; because abandon freed the scope, a replacement was
+spawned for the same work, both finished, and a duplicate reached a user. The
+scope lock existed to prevent exactly that, and a guess dissolved it. Silence
+is not death.
+
+`queue list` renders a quarantined item with a `?` head marker (we do not
+know if the agent is alive), the reason, and the release commands inline.
+
+**Ending a quarantine** — three ways, in descending order of evidence:
+
+| Command | Meaning | Outcome |
+|---------|---------|---------|
+| `queue done <id>` | the agent came back and finished | `done`; quarantine cleared, stamped `quarantine_released_by=agent-completed` |
+| `queue resurrect <id>` | respawn a replacement | old row `abandoned`, new row carries the same scope — never unlocked in between |
+| `queue release <id> --reason ...` | operator asserts the process is gone | `abandoned`, scope freed |
+
+`resurrect` is the respawn path for an agent that genuinely died, and it
+accepts a quarantined item directly — a real death costs no extra step and
+never needs a maintainer to unwedge anything.
+
+`queue abandon --confirmed-dead` skips quarantine for callers holding
+**positive** evidence of exit (an exit code, a reaped child). The workload
+reaper passes it because it reads the wrapped command's rc. Do not pass it
+because an agent *looks* dead.
+
+Both `release` and `--confirmed-dead` consult claude-watch's active-agents
+state, but only in the sound direction: a **live** agent record refuses the
+release. The **absence** of a record authorizes nothing — that is the same
+weak inference the quarantine exists to stop trusting. `--force` overrides
+the refusal when you know the state file is wrong.
+
+There is deliberately **no auto-expiry timer**. A TTL is another inference
+that the agent is dead, and inference is the bug being fixed — one that fires
+while the agent is alive reproduces the incident, just later.
 
 ### Other rules
 

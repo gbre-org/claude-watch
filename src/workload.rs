@@ -1935,8 +1935,18 @@ pub fn cmd_emit_done(
 ///
 /// Mapping rationale:
 ///   * rc==0 && !killed → `session-task queue done <qid>` (success)
-///   * killed           → `session-task queue abandon <qid> --reason ...`
-///   * other rc != 0    → `session-task queue abandon <qid> --reason ...`
+///   * killed           → `session-task queue abandon <qid> --confirmed-dead --reason ...`
+///   * other rc != 0    → `session-task queue abandon <qid> --confirmed-dead --reason ...`
+///
+/// `--confirmed-dead` is load-bearing. `session-task queue abandon` on an
+/// item that still owns its scope normally QUARANTINES it (keeps the scope
+/// locked) rather than going terminal, because callers usually abandon on an
+/// inference — "no output", "stale mtime", "looks dead" — and those
+/// inferences have been wrong in ways that produced duplicate work. This
+/// reaper is one of the few callers that is not inferring: it has the
+/// wrapped command's actual exit code, so the process demonstrably
+/// terminated. That is positive evidence of death and it earns the terminal
+/// transition. Do not copy this flag to a caller that only *suspects* death.
 ///
 /// `session-task queue done` already emits the `queue-done` claude-
 /// event; `queue abandon` emits `queue-abandoned`. Either way the main
@@ -1987,6 +1997,9 @@ fn transition_queue_item_for_workload(
             "queue".to_string(),
             "abandon".to_string(),
             queue_id.to_string(),
+            // We observed the process exit (we have its rc), so this is a
+            // confirmed death, not a guess. Skips the quarantine state.
+            "--confirmed-dead".to_string(),
             "--reason".to_string(),
             reason,
             "--silent".to_string(),
@@ -2555,6 +2568,15 @@ mod tests {
         assert!(
             recorded.contains("rc=7"),
             "abandon reason must mention exit code: {recorded}"
+        );
+        // The reaper holds the wrapped command's exit code, so it is one of
+        // the few callers with POSITIVE evidence the process died. Without
+        // this flag `session-task` quarantines the item (keeps the scope
+        // locked) instead of releasing it, and every finished-with-error
+        // workload would leave its scope wedged.
+        assert!(
+            recorded.contains("--confirmed-dead"),
+            "reaper abandon must pass --confirmed-dead: {recorded}"
         );
     }
 

@@ -398,7 +398,7 @@ cooldown_hours = 1
 # Single-line by design — tmux inject_text's vim-mode dd/i pipeline
 # expects one literal send_keys -l call. Multi-line bodies fight
 # Claude Code's Enter-to-submit input handling.
-resume_prompt = "post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id>` (reason: agent orphaned across restart). Then resume normal dispatch."
+resume_prompt = "post-restart recovery: run `session-resume restart`, then for each `session-task queue list` running item whose agent is missing from `claude-watch active-agents` and scope is repo:* (NOT workload:* — workloads survive restart): probe PR state — open PR + green CI → spawn a merge-and-redeploy recovery agent (pass PR # + queue id); open PR + CI in-progress → spawn a CI-watch recovery agent; no PR → `session-task queue abandon <id> --confirmed-dead --reason 'agent orphaned across restart'` (--confirmed-dead because the restart demonstrably killed in-process agents; a bare abandon quarantines instead, holding the scope). Then resume normal dispatch."
 
 [reauth]
 # Detect when Claude Code needs API reauth and send high-priority alerts
