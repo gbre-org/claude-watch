@@ -126,12 +126,23 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TASK_FILE = Path.home() / ".config" / "session" / "resume-action.json"
 COMPLETED_FILE = Path.home() / ".config" / "session" / "completed-tasks.jsonl"
 QUEUE_FILE = Path.home() / ".config" / "session" / "queue.json"
+# Dedicated lock file (never renamed) + last-good snapshot. See
+# `_queue_open_locked` / `_queue_write_and_unlock` for the atomic-write +
+# corruption-recovery design. Motivated by the 2026-08-16 3.9MB queue.json
+# corruption: concurrent host + container writers whose advisory flock locks
+# were incoherent across the macOS/Docker bind-mount produced a byte-
+# interleaved [valid-doc][trailing-fragment] file that json.loads rejected,
+# and the old code SILENTLY reset the queue to empty -- losing all in-flight
+# items (3759 in that incident).
+QUEUE_LOCK_FILE = QUEUE_FILE.with_suffix(".json.lock")
+QUEUE_BAK_FILE = QUEUE_FILE.with_suffix(".json.bak")
 QUEUE_SCHEMA_VERSION = 2
 
 # --- hostjob reconciliation ------------------------------------------------
@@ -506,13 +517,20 @@ def _load_queue_items_silent():
         raw = QUEUE_FILE.read_text()
         if not raw.strip():
             return {}
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Best-effort: salvage the leading valid document (recovers items
+            # written before a trailing concurrent-write fragment).
+            data = _salvage_leading_json(raw)
+            if data is None:
+                return {}
         out = {}
         for it in data.get("items", []):
             if isinstance(it, dict) and "id" in it:
                 out[it["id"]] = it
         return out
-    except (json.JSONDecodeError, OSError):
+    except OSError:
         return {}
 
 
@@ -715,29 +733,180 @@ def _queue_empty():
     }
 
 
-def _queue_open_locked(mode):
-    """Open queue.json with fcntl.LOCK_EX. Caller must close the file when done.
+def _atomic_write_text(path, text):
+    """Write `text` to `path` atomically: temp file on the same filesystem,
+    fsync, then os.replace (an atomic rename). A reader -- or a racing writer
+    in a filesystem domain where our advisory flock is NOT honored, e.g. across
+    a macOS/Docker bind-mount -- can never observe a half-written or byte-
+    interleaved file; it sees either the complete old contents or the complete
+    new contents. This is the core fix for the 2026-08-16 queue.json corruption.
+    """
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w") as tf:
+            tf.write(text)
+            tf.flush()
+            os.fsync(tf.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
-    Returns (file_handle, data). File is opened r+ (or created empty).
-    mode is informational -- we always take LOCK_EX for safety.
+
+def _salvage_leading_json(raw):
+    """Return the leading valid JSON object in `raw` (ignoring any trailing
+    bytes), or None. Recovers the common concurrent-write corruption where a
+    complete document is followed by an orphaned tail from another writer."""
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("items"), list):
+        return obj
+    return None
+
+
+def _quarantine_corrupt(raw):
+    """Preserve corrupt bytes to a timestamped queue.json.corrupt.<ts> file
+    (timestamped so repeated corruptions don't clobber each other). Returns the
+    path written, or None on failure."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = QUEUE_FILE.parent / f"queue.json.corrupt.{ts}"
+    try:
+        dest.write_text(raw)
+        return dest
+    except OSError:
+        try:
+            fallback = QUEUE_FILE.with_suffix(".json.corrupt")
+            fallback.write_text(raw)
+            return fallback
+        except OSError:
+            return None
+
+
+def _read_bak():
+    """Return the last-good queue dict from the .bak snapshot, or None."""
+    try:
+        if not QUEUE_BAK_FILE.exists():
+            return None
+        obj = json.loads(QUEUE_BAK_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("items"), list):
+        return obj
+    return None
+
+
+def _read_queue_with_recovery():
+    """Read + parse queue.json with layered corruption recovery. Never raises.
+
+    Returns (data_dict, recovery_info). recovery_info is None on a clean parse;
+    otherwise a dict describing the fallback taken so the caller can alert
+    LOUDLY. Recovery order on unparseable JSON:
+      1. salvage the leading valid document from the corrupt bytes (recovers
+         items written before a trailing concurrent-write fragment),
+      2. fall back to the last-good .bak snapshot,
+      3. reset to empty (last resort -- in-flight state lost).
+    The corrupt bytes are always quarantined first.
+    """
+    if not QUEUE_FILE.exists():
+        return _queue_empty(), None
+    try:
+        raw = QUEUE_FILE.read_text()
+    except OSError as exc:
+        return _queue_empty(), {
+            "mode": "empty", "reason": f"unreadable: {exc}",
+            "recovered_items": 0, "quarantine": None, "corrupt_bytes": 0,
+        }
+    if not raw.strip():
+        return _queue_empty(), None
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError as exc:
+        reason = str(exc)
+    quarantine = _quarantine_corrupt(raw)
+    q = str(quarantine) if quarantine else None
+    salvaged = _salvage_leading_json(raw)
+    if salvaged is not None:
+        return salvaged, {
+            "mode": "salvage-leading", "reason": reason,
+            "recovered_items": len(salvaged.get("items", [])),
+            "quarantine": q, "corrupt_bytes": len(raw),
+        }
+    bak = _read_bak()
+    if bak is not None:
+        return bak, {
+            "mode": "bak", "reason": reason,
+            "recovered_items": len(bak.get("items", [])),
+            "quarantine": q, "corrupt_bytes": len(raw),
+        }
+    return _queue_empty(), {
+        "mode": "empty", "reason": reason, "recovered_items": 0,
+        "quarantine": q, "corrupt_bytes": len(raw),
+    }
+
+
+def _alert_queue_recovery(info):
+    """Emit a LOUD alert (stderr + urgent/high claude-event) whenever queue.json
+    corruption triggered a recovery/reset. NEVER silent -- the 2026-08-16
+    incident silently reset the queue to empty, losing all in-flight items."""
+    mode = info.get("mode")
+    n = info.get("recovered_items", 0)
+    q = info.get("quarantine") or "(not preserved)"
+    if mode == "empty":
+        tag = "queue-corrupt-reset-empty"
+        priority = "urgent"
+        msg = (f"queue.json CORRUPT and UNRECOVERABLE -- reset to EMPTY "
+               f"(0 items recovered). IN-FLIGHT QUEUE STATE LOST. "
+               f"Corrupt bytes quarantined at {q}.")
+    elif mode == "bak":
+        tag = "queue-corrupt-recovered-bak"
+        priority = "high"
+        msg = (f"queue.json CORRUPT -- recovered {n} item(s) from the last-good "
+               f".bak snapshot. Corrupt bytes quarantined at {q}.")
+    else:
+        tag = "queue-corrupt-recovered-salvage"
+        priority = "high"
+        msg = (f"queue.json CORRUPT -- salvaged {n} item(s) from the leading "
+               f"valid document (trailing fragment discarded). Corrupt bytes "
+               f"quarantined at {q}.")
+    print(f"[session-task] {msg}", file=sys.stderr)
+    try:
+        _claude_event_notify(tag, msg, {
+            "recovered_items": n,
+            "quarantine": info.get("quarantine") or "",
+            "corrupt_bytes": info.get("corrupt_bytes", 0),
+            "reason": info.get("reason", ""),
+        }, priority=priority)
+    except Exception:  # noqa: BLE001 -- alerting must never break the queue op
+        pass
+
+
+def _queue_open_locked(mode):
+    """Acquire the queue write lock and read queue.json with corruption recovery.
+
+    Returns (lock_handle, data). The lock is fcntl.flock(LOCK_EX) held on a
+    DEDICATED, never-renamed lock file (queue.json.lock) -- decoupled from the
+    data file so queue.json can be rewritten atomically (temp + os.replace)
+    without the rename invalidating an in-progress writer's lock (which would
+    reintroduce lost updates among same-domain writers). Caller MUST release via
+    _queue_write_and_unlock (writes + unlocks) or _queue_unlock_readonly
+    (unlocks only). `mode` is informational -- we always take LOCK_EX.
     """
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Use os.open so we can get a writable fd even for new files.
-    fd = os.open(str(QUEUE_FILE), os.O_RDWR | os.O_CREAT, 0o600)
-    fh = os.fdopen(fd, "r+")
-    fcntl.flock(fh, fcntl.LOCK_EX)
-    fh.seek(0)
-    raw = fh.read()
-    if not raw.strip():
-        data = _queue_empty()
-    else:
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            # Corrupt queue -- back up and start fresh so we don't lose more data.
-            backup = QUEUE_FILE.with_suffix(".json.corrupt")
-            backup.write_text(raw)
-            data = _queue_empty()
+    lock_fd = os.open(str(QUEUE_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    lock_fh = os.fdopen(lock_fd, "r+")
+    fcntl.flock(lock_fh, fcntl.LOCK_EX)
+    # Read under the lock so same-domain writers serialize.
+    data, recovery = _read_queue_with_recovery()
+    if recovery is not None:
+        _alert_queue_recovery(recovery)
     # Normalize
     if not isinstance(data, dict) or "items" not in data:
         data = _queue_empty()
@@ -794,16 +963,27 @@ def _queue_open_locked(mode):
         # Drop the legacy field once the migration runs -- we keep the same
         # info as scope tokens. The next write persists it.
         it.pop("depends_on", None)
-    return fh, data
+    return lock_fh, data
 
 
 def _queue_write_and_unlock(fh, data):
+    """Atomically persist queue.json, snapshot to .bak, and release the lock.
+
+    The temp+rename write guarantees a reader or racing (cross-domain) writer
+    never observes a torn or byte-interleaved file -- the root cause of the
+    3.9MB corruption. The .bak snapshot is the last-good full write, used as a
+    recovery source by `_read_queue_with_recovery` if queue.json is later found
+    corrupt. `fh` is the flock lock handle returned by `_queue_open_locked`.
+    """
     data["schema_version"] = QUEUE_SCHEMA_VERSION
-    fh.seek(0)
-    fh.truncate()
-    fh.write(json.dumps(data, indent=2) + "\n")
-    fh.flush()
-    os.fsync(fh.fileno())
+    text = json.dumps(data, indent=2) + "\n"
+    _atomic_write_text(QUEUE_FILE, text)
+    # Best-effort last-good snapshot; never fail the queue op on a .bak error.
+    try:
+        _atomic_write_text(QUEUE_BAK_FILE, text)
+    except OSError as exc:
+        print(f"[session-task] queue .bak snapshot failed: {exc}",
+              file=sys.stderr)
     fcntl.flock(fh, fcntl.LOCK_UN)
     fh.close()
 
