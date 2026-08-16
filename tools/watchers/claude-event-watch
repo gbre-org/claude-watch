@@ -100,14 +100,16 @@ LOG_KEEP_ROTATIONS=3
 # batching entirely (surface immediately — pre-debounce behavior).
 #
 # KNOB #2 (event-delivery debounce), 2026-06-24: default raised 30 -> 120.
+# KNOB #2 (idle-spend tuning), 2026-08-16: default raised 120 -> 180 to further
+# coalesce event bursts into fewer main-loop wakes while idle.
 # At 30s the watcher fired-and-exited up to every 30s; each exit is a
 # block-print-exit cycle the main loop MUST read + restart, and (combined with
 # the daemon's aggressive watcher-down detection) the loop spent all its cycles
-# acking + restarting instead of working. A ~120s window delivers AT MOST once
+# acking + restarting instead of working. A ~180s window delivers AT MOST once
 # every ~2min, batching everything in the window into a SINGLE delivery and
 # slashing the read/restart churn. Events are never dropped — they accumulate
 # on disk and surface in the next batch (see the CRITICAL note above).
-DEBOUNCE_SECONDS="${EVENT_WATCH_DEBOUNCE_SECONDS:-120}"
+DEBOUNCE_SECONDS="${EVENT_WATCH_DEBOUNCE_SECONDS:-180}"
 
 # Quiet-period (seconds) — the settle interval for the adaptive collect loop.
 # We poll the queue every QUIET_SECONDS; each time the pending count grows we

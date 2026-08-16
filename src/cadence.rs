@@ -7,14 +7,14 @@
 //! (a treadmill). Moving the *cadence source* into the daemon removes that
 //! restart churn: the daemon ticks on its own monotonic clock.
 //!
-//! 1. `heartbeat-tick` — every [`HEARTBEAT_TICK_INTERVAL_SECS`] (300s, 5 min).
+//! 1. `heartbeat-tick` — every [`HEARTBEAT_TICK_INTERVAL_SECS`] (900s, 15 min).
 //!    Written to the event queue (`~/claude-events/`) so the main loop is
 //!    reminded — via the next `UserPromptSubmit` — to touch the host
 //!    heartbeat file. The event body carries that file's path (`data.path`,
 //!    the configurable `[claude].heartbeat_file`), so the loop is told
 //!    exactly which file to touch. That file is the wedge-detector; if the loop never
 //!    gets a recurring prompt to refresh it while idle, it goes stale at the
-//!    ~10-min threshold and the daemon fires a spurious "heartbeat stale"
+//!    ~20-min threshold and the daemon fires a spurious "heartbeat stale"
 //!    alert. So heartbeat-tick *must* reach the loop, and the event queue is
 //!    the delivery path.
 //!
@@ -33,7 +33,7 @@
 //! drains it, exits; the watcher-monitor restarts it; if another event has
 //! already landed, repeat. That treadmill is driven by event *bursts* during
 //! active threads — not by a single steady periodic signal. A lone
-//! heartbeat-tick every 5 minutes is well within the debounce window and is
+//! heartbeat-tick every 15 minutes is well within the debounce window and is
 //! an acceptable cost for the thing it buys: a reliable idle-loop reminder to
 //! refresh the heartbeat. `memory-reminder` fires far less often (every
 //! 30min) and is likewise well within the debounce window, so it too rides
@@ -65,8 +65,8 @@
 
 use std::time::{Duration, Instant};
 
-/// Interval between `heartbeat-tick` events. 300 seconds (5 min).
-pub const HEARTBEAT_TICK_INTERVAL_SECS: u64 = 300;
+/// Interval between `heartbeat-tick` events. 900 seconds (15 min).
+pub const HEARTBEAT_TICK_INTERVAL_SECS: u64 = 900;
 
 /// Interval between `memory-reminder` events. 30 minutes.
 pub const MEMORY_REMINDER_INTERVAL_SECS: u64 = 1800;
