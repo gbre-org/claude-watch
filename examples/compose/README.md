@@ -560,6 +560,17 @@ Requirements + knobs:
 - Tune via `CW_THEME_FILE`, `CW_THEME_PANE`, `CW_THEME_POLL_SECS`
   (see `container/bin/cw-theme-sync`).
 
+**Alternative producer: the host clipboard-bridge daemon.** The
+`/theme-report` sidecar is only *one* way to write `/host-clipboard/theme`.
+Deployments that already run the host-side `clipboard-bridge-daemon`
+(`bin/clipboard-bridge-daemon`, e.g. a macOS launchd agent bridging the Mac
+clipboard into `/host-clipboard`) get theme-sync for free: the daemon also
+mirrors the macOS light/dark appearance (`defaults read -g
+AppleInterfaceStyle`) into `$LOCAL_DIR/theme` on every change, which is the
+same file `cw-theme-sync` watches. No sidecar and no browser POST needed —
+the theme follows the **Mac's** appearance rather than the browser tab's.
+Opt out with `CLIPBOARD_BRIDGE_THEME_DISABLED=1` on the daemon.
+
 ### Image paste from the browser clipboard
 
 Claude Code's `chat:imagePaste` action expects to read a PNG from the host
