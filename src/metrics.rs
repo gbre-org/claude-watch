@@ -104,6 +104,71 @@ fn heartbeat_file_mtime_secs(path: &Path) -> Option<f64> {
     Some(dur.as_secs_f64())
 }
 
+/// True when claude-watch is running inside a container. Container age is only
+/// meaningful there (PID 1 == the container's init, so its start time == the
+/// container's start time); on a bare host PID 1 is the host init, so we omit
+/// the gauge rather than mislabel host uptime as container age.
+fn running_in_container() -> bool {
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+}
+
+/// Parse the process start time (field 22 of `/proc/<pid>/stat`, in clock ticks
+/// since system boot). The `comm` field (2nd) can itself contain spaces and
+/// parentheses, so we split *after the last ')'* -- the canonical robust parse
+/// -- then index the whitespace-separated tail (starttime is field 22, i.e. the
+/// 0-indexed 19th token after `comm`).
+fn parse_pid_starttime_ticks(stat: &str) -> Option<u64> {
+    let tail = stat.rsplit_once(')')?.1;
+    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Parse the `btime` line (system boot epoch, secs) from `/proc/stat`.
+fn parse_btime(proc_stat: &str) -> Option<u64> {
+    proc_stat
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Epoch (float secs) at which PID 1 started: `btime + starttime / clk_tck`.
+/// Pure combiner so the arithmetic is unit-testable without `/proc`.
+fn container_start_epoch(pid1_stat: &str, proc_stat: &str, clk_tck: u64) -> Option<f64> {
+    if clk_tck == 0 {
+        return None;
+    }
+    let starttime = parse_pid_starttime_ticks(pid1_stat)?;
+    let btime = parse_btime(proc_stat)?;
+    Some(btime as f64 + starttime as f64 / clk_tck as f64)
+}
+
+/// Epoch seconds of the container's start, derived from PID 1's start time via
+/// `/proc`. `None` (gauge omitted, matching the heartbeat pattern) when not in
+/// a container, when `/proc` is unreadable, or on any non-Linux host.
+fn container_start_time_secs() -> Option<f64> {
+    if !running_in_container() {
+        return None;
+    }
+    let pid1_stat = fs::read_to_string("/proc/1/stat").ok()?;
+    let proc_stat = fs::read_to_string("/proc/stat").ok()?;
+    // SAFETY: sysconf(_SC_CLK_TCK) is a pure libc query with no preconditions.
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let clk_tck = if clk_tck > 0 { clk_tck as u64 } else { 100 };
+    container_start_epoch(&pid1_stat, &proc_stat, clk_tck)
+}
+
+/// Prometheus block for the container start-time gauge. Empty when
+/// `container_start_time_secs` yields `None`, so nothing stale is exported.
+fn container_start_block() -> Vec<String> {
+    match container_start_time_secs() {
+        Some(ts) => vec![
+            "# HELP claude_container_start_timestamp_seconds Epoch at which the container (PID 1 / init) started; container age = time() - this. Omitted when not running in a container.".to_string(),
+            "# TYPE claude_container_start_timestamp_seconds gauge".to_string(),
+            format!("claude_container_start_timestamp_seconds {:.3}", ts),
+        ],
+        None => Vec::new(),
+    }
+}
+
 fn build_metrics(
     state: &Value,
     current_version: &str,
@@ -1160,6 +1225,13 @@ pub async fn cmd_metrics() -> i32 {
     lines.push(String::new());
     lines.extend(desk_streak_block());
 
+    // Container start-time gauge -- container age = time() minus this. Empty
+    // (gauge omitted) when not in a container / `/proc` unreadable, mirroring
+    // the main-loop-heartbeat pattern. Kept as an appended block so
+    // `build_metrics`'s signature + tests stay untouched.
+    lines.push(String::new());
+    lines.extend(container_start_block());
+
     if let Err(e) = write_prom(&lines, &prom_path) {
         eprintln!("Error writing prom file: {e}");
         return 1;
@@ -1657,6 +1729,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(heartbeat_file_mtime_secs(&missing).is_none());
+    }
+
+    #[test]
+    fn parse_pid_starttime_after_last_paren() {
+        // comm contains a space AND an internal ')': the robust parse must
+        // split on the LAST ')'. starttime (field 22) here is 7777.
+        let stat = "1 (odd )name) S 0 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 7777 12345";
+        assert_eq!(parse_pid_starttime_ticks(stat), Some(7777));
+    }
+
+    #[test]
+    fn parse_btime_extracts_boot_epoch() {
+        let proc_stat = "cpu  1 2 3\nbtime 1700000000\nprocesses 42\n";
+        assert_eq!(parse_btime(proc_stat), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn container_start_epoch_combines_btime_and_ticks() {
+        // starttime field 22 = 200 ticks; clk_tck = 100 -> 2.0s after btime.
+        let stat = "1 (init) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 200 0";
+        assert_eq!(container_start_epoch(stat, "btime 1000\n", 100), Some(1002.0));
+    }
+
+    #[test]
+    fn container_start_epoch_none_on_zero_clk_tck() {
+        assert_eq!(
+            container_start_epoch("1 (x) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 5", "btime 1\n", 0),
+            None
+        );
     }
 
     #[test]
