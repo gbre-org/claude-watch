@@ -476,6 +476,18 @@ PASTE_EVENT_HANDLER_JS = """<script id="paste-event-handler-injected">
     async function onPaste(e) {
         dbg('paste event fired, types=', e.clipboardData && e.clipboardData.types);
 
+        // Lock guard: when the terminal is locked (lock-toggle-injected
+        // sets window.__cwTerminalLocked), suppress ALL paste — image
+        // AND text — so no clipboard content reaches the live session.
+        // attachCustomKeyEventHandler only vetoes KEY events, not the
+        // browser's separate `paste` event, so the guard is enforced
+        // here too. Block native handling immediately (sync).
+        if (window.__cwTerminalLocked) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return;
+        }
+
         // SYNC branch: only intercept when an image MIME is advertised.
         // Text-only clipboards fall through to xterm.js's native paste
         // (which streams the bytes into the PTY) — this is what makes
@@ -616,6 +628,177 @@ THEME_REPORT_JS = """<script id="theme-report-injected">
 """
 
 
+# Lock-toggle CSS. A subtle, transparent padlock button pinned to the
+# TOP-RIGHT corner of the page chrome (mirrors the kiosk-mode toggle in
+# the operator's custom Grafana: near-invisible at rest, brightens on
+# hover, and follows the system color-scheme so it reads on both the
+# Solarized-dark and -light chrome painted by the autodark CSS above).
+#
+# At rest it's ~0.28 opacity so it doesn't distract from the terminal.
+# When the lock is ACTIVE the button gets the `.cw-locked` class: full
+# opacity + a Solarized-orange tint + a subtle ring, so "input is
+# suppressed" is unmistakable at a glance. Colours are chosen from the
+# same Solarized palette the rest of this file uses.
+LOCK_TOGGLE_STYLE = """<style id="lock-toggle-injected-style">
+#cw-lock-toggle {
+    position: fixed;
+    top: 6px;
+    right: 8px;
+    z-index: 10000;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    margin: 0;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    color: #93a1a1;            /* base1 — reads on the dark chrome */
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.28;             /* subtle / near-transparent at rest */
+    transition: opacity 0.15s ease, background-color 0.15s ease,
+                color 0.15s ease, border-color 0.15s ease;
+    -webkit-user-select: none;
+    user-select: none;
+}
+#cw-lock-toggle:hover,
+#cw-lock-toggle:focus-visible {
+    opacity: 0.85;
+    outline: none;
+}
+/* Active lock: unmistakable visual cue that keystrokes are ignored. */
+#cw-lock-toggle.cw-locked {
+    opacity: 0.95;
+    color: #cb4b16;                          /* solarized orange */
+    border-color: rgba(203, 75, 22, 0.5);
+    background-color: rgba(203, 75, 22, 0.12);
+}
+@media (prefers-color-scheme: light) {
+    #cw-lock-toggle { color: #586e75; }      /* base01 on light chrome */
+    #cw-lock-toggle.cw-locked { color: #cb4b16; }
+}
+</style>
+"""
+
+# Lock-toggle JS. Builds the top-right padlock button and wires the
+# actual keystroke suppression.
+#
+# Suppression mechanism: xterm.js exposes
+# `term.attachCustomKeyEventHandler(fn)` — the OFFICIAL hook for vetoing
+# key events. Returning `false` tells xterm to NOT process the key, so
+# it is never written to the PTY nor sent over ttyd's input WebSocket
+# (ttyd wires `term.onData -> ws.send('0'+data)`; a key xterm never
+# processes produces no onData). We attach ONE handler that returns
+# `!locked`, so:
+#   - unlocked → returns true → xterm behaves exactly as stock ttyd.
+#   - locked   → returns false → every keystroke is swallowed at the
+#     terminal layer.
+# This is deliberately terminal-scoped rather than a document-level
+# capture-phase keydown trap: it leaves browser-native shortcuts
+# (Cmd/Ctrl+R reload, devtools, Cmd+C copy of a selection, tab switch)
+# untouched — only input destined for the live claude/tmux session is
+# guarded. It also degrades safely: if `window.term` isn't ready on
+# first paint we retry on a poll (ttyd creates `term` asynchronously
+# after the WS connects, same race the autodark reapply defends).
+#
+# The lock state is also mirrored onto `window.__cwTerminalLocked` so
+# the paste handler above can suppress clipboard paste (image AND text)
+# while locked — `attachCustomKeyEventHandler` only vetoes key events,
+# not the browser's separate `paste` event, so the paste path needs its
+# own check for the guard to be complete.
+LOCK_TOGGLE_JS = """<script id="lock-toggle-injected">
+(function() {
+    'use strict';
+
+    var locked = false;
+
+    // Shared flag other injected handlers (the paste handler) read to
+    // suppress input while the terminal is locked. Defined up front so
+    // a paste that races button creation still sees a defined value.
+    window.__cwTerminalLocked = false;
+
+    var LOCK_ICON = '\\uD83D\\uDD12';    // closed padlock
+    var UNLOCK_ICON = '\\uD83D\\uDD13';  // open padlock
+
+    var btn = null;
+
+    function render() {
+        if (!btn) return;
+        btn.textContent = locked ? LOCK_ICON : UNLOCK_ICON;
+        btn.setAttribute('aria-pressed', locked ? 'true' : 'false');
+        btn.title = locked
+            ? 'Terminal input LOCKED — keystrokes are ignored. Click to unlock.'
+            : 'Lock terminal input (ignore keystrokes)';
+        if (locked) { btn.classList.add('cw-locked'); }
+        else { btn.classList.remove('cw-locked'); }
+    }
+
+    function setLocked(v) {
+        locked = !!v;
+        window.__cwTerminalLocked = locked;
+        render();
+    }
+
+    function ensureButton() {
+        if (btn || !document.body) return;
+        btn = document.createElement('button');
+        btn.id = 'cw-lock-toggle';
+        btn.type = 'button';
+        btn.setAttribute('aria-label', 'Toggle terminal input lock');
+        btn.addEventListener('click', function(e) {
+            if (e && e.preventDefault) { e.preventDefault(); }
+            if (e && e.stopPropagation) { e.stopPropagation(); }
+            setLocked(!locked);
+        });
+        // Keep a click on the toggle from bubbling into xterm.js focus /
+        // selection handling.
+        btn.addEventListener('mousedown', function(e) {
+            if (e && e.stopPropagation) { e.stopPropagation(); }
+        });
+        document.body.appendChild(btn);
+        render();
+    }
+
+    var handlerAttached = false;
+    function attachKeyGuard() {
+        var t = window.term;
+        if (!t || handlerAttached) return;
+        if (typeof t.attachCustomKeyEventHandler === 'function') {
+            // false => xterm ignores the key (no PTY write / no WS send)
+            // while locked; true => normal processing.
+            t.attachCustomKeyEventHandler(function() { return !locked; });
+            handlerAttached = true;
+        }
+    }
+
+    function init() {
+        ensureButton();
+        attachKeyGuard();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+    // ttyd builds window.term asynchronously after the WS connects, so
+    // it may be absent on first paint. Poll until BOTH the button is
+    // mounted and the key guard is attached, then stop (mirrors the
+    // autodark reapply poll; negligible cost).
+    var iv = setInterval(function() {
+        init();
+        if (btn && handlerAttached) { clearInterval(iv); }
+    }, 1000);
+})();
+</script>
+"""
+
+
 def inject(html: str) -> str:
     """Inject CSS + JS into the <head> of ttyd's bundled HTML.
 
@@ -634,7 +817,7 @@ def inject(html: str) -> str:
         )
     injected = (
         CSS + JS + THEME_REPORT_JS + PASTE_INTERCEPT_JS + PASTE_TOAST_STYLE
-        + PASTE_EVENT_HANDLER_JS + marker
+        + PASTE_EVENT_HANDLER_JS + LOCK_TOGGLE_STYLE + LOCK_TOGGLE_JS + marker
     )
     # Replace only the FIRST occurrence (xterm.js's inline JS may
     # mention the string '</head>' inside a quoted literal further
@@ -669,7 +852,10 @@ def main() -> int:
                    "paste-intercept-injected",
                    "paste-toast-injected-style",
                    "cw-paste-image-toast",
-                   "paste-event-handler-injected"):
+                   "paste-event-handler-injected",
+                   "lock-toggle-injected-style",
+                   "lock-toggle-injected",
+                   "cw-lock-toggle"):
         if needle not in patched:
             sys.stderr.write(
                 f"inject-autodark.py: missing '{needle}' in output — abort\n"

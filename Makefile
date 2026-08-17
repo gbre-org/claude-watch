@@ -27,7 +27,7 @@
 .PHONY: test-install-host-cron
 .PHONY: test-entrypoint test-cw test-hostjob test-launchd-plist
 .PHONY: test-personal-mcp-host test-personal-mcp-host-plist
-.PHONY: test-personal-mcp-install test-ttyd-paste-handler
+.PHONY: test-personal-mcp-install test-ttyd-paste-handler test-ttyd-lock-toggle
 # Build / install / host-deploy targets
 .PHONY: build install install-hooks install-skills install-cron deploy deploy-systemd
 .PHONY: install-mcp-host-bash-server
@@ -416,6 +416,17 @@ test-personal-mcp-install: ## personal-mcp-host install.sh dry-run tests
 # / mixed / image-jpeg / empty-types synthetic paste events.
 test-ttyd-paste-handler: ## ttyd browser paste-handler JS tests
 	python3 examples/compose/ttyd/tests/test_paste_handler.py
+
+# Tests for examples/compose/ttyd/inject-autodark.py LOCK_TOGGLE_JS — the
+# subtle top-right padlock toggle injected into ttyd's bundled index.html.
+# When ACTIVE it suppresses keystrokes by returning false from xterm.js's
+# attachCustomKeyEventHandler hook (nothing reaches the PTY / input WS) and
+# flips window.__cwTerminalLocked so the paste handler also blocks paste.
+# Runs the JS body inside Node with DOM / window.term stubs and asserts the
+# button state (glyph, aria-pressed, cw-locked class) + key-veto return
+# value across the unlocked → locked → unlocked toggle cycle.
+test-ttyd-lock-toggle: ## ttyd browser lock-toggle JS tests
+	python3 examples/compose/ttyd/tests/test_lock_toggle.py
 
 ##@ Build, install, host/systemd deploy
 
