@@ -641,16 +641,6 @@ services:
       # obligations write path) — so no new mount is required; this env var
       # just points the loader at the in-container path explicitly.
       AGENT_QUEUE_BINDINGS_JSON: /queue-home/.config/claude/agent-queue-bindings.json
-      # Operator-presence carrier — the HID-idle carrier file the Rust daemon
-      # reads for its claude_operator_present* gauges (see src/metrics.rs). The
-      # header "operator present" pill turns `now - mtime` into a live idle
-      # stopwatch. Points at the in-container path the carrier is mounted to
-      # (see the commented volume below). The app resolves this env first, else
-      # falls back to /run/claude-presence/operator-present then
-      # ~/.claude/operator-present (= /queue-home/.claude/operator-present with
-      # HOME=/queue-home). Absent/unreadable => the pill simply doesn't render,
-      # so this is safe to leave unset on a stack without the presence detector.
-      CW_PRESENCE_FILE: ${QUEUE_PRESENCE_FILE:-/queue-home/presence/operator-present}
     volumes:
       # session-task queue.json — rw because the Stop button mutates it
       # via session-task (atomic tmp+rename + flock).
@@ -686,19 +676,6 @@ services:
       # writes ~/.cache/hostjob/<label>/log on the host; the live-log modal
       # tails it via <HOSTJOB_LOG_DIR>/<label>/log (HOSTJOB_LOG_DIR above).
       - "${HOME}/.cache/hostjob:/hostjobs:ro"
-      # Operator-presence carrier DIRECTORY — read-only, feeds the header
-      # "operator present" idle-stopwatch pill (CW_PRESENCE_FILE above). We
-      # mount the DIRECTORY (not the single file) so the presence detector's
-      # in-place mtime bumps are seen and a missing carrier file doesn't make
-      # Docker auto-create a bogus empty directory at the source. OPT-IN and
-      # host-specific: the presence detector (a host-side LaunchAgent, part of
-      # the operator's personal setup — NOT this public stack) decides where
-      # the carrier lives, so set QUEUE_PRESENCE_CARRIER_DIR in your .env /
-      # docker-compose.override.yml to that directory. Left commented so a
-      # stack without the presence detector isn't forced to bind a path that
-      # may not exist. Example:
-      #   QUEUE_PRESENCE_CARRIER_DIR=${HOME}/.config/claude-container/presence
-      # - "${QUEUE_PRESENCE_CARRIER_DIR:?set to the presence-carrier dir to enable the pill}:/queue-home/presence:ro"
     restart: unless-stopped
 
   # ---------------------------------------------------------------------

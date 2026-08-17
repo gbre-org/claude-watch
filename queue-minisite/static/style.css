@@ -228,63 +228,6 @@ html.header-collapsed .topbar .density-control { display: none; }
 .dot-ok  { background: var(--ok); }
 .dot-err { background: var(--critical); }
 
-/* ------- operator-presence pill (idle stopwatch) -------
- * Rounded pill matching the .count family. The leading dot echoes the
- * liveness .dot; the label + a monospace stopwatch sit alongside. State
- * classes recolour it: present (green), idle (yellow), away (muted). The
- * stopwatch keeps ticking across the idle->away flip — only the hue changes.
- * presence.js owns the text + state class; this file owns the look. */
-.operator-presence {
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  color: var(--fg-emph);
-  min-height: 28px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.operator-presence .presence-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  display: inline-block;
-  background: currentColor;
-  flex: 0 0 auto;
-}
-.operator-presence .presence-stopwatch {
-  font-variant-numeric: tabular-nums;
-  font-feature-settings: "tnum";
-  /* Fixed-width digits so the ticking seconds don't shift the pill's width. */
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-}
-.operator-presence .presence-stopwatch[hidden] { display: none; }
-
-/* present: actively at the desk (idle under the threshold) — green. */
-.operator-presence.state-present { color: var(--ok); border-color: var(--ok); }
-/* idle: stepped away but the carrier is still fresh — yellow. */
-.operator-presence.state-idle { color: var(--pending); border-color: var(--pending); }
-/* away: carrier stale (past the freshness window) — muted. The pulsing dot
- * is dropped here so a long-away pill reads as calm/settled, not alarming. */
-.operator-presence.state-away {
-  color: var(--fg-mute);
-  border-color: var(--fg-mute);
-}
-
-/* Gentle breathing on the present dot so "present" reads as live without
- * being distracting. Disabled for reduced-motion users. */
-.operator-presence.state-present .presence-dot {
-  animation: presence-pulse 2s ease-in-out infinite;
-}
-@keyframes presence-pulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.45; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .operator-presence.state-present .presence-dot { animation: none; }
-}
-
 /* ------- source filter dropdown (topbar) ------- */
 .source-filter-label {
   display: inline-flex;

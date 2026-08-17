@@ -164,31 +164,6 @@
           {% endfor %}
         </select>
       </label>
-      {#- OPERATOR-PRESENCE PILL (idle stopwatch). Rendered only when a
-          presence carrier is wired in (operator_presence is non-null; see
-          app.py _operator_presence + CW_PRESENCE_FILE). Under the idle
-          threshold it shows the plain "operator present" state; at/above it a
-          live idle stopwatch that KEEPS TICKING across the present->away flip
-          (only the colour changes — the stopwatch is never reset or hidden).
-          static/presence.js ticks it every second, re-seeding from
-          data-idle-base on each 5s /api/queue merge. MUST stay in step with
-          buildPresencePillHTML() in static/presence.js — refresh.js rebuilds
-          #topbar-meta every tick, so a pill that existed only here would be
-          dropped after the first merge (same class of bug as the source
-          filter / density toggle). The "live" liveness dot below is left
-          untouched. -#}
-      {% if operator_presence %}
-      <span class="operator-presence state-{{ operator_presence.state }}"
-            id="operator-presence"
-            data-idle-base="{{ '%.3f' % operator_presence.idle_seconds }}"
-            data-threshold="{{ '%.0f' % operator_presence.threshold }}"
-            data-max-age="{{ '%.0f' % operator_presence.max_age }}"
-            title="Operator HID-idle time (from the presence carrier the daemon reads for claude_operator_present). Under {{ '%.0f' % operator_presence.threshold }}s: present. Above: a live idle stopwatch that keeps running across the present-to-away transition.">
-        <span class="presence-dot" aria-hidden="true"></span>
-        <span class="presence-label">{% if operator_presence.state == 'present' %}operator present{% elif operator_presence.state == 'away' %}away{% else %}idle{% endif %}</span>
-        <span class="presence-stopwatch"{% if operator_presence.state == 'present' %} hidden{% endif %}>{{ operator_presence.stopwatch }}</span>
-      </span>
-      {% endif %}
       <span class="dot {% if error %}dot-err{% else %}dot-ok{% endif %}" title="{{ 'fetch error' if error else 'live' }}"></span>
       <div class="info-wrap">
         <button
@@ -1100,11 +1075,6 @@
 
   <script src="{{ url_for('static', filename='local-time.js') }}" defer></script>
   <script src="{{ url_for('static', filename='rel-age.js') }}" defer></script>
-  {# presence.js — loaded BEFORE refresh.js so window.Presence (the shared
-     idle-stopwatch formatter + pill builder) is defined when refresh.js's
-     buildTopbarMetaDOM re-renders the pill on each 5s merge. Both are `defer`,
-     so execution order is guaranteed. #}
-  <script src="{{ url_for('static', filename='presence.js') }}" defer></script>
   <script src="{{ url_for('static', filename='refresh.js') }}" defer></script>
   <script src="{{ url_for('static', filename='action.js') }}" defer></script>
   <script src="{{ url_for('static', filename='depend.js') }}" defer></script>
