@@ -2829,6 +2829,41 @@ def _command_names_present(names, command_string):
     )
 
 
+def _command_is_sole(names, command_string):
+    """AST-aware: True iff ``command_string`` is a SINGLE simple command whose
+    effective HEAD basename matches one of ``names``, with NO pipeline, NO
+    redirection, and NO top-level list / compound / background operator.
+
+    This is the ``Bashsole:`` matcher's engine. It differs from
+    ``_command_names_present`` (the ``Bashcmd:`` engine) in ONE way: the
+    named command must be the head of the ONLY, plain segment. So a bare
+    ``botchat-show 42`` matches, but ``botchat-show 42 | tail``,
+    ``botchat-show 42 > f``, and ``botchat-show 42 ; other`` do NOT -- their
+    output is filtered / diverted / has a second stage.
+
+    Its purpose is to scope a READ-CLI exemption to the raw, unfiltered form
+    only: piping a botchat read strips attachment lines, so a piped read
+    must NOT satisfy the exemption (and thus stays gated by the no-pipe /
+    mark-read gates).
+
+    FAIL-CLOSED (the opposite of ``_command_names_present``): shell_ast
+    missing OR the command unparseable => False (NOT sole => the exemption
+    does NOT fire, so the gate stays in force). For an exemption this is the
+    safe direction -- a command we cannot prove is a bare read must not be
+    waved through as one. The escape hatch (`obligations override`) remains
+    for the rare parse-failure-on-a-legit-read case."""
+    if not names:
+        return False
+    if _shell_ast is None:
+        return False
+    try:
+        return _shell_ast.is_sole_command(command_string or "", names)
+    except _shell_ast.ShellParseError:
+        return False
+    except Exception:  # noqa: BLE001 -- a helper bug must not wrongly exempt
+        return False
+
+
 def _tool_pattern_matches(pattern, tool_name, command_string):
     """A tool_pattern is one of:
         '*'                       => matches every tool
@@ -2846,6 +2881,21 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
                                      be a glob naming a whole command family
                                      ('botchat-*'); the glob is still only
                                      ever tested against a real command head.
+        'Bashsole:<names>'        => like 'Bashcmd:', but matches ONLY when
+                                     the named command is the SOLE simple
+                                     command -- no pipeline, redirect, list /
+                                     compound / background operator. So
+                                     'botchat-show 42' matches but
+                                     'botchat-show 42 | tail',
+                                     'botchat-show 42 > f', and
+                                     'botchat-show 42 ; x' do NOT. Use for a
+                                     READ-CLI exemption that must apply only
+                                     to the raw, unfiltered form (piping a
+                                     botchat read strips attachment lines, so
+                                     a piped read must stay gated). FAIL-CLOSED
+                                     (parser missing / unparseable => NO match
+                                     => the exemption does not fire), the safe
+                                     direction for an exemption.
         'mcp__host-bash__run_command:<spec>' / '..._run_script:<spec>'
                                   => matches when tool_name == the host-bash
                                      MCP tool AND, when <spec> is a bare
@@ -2873,6 +2923,15 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
                 return False
             names = {n.strip() for n in rest.split(",") if n.strip()}
             return _command_names_present(names, command_string)
+        if head == "Bashsole":
+            # Like Bashcmd, but the named command must be the SOLE simple
+            # command (no pipeline / redirect / list / background). Scopes a
+            # read-CLI exemption to the raw form only -- a piped botchat read
+            # strips attachments, so it must NOT be exempted here. FAIL-CLOSED.
+            if tool_name != "Bash":
+                return False
+            names = {n.strip() for n in rest.split(",") if n.strip()}
+            return _command_is_sole(names, command_string)
         if tool_name != head:
             return False
         # host-bash MCP tools: a bare command-NAME spec is matched AST-aware

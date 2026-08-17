@@ -312,3 +312,73 @@ def test_hostbash_wrong_tool_name_no_match():
         "Bash",
         "botchat-send",
     ) is False
+
+
+# --- Bashsole: AST-aware SOLE-simple-command form (read-CLI exemption) ---
+#
+# ``Bashsole:<names>`` matches the Bash tool iff a named command is the head
+# of the SOLE simple command -- no pipeline, redirect, list/compound, or
+# background operator. It scopes a read-CLI exemption to the RAW form only:
+# piping a botchat read strips attachment lines, so a piped ``botchat-show``
+# must NOT be exempted (and thus stays gated). FAIL-CLOSED on parse failure.
+
+def test_bashsole_bare_read_matches():
+    assert m("Bashsole:botchat-show,botchat-history", "Bash",
+             "botchat-show 42") is True
+    assert m("Bashsole:botchat-show,botchat-history", "Bash",
+             "botchat-history --unread") is True
+
+
+def test_bashsole_env_and_path_prefixed_bare_matches():
+    assert m("Bashsole:botchat-show", "Bash",
+             "FOO=1 /usr/local/bin/botchat-show 42") is True
+    assert m("Bashsole:botchat-show", "Bash",
+             "sudo botchat-show 42") is True
+
+
+def test_bashsole_piped_read_does_not_match():
+    # The whole point: a piped botchat read is NOT the sole command, so the
+    # exemption does not fire (leaving the no-pipe / mark-read gate in force).
+    assert m("Bashsole:botchat-show,botchat-history", "Bash",
+             "botchat-show 42 | tail -5") is False
+    assert m("Bashsole:botchat-show", "Bash",
+             "echo x | botchat-show") is False
+
+
+def test_bashsole_redirect_does_not_match():
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 > /tmp/x") is False
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 < /tmp/in") is False
+
+
+def test_bashsole_list_and_background_do_not_match():
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 ; echo done") is False
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 && echo ok") is False
+    assert m("Bashsole:botchat-show", "Bash",
+             "botchat-show 42 &") is False
+
+
+def test_bashsole_arg_mention_does_not_match():
+    # A name that appears only as an argument is not the head -> no match.
+    assert m("Bashsole:botchat-show", "Bash",
+             "grep -n 'botchat-show' Dockerfile") is False
+
+
+def test_bashsole_glob_family():
+    assert m("Bashsole:botchat-*", "Bash", "botchat-show 2008") is True
+    assert m("Bashsole:botchat-*", "Bash", "botchat-show 2008 | head") is False
+    assert m("Bashsole:botchat-*", "Bash", "signal-history") is False
+
+
+def test_bashsole_wrong_tool_name_no_match():
+    assert m("Bashsole:botchat-show", "Read", "botchat-show 42") is False
+
+
+def test_bashsole_failclosed_on_unparseable():
+    # Unterminated quote => ShellParseError => FAIL CLOSED => NOT exempt
+    # (the opposite of Bashcmd, which fails SAFE to a word-boundary match).
+    # An unparseable command must not be waved through as a bare read.
+    assert m("Bashsole:botchat-show", "Bash", "botchat-show 'unterminated") is False
