@@ -100,15 +100,21 @@ LOG_KEEP_ROTATIONS=3
 # batching entirely (surface immediately — pre-debounce behavior).
 #
 # KNOB #2 (event-delivery debounce), 2026-06-24: default raised 30 -> 120.
-# KNOB #2 (idle-spend tuning), 2026-08-16: default raised 120 -> 180 to further
-# coalesce event bursts into fewer main-loop wakes while idle.
-# At 30s the watcher fired-and-exited up to every 30s; each exit is a
-# block-print-exit cycle the main loop MUST read + restart, and (combined with
-# the daemon's aggressive watcher-down detection) the loop spent all its cycles
-# acking + restarting instead of working. A ~180s window delivers AT MOST once
-# every ~2min, batching everything in the window into a SINGLE delivery and
-# slashing the read/restart churn. Events are never dropped — they accumulate
-# on disk and surface in the next batch (see the CRITICAL note above).
+# KNOB #2 (idle-spend tuning), 2026-08-16: default raised 120 -> 180.
+#
+# IMPORTANT — this HARD CAP is NOT the idle-coalescing knob. It only bounds a
+# CONTINUOUS burst where events keep arriving faster than QUIET_SECONDS apart;
+# it is the ceiling on how long the adaptive collect loop may run. For SPORADIC
+# idle traffic (events spaced further apart than QUIET_SECONDS) the collect loop
+# settles at the quiet period and drains long before this cap is reached, so
+# raising the cap has ZERO effect on how often the watcher wakes while idle.
+# The knob that actually governs idle inter-delivery cadence is QUIET_SECONDS
+# below: to coalesce sporadic idle events into fewer main-loop wakes, raise the
+# quiet period (--quiet), NOT this cap. (The 2026-08-16 120->180 bump aimed at
+# "fewer idle wakes" but tuned this cap, which idle traffic never hits; the
+# container instead sets --quiet 30 in watchers.conf.) Events are never dropped
+# regardless — they accumulate on disk and surface in the next batch (see the
+# CRITICAL note above).
 DEBOUNCE_SECONDS="${EVENT_WATCH_DEBOUNCE_SECONDS:-180}"
 
 # Quiet-period (seconds) — the settle interval for the adaptive collect loop.
