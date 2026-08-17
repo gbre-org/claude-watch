@@ -677,6 +677,46 @@ fn presence_is_fresh(mtime: Option<f64>, now: f64, max_age: f64) -> bool {
     }
 }
 
+/// Render the operator-presence gauges: `claude_operator_present` (1=present,
+/// 0=absent) and `claude_operator_present_timestamp_seconds` (the carrier file
+/// mtime, epoch secs). Present iff the carrier mtime is fresh within `max_age`
+/// -- the SAME decision (`presence_is_fresh`), carrier (`presence_carrier_mtime`),
+/// and window (`presence_max_age`) the desk-streak block uses, so the present
+/// flag can never disagree with the streak's presence view. The timestamp gauge
+/// exports the raw carrier mtime, defaulting to 0.0 when the carrier is
+/// absent/unreadable (matching the Python textfile bridge's
+/// `os.path.getmtime`-failure fallback). Gauge names, HELP, and TYPE lines are
+/// byte-for-byte identical to that bridge so retiring it (once
+/// `CLAUDE_WATCH_PROM_FILE` points this emitter at the scraped dir) drops
+/// nothing.
+fn operator_present_lines(mtime: Option<f64>, now: f64, max_age: f64) -> Vec<String> {
+    let present = if presence_is_fresh(mtime, now, max_age) {
+        1
+    } else {
+        0
+    };
+    let mtime_secs = mtime.unwrap_or(0.0);
+    vec![
+        "# HELP claude_operator_present Whether the operator is present (carrier mtime fresh within CW_PRESENCE_MAX_AGE secs); 1=present 0=absent".to_string(),
+        "# TYPE claude_operator_present gauge".to_string(),
+        format!("claude_operator_present {}", present),
+        "".to_string(),
+        "# HELP claude_operator_present_timestamp_seconds Epoch (mtime) of the operator-present carrier file touched by the host presence-detector while the operator is present".to_string(),
+        "# TYPE claude_operator_present_timestamp_seconds gauge".to_string(),
+        format!(
+            "claude_operator_present_timestamp_seconds {:.3}",
+            mtime_secs
+        ),
+    ]
+}
+
+/// Collect the operator-presence gauges, reading the live carrier mtime + the
+/// gate-derived freshness window (the SAME inputs as `desk_streak_block`).
+fn operator_present_block() -> Vec<String> {
+    let now = now_epoch();
+    operator_present_lines(presence_carrier_mtime(), now, presence_max_age())
+}
+
 /// Persisted streak state (sidecar JSON). Load is tolerant of missing fields.
 #[derive(Debug, Clone, Default)]
 struct StreakState {
@@ -871,6 +911,14 @@ pub async fn cmd_metrics() -> i32 {
     lines.push(String::new());
     lines.extend(crate::token_usage::token_metric_lines(&token_usage));
 
+    // Operator-presence gauges (present flag + carrier mtime). Reads the SAME
+    // carrier mtime + freshness window as the desk-streak block below, so the
+    // present flag never disagrees with the streak's presence view. A drop-in
+    // for the out-of-tree Python textfile bridge's identical gauges so that
+    // retiring the bridge (via CLAUDE_WATCH_PROM_FILE) drops nothing.
+    lines.push(String::new());
+    lines.extend(operator_present_block());
+
     // Operator desk-streak gauge (self-contained: reads the presence
     // carrier + a sidecar state file; see the block above cmd_metrics).
     lines.push(String::new());
@@ -983,6 +1031,62 @@ mod tests {
         assert!(joined.contains("# TYPE claude_operator_desk_streak_seconds gauge"));
         assert!(joined.contains("claude_operator_desk_streak_seconds{kind=\"current\"} 42.000"));
         assert!(joined.contains("claude_operator_desk_streak_seconds{kind=\"max\"} 100.000"));
+    }
+
+    #[test]
+    fn operator_present_lines_present_when_fresh() {
+        // Carrier mtime within the window -> present=1; timestamp echoes mtime.
+        let lines = operator_present_lines(Some(1000.0), 1050.0, 420.0);
+        let joined = lines.join("\n");
+        assert!(joined.contains("# TYPE claude_operator_present gauge"));
+        assert!(joined.contains("claude_operator_present 1"));
+        assert!(joined.contains("# TYPE claude_operator_present_timestamp_seconds gauge"));
+        assert!(joined.contains("claude_operator_present_timestamp_seconds 1000.000"));
+    }
+
+    #[test]
+    fn operator_present_lines_absent_when_stale() {
+        // Carrier mtime older than the window -> present=0 (timestamp still echoed).
+        let lines = operator_present_lines(Some(1000.0), 2000.0, 420.0);
+        let joined = lines.join("\n");
+        assert!(joined.contains("claude_operator_present 0"));
+        assert!(joined.contains("claude_operator_present_timestamp_seconds 1000.000"));
+    }
+
+    #[test]
+    fn operator_present_lines_absent_when_no_carrier() {
+        // No carrier -> present=0 and timestamp defaults to 0.000 (matches the
+        // Python bridge's os.path.getmtime-failure fallback).
+        let lines = operator_present_lines(None, 1000.0, 420.0);
+        let joined = lines.join("\n");
+        assert!(joined.contains("claude_operator_present 0"));
+        assert!(joined.contains("claude_operator_present_timestamp_seconds 0.000"));
+    }
+
+    #[test]
+    fn operator_present_lines_byte_compatible_with_python_bridge() {
+        // HELP/TYPE/value text must match the Python textfile bridge verbatim so
+        // retiring the bridge (via CLAUDE_WATCH_PROM_FILE) is a drop-in.
+        let lines = operator_present_lines(Some(1_767_225_600.0), 1_767_225_601.0, 420.0);
+        assert_eq!(
+            lines[0],
+            "# HELP claude_operator_present Whether the operator is present (carrier mtime fresh within CW_PRESENCE_MAX_AGE secs); 1=present 0=absent"
+        );
+        assert_eq!(lines[1], "# TYPE claude_operator_present gauge");
+        assert_eq!(lines[2], "claude_operator_present 1");
+        assert_eq!(lines[3], "");
+        assert_eq!(
+            lines[4],
+            "# HELP claude_operator_present_timestamp_seconds Epoch (mtime) of the operator-present carrier file touched by the host presence-detector while the operator is present"
+        );
+        assert_eq!(
+            lines[5],
+            "# TYPE claude_operator_present_timestamp_seconds gauge"
+        );
+        assert_eq!(
+            lines[6],
+            "claude_operator_present_timestamp_seconds 1767225600.000"
+        );
     }
 
     #[test]
