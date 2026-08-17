@@ -267,10 +267,24 @@ for bad in abc 0 -1; do
     fi
 done
 
+# Test --min-interval validation: non-numeric / negative fail rc=2. NOTE 0 is
+# VALID here (0 = throttle disabled), unlike --quiet, so it is NOT in this list.
+for bad in abc -1; do
+    set +e
+    CLAUDE_EVENT_QUEUE="$QUEUE" "$WATCHER" --min-interval "$bad" >/dev/null 2>&1
+    rc=$?
+    set -e
+    if (( rc != 2 )); then
+        echo "FAIL: --min-interval $bad returned rc=$rc, expected 2" >&2
+        exit 1
+    fi
+done
+
 # Test --help works (and mentions both knobs)
 help_out=$("$WATCHER" --help)
 grep -q -- '--debounce' <<<"$help_out" || { echo "FAIL: --help missing --debounce" >&2; exit 1; }
 grep -q -- '--quiet' <<<"$help_out" || { echo "FAIL: --help missing --quiet" >&2; exit 1; }
+grep -q -- '--min-interval' <<<"$help_out" || { echo "FAIL: --help missing --min-interval" >&2; exit 1; }
 
 # --- Adaptive debounce / coalesce tests ----------------------------------
 
@@ -345,6 +359,84 @@ if ! grep -q 'late' <<<"$run2"; then
     echo "FAIL: late event not surfaced on run2" >&2; echo "$run2" >&2; exit 1
 fi
 echo "  no-loss: late event persisted and surfaced on next run OK"
+
+# --- leading-edge throttle (--min-interval) tests -------------------------
+# The throttle caps how often the watcher WAKES: at most one delivery per N
+# seconds regardless of arrival spacing. Events during the hold are batched,
+# never dropped. Default 0 = disabled (existing behavior). State is persisted
+# to a file (env-overridable) so the cap survives the fire-and-exit restart.
+TQ2="$TMP/tq2"; TLOG2="$TMP/tlog2"; TSTATE="$TMP/throttle.state"
+mkdir -p "$TQ2" "$TLOG2"
+
+# (n) First delivery is IMMEDIATE on empty state (leading edge fires at once),
+# and the last-delivery epoch is persisted to disk.
+write_event "$TQ2" "100_t1.json" "throttle first"
+start=$(date +%s)
+t1_out=$(CLAUDE_EVENT_QUEUE="$TQ2" CLAUDE_EVENT_LOG_DIR="$TLOG2" \
+    CLAUDE_EVENT_WATCH_THROTTLE_STATE="$TSTATE" \
+    "$WATCHER" --debounce 0 --min-interval 6 2>&1)
+elapsed=$(( $(date +%s) - start ))
+if ! grep -q 'throttle first' <<<"$t1_out"; then
+    echo "FAIL: first throttled event not delivered immediately" >&2; echo "$t1_out" >&2; exit 1
+fi
+if (( elapsed > 3 )); then
+    echo "FAIL: first throttled delivery waited ${elapsed}s (should be immediate on empty state)" >&2; exit 1
+fi
+if [[ ! -s "$TSTATE" ]] || ! grep -qE '^[0-9]+$' "$TSTATE"; then
+    echo "FAIL: throttle did not persist an epoch last-delivery timestamp" >&2
+    cat "$TSTATE" 2>/dev/null >&2; exit 1
+fi
+echo "  throttle: first delivery immediate + last-delivery epoch persisted OK"
+
+# (o) A run WITHIN the window HOLDS until it closes; events landing DURING the
+# hold are batched (delivered, never dropped). Pre-seed last-delivery to "now"
+# so the full window must elapse — deterministic regardless of prior timing.
+date +%s >"$TSTATE"
+write_event "$TQ2" "110_t2.json" "hold A"
+( sleep 1; write_event "$TQ2" "120_t3.json" "hold B" ) &
+DRIP3=$!
+start=$(date +%s)
+t2_out=$(CLAUDE_EVENT_QUEUE="$TQ2" CLAUDE_EVENT_LOG_DIR="$TLOG2" \
+    CLAUDE_EVENT_WATCH_THROTTLE_STATE="$TSTATE" \
+    "$WATCHER" --debounce 0 --min-interval 5 2>&1)
+elapsed=$(( $(date +%s) - start ))
+wait "$DRIP3" 2>/dev/null || true
+if (( elapsed < 3 )); then
+    echo "FAIL: throttled run did not HOLD for ~the window (elapsed ${elapsed}s, --min-interval 5)" >&2
+    echo "$t2_out" >&2; exit 1
+fi
+if ! grep -q 'hold A' <<<"$t2_out" || ! grep -q 'hold B' <<<"$t2_out"; then
+    echo "FAIL: events arriving during the throttle hold were not both delivered (dropped/lost?)" >&2
+    echo "$t2_out" >&2; exit 1
+fi
+if [[ -n "$(ls "$TQ2" 2>/dev/null)" ]]; then
+    echo "FAIL: queue not drained after throttled batch surface" >&2; exit 1
+fi
+echo "  throttle: held until window, batched during-hold events, dropped nothing OK"
+
+# (p) Explicit --min-interval 0 (disabled) is INERT: even with a "recent" state
+# file present, delivery is immediate and record_delivery is a no-op (state
+# untouched). This is the default behavior when the flag is omitted.
+DQ="$TMP/dq"; DLOG="$TMP/dlog"; DSTATE="$TMP/dq.state"
+mkdir -p "$DQ" "$DLOG"
+echo "SENTINEL_UNTOUCHED" >"$DSTATE"
+write_event "$DQ" "100_d.json" "default off"
+start=$(date +%s)
+d_out=$(CLAUDE_EVENT_QUEUE="$DQ" CLAUDE_EVENT_LOG_DIR="$DLOG" \
+    CLAUDE_EVENT_WATCH_THROTTLE_STATE="$DSTATE" \
+    "$WATCHER" --debounce 0 --min-interval 0 2>&1)
+elapsed=$(( $(date +%s) - start ))
+if ! grep -q 'default off' <<<"$d_out"; then
+    echo "FAIL: --min-interval 0 (disabled) did not deliver" >&2; echo "$d_out" >&2; exit 1
+fi
+if (( elapsed > 2 )); then
+    echo "FAIL: --min-interval 0 delayed delivery ${elapsed}s — must be inert" >&2; exit 1
+fi
+if [[ "$(cat "$DSTATE")" != "SENTINEL_UNTOUCHED" ]]; then
+    echo "FAIL: throttle-off run overwrote the state file (record_delivery must be a no-op when disabled)" >&2
+    cat "$DSTATE" >&2; exit 1
+fi
+echo "  throttle: explicit-0/default is inert (immediate delivery, state untouched) OK"
 
 # --- TOCTOU gap-event / bounded-block loop test --------------------------
 # Regression for the check-then-block race: the watcher's catch-up scan finds
@@ -648,4 +740,4 @@ if command -v script >/dev/null 2>&1; then
 fi
 echo "  tty-misuse: warning string present + absent from piped runs OK"
 
-echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + singleton + tty guard)"
+echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard)"

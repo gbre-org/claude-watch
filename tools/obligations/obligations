@@ -2755,6 +2755,80 @@ def _bashcmd_name_fallback_re(name):
     return "".join(out)
 
 
+# host-bash MCP tool names whose ``command_string`` is a JSON rendering of
+# the tool_input carrying the REAL shell command / script body (see the gate
+# hook's ``_short_command_string``). A ``HEAD:REST`` tool_pattern against one
+# of these gets AST-aware command-HEAD matching (mirroring ``Bashcmd:``) when
+# REST is a bare command-NAME spec -- so a gated CLI name that appears only in
+# a ``--body`` arg / heredoc / PR-body no longer body-wide false-matches.
+_HOSTBASH_MCP_HEADS = {
+    "mcp__host-bash__run_command",
+    "mcp__host-bash__run_script",
+}
+
+# A "command-NAME spec" (comma-separated bare names / globs) uses only word
+# chars and ``- . / * ? ,`` plus whitespace. Anything else (``^ $ ( ) [ ] | \\
+# +`` ...) marks REST as a REGEX, which keeps the arg-conditional lookahead
+# exempts (e.g. the botchat mark-read clear-path) on the regex path.
+_COMMAND_NAME_SPEC_RE = re.compile(r"^[\w\-./*?,\s]+$")
+
+
+def _is_command_name_spec(rest):
+    """True iff ``rest`` is a command-NAME spec (bare names / globs) rather
+    than a regex. See ``_COMMAND_NAME_SPEC_RE``."""
+    return bool(rest) and _COMMAND_NAME_SPEC_RE.match(rest) is not None
+
+
+def _hostbash_command_text(head, command_string):
+    """Extract the real shell command / script text a host-bash MCP tool_input
+    carries, from the (usually JSON-rendered) ``command_string``.
+
+    ``run_command`` carries the shell command under ``command``; ``run_script``
+    carries the script body under ``script`` (plus an ``interpreter``). The
+    gate hook renders the tool_input via ``json.dumps`` before matching, so we
+    parse it back out here. FAIL-SAFE: if ``command_string`` is not the
+    expected JSON object (e.g. a raw command was passed directly, as the unit
+    tests do), return it unchanged so head-matching still has something real to
+    work on."""
+    field = "script" if head.endswith("run_script") else "command"
+    s = command_string or ""
+    try:
+        obj = json.loads(s)
+    except (ValueError, TypeError):
+        return s
+    if isinstance(obj, dict):
+        val = obj.get(field)
+        if isinstance(val, str):
+            return val
+        # Tolerate the sibling field name (defensive; never the normal path).
+        other = obj.get("command" if field == "script" else "script")
+        if isinstance(other, str):
+            return other
+    return s
+
+
+def _command_names_present(names, command_string):
+    """AST-aware: True iff any name in ``names`` is the effective command HEAD
+    (basename; ``VAR=val`` / ``sudo`` / ``env`` / ``nohup`` / path prefixes
+    stripped) of a top-level segment of ``command_string``. A name mentioned
+    only inside a quoted arg / heredoc body does NOT match; a glob
+    (``botchat-*``) names a whole family but is still only tested against a
+    real head. FAIL-SAFE (shell_ast missing OR unparseable command): match the
+    name as a whole word anywhere in the raw string, glob-translated the same
+    way, preserving the pre-AST behavior for the unparseable edge."""
+    if not names:
+        return False
+    if _shell_ast is not None:
+        try:
+            return _shell_ast.command_name_present(command_string or "", names)
+        except _shell_ast.ShellParseError:
+            pass  # fall through to fail-safe word-boundary match
+    return any(
+        re.search(_bashcmd_name_fallback_re(n), command_string or "")
+        for n in names
+    )
+
+
 def _tool_pattern_matches(pattern, tool_name, command_string):
     """A tool_pattern is one of:
         '*'                       => matches every tool
@@ -2772,6 +2846,21 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
                                      be a glob naming a whole command family
                                      ('botchat-*'); the glob is still only
                                      ever tested against a real command head.
+        'mcp__host-bash__run_command:<spec>' / '..._run_script:<spec>'
+                                  => matches when tool_name == the host-bash
+                                     MCP tool AND, when <spec> is a bare
+                                     command-NAME spec, any name is the
+                                     effective command HEAD of the REAL shell
+                                     command / script body the tool_input
+                                     carries (AST-aware, exactly like
+                                     'Bashcmd:'), so a gated name that appears
+                                     only inside a '--body' arg / heredoc /
+                                     PR-body does NOT match. When <spec> is a
+                                     regex (anchors / groups / ...) it stays a
+                                     body-wide re.search for backward compat
+                                     (the arg-conditional clear-path exempts).
+        '<head>:<regex>'          => matches when tool_name == <head> AND
+                                     command_string matches <regex>
         '<name>'                  => matches when tool_name == <name>
     """
     if not pattern or pattern == "*":
@@ -2783,24 +2872,20 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
             if tool_name != "Bash":
                 return False
             names = {n.strip() for n in rest.split(",") if n.strip()}
-            if _shell_ast is not None:
-                try:
-                    return _shell_ast.command_name_present(
-                        command_string or "", names)
-                except _shell_ast.ShellParseError:
-                    pass  # fall through to fail-safe word-boundary match
-            # Fail-safe (module missing OR unparseable command): match the
-            # name as a whole word anywhere in the raw command. Conservative
-            # (may over-exempt on quoted mentions) but preserves the pre-AST
-            # behavior for the unparseable edge, per shell_ast's contract.
-            # Glob names are translated to an equivalent word-boundary
-            # regex so `Bashcmd:botchat-*` degrades the same way.
-            return any(
-                re.search(_bashcmd_name_fallback_re(n), command_string or "")
-                for n in names
-            )
+            return _command_names_present(names, command_string)
         if tool_name != head:
             return False
+        # host-bash MCP tools: a bare command-NAME spec is matched AST-aware
+        # against the command HEADS of the tool_input's real command / script
+        # body (mirroring Bashcmd:), NOT with a body-wide re.search over the
+        # rendered JSON -- which would false-match a gated name buried in a
+        # quoted arg / heredoc / PR body. A regex spec (anchors, groups, ...)
+        # is left on the re.search path so the arg-conditional lookahead
+        # clear-path exempts keep working unchanged.
+        if head in _HOSTBASH_MCP_HEADS and _is_command_name_spec(rest):
+            names = {n.strip() for n in rest.split(",") if n.strip()}
+            cmd_text = _hostbash_command_text(head, command_string)
+            return _command_names_present(names, cmd_text)
         try:
             return re.search(rest, command_string or "") is not None
         except re.error:
