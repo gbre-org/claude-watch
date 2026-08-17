@@ -1003,6 +1003,12 @@ pub(crate) fn prompt_line_text(pane_output: &str) -> Option<String> {
 ///     commands MUST submit from INSERT — Escape→NORMAL then Enter does
 ///     NOT submit a slash command (the documented self-clear `/clear` bug).
 ///
+/// `no_cancel = true` selects the NON-CANCELLING typing choreography
+/// (`inject_text_queued`): it NEVER leads with an Escape, so it does not
+/// cancel an in-flight turn. Used by callers that must apply a change without
+/// interrupting the session (e.g. cw-theme-sync's `/config theme=…`). See the
+/// branch comment in the body for the trade-off.
+///
 /// Returns:
 ///   - `InjectOutcome::Typed` when `submit == false`.
 ///   - `InjectOutcome::Submitted` when submission was verified (payload
@@ -1015,15 +1021,32 @@ pub async fn inject_and_verify(
     text: &str,
     submit: bool,
     slash_command: bool,
+    no_cancel: bool,
 ) -> InjectOutcome {
-    // Reuse inject_text's proven type-and-(maybe-)submit choreography for
-    // the regular-text submit path so there is exactly ONE copy of the
-    // Escape/dd/i/type + Tab→Escape→Enter sequence. For the no-submit and
-    // slash-command paths we drive the shared low-level helpers directly
-    // (inject_text always submits with the regular-text sequence).
-    if submit && !slash_command {
+    // NON-CANCELLING submit path (`no_cancel`): NEVER send a leading Escape.
+    // `inject_text` / `inject_text_no_submit` both open with an Escape→NORMAL
+    // coercion loop, and — as inject_dispatch.rs and docs/two-channel-design.md
+    // document — *that Escape is what CANCELS the in-flight turn*. Callers that
+    // must apply a change without interrupting whatever the session is doing
+    // (e.g. cw-theme-sync's `/config theme=…`) route here: `inject_text_queued`
+    // enters INSERT via an idempotent `i` (NO Escape, NO `dd` line-clear), types
+    // the payload, and submits with a bare Enter from INSERT — which is exactly
+    // the slash-command submit contract AND is QUEUED behind an active turn
+    // rather than interrupting it. Trade-off: no `dd` line-clear, so half-typed
+    // operator input glues onto the payload (acceptable — never interrupting is
+    // the explicit priority for these callers). Then fall through to the shared
+    // verify window below.
+    if submit && no_cancel {
+        inject_text_queued(pane, text).await;
+    } else if submit && !slash_command {
+        // Reuse inject_text's proven type-and-submit choreography for the
+        // regular-text submit path so there is exactly ONE copy of the
+        // Escape/dd/i/type + Tab→Escape→Enter sequence.
         inject_text(pane, text).await;
     } else {
+        // No-submit (any), or the CANCELLING slash-command path: drive the
+        // shared low-level helpers directly (inject_text always submits with
+        // the regular-text sequence).
         inject_text_no_submit(pane, text).await;
         if submit && slash_command {
             // Slash commands submit with a bare Enter from INSERT mode.
