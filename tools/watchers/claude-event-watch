@@ -34,6 +34,16 @@
 #       --quiet SECONDS     /  $EVENT_WATCH_QUIET_SECONDS       (quiet period)
 #     Set --debounce 0 to disable batching entirely (surface immediately,
 #     pre-debounce behavior).
+#   - Optional leading-edge throttle (--min-interval SECONDS, default 0 =
+#     disabled): a HARD CAP on how often the watcher may WAKE the main loop,
+#     regardless of arrival spacing. --quiet coalesces a CLUSTERED burst WITHIN
+#     one wake; --min-interval caps the SPACING BETWEEN wakes, so even events
+#     spaced minutes apart deliver at most once per SECONDS. When enabled, after
+#     a delivery the watcher HOLDS further deliveries until SECONDS has elapsed
+#     (persisting the last-delivery epoch to disk so the cap survives the
+#     fire-and-exit restart), then drains everything pending in one batch.
+#     Events arriving during the hold are BATCHED, never dropped — the throttle
+#     only DELAYS delivery, it never discards.
 #   - Print each event as a single one-liner: EVENT[<source>/<tag>] <msg…>
 #     then delete the queue file. Full event JSON (compact, one line) is
 #     appended to the consumed-event ring buffer log at
@@ -125,9 +135,29 @@ DEBOUNCE_SECONDS="${EVENT_WATCH_DEBOUNCE_SECONDS:-180}"
 # a staggered burst. Override via --quiet flag or $EVENT_WATCH_QUIET_SECONDS.
 QUIET_SECONDS="${EVENT_WATCH_QUIET_SECONDS:-3}"
 
+# Leading-edge throttle / minimum inter-delivery interval (seconds) — an
+# OPTIONAL hard cap on how often the watcher may WAKE the main loop, independent
+# of event arrival spacing. DEFAULT 0 = DISABLED (no throttle; existing behavior
+# is completely unchanged). When set to N>0 the watcher enforces "at most one
+# delivery per N seconds": after each delivery it records a last-delivery
+# timestamp (persisted to disk — see THROTTLE_STATE below — so it survives the
+# watcher's fire-and-exit restarts); on a subsequent run, if fewer than N
+# seconds have elapsed since that timestamp it HOLDS (sleeps) until the window
+# closes, then drains EVERYTHING pending in one batch. Events that arrive during
+# the hold are NOT dropped — they accumulate on disk and surface together at the
+# end of the window (the throttle only DELAYS delivery, never discards).
+#
+# This is a DIFFERENT knob from the two above: --quiet is burst-SETTLE detection
+# WITHIN a single wake and --debounce is the cap on that settle loop, whereas
+# --min-interval is the minimum SPACING BETWEEN wakes. They compose cleanly —
+# --quiet coalesces a clustered burst; --min-interval caps the wake rate even
+# for well-spaced events. Override via --min-interval flag or
+# $EVENT_WATCH_MIN_INTERVAL_SECONDS.
+MIN_INTERVAL_SECONDS="${EVENT_WATCH_MIN_INTERVAL_SECONDS:-0}"
+
 usage() {
     cat <<EOF
-Usage: claude-event-watch [--debounce SECONDS] [--quiet SECONDS] [-h|--help]
+Usage: claude-event-watch [--debounce SECONDS] [--quiet SECONDS] [--min-interval SECONDS] [-h|--help]
 
 Block until a new claude-event arrives in \$CLAUDE_EVENT_QUEUE
 (default ~/claude-events/), batch any events that land in a short
@@ -144,6 +174,17 @@ Options:
                       batch is drained once the pending count holds steady
                       for one full quiet interval (or --debounce is hit).
                       Also configurable via \$EVENT_WATCH_QUIET_SECONDS.
+  --min-interval SECONDS
+                      Leading-edge throttle (default: 0 = disabled). When >0,
+                      deliver at most one batch per SECONDS: after a delivery,
+                      HOLD further deliveries until SECONDS has elapsed since the
+                      last delivery, then flush ALL pending events in one batch.
+                      The last-delivery timestamp persists to disk so the cap
+                      survives the watcher's fire-and-exit restarts. Events are
+                      never dropped — only delayed. Composes with --quiet /
+                      --debounce (which settle a burst WITHIN one wake); this is
+                      the minimum SPACING BETWEEN wakes. Also configurable via
+                      \$EVENT_WATCH_MIN_INTERVAL_SECONDS.
   -h, --help          Show this help.
 
 The collect loop never drops, hides, acks, or reorders an event — it only
@@ -187,6 +228,18 @@ while [[ $# -gt 0 ]]; do
             QUIET_SECONDS="${1#--quiet=}"
             shift
             ;;
+        --min-interval)
+            if [[ $# -lt 2 ]]; then
+                echo "claude-event-watch: --min-interval requires a value" >&2
+                exit 2
+            fi
+            MIN_INTERVAL_SECONDS="$2"
+            shift 2
+            ;;
+        --min-interval=*)
+            MIN_INTERVAL_SECONDS="${1#--min-interval=}"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -209,6 +262,13 @@ fi
 # interval for the collect loop; 0 would busy-spin).
 if ! [[ "$QUIET_SECONDS" =~ ^[0-9]+$ ]] || (( QUIET_SECONDS < 1 )); then
     echo "claude-event-watch: QUIET_SECONDS must be a positive integer (got: $QUIET_SECONDS)" >&2
+    exit 2
+fi
+
+# Validate MIN_INTERVAL_SECONDS is a non-negative integer (0 = throttle
+# disabled; any positive value is the minimum seconds between deliveries).
+if ! [[ "$MIN_INTERVAL_SECONDS" =~ ^[0-9]+$ ]]; then
+    echo "claude-event-watch: MIN_INTERVAL_SECONDS must be a non-negative integer (got: $MIN_INTERVAL_SECONDS)" >&2
     exit 2
 fi
 
@@ -334,6 +394,63 @@ print_restart_banner() {
 CLEAN_EXIT_MARKER="$(dirname "$LOCKFILE")/claude-event-watch.exit"
 write_clean_exit_marker() {
     date +%s >"$CLEAN_EXIT_MARKER" 2>/dev/null || true
+}
+
+# --- leading-edge throttle state (--min-interval) -------------------------
+# Persist the last-delivery epoch to a small state file beside the lockfile so
+# the "at most one wake per MIN_INTERVAL_SECONDS" cap holds ACROSS the watcher's
+# fire-and-exit restarts: each delivery exits the process, so an in-memory
+# timestamp would reset every run and defeat the throttle entirely. The path is
+# env-overridable ($CLAUDE_EVENT_WATCH_THROTTLE_STATE) for test isolation; by
+# default it lives in the same runtime dir as the lockfile / clean-exit marker
+# (or, on the /tmp fallback lock path, alongside those — still per-user).
+THROTTLE_STATE="${CLAUDE_EVENT_WATCH_THROTTLE_STATE:-$(dirname "$LOCKFILE")/claude-event-watch.last-delivery}"
+
+# Read the persisted last-delivery epoch. Missing / unreadable / non-numeric
+# content -> 0 (treated as "never delivered" -> deliver immediately). Never
+# fails: a garbage or absent state file must not break delivery.
+read_last_delivery() {
+    local v
+    v="$(cat "$THROTTLE_STATE" 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$v"
+    else
+        printf '0\n'
+    fi
+}
+
+# Stamp the current epoch as the last-delivery time. No-op when the throttle is
+# disabled (MIN_INTERVAL_SECONDS==0) so a default run never touches the runtime
+# dir. Strictly best-effort — a write failure must never break delivery.
+record_delivery() {
+    (( MIN_INTERVAL_SECONDS == 0 )) && return 0
+    date +%s >"$THROTTLE_STATE" 2>/dev/null || true
+}
+
+# Leading-edge throttle. BEFORE delivering, ensure at least MIN_INTERVAL_SECONDS
+# have elapsed since the last delivery. If the window has already passed (or the
+# throttle is disabled) return immediately; otherwise SLEEP the remainder, then
+# return so the caller drains. Events landing during this sleep accumulate on
+# disk and are drained in the SAME post-sleep batch — the throttle only DELAYS
+# delivery, it NEVER drops or deletes an event. `9>&-` closes the singleton lock
+# fd in the sleep child for the same reason inotifywait/sleep do elsewhere: an
+# inherited flock fd would keep the lock held past our death.
+throttle_wait() {
+    (( MIN_INTERVAL_SECONDS == 0 )) && return 0
+    local last now elapsed remaining
+    last="$(read_last_delivery)"
+    now="$(date +%s)"
+    # Clock skew / a future timestamp -> treat as just-delivered (wait the full
+    # window) rather than trusting a nonsensical negative elapsed.
+    if (( last > now )); then
+        last="$now"
+    fi
+    elapsed=$(( now - last ))
+    if (( elapsed >= MIN_INTERVAL_SECONDS )); then
+        return 0
+    fi
+    remaining=$(( MIN_INTERVAL_SECONDS - elapsed ))
+    sleep "$remaining" 9>&-
 }
 
 # Rotate consumed.jsonl when it exceeds LOG_MAX_LINES. Keeps last N rotations
@@ -549,6 +666,10 @@ print_pending() {
         process_event "$f" "$LOG_FILE"
         rm -f "$f"
     done < <(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | sort -z)
+    # Expose whether anything was actually delivered so the throttle stamps the
+    # last-delivery timestamp only on a REAL delivery (not on an empty drain if
+    # the queue got emptied out from under us between the catch-up scan and here).
+    DELIVERED_ANY=$any
     return $any
 }
 
@@ -592,6 +713,8 @@ fi
 # debounce/collect_burst coalescing, flock singleton, and restart banner are
 # all untouched.
 INOTIFY_TIMEOUT="${EVENT_WATCH_INOTIFY_TIMEOUT:-30}"
+# Set by print_pending; initialised here so `set -u` never sees it unbound.
+DELIVERED_ANY=0
 while true; do
     # Catch-up: anything already pending (incl. a backlog that landed during
     # the main loop's read-act-restart gap, OR a gap-event from a prior
@@ -601,8 +724,18 @@ while true; do
     # one at a time. (DEBOUNCE_SECONDS=0 short-circuits collect_burst,
     # preserving immediate-surface behavior.)
     if find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+        # Leading-edge throttle FIRST: if MIN_INTERVAL_SECONDS>0 and we last
+        # delivered less than that ago, HOLD here until the window closes. Events
+        # keep accumulating on disk during the hold (nothing is dropped);
+        # collect_burst then settles any final arrivals and print_pending drains
+        # the whole batch at once. A default run (throttle disabled) returns from
+        # throttle_wait instantly, so behavior is unchanged.
+        throttle_wait
         collect_burst
         print_pending || true
+        # Stamp the leading edge ONLY if we actually delivered >=1 event, so the
+        # throttle window is measured from a real wake (not an empty drain).
+        (( DELIVERED_ANY )) && record_delivery
         # Mark THIS instance as a clean block-print-exit BEFORE announcing the
         # restart, so the daemon sees the marker the moment we exit (see
         # write_clean_exit_marker). Only the deliberate exit-0 delivery path
