@@ -296,5 +296,52 @@ class ForceStartEndpointTest(unittest.TestCase):
             self.appmod.SESSION_TASK_BIN = orig
 
 
+    # -------------------------------------------------------------- 7
+    def test_co_run_leaves_overlapping_peer_running(self):
+        """`co_run: true` force-starts ALONGSIDE the same-scope running peer
+        WITHOUT autostopping it (Andrew #4529). The endpoint appends
+        --no-interrupt to the session-task force-start argv; default
+        (no co_run) still autostops the peer.
+        """
+        r = self.client.post(
+            f"/api/queue/{self.blocked_id}/force-start",
+            json={"reason": "scopes-safe", "co_run": True},
+        )
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        body = r.get_json()
+        self.assertTrue(body.get("ok"), body)
+        self.assertTrue(body.get("co_run"), body)
+
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        items = {it["id"]: it for it in data["items"]}
+        # Target promoted + marked co-run.
+        self.assertEqual(items[self.blocked_id]["status"], "running")
+        self.assertTrue(items[self.blocked_id].get("force_started_co_run"))
+        # The overlapping peer is STILL running (not autostopped).
+        self.assertEqual(items[self.running_id]["status"], "running")
+        self.assertNotIn(
+            "autostopped_by_force_start", items[self.running_id]
+        )
+
+    # -------------------------------------------------------------- 8
+    def test_default_force_start_autostops_overlapping_peer(self):
+        """Regression: with no co_run flag, force-start still autostops the
+        overlapping same-scope running peer (unchanged default behavior).
+        """
+        r = self.client.post(
+            f"/api/queue/{self.blocked_id}/force-start",
+            json={"reason": "interrupt-default"},
+        )
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertFalse(r.get_json().get("co_run"), r.get_json())
+
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        items = {it["id"]: it for it in data["items"]}
+        self.assertEqual(items[self.blocked_id]["status"], "running")
+        self.assertEqual(items[self.running_id]["status"], "abandoned")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

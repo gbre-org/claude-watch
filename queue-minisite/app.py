@@ -2121,8 +2121,8 @@ def api_queue_force_start(queue_id: str) -> Any:
     """Manually promote a PENDING queue item to running, bypassing scope-
     conflict serialization.
 
-    Body: ``{"reason": "..."}``. Reason is required and is auditable —
-    every successful force-start appends a row to
+    Body: ``{"reason": "...", "co_run": <bool>}``. Reason is required and is
+    auditable — every successful force-start appends a row to
     ``~/.config/claude/queue-force-start.log`` (host) /
     ``$QUEUE_FORCE_START_LOG`` (container). The id must match
     ``_QUEUE_ID_RE`` and currently be in ``pending`` status.
@@ -2169,6 +2169,12 @@ def api_queue_force_start(queue_id: str) -> Any:
     user = request.headers.get("X-Auth-Request-Email", "ui")
     annotated_reason = f"{reason} (via UI by {user})"
 
+    # Co-run (Andrew #4529): opt-in flag to force-start ALONGSIDE overlapping
+    # same-scope RUNNING peers WITHOUT autostopping them (operator asserts the
+    # scopes are safe to overlap). Accept either `co_run` or `no_interrupt` in
+    # the JSON body; default False preserves the autostop-the-peer behavior.
+    co_run = bool(payload.get("co_run") or payload.get("no_interrupt"))
+
     eligible = _ids_by_status("pending")
     if queue_id not in eligible:
         return (
@@ -2188,16 +2194,19 @@ def api_queue_force_start(queue_id: str) -> Any:
         return preflight
 
     try:
+        fs_argv = [
+            "python3",
+            SESSION_TASK_BIN,
+            "queue",
+            "force-start",
+            queue_id,
+            "--reason",
+            annotated_reason,
+        ]
+        if co_run:
+            fs_argv.append("--no-interrupt")
         proc = subprocess.run(
-            [
-                "python3",
-                SESSION_TASK_BIN,
-                "queue",
-                "force-start",
-                queue_id,
-                "--reason",
-                annotated_reason,
-            ],
+            fs_argv,
             capture_output=True,
             text=True,
             timeout=STOP_TIMEOUT_SECONDS,
@@ -2252,6 +2261,7 @@ def api_queue_force_start(queue_id: str) -> Any:
             "ok": True,
             "id": queue_id,
             "action": "force-start",
+            "co_run": co_run,
             "reason": annotated_reason,
             "stdout": proc.stdout,
             "stderr": proc.stderr,
