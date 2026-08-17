@@ -678,8 +678,11 @@ fn presence_is_fresh(mtime: Option<f64>, now: f64, max_age: f64) -> bool {
 }
 
 /// Render the operator-presence gauges: `claude_operator_present` (1=present,
-/// 0=absent) and `claude_operator_present_timestamp_seconds` (the carrier file
-/// mtime, epoch secs). Present iff the carrier mtime is fresh within `max_age`
+/// 0=absent), `claude_operator_present_timestamp_seconds` (the carrier file
+/// mtime, epoch secs), and `claude_presence_gate_max_age_secs` (the resolved
+/// gate freshness window `max_age` itself -- the SINGLE SOURCE OF TRUTH read
+/// from presence-gate.json, so consumers read the window instead of hardcoding
+/// it). Present iff the carrier mtime is fresh within `max_age`
 /// -- the SAME decision (`presence_is_fresh`), carrier (`presence_carrier_mtime`),
 /// and window (`presence_max_age`) the desk-streak block uses, so the present
 /// flag can never disagree with the streak's presence view. The timestamp gauge
@@ -707,6 +710,10 @@ fn operator_present_lines(mtime: Option<f64>, now: f64, max_age: f64) -> Vec<Str
             "claude_operator_present_timestamp_seconds {:.3}",
             mtime_secs
         ),
+        "".to_string(),
+        "# HELP claude_presence_gate_max_age_secs Operator-presence gate freshness window in seconds -- SINGLE SOURCE OF TRUTH (presence-gate.json params.max_age_secs). Consumers should read this gauge instead of hardcoding a window.".to_string(),
+        "# TYPE claude_presence_gate_max_age_secs gauge".to_string(),
+        format!("claude_presence_gate_max_age_secs {:.0}", max_age),
     ]
 }
 
@@ -1087,6 +1094,14 @@ mod tests {
             lines[6],
             "claude_operator_present_timestamp_seconds 1767225600.000"
         );
+        assert_eq!(lines[7], "");
+        assert_eq!(
+            lines[8],
+            "# HELP claude_presence_gate_max_age_secs Operator-presence gate freshness window in seconds -- SINGLE SOURCE OF TRUTH (presence-gate.json params.max_age_secs). Consumers should read this gauge instead of hardcoding a window."
+        );
+        assert_eq!(lines[9], "# TYPE claude_presence_gate_max_age_secs gauge");
+        // Integer-formatted window value (Python `:.0f`); 420.0 -> "420".
+        assert_eq!(lines[10], "claude_presence_gate_max_age_secs 420");
     }
 
     #[test]
