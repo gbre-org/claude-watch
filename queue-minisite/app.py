@@ -285,6 +285,54 @@ _QUEUE_MARKER_RE = re.compile(r"Queue item:\s*(q-[a-z0-9-]{4,64})")
 # need to allow paragraphs.
 _MAX_REASON_LEN = 500
 
+
+def _session_task_preflight() -> "tuple[Any, int] | None":
+    """Verify ``SESSION_TASK_BIN`` is actually OPENABLE before shelling out.
+
+    The script reaches the container via a docker-compose bind mount. A
+    SINGLE-FILE bind mount binds the source *inode* at container start; when
+    the host file is later replaced via atomic rename — which is exactly how
+    ``tools/session-task/session-task`` is edited, deployed, and how a git
+    checkout lands it — the container's mount keeps pointing at the now-
+    UNLINKED inode. The path still lists via ``ls`` (the mount dentry
+    survives) but ``open()`` fails with ENOENT, so ``python3
+    /app/session-task ...`` dies with rc=2 and every write endpoint
+    (force-start, abandon, depend) fails opaquely as "session-task <op>
+    failed". This preflight converts that into an actionable diagnostic.
+
+    The DURABLE fix is bind-mounting the containing DIRECTORY rather than the
+    file (a directory mount resolves the filename fresh on each ``open()``,
+    so atomic-rename replacement is picked up transparently) — see the
+    queue-minisite service in ``examples/compose/docker-compose.yml``. This
+    preflight is defense-in-depth so a future stale mount is diagnosable
+    instead of silent.
+
+    Returns ``None`` when the binary is readable, else an
+    ``(json_response, status_code)`` tuple the caller returns directly.
+    """
+    try:
+        with open(SESSION_TASK_BIN, "rb"):
+            pass
+    except OSError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": (
+                        f"session-task binary is not readable at "
+                        f"{SESSION_TASK_BIN!r}: {exc}. This usually means the "
+                        f"bind-mounted script went stale (host file replaced "
+                        f"via atomic rename after the container started) — "
+                        f"recreate the queue-minisite container to refresh "
+                        f"the mount."
+                    ),
+                    "session_task_bin": SESSION_TASK_BIN,
+                }
+            ),
+            500,
+        )
+    return None
+
 # Errored-hostjob detection. The `hostjob` runner (`examples/compose/bin/hostjob`) flips
 # its queue item to `abandoned` with `abandon_reason = "hostjob exit <N>"`
 # when the host worker exits NON-ZERO (see the reaper's `finalize_queue`).
@@ -856,6 +904,111 @@ def _task_token_target(tok: Any) -> str | None:
     return target or None
 
 
+# ---- Scope-token overlap + manual-lock detection --------------------------
+# Ported byte-for-byte from ``_tokens_overlap`` / ``_locked_tokens_blocking_item``
+# in ``~/repos/claude-watch/tools/session-task/session-task``. The minisite
+# mirrors session-task's readiness logic in-process (rather than shelling out
+# per item every render), so it must also mirror the manual-lock gate: a
+# pending item whose scope overlaps an operator-declared locked scope is PARKED
+# (``queue lock`` was used) and is NOT ready — even though it is a group head
+# with all deps done. Without this, the SPA rendered such an item as READY +
+# FORCE START while the dispatcher's spawn-gate (``_item_is_ready``) correctly
+# refused it: a mislabel that made a locked-parked item look like a ready item
+# nothing was forcing (Andrew #4430/#4432).
+_PATH_TOKEN_PREFIX = "path:"
+
+
+def _is_task_token(tok: Any) -> bool:
+    return isinstance(tok, str) and tok.startswith(_TASK_TOKEN_PREFIX)
+
+
+def _is_path_token(tok: Any) -> bool:
+    return isinstance(tok, str) and tok.startswith(_PATH_TOKEN_PREFIX)
+
+
+def _path_token_segments(tok: str) -> list[str]:
+    """Segment list of a normalized ``path:<repo>/<a>/<b>`` token.
+
+    First element is the repo; remainder is the within-repo path. Mirrors
+    session-task's helper of the same name.
+    """
+    body = tok[len(_PATH_TOKEN_PREFIX):]
+    return body.split("/")
+
+
+def _path_token_repo(tok: str) -> str:
+    """Repo name embedded in a ``path:`` token."""
+    return _path_token_segments(tok)[0]
+
+
+def _tokens_overlap(a: Any, b: Any) -> bool:
+    """Return True if two normalized scope tokens overlap.
+
+    Byte-for-byte mirror of session-task's ``_tokens_overlap`` — the same
+    overlap semantics the lock machinery uses to decide which pending items a
+    ``queue lock <scope>`` parks. See that function for the full contract:
+    ``*`` overlaps everything; ``file:`` prefix match; ``path:`` same-repo
+    segment-prefix; ``repo:X`` covers any ``path:X/...``; ``task:`` and other
+    typed tokens overlap only on exact match.
+    """
+    if a == "*" or b == "*":
+        return True
+    a_is_file = isinstance(a, str) and a.startswith("file:")
+    b_is_file = isinstance(b, str) and b.startswith("file:")
+    if a_is_file and b_is_file:
+        pa = a[len("file:"):]
+        pb = b[len("file:"):]
+
+        def with_sep(p: str) -> str:
+            return p if p.endswith("/") else p + "/"
+
+        if pa == pb:
+            return True
+        wa = with_sep(pa)
+        wb = with_sep(pb)
+        return wa.startswith(wb) or wb.startswith(wa)
+    a_is_path = _is_path_token(a)
+    b_is_path = _is_path_token(b)
+    if a_is_path and b_is_path:
+        sa = _path_token_segments(a)
+        sb = _path_token_segments(b)
+        if sa[0] != sb[0]:
+            return False
+        ra = sa[1:]
+        rb = sb[1:]
+        if len(ra) <= len(rb):
+            return rb[: len(ra)] == ra
+        return ra[: len(rb)] == rb
+    a_is_repo = isinstance(a, str) and a.startswith("repo:")
+    b_is_repo = isinstance(b, str) and b.startswith("repo:")
+    if a_is_repo and b_is_path:
+        return a[len("repo:"):] == _path_token_repo(b)
+    if b_is_repo and a_is_path:
+        return b[len("repo:"):] == _path_token_repo(a)
+    return a == b
+
+
+def _locked_tokens_blocking_item(
+    item: dict[str, Any], locked_scopes: dict[str, Any] | None
+) -> list[str]:
+    """Locked-scope tokens that overlap this item's scope (empty if none).
+
+    Mirrors session-task's helper. A "lock" is a token key in queue.json's
+    ``locked_scopes`` map; an item is parked when ANY of its scope tokens
+    overlaps ANY locked token, using ``_tokens_overlap`` semantics.
+    """
+    if not locked_scopes:
+        return []
+    item_scope = item.get("scope") or []
+    blockers: list[str] = []
+    for tok in locked_scopes.keys():
+        for it_tok in item_scope:
+            if _tokens_overlap(it_tok, tok):
+                blockers.append(tok)
+                break
+    return blockers
+
+
 def _iter_dep_ids(item: dict[str, Any]) -> list[str]:
     """Return the queue ids ``item`` depends on, deduplicated, stable order.
 
@@ -926,7 +1079,11 @@ def _has_dep_cycle(items: list[dict[str, Any]], root_id: str) -> bool:
     return False
 
 
-def _compute_ready_now(items: list[dict[str, Any]], item: dict[str, Any]) -> bool:
+def _compute_ready_now(
+    items: list[dict[str, Any]],
+    item: dict[str, Any],
+    locked_scopes: dict[str, Any] | None = None,
+) -> bool:
     """Backend-authoritative ``ready_now`` for a queue item.
 
     Mirrors ``_item_is_ready`` in
@@ -937,12 +1094,20 @@ def _compute_ready_now(items: list[dict[str, Any]], item: dict[str, Any]) -> boo
 
     Predicate:
       1. status == "pending"
-      2. item is the head of its serialization group (oldest pending in
+      2. no operator scope lock (``queue lock``) overlaps the item's scope
+      3. item is the head of its serialization group (oldest pending in
          the group, no running peers)
-      3. every entry in ``depends_on`` resolves to an item with
+      4. every entry in ``depends_on`` resolves to an item with
          status == "done"; missing/abandoned/cycle = permanent block
     """
     if item.get("status") != "pending":
+        return False
+    # Manual scope lock (operator ``queue lock <scope>``). A pending item whose
+    # scope overlaps a locked token is PARKED and NOT ready — mirrors the
+    # first gate in session-task's ``_item_is_ready``. Must precede the
+    # group-head / deps checks so a locked item never reports ready even when
+    # it is otherwise spawnable.
+    if _locked_tokens_blocking_item(item, locked_scopes):
         return False
     group_id = item.get("group_id")
     members = [
@@ -998,6 +1163,7 @@ def _shape(
     items: list[dict[str, Any]] | None = None,
     bindings: dict[str, str] | None = None,
     owner_bindings: dict[str, str] | None = None,
+    locked_scopes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status = item.get("status", "unknown")
     # Normalize to a non-empty string. A missing / null / non-string status is
@@ -1129,6 +1295,33 @@ def _shape(
         except OSError:
             has_archive = False
 
+    # Manual scope-lock state. A pending item whose scope overlaps an
+    # operator-declared locked scope (``session-task queue lock <scope>``) is
+    # PARKED, not ready — the dispatcher's spawn-gate refuses it. We surface
+    # that as a distinct LOCKED state so the card stops mislabeling it READY +
+    # FORCE START (Andrew #4430/#4432). ``lock_blockers`` are the locked tokens
+    # that overlap; ``lock_reason`` joins the operator's per-lock reasons;
+    # ``unlock_commands`` are the copyable ``queue unlock`` commands (one per
+    # blocking token) — consistent with the copy-not-click treatment the
+    # WEDGED / QUARANTINED exits use for state transitions.
+    lock_blockers = (
+        _locked_tokens_blocking_item(item, locked_scopes)
+        if status == "pending"
+        else []
+    )
+    locked = bool(lock_blockers)
+    lock_reasons: list[str] = []
+    unlock_commands: list[str] = []
+    for tok in lock_blockers:
+        meta = (locked_scopes or {}).get(tok) or {}
+        reason = ""
+        if isinstance(meta, dict):
+            reason = (meta.get("reason") or "").strip()
+        if reason:
+            lock_reasons.append(f"{tok}: {reason}")
+        unlock_commands.append(f"session-task queue unlock {tok}")
+    lock_reason = " · ".join(lock_reasons)
+
     shaped = {
         "id": item.get("id", ""),
         "summary": summary,
@@ -1145,12 +1338,22 @@ def _shape(
         # no peer is running. Computed here (not read off queue.json)
         # because session-task only persists `group_head` — the
         # dependency check is read-time / lazy.
-        "ready_now": _compute_ready_now(items, item) if items is not None else False,
+        "ready_now": _compute_ready_now(items, item, locked_scopes) if items is not None else False,
         "status": status,
         "priority": item.get("priority", ""),
         "created_by": item.get("created_by", ""),
         "abandon_reason": item.get("abandon_reason", ""),
         "block_reason": item.get("block_reason", ""),
+        # Manual scope-lock (``queue lock``) state. ``locked`` gates the
+        # LOCKED badge + suppresses the READY badge / demotes FORCE START in
+        # the pending card. ``lock_blockers`` are the overlapping locked
+        # tokens, ``lock_reason`` the operator's joined reasons, and
+        # ``unlock_commands`` the copyable ``queue unlock`` commands. Empty /
+        # False for any non-pending or non-locked item.
+        "locked": locked,
+        "lock_blockers": lock_blockers,
+        "lock_reason": lock_reason,
+        "unlock_commands": unlock_commands,
         # Why the item is wedged / quarantined. Both are operator- (or
         # reaper-) supplied free text and are the ONLY record of why the row
         # is parked in a scope-holding state, so they render on the card the
@@ -1471,6 +1674,13 @@ def _load_hostjob_command(label: str) -> dict[str, Any] | None:
 def _render_payload() -> dict[str, Any]:
     data, err = _cached_queue()
     items = data.get("items", []) if isinstance(data, dict) else []
+    # Operator-declared manual scope locks (``session-task queue lock``),
+    # stored at the top level of queue.json. Threaded into ``_shape`` so a
+    # pending item whose scope overlaps a locked token renders LOCKED (parked)
+    # instead of READY + FORCE START.
+    locked_scopes = (
+        data.get("locked_scopes") or {} if isinstance(data, dict) else {}
+    )
     now = datetime.now(timezone.utc)
     agent_by_qid = _load_agent_state()
     # Authoritative agent_id -> queue_id bindings, loaded ONCE per render
@@ -1495,7 +1705,7 @@ def _render_payload() -> dict[str, Any]:
         # depends_on_status per-edge.
         s = _shape(
             it, now, agent_by_qid, items=items, bindings=bindings,
-            owner_bindings=owner_bindings,
+            owner_bindings=owner_bindings, locked_scopes=locked_scopes,
         )
         st = s["status"]
         key = STATUS_SECTION.get(st)
@@ -1799,6 +2009,10 @@ def _do_abandon(
             404,
         )
 
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
+
     try:
         proc = subprocess.run(
             [
@@ -1968,6 +2182,10 @@ def api_queue_force_start(queue_id: str) -> Any:
             ),
             404,
         )
+
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
 
     try:
         proc = subprocess.run(
@@ -2144,6 +2362,10 @@ def api_queue_depend() -> Any:
     # Shell out to session-task — the canonical writer holds the
     # fcntl.flock on queue.json, so we never race with concurrent
     # writes from the host CLI or other endpoint hits.
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
+
     try:
         proc = subprocess.run(
             [
@@ -2244,6 +2466,10 @@ def api_queue_depend_remove(queue_id: str) -> Any:
             jsonify({"ok": False, "error": "invalid or missing 'target_id'"}),
             400,
         )
+
+    preflight = _session_task_preflight()
+    if preflight is not None:
+        return preflight
 
     try:
         proc = subprocess.run(

@@ -30,12 +30,17 @@ COPY queue-minisite/claude_agents.py /app/claude_agents.py
 # duplicates).
 #
 #   session-task — canonical source lives at
-#       tools/session-task/session-task. Bind-mounted read-only at
-#       /app/session-task by docker-compose so the container always
-#       runs the upstream version without rebuilding on every PR. The
-#       Stop endpoint invokes `python3 /app/session-task queue
+#       tools/session-task/session-task. Its containing DIRECTORY is
+#       bind-mounted read-only at /app/session-task-src by docker-compose
+#       (SESSION_TASK_BIN=/app/session-task-src/session-task) so the
+#       container always runs the upstream version without rebuilding on
+#       every PR. A directory (not single-file) mount is deliberate: a
+#       single-file bind mount binds the source inode and goes STALE when
+#       the host script is atomically replaced (edit / deploy / git
+#       checkout), silently breaking the write endpoints. The Stop /
+#       Abandon endpoints invoke `python3 $SESSION_TASK_BIN queue
 #       abandon ...` and the force-start endpoint invokes `python3
-#       /app/session-task queue force-start`.
+#       $SESSION_TASK_BIN queue force-start`.
 #   claude-event — emits queue-abandoned events into
 #       $HOME/claude-events/ for the host's event watcher to pick up.
 #   obligations — registers a hard-gate `force_started_unspawned`
