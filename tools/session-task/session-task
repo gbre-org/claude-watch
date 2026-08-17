@@ -207,6 +207,15 @@ QUEUE_SCHEMA_VERSION = 2
 # store (queue.json) so BOTH views agree and the leak self-heals. See
 # `_reconcile_hostjob_rows`.
 #
+# A SECOND leak class the same sweep now reaps: a hostjob worker that exits
+# NONZERO makes the reaper run `queue abandon --reason "hostjob exit N"`.
+# Because `abandon` on a scope-owning row is deliberately NON-terminal
+# (it lands in `quarantined` to hold the scope until death is PROVEN), that
+# row then pins its `hostjob:<label>` scope forever until a human `queue
+# release`s it — the exit-quarantine GC leak. `_reconcile_hostjob_rows` now
+# also flips such `quarantined` rows to terminal `abandoned` (scope freed)
+# once status.json is positive proof the worker is gone.
+#
 # HOSTJOB_LOG_DIR mirrors the runner's STATE_ROOT (default ~/.cache/hostjob);
 # overridable so the minisite / tests can point elsewhere.
 HOSTJOB_LOG_DIR = Path(
@@ -3895,14 +3904,50 @@ def _hostjob_effective_terminal(label, running_age_seconds):
 
 
 def _reconcile_hostjob_rows(items):
-    """Heal hostjob rows stuck ``running`` whose runner reports terminal.
+    """Heal leaked hostjob rows whose runner reports the worker is dead.
 
-    Mutates ``items`` IN PLACE, transitioning each affected row to its
-    authoritative terminal status (done / abandoned) with the same field
-    stamps `cmd_queue_done`/`cmd_queue_abandon` write (``completed_at`` /
-    ``abandoned_at`` / ``abandon_reason``, ``group_head`` cleared, plus a
-    ``reconciled_hostjob`` provenance flag). Returns the list of
-    ``(id, new_status)`` tuples reconciled (possibly empty).
+    Handles TWO leak classes, both scoped to ``hostjob:<label>`` rows only
+    (repo:/service: rows never carry that scope, so `_extract_hostjob_label`
+    already excludes them — this sweep NEVER touches a non-hostjob
+    quarantine, which needs human judgment):
+
+      1. ``running`` rows the reaper's fail-soft done/abandon flip never
+         reached (dropped flip, or a later ``hostjob clean`` removed the
+         state dir). Transitioned to their authoritative terminal state
+         (done rc==0 / abandoned otherwise), same as before.
+
+      2. ``quarantined`` rows — the EXIT-QUARANTINE leak. When a hostjob
+         worker exits nonzero the reaper runs ``queue abandon --reason
+         'hostjob exit N'``; because ``abandon`` on a scope-owning row is
+         deliberately NON-terminal (it lands in ``quarantined`` to preserve
+         the "presumed dead WITHOUT proof" scope lock), that row then holds
+         its ``hostjob:<label>`` scope FOREVER until a human ``queue
+         release``s it. The old sweep skipped these (it only handled
+         ``running``), so crashed hostjobs leaked as quarantined
+         indefinitely. We now GC them: when the runner's status.json is
+         POSITIVE PROOF the worker is gone (terminal status, or an absent
+         state dir past the starting window — ``hostjob clean`` REFUSES a
+         running job), we flip the quarantine to terminal ``abandoned``
+         (scope freed), exactly as a manual ``queue release`` would. This
+         does NOT weaken the quarantine contract's "no auto-expiry timer"
+         rule: it is not a timer, it is confirmed-death detection from the
+         runner's own authoritative state — the very positive proof the
+         quarantine exists to wait for.
+
+    Safety: a hostjob whose status.json still reads ``running`` yields
+    ``_hostjob_effective_terminal`` -> None, so a LIVE hostjob is never
+    reaped, in EITHER class. No cross-namespace pid probe is done (the CLI
+    may run in a different PID namespace than the host worker); status.json
+    is the namespace-safe authoritative signal (the reaper writes the
+    terminal status only AFTER ``proc.wait()`` returns).
+
+    Mutates ``items`` IN PLACE with the same field stamps
+    `cmd_queue_done`/`cmd_queue_abandon`/`cmd_queue_release` write
+    (``completed_at`` / ``abandoned_at`` / ``abandon_reason``, plus
+    ``quarantine_released_at`` / ``quarantine_released_by`` for the
+    quarantine class, ``group_head`` cleared, and a ``reconciled_hostjob``
+    provenance flag). Returns the list of ``(id, new_status)`` tuples
+    reconciled (possibly empty).
 
     Called under the queue write-lock by mutating commands (`list` when it
     can persist, plus a dedicated `reconcile-hostjobs` command) so the SHARED
@@ -3914,12 +3959,23 @@ def _reconcile_hostjob_rows(items):
     reconciled = []
     for it in items:
         try:
-            if it.get("status") != "running":
+            status = it.get("status")
+            if status not in ("running", "quarantined"):
                 continue
             label = _extract_hostjob_label(it.get("scope") or [])
             if not label:
                 continue
-            started_iso = it.get("registered_at") or it.get("started_at")
+            # Age since the row became scope-owning. For a quarantined row
+            # fall back to `quarantined_at` (it was abandoned out of running
+            # so `registered_at`/`started_at` should still be present, but be
+            # defensive). Age gates ONLY the absent-state-dir launch-race case
+            # inside `_hostjob_effective_terminal`; a real terminal status.json
+            # reconciles regardless of age.
+            started_iso = (
+                it.get("registered_at")
+                or it.get("started_at")
+                or it.get("quarantined_at")
+            )
             age = None
             if started_iso:
                 try:
@@ -3930,6 +3986,31 @@ def _reconcile_hostjob_rows(items):
             eff = _hostjob_effective_terminal(label, age)
             if eff is None:
                 continue
+            if status == "quarantined":
+                # Confirmed-dead exit-quarantine GC. Always -> abandoned
+                # (scope freed), mirroring `queue release`, regardless of the
+                # worker's rc: a quarantine is already the terminal-intent
+                # "presumed dead" state, and `queue release` is unconditionally
+                # `abandoned`. Never promote a quarantine to `done`.
+                now_iso = _fmt_ts()
+                prior_reason = it.get("quarantine_reason") or ""
+                reason_bits = [
+                    b for b in (prior_reason, eff.get("reason")) if b
+                ]
+                it["status"] = "abandoned"
+                it["abandoned_at"] = now_iso
+                it["quarantine_released_at"] = now_iso
+                it["quarantine_released_by"] = "reconcile-hostjobs"
+                it["abandon_reason"] = (
+                    "quarantine released (hostjob reconcile): "
+                    + ("; ".join(reason_bits) or "confirmed dead")
+                )
+                it["group_head"] = False
+                it["reconciled_hostjob"] = True
+                it["reconciled_hostjob_at"] = now_iso
+                reconciled.append((it.get("id"), "abandoned"))
+                continue
+            # status == "running": self-heal a dropped reaper flip.
             it["status"] = eff["status"]
             it["group_head"] = False
             it["reconciled_hostjob"] = True
@@ -3948,17 +4029,31 @@ def _reconcile_hostjob_rows(items):
 
 
 def cmd_queue_reconcile_hostjobs(args):
-    """Sweep queue.json for stuck-`running` hostjob rows whose runner reports
-    terminal, and heal them in the shared store.
+    """Sweep queue.json for leaked hostjob rows whose runner reports the
+    worker is dead, and heal them in the shared store.
 
-    This is the durable, both-views-agree fix for the CLI/web divergence
-    (Andrew, botchat #2029): the q-site reconciles hostjob rows at render
-    time from the runner's status.json, but the CLI showed raw queue.json, so
-    finished-but-unflipped hostjobs lingered as `running` only in `queue
-    list`. Running this sweep transitions them to their real terminal state so
-    BOTH surfaces match. Safe to run on any host with the runner's
-    ``HOSTJOB_LOG_DIR`` visible (that's where status.json lives); on a host
-    without it, absent-dir rows past the starting window reconcile to `done`.
+    Reaps TWO leak classes (see ``_reconcile_hostjob_rows``), both scoped to
+    ``hostjob:*`` rows only:
+
+      * ``running`` rows whose reaper done/abandon flip was dropped (or a
+        later ``hostjob clean`` removed the state dir) -> terminal
+        done/abandoned. The durable, both-views-agree fix for the CLI/web
+        divergence (Andrew, botchat #2029): the q-site reconciles at render
+        time from status.json but the CLI showed raw queue.json, so
+        finished-but-unflipped hostjobs lingered as `running` only in `queue
+        list`.
+      * ``quarantined`` rows from a nonzero-exit hostjob (the reaper's
+        `queue abandon` lands a scope-owning row in quarantine, which HOLDS
+        the ``hostjob:<label>`` scope forever) -> terminal ``abandoned``
+        (scope freed), but ONLY when status.json is positive proof the
+        worker is gone. This closes the exit-quarantine GC leak — crashed
+        hostjobs previously leaked as quarantined until a human `queue
+        release`d them.
+
+    Safe to run on any host with the runner's ``HOSTJOB_LOG_DIR`` visible
+    (that's where status.json lives); on a host without it, absent-dir rows
+    past the starting window reconcile (running -> done, quarantined ->
+    abandoned). A hostjob still reporting ``running`` is never touched.
     """
     fh, data = _queue_open_locked("rw")
     try:
@@ -8497,12 +8592,15 @@ def build_parser():
     q_reconcile_hj = qsub.add_parser(
         "reconcile-hostjobs",
         help=(
-            "Heal hostjob rows stuck `running` whose runner reports terminal "
-            "(the reaper's fail-soft done/abandon flip was dropped, or a later "
-            "`hostjob clean` removed the state dir). Reconciles the shared "
-            "queue.json against the runner's status.json so `queue list` and "
-            "the q-site agree. Also runs automatically at the start of every "
-            "`queue list`."
+            "Heal leaked hostjob rows whose runner reports the worker is dead "
+            "(scoped to hostjob:* only). Reaps (a) `running` rows whose reaper "
+            "done/abandon flip was dropped or whose state dir `hostjob clean` "
+            "removed, and (b) `quarantined` rows from a nonzero-exit hostjob "
+            "that hold their hostjob:<label> scope forever -> terminal "
+            "`abandoned` (scope freed), but ONLY when status.json proves the "
+            "worker is gone. Reconciles the shared queue.json against the "
+            "runner's status.json so `queue list` and the q-site agree. Also "
+            "runs automatically at the start of every `queue list`."
         ),
     )
     q_reconcile_hj.add_argument("--json", action="store_true")

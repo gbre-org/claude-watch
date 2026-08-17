@@ -31,7 +31,7 @@
 #   `cw-cron-run <job-name> ...` guard. To stop/resume a job without
 #   root, flip its flag file via `cw-cron-toggle disable|enable <name>`
 #   (job-names: active-agents, metrics, stale-ready-check, queue-check,
-#   watcher-health-check, session-rotate). Flags live under the uid-1000-writable,
+#   watcher-health-check, session-rotate, hostjob-reconcile). Flags live under the uid-1000-writable,
 #   named-volume-persistent /var/lib/claude-watch/cron-disabled. Takes
 #   effect next tick; persists across redeploys. See docs/cron-toggle.md.
 
@@ -103,3 +103,16 @@
 # fail-soft skips on a stripped-down deploy without the ~/repos bind-mount.
 # All thresholds are overridable via ROTATE_* env vars (see the CLI --help).
 17 4 * * *  hndrewaall /usr/local/bin/cw-cron-run session-rotate /home/hndrewaall/repos/claude-watch/tools/session-task/session-task queue rotate > /tmp/claude-watch-cron-session-rotate.log 2>&1
+
+# Hostjob queue-row GC. Every 10 minutes, sweep queue.json for LEAKED
+# hostjob rows whose runner (status.json under HOSTJOB_LOG_DIR) reports the
+# worker is dead, and heal them in the shared store: (a) `running` rows whose
+# reaper done/abandon flip was dropped, and (b) `quarantined` rows from a
+# nonzero-exit hostjob that otherwise pin their `hostjob:<label>` scope
+# FOREVER (the exit-quarantine leak). Both scoped to hostjob:* only; a hostjob
+# still reporting `running` is never touched. Like session-rotate this invokes
+# the bind-mounted `session-task` Python CLI (there is no baked
+# /usr/local/bin copy), so it fail-soft skips on a stripped-down deploy
+# without the ~/repos bind-mount. `queue list` already runs this sweep inline;
+# this cron makes the leak self-heal even when no one lists the queue.
+*/10 * * * *  hndrewaall /usr/local/bin/cw-cron-run hostjob-reconcile /home/hndrewaall/repos/claude-watch/tools/session-task/session-task queue reconcile-hostjobs > /tmp/claude-watch-cron-hostjob-reconcile.log 2>&1
