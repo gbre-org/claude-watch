@@ -1178,6 +1178,18 @@
     // preserved across the merge by onBeforeElUpdated. Options are
     // rebuilt from state.sources (the global distinct created_by set).
     html += buildSourceFilterHTML(state.sources || []);
+    // Operator-presence pill (idle stopwatch). MUST be rendered here too (not
+    // just in the Jinja template): this subtree is rebuilt every 5s tick, so a
+    // pill that existed only server-side would be discarded after the first
+    // merge — same class of bug as the source filter / density toggle. The
+    // markup builder lives in presence.js (window.Presence) so the server
+    // paint and the client tick stay byte-consistent. Emitted only when the
+    // payload carries presence data (carrier wired in); presence.js's 1s tick
+    // re-anchors from the fresh data-idle-base after the merge. Rendered BEFORE
+    // the "live" dot, matching the template; the dot is left untouched.
+    if (state.operator_presence && window.Presence) {
+      html += window.Presence.buildPresencePillHTML(state.operator_presence);
+    }
     html += `<span class="dot ${errorTxt ? 'dot-err' : 'dot-ok'}" title="${errorTxt ? 'fetch error' : 'live'}"></span>`;
     // NOTE: the last-fetch clock (.ts) used to live inline here. It now
     // lives inside the info-dropdown ("last fetch" row) so the topbar row
@@ -1456,6 +1468,13 @@
       // interval), so a card that just changed anchor shows the right age.
       if (window.RelAge && typeof window.RelAge.tick === 'function') {
         try { window.RelAge.tick(); } catch (_) { /* defensive */ }
+      }
+      // Re-anchor + re-render the operator-presence stopwatch to the freshly-
+      // merged data-idle-base immediately (rather than waiting up to 1s for
+      // presence.js's standalone interval), so the pill reflects the server's
+      // latest idle right after the merge.
+      if (window.Presence && typeof window.Presence.tick === 'function') {
+        try { window.Presence.tick(); } catch (_) { /* defensive */ }
       }
     } catch (_) {
       // Network blip — try again next tick.

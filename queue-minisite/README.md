@@ -133,6 +133,25 @@ brand identity lives outside the public image.
 | `SSE_TAIL_BACKFILL_LINES` | `200` | Historical-context backfill cap when a client first connects. |
 | `PINGME_SESSION_TASK` | `0` | Set to `1` to suppress pingme chatter from `session-task` lifecycle. |
 | `CLAUDE_EVENT_SESSION_TASK` | `0` | Set to `1` to suppress claude-event chatter from `session-task` lifecycle. |
+| `CW_PRESENCE_FILE` | (unset) | Path to the operator-presence carrier file (the HID-idle carrier the Rust daemon reads for its `claude_operator_present*` gauges). Drives the header "operator present" idle-stopwatch pill. Unset falls back to `/run/claude-presence/operator-present` then `~/.claude/operator-present`; a missing/unreadable carrier hides the pill entirely (graceful no-op). |
+| `CW_PRESENCE_MAX_AGE` | `420` | Freshness window (seconds): idle at/below it reads as present, above it as away. Matches the daemon's `CW_PRESENCE_MAX_AGE`. |
+| `OPERATOR_IDLE_STOPWATCH_THRESHOLD` | `10` | Idle seconds below which the pill shows the plain "operator present" state; at/above it a live idle stopwatch that keeps ticking across the present→away transition. |
+
+## Operator-presence pill
+
+The header carries an "operator present" pill next to the "live" liveness dot.
+It reads the presence carrier file's mtime (the operator's last HID-activity
+instant, stamped ~1s while active by the host presence detector) and turns
+`now - mtime` into an idle time:
+
+- **Under `OPERATOR_IDLE_STOPWATCH_THRESHOLD` (10s):** plain green "operator
+  present" — no stopwatch.
+- **At/above the threshold:** a live idle stopwatch (`M:SS` / `H:MM:SS`). It
+  ticks client-side (`static/presence.js`, 1s interval) seeded from the
+  server-computed idle and re-synced on each 5s `/api/queue` merge, so it
+  advances smoothly without hammering the backend.
+- **Past `CW_PRESENCE_MAX_AGE`:** the pill dims to "away" but the stopwatch
+  **keeps running** — it is never reset or hidden across the present→away flip.
 
 ## Tests
 

@@ -179,6 +179,42 @@ RECENT_ABANDONED_LIMIT = int(os.environ.get("RECENT_ABANDONED_LIMIT", "20"))
 STARTING_WINDOW_SECONDS = float(os.environ.get("STARTING_WINDOW_SECONDS", "60"))
 
 # ---------------------------------------------------------------------------
+# Operator-presence carrier — the same HID-idle carrier file the Rust daemon
+# reads for its `claude_operator_present*` gauges (see src/metrics.rs
+# `presence_carrier_path` / `operator_present_lines`). The host presence-
+# detector (claude-config presence-detector-rs) stamps the file's mtime to the
+# operator's last HID-activity instant (`now - idle`) roughly once a second
+# while the operator is active, so `now - mtime` IS the operator's idle time.
+# The header "operator present" pill reads that mtime to drive a client-side
+# idle stopwatch. Resolution mirrors the Rust daemon: `CW_PRESENCE_FILE`
+# overrides, else the first existing of the tmpfs-farm path then the
+# `~/.claude` fallback. Absent/unreadable carrier => the pill simply does not
+# render (graceful no-op), so a deployment without the presence detector wired
+# in is unaffected.
+CW_PRESENCE_FILE = os.environ.get("CW_PRESENCE_FILE", "").strip()
+_PRESENCE_CANDIDATES = (
+    [CW_PRESENCE_FILE] if CW_PRESENCE_FILE else [
+        "/run/claude-presence/operator-present",
+        str(Path.home() / ".claude" / "operator-present"),
+    ]
+)
+# Freshness window (seconds): mtime within this of now => the daemon's
+# `claude_operator_present` gauge is 1 (present); beyond it, 0 (away). Matches
+# the Rust default (CW_PRESENCE_MAX_AGE / presence-gate.json, currently 420s).
+# The pill's idle stopwatch is INDEPENDENT of this window — it keeps ticking
+# across the present->away transition — but the flag drives the pill's colour
+# (present vs away) so the two surfaces agree on "away".
+CW_PRESENCE_MAX_AGE = float(os.environ.get("CW_PRESENCE_MAX_AGE", "420"))
+# Idle threshold (seconds) below which the pill shows the plain "operator
+# present" state and NO stopwatch. At or above it the pill switches to a
+# ticking idle stopwatch. Actively-present typing bumps the carrier mtime every
+# ~1s, so a small threshold (default 10s) keeps the pill from flickering into
+# stopwatch mode during normal use while still catching a genuine step-away.
+OPERATOR_IDLE_STOPWATCH_THRESHOLD = float(
+    os.environ.get("OPERATOR_IDLE_STOPWATCH_THRESHOLD", "10")
+)
+
+# ---------------------------------------------------------------------------
 # Status -> section registry (the "no status may go invisible" rule)
 # ---------------------------------------------------------------------------
 #
@@ -657,6 +693,94 @@ def _humanize_age(seconds: float | None) -> str:
         return f"{h}h {m // 60}m {suffix}"
     d, rem = divmod(secs, 86400)
     return f"{d}d {rem // 3600}h {suffix}"
+
+
+def _presence_carrier_mtime() -> float | None:
+    """mtime (epoch secs) of the operator-presence carrier, or None.
+
+    Mirrors the Rust daemon's `presence_carrier_mtime`: the first candidate
+    path that exists wins; a missing / unreadable carrier returns None (the
+    pill then simply does not render). The mtime is the operator's last
+    HID-activity instant, so `now - mtime` is the idle time.
+    """
+    for candidate in _PRESENCE_CANDIDATES:
+        if not candidate:
+            continue
+        try:
+            return os.path.getmtime(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _format_idle_stopwatch(seconds: float) -> str:
+    """Stopwatch string for an idle duration: `M:SS` under an hour, else
+    `H:MM:SS`. Kept byte-identical to formatIdleStopwatch() in
+    static/presence.js so the server paint and the client tick agree.
+    """
+    secs = int(seconds)
+    if secs < 0:
+        secs = 0
+    if secs < 3600:
+        m, s = divmod(secs, 60)
+        return f"{m}:{s:02d}"
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def _presence_state(idle: float, present: bool) -> str:
+    """Pill state from idle seconds + the daemon's present flag.
+
+    - "present": actively present (idle below the stopwatch threshold).
+    - "idle":    stepped away but still within the freshness window.
+    - "away":    idle past the freshness window (daemon gauge == 0).
+
+    Both "idle" and "away" show the ticking stopwatch — the stopwatch never
+    resets across the idle->away boundary; only the colour changes.
+    """
+    if idle < OPERATOR_IDLE_STOPWATCH_THRESHOLD:
+        return "present"
+    return "idle" if present else "away"
+
+
+def _operator_presence(now_epoch: float) -> dict[str, Any] | None:
+    """Presence payload for the header pill, or None when no carrier exists.
+
+    Shape:
+      {
+        "present_ts":   <carrier mtime epoch, float>,
+        "idle_seconds": <now - mtime, clamped >= 0, float>,
+        "present":      <bool: mtime fresh within CW_PRESENCE_MAX_AGE>,
+        "state":        "present" | "idle" | "away",
+        "stopwatch":    <"M:SS" / "H:MM:SS" of idle_seconds>,
+        "threshold":    <OPERATOR_IDLE_STOPWATCH_THRESHOLD>,
+        "max_age":      <CW_PRESENCE_MAX_AGE>,
+        "server_now":   <now_epoch>,
+      }
+
+    The client seeds a 1s stopwatch from `idle_seconds` (re-synced every
+    5s /api/queue merge). `present` only tints the pill (present vs away);
+    the stopwatch ticks regardless, continuously across the present->away
+    transition — it is never reset or hidden when `present` flips to False.
+    """
+    mtime = _presence_carrier_mtime()
+    if mtime is None:
+        return None
+    idle = now_epoch - mtime
+    if idle < 0:
+        idle = 0.0
+    present = idle <= CW_PRESENCE_MAX_AGE
+    return {
+        "present_ts": mtime,
+        "idle_seconds": idle,
+        "present": present,
+        "state": _presence_state(idle, present),
+        "stopwatch": _format_idle_stopwatch(idle),
+        "threshold": OPERATOR_IDLE_STOPWATCH_THRESHOLD,
+        "max_age": CW_PRESENCE_MAX_AGE,
+        "server_now": now_epoch,
+    }
 
 
 def _load_agent_state() -> dict[str, dict[str, Any]]:
@@ -1882,6 +2006,10 @@ def _render_payload() -> dict[str, Any]:
         },
         "orphan_count": orphan_count,
         "starting_count": starting_count,
+        # Operator-presence pill data (None when no carrier is wired in, so the
+        # template / refresh.js simply skip the pill). Computed against the
+        # SAME wall clock (`time.time()`) the client reconciles below.
+        "operator_presence": _operator_presence(time.time()),
         "fetched_at": datetime.fromtimestamp(_cache.fetched_at, timezone.utc).isoformat()
         if _cache.fetched_at
         else "",
