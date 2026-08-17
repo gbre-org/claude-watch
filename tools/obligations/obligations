@@ -31,8 +31,15 @@ State: ``~/.config/claude/obligations.json`` (0600), schema:
           "satisfied_by": {
             "tool_pattern": "Bash",
             "command_pattern": "^watcher-ctl run signal-wait-dm",
+            # optional: a SECOND, independent regex for the PAYLOAD the
+            # command carried, as opposed to the shape of the command
+            # itself. Searched on its own (not anchored to wherever
+            # command_pattern matched), so payload text that sits on a
+            # different line of the command -- a heredoc body, say -- is
+            # reachable. When set it must ALSO match: it can only narrow.
+            "body_pattern": "delivered:",
             # optional: flags whose ARGUMENT is a path. When present, the
-            # command_pattern is ALSO matched against those files' contents,
+            # patterns above are ALSO matched against those files' contents,
             # so a command that hands its payload over as a file (rather
             # than inline) can still auto-satisfy. Missing / unreadable /
             # oversized / non-regular files never count as a match.
@@ -3002,24 +3009,42 @@ def cmd_add(args):
 
     file_arg_flags = [f for f in (getattr(args, "satisfied_by_file_flag", None)
                                   or []) if f]
-    if file_arg_flags and not args.satisfied_by_cmd_regex:
+    body_regex = getattr(args, "satisfied_by_body_regex", None)
+    if file_arg_flags and not (args.satisfied_by_cmd_regex or body_regex):
         # Refused deliberately. Without a regex there is nothing to look for
         # in the file, so the obligation would clear on the mere SHAPE of the
         # command ("this tool ran with a file argument") -- i.e. on any
         # unrelated file-carrying invocation. That is looser than the bug
         # this flag exists to fix.
         print("ERROR: --satisfied-by-file-flag requires "
-              "--satisfied-by-cmd-regex (the pattern is the anchor searched "
-              "inside the file; without one, any file-carrying command would "
-              "satisfy the obligation)", file=sys.stderr)
+              "--satisfied-by-cmd-regex and/or --satisfied-by-body-regex "
+              "(the pattern is the anchor searched inside the file; without "
+              "one, any file-carrying command would satisfy the obligation)",
+              file=sys.stderr)
         return 2
 
+    for label, rx in (("--satisfied-by-cmd-regex", args.satisfied_by_cmd_regex),
+                      ("--satisfied-by-body-regex", body_regex)):
+        if not rx:
+            continue
+        try:
+            re.compile(rx)
+        except re.error as e:
+            # A pattern that cannot compile is silently skipped at match
+            # time, which would register an obligation that can never
+            # auto-satisfy -- the exact failure this whole area exists to
+            # prevent. Refuse it at the door instead.
+            print(f"ERROR: {label} is not a valid regex: {e}", file=sys.stderr)
+            return 2
+
     satisfied_by = None
-    if args.satisfied_by_tool or args.satisfied_by_cmd_regex:
+    if args.satisfied_by_tool or args.satisfied_by_cmd_regex or body_regex:
         satisfied_by = {
             "tool_pattern": args.satisfied_by_tool or "*",
             "command_pattern": args.satisfied_by_cmd_regex or "",
         }
+        if body_regex:
+            satisfied_by["body_pattern"] = body_regex
         if file_arg_flags:
             satisfied_by["file_arg_flags"] = file_arg_flags
 
@@ -3728,6 +3753,47 @@ def cmd_check(args):
 # A file that is MISSING at match time -- the common case, since staged
 # scratch files are deliberately short-lived and often auto-unlinked --
 # yields NO match. "The evidence is gone" must never read as "satisfied".
+#
+# ONE PATTERN CANNOT SAY BOTH "which command" AND "carrying what"
+# -------------------------------------------------------------------------
+# `file_arg_flags` alone turned out not to fix the case it was written for,
+# and the reason generalises: a single `command_pattern` is asked to do two
+# unrelated jobs at once.
+#
+#   * It must IDENTIFY THE COMMAND -- otherwise the rule clears on any
+#     unrelated invocation, so it necessarily names the program and its
+#     addressing arguments.
+#   * It must ALSO ASSERT THE PAYLOAD -- otherwise the rule clears on a
+#     send that never mentioned the thing the obligation is about.
+#
+# Written as one regex those two halves fight each other, in both haystacks:
+#
+#   * In the COMMAND STRING the usual shape is `prog\b(?=.*A)(?=.*B)`. The
+#     lookaheads are evaluated at the offset just past the program token and
+#     `.` does not cross newlines, so they can only see the remainder of
+#     THAT line. When the payload is written by an earlier line of the same
+#     command -- a `cat > "$f" <<EOF ... EOF` heredoc staging the body, which
+#     is exactly the shape forced on a CLI that forbids stdin -- the payload
+#     text is present in the command string yet unreachable to the pattern.
+#   * In a FILE BODY the same regex fails for the opposite reason: a payload
+#     file contains the message and nothing else. It has no program token
+#     and no addressing arguments, so a pattern anchored on command shape --
+#     i.e. every pattern that is safe to use -- can never match it. Turning
+#     `file_arg_flags` on does not help; the second haystack is useless to
+#     the only kind of pattern anyone would write.
+#
+# `body_pattern` splits the job in two. `command_pattern` keeps identifying
+# the command; `body_pattern` carries the payload anchor and is searched on
+# its own, over the same haystacks (command string, then any named file
+# bodies). Both must match, so this is STRICTLY NARROWING -- an obligation
+# that adds one becomes harder to satisfy, never easier. What changes is
+# only that each half is now looked for where it actually lives.
+#
+# This matters beyond tidiness. An obligation that CANNOT self-satisfy is
+# worse than one that never existed: the operator does the real work, the
+# gate stays standing and blocks everything it matches, and the only way
+# out is an override. Train that reflex often enough and the override stops
+# being an exception -- which inverts the point of having a gate at all.
 
 # Max bytes of a named file we are willing to read for a satisfied_by match.
 # Files larger than this are declined outright (no partial read): the
@@ -3868,6 +3934,37 @@ def _satisfied_by_pattern_matches(patt, command_string, file_arg_flags):
     return False
 
 
+def _satisfied_by_regexes_match(sb, command_string):
+    """True iff every regex in ``sb`` matches what just ran.
+
+    ``command_pattern`` and ``body_pattern`` are searched INDEPENDENTLY --
+    each over the command string and, when ``file_arg_flags`` is set, the
+    bodies of the files that command names -- and the results are ANDed. A
+    pattern that is absent imposes no condition; a pattern that does not
+    compile fails CLOSED (no match), so a malformed rule keeps its
+    obligation standing rather than silently clearing it.
+
+    This is the whole satisfied_by regex decision. ``_satisfy_by_completion``
+    calls it after the tool_pattern check; nothing else should reimplement
+    it, so that a change here cannot pass tests that model it separately.
+    """
+    if not isinstance(sb, dict):
+        return False
+    flags = sb.get("file_arg_flags") or []
+    if not isinstance(flags, list):
+        flags = []
+    for src in (sb.get("command_pattern") or "", sb.get("body_pattern") or ""):
+        if not src:
+            continue
+        try:
+            patt = re.compile(src)
+        except re.error:
+            return False
+        if not _satisfied_by_pattern_matches(patt, command_string, flags):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Subcommand: post-tool-satisfy  -- called by PostToolUse hook
 # ---------------------------------------------------------------------------
@@ -3888,27 +3985,17 @@ def _satisfy_by_completion(tool_name, command_string):
                 kept.append(ob)
                 continue
             sb_tool_pat = sb.get("tool_pattern") or "*"
-            sb_cmd_pat = sb.get("command_pattern") or ""
-            sb_file_flags = sb.get("file_arg_flags") or []
-            if not isinstance(sb_file_flags, list):
-                sb_file_flags = []
             # tool_pattern check uses our standard matcher
             if not _tool_pattern_matches(sb_tool_pat, tool_name, command_string):
                 kept.append(ob)
                 continue
-            # command_pattern is a regex matched against command_string and
-            # -- when file_arg_flags is set -- against the body of the files
-            # that command names. See _satisfied_by_pattern_matches.
-            if sb_cmd_pat:
-                try:
-                    patt = re.compile(sb_cmd_pat)
-                except re.error:
-                    kept.append(ob)
-                    continue
-                if not _satisfied_by_pattern_matches(
-                        patt, command_string, sb_file_flags):
-                    kept.append(ob)
-                    continue
+            # command_pattern and body_pattern are searched independently and
+            # ANDed; see _satisfied_by_regexes_match, and the design note
+            # above _satisfied_by_pattern_matches for why one combined
+            # pattern cannot express "this command carried this payload".
+            if not _satisfied_by_regexes_match(sb, command_string):
+                kept.append(ob)
+                continue
             removed_ids.append(ob.get("id"))
         data["obligations"] = [
             ob for ob in data["obligations"] if ob.get("id") not in removed_ids
@@ -4034,15 +4121,25 @@ def build_parser():
     p_add.add_argument("--satisfied-by-tool", default=None,
                        help="tool_pattern for auto-satisfy")
     p_add.add_argument("--satisfied-by-cmd-regex", default=None,
-                       help="command regex for auto-satisfy")
+                       help="command regex for auto-satisfy: identifies WHICH "
+                            "command counts (program, addressing args)")
+    p_add.add_argument("--satisfied-by-body-regex", default=None,
+                       help="second, independent regex for the PAYLOAD the "
+                            "command carried. Searched on its own over the "
+                            "command string and any --satisfied-by-file-flag "
+                            "file bodies, so payload text on another line of "
+                            "the command (e.g. a heredoc that stages the "
+                            "body) is reachable. ANDed with "
+                            "--satisfied-by-cmd-regex, so it can only narrow.")
     p_add.add_argument("--satisfied-by-file-flag", action="append",
                        default=None, metavar="FLAG",
                        help="option flag (e.g. -F, --file) whose ARGUMENT is a "
-                            "path; --satisfied-by-cmd-regex is then ALSO "
+                            "path; the satisfy regexes are then ALSO "
                             "matched against that file's contents, so a "
                             "command that hands its payload over as a file "
                             "can auto-satisfy. Repeatable. Requires "
-                            "--satisfied-by-cmd-regex (a file body with no "
+                            "--satisfied-by-cmd-regex and/or "
+                            "--satisfied-by-body-regex (a file body with no "
                             "anchor to find would be no anchor at all).")
     p_add.add_argument("--created-by", default="manual",
                        help="audit string (e.g. 'main-loop', 'andrew')")
