@@ -614,7 +614,8 @@
   // what the quarantine state exists to stop the system from making on an
   // inference. The copy button (static/copy-cmd.js) removes the typing, not
   // the decision.
-  function renderExitList(exits) {
+  function renderExitList(exits, label) {
+    const heading = label || 'exits';
     const rows = exits.map(([cmd, note]) => (
       '<li class="exit">' +
       `<code class="exit-cmd">${esc(cmd)}</code>` +
@@ -624,7 +625,7 @@
       '</li>'
     )).join('');
     return (
-      '<div class="exits"><span class="exits-label">exits</span>' +
+      `<div class="exits"><span class="exits-label">${esc(heading)}</span>` +
       `<ul class="exit-list">${rows}</ul></div>`
     );
   }
@@ -759,18 +760,25 @@
     // ``ready_now`` field (group-head AND every depends_on resolved to
     // ``done``). The older ``group_head`` flag was FIFO-only and ignored
     // depends_on (Bug q-1b89).
+    //
+    // ``locked`` class + ``locked`` badge (Andrew #4430/#4432): a pending item
+    // whose scope overlaps an operator ``queue lock`` is PARKED. The backend
+    // sets ``ready_now`` False for it, so READY and LOCKED never co-occur;
+    // LOCKED replaces READY and demotes the force-start button below.
     const cardClasses = [
       'item',
       'state-pending',
       'drop-zone',
       'draggable',
       it.ready_now ? 'ready' : '',
+      it.locked ? 'locked' : '',
       (it.depends_on && it.depends_on.length) ? 'has-deps' : '',
     ].filter(Boolean).join(' ');
 
     let head = '';
     head += '<span class="badge state-pending">pending</span>';
     if (it.ready_now) head += '<span class="badge ghead" title="ready to spawn (group head, all deps done)">ready</span>';
+    if (it.locked) head += '<span class="badge state-locked" title="parked by an operator scope lock — NOT ready to spawn; the dispatcher refuses it until the scope is unlocked">locked</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
     if (it.depends_on && it.depends_on.length) {
@@ -787,7 +795,17 @@
       }
     }
     head += '<span class="drag-handle" aria-hidden="true" title="drag to set dependency">&#x2630;</span>';
-    head += `<button type="button" class="action-btn force-start-btn" data-action="force-start" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Override scope-conflict serialization and promote to running">force start</button>`;
+    // FORCE START is demoted to secondary on a LOCKED item (force-starting
+    // bypasses the operator's scope lock); the unlock command in the body is
+    // the intended way out. Mirrors the Jinja template's conditional class +
+    // title.
+    const forceCls = it.locked
+      ? 'action-btn force-start-btn secondary force-start-locked'
+      : 'action-btn force-start-btn';
+    const forceTitle = it.locked
+      ? 'Bypass the scope lock and promote to running anyway — prefer `queue unlock` (below) unless you mean to override the lock'
+      : 'Override scope-conflict serialization and promote to running';
+    head += `<button type="button" class="${forceCls}" data-action="force-start" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="${attr(forceTitle)}">force start</button>`;
     head += `<button type="button" class="action-btn abandon-btn" data-action="abandon" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Remove this pending item from the queue">abandon</button>`;
 
     const createdIso = it.created_at_iso || '';
@@ -809,10 +827,27 @@
         '</details>';
     }
 
+    // LOCKED body — why the item is parked + the copyable unlock command(s).
+    // MUST mirror the {% if it.locked %} block in the pending card of
+    // templates/index.html (copy-not-click unlock affordance).
+    let lockedBody = '';
+    if (it.locked) {
+      lockedBody += '<p class="description scope-locked"><strong>scope locked.</strong> ' +
+        'An operator parked this scope with <code>queue lock</code>; the dispatcher will not spawn this item until it is unlocked.</p>';
+      if (it.lock_reason) {
+        lockedBody += `<p class="description abandon-reason"><strong>lock:</strong> ${esc(it.lock_reason)}</p>`;
+      }
+      const unlockExits = (it.unlock_commands || []).map((cmd) => (
+        [cmd, 'release the operator scope lock — this item becomes ready to spawn again']
+      ));
+      lockedBody += renderExitList(unlockExits, 'unlock');
+    }
+
     return (
       `<article id="queue-${attr(it.id)}" class="${cardClasses}" draggable="true" data-queue-id="${attr(it.id)}" data-queue-status="pending" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" title="Drag onto another item to set as dependency">` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
+      lockedBody +
       `<div class="age">${ageBlock}</div>` +
       scope +
       prompt +

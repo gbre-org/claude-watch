@@ -71,6 +71,9 @@ Usage:
     session-task queue depend <id> [--add q-AAA[,q-BBB]] [--remove q-CCC]
                                    [--clear] [--json]
     session-task queue prune [--older-than DURATION] [-n/--dry-run]
+    session-task queue rotate [--queue-logs-max-age DAYS]
+                              [--queue-logs-max-count N] [--completed-max-mb MB]
+                              [--completed-retain N] [-n/--dry-run] [--json]
     session-task queue banner
     session-task queue lock <scope> [--reason "..."]   # park items overlapping
                                                        # <scope> until unlocked
@@ -138,6 +141,7 @@ Abandoning a live scope (quarantine):
 
 import argparse
 import fcntl
+import gzip
 import json
 import os
 import re
@@ -151,6 +155,23 @@ from pathlib import Path
 
 TASK_FILE = Path.home() / ".config" / "session" / "resume-action.json"
 COMPLETED_FILE = Path.home() / ".config" / "session" / "completed-tasks.jsonl"
+# Dedicated (never-renamed) advisory lock for completed-tasks.jsonl. Both the
+# append path (`log_completed`) and the size/time roller (`cmd_queue_rotate`)
+# take fcntl.flock(LOCK_EX) on it so a roll -- which reads the whole file then
+# atomically rewrites the retained tail -- can never drop an append that lands
+# in its read->rewrite window. Mirrors the queue.json lock decoupling in #580.
+COMPLETED_LOCK_FILE = COMPLETED_FILE.with_suffix(".jsonl.lock")
+# Dated, gz-compressed archive segments of completed-tasks.jsonl live here.
+# The roller moves everything OLDER than the retained recent tail into a
+# `completed-tasks-<UTC-timestamp>.jsonl.gz` segment in this dir. Overridable
+# so container deploys / tests can relocate it; default sits alongside the
+# live file.
+COMPLETED_ARCHIVE_DIR = Path(
+    os.environ.get(
+        "COMPLETED_ARCHIVE_DIR",
+        str(Path.home() / ".config" / "session" / "completed-archive"),
+    )
+)
 QUEUE_FILE = Path.home() / ".config" / "session" / "queue.json"
 # Dedicated lock file (never renamed) + last-good snapshot. See
 # `_queue_open_locked` / `_queue_write_and_unlock` for the atomic-write +
@@ -330,6 +351,61 @@ QUEUE_LOG_ARCHIVE_DIR = Path(
         "QUEUE_LOG_ARCHIVE_DIR",
         str(Path.home() / ".config" / "session" / "queue-logs"),
     )
+)
+
+# --- session-store rotation tunables ---------------------------------------
+# `session-task queue rotate` (wired to run periodically from the baked cron —
+# see container/cron.d/cw-default) bounds the two unbounded growers under
+# ~/.config/session/:
+#
+#   1. queue-logs/    -- one archived transcript per completed queue item
+#      (`<qid>.jsonl` / `<qid>.workload.txt`). Grew to ~2500 entries with no
+#      pruner. Rotation deletes entries older than MAX_AGE_DAYS, then enforces
+#      a hard MAX_COUNT floor (deleting the oldest by mtime beyond the cap).
+#      Recent transcripts stay in place so the q-site "View log" affordance
+#      keeps working for recent Done cards.
+#
+#   2. completed-tasks.jsonl -- append-only queue/resume history. Grew multi-MB
+#      with no roller. Rotation rolls it when it exceeds MAX_BYTES: the most
+#      recent RETAIN lines stay in the live file, everything older is moved to
+#      a dated gz segment under COMPLETED_ARCHIVE_DIR. Keeping the recent tail
+#      in the LIVE file is deliberate -- the q-site DONE view (#581) reads the
+#      live file, so retaining recent history there means rotation never hides
+#      recent done items from that view.
+#
+# All defaults are conservative and every knob is overridable via env var
+# (and per-invocation CLI flag). Env parsing is fail-soft: a malformed value
+# falls back to the default rather than crashing the maintenance tick.
+def _env_num(name, default, cast):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = cast(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val >= 0 else default
+
+
+# queue-logs: keep entries younger than this many days...
+ROTATE_QUEUE_LOGS_MAX_AGE_DAYS = _env_num(
+    "ROTATE_QUEUE_LOGS_MAX_AGE_DAYS", 30.0, float
+)
+# ...and cap the total number of entries kept (oldest-by-mtime pruned first).
+ROTATE_QUEUE_LOGS_MAX_COUNT = _env_num(
+    "ROTATE_QUEUE_LOGS_MAX_COUNT", 500, int
+)
+# completed-tasks.jsonl: roll once the live file exceeds this many bytes.
+ROTATE_COMPLETED_MAX_BYTES = _env_num(
+    "ROTATE_COMPLETED_MAX_BYTES", 5 * 1024 * 1024, int
+)
+# ...retaining this many of the most-recent lines in the live file post-roll.
+ROTATE_COMPLETED_RETAIN = _env_num(
+    "ROTATE_COMPLETED_RETAIN", 2000, int
+)
+# Cap on how many dated gz archive segments to keep (oldest pruned first).
+ROTATE_COMPLETED_ARCHIVE_MAX = _env_num(
+    "ROTATE_COMPLETED_ARCHIVE_MAX", 20, int
 )
 
 # claude-watch active-agents JSON — maps queue_id -> agent_id (and liveness).
@@ -516,6 +592,29 @@ def cmd_show(args):
     print("=" * 60)
 
 
+def _completed_lock():
+    """Acquire fcntl.flock(LOCK_EX) on the completed-tasks sidecar lock.
+
+    Returns the open lock handle; caller MUST release via
+    ``_completed_unlock``. Serializes the append path against the roller so a
+    size/time roll never drops a concurrent append landing in its
+    read->rewrite window. The lock file is dedicated + never renamed, mirroring
+    the queue.json lock design (#580).
+    """
+    COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(COMPLETED_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    fh = os.fdopen(fd, "r+")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+def _completed_unlock(fh):
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
 def log_completed(description, extra=None):
     COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
@@ -524,8 +623,12 @@ def log_completed(description, extra=None):
     }
     if extra:
         entry.update(extra)
-    with open(COMPLETED_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    fh = _completed_lock()
+    try:
+        with open(COMPLETED_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    finally:
+        _completed_unlock(fh)
 
 
 def cmd_complete(args):
@@ -7490,6 +7593,309 @@ def _parse_duration(s):
     return timedelta(minutes=n)
 
 
+# ---------------------------------------------------------------------------
+# Session-store rotation (`session-task queue rotate`)
+# ---------------------------------------------------------------------------
+#
+# Bounds the two unbounded growers under ~/.config/session/. Runs periodically
+# from the baked cron (container/cron.d/cw-default job-name `session-rotate`;
+# cron.d/cw-host optional row). Idempotent, safe to run any time: it no-ops
+# when nothing is over threshold. Every mutation is atomic (temp + os.replace,
+# gz via temp + rename) and the completed-tasks roll holds the same flock the
+# append path takes, so a concurrent `queue done`/`complete` can't be lost.
+
+
+def _rotate_queue_logs(max_age_days, max_count, dry_run=False):
+    """Prune queue-logs/ transcript archives by age then count.
+
+    Deletes entries (files OR dirs) with an mtime older than ``max_age_days``,
+    then, if still over ``max_count``, deletes the oldest-by-mtime entries down
+    to the cap. Recent transcripts are always kept so the q-site "View log"
+    affordance keeps working on recent Done cards. Never raises: per-entry
+    errors are collected and reported. Returns a summary dict.
+    """
+    result = {
+        "dir": str(QUEUE_LOG_ARCHIVE_DIR),
+        "scanned": 0,
+        "pruned_age": [],
+        "pruned_count": [],
+        "errors": [],
+    }
+    if not QUEUE_LOG_ARCHIVE_DIR.is_dir():
+        return result
+
+    # Skip the completed-tasks archive if it happens to be nested here; the
+    # roller owns those. (Default dirs are siblings, so this is defensive.)
+    try:
+        archive_real = COMPLETED_ARCHIVE_DIR.resolve()
+    except OSError:
+        archive_real = None
+
+    entries = []
+    for child in QUEUE_LOG_ARCHIVE_DIR.iterdir():
+        try:
+            if archive_real is not None and child.resolve() == archive_real:
+                continue
+            mtime = child.stat().st_mtime
+        except OSError as exc:
+            result["errors"].append(f"stat {child.name}: {exc}")
+            continue
+        entries.append((mtime, child))
+    result["scanned"] = len(entries)
+
+    def _remove(child):
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            return True
+        except OSError as exc:
+            result["errors"].append(f"remove {child.name}: {exc}")
+            return False
+
+    now = datetime.now(timezone.utc).timestamp()
+    survivors = []
+    if max_age_days and max_age_days > 0:
+        cutoff = now - (max_age_days * 86400.0)
+        for mtime, child in entries:
+            if mtime < cutoff:
+                if dry_run or _remove(child):
+                    result["pruned_age"].append(child.name)
+            else:
+                survivors.append((mtime, child))
+    else:
+        survivors = list(entries)
+
+    # Count cap on whatever survived the age pass. Oldest-by-mtime go first.
+    if max_count and max_count > 0 and len(survivors) > max_count:
+        survivors.sort(key=lambda t: t[0])  # oldest first
+        overflow = len(survivors) - max_count
+        for _mtime, child in survivors[:overflow]:
+            if dry_run or _remove(child):
+                result["pruned_count"].append(child.name)
+
+    return result
+
+
+def _prune_completed_archives(max_archives, dry_run=False):
+    """Cap the number of dated gz segments in COMPLETED_ARCHIVE_DIR.
+
+    Keeps the ``max_archives`` newest ``completed-tasks-*.jsonl.gz`` segments,
+    deleting older ones. Best-effort; returns list of pruned filenames.
+    """
+    pruned = []
+    if not COMPLETED_ARCHIVE_DIR.is_dir() or not max_archives or max_archives <= 0:
+        return pruned
+    segs = sorted(COMPLETED_ARCHIVE_DIR.glob("completed-tasks-*.jsonl.gz"))
+    # Lexical sort == chronological (UTC timestamp names sort correctly).
+    overflow = len(segs) - max_archives
+    if overflow <= 0:
+        return pruned
+    for seg in segs[:overflow]:
+        if dry_run:
+            pruned.append(seg.name)
+            continue
+        try:
+            seg.unlink()
+            pruned.append(seg.name)
+        except OSError:
+            pass
+    return pruned
+
+
+def _rotate_completed_tasks(max_bytes, retain, archive_max, dry_run=False):
+    """Roll completed-tasks.jsonl when it exceeds ``max_bytes``.
+
+    Keeps the most-recent ``retain`` lines in the live file; moves everything
+    older into a dated ``completed-tasks-<UTC>.jsonl.gz`` segment under
+    COMPLETED_ARCHIVE_DIR. Retaining the recent tail in the LIVE file is what
+    keeps the q-site DONE view (#581, reads the live file) showing recent done
+    items across a roll.
+
+    Safety:
+      * Holds the completed-tasks flock for the whole read->write, serializing
+        against `log_completed`'s append so no row is lost mid-roll.
+      * The gz segment is written to a temp file and os.replace'd into place
+        BEFORE the live file is truncated, so a crash never loses the archived
+        rows (worst case: the segment exists and the live file still has them
+        too -- a benign superset, never a gap).
+      * The live-file rewrite is atomic (temp + os.replace via
+        `_atomic_write_text`).
+
+    Returns a summary dict.
+    """
+    result = {
+        "file": str(COMPLETED_FILE),
+        "rolled": False,
+        "reason": None,
+        "size_before": 0,
+        "size_after": 0,
+        "archived_lines": 0,
+        "retained_lines": 0,
+        "archive": None,
+        "pruned_archives": [],
+    }
+    if not COMPLETED_FILE.exists():
+        result["reason"] = "no completed-tasks.jsonl"
+        return result
+
+    fh = _completed_lock()
+    try:
+        try:
+            size = COMPLETED_FILE.stat().st_size
+        except OSError as exc:
+            result["reason"] = f"stat failed: {exc}"
+            return result
+        result["size_before"] = size
+        if max_bytes and size <= max_bytes:
+            result["reason"] = f"under threshold ({size} <= {max_bytes} bytes)"
+            return result
+
+        try:
+            raw = COMPLETED_FILE.read_text()
+        except OSError as exc:
+            result["reason"] = f"read failed: {exc}"
+            return result
+        lines = raw.splitlines()
+        # Preserve exactly; blank lines are dropped on rewrite (they carry no
+        # entry and the parser skips them anyway).
+        lines = [ln for ln in lines if ln.strip()]
+
+        if retain < 0:
+            retain = 0
+        if len(lines) <= retain:
+            result["reason"] = (
+                f"only {len(lines)} lines, <= retain={retain}; nothing to archive"
+            )
+            return result
+
+        split = len(lines) - retain
+        old_lines = lines[:split]
+        keep_lines = lines[split:]
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        seg_name = f"completed-tasks-{ts}.jsonl.gz"
+        seg_path = COMPLETED_ARCHIVE_DIR / seg_name
+
+        if dry_run:
+            result.update(
+                rolled=True,
+                reason="dry-run",
+                archived_lines=len(old_lines),
+                retained_lines=len(keep_lines),
+                archive=seg_name,
+            )
+            result["pruned_archives"] = _prune_completed_archives(
+                archive_max, dry_run=True
+            )
+            return result
+
+        # 1. Write the gz segment atomically (temp in the archive dir, then
+        #    os.replace). Written BEFORE truncating the live file.
+        try:
+            COMPLETED_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            result["reason"] = f"archive mkdir failed: {exc}"
+            return result
+        payload = ("\n".join(old_lines) + "\n").encode("utf-8")
+        fd, tmp = tempfile.mkstemp(
+            prefix=seg_name + ".", suffix=".tmp", dir=str(COMPLETED_ARCHIVE_DIR)
+        )
+        try:
+            with os.fdopen(fd, "wb") as rawf:
+                with gzip.GzipFile(fileobj=rawf, mode="wb", mtime=0) as gz:
+                    gz.write(payload)
+                rawf.flush()
+                os.fsync(rawf.fileno())
+            os.replace(tmp, seg_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+        # 2. Now atomically rewrite the live file with just the retained tail.
+        _atomic_write_text(COMPLETED_FILE, "\n".join(keep_lines) + "\n")
+
+        result.update(
+            rolled=True,
+            reason="rolled",
+            archived_lines=len(old_lines),
+            retained_lines=len(keep_lines),
+            archive=seg_name,
+        )
+        try:
+            result["size_after"] = COMPLETED_FILE.stat().st_size
+        except OSError:
+            pass
+        result["pruned_archives"] = _prune_completed_archives(archive_max)
+        return result
+    finally:
+        _completed_unlock(fh)
+
+
+def cmd_queue_rotate(args):
+    """Rotate/archive the unbounded session-store growers (queue-logs +
+    completed-tasks.jsonl). Idempotent; safe to run periodically from cron."""
+    max_age = (
+        args.queue_logs_max_age
+        if args.queue_logs_max_age is not None
+        else ROTATE_QUEUE_LOGS_MAX_AGE_DAYS
+    )
+    max_count = (
+        args.queue_logs_max_count
+        if args.queue_logs_max_count is not None
+        else ROTATE_QUEUE_LOGS_MAX_COUNT
+    )
+    max_bytes = (
+        int(args.completed_max_mb * 1024 * 1024)
+        if args.completed_max_mb is not None
+        else ROTATE_COMPLETED_MAX_BYTES
+    )
+    retain = (
+        args.completed_retain
+        if args.completed_retain is not None
+        else ROTATE_COMPLETED_RETAIN
+    )
+    archive_max = ROTATE_COMPLETED_ARCHIVE_MAX
+
+    logs = _rotate_queue_logs(max_age, max_count, dry_run=args.dry_run)
+    completed = _rotate_completed_tasks(
+        max_bytes, retain, archive_max, dry_run=args.dry_run
+    )
+
+    summary = {"dry_run": bool(args.dry_run), "queue_logs": logs, "completed": completed}
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return
+
+    prefix = "[dry-run] " if args.dry_run else ""
+    n_age = len(logs["pruned_age"])
+    n_count = len(logs["pruned_count"])
+    print(
+        f"{prefix}queue-logs: scanned {logs['scanned']}, "
+        f"pruned {n_age} (age) + {n_count} (count cap)"
+    )
+    for err in logs["errors"]:
+        print(f"  ! {err}", file=sys.stderr)
+    if completed["rolled"]:
+        print(
+            f"{prefix}completed-tasks: rolled "
+            f"({completed['size_before']} bytes) -> archived "
+            f"{completed['archived_lines']} lines to {completed['archive']}, "
+            f"retained {completed['retained_lines']} in live file"
+        )
+        if completed["pruned_archives"]:
+            print(
+                f"{prefix}  pruned {len(completed['pruned_archives'])} "
+                f"old archive segment(s)"
+            )
+    else:
+        print(f"completed-tasks: no roll ({completed['reason']})")
+
+
 def cmd_queue_prune(args):
     cutoff = None
     if args.older_than:
@@ -8647,6 +9053,41 @@ def build_parser():
     q_prune.add_argument("--older-than", help="e.g. 7d, 24h, 30m")
     q_prune.add_argument("-n", "--dry-run", action="store_true")
 
+    q_rotate = qsub.add_parser(
+        "rotate",
+        help=(
+            "Rotate/archive the unbounded session-store growers: prune old "
+            "queue-logs/ transcripts (age + count cap) and roll "
+            "completed-tasks.jsonl (size threshold -> dated gz segment, "
+            "recent tail retained in the live file for the q-site DONE view). "
+            "Idempotent; wired to run periodically from the baked cron."
+        ),
+    )
+    q_rotate.add_argument(
+        "--queue-logs-max-age", type=float, default=None, metavar="DAYS",
+        help=f"Prune queue-logs entries older than this (default {ROTATE_QUEUE_LOGS_MAX_AGE_DAYS}d).",
+    )
+    q_rotate.add_argument(
+        "--queue-logs-max-count", type=int, default=None, metavar="N",
+        help=f"Cap queue-logs entries kept (default {ROTATE_QUEUE_LOGS_MAX_COUNT}).",
+    )
+    q_rotate.add_argument(
+        "--completed-max-mb", type=float, default=None, metavar="MB",
+        help=(
+            "Roll completed-tasks.jsonl once it exceeds this many MB "
+            f"(default {ROTATE_COMPLETED_MAX_BYTES // (1024 * 1024)})."
+        ),
+    )
+    q_rotate.add_argument(
+        "--completed-retain", type=int, default=None, metavar="N",
+        help=(
+            "Recent lines to keep in the live completed-tasks.jsonl post-roll "
+            f"(default {ROTATE_COMPLETED_RETAIN})."
+        ),
+    )
+    q_rotate.add_argument("-n", "--dry-run", action="store_true")
+    q_rotate.add_argument("--json", action="store_true")
+
     qsub.add_parser("banner", help="Top-5 ready items banner")
 
     # Manual scope locks (added 2026-05-08).
@@ -8750,6 +9191,7 @@ def main():
             "update-scope": cmd_queue_update_scope,
             "depend": cmd_queue_depend,
             "prune": cmd_queue_prune,
+            "rotate": cmd_queue_rotate,
             "banner": cmd_queue_banner,
             "lock": cmd_queue_lock,
             "unlock": cmd_queue_unlock,
