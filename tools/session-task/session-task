@@ -54,8 +54,15 @@ Usage:
                                                  # branch-protection, etc.)
     session-task queue unblock <id>              # blocked -> running
     session-task queue spawn-check <id> [--json] # "am I clear to spawn?" check
-    session-task queue force-start <id> --reason TEXT  # MANUAL OVERRIDE: promote
-                                                       # blocked-pending to running
+    session-task queue force-start <id> --reason TEXT [--no-interrupt]
+                                                       # MANUAL OVERRIDE: promote
+                                                       # blocked-pending to running.
+                                                       # Autostops overlapping
+                                                       # RUNNING peers by default;
+                                                       # --no-interrupt (alias
+                                                       # --co-run) CO-RUNS alongside
+                                                       # same-scope peers WITHOUT
+                                                       # abandoning them.
     session-task queue promote <id>
     session-task queue set-summary <id> "text"   # edit one-line summary
     session-task queue update <id> [--description TEXT | --desc-file FILE]
@@ -2243,7 +2250,8 @@ def _claude_event_notify(tag, message, data, priority="low", silent=False):
 
 
 def _obligations_register_force_start(queue_id, summary, reason, ttl_secs=900,
-                                       bundle_path=None, autostopped_count=0):
+                                       bundle_path=None, autostopped_count=0,
+                                       co_run=False):
     """Register a `force_started_unspawned` obligation on the queue id.
 
     Wired by `cmd_queue_force_start` after a successful pending->running
@@ -2278,7 +2286,13 @@ def _obligations_register_force_start(queue_id, summary, reason, ttl_secs=900,
         return None
     bundle_hint = ""
     if bundle_path:
-        if autostopped_count:
+        if co_run:
+            bundle_hint = (
+                f" CO-RUN force-start: no peers autostopped (co-running "
+                f"alongside any same-scope running peers). Recovery bundle "
+                f"at {bundle_path}."
+            )
+        elif autostopped_count:
             bundle_hint = (
                 f" Autostopped {autostopped_count} running peer(s); "
                 f"the recovery bundle at {bundle_path} contains their "
@@ -5933,9 +5947,20 @@ def cmd_queue_force_start(args):
         # routine doesn't accidentally include `target` in its scope-
         # overlap walk (the running-status filter would catch it anyway,
         # but we belt-and-suspenders by running this first).
-        autostop_bundles = _autostop_overlapping_peers(
-            items, target, raw_reason=raw_reason,
-        )
+        # Co-run mode (Andrew #4529): when --no-interrupt/--co-run is set the
+        # operator has judged the overlapping scopes safe to run concurrently,
+        # so we DO NOT autostop the overlapping running peers -- the newly
+        # force-started item CO-RUNS alongside them. Default (flag absent)
+        # preserves the original behavior: autostop every scope-overlapping
+        # running peer. Either way the overlapping peers are captured in
+        # `blockers_overridden` above for the audit trail.
+        co_run = getattr(args, "no_interrupt", False)
+        if co_run:
+            autostop_bundles = []
+        else:
+            autostop_bundles = _autostop_overlapping_peers(
+                items, target, raw_reason=raw_reason,
+            )
 
         now_iso = _fmt_ts()
         target["status"] = "running"
@@ -5949,6 +5974,7 @@ def cmd_queue_force_start(args):
         target["force_started_autostopped_peers"] = [
             b["queue_id"] for b in autostop_bundles
         ]
+        target["force_started_co_run"] = co_run
 
         _recompute_group_heads(items)
         promoted = dict(target)
@@ -5972,6 +5998,7 @@ def cmd_queue_force_start(args):
             "summary": _item_summary(promoted),
             "blockers_overridden": blockers_overridden,
             "autostopped_peers": [b["queue_id"] for b in autostop_bundles],
+            "co_run": co_run,
         }
         with open(QUEUE_FORCE_START_LOG, "a") as logf:
             logf.write(json.dumps(audit_row) + "\n")
@@ -6026,6 +6053,7 @@ def cmd_queue_force_start(args):
             "created_by": promoted.get("created_by", ""),
             "force_started": True,
             "force_started_reason": raw_reason,
+            "co_run": co_run,
             "force_started_blockers_overridden": [
                 b["id"] for b in blockers_overridden
             ],
@@ -6047,13 +6075,19 @@ def cmd_queue_force_start(args):
     _claude_event_notify(
         tag="force-start",
         message=(
-            f"queue force-started: {promoted['id']} "
+            f"queue force-started{' (CO-RUN)' if co_run else ''}: "
+            f"{promoted['id']} "
             f"({_item_summary(promoted)}) -- main loop must dispatch "
             f"Agent before any other tool call"
             + (
                 f" | autostopped {len(autostop_bundles)} running peer(s); "
                 f"recovery bundle: {bundle_path}"
                 if autostop_bundles else ""
+            )
+            + (
+                f" | CO-RUNNING alongside {len(blockers_overridden)} "
+                f"same-scope peer(s) (left running, not autostopped)"
+                if co_run and blockers_overridden else ""
             )
         ),
         data={
@@ -6063,6 +6097,7 @@ def cmd_queue_force_start(args):
             "summary": _item_summary(promoted),
             "created_by": promoted.get("created_by", ""),
             "force_started_reason": raw_reason,
+            "co_run": co_run,
             "autostopped_peers": [b["queue_id"] for b in autostop_bundles],
             "recovery_bundle_path": bundle_path,
         },
@@ -6081,6 +6116,7 @@ def cmd_queue_force_start(args):
         reason=raw_reason,
         bundle_path=bundle_path,
         autostopped_count=len(autostop_bundles),
+        co_run=co_run,
     )
 
     if args.json:
@@ -6095,12 +6131,17 @@ def cmd_queue_force_start(args):
         ]
         print(json.dumps(promoted_out, indent=2))
     else:
-        print(f"force-started: {args.id} (now running)")
+        _mode = " (CO-RUN: same-scope peers left running)" if co_run else ""
+        print(f"force-started: {args.id} (now running){_mode}")
         print(f"  group   : {promoted.get('group_id')}")
         print(f"  scope   : {','.join(promoted.get('scope', []))}")
         print(f"  reason  : {raw_reason}")
         if blockers_overridden:
-            print(f"  blockers overridden: {len(blockers_overridden)}")
+            _bo_label = (
+                "co-running alongside (NOT autostopped)"
+                if co_run else "blockers overridden"
+            )
+            print(f"  {_bo_label}: {len(blockers_overridden)}")
             for b in blockers_overridden:
                 print(
                     f"    - {b['id']} ({b['reason']}; "
@@ -8957,6 +8998,19 @@ def build_parser():
         ),
     )
     q_force_start.add_argument("--json", action="store_true")
+    q_force_start.add_argument(
+        "--no-interrupt", "--co-run",
+        dest="no_interrupt", action="store_true",
+        help=(
+            "CO-RUN mode: force-start ALONGSIDE any same-scope RUNNING peer "
+            "WITHOUT autostopping/abandoning it. Default force-start autostops "
+            "every scope-overlapping running peer (the interrupt behavior); "
+            "pass this ONLY when you have judged the overlapping scopes are "
+            "actually safe to run concurrently. Opt-in: the operator asserts "
+            "the overlap is safe. The overlapped peers are still recorded in "
+            "force_started_blockers_overridden for the audit trail."
+        ),
+    )
     q_force_start.add_argument(
         "--silent", action="store_true",
         help="Suppress the pingme lifecycle notification for this operation.",
