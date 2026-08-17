@@ -571,15 +571,72 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Presence freshness window in seconds. `CW_PRESENCE_MAX_AGE` overrides the
-/// 90s default (matches the deployed presence-gate obligation's
-/// `file_mtime_within max_age_secs: 90`).
+/// Candidate paths for the presence-gate obligation manifest, in resolution
+/// order: `$CW_PRESENCE_GATE_MANIFEST`, the in-container RO obligations mount,
+/// then the bind-mounted repo path (which resolves both on the host and inside
+/// the container). Mirrors the Python textfile bridge's `read_gate_max_age`.
+fn gate_manifest_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("CW_PRESENCE_GATE_MANIFEST") {
+        if !p.trim().is_empty() {
+            candidates.push(PathBuf::from(p));
+        }
+    }
+    candidates.push(PathBuf::from(
+        "/mnt/host-obligations-config/presence-gate.json",
+    ));
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    candidates.push(PathBuf::from(home).join("repos/claude-config/obligations/presence-gate.json"));
+    candidates
+}
+
+/// Pure: return the first readable manifest's `params.max_age_secs` (must be
+/// > 0), else `default`. Split out from `read_gate_max_age` so it is unit-
+/// testable without touching process env / real filesystem paths.
+fn read_gate_max_age_from(candidates: &[PathBuf], default: f64) -> f64 {
+    for path in candidates {
+        let Ok(s) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&s) else {
+            continue;
+        };
+        if let Some(secs) = v
+            .get("params")
+            .and_then(|p| p.get("max_age_secs"))
+            .and_then(|x| x.as_f64())
+        {
+            if secs > 0.0 {
+                return secs;
+            }
+        }
+    }
+    default
+}
+
+/// Operator-presence gate freshness window (seconds), read from the
+/// presence-gate obligation manifest -- the SINGLE SOURCE OF TRUTH
+/// (`claude-config/obligations/presence-gate.json` -> `params.max_age_secs`,
+/// currently 420s). This is the SAME window the `claude_operator_present`
+/// gauge (Python textfile bridge) and the botchat header dot consume, so the
+/// desk-streak's presence view can never drift from the presence gauge.
+/// Falls back to `default` when no manifest is readable.
+fn read_gate_max_age(default: f64) -> f64 {
+    read_gate_max_age_from(&gate_manifest_candidates(), default)
+}
+
+/// Presence freshness window in seconds. `CW_PRESENCE_MAX_AGE` overrides;
+/// otherwise the window is single-sourced from the presence-gate manifest
+/// (`presence-gate.json` params.max_age_secs -- currently 420s) so it matches
+/// the `claude_operator_present` gauge + botchat. Falls back to 420s only if
+/// the manifest is unreadable (never the old hardcoded 90s, which silently
+/// disagreed with the 420s gauge/gate window).
 fn presence_max_age() -> f64 {
     std::env::var("CW_PRESENCE_MAX_AGE")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-        .unwrap_or(90.0)
+        .unwrap_or_else(|| read_gate_max_age(420.0))
 }
 
 /// Resolve the operator-presence carrier file. `CW_PRESENCE_FILE` overrides;
@@ -899,6 +956,24 @@ mod tests {
         assert!(presence_is_fresh(Some(1000.0), 1090.0, 90.0));
         assert!(!presence_is_fresh(Some(1000.0), 1200.0, 90.0));
         assert!(!presence_is_fresh(None, 1000.0, 90.0));
+    }
+
+    #[test]
+    fn read_gate_max_age_reads_manifest_else_default() {
+        let dir = std::env::temp_dir().join(format!("cw_gate_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        // A valid manifest yields params.max_age_secs (the real deploy value 420).
+        let ok = dir.join("presence-gate.json");
+        fs::write(&ok, r#"{"params":{"max_age_secs":420}}"#).unwrap();
+        assert_eq!(read_gate_max_age_from(&[ok.clone()], 999.0), 420.0);
+        // Missing file falls back to the default (never the old hardcoded 90).
+        let missing = dir.join("does-not-exist.json");
+        assert_eq!(read_gate_max_age_from(&[missing.clone()], 420.0), 420.0);
+        // Non-positive / malformed values are skipped; first VALID candidate wins.
+        let bad = dir.join("bad.json");
+        fs::write(&bad, r#"{"params":{"max_age_secs":0}}"#).unwrap();
+        assert_eq!(read_gate_max_age_from(&[missing, bad, ok], 999.0), 420.0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
