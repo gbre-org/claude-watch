@@ -111,3 +111,13 @@ PATH=/usr/local/bin:/usr/bin:/bin:@CW_HOME@/bin
 # emit_events` in config.toml (default false), so this runs the detector but
 # stays silent until that toggle is flipped on.
 #*/5 * * * *  @CW_USER@ @CW_BIN@ queue-check > /dev/null 2>&1
+#
+# Session-store rotation: once a day, bound the two unbounded growers under
+# ~/.config/session/ -- prune old queue-logs/ transcripts (age + count cap)
+# and roll completed-tasks.jsonl (size threshold -> dated gz segment, recent
+# tail retained in the live file for the q-site DONE view). Idempotent; no-ops
+# when nothing is over threshold. This runs the `session-task` Python CLI (on
+# PATH via @CW_HOME@/bin after `make install`), NOT @CW_BIN@ (the Rust daemon),
+# so it is a bare command name resolved off the PATH set above. Thresholds are
+# overridable via ROTATE_* env vars (see `session-task queue rotate --help`).
+#17 4 * * *  @CW_USER@ session-task queue rotate > /dev/null 2>&1

@@ -570,6 +570,20 @@ services:
       # HOME drives where the vendored session-task / claude-event /
       # obligations CLIs read + write — they all use Path.home().
       HOME: /queue-home
+      # Path to the canonical session-task script the write endpoints
+      # (Stop / Abandon / Force-start / depend) shell out to. Points INTO
+      # the directory bind mount below (../../tools/session-task ->
+      # /app/session-task-src) rather than at a single-file mount. A
+      # single-file bind mount binds the source inode at container start,
+      # so when the host script is replaced via atomic rename (every edit,
+      # deploy, and git checkout does this) the mount goes stale — it keeps
+      # pointing at the now-unlinked inode and open() fails with ENOENT,
+      # breaking every write endpoint with an opaque "session-task <op>
+      # failed". A DIRECTORY mount resolves the filename fresh on each
+      # open(), so replacement is picked up transparently and hot-reload
+      # (the whole reason session-task is mounted rather than baked) keeps
+      # working. See the app.py `_session_task_preflight` defense-in-depth.
+      SESSION_TASK_BIN: /app/session-task-src/session-task
       QUEUE_JSON: /queue-home/.config/session/queue.json
       AGENTS_JSONL_ROOT: /agents-jsonl
       CACHE_TTL_SECONDS: "5"
@@ -636,9 +650,14 @@ services:
       # real hierarchical subagent tree — see AGENT_QUEUE_BINDINGS_JSON above.
       - "${HOME}/.config/claude:/queue-home/.config/claude:rw"
       # Canonical session-task script — bind-mounted read-only so the
-      # container always runs the upstream version. Path is relative to
+      # container always runs the upstream version without a rebuild. We
+      # mount the containing DIRECTORY (not the single file) so an atomic-
+      # rename replacement of the script on the host (edit / deploy / git
+      # checkout) is picked up transparently: a single-file bind mount
+      # binds the source inode and goes stale on replacement, breaking the
+      # write endpoints (see SESSION_TASK_BIN above). Path is relative to
       # the build context (claude-watch repo root).
-      - "../../tools/session-task/session-task:/app/session-task:ro"
+      - "../../tools/session-task:/app/session-task-src:ro"
       # Hostjob output dir — read-only tail target for queue items bound to
       # the host-side `hostjob` runner (scope `hostjob:<label>`). The runner
       # writes ~/.cache/hostjob/<label>/log on the host; the live-log modal

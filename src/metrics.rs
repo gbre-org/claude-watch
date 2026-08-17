@@ -528,6 +528,229 @@ async fn collect_live_counts() -> LiveCounts {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Operator desk-streak gauge
+//
+// `claude_operator_desk_streak_seconds{kind="current"|"max"}` -- length of the
+// operator's CONTINUOUS at-desk presence run. `current` is the trailing run
+// ending "now" (resets to 0 the moment presence drops to away); `max` is the
+// longest continuous run observed. Because `claude-watch metrics` is a
+// one-shot cron invocation (no long-lived process), the streak is STATEFUL on
+// disk: a small sidecar JSON file next to the daemon state. Persisting to a
+// DEDICATED file (not state.json) keeps this cron writer from racing the
+// daemon's own writes to state.json. `max` therefore SURVIVES daemon/process
+// restarts -- it is reloaded from the sidecar on each invocation.
+//
+// Presence is derived from the same operator-presence CARRIER file the
+// presence-gate uses: present == the carrier's mtime is fresh within
+// CW_PRESENCE_MAX_AGE. Reading the carrier directly (rather than the sibling
+// `claude_operator_present` gauge) keeps this block self-contained.
+// ---------------------------------------------------------------------------
+
+/// Current wall-clock epoch seconds (float).
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Presence freshness window in seconds. `CW_PRESENCE_MAX_AGE` overrides the
+/// 90s default (matches the deployed presence-gate obligation's
+/// `file_mtime_within max_age_secs: 90`).
+fn presence_max_age() -> f64 {
+    std::env::var("CW_PRESENCE_MAX_AGE")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(90.0)
+}
+
+/// Resolve the operator-presence carrier file. `CW_PRESENCE_FILE` overrides;
+/// otherwise the first existing of the tmpfs-farm path then the `~/.claude`
+/// fallback (mirrors the ambient-inject hook's candidate order).
+fn presence_carrier_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CW_PRESENCE_FILE") {
+        if !p.trim().is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let candidates = [
+        PathBuf::from("/run/claude-presence/operator-present"),
+        PathBuf::from(home).join(".claude/operator-present"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// mtime (epoch secs) of the presence carrier, or `None` if absent/unreadable.
+fn presence_carrier_mtime() -> Option<f64> {
+    let path = presence_carrier_path()?;
+    let meta = fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs_f64())
+}
+
+/// Pure presence decision: present iff the carrier mtime exists and is within
+/// `max_age` seconds of `now`. A stale mtime (laptop asleep, presence dropped)
+/// or an absent carrier reads as away.
+fn presence_is_fresh(mtime: Option<f64>, now: f64, max_age: f64) -> bool {
+    match mtime {
+        Some(m) => now - m <= max_age,
+        None => false,
+    }
+}
+
+/// Persisted streak state (sidecar JSON). Load is tolerant of missing fields.
+#[derive(Debug, Clone, Default)]
+struct StreakState {
+    /// Epoch when the current continuous-present run began; `None` when away.
+    run_start: Option<f64>,
+    /// Longest continuous-present run observed (seconds). Persisted, so it
+    /// survives restarts.
+    max_streak_secs: f64,
+    /// Epoch of the previous sample (for gap detection); `None` on first ever.
+    last_sample: Option<f64>,
+    /// Whether the operator was present at the previous sample.
+    last_present: bool,
+}
+
+fn default_streak_state_file() -> PathBuf {
+    if let Ok(s) = std::env::var("CW_DESK_STREAK_STATE") {
+        return PathBuf::from(s);
+    }
+    // Sibling of the daemon state file, in the same config dir.
+    default_state_file().with_file_name("desk_streak.json")
+}
+
+fn load_streak_state(path: &Path) -> StreakState {
+    let s = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return StreakState::default(),
+    };
+    let v: Value = match serde_json::from_str(&s) {
+        Ok(v) => v,
+        Err(_) => return StreakState::default(),
+    };
+    StreakState {
+        run_start: v.get("run_start").and_then(|x| x.as_f64()),
+        max_streak_secs: v
+            .get("max_streak_secs")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0),
+        last_sample: v.get("last_sample").and_then(|x| x.as_f64()),
+        last_present: v
+            .get("last_present")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+fn save_streak_state(path: &Path, state: &StreakState) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let v = serde_json::json!({
+        "run_start": state.run_start,
+        "max_streak_secs": state.max_streak_secs,
+        "last_sample": state.last_sample,
+        "last_present": state.last_present,
+    });
+    let content = serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string());
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Advance the streak state by one sample. Pure -- no I/O, fully unit-tested.
+///
+/// - While present, the current run accumulates as `now - run_start`; `max`
+///   ratchets up to the longest run seen.
+/// - On present->away the current run resets to 0 (run_start cleared); `max`
+///   is untouched (already captured while present).
+/// - Gap handling: if the operator was present at the last sample AND the
+///   elapsed time since that sample exceeds `max_gap_secs`, continuity across
+///   the unobserved gap can't be asserted (cron/daemon was down, or the laptop
+///   slept and the carrier re-freshened between samples) -> the run restarts
+///   at `now` rather than over-counting the gap.
+///
+/// Returns the new state and the current-run length in seconds.
+fn advance_streak(
+    prev: &StreakState,
+    present: bool,
+    now: f64,
+    max_gap_secs: f64,
+) -> (StreakState, f64) {
+    if !present {
+        return (
+            StreakState {
+                run_start: None,
+                max_streak_secs: prev.max_streak_secs,
+                last_sample: Some(now),
+                last_present: false,
+            },
+            0.0,
+        );
+    }
+    let gap_too_long = matches!(
+        (prev.last_present, prev.last_sample),
+        (true, Some(ls)) if now - ls > max_gap_secs
+    );
+    let run_start = match prev.run_start {
+        Some(rs) if prev.last_present && !gap_too_long => rs,
+        _ => now,
+    };
+    let current = (now - run_start).max(0.0);
+    let max = prev.max_streak_secs.max(current);
+    (
+        StreakState {
+            run_start: Some(run_start),
+            max_streak_secs: max,
+            last_sample: Some(now),
+            last_present: true,
+        },
+        current,
+    )
+}
+
+/// Render the `claude_operator_desk_streak_seconds` gauge block.
+fn desk_streak_lines(current: f64, max: f64) -> Vec<String> {
+    vec![
+        "# HELP claude_operator_desk_streak_seconds Continuous operator at-desk presence streak in seconds (kind=current: trailing run ending now, resets to 0 on away; kind=max: longest continuous run observed)".to_string(),
+        "# TYPE claude_operator_desk_streak_seconds gauge".to_string(),
+        format!(
+            "claude_operator_desk_streak_seconds{{kind=\"current\"}} {:.3}",
+            current
+        ),
+        format!(
+            "claude_operator_desk_streak_seconds{{kind=\"max\"}} {:.3}",
+            max
+        ),
+    ]
+}
+
+/// Collect + persist the desk-streak, returning the gauge lines. Fail-open:
+/// a persistence error still emits the freshly-computed sample.
+fn desk_streak_block() -> Vec<String> {
+    let now = now_epoch();
+    let present = presence_is_fresh(presence_carrier_mtime(), now, presence_max_age());
+    let max_gap = presence_max_age() * 2.0;
+    let path = default_streak_state_file();
+    let prev = load_streak_state(&path);
+    let (next, current) = advance_streak(&prev, present, now, max_gap);
+    let _ = save_streak_state(&path, &next);
+    desk_streak_lines(current, next.max_streak_secs)
+}
+
 /// CLI entry point: `claude-watch metrics`.
 pub async fn cmd_metrics() -> i32 {
     let state_path = default_state_file();
@@ -575,6 +798,11 @@ pub async fn cmd_metrics() -> i32 {
     lines.push(String::new());
     lines.extend(crate::token_usage::token_metric_lines(&token_usage));
 
+    // Operator desk-streak gauge (self-contained: reads the presence
+    // carrier + a sidecar state file; see the block above cmd_metrics).
+    lines.push(String::new());
+    lines.extend(desk_streak_block());
+
     if let Err(e) = write_prom(&lines, &prom_path) {
         eprintln!("Error writing prom file: {e}");
         return 1;
@@ -586,6 +814,110 @@ pub async fn cmd_metrics() -> i32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // --- Operator desk-streak -------------------------------------------
+
+    #[test]
+    fn streak_accumulates_while_present() {
+        let s0 = StreakState::default();
+        // First present sample starts a run at now; current is 0.
+        let (s1, c1) = advance_streak(&s0, true, 1000.0, 200.0);
+        assert_eq!(c1, 0.0);
+        assert_eq!(s1.run_start, Some(1000.0));
+        // Still present 30s later: current accumulates, run_start unchanged.
+        let (s2, c2) = advance_streak(&s1, true, 1030.0, 200.0);
+        assert_eq!(c2, 30.0);
+        assert_eq!(s2.run_start, Some(1000.0));
+        assert_eq!(s2.max_streak_secs, 30.0);
+    }
+
+    #[test]
+    fn streak_resets_on_away() {
+        let s0 = StreakState::default();
+        let (s1, _) = advance_streak(&s0, true, 1000.0, 200.0);
+        let (s2, c2) = advance_streak(&s1, true, 1050.0, 200.0);
+        assert_eq!(c2, 50.0);
+        // Presence drops: current resets to 0, run cleared, max preserved.
+        let (s3, c3) = advance_streak(&s2, false, 1060.0, 200.0);
+        assert_eq!(c3, 0.0);
+        assert_eq!(s3.run_start, None);
+        assert_eq!(s3.max_streak_secs, 50.0);
+        // Present again: brand-new run from now, current 0.
+        let (s4, c4) = advance_streak(&s3, true, 1100.0, 200.0);
+        assert_eq!(c4, 0.0);
+        assert_eq!(s4.run_start, Some(1100.0));
+        assert_eq!(s4.max_streak_secs, 50.0);
+    }
+
+    #[test]
+    fn streak_max_tracks_longest_run() {
+        // A 100s run.
+        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 200.0);
+        let (s, c) = advance_streak(&s, true, 100.0, 200.0);
+        assert_eq!(c, 100.0);
+        assert_eq!(s.max_streak_secs, 100.0);
+        // Away, then a shorter 20s run -- max must retain the longer 100s.
+        let (s, _) = advance_streak(&s, false, 110.0, 200.0);
+        let (s, _) = advance_streak(&s, true, 120.0, 200.0);
+        let (s, c) = advance_streak(&s, true, 140.0, 200.0);
+        assert_eq!(c, 20.0);
+        assert_eq!(s.max_streak_secs, 100.0);
+    }
+
+    #[test]
+    fn streak_restarts_after_long_sample_gap() {
+        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 100.0);
+        let (s, c) = advance_streak(&s, true, 50.0, 100.0);
+        assert_eq!(c, 50.0);
+        // Gap of 300s > max_gap 100s while present: continuity broken, restart.
+        let (s, c) = advance_streak(&s, true, 350.0, 100.0);
+        assert_eq!(c, 0.0);
+        assert_eq!(s.run_start, Some(350.0));
+        // Longest observed run is still the pre-gap 50s.
+        assert_eq!(s.max_streak_secs, 50.0);
+    }
+
+    #[test]
+    fn presence_freshness_window() {
+        assert!(presence_is_fresh(Some(1000.0), 1050.0, 90.0));
+        assert!(presence_is_fresh(Some(1000.0), 1090.0, 90.0));
+        assert!(!presence_is_fresh(Some(1000.0), 1200.0, 90.0));
+        assert!(!presence_is_fresh(None, 1000.0, 90.0));
+    }
+
+    #[test]
+    fn desk_streak_lines_exact_name_and_labels() {
+        let lines = desk_streak_lines(42.0, 100.0);
+        let joined = lines.join("\n");
+        assert!(joined.contains("# TYPE claude_operator_desk_streak_seconds gauge"));
+        assert!(joined.contains("claude_operator_desk_streak_seconds{kind=\"current\"} 42.000"));
+        assert!(joined.contains("claude_operator_desk_streak_seconds{kind=\"max\"} 100.000"));
+    }
+
+    #[test]
+    fn streak_state_round_trips_and_defaults() {
+        let dir = std::env::temp_dir().join(format!("cw_streak_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("desk_streak.json");
+        let st = StreakState {
+            run_start: Some(123.0),
+            max_streak_secs: 456.0,
+            last_sample: Some(789.0),
+            last_present: true,
+        };
+        save_streak_state(&p, &st).unwrap();
+        let loaded = load_streak_state(&p);
+        assert_eq!(loaded.run_start, Some(123.0));
+        assert_eq!(loaded.max_streak_secs, 456.0);
+        assert_eq!(loaded.last_sample, Some(789.0));
+        assert!(loaded.last_present);
+        // Missing file -> default (away, zero max).
+        let d = load_streak_state(&dir.join("does-not-exist.json"));
+        assert_eq!(d.run_start, None);
+        assert_eq!(d.max_streak_secs, 0.0);
+        assert!(!d.last_present);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_iso_rfc3339() {

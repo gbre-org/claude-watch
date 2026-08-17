@@ -115,6 +115,9 @@ scope, defaulting open on any ambiguity.
 - `~/.config/session/queue.json` — queue state (Layer 2)
 - `~/.config/session/resume-action.json` — single resume slot (Layer 1)
 - `~/.config/session/completed-tasks.jsonl` — completion log (both layers)
+- `~/.config/session/queue-logs/` — per-completed-item transcript archives
+- `~/.config/session/completed-archive/` — dated gz segments of rolled
+  `completed-tasks.jsonl` history (see "Rotation / archival" below)
 
 The schema is **stable**: `{"schema_version": 2, "items": [...]}`. Items have:
 `id, description, summary, scope, group_id, group_head, status, priority, created_at,
@@ -172,3 +175,50 @@ record` stderr warning and skip the archive step. The lifecycle
 transition (done / abandon) always completes regardless.
 
 Set `CLAUDE_AGENTS_STATE_FALLBACK_BIN=""` to disable the fallback.
+
+### Rotation / archival (`queue rotate`)
+
+Both `queue-logs/` and `completed-tasks.jsonl` grow **unbounded** — nothing
+pruned them (queue-logs reached ~2500 entries; completed-tasks grew multi-MB,
+which made the 2026-08-16 queue.json corruption incident bigger). `session-task
+queue rotate` bounds both:
+
+```bash
+session-task queue rotate                 # apply defaults
+session-task queue rotate --dry-run --json # preview, mutate nothing
+```
+
+1. **queue-logs prune** — deletes transcript archives (files OR dirs) older
+   than `--queue-logs-max-age` days (default 30), then enforces a hard
+   `--queue-logs-max-count` floor (default 500), deleting the oldest-by-mtime
+   beyond it. Recent transcripts stay so the q-site "View log" affordance keeps
+   working on recent Done cards.
+
+2. **completed-tasks roll** — once the live file exceeds `--completed-max-mb`
+   (default 5 MB), the oldest rows move into a dated
+   `completed-archive/completed-tasks-<UTC>.jsonl.gz` segment and the most
+   recent `--completed-retain` lines (default 2000) stay in the **live** file.
+   Old gz segments are themselves capped (default 20; `ROTATE_COMPLETED_ARCHIVE_MAX`).
+
+**q-site DONE-view coordination (#581):** the DONE view reads the live
+`completed-tasks.jsonl`. Rotation deliberately keeps the recent tail *in that
+live file*, so a roll never hides recent done items from the view — no minisite
+change is required. Deep history lives in the gz segments.
+
+**Safety** (reuses the #580 atomic-write/lock patterns): the completed-tasks
+roll holds the same `fcntl.flock` the append path (`log_completed`) takes, so a
+concurrent `queue done`/`complete` is never lost mid-roll. The gz segment is
+written (temp + `os.replace`) **before** the live file is truncated, so a crash
+leaves a benign superset, never a gap; the live rewrite is atomic
+(`_atomic_write_text`).
+
+Every threshold is overridable via env var (`ROTATE_QUEUE_LOGS_MAX_AGE_DAYS`,
+`ROTATE_QUEUE_LOGS_MAX_COUNT`, `ROTATE_COMPLETED_MAX_BYTES`,
+`ROTATE_COMPLETED_RETAIN`, `ROTATE_COMPLETED_ARCHIVE_MAX`; malformed values
+fall back to defaults) as well as per-invocation CLI flag.
+
+**Scheduling:** wired as a daily cron-producer, NOT a watcher (per the repo's
+watcher-vs-producer guidance) — job-name `session-rotate` in
+`container/cron.d/cw-default` (04:17 daily), toggle via
+`cw-cron-toggle disable|enable session-rotate`. A commented equivalent row
+ships in `cron.d/cw-host` for host/systemd deploys.
