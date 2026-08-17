@@ -99,6 +99,58 @@ matches what just ran:
 
 `command_pattern` is a regex over the Bash **command string**.
 
+### Asserting the payload separately (`body_pattern`)
+
+`command_pattern` alone is asked to do two unrelated jobs: identify *which*
+command counts (so the rule does not clear on an unrelated invocation) and
+assert *what it carried* (so the rule does not clear on a send that never
+mentioned the thing the obligation is about). Written as one regex those two
+halves fight each other.
+
+The usual shape is `prog\b(?=.*A)(?=.*B)`. Both lookaheads are evaluated at
+the offset just past the program token, and `.` does not cross newlines, so
+they can only see the rest of *that line*. If the payload was written by an
+**earlier line of the same command** — a `cat > "$f" <<EOF … EOF` heredoc
+staging the body, which is exactly the shape forced on a CLI that forbids
+stdin — then the payload text is sitting right there in the command string
+and the pattern still cannot reach it. The obligation can never self-satisfy.
+
+`body_pattern` splits the job in two:
+
+```json
+"satisfied_by": {
+  "tool_pattern": "Bash",
+  "command_pattern": "mysender\\b(?=.*--to\\s+alice\\b)",
+  "body_pattern": "Order\\s*#\\s*42\\b"
+}
+```
+
+```
+obligations add ... \
+  --satisfied-by-tool Bash \
+  --satisfied-by-cmd-regex 'mysender\b(?=.*--to\s+alice\b)' \
+  --satisfied-by-body-regex 'Order\s*#\s*42\b'
+```
+
+  - `command_pattern` keeps identifying the command.
+  - `body_pattern` carries the payload anchor and is searched **on its own**
+    — not anchored to wherever `command_pattern` matched — over the same
+    haystacks: the command string first, then any `file_arg_flags` file
+    bodies.
+  - **Both must match.** Adding a `body_pattern` is strictly *narrowing*: an
+    obligation that has one is harder to satisfy, never easier. All that
+    changes is that each half is looked for where it actually lives.
+  - Either pattern may be given alone. A pattern that does not compile is
+    refused by `obligations add` (exit 2) rather than silently skipped at
+    match time — a rule that can never fire is the bug this area exists to
+    prevent.
+
+An obligation that *cannot* self-satisfy is worse than no obligation at all:
+the operator does the real work, the gate stays standing and blocks
+everything it matches, and the only way out is an override. Train that
+reflex often enough and the override stops being an exception — which
+inverts the point of having a gate.
+
 ### Matching a file's contents (`file_arg_flags`)
 
 A command string is the wrong place to look when the payload is not in the
@@ -134,11 +186,17 @@ Semantics:
   - **Additive, never looser.** The command string is checked first and an
     old-style match still satisfies on its own. The regex is unchanged; the
     only difference is that it gets a second haystack.
-  - **`--satisfied-by-file-flag` requires `--satisfied-by-cmd-regex`** (the
-    CLI exits 2 otherwise). Without a pattern there is nothing to find in
-    the file, so the obligation would clear on the mere *shape* of the
-    command — any file-carrying invocation at all. That is worse than the
-    bug this exists to fix.
+  - **`--satisfied-by-file-flag` requires `--satisfied-by-cmd-regex` and/or
+    `--satisfied-by-body-regex`** (the CLI exits 2 otherwise). Without a
+    pattern there is nothing to find in the file, so the obligation would
+    clear on the mere *shape* of the command — any file-carrying invocation
+    at all. That is worse than the bug this exists to fix.
+  - **Pair it with `body_pattern`, not `command_pattern` alone.** A payload
+    file holds the message and nothing else — no program token, no
+    addressing arguments — so a `command_pattern` anchored on command shape
+    (i.e. every one that is safe to write) can never match a file body. On
+    its own, `file_arg_flags` hands a command-shaped pattern a second
+    haystack it cannot use.
   - Both `-F path` and `--file=path` spellings are recognised.
   - Paths are lifted from the **shell AST**, not scraped with a regex: a
     flag that appears inside a quoted argument or a heredoc body is data,
