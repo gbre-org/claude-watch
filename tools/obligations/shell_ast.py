@@ -734,6 +734,56 @@ def name_matches(name: str, spec: str) -> bool:
     return name == spec
 
 
+def is_sole_command(cmd: str, name_specs) -> bool:
+    """True iff ``cmd`` is a SINGLE simple command whose effective head
+    basename matches one of ``name_specs``, with NO pipeline, NO
+    redirection, and NO top-level list / compound / background operator.
+
+    This is the "sole command" gate used to scope a read-CLI exemption to
+    the RAW, unfiltered invocation only. ``botchat-show 42`` matches, but
+    every form that could divert or filter the command's output does NOT:
+
+      * a pipeline    -- ``botchat-show 42 | tail``   (strips attachments)
+      * a redirect    -- ``botchat-show 42 > f``      (captures away output)
+      * a list / seq  -- ``botchat-show 42 ; other``  (second stage)
+      * a background  -- ``botchat-show 42 &``
+      * a substitution wrapper isn't a concern here because a
+        ``$(botchat-show ...)`` capture parses as a data word, never a
+        top-level segment head, so it is not "sole" either.
+
+    Unlike ``command_name_present`` (which asks only "is the name A head of
+    ANY segment"), this asks "is the name the head of the ONLY segment, and
+    is that segment plain". A piped ``botchat-show`` has ``botchat-show`` as
+    A head but is NOT sole, so it correctly fails here.
+
+    ``name_specs`` is any iterable of literal names / globs (see
+    ``name_matches``). Empty / falsy specs => False.
+
+    Raises ``ShellParseError`` on parse failure so the caller can FAIL
+    CLOSED. For an EXEMPTION the safe direction is "not sole" (do not
+    exempt), so callers treat a parse failure as False.
+    """
+    specs = [t for t in (name_specs or []) if t]
+    if not specs:
+        return False
+    parsed = parse(cmd)
+    # Exactly one top-level segment, and no operator glued to it.
+    if len(parsed.segments) != 1:
+        return False
+    if parsed.has_top_level_operator():
+        return False
+    seg = parsed.segments[0]
+    # ANY redirection (stdout or otherwise) disqualifies -- a read whose
+    # output is redirected is not the raw form we want to exempt.
+    if seg.redirects:
+        return False
+    words = _strip_command_prefix(seg.words)
+    if not words:
+        return False
+    head = os.path.basename(words[0])
+    return any(name_matches(head, s) for s in specs)
+
+
 DEVNULL_TARGETS = ("/dev/null",)
 
 
@@ -1301,6 +1351,40 @@ def _run_tests() -> int:
     # --- ; separator + plain commands ---
     ok("a ; b -> two heads",
        parse("ls ; pwd").heads() == ["ls", "pwd"])
+
+    # --- is_sole_command: raw form matches, filtered/diverted forms don't ---
+    ok("sole: bare botchat-show matches",
+       is_sole_command("botchat-show 42", ["botchat-show"]))
+    ok("sole: env/path-prefixed bare still matches",
+       is_sole_command("FOO=1 /usr/bin/botchat-show 42", ["botchat-show"]))
+    ok("sole: glob spec matches head",
+       is_sole_command("botchat-history --unread", ["botchat-*"]))
+    ok("sole: PIPED read is NOT sole",
+       not is_sole_command("botchat-show 42 | tail -5", ["botchat-show"]))
+    ok("sole: pipe RHS head is NOT sole",
+       not is_sole_command("echo x | botchat-show", ["botchat-show"]))
+    ok("sole: stdout REDIRECT is NOT sole",
+       not is_sole_command("botchat-show 42 > /tmp/x", ["botchat-show"]))
+    ok("sole: input redirect is NOT sole",
+       not is_sole_command("botchat-show 42 < /tmp/x", ["botchat-show"]))
+    ok("sole: ';' list is NOT sole",
+       not is_sole_command("botchat-show 42 ; echo done", ["botchat-show"]))
+    ok("sole: '&&' compound is NOT sole",
+       not is_sole_command("botchat-show 42 && echo ok", ["botchat-show"]))
+    ok("sole: background '&' is NOT sole",
+       not is_sole_command("botchat-show 42 &", ["botchat-show"]))
+    ok("sole: arg-only mention is NOT sole",
+       not is_sole_command("grep botchat-show f", ["botchat-show"]))
+    ok("sole: unrelated head is NOT sole",
+       not is_sole_command("botchat-send --body x", ["botchat-show"]))
+    ok("sole: empty specs -> False",
+       not is_sole_command("botchat-show 42", []))
+    # parse failure raises (caller fails closed)
+    try:
+        is_sole_command("botchat-show 'unterminated", ["botchat-show"])
+        ok("sole: unparseable raises", False, "no exception")
+    except ShellParseError:
+        ok("sole: unparseable raises", True)
 
     passed = sum(1 for _, c, _ in cases if c)
     for name, cond, detail in cases:
