@@ -9,7 +9,7 @@
 
 use crate::reminders::all_fire_counts;
 use crate::status::get_version_info;
-use chrono::DateTime;
+use chrono::{DateTime, Local};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -550,12 +550,23 @@ async fn collect_live_counts() -> LiveCounts {
 // `claude_operator_desk_streak_seconds{kind="current"|"max"}` -- length of the
 // operator's CONTINUOUS at-desk presence run. `current` is the trailing run
 // ending "now" (resets to 0 the moment presence drops to away); `max` is the
-// longest continuous run observed. Because `claude-watch metrics` is a
-// one-shot cron invocation (no long-lived process), the streak is STATEFUL on
-// disk: a small sidecar JSON file next to the daemon state. Persisting to a
-// DEDICATED file (not state.json) keeps this cron writer from racing the
-// daemon's own writes to state.json. `max` therefore SURVIVES daemon/process
-// restarts -- it is reloaded from the sidecar on each invocation.
+// longest continuous run observed TODAY (see below). Because `claude-watch
+// metrics` is a one-shot cron invocation (no long-lived process), the streak is
+// STATEFUL on disk: a small sidecar JSON file next to the daemon state.
+// Persisting to a DEDICATED file (not state.json) keeps this cron writer from
+// racing the daemon's own writes to state.json. `max` therefore SURVIVES
+// daemon/process restarts -- it is reloaded from the sidecar on each invocation
+// (this is what fixes the "max resets to Current on every container restart"
+// bug: before persistence the max was recomputed in-memory each run).
+//
+// `max` is scoped to a SINGLE LOCAL CALENDAR DAY: the sidecar stamps the
+// max with the local date (`max_date`, "%Y-%m-%d" in the host's local
+// timezone -- the same `now()`/local-wall-clock convention the rest of
+// presence uses). On each emit, if the stored `max_date` is a PRIOR day the
+// day has rolled over -> the day's max restarts from the current run
+// (0 when away); a same-day sample ratchets `max = max(stored, current)`.
+// Net effect: `kind="max"` is "the longest continuous at-desk streak TODAY",
+// resetting at LOCAL MIDNIGHT and surviving restarts within the day.
 //
 // Presence is derived from the same operator-presence CARRIER file the
 // presence-gate uses: present == the carrier's mtime is fresh within
@@ -729,9 +740,14 @@ fn operator_present_block() -> Vec<String> {
 struct StreakState {
     /// Epoch when the current continuous-present run began; `None` when away.
     run_start: Option<f64>,
-    /// Longest continuous-present run observed (seconds). Persisted, so it
-    /// survives restarts.
+    /// Longest continuous-present run observed TODAY (seconds). Persisted, so
+    /// it survives restarts; scoped to the local calendar day via `max_date`.
     max_streak_secs: f64,
+    /// Local calendar date ("%Y-%m-%d") the `max_streak_secs` belongs to.
+    /// When a sample's local date differs, the day has rolled over and the
+    /// max restarts. `None` on a fresh/legacy sidecar (treated as "no day yet"
+    /// -> the first sample seeds today's max).
+    max_date: Option<String>,
     /// Epoch of the previous sample (for gap detection); `None` on first ever.
     last_sample: Option<f64>,
     /// Whether the operator was present at the previous sample.
@@ -762,6 +778,10 @@ fn load_streak_state(path: &Path) -> StreakState {
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0)
             .max(0.0),
+        max_date: v
+            .get("max_date")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
         last_sample: v.get("last_sample").and_then(|x| x.as_f64()),
         last_present: v
             .get("last_present")
@@ -777,6 +797,7 @@ fn save_streak_state(path: &Path, state: &StreakState) -> std::io::Result<()> {
     let v = serde_json::json!({
         "run_start": state.run_start,
         "max_streak_secs": state.max_streak_secs,
+        "max_date": state.max_date,
         "last_sample": state.last_sample,
         "last_present": state.last_present,
     });
@@ -794,7 +815,7 @@ fn save_streak_state(path: &Path, state: &StreakState) -> std::io::Result<()> {
 /// Advance the streak state by one sample. Pure -- no I/O, fully unit-tested.
 ///
 /// - While present, the current run accumulates as `now - run_start`; `max`
-///   ratchets up to the longest run seen.
+///   ratchets up to the longest run seen TODAY.
 /// - On present->away the current run resets to 0 (run_start cleared); `max`
 ///   is untouched (already captured while present).
 /// - Gap handling: if the operator was present at the last sample AND the
@@ -802,6 +823,12 @@ fn save_streak_state(path: &Path, state: &StreakState) -> std::io::Result<()> {
 ///   the unobserved gap can't be asserted (cron/daemon was down, or the laptop
 ///   slept and the carrier re-freshened between samples) -> the run restarts
 ///   at `now` rather than over-counting the gap.
+/// - Daily scoping: `max` is scoped to the local calendar day `today`
+///   ("%Y-%m-%d"). If the stored `max_date` differs from `today` the day has
+///   rolled over, so the day's max restarts from the current run (0 when away)
+///   -- i.e. `max` resets at local midnight. A same-day sample carries the
+///   stored max forward and ratchets it. The returned state's `max_date` is
+///   always stamped to `today`.
 ///
 /// Returns the new state and the current-run length in seconds.
 fn advance_streak(
@@ -809,12 +836,20 @@ fn advance_streak(
     present: bool,
     now: f64,
     max_gap_secs: f64,
+    today: &str,
 ) -> (StreakState, f64) {
+    // Daily-scoped baseline: carry the stored max forward only when it belongs
+    // to `today`; otherwise the day rolled over and today's max starts at 0.
+    let prev_max_today = match &prev.max_date {
+        Some(d) if d == today => prev.max_streak_secs,
+        _ => 0.0,
+    };
     if !present {
         return (
             StreakState {
                 run_start: None,
-                max_streak_secs: prev.max_streak_secs,
+                max_streak_secs: prev_max_today,
+                max_date: Some(today.to_string()),
                 last_sample: Some(now),
                 last_present: false,
             },
@@ -830,11 +865,12 @@ fn advance_streak(
         _ => now,
     };
     let current = (now - run_start).max(0.0);
-    let max = prev.max_streak_secs.max(current);
+    let max = prev_max_today.max(current);
     (
         StreakState {
             run_start: Some(run_start),
             max_streak_secs: max,
+            max_date: Some(today.to_string()),
             last_sample: Some(now),
             last_present: true,
         },
@@ -845,7 +881,7 @@ fn advance_streak(
 /// Render the `claude_operator_desk_streak_seconds` gauge block.
 fn desk_streak_lines(current: f64, max: f64) -> Vec<String> {
     vec![
-        "# HELP claude_operator_desk_streak_seconds Continuous operator at-desk presence streak in seconds (kind=current: trailing run ending now, resets to 0 on away; kind=max: longest continuous run observed)".to_string(),
+        "# HELP claude_operator_desk_streak_seconds Continuous operator at-desk presence streak in seconds (kind=current: trailing run ending now, resets to 0 on away; kind=max: longest continuous run TODAY -- persisted across restarts, resets at local midnight)".to_string(),
         "# TYPE claude_operator_desk_streak_seconds gauge".to_string(),
         format!(
             "claude_operator_desk_streak_seconds{{kind=\"current\"}} {:.3}",
@@ -858,15 +894,25 @@ fn desk_streak_lines(current: f64, max: f64) -> Vec<String> {
     ]
 }
 
+/// Local calendar date ("%Y-%m-%d") used to scope the daily max. Uses the
+/// host's LOCAL timezone -- the same local-wall-clock convention the rest of
+/// the presence pipeline uses (`datetime.now()` in the Python bridge) -- so
+/// "midnight" is the operator's local midnight, matching the Grafana panels'
+/// local-day boundaries.
+fn local_date_string() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
 /// Collect + persist the desk-streak, returning the gauge lines. Fail-open:
 /// a persistence error still emits the freshly-computed sample.
 fn desk_streak_block() -> Vec<String> {
     let now = now_epoch();
     let present = presence_is_fresh(presence_carrier_mtime(), now, presence_max_age());
     let max_gap = presence_max_age() * 2.0;
+    let today = local_date_string();
     let path = default_streak_state_file();
     let prev = load_streak_state(&path);
-    let (next, current) = advance_streak(&prev, present, now, max_gap);
+    let (next, current) = advance_streak(&prev, present, now, max_gap, &today);
     let _ = save_streak_state(&path, &next);
     desk_streak_lines(current, next.max_streak_secs)
 }
@@ -945,15 +991,19 @@ mod tests {
 
     // --- Operator desk-streak -------------------------------------------
 
+    // A fixed local date used across the same-day streak tests.
+    const D0: &str = "2026-01-01";
+
     #[test]
     fn streak_accumulates_while_present() {
         let s0 = StreakState::default();
         // First present sample starts a run at now; current is 0.
-        let (s1, c1) = advance_streak(&s0, true, 1000.0, 200.0);
+        let (s1, c1) = advance_streak(&s0, true, 1000.0, 200.0, D0);
         assert_eq!(c1, 0.0);
         assert_eq!(s1.run_start, Some(1000.0));
+        assert_eq!(s1.max_date.as_deref(), Some(D0));
         // Still present 30s later: current accumulates, run_start unchanged.
-        let (s2, c2) = advance_streak(&s1, true, 1030.0, 200.0);
+        let (s2, c2) = advance_streak(&s1, true, 1030.0, 200.0, D0);
         assert_eq!(c2, 30.0);
         assert_eq!(s2.run_start, Some(1000.0));
         assert_eq!(s2.max_streak_secs, 30.0);
@@ -962,16 +1012,16 @@ mod tests {
     #[test]
     fn streak_resets_on_away() {
         let s0 = StreakState::default();
-        let (s1, _) = advance_streak(&s0, true, 1000.0, 200.0);
-        let (s2, c2) = advance_streak(&s1, true, 1050.0, 200.0);
+        let (s1, _) = advance_streak(&s0, true, 1000.0, 200.0, D0);
+        let (s2, c2) = advance_streak(&s1, true, 1050.0, 200.0, D0);
         assert_eq!(c2, 50.0);
         // Presence drops: current resets to 0, run cleared, max preserved.
-        let (s3, c3) = advance_streak(&s2, false, 1060.0, 200.0);
+        let (s3, c3) = advance_streak(&s2, false, 1060.0, 200.0, D0);
         assert_eq!(c3, 0.0);
         assert_eq!(s3.run_start, None);
         assert_eq!(s3.max_streak_secs, 50.0);
         // Present again: brand-new run from now, current 0.
-        let (s4, c4) = advance_streak(&s3, true, 1100.0, 200.0);
+        let (s4, c4) = advance_streak(&s3, true, 1100.0, 200.0, D0);
         assert_eq!(c4, 0.0);
         assert_eq!(s4.run_start, Some(1100.0));
         assert_eq!(s4.max_streak_secs, 50.0);
@@ -980,29 +1030,73 @@ mod tests {
     #[test]
     fn streak_max_tracks_longest_run() {
         // A 100s run.
-        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 200.0);
-        let (s, c) = advance_streak(&s, true, 100.0, 200.0);
+        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 200.0, D0);
+        let (s, c) = advance_streak(&s, true, 100.0, 200.0, D0);
         assert_eq!(c, 100.0);
         assert_eq!(s.max_streak_secs, 100.0);
         // Away, then a shorter 20s run -- max must retain the longer 100s.
-        let (s, _) = advance_streak(&s, false, 110.0, 200.0);
-        let (s, _) = advance_streak(&s, true, 120.0, 200.0);
-        let (s, c) = advance_streak(&s, true, 140.0, 200.0);
+        let (s, _) = advance_streak(&s, false, 110.0, 200.0, D0);
+        let (s, _) = advance_streak(&s, true, 120.0, 200.0, D0);
+        let (s, c) = advance_streak(&s, true, 140.0, 200.0, D0);
         assert_eq!(c, 20.0);
         assert_eq!(s.max_streak_secs, 100.0);
     }
 
     #[test]
     fn streak_restarts_after_long_sample_gap() {
-        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 100.0);
-        let (s, c) = advance_streak(&s, true, 50.0, 100.0);
+        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 100.0, D0);
+        let (s, c) = advance_streak(&s, true, 50.0, 100.0, D0);
         assert_eq!(c, 50.0);
         // Gap of 300s > max_gap 100s while present: continuity broken, restart.
-        let (s, c) = advance_streak(&s, true, 350.0, 100.0);
+        let (s, c) = advance_streak(&s, true, 350.0, 100.0, D0);
         assert_eq!(c, 0.0);
         assert_eq!(s.run_start, Some(350.0));
         // Longest observed run is still the pre-gap 50s.
         assert_eq!(s.max_streak_secs, 50.0);
+    }
+
+    #[test]
+    fn streak_max_resets_at_local_midnight() {
+        // Build up a 100s max on day 0.
+        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 200.0, D0);
+        let (s, c) = advance_streak(&s, true, 100.0, 200.0, D0);
+        assert_eq!(c, 100.0);
+        assert_eq!(s.max_streak_secs, 100.0);
+        assert_eq!(s.max_date.as_deref(), Some(D0));
+
+        // Day rolls over. A shorter run today must NOT inherit yesterday's 100s:
+        // the daily max starts fresh from today's current run.
+        const D1: &str = "2026-01-02";
+        let (s, c) = advance_streak(&s, true, 1000.0, 200.0, D1);
+        assert_eq!(c, 0.0, "new run starts at 0 across the day boundary");
+        assert_eq!(
+            s.max_streak_secs, 0.0,
+            "yesterday's 100s max must not carry into the new day"
+        );
+        assert_eq!(s.max_date.as_deref(), Some(D1));
+        let (s, c) = advance_streak(&s, true, 1030.0, 200.0, D1);
+        assert_eq!(c, 30.0);
+        assert_eq!(s.max_streak_secs, 30.0, "today's max is today's longest run");
+        assert_eq!(s.max_date.as_deref(), Some(D1));
+    }
+
+    #[test]
+    fn streak_max_persists_across_restart_same_day() {
+        // Persistence regression: a sidecar carrying a same-day max must be
+        // preserved even though the current run restarts (process/container
+        // restart clears run_start/last_present but the sidecar survives).
+        let prev = StreakState {
+            run_start: None,
+            max_streak_secs: 600.0,
+            max_date: Some(D0.to_string()),
+            last_sample: Some(500.0),
+            last_present: false,
+        };
+        // Fresh present sample same day: current is 0 (new run) but the day's
+        // max is retained from the sidecar.
+        let (s, c) = advance_streak(&prev, true, 1000.0, 200.0, D0);
+        assert_eq!(c, 0.0);
+        assert_eq!(s.max_streak_secs, 600.0);
     }
 
     #[test]
@@ -1112,6 +1206,7 @@ mod tests {
         let st = StreakState {
             run_start: Some(123.0),
             max_streak_secs: 456.0,
+            max_date: Some("2026-01-01".to_string()),
             last_sample: Some(789.0),
             last_present: true,
         };
@@ -1119,12 +1214,14 @@ mod tests {
         let loaded = load_streak_state(&p);
         assert_eq!(loaded.run_start, Some(123.0));
         assert_eq!(loaded.max_streak_secs, 456.0);
+        assert_eq!(loaded.max_date.as_deref(), Some("2026-01-01"));
         assert_eq!(loaded.last_sample, Some(789.0));
         assert!(loaded.last_present);
-        // Missing file -> default (away, zero max).
+        // Missing file -> default (away, zero max, no day stamp).
         let d = load_streak_state(&dir.join("does-not-exist.json"));
         assert_eq!(d.run_start, None);
         assert_eq!(d.max_streak_secs, 0.0);
+        assert_eq!(d.max_date, None);
         assert!(!d.last_present);
         let _ = fs::remove_dir_all(&dir);
     }
