@@ -252,11 +252,11 @@
     },
     {
       "id": 2,
-      "title": "Heartbeat Age",
+      "title": "Heartbeat / Container Age",
       "type": "stat",
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 6,
         "x": 3,
         "y": 0
       },
@@ -267,7 +267,13 @@
       "targets": [
         {
           "expr": "time() - claude_mainloop_heartbeat_timestamp_seconds",
+          "legendFormat": "Heartbeat",
           "refId": "A"
+        },
+        {
+          "expr": "time() - claude_container_start_timestamp_seconds",
+          "legendFormat": "Container",
+          "refId": "B"
         }
       ],
       "fieldConfig": {
@@ -294,7 +300,23 @@
             ]
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Container"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#268bd2"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "reduceOptions": {
@@ -304,7 +326,7 @@
         },
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value"
+        "textMode": "value_and_name"
       }
     },
     {
@@ -314,7 +336,7 @@
       "gridPos": {
         "h": 4,
         "w": 3,
-        "x": 7,
+        "x": 9,
         "y": 0
       },
       "datasource": {
