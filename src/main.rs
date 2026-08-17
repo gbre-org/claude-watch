@@ -285,6 +285,14 @@ enum Commands {
         #[arg(long)]
         slash_command: bool,
 
+        /// NON-CANCELLING inject: never lead with an Escape, so an in-flight
+        /// turn is NOT interrupted. Types + submits as a QUEUED message (bare
+        /// Enter from INSERT, no `dd` line-clear). Use for changes that must
+        /// apply without seizing the turn (e.g. cw-theme-sync `/config theme=…`).
+        /// Trade-off: half-typed operator input glues onto the payload.
+        #[arg(long)]
+        no_cancel: bool,
+
         /// Emit machine-readable JSON outcome on stdout.
         #[arg(long)]
         json: bool,
@@ -1573,6 +1581,7 @@ async fn run_inject(
     pane_flag: Option<&str>,
     no_submit: bool,
     slash_command: bool,
+    no_cancel: bool,
     json: bool,
 ) -> i32 {
     // Wire the FleetView focus-to-main key sequence into the tmux module's
@@ -1588,7 +1597,7 @@ async fn run_inject(
     }
     let pane = resolve_inject_pane(pane_flag).await;
     let submit = !no_submit;
-    let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command).await;
+    let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command, no_cancel).await;
 
     let (code, status) = match outcome {
         tmux::InjectOutcome::Typed => (0, "typed"),
@@ -1745,9 +1754,12 @@ async fn main() {
             pane,
             no_submit,
             slash_command,
+            no_cancel,
             json,
         }) => {
-            let code = run_inject(&submit, pane.as_deref(), no_submit, slash_command, json).await;
+            let code =
+                run_inject(&submit, pane.as_deref(), no_submit, slash_command, no_cancel, json)
+                    .await;
             if code != 0 {
                 std::process::exit(code);
             }

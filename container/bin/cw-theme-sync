@@ -35,11 +35,17 @@ are taking over theme control while a browser drives it.)
 
 DESIGN NOTES
 ------------
-  * Idle-gated, NON-interrupting. We only inject when the pane shows an
-    idle prompt (the cursor glyph). We NEVER send an Escape blast -- the
-    user's browser theme toggle must not cancel the model's in-flight
-    turn. If the pane is busy the desired theme is remembered and applied
-    on a later poll once the pane goes idle.
+  * Idle-gated AND non-cancelling. We only inject when the pane shows an
+    idle prompt (the cursor glyph), AND we inject via `claude-watch inject
+    --no-cancel`, which NEVER leads with an Escape -- the user's browser
+    theme toggle must not cancel the model's in-flight turn. The idle gate
+    is best-effort (there is a race between the check and the inject); the
+    `--no-cancel` flag is the hard guarantee: even if the pane went busy in
+    that window, the `/config theme=…` slash command is typed + submitted
+    as a QUEUED message (bare Enter from INSERT, no Escape/`dd`), so it
+    lands at the next turn boundary instead of interrupting. If the pane is
+    busy at check time the desired theme is remembered and applied on a
+    later poll.
   * Debounced / coalescing. We always inject the CURRENT file value, so a
     rapid light->dark->light flip only results in the final theme.
   * Idempotent. We track the last theme we injected and skip no-op
@@ -216,6 +222,13 @@ def inject_theme(pane, theme):
             "claude-watch", "inject",
             "--pane", pane,
             "--slash-command",
+            # NON-CANCELLING: never lead with an Escape, so a theme toggle can
+            # never cancel the model's in-flight turn. Types + submits the slash
+            # command as a queued message (bare Enter from INSERT). This is the
+            # hard guarantee behind the idle-gate above: even if the pane became
+            # busy in the race window between the idle check and this inject, the
+            # theme change is queued behind the active turn, not interrupted.
+            "--no-cancel",
             "--submit", f"/config theme={theme}",
         ]
         out, rc = run(cmd, timeout=30)
