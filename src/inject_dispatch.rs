@@ -309,6 +309,19 @@ pub async fn inject_to_agent_queued(pane: &str, text: &str) {
 }
 
 async fn inject_to_agent_inner(pane: &str, text: &str, cancel_turn: bool) {
+    // Defer to an in-flight self-clear handoff (see tmux::self_clear_in_progress):
+    // typing a daemon alert / stuck-state prompt into the pane while self-clear
+    // is driving `/clear`->resume would OVERWRITE the resume handoff
+    // (operator-reported, 2026-08-17). Skip the inject; the daemon re-evaluates
+    // on its next cycle once self-clear releases the lock.
+    if crate::tmux::self_clear_in_progress() {
+        info!(
+            pane = %pane,
+            cancel_turn,
+            "inject_to_agent: self-clear in progress -- deferring daemon inject"
+        );
+        return;
+    }
     let backends = RealBackends;
     let agent_pid = resolve_agent_pid_for_pane(pane).await;
     let mode = mode_for(agent_pid);
