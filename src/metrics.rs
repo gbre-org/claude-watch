@@ -18,6 +18,22 @@ use std::path::{Path, PathBuf};
 
 const PROM_FILE: &str = "/var/lib/node-exporter/textfile/claude_watch.prom";
 
+/// Resolve the node-exporter textfile output path. Honors the
+/// `CLAUDE_WATCH_PROM_FILE` env override so containerized / macOS deployments
+/// — where the hardcoded `/var/lib/node-exporter/textfile` dir isn't writable
+/// (needs root; often doesn't exist) and node-exporter mounts a DIFFERENT dir
+/// — can point the emitter straight at the dir node-exporter actually scrapes.
+/// Without this, such deployments must run a separate out-of-tree reimplementation
+/// of `build_metrics` to bridge the textfile into the scraped dir; that bridge
+/// then silently drifts from this source (e.g. it lacked the
+/// `claude_operator_desk_streak_seconds` gauge). Falls back to `PROM_FILE`.
+fn prom_file_path() -> PathBuf {
+    match std::env::var("CLAUDE_WATCH_PROM_FILE") {
+        Ok(s) if !s.trim().is_empty() => PathBuf::from(s),
+        _ => PathBuf::from(PROM_FILE),
+    }
+}
+
 /// Live-process snapshot collected at metrics-emission time.
 ///
 /// Mirrors the four counts in `claude-watch status`'s "Claude Code" section:
@@ -754,7 +770,7 @@ fn desk_streak_block() -> Vec<String> {
 /// CLI entry point: `claude-watch metrics`.
 pub async fn cmd_metrics() -> i32 {
     let state_path = default_state_file();
-    let prom_path = PathBuf::from(PROM_FILE);
+    let prom_path = prom_file_path();
 
     let state_str = match fs::read_to_string(&state_path) {
         Ok(s) => s,
@@ -1242,5 +1258,13 @@ mod tests {
         assert!(joined.contains("claude_code_live_watchers 3"), "{joined}");
         assert!(joined.contains("claude_code_enabled_watchers 3"), "{joined}");
         assert!(joined.contains("claude_code_open_bashes 4"), "{joined}");
+    }
+
+    #[test]
+    fn prom_file_path_honors_env_override() {
+        std::env::set_var("CLAUDE_WATCH_PROM_FILE", "/tmp/cw-custom.prom");
+        assert_eq!(prom_file_path(), PathBuf::from("/tmp/cw-custom.prom"));
+        std::env::remove_var("CLAUDE_WATCH_PROM_FILE");
+        assert_eq!(prom_file_path(), PathBuf::from(PROM_FILE));
     }
 }
