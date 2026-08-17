@@ -551,13 +551,22 @@ async fn collect_live_counts() -> LiveCounts {
 // operator's CONTINUOUS at-desk presence run. `current` is the trailing run
 // ending "now" (resets to 0 the moment presence drops to away); `max` is the
 // longest continuous run observed TODAY (see below). Because `claude-watch
-// metrics` is a one-shot cron invocation (no long-lived process), the streak is
-// STATEFUL on disk: a small sidecar JSON file next to the daemon state.
-// Persisting to a DEDICATED file (not state.json) keeps this cron writer from
-// racing the daemon's own writes to state.json. `max` therefore SURVIVES
-// daemon/process restarts -- it is reloaded from the sidecar on each invocation
-// (this is what fixes the "max resets to Current on every container restart"
-// bug: before persistence the max was recomputed in-memory each run).
+// metrics` is a one-shot cron invocation (no long-lived process), the streak
+// must be RECONSTRUCTED on every emit rather than accumulated in RAM.
+//
+// PRIMARY SOURCE OF TRUTH: Prometheus. Each emit queries the scraped
+// `claude_operator_present` series (query_range over a trailing window) and
+// REPLAYS it through the same `advance_streak` fold the sidecar path uses, so
+// BOTH `current` AND `max` are derived purely from the dataset -- they survive
+// a container/cw restart with no local state. This is what fixes the "streak +
+// daily-max reset to zero on every container restart" bug: the sidecar did not
+// survive a container recreate, and `current` was never persisted at all.
+//
+// FALLBACK: a small sidecar JSON file next to the daemon state, used only when
+// Prometheus is unreachable/disabled at emit time (restart-lossy, but better
+// than blanking the gauge). It is kept warm on the Prometheus path too, so a
+// later Prometheus outage degrades gracefully. A DEDICATED file (not
+// state.json) keeps this cron writer from racing the daemon's own writes.
 //
 // `max` is scoped to a SINGLE LOCAL CALENDAR DAY: the sidecar stamps the
 // max with the local date (`max_date`, "%Y-%m-%d" in the host's local
@@ -881,7 +890,7 @@ fn advance_streak(
 /// Render the `claude_operator_desk_streak_seconds` gauge block.
 fn desk_streak_lines(current: f64, max: f64) -> Vec<String> {
     vec![
-        "# HELP claude_operator_desk_streak_seconds Continuous operator at-desk presence streak in seconds (kind=current: trailing run ending now, resets to 0 on away; kind=max: longest continuous run TODAY -- persisted across restarts, resets at local midnight)".to_string(),
+        "# HELP claude_operator_desk_streak_seconds Continuous operator at-desk presence streak in seconds (kind=current: trailing run ending now, resets to 0 on away; kind=max: longest continuous run TODAY, resets at local midnight). BOTH rehydrated from the Prometheus claude_operator_present series each emit, so they survive container/cw restarts.".to_string(),
         "# TYPE claude_operator_desk_streak_seconds gauge".to_string(),
         format!(
             "claude_operator_desk_streak_seconds{{kind=\"current\"}} {:.3}",
@@ -903,14 +912,188 @@ fn local_date_string() -> String {
     Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// Collect + persist the desk-streak, returning the gauge lines. Fail-open:
-/// a persistence error still emits the freshly-computed sample.
+/// Prometheus HTTP API base URL for rehydrating the desk-streak from the
+/// scraped `claude_operator_present` series. `CW_PROMETHEUS_URL` overrides;
+/// when UNSET it defaults to `http://localhost:9090` (host-native deploys where
+/// cw and Prometheus share localhost). Set it EMPTY to DISABLE the Prometheus
+/// path entirely (force the sidecar fallback) -- e.g. a deployment with no
+/// reachable Prometheus. A trailing slash is trimmed.
+fn prometheus_base_url() -> Option<String> {
+    match std::env::var("CW_PROMETHEUS_URL") {
+        Ok(s) if !s.trim().is_empty() => Some(s.trim().trim_end_matches('/').to_string()),
+        Ok(_) => None, // explicitly empty => disabled
+        Err(_) => Some("http://localhost:9090".to_string()),
+    }
+}
+
+/// Trailing window (seconds) of `claude_operator_present` history to pull when
+/// rehydrating. Must comfortably cover today (for the daily max) plus a current
+/// run that began before local midnight. `CW_DESK_STREAK_LOOKBACK_SECS`
+/// overrides; defaults to 48h.
+fn desk_streak_lookback_secs() -> f64 {
+    std::env::var("CW_DESK_STREAK_LOOKBACK_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(172_800.0)
+}
+
+/// query_range step (seconds). Should match the metrics emit cadence (cron
+/// every minute). `CW_DESK_STREAK_STEP_SECS` overrides; defaults to 60s.
+fn desk_streak_step_secs() -> f64 {
+    std::env::var("CW_DESK_STREAK_STEP_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(60.0)
+}
+
+/// LOCAL calendar date ("%Y-%m-%d") of an epoch second, in the host's local
+/// timezone (same convention as `local_date_string`). Scopes each rehydrated
+/// Prometheus sample to its day for the daily-max midnight reset.
+fn local_date_of(epoch: f64) -> String {
+    use chrono::TimeZone;
+    match Local.timestamp_opt(epoch as i64, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d").to_string(),
+        None => local_date_string(),
+    }
+}
+
+/// One presence sample rehydrated from Prometheus: epoch second, present flag,
+/// and the LOCAL calendar date that second falls in (for daily-max scoping).
+#[derive(Debug, Clone, PartialEq)]
+struct PresenceSample {
+    ts: f64,
+    present: bool,
+    date: String,
+}
+
+/// Parse a Prometheus `query_range` matrix response into ordered presence
+/// samples. Pure + testable: `date_fn` maps an epoch second to a LOCAL calendar
+/// date so tests stay timezone-independent. Returns:
+///   - `None` when the body is not a `status:"success"` matrix (malformed /
+///     error response) -> the caller falls back to the sidecar.
+///   - `Some([])` when the query succeeded but the series has no points (fresh
+///     Prometheus / metric absent in the window) -> a legitimate empty history
+///     (streak 0), NOT a fallback.
+/// node-exporter's textfile collector yields a single series, so only the first
+/// series' `values` are read. Point values use Prometheus' string encoding
+/// ("1"/"0"); `>= 0.5` counts as present. Samples are returned sorted by ts.
+fn parse_prom_presence(
+    json: &str,
+    date_fn: &dyn Fn(f64) -> String,
+) -> Option<Vec<PresenceSample>> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    if v.get("status").and_then(|s| s.as_str()) != Some("success") {
+        return None;
+    }
+    let result = v.get("data")?.get("result")?.as_array()?;
+    if result.is_empty() {
+        return Some(Vec::new());
+    }
+    let values = result[0].get("values")?.as_array()?;
+    let mut samples: Vec<PresenceSample> = Vec::with_capacity(values.len());
+    for pair in values {
+        let arr = pair.as_array()?;
+        let ts = arr.first()?.as_f64()?;
+        let raw = arr.get(1)?.as_str()?;
+        let numv: f64 = raw.trim().parse().unwrap_or(0.0);
+        samples.push(PresenceSample {
+            ts,
+            present: numv >= 0.5,
+            date: date_fn(ts),
+        });
+    }
+    samples.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
+    Some(samples)
+}
+
+/// Reconstruct the streak by folding the tested `advance_streak` over the
+/// rehydrated Prometheus samples (each carrying its own local date, so
+/// daily-max midnight resets AND scrape-gap breaks reuse the exact logic the
+/// sidecar path uses), then over the LIVE "now" sample last so the emitted
+/// `current` reflects this instant. Historical samples at or after `now` are
+/// ignored. Returns the reconstructed state and the current-run length (secs).
+fn compute_streak_from_samples(
+    samples: &[PresenceSample],
+    now: f64,
+    present_now: bool,
+    now_date: &str,
+    max_gap_secs: f64,
+) -> (StreakState, f64) {
+    let mut state = StreakState::default();
+    for s in samples {
+        if s.ts >= now {
+            continue;
+        }
+        let (next, _) = advance_streak(&state, s.present, s.ts, max_gap_secs, &s.date);
+        state = next;
+    }
+    advance_streak(&state, present_now, now, max_gap_secs, now_date)
+}
+
+/// Query Prometheus `query_range` for the `claude_operator_present` series over
+/// `[now - lookback, now]`. Shells out to `curl` -- matching the daemon's
+/// established "shell out to an external tool" convention (ps/tmux/session-task)
+/// and keeping an HTTP client out of the dependency tree, appropriate for this
+/// one-shot cron command. Returns the raw response body, or `None` on ANY
+/// failure (curl missing, non-zero exit, empty body) so the caller falls back
+/// to the sidecar. A short `--max-time` keeps a wedged Prometheus from stalling
+/// the emit.
+fn fetch_prom_presence_range(base: &str, now: f64, lookback: f64, step: f64) -> Option<String> {
+    let start = (now - lookback).max(0.0);
+    // The query is a bare metric name (no special chars) -> no URL-encoding.
+    let url = format!(
+        "{base}/api/v1/query_range?query=claude_operator_present&start={start:.3}&end={now:.3}&step={step:.0}s"
+    );
+    let out = std::process::Command::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg(&url)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some(body)
+}
+
+/// Collect the desk-streak gauge lines. Rehydrates BOTH `current` and `max`
+/// from the Prometheus `claude_operator_present` series so they survive a
+/// container/cw restart; falls back to the on-disk sidecar when Prometheus is
+/// unreachable/disabled. Fail-open: a persistence error still emits the sample.
 fn desk_streak_block() -> Vec<String> {
     let now = now_epoch();
     let present = presence_is_fresh(presence_carrier_mtime(), now, presence_max_age());
     let max_gap = presence_max_age() * 2.0;
     let today = local_date_string();
     let path = default_streak_state_file();
+
+    // Preferred: rehydrate from Prometheus (survives restarts, no local state).
+    if let Some(base) = prometheus_base_url() {
+        if let Some(body) = fetch_prom_presence_range(
+            &base,
+            now,
+            desk_streak_lookback_secs(),
+            desk_streak_step_secs(),
+        ) {
+            if let Some(samples) = parse_prom_presence(&body, &|ts| local_date_of(ts)) {
+                let (next, current) =
+                    compute_streak_from_samples(&samples, now, present, &today, max_gap);
+                // Keep the sidecar warm so a later Prometheus outage degrades
+                // gracefully rather than restarting from zero.
+                let _ = save_streak_state(&path, &next);
+                return desk_streak_lines(current, next.max_streak_secs);
+            }
+        }
+    }
+
+    // Fallback: single-sample accumulation persisted to the sidecar.
     let prev = load_streak_state(&path);
     let (next, current) = advance_streak(&prev, present, now, max_gap, &today);
     let _ = save_streak_state(&path, &next);
@@ -1097,6 +1280,141 @@ mod tests {
         let (s, c) = advance_streak(&prev, true, 1000.0, 200.0, D0);
         assert_eq!(c, 0.0);
         assert_eq!(s.max_streak_secs, 600.0);
+    }
+
+    // --- Prometheus rehydration (restart-survives) ----------------------
+
+    #[test]
+    fn parse_prom_presence_valid_matrix() {
+        let json = r#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"claude_operator_present"},"values":[[1000,"1"],[1060,"1"],[1120,"0"]]}]}}"#;
+        let s = parse_prom_presence(json, &|_| "2026-01-01".to_string()).unwrap();
+        assert_eq!(s.len(), 3);
+        assert_eq!(
+            s[0],
+            PresenceSample {
+                ts: 1000.0,
+                present: true,
+                date: "2026-01-01".to_string()
+            }
+        );
+        assert!(s[1].present);
+        assert!(!s[2].present);
+    }
+
+    #[test]
+    fn parse_prom_presence_empty_result_is_empty_history() {
+        // Query succeeded but the metric had no points in the window: a valid
+        // empty history (streak 0), NOT a fallback signal.
+        let json = r#"{"status":"success","data":{"resultType":"matrix","result":[]}}"#;
+        let s = parse_prom_presence(json, &|_| "d".to_string()).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn parse_prom_presence_malformed_is_none() {
+        // Non-success / unparseable => None => caller falls back to the sidecar.
+        assert!(parse_prom_presence(r#"{"status":"error"}"#, &|_| "d".to_string()).is_none());
+        assert!(parse_prom_presence("not json at all", &|_| "d".to_string()).is_none());
+    }
+
+    #[test]
+    fn parse_prom_presence_sorts_by_timestamp() {
+        let json =
+            r#"{"status":"success","data":{"result":[{"values":[[200,"1"],[100,"0"],[300,"1"]]}]}}"#;
+        let s = parse_prom_presence(json, &|_| "d".to_string()).unwrap();
+        assert_eq!(
+            s.iter().map(|x| x.ts).collect::<Vec<_>>(),
+            vec![100.0, 200.0, 300.0]
+        );
+    }
+
+    #[test]
+    fn rehydrate_continuous_run_survives_restart() {
+        // No sidecar involved: the streak is reconstructed PURELY from the
+        // Prometheus samples -- exactly the post-restart path.
+        let samples: Vec<PresenceSample> = (0..=5)
+            .map(|i| PresenceSample {
+                ts: 1000.0 + i as f64 * 60.0,
+                present: true,
+                date: D0.to_string(),
+            })
+            .collect();
+        // now = 60s after the last sample, still present.
+        let (state, current) = compute_streak_from_samples(&samples, 1360.0, true, D0, 200.0);
+        assert_eq!(
+            current, 360.0,
+            "current run reconstructed from the first present sample's ts"
+        );
+        assert_eq!(state.max_streak_secs, 360.0);
+    }
+
+    #[test]
+    fn rehydrate_breaks_continuity_on_scrape_gap() {
+        let samples = vec![
+            PresenceSample { ts: 0.0, present: true, date: D0.to_string() },
+            PresenceSample { ts: 60.0, present: true, date: D0.to_string() },
+            // 300s gap > max_gap 100 (cron/scrape outage): continuity broken.
+            PresenceSample { ts: 360.0, present: true, date: D0.to_string() },
+            PresenceSample { ts: 420.0, present: true, date: D0.to_string() },
+        ];
+        let (state, current) = compute_streak_from_samples(&samples, 480.0, true, D0, 100.0);
+        assert_eq!(current, 120.0, "trailing run restarts after the gap (360..480)");
+        assert_eq!(state.max_streak_secs, 120.0);
+    }
+
+    #[test]
+    fn rehydrate_current_zero_when_away_now() {
+        let samples = vec![
+            PresenceSample { ts: 0.0, present: true, date: D0.to_string() },
+            PresenceSample { ts: 60.0, present: true, date: D0.to_string() },
+        ];
+        // Live sample = away: current resets, today's max is preserved.
+        let (state, current) = compute_streak_from_samples(&samples, 120.0, false, D0, 200.0);
+        assert_eq!(current, 0.0);
+        assert_eq!(state.max_streak_secs, 60.0);
+    }
+
+    #[test]
+    fn rehydrate_daily_max_resets_across_midnight() {
+        let samples = vec![
+            PresenceSample { ts: 0.0, present: true, date: "2026-01-01".to_string() },
+            PresenceSample { ts: 60.0, present: true, date: "2026-01-01".to_string() },
+            PresenceSample { ts: 120.0, present: true, date: "2026-01-01".to_string() },
+            // Next local day, after a gap.
+            PresenceSample { ts: 1000.0, present: true, date: "2026-01-02".to_string() },
+        ];
+        let (state, current) =
+            compute_streak_from_samples(&samples, 1060.0, true, "2026-01-02", 200.0);
+        assert_eq!(current, 60.0);
+        assert_eq!(
+            state.max_streak_secs, 60.0,
+            "yesterday's 120s max must not carry into the new day"
+        );
+        assert_eq!(state.max_date.as_deref(), Some("2026-01-02"));
+    }
+
+    #[test]
+    fn rehydrate_ignores_samples_at_or_after_now() {
+        // A stray sample >= now (clock skew) must not corrupt the fold.
+        let samples = vec![
+            PresenceSample { ts: 1000.0, present: true, date: D0.to_string() },
+            PresenceSample { ts: 2000.0, present: true, date: D0.to_string() }, // == now, skipped
+        ];
+        let (_, current) = compute_streak_from_samples(&samples, 2000.0, true, D0, 5000.0);
+        assert_eq!(current, 1000.0);
+    }
+
+    #[test]
+    fn prometheus_base_url_env_semantics() {
+        std::env::set_var("CW_PROMETHEUS_URL", "http://prom:9090/");
+        assert_eq!(prometheus_base_url().as_deref(), Some("http://prom:9090"));
+        std::env::set_var("CW_PROMETHEUS_URL", "");
+        assert_eq!(prometheus_base_url(), None, "empty => disabled");
+        std::env::remove_var("CW_PROMETHEUS_URL");
+        assert_eq!(
+            prometheus_base_url().as_deref(),
+            Some("http://localhost:9090")
+        );
     }
 
     #[test]

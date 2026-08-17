@@ -254,6 +254,19 @@ services:
       # claude-events inside the container), preserving the legacy
       # shape for operators who don't bridge the host spool.
       CLAUDE_EVENT_QUEUE: ${CLAUDE_HOST_EVENTS_DIR:-}
+      # CW_PROMETHEUS_URL — Prometheus HTTP API base the `claude-watch
+      # metrics` cron queries to REHYDRATE the operator desk-streak
+      # (claude_operator_desk_streak_seconds{kind=current|max}) from the
+      # scraped `claude_operator_present` series each emit, so BOTH the
+      # current streak AND the day's max survive a container/cw restart
+      # instead of resetting to zero. The metrics cron runs INSIDE this
+      # container, so the default points at the host gateway (Prometheus
+      # is typically published on the host); override in .env if your
+      # Prometheus is reachable at a different URL (e.g. a compose-network
+      # `http://prometheus:9090`). Set EMPTY to disable rehydration and
+      # fall back to the on-disk sidecar (restart-lossy). host.docker.internal
+      # is already mapped via extra_hosts above.
+      CW_PROMETHEUS_URL: ${CW_PROMETHEUS_URL:-http://host.docker.internal:9090}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in
