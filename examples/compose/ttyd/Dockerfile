@@ -86,6 +86,9 @@ RUN set -eux; \
     grep -q 'paste-toast-injected-style' /tmp/index.patched.html; \
     grep -q 'cw-paste-image-toast' /tmp/index.patched.html; \
     grep -q 'paste-event-handler-injected' /tmp/index.patched.html; \
+    grep -q 'lock-toggle-injected-style' /tmp/index.patched.html; \
+    grep -q 'lock-toggle-injected' /tmp/index.patched.html; \
+    grep -q 'cw-lock-toggle' /tmp/index.patched.html; \
     ! grep -q 'paste-image-button-injected' /tmp/index.patched.html; \
     ! grep -q 'cw-paste-image-btn' /tmp/index.patched.html
 
