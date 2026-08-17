@@ -738,6 +738,86 @@ async fn reselect_main_loop_pane(pane: &str) {
     }
 }
 
+/// Pure: resolve the `self-clear` coordination lockfile path from the two env
+/// inputs, mirroring `container/bin/self-clear`'s `_default_lock_file()` EXACTLY
+/// so the daemon and the self-clear tool agree on the same file:
+///   1. `env_lock` ($CLAUDE_SELF_CLEAR_LOCK) if set & non-empty,
+///   2. else `$XDG_RUNTIME_DIR/claude-self-clear.lock` if XDG set & non-empty,
+///   3. else `/var/run/claude/claude-self-clear.lock`.
+pub(crate) fn resolve_self_clear_lock_path(
+    env_lock: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> String {
+    if let Some(v) = env_lock {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Some(rt) = xdg_runtime_dir {
+        let rt = rt.trim();
+        if !rt.is_empty() {
+            return format!("{}/claude-self-clear.lock", rt.trim_end_matches('/'));
+        }
+    }
+    "/var/run/claude/claude-self-clear.lock".to_string()
+}
+
+/// Resolve the live `self-clear` lockfile path from the process environment.
+pub(crate) fn self_clear_lock_path() -> String {
+    resolve_self_clear_lock_path(
+        std::env::var("CLAUDE_SELF_CLEAR_LOCK").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+/// Best-effort probe: is the advisory `flock` on `path` currently HELD by some
+/// other process? Non-blocking exclusive acquire: acquired -> release + false;
+/// EWOULDBLOCK -> true; missing file / other error -> false (fail-open). Matches
+/// `container/bin/self-clear`'s `fcntl.flock(LOCK_EX | LOCK_NB)` semantics.
+pub(crate) fn lockfile_held(path: &str) -> bool {
+    use std::os::unix::io::AsRawFd;
+    // Open WITHOUT O_CREAT: a missing lockfile means self-clear never ran.
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is a valid descriptor owned by `file` for this call.
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        unsafe {
+            libc::flock(fd, libc::LOCK_UN);
+        }
+        false
+    } else {
+        matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(e) if e == libc::EWOULDBLOCK
+        )
+    }
+}
+
+/// Is a `self-clear` (`/clear` + resume-handoff tool) currently RUNNING?
+///
+/// self-clear holds an exclusive `flock` on its lockfile for its ENTIRE
+/// lifecycle -- from the `/clear` inject, through polling for the fresh session,
+/// to the resume-prompt inject (see `container/bin/self-clear` main(), which
+/// takes `LOCK_EX | LOCK_NB` and holds it until `child_main` returns). The
+/// daemon MUST NOT `send-keys` into the pane while that handoff is mid-flight: a
+/// daemon stuck-state / alert inject landing between self-clear's `/clear` and
+/// its resume submit OVERWRITES the handoff prompt (operator-reported,
+/// 2026-08-17: the "Daemon detected stuck state" inject clobbered the self-clear
+/// resume prompt after a `/clear`). So both `interrupt_and_wait` and
+/// `inject_dispatch::inject_to_agent*` consult this and DEFER while it is true.
+///
+/// The daemon-spawned self-clear (`policy::spawn_immediate_clear`) inherits the
+/// daemon env with no `--lock-file` override, so `self_clear_lock_path` resolves
+/// to the SAME file. Fail-open so a probe glitch never wedges recovery injects.
+pub(crate) fn self_clear_in_progress() -> bool {
+    lockfile_held(&self_clear_lock_path())
+}
+
 /// Actively interrupt Claude Code: rapid-fire Escape, periodically Ctrl-B x2.
 /// Returns true if idle state confirmed within `timeout_secs`. Returns false
 /// at the deadline; callers should still proceed with their inject (the
@@ -764,6 +844,17 @@ async fn reselect_main_loop_pane(pane: &str) {
 ///      path already uses). No-op when `[tmux].focus_main_keys` is empty
 ///      (the default), so zero regression risk for setups not using it.
 pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
+    // Coordinate with an in-flight `self-clear`: if the self-clear tool is
+    // mid-handoff (holding its lockfile), DEFER -- an Escape blast here would
+    // clobber the `/clear`->resume-prompt sequence it drives into this same pane
+    // (operator-reported, 2026-08-17). Fail-open. See `self_clear_in_progress`.
+    if self_clear_in_progress() {
+        info!(
+            pane = %pane,
+            "interrupt_and_wait: self-clear in progress -- deferring interrupt (not seizing pane)"
+        );
+        return false;
+    }
     // Andrew #1803/#1804: an interrupt must ONLY ever land on the main loop.
     // Reselect the main-loop tmux pane (if some other pane is active) and
     // return Claude Code's in-pane FleetView selection to main BEFORE the
@@ -862,6 +953,71 @@ pub async fn inject_text(pane: &str, text: &str) {
     }
 }
 
+/// Pure: after sending a single `i` keystroke, did it land as a LITERAL char
+/// appended to the prompt-line input, rather than being consumed as a vim
+/// NORMAL->INSERT mode switch? True iff the prompt-line text after the `i` is
+/// exactly the before-text with a trailing `i` appended.
+///
+/// editorMode-agnostic signal (Andrew 2026-08-17): in vim NORMAL mode `i`
+/// switches to INSERT and the prompt line is unchanged; in NON-vim mode (or vim
+/// already-INSERT) the `i` is typed as text, so the prompt line gains a trailing
+/// `i`. Detecting the literal lets the caller Backspace exactly that one char
+/// before typing the real payload -- so an injected `[CLAUDE-WATCH] ...` /
+/// `/config ...` never arrives as `i[CLAUDE-WATCH]` / `i/config ...`.
+pub(crate) fn insert_key_landed_literal(before: Option<&str>, after: Option<&str>) -> bool {
+    let b = before.unwrap_or("");
+    let expected = format!("{b}i");
+    after == Some(expected.as_str())
+}
+
+/// Ensure the (vim-mode) input editor is in INSERT before typing a payload,
+/// leaving NO stray literal `i` on the prompt -- robust across Claude Code's
+/// `editorMode` (vim / normal) setting.
+///
+/// Historically the injectors blind-sent an `i` to enter vim INSERT mode. With
+/// `"editorMode": "vim"` that works ONLY from NORMAL mode, but the idle prompt
+/// is frequently ALREADY in INSERT (a prior inject left it there), so the `i`
+/// was typed as a LITERAL char -- the operator-reported `i[CLAUDE-WATCH] ...` /
+/// `i/config theme=...` (2026-08-17). In NON-vim mode there is no INSERT
+/// concept, so an `i` is ALWAYS literal.
+///
+/// Robust, setting-agnostic strategy:
+///   1. Already in INSERT (`-- INSERT --`) -> send nothing (vim, common idle).
+///   2. Else snapshot the prompt line, send exactly ONE `i`, then poll:
+///      a. now in INSERT -> the `i` was consumed as a vim NORMAL->INSERT switch.
+///      b. else the prompt line gained a trailing `i`
+///         (`insert_key_landed_literal`) -> it landed as LITERAL text (non-vim,
+///         or vim couldn't switch): Backspace exactly that one char.
+///      c. else ambiguous -> proceed (fail-open); the payload types either way.
+///   Only ONE `i` is ever sent, so a stuck probe can never accumulate `iii`.
+async fn ensure_insert_mode(pane: &str) {
+    // (1) Already INSERT -- never send a redundant `i`.
+    if is_insert_mode(pane).await {
+        return;
+    }
+    let before = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+    send_keys(pane, &["i"]).await;
+    // Poll for the mode switch (2a) or a literal `i` (2b); never send more `i`.
+    for _ in 0..3 {
+        sleep(Duration::from_millis(300)).await;
+        if is_insert_mode(pane).await {
+            return; // (2a) vim NORMAL->INSERT
+        }
+        let after = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+        if insert_key_landed_literal(before.as_deref(), after.as_deref()) {
+            // (2b) literal `i` on the prompt -- erase exactly that one char.
+            send_keys(pane, &["BSpace"]).await;
+            sleep(Duration::from_millis(150)).await;
+            return;
+        }
+        // (2c) neither signal yet -- re-poll (redraw lag).
+    }
+    debug!(
+        pane = %pane,
+        "ensure_insert_mode: INSERT mode ambiguous after `i`; proceeding (fail-open)"
+    );
+}
+
 /// NON-CANCELLING inject: type `text` and submit it as a QUEUED message
 /// WITHOUT seizing the in-flight turn.
 ///
@@ -902,27 +1058,14 @@ pub async fn inject_text_queued(pane: &str, text: &str) {
     // preserved.
     send_focus_main_keys(pane).await;
 
-    // Enter INSERT mode (idempotent — `i` in INSERT just inserts an 'i' that
-    // the line-clear-free submit tolerates; verify-and-retry up to 3x mirrors
-    // inject_text_no_submit Step 3 so a NORMAL-mode pane still ends up typing
-    // into the input editor, NOT issuing motion commands). NO leading Escape:
-    // that is the whole point — we must not cancel the active turn.
-    let mut entered_insert = false;
-    for _ in 0..3 {
-        send_keys(pane, &["i"]).await;
-        sleep(Duration::from_millis(400)).await;
-        if is_insert_mode(pane).await {
-            entered_insert = true;
-            break;
-        }
-    }
+    // Enter INSERT mode WITHOUT leaving a stray literal `i` (Andrew 2026-08-17).
+    // The idle vim-mode prompt is frequently ALREADY in INSERT, so the old
+    // blind `i` was typed as text (`i[CLAUDE-WATCH] ...` / `i/config theme=...`).
+    // `ensure_insert_mode` sends `i` only when needed and Backspaces it if it
+    // lands literally. NO leading Escape -- the non-cancelling contract of this
+    // path (never seize the active turn) is preserved.
+    ensure_insert_mode(pane).await;
     sleep(Duration::from_millis(300)).await;
-    if !entered_insert {
-        debug!(
-            pane = %pane,
-            "inject_text_queued: INSERT mode not confirmed after 3 `i` attempts; proceeding anyway"
-        );
-    }
 
     // Type the payload, then submit with a bare Enter from INSERT. A message
     // typed-and-Entered while a turn is generating is QUEUED by Claude Code,
@@ -1164,25 +1307,17 @@ pub(crate) async fn inject_text_no_submit(pane: &str, text: &str) {
     // that jump the cursor around before INSERT finally engages. Symmetric
     // fix: verify INSERT is active (mirror of the Step 1 Escape→NORMAL
     // verify loop), retry up to 3 times.
-    let mut entered_insert = false;
-    for _ in 0..3 {
-        send_keys(pane, &["i"]).await;
-        sleep(Duration::from_millis(500)).await;
-        if is_insert_mode(pane).await {
-            entered_insert = true;
-            break;
-        }
-    }
+    // Enter INSERT robustly and without leaving a stray literal `i` (Andrew
+    // 2026-08-17): after the Step 1 Escape->NORMAL coercion + Step 2 `dd` the
+    // pane is normally in NORMAL mode with an empty line, so `ensure_insert_mode`
+    // sends one `i` to switch to INSERT; if the pane was actually already in
+    // INSERT (Escape didn't take) or is non-vim, it sends no `i` / Backspaces a
+    // literal one -- so `send_literal` below always types onto a clean INSERT
+    // buffer instead of issuing motion commands or gluing an `i` prefix.
+    ensure_insert_mode(pane).await;
     // Final settle even on success — Claude Code may render `-- INSERT --`
     // before the input editor has fully accepted typed characters.
     sleep(Duration::from_millis(500)).await;
-    if !entered_insert {
-        debug!(
-            pane = pane,
-            "inject_text_no_submit: INSERT mode not confirmed after 3 `i` attempts; \
-             proceeding anyway (fall-through to legacy behavior)"
-        );
-    }
 
     // Step 4: Type the text
     send_literal(pane, text).await;
@@ -4228,5 +4363,80 @@ Retrying in 32s\n\
 
         // Restore for downstream tests.
         set_focus_main_keys(original);
+    }
+}
+
+#[cfg(test)]
+mod inject_and_selfclear_coord_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn insert_key_literal_detected_when_i_appended() {
+        assert!(insert_key_landed_literal(Some(""), Some("i")));
+        assert!(insert_key_landed_literal(None, Some("i")));
+        assert!(insert_key_landed_literal(Some("hello"), Some("helloi")));
+    }
+
+    #[test]
+    fn insert_key_not_literal_on_mode_switch() {
+        assert!(!insert_key_landed_literal(Some(""), Some("")));
+        assert!(!insert_key_landed_literal(Some("hello"), Some("hello")));
+        assert!(!insert_key_landed_literal(Some("hello"), Some("helloX")));
+        assert!(!insert_key_landed_literal(Some("hello"), Some("helloii")));
+        assert!(!insert_key_landed_literal(Some("hello"), None));
+        assert!(!insert_key_landed_literal(None, None));
+    }
+
+    #[test]
+    fn self_clear_lock_path_prefers_env_then_xdg_then_default() {
+        assert_eq!(
+            resolve_self_clear_lock_path(Some("/tmp/custom.lock"), Some("/run/user/1000")),
+            "/tmp/custom.lock"
+        );
+        assert_eq!(
+            resolve_self_clear_lock_path(Some("   "), Some("/run/user/1000")),
+            "/run/user/1000/claude-self-clear.lock"
+        );
+        assert_eq!(
+            resolve_self_clear_lock_path(None, Some("/run/user/1000/")),
+            "/run/user/1000/claude-self-clear.lock"
+        );
+        assert_eq!(
+            resolve_self_clear_lock_path(None, None),
+            "/var/run/claude/claude-self-clear.lock"
+        );
+        assert_eq!(
+            resolve_self_clear_lock_path(None, Some("  ")),
+            "/var/run/claude/claude-self-clear.lock"
+        );
+    }
+
+    #[test]
+    fn lockfile_held_false_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.lock");
+        assert!(!lockfile_held(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn lockfile_held_true_while_locked_false_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("self-clear.lock");
+        let path_s = path.to_str().unwrap().to_string();
+        // Hold an exclusive flock via a SEPARATE open file description; flock
+        // treats independent opens (even same-process) as conflicting.
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let hfd = holder.as_raw_fd();
+        assert_eq!(unsafe { libc::flock(hfd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        assert!(lockfile_held(&path_s), "held lock must be detected");
+        assert_eq!(unsafe { libc::flock(hfd, libc::LOCK_UN) }, 0);
+        assert!(!lockfile_held(&path_s), "released lock must read as free");
+        drop(holder);
     }
 }
