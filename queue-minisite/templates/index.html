@@ -487,7 +487,7 @@
       {% for it in pending %}
         <article
           id="queue-{{ it.id }}"
-          class="item state-pending drop-zone draggable {% if it.ready_now %}ready{% endif %} {% if it.depends_on %}has-deps{% endif %}"
+          class="item state-pending drop-zone draggable {% if it.ready_now %}ready{% endif %} {% if it.locked %}locked{% endif %} {% if it.depends_on %}has-deps{% endif %}"
           draggable="true"
           data-queue-id="{{ it.id }}"
           data-queue-status="pending"
@@ -500,8 +500,16 @@
                (group-head AND every depends_on resolved to ``done``). The
                older ``group_head`` flag was FIFO-only and ignored
                depends_on, leading to false-READY on items still waiting
-               on a running blocker (Bug q-1b89). #}
+               on a running blocker (Bug q-1b89).
+
+               LOCKED badge (Andrew #4430/#4432): a pending item whose scope
+               overlaps an operator ``queue lock`` is PARKED — the dispatcher
+               refuses to spawn it. ``ready_now`` is already False for a locked
+               item (the backend consults ``locked_scopes``), so READY and
+               LOCKED are mutually exclusive; LOCKED replaces the missing READY
+               badge and demotes FORCE START (below). #}
             {% if it.ready_now %}<span class="badge ghead" title="ready to spawn (group head, all deps done)">ready</span>{% endif %}
+            {% if it.locked %}<span class="badge state-locked" title="parked by an operator scope lock — NOT ready to spawn; the dispatcher refuses it until the scope is unlocked">locked</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
             {# depends-on badge — depends_on landed 2026-05-02.
@@ -522,13 +530,18 @@
               {% endfor %}
             {% endif %}
             <span class="drag-handle" aria-hidden="true" title="drag to set dependency">&#x2630;</span>
+            {# FORCE START is demoted to a secondary affordance on a LOCKED
+               item: force-starting bypasses the operator's scope lock, so it
+               must not read as the primary action the way it does for an
+               ordinary pending item. The unlock command (rendered in the body
+               below) is the intended way out. #}
             <button
               type="button"
-              class="action-btn force-start-btn"
+              class="action-btn force-start-btn{% if it.locked %} secondary force-start-locked{% endif %}"
               data-action="force-start"
               data-id="{{ it.id }}"
               data-summary="{{ it.summary }}"
-              title="Override scope-conflict serialization and promote to running">force start</button>
+              title="{% if it.locked %}Bypass the scope lock and promote to running anyway — prefer `queue unlock` (below) unless you mean to override the lock{% else %}Override scope-conflict serialization and promote to running{% endif %}">force start</button>
             <button
               type="button"
               class="action-btn abandon-btn"
@@ -538,6 +551,21 @@
               title="Remove this pending item from the queue">abandon</button>
           </header>
           <p class="summary">{{ it.summary }}</p>
+          {# LOCKED body: why it's parked + the copyable unlock command(s).
+             Copy-not-click, consistent with the WEDGED / QUARANTINED exits —
+             unlocking a scope is an operator decision, not a one-click button.
+             MUST stay in step with renderPendingItem() in static/refresh.js. #}
+          {% if it.locked %}
+            <p class="description scope-locked"><strong>scope locked.</strong> An operator parked this scope with <code>queue lock</code>; the dispatcher will not spawn this item until it is unlocked.</p>
+            {% if it.lock_reason %}<p class="description abandon-reason"><strong>lock:</strong> {{ it.lock_reason }}</p>{% endif %}
+            <div class="exits"><span class="exits-label">unlock</span>
+              <ul class="exit-list">
+                {% for cmd in it.unlock_commands %}
+                  {{ exit_cmd(cmd, 'release the operator scope lock — this item becomes ready to spawn again') }}
+                {% endfor %}
+              </ul>
+            </div>
+          {% endif %}
           <div class="age">
             <span
               {% if it.created_at_iso %}data-local-time-iso="{{ it.created_at_iso }}" data-local-time-title-only{% endif %}
