@@ -9,7 +9,7 @@
 
 use crate::reminders::all_fire_counts;
 use crate::status::get_version_info;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -831,14 +831,19 @@ fn operator_present_block() -> Vec<String> {
 struct StreakState {
     /// Epoch when the current continuous-present run began; `None` when away.
     run_start: Option<f64>,
-    /// Longest continuous-present run observed TODAY (seconds). Persisted, so
-    /// it survives restarts; scoped to the local calendar day via `max_date`.
-    max_streak_secs: f64,
-    /// Local calendar date ("%Y-%m-%d") the `max_streak_secs` belongs to.
-    /// When a sample's local date differs, the day has rolled over and the
-    /// max restarts. `None` on a fresh/legacy sidecar (treated as "no day yet"
-    /// -> the first sample seeds today's max).
-    max_date: Option<String>,
+    /// Longest continuous-present run observed THIS WEEK (seconds). Persisted,
+    /// so it survives restarts; scoped to the operator's local calendar week
+    /// (Sunday-start) via `week_start`.
+    weekly_max_secs: f64,
+    /// Local date ("%Y-%m-%d") of the SUNDAY that starts the week
+    /// `weekly_max_secs` belongs to. When a sample's week-start differs, the
+    /// week has rolled over (Sunday 00:00 local) and the weekly max restarts.
+    /// `None` on a fresh/legacy sidecar (treated as "no week yet" -> the first
+    /// sample seeds this week's max).
+    week_start: Option<String>,
+    /// Longest continuous-present run observed EVER (seconds). Persisted and
+    /// never reset -- an all-time high-water mark that only ratchets up.
+    alltime_max_secs: f64,
     /// Epoch of the previous sample (for gap detection); `None` on first ever.
     last_sample: Option<f64>,
     /// Whether the operator was present at the previous sample.
@@ -862,17 +867,30 @@ fn load_streak_state(path: &Path) -> StreakState {
         Ok(v) => v,
         Err(_) => return StreakState::default(),
     };
+    // Legacy sidecars stored a single daily `max_streak_secs`/`max_date`. Use
+    // the legacy daily max as an all-time floor so an in-place upgrade doesn't
+    // blank the all-time high-water mark; the weekly max simply restarts.
+    let legacy_max = v
+        .get("max_streak_secs")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0)
+        .max(0.0);
     StreakState {
         run_start: v.get("run_start").and_then(|x| x.as_f64()),
-        max_streak_secs: v
-            .get("max_streak_secs")
+        weekly_max_secs: v
+            .get("weekly_max_secs")
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0)
             .max(0.0),
-        max_date: v
-            .get("max_date")
+        week_start: v
+            .get("week_start")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
+        alltime_max_secs: v
+            .get("alltime_max_secs")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(legacy_max)
+            .max(0.0),
         last_sample: v.get("last_sample").and_then(|x| x.as_f64()),
         last_present: v
             .get("last_present")
@@ -887,8 +905,9 @@ fn save_streak_state(path: &Path, state: &StreakState) -> std::io::Result<()> {
     }
     let v = serde_json::json!({
         "run_start": state.run_start,
-        "max_streak_secs": state.max_streak_secs,
-        "max_date": state.max_date,
+        "weekly_max_secs": state.weekly_max_secs,
+        "week_start": state.week_start,
+        "alltime_max_secs": state.alltime_max_secs,
         "last_sample": state.last_sample,
         "last_present": state.last_present,
     });
@@ -905,21 +924,25 @@ fn save_streak_state(path: &Path, state: &StreakState) -> std::io::Result<()> {
 
 /// Advance the streak state by one sample. Pure -- no I/O, fully unit-tested.
 ///
-/// - While present, the current run accumulates as `now - run_start`; `max`
-///   ratchets up to the longest run seen TODAY.
-/// - On present->away the current run resets to 0 (run_start cleared); `max`
-///   is untouched (already captured while present).
+/// - While present, the current run accumulates as `now - run_start`; the
+///   weekly and all-time maxes ratchet up to the longest run seen in their
+///   respective windows.
+/// - On present->away the current run resets to 0 (run_start cleared); the
+///   maxes are untouched (already captured while present).
 /// - Gap handling: if the operator was present at the last sample AND the
 ///   elapsed time since that sample exceeds `max_gap_secs`, continuity across
 ///   the unobserved gap can't be asserted (cron/daemon was down, or the laptop
 ///   slept and the carrier re-freshened between samples) -> the run restarts
 ///   at `now` rather than over-counting the gap.
-/// - Daily scoping: `max` is scoped to the local calendar day `today`
-///   ("%Y-%m-%d"). If the stored `max_date` differs from `today` the day has
-///   rolled over, so the day's max restarts from the current run (0 when away)
-///   -- i.e. `max` resets at local midnight. A same-day sample carries the
-///   stored max forward and ratchets it. The returned state's `max_date` is
-///   always stamped to `today`.
+/// - Weekly scoping: `weekly_max_secs` is scoped to the local calendar week
+///   identified by `week_key` (the "%Y-%m-%d" date of that week's Sunday). If
+///   the stored `week_start` differs from `week_key` the week has rolled over,
+///   so the week's max restarts from the current run (0 when away) -- i.e. it
+///   resets at the operator's local Sunday 00:00. A same-week sample carries
+///   the stored weekly max forward and ratchets it. The returned state's
+///   `week_start` is always stamped to `week_key`.
+/// - All-time scoping: `alltime_max_secs` is never reset -- it carries the
+///   prior value forward and ratchets up to the longest run ever observed.
 ///
 /// Returns the new state and the current-run length in seconds.
 fn advance_streak(
@@ -927,20 +950,24 @@ fn advance_streak(
     present: bool,
     now: f64,
     max_gap_secs: f64,
-    today: &str,
+    week_key: &str,
 ) -> (StreakState, f64) {
-    // Daily-scoped baseline: carry the stored max forward only when it belongs
-    // to `today`; otherwise the day rolled over and today's max starts at 0.
-    let prev_max_today = match &prev.max_date {
-        Some(d) if d == today => prev.max_streak_secs,
+    // Weekly-scoped baseline: carry the stored weekly max forward only when it
+    // belongs to `week_key`; otherwise the week rolled over (Sunday 00:00
+    // local) and this week's max starts at 0. The all-time baseline always
+    // carries forward -- it never resets.
+    let prev_weekly = match &prev.week_start {
+        Some(w) if w == week_key => prev.weekly_max_secs,
         _ => 0.0,
     };
+    let prev_alltime = prev.alltime_max_secs;
     if !present {
         return (
             StreakState {
                 run_start: None,
-                max_streak_secs: prev_max_today,
-                max_date: Some(today.to_string()),
+                weekly_max_secs: prev_weekly,
+                week_start: Some(week_key.to_string()),
+                alltime_max_secs: prev_alltime,
                 last_sample: Some(now),
                 last_present: false,
             },
@@ -956,12 +983,14 @@ fn advance_streak(
         _ => now,
     };
     let current = (now - run_start).max(0.0);
-    let max = prev_max_today.max(current);
+    let weekly_max = prev_weekly.max(current);
+    let alltime_max = prev_alltime.max(current);
     (
         StreakState {
             run_start: Some(run_start),
-            max_streak_secs: max,
-            max_date: Some(today.to_string()),
+            weekly_max_secs: weekly_max,
+            week_start: Some(week_key.to_string()),
+            alltime_max_secs: alltime_max,
             last_sample: Some(now),
             last_present: true,
         },
@@ -970,28 +999,43 @@ fn advance_streak(
 }
 
 /// Render the `claude_operator_desk_streak_seconds` gauge block.
-fn desk_streak_lines(current: f64, max: f64) -> Vec<String> {
+fn desk_streak_lines(current: f64, weekly_max: f64, alltime_max: f64) -> Vec<String> {
     vec![
-        "# HELP claude_operator_desk_streak_seconds Continuous operator at-desk presence streak in seconds (kind=current: trailing run ending now, resets to 0 on away; kind=max: longest continuous run TODAY, resets at local midnight). BOTH rehydrated from the Prometheus claude_operator_present series each emit, so they survive container/cw restarts.".to_string(),
+        "# HELP claude_operator_desk_streak_seconds Continuous operator at-desk presence streak in seconds (kind=current: trailing run ending now, resets to 0 on away; kind=weekly_max: longest continuous run THIS WEEK, resets at the operator's local Sunday 00:00; kind=max: longest continuous run EVER, never resets). ALL rehydrated from the Prometheus claude_operator_present series each emit (weekly_max/max also merged with the persisted sidecar high-water marks), so they survive container/cw restarts.".to_string(),
         "# TYPE claude_operator_desk_streak_seconds gauge".to_string(),
         format!(
             "claude_operator_desk_streak_seconds{{kind=\"current\"}} {:.3}",
             current
         ),
         format!(
+            "claude_operator_desk_streak_seconds{{kind=\"weekly_max\"}} {:.3}",
+            weekly_max
+        ),
+        format!(
             "claude_operator_desk_streak_seconds{{kind=\"max\"}} {:.3}",
-            max
+            alltime_max
         ),
     ]
 }
 
-/// Local calendar date ("%Y-%m-%d") used to scope the daily max. Uses the
-/// host's LOCAL timezone -- the same local-wall-clock convention the rest of
-/// the presence pipeline uses (`datetime.now()` in the Python bridge) -- so
-/// "midnight" is the operator's local midnight, matching the Grafana panels'
-/// local-day boundaries.
-fn local_date_string() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
+/// Pure: the "%Y-%m-%d" date of the SUNDAY that starts the local calendar week
+/// containing `date`. `Weekday::num_days_from_sunday()` is 0 for Sunday..6 for
+/// Saturday, so subtracting it lands on that week's Sunday. Split out so the
+/// Sunday-week boundary is unit-testable without touching the system clock/tz.
+fn sunday_week_key(date: NaiveDate) -> String {
+    use chrono::Datelike;
+    let back = date.weekday().num_days_from_sunday() as i64;
+    let sunday = date - chrono::Duration::days(back);
+    sunday.format("%Y-%m-%d").to_string()
+}
+
+/// Local calendar-week key (the current week's Sunday date, "%Y-%m-%d") used to
+/// scope the weekly max. Uses the host's LOCAL timezone -- the same local-wall-
+/// clock convention the rest of the presence pipeline uses -- so the week
+/// boundary is the operator's local Sunday 00:00, matching the Grafana panel's
+/// local boundaries.
+fn local_week_string() -> String {
+    sunday_week_key(Local::now().date_naive())
 }
 
 /// Prometheus HTTP API base URL for rehydrating the desk-streak from the
@@ -1009,15 +1053,17 @@ fn prometheus_base_url() -> Option<String> {
 }
 
 /// Trailing window (seconds) of `claude_operator_present` history to pull when
-/// rehydrating. Must comfortably cover today (for the daily max) plus a current
-/// run that began before local midnight. `CW_DESK_STREAK_LOOKBACK_SECS`
-/// overrides; defaults to 48h.
+/// rehydrating. Must comfortably cover the current local week (for the weekly
+/// max) plus a run that began before the week boundary, so a cold start (no sidecar) can
+/// still reconstruct this week's max. `CW_DESK_STREAK_LOOKBACK_SECS` overrides;
+/// defaults to 8 days (7-day week + a day of slack). All-time beyond this window
+/// relies on the persisted sidecar floor.
 fn desk_streak_lookback_secs() -> f64 {
     std::env::var("CW_DESK_STREAK_LOOKBACK_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-        .unwrap_or(172_800.0)
+        .unwrap_or(691_200.0)
 }
 
 /// query_range step (seconds). Should match the metrics emit cadence (cron
@@ -1030,29 +1076,31 @@ fn desk_streak_step_secs() -> f64 {
         .unwrap_or(60.0)
 }
 
-/// LOCAL calendar date ("%Y-%m-%d") of an epoch second, in the host's local
-/// timezone (same convention as `local_date_string`). Scopes each rehydrated
-/// Prometheus sample to its day for the daily-max midnight reset.
-fn local_date_of(epoch: f64) -> String {
+/// LOCAL calendar-week key of an epoch second (the Sunday date of that second's
+/// local week), in the host's local timezone (same convention as
+/// `local_week_string`). Scopes each rehydrated Prometheus sample to its week
+/// for the weekly-max Sunday reset.
+fn local_week_of(epoch: f64) -> String {
     use chrono::TimeZone;
     match Local.timestamp_opt(epoch as i64, 0).single() {
-        Some(dt) => dt.format("%Y-%m-%d").to_string(),
-        None => local_date_string(),
+        Some(dt) => sunday_week_key(dt.date_naive()),
+        None => local_week_string(),
     }
 }
 
 /// One presence sample rehydrated from Prometheus: epoch second, present flag,
-/// and the LOCAL calendar date that second falls in (for daily-max scoping).
+/// and the LOCAL calendar-week key (that second's week's Sunday date) it falls
+/// in (for weekly-max scoping).
 #[derive(Debug, Clone, PartialEq)]
 struct PresenceSample {
     ts: f64,
     present: bool,
-    date: String,
+    week: String,
 }
 
 /// Parse a Prometheus `query_range` matrix response into ordered presence
-/// samples. Pure + testable: `date_fn` maps an epoch second to a LOCAL calendar
-/// date so tests stay timezone-independent. Returns:
+/// samples. Pure + testable: `week_fn` maps an epoch second to a LOCAL calendar-
+/// week key so tests stay timezone-independent. Returns:
 ///   - `None` when the body is not a `status:"success"` matrix (malformed /
 ///     error response) -> the caller falls back to the sidecar.
 ///   - `Some([])` when the query succeeded but the series has no points (fresh
@@ -1063,7 +1111,7 @@ struct PresenceSample {
 /// ("1"/"0"); `>= 0.5` counts as present. Samples are returned sorted by ts.
 fn parse_prom_presence(
     json: &str,
-    date_fn: &dyn Fn(f64) -> String,
+    week_fn: &dyn Fn(f64) -> String,
 ) -> Option<Vec<PresenceSample>> {
     let v: Value = serde_json::from_str(json).ok()?;
     if v.get("status").and_then(|s| s.as_str()) != Some("success") {
@@ -1083,7 +1131,7 @@ fn parse_prom_presence(
         samples.push(PresenceSample {
             ts,
             present: numv >= 0.5,
-            date: date_fn(ts),
+            week: week_fn(ts),
         });
     }
     samples.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
@@ -1091,8 +1139,8 @@ fn parse_prom_presence(
 }
 
 /// Reconstruct the streak by folding the tested `advance_streak` over the
-/// rehydrated Prometheus samples (each carrying its own local date, so
-/// daily-max midnight resets AND scrape-gap breaks reuse the exact logic the
+/// rehydrated Prometheus samples (each carrying its own local-week key, so
+/// weekly-max Sunday resets AND scrape-gap breaks reuse the exact logic the
 /// sidecar path uses), then over the LIVE "now" sample last so the emitted
 /// `current` reflects this instant. Historical samples at or after `now` are
 /// ignored. Returns the reconstructed state and the current-run length (secs).
@@ -1100,7 +1148,7 @@ fn compute_streak_from_samples(
     samples: &[PresenceSample],
     now: f64,
     present_now: bool,
-    now_date: &str,
+    now_week: &str,
     max_gap_secs: f64,
 ) -> (StreakState, f64) {
     let mut state = StreakState::default();
@@ -1108,10 +1156,26 @@ fn compute_streak_from_samples(
         if s.ts >= now {
             continue;
         }
-        let (next, _) = advance_streak(&state, s.present, s.ts, max_gap_secs, &s.date);
+        let (next, _) = advance_streak(&state, s.present, s.ts, max_gap_secs, &s.week);
         state = next;
     }
-    advance_streak(&state, present_now, now, max_gap_secs, now_date)
+    advance_streak(&state, present_now, now, max_gap_secs, now_week)
+}
+
+/// Merge the Prometheus-recomputed maxes with the persisted sidecar high-water
+/// marks. The Prometheus lookback window can be shorter than a week (and is
+/// always shorter than all-time), so a pure recompute from the window would
+/// under-report both maxes. The persisted sidecar is therefore a FLOOR: the
+/// all-time max always ratchets against it, and the weekly max ratchets against
+/// it ONLY when the persisted value belongs to the same (current) week --
+/// otherwise the week has rolled over and the recomputed (reset) value stands.
+/// Pure + testable.
+fn merge_persisted_maxes(mut computed: StreakState, persisted: &StreakState) -> StreakState {
+    computed.alltime_max_secs = computed.alltime_max_secs.max(persisted.alltime_max_secs);
+    if computed.week_start.is_some() && computed.week_start == persisted.week_start {
+        computed.weekly_max_secs = computed.weekly_max_secs.max(persisted.weekly_max_secs);
+    }
+    computed
 }
 
 /// Query Prometheus `query_range` for the `claude_operator_present` series over
@@ -1153,7 +1217,7 @@ fn desk_streak_block() -> Vec<String> {
     let now = now_epoch();
     let present = presence_is_fresh(presence_carrier_mtime(), now, presence_max_age());
     let max_gap = presence_max_age() * 2.0;
-    let today = local_date_string();
+    let week = local_week_string();
     let path = default_streak_state_file();
 
     // Preferred: rehydrate from Prometheus (survives restarts, no local state).
@@ -1164,22 +1228,28 @@ fn desk_streak_block() -> Vec<String> {
             desk_streak_lookback_secs(),
             desk_streak_step_secs(),
         ) {
-            if let Some(samples) = parse_prom_presence(&body, &|ts| local_date_of(ts)) {
-                let (next, current) =
-                    compute_streak_from_samples(&samples, now, present, &today, max_gap);
+            if let Some(samples) = parse_prom_presence(&body, &|ts| local_week_of(ts)) {
+                let (computed, current) =
+                    compute_streak_from_samples(&samples, now, present, &week, max_gap);
+                // The Prometheus window can be shorter than a week (and is
+                // always shorter than all-time), so fold the persisted sidecar
+                // high-water marks in as a floor before emitting/saving.
+                let persisted = load_streak_state(&path);
+                let next = merge_persisted_maxes(computed, &persisted);
                 // Keep the sidecar warm so a later Prometheus outage degrades
                 // gracefully rather than restarting from zero.
                 let _ = save_streak_state(&path, &next);
-                return desk_streak_lines(current, next.max_streak_secs);
+                return desk_streak_lines(current, next.weekly_max_secs, next.alltime_max_secs);
             }
         }
     }
 
-    // Fallback: single-sample accumulation persisted to the sidecar.
+    // Fallback: single-sample accumulation persisted to the sidecar (the weekly
+    // + all-time maxes carry forward through `advance_streak`).
     let prev = load_streak_state(&path);
-    let (next, current) = advance_streak(&prev, present, now, max_gap, &today);
+    let (next, current) = advance_streak(&prev, present, now, max_gap, &week);
     let _ = save_streak_state(&path, &next);
-    desk_streak_lines(current, next.max_streak_secs)
+    desk_streak_lines(current, next.weekly_max_secs, next.alltime_max_secs)
 }
 
 /// CLI entry point: `claude-watch metrics`.
@@ -1263,8 +1333,10 @@ mod tests {
 
     // --- Operator desk-streak -------------------------------------------
 
-    // A fixed local date used across the same-day streak tests.
-    const D0: &str = "2026-01-01";
+    // A fixed local-week key used across the same-week streak tests. The value
+    // is opaque to `advance_streak` (it only compares week keys for equality);
+    // 2026-01-04 is a Sunday, so it reads as a real week-start.
+    const D0: &str = "2026-01-04";
 
     #[test]
     fn streak_accumulates_while_present() {
@@ -1273,12 +1345,13 @@ mod tests {
         let (s1, c1) = advance_streak(&s0, true, 1000.0, 200.0, D0);
         assert_eq!(c1, 0.0);
         assert_eq!(s1.run_start, Some(1000.0));
-        assert_eq!(s1.max_date.as_deref(), Some(D0));
+        assert_eq!(s1.week_start.as_deref(), Some(D0));
         // Still present 30s later: current accumulates, run_start unchanged.
         let (s2, c2) = advance_streak(&s1, true, 1030.0, 200.0, D0);
         assert_eq!(c2, 30.0);
         assert_eq!(s2.run_start, Some(1000.0));
-        assert_eq!(s2.max_streak_secs, 30.0);
+        assert_eq!(s2.weekly_max_secs, 30.0);
+        assert_eq!(s2.alltime_max_secs, 30.0);
     }
 
     #[test]
@@ -1291,12 +1364,14 @@ mod tests {
         let (s3, c3) = advance_streak(&s2, false, 1060.0, 200.0, D0);
         assert_eq!(c3, 0.0);
         assert_eq!(s3.run_start, None);
-        assert_eq!(s3.max_streak_secs, 50.0);
+        assert_eq!(s3.weekly_max_secs, 50.0);
+        assert_eq!(s3.alltime_max_secs, 50.0);
         // Present again: brand-new run from now, current 0.
         let (s4, c4) = advance_streak(&s3, true, 1100.0, 200.0, D0);
         assert_eq!(c4, 0.0);
         assert_eq!(s4.run_start, Some(1100.0));
-        assert_eq!(s4.max_streak_secs, 50.0);
+        assert_eq!(s4.weekly_max_secs, 50.0);
+        assert_eq!(s4.alltime_max_secs, 50.0);
     }
 
     #[test]
@@ -1305,13 +1380,14 @@ mod tests {
         let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 200.0, D0);
         let (s, c) = advance_streak(&s, true, 100.0, 200.0, D0);
         assert_eq!(c, 100.0);
-        assert_eq!(s.max_streak_secs, 100.0);
+        assert_eq!(s.weekly_max_secs, 100.0);
         // Away, then a shorter 20s run -- max must retain the longer 100s.
         let (s, _) = advance_streak(&s, false, 110.0, 200.0, D0);
         let (s, _) = advance_streak(&s, true, 120.0, 200.0, D0);
         let (s, c) = advance_streak(&s, true, 140.0, 200.0, D0);
         assert_eq!(c, 20.0);
-        assert_eq!(s.max_streak_secs, 100.0);
+        assert_eq!(s.weekly_max_secs, 100.0);
+        assert_eq!(s.alltime_max_secs, 100.0);
     }
 
     #[test]
@@ -1324,51 +1400,60 @@ mod tests {
         assert_eq!(c, 0.0);
         assert_eq!(s.run_start, Some(350.0));
         // Longest observed run is still the pre-gap 50s.
-        assert_eq!(s.max_streak_secs, 50.0);
+        assert_eq!(s.weekly_max_secs, 50.0);
+        assert_eq!(s.alltime_max_secs, 50.0);
     }
 
     #[test]
-    fn streak_max_resets_at_local_midnight() {
-        // Build up a 100s max on day 0.
+    fn streak_weekly_max_resets_at_week_boundary_alltime_does_not() {
+        // Build up a 100s run in week 0.
         let (s, _) = advance_streak(&StreakState::default(), true, 0.0, 200.0, D0);
         let (s, c) = advance_streak(&s, true, 100.0, 200.0, D0);
         assert_eq!(c, 100.0);
-        assert_eq!(s.max_streak_secs, 100.0);
-        assert_eq!(s.max_date.as_deref(), Some(D0));
+        assert_eq!(s.weekly_max_secs, 100.0);
+        assert_eq!(s.alltime_max_secs, 100.0);
+        assert_eq!(s.week_start.as_deref(), Some(D0));
 
-        // Day rolls over. A shorter run today must NOT inherit yesterday's 100s:
-        // the daily max starts fresh from today's current run.
-        const D1: &str = "2026-01-02";
+        // Week rolls over (Sunday 00:00). A shorter run in the new week must NOT
+        // inherit last week's 100s WEEKLY max -- but the ALL-TIME max must.
+        const D1: &str = "2026-01-11"; // the following Sunday
         let (s, c) = advance_streak(&s, true, 1000.0, 200.0, D1);
-        assert_eq!(c, 0.0, "new run starts at 0 across the day boundary");
+        assert_eq!(c, 0.0, "new run starts at 0 across the week boundary");
         assert_eq!(
-            s.max_streak_secs, 0.0,
-            "yesterday's 100s max must not carry into the new day"
+            s.weekly_max_secs, 0.0,
+            "last week's 100s weekly max must not carry into the new week"
         );
-        assert_eq!(s.max_date.as_deref(), Some(D1));
+        assert_eq!(
+            s.alltime_max_secs, 100.0,
+            "all-time max must survive the week boundary"
+        );
+        assert_eq!(s.week_start.as_deref(), Some(D1));
         let (s, c) = advance_streak(&s, true, 1030.0, 200.0, D1);
         assert_eq!(c, 30.0);
-        assert_eq!(s.max_streak_secs, 30.0, "today's max is today's longest run");
-        assert_eq!(s.max_date.as_deref(), Some(D1));
+        assert_eq!(s.weekly_max_secs, 30.0, "this week's max is this week's longest run");
+        assert_eq!(s.alltime_max_secs, 100.0, "all-time still holds the 100s peak");
+        assert_eq!(s.week_start.as_deref(), Some(D1));
     }
 
     #[test]
-    fn streak_max_persists_across_restart_same_day() {
-        // Persistence regression: a sidecar carrying a same-day max must be
-        // preserved even though the current run restarts (process/container
-        // restart clears run_start/last_present but the sidecar survives).
+    fn streak_max_persists_across_restart_same_week() {
+        // Persistence regression: a sidecar carrying a same-week weekly max + an
+        // all-time max must be preserved even though the current run restarts
+        // (restart clears run_start/last_present but the sidecar survives).
         let prev = StreakState {
             run_start: None,
-            max_streak_secs: 600.0,
-            max_date: Some(D0.to_string()),
+            weekly_max_secs: 600.0,
+            week_start: Some(D0.to_string()),
+            alltime_max_secs: 9000.0,
             last_sample: Some(500.0),
             last_present: false,
         };
-        // Fresh present sample same day: current is 0 (new run) but the day's
-        // max is retained from the sidecar.
+        // Fresh present sample same week: current is 0 (new run) but the week's
+        // max and the all-time max are retained from the sidecar.
         let (s, c) = advance_streak(&prev, true, 1000.0, 200.0, D0);
         assert_eq!(c, 0.0);
-        assert_eq!(s.max_streak_secs, 600.0);
+        assert_eq!(s.weekly_max_secs, 600.0);
+        assert_eq!(s.alltime_max_secs, 9000.0);
     }
 
     // --- Prometheus rehydration (restart-survives) ----------------------
@@ -1383,7 +1468,7 @@ mod tests {
             PresenceSample {
                 ts: 1000.0,
                 present: true,
-                date: "2026-01-01".to_string()
+                week: "2026-01-01".to_string()
             }
         );
         assert!(s[1].present);
@@ -1425,7 +1510,7 @@ mod tests {
             .map(|i| PresenceSample {
                 ts: 1000.0 + i as f64 * 60.0,
                 present: true,
-                date: D0.to_string(),
+                week: D0.to_string(),
             })
             .collect();
         // now = 60s after the last sample, still present.
@@ -1434,60 +1519,64 @@ mod tests {
             current, 360.0,
             "current run reconstructed from the first present sample's ts"
         );
-        assert_eq!(state.max_streak_secs, 360.0);
+        assert_eq!(state.weekly_max_secs, 360.0);
+        assert_eq!(state.alltime_max_secs, 360.0);
     }
 
     #[test]
     fn rehydrate_breaks_continuity_on_scrape_gap() {
         let samples = vec![
-            PresenceSample { ts: 0.0, present: true, date: D0.to_string() },
-            PresenceSample { ts: 60.0, present: true, date: D0.to_string() },
+            PresenceSample { ts: 0.0, present: true, week: D0.to_string() },
+            PresenceSample { ts: 60.0, present: true, week: D0.to_string() },
             // 300s gap > max_gap 100 (cron/scrape outage): continuity broken.
-            PresenceSample { ts: 360.0, present: true, date: D0.to_string() },
-            PresenceSample { ts: 420.0, present: true, date: D0.to_string() },
+            PresenceSample { ts: 360.0, present: true, week: D0.to_string() },
+            PresenceSample { ts: 420.0, present: true, week: D0.to_string() },
         ];
         let (state, current) = compute_streak_from_samples(&samples, 480.0, true, D0, 100.0);
         assert_eq!(current, 120.0, "trailing run restarts after the gap (360..480)");
-        assert_eq!(state.max_streak_secs, 120.0);
+        assert_eq!(state.weekly_max_secs, 120.0);
     }
 
     #[test]
     fn rehydrate_current_zero_when_away_now() {
         let samples = vec![
-            PresenceSample { ts: 0.0, present: true, date: D0.to_string() },
-            PresenceSample { ts: 60.0, present: true, date: D0.to_string() },
+            PresenceSample { ts: 0.0, present: true, week: D0.to_string() },
+            PresenceSample { ts: 60.0, present: true, week: D0.to_string() },
         ];
-        // Live sample = away: current resets, today's max is preserved.
+        // Live sample = away: current resets, this week's max is preserved.
         let (state, current) = compute_streak_from_samples(&samples, 120.0, false, D0, 200.0);
         assert_eq!(current, 0.0);
-        assert_eq!(state.max_streak_secs, 60.0);
+        assert_eq!(state.weekly_max_secs, 60.0);
+        assert_eq!(state.alltime_max_secs, 60.0);
     }
 
     #[test]
-    fn rehydrate_daily_max_resets_across_midnight() {
+    fn rehydrate_weekly_max_resets_across_week_boundary() {
         let samples = vec![
-            PresenceSample { ts: 0.0, present: true, date: "2026-01-01".to_string() },
-            PresenceSample { ts: 60.0, present: true, date: "2026-01-01".to_string() },
-            PresenceSample { ts: 120.0, present: true, date: "2026-01-01".to_string() },
-            // Next local day, after a gap.
-            PresenceSample { ts: 1000.0, present: true, date: "2026-01-02".to_string() },
+            PresenceSample { ts: 0.0, present: true, week: "2026-01-04".to_string() },
+            PresenceSample { ts: 60.0, present: true, week: "2026-01-04".to_string() },
+            PresenceSample { ts: 120.0, present: true, week: "2026-01-04".to_string() },
+            // Next local week, after a gap.
+            PresenceSample { ts: 1000.0, present: true, week: "2026-01-11".to_string() },
         ];
         let (state, current) =
-            compute_streak_from_samples(&samples, 1060.0, true, "2026-01-02", 200.0);
+            compute_streak_from_samples(&samples, 1060.0, true, "2026-01-11", 200.0);
         assert_eq!(current, 60.0);
         assert_eq!(
-            state.max_streak_secs, 60.0,
-            "yesterday's 120s max must not carry into the new day"
+            state.weekly_max_secs, 60.0,
+            "last week's 120s weekly max must not carry into the new week"
         );
-        assert_eq!(state.max_date.as_deref(), Some("2026-01-02"));
+        // All-time is not week-scoped: the fold keeps the 120s peak.
+        assert_eq!(state.alltime_max_secs, 120.0);
+        assert_eq!(state.week_start.as_deref(), Some("2026-01-11"));
     }
 
     #[test]
     fn rehydrate_ignores_samples_at_or_after_now() {
         // A stray sample >= now (clock skew) must not corrupt the fold.
         let samples = vec![
-            PresenceSample { ts: 1000.0, present: true, date: D0.to_string() },
-            PresenceSample { ts: 2000.0, present: true, date: D0.to_string() }, // == now, skipped
+            PresenceSample { ts: 1000.0, present: true, week: D0.to_string() },
+            PresenceSample { ts: 2000.0, present: true, week: D0.to_string() }, // == now, skipped
         ];
         let (_, current) = compute_streak_from_samples(&samples, 2000.0, true, D0, 5000.0);
         assert_eq!(current, 1000.0);
@@ -1534,11 +1623,12 @@ mod tests {
 
     #[test]
     fn desk_streak_lines_exact_name_and_labels() {
-        let lines = desk_streak_lines(42.0, 100.0);
+        let lines = desk_streak_lines(42.0, 100.0, 250.0);
         let joined = lines.join("\n");
         assert!(joined.contains("# TYPE claude_operator_desk_streak_seconds gauge"));
         assert!(joined.contains("claude_operator_desk_streak_seconds{kind=\"current\"} 42.000"));
-        assert!(joined.contains("claude_operator_desk_streak_seconds{kind=\"max\"} 100.000"));
+        assert!(joined.contains("claude_operator_desk_streak_seconds{kind=\"weekly_max\"} 100.000"));
+        assert!(joined.contains("claude_operator_desk_streak_seconds{kind=\"max\"} 250.000"));
     }
 
     #[test]
@@ -1612,24 +1702,117 @@ mod tests {
         let p = dir.join("desk_streak.json");
         let st = StreakState {
             run_start: Some(123.0),
-            max_streak_secs: 456.0,
-            max_date: Some("2026-01-01".to_string()),
+            weekly_max_secs: 456.0,
+            week_start: Some("2026-01-04".to_string()),
+            alltime_max_secs: 7890.0,
             last_sample: Some(789.0),
             last_present: true,
         };
         save_streak_state(&p, &st).unwrap();
         let loaded = load_streak_state(&p);
         assert_eq!(loaded.run_start, Some(123.0));
-        assert_eq!(loaded.max_streak_secs, 456.0);
-        assert_eq!(loaded.max_date.as_deref(), Some("2026-01-01"));
+        assert_eq!(loaded.weekly_max_secs, 456.0);
+        assert_eq!(loaded.week_start.as_deref(), Some("2026-01-04"));
+        assert_eq!(loaded.alltime_max_secs, 7890.0);
         assert_eq!(loaded.last_sample, Some(789.0));
         assert!(loaded.last_present);
-        // Missing file -> default (away, zero max, no day stamp).
+        // Missing file -> default (away, zero maxes, no week stamp).
         let d = load_streak_state(&dir.join("does-not-exist.json"));
         assert_eq!(d.run_start, None);
-        assert_eq!(d.max_streak_secs, 0.0);
-        assert_eq!(d.max_date, None);
+        assert_eq!(d.weekly_max_secs, 0.0);
+        assert_eq!(d.alltime_max_secs, 0.0);
+        assert_eq!(d.week_start, None);
         assert!(!d.last_present);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sunday_week_key_groups_sunday_through_saturday() {
+        use chrono::{Datelike, NaiveDate, Weekday};
+        // 2026-01-04 is a Sunday; that week runs Sun 01-04 .. Sat 01-10.
+        let sunday = NaiveDate::from_ymd_opt(2026, 1, 4).unwrap();
+        assert_eq!(sunday.weekday(), Weekday::Sun, "fixture sanity");
+        assert_eq!(sunday_week_key(sunday), "2026-01-04");
+        // Every day Sun..Sat maps to that same Sunday key.
+        for d in 4..=10 {
+            let day = NaiveDate::from_ymd_opt(2026, 1, d).unwrap();
+            assert_eq!(sunday_week_key(day), "2026-01-04", "same week");
+        }
+        // The next Sunday starts a new week.
+        let next_sun = NaiveDate::from_ymd_opt(2026, 1, 11).unwrap();
+        assert_eq!(next_sun.weekday(), Weekday::Sun);
+        assert_eq!(sunday_week_key(next_sun), "2026-01-11");
+        // The returned key is itself always a Sunday (Tue 2026-08-18 -> Sun 08-16).
+        let key = sunday_week_key(NaiveDate::from_ymd_opt(2026, 8, 18).unwrap());
+        assert_eq!(key, "2026-08-16");
+        assert_eq!(
+            NaiveDate::parse_from_str(&key, "%Y-%m-%d").unwrap().weekday(),
+            Weekday::Sun
+        );
+    }
+
+    #[test]
+    fn merge_persisted_maxes_floors_alltime_and_same_week_weekly() {
+        // A short-window recompute under-reports; the persisted sidecar floors.
+        let computed = StreakState {
+            run_start: Some(0.0),
+            weekly_max_secs: 50.0,
+            week_start: Some("2026-01-04".to_string()),
+            alltime_max_secs: 50.0,
+            last_sample: Some(0.0),
+            last_present: true,
+        };
+        let persisted = StreakState {
+            run_start: None,
+            weekly_max_secs: 300.0, // earlier this week, outside the window
+            week_start: Some("2026-01-04".to_string()),
+            alltime_max_secs: 9000.0, // months ago
+            last_sample: None,
+            last_present: false,
+        };
+        let m = merge_persisted_maxes(computed, &persisted);
+        assert_eq!(m.weekly_max_secs, 300.0, "same-week persisted weekly floors");
+        assert_eq!(m.alltime_max_secs, 9000.0, "all-time persisted floors");
+    }
+
+    #[test]
+    fn merge_persisted_maxes_drops_stale_week_weekly_but_keeps_alltime() {
+        let computed = StreakState {
+            run_start: Some(0.0),
+            weekly_max_secs: 40.0,
+            week_start: Some("2026-01-11".to_string()), // NEW week
+            alltime_max_secs: 40.0,
+            last_sample: Some(0.0),
+            last_present: true,
+        };
+        let persisted = StreakState {
+            run_start: None,
+            weekly_max_secs: 300.0,
+            week_start: Some("2026-01-04".to_string()), // last week
+            alltime_max_secs: 9000.0,
+            last_sample: None,
+            last_present: false,
+        };
+        let m = merge_persisted_maxes(computed, &persisted);
+        assert_eq!(m.weekly_max_secs, 40.0, "stale-week persisted weekly is NOT merged");
+        assert_eq!(m.alltime_max_secs, 9000.0, "all-time floors regardless of week");
+    }
+
+    #[test]
+    fn load_streak_state_migrates_legacy_daily_max_to_alltime_floor() {
+        let dir = std::env::temp_dir().join(format!("cw_streak_migrate_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("desk_streak.json");
+        // Legacy sidecar shape: only run_start + daily max_streak_secs/max_date.
+        fs::write(
+            &p,
+            r#"{"run_start":null,"max_streak_secs":1234.0,"max_date":"2026-01-01","last_sample":500.0,"last_present":false}"#,
+        )
+        .unwrap();
+        let st = load_streak_state(&p);
+        assert_eq!(st.alltime_max_secs, 1234.0, "legacy daily max seeds all-time floor");
+        assert_eq!(st.weekly_max_secs, 0.0, "no legacy weekly field -> starts fresh");
+        assert_eq!(st.week_start, None);
         let _ = fs::remove_dir_all(&dir);
     }
 
