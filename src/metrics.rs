@@ -1076,6 +1076,36 @@ fn desk_streak_step_secs() -> f64 {
         .unwrap_or(60.0)
 }
 
+/// Maximum unobserved data gap (seconds) between two consecutive presence
+/// samples that is still bridged as ONE continuous run. A gap LARGER than this
+/// means the emitter simply was not running across it (host metrics cron paused
+/// -- laptop closed/asleep -- or a Prometheus scrape outage), so there is NO
+/// evidence the operator stayed at their desk: the current run restarts at the
+/// first post-gap sample rather than counting the unobserved gap as desk time.
+///
+/// `CW_DESK_STREAK_MAX_GAP_SECS` overrides; otherwise defaults to 3x the emit
+/// cadence (`desk_streak_step_secs`, 60s default => 180s). That tolerates a
+/// couple of missed cron/scrape cycles without over-eagerly resetting a real
+/// streak, while a genuine absence (laptop closed for minutes) resets it.
+///
+/// IMPORTANT: this is a DIFFERENT quantity from `presence_max_age` (the
+/// carrier-mtime freshness window, 420s). presence_max_age governs how stale a
+/// SINGLE carrier mtime may be and still read "present"; max_gap governs how big
+/// a hole in the SAMPLE STREAM we bridge as continuous. The two were previously
+/// conflated (`max_gap = presence_max_age * 2 = 840s / 14min`), which silently
+/// counted 7-14min laptop-close gaps as continuous at-desk time. Note that
+/// Prometheus' query_range lookback-delta (default 5m) carries the last present
+/// sample forward across the front of a gap, so on the Prometheus path the
+/// effective break point is roughly this threshold plus that lookback window;
+/// tune this env down if a tighter bound is needed.
+fn desk_streak_max_gap_secs() -> f64 {
+    std::env::var("CW_DESK_STREAK_MAX_GAP_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or_else(|| desk_streak_step_secs() * 3.0)
+}
+
 /// LOCAL calendar-week key of an epoch second (the Sunday date of that second's
 /// local week), in the host's local timezone (same convention as
 /// `local_week_string`). Scopes each rehydrated Prometheus sample to its week
@@ -1216,7 +1246,7 @@ fn fetch_prom_presence_range(base: &str, now: f64, lookback: f64, step: f64) -> 
 fn desk_streak_block() -> Vec<String> {
     let now = now_epoch();
     let present = presence_is_fresh(presence_carrier_mtime(), now, presence_max_age());
-    let max_gap = presence_max_age() * 2.0;
+    let max_gap = desk_streak_max_gap_secs();
     let week = local_week_string();
     let path = default_streak_state_file();
 
@@ -1402,6 +1432,67 @@ mod tests {
         // Longest observed run is still the pre-gap 50s.
         assert_eq!(s.weekly_max_secs, 50.0);
         assert_eq!(s.alltime_max_secs, 50.0);
+    }
+
+    #[test]
+    fn desk_streak_max_gap_default_and_override() {
+        // Default is 3x the emit cadence (60s step => 180s) -- MUCH smaller than
+        // the old presence_max_age()*2 (840s / 14min) that bridged laptop-close
+        // gaps as continuous desk time.
+        std::env::remove_var("CW_DESK_STREAK_MAX_GAP_SECS");
+        std::env::remove_var("CW_DESK_STREAK_STEP_SECS");
+        assert_eq!(desk_streak_max_gap_secs(), 180.0);
+        // An explicit override wins.
+        std::env::set_var("CW_DESK_STREAK_MAX_GAP_SECS", "90");
+        assert_eq!(desk_streak_max_gap_secs(), 90.0);
+        std::env::remove_var("CW_DESK_STREAK_MAX_GAP_SECS");
+    }
+
+    #[test]
+    fn laptop_close_gap_resets_current_streak() {
+        // Build a continuous at-desk run from samples spaced UNDER max_gap, then
+        // inject a laptop-close data gap (no samples emitted while the host cron
+        // is paused) that EXCEEDS max_gap. The current run MUST reset -- the gap
+        // is a genuine absence, not continuous desk time -- and the weekly/
+        // all-time maxes must NOT be inflated by the unobserved gap.
+        let max_gap = 180.0;
+        // Continuous run: samples 150s apart (each gap <= max_gap) keep run_start.
+        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, max_gap, D0);
+        let (s, c) = advance_streak(&s, true, 150.0, max_gap, D0);
+        assert_eq!(c, 150.0);
+        let (s, c) = advance_streak(&s, true, 300.0, max_gap, D0);
+        assert_eq!(c, 300.0, "continuous run keeps growing across sub-threshold gaps");
+        assert_eq!(s.run_start, Some(0.0));
+        assert_eq!(s.weekly_max_secs, 300.0);
+        assert_eq!(s.alltime_max_secs, 300.0);
+        // Laptop closed ~10 min: NO samples recorded. The next present sample
+        // arrives 600s later -- 600 > max_gap 180 => continuity broken.
+        let (s, c) = advance_streak(&s, true, 900.0, max_gap, D0);
+        assert_eq!(c, 0.0, "genuine >max_gap absence resets the current run");
+        assert_eq!(s.run_start, Some(900.0));
+        // The maxes captured the pre-gap 300s run and did NOT absorb the 600s gap.
+        assert_eq!(
+            s.weekly_max_secs, 300.0,
+            "weekly max not extended across the unobserved gap"
+        );
+        assert_eq!(
+            s.alltime_max_secs, 300.0,
+            "all-time max not extended across the unobserved gap"
+        );
+    }
+
+    #[test]
+    fn short_gap_within_threshold_stays_continuous() {
+        // A brief scrape hiccup (a single missed 60s cycle) is UNDER max_gap and
+        // must NOT reset the run -- continuity survives transient blips.
+        let max_gap = 180.0;
+        let (s, _) = advance_streak(&StreakState::default(), true, 0.0, max_gap, D0);
+        let (s, c) = advance_streak(&s, true, 60.0, max_gap, D0);
+        assert_eq!(c, 60.0);
+        // 120s gap (<= 180) while present: the run continues, current keeps growing.
+        let (s, c) = advance_streak(&s, true, 180.0, max_gap, D0);
+        assert_eq!(c, 180.0, "sub-threshold gap keeps the run continuous");
+        assert_eq!(s.run_start, Some(0.0));
     }
 
     #[test]
