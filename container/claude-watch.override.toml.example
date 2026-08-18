@@ -1,0 +1,30 @@
+# claude-watch runtime override — EXAMPLE (operator-editable, takes effect LIVE)
+#
+# Copy/rename to the path claude-watch reads at runtime and uncomment values.
+# In the container stack the daemon reads $CLAUDE_WATCH_RUNTIME_CONFIG, which
+# entrypoint.sh defaults to the bind-mounted, operator-editable file:
+#
+#     ~/.config/claude-container/claude-watch.override.toml   (on the HOST)
+#
+# (entrypoint.sh seeds a fully-commented copy there on first boot, so you
+# normally just edit that seeded file directly — no need to copy this example.)
+#
+# HOW IT WORKS
+#   * This file is layered on TOP of the baked /etc/claude-watch/config.toml at
+#     HIGHEST precedence — it overrides only the fields it sets, per-field.
+#   * The daemon watches the mtime of every config layer and auto-reloads when
+#     any changes, so editing + saving this file retunes claude-watch within
+#     one daemon loop pass. NO image rebuild, NO redeploy. (A manual
+#     `pkill -HUP claude-watch` also forces an immediate reload.)
+#   * It lives OUTSIDE the config dir ~/.config/claude-watch on purpose — that
+#     dir must never be overlay-mounted (doing so historically root-broke it).
+#     This is a SEPARATE bind-mounted file under ~/.config/claude-container/.
+#
+# The motivating case is the daemon-emitted cadence claude-events, but ANY
+# config field can be overridden here.
+
+# --- Cadence claude-events (heartbeat-tick + memory-reminder) ---------------
+# [cadence]
+# enabled = true
+# memory_reminder_interval_secs = 3600   # 1h   (code default 1800 = 30 min)
+# heartbeat_tick_interval_secs  = 900    # 15min (code default 900)

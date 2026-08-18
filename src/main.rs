@@ -1104,9 +1104,29 @@ async fn run_daemon() {
         Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
     );
 
+    // Auto-reload on config-file edits — no SIGHUP required. Sample the newest
+    // mtime across all config layers (baked base + bind-mounted runtime
+    // override) each loop pass; when it advances, an operator edited a config
+    // file on the host, so trip the SAME reload flag SIGHUP uses. This is what
+    // makes cadence (and any other) tunables editable LIVE: change the
+    // bind-mounted ~/.config/claude-container/claude-watch.override.toml on the
+    // host and the daemon picks it up within one loop interval, no image
+    // rebuild. Seeded to the current newest mtime so startup does not reload.
+    let mut last_config_mtime = config::config_layers_mtime();
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Auto-reload when an operator edits a config file (no SIGHUP needed).
+        // Reuses the SIGHUP reload path below; a strictly-newer mtime (or a
+        // newly-created runtime-override file) trips it exactly once per edit.
+        let current_config_mtime = config::config_layers_mtime();
+        if current_config_mtime > last_config_mtime {
+            last_config_mtime = current_config_mtime;
+            info!("config file change detected on disk, will reload config");
+            reload.store(true, Ordering::Relaxed);
         }
 
         // Reload config if SIGHUP received
