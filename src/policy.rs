@@ -2652,8 +2652,19 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
             state.reauth_detected = true;
         }
 
-        // Inject /login once per reauth cycle so the login screen appears
-        if !state.login_injected {
+        // Inject /login once per reauth cycle so the login screen appears.
+        //
+        // The `self_login_dialog_opened_at` half is not redundant with the
+        // `login_injected` latch. When the PROACTIVE path opens the dialog,
+        // this function's detector sees exactly what it sees after a real
+        // 401 — the TUI gone, a login screen up — and would inject `/login`
+        // straight into the modal. `inject_to_agent` opens with an Escape
+        // blast to reach vim NORMAL mode, and Escape in this modal CANCELS
+        // the login, so the two paths would take turns killing each other's
+        // dialog forever. The latch is cleared when the dialog is abandoned
+        // or the credentials are renewed, so this cannot wedge the reactive
+        // path shut.
+        if !state.login_injected && state.self_login_dialog_opened_at.is_none() {
             info!("injecting /login command into pane");
             inject_dispatch::inject_to_agent(pane, "/login").await;
             state.login_injected = true;
@@ -2733,6 +2744,439 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
         state.login_injected = false;
         crate::state::save_state(&config.general.state_file, state);
     }
+}
+
+/// What the proactive expiry check decided to do this cycle.
+///
+/// Split out as a pure function so the whole decision — the corroboration
+/// rules, the retry spacing, the attempt budget — is testable without a tmux
+/// pane, a credential file, or a clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExpiryAction {
+    /// Nothing is expiring, or the evidence does not support acting.
+    Idle,
+    /// Warn the operator, but do not touch the session.
+    AlertOnly { days_left: u32, corroborated: bool },
+    /// Warn AND drive `self-login`.
+    AutoLogin { days_left: u32 },
+}
+
+/// Evidence available to the proactive expiry decision on one cycle.
+pub(crate) struct ExpiryEvidence {
+    /// Days-left parsed off Claude Code's own on-screen warning, if it was
+    /// on the pane this cycle.
+    pub pane_days_left: Option<u32>,
+    /// What the on-disk credential store says.
+    pub credentials: crate::credentials::CredentialExpiry,
+    /// Whether the credential store may TRIGGER on its own, or may only
+    /// corroborate a warning that was seen on the pane. See
+    /// `ReauthConfig::expiry_from_credentials` — a short-lived rolling refresh
+    /// token classifies as "expiring" permanently, so a store-driven trigger
+    /// is only safe where the token's lifetime is long relative to the
+    /// three-day warning window.
+    pub credentials_may_trigger: bool,
+    /// Auto-fire configured on.
+    pub auto_enabled: bool,
+    /// Auto-fire only at or below this many days left.
+    pub auto_days: u32,
+    /// Seconds since the last auto-fire, if there was one.
+    pub since_last_attempt: Option<f64>,
+    /// Minimum spacing between auto-fires.
+    pub retry_seconds: u64,
+    /// Attempts already spent in this expiry window.
+    pub attempts: u32,
+    /// Attempt ceiling for one window.
+    pub max_attempts: u32,
+    /// An auto-fired login is already up and waiting for a code.
+    pub login_pending: bool,
+}
+
+/// Decide what the proactive expiry path should do, given this cycle's evidence.
+///
+/// The corroboration rule is the important part. "Your login expires in 2
+/// days" is a sentence, and a session that is reading this file, its tests, or
+/// the diff that introduced them will have that sentence on the pane while
+/// being perfectly well authenticated. Auto-firing `/login` at it would park a
+/// healthy loop in a modal. So a pane sighting is believed only when the
+/// credential store either agrees or cannot be read at all:
+///
+///   * pane says expiring + credentials agree  -> act, corroborated
+///   * pane says expiring + credentials UNKNOWN -> act, uncorroborated (the
+///     store is not readable in every deployment, and an unreadable file is
+///     UNKNOWN, never a negative — but say so out loud)
+///   * pane says expiring + credentials healthy or already expired -> IGNORE.
+///     Healthy means the sentence was conversation text. Already-expired is
+///     the reactive path's territory, and racing it into the same modal helps
+///     nobody.
+///   * pane silent + credentials expiring -> act only when the store is
+///     allowed to trigger. The transient form of Claude Code's warning lives
+///     about fifteen seconds, so a poller missing it is not evidence of
+///     anything — but a short-lived rolling refresh token classifies as
+///     "expiring" every second of its healthy life, so this branch is opt-in
+///     rather than the default.
+pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
+    use crate::credentials::CredentialExpiry;
+
+    let (days_left, corroborated) = match (ev.pane_days_left, ev.credentials) {
+        // The reactive path owns a dead credential, whatever the pane says.
+        (_, CredentialExpiry::Expired) => return ExpiryAction::Idle,
+        (Some(_), CredentialExpiry::Healthy) => return ExpiryAction::Idle,
+        (Some(pane), CredentialExpiry::Expiring { days_left }) => {
+            // Trust the credential store's arithmetic over a scraped digit,
+            // but take whichever is more urgent so a stale banner cannot
+            // stretch the deadline.
+            (pane.min(days_left), true)
+        }
+        (Some(pane), CredentialExpiry::Unknown) => (pane, false),
+        (None, CredentialExpiry::Expiring { days_left }) if ev.credentials_may_trigger => {
+            (days_left, true)
+        }
+        (None, _) => return ExpiryAction::Idle,
+    };
+
+    let alert_only = ExpiryAction::AlertOnly {
+        days_left,
+        corroborated,
+    };
+
+    if !ev.auto_enabled || days_left > ev.auto_days {
+        return alert_only;
+    }
+    // A login dialog we already opened is still waiting for its code. Firing
+    // a second one types `/login` into the first one's text field.
+    if ev.login_pending {
+        return alert_only;
+    }
+    if ev.attempts >= ev.max_attempts {
+        return alert_only;
+    }
+    if let Some(elapsed) = ev.since_last_attempt {
+        if elapsed < ev.retry_seconds as f64 {
+            return alert_only;
+        }
+    }
+    ExpiryAction::AutoLogin { days_left }
+}
+
+/// Proactive counterpart to `check_reauth`: act on Claude Code's warning that
+/// the login is ABOUT to lapse, rather than waiting for it to actually lapse.
+///
+/// The reactive path only ever runs on a session that is already dead, which
+/// means the recovery always happens at the worst possible moment. This one
+/// runs while everything still works.
+async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
+    let pane_days_left = tmux::login_expiry_warning(pane).await;
+
+    let creds_path = if config.reauth.credentials_file.is_empty() {
+        crate::credentials::default_path()
+    } else {
+        std::path::PathBuf::from(&config.reauth.credentials_file)
+    };
+    let credentials = crate::credentials::read(&creds_path);
+
+    // Renewal is the ONLY unambiguous "this is resolved" signal, and it is
+    // the value MOVING that says so, not where the value sits. A short-lived
+    // rolling refresh token never leaves the three-day warning window, so it
+    // would otherwise never resolve, the attempt budget would never reset,
+    // and the alert would stand forever on a session in no trouble at all.
+    let refresh_expiry = crate::credentials::read_refresh_expiry_ms(&creds_path);
+    if let (Some(now_val), Some(prev)) = (refresh_expiry, state.last_seen_refresh_expiry_ms) {
+        if now_val > prev {
+            info!("oauth credentials were renewed; resetting the expiry window");
+            write_jsonl_log(
+                &config.general.log_file,
+                "login_expiry_credentials_renewed",
+                serde_json::json!({ "previous": prev, "current": now_val }),
+            );
+            state.login_expiry_detected = false;
+            state.login_expiry_days_left = None;
+            state.last_login_expiry_alert = None;
+            state.last_self_login_attempt = None;
+            state.self_login_attempts_this_window = 0;
+            state.self_login_dialog_opened_at = None;
+        }
+    }
+    if state.last_seen_refresh_expiry_ms != refresh_expiry {
+        state.last_seen_refresh_expiry_ms = refresh_expiry;
+        crate::state::save_state(&config.general.state_file, state);
+    }
+
+    let action = decide_expiry_action(&ExpiryEvidence {
+        pane_days_left,
+        credentials,
+        credentials_may_trigger: config.reauth.expiry_from_credentials,
+        auto_enabled: config.reauth.expiry_auto_self_login,
+        auto_days: config.reauth.expiry_auto_days,
+        since_last_attempt: state
+            .last_self_login_attempt
+            .as_deref()
+            .and_then(elapsed_since),
+        retry_seconds: config.reauth.self_login_retry_seconds,
+        attempts: state.self_login_attempts_this_window,
+        max_attempts: config.reauth.self_login_max_attempts,
+        login_pending: state.self_login_dialog_opened_at.is_some(),
+    });
+
+    // Hand the pane back if an auto-fired login has been sitting unconsumed.
+    run_self_login_abandon_watchdog(config, state, pane).await;
+
+    if matches!(action, ExpiryAction::Idle) {
+        if state.login_expiry_detected {
+            info!("login expiry resolved");
+            write_jsonl_log(
+                &config.general.log_file,
+                "login_expiry_resolved",
+                serde_json::json!({ "pane": pane }),
+            );
+            write_legacy_log(
+                &config.general.legacy_log_file,
+                "Login expiry resolved (credentials renewed)",
+            );
+            state.login_expiry_detected = false;
+            state.login_expiry_days_left = None;
+            state.last_login_expiry_alert = None;
+            state.last_self_login_attempt = None;
+            state.self_login_attempts_this_window = 0;
+            crate::state::save_state(&config.general.state_file, state);
+        }
+        // Release the dialog latch OUTSIDE the `login_expiry_detected` guard,
+        // and on every idle cycle rather than only on the transition. The
+        // latch suppresses the reactive path's `/login` inject, so a stuck one
+        // is not a cosmetic leak — it is the reactive recovery quietly
+        // disabled. The abandon watchdog normally clears it, but a deployment
+        // that set `self_login_abandon_seconds = 0` has no watchdog, and a
+        // daemon restart can land here with the latch set and
+        // `login_expiry_detected` false. Nothing is expiring on this branch,
+        // so nothing needs the latch held.
+        if state.self_login_dialog_opened_at.is_some() {
+            state.self_login_dialog_opened_at = None;
+            crate::state::save_state(&config.general.state_file, state);
+        }
+        return;
+    }
+
+    let (days_left, corroborated, auto) = match action {
+        ExpiryAction::AlertOnly {
+            days_left,
+            corroborated,
+        } => (days_left, corroborated, false),
+        ExpiryAction::AutoLogin { days_left } => (days_left, true, true),
+        ExpiryAction::Idle => unreachable!(),
+    };
+
+    if !state.login_expiry_detected {
+        info!(days_left, "login expiry warning: first detection");
+        write_jsonl_log(
+            &config.general.log_file,
+            "login_expiry_detected",
+            serde_json::json!({
+                "pane": pane,
+                "days_left": days_left,
+                "corroborated": corroborated,
+                "from_pane": pane_days_left.is_some(),
+            }),
+        );
+        state.login_expiry_detected = true;
+    }
+    state.login_expiry_days_left = Some(days_left);
+
+    if auto {
+        fire_self_login(config, state, pane, days_left).await;
+    }
+
+    // Alert on the same cooldown the reactive path uses. The warning stands
+    // for days; without this it would page every ten seconds.
+    let should_alert = match &state.last_login_expiry_alert {
+        Some(last) => elapsed_since(last)
+            .map(|e| e >= config.reauth.alert_interval_seconds as f64)
+            .unwrap_or(true),
+        None => true,
+    };
+    if should_alert {
+        let qualifier = if corroborated {
+            ""
+        } else {
+            " (seen on the pane only — the credential store was not readable)"
+        };
+        let tail = if auto {
+            " Auto-login fired; watch for the OAuth URL."
+        } else if config.reauth.expiry_auto_self_login {
+            " Auto-login has not fired yet."
+        } else {
+            " Auto-login is disabled; run `self-login start` when convenient."
+        };
+        warn!(days_left, "Claude Code login is expiring");
+        alert::notify(crate::event_bus::ClaudeWatchAlert {
+            alert_type: "login-expiring",
+            stuck_reason: "claude code oauth credentials expiring soon",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: crate::event_bus::Severity::High,
+            message: &format!(
+                "Claude Code login expires in {days_left} day(s){qualifier}.{tail}"
+            ),
+        })
+        .await;
+        state.last_login_expiry_alert = Some(Local::now().to_rfc3339());
+    }
+
+    crate::state::save_state(&config.general.state_file, state);
+}
+
+/// Drive `self-login start` out of process and publish whatever it produced.
+///
+/// Spawned rather than awaited: `start` interrupts the pane, injects `/login`,
+/// drives the method picker and then waits for the dialog to paint, which is
+/// far longer than a check cycle. Blocking the cycle on it would stall every
+/// other monitor the daemon runs.
+async fn fire_self_login(config: &Config, state: &mut State, pane: &str, days_left: u32) {
+    // Book the attempt BEFORE spawning. If the process crashes mid-run the
+    // budget is still spent, which is the safe direction: an unbooked attempt
+    // re-fires on the next cycle and every cycle after it.
+    state.last_self_login_attempt = Some(Local::now().to_rfc3339());
+    state.self_login_attempts_this_window = state.self_login_attempts_this_window.saturating_add(1);
+    state.self_login_autofire_total = state.self_login_autofire_total.saturating_add(1);
+    let attempt = state.self_login_attempts_this_window;
+    state.self_login_dialog_opened_at = Some(Local::now().to_rfc3339());
+    crate::state::save_state(&config.general.state_file, state);
+
+    info!(days_left, attempt, "auto-firing self-login");
+    write_jsonl_log(
+        &config.general.log_file,
+        "self_login_autofire",
+        serde_json::json!({ "pane": pane, "days_left": days_left, "attempt": attempt }),
+    );
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        &format!("Login expiring in {days_left}d: auto-firing self-login (attempt {attempt})"),
+    );
+
+    let cmd = config.reauth.self_login_command.clone();
+    let pane = pane.to_string();
+    let log_file = config.general.log_file.clone();
+    let legacy_log_file = config.general.legacy_log_file.clone();
+    tokio::spawn(async move {
+        // `--foreground --json` is self-login's programmatic entry point: it
+        // blocks and emits exactly one JSON object.
+        let (out, ok) = crate::cmd::run_cmd_any(
+            &[
+                &cmd,
+                "--pane",
+                &pane,
+                "--json",
+                "start",
+                "--foreground",
+            ],
+            300,
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or(serde_json::json!({}));
+        let url = parsed.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        if ok && !url.is_empty() {
+            warn!("self-login produced an OAuth URL");
+            write_jsonl_log(
+                &log_file,
+                "self_login_url",
+                serde_json::json!({ "pane": pane, "url": url }),
+            );
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "reauth-needed",
+                stuck_reason: "claude code login expiring, auto-login started",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &format!(
+                    "Claude Code login is expiring and auto-login has opened the dialog. \
+                     Authorize at {url} then run: self-login code <CODE>"
+                ),
+            })
+            .await;
+        } else {
+            // FAIL LOUD. A self-login that produced no URL has usually left
+            // the pane somewhere unexpected, and a quiet failure here is a
+            // session that dies for real a day later.
+            let reason = parsed
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("self-login produced no URL and gave no reason");
+            warn!(reason, "self-login auto-fire failed");
+            write_jsonl_log(
+                &log_file,
+                "self_login_autofire_failed",
+                serde_json::json!({ "pane": pane, "reason": reason }),
+            );
+            write_legacy_log(
+                &legacy_log_file,
+                &format!("self-login auto-fire FAILED: {reason}"),
+            );
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "reauth-needed",
+                stuck_reason: "self-login auto-fire failed",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &format!(
+                    "Claude Code login is expiring and auto-login FAILED: {reason}. \
+                     Log in by hand before the credentials lapse."
+                ),
+            })
+            .await;
+        }
+    });
+}
+
+/// Hand the session back if an auto-fired login dialog was never consumed.
+///
+/// The failure this exists for: auto-fire runs at 3am, publishes a URL nobody
+/// is awake to open, and the login modal sits on the pane swallowing the
+/// loop's keystrokes until morning. The OAuth link has a short life of its
+/// own, so waiting it out buys nothing. `self-login cancel` escapes the dialog
+/// only if it is still up, so this is a no-op when the code was entered
+/// normally.
+async fn run_self_login_abandon_watchdog(config: &Config, state: &mut State, pane: &str) {
+    if config.reauth.self_login_abandon_seconds == 0 {
+        return;
+    }
+    let Some(published) = state.self_login_dialog_opened_at.clone() else {
+        return;
+    };
+    let Some(elapsed) = elapsed_since(&published) else {
+        // Unparseable timestamp: clear it rather than wedge the watchdog on it.
+        state.self_login_dialog_opened_at = None;
+        return;
+    };
+    if elapsed < config.reauth.self_login_abandon_seconds as f64 {
+        return;
+    }
+
+    info!(elapsed, "abandoning unconsumed self-login dialog");
+    let (out, ok) = crate::cmd::run_cmd_any(
+        &[
+            &config.reauth.self_login_command,
+            "--pane",
+            pane,
+            "--json",
+            "cancel",
+        ],
+        120,
+    )
+    .await;
+    write_jsonl_log(
+        &config.general.log_file,
+        "self_login_abandoned",
+        serde_json::json!({
+            "pane": pane,
+            "waited_seconds": elapsed.round(),
+            "cancel_ok": ok,
+            "cancel_output": out.trim(),
+        }),
+    );
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        "Unconsumed self-login dialog abandoned; pane handed back",
+    );
+    state.self_login_dialog_opened_at = None;
+    crate::state::save_state(&config.general.state_file, state);
 }
 
 /// Check for a manual update trigger file written by `claude-watch update`.
@@ -4517,6 +4961,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // --- Reauth detection ---
     if config.reauth.enabled && !effective_pane.is_empty() {
         check_reauth(config, state, &effective_pane).await;
+    }
+
+    // --- Proactive login-expiry detection ---
+    //
+    // Runs alongside the reactive path, not inside it: that one only ever
+    // sees a session that is already dead, so its recovery always lands at
+    // the worst possible moment. This one acts on Claude Code's own warning
+    // while everything still works.
+    if config.reauth.enabled && config.reauth.expiry_watch_enabled && !effective_pane.is_empty() {
+        check_login_expiry(config, state, &effective_pane).await;
     }
 
     // --- Post-clear resume detection ---
@@ -6318,6 +6772,233 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::CredentialExpiry;
+
+    // ---- Proactive login-expiry decision ----
+
+    fn evidence() -> ExpiryEvidence {
+        ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Unknown,
+            credentials_may_trigger: true,
+            auto_enabled: true,
+            auto_days: 1,
+            since_last_attempt: None,
+            retry_seconds: 3600,
+            attempts: 0,
+            max_attempts: 3,
+            login_pending: false,
+        }
+    }
+
+    /// Nothing on the pane and nothing on disk: the daemon stays out of it.
+    #[test]
+    fn no_evidence_is_idle() {
+        assert_eq!(decide_expiry_action(&evidence()), ExpiryAction::Idle);
+    }
+
+    /// THE false-positive guard, and the reason this function exists. A pane
+    /// sighting that the credential store contradicts is conversation text —
+    /// somebody reading this file, or its tests, or the diff that added them.
+    /// Acting on it would park a healthy session in a login modal.
+    #[test]
+    fn a_pane_sighting_a_healthy_credential_contradicts_is_ignored() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Healthy,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+    }
+
+    /// An already-dead credential belongs to the REACTIVE path. Racing it into
+    /// the same modal from two directions helps nobody.
+    #[test]
+    fn an_already_expired_credential_is_left_to_the_reactive_path() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(1),
+            credentials: CredentialExpiry::Expired,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+    }
+
+    /// An unreadable credential store is UNKNOWN, never a negative — the pane
+    /// still carries the decision, but the alert has to say it stands alone.
+    #[test]
+    fn an_unreadable_credential_store_still_acts_but_uncorroborated() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Unknown,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 2,
+                corroborated: false,
+            }
+        );
+    }
+
+    /// The transient form of Claude Code's warning lives about fifteen
+    /// seconds, so a poller MISSING it proves nothing. The credential store
+    /// alone is enough to act on.
+    #[test]
+    fn the_credential_store_alone_can_carry_the_decision() {
+        let ev = ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// The store is a VETO by default, not a trigger: a short-lived rolling
+    /// refresh token classifies as "expiring" for every second of its healthy
+    /// life, so a store-driven trigger would fire forever on a fine session.
+    #[test]
+    fn the_credential_store_does_not_trigger_on_its_own_unless_allowed() {
+        let ev = ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+
+        // ...but it still VETOES a pane sighting it contradicts, which is the
+        // half that is never optional.
+        let vetoed = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Healthy,
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&vetoed), ExpiryAction::Idle);
+
+        // ...and still corroborates one it agrees with.
+        let agreed = ExpiryEvidence {
+            pane_days_left: Some(1),
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&agreed), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Claude Code starts SHOWING the warning three days out but only starts
+    /// nagging inside one. Three days out is a heads-up, not a reason to
+    /// interrupt a working session.
+    #[test]
+    fn a_warning_outside_the_auto_window_only_alerts() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(3),
+            credentials: CredentialExpiry::Expiring { days_left: 3 },
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 3,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// When the two sources disagree, take the more urgent number: a banner
+    /// left over from an earlier render must not be able to stretch a deadline.
+    #[test]
+    fn disagreeing_sources_resolve_to_the_more_urgent_one() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(3),
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Debounce. The warning stands for DAYS; without spacing, a ten-second
+    /// poll re-fires the login flow ~8,600 times a day.
+    #[test]
+    fn a_recent_attempt_blocks_a_re_fire_and_an_old_one_does_not() {
+        let recent = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(60.0),
+            attempts: 1,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&recent),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+
+        let stale = ExpiryEvidence {
+            since_last_attempt: Some(3601.0),
+            ..recent
+        };
+        assert_eq!(decide_expiry_action(&stale), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Failing loudly is right; failing every hour forever is not. Once the
+    /// budget is spent the alert keeps going out and the session is left alone.
+    #[test]
+    fn the_attempt_budget_stops_auto_fire_but_not_the_alert() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(99999.0),
+            attempts: 3,
+            max_attempts: 3,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// A dialog we already opened is still waiting for its code. Firing a
+    /// second `/login` types the literal text into the first one's field.
+    #[test]
+    fn a_pending_login_dialog_blocks_a_second_fire() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(99999.0),
+            login_pending: true,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// Auto-fire off means alert only — the reactive path is untouched either
+    /// way, so turning this off degrades to "tell me, I'll handle it".
+    #[test]
+    fn auto_fire_disabled_degrades_to_alert_only() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            auto_enabled: false,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
 
     #[test]
     fn test_elapsed_since_valid() {

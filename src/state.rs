@@ -293,6 +293,43 @@ pub struct State {
     pub last_reauth_alert: Option<String>,
     #[serde(default)]
     pub login_injected: bool,
+
+    // Proactive login-expiry tracking (the forward-looking half of reauth).
+    /// Latched while Claude Code's "your login expires in N days" warning is
+    /// standing. Cleared when the credentials are renewed, which is also what
+    /// resets the auto-fire attempt budget.
+    #[serde(default)]
+    pub login_expiry_detected: bool,
+    /// Days-left reported by the most recent detection, for the log/alert.
+    #[serde(default)]
+    pub login_expiry_days_left: Option<u32>,
+    /// Last time the expiry warning was alerted on (rate limiting).
+    #[serde(default)]
+    pub last_login_expiry_alert: Option<String>,
+    /// Last time `self-login` was auto-fired (retry spacing).
+    #[serde(default)]
+    pub last_self_login_attempt: Option<String>,
+    /// Auto-fire attempts spent in the CURRENT expiry window. Reset when the
+    /// warning clears — never on a timer, or the budget is not a budget.
+    #[serde(default)]
+    pub self_login_attempts_this_window: u32,
+    /// When auto-fire last put a login dialog on the pane. Set BEFORE the
+    /// flow runs, not after it succeeds: a `self-login start` that fails
+    /// partway can still have left a modal up, and that modal has to be
+    /// cleaned up by the same watchdog. Cleared once the watchdog has handed
+    /// the pane back, or when the credentials are renewed.
+    #[serde(default)]
+    pub self_login_dialog_opened_at: Option<String>,
+    /// Cumulative count of auto-fired `self-login` runs (for metrics).
+    #[serde(default)]
+    pub self_login_autofire_total: u64,
+    /// Last observed `refreshTokenExpiresAt`. Watched for MOVEMENT, not
+    /// position: a value that jumps forward is the credentials being renewed,
+    /// which is the one unambiguous "this is resolved" signal available. It
+    /// works even for a short-lived rolling token that never leaves the
+    /// warning window and therefore never "resolves" by position alone.
+    #[serde(default)]
+    pub last_seen_refresh_expiry_ms: Option<i64>,
     /// Tracks whether we've already injected "resume" for a fresh external session
     /// (tokens=0 with Claude idle prompt visible). Reset when tokens become non-zero.
     #[serde(default)]

@@ -42,6 +42,8 @@ pub struct TestEnv {
     pub heartbeat_file: PathBuf,
     /// Path to mock bin directory (prepended to PATH).
     pub mock_bin_dir: PathBuf,
+    /// Where the mock `self-login` records that it was invoked.
+    pub self_login_log: PathBuf,
     /// Watchers config file path.
     pub watchers_config: PathBuf,
     /// Path to the mock self-clear invocation log (one line per invocation).
@@ -230,6 +232,7 @@ impl TestEnv {
             legacy_log_file: log_dir.join("claude-watch.log"),
             heartbeat_file: tmp_dir.join("heartbeat"),
             self_clear_log: tmp_dir.join("self-clear.log"),
+            self_login_log: tmp_dir.join("self-login.log"),
             mock_bin_dir,
             watchers_config: tmp_dir.join("watchers.conf"),
             tmp_dir,
@@ -246,6 +249,7 @@ impl TestEnv {
 
         // Write mock self-clear script (logs invocation instead of injecting /clear)
         env.write_mock_self_clear_script();
+        env.write_mock_self_login_script();
 
         // Write empty watchers config
         fs::write(&env.watchers_config, "# test watchers\n").expect("write watchers config");
@@ -314,6 +318,34 @@ echo "$(date -Is) self-clear $@" >> "{log}"
     /// Read the mock self-clear invocation log (empty string if never invoked).
     pub fn read_self_clear_log(&self) -> String {
         fs::read_to_string(&self.self_clear_log).unwrap_or_default()
+    }
+
+    /// Write a mock `self-login` that records its invocation and does nothing.
+    ///
+    /// Not optional politeness. `test_path()` appends the DEVELOPER'S real
+    /// PATH, so without a mock ahead of it a daemon under test resolves the
+    /// real `self-login` and starts driving an actual OAuth login flow. It
+    /// would target the test pane rather than a live session, but a test
+    /// suite must not be one config default away from typing `/login`
+    /// anywhere at all.
+    fn write_mock_self_login_script(&self) {
+        let script = format!(
+            r#"#!/bin/bash
+# Mock self-login for e2e tests -- records invocation instead of logging in.
+echo "$(date -Is) self-login $@" >> "{log}"
+echo '{{"ok": false, "reason": "mock self-login (e2e); no login was attempted"}}'
+exit 4
+"#,
+            log = self.self_login_log.display()
+        );
+        let path = self.mock_bin_dir.join("self-login");
+        fs::write(&path, &script).expect("write mock self-login");
+        make_executable(&path);
+    }
+
+    /// Read the mock self-login invocation log (empty string if never invoked).
+    pub fn read_self_login_log(&self) -> String {
+        fs::read_to_string(&self.self_login_log).unwrap_or_default()
     }
 
     /// Write mock tmux-healthcheck that returns OK.
@@ -573,23 +605,52 @@ resume_prompt = "resume"
         PathBuf::from(env!("CARGO_BIN_EXE_claude-watch"))
     }
 
-    /// Run the daemon for a specified number of check cycles, then kill it.
-    /// Returns the process exit status.
-    pub fn run_daemon_cycles(&self, cycles: u32, extra_wait_ms: u64) -> DaemonRun {
-        let binary = Self::daemon_binary();
-        let wait_ms = (self.read_config_interval() * 1000 * cycles as u64) + extra_wait_ms;
-
-        let child = Command::new(&binary)
-            .env("CLAUDE_WATCH_CONFIG", &self.config_path)
+    /// A `Command` for the daemon under test with every isolation env var
+    /// already set. **Spawn the daemon through this, never by building a
+    /// `Command` by hand.**
+    ///
+    /// This is not a convenience wrapper, it is the isolation boundary. Two
+    /// tests once assembled their own `Command` because they wanted to
+    /// control the daemon's lifetime, and in copying the env list they
+    /// dropped `HOME`. Those daemons therefore ran against the developer's
+    /// real home directory: they read the real Claude Code credential store
+    /// and wrote real high-priority alerts into the real `~/claude-events/`,
+    /// where a live main loop picked them up and reported them to a human as
+    /// genuine. Controlling a daemon's lifetime is a fine reason to spawn it
+    /// directly; re-deriving its environment is not, so there is now exactly
+    /// one place that environment is written down.
+    pub fn daemon_command(&self) -> Command {
+        let mut cmd = Command::new(Self::daemon_binary());
+        cmd.env("CLAUDE_WATCH_CONFIG", &self.config_path)
             .env("PATH", self.test_path())
             .env("CLAUDE_STATUS_CMD", "1")
             .env("RUST_LOG", "debug")
-            // Hermeticity: point HOME at the test tmp dir so the layered
-            // user config at ~/.config/claude-watch/config.toml does NOT
-            // overlay (and override e.g. [tmux] dashboard_pane onto) the
-            // test config. Without this, a developer's real config leaks
-            // into the daemon under test.
+            // Point HOME at the test tmp dir so the layered user config at
+            // ~/.config/claude-watch/config.toml does NOT overlay (and
+            // override e.g. [tmux] dashboard_pane onto) the test config —
+            // and so nothing under the real home is read at all.
             .env("HOME", &self.tmp_dir)
+            // Event isolation. HOME already redirects the default
+            // `~/claude-events/`, but CLAUDE_EVENT_QUEUE is read FIRST and is
+            // inherited from whoever ran the suite, so a developer or CI
+            // runner with it set would put every test alert into the real
+            // queue. Setting it explicitly means the isolation does not
+            // depend on the ambient environment.
+            .env("CLAUDE_EVENT_QUEUE", self.tmp_dir.join("claude-events"))
+            .env("CRON_EVENT_QUEUE", self.tmp_dir.join("claude-events"))
+            // Empty = push notifications are skipped. A test suite must not
+            // be able to ring a real phone.
+            .env("CLAUDE_WATCH_NOTIFY_CMD", "");
+        cmd
+    }
+
+    /// Run the daemon for a specified number of check cycles, then kill it.
+    /// Returns the process exit status.
+    pub fn run_daemon_cycles(&self, cycles: u32, extra_wait_ms: u64) -> DaemonRun {
+        let wait_ms = (self.read_config_interval() * 1000 * cycles as u64) + extra_wait_ms;
+
+        let child = self
+            .daemon_command()
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

@@ -2050,6 +2050,66 @@ pub(crate) fn extract_login_url(pane_output: &str) -> Option<String> {
     Some(url)
 }
 
+/// Claude Code's PROACTIVE "your login is about to expire" warning.
+///
+/// This is a different signal from `check_lines_for_reauth`, and the two must
+/// not be confused. `check_lines_for_reauth` fires when the credentials are
+/// ALREADY dead: the TUI has been replaced by a login screen and the session
+/// can no longer do anything. This one fires while the session is perfectly
+/// healthy — the TUI is up, work is happening, and Claude Code has merely
+/// started warning that the OAuth refresh token lapses soon.
+///
+/// The exact wording was read out of the shipped Claude Code bundle rather
+/// than guessed, the same way `LOGIN_URL_PREFIXES` was. Two independent call
+/// sites render it and both compose the identical visible text:
+///
+/// ```text
+/// Your login expires in 2 days · run /login to renew
+/// ```
+///
+/// One is a startup banner that renders whenever the refresh token is inside
+/// its warning window; the other is a transient notice that renders only when
+/// the window is down to a single day. Because the notice is transient, a
+/// poller can legitimately MISS it — which is why the daemon corroborates
+/// with, and can fall back to, the on-disk credential expiry.
+///
+/// Matching strategy: strip ALL whitespace and lowercase before matching. A
+/// tmux pane hard-wraps with no separator and no hyphenation, so a phrase this
+/// long can be split at any column; a whitespace-insensitive match is wrap
+/// proof by construction, where a literal `"your login expires in"` is not.
+///
+/// Returns the number of days Claude Code claims are left.
+pub(crate) fn detect_login_expiry_warning(pane_output: &str) -> Option<u32> {
+    // No cheap literal pre-filter here, deliberately. The obvious one —
+    // "does the pane contain `login expires in`?" — is exactly the literal
+    // this function refuses to match on, and it silently defeats the whole
+    // point: a pane that wrapped mid-word would fail the pre-filter and
+    // return None while the squashed form matches perfectly. Squashing a
+    // pane capture is a few microseconds; a wrap-blind fast path is a bug.
+    static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex_lite::Regex::new(r"yourloginexpiresin(\d{1,4})day")
+            .expect("static login-expiry pattern is valid")
+    });
+    let squashed: String = pane_output
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    let caps = re.captures(&squashed)?;
+    caps.get(1)?.as_str().parse::<u32>().ok()
+}
+
+/// Capture the pane and report Claude Code's proactive login-expiry warning.
+///
+/// Companion to `needs_reauth`, deliberately a separate capture: the two
+/// signals are mutually exclusive (one needs the TUI gone, the other needs it
+/// present) so neither can mask the other.
+pub async fn login_expiry_warning(pane: &str) -> Option<u32> {
+    let out = capture_pane(pane).await?;
+    detect_login_expiry_warning(&out)
+}
+
 /// Check if the pane is showing a reauth/login prompt.
 /// Returns the login URL if reauth is needed (or empty string if needed but URL not found).
 pub async fn needs_reauth(pane: &str) -> Option<String> {
@@ -2661,6 +2721,112 @@ pub async fn healthcheck_brief(config: &crate::config::TmuxConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Proactive login-expiry warning ----
+
+    /// The literal string Claude Code renders, verbatim. Both of its render
+    /// sites compose this same text.
+    #[test]
+    fn login_expiry_warning_is_read_off_a_normal_pane() {
+        let pane = "\
+  Some tool output here
+  ⚠ Your login expires in 2 days · run /login to renew
+
+╭──────────────────────────────────────────────────────────╮
+│ > ";
+        assert_eq!(detect_login_expiry_warning(pane), Some(2));
+    }
+
+    /// Singular vs plural: Claude Code pluralizes the unit, so "1 day" has to
+    /// match as surely as "3 days".
+    #[test]
+    fn both_the_singular_and_plural_forms_match() {
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 1 day · run /login to renew"),
+            Some(1)
+        );
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 3 days · run /login to renew"),
+            Some(3)
+        );
+    }
+
+    /// The reason the matcher strips whitespace instead of matching a literal:
+    /// a tmux pane hard-wraps with NO separator and no hyphenation, so the
+    /// phrase can be cut at any column — including mid-word.
+    #[test]
+    fn a_hard_wrapped_warning_still_matches() {
+        // Wrapped between words.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires\nin 2 days · run /login to renew"),
+            Some(2)
+        );
+        // Wrapped MID-WORD, which is what tmux actually does at a narrow width.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expi\nres in 2 days · run /log\nin to renew"),
+            Some(2)
+        );
+        // And with the trailing half of the line missing entirely, because a
+        // narrow pane truncates the notice with an ellipsis.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 2 days ·…"),
+            Some(2)
+        );
+    }
+
+    /// A live session with no warning must report nothing — including one
+    /// whose conversation is full of auth vocabulary.
+    #[test]
+    fn an_ordinary_pane_reports_no_warning() {
+        assert_eq!(detect_login_expiry_warning(""), None);
+        assert_eq!(
+            detect_login_expiry_warning(
+                "⏵⏵ bypass permissions on · 3 shells · esc to interrupt\n337594 tokens"
+            ),
+            None
+        );
+        // Near-misses that are NOT the warning.
+        assert_eq!(
+            detect_login_expiry_warning("your session expires in 2 days"),
+            None
+        );
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in a couple of days"),
+            None
+        );
+        assert_eq!(
+            detect_login_expiry_warning("OAuth token has expired. Re-authenticate to continue."),
+            None
+        );
+    }
+
+    /// Documented, deliberately: the detector CANNOT tell Claude Code's banner
+    /// from the same sentence sitting in conversation text, and this test pins
+    /// that as a known property rather than leaving it as a surprise. It is
+    /// why `decide_expiry_action` refuses to act on a pane sighting the
+    /// credential store contradicts.
+    #[test]
+    fn conversation_text_matches_too_which_is_why_corroboration_exists() {
+        let quoting_the_docs =
+            "  I'm reading the detector docs, which quote \"Your login expires in 2 days\".";
+        assert_eq!(detect_login_expiry_warning(quoting_the_docs), Some(2));
+    }
+
+    /// The reactive login SCREEN and the proactive warning are different
+    /// states and must not be confused: the warning fires while the TUI is up,
+    /// the login screen fires only once it is gone.
+    #[test]
+    fn the_expiry_warning_and_the_login_screen_are_disjoint_signals() {
+        let warning = "Your login expires in 1 day · run /login to renew\n337594 tokens";
+        assert_eq!(detect_login_expiry_warning(warning), Some(1));
+        // TUI is visible, so the reactive path correctly stands down.
+        assert!(!check_lines_for_reauth(warning));
+
+        let login_screen = "Browser didn't open? Use the url below to sign in\n\n\
+                            https://claude.com/cai/oauth/authorize?code=true";
+        assert!(check_lines_for_reauth(login_screen));
+        assert_eq!(detect_login_expiry_warning(login_screen), None);
+    }
 
     // ---- Interrupt-only-hits-main-loop (Andrew #1803/#1804) ----
 

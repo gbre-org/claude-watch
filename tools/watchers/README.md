@@ -9,7 +9,7 @@ background tasks. These are the **canonical implementations**.
 |--------|------|---------|
 | `claude-event-watch` | bash watcher | Block on `$CLAUDE_EVENT_QUEUE` (default `~/claude-events/`); print one-liner per pending event; append full JSON to `$CLAUDE_EVENT_LOG_DIR/consumed.jsonl`; exit. The main loop re-invokes it after each delivery. |
 | `self-clear` | one-shot | Inject `/clear` + a configurable resume-prompt into the Claude Code tmux pane. Final step of a compact-prep procedure; eliminates the wait for the daemon's resume-injection path to fire on its own. |
-| `self-login` | one-shot | Inject `/login`, scrape the OAuth URL back out of the pane, and take the authorization code back in. Re-authenticates a session from outside it, so nobody has to be at the terminal. |
+| `self-login` | one-shot | Inject `/login`, scrape the OAuth URL back out of the pane, and take the authorization code back in. Re-authenticates a session from outside it, so nobody has to be at the terminal. The daemon drives it automatically when Claude Code warns the login is about to expire — see `docs/watchers.md`. |
 
 ## Watcher lifecycle (cardinal rule)
 
@@ -99,6 +99,7 @@ self-login [--pane PANE] [--log-file PATH] [--state-file PATH]
                  [--login-method claudeai|console|platform]
                  [--menu-attempts N] [--force]
          | code CODE [--verify-timeout SECS] [--force]
+         | cancel
          | url
          | status
 ```
@@ -126,8 +127,18 @@ Three publication sinks, all independent:
 quiet success: it can mean the session is already authenticated, the dialog
 never rendered, or the pane is wedged, and the operator has to see all three.
 
-Exit codes: `0` success, `1` usage / no pane / internal error, `4` no URL or
-login did not complete, `5` a code was submitted with no login dialog on screen.
+`cancel` escapes out of a login dialog nobody is going to finish. It exists
+because `start` leaves a **modal** on the pane: until the code arrives the
+dialog swallows the session's keystrokes and the loop stops working, so a login
+that goes unanswered overnight is an outage. It presses Escape only while a
+dialog is actually up, so calling it on a healthy session does nothing — which
+is what lets the daemon fire it on a timer without first proving the dialog is
+still there.
+
+Exit codes: `0` success (for `cancel`: the pane is not in a login dialog,
+whether or not this call is what got it out of one), `1` usage / no pane /
+internal error, `4` no URL, login did not complete, or the dialog would not
+close, `5` a code was submitted with no login dialog on screen.
 
 Two implementation constraints, both easy to get wrong:
 

@@ -25,6 +25,7 @@ mod alert;
 mod cadence;
 mod cmd;
 mod config;
+mod credentials;
 mod event_bus;
 mod hook_fire;
 mod inject_dispatch;
@@ -326,6 +327,35 @@ enum Commands {
         /// if it were the new one.
         #[arg(long, value_name = "URL")]
         not: Vec<String>,
+
+        /// Emit machine-readable JSON outcome on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report whether the Claude Code login is about to expire — read only.
+    ///
+    /// Shows both halves of the signal the daemon's proactive re-login path
+    /// acts on: Claude Code's on-screen "Your login expires in N days"
+    /// warning, and the OAuth credential store it is corroborated against.
+    /// Neither is sufficient alone — the on-screen text is also just a
+    /// sentence that can appear in conversation, and the store closes the gap
+    /// left by the warning's transient form, which is on screen for about
+    /// fifteen seconds at a time.
+    ///
+    /// This command NEVER injects, types, or opens a dialog. It is the safe
+    /// way to see what the daemon is seeing.
+    ///
+    /// Exit codes: 0 = nothing expiring. 3 = expiring inside the warning
+    /// window. 4 = already expired (the REACTIVE reauth path's territory).
+    LoginExpiry {
+        /// Target tmux pane. Same resolution order as `inject`.
+        #[arg(long, value_name = "PANE")]
+        pane: Option<String>,
+
+        /// Override the credential store path (default:
+        /// `$HOME/.claude/.credentials.json`).
+        #[arg(long, value_name = "PATH")]
+        credentials_file: Option<String>,
 
         /// Emit machine-readable JSON outcome on stdout.
         #[arg(long)]
@@ -1750,6 +1780,78 @@ async fn run_login_url(
     4
 }
 
+/// Read-only report on how much login is left. Injects nothing.
+async fn run_login_expiry(
+    pane_flag: Option<&str>,
+    credentials_file: Option<&str>,
+    json: bool,
+) -> i32 {
+    use credentials::CredentialExpiry;
+
+    let pane = resolve_inject_pane(pane_flag).await;
+    let pane_days = tmux::login_expiry_warning(&pane).await;
+
+    let path = match credentials_file {
+        Some(p) => std::path::PathBuf::from(p),
+        None => credentials::default_path(),
+    };
+    let creds = credentials::read(&path);
+
+    let (state_str, days, code) = match creds {
+        CredentialExpiry::Expiring { days_left } => ("expiring", Some(days_left), 3),
+        CredentialExpiry::Expired => ("expired", None, 4),
+        CredentialExpiry::Healthy => ("healthy", None, 0),
+        // An unreadable store is UNKNOWN, never "fine". If the pane is
+        // warning, that warning stands on its own and this still reports it.
+        CredentialExpiry::Unknown if pane_days.is_some() => ("unknown", pane_days, 3),
+        CredentialExpiry::Unknown => ("unknown", None, 0),
+    };
+
+    if json {
+        println!(
+            "{{\"pane\":{},\"pane_warning_days\":{},\"credentials\":{},\"credentials_file\":{},\"days_left\":{}}}",
+            serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
+            pane_days
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            serde_json::to_string(state_str).unwrap_or_else(|_| "\"\"".to_string()),
+            serde_json::to_string(&path.display().to_string())
+                .unwrap_or_else(|_| "\"\"".to_string()),
+            days.map(|d| d.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        );
+        return code;
+    }
+
+    println!("pane:            {pane}");
+    match pane_days {
+        Some(d) => println!("on-screen:       \"Your login expires in {d} day(s)\""),
+        None => println!("on-screen:       no expiry warning on the pane"),
+    }
+    println!("credentials:     {state_str} ({})", path.display());
+    match (state_str, days) {
+        ("expiring", Some(d)) if pane_days.is_none() => {
+            println!("=> the credential store says {d} day(s), with no warning on the pane.");
+            println!("   The store only VETOES by default, it does not trigger: a short-lived");
+            println!("   rolling refresh token reads as \"1 day\" for its whole healthy life.");
+            println!("   Compare refreshTokenExpiresAt across a few minutes before setting");
+            println!("   expiry_from_credentials = true.");
+        }
+        ("expiring", Some(d)) => println!("=> login expires in {d} day(s)"),
+        ("expired", _) => println!("=> login has ALREADY expired (reactive reauth territory)"),
+        ("unknown", Some(d)) => println!(
+            "=> the pane says {d} day(s), and the credential store could not be read \
+             to confirm it"
+        ),
+        ("unknown", None) => println!(
+            "=> UNKNOWN: the credential store could not be read, and there is no \
+             warning on the pane. This is not the same as \"fine\"."
+        ),
+        _ => println!("=> login is not expiring"),
+    }
+    code
+}
+
 #[tokio::main]
 async fn main() {
     // Restore default SIGPIPE handling so piping to `head` etc. exits
@@ -1881,6 +1983,17 @@ async fn main() {
             json,
         }) => {
             let code = run_login_url(pane.as_deref(), wait, &not, json).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::LoginExpiry {
+            pane,
+            credentials_file,
+            json,
+        }) => {
+            let code =
+                run_login_expiry(pane.as_deref(), credentials_file.as_deref(), json).await;
             if code != 0 {
                 std::process::exit(code);
             }
