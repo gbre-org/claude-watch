@@ -102,6 +102,18 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       # Forwarded if set on the host (VSCode IDE port).
       CLAUDE_CODE_SSE_PORT: ${CLAUDE_CODE_SSE_PORT:-}
+      # TZ — container-local timezone. Unset (default) leaves the image
+      # clock at UTC. Set to an IANA zone (e.g. America/New_York) so
+      # in-container `date`, log timestamps, and cron fire in that local
+      # time to match the operator's host — the image ships tzdata, so
+      # glibc resolves the named zone via this env var alone. We use a TZ
+      # env var rather than bind-mounting /etc/localtime because on Docker
+      # Desktop (macOS) the host's /etc/localtime symlinks into
+      # /var/db/timezone/zoneinfo, which is not a reliably shareable mount
+      # path; a TZ env var is portable across host OSes and needs no mount.
+      # Set the concrete value per-operator in deploy.env / the override
+      # (e.g. TZ=America/New_York).
+      TZ: ${TZ:-}
       # Corporate-network passthrough: SSL CA bundles + proxy settings for
       # operators on enterprise VPNs where the host
       # injects a corp CA into NODE_EXTRA_CA_CERTS / SSL_CERT_FILE etc.
