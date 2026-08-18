@@ -597,6 +597,19 @@ enabled = true
 # so cadence can be retuned live, with no image rebuild. See src/config.rs
 # `config_layer_paths` / `config_layers_mtime`.
 
+# --- Event-watcher health check (cw-watcher-health-check cron) --------------
+# CONSUMED BY THE cw-watcher-health-check CRON SCRIPT, not the claude-watch
+# daemon (the daemon ignores unknown sections). Sets how many minutes a
+# claude-event may sit unconsumed in the spool dir before the script injects a
+# "[CLAUDE-WATCH] WATCHER DOWN: N event(s) unconsumed >Nmin" recovery alert.
+# Default 6 -- >= 2x the event watcher's ~3min ($EVENT_WATCH_DEBOUNCE_SECONDS=180)
+# debounce window, so a normal debounce never false-fires before the batch
+# surfaces. Tunable LIVE (next cron tick) via the runtime override
+# ($CLAUDE_WATCH_RUNTIME_CONFIG); an explicit CW_WATCHER_HEALTH_STALE_MIN env
+# var still pins/overrides it.
+#[watcher_health]
+#stale_minutes = 6
+
 [ask_question_monitor]
 # AFK auto-reject of a stale interactive AskUserQuestion prompt.
 #
