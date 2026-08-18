@@ -67,7 +67,9 @@
 */5 * * * *  hndrewaall /usr/local/bin/cw-cron-run queue-check /usr/local/bin/claude-watch queue-check > /tmp/claude-watch-cron-queue-check.log 2>&1
 
 # Event-watcher health check. Every minute, look for .json event
-# files in the queue dir that have been sitting unconsumed for >2 min.
+# files in the queue dir that have been sitting unconsumed for >6 min
+# (the default; tunable via [watcher_health] stale_minutes in the runtime
+# override TOML -- see cw-watcher-health-check).
 # If any exist, the event watcher is dead (container recreate, session
 # clear, etc). Injects a [CLAUDE-WATCH] alert directly into the tmux
 # pane via `claude-watch inject` — bypasses the event system entirely
