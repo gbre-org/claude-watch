@@ -588,6 +588,14 @@ enabled = true
 # on a specific host; otherwise a bump to the const is the only change needed.
 #   heartbeat_tick_interval_secs = 900     # default: 15min
 #   memory_reminder_interval_secs = 1800   # default: 30min
+#
+# RUNTIME (live) override without editing this file: the loader also layers, at
+# highest precedence, the file named by $CLAUDE_WATCH_RUNTIME_CONFIG (if set +
+# present), and the daemon auto-reloads when any config layer's mtime changes
+# (no SIGHUP needed). The container points that env var at a bind-mounted,
+# operator-editable file (~/.config/claude-container/claude-watch.override.toml)
+# so cadence can be retuned live, with no image rebuild. See src/config.rs
+# `config_layer_paths` / `config_layers_mtime`.
 
 [ask_question_monitor]
 # AFK auto-reject of a stale interactive AskUserQuestion prompt.

@@ -110,6 +110,41 @@ fi
 # claude-watch/src/config.rs `try_load_config`).
 export CLAUDE_WATCH_CONFIG="${CLAUDE_WATCH_CONFIG:-/etc/claude-watch/config.toml}"
 
+# Runtime-editable cadence / tunables override. The baked config above is
+# frozen into the image (changing it needs `make container-build` + a
+# redeploy). This runtime override lives in the bind-mounted, operator-editable
+# ~/.config/claude-container/ dir (NOT the config dir ~/.config/claude-watch —
+# overlaying THAT historically root-broke the config dir; this is a SEPARATE
+# file). The daemon layers it on TOP of the baked config (highest precedence)
+# and AUTO-RELOADS when its mtime changes, so editing it on the host retunes
+# e.g. the memory-reminder cadence LIVE — no rebuild, no redeploy.
+export CLAUDE_WATCH_RUNTIME_CONFIG="${CLAUDE_WATCH_RUNTIME_CONFIG:-${HOME:-/home/hndrewaall}/.config/claude-container/claude-watch.override.toml}"
+# Seed a fully-commented template on first boot so the override is
+# discoverable. All-commented => a pure no-op layer until the operator
+# uncomments a value. Never overwrites an existing (possibly operator-edited)
+# file. Best-effort: a missing/unwritable dir (bare `docker run` without the
+# ~/.config/claude-container mount) is fine — the daemon just finds no runtime
+# layer and uses the baked defaults.
+if [ ! -e "$CLAUDE_WATCH_RUNTIME_CONFIG" ]; then
+    mkdir -p "$(dirname "$CLAUDE_WATCH_RUNTIME_CONFIG")" 2>/dev/null || true
+    cat > "$CLAUDE_WATCH_RUNTIME_CONFIG" 2>/dev/null <<'CWRUNTIMEEOF' || true
+# claude-watch runtime override — operator-editable, takes effect LIVE.
+#
+# Layered on TOP of the baked /etc/claude-watch/config.toml (highest
+# precedence). The daemon watches this file's mtime and auto-reloads when it
+# changes, so edits here take effect within one daemon loop pass — NO image
+# rebuild, NO redeploy. This file lives under the bind-mounted
+# ~/.config/claude-container/ dir (NOT ~/.config/claude-watch, which must never
+# be overlay-mounted). Uncomment + edit a value, save, and the daemon picks it
+# up. (A manual `pkill -HUP claude-watch` also forces an immediate reload.)
+#
+# Example — retune the daemon-emitted cadence claude-events live:
+# [cadence]
+# memory_reminder_interval_secs = 3600   # 1h  (code default 1800 = 30min)
+# heartbeat_tick_interval_secs  = 900    # 15min
+CWRUNTIMEEOF
+fi
+
 # Make sure the directories claude-watch wants to write to exist + are
 # writable by uid 1000. State dir is under ~/.cache; logs are in /tmp.
 mkdir -p "${HOME:-/home/hndrewaall}/.cache/claude-watch"
@@ -752,6 +787,7 @@ if [ -n "${CLAUDE_EVENT_QUEUE:-}" ] || [ -n "${CW_PROMETHEUS_URL:-}" ] \
         printf 'HOME=%s\n' "${HOME:-/home/hndrewaall}"
         printf 'PATH=%s\n' "${PATH}"
         printf 'CLAUDE_WATCH_CONFIG=%s\n' "${CLAUDE_WATCH_CONFIG:-/etc/claude-watch/config.toml}"
+        [ -n "${CLAUDE_WATCH_RUNTIME_CONFIG:-}" ] && printf 'CLAUDE_WATCH_RUNTIME_CONFIG=%s\n' "${CLAUDE_WATCH_RUNTIME_CONFIG}"
         [ -n "${CW_PROMETHEUS_URL:-}" ] && printf 'CW_PROMETHEUS_URL=%s\n' "${CW_PROMETHEUS_URL}"
         [ -n "${CLAUDE_WATCH_PROM_FILE:-}" ] && printf 'CLAUDE_WATCH_PROM_FILE=%s\n' "${CLAUDE_WATCH_PROM_FILE}"
         [ -n "${CLAUDE_WATCH_STATE:-}" ] && printf 'CLAUDE_WATCH_STATE=%s\n' "${CLAUDE_WATCH_STATE}"

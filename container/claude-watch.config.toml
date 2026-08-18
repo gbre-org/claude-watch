@@ -270,5 +270,12 @@ respawn_command = ["cwsr", "--no-upgrade"]
 # commit + push repos) is heavier-touch than a 30-min beat warrants here.
 # heartbeat_tick_interval_secs is left unset -> inherits the 900s (15-min)
 # code default. This is a plain daemon config VALUE, not an overlay mount.
+#
+# NOTE: this value is the baked DEFAULT — frozen into the image. To retune the
+# cadence WITHOUT a rebuild + redeploy, edit the operator runtime override at
+# ~/.config/claude-container/claude-watch.override.toml on the host (a separate
+# bind-mounted file, seeded commented on first boot). The daemon layers it on
+# top of this file and auto-reloads on its mtime change, so edits take effect
+# live. See $CLAUDE_WATCH_RUNTIME_CONFIG in container/entrypoint.sh.
 enabled = true
 memory_reminder_interval_secs = 3600
