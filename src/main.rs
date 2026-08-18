@@ -253,10 +253,18 @@ enum Commands {
     /// MUST shell out to this subcommand instead of hand-rolling
     /// `tmux send-keys` sequences — drifted copies of that logic (one of
     /// which injected alert text WITHOUT submitting it) are the bug this
-    /// subcommand exists to retire. The keystroke sequence is the proven
-    /// `src/tmux.rs` path: Escape→NORMAL coercion, dd line-clear, `i`
-    /// INSERT verify-and-retry, literal type, then Tab→Escape→Enter to
-    /// submit (or a bare Enter for `--slash-command`).
+    /// subcommand exists to retire.
+    ///
+    /// DEFAULT (no `--escape`): NON-CANCELLING. Enter INSERT with an
+    /// idempotent `i`, type, submit with a bare Enter from INSERT. No
+    /// Escape is ever sent, so an in-flight turn is not interrupted and a
+    /// modal on the pane is not cancelled. No `dd` line-clear either, so
+    /// half-typed operator input glues onto the payload.
+    ///
+    /// With `--escape`: the historical CANCELLING choreography —
+    /// Escape→NORMAL coercion, dd line-clear, `i` INSERT verify-and-retry,
+    /// literal type, then Tab→Escape→Enter to submit (or a bare Enter for
+    /// `--slash-command`).
     ///
     /// Verification: a landed submit CLEARS the payload from the prompt
     /// line. If the payload is still on the input line after the verify
@@ -286,11 +294,21 @@ enum Commands {
         #[arg(long)]
         slash_command: bool,
 
-        /// NON-CANCELLING inject: never lead with an Escape, so an in-flight
-        /// turn is NOT interrupted. Types + submits as a QUEUED message (bare
-        /// Enter from INSERT, no `dd` line-clear). Use for changes that must
-        /// apply without seizing the turn (e.g. cw-theme-sync `/config theme=…`).
-        /// Trade-off: half-typed operator input glues onto the payload.
+        /// CANCELLING inject: lead with the Escape→NORMAL blast and `dd`
+        /// line-clear before typing. OFF BY DEFAULT (Andrew, 2026-08-18) —
+        /// that Escape is what CANCELS an in-flight turn, and it also cancels
+        /// any modal standing on the pane (which is why the login flow could
+        /// not use this subcommand at all). Opt in only when the caller
+        /// genuinely needs the turn seized AND the prompt line wiped before
+        /// typing: self-clear's `/clear`, mcp-reconnect's `/mcp`.
+        #[arg(long, visible_alias = "cancel")]
+        escape: bool,
+
+        /// DEPRECATED no-op, kept so older callers keep parsing. Not
+        /// cancelling the turn is the DEFAULT now; pass `--escape` for the
+        /// opposite. Accepted because container scripts and the host binary
+        /// deploy independently, so a rollout can briefly run an updated
+        /// binary against a script that still passes this flag.
         #[arg(long)]
         no_cancel: bool,
 
@@ -1673,7 +1691,7 @@ async fn run_inject(
     pane_flag: Option<&str>,
     no_submit: bool,
     slash_command: bool,
-    no_cancel: bool,
+    escape: bool,
     json: bool,
 ) -> i32 {
     // Wire the FleetView focus-to-main key sequence into the tmux module's
@@ -1689,7 +1707,7 @@ async fn run_inject(
     }
     let pane = resolve_inject_pane(pane_flag).await;
     let submit = !no_submit;
-    let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command, no_cancel).await;
+    let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command, escape).await;
 
     let (code, status) = match outcome {
         tmux::InjectOutcome::Typed => (0, "typed"),
@@ -1699,11 +1717,12 @@ async fn run_inject(
 
     if json {
         println!(
-            "{{\"pane\":{},\"status\":\"{}\",\"submitted\":{},\"slash_command\":{}}}",
+            "{{\"pane\":{},\"status\":\"{}\",\"submitted\":{},\"slash_command\":{},\"escape\":{}}}",
             serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
             status,
             submit,
-            slash_command
+            slash_command,
+            escape
         );
     } else if code == 0 {
         eprintln!("[claude-watch inject] {} on pane {}", status, pane);
@@ -2003,12 +2022,14 @@ async fn main() {
             pane,
             no_submit,
             slash_command,
-            no_cancel,
+            escape,
+            // Deprecated no-op: non-cancelling is the default now. Bound and
+            // dropped on purpose so an older caller still passing it parses.
+            no_cancel: _,
             json,
         }) => {
             let code =
-                run_inject(&submit, pane.as_deref(), no_submit, slash_command, no_cancel, json)
-                    .await;
+                run_inject(&submit, pane.as_deref(), no_submit, slash_command, escape, json).await;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -2039,6 +2060,54 @@ mod tests {
             claude_watch_version: "0.1.0",
             daemon_active: Some(true),
         }
+    }
+
+    /// Pull the `Inject` variant's flags out of a parsed argv, or panic.
+    fn parse_inject(args: &[&str]) -> (bool, bool, bool) {
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Inject {
+                escape,
+                no_cancel,
+                slash_command,
+                ..
+            }) => (escape, no_cancel, slash_command),
+            other => panic!("expected Inject, got {:?}", other.is_some()),
+        }
+    }
+
+    /// THE contract of the 2026-08-18 flip: a bare `claude-watch inject`
+    /// sends NO Escape. The Escape blast cancels an in-flight turn and
+    /// cancels any modal on the pane, so it must never be what a caller
+    /// gets by forgetting a flag.
+    #[test]
+    fn inject_does_not_escape_by_default() {
+        let (escape, _, _) = parse_inject(&["claude-watch", "inject", "--submit", "hello"]);
+        assert!(
+            !escape,
+            "`claude-watch inject` must NOT lead with an Escape unless --escape is passed"
+        );
+    }
+
+    #[test]
+    fn inject_escape_is_opt_in_under_both_names() {
+        let (escape, _, _) =
+            parse_inject(&["claude-watch", "inject", "--submit", "hello", "--escape"]);
+        assert!(escape, "--escape must select the cancelling choreography");
+        let (aliased, _, _) =
+            parse_inject(&["claude-watch", "inject", "--submit", "hello", "--cancel"]);
+        assert!(aliased, "--cancel must remain a visible alias for --escape");
+    }
+
+    /// `--no-cancel` is now the default, but older container scripts still
+    /// pass it and the binary deploys independently of them. It must PARSE
+    /// (not error) and must not turn the Escape blast back on.
+    #[test]
+    fn inject_accepts_deprecated_no_cancel_as_a_noop() {
+        let (escape, no_cancel, _) =
+            parse_inject(&["claude-watch", "inject", "--submit", "hi", "--no-cancel"]);
+        assert!(no_cancel, "--no-cancel must still parse");
+        assert!(!escape, "--no-cancel must not imply --escape");
     }
 
     #[test]

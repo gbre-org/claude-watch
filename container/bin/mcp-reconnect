@@ -41,12 +41,17 @@ fi
 # (src/tmux.rs) — instead of being hand-rolled here. `/mcp` is a slash
 # command, so we pass --slash-command: slash commands submit with a bare
 # Enter from INSERT mode (the Tab→Escape→Enter regular-text sequence does
-# NOT submit a slash command — the documented self-clear `/clear` bug). The
-# old hand-rolled `tmux send-keys '/mcp' Enter` also assumed the pane was
-# already at a clean prompt; the centralized path additionally coerces
-# Escape→NORMAL and clears the input line first.
+# NOT submit a slash command — the documented self-clear `/clear` bug).
+#
+# `--escape` is REQUIRED here and is not decoration. `claude-watch inject`
+# stopped sending the Escape→NORMAL blast by default (2026-08-18), and the
+# Escape blast is exactly what this caller was migrated onto the centralized
+# path to get: the old hand-rolled `tmux send-keys '/mcp' Enter` assumed the
+# pane was already at a clean prompt, and the fix was to coerce Escape→NORMAL
+# and `dd` the input line first. Drop the flag and `/mcp` silently glues onto
+# whatever was half-typed on the prompt line.
 printf '[mcp-reconnect] sending /mcp to pane %s\n' "$PANE" >&2
-claude-watch inject --pane "$PANE" --submit '/mcp' --slash-command
+claude-watch inject --pane "$PANE" --submit '/mcp' --slash-command --escape
 
 # Wait for reconnection
 sleep "$TIMEOUT"
