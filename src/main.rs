@@ -297,6 +297,40 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Scrape the Claude Code OAuth login URL out of the tmux pane.
+    ///
+    /// Companion to `inject`: `inject --slash-command /login` puts the login
+    /// dialog on screen, `login-url` reads the resulting
+    /// `https://claude.ai/oauth/authorize?...` link back OUT of it. The URL is
+    /// reassembled across tmux's hard line wraps by the same
+    /// `tmux::extract_login_url` the daemon's reactive reauth path uses, so
+    /// there is exactly ONE copy of that parser.
+    ///
+    /// Exit codes: 0 = URL printed on stdout. 4 = no URL found (already logged
+    /// in, dialog not rendered yet, or the pane is wedged). A missing URL is
+    /// ALWAYS an error — callers must never treat it as success.
+    LoginUrl {
+        /// Target tmux pane. Same resolution order as `inject`.
+        #[arg(long, value_name = "PANE")]
+        pane: Option<String>,
+
+        /// Poll for up to N seconds for the URL to appear. The dialog is not
+        /// rendered the instant `/login` is submitted, so a single-shot read
+        /// races it. 0 = single shot (default).
+        #[arg(long, default_value_t = 0, value_name = "SECS")]
+        wait: u64,
+
+        /// Reject this URL if it is the one found (it is a STALE URL left on
+        /// screen by an earlier login). Repeatable. Lets a caller snapshot the
+        /// pane before injecting `/login` and refuse to report the old link as
+        /// if it were the new one.
+        #[arg(long, value_name = "URL")]
+        not: Vec<String>,
+
+        /// Emit machine-readable JSON outcome on stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1653,6 +1687,69 @@ async fn run_inject(
     code
 }
 
+/// Handler for `claude-watch login-url`. Returns a process exit code:
+///   0 = a fresh OAuth URL was found and printed
+///   4 = no URL found within the wait window (or only a rejected/stale one)
+///
+/// Deliberately LOUD on failure: "no URL" can mean the session is already
+/// authenticated, the dialog never rendered, or the pane is wedged, and every
+/// one of those is something the caller must surface rather than swallow.
+async fn run_login_url(
+    pane_flag: Option<&str>,
+    wait: u64,
+    not: &[String],
+    json: bool,
+) -> i32 {
+    let pane = resolve_inject_pane(pane_flag).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    let mut saw_stale = false;
+
+    loop {
+        // Visible pane only, never scrollback: an OAuth URL that has scrolled
+        // out of view is by definition not the dialog we just opened, and
+        // treating a scrolled-back link as current is how a stale URL gets
+        // reported as a fresh one.
+        if let Some(out) = tmux::capture_pane(&pane).await {
+            if let Some(url) = tmux::extract_login_url(&out) {
+                if not.iter().any(|n| n == &url) {
+                    saw_stale = true;
+                } else {
+                    if json {
+                        println!(
+                            "{{\"pane\":{},\"url\":{},\"found\":true}}",
+                            serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
+                            serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string()),
+                        );
+                    } else {
+                        println!("{}", url);
+                    }
+                    return 0;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(1000)).await;
+    }
+
+    let reason = if saw_stale {
+        "only a rejected (stale) login URL was on screen"
+    } else {
+        "no claude.ai/oauth/authorize URL on the pane"
+    };
+    if json {
+        println!(
+            "{{\"pane\":{},\"url\":null,\"found\":false,\"reason\":{}}}",
+            serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
+            serde_json::to_string(reason).unwrap_or_else(|_| "\"\"".to_string()),
+        );
+    } else {
+        eprintln!("[claude-watch login-url] {} (pane {})", reason, pane);
+    }
+    4
+}
+
 #[tokio::main]
 async fn main() {
     // Restore default SIGPIPE handling so piping to `head` etc. exits
@@ -1773,6 +1870,17 @@ async fn main() {
         }
         Some(Commands::InjectProbe { pid, text, json }) => {
             let code = inject_probe::cmd_inject_probe(pid, &text, json);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::LoginUrl {
+            pane,
+            wait,
+            not,
+            json,
+        }) => {
+            let code = run_login_url(pane.as_deref(), wait, &not, json).await;
             if code != 0 {
                 std::process::exit(code);
             }

@@ -9,6 +9,7 @@ background tasks. These are the **canonical implementations**.
 |--------|------|---------|
 | `claude-event-watch` | bash watcher | Block on `$CLAUDE_EVENT_QUEUE` (default `~/claude-events/`); print one-liner per pending event; append full JSON to `$CLAUDE_EVENT_LOG_DIR/consumed.jsonl`; exit. The main loop re-invokes it after each delivery. |
 | `self-clear` | one-shot | Inject `/clear` + a configurable resume-prompt into the Claude Code tmux pane. Final step of a compact-prep procedure; eliminates the wait for the daemon's resume-injection path to fire on its own. |
+| `self-login` | one-shot | Inject `/login`, scrape the OAuth URL back out of the pane, and take the authorization code back in. Re-authenticates a session from outside it, so nobody has to be at the terminal. |
 
 ## Watcher lifecycle (cardinal rule)
 
@@ -89,6 +90,65 @@ Environment defaults (all overridable via flag):
   generic placeholder; override to point at a host-specific
   resume-checklist).
 
+## `self-login`
+
+```
+self-login [--pane PANE] [--log-file PATH] [--state-file PATH]
+           [--lock-file PATH] [--json]
+           start [--foreground] [--url-timeout SECS] [--timeout SECS]
+                 [--login-method claudeai|console|platform]
+                 [--menu-attempts N] [--force]
+         | code CODE [--verify-timeout SECS] [--force]
+         | url
+         | status
+```
+
+The `/login` counterpart to `self-clear`. When Claude Code's credentials lapse
+the session cannot recover on its own — the login screen is a modal that
+swallows the loop's own keystrokes — so this drives the flow from outside:
+inject `/login`, answer the "Select login method" picker, scrape the OAuth
+authorize URL off the pane, publish it, and later type the operator's
+authorization code into the dialog.
+
+`start` forks like `self-clear` and for the same reason: when the session
+itself is the caller, the TUI is busy running that very command, and the turn
+must end before the pane reaches an idle prompt. Results land in the state
+file. `--foreground --json` blocks instead and emits one JSON object on stdout
+— the entry point for driving the flow programmatically rather than by hand.
+
+Three publication sinks, all independent:
+
+1. the state file (always written),
+2. a `claude-event` when that binary is on PATH,
+3. `$CLAUDE_SELF_LOGIN_NOTIFY_CMD` when set, invoked as `<cmd...> <url>`.
+
+**A missing URL is always an error** (exit 4 + a high-priority event), never a
+quiet success: it can mean the session is already authenticated, the dialog
+never rendered, or the pane is wedged, and the operator has to see all three.
+
+Exit codes: `0` success, `1` usage / no pane / internal error, `4` no URL or
+login did not complete, `5` a code was submitted with no login dialog on screen.
+
+Two implementation constraints, both easy to get wrong:
+
+- The URL is parsed by `claude-watch login-url`, which wraps
+  `tmux::extract_login_url` — the same tmux-wrap reassembler the daemon's
+  reactive reauth path uses. There must not be a second copy.
+- The authorization code is typed with raw `tmux send-keys`, **not**
+  `claude-watch inject`: inject opens with an Escape blast to reach vim NORMAL
+  mode, and Escape in the login modal cancels the login.
+
+Environment defaults (all overridable via flag):
+
+- `$CLAUDE_SELF_LOGIN_LOG` — log path (default
+  `$XDG_STATE_HOME/claude-watch/self-login.log`)
+- `$CLAUDE_SELF_LOGIN_STATE` — state path (default
+  `$XDG_STATE_HOME/claude-watch/self-login.json`)
+- `$CLAUDE_SELF_LOGIN_LOCK` — lock path (default
+  `$XDG_RUNTIME_DIR/claude-self-login.lock`)
+- `$CLAUDE_SELF_LOGIN_NOTIFY_CMD` — optional push command, invoked as
+  `<cmd...> <url>`
+
 ## What's NOT here
 
 `session-resume` is intentionally NOT migrated — it's a host-specific
@@ -100,10 +160,21 @@ injects, plus whatever per-host resume-checklist the operator writes.
 ## Tests
 
 ```
-make test-watchers      # runs both:
+make test-watchers          # runs all three:
 python3 tools/watchers/tests/test_self_clear_config.py
+python3 tools/watchers/tests/test_self_login.py
 tools/watchers/tests/test_claude_event_watch.sh
+
+make test-self-login-tmux   # end-to-end, needs tmux + a built claude-watch
+tools/watchers/tests/test_self_login_tmux.sh
 ```
+
+`test_self_login_tmux.sh` spins up its OWN throwaway tmux session running a
+fake login screen and points `self-login --pane` at it, so the whole
+inject-scrape-type path is exercised for real without going anywhere near a
+live Claude Code session. It self-skips when tmux or a built binary is
+missing, which is why it runs in the e2e CI job (which has both) rather than
+alongside the shell tests.
 
 `self-clear`'s end-to-end inject flow needs a live Claude Code tmux pane,
 so the unit tests cover only the portable config-resolution path. The

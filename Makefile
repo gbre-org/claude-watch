@@ -21,7 +21,8 @@
 # Python / shell tool test targets
 .PHONY: test-session-task test-obligations-init test-queue-minisite test-hooks
 .PHONY: test-agent-msg test-agent-tail test-claude-event test-event-must-act
-.PHONY: test-self-clear test-watchers test-dashboard test-trust-workspace
+.PHONY: test-self-clear test-self-login test-self-login-tmux test-watchers
+.PHONY: test-dashboard test-trust-workspace
 .PHONY: test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links
 .PHONY: test-claude-md-size test-install-hooks test-install-host-skills
 .PHONY: test-install-host-cron
@@ -185,8 +186,20 @@ test-event-must-act: ## event-must-act toolchain self-tests
 test-self-clear: ## self-clear config-only smoke tests
 	python3 tools/watchers/tests/test_self_clear_config.py
 
+# self-login pure predicates + config paths. No terminal needed.
+test-self-login: ## self-login unit tests (pane predicates, code validation, config)
+	python3 tools/watchers/tests/test_self_login.py
+
+# self-login end-to-end against a THROWAWAY tmux session running a fake login
+# screen — never a real Claude Code pane. Split from test-self-login because it
+# needs both tmux and a built claude-watch binary; it self-skips without them,
+# so it runs in the e2e CI job that has both rather than hiding a vacuous pass
+# in the shell-test job.
+test-self-login-tmux: ## self-login end-to-end against a real tmux pane
+	tools/watchers/tests/test_self_login_tmux.sh
+
 # Run the claude-event-watch fast-path smoke test.
-test-watchers: test-self-clear ## claude-event-watch fast-path + self-clear config
+test-watchers: test-self-clear test-self-login ## claude-event-watch fast-path + self-clear/self-login
 	tools/watchers/tests/test_claude_event_watch.sh
 
 # Run the dashboard parser tests (sources dashboard-lib.sh in a bash
@@ -551,6 +564,7 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@ln -sfn $(abspath tools/claude-event/claude-event-tail) $(BIN_DIR)/claude-event-tail
 	@ln -sfn $(abspath tools/watchers/claude-event-watch) $(BIN_DIR)/claude-event-watch
 	@ln -sfn $(abspath tools/watchers/self-clear) $(BIN_DIR)/self-clear
+	@ln -sfn $(abspath tools/watchers/self-login) $(BIN_DIR)/self-login
 	@echo "Installed to $(BIN_DIR):"
 	@echo "  - claude-watch              (file copy, build artifact)"
 	@echo "  - session-task              (symlink -> tools/session-task/)"
@@ -568,6 +582,7 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@echo "  - claude-event-tail         (symlink -> tools/claude-event/)"
 	@echo "  - claude-event-watch        (symlink -> tools/watchers/)"
 	@echo "  - self-clear                (symlink -> tools/watchers/)"
+	@echo "  - self-login                (symlink -> tools/watchers/)"
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
 # Points core.hooksPath at the tracked scripts/git-hooks/ dir instead of

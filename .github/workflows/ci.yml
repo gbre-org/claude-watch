@@ -97,6 +97,14 @@ jobs:
         run: cargo nextest run -E 'binary(~e2e_)' --retries 2
         timeout-minutes: 5
 
+      - name: Run self-login end-to-end tests (real tmux pane)
+        # Lives in THIS job because it needs both tmux and a built
+        # claude-watch binary; the script self-skips without either, and a
+        # self-skip in the shell-test job would be a silent vacuous pass.
+        # nextest built the binary above, so no extra cargo build is needed.
+        run: make test-self-login-tmux
+        timeout-minutes: 5
+
   queue-minisite-tests:
     name: Queue-minisite Python tests
     runs-on: ubuntu-latest
@@ -215,7 +223,7 @@ jobs:
       - name: Install inotify-tools (for claude-event-watch tests)
         run: sudo apt-get update && sudo apt-get install -y inotify-tools
 
-      - name: Run watcher tests (self-clear + claude-event-watch debounce)
+      - name: Run watcher tests (self-clear/self-login + claude-event-watch debounce)
         run: make test-watchers
         timeout-minutes: 5
 

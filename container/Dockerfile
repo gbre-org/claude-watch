@@ -1337,6 +1337,20 @@ COPY container/bin/xclip /usr/local/bin/xclip
 # same bytes.
 COPY container/bin/self-clear /usr/local/bin/self-clear
 
+# self-login — the /login counterpart to self-clear. Injects /login, answers
+# the login-method picker, scrapes the OAuth authorize URL off the pane, and
+# takes the operator's authorization code back in, so a container whose
+# credentials have lapsed can be re-authenticated without anyone attaching to
+# the tmux pane.
+#
+# It IMPORTS self-clear as a sibling for the shared pane primitives (pane
+# resolution, FleetView focus return, interrupt-and-wait) rather than carrying
+# a second copy, so it must land in the SAME directory as the baked self-clear
+# above — which /usr/local/bin is. Same source-of-truth arrangement:
+# container/bin/self-login is the file, tools/watchers/self-login is a symlink
+# into it, so the host chain and the image run the same bytes.
+COPY container/bin/self-login /usr/local/bin/self-login
+
 # cw-theme-sync — make Claude Code's TUI theme follow the browser theme.
 # Long-lived process-compose process (see container/process-compose.yml):
 # watches the theme-report file the clipboard-upload sidecar writes on the
@@ -1388,6 +1402,7 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
              /usr/local/bin/mcp-reconnect \
              /usr/local/bin/xclip \
              /usr/local/bin/self-clear \
+             /usr/local/bin/self-login \
              /usr/local/bin/cw-theme-sync \
              /usr/local/bin/cw-watcher-health-check \
              /usr/local/bin/cw-cron-run \
