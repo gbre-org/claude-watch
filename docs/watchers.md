@@ -238,6 +238,7 @@ works from a phone.
 ```
 self-login start                 # inject /login, scrape the OAuth URL, publish it
 self-login code <CODE>           # type the authorization code into the dialog
+self-login cancel                # escape out of a dialog nobody will finish
 self-login url                   # print the URL on the pane (no injection)
 self-login status                # print the state file
 ```
@@ -269,9 +270,100 @@ Two details worth knowing if you touch this code:
   `claude-watch inject`. Inject opens with an Escape blast to reach vim NORMAL
   mode, and Escape in the login modal cancels the login.
 
+`cancel` exists because `start` leaves a **modal** on the pane. Until somebody
+pastes the code, the dialog swallows the session's keystrokes and the loop
+stops working. `cancel` presses Escape only while a dialog is actually up,
+which makes it a no-op in the normal case — the property that lets the daemon
+fire it on a timer without first proving anything about the pane.
+
 Config: `$CLAUDE_SELF_LOGIN_LOG`, `$CLAUDE_SELF_LOGIN_STATE`,
 `$CLAUDE_SELF_LOGIN_LOCK`, `$CLAUDE_SELF_LOGIN_NOTIFY_CMD` (each with a
 matching CLI flag).
+
+## Automatic re-login before the credentials lapse
+
+The daemon has always had a *reactive* reauth path: notice the login screen,
+inject `/login`, alert with the URL. Its problem is structural — it only ever
+runs on a session that is already dead, so the recovery always lands at the
+worst possible moment, and everything queued behind it has already stopped.
+
+Claude Code warns first. Inside a three-day window it renders
+
+```
+Your login expires in 2 days · run /login to renew
+```
+
+and the daemon now acts on that (`[reauth]` in `config.toml`, second half).
+
+**Two signals, because neither is sufficient alone.**
+
+The pane text is the signal, but it is also just a sentence: a session reading
+this document, or the tests for the detector, or the diff that added them, has
+that sentence on screen while perfectly well authenticated. Auto-firing
+`/login` at it would park a healthy loop in a modal. So a pane sighting is
+corroborated against Claude Code's OAuth credential store, which is ground
+truth and cannot be spoofed by anything on screen. If the store disagrees, the
+sighting is conversation text and is dropped.
+
+An unreadable credential store is UNKNOWN, never a negative: the pane signal
+still acts, and the alert says out loud that it stands alone.
+
+**Why the store only vetoes, and does not trigger.** The obvious symmetry —
+let the credential expiry fire the path by itself, closing the gap left by the
+transient notice, which is on screen for about fifteen seconds at a time — is
+`expiry_from_credentials`, and it is **off by default** for a measured reason.
+A refresh token can be short-lived and rolling. On one live host its entire
+lifetime was under five hours, renewed silently long before it lapsed. Against
+a three-day window that credential classifies as "expires in 1 day" for every
+second of its healthy life, so a store-driven trigger would fire forever on a
+session in no trouble at all. Check yours with `claude-watch login-expiry`
+before turning it on.
+
+That same rolling credential is why "resolved" is defined as the expiry
+**moving forward**, not as it leaving the window — a token that never leaves
+the window would otherwise never resolve, and the attempt budget would never
+reset.
+
+### Inspecting it
+
+```
+claude-watch login-expiry [--pane PANE] [--credentials-file PATH] [--json]
+```
+
+Read only — it never injects, types, or opens a dialog. It prints both halves
+of the signal and exits 0 (nothing expiring), 3 (inside the window) or 4
+(already expired, which is the reactive path's territory).
+
+**What stops it re-firing.** The warning persists for days, so a naive detector
+re-fires every poll — 8,600 times a day at a ten-second cadence. Four separate
+brakes:
+
+| Brake | Default | What it stops |
+| --- | --- | --- |
+| `expiry_auto_days` | 1 | Firing three days out. Claude Code shows the warning at three days but only nags inside one; one day is the right side of that line to interrupt a working session on. |
+| `self_login_retry_seconds` | 3600 | Re-firing on the next poll. |
+| `self_login_max_attempts` | 3 | Re-firing forever. The budget resets only when the credentials are actually renewed — never on a timer. |
+| pending-dialog check | — | Firing a second `/login` into the first one's text field. |
+
+Alerts are separately rate-limited by `alert_interval_seconds`, the same
+cooldown the reactive path uses.
+
+**And if nobody answers it.** Auto-fire at 3am publishes a URL to a sleeping
+operator, and the modal it opened would hold the session until morning. The
+OAuth link has a short life of its own, so waiting it out buys nothing and
+costs everything: after `self_login_abandon_seconds` (default 30 minutes) the
+daemon runs `self-login cancel`, the session gets its pane back, and the next
+attempt produces a fresh link. Set it to 0 to leave the dialog standing.
+
+Set `expiry_auto_self_login = false` to keep the detection and the alerting
+but handle the login by hand. `expiry_watch_enabled = false` turns the whole
+proactive half off; the reactive path is untouched either way.
+
+**Known limit, stated plainly:** the on-screen signatures this path keys on
+were read out of a shipped Claude Code binary, not observed during a real
+expiry. The wording is verbatim and the parsing is covered by tests against
+wrapped, truncated and near-miss panes, but nothing here has yet met a live
+credential lapse in production.
 
 ## Tests
 

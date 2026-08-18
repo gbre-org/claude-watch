@@ -818,6 +818,97 @@ pub(crate) fn self_clear_in_progress() -> bool {
     lockfile_held(&self_clear_lock_path())
 }
 
+/// Pure: resolve the `self-clear` HANDOFF-COMPLETION marker path from the two
+/// env inputs, mirroring `container/bin/self-clear`'s `_default_handoff_file()`
+/// EXACTLY so the daemon and the self-clear tool agree on the same file:
+///   1. `env_marker` ($CLAUDE_SELF_CLEAR_HANDOFF) if set & non-empty,
+///   2. else `$XDG_RUNTIME_DIR/claude-self-clear-handoff` if XDG set & non-empty,
+///   3. else `/var/run/claude/claude-self-clear-handoff`.
+///
+/// This is DISTINCT from the coordination lockfile: the lock signals "a
+/// self-clear is RUNNING" (held only for the `/clear`->resume handoff), whereas
+/// this marker is TOUCHED once, at the moment the resume prompt is delivered,
+/// so the daemon can suppress its own fresh-session / post-clear injects for a
+/// grace window AFTER the lock releases while the fresh session bootstraps.
+pub(crate) fn resolve_self_clear_handoff_path(
+    env_marker: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> String {
+    if let Some(v) = env_marker {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Some(rt) = xdg_runtime_dir {
+        let rt = rt.trim();
+        if !rt.is_empty() {
+            return format!("{}/claude-self-clear-handoff", rt.trim_end_matches('/'));
+        }
+    }
+    "/var/run/claude/claude-self-clear-handoff".to_string()
+}
+
+/// Resolve the live `self-clear` handoff-marker path from the process env.
+pub(crate) fn self_clear_handoff_path() -> String {
+    resolve_self_clear_handoff_path(
+        std::env::var("CLAUDE_SELF_CLEAR_HANDOFF").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+/// Pure: is a handoff-marker mtime "recent" (within `grace_secs` of `now`)?
+/// A marker in the (small clock-skew) future also counts as recent. `None`
+/// mtime (marker absent) => not recent. `grace_secs == 0` => never recent
+/// (feature disabled) is handled by the caller.
+pub(crate) fn handoff_is_recent(marker_mtime: Option<f64>, now: f64, grace_secs: u64) -> bool {
+    match marker_mtime {
+        Some(m) => m >= now - grace_secs as f64,
+        None => false,
+    }
+}
+
+/// Did a `self-clear` tool FINISH delivering its resume/handoff prompt within
+/// the last `grace_secs`? The self-clear tool touches
+/// `self_clear_handoff_path()` immediately after it submits the resume prompt.
+/// The daemon consults this so its fresh-session / post-clear inject gates DEFER
+/// while the freshly-cleared session is still bootstrapping (tokens still 0,
+/// pane idle) — the window where the daemon would otherwise CLOBBER the handoff
+/// prompt with its generic "You are a fresh session ..." text (operator #4799).
+///
+/// Distinct from `self_clear_in_progress` (lock HELD during the handoff): that
+/// covers only the in-flight window; this covers the post-release bootstrap
+/// window. Fail-open (returns false) so a probe glitch never wedges recovery.
+pub(crate) fn self_clear_handoff_recent(grace_secs: u64) -> bool {
+    if grace_secs == 0 {
+        return false;
+    }
+    let path = self_clear_handoff_path();
+    let mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    handoff_is_recent(mtime, now, grace_secs)
+}
+
+/// Grace window (seconds) for `self_clear_handoff_recent` when consulted from a
+/// lib-level primitive that has no `Config` in hand (e.g. `interrupt_and_wait`).
+/// `$CLAUDE_SELF_CLEAR_HANDOFF_GRACE_SECS` overrides; defaults to 120 to match
+/// `config::default_self_clear_handoff_grace_secs`. The daemon's policy gates
+/// use the config field directly; this env fallback keeps the primitive
+/// config-free (same convention as the lockfile-path env resolution).
+pub(crate) fn self_clear_handoff_grace_secs_env() -> u64 {
+    std::env::var("CLAUDE_SELF_CLEAR_HANDOFF_GRACE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(120)
+}
+
 /// Actively interrupt Claude Code: rapid-fire Escape, periodically Ctrl-B x2.
 /// Returns true if idle state confirmed within `timeout_secs`. Returns false
 /// at the deadline; callers should still proceed with their inject (the
@@ -848,10 +939,11 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
     // mid-handoff (holding its lockfile), DEFER -- an Escape blast here would
     // clobber the `/clear`->resume-prompt sequence it drives into this same pane
     // (operator-reported, 2026-08-17). Fail-open. See `self_clear_in_progress`.
-    if self_clear_in_progress() {
+    if self_clear_in_progress() || self_clear_handoff_recent(self_clear_handoff_grace_secs_env())
+    {
         info!(
             pane = %pane,
-            "interrupt_and_wait: self-clear in progress -- deferring interrupt (not seizing pane)"
+            "interrupt_and_wait: self-clear in progress or recent handoff -- deferring interrupt (not seizing pane)"
         );
         return false;
     }
@@ -1958,6 +2050,66 @@ pub(crate) fn extract_login_url(pane_output: &str) -> Option<String> {
     Some(url)
 }
 
+/// Claude Code's PROACTIVE "your login is about to expire" warning.
+///
+/// This is a different signal from `check_lines_for_reauth`, and the two must
+/// not be confused. `check_lines_for_reauth` fires when the credentials are
+/// ALREADY dead: the TUI has been replaced by a login screen and the session
+/// can no longer do anything. This one fires while the session is perfectly
+/// healthy — the TUI is up, work is happening, and Claude Code has merely
+/// started warning that the OAuth refresh token lapses soon.
+///
+/// The exact wording was read out of the shipped Claude Code bundle rather
+/// than guessed, the same way `LOGIN_URL_PREFIXES` was. Two independent call
+/// sites render it and both compose the identical visible text:
+///
+/// ```text
+/// Your login expires in 2 days · run /login to renew
+/// ```
+///
+/// One is a startup banner that renders whenever the refresh token is inside
+/// its warning window; the other is a transient notice that renders only when
+/// the window is down to a single day. Because the notice is transient, a
+/// poller can legitimately MISS it — which is why the daemon corroborates
+/// with, and can fall back to, the on-disk credential expiry.
+///
+/// Matching strategy: strip ALL whitespace and lowercase before matching. A
+/// tmux pane hard-wraps with no separator and no hyphenation, so a phrase this
+/// long can be split at any column; a whitespace-insensitive match is wrap
+/// proof by construction, where a literal `"your login expires in"` is not.
+///
+/// Returns the number of days Claude Code claims are left.
+pub(crate) fn detect_login_expiry_warning(pane_output: &str) -> Option<u32> {
+    // No cheap literal pre-filter here, deliberately. The obvious one —
+    // "does the pane contain `login expires in`?" — is exactly the literal
+    // this function refuses to match on, and it silently defeats the whole
+    // point: a pane that wrapped mid-word would fail the pre-filter and
+    // return None while the squashed form matches perfectly. Squashing a
+    // pane capture is a few microseconds; a wrap-blind fast path is a bug.
+    static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex_lite::Regex::new(r"yourloginexpiresin(\d{1,4})day")
+            .expect("static login-expiry pattern is valid")
+    });
+    let squashed: String = pane_output
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    let caps = re.captures(&squashed)?;
+    caps.get(1)?.as_str().parse::<u32>().ok()
+}
+
+/// Capture the pane and report Claude Code's proactive login-expiry warning.
+///
+/// Companion to `needs_reauth`, deliberately a separate capture: the two
+/// signals are mutually exclusive (one needs the TUI gone, the other needs it
+/// present) so neither can mask the other.
+pub async fn login_expiry_warning(pane: &str) -> Option<u32> {
+    let out = capture_pane(pane).await?;
+    detect_login_expiry_warning(&out)
+}
+
 /// Check if the pane is showing a reauth/login prompt.
 /// Returns the login URL if reauth is needed (or empty string if needed but URL not found).
 pub async fn needs_reauth(pane: &str) -> Option<String> {
@@ -2569,6 +2721,112 @@ pub async fn healthcheck_brief(config: &crate::config::TmuxConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Proactive login-expiry warning ----
+
+    /// The literal string Claude Code renders, verbatim. Both of its render
+    /// sites compose this same text.
+    #[test]
+    fn login_expiry_warning_is_read_off_a_normal_pane() {
+        let pane = "\
+  Some tool output here
+  ⚠ Your login expires in 2 days · run /login to renew
+
+╭──────────────────────────────────────────────────────────╮
+│ > ";
+        assert_eq!(detect_login_expiry_warning(pane), Some(2));
+    }
+
+    /// Singular vs plural: Claude Code pluralizes the unit, so "1 day" has to
+    /// match as surely as "3 days".
+    #[test]
+    fn both_the_singular_and_plural_forms_match() {
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 1 day · run /login to renew"),
+            Some(1)
+        );
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 3 days · run /login to renew"),
+            Some(3)
+        );
+    }
+
+    /// The reason the matcher strips whitespace instead of matching a literal:
+    /// a tmux pane hard-wraps with NO separator and no hyphenation, so the
+    /// phrase can be cut at any column — including mid-word.
+    #[test]
+    fn a_hard_wrapped_warning_still_matches() {
+        // Wrapped between words.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires\nin 2 days · run /login to renew"),
+            Some(2)
+        );
+        // Wrapped MID-WORD, which is what tmux actually does at a narrow width.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expi\nres in 2 days · run /log\nin to renew"),
+            Some(2)
+        );
+        // And with the trailing half of the line missing entirely, because a
+        // narrow pane truncates the notice with an ellipsis.
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in 2 days ·…"),
+            Some(2)
+        );
+    }
+
+    /// A live session with no warning must report nothing — including one
+    /// whose conversation is full of auth vocabulary.
+    #[test]
+    fn an_ordinary_pane_reports_no_warning() {
+        assert_eq!(detect_login_expiry_warning(""), None);
+        assert_eq!(
+            detect_login_expiry_warning(
+                "⏵⏵ bypass permissions on · 3 shells · esc to interrupt\n337594 tokens"
+            ),
+            None
+        );
+        // Near-misses that are NOT the warning.
+        assert_eq!(
+            detect_login_expiry_warning("your session expires in 2 days"),
+            None
+        );
+        assert_eq!(
+            detect_login_expiry_warning("Your login expires in a couple of days"),
+            None
+        );
+        assert_eq!(
+            detect_login_expiry_warning("OAuth token has expired. Re-authenticate to continue."),
+            None
+        );
+    }
+
+    /// Documented, deliberately: the detector CANNOT tell Claude Code's banner
+    /// from the same sentence sitting in conversation text, and this test pins
+    /// that as a known property rather than leaving it as a surprise. It is
+    /// why `decide_expiry_action` refuses to act on a pane sighting the
+    /// credential store contradicts.
+    #[test]
+    fn conversation_text_matches_too_which_is_why_corroboration_exists() {
+        let quoting_the_docs =
+            "  I'm reading the detector docs, which quote \"Your login expires in 2 days\".";
+        assert_eq!(detect_login_expiry_warning(quoting_the_docs), Some(2));
+    }
+
+    /// The reactive login SCREEN and the proactive warning are different
+    /// states and must not be confused: the warning fires while the TUI is up,
+    /// the login screen fires only once it is gone.
+    #[test]
+    fn the_expiry_warning_and_the_login_screen_are_disjoint_signals() {
+        let warning = "Your login expires in 1 day · run /login to renew\n337594 tokens";
+        assert_eq!(detect_login_expiry_warning(warning), Some(1));
+        // TUI is visible, so the reactive path correctly stands down.
+        assert!(!check_lines_for_reauth(warning));
+
+        let login_screen = "Browser didn't open? Use the url below to sign in\n\n\
+                            https://claude.com/cai/oauth/authorize?code=true";
+        assert!(check_lines_for_reauth(login_screen));
+        assert_eq!(detect_login_expiry_warning(login_screen), None);
+    }
 
     // ---- Interrupt-only-hits-main-loop (Andrew #1803/#1804) ----
 
@@ -4477,6 +4735,52 @@ mod inject_and_selfclear_coord_tests {
             resolve_self_clear_lock_path(None, Some("  ")),
             "/var/run/claude/claude-self-clear.lock"
         );
+    }
+
+    #[test]
+    fn self_clear_handoff_path_prefers_env_then_xdg_then_default() {
+        // Mirrors the lockfile resolution EXACTLY (must agree with
+        // container/bin/self-clear's _default_handoff_file()).
+        assert_eq!(
+            resolve_self_clear_handoff_path(Some("/tmp/custom.handoff"), Some("/run/user/1000")),
+            "/tmp/custom.handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(Some("   "), Some("/run/user/1000")),
+            "/run/user/1000/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, Some("/run/user/1000/")),
+            "/run/user/1000/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, None),
+            "/var/run/claude/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, Some("  ")),
+            "/var/run/claude/claude-self-clear-handoff"
+        );
+    }
+
+    #[test]
+    fn handoff_is_recent_window_semantics() {
+        let now = 1_000_000.0;
+        // Absent marker => never recent.
+        assert!(!handoff_is_recent(None, now, 120));
+        // Just stamped => recent.
+        assert!(handoff_is_recent(Some(now), now, 120));
+        // Within the window => recent.
+        assert!(handoff_is_recent(Some(now - 119.0), now, 120));
+        // Exactly at the window edge => recent (inclusive).
+        assert!(handoff_is_recent(Some(now - 120.0), now, 120));
+        // Older than the window => NOT recent.
+        assert!(!handoff_is_recent(Some(now - 120.1), now, 120));
+        // Small clock-skew future mtime => still recent.
+        assert!(handoff_is_recent(Some(now + 5.0), now, 120));
+        // grace 0 disables at the caller layer, but the pure fn with a 0 window
+        // only treats an exactly-now (or future) marker as recent.
+        assert!(!handoff_is_recent(Some(now - 1.0), now, 0));
     }
 
     #[test]
