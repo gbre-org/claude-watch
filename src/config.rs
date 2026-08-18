@@ -1485,6 +1485,14 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
 pub fn try_load_config() -> Result<Config, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
     let user_path = format!("{}/.config/claude-watch/config.toml", home);
+    // Highest-precedence, operator-editable RUNTIME override. Path from
+    // $CLAUDE_WATCH_RUNTIME_CONFIG (empty/unset => no runtime layer). The
+    // container points this at a bind-mounted file under
+    // ~/.config/claude-container/ — a SEPARATE file, NOT an overlay over the
+    // config dir ~/.config/claude-watch (overlaying that historically
+    // root-broke the config dir). Editing it + the daemon's mtime auto-reload
+    // (see `config_layers_mtime`) changes cadence live, with no image rebuild.
+    let runtime_path = std::env::var("CLAUDE_WATCH_RUNTIME_CONFIG").unwrap_or_default();
 
     // Base layer: first existing of $CLAUDE_WATCH_CONFIG, then
     // ./config.toml, then the well-known container path
@@ -1544,6 +1552,20 @@ pub fn try_load_config() -> Result<Config, String> {
         loaded_from.push(user_path.clone());
     }
 
+    // Overlay the RUNTIME override LAST (highest precedence). This is the
+    // bind-mounted, operator-editable file ($CLAUDE_WATCH_RUNTIME_CONFIG); it
+    // lets an operator retune cadence (and any other field) WITHOUT rebuilding
+    // the image — pair it with the daemon's config-mtime auto-reload so edits
+    // take effect live. Empty/absent path => no-op (read_layer returns None).
+    if let Some(res) = read_layer(&runtime_path) {
+        let overlay = res?;
+        match merged.as_mut() {
+            Some(base) => merge_toml(base, overlay),
+            None => merged = Some(overlay),
+        }
+        loaded_from.push(runtime_path.clone());
+    }
+
     match merged {
         Some(value) => match value.try_into::<Config>() {
             Ok(config) => {
@@ -1561,6 +1583,36 @@ pub fn try_load_config() -> Result<Config, String> {
             Err(format!("no config file found. Tried: {:?}", tried))
         }
     }
+}
+
+/// All config-layer file paths the loader consults, lowest precedence first,
+/// with unset/empty entries dropped. The daemon samples these files' mtimes
+/// (see [`config_layers_mtime`]) to auto-reload on operator edits — the same
+/// precedence order [`try_load_config`] layers.
+pub fn config_layer_paths() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+    let mut paths = vec![
+        std::env::var("CLAUDE_WATCH_CONFIG").unwrap_or_default(),
+        "config.toml".to_string(),
+        "/etc/claude-watch/config.toml".to_string(),
+        format!("{}/.config/claude-watch/config.toml", home),
+        std::env::var("CLAUDE_WATCH_RUNTIME_CONFIG").unwrap_or_default(),
+    ];
+    paths.retain(|p| !p.is_empty());
+    paths
+}
+
+/// Newest modification time across all existing config-layer files, or `None`
+/// if none exist yet. The daemon samples this each loop pass; when it advances
+/// (an operator edited a bind-mounted config / runtime-override file) the
+/// daemon reloads config WITHOUT a manual SIGHUP, so cadence (and any other)
+/// tunables take effect live — no image rebuild, no redeploy.
+pub fn config_layers_mtime() -> Option<std::time::SystemTime> {
+    config_layer_paths()
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .filter_map(|m| m.modified().ok())
+        .max()
 }
 
 /// Parse config from a TOML string. Useful for testing.
@@ -2791,5 +2843,41 @@ legacy_log_file = "/tmp/ll"
         // newline.
         assert!(!nudge.contains('\n'), "phase-1 nudge must stay single-line");
         assert!(!hard.contains('\n'), "phase-2 hard block must stay single-line");
+    }
+
+    #[test]
+    fn test_runtime_override_layer_wins_for_cadence() {
+        // The runtime-override layer is the operator-editable, bind-mounted
+        // file that makes cadence retunable WITHOUT an image rebuild. Model the
+        // layering here: a baked base (memory-reminder = 3600, like the
+        // in-container config #612 bakes) with a runtime overlay dropping it to
+        // 600 must merge to 600 and still parse into a full Config. Uses
+        // merge_toml directly so the test is pure (no env/filesystem). Appends
+        // a [cadence] table to SAMPLE_CONFIG (which omits one, relying on the
+        // struct default) to stand in for the baked base layer.
+        let base_toml = format!(
+            "{}\n[cadence]\nenabled = true\nmemory_reminder_interval_secs = 3600\n",
+            SAMPLE_CONFIG
+        );
+        let mut base: toml::Value = toml::from_str(&base_toml).unwrap();
+        // Sanity: the base really carries the baked 3600 value.
+        assert_eq!(
+            base.get("cadence")
+                .and_then(|c| c.get("memory_reminder_interval_secs"))
+                .and_then(|v| v.as_integer()),
+            Some(3600)
+        );
+        let overlay: toml::Value =
+            toml::from_str("[cadence]\nmemory_reminder_interval_secs = 600\n").unwrap();
+        merge_toml(&mut base, overlay);
+        let config: Config = base.try_into().unwrap();
+        // Runtime overlay wins.
+        assert_eq!(config.cadence.memory_reminder_interval_secs, 600);
+        // A field the overlay did NOT set falls back to the code default
+        // (heartbeat interval), proving the merge is per-field, not wholesale.
+        assert_eq!(
+            config.cadence.heartbeat_tick_interval_secs,
+            crate::cadence::HEARTBEAT_TICK_INTERVAL_SECS
+        );
     }
 }
