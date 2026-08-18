@@ -9,9 +9,10 @@ cron jobs calling `claude-event` write events to the default
 $HOME/claude-events instead of the bind-mounted host spool at
 $CLAUDE_EVENT_QUEUE. The fix: the entrypoint generates
 /etc/cron.d/00-env at boot with the container's CLAUDE_EVENT_QUEUE,
-HOME, and PATH. Cron reads /etc/cron.d/ files in sorted order, so
-"00-env" sorts first and its env-var lines apply to all subsequent
-entries (cw-default, private/).
+HOME, and PATH. cron scopes env-var lines PER cron.d file, so 00-env's
+vars do NOT propagate to jobs in other files (cw-default, private/);
+`cw-cron-run` — the wrapper every cw-default job runs through — SOURCES
+/etc/cron.d/00-env before exec so those jobs actually inherit them.
 
 Asserts:
 
@@ -27,6 +28,10 @@ Asserts:
   5. Dockerfile grants passwordless sudo for `tee /etc/cron.d/00-env`
      so the uid-1000 entrypoint can write the root-owned file.
   6. Dockerfile grants passwordless sudo for `chmod 0644 /etc/cron.d/00-env`.
+  7. container/bin/cw-cron-run SOURCES /etc/cron.d/00-env (exporting the
+     assignments) before exec'ing the real command — the step that actually
+     delivers 00-env's vars to cw-default jobs, since cron does not propagate
+     env-var lines across cron.d files.
 
 Run:  ./cron-env-propagation.test
 """
@@ -174,6 +179,52 @@ if DOCKERFILE.is_file():
         "carve-out. Without this the entrypoint can write the file "
         "but can't ensure the mode is correct (cron rejects "
         "non-0644 files in /etc/cron.d/).",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. cw-cron-run sources /etc/cron.d/00-env before exec.
+#
+#    Writing 00-env (checks 1-6) is necessary but NOT sufficient: cron scopes
+#    env-var lines PER cron.d file, so the vars in /etc/cron.d/00-env do NOT
+#    propagate to the metrics/active-agents jobs, which live in the SEPARATE
+#    /etc/cron.d/cw-default file. cw-cron-run — the wrapper every cw-default
+#    job runs through — must SOURCE the env file and EXPORT its assignments
+#    before exec'ing the real command; otherwise `claude-watch metrics` never
+#    sees CLAUDE_WATCH_PROM_FILE and falls back to its hardcoded, unwritable
+#    /var/lib/node-exporter/textfile default -> "Permission denied".
+# ---------------------------------------------------------------------------
+CW_CRON_RUN = CONTAINER_DIR / "bin" / "cw-cron-run"
+expect(CW_CRON_RUN.is_file(), f"cw-cron-run missing at {CW_CRON_RUN}")
+if CW_CRON_RUN.is_file():
+    cron_run = CW_CRON_RUN.read_text(encoding="utf-8")
+
+    # References the canonical env file the entrypoint writes into.
+    expect(
+        "/etc/cron.d/00-env" in cron_run,
+        "cw-cron-run: must reference the canonical cron env file "
+        "/etc/cron.d/00-env (where the entrypoint writes the metrics env) "
+        "so it can source it before exec.",
+    )
+
+    # Sources that file BEFORE the final exec of the real command.
+    env_pos = cron_run.find("CW_CRON_ENV_FILE")
+    exec_pos = cron_run.rfind("exec ")
+    expect(
+        env_pos != -1 and exec_pos != -1 and env_pos < exec_pos,
+        "cw-cron-run: must source the cron env file (CW_CRON_ENV_FILE / "
+        "/etc/cron.d/00-env) BEFORE `exec`'ing the real command. cron does "
+        "not propagate env-var lines across cron.d files, so this source "
+        "step is what actually delivers 00-env's vars to cw-default jobs "
+        "(without it, `claude-watch metrics` hits its unwritable hardcoded "
+        "prom path and permission-denies every minute).",
+    )
+
+    # Exports the assignments — a non-exported shell var would not survive exec.
+    expect(
+        re.search(r"\bexport\b", cron_run) is not None,
+        "cw-cron-run: must EXPORT the sourced assignments so the exec'd "
+        "command inherits them (a non-exported shell var does not cross exec).",
     )
 
 
