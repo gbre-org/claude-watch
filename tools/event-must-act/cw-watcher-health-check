@@ -204,11 +204,19 @@ fi
 # daemon uses for its alerts, triggering the "STOP EVERYTHING" protocol.
 #
 # The type-and-submit choreography is CENTRALIZED in `claude-watch inject`
-# (src/tmux.rs) — the ONE verified copy of the Escape->NORMAL / dd / `i`
-# INSERT verify-and-retry / type / Tab->Escape->Enter sequence. Shelling out
-# to it (instead of hand-rolling send-keys) carries the proven keystroke
-# order AND verifies the submission landed (payload cleared from the prompt
-# line), exiting non-zero if it didn't.
+# (src/tmux.rs) — the ONE verified copy of the type-and-submit sequence.
+# Shelling out to it (instead of hand-rolling send-keys) carries the proven
+# keystroke order AND verifies the submission landed (payload cleared from the
+# prompt line), exiting non-zero if it didn't.
+#
+# Deliberately NO `--escape`. Since 2026-08-18 inject only fires the
+# Escape->NORMAL blast when asked, and this alert must NOT ask: the daemon's
+# own watcher-down alert is the ROUTINE tier (src/alert.rs, KNOB #4) precisely
+# because seizing the turn to deliver a can-wait recovery nudge aborts the
+# loop's in-flight turn and kills mid-flight background agents. This script is
+# the cron-driven twin of that same alert, so it now delivers the same way:
+# queued, arriving by the next turn boundary. Adding `--escape` here would
+# re-introduce the cancellation the daemon side deliberately gave up.
 ALERT="[CLAUDE-WATCH] WATCHER DOWN: $STALE event(s) unconsumed >${STALE_MIN}min — the event watcher is dead or stuck. $RESTART_HINT"
 
 inject_rc=0

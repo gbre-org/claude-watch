@@ -638,13 +638,22 @@ def inject(pane, text, label="inject", slash_command=False):
     order AND verifies the submission landed (payload cleared from the
     prompt line), exiting non-zero if it didn't.
 
-    `claude-watch inject` reproduces BOTH branches this function used to
-    implement:
+    `claude-watch inject --escape` reproduces BOTH branches this function
+    used to implement:
       - regular text  -> Tab→Escape→Enter submit (the default).
       - slash command  -> `--slash-command`: bare Enter from INSERT mode
         (the Tab+Escape sequence does NOT submit a slash command, because
         Escape goes INSERT→NORMAL and Enter in NORMAL mode doesn't submit
         — the 2026-03-01 `/clear`-sent-as-text bug).
+
+    `--escape` is LOAD-BEARING and must not be dropped. `claude-watch
+    inject` stopped sending the Escape→NORMAL blast by default on
+    2026-08-18, and self-clear is the caller that most needs it: this whole
+    flow deliberately SEIZES the pane (it runs its own interrupt-and-wait
+    Escape blast first) and relies on the `dd` line-clear to wipe the input
+    line before typing. Without it, a `/clear` typed onto leftover prompt
+    text is submitted as ordinary text and the context is never cleared —
+    the exact 2026-03-01 failure, back by a different route.
 
     NOTE: only the per-keystroke type-and-submit step is centralized. The
     HIGHER-LEVEL self-clear flow that wraps this call — interrupt_and_wait,
@@ -655,7 +664,7 @@ def inject(pane, text, label="inject", slash_command=False):
     """
     log(f"  [{label}] pane before: {capture_pane_text(pane)}")
 
-    cmd = ["claude-watch", "inject", "--pane", pane, "--submit", text]
+    cmd = ["claude-watch", "inject", "--pane", pane, "--submit", text, "--escape"]
     if slash_command:
         cmd.append("--slash-command")
 

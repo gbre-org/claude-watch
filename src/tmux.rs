@@ -1141,6 +1141,23 @@ async fn ensure_insert_mode(pane: &str) {
 /// that genuinely must seize the turn (context-critical, wedged, auto-update,
 /// prolonged-thinking) keep using `inject_text` + `interrupt_and_wait`.
 pub async fn inject_text_queued(pane: &str, text: &str) {
+    type_text_non_cancelling(pane, text).await;
+
+    // Submit with a bare Enter from INSERT. A message typed-and-Entered while a
+    // turn is generating is QUEUED by Claude Code, not injected mid-generation
+    // — so the active turn keeps running.
+    send_keys(pane, &["Enter"]).await;
+    sleep(Duration::from_millis(300)).await;
+}
+
+/// The TYPE-ONLY half of the non-cancelling choreography: focus-return, enter
+/// INSERT without leaving a stray literal `i`, type the payload. Sends NO
+/// submit keystroke and — the load-bearing property — NO Escape.
+///
+/// Factored out of `inject_text_queued` so the non-cancelling `--no-submit`
+/// path (`inject_and_verify` without `--escape`) shares exactly one copy of it
+/// rather than falling back to the Escape-leading `inject_text_no_submit`.
+pub(crate) async fn type_text_non_cancelling(pane: &str, text: &str) {
     // Return FleetView selection to `main` FIRST (before entering INSERT and
     // typing), so a queued nudge lands on the main conversation and not on a
     // background agent selected in the FleetView (Andrew #270/#288/#291).
@@ -1159,13 +1176,8 @@ pub async fn inject_text_queued(pane: &str, text: &str) {
     ensure_insert_mode(pane).await;
     sleep(Duration::from_millis(300)).await;
 
-    // Type the payload, then submit with a bare Enter from INSERT. A message
-    // typed-and-Entered while a turn is generating is QUEUED by Claude Code,
-    // not injected mid-generation — so the active turn keeps running.
     send_literal(pane, text).await;
     sleep(Duration::from_millis(500)).await;
-    send_keys(pane, &["Enter"]).await;
-    sleep(Duration::from_millis(300)).await;
 }
 
 /// The ordered keystroke sequence used by `inject_text` Step 5 to submit
@@ -1238,11 +1250,22 @@ pub(crate) fn prompt_line_text(pane_output: &str) -> Option<String> {
 ///     commands MUST submit from INSERT — Escape→NORMAL then Enter does
 ///     NOT submit a slash command (the documented self-clear `/clear` bug).
 ///
-/// `no_cancel = true` selects the NON-CANCELLING typing choreography
-/// (`inject_text_queued`): it NEVER leads with an Escape, so it does not
-/// cancel an in-flight turn. Used by callers that must apply a change without
-/// interrupting the session (e.g. cw-theme-sync's `/config theme=…`). See the
-/// branch comment in the body for the trade-off.
+/// `escape` selects the choreography, and it DEFAULTS OFF (Andrew, 2026-08-18:
+/// make `claude-watch inject` not use Escape by default, and put it behind a
+/// flag):
+///   - `escape = false` (DEFAULT) — NON-CANCELLING. Never sends an Escape, so
+///     an in-flight turn is not interrupted AND a modal standing on the pane
+///     is not cancelled. Enters INSERT with an idempotent `i`, types, and
+///     (when `submit`) commits with a bare Enter from INSERT — which Claude
+///     Code QUEUES behind an active turn. `slash_command` makes no difference
+///     here: bare-Enter-from-INSERT already IS the slash-command contract.
+///     Trade-off: no `dd` line-clear, so half-typed operator input on the
+///     prompt line glues onto the payload.
+///   - `escape = true` — CANCELLING. The historical choreography:
+///     Escape→NORMAL coercion, `dd` line-clear, `i`, type, then
+///     Tab→Escape→Enter (or a bare Enter for `slash_command`). Opt in when the
+///     caller genuinely needs the turn seized and the prompt line wiped
+///     (self-clear's `/clear`, mcp-reconnect's `/mcp`).
 ///
 /// Returns:
 ///   - `InjectOutcome::Typed` when `submit == false`.
@@ -1256,23 +1279,31 @@ pub async fn inject_and_verify(
     text: &str,
     submit: bool,
     slash_command: bool,
-    no_cancel: bool,
+    escape: bool,
 ) -> InjectOutcome {
-    // NON-CANCELLING submit path (`no_cancel`): NEVER send a leading Escape.
+    // DEFAULT PATH (`escape == false`): NEVER send a leading Escape.
     // `inject_text` / `inject_text_no_submit` both open with an Escape→NORMAL
     // coercion loop, and — as inject_dispatch.rs and docs/two-channel-design.md
-    // document — *that Escape is what CANCELS the in-flight turn*. Callers that
-    // must apply a change without interrupting whatever the session is doing
-    // (e.g. cw-theme-sync's `/config theme=…`) route here: `inject_text_queued`
-    // enters INSERT via an idempotent `i` (NO Escape, NO `dd` line-clear), types
-    // the payload, and submits with a bare Enter from INSERT — which is exactly
-    // the slash-command submit contract AND is QUEUED behind an active turn
-    // rather than interrupting it. Trade-off: no `dd` line-clear, so half-typed
-    // operator input glues onto the payload (acceptable — never interrupting is
-    // the explicit priority for these callers). Then fall through to the shared
-    // verify window below.
-    if submit && no_cancel {
-        inject_text_queued(pane, text).await;
+    // document — *that Escape is what CANCELS the in-flight turn*. It also
+    // cancels any MODAL standing on the pane, which is why the login flow could
+    // not use this subcommand at all until the default flipped. So the
+    // un-flagged behaviour is now the safe one: enter INSERT via an idempotent
+    // `i` (NO Escape, NO `dd` line-clear), type the payload, and — when
+    // submitting — commit with a bare Enter from INSERT, which is both the
+    // slash-command submit contract AND queued behind an active turn rather
+    // than interrupting it. Trade-off: no `dd` line-clear, so half-typed
+    // operator input glues onto the payload. Callers that need the turn seized
+    // and the prompt line wiped pass `--escape`. Then fall through to the
+    // shared verify window below.
+    if !escape {
+        type_text_non_cancelling(pane, text).await;
+        if submit {
+            // Bare Enter from INSERT — the same submit `inject_text_queued`
+            // uses, and the same one slash commands require, so
+            // `slash_command` makes no difference on this path.
+            send_keys(pane, &["Enter"]).await;
+            sleep(Duration::from_millis(300)).await;
+        }
     } else if submit && !slash_command {
         // Reuse inject_text's proven type-and-submit choreography for the
         // regular-text submit path so there is exactly ONE copy of the
