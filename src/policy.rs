@@ -4846,7 +4846,25 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     state.alert_count = 0;
                     reset_suppression(state);
                 }
-            } else if {
+            } else if
+                // SELF-CLEAR HANDOFF GUARD (operator #4799, q-2026-08-18-e509):
+                // do NOT fire the generic fresh-session prompt while a
+                // `self-clear` is mid-handoff (lock held) OR has JUST delivered
+                // its own resume prompt (marker within the grace window). The
+                // lock-held check alone was insufficient: `self-clear` releases
+                // the lock the instant it submits the resume prompt, but the
+                // fresh session then reads idle+0-tokens for many more seconds
+                // while it bootstraps — the exact window in which this gate
+                // fired the generic "You are a fresh session ..." text and
+                // CLOBBERED the handoff. Checked BEFORE the pane captures so a
+                // recent handoff short-circuits without extra tmux work, and
+                // placed at the GATE (not just inside `inject_to_agent`) so the
+                // `fresh_session_injected` latch is not set on a deferred fire.
+                !tmux::self_clear_in_progress()
+                && !tmux::self_clear_handoff_recent(
+                    config.fresh_clear.self_clear_handoff_grace_secs,
+                )
+                && {
                 // Evaluate the pane reads ONCE into locals, then defer the
                 // FIRE/SUPPRESS decision to the pure `fresh_inject_due` gate
                 // (unit-tested, so the interactive-prompt suppression is
@@ -4988,7 +5006,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             .is_some_and(|e| e < config.fresh_clear.post_clear_window_secs as f64)
             || state
                 .context_clear_child_pid
-                .is_some_and(clear_child_is_running);
+                .is_some_and(clear_child_is_running)
+            // A self-clear (daemon-, operator-, or skill-driven) that JUST
+            // delivered its own resume prompt also counts as "daemon covered":
+            // its handoff marker is fresh, so this post-clear gate must NOT
+            // inject a second resume on top of it (operator #4799). Covers the
+            // operator/skill self-clears that `context_clear_child_pid` /
+            // `last_wedged_clear` do not, plus the post-lock-release window.
+            || tmux::self_clear_handoff_recent(
+                config.fresh_clear.self_clear_handoff_grace_secs,
+            );
         let idle = tmux::is_idle(&effective_pane).await;
         // Only consulted when idle already holds, to avoid a second pane
         // capture on the common not-idle path (same shape as the gates above).

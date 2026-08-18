@@ -1057,6 +1057,14 @@ async fn run_daemon() {
 
     let config = load_config();
     let mut state = load_state(&config.general.state_file);
+    // Anchor for the "time since last clear" metric fallback: record when THIS
+    // daemon process started, so the (separate, short-lived) `claude-watch
+    // metrics` scraper can render a real duration even before any /clear is
+    // observed (e.g. right after a deploy/recreate). Overwritten each start.
+    state.daemon_start_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs_f64());
 
     // Wire the post-escape settle delay into the tmux module's process-global
     // atomic. Default is 0 (no extra wait — fast path); see TmuxConfig for

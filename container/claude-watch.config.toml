@@ -21,7 +21,19 @@
 
 [general]
 check_interval = 5
-state_file = "/home/hndrewaall/.cache/claude-watch/state.json"
+# Persist the daemon's main state on the DURABLE named volume mounted at
+# /var/lib/claude-watch (compose service `claude-watch-state`), NOT the
+# ephemeral container-local ~/.cache. This is where every OTHER piece of
+# daemon state already lives (active-agents.json, queue-check-state.json,
+# stale-ready-state.json — see src/{queue_check,stale_ready}.rs
+# default_state_dir()). Keeping the main state.json here was the root cause of
+# `last_context_clear` (the `claude_last_context_clear_timestamp_seconds`
+# gauge) — and every cumulative `*_interrupts_total` counter — vanishing on a
+# `docker compose up --force-recreate`: ~/.cache is wiped with the container
+# FS, so the persisted timestamp was lost until the next observed /clear
+# (q-2026-08-18-e509). The metrics reader resolves the same path via
+# general.state_file, so daemon + emitter stay in sync.
+state_file = "/var/lib/claude-watch/state.json"
 log_file = "/var/log/claude-watch/claude-watch.jsonl"
 legacy_log_file = "/var/log/claude-watch/claude-watch.log"
 # Global post-interrupt cooldown (seconds): 5-min outer ceiling on ALL

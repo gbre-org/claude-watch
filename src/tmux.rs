@@ -818,6 +818,97 @@ pub(crate) fn self_clear_in_progress() -> bool {
     lockfile_held(&self_clear_lock_path())
 }
 
+/// Pure: resolve the `self-clear` HANDOFF-COMPLETION marker path from the two
+/// env inputs, mirroring `container/bin/self-clear`'s `_default_handoff_file()`
+/// EXACTLY so the daemon and the self-clear tool agree on the same file:
+///   1. `env_marker` ($CLAUDE_SELF_CLEAR_HANDOFF) if set & non-empty,
+///   2. else `$XDG_RUNTIME_DIR/claude-self-clear-handoff` if XDG set & non-empty,
+///   3. else `/var/run/claude/claude-self-clear-handoff`.
+///
+/// This is DISTINCT from the coordination lockfile: the lock signals "a
+/// self-clear is RUNNING" (held only for the `/clear`->resume handoff), whereas
+/// this marker is TOUCHED once, at the moment the resume prompt is delivered,
+/// so the daemon can suppress its own fresh-session / post-clear injects for a
+/// grace window AFTER the lock releases while the fresh session bootstraps.
+pub(crate) fn resolve_self_clear_handoff_path(
+    env_marker: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> String {
+    if let Some(v) = env_marker {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Some(rt) = xdg_runtime_dir {
+        let rt = rt.trim();
+        if !rt.is_empty() {
+            return format!("{}/claude-self-clear-handoff", rt.trim_end_matches('/'));
+        }
+    }
+    "/var/run/claude/claude-self-clear-handoff".to_string()
+}
+
+/// Resolve the live `self-clear` handoff-marker path from the process env.
+pub(crate) fn self_clear_handoff_path() -> String {
+    resolve_self_clear_handoff_path(
+        std::env::var("CLAUDE_SELF_CLEAR_HANDOFF").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+/// Pure: is a handoff-marker mtime "recent" (within `grace_secs` of `now`)?
+/// A marker in the (small clock-skew) future also counts as recent. `None`
+/// mtime (marker absent) => not recent. `grace_secs == 0` => never recent
+/// (feature disabled) is handled by the caller.
+pub(crate) fn handoff_is_recent(marker_mtime: Option<f64>, now: f64, grace_secs: u64) -> bool {
+    match marker_mtime {
+        Some(m) => m >= now - grace_secs as f64,
+        None => false,
+    }
+}
+
+/// Did a `self-clear` tool FINISH delivering its resume/handoff prompt within
+/// the last `grace_secs`? The self-clear tool touches
+/// `self_clear_handoff_path()` immediately after it submits the resume prompt.
+/// The daemon consults this so its fresh-session / post-clear inject gates DEFER
+/// while the freshly-cleared session is still bootstrapping (tokens still 0,
+/// pane idle) — the window where the daemon would otherwise CLOBBER the handoff
+/// prompt with its generic "You are a fresh session ..." text (operator #4799).
+///
+/// Distinct from `self_clear_in_progress` (lock HELD during the handoff): that
+/// covers only the in-flight window; this covers the post-release bootstrap
+/// window. Fail-open (returns false) so a probe glitch never wedges recovery.
+pub(crate) fn self_clear_handoff_recent(grace_secs: u64) -> bool {
+    if grace_secs == 0 {
+        return false;
+    }
+    let path = self_clear_handoff_path();
+    let mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    handoff_is_recent(mtime, now, grace_secs)
+}
+
+/// Grace window (seconds) for `self_clear_handoff_recent` when consulted from a
+/// lib-level primitive that has no `Config` in hand (e.g. `interrupt_and_wait`).
+/// `$CLAUDE_SELF_CLEAR_HANDOFF_GRACE_SECS` overrides; defaults to 120 to match
+/// `config::default_self_clear_handoff_grace_secs`. The daemon's policy gates
+/// use the config field directly; this env fallback keeps the primitive
+/// config-free (same convention as the lockfile-path env resolution).
+pub(crate) fn self_clear_handoff_grace_secs_env() -> u64 {
+    std::env::var("CLAUDE_SELF_CLEAR_HANDOFF_GRACE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(120)
+}
+
 /// Actively interrupt Claude Code: rapid-fire Escape, periodically Ctrl-B x2.
 /// Returns true if idle state confirmed within `timeout_secs`. Returns false
 /// at the deadline; callers should still proceed with their inject (the
@@ -848,10 +939,11 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
     // mid-handoff (holding its lockfile), DEFER -- an Escape blast here would
     // clobber the `/clear`->resume-prompt sequence it drives into this same pane
     // (operator-reported, 2026-08-17). Fail-open. See `self_clear_in_progress`.
-    if self_clear_in_progress() {
+    if self_clear_in_progress() || self_clear_handoff_recent(self_clear_handoff_grace_secs_env())
+    {
         info!(
             pane = %pane,
-            "interrupt_and_wait: self-clear in progress -- deferring interrupt (not seizing pane)"
+            "interrupt_and_wait: self-clear in progress or recent handoff -- deferring interrupt (not seizing pane)"
         );
         return false;
     }
@@ -4643,6 +4735,52 @@ mod inject_and_selfclear_coord_tests {
             resolve_self_clear_lock_path(None, Some("  ")),
             "/var/run/claude/claude-self-clear.lock"
         );
+    }
+
+    #[test]
+    fn self_clear_handoff_path_prefers_env_then_xdg_then_default() {
+        // Mirrors the lockfile resolution EXACTLY (must agree with
+        // container/bin/self-clear's _default_handoff_file()).
+        assert_eq!(
+            resolve_self_clear_handoff_path(Some("/tmp/custom.handoff"), Some("/run/user/1000")),
+            "/tmp/custom.handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(Some("   "), Some("/run/user/1000")),
+            "/run/user/1000/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, Some("/run/user/1000/")),
+            "/run/user/1000/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, None),
+            "/var/run/claude/claude-self-clear-handoff"
+        );
+        assert_eq!(
+            resolve_self_clear_handoff_path(None, Some("  ")),
+            "/var/run/claude/claude-self-clear-handoff"
+        );
+    }
+
+    #[test]
+    fn handoff_is_recent_window_semantics() {
+        let now = 1_000_000.0;
+        // Absent marker => never recent.
+        assert!(!handoff_is_recent(None, now, 120));
+        // Just stamped => recent.
+        assert!(handoff_is_recent(Some(now), now, 120));
+        // Within the window => recent.
+        assert!(handoff_is_recent(Some(now - 119.0), now, 120));
+        // Exactly at the window edge => recent (inclusive).
+        assert!(handoff_is_recent(Some(now - 120.0), now, 120));
+        // Older than the window => NOT recent.
+        assert!(!handoff_is_recent(Some(now - 120.1), now, 120));
+        // Small clock-skew future mtime => still recent.
+        assert!(handoff_is_recent(Some(now + 5.0), now, 120));
+        // grace 0 disables at the caller layer, but the pure fn with a 0 window
+        // only treats an exactly-now (or future) marker as recent.
+        assert!(!handoff_is_recent(Some(now - 1.0), now, 0));
     }
 
     #[test]
