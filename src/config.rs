@@ -278,6 +278,24 @@ pub struct FreshClearConfig {
     /// count. `0` disables it. Default: 300 (5 min).
     #[serde(default = "default_post_clear_window_secs")]
     pub post_clear_window_secs: u64,
+    /// Grace window (seconds) AFTER a `self-clear` tool finishes delivering its
+    /// own resume/handoff prompt during which the daemon suppresses BOTH the
+    /// fresh-external-session inject and the post-clear resume inject.
+    ///
+    /// Why this exists: `self-clear` (daemon-, operator-, or skill-driven) holds
+    /// an flock for its `/clear`->resume handoff, and `inject_to_agent` /
+    /// `interrupt_and_wait` defer while that lock is HELD. But the lock releases
+    /// the instant the resume prompt is submitted+verified — while the fresh
+    /// session is still bootstrapping (status bar reads 0 tokens, pane idle) for
+    /// many more seconds. In that post-release window the daemon's fresh-session
+    /// gate (which has been accumulating dead_checks the whole time) fires its
+    /// GENERIC "You are a fresh session ..." prompt and CLOBBERS the handoff the
+    /// self-clearer just delivered (operator-reported #4799, 2026-08-18). The
+    /// `self-clear` tool stamps a completion marker (see
+    /// `tmux::self_clear_handoff_recent`); this window keys off that marker to
+    /// bridge the bootstrap gap. `0` disables it. Default: 120s.
+    #[serde(default = "default_self_clear_handoff_grace_secs")]
+    pub self_clear_handoff_grace_secs: u64,
 }
 
 fn default_suppress_when_active() -> bool {
@@ -286,6 +304,10 @@ fn default_suppress_when_active() -> bool {
 
 fn default_post_clear_window_secs() -> u64 {
     300
+}
+
+fn default_self_clear_handoff_grace_secs() -> u64 {
+    120
 }
 
 fn default_fresh_clear_active_window_secs() -> u64 {

@@ -64,6 +64,28 @@ def _default_log_file() -> str:
     return "/var/log/claude-watch/self-clear.log"
 
 
+def _default_handoff_file() -> str:
+    """Default handoff-completion marker path. Honors $CLAUDE_SELF_CLEAR_HANDOFF.
+
+    TOUCHED once, right after the resume prompt is delivered, so the
+    claude-watch daemon can suppress its own fresh-session / post-clear resume
+    injects for a grace window while the freshly-cleared session bootstraps
+    (otherwise the daemon's generic "You are a fresh session ..." prompt
+    CLOBBERS this handoff — operator #4799). MUST resolve to the SAME path the
+    daemon computes in src/tmux.rs `resolve_self_clear_handoff_path`:
+      1. $CLAUDE_SELF_CLEAR_HANDOFF, else
+      2. $XDG_RUNTIME_DIR/claude-self-clear-handoff, else
+      3. /var/run/claude/claude-self-clear-handoff.
+    """
+    env = os.environ.get("CLAUDE_SELF_CLEAR_HANDOFF", "").strip()
+    if env:
+        return env
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return str(Path(runtime) / "claude-self-clear-handoff")
+    return "/var/run/claude/claude-self-clear-handoff"
+
+
 def _default_lock_file() -> str:
     """Default lock path. Honors $CLAUDE_SELF_CLEAR_LOCK."""
     env = os.environ.get("CLAUDE_SELF_CLEAR_LOCK", "").strip()
@@ -91,6 +113,7 @@ def _default_resume_prompt() -> str:
 RESUME_PROMPT = _default_resume_prompt()
 LOG_FILE = _default_log_file()
 LOCKFILE = _default_lock_file()
+HANDOFF_FILE = _default_handoff_file()
 
 # After /clear, a fresh session should be well under this token count.
 # Above this means exo-watcher (or the user) already injected resume
@@ -654,6 +677,22 @@ def inject(pane, text, label="inject", slash_command=False):
             f"out={out!r} pane: {capture_pane_text(pane)}")
 
 
+def _stamp_handoff_marker():
+    """Touch the handoff-completion marker (see _default_handoff_file).
+
+    Best-effort: a failure here only means the daemon might not suppress its
+    fresh-session inject for the grace window, so we log and continue rather
+    than fail the (already-successful) handoff.
+    """
+    try:
+        Path(HANDOFF_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(HANDOFF_FILE, "w") as f:
+            f.write(str(int(time.time())))
+        log(f"  handoff marker stamped: {HANDOFF_FILE}")
+    except OSError as e:
+        log(f"  WARNING: could not stamp handoff marker {HANDOFF_FILE}: {e}")
+
+
 def child_main(pane, args):
     """Main logic for the forked child process.
 
@@ -741,6 +780,11 @@ def child_main(pane, args):
     if not wait_for_idle(pane, timeout=30):
         log("  WARNING: idle wait timed out before resume inject")
     inject(pane, RESUME_PROMPT, label="resume")
+    # Stamp the handoff marker so the claude-watch daemon defers its own
+    # fresh-session / post-clear resume injects while this fresh session
+    # bootstraps — otherwise the daemon's generic prompt clobbers this handoff
+    # a few seconds after our lock releases (operator #4799).
+    _stamp_handoff_marker()
     log("SUCCESS: /clear + resume injected")
 
 
