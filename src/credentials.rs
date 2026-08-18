@@ -118,17 +118,32 @@ pub fn classify(
 
 /// Read the credential store and classify it against the current clock.
 pub fn read(path: &Path) -> CredentialExpiry {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return CredentialExpiry::Unknown;
-    };
-    let Ok(parsed) = serde_json::from_str::<CredentialsFile>(&raw) else {
-        return CredentialExpiry::Unknown;
-    };
-    let Some(oauth) = parsed.claude_ai_oauth else {
+    let Some(oauth) = read_oauth(path) else {
         return CredentialExpiry::Unknown;
     };
     let now_ms = chrono::Local::now().timestamp_millis();
     classify(oauth.refresh_token_expires_at, oauth.expires_at, now_ms)
+}
+
+/// The raw `refreshTokenExpiresAt`, for callers that need to notice it MOVING
+/// rather than where it currently sits.
+///
+/// This matters more than it looks. A deployment's refresh token can be
+/// short-lived and rolling — measured on one live host, a lifetime of under
+/// five hours, silently renewed long before it lapses. Against a three-day
+/// warning window such a credential reads as "expires in 1 day" permanently,
+/// every second of every day, while being perfectly healthy. The value's
+/// POSITION cannot tell those two situations apart; the value MOVING FORWARD
+/// can, because that is renewal happening.
+pub fn read_refresh_expiry_ms(path: &Path) -> Option<i64> {
+    read_oauth(path)?.refresh_token_expires_at
+}
+
+fn read_oauth(path: &Path) -> Option<OauthBlock> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<CredentialsFile>(&raw)
+        .ok()?
+        .claude_ai_oauth
 }
 
 #[cfg(test)]
@@ -225,6 +240,36 @@ mod tests {
             f.write_all(body.as_bytes()).unwrap();
             assert_eq!(read(&path), CredentialExpiry::Unknown, "body: {body}");
         }
+    }
+
+    /// The rolling-credential case, from a real host: a refresh token with a
+    /// sub-five-hour life sits permanently inside a three-day window. Its
+    /// classification is "expiring" and always will be, which is exactly why
+    /// nothing may treat that classification as a standalone trigger.
+    #[test]
+    fn a_short_lived_rolling_token_reads_as_expiring_forever() {
+        let life = (4.8 * 60.0 * 60.0 * 1000.0) as i64;
+        // Freshly renewed, mid-life, and nearly due all classify identically.
+        for age in [0, life / 2, life - 60_000] {
+            assert_eq!(
+                classify(Some(NOW + life - age), None, NOW),
+                CredentialExpiry::Expiring { days_left: 1 },
+                "age {age}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn the_raw_refresh_expiry_is_readable_for_movement_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"refreshTokenExpiresAt":1787101726751}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_refresh_expiry_ms(&path), Some(1_787_101_726_751));
+        assert_eq!(read_refresh_expiry_ms(&dir.path().join("nope.json")), None);
     }
 
     #[test]

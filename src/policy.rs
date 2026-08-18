@@ -2768,6 +2768,13 @@ pub(crate) struct ExpiryEvidence {
     pub pane_days_left: Option<u32>,
     /// What the on-disk credential store says.
     pub credentials: crate::credentials::CredentialExpiry,
+    /// Whether the credential store may TRIGGER on its own, or may only
+    /// corroborate a warning that was seen on the pane. See
+    /// `ReauthConfig::expiry_from_credentials` — a short-lived rolling refresh
+    /// token classifies as "expiring" permanently, so a store-driven trigger
+    /// is only safe where the token's lifetime is long relative to the
+    /// three-day warning window.
+    pub credentials_may_trigger: bool,
     /// Auto-fire configured on.
     pub auto_enabled: bool,
     /// Auto-fire only at or below this many days left.
@@ -2801,9 +2808,12 @@ pub(crate) struct ExpiryEvidence {
 ///     Healthy means the sentence was conversation text. Already-expired is
 ///     the reactive path's territory, and racing it into the same modal helps
 ///     nobody.
-///   * pane silent + credentials expiring -> act anyway. The transient form of
-///     Claude Code's warning lives about fifteen seconds; a poller will miss
-///     it, and missing it is not evidence of anything.
+///   * pane silent + credentials expiring -> act only when the store is
+///     allowed to trigger. The transient form of Claude Code's warning lives
+///     about fifteen seconds, so a poller missing it is not evidence of
+///     anything — but a short-lived rolling refresh token classifies as
+///     "expiring" every second of its healthy life, so this branch is opt-in
+///     rather than the default.
 pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
     use crate::credentials::CredentialExpiry;
 
@@ -2818,7 +2828,9 @@ pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
             (pane.min(days_left), true)
         }
         (Some(pane), CredentialExpiry::Unknown) => (pane, false),
-        (None, CredentialExpiry::Expiring { days_left }) => (days_left, true),
+        (None, CredentialExpiry::Expiring { days_left }) if ev.credentials_may_trigger => {
+            (days_left, true)
+        }
         (None, _) => return ExpiryAction::Idle,
     };
 
@@ -2862,9 +2874,37 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
     };
     let credentials = crate::credentials::read(&creds_path);
 
+    // Renewal is the ONLY unambiguous "this is resolved" signal, and it is
+    // the value MOVING that says so, not where the value sits. A short-lived
+    // rolling refresh token never leaves the three-day warning window, so it
+    // would otherwise never resolve, the attempt budget would never reset,
+    // and the alert would stand forever on a session in no trouble at all.
+    let refresh_expiry = crate::credentials::read_refresh_expiry_ms(&creds_path);
+    if let (Some(now_val), Some(prev)) = (refresh_expiry, state.last_seen_refresh_expiry_ms) {
+        if now_val > prev {
+            info!("oauth credentials were renewed; resetting the expiry window");
+            write_jsonl_log(
+                &config.general.log_file,
+                "login_expiry_credentials_renewed",
+                serde_json::json!({ "previous": prev, "current": now_val }),
+            );
+            state.login_expiry_detected = false;
+            state.login_expiry_days_left = None;
+            state.last_login_expiry_alert = None;
+            state.last_self_login_attempt = None;
+            state.self_login_attempts_this_window = 0;
+            state.self_login_dialog_opened_at = None;
+        }
+    }
+    if state.last_seen_refresh_expiry_ms != refresh_expiry {
+        state.last_seen_refresh_expiry_ms = refresh_expiry;
+        crate::state::save_state(&config.general.state_file, state);
+    }
+
     let action = decide_expiry_action(&ExpiryEvidence {
         pane_days_left,
         credentials,
+        credentials_may_trigger: config.reauth.expiry_from_credentials,
         auto_enabled: config.reauth.expiry_auto_self_login,
         auto_days: config.reauth.expiry_auto_days,
         since_last_attempt: state
@@ -6713,6 +6753,7 @@ mod tests {
         ExpiryEvidence {
             pane_days_left: None,
             credentials: CredentialExpiry::Unknown,
+            credentials_may_trigger: true,
             auto_enabled: true,
             auto_days: 1,
             since_last_attempt: None,
@@ -6784,6 +6825,39 @@ mod tests {
             ..evidence()
         };
         assert_eq!(decide_expiry_action(&ev), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// The store is a VETO by default, not a trigger: a short-lived rolling
+    /// refresh token classifies as "expiring" for every second of its healthy
+    /// life, so a store-driven trigger would fire forever on a fine session.
+    #[test]
+    fn the_credential_store_does_not_trigger_on_its_own_unless_allowed() {
+        let ev = ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+
+        // ...but it still VETOES a pane sighting it contradicts, which is the
+        // half that is never optional.
+        let vetoed = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Healthy,
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&vetoed), ExpiryAction::Idle);
+
+        // ...and still corroborates one it agrees with.
+        let agreed = ExpiryEvidence {
+            pane_days_left: Some(1),
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            credentials_may_trigger: false,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&agreed), ExpiryAction::AutoLogin { days_left: 1 });
     }
 
     /// Claude Code starts SHOWING the warning three days out but only starts

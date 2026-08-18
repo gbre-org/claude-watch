@@ -305,13 +305,34 @@ corroborated against Claude Code's OAuth credential store, which is ground
 truth and cannot be spoofed by anything on screen. If the store disagrees, the
 sighting is conversation text and is dropped.
 
-Corroboration runs the other way too. One of the two places Claude Code renders
-the warning is a *transient* notice that lives about fifteen seconds, so a
-poller can legitimately never see it — and missing it is not evidence of
-anything. The credential expiry alone is therefore enough to act on.
-
 An unreadable credential store is UNKNOWN, never a negative: the pane signal
 still acts, and the alert says out loud that it stands alone.
+
+**Why the store only vetoes, and does not trigger.** The obvious symmetry —
+let the credential expiry fire the path by itself, closing the gap left by the
+transient notice, which is on screen for about fifteen seconds at a time — is
+`expiry_from_credentials`, and it is **off by default** for a measured reason.
+A refresh token can be short-lived and rolling. On one live host its entire
+lifetime was under five hours, renewed silently long before it lapsed. Against
+a three-day window that credential classifies as "expires in 1 day" for every
+second of its healthy life, so a store-driven trigger would fire forever on a
+session in no trouble at all. Check yours with `claude-watch login-expiry`
+before turning it on.
+
+That same rolling credential is why "resolved" is defined as the expiry
+**moving forward**, not as it leaving the window — a token that never leaves
+the window would otherwise never resolve, and the attempt budget would never
+reset.
+
+### Inspecting it
+
+```
+claude-watch login-expiry [--pane PANE] [--credentials-file PATH] [--json]
+```
+
+Read only — it never injects, types, or opens a dialog. It prints both halves
+of the signal and exits 0 (nothing expiring), 3 (inside the window) or 4
+(already expired, which is the reactive path's territory).
 
 **What stops it re-firing.** The warning persists for days, so a naive detector
 re-fires every poll — 8,600 times a day at a ten-second cadence. Four separate

@@ -735,6 +735,25 @@ pub struct ReauthConfig {
     #[serde(default = "default_self_login_abandon_seconds")]
     pub self_login_abandon_seconds: u64,
 
+    /// Let the credential store TRIGGER the expiry path on its own, rather
+    /// than only corroborating a warning seen on the pane.
+    ///
+    /// Off by default, and the reason is measured rather than theoretical. A
+    /// refresh token can be short-lived and rolling — on one live host, under
+    /// five hours, renewed silently long before it lapses. Against a
+    /// three-day warning window that credential classifies as "expiring in 1
+    /// day" permanently, so a store-driven trigger would fire forever on a
+    /// session that is in no trouble at all. The pane warning does not have
+    /// that failure mode: Claude Code renders it a bounded number of times,
+    /// not continuously.
+    ///
+    /// Turn it on where the refresh token's lifetime is known to be long
+    /// relative to the warning window. The cost of leaving it off is the one
+    /// stated above the `expiry_watch_enabled` docs: the transient form of
+    /// the warning can be missed between polls.
+    #[serde(default)]
+    pub expiry_from_credentials: bool,
+
     /// Path to Claude Code's OAuth credential store, which is what the pane
     /// warning is corroborated against. Empty = `$HOME/.claude/.credentials.json`.
     #[serde(default)]
@@ -757,6 +776,7 @@ impl Default for ReauthConfig {
             self_login_retry_seconds: default_self_login_retry_seconds(),
             self_login_max_attempts: default_self_login_max_attempts(),
             self_login_abandon_seconds: default_self_login_abandon_seconds(),
+            expiry_from_credentials: false,
             credentials_file: String::new(),
             self_login_command: default_self_login_command(),
         }
@@ -2205,6 +2225,7 @@ cooldown = 300
         assert_eq!(config.reauth.self_login_retry_seconds, 3600);
         assert_eq!(config.reauth.self_login_max_attempts, 3);
         assert_eq!(config.reauth.self_login_abandon_seconds, 1800);
+        assert!(!config.reauth.expiry_from_credentials);
         assert_eq!(config.reauth.credentials_file, "");
         assert_eq!(config.reauth.self_login_command, "self-login");
     }

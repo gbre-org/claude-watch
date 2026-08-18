@@ -444,6 +444,23 @@ self_login_max_attempts = 3
 # the loop in a modal until morning buys nothing. 0 disables the watchdog.
 self_login_abandon_seconds = 1800
 
+# Let the credential store TRIGGER on its own, rather than only corroborating
+# a warning seen on the pane.
+#
+# Off by default, for a measured reason. A refresh token can be short-lived
+# and rolling: on one live host its whole lifetime was under five hours,
+# renewed silently long before it lapsed. Against the three-day warning window
+# that credential classifies as "expiring in 1 day" permanently, so a
+# store-driven trigger fires forever on a session in no trouble at all. The
+# on-screen warning does not have that failure mode — Claude Code renders it a
+# bounded number of times, not continuously.
+#
+# Turn it on where the refresh token's lifetime is known to be long relative
+# to the window. Check yours with `claude-watch login-expiry` before you do.
+# The cost of leaving it off: the transient form of the warning is on screen
+# for about fifteen seconds, so a poll can miss it.
+expiry_from_credentials = false
+
 # Claude Code's OAuth credential store, which the on-screen warning is
 # corroborated against — "Your login expires in 2 days" is also just a
 # sentence, and a session reading these docs will have it on the pane while

@@ -314,6 +314,13 @@ pub struct State {
     /// Cumulative count of auto-fired `self-login` runs (for metrics).
     #[serde(default)]
     pub self_login_autofire_total: u64,
+    /// Last observed `refreshTokenExpiresAt`. Watched for MOVEMENT, not
+    /// position: a value that jumps forward is the credentials being renewed,
+    /// which is the one unambiguous "this is resolved" signal available. It
+    /// works even for a short-lived rolling token that never leaves the
+    /// warning window and therefore never "resolves" by position alone.
+    #[serde(default)]
+    pub last_seen_refresh_expiry_ms: Option<i64>,
     /// Tracks whether we've already injected "resume" for a fresh external session
     /// (tokens=0 with Claude idle prompt visible). Reset when tokens become non-zero.
     #[serde(default)]
