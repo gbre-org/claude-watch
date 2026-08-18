@@ -56,7 +56,24 @@ pub struct LiveCounts {
 
 fn default_state_file() -> PathBuf {
     if let Ok(s) = std::env::var("CLAUDE_WATCH_STATE") {
-        return PathBuf::from(s);
+        if !s.trim().is_empty() {
+            return PathBuf::from(s);
+        }
+    }
+    // Fall back to the daemon-configured `general.state_file` so the metrics
+    // reader points at the SAME file the daemon writes. The historical
+    // hardcoded `~/.config/claude-watch/state.json` default silently diverged
+    // from container deployments, where the baked config.toml sets
+    // `~/.cache/claude-watch/state.json`; the mismatch made the emitter read a
+    // nonexistent file and bail to `down_metrics` (claude_watch_up 0). Reading
+    // the config here is the same pattern `cmd_metrics` already uses for
+    // `claude.heartbeat_file`. Falls through to the legacy default only when no
+    // config is loadable (fresh/bootstrap host).
+    if let Ok(cfg) = crate::config::try_load_config() {
+        let sf = cfg.general.state_file.trim().to_string();
+        if !sf.is_empty() {
+            return PathBuf::from(sf);
+        }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home).join(".config/claude-watch/state.json")
@@ -1976,5 +1993,22 @@ mod tests {
         assert_eq!(prom_file_path(), PathBuf::from("/tmp/cw-custom.prom"));
         std::env::remove_var("CLAUDE_WATCH_PROM_FILE");
         assert_eq!(prom_file_path(), PathBuf::from(PROM_FILE));
+    }
+
+    #[test]
+    fn default_state_file_honors_env_override() {
+        // CLAUDE_WATCH_STATE wins and short-circuits before the config /
+        // hardcoded-default fallbacks — the metrics reader must be able to be
+        // pointed at the daemon's live state file explicitly.
+        std::env::set_var("CLAUDE_WATCH_STATE", "/tmp/cw-live-state.json");
+        assert_eq!(
+            default_state_file(),
+            PathBuf::from("/tmp/cw-live-state.json")
+        );
+        // An empty override is ignored (falls through to config/default rather
+        // than pointing the reader at a bogus "" path).
+        std::env::set_var("CLAUDE_WATCH_STATE", "");
+        assert_ne!(default_state_file(), PathBuf::from(""));
+        std::env::remove_var("CLAUDE_WATCH_STATE");
     }
 }
