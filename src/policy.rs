@@ -2652,8 +2652,19 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
             state.reauth_detected = true;
         }
 
-        // Inject /login once per reauth cycle so the login screen appears
-        if !state.login_injected {
+        // Inject /login once per reauth cycle so the login screen appears.
+        //
+        // The `self_login_dialog_opened_at` half is not redundant with the
+        // `login_injected` latch. When the PROACTIVE path opens the dialog,
+        // this function's detector sees exactly what it sees after a real
+        // 401 — the TUI gone, a login screen up — and would inject `/login`
+        // straight into the modal. `inject_to_agent` opens with an Escape
+        // blast to reach vim NORMAL mode, and Escape in this modal CANCELS
+        // the login, so the two paths would take turns killing each other's
+        // dialog forever. The latch is cleared when the dialog is abandoned
+        // or the credentials are renewed, so this cannot wedge the reactive
+        // path shut.
+        if !state.login_injected && state.self_login_dialog_opened_at.is_none() {
             info!("injecting /login command into pane");
             inject_dispatch::inject_to_agent(pane, "/login").await;
             state.login_injected = true;
@@ -2886,9 +2897,18 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
             state.last_login_expiry_alert = None;
             state.last_self_login_attempt = None;
             state.self_login_attempts_this_window = 0;
-            // The credentials being renewed is the strongest possible proof
-            // that the dialog was answered, so stop holding the watchdog's
-            // latch open waiting for a timeout to tell us the same thing.
+            crate::state::save_state(&config.general.state_file, state);
+        }
+        // Release the dialog latch OUTSIDE the `login_expiry_detected` guard,
+        // and on every idle cycle rather than only on the transition. The
+        // latch suppresses the reactive path's `/login` inject, so a stuck one
+        // is not a cosmetic leak — it is the reactive recovery quietly
+        // disabled. The abandon watchdog normally clears it, but a deployment
+        // that set `self_login_abandon_seconds = 0` has no watchdog, and a
+        // daemon restart can land here with the latch set and
+        // `login_expiry_detected` false. Nothing is expiring on this branch,
+        // so nothing needs the latch held.
+        if state.self_login_dialog_opened_at.is_some() {
             state.self_login_dialog_opened_at = None;
             crate::state::save_state(&config.general.state_file, state);
         }
