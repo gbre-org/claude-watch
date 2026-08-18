@@ -182,6 +182,9 @@ jobs:
       - name: Run event-must-act toolchain tests
         run: make test-event-must-act
 
+      - name: Run pr-branches tests
+        run: make test-pr-branches
+
       - name: Run entrypoint CLAUDE_CMD construction tests
         run: make test-entrypoint
 

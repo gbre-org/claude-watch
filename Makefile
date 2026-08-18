@@ -21,6 +21,7 @@
 # Python / shell tool test targets
 .PHONY: test-session-task test-obligations-init test-queue-minisite test-hooks
 .PHONY: test-agent-msg test-agent-tail test-claude-event test-event-must-act
+.PHONY: test-pr-branches
 .PHONY: test-self-clear test-self-login test-self-login-tmux test-watchers
 .PHONY: test-dashboard test-trust-workspace
 .PHONY: test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links
@@ -165,6 +166,15 @@ test-agent-tail: ## agent-tail embedded --test suite
 
 test-claude-event: ## claude-event + claude-event-tail unit tests
 	python3 tools/claude-event/tests/test_claude_event.py
+
+# Run the pr-branches tests (PR branch lifecycle CLI under tools/).
+# Fully offline: every GitHub/git accessor is stubbed out, so no test touches
+# a real repository, remote, or the GitHub API. Covers each classification
+# bucket, the squash-merge trap (ancestry must never decide merged-ness),
+# worktree/default-branch precedence, and the delete path refusing when the
+# live PR state disagrees with the classification.
+test-pr-branches: ## pr-branches classification + merge-assertion unit tests
+	python3 tools/pr-branches/tests/test_pr_branches.py
 
 # Run the event-must-act toolchain tests. The toolchain (event-classify,
 # event-ack, eval-event-must-act, user-prompt-ambient-inject-hook) lives in
@@ -560,6 +570,7 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@ln -sfn $(abspath tools/hooks/worktree-create-hook) $(BIN_DIR)/worktree-create-hook
 	@ln -sfn $(abspath tools/agent-msg/agent-msg) $(BIN_DIR)/agent-msg
 	@ln -sfn $(abspath tools/agent-tail/agent-tail) $(BIN_DIR)/agent-tail
+	@ln -sfn $(abspath tools/pr-branches/pr-branches) $(BIN_DIR)/pr-branches
 	@ln -sfn $(abspath tools/claude-event/claude-event) $(BIN_DIR)/claude-event
 	@ln -sfn $(abspath tools/claude-event/claude-event-tail) $(BIN_DIR)/claude-event-tail
 	@ln -sfn $(abspath tools/watchers/claude-event-watch) $(BIN_DIR)/claude-event-watch
@@ -578,6 +589,7 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@echo "  - worktree-create-hook      (symlink -> tools/hooks/)"
 	@echo "  - agent-msg                 (symlink -> tools/agent-msg/)"
 	@echo "  - agent-tail                (symlink -> tools/agent-tail/)"
+	@echo "  - pr-branches               (symlink -> tools/pr-branches/)"
 	@echo "  - claude-event              (symlink -> tools/claude-event/)"
 	@echo "  - claude-event-tail         (symlink -> tools/claude-event/)"
 	@echo "  - claude-event-watch        (symlink -> tools/watchers/)"
