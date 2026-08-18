@@ -51,8 +51,11 @@ ack-gate). The tier of a `source/tag` pair is DATA, in `event-classify`.
   `CW_WATCHER_HEALTH_STALE_MIN` (default 6) minutes, the event watcher is dead
   or stuck, so it injects a `[CLAUDE-WATCH] WATCHER DOWN…` alert into the
   Claude pane via `claude-watch inject` (the ONE verified type-and-submit
-  path). A per-condition cooldown (`CW_WATCHER_HEALTH_COOLDOWN_SECS`, default
-  600s) prevents re-injecting every tick while a stale window persists.
+  path), deliberately WITHOUT `--escape` — the alert is queued behind the
+  active turn rather than seizing it, matching the daemon's ROUTINE tier for
+  the same condition. A per-condition cooldown
+  (`CW_WATCHER_HEALTH_COOLDOWN_SECS`, default 600s) prevents re-injecting every
+  tick while a stale window persists.
 
   This is the **recovery** path for a dead event *watcher*. It is distinct from
   the claude-watch **daemon's** own heartbeat-stale inject, which fires on a

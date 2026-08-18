@@ -519,7 +519,7 @@ max_suppression_window_secs = 86400
 # retries with exponential backoff and prints lines like:
 #   API Error: 529 {"type":"error","error":{"type":"overloaded_error",...}}
 #   ⎿  Retrying in 24s · attempt 3/10
-# During that window every claude-watch inject (Escape + text) wipes the retry
+# During that window a cancelling inject (Escape + text) wipes the retry
 # state machine and forces Claude to start a brand-new turn — which then hits
 # the same overload and re-enters retry. The result is a livelock where the
 # daemon's interrupts perpetually reset the retry timer (seen 2026-04-28).
