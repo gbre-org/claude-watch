@@ -94,6 +94,15 @@ pub struct State {
     pub context_clear_triggered: bool,
     #[serde(default)]
     pub last_context_clear: Option<String>,
+    /// Epoch (float secs) at which THIS daemon process started. Set once at
+    /// daemon startup (`run_daemon`); persisted so the short-lived
+    /// `claude-watch metrics` scraper can use it as a platform-independent
+    /// fallback anchor for the "time since last clear" panel when no explicit
+    /// /clear has been observed yet (e.g. right after a deploy/recreate wipes
+    /// the observed-clear state). NOT reset on load -- `run_daemon` overwrites
+    /// it each start.
+    #[serde(default)]
+    pub daemon_start_epoch: Option<f64>,
     #[serde(default)]
     pub context_clear_child_pid: Option<u32>,
     /// Last observed token count (for detecting external clears)

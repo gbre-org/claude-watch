@@ -192,23 +192,37 @@ fn build_metrics(
     latest_version: &str,
     live: &LiveCounts,
     mainloop_heartbeat_mtime: Option<f64>,
+    session_start_fallback: Option<f64>,
 ) -> Vec<String> {
     let last_check = state
         .get("last_check")
         .and_then(|v| v.as_str())
         .map(parse_iso_timestamp)
         .unwrap_or(0.0);
-    // Epoch (float secs) of the last context clear, or `None` when the daemon
-    // has not yet recorded a clear this session. Crucially we DO NOT default a
-    // missing/unparseable value to `0.0`: a zero epoch makes a downstream
-    // "now - last_clear" panel render ~56.5 years (2026 - 1970), the classic
-    // epoch-zero bug. Treating "no clear recorded" as an absent series (gauge
-    // omitted) matches how `mainloop_heartbeat_mtime` handles a missing file.
+    // Epoch (float secs) anchoring the "time since last context clear" panel.
+    // Priority: (1) an explicitly OBSERVED clear (`last_context_clear`); else
+    // (2) a session-start fallback (the container start epoch, passed in by the
+    // caller); else (3) the daemon's own start epoch persisted in state. We
+    // fall back rather than omit so the panel ALWAYS renders a real elapsed
+    // duration: after a deploy/recreate the observed-clear state is wiped, but
+    // "time since the session became fresh" (== container / daemon start) is
+    // still a truthful duration. We DO NOT default a missing/unparseable value
+    // to `0.0`: a zero epoch makes a "now - last_clear" panel render ~56.5
+    // years (2026 - 1970), the classic epoch-zero bug -- so every candidate is
+    // filtered to `t > 0.0`, and the gauge is omitted only when NONE of the
+    // three anchors is available.
     let last_context_clear = state
         .get("last_context_clear")
         .and_then(|v| v.as_str())
         .map(parse_iso_timestamp)
-        .filter(|&t| t > 0.0);
+        .filter(|&t| t > 0.0)
+        .or_else(|| session_start_fallback.filter(|&t| t > 0.0))
+        .or_else(|| {
+            state
+                .get("daemon_start_epoch")
+                .and_then(|v| v.as_f64())
+                .filter(|&t| t > 0.0)
+        });
 
     let last_known_tokens = num(state, "last_known_tokens");
     let last_known_bashes = num(state, "last_known_bashes");
@@ -499,14 +513,16 @@ fn build_metrics(
         ));
     }
 
-    // Last context-clear timestamp. Omitted entirely when the daemon has not
-    // recorded a clear this session (see `last_context_clear` derivation
-    // above) so a downstream "time since last clear" panel shows "no data"
-    // rather than a bogus ~56-year duration computed from epoch zero.
+    // Last context-clear timestamp (with session-start fallback -- see the
+    // `last_context_clear` derivation above). Emitted whenever ANY anchor is
+    // available (observed clear, container start, or daemon start) so the
+    // downstream "time since last clear" panel ALWAYS renders a real elapsed
+    // duration. Omitted only when none of the three exists -- and never with a
+    // bogus ~56-year duration computed from epoch zero.
     if let Some(ts) = last_context_clear {
         lines.push("".to_string());
         lines.push(
-            "# HELP claude_last_context_clear_timestamp_seconds Epoch of last context clear"
+            "# HELP claude_last_context_clear_timestamp_seconds Epoch of last observed context clear, or the session/daemon start epoch as a fallback when none observed"
                 .to_string(),
         );
         lines.push("# TYPE claude_last_context_clear_timestamp_seconds gauge".to_string());
@@ -1316,7 +1332,19 @@ pub async fn cmd_metrics() -> i32 {
         .unwrap_or_else(|_| "/run/claude/heartbeat".to_string());
     let mainloop_heartbeat_mtime = heartbeat_file_mtime_secs(Path::new(&heartbeat_path));
 
-    let mut lines = build_metrics(&state, &cur, &latest, &live, mainloop_heartbeat_mtime);
+    // Session-start fallback for the "since last clear" gauge: the container's
+    // start epoch (Some only in-container). build_metrics falls back further to
+    // the persisted daemon_start_epoch when this is None (bare-host case), so
+    // the panel always renders a duration even before any /clear is observed.
+    let session_start_fallback = container_start_time_secs();
+    let mut lines = build_metrics(
+        &state,
+        &cur,
+        &latest,
+        &live,
+        mainloop_heartbeat_mtime,
+        session_start_fallback,
+    );
 
     // Token usage — aggregated from the Claude Code JSONL transcripts (same
     // observation surface as active_agents) and appended to the existing
@@ -1926,7 +1954,7 @@ mod tests {
     #[test]
     fn build_metrics_minimal() {
         let state = json!({});
-        let lines = build_metrics(&state, "1.2.3", "1.2.4", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "1.2.3", "1.2.4", &LiveCounts::default(), None, None);
         // Key lines present
         assert!(lines.iter().any(|l| l == "claude_watch_up 1"));
         assert!(lines.iter().any(|l| l == "claude_context_tokens 0"));
@@ -1945,24 +1973,78 @@ mod tests {
     }
 
     #[test]
-    fn last_context_clear_omitted_when_unset() {
-        // Regression: a missing `last_context_clear` must NOT export the gauge
-        // with a 0.0 (epoch-zero) value — that renders downstream as ~56.5
-        // years ("now - 1970"). Absent clear => absent series.
+    fn last_context_clear_omitted_when_no_anchor() {
+        // Regression: with NO observed clear, NO session-start fallback, and NO
+        // persisted daemon_start_epoch, the gauge must NOT export with a 0.0
+        // (epoch-zero) value -- that renders downstream as ~56.5 years
+        // ("now - 1970"). No anchor => absent series.
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         assert!(
             !lines
                 .iter()
                 .any(|l| l.starts_with("claude_last_context_clear_timestamp_seconds")),
-            "gauge must be omitted when no clear recorded, got: {lines:?}"
+            "gauge must be omitted when no anchor exists, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn last_context_clear_falls_back_to_session_start() {
+        // No observed clear, but a session-start fallback (container start) is
+        // provided: the gauge is emitted with that anchor so the panel renders
+        // a real duration instead of "no data".
+        let state = json!({});
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, Some(1000.0));
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("claude_last_context_clear_timestamp_seconds "))
+            .expect("gauge should fall back to the session-start anchor");
+        assert!(
+            line.contains("1000"),
+            "expected session-start epoch in line, got: {line}"
+        );
+    }
+
+    #[test]
+    fn last_context_clear_falls_back_to_daemon_start_epoch() {
+        // No observed clear and no session-start fallback, but a persisted
+        // daemon_start_epoch exists (the bare-host path): the gauge falls back
+        // to it so the panel still renders a duration.
+        let state = json!({ "daemon_start_epoch": 1234.5 });
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("claude_last_context_clear_timestamp_seconds "))
+            .expect("gauge should fall back to daemon_start_epoch");
+        assert!(
+            line.contains("1234.5"),
+            "expected daemon_start_epoch in line, got: {line}"
+        );
+    }
+
+    #[test]
+    fn explicit_clear_wins_over_fallbacks() {
+        // An observed clear takes priority over both fallbacks.
+        let state = json!({
+            "last_context_clear": "2026-01-01T00:00:00Z",
+            "daemon_start_epoch": 1234.5
+        });
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, Some(1000.0));
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("claude_last_context_clear_timestamp_seconds "))
+            .expect("gauge should be present");
+        // 2026-01-01T00:00:00Z == 1767225600 epoch secs (not 1000 or 1234.5).
+        assert!(
+            line.contains("1767225600"),
+            "expected observed-clear epoch to win, got: {line}"
         );
     }
 
     #[test]
     fn last_context_clear_emitted_when_set() {
         let state = json!({ "last_context_clear": "2026-01-01T00:00:00Z" });
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         let line = lines
             .iter()
             .find(|l| l.starts_with("claude_last_context_clear_timestamp_seconds "))
@@ -1985,7 +2067,7 @@ mod tests {
             "last_known_tokens": 42,
             "alert_count": 3,
         });
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         assert!(lines.iter().any(|l| l == "claude_watchers_total 2"));
         assert!(lines.iter().any(|l| l == "claude_watchers_missing 1"));
         assert!(lines.iter().any(|l| l == "claude_context_tokens 42"));
@@ -2061,6 +2143,7 @@ mod tests {
             "y",
             &LiveCounts::default(),
             Some(1_767_225_600.0),
+            None,
         );
         assert!(lines
             .iter()
@@ -2077,7 +2160,7 @@ mod tests {
     #[test]
     fn build_metrics_omits_mainloop_heartbeat_when_absent() {
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         assert!(!lines
             .iter()
             .any(|l| l.contains("claude_mainloop_heartbeat_timestamp_seconds")));
@@ -2110,7 +2193,7 @@ mod tests {
             "reminder_to_clear_latency_secs_sum": 123.5,
             "reminder_to_clear_latency_count": 3,
         });
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         let joined = lines.join("\n");
         assert!(joined.contains(
             "claude_watch_fallback_injections_total{type=\"clear\"} 4"
@@ -2142,7 +2225,7 @@ mod tests {
             "fresh_clear_resume_inject_interrupts_total": 6,
             "restart_claude_interrupts_total": 8,
         });
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         let joined = lines.join("\n");
 
         // # TYPE claude_interrupts_total counter (NOT gauge)
@@ -2183,7 +2266,7 @@ mod tests {
     fn build_metrics_per_interrupt_defaults_to_zero() {
         // Missing fields default to 0 (new counters, state file predates them).
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         let joined = lines.join("\n");
         assert!(
             joined.contains("claude_interrupts_total{kind=\"prolonged_thinking\"} 0"),
@@ -2203,7 +2286,7 @@ mod tests {
         // reads from the shared dir), but we can at least verify all
         // three label types are present in the output.
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         let joined = lines.join("\n");
         for label in ["context_high", "version_update", "pre_compact"] {
             assert!(
@@ -2222,7 +2305,7 @@ mod tests {
     fn build_metrics_live_counts_zero_default() {
         // LiveCounts::default() means all five gauges emit 0.
         let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None);
+        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         let joined = lines.join("\n");
         for name in [
             "claude_code_active_agents",
@@ -2252,7 +2335,7 @@ mod tests {
             enabled_watchers: 3,
             open_bashes: 4,
         };
-        let lines = build_metrics(&state, "x", "y", &live, None);
+        let lines = build_metrics(&state, "x", "y", &live, None, None);
         let joined = lines.join("\n");
         assert!(joined.contains("claude_code_active_agents 2"), "{joined}");
         assert!(joined.contains("claude_code_running_tasks 1"), "{joined}");
