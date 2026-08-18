@@ -52,7 +52,7 @@ inject_count() {
 stale_event() {
     local f="$QUEUE/ev-$RANDOM.json"
     echo '{}' > "$f"
-    touch -d '5 minutes ago' "$f"
+    touch -d '10 minutes ago' "$f"
 }
 
 # ---------------------------------------------------------------- 1
@@ -281,6 +281,88 @@ if [ "$runs" = 0 ] && [ ! -f "$ESC_FILE" ]; then
 else
     fail "failed inject escalated: watcher runs=$runs, ledger_exists=$([ -f "$ESC_FILE" ] && echo yes || echo no)"
 fi
+teardown
+
+# ---------------------------------------------------------------- 15
+# Runtime override.toml [watcher_health] stale_minutes RAISES the threshold:
+# a 10-min-old event is NOT stale under a 20-min threshold -> no inject.
+setup
+cat > "$SBX/override.toml" <<EOF
+[watcher_health]
+stale_minutes = 20
+EOF
+stale_event   # 10 min old
+run_check CLAUDE_WATCH_RUNTIME_CONFIG="$SBX/override.toml" >/dev/null 2>&1
+[ "$(inject_count)" = 0 ] \
+    && pass "override.toml raises threshold (20min): 10min event not stale" \
+    || fail "override raise failed, injects=$(inject_count) (want 0)"
+teardown
+
+# ---------------------------------------------------------------- 16
+# Runtime override.toml LOWERS the threshold: a 2-min-old event IS stale under
+# a 1-min threshold -> one inject.
+setup
+cat > "$SBX/override.toml" <<EOF
+[watcher_health]
+stale_minutes = 1
+EOF
+f="$QUEUE/ev-lo.json"; echo '{}' > "$f"; touch -d '2 minutes ago' "$f"
+run_check CLAUDE_WATCH_RUNTIME_CONFIG="$SBX/override.toml" >/dev/null 2>&1
+[ "$(inject_count)" = 1 ] \
+    && pass "override.toml lowers threshold (1min): 2min event is stale" \
+    || fail "override lower failed, injects=$(inject_count) (want 1)"
+teardown
+
+# ---------------------------------------------------------------- 17
+# Explicit env var PINS over the runtime override (env 20 beats override 1):
+# a 10-min-old event is not stale at 20min -> no inject.
+setup
+cat > "$SBX/override.toml" <<EOF
+[watcher_health]
+stale_minutes = 1
+EOF
+stale_event   # 10 min old
+run_check CLAUDE_WATCH_RUNTIME_CONFIG="$SBX/override.toml" CW_WATCHER_HEALTH_STALE_MIN=20 >/dev/null 2>&1
+[ "$(inject_count)" = 0 ] \
+    && pass "env var pins over override.toml (20>1): 10min event not stale" \
+    || fail "env pin failed, injects=$(inject_count) (want 0)"
+teardown
+
+# ---------------------------------------------------------------- 18
+# Baked config ($CLAUDE_WATCH_CONFIG) [watcher_health] is used when no override
+# + no env var: 20-min threshold -> 10-min event not stale -> no inject.
+setup
+cat > "$SBX/baked.toml" <<EOF
+[watcher_health]
+stale_minutes = 20
+EOF
+stale_event   # 10 min old
+run_check CLAUDE_WATCH_CONFIG="$SBX/baked.toml" >/dev/null 2>&1
+[ "$(inject_count)" = 0 ] \
+    && pass "baked config [watcher_health] stale_minutes honored (20min)" \
+    || fail "baked config layer failed, injects=$(inject_count) (want 0)"
+teardown
+
+# ---------------------------------------------------------------- 19
+# Invalid explicit env value falls back to the default 6: a 10-min-old event is
+# stale at the default -> one inject (the case-guard rescues a bad value).
+setup
+stale_event   # 10 min old
+run_check CW_WATCHER_HEALTH_STALE_MIN=notanumber >/dev/null 2>&1
+[ "$(inject_count)" = 1 ] \
+    && pass "invalid env stale-min falls back to default 6 (10min event stale)" \
+    || fail "invalid-env fallback failed, injects=$(inject_count) (want 1)"
+teardown
+
+# ---------------------------------------------------------------- 20
+# New 6-min default (no override, no env): a 4-min-old event is NOT stale
+# (it WOULD have injected under the old 2-min default) -> no inject.
+setup
+f="$QUEUE/ev-def.json"; echo '{}' > "$f"; touch -d '4 minutes ago' "$f"
+run_check >/dev/null 2>&1
+[ "$(inject_count)" = 0 ] \
+    && pass "default 6min: 4min event not stale (old 2min default would fire)" \
+    || fail "new default failed, injects=$(inject_count) (want 0)"
 teardown
 
 # ----------------------------------------------------------------
