@@ -64,15 +64,6 @@ fn unique_token(prefix: &str) -> String {
     format!("{}-{}-{}", prefix, std::process::id(), n)
 }
 
-/// Path to the daemon binary under test.
-///
-/// Cargo has already built it and handed us the path in
-/// `CARGO_BIN_EXE_<name>`. See `tests/common/mod.rs::daemon_binary` for why
-/// invoking `cargo build` from inside a test is not an option.
-fn daemon_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_claude-watch"))
-}
-
 /// Count processes matching a pgrep pattern.
 fn pgrep_count(pattern: &str) -> u32 {
     let out = Command::new("pgrep")
@@ -469,11 +460,12 @@ sleep infinity
     //    fixed wait then SIGTERM, but for this test we want to control
     //    the lifetime so we can synchronize on inject events. So spawn
     //    directly.
-    let binary = daemon_binary();
-    let daemon = Command::new(&binary)
-        .env("CLAUDE_WATCH_CONFIG", &env.config_path)
+    //    Built from `daemon_command()` so the isolation env (HOME, the
+    //    claude-event queue, the notify command) comes from the one place
+    //    that owns it; only PATH and log level are overridden here.
+    let daemon = env
+        .daemon_command()
         .env("PATH", &test_path)
-        .env("CLAUDE_STATUS_CMD", "1")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

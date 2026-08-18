@@ -212,12 +212,12 @@ fn foreground_uses_own_check_interval() {
     // (sets foreground_start) and never a second check to detect elapsed time.
     // With foreground_monitor.check_interval (1s), we get ~7 foreground checks
     // and should detect blocking after 3s.
-    let binary = TestEnv::daemon_binary();
-    let child = std::process::Command::new(&binary)
-        .env("CLAUDE_WATCH_CONFIG", &env.config_path)
-        .env("PATH", env.test_path())
-        .env("CLAUDE_STATUS_CMD", "1")
-        .env("RUST_LOG", "debug")
+    // Spawned directly rather than via run_daemon_cycles because this test
+    // controls the lifetime itself — but through `daemon_command()`, which
+    // owns the isolation env. Hand-rolling the Command here is what once let
+    // a test daemon run against the real home directory and emit real alerts.
+    let child = env
+        .daemon_command()
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

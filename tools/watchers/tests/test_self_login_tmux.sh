@@ -50,9 +50,17 @@ export PATH="$WORK/bin:$PATH"
 export CLAUDE_SELF_LOGIN_LOG="$WORK/self-login.log"
 export CLAUDE_SELF_LOGIN_STATE="$WORK/self-login.json"
 export CLAUDE_SELF_LOGIN_LOCK="$WORK/self-login.lock"
-# No notify command and no claude-event on PATH inside the test: both sinks are
-# optional by design and must not be required for the state file to land.
 unset CLAUDE_SELF_LOGIN_NOTIFY_CMD
+# Event isolation, and it is load bearing. `self-login` emits through whatever
+# `claude-event` is on PATH, and PATH here PREPENDS to the caller's rather than
+# replacing it — so on a host that has the real binary, a test run drops
+# high-priority events into the operator's live queue and a running main loop
+# acts on them as real. Pointing the queue at the tempdir keeps the real
+# `claude-event` in the test (its absence must not be what makes this pass)
+# while sending everything it writes somewhere harmless.
+export CLAUDE_EVENT_QUEUE="$WORK/events"
+export CRON_EVENT_QUEUE="$WORK/events"
+mkdir -p "$WORK/events"
 
 ok()   { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -221,6 +229,116 @@ else
 fi
 
 tmux kill-session -t "$SESSION" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# The PROACTIVE expiry detector, against a real terminal.
+#
+# The unit tests feed it synthetic strings. This feeds it a genuine tmux pane
+# at a width narrow enough that Claude Code's warning really does hard-wrap,
+# which is the case the whitespace-stripping matcher exists for and the one a
+# literal match would silently fail.
+#
+# Everything here is read-only: `login-expiry` never injects, types, or opens
+# a dialog, and the credential paths below are fixtures, not the real store.
+# ---------------------------------------------------------------------------
+WARNING_LINE="Your login expires in 2 days · run /login to renew"
+
+# The wrap has to be forced from INSIDE the pane. `tmux new-session -x` is a
+# request, not a guarantee — on a host with an attached client or a
+# `default-size` setting it is quietly overridden, and a test that assumed a
+# 24-column pane would sail through on an 80-column one having exercised
+# nothing. So the fake reads its own real width and pads the line to start a
+# few columns short of the right edge, which wraps the phrase MID-WORD at any
+# terminal size.
+cat > "$WORK/fake-warning-tui.sh" <<EOF
+#!/usr/bin/env bash
+clear
+W=\$(tput cols 2>/dev/null || echo 80)
+PAD=\$(printf '%*s' \$((W - 10)) '' | tr ' ' '.')
+printf '%s%s\n' "\$PAD" "$WARNING_LINE"
+printf "> \n"
+printf "  bypass permissions on · 0 shells\n"
+printf "  12345 tokens\n"
+sleep 300
+EOF
+chmod +x "$WORK/fake-warning-tui.sh"
+
+tmux new-session -d -s "$SESSION" -x 24 -y 12 "$WORK/fake-warning-tui.sh"
+sleep 1.5
+
+# Prove the wrap actually happened, so the assertion below means something.
+if tmux capture-pane -t "$PANE" -p | grep -qF "$WARNING_LINE"; then
+  bad "the warning fit on one pane line; the wrap-tolerant path was NOT exercised"
+else
+  ok "the warning is hard-wrapped on the pane (wrap-tolerant path exercised)"
+fi
+
+# --- 7. the warning is read back off a wrapped, real pane ---
+OUT="$("$CW_BIN" login-expiry --pane "$PANE" \
+        --credentials-file "$WORK/no-such-credentials.json" --json 2>&1)"
+RC=$?
+if printf '%s' "$OUT" | grep -q '"pane_warning_days":2'; then
+  ok "login-expiry reads the wrapped warning off a real pane"
+else
+  bad "login-expiry did not report the wrapped warning (got: $OUT)"
+fi
+check_eq "login-expiry exits 3 on an uncorroborated pane warning" "3" "$RC"
+if printf '%s' "$OUT" | grep -q '"credentials":"unknown"'; then
+  ok "an unreadable credential store reports UNKNOWN, not healthy"
+else
+  bad "unreadable credential store was not reported as unknown (got: $OUT)"
+fi
+
+# --- 8. a healthy credential store VETOES the pane warning ---
+#
+# The guard that keeps the daemon from firing /login at the sentence "Your
+# login expires in 2 days" merely appearing in conversation.
+FAR="$(python3 -c 'import time; print(int((time.time()+90*86400)*1000))')"
+printf '{"claudeAiOauth":{"refreshTokenExpiresAt":%s}}\n' "$FAR" \
+  > "$WORK/healthy-credentials.json"
+OUT="$("$CW_BIN" login-expiry --pane "$PANE" \
+        --credentials-file "$WORK/healthy-credentials.json" --json 2>&1)"
+RC=$?
+check_eq "a healthy credential store vetoes the pane warning (exit 0)" "0" "$RC"
+if printf '%s' "$OUT" | grep -q '"credentials":"healthy"'; then
+  ok "the credential store is reported healthy despite the on-screen warning"
+else
+  bad "healthy credential store not reported (got: $OUT)"
+fi
+
+tmux kill-session -t "$SESSION" 2>/dev/null
+
+# --- 9. an ordinary pane with no warning reports nothing ---
+tmux new-session -d -s "$SESSION" -x 80 -y 24 "sleep 300"
+sleep 1
+OUT="$("$CW_BIN" login-expiry --pane "$PANE" \
+        --credentials-file "$WORK/healthy-credentials.json" --json 2>&1)"
+check_eq "login-expiry exits 0 on a pane with no warning" "0" "$?"
+if printf '%s' "$OUT" | grep -q '"pane_warning_days":null'; then
+  ok "no warning on the pane is reported as null, not as a number"
+else
+  bad "a pane with no warning did not report null (got: $OUT)"
+fi
+
+tmux kill-session -t "$SESSION" 2>/dev/null
+
+# --- 10. nothing this suite did escaped into the real event queue ---
+#
+# Asserted rather than assumed: the failure mode is silent, and its blast
+# radius is somebody else's production main loop reacting to a fixture.
+if [ -d "$HOME/claude-events" ]; then
+  ESCAPED="$(grep -rl "cw-self-login-test-" "$HOME/claude-events" 2>/dev/null | head -5)"
+  if [ -n "$ESCAPED" ]; then
+    bad "test events escaped into the real queue: $ESCAPED"
+  else
+    ok "no test events landed in the real claude-events queue"
+  fi
+else
+  ok "no real claude-events queue on this host; nothing could escape"
+fi
+if [ -n "$(ls -A "$WORK/events" 2>/dev/null)" ]; then
+  ok "test events were captured in the isolated queue"
+fi
 
 echo
 echo "== $PASS passed, $FAIL failed =="
