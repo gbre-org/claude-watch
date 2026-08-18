@@ -145,9 +145,16 @@ Two implementation constraints, both easy to get wrong:
 - The URL is parsed by `claude-watch login-url`, which wraps
   `tmux::extract_login_url` — the same tmux-wrap reassembler the daemon's
   reactive reauth path uses. There must not be a second copy.
+- The `/login` submission goes through `claude-watch inject`, explicitly
+  without `--escape` so a dialog that raced in is not cancelled.
 - The authorization code is typed with raw `tmux send-keys`, **not**
-  `claude-watch inject`: inject opens with an Escape blast to reach vim NORMAL
-  mode, and Escape in the login modal cancels the login.
+  `claude-watch inject`. Inject stopped leading with an Escape by default on
+  2026-08-18, but three problems remain in a modal: its INSERT-mode probe
+  leaves a literal `i` glued to the payload (a modal has no prompt line to
+  detect it on), any configured FleetView focus-to-main keys land in the text
+  field as raw escape sequences, and its "payload cleared from the prompt line"
+  success check is vacuous there — so it reports success over a corrupted code.
+  `tools/watchers/tests/test_self_login_tmux.sh` reproduces all three.
 
 Environment defaults (all overridable via flag):
 

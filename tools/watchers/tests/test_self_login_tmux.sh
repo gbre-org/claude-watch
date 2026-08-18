@@ -136,6 +136,150 @@ fi
 tmux kill-session -t "$SESSION" 2>/dev/null
 
 # ---------------------------------------------------------------------------
+# WHY the code is typed with raw send-keys and NOT `claude-watch inject`.
+#
+# The original reason was that inject opened with an Escape blast and Escape
+# cancels the login modal. That reason expired on 2026-08-18, when inject
+# stopped sending the Escape unless `--escape` is passed. These checks pin the
+# reasons that DID NOT expire, so the next person to look at self-login and
+# think "inject is safe now, delete the raw path" gets a failing test instead
+# of a login that silently authenticates with a corrupted code.
+#
+# Both failures below are silent by construction: inject reports
+# `status: submitted` either way, because its success check is "the payload
+# cleared from the prompt line" and a modal has no prompt line.
+# ---------------------------------------------------------------------------
+INJECT_HOME="$WORK/inject-probe-home"
+mkdir -p "$INJECT_HOME"
+# A config with a NON-EMPTY FleetView focus-to-main key sequence. Copied from
+# the repo config so every other field keeps its real default (a partial TOML
+# is rejected outright). gomorrah ships ten Up presses; one is enough to show
+# the class. HOME is redirected too, so the user-config overlay cannot make
+# this probe depend on whoever is running it.
+sed 's/^focus_main_keys = \[\]/focus_main_keys = ["Up"]/' "$REPO/config.toml" \
+  > "$WORK/inject-probe-config.toml"
+
+PROBE_CODE="cw-inject-probe-code-9876"
+cat > "$WORK/fake-code-prompt.sh" <<EOF
+#!/usr/bin/env bash
+printf "Paste code here if prompted > "
+read -r code
+printf "%s\n" "\$code" > "$WORK/inject-probe-received"
+sleep 300
+EOF
+chmod +x "$WORK/fake-code-prompt.sh"
+
+tmux new-session -d -s "$SESSION" -x 80 -y 24 "$WORK/fake-code-prompt.sh"
+sleep 1.5
+
+INJECT_OUT="$(HOME="$INJECT_HOME" \
+  CLAUDE_WATCH_CONFIG="$WORK/inject-probe-config.toml" \
+  "$CW_BIN" inject --pane "$PANE" --submit "$PROBE_CODE" --json 2>"$WORK/inject-probe.err")"
+sleep 1.5
+PROBE_RECEIVED="$(cat "$WORK/inject-probe-received" 2>/dev/null)"
+
+# --- 4a. inject does NOT deliver a modal code intact ---
+if [ "$PROBE_RECEIVED" = "$PROBE_CODE" ]; then
+  bad "claude-watch inject delivered the code into the modal INTACT — the raw send-keys path in self-login's do_code may now be replaceable; re-check by hand before deleting this test"
+else
+  ok "claude-watch inject corrupts a code typed into a login modal (raw send-keys path is still required)"
+fi
+
+# --- 4b. the corruption is the stray INSERT-mode probe `i` ---
+#
+# inject enters INSERT by sending one `i` and un-types it only if it can see
+# the literal land on the prompt line. A modal shows no `-- INSERT --` and no
+# prompt glyph, so the detection is ambiguous, inject fails open, and the `i`
+# stays glued to the front of the payload.
+case "$PROBE_RECEIVED" in
+  *i"$PROBE_CODE") ok "the INSERT-probe \`i\` arrives as a literal prefix on the code" ;;
+  *) bad "expected a literal \`i\` immediately before the code, got: $(printf '%s' "$PROBE_RECEIVED" | od -c | head -2)" ;;
+esac
+
+# --- 4c. the configured FleetView focus keys leak into the modal ---
+case "$PROBE_RECEIVED" in
+  *$'\033'*) ok "the FleetView focus-to-main keys leak into the modal as raw escape sequences" ;;
+  *) bad "expected the focus_main_keys sequence in the received code, got: $(printf '%s' "$PROBE_RECEIVED" | od -c | head -2)" ;;
+esac
+
+# --- 4d. and inject reports SUCCESS over the corrupted payload ---
+#
+# The property that makes this dangerous rather than merely wrong: a caller
+# checking inject's exit code or status field learns nothing.
+if printf '%s' "$INJECT_OUT" | grep -q '"status":"submitted"'; then
+  ok "inject reports status=submitted over the corrupted payload (its prompt-line check is vacuous in a modal)"
+else
+  bad "expected inject to report status=submitted (got: $INJECT_OUT)"
+fi
+
+tmux kill-session -t "$SESSION" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# The 2026-08-18 default flip, asserted from the modal's point of view: a
+# plain `claude-watch inject` must leave a standing login dialog alone, and
+# `--escape` must still be able to cancel it. This is what made self-login's
+# `/login` submission safe to route through inject in the first place.
+#
+# The fake reads one keystroke at a time and drops back to the TUI on Escape,
+# so "did the dialog survive" is a real observation, not a rendering guess.
+#
+# These two use the repo's stock config (focus_main_keys EMPTY), unlike the
+# probes above. That is deliberate and it is not cheating: a byte-at-a-time
+# reader sees an arrow key's `ESC [ A` as a bare Escape, so a non-empty
+# focus-key sequence would trip this fake no matter what inject did, and the
+# assertion would stop being about inject. A real TUI disambiguates the two;
+# this fake cannot, so the focus keys are held out and their (real) damage is
+# pinned by check 4c instead.
+# ---------------------------------------------------------------------------
+cat > "$WORK/fake-escape-sensitive.sh" <<EOF
+#!/usr/bin/env bash
+draw_login() {
+  clear
+  printf "Paste code here if prompted > "
+}
+draw_tui() {
+  clear
+  printf "> \n"
+  printf "  bypass permissions on · 0 shells\n"
+}
+draw_login
+while IFS= read -r -n1 -s key; do
+  if [ "\$key" = \$'\e' ]; then
+    draw_tui
+    break
+  fi
+done
+sleep 300
+EOF
+chmod +x "$WORK/fake-escape-sensitive.sh"
+
+# --- 5a. default inject leaves the modal standing ---
+tmux new-session -d -s "$SESSION" -x 80 -y 24 "$WORK/fake-escape-sensitive.sh"
+sleep 1.5
+HOME="$INJECT_HOME" CLAUDE_WATCH_CONFIG="$REPO/config.toml" \
+  "$CW_BIN" inject --pane "$PANE" --submit 'probe' --no-submit >/dev/null 2>&1
+sleep 1
+if tmux capture-pane -t "$PANE" -p | grep -qF "Paste code here"; then
+  ok "a default (no --escape) inject leaves a standing login modal alone"
+else
+  bad "a default inject CANCELLED the login modal — the 2026-08-18 flip regressed"
+fi
+tmux kill-session -t "$SESSION" 2>/dev/null
+
+# --- 5b. --escape still cancels it (the behaviour, now opt-in) ---
+tmux new-session -d -s "$SESSION" -x 80 -y 24 "$WORK/fake-escape-sensitive.sh"
+sleep 1.5
+HOME="$INJECT_HOME" CLAUDE_WATCH_CONFIG="$REPO/config.toml" \
+  "$CW_BIN" inject --pane "$PANE" --submit 'probe' --no-submit --escape >/dev/null 2>&1
+sleep 1
+if tmux capture-pane -t "$PANE" -p | grep -qF "Paste code here"; then
+  bad "--escape did NOT cancel the login modal; the cancelling path is not reachable"
+else
+  ok "--escape still reaches the Escape blast (cancels the modal), so the flag is a real opt-in"
+fi
+tmux kill-session -t "$SESSION" 2>/dev/null
+
+# ---------------------------------------------------------------------------
 # A pane with NO login dialog must be refused, not silently typed into.
 # ---------------------------------------------------------------------------
 tmux new-session -d -s "$SESSION" -x 80 -y 24 "sleep 300"

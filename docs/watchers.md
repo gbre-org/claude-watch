@@ -266,9 +266,21 @@ Two details worth knowing if you touch this code:
 - The OAuth URL is parsed by `claude-watch login-url`, which wraps
   `tmux::extract_login_url` — the same reassembler the daemon's reactive reauth
   path uses. Do not add a second copy.
-- The authorization code is typed with raw `tmux send-keys`, **not**
-  `claude-watch inject`. Inject opens with an Escape blast to reach vim NORMAL
-  mode, and Escape in the login modal cancels the login.
+- The `/login` submission DOES go through `claude-watch inject` — explicitly
+  without `--escape`, so a login dialog that raced in between the pre-flight
+  check and the inject is not cancelled.
+- The authorization code is still typed with raw `tmux send-keys`, **not**
+  `claude-watch inject`. The original reason (inject always opened with an
+  Escape blast, and Escape cancels the login modal) expired when the flag
+  became opt-in on 2026-08-18; three others did not. Inject enters INSERT by
+  probing with a literal `i` it can only un-type by seeing it on a prompt line,
+  and a modal has none — so the code arrives as `i<code>`. Any configured
+  FleetView focus-to-main keys are sent first and land in the modal's text
+  field as raw escape sequences. And inject's success check is "the payload
+  cleared from the prompt line", which in a modal is vacuous, so it reports
+  `submitted` over the corrupted payload. All three are reproduced against a
+  real tmux pane in `tools/watchers/tests/test_self_login_tmux.sh`; read those
+  checks before trying to delete the raw path.
 
 `cancel` exists because `start` leaves a **modal** on the pane. Until somebody
 pastes the code, the dialog swallows the session's keystrokes and the loop

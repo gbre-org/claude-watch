@@ -432,10 +432,10 @@ def select_login_method(pane: str, method: str, max_enters: int, settle: float =
     Console account, a third-party platform. The first entry is preselected, so
     `claudeai` needs a bare Enter and the others need N Down presses first.
 
-    Raw `tmux send-keys` on purpose: this is a MODAL, not the vim-mode prompt.
-    `claude-watch inject` opens with an Escape blast to reach NORMAL mode, and
-    Escape in this modal CANCELS the login. The inject choreography is right for
-    the prompt line and wrong here.
+    Raw `tmux send-keys` on purpose: this is a MODAL, not the vim-mode prompt,
+    and these are NAVIGATION keys (Down/Enter through a picker), not typed
+    text. `claude-watch inject` types a payload; it has no keystroke API, so
+    there is nothing here for it to own.
 
     Returns True if the picker was handled or was never showing.
     """
@@ -506,7 +506,22 @@ def do_start(pane: str, args) -> dict:
 
     # `/login` is a slash command: bare Enter from INSERT. The Tab->Escape->Enter
     # regular-text sequence does NOT submit a slash command.
-    sc.inject(pane, "/login", label="/login", slash_command=True)
+    #
+    # NO escape (the `claude-watch inject` default since 2026-08-18), stated
+    # explicitly rather than inherited from the shared helper. Two reasons, and
+    # the second is the load-bearing one:
+    #   * It is not needed. `interrupt_and_wait` above has already brought the
+    #     pane to an idle prompt, which is the state the Escape blast exists to
+    #     reach.
+    #   * It is DANGEROUS here. The pre-flight check above bails when a login
+    #     dialog is already on screen, but that check and this inject are not
+    #     atomic. If a dialog arrives in between -- the daemon's reactive reauth
+    #     path getting here first is the realistic case -- an Escape blast would
+    #     cancel it, and the two paths would take turns killing each other's
+    #     dialog. Typing "/login" into a modal is merely a wasted attempt that
+    #     the URL-scrape below reports as a loud failure; cancelling one is the
+    #     failure that hides.
+    sc.inject(pane, "/login", label="/login", slash_command=True, escape=False)
 
     # The dialog is not painted the instant the command submits, and it may
     # arrive as the method picker rather than the URL screen. Poll for either,
@@ -615,9 +630,29 @@ def do_code(pane: str, code: str, args) -> dict:
             return {"ok": False, "pane": pane, "reason": reason, "exit_code": 5}
         log("  WARNING: code prompt not detected, proceeding due to --force")
 
-    # Raw send-keys, NOT `claude-watch inject`: the code goes into a modal text
-    # field, and inject's Escape->NORMAL preamble would cancel the login
-    # ("Press Esc to cancel") instead of typing into it.
+    # Raw send-keys, NOT `claude-watch inject`. This was re-evaluated on
+    # 2026-08-18, when inject stopped leading with an Escape by default and the
+    # original objection (Escape cancels the login modal) went away. It still
+    # cannot be used here, for THREE further reasons, all reproduced against a
+    # real tmux pane in tools/watchers/tests/test_self_login_tmux.sh:
+    #
+    #   1. inject enters INSERT by probing with a literal `i`, and it can only
+    #      un-type that `i` by detecting it on the prompt line. A login modal
+    #      has no `-- INSERT --` indicator and no prompt glyph, so the probe is
+    #      ambiguous, inject fails open, and the `i` stays -- the code arrives
+    #      as `i<code>`.
+    #   2. inject first sends the configured FleetView focus-to-main keys. On a
+    #      deployment that sets any (gomorrah sends ten Up presses) those arrive
+    #      in the modal's text field as raw escape sequences, ahead of the code.
+    #   3. inject's success check is "the payload cleared from the prompt
+    #      line". A modal has no prompt line, so the check is vacuous and inject
+    #      reports `status: submitted` over a corrupted payload. A wrong answer
+    #      that reports success is worse than no answer.
+    #
+    # Fixing all three would mean a mode in which inject does none of the
+    # things inject does, so the raw path stays. Reuse of the centralized
+    # choreography stops at the `/login` submission above, which IS a
+    # prompt-line inject and does go through it.
     sc.run(["tmux", "send-keys", "-t", pane, "-l", code])
     time.sleep(0.6)
 
