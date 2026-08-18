@@ -406,6 +406,55 @@ enabled = true
 # Interval between repeated alerts (seconds); 10800 = 3 hours
 alert_interval_seconds = 10800
 
+# --- Proactive half -------------------------------------------------------
+# Everything above reacts to credentials that are ALREADY dead, which means
+# the recovery always lands at the worst possible moment. Everything below
+# acts on Claude Code's own warning that they are ABOUT to be, while the
+# session still works.
+
+# Watch for the "Your login expires in N days · run /login to renew" warning.
+# Turning this off leaves the reactive path untouched.
+expiry_watch_enabled = true
+
+# Drive `self-login` automatically, instead of only alerting.
+#
+# AUTO-FIRE IS INTRUSIVE BY NATURE: /login opens a modal that swallows the
+# session's keystrokes until somebody pastes the authorization code, so the
+# loop stops working until then. self_login_abandon_seconds is what bounds
+# that. Set false to be told about the expiry and handle it yourself.
+expiry_auto_self_login = true
+
+# Auto-fire only once the warning is down to this many days. Claude Code
+# starts SHOWING the warning three days out but only starts nagging inside
+# one day, and one day is the right side of that line to interrupt a working
+# session on.
+expiry_auto_days = 1
+
+# Minimum gap between auto-fire attempts (seconds). The warning persists for
+# days, so without this a ten-second poll re-fires the flow all day.
+self_login_retry_seconds = 3600
+
+# Attempts allowed in one expiry window, reset when the credentials are
+# actually renewed. Failing loudly is right; failing every hour forever is not.
+self_login_max_attempts = 3
+
+# Escape out of an unconsumed login dialog after this many seconds, handing
+# the pane back. This is the answer to "auto-fire ran at 3am and nobody
+# pasted the code": the OAuth link has a short life of its own, so parking
+# the loop in a modal until morning buys nothing. 0 disables the watchdog.
+self_login_abandon_seconds = 1800
+
+# Claude Code's OAuth credential store, which the on-screen warning is
+# corroborated against — "Your login expires in 2 days" is also just a
+# sentence, and a session reading these docs will have it on the pane while
+# perfectly well authenticated. Empty = $HOME/.claude/.credentials.json.
+# An unreadable store is UNKNOWN, not a negative: the pane signal still acts,
+# and the alert says it stands alone.
+credentials_file = ""
+
+# Command used to drive the login flow.
+self_login_command = "self-login"
+
 [task_watch]
 # Enable task-watch daemon loop (auto-manage tmux panes for background tasks)
 enabled = true

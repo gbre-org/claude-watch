@@ -2193,6 +2193,49 @@ cooldown = 300
         assert!(!config.task_watch.show_all);
     }
 
+    /// The proactive-expiry knobs must all default without appearing in the
+    /// file. `[reauth]` predates them, so every existing deployment's config
+    /// is missing them and would fail to load if any were required.
+    #[test]
+    fn test_reauth_expiry_defaults_apply_to_a_config_that_predates_them() {
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert!(config.reauth.expiry_watch_enabled);
+        assert!(config.reauth.expiry_auto_self_login);
+        assert_eq!(config.reauth.expiry_auto_days, 1);
+        assert_eq!(config.reauth.self_login_retry_seconds, 3600);
+        assert_eq!(config.reauth.self_login_max_attempts, 3);
+        assert_eq!(config.reauth.self_login_abandon_seconds, 1800);
+        assert_eq!(config.reauth.credentials_file, "");
+        assert_eq!(config.reauth.self_login_command, "self-login");
+    }
+
+    /// Auto-fire must be switchable off WITHOUT losing the reactive path or
+    /// the warning itself — "tell me, I'll handle it" is a supported mode.
+    #[test]
+    fn test_reauth_expiry_knobs_are_overridable() {
+        let toml = SAMPLE_CONFIG.replace(
+            "[reauth]\nenabled = true\nalert_interval_seconds = 10800\n",
+            "[reauth]\n\
+             enabled = true\n\
+             alert_interval_seconds = 10800\n\
+             expiry_auto_self_login = false\n\
+             expiry_auto_days = 2\n\
+             self_login_abandon_seconds = 0\n\
+             self_login_command = \"/usr/local/bin/self-login\"\n",
+        );
+        assert!(
+            toml.contains("expiry_auto_days"),
+            "the [reauth] block moved; this test would have silently asserted defaults"
+        );
+        let config = parse_config(&toml).unwrap();
+        assert!(config.reauth.enabled);
+        assert!(config.reauth.expiry_watch_enabled);
+        assert!(!config.reauth.expiry_auto_self_login);
+        assert_eq!(config.reauth.expiry_auto_days, 2);
+        assert_eq!(config.reauth.self_login_abandon_seconds, 0);
+        assert_eq!(config.reauth.self_login_command, "/usr/local/bin/self-login");
+    }
+
     #[test]
     fn test_ask_question_monitor_defaults() {
         // No [ask_question_monitor] in SAMPLE_CONFIG -> Phase-1 defaults.

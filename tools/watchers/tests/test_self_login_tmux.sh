@@ -144,6 +144,84 @@ else
   bad "refused code submission did not record a failure state"
 fi
 
+tmux kill-session -t "$SESSION" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# `cancel`: the watchdog that hands the pane back when an auto-fired login is
+# never answered. This is the failure mode the whole abandon path exists for
+# — /login opens a MODAL, so a login nobody completes takes the session down
+# for as long as it stands there.
+#
+# The fake here has to model the one property that matters: Escape closes the
+# dialog and the TUI comes back. A fake that ignored Escape would let a broken
+# cancel pass.
+# ---------------------------------------------------------------------------
+cat > "$WORK/fake-cancellable-login.sh" <<EOF
+#!/usr/bin/env bash
+draw_login() {
+  clear
+  printf "Browser didn't open? Use the url below to sign in\n\n"
+  printf '%s\n\n' "$FAKE_URL"
+  printf "Paste code here if prompted > "
+}
+draw_tui() {
+  clear
+  printf "> \n"
+  printf "  bypass permissions on · 0 shells\n"
+  printf "                          12345 tokens\n"
+}
+draw_login
+# Read one keystroke at a time; Escape (\$'\e') drops back to the TUI, which is
+# what self-login cancel is supposed to achieve.
+while IFS= read -r -n1 -s key; do
+  if [ "\$key" = \$'\e' ]; then
+    draw_tui
+    break
+  fi
+done
+sleep 300
+EOF
+chmod +x "$WORK/fake-cancellable-login.sh"
+
+tmux new-session -d -s "$SESSION" -x 80 -y 24 "$WORK/fake-cancellable-login.sh"
+sleep 1.5
+
+# --- 5. a standing, unconsumed login dialog is escaped out of ---
+OUT="$("$SELF_LOGIN" --pane "$PANE" --json cancel 2>"$WORK/cancel.err")"
+check_eq "self-login cancel exits 0 on a standing login dialog" "0" "$?"
+if printf '%s' "$OUT" | grep -q '"cancelled": true'; then
+  ok "self-login cancel reports it actually dismissed the dialog"
+else
+  bad "self-login cancel did not report cancelled:true (got: $OUT)"
+fi
+sleep 0.5
+if tmux capture-pane -t "$PANE" -p | grep -qF "Paste code here"; then
+  bad "the login dialog is STILL on the pane after cancel"
+else
+  ok "the login dialog is gone from the pane after cancel"
+fi
+if grep -q '"status": "cancelled"' "$CLAUDE_SELF_LOGIN_STATE" 2>/dev/null; then
+  ok "state file records status=cancelled"
+else
+  bad "state file did not record status=cancelled (got: $(cat "$CLAUDE_SELF_LOGIN_STATE" 2>/dev/null))"
+fi
+
+# --- 6. cancel on an ALREADY-clean pane is a no-op, not a keystroke ---
+#
+# The load-bearing property: the abandon watchdog fires on a timer without
+# first proving the dialog is still up, so cancelling a healthy session must
+# do nothing at all. If it blindly pressed Escape it would interrupt whatever
+# the session was doing.
+OUT="$("$SELF_LOGIN" --pane "$PANE" --json cancel 2>"$WORK/cancel2.err")"
+check_eq "self-login cancel exits 0 when there is no dialog" "0" "$?"
+if printf '%s' "$OUT" | grep -q '"cancelled": false'; then
+  ok "self-login cancel is a no-op on a pane with no login dialog"
+else
+  bad "self-login cancel did not report cancelled:false (got: $OUT)"
+fi
+
+tmux kill-session -t "$SESSION" 2>/dev/null
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
