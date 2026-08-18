@@ -670,7 +670,7 @@ def _self_test() -> int:
             fail(f"signal exclusion leaked: {snap}")
 
         # 11b. Producer-SHIPPED tier routes actionable even when the message
-        # alone would classify ambient (botchat #3879: pr-watch stamps
+        # alone would classify ambient (botchat #3879: the producer stamps
         # data.tier=actionable on its unresolved-comment events). Routed by the
         # shipped tier, NOT a message regex.
         clear_pending(sd)
