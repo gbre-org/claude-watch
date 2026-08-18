@@ -260,3 +260,15 @@ enabled = false
 # container — calling it would fall straight through to LaunchFailed).
 enabled = false
 respawn_command = ["cwsr", "--no-upgrade"]
+
+[cadence]
+# Daemon-emitted cadence claude-events (heartbeat-tick + memory-reminder).
+# See the top-level config.toml [cadence] section and src/cadence.rs for the
+# full contract. Container-specific override: the memory-reminder cadence is
+# stretched from the 30-min code default to 1 hour for this deployment
+# (operator directive, botchat #4712) — the reminder checklist (update logs,
+# commit + push repos) is heavier-touch than a 30-min beat warrants here.
+# heartbeat_tick_interval_secs is left unset -> inherits the 900s (15-min)
+# code default. This is a plain daemon config VALUE, not an overlay mount.
+enabled = true
+memory_reminder_interval_secs = 3600
