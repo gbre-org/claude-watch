@@ -6681,6 +6681,199 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::CredentialExpiry;
+
+    // ---- Proactive login-expiry decision ----
+
+    fn evidence() -> ExpiryEvidence {
+        ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Unknown,
+            auto_enabled: true,
+            auto_days: 1,
+            since_last_attempt: None,
+            retry_seconds: 3600,
+            attempts: 0,
+            max_attempts: 3,
+            login_pending: false,
+        }
+    }
+
+    /// Nothing on the pane and nothing on disk: the daemon stays out of it.
+    #[test]
+    fn no_evidence_is_idle() {
+        assert_eq!(decide_expiry_action(&evidence()), ExpiryAction::Idle);
+    }
+
+    /// THE false-positive guard, and the reason this function exists. A pane
+    /// sighting that the credential store contradicts is conversation text —
+    /// somebody reading this file, or its tests, or the diff that added them.
+    /// Acting on it would park a healthy session in a login modal.
+    #[test]
+    fn a_pane_sighting_a_healthy_credential_contradicts_is_ignored() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Healthy,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+    }
+
+    /// An already-dead credential belongs to the REACTIVE path. Racing it into
+    /// the same modal from two directions helps nobody.
+    #[test]
+    fn an_already_expired_credential_is_left_to_the_reactive_path() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(1),
+            credentials: CredentialExpiry::Expired,
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::Idle);
+    }
+
+    /// An unreadable credential store is UNKNOWN, never a negative — the pane
+    /// still carries the decision, but the alert has to say it stands alone.
+    #[test]
+    fn an_unreadable_credential_store_still_acts_but_uncorroborated() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(2),
+            credentials: CredentialExpiry::Unknown,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 2,
+                corroborated: false,
+            }
+        );
+    }
+
+    /// The transient form of Claude Code's warning lives about fifteen
+    /// seconds, so a poller MISSING it proves nothing. The credential store
+    /// alone is enough to act on.
+    #[test]
+    fn the_credential_store_alone_can_carry_the_decision() {
+        let ev = ExpiryEvidence {
+            pane_days_left: None,
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Claude Code starts SHOWING the warning three days out but only starts
+    /// nagging inside one. Three days out is a heads-up, not a reason to
+    /// interrupt a working session.
+    #[test]
+    fn a_warning_outside_the_auto_window_only_alerts() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(3),
+            credentials: CredentialExpiry::Expiring { days_left: 3 },
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 3,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// When the two sources disagree, take the more urgent number: a banner
+    /// left over from an earlier render must not be able to stretch a deadline.
+    #[test]
+    fn disagreeing_sources_resolve_to_the_more_urgent_one() {
+        let ev = ExpiryEvidence {
+            pane_days_left: Some(3),
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            ..evidence()
+        };
+        assert_eq!(decide_expiry_action(&ev), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Debounce. The warning stands for DAYS; without spacing, a ten-second
+    /// poll re-fires the login flow ~8,600 times a day.
+    #[test]
+    fn a_recent_attempt_blocks_a_re_fire_and_an_old_one_does_not() {
+        let recent = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(60.0),
+            attempts: 1,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&recent),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+
+        let stale = ExpiryEvidence {
+            since_last_attempt: Some(3601.0),
+            ..recent
+        };
+        assert_eq!(decide_expiry_action(&stale), ExpiryAction::AutoLogin { days_left: 1 });
+    }
+
+    /// Failing loudly is right; failing every hour forever is not. Once the
+    /// budget is spent the alert keeps going out and the session is left alone.
+    #[test]
+    fn the_attempt_budget_stops_auto_fire_but_not_the_alert() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(99999.0),
+            attempts: 3,
+            max_attempts: 3,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// A dialog we already opened is still waiting for its code. Firing a
+    /// second `/login` types the literal text into the first one's field.
+    #[test]
+    fn a_pending_login_dialog_blocks_a_second_fire() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(99999.0),
+            login_pending: true,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
+
+    /// Auto-fire off means alert only — the reactive path is untouched either
+    /// way, so turning this off degrades to "tell me, I'll handle it".
+    #[test]
+    fn auto_fire_disabled_degrades_to_alert_only() {
+        let ev = ExpiryEvidence {
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            auto_enabled: false,
+            ..evidence()
+        };
+        assert_eq!(
+            decide_expiry_action(&ev),
+            ExpiryAction::AlertOnly {
+                days_left: 1,
+                corroborated: true,
+            }
+        );
+    }
 
     #[test]
     fn test_elapsed_since_valid() {

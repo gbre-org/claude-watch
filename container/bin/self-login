@@ -17,6 +17,7 @@ Subcommands
 -----------
   start           Inject `/login`, scrape the OAuth URL, publish it.
   code <CODE>     Type the authorization code into the login dialog.
+  cancel          Escape out of a login dialog nobody is going to finish.
   url             Print the OAuth URL currently on the pane (no injection).
   status          Print the state file as JSON.
 
@@ -45,10 +46,20 @@ Configuration (defaults portable; override via CLI flag or env var):
   --state-file PATH  (env $CLAUDE_SELF_LOGIN_STATE)
                      (notify cmd: env $CLAUDE_SELF_LOGIN_NOTIFY_CMD)
 
+`cancel` exists because `start` leaves a MODAL on the pane. The login dialog
+swallows the session's keystrokes until somebody pastes the code, so an
+auto-fired login that nobody answers takes the whole loop down for as long as
+it stands there. The OAuth link has a short life of its own, so waiting it out
+overnight buys nothing. `cancel` presses Escape only while the dialog is
+actually up, which makes it a no-op in the normal case where the code was
+entered — safe for a supervisor to call unconditionally on a timer.
+
 Exit codes:
-  0  success
+  0  success (for `cancel`: the pane is not sitting in a login dialog, whether
+     or not this invocation is what got it out of one)
   1  usage / no Claude Code pane / internal error
-  4  no OAuth URL found (start), or login did not complete (code)
+  4  no OAuth URL found (start), login did not complete (code), or the dialog
+     would not close (cancel)
   5  the login dialog was not on screen when a code was submitted
 """
 
@@ -654,6 +665,40 @@ def do_code(pane: str, code: str, args) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# `cancel` — hand the pane back when nobody is going to finish the login
+# ---------------------------------------------------------------------------
+
+def do_cancel(pane: str) -> dict:
+    """Escape out of a login dialog that is never going to be completed.
+
+    Deliberately conditional and deliberately dull. It presses Escape ONLY
+    while a login dialog is on screen, so calling it on a healthy session does
+    nothing at all — which is the property that lets a supervisor fire it on a
+    timer without first proving the dialog is still up. Racing a human who is
+    mid-paste is the one thing it must not do, and `dismiss_login_dialog`
+    re-checks the pane before every keypress for exactly that reason.
+    """
+    text = capture(pane)
+    if not login_dialog_visible(text):
+        log("CANCEL: no login dialog on the pane; nothing to cancel")
+        return {"ok": True, "pane": pane, "cancelled": False,
+                "message": "no login dialog on the pane"}
+
+    log("CANCEL: login dialog is up and unconsumed; escaping out of it")
+    dismissed = dismiss_login_dialog(pane)
+    if not dismissed:
+        reason = ("the login dialog would not close — the pane is still "
+                  "showing it after the Escape attempts")
+        log(f"  FAILED: {reason}")
+        log(f"  pane tail: {sc.capture_pane_text(pane)}")
+        return {"ok": False, "pane": pane, "cancelled": False,
+                "reason": reason, "exit_code": 4}
+
+    return {"ok": True, "pane": pane, "cancelled": True,
+            "message": "login dialog cancelled; the session has the pane back"}
+
+
+# ---------------------------------------------------------------------------
 # Locking + daemonization
 # ---------------------------------------------------------------------------
 
@@ -753,6 +798,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("url", help="Print the OAuth URL currently on the pane")
     sub.add_parser("status", help="Print the self-login state file as JSON")
+
+    sub.add_parser(
+        "cancel",
+        help="Escape out of a login dialog nobody is going to finish "
+             "(no-op when no dialog is on the pane)",
+    )
     return p
 
 
@@ -787,6 +838,37 @@ def main() -> int:
             return 4
         print(url)
         return 0
+
+    if subcommand == "cancel":
+        lock_fd = acquire_lock()
+        if lock_fd is None:
+            # A `start` is mid-flight. It owns the pane, and Escape is the one
+            # keystroke that would cancel the login it is driving.
+            msg = "another self-login is running (lock held); not cancelling"
+            log(f"SKIP: {msg}")
+            emit_result(args.json, {"ok": False, "reason": msg})
+            return 1
+        try:
+            result = do_cancel(pane)
+        finally:
+            os.close(lock_fd)
+        if result.get("ok"):
+            if result.get("cancelled"):
+                write_state({"status": "cancelled", "pane": pane,
+                             "reason": "login dialog was never completed"})
+                emit_event(
+                    "Claude Code self-login was cancelled: the OAuth URL went "
+                    "unused, so the login dialog was dismissed and the session "
+                    "has its pane back. Re-run `self-login start` for a fresh link.",
+                    tag="self-login-cancelled", priority="high",
+                    data={"pane": pane},
+                )
+            emit_result(args.json, result)
+            return 0
+        publish_failure(pane, result.get("reason", "unknown"),
+                        tag="self-login-cancel-failed")
+        emit_result(args.json, result)
+        return int(result.get("exit_code", 4))
 
     if subcommand == "code":
         lock_fd = acquire_lock()
