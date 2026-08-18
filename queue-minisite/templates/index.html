@@ -858,6 +858,19 @@
           override is recorded in
           <code>~/.config/claude/queue-force-start.log</code>.
         </p>
+        {# Force-start-only opt-in: re-scope instead of autostopping the peer.
+           Shown/hidden by action.js via the shared [data-show-for] toggle. #}
+        <label
+          id="action-modal-new-scope-label"
+          class="modal-checkbox-label"
+          data-show-for="force-start"
+          hidden>
+          <input type="checkbox" id="action-modal-new-scope">
+          <span>Force-start with a <strong>new scope</strong> &mdash; assign
+          this item a fresh, distinct scope so it no longer overlaps the
+          running peer. Both keep running in parallel; the peer is
+          <strong>not</strong> autostopped.</span>
+        </label>
         <label class="modal-reason-label" for="action-modal-reason" id="action-modal-reason-label">Reason (optional)</label>
         <input
           id="action-modal-reason"

@@ -34,6 +34,9 @@
   const titleEl = document.getElementById('action-modal-title');
   const confirmBtn = document.getElementById('action-modal-confirm');
   const cancelBtn = document.getElementById('action-modal-cancel');
+  // Force-start-only checkbox: re-scope the item to a fresh distinct scope
+  // instead of autostopping the overlapping running peer (Andrew #4713).
+  const newScopeEl = document.getElementById('action-modal-new-scope');
   const warnings = modal.querySelectorAll('[data-show-for]');
 
   // Per-action presentation. Endpoints differ; copy differs; confirm
@@ -156,6 +159,7 @@
     idEl.textContent = id;
     summaryEl.textContent = summary;
     reasonEl.value = '';
+    if (newScopeEl) newScopeEl.checked = false;
     setError(null);
     setBusy(false);
     modal.hidden = false;
@@ -202,6 +206,11 @@
     const reqBody = cfg.idInPath
       ? { reason: reasonVal }
       : { id: id, reason: reasonVal };
+    // Force-start with a new scope: signal the backend to re-scope this item
+    // to a fresh distinct scope so it co-runs with the peer (no autostop).
+    if (currentAction === 'force-start' && newScopeEl && newScopeEl.checked) {
+      reqBody.new_scope = true;
+    }
     setBusy(true);
     setError(null);
     try {
