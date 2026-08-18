@@ -265,7 +265,7 @@ fresh deployments self-contained.
 | Hook scripts | [`tools/hooks/`](tools/hooks/) | PreToolUse / PostToolUse hooks that wire the queue + obligations gate into Claude Code's hook contract. See [`docs/hooks.md`](docs/hooks.md). |
 | `agent-msg` | [`tools/agent-msg/`](tools/agent-msg/) | Async-messaging CLI for delivering inbox messages to running subagents via the obligations gate. See [`docs/agent-msg.md`](docs/agent-msg.md). |
 | `claude-event` + `claude-event-tail` | [`tools/claude-event/`](tools/claude-event/) | Source-agnostic JSON event bus (emitter + ring-buffer reader). See [`docs/events.md`](docs/events.md), and [`docs/concepts/event-hierarchy.md`](docs/concepts/event-hierarchy.md) for how events relate to obligations and interruptions. |
-| `claude-event-watch` + `self-clear` | [`tools/watchers/`](tools/watchers/) | Watcher script (inotify-blocking event surfacer) and the `/clear` + resume-prompt injector. See [`docs/watchers.md`](docs/watchers.md) for operator hygiene and [`docs/adding-watchers.md`](docs/adding-watchers.md) for authoring a custom watcher. |
+| `claude-event-watch`, `self-clear`, `self-login` | [`tools/watchers/`](tools/watchers/) | Watcher script (inotify-blocking event surfacer), the `/clear` + resume-prompt injector, and the on-demand `/login` driver that scrapes the OAuth URL out of the pane and takes the authorization code back. See [`docs/watchers.md`](docs/watchers.md) for operator hygiene and [`docs/adding-watchers.md`](docs/adding-watchers.md) for authoring a custom watcher. |
 | `queue-minisite` | [`queue-minisite/`](queue-minisite/) | Mobile-friendly Flask UI for the `session-task` work queue. Renders running/pending/blocked items with Stop / Abandon / Force-start buttons. Designed to sit behind an upstream auth proxy. See [`queue-minisite/README.md`](queue-minisite/README.md). |
 | `container` | [`container/`](container/) | Containerized deployment of Claude Code + the `claude-watch` daemon + tmux as a single Docker image, plus a host-side `claude-tmux` wrapper with bind mounts, env passthrough, POSIX signal handling, and TTY. Lets the same Claude Code environment run identically on Linux servers and macOS work laptops. See [`container/README.md`](container/README.md). |
 
@@ -287,7 +287,7 @@ make test-hooks          # obligations + queue PreToolUse hook tests
 make test-queue-minisite # queue-minisite Flask end-to-end suites
 make test-agent-msg      # agent-msg embedded --test suite
 make test-claude-event   # claude-event + claude-event-tail unit tests
-make test-watchers       # claude-event-watch fast-path + self-clear config
+make test-watchers       # claude-event-watch fast-path + self-clear/self-login
 
 make build               # release build
 make install             # build; copy daemon + symlink tool scripts into $BIN_DIR (default ~/bin/)

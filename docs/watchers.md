@@ -227,8 +227,55 @@ final step of a compact-prep procedure; eliminates the wait for the
 daemon's resume-injection path to fire on its own. See
 [`watchers.md`](../tools/watchers/README.md) for config.
 
+## Self-login: re-authenticating from outside the session
+
+`tools/watchers/self-login` is the same idea applied to `/login`. When Claude
+Code's credentials lapse, the session cannot fix itself: the login screen is a
+modal that swallows the loop's own keystrokes, and normally somebody has to be
+sitting at the terminal. `self-login` drives the whole flow from outside, so it
+works from a phone.
+
+```
+self-login start                 # inject /login, scrape the OAuth URL, publish it
+self-login code <CODE>           # type the authorization code into the dialog
+self-login url                   # print the URL on the pane (no injection)
+self-login status                # print the state file
+```
+
+`start` forks and returns immediately, exactly as `self-clear` does — when the
+caller is the session itself, the TUI is busy running that very command, and
+the turn has to end before the pane reaches an idle prompt. The result lands in
+the state file. Pass `--foreground --json` to block and get a single JSON
+object on stdout instead; that is the entry point for driving the flow
+programmatically (a supervisor that notices credentials are about to lapse, for
+instance) rather than by hand.
+
+The URL is published to three independent sinks: the state file (always), a
+`claude-event` when that binary is on PATH, and `$CLAUDE_SELF_LOGIN_NOTIFY_CMD`
+when set (invoked as `<cmd...> <url>`). Both optional sinks may be absent
+without affecting the state file.
+
+**Failures are loud by design.** No URL can mean the session is already
+authenticated, the dialog never rendered, or the pane is wedged — all things an
+operator has to see. A missing URL is a non-zero exit plus a high-priority
+event, never a quiet success.
+
+Two details worth knowing if you touch this code:
+
+- The OAuth URL is parsed by `claude-watch login-url`, which wraps
+  `tmux::extract_login_url` — the same reassembler the daemon's reactive reauth
+  path uses. Do not add a second copy.
+- The authorization code is typed with raw `tmux send-keys`, **not**
+  `claude-watch inject`. Inject opens with an Escape blast to reach vim NORMAL
+  mode, and Escape in the login modal cancels the login.
+
+Config: `$CLAUDE_SELF_LOGIN_LOG`, `$CLAUDE_SELF_LOGIN_STATE`,
+`$CLAUDE_SELF_LOGIN_LOCK`, `$CLAUDE_SELF_LOGIN_NOTIFY_CMD` (each with a
+matching CLI flag).
+
 ## Tests
 
 ```
-make test-watchers         # claude-event-watch fast-path + self-clear config
+make test-watchers         # claude-event-watch fast-path + self-clear/self-login
+make test-self-login-tmux  # self-login end-to-end against a throwaway tmux pane
 ```
