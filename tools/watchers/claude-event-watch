@@ -695,7 +695,7 @@ fi
 # inotifywait wasn't watching yet. With an unbounded wait, that gap-event then
 # sat on disk until the NEXT unrelated event happened to wake inotifywait —
 # which could be many minutes (or never). The cron health-check
-# (cw-watcher-health-check) then flags it as "WATCHER DOWN" at the 2-min mark,
+# (cw-watcher-health-check) then flags it as "WATCHER DOWN" at the 6-min mark (default),
 # even though the watcher PROCESS is perfectly alive — it's just blind to the
 # gap-event. That false "down" alert is what fired repeatedly all session.
 #

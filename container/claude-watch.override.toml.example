@@ -28,3 +28,12 @@
 # enabled = true
 # memory_reminder_interval_secs = 3600   # 1h   (code default 1800 = 30 min)
 # heartbeat_tick_interval_secs  = 900    # 15min (code default 900)
+
+# --- Event-watcher health check (cw-watcher-health-check cron) --------------
+# How many minutes a claude-event may sit unconsumed in the spool dir before the
+# cron injects a "[CLAUDE-WATCH] WATCHER DOWN: N event(s) unconsumed >Nmin"
+# recovery alert. Consumed by the cron SCRIPT (not the daemon). Default 6 (>= 2x
+# the event watcher's ~3min debounce). Editing this retunes it on the next cron
+# tick -- no rebuild. (An explicit CW_WATCHER_HEALTH_STALE_MIN env var still pins.)
+# [watcher_health]
+# stale_minutes = 6

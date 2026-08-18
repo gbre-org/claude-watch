@@ -48,7 +48,7 @@ ack-gate). The tier of a `source/tag` pair is DATA, in `event-classify`.
 
 - **`cw-watcher-health-check`** — runs from cron (once/min by default). If
   `*.json` event files have sat unconsumed in the spool dir past
-  `CW_WATCHER_HEALTH_STALE_MIN` (default 2) minutes, the event watcher is dead
+  `CW_WATCHER_HEALTH_STALE_MIN` (default 6) minutes, the event watcher is dead
   or stuck, so it injects a `[CLAUDE-WATCH] WATCHER DOWN…` alert into the
   Claude pane via `claude-watch inject` (the ONE verified type-and-submit
   path). A per-condition cooldown (`CW_WATCHER_HEALTH_COOLDOWN_SECS`, default
@@ -61,7 +61,12 @@ ack-gate). The tier of a `source/tag` pair is DATA, in `event-classify`.
 
   Env:
   - `CLAUDE_EVENT_QUEUE` (default `~/claude-events`)
-  - `CW_WATCHER_HEALTH_STALE_MIN` (default 2)
+  - `CW_WATCHER_HEALTH_STALE_MIN` (default 6). If UNSET, read from
+    `[watcher_health] stale_minutes` in the runtime override
+    (`$CLAUDE_WATCH_RUNTIME_CONFIG`, the bind-mounted
+    `~/.config/claude-container/claude-watch.override.toml`) then the baked
+    `$CLAUDE_WATCH_CONFIG`; default 6 = >= 2x the event watcher's ~3min
+    debounce. An explicit env var pins/overrides.
   - `CW_WATCHER_HEALTH_PANE` — pin a tmux pane; UNSET = let `claude-watch
     inject` resolve it (`$CLAUDE_WATCH_PANE` → `[tmux] dashboard_pane` config →
     auto-detect).
