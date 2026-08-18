@@ -2121,7 +2121,8 @@ def api_queue_force_start(queue_id: str) -> Any:
     """Manually promote a PENDING queue item to running, bypassing scope-
     conflict serialization.
 
-    Body: ``{"reason": "...", "co_run": <bool>}``. Reason is required and is
+    Body: ``{"reason": "...", "co_run": <bool>, "new_scope": <bool|str>}``.
+    Reason is required and is
     auditable — every successful force-start appends a row to
     ``~/.config/claude/queue-force-start.log`` (host) /
     ``$QUEUE_FORCE_START_LOG`` (container). The id must match
@@ -2175,6 +2176,20 @@ def api_queue_force_start(queue_id: str) -> Any:
     # the JSON body; default False preserves the autostop-the-peer behavior.
     co_run = bool(payload.get("co_run") or payload.get("no_interrupt"))
 
+    # Re-scope (Andrew #4713): opt-in flag from the modal checkbox "force
+    # start with a new scope". When set, session-task reassigns the item a
+    # DISTINCT scope so it no longer overlaps the running peer -- both run in
+    # parallel and the peer is NOT autostopped (re-scope implies co-run).
+    # Accept ``new_scope`` as a bool (auto-derive a distinct scope) or a
+    # non-empty string (the operator-typed scope, passed verbatim).
+    new_scope_val = payload.get("new_scope")
+    rescope = bool(new_scope_val)
+    new_scope_explicit = (
+        new_scope_val.strip()
+        if isinstance(new_scope_val, str) and new_scope_val.strip()
+        else None
+    )
+
     eligible = _ids_by_status("pending")
     if queue_id not in eligible:
         return (
@@ -2205,6 +2220,11 @@ def api_queue_force_start(queue_id: str) -> Any:
         ]
         if co_run:
             fs_argv.append("--no-interrupt")
+        if rescope:
+            if new_scope_explicit is not None:
+                fs_argv.extend(["--new-scope", new_scope_explicit])
+            else:
+                fs_argv.append("--new-scope")
         proc = subprocess.run(
             fs_argv,
             capture_output=True,
@@ -2262,6 +2282,7 @@ def api_queue_force_start(queue_id: str) -> Any:
             "id": queue_id,
             "action": "force-start",
             "co_run": co_run,
+            "rescope": rescope,
             "reason": annotated_reason,
             "stdout": proc.stdout,
             "stderr": proc.stderr,

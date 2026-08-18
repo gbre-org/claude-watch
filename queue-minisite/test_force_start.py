@@ -342,6 +342,55 @@ class ForceStartEndpointTest(unittest.TestCase):
         self.assertEqual(items[self.blocked_id]["status"], "running")
         self.assertEqual(items[self.running_id]["status"], "abandoned")
 
+    # -------------------------------------------------------------- 9
+    def test_new_scope_true_re_scopes_and_leaves_peer_running(self):
+        """`new_scope: true` (modal checkbox) appends --new-scope to the
+        session-task argv: the item is re-scoped to a fresh distinct scope so
+        it no longer overlaps the running peer -- both keep running, the peer
+        is NOT autostopped (Andrew #4713). Re-scope implies co-run.
+        """
+        r = self.client.post(
+            f"/api/queue/{self.blocked_id}/force-start",
+            json={"reason": "run-in-parallel", "new_scope": True},
+        )
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        body = r.get_json()
+        self.assertTrue(body.get("ok"), body)
+        self.assertTrue(body.get("rescope"), body)
+
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        items = {it["id"]: it for it in data["items"]}
+        promoted = items[self.blocked_id]
+        self.assertEqual(promoted["status"], "running")
+        self.assertTrue(promoted.get("force_started_rescoped"))
+        self.assertTrue(promoted.get("force_started_co_run"))
+        # The item got a distinct scope; the peer keeps its original one.
+        self.assertNotEqual(promoted.get("scope"), ["repo:web"])
+        self.assertNotIn("repo:web", promoted.get("scope", []))
+        self.assertEqual(items[self.running_id]["status"], "running")
+        self.assertNotIn(
+            "autostopped_by_force_start", items[self.running_id]
+        )
+
+    # -------------------------------------------------------------- 10
+    def test_new_scope_string_sets_scope_verbatim(self):
+        """A non-empty ``new_scope`` STRING is passed verbatim as the item's
+        new scope (the operator-typed-scope alternative).
+        """
+        r = self.client.post(
+            f"/api/queue/{self.blocked_id}/force-start",
+            json={"reason": "typed-scope", "new_scope": "repo:api"},
+        )
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertTrue(r.get_json().get("rescope"), r.get_json())
+
+        with open(self.queue_actual) as f:
+            data = json.load(f)
+        items = {it["id"]: it for it in data["items"]}
+        self.assertEqual(items[self.blocked_id].get("scope"), ["repo:api"])
+        self.assertEqual(items[self.running_id]["status"], "running")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

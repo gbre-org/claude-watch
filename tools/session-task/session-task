@@ -5954,7 +5954,39 @@ def cmd_queue_force_start(args):
         # preserves the original behavior: autostop every scope-overlapping
         # running peer. Either way the overlapping peers are captured in
         # `blockers_overridden` above for the audit trail.
-        co_run = getattr(args, "no_interrupt", False)
+        # Re-scope mode (Andrew #4713): the operator opted (via the modal
+        # checkbox "force start with a new scope") to force-start WITHOUT
+        # disturbing the running peer. Before we decide on autostop, reassign
+        # this item a DISTINCT scope so it no longer overlaps ANY running
+        # peer. `cross_blockers`/`blockers_overridden` above were computed on
+        # the ORIGINAL scope so the audit trail still records the peer we are
+        # co-running alongside; the peer itself is left running (re-scope
+        # implies co-run). Bare `--new-scope` auto-derives the distinct scope
+        # by suffixing each serializing token with ':forced-<shortid>' (task:
+        # dep tokens preserved); an explicit value sets the scope verbatim
+        # (the operator-typed-scope alternative).
+        new_scope_arg = getattr(args, "new_scope", None)
+        rescoped = new_scope_arg is not None
+        if rescoped:
+            if new_scope_arg == "__AUTO__":
+                shortid = secrets.token_hex(3)
+                serializing = _serializing_scope(scope)
+                task_tokens = [t for t in scope if _is_task_token(t)]
+                if serializing:
+                    resuffixed = [f"{t}:forced-{shortid}" for t in serializing]
+                else:
+                    # No serializing tokens to derive from (empty or
+                    # task-only scope): mint a standalone distinct token.
+                    resuffixed = [f"forced:{target['id']}-{shortid}"]
+                new_scope = resuffixed + task_tokens
+            else:
+                # Explicit operator-typed scope: split on whitespace/commas.
+                new_scope = [t for t in re.split(r"[\s,]+", new_scope_arg) if t]
+                if not new_scope:
+                    new_scope = [f"forced:{target['id']}-{secrets.token_hex(3)}"]
+            target["scope"] = new_scope
+
+        co_run = getattr(args, "no_interrupt", False) or rescoped
         if co_run:
             autostop_bundles = []
         else:
@@ -5975,6 +6007,13 @@ def cmd_queue_force_start(args):
             b["queue_id"] for b in autostop_bundles
         ]
         target["force_started_co_run"] = co_run
+        target["force_started_rescoped"] = rescoped
+        if rescoped:
+            # `scope` still references the ORIGINAL list (target["scope"] was
+            # rebound to a fresh list above), so this captures the pre-rescope
+            # scope for provenance / audit / possible manual revert.
+            target["force_started_original_scope"] = scope
+            target["force_started_rescoped_to"] = target["scope"]
 
         _recompute_group_heads(items)
         promoted = dict(target)
@@ -5999,6 +6038,9 @@ def cmd_queue_force_start(args):
             "blockers_overridden": blockers_overridden,
             "autostopped_peers": [b["queue_id"] for b in autostop_bundles],
             "co_run": co_run,
+            "rescoped": rescoped,
+            "original_scope": (scope if rescoped else None),
+            "rescoped_to": (promoted.get("scope", []) if rescoped else None),
         }
         with open(QUEUE_FORCE_START_LOG, "a") as logf:
             logf.write(json.dumps(audit_row) + "\n")
@@ -9009,6 +9051,22 @@ def build_parser():
             "actually safe to run concurrently. Opt-in: the operator asserts "
             "the overlap is safe. The overlapped peers are still recorded in "
             "force_started_blockers_overridden for the audit trail."
+        ),
+    )
+    q_force_start.add_argument(
+        "--new-scope", dest="new_scope", nargs="?", const="__AUTO__",
+        default=None, metavar="SCOPE",
+        help=(
+            "RE-SCOPE mode (Andrew #4713): before promoting, reassign this "
+            "item a NEW DISTINCT scope so it no longer overlaps ANY running "
+            "peer -- both run in parallel and NO peer is autostopped. Bare "
+            "`--new-scope` auto-derives a distinct scope by suffixing each "
+            "existing serializing token with ':forced-<shortid>' (task: dep "
+            "tokens are preserved). Pass an explicit value (e.g. `--new-scope "
+            "repo:foo` or a comma/space-separated token list) to set the scope "
+            "verbatim instead. Implies --no-interrupt. Original scope is "
+            "recorded as force_started_original_scope; the new scope as "
+            "force_started_rescoped_to (+ the audit log)."
         ),
     )
     q_force_start.add_argument(
