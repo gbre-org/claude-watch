@@ -151,52 +151,47 @@ not the host's full automation stack, so these checks are all that's needed.
    [`container/agents/`](/opt/claude-container/container/agents),
    [`container/watchers/`](/opt/claude-container/container/watchers).
 7. **Start event watchers via `/claude-container:start-watchers`**.
-   Watchers are **session-scoped `run_in_background` Bash tasks** that
-   must be (re)started on every session start, `/clear`, resume, or
-   context compaction. They do NOT survive across sessions — there is
-   no long-lived supervisor process.
+   A watcher is a **live `run_in_background` Bash shell the main loop
+   holds** — NOT a daemon or pidfile process. It is "running" ONLY while
+   the session holds a live background shell for it; nothing supervises
+   watchers across sessions, so (re)start them on every session start,
+   `/clear`, resume, or compaction. A launcher exiting 0 is NOT liveness
+   proof: `watcher-ctl run` exits 0 idempotently when another instance
+   already holds the slot ("already running…" / "spawn lock held").
 
-   The canonical watcher is `claude-event-watch` (block-print-exit
-   pattern):
-   - Blocks on `inotifywait` until a new `.json` event file appears
-     in `~/claude-events/` (or `$CLAUDE_EVENT_QUEUE`)
-   - Debounces (default 30s) to batch burst events
-   - Prints all pending events as one-liners:
-     `EVENT[source/tag] message`
-   - Deletes processed event files
-   - Prints a restart banner and **EXITS**
+   The canonical watcher, `claude-event-watch`, is **block-print-exit**:
+   it blocks on `inotifywait` for a `.json` in `~/claude-events/` (or
+   `$CLAUDE_EVENT_QUEUE`), debounces (default 30s) to batch bursts, prints
+   each pending event as `EVENT[source/tag] message`, deletes the files,
+   prints a restart banner, and **EXITS**. On exit it is no longer running:
+   Claude Code delivers its stdout as a task-completion notification, and
+   you relaunch IMMEDIATELY (before processing) so nothing is missed.
 
-   Claude Code delivers the watcher's stdout back to the session as a
-   background-task completion notification. **On receiving watcher
-   output, IMMEDIATELY restart the watcher** (before processing the
-   events) to avoid missing events during processing.
+   **READ every completion's output — the ONLY way to tell what happened.**
+   It is either a real event batch (parse ambient, handle actionable) OR a
+   no-op notice ("already running" / spawn-lock) meaning a duplicate was
+   suppressed and NO watcher was delivered. Never treat a completion as
+   routine or skip the read.
 
-   The `/claude-container:start-watchers` skill starts (or restarts)
-   all watchers. Run it at step 7 of this checklist and again whenever
-   a watcher exits with output.
+   The daemon does NOT run watchers — its `[watcher_monitor]` only ALERTS.
+   After a sustained pidfile-liveness outage (a clean block-print-exit is
+   graced, not flapped) it fires `WATCHER(S) DOWN`, tmux-injecting
+   `watcher-ctl run <name>` so the MAIN LOOP respawns it (cardinal rule:
+   watchers spawn only from the main loop). A down `claude-event-watch`
+   can't be alerted via the very bus it drains, so it injects directly.
 
-**Event watchers inside this container are scoped narrowly.** The container
-is a code-writing sandbox, not a host automation hub. Don't start torrent /
-podcast watchers or anything from the host's resume-checklist playbook; the
-relevant tools and services aren't installed here. The baked watcher
-(`claude-event-watch`) covers the in-container event bus at
-`~/claude-events/`.
+**Event watchers here are scoped narrowly.** The container is a
+code-writing sandbox, not a host automation hub. Don't start torrent /
+podcast watchers or the host's resume-checklist playbook — those tools
+aren't installed here. The baked set is `claude-event-watch` (the
+`~/claude-events/` bus) and `botchat-wait` (inbound chat). A job needing a
+host-side watcher / notifier runs on the host or bridges over `host-bash`.
 
-If a job genuinely needs a host-side watcher / notifier, run it on the host
-(via the operator's host Claude Code session) or bridge the event over
-`host-bash`.
-
-> **Watcher vs. producer (cron) decision:** before adding a new *watcher*
-> (a one-shot, main-loop-supervised tool that blocks-prints-exits), confirm
-> one is actually needed. A *cron producer* — a script that emits a
-> claude-event and exits, surfaced by the existing `claude-event-watch`
-> watcher — is almost always simpler: no persistent supervised slot, no
-> restart cycles, no DOWN-state alerts. A dedicated watcher is justified only
-> when sub-minute reactivity is required AND no kernel event mechanism
-> (inotify, systemd path units) fits. See
-> [`docs/watchers.md` § Watcher vs. producer (cron)](/opt/claude-container/docs/watchers.md#watcher-vs-producer-cron--pick-the-right-tool)
-> for the full decision framework, alternatives (kernel events, extending
-> claude-watch, cron + internal poll loop), and a concrete example.
+> **Watcher vs. producer (cron):** prefer a *cron producer* (emits a
+> claude-event, surfaced by `claude-event-watch`) over a new watcher — no
+> session-restart cycles, no DOWN alerts; a watcher is justified only for
+> sub-minute reactivity with no kernel-event (inotify, path-unit) fit. Full
+> framework: [`docs/watchers.md`](/opt/claude-container/docs/watchers.md#watcher-vs-producer-cron--pick-the-right-tool).
 
 ## Main loop is a coordinator, not a worker
 
@@ -1248,10 +1243,8 @@ vs. recent corpus activity, flag it to the operator — re-indexing is host-side
 > individual `claude-event` is triaged), not the event→obligation→interruption
 > *force ladder*. The concept doc's terminology applies here verbatim:
 >
-> - A **watcher** is the one-shot tool the main loop runs
->   (`claude-event-watch`) — it **blocks, prints events to stdout, and exits**;
->   the loop reads that stdout and respawns a fresh instance. Event-*delivery*,
->   not a long-lived poller.
+> - A **watcher** (see checklist step 7) is a block-print-exit background
+>   shell the main loop respawns — event *delivery*, not a long-lived poller.
 > - An **event producer** (cron job, alertmanager, the queue) *emits* a
 >   `claude-event` onto the bus for the `claude-event-watch` watcher to surface.
 >   Cron ticks below are producer output — cron jobs are **not** watchers.
