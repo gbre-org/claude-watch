@@ -2863,7 +2863,7 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
         retry_seconds: config.reauth.self_login_retry_seconds,
         attempts: state.self_login_attempts_this_window,
         max_attempts: config.reauth.self_login_max_attempts,
-        login_pending: state.self_login_url_published_at.is_some(),
+        login_pending: state.self_login_dialog_opened_at.is_some(),
     });
 
     // Hand the pane back if an auto-fired login has been sitting unconsumed.
@@ -2886,6 +2886,10 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
             state.last_login_expiry_alert = None;
             state.last_self_login_attempt = None;
             state.self_login_attempts_this_window = 0;
+            // The credentials being renewed is the strongest possible proof
+            // that the dialog was answered, so stop holding the watchdog's
+            // latch open waiting for a timeout to tell us the same thing.
+            state.self_login_dialog_opened_at = None;
             crate::state::save_state(&config.general.state_file, state);
         }
         return;
@@ -2973,7 +2977,7 @@ async fn fire_self_login(config: &Config, state: &mut State, pane: &str, days_le
     state.self_login_attempts_this_window = state.self_login_attempts_this_window.saturating_add(1);
     state.self_login_autofire_total = state.self_login_autofire_total.saturating_add(1);
     let attempt = state.self_login_attempts_this_window;
-    state.self_login_url_published_at = Some(Local::now().to_rfc3339());
+    state.self_login_dialog_opened_at = Some(Local::now().to_rfc3339());
     crate::state::save_state(&config.general.state_file, state);
 
     info!(days_left, attempt, "auto-firing self-login");
@@ -3073,12 +3077,12 @@ async fn run_self_login_abandon_watchdog(config: &Config, state: &mut State, pan
     if config.reauth.self_login_abandon_seconds == 0 {
         return;
     }
-    let Some(published) = state.self_login_url_published_at.clone() else {
+    let Some(published) = state.self_login_dialog_opened_at.clone() else {
         return;
     };
     let Some(elapsed) = elapsed_since(&published) else {
         // Unparseable timestamp: clear it rather than wedge the watchdog on it.
-        state.self_login_url_published_at = None;
+        state.self_login_dialog_opened_at = None;
         return;
     };
     if elapsed < config.reauth.self_login_abandon_seconds as f64 {
@@ -3111,7 +3115,7 @@ async fn run_self_login_abandon_watchdog(config: &Config, state: &mut State, pan
         &config.general.legacy_log_file,
         "Unconsumed self-login dialog abandoned; pane handed back",
     );
-    state.self_login_url_published_at = None;
+    state.self_login_dialog_opened_at = None;
     crate::state::save_state(&config.general.state_file, state);
 }
 

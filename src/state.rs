@@ -304,11 +304,13 @@ pub struct State {
     /// warning clears — never on a timer, or the budget is not a budget.
     #[serde(default)]
     pub self_login_attempts_this_window: u32,
-    /// When an auto-fired login published an OAuth URL that nobody has
-    /// consumed yet. Set on publish, cleared once the abandon watchdog has
-    /// handed the pane back.
+    /// When auto-fire last put a login dialog on the pane. Set BEFORE the
+    /// flow runs, not after it succeeds: a `self-login start` that fails
+    /// partway can still have left a modal up, and that modal has to be
+    /// cleaned up by the same watchdog. Cleared once the watchdog has handed
+    /// the pane back, or when the credentials are renewed.
     #[serde(default)]
-    pub self_login_url_published_at: Option<String>,
+    pub self_login_dialog_opened_at: Option<String>,
     /// Cumulative count of auto-fired `self-login` runs (for metrics).
     #[serde(default)]
     pub self_login_autofire_total: u64,

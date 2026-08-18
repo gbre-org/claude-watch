@@ -260,6 +260,7 @@ fn build_metrics(
     let malformed_tool_call_hard_blocks = num(state, "malformed_tool_call_hard_block_count");
     let auto_update_interrupts = num(state, "auto_update_interrupts_total");
     let reauth_inject_interrupts = num(state, "reauth_inject_interrupts_total");
+    let self_login_autofire = num(state, "self_login_autofire_total");
     let post_restart_resume_inject_interrupts =
         num(state, "post_restart_resume_inject_interrupts_total");
     let fresh_session_inject_interrupts = num(state, "fresh_session_inject_interrupts_total");
@@ -407,6 +408,14 @@ fn build_metrics(
         format!(
             "claude_interrupts_total{{kind=\"reauth_inject\"}} {}",
             reauth_inject_interrupts
+        ),
+        // Proactive re-login. Separate kind from `reauth_inject` on purpose:
+        // that one only fires on a session that is ALREADY dead, so if the two
+        // were pooled there would be no way to tell "we caught it in time"
+        // from "we did not", which is the only question this counter answers.
+        format!(
+            "claude_interrupts_total{{kind=\"self_login_autofire\"}} {}",
+            self_login_autofire
         ),
         format!(
             "claude_interrupts_total{{kind=\"post_restart_resume_inject\"}} {}",
@@ -2137,6 +2146,7 @@ mod tests {
             "wedged_clear_interrupts_total": 2,
             "auto_update_interrupts_total": 19,
             "reauth_inject_interrupts_total": 1,
+            "self_login_autofire_total": 9,
             "post_restart_resume_inject_interrupts_total": 4,
             "fresh_session_inject_interrupts_total": 5,
             "fresh_clear_resume_inject_interrupts_total": 6,
@@ -2161,6 +2171,7 @@ mod tests {
             ("wedged_clear", 2),
             ("auto_update", 19),
             ("reauth_inject", 1),
+            ("self_login_autofire", 9),
             ("post_restart_resume_inject", 4),
             ("fresh_session_inject", 5),
             ("fresh_clear_resume_inject", 6),
