@@ -267,6 +267,19 @@ services:
       # fall back to the on-disk sidecar (restart-lossy). host.docker.internal
       # is already mapped via extra_hosts above.
       CW_PROMETHEUS_URL: ${CW_PROMETHEUS_URL:-http://host.docker.internal:9090}
+      # CLAUDE_WATCH_PROM_FILE — absolute path the baked `claude-watch
+      # metrics` cron (cron.d/cw-default) writes the node-exporter textfile
+      # to. It MUST match the directory your node-exporter actually scrapes
+      # (its --collector.textfile.directory / the dir bind-mounted into the
+      # node-exporter container). Left UNSET, the emitter falls back to its
+      # built-in /var/lib/node-exporter/textfile/claude_watch.prom, which on
+      # a containerized/macOS deploy is typically NOT the scraped dir (and is
+      # unwritable without root) — so the metrics never reach Grafana unless
+      # you set this. The entrypoint propagates it into the cron environment
+      # via /etc/cron.d/00-env. Example: a host-shared dir under the rw ~/repos
+      # mount that node-exporter mounts read-only, e.g.
+      # /home/hndrewaall/repos/.claude-watch-textfile/claude_watch.prom.
+      CLAUDE_WATCH_PROM_FILE: ${CLAUDE_WATCH_PROM_FILE:-}
     volumes:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in

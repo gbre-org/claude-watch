@@ -69,31 +69,29 @@ if ENTRYPOINT.is_file():
         "uid-1000 entrypoint needs sudo.",
     )
 
-    # 2. Propagates CLAUDE_EVENT_QUEUE, HOME, and PATH.
+    # 2. Propagates CLAUDE_EVENT_QUEUE, HOME, and PATH. The env lines are
+    #    emitted as `printf '<VAR>=%s\n' "..."` (one printf per var), so the
+    #    generated 00-env carries a literal `<VAR>=<value>` line.
     expect(
-        "CLAUDE_EVENT_QUEUE=" in text
-        and re.search(
-            r'CLAUDE_EVENT_QUEUE=\$\{?CLAUDE_EVENT_QUEUE', text
-        )
-        is not None,
+        re.search(r"CLAUDE_EVENT_QUEUE=%s", text) is not None,
         "entrypoint.sh: /etc/cron.d/00-env must include "
         "CLAUDE_EVENT_QUEUE — the whole point is to tell cron jobs "
         "where the event spool lives.",
     )
     expect(
-        re.search(r'"HOME=', text) is not None,
+        re.search(r"'HOME=%s", text) is not None,
         "entrypoint.sh: /etc/cron.d/00-env must include HOME — cron "
         "jobs need HOME to resolve default paths in claude-event and "
         "other CLIs.",
     )
     expect(
-        re.search(r'"PATH=', text) is not None,
+        re.search(r"'PATH=%s", text) is not None,
         "entrypoint.sh: /etc/cron.d/00-env must include PATH — cron "
         "jobs need the container's full PATH to find claude-event, "
         "session-task, and other tools.",
     )
     expect(
-        re.search(r'"CLAUDE_WATCH_CONFIG=', text) is not None,
+        re.search(r"CLAUDE_WATCH_CONFIG=%s", text) is not None,
         "entrypoint.sh: /etc/cron.d/00-env must include "
         "CLAUDE_WATCH_CONFIG — the `queue-check` cron job runs the "
         "daemon config loader, which searches $CLAUDE_WATCH_CONFIG for "
@@ -102,6 +100,30 @@ if ENTRYPOINT.is_file():
         "emit_events reads its fail-closed default (false), and "
         "queue-stuck/queue-orphaned events are never emitted.",
     )
+
+    # 2b. Propagates the metrics-emit env so the baked `claude-watch metrics`
+    #     cron writes the scraped textfile, reads the live state, and can
+    #     reach Prometheus to rehydrate the desk-streak. Without this the
+    #     shipped Rust emitter never reaches the node-exporter-scraped dir
+    #     (it writes its hardcoded built-in path) and an out-of-tree Python
+    #     textfile bridge has to stand in — the exact divergence this retires.
+    for var in ("CW_PROMETHEUS_URL", "CLAUDE_WATCH_PROM_FILE", "CLAUDE_WATCH_STATE"):
+        expect(
+            re.search(rf"{var}=%s", text) is not None,
+            f"entrypoint.sh: /etc/cron.d/00-env must propagate {var} so the "
+            "baked `claude-watch metrics` cron (which runs in cron's clean "
+            "env) inherits it. These are set in the container env (compose) "
+            "but invisible to cron without explicit propagation.",
+        )
+        # Each metrics var is emitted only when set (guards a bare deploy from
+        # a stray empty line that would override the emitter's built-in default).
+        expect(
+            re.search(rf'-n\s+"\$\{{{var}:-\}}"\s+\]\s+&&\s+printf', text)
+            is not None,
+            f"entrypoint.sh: the {var} 00-env line must be conditional on "
+            f"{var} being non-empty (`[ -n \"${{{var}:-}}\" ] && printf ...`) "
+            "so a bare deploy keeps the emitter's built-in default.",
+        )
 
     # 3. chmod 0644 after write.
     expect(
