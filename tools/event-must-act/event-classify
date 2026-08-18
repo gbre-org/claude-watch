@@ -161,12 +161,12 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "immediate action."),
 
     # pr-status-change is conditionally actionable: a CI outcome (CI
-    # failure / CI success) OR a merge CONFLICT (pr-watch emits
+    # failure / CI success) OR a merge CONFLICT (the upstream producer emits
     # "mergeable=conflicting" on a tracked PR going CONFLICTING/DIRTY)
     # demands attention. "new push" / "CI pending" / a conflict
     # RESOLUTION ("mergeable=mergeable (was: conflicting)") are routine
     # context and stay ambient via the catch-all below. Matching the
-    # PRECISE token "mergeable=conflicting" (the NEW value in pr-watch's
+    # PRECISE token "mergeable=conflicting" (the NEW value in the producer's
     # `mergeable={new} (was: {old})` message) is deliberate: it fires
     # only when a PR BECOMES conflicting, never when one is resolved —
     # so it doesn't flood on benign transitions. (botchat #3583/#2936:
@@ -221,24 +221,24 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("*", "slack-unread", None, ACTIONABLE,
         "Slack DM unread; needs read+reply."),
 
-    # comment-triage-needed -> pr-watch's bot-comment-triage DETECTOR (botchat
+    # comment-triage-needed -> the upstream bot-comment-triage DETECTOR (botchat
     # #3337/3339) found a PR with un-collapsed bot/automation issue-comments.
     # The producer makes NO triage judgment; this event tells the main loop to
     # dispatch a triage AGENT to review/collapse/act on those comments. The
-    # producer emits source="cron" (pr-watch runs under launchd/cron), so this
+    # producer emits source="cron" (the producer runs under launchd/cron), so this
     # row MUST precede the ("cron", "*") ambient catch-all below or it would be
     # swallowed as routine cron context.
     ("cron", "comment-triage-needed", None, ACTIONABLE,
         "PR has un-collapsed bot comments; dispatch a triage agent to "
-        "review/collapse them (pr-watch detector, botchat #3337/3339)."),
+        "review/collapse them (bot-comment detector, botchat #3337/3339)."),
     # Back-compat: a future producer emitting the same tag under a different
     # source still routes actionable.
     ("*", "comment-triage-needed", None, ACTIONABLE,
         "PR has un-collapsed bot comments; dispatch a triage agent "
-        "(pr-watch detector, botchat #3337/3339)."),
+        "(bot-comment detector, botchat #3337/3339)."),
 
     # comment-triage-STUCK -> ESCALATED fallback (Andrew botchat #3610). The
-    # pr-watch detector re-emits ``comment-triage-needed`` on a dwell while a
+    # upstream detector re-emits ``comment-triage-needed`` on a dwell while a
     # backlog stays live, and the loop is pressed to ACK each one — but an ack is
     # not a RESOLUTION. When the un-triaged count fails to DROP across several
     # consecutive emissions (the loop ack-looped "residual" without progress),
@@ -250,10 +250,10 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("cron", "comment-triage-STUCK", None, ACTIONABLE,
         "PR comment-triage is STUCK (un-triaged count not dropping across "
         "cycles); force a real resolution or ping the operator — a residual-ack "
-        "is no longer sufficient (pr-watch escalation, botchat #3610)."),
+        "is no longer sufficient (triage escalation, botchat #3610)."),
     ("*", "comment-triage-STUCK", None, ACTIONABLE,
         "PR comment-triage is STUCK (no progress); force a resolution or ping "
-        "the operator (pr-watch escalation, botchat #3610)."),
+        "the operator (triage escalation, botchat #3610)."),
 
     # --- AMBIENT ----------------------------------------------------------
     #
@@ -390,7 +390,7 @@ def classify(source: str, tag: str, message: str = "",
                     "matched": f"{src_pat}/{tag_pat}"}
 
     # (a) Honor a PRODUCER-SHIPPED tier when present + valid. Self-describing
-    # events carry their own routing (e.g. pr-watch stamps data.tier=actionable
+    # events carry their own routing (e.g. a producer stamps data.tier=actionable
     # on nonzero-unresolved-comment events, botchat #3879), so per-PRODUCER
     # knowledge lives with the producer -- NOT as a per-tag catalog in this
     # central classifier.
@@ -492,7 +492,7 @@ def _self_test() -> int:
         (("manual", "workbot-prompt", ""), ACTIONABLE),
         (("queue", "queue-stale-ready", ""), ACTIONABLE),
         (("manual", "slack-unread", ""), ACTIONABLE),
-        # comment-triage-needed: pr-watch bot-comment detector. Emitted under
+        # comment-triage-needed: bot-comment detector. Emitted under
         # source="cron"; MUST route actionable (win over cron/* ambient).
         (("cron", "comment-triage-needed", ""), ACTIONABLE),
         (("manual", "comment-triage-needed", ""), ACTIONABLE),
@@ -532,7 +532,7 @@ def _self_test() -> int:
         (("manual", "pr-status-change", "new push to branch"), AMBIENT),
         (("manual", "pr-status-change", "CI pending"), AMBIENT),
         (("manual", "pr-status-change", "mergeable"), AMBIENT),
-        # Merge CONFLICT is actionable: pr-watch emits
+        # Merge CONFLICT is actionable: the producer emits
         # "PR <name>: mergeable=conflicting (was: <old>)" when a tracked
         # PR goes CONFLICTING/DIRTY. The operator must resolve it.
         # (botchat #3583/#2936: conflicts sat unnoticed as ambient.)
@@ -623,7 +623,7 @@ def _self_test() -> int:
 
     # --- Shipped-priority precedence (botchat #3879 redesign) ---------------
     # A PRODUCER-SHIPPED tier wins over the consumer-side table. This is how
-    # pr-watch's unresolved-comment events now route actionable -- via the
+    # the producer's unresolved-comment events now route actionable -- via the
     # SHIPPED tier, NOT a message regex in this file.
     r = classify("cron", "pr-status-change",
                  "PR foo/bar#12: 3 unresolved comment(s) (was: 0)",
