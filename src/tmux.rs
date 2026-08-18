@@ -1869,7 +1869,9 @@ pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
     // "Paste code here", and a claude.ai/oauth/authorize URL.
     lower.contains("browser didn't open")
         || lower.contains("paste code here")
-        || lower.contains("claude.ai/oauth/authorize")
+        || LOGIN_URL_PREFIXES
+            .iter()
+            .any(|p| lower.contains(&p.to_lowercase()))
         || lower.contains("open this url") && lower.contains("login")
         || lower.contains("session expired")
         || lower.contains("login required")
@@ -1879,19 +1881,47 @@ pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
         || lower.contains("api key expired")
 }
 
+/// Every OAuth authorize-URL prefix a Claude Code login screen can print.
+///
+/// Claude Code MOVED its subscription authorize endpoint: current builds use
+/// `https://claude.com/cai/oauth/authorize` (the `CLAUDE_AI_AUTHORIZE_URL`
+/// constant in the shipped bundle), and the Console login path uses
+/// `https://platform.claude.com/oauth/authorize`. The original
+/// `https://claude.ai/oauth/authorize` this parser was written against no
+/// longer appears anywhere in a current build — matching only that string
+/// meant the login screen was detected but the URL came back EMPTY, so the
+/// operator got an alert with no link in it. Keep the legacy prefix for older
+/// Claude Code versions; match whichever appears FIRST in the pane.
+pub(crate) const LOGIN_URL_PREFIXES: &[&str] = &[
+    "https://claude.com/cai/oauth/authorize",
+    "https://platform.claude.com/oauth/authorize",
+    "https://claude.ai/oauth/authorize",
+];
+
 /// Extract the login URL from pane output, handling possible line wrapping.
-/// Looks for URLs starting with `https://claude.ai/oauth/authorize`.
+/// Looks for URLs starting with any prefix in `LOGIN_URL_PREFIXES`.
 /// tmux line wrapping splits a URL across lines with NO separator, so we
 /// reassemble by joining consecutive lines that look like URL continuations
 /// (no whitespace at start, valid URL chars).
 pub(crate) fn extract_login_url(pane_output: &str) -> Option<String> {
     let lines: Vec<&str> = pane_output.lines().collect();
 
-    // Find the line containing the URL start
+    // Find the line containing the URL start. Scan line-by-line so the
+    // EARLIEST line wins, and within a line take the leftmost prefix match,
+    // regardless of which prefix matched.
     let mut url_line_idx = None;
     let mut url_start_col = 0;
     for (i, line) in lines.iter().enumerate() {
-        if let Some(pos) = line.find("https://claude.ai/oauth/authorize") {
+        let mut best: Option<usize> = None;
+        for prefix in LOGIN_URL_PREFIXES {
+            if let Some(pos) = line.find(prefix) {
+                best = Some(match best {
+                    Some(b) if b <= pos => b,
+                    _ => pos,
+                });
+            }
+        }
+        if let Some(pos) = best {
             url_line_idx = Some(i);
             url_start_col = pos;
             break;
@@ -3713,6 +3743,43 @@ mod tests {
     fn test_extract_login_url_none() {
         let output = "Session expired\nPlease re-login";
         assert_eq!(extract_login_url(output), None);
+    }
+
+    #[test]
+    fn test_extract_login_url_current_claude_com_endpoint() {
+        // The endpoint CURRENT Claude Code builds actually print. Matching only
+        // the legacy claude.ai host produced an empty URL in the reauth alert.
+        let output = "Browser didn't open? Use the url below to sign in\n\nhttps://claude.com/cai/oauth/authorize?code=true&client_id=abc123\n\nPaste code here if prompted > ";
+        assert_eq!(
+            extract_login_url(output),
+            Some("https://claude.com/cai/oauth/authorize?code=true&client_id=abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_login_url_console_endpoint() {
+        let output = "https://platform.claude.com/oauth/authorize?code=true&client_id=xyz\n";
+        assert_eq!(
+            extract_login_url(output),
+            Some("https://platform.claude.com/oauth/authorize?code=true&client_id=xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_login_url_current_endpoint_wrapped() {
+        // Same hard-wrap reassembly, on the current host.
+        let output = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc123&code_chall\nenge=xyz789&code_challenge_method=S256";
+        assert_eq!(
+            extract_login_url(output),
+            Some("https://claude.com/cai/oauth/authorize?code=true&client_id=abc123&code_challenge=xyz789&code_challenge_method=S256".to_string())
+        );
+    }
+
+    #[test]
+    fn test_reauth_detected_on_current_authorize_host() {
+        // TUI gone + the current authorize URL => reauth screen.
+        let output = "Login\n\nBrowser didn't open? Use the url below to sign in\n\nhttps://claude.com/cai/oauth/authorize?code=true\n";
+        assert!(check_lines_for_reauth(output));
     }
 
     #[test]
