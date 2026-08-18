@@ -284,6 +284,34 @@ pub struct State {
     pub last_reauth_alert: Option<String>,
     #[serde(default)]
     pub login_injected: bool,
+
+    // Proactive login-expiry tracking (the forward-looking half of reauth).
+    /// Latched while Claude Code's "your login expires in N days" warning is
+    /// standing. Cleared when the credentials are renewed, which is also what
+    /// resets the auto-fire attempt budget.
+    #[serde(default)]
+    pub login_expiry_detected: bool,
+    /// Days-left reported by the most recent detection, for the log/alert.
+    #[serde(default)]
+    pub login_expiry_days_left: Option<u32>,
+    /// Last time the expiry warning was alerted on (rate limiting).
+    #[serde(default)]
+    pub last_login_expiry_alert: Option<String>,
+    /// Last time `self-login` was auto-fired (retry spacing).
+    #[serde(default)]
+    pub last_self_login_attempt: Option<String>,
+    /// Auto-fire attempts spent in the CURRENT expiry window. Reset when the
+    /// warning clears — never on a timer, or the budget is not a budget.
+    #[serde(default)]
+    pub self_login_attempts_this_window: u32,
+    /// When an auto-fired login published an OAuth URL that nobody has
+    /// consumed yet. Set on publish, cleared once the abandon watchdog has
+    /// handed the pane back.
+    #[serde(default)]
+    pub self_login_url_published_at: Option<String>,
+    /// Cumulative count of auto-fired `self-login` runs (for metrics).
+    #[serde(default)]
+    pub self_login_autofire_total: u64,
     /// Tracks whether we've already injected "resume" for a fresh external session
     /// (tokens=0 with Claude idle prompt visible). Reset when tokens become non-zero.
     #[serde(default)]

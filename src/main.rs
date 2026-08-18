@@ -25,6 +25,7 @@ mod alert;
 mod cadence;
 mod cmd;
 mod config;
+mod credentials;
 mod event_bus;
 mod hook_fire;
 mod inject_dispatch;

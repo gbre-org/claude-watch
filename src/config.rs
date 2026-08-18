@@ -690,6 +690,60 @@ pub struct ReauthConfig {
     /// Interval between repeated reauth alerts in seconds (default: 10800 = 3 hours)
     #[serde(default = "default_reauth_alert_interval")]
     pub alert_interval_seconds: u64,
+
+    // --- Proactive expiry (the `[reauth]` section's second, forward-looking
+    // half). The fields above react to credentials that are ALREADY dead; the
+    // ones below act on Claude Code's warning that they are about to be.
+    /// Watch for the proactive "your login expires in N days" warning at all.
+    /// Turning this off leaves the reactive 401 path untouched.
+    #[serde(default = "default_expiry_watch_enabled")]
+    pub expiry_watch_enabled: bool,
+
+    /// Drive `self-login` automatically when the warning is corroborated,
+    /// instead of only alerting. AUTO-FIRE IS INTRUSIVE BY NATURE: `/login`
+    /// opens a modal that swallows the session's keystrokes until somebody
+    /// pastes the authorization code, so the loop stops working until then.
+    /// `self_login_abandon_seconds` is what bounds that.
+    #[serde(default = "default_expiry_auto_self_login")]
+    pub expiry_auto_self_login: bool,
+
+    /// Auto-fire only once the warning is down to this many days. Claude Code
+    /// itself starts SHOWING the warning three days out but only starts
+    /// nagging about it inside one day, and one day is the right side of that
+    /// line to interrupt a working session on.
+    #[serde(default = "default_expiry_auto_days")]
+    pub expiry_auto_days: u32,
+
+    /// Minimum gap between auto-fire attempts (default: 3600 = 1 hour). The
+    /// warning persists for days, so without this a poller re-fires every
+    /// cycle.
+    #[serde(default = "default_self_login_retry_seconds")]
+    pub self_login_retry_seconds: u64,
+
+    /// Give up after this many auto-fire attempts in one expiry window
+    /// (default: 3). Resets when the credentials are renewed. Failing loudly
+    /// is right; failing every hour forever is not.
+    #[serde(default = "default_self_login_max_attempts")]
+    pub self_login_max_attempts: u32,
+
+    /// Escape out of an unconsumed login dialog after this many seconds
+    /// (default: 1800 = 30 minutes), handing the session back. This is the
+    /// answer to "auto-fire ran at 3am and nobody pasted the code": the OAuth
+    /// link has a short life of its own, so parking the loop in a modal until
+    /// morning buys nothing and costs everything. 0 disables the watchdog and
+    /// leaves the dialog up indefinitely.
+    #[serde(default = "default_self_login_abandon_seconds")]
+    pub self_login_abandon_seconds: u64,
+
+    /// Path to Claude Code's OAuth credential store, which is what the pane
+    /// warning is corroborated against. Empty = `$HOME/.claude/.credentials.json`.
+    #[serde(default)]
+    pub credentials_file: String,
+
+    /// Command used to drive the login flow. Overridable so a deployment that
+    /// installs the script elsewhere does not have to patch the binary.
+    #[serde(default = "default_self_login_command")]
+    pub self_login_command: String,
 }
 
 impl Default for ReauthConfig {
@@ -697,6 +751,14 @@ impl Default for ReauthConfig {
         Self {
             enabled: default_reauth_enabled(),
             alert_interval_seconds: default_reauth_alert_interval(),
+            expiry_watch_enabled: default_expiry_watch_enabled(),
+            expiry_auto_self_login: default_expiry_auto_self_login(),
+            expiry_auto_days: default_expiry_auto_days(),
+            self_login_retry_seconds: default_self_login_retry_seconds(),
+            self_login_max_attempts: default_self_login_max_attempts(),
+            self_login_abandon_seconds: default_self_login_abandon_seconds(),
+            credentials_file: String::new(),
+            self_login_command: default_self_login_command(),
         }
     }
 }
@@ -707,6 +769,34 @@ fn default_reauth_enabled() -> bool {
 
 fn default_reauth_alert_interval() -> u64 {
     10800 // 3 hours
+}
+
+fn default_expiry_watch_enabled() -> bool {
+    true
+}
+
+fn default_expiry_auto_self_login() -> bool {
+    true
+}
+
+fn default_expiry_auto_days() -> u32 {
+    1
+}
+
+fn default_self_login_retry_seconds() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_self_login_max_attempts() -> u32 {
+    3
+}
+
+fn default_self_login_abandon_seconds() -> u64 {
+    1800 // 30 minutes
+}
+
+fn default_self_login_command() -> String {
+    "self-login".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]

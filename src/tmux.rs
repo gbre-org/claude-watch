@@ -1958,6 +1958,58 @@ pub(crate) fn extract_login_url(pane_output: &str) -> Option<String> {
     Some(url)
 }
 
+/// Claude Code's PROACTIVE "your login is about to expire" warning.
+///
+/// This is a different signal from `check_lines_for_reauth`, and the two must
+/// not be confused. `check_lines_for_reauth` fires when the credentials are
+/// ALREADY dead: the TUI has been replaced by a login screen and the session
+/// can no longer do anything. This one fires while the session is perfectly
+/// healthy — the TUI is up, work is happening, and Claude Code has merely
+/// started warning that the OAuth refresh token lapses soon.
+///
+/// The exact wording was read out of the shipped Claude Code bundle rather
+/// than guessed, the same way `LOGIN_URL_PREFIXES` was. Two independent call
+/// sites render it and both compose the identical visible text:
+///
+/// ```text
+/// Your login expires in 2 days · run /login to renew
+/// ```
+///
+/// One is a startup banner that renders whenever the refresh token is inside
+/// its warning window; the other is a transient notice that renders only when
+/// the window is down to a single day. Because the notice is transient, a
+/// poller can legitimately MISS it — which is why the daemon corroborates
+/// with, and can fall back to, the on-disk credential expiry.
+///
+/// Matching strategy: strip ALL whitespace and lowercase before matching. A
+/// tmux pane hard-wraps with no separator and no hyphenation, so a phrase this
+/// long can be split at any column; a whitespace-insensitive match is wrap
+/// proof by construction, where a literal `"your login expires in"` is not.
+///
+/// Returns the number of days Claude Code claims are left.
+pub(crate) fn detect_login_expiry_warning(pane_output: &str) -> Option<u32> {
+    // Cheap reject first: this runs on every check cycle, and squashing a
+    // whole scrollback allocates.
+    let lower = pane_output.to_lowercase();
+    if !lower.contains("login expires in") && !lower.contains("loginexpiresin") {
+        return None;
+    }
+    let squashed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    let re = regex_lite::Regex::new(r"yourloginexpiresin(\d{1,4})day").ok()?;
+    let caps = re.captures(&squashed)?;
+    caps.get(1)?.as_str().parse::<u32>().ok()
+}
+
+/// Capture the pane and report Claude Code's proactive login-expiry warning.
+///
+/// Companion to `needs_reauth`, deliberately a separate capture: the two
+/// signals are mutually exclusive (one needs the TUI gone, the other needs it
+/// present) so neither can mask the other.
+pub async fn login_expiry_warning(pane: &str) -> Option<u32> {
+    let out = capture_pane(pane).await?;
+    detect_login_expiry_warning(&out)
+}
+
 /// Check if the pane is showing a reauth/login prompt.
 /// Returns the login URL if reauth is needed (or empty string if needed but URL not found).
 pub async fn needs_reauth(pane: &str) -> Option<String> {
