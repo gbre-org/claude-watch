@@ -719,10 +719,14 @@ mkdir -p /var/log/claude-watch/watchers /var/run/claude 2>/dev/null || true
 # `emit_events` reads its fail-closed default (false) because the daemon
 # config loader can't find the baked config without $CLAUDE_WATCH_CONFIG
 # — so it detects stale/orphaned queue items but emits no
-# queue-stuck/queue-orphaned event. The file sorts first in /etc/cron.d/
-# so its env-var lines apply to all subsequent entries (cron processes
-# /etc/cron.d/ in sorted order and env-var lines apply to entries in the
-# same file + later files).
+# queue-stuck/queue-orphaned event. IMPORTANT: cron scopes env-var lines
+# PER cron.d FILE — 00-env's vars do NOT propagate to jobs defined in OTHER
+# files (e.g. the metrics/active-agents jobs in cw-default). So 00-env is the
+# canonical env SOURCE, and `cw-cron-run` — the wrapper EVERY cw-default job
+# runs through — SOURCES this file before exec'ing the real command; that is
+# what actually delivers these vars to cw-default jobs. (An earlier version of
+# this comment wrongly assumed cron applies env-var lines to later files in
+# sorted order — it does not.) See container/bin/cw-cron-run.
 #
 # The metrics-emit vars (CW_PROMETHEUS_URL, CLAUDE_WATCH_PROM_FILE,
 # CLAUDE_WATCH_STATE) are propagated the same way so the baked

@@ -55,4 +55,33 @@ if [ -e "${DISABLE_DIR}/${JOB}" ]; then
     exit 0
 fi
 
+# --- cron env propagation (cross-cron.d-file) -------------------------------
+# Vixie cron scopes environment settings PER cron.d FILE: env-var lines in one
+# /etc/cron.d/ file apply ONLY to the job lines in that SAME file — cron does
+# NOT carry them across to jobs defined in other files. The entrypoint writes
+# the container's runtime env (CLAUDE_EVENT_QUEUE, CLAUDE_WATCH_CONFIG,
+# CW_PROMETHEUS_URL, CLAUDE_WATCH_PROM_FILE, CLAUDE_WATCH_STATE, HOME, PATH)
+# into /etc/cron.d/00-env, but the jobs that need them live in
+# /etc/cron.d/cw-default — a DIFFERENT file — so cron never applies 00-env's
+# vars to them. The `metrics` job then falls back to claude-watch's hardcoded
+# prom path (/var/lib/node-exporter/textfile/..., unwritable in-container) and
+# dies every minute with "Error writing prom file: Permission denied".
+#
+# Fix: source the canonical env file HERE, at the single choke-point EVERY
+# cw-default job already routes through. This delivers the env uniformly to
+# ALL cw-default jobs regardless of cron's per-file scoping — one place, no
+# per-entry env duplication. Assignment lines only (defensive against a stray
+# crontab time-spec line); exported so the exec'd command inherits them (a
+# non-exported shell var would not cross the exec).
+CW_CRON_ENV_FILE="${CW_CRON_ENV_FILE:-/etc/cron.d/00-env}"
+if [ -r "$CW_CRON_ENV_FILE" ]; then
+    while IFS= read -r _cw_env_line; do
+        case "$_cw_env_line" in
+            [A-Za-z_]*=*)
+                export "${_cw_env_line%%=*}=${_cw_env_line#*=}"
+                ;;
+        esac
+    done < "$CW_CRON_ENV_FILE"
+fi
+
 exec "$@"
