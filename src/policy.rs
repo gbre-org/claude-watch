@@ -1204,7 +1204,14 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
     // included; only the shell-safe `claude` argv is.)
     let inline_launch = format!("cd $HOME && {}", launch);
     let inject_cmd = build_relaunch_inject_cmd(&config.relaunch_script, &inline_launch);
-    tmux::inject_shell(pane, &inject_cmd).await;
+    // Serialize with every other injector (see `inject_lock`). The pane shows a
+    // SHELL prompt here, but cw-theme-sync's idle gate keys on the prompt-cursor
+    // glyph, which a zsh prompt can also render — so a theme inject can and does
+    // aim at this pane mid-relaunch. Same interleave hazard, same lock.
+    {
+        let _guard = crate::inject_lock::InjectLock::acquire("relaunch-shell").await;
+        tmux::inject_shell(pane, &inject_cmd).await;
+    }
 
     state.last_restart = Some(now);
     state.restart_count += 1;
@@ -3873,7 +3880,11 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     info!("auto-update: injecting relaunch command...");
     let inline_launch = format!("cd $HOME && {}", launch);
     let inject_cmd = build_relaunch_inject_cmd(&config.claude.relaunch_script, &inline_launch);
-    tmux::inject_shell(pane, &inject_cmd).await;
+    // Serialize with every other injector (see `inject_lock`), as above.
+    {
+        let _guard = crate::inject_lock::InjectLock::acquire("auto-update-shell").await;
+        tmux::inject_shell(pane, &inject_cmd).await;
+    }
 
     // Step 7: Wait for claude binary to appear in process tree.
     //

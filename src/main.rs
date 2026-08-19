@@ -29,6 +29,7 @@ mod credentials;
 mod event_bus;
 mod hook_fire;
 mod inject_dispatch;
+mod inject_lock;
 mod inject_probe;
 mod logging;
 mod metrics;
@@ -1731,6 +1732,17 @@ async fn run_inject(
     }
     let pane = resolve_inject_pane(pane_flag).await;
     let submit = !no_submit;
+
+    // SERIALIZE against every other injector — the daemon's own in-process
+    // alerts and any other `claude-watch inject` process. Without this, two
+    // injectors type into the SAME prompt line concurrently and, because the
+    // default non-cancelling choreography has no `dd` line-clear, their
+    // payloads INTERLEAVE: on 2026-08-19 a `/config theme=light` landed
+    // spliced into the middle of the word "6min" in a WATCHER DOWN banner, and
+    // both injects still reported success. Held across type+submit+verify, and
+    // released when the guard drops. See `inject_lock` for the full autopsy.
+    let _inject_guard = inject_lock::InjectLock::acquire("cli").await;
+
     let outcome = tmux::inject_and_verify(&pane, text, submit, slash_command, escape).await;
 
     let (code, status) = match outcome {

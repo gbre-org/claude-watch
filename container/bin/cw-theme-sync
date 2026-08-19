@@ -51,10 +51,36 @@ DESIGN NOTES
     rapid light->dark->light flip only results in the final theme.
   * Idempotent. We track the last theme we injected and skip no-op
     re-injects.
-  * Serialised with self-clear. Both drive `tmux send-keys` on the same
-    pane; interleaved keystrokes corrupt each other. We take the same
-    non-blocking flock self-clear uses, held only around the single
-    inject, and skip-this-cycle (retry next poll) if it's contended.
+  * Serialised with EVERY other injector -- inside `claude-watch inject`.
+    All injectors drive `tmux send-keys` on the same prompt line, and the
+    non-cancelling choreography has no `dd` line-clear, so concurrent
+    payloads INTERLEAVE. Observed 2026-08-19: this daemon's
+    `/config theme=light` landed spliced into the middle of the word
+    "6min" in cw-watcher-health-check's WATCHER DOWN banner --
+
+        unconsumed >6mi/config theme=lightn -- the event watcher is dead
+
+    -- so Claude Code never saw a slash command, the theme never changed,
+    and this daemon logged "(verified)" anyway. The lock now lives INSIDE
+    `claude-watch inject` (src/inject_lock.rs) rather than in each caller,
+    because the daemon's own in-process alerts never shell out to
+    `claude-watch inject` at all -- no caller-side convention could cover
+    both racing populations. We still take the legacy self-clear flock
+    below, but that is only a "stay off the pane during a self-clear"
+    courtesy, not the interleave guard.
+
+  * Verified against the EFFECT, not the prompt line. `claude-watch
+    inject` reports success when the payload CLEARS from the input line --
+    equally true when MANGLED text gets submitted, which is exactly how
+    the failure above logged "(verified)". After a successful inject we
+    read `theme` back out of Claude Code's settings file (`/config`
+    persists an explicit value there) and confirm it matches.
+
+  * Re-assertable on demand. A same-value write to the theme file is a
+    no-op by design, so a TUI that drifted out of sync could not be
+    corrected without toggling the browser theme twice. `--force` injects
+    the current file value regardless of what we think is applied, and
+    SIGHUP makes the running daemon re-assert on its next poll.
   * Dependency-free. Pure mtime poll (no inotify), tiny cost; theme
     changes are rare.
 
@@ -70,9 +96,29 @@ Configuration (env, all optional):
   CW_THEME_LOG             log path (default
                            $XDG_STATE_HOME/claude-watch/theme-sync.log
                            or /var/log/claude-watch/theme-sync.log)
-  CW_THEME_LOCK            send-keys coordination lock (default matches
-                           self-clear: $XDG_RUNTIME_DIR/claude-self-clear.lock
-                           or /var/run/claude/claude-self-clear.lock)
+  CW_THEME_LOCK            legacy self-clear coordination lock (default
+                           matches self-clear:
+                           $XDG_RUNTIME_DIR/claude-self-clear.lock or
+                           /var/run/claude/claude-self-clear.lock). NOT the
+                           inject interleave guard -- that lives inside
+                           `claude-watch inject`.
+  CW_THEME_SETTINGS_FILE   Claude Code settings file to read `theme` back
+                           from for verification (default
+                           $CLAUDE_CONFIG_DIR/settings.json, else
+                           ~/.claude/settings.json)
+  CW_THEME_VERIFY_SECS     how long to wait for settings.json to show the
+                           requested theme (default 10.0)
+
+Flags:
+  --status   print resolved config, current file value, and whether the
+             TUI is in sync; exit 0
+  --force    inject the CURRENT theme-file value once, regardless of
+             whether it changed, then exit. Use to re-assert a TUI that
+             has drifted out of sync with the file.
+
+Signals:
+  SIGHUP     running daemon forgets what it thinks is applied and
+             re-asserts the current theme file value on the next poll.
 
 Runs as a long-lived process under process-compose (see
 container/process-compose.yml). Disable with
@@ -82,6 +128,8 @@ CLAUDE_CONTAINER_THEME_SYNC_DISABLED=true.
 import fcntl
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -116,11 +164,59 @@ def _default_lock_file():
     return "/var/run/claude/claude-self-clear.lock"
 
 
+def _default_settings_file():
+    """Claude Code's settings file -- where `/config theme=X` persists the
+    value we then read back to VERIFY the inject actually took effect."""
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if cfg_dir:
+        return str(Path(cfg_dir) / "settings.json")
+    return str(Path.home() / ".claude" / "settings.json")
+
+
 THEME_FILE = _env("CW_THEME_FILE", "/host-clipboard/theme")
 POLL_SECS = float(_env("CW_THEME_POLL_SECS", "1.5"))
 IDLE_POLL_SECS = float(_env("CW_THEME_IDLE_POLL_SECS", "2.0"))
 LOG_FILE = _env("CW_THEME_LOG", _default_log_file())
 LOCK_FILE = _env("CW_THEME_LOCK", _default_lock_file())
+SETTINGS_FILE = _env("CW_THEME_SETTINGS_FILE", _default_settings_file())
+VERIFY_SECS = float(_env("CW_THEME_VERIFY_SECS", "10.0"))
+
+# After this many consecutive verified-failures for the SAME theme value we
+# stop retrying it. Without a cap, a genuinely broken /config (Claude Code
+# too old, settings file not writable, pane not actually Claude) would have
+# us re-injecting into the operator's prompt line every poll, forever.
+MAX_VERIFY_FAILURES = 3
+
+# Delay before retry attempt N (seconds). An unbounded retry against a SHARED
+# prompt line is a self-inflicted denial of service: on 2026-08-19 the
+# every-poll retry put three mangled payloads into the live pane in ~90s,
+# which is worse than the silent failure it replaced. Back off hard, then
+# give up -- a wrong-coloured TUI is much cheaper than a corrupted input
+# stream.
+RETRY_BACKOFF_SECS = (30.0, 120.0, 300.0)
+
+# How long the input line must stay empty before we believe the pane is
+# genuinely idle rather than being typed into right now.
+PROMPT_RECHECK_SECS = float(_env("CW_THEME_PROMPT_RECHECK_SECS", "0.8"))
+
+# Set by SIGHUP: forget what we think is applied and re-assert.
+_reassert_requested = False
+
+# How long `--force` waits for a busy pane to go idle before giving up. It
+# gives up rather than injecting into a busy pane, because forcing the issue
+# would mean --escape, and --escape cancels the in-flight turn (Andrew,
+# 2026-08-19: "i do NOT want you to inject escape bc that interrupts").
+FORCE_IDLE_WAIT_SECS = float(_env("CW_THEME_FORCE_IDLE_WAIT_SECS", "60.0"))
+
+
+def _on_sighup(_signum, _frame):
+    """SIGHUP => re-assert the current theme on the next poll.
+
+    Gives a running daemon the same escape hatch `--force` gives a one-shot
+    caller, without a second process racing it onto the pane.
+    """
+    global _reassert_requested
+    _reassert_requested = True
 
 
 def log(msg):
@@ -168,19 +264,92 @@ def resolve_pane():
     return "claude-container:0.0"
 
 
-def is_idle(pane):
-    """True when the pane shows an idle input prompt cursor.
+# Glyph class is a RANGE, not a hand-listed set. Claude Code rotates the
+# indicator glyph, and a hand-listed set FAILS OPEN on the one you forgot:
+# U+273D was missing from the first draft, so a live thinking pane read IDLE.
+_BUSY_RE = re.compile(r"^\s*[\u2722-\u274b\u00b7\u25cb-\u25d3*+]\s+\S.*\u2026\s*\(", re.M)
 
-    Mirrors self-clear's is_idle. We only inject when idle so a theme
-    toggle never interrupts an in-flight turn.
+
+def _capture(pane):
+    """Capture the pane with wrapped lines JOINED (`-J`).
+
+    `-J` is load-bearing. Without it tmux truncates each visual line at the
+    pane width, and the status bar renders as
+        "-- INSERT -- ⏵⏵ bypass permissions on · 3 shells · ← for agen…"
+    with "esc to interrupt" CUT OFF the end. A busy-check keyed on that string
+    then reports idle for a pane with a turn in flight — which is exactly how
+    a theme inject got queued behind a live turn on 2026-08-19.
     """
-    out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
+    out, rc = run(["tmux", "capture-pane", "-t", pane, "-p", "-J"])
     if rc != 0 or not out:
+        return None
+    return out
+
+
+def _busy(pane_text):
+    """True when a turn is in flight or work is already queued.
+
+    Three signals, because any one alone has a blind spot:
+      * "esc to interrupt" — the status-bar marker (needs `-J`, see _capture).
+      * an activity/spinner line — present while generating.
+      * "Press up to edit queued messages" — Claude Code QUEUES a message
+        typed during a turn rather than running it. An inject that lands in
+        the queue has not been applied and will not be for an unbounded time,
+        so verifying it within any fixed window reports a false failure.
+    """
+    low = pane_text.lower()
+    if "esc to interrupt" in low:
+        return True
+    if "press up to edit queued messages" in low:
+        return True
+    return bool(_BUSY_RE.search(pane_text))
+
+
+def _prompt_line(pane_text):
+    """Text currently sitting on the `❯` input line, or None if no prompt
+    is rendered. '' means the input line is empty."""
+    for line in reversed(pane_text.split("\n")):
+        if "❯" in line:
+            return line.split("❯", 1)[1].strip()
+    return None
+
+
+def is_idle(pane):
+    """True only when it is SAFE to type into the pane.
+
+    The original check -- "is the `❯` glyph anywhere in the last 15 lines"
+    -- was far too weak. Claude Code renders that prompt box permanently,
+    including while a turn is generating, so it reported idle for a pane that
+    was mid-composition. On 2026-08-19 that let three theme injects land in an
+    actively-generating pane.
+
+    Four gates now, each closing a distinct way the old one was wrong:
+
+      1. A prompt must actually be rendered (`❯` present).
+      2. No in-flight turn -- Claude Code shows "esc to interrupt" in the
+         status bar for the whole duration of one.
+      3. THE INPUT LINE MUST BE EMPTY. This is the direct guard against the
+         bug: the non-cancelling inject has no `dd` line-clear, so anything
+         already on that line gets our payload glued onto it. If someone (or
+         something) has half-typed input sitting there, typing is exactly the
+         wrong move.
+      4. The input line must still be empty a moment later, so we don't race
+         a human who just started typing.
+
+    Deliberately NOT a full-pane stability check: the pane carries a ticking
+    token counter and agent elapsed-time line, so it is never byte-stable and
+    such a check would report "never idle".
+    """
+    out = _capture(pane)
+    if out is None or _busy(out):
         return False
-    for line in out.strip().split("\n")[-15:]:
-        if "❯" in line:  # the prompt cursor
-            return True
-    return False
+    if _prompt_line(out) != "":
+        return False                      # no prompt, or input already there
+    time.sleep(PROMPT_RECHECK_SECS)
+    out2 = _capture(pane)
+    if out2 is None or _busy(out2):
+        return False
+    return _prompt_line(out2) == ""
 
 
 def read_theme():
@@ -197,6 +366,69 @@ def read_theme():
     if val:
         log(f"ignoring unrecognised theme value {val!r} (want one of {VALID})")
     return None
+
+
+def read_settings_theme():
+    """Read the CURRENTLY APPLIED theme out of Claude Code's settings file.
+
+    This is the ground truth for verification. `/config theme=X` hot-applies
+    AND persists an explicit `theme` key here, so the file agreeing with what
+    we asked for is real evidence the slash command was parsed and executed --
+    unlike "the payload left the prompt line", which is equally true when
+    mangled text gets submitted.
+
+    Returns 'dark'/'light', the raw string for any other value (e.g. 'auto',
+    a daltonized variant a human set by hand), or None if the file is
+    missing / unreadable / not JSON.
+    """
+    try:
+        raw = Path(SETTINGS_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log(f"settings read error: {e}")
+        return None
+    try:
+        val = json.loads(raw).get("theme")
+    except Exception as e:
+        # A concurrent write can catch us mid-rewrite; the caller polls, so a
+        # transient parse failure just costs one attempt.
+        log(f"settings parse error: {e}")
+        return None
+    if isinstance(val, str):
+        return val.strip().lower()
+    return None
+
+
+def verify_applied(theme):
+    """Poll the settings file until it reports `theme`, up to VERIFY_SECS.
+
+    Returns (ok, detail):
+      (True,  'settings.json theme=<theme>')  -- confirmed applied.
+      (False, 'settings.json theme=<other>')  -- REAL failure; /config did
+                                                 not take (this is the
+                                                 2026-08-19 mangled-inject
+                                                 case).
+      (True,  'UNVERIFIABLE: ...')            -- settings file unreadable.
+                                                 We cannot prove success OR
+                                                 failure, so we do NOT retry
+                                                 (retrying types into the
+                                                 operator's prompt line every
+                                                 poll, forever) but we also
+                                                 never claim "verified".
+    """
+    deadline = time.monotonic() + VERIFY_SECS
+    seen = None
+    while True:
+        seen = read_settings_theme()
+        if seen == theme:
+            return True, f"settings.json theme={theme}"
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    if seen is None:
+        return True, f"UNVERIFIABLE: cannot read theme from {SETTINGS_FILE}"
+    return False, f"settings.json theme={seen!r}, wanted {theme!r}"
 
 
 def inject_theme(pane, theme):
@@ -235,8 +467,18 @@ def inject_theme(pane, theme):
         ]
         out, rc = run(cmd, timeout=30)
         if rc == 0:
-            log(f"injected /config theme={theme} (verified)")
-            return True
+            # rc==0 only means the payload LEFT THE PROMPT LINE. It does not
+            # mean Claude Code parsed a slash command -- a mangled payload
+            # submits and clears just the same. Confirm the EFFECT instead.
+            ok, detail = verify_applied(theme)
+            if ok:
+                log(f"injected /config theme={theme} ({detail})")
+                return True
+            log(
+                f"inject /config theme={theme}: submit landed but theme did NOT "
+                f"change ({detail}) -- payload likely mangled on the prompt line; retry"
+            )
+            return False
         if rc == 3:
             log(f"inject /config theme={theme}: submit NOT verified (rc=3); retry")
         else:
@@ -250,7 +492,67 @@ def inject_theme(pane, theme):
                 pass
 
 
+def print_status():
+    pane = resolve_pane()
+    want = read_theme()
+    have = read_settings_theme()
+    print(f"theme_file    : {THEME_FILE}")
+    print(f"theme_value   : {want!r}")
+    print(f"settings_file : {SETTINGS_FILE}")
+    print(f"settings_theme: {have!r}")
+    if want is None or have is None:
+        sync = "unknown"
+    elif want == have:
+        sync = "in-sync"
+    else:
+        sync = "OUT OF SYNC (run --force to re-assert)"
+    print(f"in_sync       : {sync}")
+    print(f"pane          : {pane}")
+    print(f"pane_idle     : {is_idle(pane)}")
+    print(f"lock_file     : {LOCK_FILE}")
+    print(f"log_file      : {LOG_FILE}")
+    return 0
+
+
+def force_once():
+    """Re-assert the CURRENT theme-file value, ignoring what we think is
+    already applied.
+
+    Exists because the daemon is deliberately idempotent: it skips a re-inject
+    when the file value equals the last value it applied, and a same-value
+    write to the theme file is a no-op. That is correct for the normal path
+    (the frontend re-POSTs on every page load) but it means a TUI that drifted
+    out of sync -- exactly what the 2026-08-19 mangled inject left behind --
+    could not be corrected without toggling the browser theme twice.
+
+    Waits for the pane to go idle, bounded, rather than injecting into a busy
+    pane. Still NON-cancelling: no --escape anywhere.
+    """
+    theme = read_theme()
+    if theme is None:
+        log(f"--force: no usable theme value in {THEME_FILE}; nothing to do")
+        return 1
+    pane = resolve_pane()
+    deadline = time.monotonic() + FORCE_IDLE_WAIT_SECS
+    while not is_idle(pane):
+        if time.monotonic() >= deadline:
+            log(
+                f"--force: pane {pane} still busy after {FORCE_IDLE_WAIT_SECS}s; "
+                f"NOT injecting (would have to seize the turn to do so)"
+            )
+            return 2
+        time.sleep(IDLE_POLL_SECS)
+    log(f"--force: re-asserting theme={theme} on pane {pane}")
+    return 0 if inject_theme(pane, theme) else 3
+
+
 def main():
+    global _reassert_requested
+    argv = sys.argv[1:]
+    if "--status" in argv:
+        return print_status()
+    force = "--force" in argv
+
     try:
         Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -262,13 +564,38 @@ def main():
         log("CLAUDE_CONTAINER_THEME_SYNC_DISABLED set; exiting 0 (disabled)")
         return 0
 
-    log(f"START: watching {THEME_FILE} (poll {POLL_SECS}s), lock={LOCK_FILE}")
+    if force:
+        return force_once()
 
-    applied = None          # last theme we successfully injected
+    # SIGHUP => re-assert on the next poll. Registered only for the daemon
+    # path; the one-shot paths above have already returned.
+    try:
+        signal.signal(signal.SIGHUP, _on_sighup)
+    except (ValueError, OSError):
+        pass
+
+    log(
+        f"START: watching {THEME_FILE} (poll {POLL_SECS}s), "
+        f"verify={SETTINGS_FILE}, legacy lock={LOCK_FILE}"
+    )
+
+    applied = None          # last theme we VERIFIED as applied
     desired = None          # last theme read from the file (may await idle)
     last_mtime = None
+    verify_failures = 0     # consecutive failed verifications of `desired`
+    retry_not_before = 0.0  # monotonic deadline enforcing RETRY_BACKOFF_SECS
 
     while True:
+        # SIGHUP asks us to re-assert even though the file value has not
+        # changed.
+        if _reassert_requested:
+            _reassert_requested = False
+            log("SIGHUP: re-asserting current theme (forgetting applied state)")
+            applied = None
+            verify_failures = 0
+            retry_not_before = 0.0
+            last_mtime = None
+
         try:
             mtime = os.path.getmtime(THEME_FILE)
         except OSError:
@@ -279,12 +606,49 @@ def main():
             if val and val != desired:
                 log(f"theme reported: {val}")
                 desired = val
+                verify_failures = 0
+                retry_not_before = 0.0
 
         if desired and desired != applied:
+            # Backoff gate: after a failed attempt we wait out
+            # RETRY_BACKOFF_SECS before touching the pane again.
+            if time.monotonic() < retry_not_before:
+                time.sleep(min(IDLE_POLL_SECS, POLL_SECS))
+                continue
+
             pane = resolve_pane()
             if is_idle(pane):
                 if inject_theme(pane, desired):
                     applied = desired
+                    verify_failures = 0
+                    retry_not_before = 0.0
+                else:
+                    verify_failures += 1
+                    if verify_failures >= MAX_VERIFY_FAILURES:
+                        # Stop hammering the operator's prompt line. Mark it
+                        # applied so we go quiet until the theme file changes
+                        # again (or someone sends SIGHUP / runs --force), and
+                        # say so LOUDLY -- this is the state the old code hid
+                        # behind a bogus "(verified)".
+                        log(
+                            f"GIVING UP on theme={desired} after "
+                            f"{verify_failures} failed verifications; the TUI is "
+                            f"OUT OF SYNC with {THEME_FILE}. Investigate, then "
+                            f"re-assert with `cw-theme-sync --force` or SIGHUP."
+                        )
+                        applied = desired
+                        verify_failures = 0
+                        retry_not_before = 0.0
+                    else:
+                        backoff = RETRY_BACKOFF_SECS[
+                            min(verify_failures - 1, len(RETRY_BACKOFF_SECS) - 1)
+                        ]
+                        retry_not_before = time.monotonic() + backoff
+                        log(
+                            f"backing off {backoff:.0f}s before retry "
+                            f"{verify_failures + 1}/{MAX_VERIFY_FAILURES} of "
+                            f"theme={desired}"
+                        )
                 time.sleep(POLL_SECS)
                 continue
             time.sleep(min(IDLE_POLL_SECS, POLL_SECS))

@@ -107,9 +107,19 @@ pub struct RealBackends;
 #[async_trait::async_trait]
 impl InjectBackends for RealBackends {
     async fn tmux_inject(&self, pane: &str, text: &str) {
+        // SERIALIZE with every other injector (see `inject_lock`). The daemon
+        // is the population a per-caller lock convention can never cover: it
+        // never shells out to `claude-watch inject`, so the only place its
+        // alerts can be serialized against an out-of-process injector is right
+        // here, at the backend boundary.
+        let _guard = crate::inject_lock::InjectLock::acquire("daemon-cancelling").await;
         crate::tmux::inject_text(pane, text).await;
     }
     async fn tmux_inject_queued(&self, pane: &str, text: &str) {
+        // Same serialization as `tmux_inject`. This is the ROUTINE tier — the
+        // exact path that typed the WATCHER DOWN banner which `cw-theme-sync`
+        // interleaved with on 2026-08-19.
+        let _guard = crate::inject_lock::InjectLock::acquire("daemon-queued").await;
         crate::tmux::inject_text_queued(pane, text).await;
     }
     fn pidfd_inject(&self, agent_pid: u32, text: &str) -> ProbeOutcome {
