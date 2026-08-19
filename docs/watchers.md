@@ -272,15 +272,26 @@ Two details worth knowing if you touch this code:
 - The authorization code is still typed with raw `tmux send-keys`, **not**
   `claude-watch inject`. The original reason (inject always opened with an
   Escape blast, and Escape cancels the login modal) expired when the flag
-  became opt-in on 2026-08-18; three others did not. Inject enters INSERT by
-  probing with a literal `i` it can only un-type by seeing it on a prompt line,
-  and a modal has none — so the code arrives as `i<code>`. Any configured
-  FleetView focus-to-main keys are sent first and land in the modal's text
-  field as raw escape sequences. And inject's success check is "the payload
-  cleared from the prompt line", which in a modal is vacuous, so it reports
-  `submitted` over the corrupted payload. All three are reproduced against a
-  real tmux pane in `tools/watchers/tests/test_self_login_tmux.sh`; read those
-  checks before trying to delete the raw path.
+  became opt-in on 2026-08-18; others did not. Inject enters INSERT by probing
+  with a literal `i` it can only un-type by seeing it on a prompt line, and a
+  modal has none — so the code arrives as `i<code>`. Any configured FleetView
+  focus-to-main keys are sent first and land in the modal's text field as raw
+  escape sequences.
+
+  Since 2026-08-19 inject additionally refuses to press Enter unless the prompt
+  line holds its payload and nothing else. A modal has no prompt line, so that
+  gate can never be satisfied there: inject backspaces its payload out and
+  reports `prompt_dirty` / exit 4. That replaced the older and more dangerous
+  behaviour, where the success check ("the payload cleared from the prompt
+  line") was vacuous in a modal and inject reported `submitted` over the
+  corrupted code. The typing defects above are unchanged, so the raw path is
+  still required — but a mistake here now fails loudly instead of
+  authenticating with a corrupted code.
+
+  All of this is reproduced against a real tmux pane in
+  `tools/watchers/tests/test_self_login_tmux.sh` — the typing defects via a
+  `--no-submit` probe committed with a raw Enter, the refusal via a real
+  `--submit`. Read those checks before trying to delete the raw path.
 
 `cancel` exists because `start` leaves a **modal** on the pane. Until somebody
 pastes the code, the dialog swallows the session's keystrokes and the loop
