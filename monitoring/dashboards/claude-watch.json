@@ -14,243 +14,6 @@
   "refresh": "30s",
   "panels": [
     {
-      "id": 101,
-      "title": "Tokens This Month (MTD)",
-      "description": "Total Claude Code token usage for the current calendar month. Sums input + output + cache_creation + cache_read across all retained transcripts whose timestamp falls in this month. Resets on the 1st.",
-      "type": "stat",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum(claude_code_tokens_month_to_date)",
-          "instant": true,
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "#268bd2"
-          },
-          "unit": "short",
-          "decimals": 2
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "value",
-        "graphMode": "none",
-        "textMode": "value",
-        "justifyMode": "center"
-      }
-    },
-    {
-      "id": 103,
-      "title": "Token Usage by Day",
-      "description": "Rolling 24h token usage stacked by type. With only partial-day data the bars show today's running total; once multi-day data accumulates the chart shows the rolling 24h window as a time series. Bars are stacked input/output/cache_creation/cache_read.",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 9,
-        "w": 24,
-        "x": 0,
-        "y": 12
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum by (type) (increase(claude_code_tokens_total[1d]))",
-          "refId": "A",
-          "legendFormat": "{{type}}",
-          "interval": ""
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short",
-          "custom": {
-            "drawStyle": "bars",
-            "barAlignment": 0,
-            "lineWidth": 1,
-            "fillOpacity": 80,
-            "showPoints": "never",
-            "spanNulls": false,
-            "axisSoftMin": 0,
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "input"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#268bd2",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "output"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#859900",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "cache_creation"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#b58900",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "cache_read"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#2aa198",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "sum"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "id": 1,
-      "title": "Status",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 0
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "claude_watch_up",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "1": {
-                  "text": "UP",
-                  "color": "#859900"
-                }
-              }
-            },
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "text": "DOWN",
-                  "color": "#dc322f"
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#dc322f",
-                "value": null
-              },
-              {
-                "color": "#859900",
-                "value": 1
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background",
-        "graphMode": "none",
-        "textMode": "value"
-      }
-    },
-    {
       "id": 2,
       "title": "Session Timers",
       "type": "stat",
@@ -395,14 +158,99 @@
       "description": "Session lifetime timers, ONE stat panel with three tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded)."
     },
     {
+      "id": 104,
+      "title": "Tokens / Minute (excl. cache reads)",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(claude_code_tokens_total{type!=\"cache_read\"}[1m])) * 60",
+          "legendFormat": "1m",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "expr": "sum(rate(claude_code_tokens_total{type!=\"cache_read\"}[5m])) * 60",
+          "legendFormat": "5m",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "expr": "sum(rate(claude_code_tokens_total{type!=\"cache_read\"}[15m])) * 60",
+          "legendFormat": "15m",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 30000
+              },
+              {
+                "color": "#dc322f",
+                "value": 100000
+              }
+            ]
+          },
+          "unit": "short",
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "orientation": "vertical",
+        "textMode": "value_and_name",
+        "justifyMode": "auto",
+        "text": {
+          "valueSize": 32,
+          "titleSize": 16
+        }
+      },
+      "description": "Tokens per minute, averaged over 1m / 5m / 15m. claude_code_tokens_total is a cumulative COUNTER, so each tile is rate(...[window]) * 60 \u2014 never the raw counter. type=\"cache_read\" is excluded: cache reads re-count the whole cached prefix on every request and dominate the sum by ~300x, which would make the tiles read in the millions rather than the actual burn rate."
+    },
+    {
       "id": 3,
       "title": "Context Tokens",
       "type": "stat",
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 0
+        "w": 12,
+        "x": 0,
+        "y": 4
       },
       "datasource": {
         "type": "prometheus",
@@ -453,406 +301,14 @@
       }
     },
     {
-      "id": 8,
-      "title": "Watchers",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 41
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "claude_watchers_total",
-          "legendFormat": "Total",
-          "refId": "A"
-        },
-        {
-          "expr": "claude_watchers_missing",
-          "legendFormat": "Missing",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false,
-            "axisSoftMin": 0
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Total"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#268bd2",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Missing"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#dc322f",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 10,
-      "title": "Failures & Dead Checks",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 49
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "claude_consecutive_failures",
-          "legendFormat": "Consecutive Failures",
-          "refId": "A"
-        },
-        {
-          "expr": "claude_consecutive_dead_checks",
-          "legendFormat": "Dead Checks",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false,
-            "axisSoftMin": 0
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Consecutive Failures"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#b58900",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Dead Checks"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#dc322f",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 11,
-      "title": "Interruptions Over Time",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 41
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "increase(claude_watcher_inject_total[5m])",
-          "legendFormat": "Watcher Inject",
-          "refId": "A"
-        },
-        {
-          "expr": "increase(claude_thinking_interrupt_total[5m])",
-          "legendFormat": "Thinking Interrupt",
-          "refId": "B"
-        },
-        {
-          "expr": "increase(claude_auto_update_total[5m])",
-          "legendFormat": "Auto Update",
-          "refId": "C"
-        },
-        {
-          "expr": "increase(claude_heartbeat_stale_total[5m])",
-          "legendFormat": "Heartbeat Stale",
-          "refId": "D"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "fixed"
-          },
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false,
-            "axisSoftMin": 0
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Watcher Inject"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#2aa198",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Thinking Interrupt"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#b58900",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Auto Update"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#268bd2",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Heartbeat Stale"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#dc322f",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 12,
-      "title": "Heartbeat Staleness",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 49
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "time() - claude_mainloop_heartbeat_timestamp_seconds",
-          "legendFormat": "Heartbeat Staleness",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false,
-            "axisSoftMin": 0
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 360
-              },
-              {
-                "color": "#dc322f",
-                "value": 600
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Consecutive Failures"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#b58900",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Dead Checks"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#dc322f",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
       "id": 13,
       "title": "Claude Code Version",
       "type": "stat",
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 0
+        "w": 12,
+        "x": 12,
+        "y": 4
       },
       "datasource": {
         "type": "prometheus",
@@ -895,537 +351,15 @@
       }
     },
     {
-      "id": 21,
-      "title": "Reminder Fires by Type (rate / 5m)",
-      "type": "timeseries",
-      "description": "Rate of hook-driven reminder fires. context_high fires when context % crosses the high threshold; version_update fires when a new claude version is detected; pre_compact fires before a compaction.",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 57
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "rate(claude_watch_reminder_fires_total[5m])",
-          "legendFormat": "{{type}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 25,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false,
-            "axisSoftMin": 0,
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 22,
-      "title": "Fallback Injections by Type (rate / 5m)",
-      "type": "timeseries",
-      "description": "Rate of daemon-driven fallback injections. When nonzero, Claude ignored the corresponding reminder and the daemon had to intervene (force /clear or /restart).",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 57
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "rate(claude_watch_fallback_injections_total[5m])",
-          "legendFormat": "{{type}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 25,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false,
-            "axisSoftMin": 0,
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 23,
-      "title": "Cooperation Ratio (30m)",
-      "type": "gauge",
-      "description": "Fraction of context_high reminders that Claude acted on autonomously (did NOT require fallback). Computed as 1 - (fallback clear rate / context_high reminder rate) over 30m. Target >= 0.8. Falls back to 1.0 when no reminders fired in the window.",
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 0,
-        "y": 65
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "clamp_min(1 - (rate(claude_watch_fallback_injections_total{type=\"clear\"}[30m]) / on(instance, job) clamp_min(rate(claude_watch_reminder_fires_total{type=\"context_high\"}[30m]), 1e-12)), 0)",
-          "legendFormat": "cooperation",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "decimals": 2,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#dc322f",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 0.5
-              },
-              {
-                "color": "#859900",
-                "value": 0.8
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "showThresholdLabels": true,
-        "showThresholdMarkers": true
-      }
-    },
-    {
-      "id": 24,
-      "title": "Reminder\u2192Action Latency (avg)",
-      "type": "timeseries",
-      "description": "Average time from reminder fire to Claude action (self-/clear or /restart), split by type. Computed as sum/count since the exporter ships counter pairs rather than a true histogram -- this is an AVERAGE, not a real quantile. Samples only when Claude acted within 1h (context) / 6h (version).",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 6,
-        "y": 65
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "claude_watch_reminder_to_action_latency_seconds_sum / clamp_min(claude_watch_reminder_to_action_latency_seconds_count, 1)",
-          "legendFormat": "{{type}} avg",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": true,
-            "axisSoftMin": 0
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 25,
-      "title": "Counter Values (debug)",
-      "type": "table",
-      "description": "Raw counter values for debugging: reminder_fires and fallback_injections by type, plus latency sum/count pairs.",
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 65
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "claude_watch_reminder_fires_total",
-          "legendFormat": "fires {{type}}",
-          "refId": "A",
-          "instant": true,
-          "format": "table"
-        },
-        {
-          "expr": "claude_watch_fallback_injections_total",
-          "legendFormat": "fallback {{type}}",
-          "refId": "B",
-          "instant": true,
-          "format": "table"
-        },
-        {
-          "expr": "claude_watch_reminder_to_action_latency_seconds_sum",
-          "legendFormat": "latency_sum {{type}}",
-          "refId": "C",
-          "instant": true,
-          "format": "table"
-        },
-        {
-          "expr": "claude_watch_reminder_to_action_latency_seconds_count",
-          "legendFormat": "latency_count {{type}}",
-          "refId": "D",
-          "instant": true,
-          "format": "table"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "custom": {
-            "align": "left"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "showHeader": true
-      },
-      "transformations": [
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true,
-              "job": true,
-              "instance": true
-            }
-          }
-        }
-      ]
-    },
-    {
-      "id": 31,
-      "title": "Total Interrupts (24h)",
-      "type": "stat",
-      "description": "Sum of all claude_interrupts_total increases across every kind over the last 24h. Red above 50 (wedge-state territory), yellow above 20.",
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 0,
-        "y": 73
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum(increase(claude_interrupts_total[24h]))",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "unit": "short",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 20
-              },
-              {
-                "color": "#dc322f",
-                "value": 50
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background",
-        "graphMode": "area",
-        "textMode": "value"
-      }
-    },
-    {
-      "id": 32,
-      "title": "Interrupts per Kind (1h)",
-      "type": "bargauge",
-      "description": "Per-kind count of interrupts fired in the last hour. Quick triage to spot which kind is currently firing.",
-      "gridPos": {
-        "h": 8,
-        "w": 18,
-        "x": 6,
-        "y": 73
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum by (kind) (increase(claude_interrupts_total[1h]))",
-          "legendFormat": "{{kind}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "unit": "short",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 5
-              },
-              {
-                "color": "#dc322f",
-                "value": 15
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "orientation": "horizontal",
-        "displayMode": "gradient",
-        "showUnfilled": true
-      }
-    },
-    {
-      "id": 33,
-      "title": "Interrupts by Kind (rate / min)",
-      "type": "timeseries",
-      "description": "Per-minute rate of claude_interrupts_total by kind, smoothed over 5m. Stacked area. Key chart for noise monitoring and cascade detection.",
-      "gridPos": {
-        "h": 8,
-        "w": 18,
-        "x": 0,
-        "y": 81
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum by (kind) (rate(claude_interrupts_total[5m])) * 60",
-          "legendFormat": "{{kind}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 25,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false,
-            "axisSoftMin": 0,
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
-      "id": 34,
-      "title": "Cascade Indicator (10m avg /min)",
-      "type": "stat",
-      "description": "Total interrupts per minute averaged over 10m. Red > 2/min indicates cascade state (like yesterday's wedge).",
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 81
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum(rate(claude_interrupts_total[10m])) * 60",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "unit": "short",
-          "decimals": 2,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 1
-              },
-              {
-                "color": "#dc322f",
-                "value": 2
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background",
-        "graphMode": "area",
-        "textMode": "value"
-      }
-    },
-    {
-      "id": 35,
-      "title": "Config File Sizes",
+      "id": 101,
+      "title": "Tokens This Month (MTD)",
+      "description": "Total Claude Code token usage for the current calendar month. Sums input + output + cache_creation + cache_read across all retained transcripts whose timestamp falls in this month. Resets on the 1st.",
       "type": "stat",
       "gridPos": {
-        "h": 4,
-        "w": 12,
+        "h": 8,
+        "w": 24,
         "x": 0,
-        "y": 89
+        "y": 8
       },
       "datasource": {
         "type": "prometheus",
@@ -1433,26 +367,19 @@
       },
       "targets": [
         {
-          "expr": "claude_config_size_bytes",
-          "legendFormat": "{{file}}",
+          "expr": "sum(claude_code_tokens_month_to_date)",
+          "instant": true,
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
+            "mode": "fixed",
+            "fixedColor": "#268bd2"
           },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              }
-            ]
-          },
-          "unit": "bytes"
+          "unit": "short",
+          "decimals": 2
         },
         "overrides": []
       },
@@ -1463,18 +390,21 @@
           ]
         },
         "colorMode": "value",
-        "graphMode": "none"
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
       }
     },
     {
-      "id": 41,
-      "title": "Agents / Tasks / Shells",
+      "id": 103,
+      "title": "Token Usage by Day",
+      "description": "Rolling 24h token usage stacked by type. With only partial-day data the bars show today's running total; once multi-day data accumulates the chart shows the rolling 24h window as a time series. Bars are stacked input/output/cache_creation/cache_read.",
       "type": "timeseries",
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 9,
+        "w": 24,
         "x": 0,
-        "y": 93
+        "y": 16
       },
       "datasource": {
         "type": "prometheus",
@@ -1482,19 +412,10 @@
       },
       "targets": [
         {
-          "expr": "claude_code_active_agents",
-          "legendFormat": "active agents",
-          "refId": "A"
-        },
-        {
-          "expr": "claude_code_running_tasks",
-          "refId": "B",
-          "legendFormat": "running tasks"
-        },
-        {
-          "expr": "claude_code_open_bashes",
-          "refId": "C",
-          "legendFormat": "open shells"
+          "expr": "sum by (type) (increase(claude_code_tokens_total[1d]))",
+          "refId": "A",
+          "legendFormat": "{{type}}",
+          "interval": ""
         }
       ],
       "fieldConfig": {
@@ -1502,37 +423,107 @@
           "color": {
             "mode": "palette-classic"
           },
+          "unit": "short",
           "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false
-          },
-          "unit": "short"
+            "drawStyle": "bars",
+            "barAlignment": 0,
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "input"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#268bd2",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "output"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#859900",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cache_creation"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#b58900",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cache_read"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#2aa198",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum"
+          ]
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "multi",
+          "sort": "desc"
         }
       }
     },
     {
-      "id": 42,
-      "title": "Live vs Enabled Watchers",
-      "type": "timeseries",
+      "id": 47,
+      "title": "Build Info",
+      "type": "stat",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 93
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 25
       },
       "datasource": {
         "type": "prometheus",
@@ -1540,41 +531,135 @@
       },
       "targets": [
         {
-          "expr": "claude_code_live_watchers",
-          "legendFormat": "live",
-          "refId": "A"
+          "expr": "claude_watch_build_info",
+          "legendFormat": "commit {{commit}}",
+          "refId": "A",
+          "instant": true
         },
         {
-          "expr": "claude_code_enabled_watchers",
+          "expr": "claude_watch_build_info",
+          "legendFormat": "PR #{{pr}}",
           "refId": "B",
-          "legendFormat": "enabled"
+          "instant": true
         }
       ],
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "mode": "fixed",
+            "fixedColor": "#268bd2"
           },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "auto",
-            "pointSize": 5,
-            "spanNulls": false
-          },
-          "unit": "short"
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              }
+            ]
+          }
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
         },
-        "tooltip": {
-          "mode": "multi"
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 46,
+      "title": "Restarts / Alerts",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 29
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_restart_count",
+          "legendFormat": "Restarts",
+          "refId": "A"
+        },
+        {
+          "expr": "claude_alert_count",
+          "refId": "B",
+          "legendFormat": "Alerts"
         }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Restarts"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#268bd2"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Alerts"
+            },
+            "properties": [
+              {
+                "id": "color.mode",
+                "value": "fixed"
+              },
+              {
+                "id": "color.fixedColor",
+                "value": "#b58900"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "vertical",
+        "textMode": "value_and_name"
       }
     },
     {
@@ -1700,14 +785,14 @@
       }
     },
     {
-      "id": 46,
-      "title": "Restarts / Alerts",
+      "id": 1,
+      "title": "Status",
       "type": "stat",
       "gridPos": {
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 29
+        "y": 41
       },
       "datasource": {
         "type": "prometheus",
@@ -1715,14 +800,996 @@
       },
       "targets": [
         {
-          "expr": "claude_restart_count",
-          "legendFormat": "Restarts",
+          "expr": "claude_watch_up",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "UP",
+                  "color": "#859900"
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "#dc322f"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#dc322f",
+                "value": null
+              },
+              {
+                "color": "#859900",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 11,
+      "title": "Interruptions Over Time",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(claude_watcher_inject_total[5m])",
+          "legendFormat": "Watcher Inject",
           "refId": "A"
         },
         {
-          "expr": "claude_alert_count",
+          "expr": "increase(claude_thinking_interrupt_total[5m])",
+          "legendFormat": "Thinking Interrupt",
+          "refId": "B"
+        },
+        {
+          "expr": "increase(claude_auto_update_total[5m])",
+          "legendFormat": "Auto Update",
+          "refId": "C"
+        },
+        {
+          "expr": "increase(claude_heartbeat_stale_total[5m])",
+          "legendFormat": "Heartbeat Stale",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed"
+          },
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Watcher Inject"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#2aa198",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Thinking Interrupt"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#b58900",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Auto Update"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#268bd2",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Heartbeat Stale"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#dc322f",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Watchers",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_watchers_total",
+          "legendFormat": "Total",
+          "refId": "A"
+        },
+        {
+          "expr": "claude_watchers_missing",
+          "legendFormat": "Missing",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#268bd2",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Missing"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#dc322f",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Heartbeat Staleness",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 53
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "time() - claude_mainloop_heartbeat_timestamp_seconds",
+          "legendFormat": "Heartbeat Staleness",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisSoftMin": 0
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 360
+              },
+              {
+                "color": "#dc322f",
+                "value": 600
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Consecutive Failures"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#b58900",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Dead Checks"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#dc322f",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Failures & Dead Checks",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_consecutive_failures",
+          "legendFormat": "Consecutive Failures",
+          "refId": "A"
+        },
+        {
+          "expr": "claude_consecutive_dead_checks",
+          "legendFormat": "Dead Checks",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Consecutive Failures"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#b58900",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Dead Checks"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#dc322f",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Reminder Fires by Type (rate / 5m)",
+      "type": "timeseries",
+      "description": "Rate of hook-driven reminder fires. context_high fires when context % crosses the high threshold; version_update fires when a new claude version is detected; pre_compact fires before a compaction.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "rate(claude_watch_reminder_fires_total[5m])",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "Fallback Injections by Type (rate / 5m)",
+      "type": "timeseries",
+      "description": "Rate of daemon-driven fallback injections. When nonzero, Claude ignored the corresponding reminder and the daemon had to intervene (force /clear or /restart).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "rate(claude_watch_fallback_injections_total[5m])",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "title": "Cooperation Ratio (30m)",
+      "type": "gauge",
+      "description": "Fraction of context_high reminders that Claude acted on autonomously (did NOT require fallback). Computed as 1 - (fallback clear rate / context_high reminder rate) over 30m. Target >= 0.8. Falls back to 1.0 when no reminders fired in the window.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 69
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "clamp_min(1 - (rate(claude_watch_fallback_injections_total{type=\"clear\"}[30m]) / on(instance, job) clamp_min(rate(claude_watch_reminder_fires_total{type=\"context_high\"}[30m]), 1e-12)), 0)",
+          "legendFormat": "cooperation",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#dc322f",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 0.5
+              },
+              {
+                "color": "#859900",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true
+      }
+    },
+    {
+      "id": 24,
+      "title": "Reminder\u2192Action Latency (avg)",
+      "type": "timeseries",
+      "description": "Average time from reminder fire to Claude action (self-/clear or /restart), split by type. Computed as sum/count since the exporter ships counter pairs rather than a true histogram -- this is an AVERAGE, not a real quantile. Samples only when Claude acted within 1h (context) / 6h (version).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 6,
+        "y": 69
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_watch_reminder_to_action_latency_seconds_sum / clamp_min(claude_watch_reminder_to_action_latency_seconds_count, 1)",
+          "legendFormat": "{{type}} avg",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "title": "Counter Values (debug)",
+      "type": "table",
+      "description": "Raw counter values for debugging: reminder_fires and fallback_injections by type, plus latency sum/count pairs.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 69
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_watch_reminder_fires_total",
+          "legendFormat": "fires {{type}}",
+          "refId": "A",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "expr": "claude_watch_fallback_injections_total",
+          "legendFormat": "fallback {{type}}",
           "refId": "B",
-          "legendFormat": "Alerts"
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "expr": "claude_watch_reminder_to_action_latency_seconds_sum",
+          "legendFormat": "latency_sum {{type}}",
+          "refId": "C",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "expr": "claude_watch_reminder_to_action_latency_seconds_count",
+          "legendFormat": "latency_count {{type}}",
+          "refId": "D",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "job": true,
+              "instance": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Total Interrupts (24h)",
+      "type": "stat",
+      "description": "Sum of all claude_interrupts_total increases across every kind over the last 24h. Red above 50 (wedge-state territory), yellow above 20.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 77
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(claude_interrupts_total[24h]))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 20
+              },
+              {
+                "color": "#dc322f",
+                "value": 50
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 32,
+      "title": "Interrupts per Kind (1h)",
+      "type": "bargauge",
+      "description": "Per-kind count of interrupts fired in the last hour. Quick triage to spot which kind is currently firing.",
+      "gridPos": {
+        "h": 8,
+        "w": 18,
+        "x": 6,
+        "y": 77
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (kind) (increase(claude_interrupts_total[1h]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 5
+              },
+              {
+                "color": "#dc322f",
+                "value": 15
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 33,
+      "title": "Interrupts by Kind (rate / min)",
+      "type": "timeseries",
+      "description": "Per-minute rate of claude_interrupts_total by kind, smoothed over 5m. Stacked area. Key chart for noise monitoring and cascade detection.",
+      "gridPos": {
+        "h": 8,
+        "w": 18,
+        "x": 0,
+        "y": 85
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (kind) (rate(claude_interrupts_total[5m])) * 60",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "title": "Cascade Indicator (10m avg /min)",
+      "type": "stat",
+      "description": "Total interrupts per minute averaged over 10m. Red > 2/min indicates cascade state (like yesterday's wedge).",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 85
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(claude_interrupts_total[10m])) * 60",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#859900",
+                "value": null
+              },
+              {
+                "color": "#b58900",
+                "value": 1
+              },
+              {
+                "color": "#dc322f",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 35,
+      "title": "Config File Sizes",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 93
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_config_size_bytes",
+          "legendFormat": "{{file}}",
+          "refId": "A"
         }
       ],
       "fieldConfig": {
@@ -1738,99 +1805,8 @@
                 "value": null
               }
             ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Restarts"
-            },
-            "properties": [
-              {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#268bd2"
-              }
-            ]
           },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Alerts"
-            },
-            "properties": [
-              {
-                "id": "color.mode",
-                "value": "fixed"
-              },
-              {
-                "id": "color.fixedColor",
-                "value": "#b58900"
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "none",
-        "orientation": "vertical",
-        "textMode": "value_and_name"
-      }
-    },
-    {
-      "id": 47,
-      "title": "Build Info",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 24,
-        "x": 0,
-        "y": 25
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "claude_watch_build_info",
-          "legendFormat": "commit {{commit}}",
-          "refId": "A",
-          "instant": true
-        },
-        {
-          "expr": "claude_watch_build_info",
-          "legendFormat": "PR #{{pr}}",
-          "refId": "B",
-          "instant": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "#268bd2"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              }
-            ]
-          }
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -1840,10 +1816,119 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "name",
-        "orientation": "auto"
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 41,
+      "title": "Agents / Tasks / Shells",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 97
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_code_active_agents",
+          "legendFormat": "active agents",
+          "refId": "A"
+        },
+        {
+          "expr": "claude_code_running_tasks",
+          "refId": "B",
+          "legendFormat": "running tasks"
+        },
+        {
+          "expr": "claude_code_open_bashes",
+          "refId": "C",
+          "legendFormat": "open shells"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 42,
+      "title": "Live vs Enabled Watchers",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 97
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_code_live_watchers",
+          "legendFormat": "live",
+          "refId": "A"
+        },
+        {
+          "expr": "claude_code_enabled_watchers",
+          "refId": "B",
+          "legendFormat": "enabled"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       }
     }
   ]
