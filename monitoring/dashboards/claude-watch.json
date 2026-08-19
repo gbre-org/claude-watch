@@ -184,8 +184,8 @@
       "type": "stat",
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 0,
+        "w": 4,
+        "x": 12,
         "y": 0
       },
       "datasource": {
@@ -252,12 +252,12 @@
     },
     {
       "id": 2,
-      "title": "Heartbeat / Container Age",
+      "title": "Session Timers",
       "type": "stat",
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 3,
+        "w": 12,
+        "x": 0,
         "y": 0
       },
       "datasource": {
@@ -268,39 +268,76 @@
         {
           "expr": "time() - claude_mainloop_heartbeat_timestamp_seconds",
           "legendFormat": "Heartbeat",
-          "refId": "A"
+          "refId": "A",
+          "range": true,
+          "instant": false
         },
         {
           "expr": "time() - claude_container_start_timestamp_seconds",
           "legendFormat": "Container",
-          "refId": "B"
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "expr": "time() - (claude_last_context_clear_timestamp_seconds > 0)",
+          "legendFormat": "Since Clear",
+          "refId": "C",
+          "range": true,
+          "instant": false
         }
       ],
       "fieldConfig": {
         "defaults": {
+          "unit": "s",
           "color": {
             "mode": "thresholds"
           },
-          "unit": "s",
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "#859900",
                 "value": null
-              },
-              {
-                "color": "#b58900",
-                "value": 360
-              },
-              {
-                "color": "#dc322f",
-                "value": 600
               }
             ]
           }
         },
         "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Heartbeat"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#859900",
+                      "value": null
+                    },
+                    {
+                      "color": "#b58900",
+                      "value": 360
+                    },
+                    {
+                      "color": "#dc322f",
+                      "value": 600
+                    }
+                  ]
+                }
+              }
+            ]
+          },
           {
             "matcher": {
               "id": "byName",
@@ -315,19 +352,47 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Since Clear"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#b58900"
+                }
+              },
+              {
+                "id": "noValue",
+                "value": "n/a \u2014 no clear recorded"
+              }
+            ]
           }
         ]
       },
       "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "vertical",
+        "textMode": "value_and_name",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "fields": "",
+          "values": false
         },
-        "colorMode": "background",
-        "graphMode": "none",
-        "textMode": "value_and_name"
-      }
+        "text": {
+          "valueSize": 32,
+          "titleSize": 16
+        }
+      },
+      "description": "Session lifetime timers, ONE stat panel with three tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CONTAINER = seconds since container start; SINCE CLEAR = seconds since the last context clear (n/a if none recorded)."
     },
     {
       "id": 3,
@@ -335,8 +400,8 @@
       "type": "stat",
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 9,
+        "w": 4,
+        "x": 16,
         "y": 0
       },
       "datasource": {
@@ -787,7 +852,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 21
+        "y": 0
       },
       "datasource": {
         "type": "prometheus",
@@ -827,56 +892,6 @@
         "graphMode": "none",
         "textMode": "name",
         "orientation": "vertical"
-      }
-    },
-    {
-      "id": 15,
-      "title": "Since Last Clear",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 13,
-        "y": 0
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "time() - claude_last_context_clear_timestamp_seconds",
-          "legendFormat": "",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "#b58900"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#859900",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "value",
-        "graphMode": "none"
       }
     },
     {
