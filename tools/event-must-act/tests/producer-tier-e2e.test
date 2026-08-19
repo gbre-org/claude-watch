@@ -20,8 +20,13 @@
 # A unit test of classify() would pass even if the watcher never read
 # data.tier at all; that gap is exactly what this file closes.
 #
-# Fully sandboxed: its own queue dir, state dir, lock file and PATH, so it
-# never touches a live watcher or live event state.
+# Fully sandboxed: its own queue dir, state dir, consumed-log dir, lock file
+# and PATH, so it never touches a live watcher or live event state.
+#
+# REQUIRES inotify-tools (claude-event-watch blocks on inotifywait) and
+# python3. Both are preconditions, checked up front and treated as hard
+# failures rather than skips -- see the preflight block below for why a skip
+# would be the worst of the three outcomes.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -32,10 +37,32 @@ fails=0
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
 
+# A precondition this suite cannot run without. NEVER a skip: a skipped
+# suite is a GREEN run that executed no assertion at all, which is the one
+# outcome worse than a red one here.
+abort() { printf 'producer-tier-e2e FATAL: %s\n' "$1" >&2; exit 1; }
+
+realpath_of() {
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
 if [[ ! -x "$WATCHER" ]]; then
-    printf 'SKIP: claude-event-watch not found at %s\n' "$WATCHER"
-    exit 0
+    abort "claude-event-watch not found at $WATCHER (it is tracked in this
+repo, so a missing file is a broken tree, not a reason to skip)."
 fi
+
+# --- dependency preflight -------------------------------------------------
+# claude-event-watch hard-exits 1 ("inotifywait not found") BEFORE it drains
+# anything. Without this check that exit is invisible: `drain` would return
+# with the queue untouched, every state assertion below would fail, and the
+# single assertion that checks for ABSENCE (signal stays excluded) would pass
+# VACUOUSLY -- an 11-fail/1-pass shape that looks like a broken precedence
+# ladder and is actually a missing package. That is exactly how this suite
+# first failed in CI, on a runner image that ships no inotify-tools.
+command -v inotifywait >/dev/null 2>&1 || abort \
+"inotifywait not found, so claude-event-watch cannot drain the queue and
+every case below would fail for a reason unrelated to classification.
+Install it (Debian/Ubuntu: apt-get install -y inotify-tools) and re-run."
 
 SBX="$(mktemp -d)"
 trap 'rm -rf "$SBX"' EXIT
@@ -60,6 +87,27 @@ export CLAUDE_EVENT_WATCH_AUTO_INGEST=1
 export CLAUDE_EVENT_WATCH_MODE=exit
 export EVENT_CLASSIFY_OVERRIDES="$SBX/tier-overrides.json"   # absent by default
 
+# --- provenance guard -----------------------------------------------------
+# The symlinks above are only a claim; this is the proof. Both CLIs are
+# resolved through PATH by their real callers -- claude-event-watch does
+# `command -v event-ack`, and event-ack does `shutil.which("event-classify")`
+# -- so on a host with an older deployed copy the suite would happily
+# validate THAT instead of this working tree, and a green run would prove
+# nothing about the change under test. Worse, both callers degrade SILENTLY
+# when their lookup misses (the watcher treats an unresolvable event-ack as
+# a no-op auto-ingest; event-ack falls back to an inline classifier), so the
+# mis-resolution never announces itself. Assert the resolution instead.
+for _tool in event-ack event-classify; do
+    _got="$(command -v "$_tool" 2>/dev/null || true)"
+    [[ -n "$_got" ]] || abort "$_tool does not resolve on the sandbox PATH"
+    _got="$(realpath_of "$_got")"
+    _want="$(realpath_of "$TOOLS/$_tool")"
+    [[ "$_got" == "$_want" ]] || abort \
+"$_tool resolves to $_got, not this tree's $_want -- the suite would be
+validating an installed copy rather than the code under test."
+done
+printf 'under test: %s\n' "$WATCHER" "$TOOLS/event-ack" "$TOOLS/event-classify"
+
 # Drop one event file into the queue. $1 source, $2 tag, $3 message,
 # $4 (optional) raw JSON object for `data`.
 emit() {
@@ -73,8 +121,23 @@ EOF
 }
 
 # Drain the queue through the REAL watcher (debounce 0 = no batching wait).
+#
+# The watcher's exit status is CHECKED, not discarded. A drain that failed
+# leaves the state files untouched, which downstream reads as "the classifier
+# routed it wrong" -- the assertion fires on the symptom and names the wrong
+# culprit. Anything non-zero here is an environment/harness fault, so abort
+# the whole suite with the watcher's own output rather than emitting a wall
+# of misleading FAILs.
 drain() {
-    timeout 60 "$WATCHER" --debounce 0 --mode exit >/dev/null 2>&1
+    local out rc
+    out="$(timeout 60 "$WATCHER" --debounce 0 --mode exit 2>&1)"
+    rc=$?
+    (( rc == 0 )) && return 0
+    printf 'producer-tier-e2e FATAL: claude-event-watch exited rc=%d; the queue\n' "$rc" >&2
+    printf '  was never drained, so no assertion below would mean anything.\n' >&2
+    printf '  watcher output:\n' >&2
+    printf '%s\n' "$out" | sed 's/^/  | /' >&2
+    exit 1
 }
 
 reset_state() { rm -f "$STATE"/*.json; }

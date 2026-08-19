@@ -207,6 +207,38 @@ jobs:
       - name: Run agent-tail embedded test suite
         run: make test-agent-tail
 
+      - name: Install inotify-tools (for every suite that drives claude-event-watch)
+        # The ONLY apt install left in CI — inotify-tools is genuinely absent
+        # from the runner image (unlike tmux, whose step is gone entirely).
+        #
+        # PLACEMENT IS LOAD-BEARING: this must precede EVERY step that runs
+        # the real claude-event-watch, not just `test-watchers`. It used to sit
+        # ~45 lines further down, which was fine until `test-event-must-act`
+        # grew an end-to-end suite that also drives the watcher. Without
+        # inotifywait the watcher hard-exits before draining anything, so that
+        # suite's queue stayed full and 11 of its 12 cases failed on state that
+        # was never written — a missing package wearing a classifier bug's
+        # costume. New watcher-driven suites go AFTER this step.
+        #
+        # This step is where the wedge was captured in full: apt cycling
+        # `Ign:` on the runner's azure.archive.ubuntu.com mirror, falling
+        # back to archive.ubuntu.com, and timing out part-way through the
+        # index refresh — three attempts in a row, all against the same dead
+        # mirror. So scripts/ci-apt-install.sh now (a) installs straight from
+        # the image's pre-baked package lists and only runs `apt-get update`
+        # if that fails, and (b) drops the stalling mirror from the runner's
+        # mirrorlist before any retry, so a retry actually goes somewhere new.
+        #
+        # `timeout-minutes: 5` STAYS as the outer backstop. Before it existed
+        # these hangs ran to the implicit 360-minute job ceiling, so a larger
+        # bound buys longer failures, not passes — and without it a
+        # restructured step would silently revert to that ceiling. But a cap
+        # alone only converts the hang into a failed job, because the first
+        # wedged attempt consumes the whole budget and nothing retries. The
+        # script's inner bound is what leaves the retry room to succeed.
+        run: scripts/ci-apt-install.sh inotify-tools
+        timeout-minutes: 5
+
       - name: Run event-must-act toolchain tests
         run: make test-event-must-act
 
@@ -251,29 +283,6 @@ jobs:
 
       - name: Run ttyd lock-toggle tests
         run: make test-ttyd-lock-toggle
-
-      - name: Install inotify-tools (for claude-event-watch tests)
-        # The ONLY apt install left in CI — inotify-tools is genuinely absent
-        # from the runner image (unlike tmux, whose step is gone entirely).
-        #
-        # This step is where the wedge was captured in full: apt cycling
-        # `Ign:` on the runner's azure.archive.ubuntu.com mirror, falling
-        # back to archive.ubuntu.com, and timing out part-way through the
-        # index refresh — three attempts in a row, all against the same dead
-        # mirror. So scripts/ci-apt-install.sh now (a) installs straight from
-        # the image's pre-baked package lists and only runs `apt-get update`
-        # if that fails, and (b) drops the stalling mirror from the runner's
-        # mirrorlist before any retry, so a retry actually goes somewhere new.
-        #
-        # `timeout-minutes: 5` STAYS as the outer backstop. Before it existed
-        # these hangs ran to the implicit 360-minute job ceiling, so a larger
-        # bound buys longer failures, not passes — and without it a
-        # restructured step would silently revert to that ceiling. But a cap
-        # alone only converts the hang into a failed job, because the first
-        # wedged attempt consumes the whole budget and nothing retries. The
-        # script's inner bound is what leaves the retry room to succeed.
-        run: scripts/ci-apt-install.sh inotify-tools
-        timeout-minutes: 5
 
       - name: Run watcher tests (self-clear/self-login + claude-event-watch debounce)
         run: make test-watchers
