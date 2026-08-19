@@ -103,8 +103,16 @@ for i in $(seq 1 60); do
     # break on all-green, exit 1 on any FAILURE conclusion
     sleep 30
 done
-gh pr merge <PR#> --squash --delete-branch
+pr-branches merge <PR#>
 ```
+
+Use `pr-branches merge` rather than `gh pr merge --squash --delete-branch`
+directly. `gh` performs the remote-branch deletion and the local branch
+cleanup in one step, and the local half fails when the branch is still checked
+out in a worktree -- aborting *before* the remote ref is deleted, so the branch
+survives while the non-zero exit reads like a cosmetic local-cleanup nit.
+`pr-branches merge` re-reads the PR afterwards and deletes the ref explicitly
+if that happened. See `tools/pr-branches/README.md`.
 
 Run that loop with `run_in_background: true` so the agent blocks in a
 normal tool-call wait state (not a Monitor-event-driven async state).

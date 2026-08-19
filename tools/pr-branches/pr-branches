@@ -1,0 +1,575 @@
+#!/usr/bin/python3
+"""
+pr-branches: PR branch lifecycle tooling -- keep the remote free of branches
+whose pull request has already been merged, and make the merge path prove it.
+
+Two subcommands, one problem:
+
+  merge <PR#>   Merge a PR and then ASSERT the remote branch is actually gone,
+                deleting it explicitly if the merge tool bailed out early.
+  sweep         Classify every remote branch by the state of its pull request
+                and delete only the ones whose PR is merged. Dry-run default.
+
+Why this exists
+---------------
+`gh pr merge --squash --delete-branch` performs the remote-branch deletion and
+the LOCAL branch cleanup in one step, and the local half can fail -- most
+commonly because the branch is still checked out in a git worktree. When that
+happens `gh` exits non-zero and the abort happens BEFORE the remote ref is
+deleted, so the remote branch survives while the failure reads like a cosmetic
+local-cleanup nit. Repeat that a few hundred times and the remote accumulates
+hundreds of dead branches.
+
+`merge` closes that hole at the source: it re-reads the PR state after the
+merge attempt and, if the PR really did merge but the branch ref is still
+there, deletes the ref and re-verifies it is gone. `sweep` cleans up whatever
+backlog accrued before the assertion existed.
+
+Safety rules that are not negotiable
+------------------------------------
+* A branch is deleted ONLY when a pull request exists for it AND that pull
+  request's state is MERGED. No PR, open, draft, or closed-without-merging all
+  mean KEEP -- an unmerged branch may be the only copy of someone's work.
+* PR state is the authority for "is it merged?", never git ancestry.
+  `git merge-base --is-ancestor` answers that question WRONG for squash merges:
+  a squash replays the branch as a single new commit, so the branch's own
+  commits never become ancestors of the base and EVERY squash-merged branch
+  reports "not merged". A tool built on ancestry either keeps everything or,
+  with the sense inverted, deletes live work.
+* Ancestry is used for one different and much narrower job: proving a branch
+  holds nothing that would be lost. It is consulted only for branches the API
+  has already reported MERGED, so it refines the delete set and can never
+  promote a branch that PR state did not clear. An unknown answer keeps.
+* The remote branch tip must still match the merged PR's head commit, or else
+  be an ancestor of the base branch. If someone pushed commits the base branch
+  does not contain, that is potentially unmerged work and the branch is kept.
+* The default branch is never touched, and nothing here force-pushes.
+* Branches checked out in a local git worktree are skipped -- that is the exact
+  condition that made the merge tool bail in the first place.
+* Every delete candidate is re-verified against the API individually,
+  immediately before its ref is deleted. The bulk PR listing only nominates;
+  the per-branch check decides.
+
+Usage:
+    pr-branches sweep [--pattern GLOB]... [--delete] [--json]
+    pr-branches merge <PR#> [--squash|--rebase|--strategy S] [--dry-run]
+    pr-branches verify <PR#> [--delete]
+
+Exit codes:
+    0  success (dry runs included)
+    1  operation failed (merge did not land, ref deletion failed, ...)
+    2  usage / environment error
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import subprocess
+import sys
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Classification vocabulary. Exactly one bucket is deletable.
+# ---------------------------------------------------------------------------
+
+DELETABLE = {"merged", "merged-contained"}
+
+REASONS = {
+    "merged": "PR merged and branch tip still matches the merged head",
+    "merged-contained": "PR merged; tip moved but is an ancestor of the base branch, so it holds no commit the base lacks",
+    "no-pr": "no pull request was ever opened for this branch",
+    "open": "pull request is still open",
+    "draft": "pull request is an open draft",
+    "closed-unmerged": "pull request was closed without merging",
+    "sha-mismatch": "PR merged but the tip has commits the base branch does not contain",
+    "worktree": "branch is checked out in a local git worktree",
+    "default-branch": "this is the repository default branch",
+}
+
+
+class Fail(Exception):
+    """Fatal, user-facing error."""
+
+
+# ---------------------------------------------------------------------------
+# Process helpers
+# ---------------------------------------------------------------------------
+
+
+def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise Fail(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr.strip()}")
+    return proc
+
+
+def gh_json(args: list[str]) -> Any:
+    proc = run(["gh", *args])
+    try:
+        return json.loads(proc.stdout or "null")
+    except json.JSONDecodeError as exc:
+        raise Fail(f"could not parse gh output as JSON: {exc}\n{proc.stdout[:500]}")
+
+
+# ---------------------------------------------------------------------------
+# Repository facts
+# ---------------------------------------------------------------------------
+
+
+def repo_slug(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    data = gh_json(["repo", "view", "--json", "nameWithOwner"])
+    slug = (data or {}).get("nameWithOwner")
+    if not slug:
+        raise Fail("could not determine the repository; pass --repo OWNER/REPO")
+    return slug
+
+
+def default_branch(slug: str) -> str:
+    # `gh repo view` takes the repo as a positional, not behind --repo.
+    data = gh_json(["repo", "view", slug, "--json", "defaultBranchRef"])
+    name = ((data or {}).get("defaultBranchRef") or {}).get("name")
+    if not name:
+        raise Fail("could not determine the default branch")
+    return name
+
+
+def remote_branches(remote: str) -> dict[str, str]:
+    """Map remote branch name -> tip SHA."""
+    proc = run(["git", "ls-remote", "--heads", remote])
+    out: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[1].startswith("refs/heads/"):
+            continue
+        out[parts[1][len("refs/heads/"):]] = parts[0]
+    return out
+
+
+def worktree_branches() -> set[str]:
+    """Local branch names currently checked out in any worktree of this repo."""
+    proc = run(["git", "worktree", "list", "--porcelain"], check=False)
+    names: set[str] = set()
+    for line in proc.stdout.splitlines():
+        if line.startswith("branch refs/heads/"):
+            names.add(line[len("branch refs/heads/"):].strip())
+    return names
+
+
+def all_prs(slug: str, limit: int) -> list[dict]:
+    return gh_json(
+        [
+            "pr", "list", "--repo", slug, "--state", "all", "--limit", str(limit),
+            "--json", "number,headRefName,headRefOid,state,isDraft,mergedAt,url,title",
+        ]
+    ) or []
+
+
+def pr_view(slug: str, number: int) -> dict:
+    return gh_json(
+        [
+            "pr", "view", str(number), "--repo", slug,
+            "--json", "number,headRefName,headRefOid,state,isDraft,url,title",
+        ]
+    ) or {}
+
+
+def ref_exists(slug: str, branch: str) -> bool:
+    """True if refs/heads/<branch> still exists on the remote."""
+    proc = run(["gh", "api", f"repos/{slug}/git/ref/heads/{branch}"], check=False)
+    if proc.returncode == 0:
+        return True
+    if "Not Found" in proc.stderr or "404" in proc.stderr:
+        return False
+    raise Fail(f"could not read refs/heads/{branch}: {proc.stderr.strip()}")
+
+
+def commits_not_in(slug: str, base: str, sha: str) -> int | None:
+    """How many commits are reachable from `sha` but not from `base`.
+
+    0 means `sha` is an ancestor of `base`: the branch holds nothing the base
+    branch does not already have, so deleting it cannot lose anything.
+
+    This is emphatically NOT the "is it merged?" test -- ancestry answers that
+    question WRONG for squash merges, because a squash replays the branch as a
+    single new commit and the branch's own commits never become ancestors of
+    the base. PR state is what proves a merge, and this count is only ever
+    consulted for branches whose PR the API has already reported as MERGED. It
+    can shrink the delete set (a non-zero count keeps a branch) and refine it,
+    but it can never promote a branch the PR state did not already clear.
+
+    Returns None when the comparison could not be made, which is treated as
+    "unknown" and therefore keeps the branch.
+    """
+    proc = run(["gh", "api", f"repos/{slug}/compare/{base}...{sha}", "--jq", ".ahead_by"], check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def remote_tip(slug: str, branch: str) -> str | None:
+    """Current SHA of refs/heads/<branch> on the remote, or None if it is gone."""
+    proc = run(["gh", "api", f"repos/{slug}/git/ref/heads/{branch}", "--jq", ".object.sha"], check=False)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def delete_ref(slug: str, branch: str) -> None:
+    proc = run(["gh", "api", "-X", "DELETE", f"repos/{slug}/git/refs/heads/{branch}"], check=False)
+    if proc.returncode != 0 and not (
+        "Not Found" in proc.stderr or "Reference does not exist" in proc.stderr
+    ):
+        raise Fail(f"failed to delete refs/heads/{branch}: {proc.stderr.strip()}")
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+
+
+def classify(
+    branches: dict[str, str],
+    prs: list[dict],
+    default: str,
+    worktrees: set[str],
+    slug: str | None = None,
+    containment: bool = False,
+) -> list[dict]:
+    """Bucket every remote branch. When a name has several PRs, the newest wins.
+
+    A reused branch name is the dangerous case: an old merged PR must never
+    authorize deleting the branch that a newer, unmerged PR is using.
+    """
+    by_branch: dict[str, list[dict]] = {}
+    for pr in prs:
+        by_branch.setdefault(pr["headRefName"], []).append(pr)
+    for prlist in by_branch.values():
+        prlist.sort(key=lambda p: p["number"], reverse=True)
+
+    rows: list[dict] = []
+    for name in sorted(branches):
+        sha = branches[name]
+        prlist = by_branch.get(name, [])
+        latest = prlist[0] if prlist else None
+        row = {
+            "branch": name,
+            "sha": sha,
+            "pr": latest["number"] if latest else None,
+            "pr_state": latest["state"] if latest else None,
+            "pr_url": latest["url"] if latest else None,
+            "pr_count": len(prlist),
+        }
+
+        # Order matters: the hard stops come first, so a branch that is both
+        # merged and checked out in a worktree reports as a worktree skip
+        # rather than being silently deleted.
+        if name == default:
+            row["category"] = "default-branch"
+        elif name in worktrees:
+            row["category"] = "worktree"
+        elif latest is None:
+            row["category"] = "no-pr"
+        elif latest["state"] == "OPEN":
+            row["category"] = "draft" if latest.get("isDraft") else "open"
+        elif latest["state"] == "CLOSED":
+            row["category"] = "closed-unmerged"
+        elif latest["state"] == "MERGED":
+            if latest["headRefOid"] == sha:
+                row["category"] = "merged"
+            elif not containment or slug is None:
+                row["category"] = "sha-mismatch"
+            else:
+                ahead = commits_not_in(slug, default, sha)
+                row["ahead_of_base"] = ahead
+                # None (comparison failed) is UNKNOWN, never "nothing there".
+                row["category"] = "merged-contained" if ahead == 0 else "sha-mismatch"
+        else:
+            # Unrecognised state from a future API: keep it, never guess.
+            row["category"] = "closed-unmerged"
+
+        row["reason"] = REASONS[row["category"]]
+        rows.append(row)
+    return rows
+
+
+def matches(name: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
+
+
+# ---------------------------------------------------------------------------
+# sweep
+# ---------------------------------------------------------------------------
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    slug = repo_slug(args.repo)
+    default = default_branch(slug)
+    branches = remote_branches(args.remote)
+    patterns = args.pattern or ["*"]
+    branches = {k: v for k, v in branches.items() if matches(k, patterns)}
+    if not branches:
+        print(f"No remote branches on {args.remote} match: {' '.join(patterns)}")
+        return 0
+
+    prs = all_prs(slug, args.pr_limit)
+    rows = classify(
+        branches, prs, default, worktree_branches(),
+        slug=slug, containment=not args.no_containment_check,
+    )
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["category"]] = counts.get(row["category"], 0) + 1
+    candidates = [r for r in rows if r["category"] in DELETABLE]
+    kept = [r for r in rows if r["category"] not in DELETABLE]
+
+    if args.json:
+        print(json.dumps({"repo": slug, "counts": counts, "branches": rows}, indent=2))
+    else:
+        mode = "DELETE" if args.delete else "DRY RUN (nothing will be deleted)"
+        print(f"pr-branches sweep -- {slug} -- {mode}")
+        print(f"patterns: {' '.join(patterns)}   remote branches matched: {len(rows)}")
+        print(f"pull requests consulted: {len(prs)}\n")
+        print("counts by category:")
+        for cat in sorted(counts, key=lambda c: (-counts[c], c)):
+            flag = "DELETE" if cat in DELETABLE else "keep  "
+            print(f"  {flag}  {cat:<17} {counts[cat]:>4}   {REASONS[cat]}")
+        print(f"\nKEPT branches ({len(kept)}):")
+        if not kept:
+            print("  (none)")
+        for row in sorted(kept, key=lambda r: (r["category"], r["branch"])):
+            pr = f"#{row['pr']}" if row["pr"] else "no PR"
+            extra = ""
+            if row.get("ahead_of_base") is not None:
+                extra = f" ({row['ahead_of_base']} commit(s) not in {default})"
+            print(f"  {row['category']:<17} {row['branch']:<52} {pr:<7} {row['reason']}{extra}")
+        print(f"\nDELETE candidates ({len(candidates)}):")
+        for row in sorted(candidates, key=lambda r: (r["category"], r["branch"])):
+            print(f"  {row['category']:<17} {row['branch']:<52} #{row['pr']} {row['pr_state']}")
+
+    if not args.delete:
+        # --json must stay machine-parseable, so the human epilogue is skipped.
+        if not args.json:
+            print(f"\nDry run: {len(candidates)} branch(es) would be deleted, {len(kept)} kept.")
+            print("Re-run with --delete to actually remove them.")
+        return 0
+
+    deleted, failed = 0, []
+    print()
+    for row in candidates:
+        branch, number = row["branch"], row["pr"]
+        # Per-branch re-verification at the moment of deletion. The bulk
+        # listing only nominates; this call is what authorizes the delete.
+        try:
+            live = pr_view(slug, number)
+        except Fail as exc:
+            failed.append((branch, f"re-verify failed: {exc}"))
+            continue
+        if live.get("state") != "MERGED":
+            failed.append((branch, f"re-verify: PR #{number} is {live.get('state')}, not MERGED"))
+            continue
+        if live.get("headRefName") != branch:
+            failed.append((branch, f"re-verify: PR #{number} head is {live.get('headRefName')}"))
+            continue
+        if row["category"] == "merged" and live.get("headRefOid") != row["sha"]:
+            failed.append((branch, "re-verify: branch tip moved since classification"))
+            continue
+        if row["category"] == "merged-contained":
+            # Re-prove containment against the live remote right before the
+            # delete, so a push landing between classification and now is
+            # caught rather than silently discarded.
+            tip = remote_tip(slug, branch)
+            if tip is None:
+                failed.append((branch, "re-verify: branch ref vanished"))
+                continue
+            ahead = commits_not_in(slug, default, tip)
+            if ahead != 0:
+                failed.append((branch, f"re-verify: tip now has {ahead} commit(s) not in {default}"))
+                continue
+        try:
+            delete_ref(slug, branch)
+        except Fail as exc:
+            failed.append((branch, str(exc)))
+            continue
+        deleted += 1
+        print(f"  deleted {branch} (PR #{number} MERGED)")
+
+    print(f"\nDeleted {deleted}, kept {len(kept)}, failed {len(failed)}.")
+    for branch, why in failed:
+        print(f"  FAILED {branch}: {why}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# merge -- the root-cause fix
+# ---------------------------------------------------------------------------
+
+
+def assert_branch_gone(slug: str, branch: str, number: int, dry_run: bool) -> int:
+    """Verify the branch ref is gone; delete it explicitly if it is not.
+
+    Only ever called once the PR has been confirmed MERGED.
+    """
+    if not ref_exists(slug, branch):
+        print(f"verified: refs/heads/{branch} is gone")
+        return 0
+    print(
+        f"remote branch {branch} still exists after the merge -- the merge tool "
+        f"aborted before deleting it. Deleting explicitly."
+    )
+    if dry_run:
+        print(f"[dry-run] would delete refs/heads/{branch}")
+        return 0
+    delete_ref(slug, branch)
+    if ref_exists(slug, branch):
+        print(f"ERROR: refs/heads/{branch} still present after delete", file=sys.stderr)
+        return 1
+    print(f"verified: refs/heads/{branch} deleted (PR #{number})")
+    return 0
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    slug = repo_slug(args.repo)
+    default = default_branch(slug)
+    pr = pr_view(slug, args.number)
+    branch = pr.get("headRefName")
+    if not branch:
+        raise Fail(f"could not resolve the head branch of PR #{args.number}")
+    if branch == default:
+        raise Fail(f"refusing to operate on the default branch ({default})")
+
+    if pr.get("state") == "MERGED":
+        print(f"PR #{args.number} is already merged; verifying the branch is gone.")
+        return assert_branch_gone(slug, branch, args.number, args.dry_run)
+
+    cmd = ["gh", "pr", "merge", str(args.number), "--repo", slug, f"--{args.strategy}"]
+    if not args.no_delete_branch:
+        cmd.append("--delete-branch")
+    if args.admin:
+        cmd.append("--admin")
+    if args.dry_run:
+        print(f"[dry-run] would run: {' '.join(cmd)}")
+        print(f"[dry-run] would then assert refs/heads/{branch} is gone")
+        return 0
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+
+    # The exit code is deliberately not trusted in either direction. Non-zero
+    # can mean "the merge landed but local cleanup failed", and zero is not by
+    # itself proof the remote ref went away. Re-read the PR and check the ref;
+    # that assertion is the whole point of this wrapper.
+    after = pr_view(slug, args.number)
+    if after.get("state") != "MERGED":
+        print(
+            f"ERROR: PR #{args.number} is {after.get('state')} after the merge attempt "
+            f"(gh exit {proc.returncode}). Not deleting anything.",
+            file=sys.stderr,
+        )
+        return 1
+    if proc.returncode != 0:
+        print(
+            f"note: gh exited {proc.returncode} but PR #{args.number} did merge -- "
+            f"this is the local-cleanup failure mode this wrapper exists for."
+        )
+    if args.no_delete_branch:
+        print(f"PR #{args.number} merged; --no-delete-branch given, leaving {branch} alone.")
+        return 0
+    return assert_branch_gone(slug, branch, args.number, args.dry_run)
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    slug = repo_slug(args.repo)
+    pr = pr_view(slug, args.number)
+    branch = pr.get("headRefName")
+    if not branch:
+        raise Fail(f"could not resolve the head branch of PR #{args.number}")
+    if pr.get("state") != "MERGED":
+        print(f"PR #{args.number} is {pr.get('state')}, not MERGED -- branch is kept.")
+        return 0
+    if not ref_exists(slug, branch):
+        print(f"clean: PR #{args.number} merged and refs/heads/{branch} is gone")
+        return 0
+    print(f"leaked: PR #{args.number} merged but refs/heads/{branch} still exists")
+    if not args.delete:
+        print("Re-run with --delete to remove it.")
+        return 0
+    return assert_branch_gone(slug, branch, args.number, dry_run=False)
+
+
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="pr-branches",
+        description="Delete remote branches whose PR is merged, and assert the merge path did it.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--repo", help="OWNER/REPO (default: the repo in the current directory)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sw = sub.add_parser("sweep", help="classify remote branches; delete only merged-PR ones")
+    sw.add_argument(
+        "--pattern", action="append",
+        help="glob of branch names to consider; repeatable (default: all branches)",
+    )
+    sw.add_argument("--remote", default="origin", help="git remote to read (default: origin)")
+    sw.add_argument(
+        "--delete", action="store_true",
+        help="actually delete the merged-PR branches (default: dry run)",
+    )
+    sw.add_argument("--json", action="store_true", help="emit the full classification as JSON")
+    sw.add_argument(
+        "--pr-limit", type=int, default=5000,
+        help="max pull requests to fetch (default: 5000)",
+    )
+    sw.add_argument(
+        "--no-containment-check", action="store_true",
+        help="skip the ancestor-of-base check; every merged branch whose tip "
+             "moved is then kept as sha-mismatch (fewer API calls, keeps more)",
+    )
+    sw.set_defaults(func=cmd_sweep)
+
+    mg = sub.add_parser("merge", help="merge a PR, then assert its remote branch is gone")
+    mg.add_argument("number", type=int, help="pull request number")
+    mg.add_argument(
+        "--strategy", choices=["squash", "merge", "rebase"], default="squash",
+        help="merge strategy (default: squash)",
+    )
+    mg.add_argument("--squash", dest="strategy", action="store_const", const="squash",
+                    help="alias for --strategy squash")
+    mg.add_argument("--rebase", dest="strategy", action="store_const", const="rebase",
+                    help="alias for --strategy rebase")
+    mg.add_argument("--admin", action="store_true", help="pass --admin through to gh pr merge")
+    mg.add_argument("--no-delete-branch", action="store_true",
+                    help="merge without deleting the branch (skips the assertion)")
+    mg.add_argument("-n", "--dry-run", action="store_true", help="show what would happen")
+    mg.set_defaults(func=cmd_merge)
+
+    vf = sub.add_parser("verify", help="check whether a merged PR's branch was really deleted")
+    vf.add_argument("number", type=int, help="pull request number")
+    vf.add_argument("--delete", action="store_true", help="delete the leaked branch if present")
+    vf.set_defaults(func=cmd_verify)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except Fail as exc:
+        print(f"pr-branches: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
