@@ -605,14 +605,29 @@
     <details id="section-blocked" class="queue-section" data-section-key="blocked">
       <summary class="section-summary"><h2 class="section-title">Blocked <span class="section-count">{{ totals.blocked }}</span></h2></summary>
       {% for it in blocked %}
+        {# CLICKABLE (botchat #2413). A blocked card carries the block
+           reason as a plain paragraph, and compact density elides
+           `.description` wholesale — so in compact the reason is invisible
+           and the only way to read it was to switch density modes. The card
+           now opens the detail modal in `meta` mode: no log stream (a
+           blocked item has no live agent and `session-task queue block`
+           never stamps `log_archive_path`, so there is nothing to tail),
+           just the blocker text plus the same scope / group / timestamp /
+           dependency rows every other status gets. Mode + markup MUST stay
+           in sync with renderBlockedItem() in static/refresh.js. #}
         <article
           id="queue-{{ it.id }}"
-          class="item state-blocked"
+          class="item state-blocked log-clickable"
           data-queue-id="{{ it.id }}"
           data-queue-status="blocked"
           data-created-by="{{ it.created_by }}"
           data-queue-summary="{{ it.summary }}"
-          data-queue-description="{{ it.description }}">
+          data-queue-description="{{ it.description }}"
+          data-log-mode="meta"
+          tabindex="0"
+          role="button"
+          aria-label="View details for {{ it.id }}, including the block reason"
+          title="Click to view item details + the full block reason.">
           <header class="item-head">
             <span class="badge state-blocked" title="parked on an external blocker; no live agent expected">blocked</span>
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
@@ -988,6 +1003,17 @@
            lifecycle. The agent-return <details> sits OUTSIDE this
            wrapper so the most-important "what did this agent do?" text
            stays visible even when metadata is collapsed. #}
+        {# BLOCK REASON (botchat #2413) — the headline datum for a blocked
+           item, so it sits ABOVE the Metadata disclosure and defaults to
+           OPEN. Real reasons run to several hundred words, so the body is
+           a <pre class="prompt-body">, which already caps at 40vh and
+           scrolls (see style.css) rather than overflowing the panel.
+           Hidden for every item with no block_reason, i.e. every status
+           other than blocked. #}
+        <details class="prompt-toggle log-modal-blocker" id="log-modal-blocker" hidden open>
+          <summary class="prompt-summary"><span id="log-modal-blocker-label">Block reason</span></summary>
+          <pre class="prompt-body" id="log-modal-blocker-body"></pre>
+        </details>
         <details class="prompt-toggle log-meta-toggle" id="log-meta-toggle" open>
           <summary class="prompt-summary"><span class="log-meta-toggle-label">Metadata</span></summary>
           <div class="log-meta-rows">

@@ -71,6 +71,13 @@
     usage:      document.getElementById('log-meta-usage'),
     abandon:    document.getElementById('log-meta-abandon'),
   };
+  // Block-reason disclosure (botchat #2413). Populated from the
+  // /api/queue/<id>/meta `block_reason` field; hidden for every item that
+  // has none. Sits ABOVE the metadata rows in the template because for a
+  // blocked item it IS the answer the viewer opened the modal for.
+  const blockerDetailsEl = document.getElementById('log-modal-blocker');
+  const blockerLabelEl = document.getElementById('log-modal-blocker-label');
+  const blockerBodyEl = document.getElementById('log-modal-blocker-body');
   const returnDetailsEl = document.getElementById('log-modal-return');
   const returnLabelEl = document.getElementById('log-modal-return-label');
   const returnBodyEl = document.getElementById('log-modal-return-body');
@@ -483,6 +490,14 @@
   function resetMetaSummary() {
     if (metaSummaryEl) metaSummaryEl.hidden = true;
     Object.keys(metaRowEls).forEach((k) => setMetaRow(k, ''));
+    // Tear down the block-reason disclosure so a slow meta fetch on the
+    // next open can't leave the PREVIOUS item's blocker text on screen.
+    if (blockerDetailsEl) {
+      blockerDetailsEl.hidden = true;
+      blockerDetailsEl.open = true;
+    }
+    if (blockerBodyEl) blockerBodyEl.textContent = '';
+    if (blockerLabelEl) blockerLabelEl.textContent = 'Block reason';
     if (returnDetailsEl) {
       returnDetailsEl.hidden = true;
       returnDetailsEl.open = true;
@@ -551,6 +566,7 @@
       setMetaRow('by', '');
       setMetaRow('usage', '');
       setMetaRow('abandon', '');
+      applyBlockReason('');
       metaSummaryEl.hidden = false;
       return;
     }
@@ -599,6 +615,11 @@
     if (meta.started_at) tsParts.push('started ' + fmtLocalIso(meta.started_at));
     if (meta.completed_at) tsParts.push('completed ' + fmtLocalIso(meta.completed_at));
     if (meta.abandoned_at) tsParts.push('abandoned ' + fmtLocalIso(meta.abandoned_at));
+    // `blocked_at` is stamped by `session-task queue block`. It is a
+    // distinct anchor from created/started (an item can sit pending for
+    // days before being parked), so it gets its own segment rather than
+    // being folded into one of the others.
+    if (meta.blocked_at) tsParts.push('blocked ' + fmtLocalIso(meta.blocked_at));
     setMetaRow('times', tsParts.length ? tsParts.join(' · ') : '');
 
     // scope chips
@@ -697,6 +718,14 @@
     // abandon reason (only set when the item was abandoned).
     setMetaRow('abandon', meta.abandon_reason || '');
 
+    // Block reason (only set when the item is blocked). Rendered as a
+    // default-open disclosure rather than a meta ROW because real reasons
+    // run to several hundred words — a row would blow out the key:value
+    // grid, whereas <pre class="prompt-body"> caps at 40vh and scrolls.
+    // Written via textContent so reason prose containing HTML-looking
+    // tokens is never interpreted.
+    applyBlockReason(meta.block_reason);
+
     // Captured script contents — only present for workload-bound
     // items whose command parsed as `<interpreter> <path>`. The
     // backend serves a `null` payload (or omits the key for older
@@ -707,6 +736,26 @@
     applyScriptCapture(meta.script_capture);
 
     metaSummaryEl.hidden = false;
+  }
+
+  // Show / hide the block-reason disclosure. Empty, missing, or
+  // whitespace-only reasons hide the section entirely (that is every
+  // non-blocked item, plus a blocked item parked with no reason text).
+  function applyBlockReason(reason) {
+    if (!blockerDetailsEl || !blockerBodyEl) return;
+    const text = (typeof reason === 'string') ? reason : '';
+    if (!text.trim()) {
+      blockerDetailsEl.hidden = true;
+      blockerBodyEl.textContent = '';
+      return;
+    }
+    blockerBodyEl.textContent = text;
+    if (blockerLabelEl) {
+      blockerLabelEl.textContent = 'Block reason (' + text.length + ' chars)';
+    }
+    blockerDetailsEl.hidden = false;
+    // Default OPEN — this is the datum the viewer clicked in to read.
+    blockerDetailsEl.open = true;
   }
 
   // Render the captured-script disclosure block from the meta payload.
@@ -1688,8 +1737,15 @@
     // 'subagent' uses /api/subagent/<subagent-id>/stream — tails a child
     //   subagent's JSONL directly (nested tree under a running card). Same
     //   wire envelope as 'live', just a different endpoint + meta source.
+    // 'meta' opens the SAME modal with NO stream at all — used by blocked
+    //   rows (botchat #2413), which have no live agent and no archived
+    //   transcript, but do have metadata (above all the block reason) that
+    //   compact density hides on the card.
     mode = (row.getAttribute('data-log-mode') || 'live').toLowerCase();
-    if (mode !== 'archive' && mode !== 'workload' && mode !== 'hostjob' && mode !== 'subagent') mode = 'live';
+    if (
+      mode !== 'archive' && mode !== 'workload' && mode !== 'hostjob' &&
+      mode !== 'subagent' && mode !== 'meta'
+    ) mode = 'live';
     // Subagent rows carry their own id distinct from the queue id; the
     // header + stream + meta key off it in subagent mode.
     subagentId = (mode === 'subagent')
@@ -1705,6 +1761,7 @@
       else if (mode === 'workload') modeLabelEl.textContent = 'Workload output';
       else if (mode === 'hostjob') modeLabelEl.textContent = 'Hostjob output';
       else if (mode === 'subagent') modeLabelEl.textContent = 'Subagent log';
+      else if (mode === 'meta') modeLabelEl.textContent = 'Item details';
       else modeLabelEl.textContent = 'Live log';
     }
     summaryEl.textContent = summary;
@@ -1750,18 +1807,26 @@
         'log-meta-line',
       );
     }
-    setStatus(pollingQid ? 'waiting for agent…' : 'connecting…', 'pending');
+    // 'meta' mode never opens a stream, so it must not claim to be
+    // connecting to one.
+    if (mode === 'meta') {
+      setStatus('details only', 'pending');
+    } else {
+      setStatus(pollingQid ? 'waiting for agent…' : 'connecting…', 'pending');
+    }
     // In live + workload modes auto-scroll defaults on (we want to see
     // new events as they arrive). In archive mode the file is finite —
     // start at the top and let the reader scroll naturally; auto-scroll
     // off so the initial view isn't yanked to the bottom.
-    autoscroll = mode !== 'archive';
+    autoscroll = mode !== 'archive' && mode !== 'meta';
     if (autoscrollBtn) {
       autoscrollBtn.setAttribute('aria-pressed', autoscroll ? 'true' : 'false');
       // Auto-scroll toggle is meaningless once a finite archive replay
       // completes, but we keep it interactive so the reader can re-arm
-      // bottom-tracking after manually scrolling around.
-      autoscrollBtn.hidden = false;
+      // bottom-tracking after manually scrolling around. In 'meta' mode
+      // there is no stream at all, so the control is hidden outright —
+      // same for the jump/expand buttons (CSS, keyed on data-mode).
+      autoscrollBtn.hidden = mode === 'meta';
     }
 
     // Populate the Prompt section. Hidden when there's nothing to show.
@@ -1793,7 +1858,11 @@
     modal.hidden = false;
     document.body.classList.add('modal-open');
 
-    connectEventSource(mode === 'subagent' ? subagentId : id);
+    // 'meta' mode is metadata-only: no EventSource, no reconnect ladder, no
+    // polling. The meta fetch above is the whole payload.
+    if (mode !== 'meta') {
+      connectEventSource(mode === 'subagent' ? subagentId : id);
+    }
 
     setTimeout(() => closeBtn && closeBtn.focus(), 0);
   }
@@ -2275,5 +2344,10 @@
     // applyScriptCapture() with a capture payload and assert the
     // <details> section toggles + body renders correctly.
     applyScriptCapture,
+    // Block-reason render hook (botchat #2413) — lets a jsdom test drive
+    // applyBlockReason() directly and assert the disclosure shows/hides
+    // and renders long reasons verbatim.
+    applyBlockReason,
+    getMode: () => mode,
   };
 })();

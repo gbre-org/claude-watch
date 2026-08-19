@@ -574,8 +574,17 @@
         '</details>';
     }
 
+    // CLICKABLE (botchat #2413): the card opens the detail modal in
+    // `meta` mode — no stream (a blocked item has no live agent and
+    // `session-task queue block` never stamps log_archive_path), just the
+    // full block reason plus the usual scope / group / timestamp / deps
+    // rows. Compact density elides the `.description` paragraph that
+    // carries the reason on the card, so without this the reason is
+    // unreadable without switching density modes. MUST mirror the BLOCKED
+    // block in templates/index.html — an affordance present only there is
+    // discarded by morphdom on the first 5s tick.
     return (
-      `<article id="queue-${attr(it.id)}" class="item state-blocked" data-queue-id="${attr(it.id)}" data-queue-status="blocked" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}">` +
+      `<article id="queue-${attr(it.id)}" class="item state-blocked log-clickable" data-queue-id="${attr(it.id)}" data-queue-status="blocked" data-created-by="${attr(it.created_by || '')}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-log-mode="meta" tabindex="0" role="button" aria-label="View details for ${attr(it.id)}, including the block reason" title="Click to view item details + the full block reason.">` +
       `<header class="item-head">${head}</header>` +
       `<p class="summary">${esc(it.summary)}</p>` +
       reasonHtml +

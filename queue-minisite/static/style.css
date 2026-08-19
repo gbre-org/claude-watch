@@ -1381,6 +1381,48 @@ body.modal-open { overflow: hidden; }
   font-size: 0.85rem;
 }
 
+/* BLOCK REASON (botchat #2413) — the headline datum for a blocked item.
+ * Same integrated-disclosure treatment as the agent-return block, with a
+ * warning-toned left rule so it reads as "this is why the item is parked"
+ * rather than as more metadata. Reasons routinely run to several hundred
+ * words, so the body SCROLLS (max-height + overflow) instead of growing
+ * the modal past the panel's 90vh cap and clipping the tail. */
+.log-modal-meta-summary .log-modal-blocker {
+  margin-top: 0;
+  border-top: none;
+  padding-top: 0;
+  padding-left: 8px;
+  border-left: 3px solid var(--pending);
+}
+
+.log-modal-meta-summary .log-modal-blocker > .prompt-summary {
+  color: var(--pending);
+  font-weight: 700;
+}
+
+.log-modal-meta-summary .log-modal-blocker .prompt-body {
+  max-height: 320px;
+  overflow: auto;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* DETAILS-ONLY MODE (data-mode="meta", botchat #2413). Blocked rows open
+ * the modal with no transcript to tail, so the stream pane and every
+ * stream-only control are hidden. With the flex:1 stream gone the panel
+ * itself becomes the scroll container, so a long block reason can never
+ * overflow past the 90vh cap. */
+.log-modal[data-mode="meta"] .log-stream,
+.log-modal[data-mode="meta"] .log-jump-btn,
+.log-modal[data-mode="meta"] #log-modal-expand {
+  display: none;
+}
+
+.log-modal[data-mode="meta"] .log-modal-panel {
+  overflow-y: auto;
+}
+
 .log-status {
   display: inline-block;
   padding: 2px 8px;
