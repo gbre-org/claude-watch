@@ -9,8 +9,16 @@ drifts.
 - **`claude-watch.json`** (uid `claude-watch`) — the daemon dashboard: status,
   heartbeat, context, watchers, hook reminders/fallbacks, interrupts, and
   token usage.
+- **`claude-events.json`** (uid `claude-events`) — the event bus: backlog
+  depth, oldest-unconsumed age, emission rate split by producer and by tag,
+  emitted-vs-consumed, and cumulative totals. Needs
+  `exporters/claude-events-exporter/`.
+- **`work-queue.json`** (uid `work-queue`) — the `session-task` work queue:
+  status and priority breakdowns, active groups, throughput, wait/run/total
+  latency quantiles, a run-duration heatmap, and a table of currently-running
+  items with elapsed time. Needs `exporters/work-queue-exporter/`.
 
-Validate with `jq empty monitoring/dashboards/claude-watch.json`.
+Validate with `jq empty monitoring/dashboards/*.json`.
 
 ## This is a source of record, NOT a mount target
 
