@@ -175,11 +175,19 @@ def _now() -> str:
 # --- Core operations ------------------------------------------------------
 
 def add_pending(state_dir: Path, key: str, source: str = "",
-                reset_counter: bool = True) -> dict:
+                reset_counter: bool = True, reason: str = "",
+                unclassified: bool = False) -> dict:
     """Add an entry to pending-actions.json. Reset the N-counter so
     a newly-arrived actionable event doesn't immediately tip a gate
     that was about to fire from a previous burst (each actionable
-    event gets a fresh N-call grace window)."""
+    event gets a fresh N-call grace window).
+
+    ``reason`` / ``unclassified`` carry the classifier's verdict onto the
+    stored entry. ``unclassified`` marks an event that matched NO rule AND
+    whose producer shipped no ``data.tier`` -- it landed here via the
+    fail-loud default. The gate renders that distinctly so a missing
+    classification reads as "add a rule / have the producer ship a tier"
+    rather than as mysterious gating (botchat #2483)."""
     added = False
     with _locked(state_dir, PENDING_FILE) as p:
         pending = p["data"].setdefault("pending", [])
@@ -187,6 +195,10 @@ def add_pending(state_dir: Path, key: str, source: str = "",
             entry = {"key": key, "added_at": _now()}
             if source:
                 entry["source_event"] = source
+            if reason:
+                entry["reason"] = reason
+            if unclassified:
+                entry["unclassified"] = True
             pending.append(entry)
             p["write"] = True
             added = True
@@ -280,14 +292,18 @@ def reset_counter(state_dir: Path) -> int:
 # --- Ambient queue --------------------------------------------------------
 
 def queue_ambient(state_dir: Path, source: str, tag: str,
-                  message: str, reason: str = "") -> dict:
+                  message: str, reason: str = "",
+                  unclassified: bool = False) -> dict:
     """Append an ambient event to the inject queue. No counter touch."""
     with _locked(state_dir, AMBIENT_FILE) as a:
         events = a["data"].setdefault("events", [])
-        events.append({
+        entry = {
             "source": source, "tag": tag, "message": message,
             "reason": reason, "queued_at": _now(),
-        })
+        }
+        if unclassified:
+            entry["unclassified"] = True
+        events.append(entry)
         a["write"] = True
         return {"queued": True, "depth": len(events)}
 
@@ -364,20 +380,23 @@ def ingest(state_dir: Path, source: str, tag: str,
     consumer-side table (see event-classify)."""
     cls = _classify(source, tag, message, shipped_tier)
     tier = cls.get("tier", "ambient")
+    reason = cls.get("reason", "")
+    unclassified = bool(cls.get("unclassified"))
     if tier == "excluded":
-        return {"routed": "excluded", "tier": tier,
-                "reason": cls.get("reason", "")}
+        return {"routed": "excluded", "tier": tier, "reason": reason,
+                "unclassified": unclassified}
     if tier == "actionable":
         key = f"{tag}:{(message or '')[:80]}"
-        add_pending(state_dir, key,
-                    source=f"{source}/{tag}", reset_counter=True)
+        add_pending(state_dir, key, source=f"{source}/{tag}",
+                    reset_counter=True, reason=reason,
+                    unclassified=unclassified)
         return {"routed": "pending", "tier": tier, "key": key,
-                "reason": cls.get("reason", "")}
+                "reason": reason, "unclassified": unclassified}
     # ambient (or unknown -> defaults to ambient)
-    queue_ambient(state_dir, source, tag, message,
-                  reason=cls.get("reason", ""))
-    return {"routed": "ambient", "tier": tier,
-            "reason": cls.get("reason", "")}
+    queue_ambient(state_dir, source, tag, message, reason=reason,
+                  unclassified=unclassified)
+    return {"routed": "ambient", "tier": tier, "reason": reason,
+            "unclassified": unclassified}
 
 
 # --- CLI ------------------------------------------------------------------
@@ -592,6 +611,18 @@ def _self_test() -> int:
     import tempfile
     failures: list[str] = []
 
+    # Pin classification to OUR sibling event-classify. `_classify` prefers
+    # `shutil.which("event-classify")`, which in a dev checkout resolves to
+    # the INSTALLED copy on PATH -- so without this the suite would validate
+    # whatever is deployed on the host rather than the code in this tree, and
+    # a green run would prove nothing about the change under test.
+    os.environ["PATH"] = (str(Path(__file__).resolve().parent)
+                          + os.pathsep + os.environ.get("PATH", ""))
+    # Also isolate from a real operator override file (rung 1 of the
+    # precedence ladder) so host config can't flip an expected tier.
+    os.environ["EVENT_CLASSIFY_OVERRIDES"] = str(
+        Path(tempfile.gettempdir()) / "event-ack-self-test-no-such-file")
+
     def fail(msg: str) -> None:
         failures.append(msg)
 
@@ -688,6 +719,41 @@ def _self_test() -> int:
         if snap["ambient_queued"] != ambient_before + 1:
             fail(f"unstamped unresolved-comment should be ambient: {snap}")
 
+        # 11c. UNCLASSIFIED propagation (botchat #2483). A pair with no rule
+        # and no producer-shipped tier still routes actionable (fail-loud,
+        # unchanged) but the entry is MARKED and carries the directive
+        # reason, so the gate can render "add a rule" instead of a mystery.
+        clear_pending(sd)
+        res = ingest(sd, "novel-source", "novel-tag", "something new")
+        if res["routed"] != "pending" or not res.get("unclassified"):
+            fail(f"unclassified ingest: {res}")
+        entry = list_state(sd)["pending"][0]
+        if not entry.get("unclassified"):
+            fail(f"unclassified flag not persisted on entry: {entry}")
+        if "data.tier" not in entry.get("reason", ""):
+            fail(f"directive reason not persisted: {entry}")
+
+        # A CLASSIFIED actionable event must NOT be marked (no false noise).
+        clear_pending(sd)
+        res = ingest(sd, "torrent", "torrent-completed", "done")
+        if res["routed"] != "pending" or res.get("unclassified"):
+            fail(f"classified event wrongly marked unclassified: {res}")
+        if list_state(sd)["pending"][0].get("unclassified"):
+            fail("classified entry carries an unclassified flag")
+
+        # 11d. pr-status-change: "CI success" is AMBIENT now (#2484/#2485),
+        # "CI failure" stays ACTIONABLE on the transition itself -- so a
+        # newly-red PR is actionable immediately, with no ambient window
+        # before the separate pr-ci-red nudge.
+        clear_pending(sd)
+        if ingest(sd, "cron", "pr-status-change",
+                  "PR o/r#642: CI success (was: pending)")["tier"] != "ambient":
+            fail("CI success should be ambient")
+        if ingest(sd, "cron", "pr-status-change",
+                  "PR o/r#642: CI failure (was: pending)")["tier"] \
+                != "actionable":
+            fail("CI failure must stay actionable")
+
         # 12. Drain ambient -> empties queue + returns events.
         events = drain_ambient(sd)
         snap = list_state(sd)
@@ -758,7 +824,8 @@ def _self_test() -> int:
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("OK: 17 cases pass.")
+    print("OK: 22 cases pass (incl. unclassified propagation, "
+          "CI-success ambient).")
     return 0
 
 

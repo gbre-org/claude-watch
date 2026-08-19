@@ -26,12 +26,20 @@ deployments use one copy:
 
 The claude-event model has three tiers — **ambient** (info-only context),
 **actionable** (demands a response), **excluded** (Signal, owned by its own
-ack-gate). The tier of a `source/tag` pair is DATA, in `event-classify`.
+ack-gate). **The producer owns its own classification**: an event source
+ships its tier in the event's `data.tier`, and that is not duplicated here.
 
-- **`event-classify`** — data-driven `source/tag → tier` classifier. Inspect
-  with `event-classify --list-rules`. Add a new event source = append a row.
-  `heartbeat-tick` is classified **actionable** here (refresh the heartbeat
-  file — see `heartbeat-ack` below).
+Precedence (highest first): `excluded` consumer policy (absolute, `signal/*`)
+→ **user override** (`~/.config/claude-events/tier-overrides.json`) →
+**producer-shipped `data.tier`** → `CLASSIFICATIONS` table (fallback) →
+fail-LOUD `actionable` default (marked `UNCLASSIFIED`). Details:
+[`docs/event-must-act.md`](../../docs/event-must-act.md).
+
+- **`event-classify`** — the classifier. Inspect every rung with
+  `event-classify --list-rules`. Adding a new event source: prefer stamping
+  `data.tier` in the PRODUCER; append a `CLASSIFICATIONS` row only when you
+  do not control the producer. `heartbeat-tick` is classified **actionable**
+  here (refresh the heartbeat file — see `heartbeat-ack` below).
 - **`event-ack`** — CLI managing the response surface:
   - `event-ack ingest --source S --tag T --message M` — classify + route an
     event into `pending-actions.json` (actionable) or `ambient-context.json`

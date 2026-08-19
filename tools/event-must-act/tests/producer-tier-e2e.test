@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# End-to-end test of the PRODUCER-shipped classification path.
+#
+# The design (botchat #2486-#2490): an event SOURCE ships its own tier
+# alongside the event, and that decision is NOT duplicated in claude-watch's
+# CLASSIFICATIONS table or in local config. The table is the FALLBACK for
+# producers that ship nothing, plus a user-override layer.
+#
+# The self-tests in event-classify / event-ack cover the classifier in
+# isolation. THIS test covers the thing they cannot: that the whole chain is
+# actually wired, from a JSON event file on disk through the real
+# `claude-event-watch` delivery path into pending/ambient state --
+#
+#     event file (data.tier)
+#       -> claude-event-watch  (reads data.tier, passes --tier)
+#       -> event-ack ingest    (passes shipped_tier)
+#       -> event-classify      (precedence ladder)
+#       -> pending-actions.json / ambient-context.json
+#
+# A unit test of classify() would pass even if the watcher never read
+# data.tier at all; that gap is exactly what this file closes.
+#
+# Fully sandboxed: its own queue dir, state dir, lock file and PATH, so it
+# never touches a live watcher or live event state.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+TOOLS="$(cd "$HERE/.." && pwd)"
+WATCHER="$(cd "$TOOLS/../watchers" && pwd)/claude-event-watch"
+
+fails=0
+pass() { printf '  ok   %s\n' "$1"; }
+fail() { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
+
+if [[ ! -x "$WATCHER" ]]; then
+    printf 'SKIP: claude-event-watch not found at %s\n' "$WATCHER"
+    exit 0
+fi
+
+SBX="$(mktemp -d)"
+trap 'rm -rf "$SBX"' EXIT
+QUEUE="$SBX/queue"; STATE="$SBX/state"; BIN="$SBX/bin"
+mkdir -p "$QUEUE" "$STATE" "$BIN"
+
+# Resolve event-ack / event-classify to THIS tree, not whatever is installed
+# on the host -- otherwise a green run would prove nothing about this change.
+ln -sf "$TOOLS/event-ack" "$BIN/event-ack"
+ln -sf "$TOOLS/event-classify" "$BIN/event-classify"
+
+export PATH="$BIN:$PATH"
+export CLAUDE_EVENT_QUEUE="$QUEUE"
+export CLAUDE_EVENT_STATE_DIR="$STATE"
+export CLAUDE_EVENT_WATCH_LOCK="$SBX/watch.lock"
+export CLAUDE_EVENT_WATCH_AUTO_INGEST=1
+export CLAUDE_EVENT_WATCH_MODE=exit
+export EVENT_CLASSIFY_OVERRIDES="$SBX/tier-overrides.json"   # absent by default
+
+# Drop one event file into the queue. $1 source, $2 tag, $3 message,
+# $4 (optional) raw JSON object for `data`.
+emit() {
+    local src="$1" tag="$2" msg="$3" data="${4:-{\}}"
+    local f
+    f="$QUEUE/$(date +%s%N)-$RANDOM.json"
+    cat > "$f" <<EOF
+{"source": "$src", "tag": "$tag", "message": "$msg",
+ "timestamp": "2026-08-19T00:00:00Z", "data": $data}
+EOF
+}
+
+# Drain the queue through the REAL watcher (debounce 0 = no batching wait).
+drain() {
+    timeout 60 "$WATCHER" --debounce 0 --mode exit >/dev/null 2>&1
+}
+
+reset_state() { rm -f "$STATE"/*.json; }
+
+# Is $1 present as a pending key substring?
+pending_has() {
+    python3 - "$STATE/pending-actions.json" "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(sys.argv[2] in i.get("key", "")
+                  for i in d.get("pending", [])) else 1)
+PY
+}
+
+ambient_has() {
+    python3 - "$STATE/ambient-context.json" "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(sys.argv[2] in e.get("message", "")
+                  for e in d.get("events", [])) else 1)
+PY
+}
+
+# Print a JSON field of the first pending entry matching $1.
+pending_field() {
+    python3 - "$STATE/pending-actions.json" "$1" "$2" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(""); sys.exit(0)
+for i in d.get("pending", []):
+    if sys.argv[2] in i.get("key", ""):
+        print(i.get(sys.argv[3], "")); sys.exit(0)
+print("")
+PY
+}
+
+echo "producer-tier-e2e:"
+
+# --- 1. PRODUCER-SHIPPED tier is honored end to end -----------------------
+# Real pr-watch nudge shape: it ships data.tier=actionable and has NO row in
+# CLASSIFICATIONS. Without the shipped-tier wiring it would fall through to
+# the ("cron","*") ambient catch-all and never arm the gate.
+reset_state
+emit cron pr-ci-red "PR o/r#637: CI still RED (failure) for 0.5h - renotify #2." \
+    '{"tier": "actionable", "ci_status": "failure", "renotify_count": "2"}'
+drain
+if pending_has "pr-ci-red"; then
+    pass "producer-shipped tier=actionable -> pending (no consumer row needed)"
+else
+    fail "producer-shipped tier=actionable did NOT reach pending"
+fi
+
+# The same tag with NO shipped tier must fall to the cron/* ambient catch-all
+# -- proving the routing above came from the PRODUCER, not a hidden rule.
+reset_state
+emit cron pr-ci-red "PR o/r#637: CI still RED (failure) - unstamped."
+drain
+if ambient_has "unstamped" && ! pending_has "pr-ci-red"; then
+    pass "same tag WITHOUT a shipped tier -> ambient (no pr-ci-red row exists)"
+else
+    fail "unstamped pr-ci-red should be ambient via cron/* catch-all"
+fi
+
+# --- 2. pr-status-change: CI success ambient, CI failure actionable -------
+# Verbatim producer wording (verified against live traffic).
+reset_state
+emit cron pr-status-change "PR o/r#642: CI success (was: pending)" \
+    '{"field": "ci_status", "old_value": "pending", "new_value": "success"}'
+drain
+if ambient_has "CI success" && ! pending_has "pr-status-change"; then
+    pass "pr-status-change CI success -> ambient (#2484/#2485)"
+else
+    fail "CI success should be ambient"
+fi
+
+reset_state
+emit cron pr-status-change "PR o/r#642: CI failure (was: pending)" \
+    '{"field": "ci_status", "old_value": "pending", "new_value": "failure"}'
+drain
+if pending_has "pr-status-change"; then
+    pass "pr-status-change CI failure -> actionable on the TRANSITION itself"
+else
+    fail "CI failure must stay actionable (no ambient window before the nudge)"
+fi
+
+reset_state
+emit cron pr-status-change "PR o/r#12: mergeable=conflicting (was: mergeable)"
+drain
+if pending_has "pr-status-change"; then
+    pass "pr-status-change mergeable=conflicting -> actionable (kept)"
+else
+    fail "merge CONFLICT must stay actionable"
+fi
+
+# --- 3. The 'add a rule' signal (#2483) -----------------------------------
+reset_state
+emit some-new-source brand-new-tag "a brand new kind of event"
+drain
+if pending_has "brand-new-tag"; then
+    pass "unmatched + unshipped -> still ACTIONABLE (fail-loud default kept)"
+else
+    fail "fail-loud default must remain actionable"
+fi
+if [[ "$(pending_field "brand-new-tag" unclassified)" == "True" ]]; then
+    pass "unmatched event is MARKED unclassified"
+else
+    fail "unclassified flag missing from the pending entry"
+fi
+reason="$(pending_field "brand-new-tag" reason)"
+if [[ "$reason" == *"data.tier"* && "$reason" == *"CLASSIFICATIONS"* \
+      && "$reason" == *"override"* ]]; then
+    pass "directive reason names all three fixes"
+else
+    fail "reason does not tell the operator how to fix it: $reason"
+fi
+
+# A classified event must NOT be marked (no false 'add a rule' noise).
+reset_state
+emit torrent torrent-completed "Some.Release.mkv"
+drain
+if pending_has "torrent-completed" \
+   && [[ "$(pending_field "torrent-completed" unclassified)" != "True" ]]; then
+    pass "classified actionable event is NOT marked unclassified"
+else
+    fail "classified event wrongly marked unclassified"
+fi
+
+# --- 4. USER OVERRIDE outranks the producer (#2490) -----------------------
+cat > "$EVENT_CLASSIFY_OVERRIDES" <<'JSON'
+{"overrides": [
+  {"source": "cron", "tag": "pr-ci-red", "tier": "ambient",
+   "reason": "operator watches PRs directly"}
+]}
+JSON
+reset_state
+emit cron pr-ci-red "PR o/r#637: CI still RED - overridden by operator." \
+    '{"tier": "actionable"}'
+drain
+if ambient_has "overridden by operator" && ! pending_has "pr-ci-red"; then
+    pass "user override BEATS the producer-shipped tier"
+else
+    fail "user override failed to outrank the producer"
+fi
+
+# An override must NOT be able to un-exclude signal (rung 0 is absolute).
+cat > "$EVENT_CLASSIFY_OVERRIDES" <<'JSON'
+{"overrides": [{"tag": "signal-*", "tier": "actionable"}]}
+JSON
+reset_state
+emit manual signal-dm-inbound "from alice"
+drain
+if ! pending_has "signal-dm-inbound" && ! ambient_has "from alice"; then
+    pass "override CANNOT un-exclude signal (excluded stays absolute)"
+else
+    fail "signal exclusion was breached by a user override"
+fi
+
+# A malformed override file is ignored wholesale (default-open): routing must
+# keep working rather than breaking on an operator typo.
+printf '{ not json' > "$EVENT_CLASSIFY_OVERRIDES"
+reset_state
+emit cron pr-ci-red "PR o/r#637: malformed override file present." \
+    '{"tier": "actionable"}'
+drain
+if pending_has "pr-ci-red"; then
+    pass "malformed override file is ignored; routing still works"
+else
+    fail "a bad override file broke routing (must be default-open)"
+fi
+
+rm -f "$EVENT_CLASSIFY_OVERRIDES"
+
+if (( fails > 0 )); then
+    printf 'FAIL: %d case(s)\n' "$fails"
+    exit 1
+fi
+echo "OK: producer-tier e2e passes."
