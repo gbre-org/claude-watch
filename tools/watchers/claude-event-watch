@@ -56,6 +56,25 @@
 #     Best-effort: a missing/failing event-ack CLI never breaks delivery.
 #   - Print the WATCHER EXITED restart banner at the end.
 #
+# DELIVERY MODE (--mode / runtime-toggleable, default unchanged):
+#   The block-print-EXIT shape above is `--mode exit`, the DEFAULT, and it is
+#   what a background-task launcher requires: such a launcher only hands the
+#   captured stdout back to the session when the process TERMINATES, so the
+#   exit is not a courtesy, it is the delivery event.
+#
+#   `--mode monitor` is the opt-in alternative for a LINE-STREAMING launcher
+#   (one that turns each stdout line into its own notification as it is
+#   written). There the process stays alive across batches: same block, same
+#   debounce, same drain, same one-liners — it simply does not exit, so the
+#   surrounding loop never has to spend a call restarting it.
+#
+#   The mode is resolved from (first hit wins): --mode flag, then
+#   $CLAUDE_EVENT_WATCH_MODE, then a one-word MODE FILE (default
+#   $CLAUDE_EVENT_LOG_DIR/mode), then "exit". Only the FILE is re-read at
+#   runtime, and it is re-read on every loop iteration — so flipping the mode
+#   needs no rebuild, no revert, and no session restart. See the MODE block
+#   further down for the full contract.
+#
 # The one-liner stdout shape is intentional — the main loop's bash-task view
 # stays small. Use `claude-event-tail` to inspect details.
 
@@ -93,7 +112,15 @@ export PYTHONUNBUFFERED=1
 # stdout is still the same non-tty pipe — the warning correctly stays silent.
 # In a tty launch the re-exec is skipped entirely, so we are in the original
 # process and the warning fires once.
-if [[ -t 1 ]]; then
+# Query-only invocations (--help, --print-mode, --mode-status) are legitimate
+# interactive uses that deliver nothing, so the warning would be pure noise.
+_cew_query_only=0
+for _cew_arg in "$@"; do
+    case "$_cew_arg" in
+        -h|--help|--print-mode|--mode-status) _cew_query_only=1 ;;
+    esac
+done
+if [[ -t 1 && $_cew_query_only -eq 0 ]]; then
     echo "claude-event-watch: WARNING — stdout is a tty; this watcher is meant to run as a run_in_background task (block-print-exit). Continuing, but the main loop won't receive this output." >&2
 fi
 
@@ -155,9 +182,68 @@ QUIET_SECONDS="${EVENT_WATCH_QUIET_SECONDS:-3}"
 # $EVENT_WATCH_MIN_INTERVAL_SECONDS.
 MIN_INTERVAL_SECONDS="${EVENT_WATCH_MIN_INTERVAL_SECONDS:-0}"
 
+# --- DELIVERY MODE --------------------------------------------------------
+# Two delivery shapes coexist in this one script. The default is UNCHANGED
+# from the historical behaviour, and switching between them is a RUNTIME
+# toggle: no rebuild, no code revert, no session restart, no manual kill.
+#
+#   exit     (DEFAULT) block-print-exit. Block, drain one batch, print it,
+#            print the restart banner, exit 0. Required by a background-task
+#            launcher, which only hands the captured stdout back to the
+#            session when the process TERMINATES — under that launcher the
+#            exit IS the delivery, not merely a prod to handle the batch.
+#
+#   monitor  Long-lived. Block, drain a batch, print it, and keep running.
+#            For a LINE-STREAMING launcher that turns each stdout line into a
+#            notification as it is written. Same drain, same one-liners, same
+#            debounce/throttle — the only difference is that the process does
+#            not terminate, so nothing has to spend a call restarting it.
+#
+# RESOLUTION ORDER (first hit wins):
+#   1. --mode exit|monitor           pins this process (NOT runtime-toggleable)
+#   2. $CLAUDE_EVENT_WATCH_MODE      pins this process (NOT runtime-toggleable)
+#   3. the MODE FILE, default $LOG_DIR/mode, override
+#      $CLAUDE_EVENT_WATCH_MODE_FILE                    <-- THE RUNTIME TOGGLE
+#   4. "exit"
+#
+# Only the mode FILE is re-read while running; it is re-read on every loop
+# iteration. That is what makes the toggle restart-free in BOTH directions:
+#   * monitor -> exit : the running monitor notices within one loop iteration
+#     (at most $INOTIFY_TIMEOUT, default 30s), writes its clean-exit marker,
+#     prints the restart banner and exits — i.e. it hands itself back to the
+#     block-print-exit cycle, which the surrounding loop already knows how to
+#     drive. Nothing has to be killed.
+#   * exit -> monitor : exit mode terminates after every batch anyway, so the
+#     next ordinary restart comes up in monitor mode.
+# `--mode`/env exist for tests and for pinning a single invocation; use the
+# FILE when you want to flip a live deployment.
+#
+# FAIL-SAFE: an unreadable or unrecognised mode-file value degrades to "exit"
+# (today's behaviour) with a warning. A typo can never silently blackhole
+# event delivery.
+#
+# Observe the resolved mode without touching the queue or the singleton lock:
+#   claude-event-watch --print-mode    # one word, for scripts
+#   claude-event-watch --mode-status   # configured + LIVE instance + pending
+MODE_FLAG=""
+MODE_FILE="${CLAUDE_EVENT_WATCH_MODE_FILE:-$LOG_DIR/mode}"
+
+# Silence-breaker cadence for monitor mode (seconds; 0 disables). In monitor
+# mode nothing exits, so "no output" is ambiguous between "no events happened",
+# "the loop wedged" and "the process was killed" — three states that are
+# indistinguishable from outside. Every $LIVENESS_INTERVAL seconds WITHOUT any
+# stdout the watcher emits one EVENT-WATCH ALIVE line, which turns a silence
+# into a positive statement. The timer is reset by real deliveries too, so a
+# busy period costs nothing extra; the line only ever appears during a lull.
+# (This covers the WEDGE case. Outright DEATH is additionally caught from
+# outside — see the LIVENESS note by the lockfile below.)
+LIVENESS_INTERVAL="${EVENT_WATCH_LIVENESS_INTERVAL:-900}"
+
 usage() {
     cat <<EOF
-Usage: claude-event-watch [--debounce SECONDS] [--quiet SECONDS] [--min-interval SECONDS] [-h|--help]
+Usage: claude-event-watch [--debounce SECONDS] [--quiet SECONDS] [--min-interval SECONDS]
+                          [--mode exit|monitor] [--liveness-interval SECONDS]
+                          [--print-mode] [--mode-status] [-h|--help]
 
 Block until a new claude-event arrives in \$CLAUDE_EVENT_QUEUE
 (default ~/claude-events/), batch any events that land in a short
@@ -185,6 +271,29 @@ Options:
                       --debounce (which settle a burst WITHIN one wake); this is
                       the minimum SPACING BETWEEN wakes. Also configurable via
                       \$EVENT_WATCH_MIN_INTERVAL_SECONDS.
+  --mode exit|monitor Delivery mode for THIS invocation (default: exit).
+                      exit    = block-print-exit; drain one batch, print the
+                                restart banner, exit 0. Required by a
+                                background-task launcher, which only delivers
+                                captured stdout when the process terminates.
+                      monitor = stay alive across batches, one stdout line per
+                                batch. For a line-streaming launcher only.
+                      Passing this flag PINS the mode for this process. Leave
+                      it off and write the word into the mode file instead to
+                      keep the runtime toggle live. Also settable (also pinned)
+                      via \$CLAUDE_EVENT_WATCH_MODE.
+  --liveness-interval SECONDS
+                      Monitor mode only (default: 900, 0 disables). After this
+                      many seconds with NO stdout, emit one
+                      \`EVENT-WATCH ALIVE …\` line so a silence can be told
+                      apart from a wedged loop. Reset by real deliveries, so it
+                      never fires during a busy period. Also settable via
+                      \$EVENT_WATCH_LIVENESS_INTERVAL.
+  --print-mode        Print the resolved mode (one word) and exit. Takes no
+                      lock and touches no event — safe while a watcher runs.
+  --mode-status       Print the resolved mode, where it came from, the live
+                      instance (if any) and the pending-event count, then exit.
+                      Also takes no lock.
   -h, --help          Show this help.
 
 The collect loop never drops, hides, acks, or reorders an event — it only
@@ -198,10 +307,27 @@ Output: one line per event, shape:
 Full event JSON appended to \$CLAUDE_EVENT_LOG_DIR/consumed.jsonl
 (default ~/.config/claude-events/, ring-buffered at
 \$CLAUDE_EVENT_LOG_MAX_LINES lines, default 10000).
+
+MODE FILE (the runtime toggle) — default \$CLAUDE_EVENT_LOG_DIR/mode,
+override \$CLAUDE_EVENT_WATCH_MODE_FILE. One word, \`exit\` or \`monitor\`;
+\`#\` comments and surrounding whitespace are ignored. It is re-read on every
+loop iteration, so flipping it needs no rebuild, no revert and no restart: a
+running monitor exits cleanly (with the usual restart banner) within one
+iteration of being switched back to \`exit\`, and an exit-mode watcher comes up
+in monitor mode on its next ordinary restart. An unreadable or unrecognised
+value falls back to \`exit\`.
+
+    echo monitor > "\$CLAUDE_EVENT_LOG_DIR/mode"   # on
+    echo exit    > "\$CLAUDE_EVENT_LOG_DIR/mode"   # off (default)
 EOF
 }
 
-# Parse CLI args. Keep it simple — only --debounce / --help.
+# Query-only mode: "print" (one word) or "status" (human block). Set by
+# --print-mode / --mode-status; handled after the lockfile path is resolved but
+# BEFORE the lock is taken, so either can be run while a watcher is live.
+MODE_QUERY=""
+
+# Parse CLI args.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --debounce)
@@ -240,6 +366,38 @@ while [[ $# -gt 0 ]]; do
             MIN_INTERVAL_SECONDS="${1#--min-interval=}"
             shift
             ;;
+        --mode)
+            if [[ $# -lt 2 ]]; then
+                echo "claude-event-watch: --mode requires a value" >&2
+                exit 2
+            fi
+            MODE_FLAG="$2"
+            shift 2
+            ;;
+        --mode=*)
+            MODE_FLAG="${1#--mode=}"
+            shift
+            ;;
+        --liveness-interval)
+            if [[ $# -lt 2 ]]; then
+                echo "claude-event-watch: --liveness-interval requires a value" >&2
+                exit 2
+            fi
+            LIVENESS_INTERVAL="$2"
+            shift 2
+            ;;
+        --liveness-interval=*)
+            LIVENESS_INTERVAL="${1#--liveness-interval=}"
+            shift
+            ;;
+        --print-mode)
+            MODE_QUERY="print"
+            shift
+            ;;
+        --mode-status)
+            MODE_QUERY="status"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -272,8 +430,123 @@ if ! [[ "$MIN_INTERVAL_SECONDS" =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
+# Validate LIVENESS_INTERVAL is a non-negative integer (0 = disabled).
+if ! [[ "$LIVENESS_INTERVAL" =~ ^[0-9]+$ ]]; then
+    echo "claude-event-watch: LIVENESS_INTERVAL must be a non-negative integer (got: $LIVENESS_INTERVAL)" >&2
+    exit 2
+fi
+
+# Validate an explicitly-passed --mode. (An out-of-range value in the mode
+# FILE or the env var degrades to "exit" with a warning instead of exiting —
+# see resolve_mode — because those are ambient config a live deployment reads,
+# and hard-failing there would take event delivery down over a typo. An
+# explicit flag is a direct instruction, so a bad one is an error.)
+if [[ -n "$MODE_FLAG" ]] && [[ "$MODE_FLAG" != "exit" && "$MODE_FLAG" != "monitor" ]]; then
+    echo "claude-event-watch: --mode must be 'exit' or 'monitor' (got: $MODE_FLAG)" >&2
+    exit 2
+fi
+
 mkdir -p "$QUEUE_DIR"
 mkdir -p "$LOG_DIR"
+
+# --- mode resolution ------------------------------------------------------
+# Sets MODE_RESOLVED + MODE_SOURCE from (in order) the --mode flag, the env
+# var, the mode file, then the "exit" default. Called once before the loop and
+# again on EVERY loop iteration, which is what makes the file a live toggle.
+# Pure read: never mutates the queue, the lock, or the mode file itself.
+MODE_RESOLVED=""
+MODE_SOURCE=""
+# Which one-time warning has already been printed, so a re-read every ~30s does
+# not spam the stream with the same line.
+_MODE_WARNED=""
+# Set once, before the loop, by monitor_launcher_is_block_print_exit.
+MONITOR_BLOCKED=0
+
+resolve_mode() {
+    local m src
+    if [[ -n "$MODE_FLAG" ]]; then
+        m="$MODE_FLAG"; src="flag"
+    elif [[ -n "${CLAUDE_EVENT_WATCH_MODE:-}" ]]; then
+        m="${CLAUDE_EVENT_WATCH_MODE}"; src="env:CLAUDE_EVENT_WATCH_MODE"
+    elif [[ -r "$MODE_FILE" ]]; then
+        m="$(sed -e 's/#.*//' "$MODE_FILE" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        src="file:$MODE_FILE"
+        if [[ -z "$m" ]]; then
+            m="exit"; src="default(empty $MODE_FILE)"
+        fi
+    else
+        m="exit"; src="default"
+    fi
+
+    case "$m" in
+        exit|monitor) ;;
+        *)
+            if [[ "$_MODE_WARNED" != "invalid:$m" ]]; then
+                echo "claude-event-watch: unrecognised mode '$m' from $src — falling back to 'exit' (the default block-print-exit behaviour)" >&2
+                _MODE_WARNED="invalid:$m"
+            fi
+            m="exit"; src="$src (invalid -> exit)"
+            ;;
+    esac
+
+    # A monitor that cannot stream is worse than no monitor: under a
+    # background-task launcher its stdout is buffered until the process exits,
+    # which it never does, so every batch would be drained off the queue and
+    # surfaced to nobody. Degrade to the default instead of blackholing.
+    if [[ "$m" == "monitor" && "$MONITOR_BLOCKED" == "1" ]]; then
+        if [[ "$_MODE_WARNED" != "supervised" ]]; then
+            echo "claude-event-watch: WARNING — monitor mode requested ($src) but this process was launched by a block-print-exit supervisor, whose launcher only delivers stdout when the process EXITS. A monitor under it would drain events and surface nothing, so staying in 'exit' mode. Launch monitor mode from a line-streaming launcher, or set CLAUDE_EVENT_WATCH_ALLOW_SUPERVISED_MONITOR=1 to override." >&2
+            _MODE_WARNED="supervised"
+        fi
+        m="exit"; src="$src (supervised -> exit)"
+    fi
+
+    MODE_RESOLVED="$m"
+    MODE_SOURCE="$src"
+}
+
+# True when an ancestor process is a `watcher-ctl run claude-event-watch`
+# supervisor — i.e. we were started by the block-print-exit launcher, whose
+# captured stdout is only delivered on process exit.
+#
+# Identity is decided by TWO facts together: the ancestor's /proc comm must be
+# a supervisor binary name AND its argv must be the `run <this watcher>` form.
+# The comm half is not decoration — matching on argv alone makes any ancestor
+# SHELL whose command line merely CONTAINS the phrase (a test harness, an
+# operator's one-liner, an editor task) look like a supervisor, which is a
+# false positive that would silently pin a legitimate monitor to exit mode.
+# This mirrors how the supervisor-process lookup identifies the same thing.
+#
+# Walks at most 5 levels (the supervisor may spawn through an intermediate
+# shell). On any system without /proc it simply never fires — permissive, since
+# the consequence of a miss is only that a misconfigured monitor is not caught
+# here; and the override env var short-circuits it entirely.
+SUPERVISOR_COMMS="watcher-ctl claude-watch"
+
+monitor_launcher_is_block_print_exit() {
+    [[ "${CLAUDE_EVENT_WATCH_ALLOW_SUPERVISED_MONITOR:-0}" == "1" ]] && return 1
+    local pid="${PPID:-0}" depth=0 cl comm next
+    while (( depth < 5 )); do
+        [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+        (( pid > 1 )) || return 1
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || return 1
+        if [[ " $SUPERVISOR_COMMS " == *" $comm "* ]]; then
+            cl="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+            if [[ "$cl" == *"run claude-event-watch"* ]]; then
+                return 0
+            fi
+        fi
+        next="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+        [[ -n "$next" ]] || return 1
+        pid="$next"
+        depth=$(( depth + 1 ))
+    done
+    return 1
+}
+
+if monitor_launcher_is_block_print_exit; then
+    MONITOR_BLOCKED=1
+fi
 
 # --- flock singleton guard ------------------------------------------------
 # Only ONE claude-event-watch may run at a time: two concurrent instances
@@ -340,6 +613,48 @@ if [[ -e "$LOCKFILE" && ! -O "$LOCKFILE" ]]; then
     echo "claude-event-watch: lockfile $LOCKFILE is not owned by this user — refusing to use it" >&2
     exit 1
 fi
+# Path of the ACTIVE-mode stamp: what the currently-running instance actually
+# resolved, as opposed to what the config now says. They differ for exactly one
+# iteration after a toggle, which is precisely the window where a human asking
+# "did the flip take?" needs to see both. Written by the running watcher;
+# advisory only, never read back by the delivery path.
+MODE_ACTIVE_FILE="$(dirname "$LOCKFILE")/claude-event-watch.mode-active"
+
+stamp_active_mode() {
+    printf '%s pid=%s epoch=%s source=%s\n' \
+        "$MODE_RESOLVED" "$$" "$(date +%s)" "$MODE_SOURCE" \
+        >"$MODE_ACTIVE_FILE" 2>/dev/null || true
+}
+
+# --- query-only invocations ----------------------------------------------
+# Handled HERE: after the lockfile PATH is resolved (so we can report on the
+# live instance) but BEFORE the lock is taken and before the fd is opened for
+# write (`exec 9>` truncates). Neither query blocks, drains, locks, nor
+# truncates anything, so both are safe to run against a live deployment.
+if [[ -n "$MODE_QUERY" ]]; then
+    resolve_mode
+    if [[ "$MODE_QUERY" == "print" ]]; then
+        printf '%s\n' "$MODE_RESOLVED"
+        exit 0
+    fi
+    live_pid="$(cat "$LOCKFILE" 2>/dev/null | tr -d '[:space:]')"
+    printf 'mode:       %s\n' "$MODE_RESOLVED"
+    printf 'source:     %s\n' "$MODE_SOURCE"
+    printf 'mode file:  %s%s\n' "$MODE_FILE" \
+        "$([[ -r "$MODE_FILE" ]] && echo "" || echo "  (absent -> default 'exit')")"
+    if [[ "$live_pid" =~ ^[0-9]+$ ]] && kill -0 "$live_pid" 2>/dev/null; then
+        printf 'live:       pid %s  [%s]\n' "$live_pid" \
+            "$(cat "$MODE_ACTIVE_FILE" 2>/dev/null | tr -d '\n' || echo "active mode unknown")"
+    else
+        printf 'live:       none (no watcher holding %s)\n' "$LOCKFILE"
+    fi
+    printf 'pending:    %s event(s) in %s\n' \
+        "$(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]')" \
+        "$QUEUE_DIR"
+    printf 'toggle:     echo monitor > %s   |   echo exit > %s\n' "$MODE_FILE" "$MODE_FILE"
+    exit 0
+fi
+
 if command -v flock >/dev/null 2>&1; then
     # Read any existing holder pid FIRST, before we open the fd for write —
     # opening with `9>` truncates the file, which would otherwise wipe the
@@ -359,6 +674,27 @@ if command -v flock >/dev/null 2>&1; then
     # We hold the lock. The truncating open already emptied the file; record
     # our pid so a refused second instance can name us. The fd stays open for
     # the lock's lifetime (auto-released on process death — no stale cleanup).
+    #
+    # LIVENESS — why this pid write is load-bearing for BOTH modes.
+    # The lockfile doubles as this watcher's liveness record: the supervision
+    # layer resolves a watcher's UP/DOWN by reading `<runtime-dir>/<name>.lock`
+    # (and `<name>.pid`) and checking that the recorded pid is a genuinely-live
+    # process whose /proc cmdline still identifies this watcher. That check is
+    # entirely MODE-INDEPENDENT — it inspects a pid, not an exit — so a
+    # monitor-mode instance is supervised by exactly the same machinery as a
+    # block-print-exit one, and its DEATH is detected from OUTSIDE without the
+    # watcher needing to announce anything. Two consequences worth stating
+    # plainly, because monitor mode's silence would otherwise be ambiguous:
+    #   * killed / crashed monitor -> recorded pid is dead -> DOWN, with no
+    #     clean-exit marker and (because the lockfile was written once at
+    #     startup, not per batch) no fresh runtime-file mtime to hold it in the
+    #     restart grace window. It reads as a genuine outage, which it is.
+    #   * WEDGED monitor (process alive, loop stuck) -> pid still live, so the
+    #     external check cannot see it. That case is covered from the INSIDE by
+    #     the EVENT-WATCH ALIVE silence-breaker (see LIVENESS_INTERVAL).
+    # Together they make "no output from the monitor" a statement rather than
+    # an unknown: silence with a live ALIVE cadence means idle; missing ALIVE
+    # lines mean wedged; a DOWN report means dead.
     printf '%s\n' "$$" >&9
 else
     # flock unavailable (e.g. macOS without util-linux). Degrade gracefully:
@@ -715,7 +1051,69 @@ fi
 INOTIFY_TIMEOUT="${EVENT_WATCH_INOTIFY_TIMEOUT:-30}"
 # Set by print_pending; initialised here so `set -u` never sees it unbound.
 DELIVERED_ANY=0
+
+# --- monitor-mode bookkeeping --------------------------------------------
+STARTED_AT="$(date +%s)"
+BATCHES_DELIVERED=0
+LAST_OUTPUT_AT="$STARTED_AT"
+LAST_DELIVERY_AT=0
+
+# Silence-breaker (monitor mode only). See LIVENESS_INTERVAL above for why a
+# silence has to be broken: a dead monitor, a wedged monitor and an idle
+# monitor are indistinguishable from the outside, so an idle one says so out
+# loud and the other two are then legible by the absence of this line.
+# Cheap by construction — the timer is reset by any stdout, so a busy watcher
+# never emits it, and it reports the pending count so a wedge (alive, but not
+# draining) is visible rather than merely inferable.
+maybe_emit_liveness() {
+    [[ "$MODE_RESOLVED" == "monitor" ]] || return 0
+    (( LIVENESS_INTERVAL > 0 )) || return 0
+    local now since_delivery
+    now="$(date +%s)"
+    (( now - LAST_OUTPUT_AT >= LIVENESS_INTERVAL )) || return 0
+    if (( LAST_DELIVERY_AT > 0 )); then
+        since_delivery="$(( now - LAST_DELIVERY_AT ))s"
+    else
+        since_delivery="never"
+    fi
+    echo "EVENT-WATCH ALIVE mode=monitor pid=$$ uptime=$(( now - STARTED_AT ))s batches=$BATCHES_DELIVERED since_delivery=$since_delivery pending=$(count_pending)"
+    LAST_OUTPUT_AT="$now"
+}
+
+resolve_mode
+stamp_active_mode
+if [[ "$MODE_RESOLVED" == "monitor" ]]; then
+    # A stale clean-exit marker from a PREVIOUS block-print-exit run must not
+    # be mistaken for this long-lived instance having exited cleanly. Clearing
+    # it here means the marker only ever describes a real exit of a real
+    # block-print-exit run.
+    rm -f "$CLEAN_EXIT_MARKER" 2>/dev/null || true
+    # Positive control at startup: one line proving the monitor came up, so an
+    # immediately-failing launch is distinguishable from a quiet queue.
+    echo "EVENT-WATCH MONITOR MODE ACTIVE pid=$$ queue=$QUEUE_DIR liveness=${LIVENESS_INTERVAL}s mode_file=$MODE_FILE source=$MODE_SOURCE"
+    LAST_OUTPUT_AT="$(date +%s)"
+fi
+
 while true; do
+    # Re-read the mode every iteration — THIS is the runtime toggle. Flipping
+    # the mode file to `exit` makes a running monitor hand itself back to the
+    # block-print-exit cycle at the next iteration, with the ordinary clean-
+    # exit marker + restart banner, so nothing has to be killed or restarted
+    # by hand. Flipping to `monitor` needs no action at all: exit mode
+    # terminates after every batch, and the next ordinary restart reads the
+    # new value.
+    prev_mode="$MODE_RESOLVED"
+    resolve_mode
+    if [[ "$MODE_RESOLVED" != "$prev_mode" ]]; then
+        stamp_active_mode
+        if [[ "$prev_mode" == "monitor" ]]; then
+            echo "EVENT-WATCH MODE CHANGED monitor -> $MODE_RESOLVED (source: $MODE_SOURCE) — exiting so the block-print-exit cycle resumes"
+            write_clean_exit_marker
+            print_restart_banner
+            exit 0
+        fi
+    fi
+
     # Catch-up: anything already pending (incl. a backlog that landed during
     # the main loop's read-act-restart gap, OR a gap-event from a prior
     # iteration's arm window) → coalesce the burst + drain + exit. We run the
@@ -735,7 +1133,21 @@ while true; do
         print_pending || true
         # Stamp the leading edge ONLY if we actually delivered >=1 event, so the
         # throttle window is measured from a real wake (not an empty drain).
-        (( DELIVERED_ANY )) && record_delivery
+        if (( DELIVERED_ANY )); then
+            record_delivery
+            BATCHES_DELIVERED=$(( BATCHES_DELIVERED + 1 ))
+            LAST_DELIVERY_AT="$(date +%s)"
+            LAST_OUTPUT_AT="$LAST_DELIVERY_AT"
+        fi
+        if [[ "$MODE_RESOLVED" == "monitor" ]]; then
+            # Monitor mode: the batch has already been written to stdout, which
+            # IS the delivery under a line-streaming launcher. Nothing to exit
+            # for — loop straight back to watching the queue. The drain above
+            # is the SAME print_pending call the exit path uses, so the
+            # no-consume contract is identical in both modes: events are
+            # surfaced and logged, never acked on the loop's behalf.
+            continue
+        fi
         # Mark THIS instance as a clean block-print-exit BEFORE announcing the
         # restart, so the daemon sees the marker the moment we exit (see
         # write_clean_exit_marker). Only the deliberate exit-0 delivery path
@@ -765,4 +1177,8 @@ while true; do
         print_restart_banner
         exit 1
     fi
+
+    # Break a monitor-mode silence if we have been quiet too long. No-op in
+    # exit mode (which cannot be silent for long — it exits on every batch).
+    maybe_emit_liveness
 done

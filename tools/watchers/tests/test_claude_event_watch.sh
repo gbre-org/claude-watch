@@ -14,6 +14,12 @@
 # here — that would require a tmux/timeout dance and is best left to the
 # live integration. The fast path + debounce loop is the bulk of the
 # script's logic and where the batching correctness lives.
+#
+# The delivery-mode section at the bottom additionally spawns a LIVE monitor-
+# mode watcher (which by definition does not exit on its own) and drives it
+# through a real batch, a second batch, a silence-breaker line, and finally the
+# runtime toggle that winds it back down. Every such instance is registered in
+# BG_PIDS and reaped by the EXIT trap, so nothing outlives the suite.
 
 set -euo pipefail
 
@@ -740,4 +746,181 @@ if command -v script >/dev/null 2>&1; then
 fi
 echo "  tty-misuse: warning string present + absent from piped runs OK"
 
-echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard)"
+# --- delivery mode (--mode / mode file) tests -----------------------------
+# Two delivery shapes coexist: the DEFAULT block-print-exit ("exit") and the
+# long-lived "monitor". The mode file is the RUNTIME toggle — re-read on every
+# loop iteration, so flipping it needs no rebuild, no revert and no restart.
+# These tests pin down (i) the default is unchanged, (ii) precedence, (iii)
+# fail-safe on bad input, (iv) monitor mode really does keep running and keep
+# delivering, (v) flipping the file back to exit makes a LIVE monitor exit on
+# its own with the usual clean-exit banner, and (vi) the silence-breaker.
+
+MQ="$TMP/mq"; MLOG="$TMP/mlog"; mkdir -p "$MQ" "$MLOG"
+MODEFILE="$MLOG/mode"
+
+# (o) Default is `exit` — no flag, no env, no mode file.
+mode_out=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" "$WATCHER" --print-mode 2>/dev/null)
+if [[ "$mode_out" != "exit" ]]; then
+    echo "FAIL: default mode is '$mode_out', expected 'exit' (the default MUST be unchanged)" >&2
+    exit 1
+fi
+echo "  mode: default is 'exit' (block-print-exit) OK"
+
+# (p) Precedence: mode file < env < flag.
+echo monitor >"$MODEFILE"
+m_file=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" "$WATCHER" --print-mode 2>/dev/null)
+m_env=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" \
+    CLAUDE_EVENT_WATCH_MODE=exit "$WATCHER" --print-mode 2>/dev/null)
+m_flag=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" \
+    CLAUDE_EVENT_WATCH_MODE=exit "$WATCHER" --mode monitor --print-mode 2>/dev/null)
+if [[ "$m_file" != "monitor" || "$m_env" != "exit" || "$m_flag" != "monitor" ]]; then
+    echo "FAIL: mode precedence wrong (file=$m_file env=$m_env flag=$m_flag; expected monitor/exit/monitor)" >&2
+    exit 1
+fi
+echo "  mode: precedence flag > env > file OK"
+
+# (q) Fail-safe: garbage in the mode file degrades to `exit` (with a warning)
+# rather than taking event delivery down over a typo. An explicit BAD --mode
+# flag, by contrast, is a direct instruction and is a hard error.
+printf 'moniter\n' >"$MODEFILE"
+bad_out=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" "$WATCHER" --print-mode 2>"$TMP/bad.err")
+if [[ "$bad_out" != "exit" ]]; then
+    echo "FAIL: invalid mode file resolved to '$bad_out', expected fail-safe 'exit'" >&2
+    exit 1
+fi
+grep -q 'unrecognised mode' "$TMP/bad.err" || {
+    echo "FAIL: invalid mode file produced no warning" >&2; cat "$TMP/bad.err" >&2; exit 1; }
+if CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" "$WATCHER" --mode bogus --print-mode >/dev/null 2>&1; then
+    echo "FAIL: --mode bogus should exit non-zero" >&2
+    exit 1
+fi
+echo "  mode: invalid file fails safe to 'exit'; invalid --mode flag is an error OK"
+
+# (r) --mode-status reports the resolved mode, its source and the toggle.
+echo monitor >"$MODEFILE"
+st_out=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" "$WATCHER" --mode-status 2>/dev/null)
+grep -q '^mode: *monitor' <<<"$st_out" || { echo "FAIL: --mode-status missing mode line" >&2; echo "$st_out" >&2; exit 1; }
+grep -q "$MODEFILE" <<<"$st_out" || { echo "FAIL: --mode-status does not name the mode file" >&2; echo "$st_out" >&2; exit 1; }
+echo "  mode: --mode-status shows resolved mode + source + toggle OK"
+
+# (s) Supervised-monitor guard: a monitor launched UNDER the block-print-exit
+# supervisor would drain events to a stdout nobody reads until it exits (which
+# it never does), so it degrades to `exit` with a warning. Identity requires
+# BOTH a supervisor comm and the `run <watcher>` argv — a plain shell whose
+# command line merely contains the phrase must NOT trip it.
+if [[ -d /proc/$$ ]]; then
+    ln -sf /bin/bash "$TMP/watcher-ctl"
+    # `; :` defeats bash's exec-optimisation so the fake supervisor survives as
+    # the watcher's parent instead of being replaced by it.
+    sup_out=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" \
+        "$TMP/watcher-ctl" -c '"$0" --print-mode; :' "$WATCHER" run claude-event-watch 2>/dev/null)
+    sup_ovr=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" \
+        CLAUDE_EVENT_WATCH_ALLOW_SUPERVISED_MONITOR=1 \
+        "$TMP/watcher-ctl" -c '"$0" --print-mode; :' "$WATCHER" run claude-event-watch 2>/dev/null)
+    plain_out=$(CLAUDE_EVENT_QUEUE="$MQ" CLAUDE_EVENT_LOG_DIR="$MLOG" \
+        bash -c '"$0" --print-mode; :' "$WATCHER" run claude-event-watch 2>/dev/null)
+    if [[ "$sup_out" != "exit" ]]; then
+        echo "FAIL: monitor under a block-print-exit supervisor resolved '$sup_out', expected 'exit'" >&2
+        exit 1
+    fi
+    if [[ "$sup_ovr" != "monitor" ]]; then
+        echo "FAIL: CLAUDE_EVENT_WATCH_ALLOW_SUPERVISED_MONITOR=1 did not override the guard (got '$sup_ovr')" >&2
+        exit 1
+    fi
+    if [[ "$plain_out" != "monitor" ]]; then
+        echo "FAIL: a plain shell ancestor tripped the supervisor guard (got '$plain_out') — false positive" >&2
+        exit 1
+    fi
+    echo "  mode: supervised-monitor guard fires on a real supervisor only OK"
+fi
+
+# (t)+(u)+(v) The live monitor: it delivers a batch WITHOUT exiting, delivers a
+# SECOND batch from the same process, breaks its own silence, and then — this
+# is the acceptance test for "toggle without a restart" — exits cleanly on its
+# own when the mode file is flipped back to `exit`, printing the same restart
+# banner the block-print-exit path prints.
+LIVE_Q="$TMP/liveq"; LIVE_LOG="$TMP/livelog"; mkdir -p "$LIVE_Q" "$LIVE_LOG"
+LIVE_MODEFILE="$LIVE_LOG/mode"
+LIVE_OUT="$TMP/live.out"
+echo monitor >"$LIVE_MODEFILE"
+write_event "$LIVE_Q" "100_m1.json" "monitor first"
+CLAUDE_EVENT_QUEUE="$LIVE_Q" CLAUDE_EVENT_LOG_DIR="$LIVE_LOG" \
+    CLAUDE_EVENT_WATCH_LOCK="$TMP/live.lock" \
+    EVENT_WATCH_INOTIFY_TIMEOUT=2 \
+    "$WATCHER" --debounce 2 --quiet 1 --liveness-interval 3 >"$LIVE_OUT" 2>&1 &
+LIVE_PID=$!
+BG_PIDS+=("$LIVE_PID")
+
+# Wait (bounded) for the first batch to appear.
+waited=0
+while ! grep -q 'monitor first' "$LIVE_OUT" 2>/dev/null; do
+    if (( waited >= 20 )); then
+        echo "FAIL: monitor mode never surfaced the first batch" >&2
+        cat "$LIVE_OUT" >&2; exit 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+done
+if ! kill -0 "$LIVE_PID" 2>/dev/null; then
+    echo "FAIL: monitor mode EXITED after its first batch (it must stay alive)" >&2
+    cat "$LIVE_OUT" >&2; exit 1
+fi
+if grep -q 'WATCHER EXITED' "$LIVE_OUT"; then
+    echo "FAIL: monitor mode printed the restart banner after a batch" >&2
+    cat "$LIVE_OUT" >&2; exit 1
+fi
+grep -q 'MONITOR MODE ACTIVE' "$LIVE_OUT" || {
+    echo "FAIL: monitor mode printed no startup line (no positive control)" >&2
+    cat "$LIVE_OUT" >&2; exit 1; }
+# No-consume contract holds in monitor mode too: the queue file is drained and
+# the consumed-log line is appended, exactly as in exit mode.
+if [[ -n "$(ls "$LIVE_Q" 2>/dev/null)" ]]; then
+    echo "FAIL: monitor mode did not drain the queue" >&2; exit 1
+fi
+grep -q 'monitor first' "$LIVE_LOG/consumed.jsonl" || {
+    echo "FAIL: monitor mode did not append to the consumed log" >&2; exit 1; }
+echo "  mode: monitor delivered a batch and stayed alive (no banner) OK"
+
+# Second batch from the SAME process — this is the whole point of the mode.
+write_event "$LIVE_Q" "200_m2.json" "monitor second"
+waited=0
+while ! grep -q 'monitor second' "$LIVE_OUT" 2>/dev/null; do
+    if (( waited >= 20 )); then
+        echo "FAIL: monitor mode did not deliver a SECOND batch without a restart" >&2
+        cat "$LIVE_OUT" >&2; exit 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+done
+echo "  mode: monitor delivered a second batch from the same process OK"
+
+# Silence-breaker: with --liveness-interval 3 a quiet monitor must say so.
+waited=0
+while ! grep -q 'EVENT-WATCH ALIVE' "$LIVE_OUT" 2>/dev/null; do
+    if (( waited >= 20 )); then
+        echo "FAIL: monitor mode emitted no EVENT-WATCH ALIVE line during a lull" >&2
+        cat "$LIVE_OUT" >&2; exit 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+done
+echo "  mode: silence-breaker emitted EVENT-WATCH ALIVE during a lull OK"
+
+# THE ACCEPTANCE TEST — flip the file back and the LIVE process winds itself
+# down: no kill, no restart command, no rebuild, no revert.
+echo exit >"$LIVE_MODEFILE"
+if ! reap_within "$LIVE_PID" 25; then
+    echo "FAIL: flipping the mode file to 'exit' did not stop the live monitor" >&2
+    cat "$LIVE_OUT" >&2; exit 1
+fi
+grep -q 'MODE CHANGED monitor -> exit' "$LIVE_OUT" || {
+    echo "FAIL: monitor did not announce the mode change" >&2; cat "$LIVE_OUT" >&2; exit 1; }
+grep -q 'WATCHER EXITED' "$LIVE_OUT" || {
+    echo "FAIL: monitor exited without the restart banner (the loop would not restart it)" >&2
+    cat "$LIVE_OUT" >&2; exit 1; }
+echo "  mode: mode-file flip made a LIVE monitor exit cleanly, no restart needed OK"
+
+# --help advertises the new surface.
+grep -q -- '--mode' <<<"$help_out" || { echo "FAIL: --help missing --mode" >&2; exit 1; }
+grep -q -- '--liveness-interval' <<<"$help_out" || { echo "FAIL: --help missing --liveness-interval" >&2; exit 1; }
+grep -q -- '--print-mode' <<<"$help_out" || { echo "FAIL: --help missing --print-mode" >&2; exit 1; }
+echo "  mode: --help documents --mode / --liveness-interval / --print-mode OK"
+
+echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard + delivery mode)"
