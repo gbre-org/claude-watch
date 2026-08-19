@@ -2784,12 +2784,35 @@ mod tests {
         );
 
         // Exactly one live poller for the sentinel.
-        let pollers = process_pids(&sentinel).await;
+        //
+        // `process_pids` is a bare `pgrep -f`, and the poller is a `/bin/sh`
+        // script whose FILENAME carries the sentinel. That shell forks a child
+        // to run its `sleep`, and between the fork() and the child's execve()
+        // the child still carries the PARENT's argv — so a `pgrep` that lands
+        // inside that window reports TWO pids for ONE poller. Measured at
+        // ~1-in-3000 on an idle box with a tight sampling loop; a loaded CI
+        // runner widens the window and it turns the job red for a reason that
+        // has nothing to do with the guard under test.
+        //
+        // Filter the poller's own descendants out before counting. This does
+        // not weaken the assertion: a genuine second instance is spawned by
+        // `watcher_run`, so it would be a child of THIS test process, never a
+        // child of the first poller.
+        let raw = process_pids(&sentinel).await;
+        let own_descendants = descendants_of(&[first_pid], &read_ppid_map());
+        let pollers: Vec<u32> = raw
+            .iter()
+            .copied()
+            .filter(|pid| !own_descendants.contains(pid))
+            .collect();
         assert_eq!(
             pollers.len(),
             1,
-            "only the first instance should be alive, got pids {:?}",
-            pollers
+            "only the first instance should be alive, got pids {:?} \
+             (raw pgrep matches {:?}, first poller's descendants {:?})",
+            pollers,
+            raw,
+            own_descendants
         );
 
         // Cleanup.

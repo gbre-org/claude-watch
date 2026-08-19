@@ -4752,7 +4752,7 @@ def api_queue_archive(qid: str) -> Any:
 #
 #   1. queue.json — authoritative for queue-state fields (status, scope,
 #      depends_on, timestamps, summary, description, abandon_reason,
-#      group_id, priority, created_by).
+#      block_reason, group_id, priority, created_by).
 #
 #   2. Parent-session JSONL (the harness writes a `queue-operation`
 #      record of type `enqueue` with a `<task-notification>` XML
@@ -5031,10 +5031,19 @@ def api_queue_meta(qid: str) -> Any:
         "priority": shaped["priority"],
         "created_by": shaped["created_by"],
         "abandon_reason": shaped["abandon_reason"],
+        # Operator-set free text from `session-task queue block <id>
+        # --reason ...`. Surfaced here so the detail modal can show WHY a
+        # blocked item is parked: the card paragraph that used to be its
+        # only home is elided wholesale by compact density, which made the
+        # reason invisible to anyone running compact (botchat #2413).
+        # Empty string for every non-blocked item -> the front-end hides
+        # the section.
+        "block_reason": shaped["block_reason"],
         "created_at": shaped["created_at_iso"],
         "started_at": shaped["started_at_iso"],
         "completed_at": shaped["completed_at_iso"],
         "abandoned_at": shaped["abandoned_at_iso"],
+        "blocked_at": shaped["blocked_at_iso"],
         "group_id": shaped["group_id"],
         "group_head": shaped["group_head"],
         "ready_now": shaped["ready_now"],
