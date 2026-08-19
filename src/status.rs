@@ -540,8 +540,22 @@ pub fn get_version_info() -> VersionInfo {
     }
 
     // Running version: iterate claude PIDs, take the first that resolves.
+    //
+    // Match on the FULL command line (`pgrep -af`), NOT the process name
+    // (`pgrep -a`, which matches `comm`). The claude-code NATIVE installer runs
+    // the inner claude as `~/.local/share/claude/versions/<X.Y.Z>`, so on those
+    // builds the process `comm` is the bare VERSION STRING (e.g. `2.1.235`), not
+    // `claude` — the documented native-installer gotcha that already broke pane
+    // detection (see `find_claude_pane` / `is_version_string_comm`). A
+    // comm-based `pgrep claude` MISSES that PID entirely (it matches only
+    // `claude-watch`, which never resolves to a running version), so `running`
+    // came back `None` and the version panel reported `current=unknown` while
+    // `latest`/`installed` (sourced from the versions-dir symlink) resolved
+    // fine. The binary PATH always contains `claude`
+    // (`.local/bin/claude` or `.local/share/claude/versions/...`), so a
+    // full-cmdline match finds the PID regardless of how it retitled its `comm`.
     if let Ok(output) = std::process::Command::new("pgrep")
-        .args(["-a", "claude"])
+        .args(["-af", "claude"])
         .output()
     {
         let stdout = String::from_utf8_lossy(&output.stdout);

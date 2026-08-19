@@ -593,8 +593,23 @@ fn write_prom(lines: &[String], path: &Path) -> std::io::Result<()> {
 /// avoids the recursive subprocess and config dependency entirely.
 fn fetch_version_info() -> (String, String) {
     let info = get_version_info();
-    let current = info.running.unwrap_or_else(|| "unknown".to_string());
-    let latest = info.installed.unwrap_or_else(|| "unknown".to_string());
+    // "latest" is the on-disk installed version (the versions-dir active
+    // symlink); it resolves independently of any running process.
+    let installed = info.installed;
+    // "current" is the running version. If it can't be resolved (transient
+    // startup race before the claude PID is up, or an unexpected comm/exe
+    // layout), fall back to the installed version — the versions-dir active
+    // symlink is what a freshly-(re)spawned native-install claude runs — rather
+    // than emitting the useless `unknown`. NOTE: this fallback lives HERE, at
+    // the metric layer, on purpose: `get_version_info().running` MUST stay a
+    // truthful Option for `hook_fire::handle_version_update`, whose
+    // running != installed check drives the restart nudge. Collapsing them in
+    // get_version_info would silence that nudge.
+    let current = info
+        .running
+        .or_else(|| installed.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let latest = installed.unwrap_or_else(|| "unknown".to_string());
     (current, latest)
 }
 
