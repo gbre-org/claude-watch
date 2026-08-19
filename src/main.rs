@@ -1761,12 +1761,26 @@ async fn run_inject(
         tmux::InjectOutcome::PromptDirty => (4, "prompt_dirty"),
     };
 
+    // `submitted` reports what ACTUALLY happened, not what was asked for. It
+    // used to echo the `--no-submit` request flag, so a REFUSED inject
+    // advertised `"submitted":true` next to `"status":"prompt_dirty"` — which
+    // reads as "it submitted anyway", i.e. exactly the bug this change exists
+    // to fix, wearing a nicer name. (A reviewer did read it that way.) Values
+    // for the three pre-existing statuses are unchanged — `typed` => false,
+    // `submitted` and `submit_unverified` => true, since both did press Enter
+    // — so only the new refusal, where Enter is never sent, flips to false.
+    // `status` remains the authoritative field.
+    let submitted = matches!(
+        outcome,
+        tmux::InjectOutcome::Submitted | tmux::InjectOutcome::SubmitUnverified
+    );
+
     if json {
         println!(
             "{{\"pane\":{},\"status\":\"{}\",\"submitted\":{},\"slash_command\":{},\"escape\":{}}}",
             serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
             status,
-            submit,
+            submitted,
             slash_command,
             escape
         );

@@ -145,9 +145,26 @@ tmux kill-session -t "$SESSION" 2>/dev/null
 # think "inject is safe now, delete the raw path" gets a failing test instead
 # of a login that silently authenticates with a corrupted code.
 #
-# Both failures below are silent by construction: inject reports
-# `status: submitted` either way, because its success check is "the payload
-# cleared from the prompt line" and a modal has no prompt line.
+# There are TWO independent reasons, and they are probed separately below
+# because they live at different stages of the choreography:
+#
+#   * The TYPING corrupts the payload (probe A, checks 4a-4c). inject's
+#     INSERT-mode probe `i` and the configured FleetView focus keys are typed
+#     into the modal ahead of the code. This is unchanged and is why the code
+#     must never be routed through inject's typing path.
+#
+#   * The SUBMIT now refuses outright (probe B, check 4d). Since the prompt
+#     line must hold our payload and nothing else before Enter, and a modal has
+#     no prompt line at all, inject can never satisfy that gate in a modal — it
+#     retracts and reports `prompt_dirty`.
+#
+# Probe A deliberately uses `--no-submit` and commits with a RAW tmux Enter.
+# That is not a workaround for the new gate, it is what isolates the typing
+# defects: `--no-submit` runs the identical type choreography (focus keys +
+# `i` probe) but stops before the submit gate, so the corrupted bytes actually
+# reach the fake's `read` and can be asserted on. Routing probe A through
+# `--submit` would now block at the gate and deliver an EMPTY file, which
+# would silently retire checks 4b and 4c rather than test them.
 # ---------------------------------------------------------------------------
 INJECT_HOME="$WORK/inject-probe-home"
 mkdir -p "$INJECT_HOME"
@@ -172,9 +189,16 @@ chmod +x "$WORK/fake-code-prompt.sh"
 tmux new-session -d -s "$SESSION" -x 80 -y 24 "$WORK/fake-code-prompt.sh"
 sleep 1.5
 
-INJECT_OUT="$(HOME="$INJECT_HOME" \
+# --- probe A: the TYPING corrupts the payload ---------------------------
+# `--no-submit` types the payload with the full choreography and stops short
+# of the submit gate; a raw tmux Enter then commits whatever landed, so the
+# fake's `read` observes exactly the bytes inject typed.
+HOME="$INJECT_HOME" \
   CLAUDE_WATCH_CONFIG="$WORK/inject-probe-config.toml" \
-  "$CW_BIN" inject --pane "$PANE" --submit "$PROBE_CODE" --json 2>"$WORK/inject-probe.err")"
+  "$CW_BIN" inject --pane "$PANE" --submit "$PROBE_CODE" --no-submit \
+  >/dev/null 2>"$WORK/inject-probe.err"
+sleep 1
+tmux send-keys -t "$PANE" Enter
 sleep 1.5
 PROBE_RECEIVED="$(cat "$WORK/inject-probe-received" 2>/dev/null)"
 
@@ -202,14 +226,53 @@ case "$PROBE_RECEIVED" in
   *) bad "expected the focus_main_keys sequence in the received code, got: $(printf '%s' "$PROBE_RECEIVED" | od -c | head -2)" ;;
 esac
 
-# --- 4d. and inject reports SUCCESS over the corrupted payload ---
+tmux kill-session -t "$SESSION" 2>/dev/null
+
+# --- probe B: a real `--submit` REFUSES rather than authenticating -------
 #
-# The property that makes this dangerous rather than merely wrong: a caller
-# checking inject's exit code or status field learns nothing.
-if printf '%s' "$INJECT_OUT" | grep -q '"status":"submitted"'; then
-  ok "inject reports status=submitted over the corrupted payload (its prompt-line check is vacuous in a modal)"
+# Until 2026-08-19 inject reported `status: submitted` over the corrupted
+# payload, because its success check was "the payload cleared from the prompt
+# line" and a modal has no prompt line — so a caller checking the exit code or
+# status field learned nothing, which is what made this dangerous rather than
+# merely wrong.
+#
+# Now the payload must BE the whole prompt line before Enter is pressed. A
+# modal renders no prompt line, so that can never hold: inject backspaces its
+# payload out and reports `prompt_dirty` / exit 4. The corrupted code is never
+# committed. self-login still must not use inject here — but the failure mode
+# is now a loud refusal instead of a silent bad authentication.
+rm -f "$WORK/inject-probe-received"
+tmux new-session -d -s "$SESSION" -x 80 -y 24 "$WORK/fake-code-prompt.sh"
+sleep 1.5
+
+INJECT_OUT="$(HOME="$INJECT_HOME" \
+  CLAUDE_WATCH_CONFIG="$WORK/inject-probe-config.toml" \
+  "$CW_BIN" inject --pane "$PANE" --submit "$PROBE_CODE" --json 2>"$WORK/inject-probe2.err")"
+INJECT_RC=$?
+sleep 1.5
+
+check_eq "inject exits 4 (refused) when asked to submit into a modal" "4" "$INJECT_RC"
+
+if printf '%s' "$INJECT_OUT" | grep -q '"status":"prompt_dirty"'; then
+  ok "inject reports status=prompt_dirty in a modal (no prompt line can ever be exclusively ours)"
 else
-  bad "expected inject to report status=submitted (got: $INJECT_OUT)"
+  bad "expected inject to report status=prompt_dirty (got: $INJECT_OUT)"
+fi
+
+# The field that made a reviewer misread the refusal as a submission. It must
+# track the OUTCOME, not the `--no-submit` request flag.
+if printf '%s' "$INJECT_OUT" | grep -q '"submitted":false'; then
+  ok "a refused inject reports submitted:false (the JSON does not claim a submit it did not make)"
+else
+  bad "expected \"submitted\":false alongside prompt_dirty (got: $INJECT_OUT)"
+fi
+
+# The whole point: nothing reached the fake login.
+PROBE2_RECEIVED="$(cat "$WORK/inject-probe-received" 2>/dev/null)"
+if [ -z "$PROBE2_RECEIVED" ]; then
+  ok "no code was committed to the modal by the refused inject"
+else
+  bad "a refused inject still delivered something to the modal: $(printf '%s' "$PROBE2_RECEIVED" | od -c | head -2)"
 fi
 
 tmux kill-session -t "$SESSION" 2>/dev/null

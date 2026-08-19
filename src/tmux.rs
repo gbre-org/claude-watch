@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
 /// transition and the dd/i/text sequence in `inject_text`. See
@@ -89,9 +89,75 @@ async fn send_focus_main_keys(pane: &str) {
         keys = ?keys,
         "send_focus_main_keys: returning FleetView selection to main before inject"
     );
+    // Snapshot the input line so we can tell who consumed the keys.
+    let before = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+
     for key in &keys {
         send_keys(pane, &[key.as_str()]).await;
         sleep(Duration::from_millis(150)).await;
+    }
+
+    // WHO ATE THE KEYS?
+    //
+    // These are FleetView NAVIGATION keys, and on this host they are ten
+    // `Up`s (enough to walk the selection cursor to `main` from any row). That
+    // is correct WHILE A FLEETVIEW IS RENDERED. When one is not — the ordinary
+    // case, and the case every routine alert lands in — Claude Code's input
+    // editor receives them instead, and `Up` on an input line means RECALL THE
+    // PREVIOUS PROMPT. Ten of them load a prior submission into what was an
+    // empty line, the caller then types its payload at the recalled text's
+    // cursor position, and the result is two payloads spliced together:
+    //
+    //     ❯ /config theme=light[CLAUDE-WATCH] WATCHER DOWN: 3 event(s)…
+    //
+    // Verified by A/B on a live pane, same binary and same payload, with only
+    // this setting varying: with the keys the line came back spliced, with
+    // `focus_main_keys = []` it came back as exactly the payload. This — not
+    // concurrency — is why injects kept arriving mangled after the inject lock
+    // shipped: ONE injector is enough, because it corrupts its own line.
+    //
+    // So: if the input line changed, the editor ate them, and this inject is
+    // now doomed — the exclusivity check below will refuse the submit rather
+    // than splice onto the recalled text. Say so precisely, because the
+    // symptom (an inject that refuses forever) otherwise looks like a bug in
+    // the refusal rather than in the configuration that caused it.
+    //
+    // We deliberately do NOT try to undo the recall by walking history forward
+    // with `Down`. That looks symmetric and is not: `Up` SATURATES at the
+    // oldest entry, so N `Up`s against a shorter history leave the cursor
+    // somewhere the same N `Down`s do not reverse. Measured on a live pane —
+    // ten `Up`s then ten `Down`s landed on a different entry, not the empty
+    // line it started from. An unreliable repair on a shared input line is
+    // worse than a clean refusal.
+    //
+    // The real fix is configuration: `focus_main_keys` must be empty unless a
+    // FleetView is genuinely being driven, since these keys are only meaningful
+    // while a fleet list is rendered and are destructive whenever it is not.
+    let after = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+    if after != before {
+        warn!(
+            pane = %pane,
+            before = ?before,
+            after = ?after,
+            count = keys.len(),
+            "send_focus_main_keys: the input editor consumed the FleetView keys (no fleet \
+             list was rendered) and recalled prompt history onto the input line. This inject \
+             will be REFUSED rather than spliced. Set [tmux].focus_main_keys = [] unless a \
+             FleetView is actually in use."
+        );
+        // Also to stderr: `claude-watch inject` is a CLI whose callers read
+        // stderr, and it installs no tracing subscriber, so the `warn!` above
+        // reaches the daemon log but NOT the shell tooling. Without this an
+        // operator sees a bare `rc=4` and no reason for it — which is how a
+        // configuration bug gets mistaken for a bug in the refusal.
+        eprintln!(
+            "[claude-watch inject] {} FleetView focus key(s) were eaten by the input editor \
+             (no fleet list rendered) and recalled prompt history onto the line: {:?}. \
+             This inject will be refused. Fix: set [tmux].focus_main_keys = [] in \
+             config.toml unless a FleetView is actually in use.",
+            keys.len(),
+            after.as_deref().unwrap_or("")
+        );
     }
 }
 
