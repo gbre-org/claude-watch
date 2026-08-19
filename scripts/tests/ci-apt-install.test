@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Tests for scripts/ci-apt-install.sh — the bounded, retrying apt installer.
+
+Background: two CI steps install a system package (`tmux` for the e2e job,
+`inotify-tools` for the container-shell job). Both wedge intermittently on
+GitHub's Ubuntu runners, in `apt-get update`, with no middle ground: a healthy
+run takes ~21s, a wedged one goes silent and runs flat into whatever bound it
+is given (312s / 21s / 313s on three consecutive runs of one branch).
+
+`timeout-minutes: 5` on the step is the right outer bound and must stay — a
+larger bound buys longer failures, not passes. But a step cap alone only turns
+the hang into a failed job: the first wedged attempt eats the whole budget and
+nothing retries. `ci-apt-install.sh` catches the wedge EARLY (an inner
+per-attempt timeout, well under the step cap) and retries inside the same outer
+bound.
+
+The properties worth pinning are all about that budget arithmetic — a retry
+policy that cannot fit its retries inside the outer cap is decoration, and a
+"resilient" wrapper that hangs anyway is worse than none because it reads as
+handled. So the suite drives the real script against a FAKE apt-get that hangs
+on demand, and asserts on wall-clock behavior, not just exit codes.
+
+What's covered:
+
+  1. The script exists, is executable, and is public-repo clean.
+  2. Happy path: one update + one install, no retries, exit 0.
+  3. A wedged `apt-get update` is ABORTED at the inner timeout, not left to run
+     — the whole invocation finishes in seconds, not minutes.
+  4. A wedged-then-healthy update RECOVERS: the retry runs and the script
+     exits 0. This is the entire point of the change.
+  5. A wedged `apt-get install` is bounded and retried the same way.
+  6. Retries are capped by attempt count, and the failure names the wedge.
+  7. The shared deadline is respected: the script never runs past its total
+     budget, so a total wedge still fails inside the outer step cap.
+  8. apt's own acquire timeouts are passed through (the root-cause mitigation:
+     apt's 120s-per-connection default is what lets one dead mirror stall).
+  9. Usage error with no packages.
+ 10. CI wiring: every apt-installing CI step goes through this script, and each
+     one keeps its `timeout-minutes` backstop.
+
+Run:  ./scripts/tests/ci-apt-install.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "ci-apt-install.sh"
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+PRIVATE_SENTINELS = [
+    "/mnt/Raiden",
+    "/mnt/Scorpion",
+    "ADHPrivate",
+    "~/repos/claude-config",
+    "~/repos/server-config",
+]
+
+failures: list[str] = []
+
+
+def check(cond: bool, msg: str) -> None:
+    if cond:
+        print(f"  ok: {msg}")
+    else:
+        print(f"  FAIL: {msg}")
+        failures.append(msg)
+
+
+# A fake apt-get. `HANG_ON` names the subcommand that should hang; a counter
+# file lets the first N invocations of that subcommand hang and the rest
+# succeed, so "wedged then healthy" is expressible.
+FAKE_APT = """#!/usr/bin/env bash
+sub="${1:-}"
+if [ "$sub" = "$HANG_ON" ]; then
+    n=$(cat "$FAKE_STATE" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "$FAKE_STATE"
+    if [ "$n" -lt "${HANG_TIMES:-9999}" ]; then
+        echo "fake $sub: hanging (call $((n + 1)))"
+        sleep 600
+    fi
+fi
+echo "FAKEAPT $*"
+exit 0
+"""
+
+
+def run_script(
+    packages: list[str],
+    *,
+    hang_on: str = "",
+    hang_times: int = 9999,
+    budget: int = 20,
+    attempt_timeout: int = 2,
+    attempts: int = 3,
+    backoff: int = 0,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess, float, Path]:
+    """Run the real script against the fake apt-get. Returns (proc, elapsed, log)."""
+    tmp = Path(tempfile.mkdtemp(prefix="ci-apt-test-"))
+    fake = tmp / "fake-apt-get"
+    fake.write_text(FAKE_APT)
+    fake.chmod(0o755)
+    state = tmp / "calls"
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "CI_APT_GET": str(fake),
+            "CI_APT_DPKG": "true",
+            "CI_APT_TOTAL_BUDGET": str(budget),
+            "CI_APT_ATTEMPT_TIMEOUT": str(attempt_timeout),
+            "CI_APT_ATTEMPTS": str(attempts),
+            "CI_APT_BACKOFF": str(backoff),
+            "HANG_ON": hang_on,
+            "HANG_TIMES": str(hang_times),
+            "FAKE_STATE": str(state),
+        }
+    )
+    if extra_env:
+        env.update(extra_env)
+
+    start = time.monotonic()
+    proc = subprocess.run(
+        [str(SCRIPT), *packages],
+        capture_output=True,
+        text=True,
+        env=env,
+        # Hard backstop: if the script ever fails to bound its own child, this
+        # is what turns a hung suite into a failed assertion. Deliberately much
+        # larger than any configured budget above.
+        timeout=180,
+    )
+    return proc, time.monotonic() - start, state
+
+
+# -----------------------------------------------------------------------------
+print("1. Script exists, is executable, public-repo clean")
+# -----------------------------------------------------------------------------
+check(SCRIPT.is_file(), "scripts/ci-apt-install.sh exists")
+check(os.access(SCRIPT, os.X_OK), "ci-apt-install.sh is executable")
+text = SCRIPT.read_text() if SCRIPT.is_file() else ""
+for sentinel in PRIVATE_SENTINELS:
+    check(sentinel not in text, f"free of private sentinel {sentinel!r}")
+check(
+    subprocess.run(["bash", "-n", str(SCRIPT)]).returncode == 0,
+    "passes `bash -n` syntax check",
+)
+
+# -----------------------------------------------------------------------------
+print("2. Happy path: no hang, one update + one install, exit 0")
+# -----------------------------------------------------------------------------
+proc, elapsed, _ = run_script(["tmux"])
+check(proc.returncode == 0, f"exit 0 (got {proc.returncode})")
+check("FAKEAPT update" in proc.stdout, "ran `apt-get update`")
+check("FAKEAPT install" in proc.stdout, "ran `apt-get install`")
+check("tmux" in proc.stdout, "passed the package name through")
+check("attempt 2/" not in proc.stdout, "did not retry a healthy run")
+
+# -----------------------------------------------------------------------------
+print("3. A wedged `apt-get update` is aborted at the inner timeout")
+# -----------------------------------------------------------------------------
+# The fake hangs for 600s. If the inner timeout were absent or ineffective the
+# call below would sit there until the subprocess backstop fired.
+proc, elapsed, _ = run_script(
+    ["tmux"], hang_on="update", budget=12, attempt_timeout=2, attempts=3
+)
+check(proc.returncode != 0, "a permanently wedged update fails (non-zero exit)")
+check(
+    elapsed < 30,
+    f"aborted early rather than hanging: finished in {elapsed:.1f}s "
+    f"against a 600s fake hang",
+)
+check("TIMED OUT" in proc.stderr, "names the timeout in the failure output")
+
+# -----------------------------------------------------------------------------
+print("4. Wedged-then-healthy update RECOVERS (the point of the change)")
+# -----------------------------------------------------------------------------
+proc, elapsed, state = run_script(
+    ["tmux"], hang_on="update", hang_times=1, budget=20, attempt_timeout=2
+)
+check(proc.returncode == 0, f"recovers and exits 0 (got {proc.returncode})")
+check("attempt 2/" in proc.stdout, "a second update attempt actually ran")
+check("FAKEAPT install" in proc.stdout, "the install still ran after recovery")
+check(
+    elapsed < 20,
+    f"recovery fits well inside the outer step cap ({elapsed:.1f}s)",
+)
+
+# -----------------------------------------------------------------------------
+print("5. A wedged `apt-get install` is bounded and retried too")
+# -----------------------------------------------------------------------------
+# The observed wedge is in `update`, but `install` pulls from the same mirrors,
+# so bounding only `update` would move the hang rather than fix it.
+proc, elapsed, _ = run_script(
+    ["inotify-tools"], hang_on="install", hang_times=1, budget=20, attempt_timeout=2
+)
+check(proc.returncode == 0, f"install retry recovers (got {proc.returncode})")
+check(
+    "apt-get install" in proc.stdout and "attempt 2/" in proc.stdout,
+    "a second install attempt actually ran",
+)
+
+proc, elapsed, _ = run_script(
+    ["inotify-tools"], hang_on="install", budget=12, attempt_timeout=2
+)
+check(proc.returncode != 0, "a permanently wedged install fails")
+check(elapsed < 30, f"and is bounded ({elapsed:.1f}s, not 600s)")
+
+# -----------------------------------------------------------------------------
+print("6. Retries are capped by attempt count")
+# -----------------------------------------------------------------------------
+proc, elapsed, state = run_script(
+    ["tmux"], hang_on="update", budget=60, attempt_timeout=1, attempts=2
+)
+calls = int(state.read_text().strip()) if state.exists() else 0
+check(calls == 2, f"exactly 2 update attempts with CI_APT_ATTEMPTS=2 (got {calls})")
+check("all 2 attempts failed" in proc.stderr, "reports the attempt cap in the error")
+
+# -----------------------------------------------------------------------------
+print("7. The shared deadline caps total wall-clock time")
+# -----------------------------------------------------------------------------
+# A generous attempt count against a permanent wedge must still stop at the
+# budget, so the wrapper can never be the thing that blows the 5-minute step
+# cap it lives under.
+budget = 8
+proc, elapsed, _ = run_script(
+    ["tmux"], hang_on="update", budget=budget, attempt_timeout=2, attempts=99
+)
+check(proc.returncode != 0, "permanent wedge still fails")
+check(
+    elapsed <= budget + 8,
+    f"stopped near the {budget}s budget rather than running 99 attempts "
+    f"(took {elapsed:.1f}s)",
+)
+
+# -----------------------------------------------------------------------------
+print("8. apt's own acquire timeouts are passed through")
+# -----------------------------------------------------------------------------
+proc, _, _ = run_script(["tmux"])
+for opt in ("Acquire::http::Timeout", "Acquire::https::Timeout", "Acquire::Retries"):
+    check(opt in proc.stdout, f"passes -o {opt} to apt-get")
+check(
+    "Acquire::http::Timeout=15" in proc.stdout,
+    "the acquire timeout is short (15s), not apt's 120s default",
+)
+
+# -----------------------------------------------------------------------------
+print("9. Usage error with no packages")
+# -----------------------------------------------------------------------------
+proc = subprocess.run([str(SCRIPT)], capture_output=True, text=True)
+check(proc.returncode == 2, f"exit 2 on no arguments (got {proc.returncode})")
+check("usage:" in proc.stderr, "prints usage")
+
+# -----------------------------------------------------------------------------
+print("10. CI wiring: apt steps go through the script and keep their backstop")
+# -----------------------------------------------------------------------------
+wf = WORKFLOW.read_text() if WORKFLOW.is_file() else ""
+check(bool(wf), ".github/workflows/ci.yml is readable")
+
+# Any step that still calls apt-get directly is one this fix does not cover.
+raw_apt = [
+    ln.strip()
+    for ln in wf.splitlines()
+    if "apt-get" in ln and "ci-apt-install" not in ln and not ln.strip().startswith("#")
+]
+check(
+    not raw_apt,
+    f"no CI step calls apt-get directly (found {raw_apt})",
+)
+
+steps = re.findall(r"run: [^\n]*ci-apt-install\.sh[^\n]*", wf)
+check(len(steps) >= 2, f"at least the two known apt steps use it (found {len(steps)})")
+check(
+    any("tmux" in s for s in steps) and any("inotify-tools" in s for s in steps),
+    "both tmux and inotify-tools are installed through it",
+)
+
+# The outer bound must survive the restructure — losing it would silently
+# restore the 360-minute job-ceiling behavior this whole fix exists to avoid.
+blocks = [b for b in wf.split("- name:") if "ci-apt-install.sh" in b]
+for b in blocks:
+    label = b.strip().splitlines()[0].strip()
+    check(
+        "timeout-minutes:" in b,
+        f"step {label!r} keeps its timeout-minutes backstop",
+    )
+
+# -----------------------------------------------------------------------------
+print()
+if failures:
+    print(f"{len(failures)} FAILURE(S):")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+print("All ci-apt-install tests passed.")

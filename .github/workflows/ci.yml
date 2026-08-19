@@ -78,16 +78,21 @@ jobs:
         timeout-minutes: 5
 
       - name: Install tmux
-        # Bounded because a stuck runner makes an infra step
-        # indistinguishable from a slow one. This `apt-get` and the
-        # inotify-tools one below have each wedged twice in the last 60
-        # runs; with no step bound they ran until the implicit 360-minute
-        # job ceiling, so every later step in the job stayed pending for
-        # six hours over a package install that normally takes seconds.
-        # 5 minutes is ~9x the slowest healthy run of this step (35s) and
-        # >2x the slowest healthy run of any apt step here (134s), so a
-        # genuinely slow mirror still passes while a hang fails fast.
-        run: sudo apt-get update && sudo apt-get install -y tmux
+        # Goes through scripts/ci-apt-install.sh, which bounds each
+        # `apt-get` attempt WELL BELOW the step cap and retries inside it.
+        # This step and the inotify-tools one below wedge intermittently,
+        # always in `apt-get update`, and the failure has no middle ground:
+        # ~21s healthy, or silent until it hits whatever bound it is given
+        # (312s / 21s / 313s on three consecutive runs of one branch).
+        #
+        # `timeout-minutes: 5` STAYS as the outer backstop. Before it
+        # existed these hangs ran to the implicit 360-minute job ceiling, so
+        # a larger bound buys longer failures, not passes — and without it a
+        # restructured step would silently revert to that ceiling. But a cap
+        # alone only converts the hang into a failed job, because the first
+        # wedged attempt consumes the whole budget and nothing retries.
+        # The script's inner bound is what leaves the retry room to succeed.
+        run: scripts/ci-apt-install.sh tmux
         timeout-minutes: 5
 
       - name: Cache cargo registry + target
@@ -162,6 +167,14 @@ jobs:
 
       - name: Run install-hooks (core.hooksPath + worktree) tests
         run: make test-install-hooks
+
+      # The bounded/retrying apt wrapper THIS workflow's package-install
+      # steps run through. Deliberately placed before the step that uses it
+      # so a broken wrapper is reported as a wrapper failure rather than as
+      # a mysterious install failure later in the job. Fakes only.
+      - name: Run CI apt-installer (hang + retry) tests
+        run: make test-ci-apt-install
+        timeout-minutes: 5
 
       # Skills installer: the skills/ (any deployment) vs container/skills/
       # (container-only) split, the `cw-` host prefix, and the
@@ -241,9 +254,12 @@ jobs:
         run: make test-ttyd-lock-toggle
 
       - name: Install inotify-tools (for claude-event-watch tests)
-        # Same exposure as the tmux install in the e2e job, and it hung on
-        # the same two days. Slowest healthy run of this step was 134s.
-        run: sudo apt-get update && sudo apt-get install -y inotify-tools
+        # Same exposure as the tmux install in the e2e job, same fix. This
+        # step is where the wedge was captured in full: apt cycling `Ign:`
+        # on the runner's azure.archive.ubuntu.com mirror, falling back to
+        # archive.ubuntu.com, then going silent for 4.5 minutes mid-transfer
+        # until the step cap killed it. See scripts/ci-apt-install.sh.
+        run: scripts/ci-apt-install.sh inotify-tools
         timeout-minutes: 5
 
       - name: Run watcher tests (self-clear/self-login + claude-event-watch debounce)

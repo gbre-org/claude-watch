@@ -273,8 +273,8 @@
           "instant": false
         },
         {
-          "expr": "time() - claude_container_start_timestamp_seconds",
-          "legendFormat": "Container",
+          "expr": "time() - claude_process_start_timestamp_seconds",
+          "legendFormat": "Claude Uptime",
           "refId": "B",
           "range": true,
           "instant": false
@@ -341,7 +341,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Container"
+              "options": "Claude Uptime"
             },
             "properties": [
               {
@@ -392,7 +392,7 @@
           "titleSize": 16
         }
       },
-      "description": "Session lifetime timers, ONE stat panel with three tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CONTAINER = seconds since container start; SINCE CLEAR = seconds since the last context clear (n/a if none recorded)."
+      "description": "Session lifetime timers, ONE stat panel with three tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded)."
     },
     {
       "id": 3,

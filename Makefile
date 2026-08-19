@@ -26,7 +26,7 @@
 .PHONY: test-dashboard test-trust-workspace
 .PHONY: test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links
 .PHONY: test-claude-md-size test-install-hooks test-install-host-skills
-.PHONY: test-install-host-cron
+.PHONY: test-install-host-cron test-ci-apt-install
 .PHONY: test-entrypoint test-cw test-hostjob test-launchd-plist
 .PHONY: test-personal-mcp-host test-personal-mcp-host-plist
 .PHONY: test-personal-mcp-install test-ttyd-paste-handler test-ttyd-lock-toggle
@@ -307,6 +307,16 @@ test-install-host-skills: ## Tests for the host-skills installer + its wiring
 # never touches /etc/cron.d.
 test-install-host-cron: ## Tests for the host-cron fragment + its installer
 	scripts/tests/install-host-cron.test
+
+# The bounded/retrying apt wrapper CI's two package-install steps run through.
+# Drives the real script against a fake apt-get that hangs on demand and
+# asserts on WALL-CLOCK behavior: a wedged attempt is aborted early, the retry
+# recovers, and a permanent wedge still stops inside the total budget. A retry
+# policy whose retries cannot fit inside the outer step cap is decoration, and
+# a "resilient" wrapper that hangs anyway is worse than none — it reads as
+# handled. Fakes only; never touches the real package manager.
+test-ci-apt-install: ## Tests for the bounded/retrying CI apt installer
+	scripts/tests/ci-apt-install.test
 
 # The container image's static-assertion suite: ~30 scripts that check the
 # entrypoint's runtime behaviour and that the Dockerfile actually baked what
