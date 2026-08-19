@@ -40,7 +40,7 @@ fi
 SBX="$(mktemp -d)"
 trap 'rm -rf "$SBX"' EXIT
 QUEUE="$SBX/queue"; STATE="$SBX/state"; BIN="$SBX/bin"
-mkdir -p "$QUEUE" "$STATE" "$BIN"
+mkdir -p "$QUEUE" "$STATE" "$BIN" "$SBX/log"
 
 # Resolve event-ack / event-classify to THIS tree, not whatever is installed
 # on the host -- otherwise a green run would prove nothing about this change.
@@ -50,6 +50,11 @@ ln -sf "$TOOLS/event-classify" "$BIN/event-classify"
 export PATH="$BIN:$PATH"
 export CLAUDE_EVENT_QUEUE="$QUEUE"
 export CLAUDE_EVENT_STATE_DIR="$STATE"
+# The consumed-event HISTORY log is keyed off its OWN env var, NOT the state
+# dir -- without this the watcher appends every synthetic test event to the
+# operator's real ~/.config/claude-events/consumed.jsonl, polluting
+# `claude-event-tail`. Sandbox it explicitly.
+export CLAUDE_EVENT_LOG_DIR="$SBX/log"
 export CLAUDE_EVENT_WATCH_LOCK="$SBX/watch.lock"
 export CLAUDE_EVENT_WATCH_AUTO_INGEST=1
 export CLAUDE_EVENT_WATCH_MODE=exit
