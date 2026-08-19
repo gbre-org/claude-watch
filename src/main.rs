@@ -259,19 +259,26 @@ enum Commands {
     /// DEFAULT (no `--escape`): NON-CANCELLING. Enter INSERT with an
     /// idempotent `i`, type, submit with a bare Enter from INSERT. No
     /// Escape is ever sent, so an in-flight turn is not interrupted and a
-    /// modal on the pane is not cancelled. No `dd` line-clear either, so
-    /// half-typed operator input glues onto the payload.
+    /// modal on the pane is not cancelled. There is no `dd` line-clear on
+    /// this path (it would need the turn-cancelling Escape), so BEFORE
+    /// pressing Enter the prompt line is checked to hold our payload and
+    /// nothing else. If it holds anything more, the typed payload is
+    /// retracted with backspaces and the inject is REFUSED (exit 4) rather
+    /// than submitting a splice of two payloads.
     ///
     /// With `--escape`: the historical CANCELLING choreography —
     /// Escape→NORMAL coercion, dd line-clear, `i` INSERT verify-and-retry,
     /// literal type, then Tab→Escape→Enter to submit (or a bare Enter for
-    /// `--slash-command`).
+    /// `--slash-command`). The `dd` clears the line, so the exclusivity
+    /// check does not apply there.
     ///
-    /// Verification: a landed submit CLEARS the payload from the prompt
-    /// line. If the payload is still on the input line after the verify
-    /// window, the submit did NOT land and the command exits non-zero
-    /// (exit 3) so callers can detect a stuck inject. `--no-submit` types
-    /// without submitting and always exits 0.
+    /// Exit codes:
+    ///   0  typed (`--no-submit`), or the submission was verified.
+    ///   3  submit keystrokes were sent but the payload was still on the
+    ///      input line after the verify window — the submit did not land.
+    ///   4  REFUSED: after typing, the prompt line held more than our
+    ///      payload. The payload was retracted and nothing was submitted.
+    ///      Retry when the line is clear.
     Inject {
         /// Text to type (and, unless --no-submit, submit).
         #[arg(long, value_name = "TEXT")]
@@ -1711,6 +1718,8 @@ async fn resolve_inject_pane(flag: Option<&str>) -> String {
 ///   0 = typed (no-submit) OR submission verified
 ///   3 = submit keystrokes sent but the payload was still on the prompt line
 ///       after the verify window (submission likely did NOT land)
+///   4 = REFUSED because the prompt line held more than our payload after
+///       typing. The payload was retracted; nothing was submitted.
 async fn run_inject(
     text: &str,
     pane_flag: Option<&str>,
@@ -1749,6 +1758,7 @@ async fn run_inject(
         tmux::InjectOutcome::Typed => (0, "typed"),
         tmux::InjectOutcome::Submitted => (0, "submitted"),
         tmux::InjectOutcome::SubmitUnverified => (3, "submit_unverified"),
+        tmux::InjectOutcome::PromptDirty => (4, "prompt_dirty"),
     };
 
     if json {
@@ -1762,6 +1772,13 @@ async fn run_inject(
         );
     } else if code == 0 {
         eprintln!("[claude-watch inject] {} on pane {}", status, pane);
+    } else if code == 4 {
+        eprintln!(
+            "[claude-watch inject] REFUSED on pane {}: after typing, the prompt line held more \
+             than our payload (residue from a half-typed line, or a peer injector). The payload \
+             was RETRACTED and NOTHING was submitted — retry once the line is clear.",
+            pane
+        );
     } else {
         eprintln!(
             "[claude-watch inject] WARNING: submit may not have landed (payload still on prompt line) on pane {}",

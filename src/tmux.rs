@@ -1213,6 +1213,157 @@ pub enum InjectOutcome {
     /// Submit keystrokes were sent but the payload was still visible on the
     /// prompt line after the verify window — submission likely did NOT land.
     SubmitUnverified,
+    /// REFUSED: after typing, the prompt line held more than our payload, so
+    /// we retracted what we typed and submitted NOTHING.
+    ///
+    /// Either the line was already dirty (residue from an operator's
+    /// half-typed input, or from a previous inject whose submit did not land)
+    /// or it acquired foreign text while we typed. Submitting such a line
+    /// splices two payloads into one string that is neither — and the old
+    /// "the payload cleared from the prompt line" check calls that a success.
+    /// See `inject_and_verify` for the autopsy.
+    PromptDirty,
+}
+
+/// How long to let a dirty prompt line clear before typing anyway.
+///
+/// Short on purpose. The inject lock already serialises us against other
+/// injectors, so a line still dirty here is residue nobody is actively
+/// clearing — most likely an operator's half-typed input. Waiting longer does
+/// not make it go away.
+const PROMPT_CLEAR_WAIT: Duration = Duration::from_secs(5);
+
+/// How long to let the typed payload settle before deciding the line is
+/// contaminated. Covers TUI redraw lag, not a competing writer.
+const TYPED_SETTLE_WAIT: Duration = Duration::from_millis(1500);
+
+const PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Pure: is the prompt line empty (or absent)?
+///
+/// `None` (no `❯` rendered at all) counts as NOT empty: we cannot see the
+/// input line, so we cannot assert anything about it.
+pub(crate) fn prompt_line_is_empty(prompt: Option<&str>) -> bool {
+    matches!(prompt, Some(p) if p.is_empty())
+}
+
+/// Pure: after typing `text`, is the prompt line EXACTLY our payload and
+/// nothing else?
+///
+/// The load-bearing check. `inject_and_verify`'s historical success criterion
+/// was "the payload prefix disappeared from the prompt line after Enter" —
+/// which is just as true when a SPLICED line gets submitted, because a splice
+/// submits and clears exactly like the real thing. On 2026-08-19 that reported
+/// `(verified)` for a `/config theme=light` that had been glued into the
+/// middle of a `WATCHER DOWN` banner; Claude Code answered
+/// `Expected key=value, got "theme=light[CLAUDE-WATCH] WATCHER DO…"` and the
+/// theme never changed.
+///
+/// tmux truncates the prompt line at pane width, so we can only see a PREFIX
+/// of a long payload. We therefore assert the strongest property the capture
+/// can support: everything visible on the line must be a prefix of what we
+/// typed. That rejects text PREPENDED to our payload
+/// (`WATCHER DOWN…/config theme=light`) and text APPENDED to it
+/// (`/config theme=light[CLAUDE-WATCH] WATCHER DOWN…`) as long as the extra
+/// characters fall inside the visible row — exactly the regime the observed
+/// failures live in, since the theme payload is 19 characters and the pane is
+/// 66 wide.
+pub(crate) fn typed_line_is_exclusively_payload(prompt: Option<&str>, text: &str) -> bool {
+    let Some(prompt) = prompt else {
+        return false;
+    };
+    let want: Vec<char> = text.trim().chars().collect();
+    let got: Vec<char> = prompt.chars().collect();
+    if want.is_empty() {
+        return got.is_empty();
+    }
+    // Nothing on the line (or it was cleared under us) is not "clean" — it
+    // means our payload is not on the line we are about to submit.
+    if got.is_empty() {
+        return false;
+    }
+    // More characters on the line than we typed => something else is there.
+    if got.len() > want.len() {
+        return false;
+    }
+    got[..] == want[..got.len()]
+}
+
+/// Give a dirty prompt line a bounded chance to clear before we type.
+///
+/// ADVISORY ONLY — it never blocks the inject. The authoritative gate is the
+/// post-type [`wait_for_clean_payload`] check. Refusing here would be the
+/// wrong shape of guard: `prompt_line_text` cannot distinguish an empty input
+/// from an empty input the TUI has painted a placeholder hint into (a virgin
+/// session renders `❯ Try "edit …"` with nothing actually typed), so a
+/// blocking pre-check could refuse forever on a perfectly clean pane — and a
+/// guard that can suppress a WATCHER DOWN alert indefinitely is worse than the
+/// bug it fixes. Waiting costs nothing and usually lets a peer's in-flight
+/// submit land first.
+async fn settle_prompt_line(pane: &str) {
+    let deadline = tokio::time::Instant::now() + PROMPT_CLEAR_WAIT;
+    loop {
+        let prompt = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+        if prompt_line_is_empty(prompt.as_deref()) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            debug!(
+                pane = %pane,
+                residue = ?prompt,
+                "inject: prompt line still not empty after settle window; typing anyway \
+                 (the post-type exclusivity check decides whether we submit)"
+            );
+            return;
+        }
+        sleep(PROMPT_POLL_INTERVAL).await;
+    }
+}
+
+/// Wait (bounded) for the prompt line to settle to EXACTLY our payload.
+async fn wait_for_clean_payload(pane: &str, text: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + TYPED_SETTLE_WAIT;
+    loop {
+        let prompt = capture_pane(pane).await.and_then(|o| prompt_line_text(&o));
+        if typed_line_is_exclusively_payload(prompt.as_deref(), text) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            debug!(
+                pane = %pane,
+                on_line = ?prompt,
+                "inject: prompt line is not exclusively our payload; refusing to submit"
+            );
+            return false;
+        }
+        sleep(PROMPT_POLL_INTERVAL).await;
+    }
+}
+
+/// Send `count` presses of `key` in a single tmux call (`send-keys -N`).
+async fn send_key_repeated(pane: &str, key: &str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let n = count.to_string();
+    let _ = run_cmd(&["tmux", "send-keys", "-t", pane, "-N", &n, key], 5).await;
+}
+
+/// Undo our own typing after the exclusivity check failed, leaving the prompt
+/// line exactly as we found it.
+///
+/// Backspace removes the characters immediately BEFORE the caret, and the
+/// caret is sitting at the end of what we just typed — so this retracts our
+/// payload and nothing else, even when it landed spliced into the MIDDLE of
+/// someone else's text (the 2026-08-19 shape). Non-cancelling: no Escape, no
+/// `dd`, so an in-flight turn and any operator input are untouched.
+///
+/// Without this, every refused attempt would leave its payload behind for the
+/// next one to glue onto — which is how five and six fragments came to pile up
+/// in a single line.
+async fn retract_typed_payload(pane: &str, text: &str) {
+    send_key_repeated(pane, "BSpace", text.chars().count()).await;
+    sleep(Duration::from_millis(200)).await;
 }
 
 /// Pure helper: extract the text after the LAST `❯` prompt char in the
@@ -1296,7 +1447,39 @@ pub async fn inject_and_verify(
     // and the prompt line wiped pass `--escape`. Then fall through to the
     // shared verify window below.
     if !escape {
+        // This path has no `dd` line-clear (that needs NORMAL mode, reached by
+        // an Escape that would cancel the in-flight turn), so whatever is
+        // already on the input line gets our payload glued onto it. The inject
+        // LOCK does not prevent that: it serialises injectors, but residue
+        // OUTLIVES the lock — a previous injector whose submit did not land,
+        // or an operator who half-typed something and walked away, leaves the
+        // line dirty long after every lock is released.
+        //
+        // Give it a bounded chance to clear (advisory — see
+        // `settle_prompt_line` for why this must not be a hard gate), then
+        // type, then decide.
+        settle_prompt_line(pane).await;
         type_text_non_cancelling(pane, text).await;
+        // AUTHORITATIVE GATE: the line must be EXCLUSIVELY our payload before
+        // we press Enter.
+        //
+        // This is the check whose absence is the whole bug. The historical
+        // success criterion — "the payload cleared from the prompt line after
+        // Enter" — is satisfied just as well by a SPLICED line, because a
+        // splice submits and clears exactly like the real thing. So a
+        // `/config theme=light` glued into a WATCHER DOWN banner submitted,
+        // cleared, and reported `(verified)`, while Claude Code answered
+        // `Expected key=value, got "theme=light[CLAUDE-WATCH] WATCHER DO…"`
+        // and the theme never changed. Checking BEFORE Enter is what makes the
+        // difference: a submitted splice is unrecoverable, an un-submitted one
+        // we can simply take back.
+        //
+        // Deliberately not applied to `--no-submit`, whose entire contract is
+        // to leave text sitting on the prompt line.
+        if submit && !wait_for_clean_payload(pane, text).await {
+            retract_typed_payload(pane, text).await;
+            return InjectOutcome::PromptDirty;
+        }
         if submit {
             // Bare Enter from INSERT — the same submit `inject_text_queued`
             // uses, and the same one slash commands require, so
@@ -2976,6 +3159,81 @@ mod tests {
         // An older `❯` in scrollback must not shadow the live input line.
         let output = "\u{276f} old typed text\nstuff\n\u{276f} new text";
         assert_eq!(prompt_line_text(output).as_deref(), Some("new text"));
+    }
+
+    // ---- prompt-line exclusivity guards (the 2026-08-19 splice) ----
+
+    #[test]
+    fn empty_prompt_line_is_the_only_empty_state() {
+        assert!(prompt_line_is_empty(Some("")));
+        assert!(!prompt_line_is_empty(Some("half-typed operator input")));
+        // No `❯` rendered at all: we cannot SEE the input line, so we must not
+        // claim anything about it. A missing prompt is UNKNOWN, never empty.
+        assert!(!prompt_line_is_empty(None));
+    }
+
+    #[test]
+    fn clean_payload_accepts_exactly_what_we_typed() {
+        assert!(typed_line_is_exclusively_payload(
+            Some("/config theme=light"),
+            "/config theme=light"
+        ));
+    }
+
+    #[test]
+    fn clean_payload_accepts_a_width_truncated_prefix() {
+        // tmux truncates the prompt line at pane width, so a long banner is
+        // only visible as a prefix. That prefix must still be OURS.
+        let banner = "[CLAUDE-WATCH] WATCHER DOWN: 3 event(s) unconsumed >6min - dead";
+        assert!(typed_line_is_exclusively_payload(
+            Some("[CLAUDE-WATCH] WATCHER DOWN: 3 event(s)"),
+            banner
+        ));
+    }
+
+    #[test]
+    fn clean_payload_rejects_appended_foreign_text() {
+        // Reproduced 2026-08-19: cw-theme-sync typed first, the WATCHER DOWN
+        // banner landed after it, and Claude Code answered
+        // `Expected key=value, got "theme=light[CLAUDE-WATCH] WATCHER DO…"`.
+        assert!(!typed_line_is_exclusively_payload(
+            Some("/config theme=light[CLAUDE-WATCH] WATCHER DOWN: 3 event(s)"),
+            "/config theme=light"
+        ));
+    }
+
+    #[test]
+    fn clean_payload_rejects_prepended_foreign_text() {
+        // The 2026-08-19T10:08:47 shape: the theme payload spliced INTO the
+        // middle of the banner, so the line does not even start with ours.
+        assert!(!typed_line_is_exclusively_payload(
+            Some("unconsumed >6mi/config theme=lightn - the event watcher is dead"),
+            "/config theme=light"
+        ));
+    }
+
+    #[test]
+    fn clean_payload_rejects_an_empty_or_absent_line() {
+        // Our payload is not on the line we are about to submit.
+        assert!(!typed_line_is_exclusively_payload(
+            Some(""),
+            "/config theme=light"
+        ));
+        assert!(!typed_line_is_exclusively_payload(
+            None,
+            "/config theme=light"
+        ));
+    }
+
+    #[test]
+    fn prompt_dirty_is_a_distinct_outcome() {
+        // Must not collapse into SubmitUnverified: they mean different things
+        // to a caller. SubmitUnverified => keystrokes were sent and the
+        // payload may yet land. PromptDirty => NOTHING was submitted, and the
+        // pane still holds someone else's text.
+        assert_ne!(InjectOutcome::PromptDirty, InjectOutcome::SubmitUnverified);
+        assert_ne!(InjectOutcome::PromptDirty, InjectOutcome::Submitted);
+        assert_ne!(InjectOutcome::PromptDirty, InjectOutcome::Typed);
     }
 
     #[test]
