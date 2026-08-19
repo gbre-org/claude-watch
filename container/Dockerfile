@@ -1182,6 +1182,16 @@ COPY tools/event-must-act/event-ack /usr/local/bin/event-ack
 # (event-classify --source X --tag Y) when manually triaging events.
 COPY tools/event-must-act/event-classify /usr/local/bin/event-classify
 
+# heartbeat-ack — one command that touches the host liveness heartbeat file
+# AND acks the pending `heartbeat-tick` entry. `heartbeat-tick` is classified
+# ACTIONABLE, so the bare `touch` alone left the entry pending forever while
+# the ack alone proved no liveness; the loop owed two commands per tick. The
+# wrapper collapses them, derives the ack key from what is actually pending
+# (never a hardcoded key string) and the file path from `[claude]
+# heartbeat_file`, and is exempt in eval-event-must-act +
+# pre-tool-dispatch-gate-hook + pre-tool-obligations-gate-hook.
+COPY tools/event-must-act/heartbeat-ack /usr/local/bin/heartbeat-ack
+
 # user-prompt-ambient-inject-hook — UserPromptSubmit hook that drains
 # the ambient event queue on every prompt and emits the queued events
 # as additional context for the LLM's next turn. Non-blocking, no
@@ -1392,6 +1402,7 @@ RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output \
              /usr/local/bin/agent-ack \
              /usr/local/bin/event-ack \
              /usr/local/bin/event-classify \
+             /usr/local/bin/heartbeat-ack \
              /usr/local/bin/user-prompt-ambient-inject-hook \
              /usr/local/bin/trust-workspace \
              /usr/local/bin/audit-hooks \

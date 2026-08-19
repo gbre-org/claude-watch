@@ -414,7 +414,7 @@ fn default_interrupt_enabled() -> bool {
 /// daemon interrupt, and asks for a watcher sanity-check + heartbeat-tick
 /// triage so a genuinely-wedged event pipeline still gets surfaced.
 fn default_heartbeat_stale_prompt() -> String {
-    "[CLAUDE-WATCH] The host heartbeat file went stale — you are not touching /var/run/claude/claude-heartbeat. Immediately run `touch /var/run/claude/claude-heartbeat` as a single well-formed Bash tool call to restore liveness, then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details.".to_string()
+    "[CLAUDE-WATCH] The host heartbeat file went stale — you are not touching /var/run/claude/claude-heartbeat. Immediately run `heartbeat-ack` (it touches the file AND acks the pending heartbeat-tick entries; fall back to `touch /var/run/claude/claude-heartbeat` if that command is not installed) as a single well-formed Bash tool call to restore liveness, then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details.".to_string()
 }
 
 fn default_interrupt_message() -> String {

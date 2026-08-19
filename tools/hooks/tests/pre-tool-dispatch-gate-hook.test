@@ -272,6 +272,12 @@ def test_baked_bash_exempt_patterns_allow():
             # Heartbeat-liveness touch (both watched paths).
             "touch /var/run/claude/heartbeat",
             "touch /var/run/claude/claude-heartbeat",
+            # ...and the heartbeat-ack wrapper that replaces it (touch +
+            # ack of the pending heartbeat-tick event in one command).
+            "heartbeat-ack",
+            "heartbeat-ack --quiet",
+            "/usr/local/bin/heartbeat-ack",
+            "/home/x/bin/heartbeat-ack --json",
             # botchat comms surface (operator DM channel) -- reading + replying
             # is dispatcher bookkeeping, not an inline worker chain.
             "botchat-unread-check --ids",

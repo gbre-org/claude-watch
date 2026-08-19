@@ -208,8 +208,22 @@ typically **before** you seed the row. Check `event-ack list` (and
 or the gate denies on its very first evaluation.
 
 Note that `heartbeat-tick` is classified **actionable**, so on a host that
-emits it the gate is what forces the loop to touch the heartbeat file —
-`event-ack ack` is what clears it, not the `touch` itself.
+emits it the gate is what forces the loop to touch the heartbeat file. The
+`touch` alone does NOT clear the pending entry (only an `event-ack ack`
+does), and an ack alone proves no liveness — so the loop runs
+**`heartbeat-ack`**, the wrapper that does both in one command:
+
+```sh
+heartbeat-ack        # touch the heartbeat file + ack the pending tick
+```
+
+It touches first and acks second (a broken ack can never cost you the
+liveness signal), derives the ack key from what is actually pending rather
+than hardcoding `heartbeat-tick:heartbeat tick`, and exits 0 when nothing is
+pending — including on a host where this obligation was never seeded. It is
+exempt in this evaluator, in `pre-tool-dispatch-gate-hook`, and (in its bare
+form) in `pre-tool-obligations-gate-hook`, so the command that discharges the
+tick can never be the command the gate denies.
 
 ### Container redeploy
 

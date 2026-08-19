@@ -1274,14 +1274,14 @@ Events that demand a response within a reasonable window: torrent-completed
 PR CI failure/success, workbot-prompt, queue-stale-ready, slack-unread,
 **claude-watch/heartbeat-tick**.
 
-> **`heartbeat-tick` — touch the heartbeat file.** Every ~5 min the
-> claude-watch daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick
-> [path=<FILE> interval_secs=…]`. When you see it, run **`touch <FILE>`** (the
-> path on the event line, e.g. `/var/run/claude/claude-heartbeat`). That file
-> is the daemon's wedge-detector: if its mtime goes stale (~10 min) the
-> daemon fires a "heartbeat stale" alert and may try to recover the loop. The
-> touch MUST come from you acting on the event (it proves the loop is alive);
-> the daemon never touches it. One command, no agent spawn.
+> **`heartbeat-tick` — run `heartbeat-ack`.** Every ~5 min the claude-watch
+> daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick [path=<FILE>
+> interval_secs=…]`. Run **`heartbeat-ack`**: one command that refreshes the
+> heartbeat file AND acks this entry. A bare `touch <FILE>` moves the mtime
+> but leaves the entry pending forever, so the gate escalates while you think
+> you handled it. The file is the wedge-detector: a stale mtime (~10 min)
+> fires a "heartbeat stale" alert. The refresh MUST come from you acting on
+> the event (it proves the loop is alive); never the daemon.
 
   - Routed by `event-ack ingest` into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt

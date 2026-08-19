@@ -139,6 +139,10 @@ KNOWN_BUILTINS = {
     "event-classify",
     "event-ack",
     "eval-event-must-act",
+    # heartbeat-ack: the one-command heartbeat-tick clear-path (touch the
+    # liveness file + ack the pending entry). Baked alongside the rest of
+    # the event-must-act toolchain.
+    "heartbeat-ack",
     "eval-queue-ready-unspawned",
     "user-prompt-ambient-inject-hook",
 }

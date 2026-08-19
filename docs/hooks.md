@@ -118,7 +118,7 @@ Run that loop with `run_in_background: true` so the agent blocks in a
 normal tool-call wait state (not a Monitor-event-driven async state).
 The harness's "agent is done" semantics correctly distinguish the two.
 
-### Heartbeat-liveness `touch` (narrow ALLOW)
+### Heartbeat-liveness `touch` / `heartbeat-ack` (narrow ALLOW)
 
 When claude-watch detects a stale heartbeat it injects an instruction to
 run `touch /var/run/claude/heartbeat` as a single Bash tool call to
@@ -141,6 +141,15 @@ operand, or a value-taking flag (`-r`/`-t`/`-d`) all fall through to the
 normal gate. The liveness touch is a pure state-restore with no
 destructive side effect, so allowing it is safe. Parse failure fails
 CLOSED (the command is treated as non-exempt).
+
+The same ALLOW covers a **bare `heartbeat-ack`** — the
+`tools/event-must-act/heartbeat-ack` wrapper that performs that touch *and*
+acks the pending `heartbeat-tick` event in one command, and which is the
+shape the loop runs on every tick. It needs the identical catch-22
+exemption. It is scoped one notch tighter than the touch: exactly one
+top-level segment, effective head `heartbeat-ack` (bare or path-resolved),
+and **no arguments at all** — `heartbeat-ack --path <file>` could name an
+arbitrary file to create, so any argument falls through to the normal gate.
 
 ### Bypass
 
