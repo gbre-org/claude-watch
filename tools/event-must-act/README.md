@@ -6,10 +6,19 @@ were originally container-only (`container/bin/`); they now live here so BOTH
 deployments use one copy:
 
 - **Container** (`container/Dockerfile`) bakes each via `COPY tools/event-must-act/<name> /usr/local/bin/<name>`.
-- **Non-container / systemd host** symlinks each into the operator's `~/bin`
-  (or any PATH dir). Nothing here is container-specific — all state lives under
-  `~/.config/claude-events/` (override with `$CLAUDE_EVENT_STATE_DIR`), and the
-  one container-pane default in `cw-watcher-health-check` is now env-driven.
+- **Non-container / systemd host** symlinks each into `$BIN_DIR` (default
+  `~/bin`) via `make install`. Nothing here is container-specific — all state
+  lives under `~/.config/claude-events/` (override with
+  `$CLAUDE_EVENT_STATE_DIR`), and the one container-pane default in
+  `cw-watcher-health-check` is now env-driven.
+
+  Because the seeded obligation row stores an ABSOLUTE `cmd`, a host install
+  must also tell `obligations-init` where the `eval-*` scripts landed:
+  `CW_EVAL_BIN_DIR="$HOME/bin" obligations-init --only event_must_act`. Skip
+  that and the row points at the baked `/usr/local/bin` path, which does not
+  exist on a host — and since the `evaluator` predicate is default-open on
+  spawn error, the gate then looks seeded while enforcing nothing. See
+  [docs/event-must-act.md](../../docs/event-must-act.md#non-container-systemd-host-install).
 
 ## Scripts
 

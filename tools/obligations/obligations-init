@@ -80,6 +80,21 @@ a bare evaluator row fired inside subagent contexts, letting a subagent block
 itself over -- and then clobber -- the main loop's pending-ack / event /
 queue state.
 
+DEPLOYMENT PATHS: the four evaluator-backed rows shell out to external
+``eval-*`` scripts. The container bakes them at ``/usr/local/bin`` (the
+default here); a systemd-host deployment installs the SAME scripts via
+``make install``, which symlinks them into ``$BIN_DIR`` (default ``~/bin``).
+Set ``$CW_EVAL_BIN_DIR`` to that prefix before seeding on such a host --
+otherwise the row is registered pointing at a nonexistent file, and because
+the ``evaluator`` predicate is default-open on spawn errors, the gate looks
+seeded while silently enforcing nothing.
+
+SELECTIVE SEEDING: ``--only <row>`` (repeatable) seeds exactly the named
+row(s) and skips the user-manifest pass. Bare ``obligations-init`` seeds
+ALL rows, which is correct for a fresh container but is the wrong tool for
+turning on ONE gate on a host that is already running: the remaining rows
+become live gates on the operator's very next tool call.
+
 The script is best-effort: any failure (missing CLI, broken state file,
 permission error) is logged to stderr but exits 0 so the entrypoint
 keeps going. The whole obligations system is default-open on internal
@@ -154,6 +169,34 @@ DEFAULT_EXEMPT_PATTERNS = [
     # agent-tail self-inspection (rare, but harmless when allowed).
     r"Bash:^agent-tail\b",
 ]
+
+
+# Directory holding the external ``eval-*`` evaluator scripts that the
+# evaluator-backed default rows shell out to.
+#
+# The CONTAINER bakes them at ``/usr/local/bin`` (``COPY tools/event-must-act/
+# <name> /usr/local/bin/<name>`` in container/Dockerfile), which is why every
+# seeder used to hardcode ``/usr/local/bin/eval-event-must-act`` and friends.
+# A NON-container (systemd host) deployment installs the very same scripts via
+# ``make install``, which symlinks them into ``$BIN_DIR`` (default ``~/bin``) —
+# a path that needs no root and is not ``/usr/local/bin``. A hardcoded prefix
+# therefore seeded rows whose ``cmd`` pointed at a file that does not exist on
+# that host.
+#
+# That failure mode is SILENT-BY-DESIGN in the worst way: the ``evaluator``
+# predicate is default-open on spawn errors, so a row pointing at a missing
+# binary never denies anything — it just logs to the obligations error log and
+# allows. The gate looks seeded and enforces nothing.
+#
+# ``$CW_EVAL_BIN_DIR`` overrides the prefix; the default stays
+# ``/usr/local/bin`` so container behaviour is byte-for-byte unchanged.
+DEFAULT_EVAL_BIN_DIR = "/usr/local/bin"
+
+
+def _eval_bin(name: str) -> str:
+    """Absolute path to an ``eval-*`` evaluator script for this deployment."""
+    base = os.environ.get("CW_EVAL_BIN_DIR", "").strip() or DEFAULT_EVAL_BIN_DIR
+    return os.path.join(base, name)
 
 
 def _resolve_cli() -> str | None:
@@ -330,7 +373,7 @@ def seed_no_grep_watcher_output(cli: str, *, dry_run: bool = False,
     # the MAIN loop's state it does not own. See
     # _main_loop_only_evaluator_params().
     predicate_params = _main_loop_only_evaluator_params(
-        "/usr/local/bin/eval-no-grep-watcher-output")
+        _eval_bin("eval-no-grep-watcher-output"))
 
     cmd = [
         cli, "add",
@@ -394,7 +437,7 @@ def seed_event_must_act(cli: str, *, dry_run: bool = False,
     # the MAIN loop's state it does not own. See
     # _main_loop_only_evaluator_params().
     predicate_params = _main_loop_only_evaluator_params(
-        "/usr/local/bin/eval-event-must-act")
+        _eval_bin("eval-event-must-act"))
 
     cmd = [
         cli, "add",
@@ -459,7 +502,7 @@ def seed_agent_ack_pending(cli: str, *, dry_run: bool = False,
     # the MAIN loop's state it does not own. See
     # _main_loop_only_evaluator_params().
     predicate_params = _main_loop_only_evaluator_params(
-        "/usr/local/bin/eval-agent-ack-pending")
+        _eval_bin("eval-agent-ack-pending"))
 
     cmd = [
         cli, "add",
@@ -574,7 +617,7 @@ def seed_queue_ready_unspawned(cli: str, *, dry_run: bool = False,
     # the MAIN loop's state it does not own. See
     # _main_loop_only_evaluator_params().
     predicate_params = _main_loop_only_evaluator_params(
-        "/usr/local/bin/eval-queue-ready-unspawned")
+        _eval_bin("eval-queue-ready-unspawned"))
 
     cmd = [
         cli, "add",
@@ -1128,6 +1171,20 @@ def seed_from_manifest_dir(cli: str, manifest_dir: str, *,
     return first_rc
 
 
+# Row-name -> seeder registry. Backs ``--only`` and keeps the name the
+# operator types identical to the name in this file's docstring and in the
+# row's ``[default-seed] <name>`` deny-message tag.
+SEEDERS = {
+    "subagent_queue_item_running": seed_subagent_queue_item_running,
+    "no_grep_watcher_output": seed_no_grep_watcher_output,
+    "event_must_act": seed_event_must_act,
+    "agent_ack_pending": seed_agent_ack_pending,
+    "queue_ready_unspawned": seed_queue_ready_unspawned,
+    "no_backgrounded_watcher": seed_no_backgrounded_watcher,
+    "subagent_queue_mutating_banned": seed_subagent_queue_mutating_banned,
+}
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="obligations-init",
@@ -1147,17 +1204,47 @@ def main() -> int:
         "-v", "--verbose", action="store_true",
         help="Print one-line stderr summaries for each row.",
     )
+    p.add_argument(
+        "--only", action="append", metavar="ROW", choices=sorted(SEEDERS),
+        help="Seed ONLY the named default row (repeatable). Without this "
+             "flag every default row is seeded in one shot, which is the "
+             "right default for a fresh container but far too blunt for "
+             "enabling ONE gate on an already-running host: the other rows "
+             "become live gates on the operator's next tool call. Choices: "
+             + ", ".join(sorted(SEEDERS)) + ". The user-manifest pass is "
+             "skipped when --only is given.",
+    )
     args = p.parse_args()
 
     cli = _resolve_cli()
     if not cli:
-        # Default-open: container builds without the obligations CLI on
-        # PATH (broken bind-mount, intentionally stripped) silently skip
-        # seeding. The hook scripts default-open on the same condition.
-        if args.verbose:
-            print("obligations-init: obligations CLI not found -- "
-                  "skipping seed", file=sys.stderr)
-        return 0
+        if args.dry_run:
+            # A dry run registers nothing, so a missing CLI is no reason to
+            # print nothing: the whole point of `-n` is to SHOW the operator
+            # the exact `obligations add` invocation before they commit to
+            # it (and to let CI assert on that rendering on a runner that has
+            # no obligations install at all). Fall back to the bare command
+            # name so the printed line is still copy-pasteable.
+            cli = "obligations"
+        else:
+            # Default-open: container builds without the obligations CLI on
+            # PATH (broken bind-mount, intentionally stripped) silently skip
+            # seeding. The hook scripts default-open on the same condition.
+            if args.verbose:
+                print("obligations-init: obligations CLI not found -- "
+                      "skipping seed", file=sys.stderr)
+            return 0
+
+    if args.only:
+        # Single-row mode. Deliberately does NOT run the manifest pass:
+        # --only means "seed exactly what I named and nothing else".
+        rc_only = 0
+        for row in args.only:
+            rc_only = SEEDERS[row](
+                cli, dry_run=args.dry_run, force=args.force,
+                verbose=args.verbose,
+            ) or rc_only
+        return rc_only
 
     rc = seed_subagent_queue_item_running(
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,

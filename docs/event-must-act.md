@@ -158,6 +158,61 @@ container image:
 - `tools/event-must-act/user-prompt-ambient-inject-hook` drains the ambient
   queue on every `UserPromptSubmit`.
 
+### Non-container (systemd host) install
+
+The four scripts above are deployment-agnostic — all their state lives
+under `~/.config/claude-events/` (override with `$CLAUDE_EVENT_STATE_DIR`)
+— so a host deployment uses the exact same copies rather than a fork.
+`make install` symlinks them (plus `obligations-init`) into `$BIN_DIR`
+(default `~/bin`).
+
+Two things differ from the container and both are easy to get silently
+wrong:
+
+1. **The evaluator path.** The seeded row stores an absolute `cmd`. On a
+   host that is `$BIN_DIR/eval-event-must-act`, not the baked
+   `/usr/local/bin/...`. Export `CW_EVAL_BIN_DIR` before seeding.
+   Getting this wrong fails **open and silently**: the `evaluator`
+   predicate allows on spawn error, so the row exists, `obligations list`
+   shows it, and it enforces nothing.
+2. **Seed one row, not all of them.** Bare `obligations-init` seeds every
+   default row — right for a fresh container, wrong for switching on one
+   gate on a host that is already running, where the other rows become
+   live gates on the next tool call. Use `--only`.
+
+```sh
+make install                                   # symlinks into ~/bin
+export CW_EVAL_BIN_DIR="$HOME/bin"
+obligations-init --only event_must_act -n      # inspect the exact add
+obligations-init --only event_must_act -v      # then seed it
+```
+
+Verify the row actually points somewhere real, rather than trusting that
+it was seeded:
+
+```sh
+obligations list --json \
+  | python3 -c 'import json,sys,os;
+rows=[o for o in json.load(sys.stdin)["obligations"]
+      if o.get("deny_message")=="[default-seed] event_must_act"]
+print(rows and os.access(
+    rows[0]["predicate_params"]["predicates"][1]["params"]["cmd"], os.X_OK))'
+```
+
+`claude-event-watch` auto-ingests every delivered event through
+`event-ack ingest` (disable with `CLAUDE_EVENT_WATCH_AUTO_INGEST=0`), and
+it resolves the CLI by `command -v` at startup — so ingestion begins on
+the first watcher run after `event-ack` lands on `PATH`, which is
+typically **before** you seed the row. Check `event-ack list` (and
+`event-ack clear` if a backlog accumulated) immediately before seeding,
+or the gate denies on its very first evaluation.
+
+Note that `heartbeat-tick` is classified **actionable**, so on a host that
+emits it the gate is what forces the loop to touch the heartbeat file —
+`event-ack ack` is what clears it, not the `touch` itself.
+
+### Container redeploy
+
 To pick up changes to any of the above on workbot, rebuild and
 redeploy the container:
 
