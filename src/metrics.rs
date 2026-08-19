@@ -147,15 +147,29 @@ fn parse_btime(proc_stat: &str) -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
-/// Epoch (float secs) at which PID 1 started: `btime + starttime / clk_tck`.
-/// Pure combiner so the arithmetic is unit-testable without `/proc`.
-fn container_start_epoch(pid1_stat: &str, proc_stat: &str, clk_tck: u64) -> Option<f64> {
+/// Epoch (float secs) at which a process started: `btime + starttime / clk_tck`,
+/// given its `/proc/<pid>/stat` contents and `/proc/stat`. Pure combiner so the
+/// arithmetic is unit-testable without `/proc`. Shared by the container gauge
+/// (PID 1) and the Claude Code process gauge.
+fn pid_start_epoch(pid_stat: &str, proc_stat: &str, clk_tck: u64) -> Option<f64> {
     if clk_tck == 0 {
         return None;
     }
-    let starttime = parse_pid_starttime_ticks(pid1_stat)?;
+    let starttime = parse_pid_starttime_ticks(pid_stat)?;
     let btime = parse_btime(proc_stat)?;
     Some(btime as f64 + starttime as f64 / clk_tck as f64)
+}
+
+/// `sysconf(_SC_CLK_TCK)` — the unit of `/proc/<pid>/stat`'s starttime field.
+/// Falls back to the near-universal 100 if the query fails.
+fn clk_tck() -> u64 {
+    // SAFETY: sysconf(_SC_CLK_TCK) is a pure libc query with no preconditions.
+    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if v > 0 {
+        v as u64
+    } else {
+        100
+    }
 }
 
 /// Epoch seconds of the container's start, derived from PID 1's start time via
@@ -167,10 +181,64 @@ fn container_start_time_secs() -> Option<f64> {
     }
     let pid1_stat = fs::read_to_string("/proc/1/stat").ok()?;
     let proc_stat = fs::read_to_string("/proc/stat").ok()?;
-    // SAFETY: sysconf(_SC_CLK_TCK) is a pure libc query with no preconditions.
-    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let clk_tck = if clk_tck > 0 { clk_tck as u64 } else { 100 };
-    container_start_epoch(&pid1_stat, &proc_stat, clk_tck)
+    pid_start_epoch(&pid1_stat, &proc_stat, clk_tck())
+}
+
+/// Oldest start epoch among the supplied `/proc/<pid>/stat` blobs.
+///
+/// Pure combiner (no `/proc` reads) so the selection rule is unit-testable.
+/// OLDEST — not first, not newest — because short-lived `claude -p`
+/// invocations (hooks, tooling) exec the same binary as the main loop, and a
+/// process-AGE gauge that latched onto one of those would collapse to ~0 at
+/// random scrapes. The main loop is by construction the earliest-started
+/// Claude Code process in the session.
+fn oldest_start_epoch(pid_stats: &[String], proc_stat: &str, clk_tck: u64) -> Option<f64> {
+    pid_stats
+        .iter()
+        .filter_map(|s| pid_start_epoch(s, proc_stat, clk_tck))
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// Epoch seconds at which the running Claude Code process started.
+///
+/// Derived from `/proc/<pid>/stat` field 22 (starttime, in clock ticks since
+/// boot) plus `/proc/stat`'s `btime`, rather than by shelling out to `ps` —
+/// `ps` output is locale- and format-dependent, and this needs to be exact.
+///
+/// Unlike the container gauge this works IDENTICALLY inside and outside a
+/// container: a containerized Claude Code has a `/proc/<pid>/stat` just as a
+/// bare-host one does, and `btime` is namespace-stable. It is therefore the
+/// portable "how long has this session been alive" signal, where container age
+/// only exists in one of the two deployment shapes.
+///
+/// `None` (gauge omitted, matching the heartbeat pattern) when no Claude Code
+/// process is running or `/proc` is unreadable — nothing stale is exported.
+fn claude_process_start_time_secs() -> Option<f64> {
+    let pids = crate::agent::find_claude_pids();
+    if pids.is_empty() {
+        return None;
+    }
+    let proc_stat = fs::read_to_string("/proc/stat").ok()?;
+    // A pid can exit between the scan and the read; skip those rather than
+    // failing the whole gauge.
+    let stats: Vec<String> = pids
+        .iter()
+        .filter_map(|pid| fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+        .collect();
+    oldest_start_epoch(&stats, &proc_stat, clk_tck())
+}
+
+/// Prometheus block for the Claude Code process start-time gauge.
+/// Empty when no Claude Code process is detectable.
+fn claude_process_start_block() -> Vec<String> {
+    match claude_process_start_time_secs() {
+        Some(ts) => vec![
+            "# HELP claude_process_start_timestamp_seconds Epoch at which the running Claude Code process started (oldest matching PID); process age = time() - this. Read from /proc/<pid>/stat starttime + /proc/stat btime, so it works identically inside and outside a container. Omitted when no Claude Code process is running.".to_string(),
+            "# TYPE claude_process_start_timestamp_seconds gauge".to_string(),
+            format!("claude_process_start_timestamp_seconds {ts:.3}"),
+        ],
+        None => Vec::new(),
+    }
 }
 
 /// Prometheus block for the container start-time gauge. Empty when
@@ -1461,6 +1529,14 @@ pub async fn cmd_metrics() -> i32 {
     lines.push(String::new());
     lines.extend(container_start_block());
 
+    // Claude Code process start-time gauge -- process age = time() minus this.
+    // The PORTABLE session-age signal: unlike the container gauge above it is
+    // emitted in BOTH deployment shapes (bare host under tmux, and in a
+    // container), which is why the dashboard's Session Timers panel reads this
+    // one. Empty when no Claude Code process is running.
+    lines.push(String::new());
+    lines.extend(claude_process_start_block());
+
     if let Err(e) = write_prom(&lines, &prom_path) {
         eprintln!("Error writing prom file: {e}");
         return 1;
@@ -2225,18 +2301,73 @@ mod tests {
     }
 
     #[test]
-    fn container_start_epoch_combines_btime_and_ticks() {
+    fn pid_start_epoch_combines_btime_and_ticks() {
         // starttime field 22 = 200 ticks; clk_tck = 100 -> 2.0s after btime.
         let stat = "1 (init) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 200 0";
-        assert_eq!(container_start_epoch(stat, "btime 1000\n", 100), Some(1002.0));
+        assert_eq!(pid_start_epoch(stat, "btime 1000\n", 100), Some(1002.0));
     }
 
     #[test]
-    fn container_start_epoch_none_on_zero_clk_tck() {
+    fn pid_start_epoch_none_on_zero_clk_tck() {
         assert_eq!(
-            container_start_epoch("1 (x) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 5", "btime 1\n", 0),
+            pid_start_epoch("1 (x) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 5", "btime 1\n", 0),
             None
         );
+    }
+
+    // --- Claude Code process-age gauge ----------------------------------
+
+    /// Build a synthetic `/proc/<pid>/stat` line whose field 22 (starttime)
+    /// is `ticks`.
+    fn stat_with_starttime(ticks: u64) -> String {
+        format!("42 (claude) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0")
+    }
+
+    #[test]
+    fn oldest_start_epoch_picks_the_earliest_process() {
+        // Two live claude binaries: the long-running main loop (200 ticks
+        // after boot) and a short-lived `claude -p` (900000 ticks). The gauge
+        // must anchor on the OLDEST, else process age collapses to ~0 the
+        // moment a hook shells out to claude.
+        let stats = vec![stat_with_starttime(900_000), stat_with_starttime(200)];
+        assert_eq!(
+            oldest_start_epoch(&stats, "btime 1000\n", 100),
+            Some(1002.0)
+        );
+    }
+
+    #[test]
+    fn oldest_start_epoch_none_on_empty_input() {
+        assert_eq!(oldest_start_epoch(&[], "btime 1000\n", 100), None);
+    }
+
+    #[test]
+    fn oldest_start_epoch_skips_unparseable_stats() {
+        // A pid that exited mid-scan can yield garbage; it must be skipped,
+        // not poison the whole gauge.
+        let stats = vec!["".to_string(), stat_with_starttime(500)];
+        assert_eq!(
+            oldest_start_epoch(&stats, "btime 1000\n", 100),
+            Some(1005.0)
+        );
+    }
+
+    #[test]
+    fn claude_process_start_block_is_well_formed_or_empty() {
+        // Environment-dependent (no claude running in CI), so assert the
+        // shape rather than the value: either omitted entirely, or a
+        // complete HELP/TYPE/sample triple naming the right metric.
+        let lines = claude_process_start_block();
+        if lines.is_empty() {
+            return;
+        }
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("# HELP claude_process_start_timestamp_seconds"));
+        assert!(lines[1].starts_with("# TYPE claude_process_start_timestamp_seconds gauge"));
+        let sample = lines[2]
+            .strip_prefix("claude_process_start_timestamp_seconds ")
+            .expect("sample line names the metric");
+        assert!(sample.parse::<f64>().expect("sample is numeric") > 0.0);
     }
 
     #[test]
