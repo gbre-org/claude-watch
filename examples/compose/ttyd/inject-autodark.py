@@ -710,16 +710,56 @@ LOCK_TOGGLE_STYLE = """<style id="lock-toggle-injected-style">
 # while locked — `attachCustomKeyEventHandler` only vetoes key events,
 # not the browser's separate `paste` event, so the paste path needs its
 # own check for the guard to be complete.
+#
+# Persistence: the lock state is stored in localStorage under
+# `cw-terminal-locked` ('1' locked / '0' unlocked). It's read back on
+# page load to seed the initial state (button glyph, aria-pressed, the
+# `.cw-locked` class, `window.__cwTerminalLocked`, and the key-veto), so
+# a locked terminal survives a browser refresh / reconnect instead of
+# silently reverting to unlocked. First load (no stored value) defaults
+# to unlocked; localStorage access is wrapped in try/catch so private
+# mode / disabled storage degrades to in-memory-only rather than breaking
+# the toggle.
 LOCK_TOGGLE_JS = """<script id="lock-toggle-injected">
 (function() {
     'use strict';
 
-    var locked = false;
+    // Persist the lock state across page reloads in localStorage. Without
+    // this the lock is a per-page in-memory flag, so every browser refresh
+    // / laptop-sleep-driven ttyd reconnect / accidental reload silently
+    // drops back to UNLOCKED — surprising for a safety guard whose whole
+    // point is "don't let stray keystrokes reach the live session". With
+    // persistence a locked terminal STAYS locked until explicitly unlocked.
+    var STORAGE_KEY = 'cw-terminal-locked';
+
+    function readStoredLocked() {
+        // First load (nothing stored) → getItem returns null → false
+        // (unlocked), the safe / stock default. Wrapped in try/catch
+        // because Safari private mode and disabled-storage configs THROW
+        // on any localStorage access rather than returning null.
+        try {
+            return window.localStorage.getItem(STORAGE_KEY) === '1';
+        } catch (e) { return false; }
+    }
+
+    function writeStoredLocked(v) {
+        // Degrade to in-memory-only if storage is unavailable (private
+        // mode / quota / disabled): the lock still works for this session,
+        // it just won't survive a reload. Never let a storage error break
+        // the toggle itself.
+        try {
+            window.localStorage.setItem(STORAGE_KEY, v ? '1' : '0');
+        } catch (e) { /* noop */ }
+    }
+
+    // Seed from persisted state so a reload restores the prior lock.
+    var locked = readStoredLocked();
 
     // Shared flag other injected handlers (the paste handler) read to
-    // suppress input while the terminal is locked. Defined up front so
-    // a paste that races button creation still sees a defined value.
-    window.__cwTerminalLocked = false;
+    // suppress input while the terminal is locked. Defined up front AND
+    // seeded from storage so a paste that races button creation still
+    // sees the correct restored value.
+    window.__cwTerminalLocked = locked;
 
     var LOCK_ICON = '\\uD83D\\uDD12';    // closed padlock
     var UNLOCK_ICON = '\\uD83D\\uDD13';  // open padlock
@@ -740,6 +780,7 @@ LOCK_TOGGLE_JS = """<script id="lock-toggle-injected">
     function setLocked(v) {
         locked = !!v;
         window.__cwTerminalLocked = locked;
+        writeStoredLocked(locked);   // persist so the state survives reload
         render();
     }
 

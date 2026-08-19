@@ -102,6 +102,19 @@ global.window = {
     },
 };
 
+// --- localStorage stub: backs the persistence path -----------------
+// Pre-seeded with __PRESEED__ (a JSON object) so we can exercise both
+// the fresh-load (empty) and restore-from-storage (pre-set) cases.
+var __lsStore = __PRESEED__;
+global.window.localStorage = {
+    getItem: function(k) {
+        return Object.prototype.hasOwnProperty.call(__lsStore, k)
+            ? __lsStore[k] : null;
+    },
+    setItem: function(k, v) { __lsStore[k] = String(v); },
+    removeItem: function(k) { delete __lsStore[k]; },
+};
+
 // Poll is a no-op in the harness (term is present at load, so init()
 // runs synchronously and attaches everything on first call).
 global.setInterval = function() { return 0; };
@@ -131,6 +144,8 @@ function snapshot() {
         // keyVeto returns TRUE when xterm should process the key (unlocked)
         // and FALSE when the key must be suppressed (locked).
         keyProcessed: keyVeto({ key: 'a' }),
+        // Persisted value in the localStorage stub ('1'/'0'/null).
+        stored: global.window.localStorage.getItem('cw-terminal-locked'),
     };
 }
 
@@ -163,9 +178,10 @@ UNLOCK_GLYPH = "\U0001F513"  # open padlock
 LOCK_GLYPH = "\U0001F512"    # closed padlock
 
 
-def _run_node_harness() -> dict:
+def _run_node_harness(preseed: dict | None = None) -> dict:
     js = _strip_script_tags(_extract_js_const("LOCK_TOGGLE_JS"))
     harness = HARNESS_TEMPLATE.replace("__HANDLER_BODY__", js)
+    harness = harness.replace("__PRESEED__", json.dumps(preseed or {}))
     proc = subprocess.run(
         ["node", "-e", harness],
         capture_output=True,
@@ -217,6 +233,47 @@ class LockToggleTests(unittest.TestCase):
         self.assertEqual(u["textContent"], UNLOCK_GLYPH)
         self.assertTrue(u["keyProcessed"])
         self.assertFalse(u["lockedFlag"])
+
+    def test_toggle_persists_state_to_localstorage(self):
+        # Fresh load with empty storage writes nothing until the first
+        # toggle; each toggle then persists the new state so it survives
+        # a page reload.
+        self.assertIsNone(self.out["initial"]["stored"])
+        self.assertEqual(self.out["afterLock"]["stored"], "1")
+        self.assertEqual(self.out["afterUnlock"]["stored"], "0")
+
+
+class LockToggleRestoreTests(unittest.TestCase):
+    """Loading with a persisted locked state restores the lock on init."""
+
+    @classmethod
+    def setUpClass(cls):
+        # localStorage already says locked ('1') — simulates a reload
+        # after the operator locked the terminal in a prior page load.
+        cls.out = _run_node_harness({"cw-terminal-locked": "1"})
+
+    def test_restores_locked_on_load(self):
+        i = self.out["initial"]
+        # Button reflects the restored locked state immediately on load.
+        self.assertEqual(i["ariaPressed"], "true")
+        self.assertTrue(i["hasLockedClass"], "restored lock cue missing")
+        self.assertEqual(i["textContent"], LOCK_GLYPH)
+        # The key guard is seeded locked, so keystrokes are suppressed
+        # from the very first paint (veto returns false).
+        self.assertFalse(i["keyProcessed"])
+        # Shared flag the paste handler reads is restored too.
+        self.assertTrue(i["lockedFlag"])
+        self.assertEqual(i["stored"], "1")
+
+    def test_click_unlocks_and_persists(self):
+        # Toggling from the restored locked state unlocks and persists '0'.
+        a = self.out["afterLock"]
+        self.assertEqual(a["ariaPressed"], "false")
+        self.assertFalse(a["hasLockedClass"])
+        self.assertEqual(a["textContent"], UNLOCK_GLYPH)
+        self.assertTrue(a["keyProcessed"])
+        self.assertFalse(a["lockedFlag"])
+        self.assertEqual(a["stored"], "0")
 
 
 if __name__ == "__main__":
