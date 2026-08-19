@@ -1116,6 +1116,29 @@ fn desk_streak_step_secs() -> f64 {
         .unwrap_or(60.0)
 }
 
+/// Prometheus' `query_range` rejects any request whose point count
+/// (`(end-start)/step + 1`) exceeds its resolution cap -- 11 000 points per
+/// timeseries by default. The configured step (`desk_streak_step_secs`, 60s)
+/// over the default 8-day lookback is 691200/60 = 11 520 points, so Prometheus
+/// returns `status:"error"`, `parse_prom_presence` bails, and the desk-streak
+/// SILENTLY falls back to the sidecar on EVERY emit -- disabling the Prometheus
+/// rehydration the `kind=max` gauge relies on to survive a container/cw restart
+/// (the "desk-streak max resets on restart" regression). We clamp the step UP
+/// so the request stays comfortably under this cap.
+const PROM_MAX_RANGE_POINTS: f64 = 10_000.0;
+
+/// Pure: the effective `query_range` step (seconds) that keeps `lookback/step`
+/// under the Prometheus point cap (`PROM_MAX_RANGE_POINTS`). Never returns below
+/// the configured `step` (resolution is only ever COARSENED, never finer than
+/// asked) nor below 1s. Coarsening the step merely widens sample spacing --
+/// still far finer than `max_gap` (180s default) -- so it never introduces
+/// spurious run breaks, and widening the lookback later can only raise the step,
+/// never re-break the query.
+fn effective_step_secs(lookback: f64, step: f64) -> f64 {
+    let min_step = (lookback / PROM_MAX_RANGE_POINTS).ceil();
+    step.max(min_step).max(1.0)
+}
+
 /// Maximum unobserved data gap (seconds) between two consecutive presence
 /// samples that is still bridged as ONE continuous run. A gap LARGER than this
 /// means the emitter simply was not running across it (host metrics cron paused
@@ -1292,12 +1315,13 @@ fn desk_streak_block() -> Vec<String> {
 
     // Preferred: rehydrate from Prometheus (survives restarts, no local state).
     if let Some(base) = prometheus_base_url() {
-        if let Some(body) = fetch_prom_presence_range(
-            &base,
-            now,
-            desk_streak_lookback_secs(),
-            desk_streak_step_secs(),
-        ) {
+        let lookback = desk_streak_lookback_secs();
+        // Clamp the step UP so `lookback/step` stays under Prometheus'
+        // query_range point cap; otherwise the request errors and the whole
+        // rehydration silently falls back to the sidecar (see
+        // `effective_step_secs`).
+        let step = effective_step_secs(lookback, desk_streak_step_secs());
+        if let Some(body) = fetch_prom_presence_range(&base, now, lookback, step) {
             if let Some(samples) = parse_prom_presence(&body, &|ts| local_week_of(ts)) {
                 let (computed, current) =
                     compute_streak_from_samples(&samples, now, present, &week, max_gap);
@@ -1310,6 +1334,17 @@ fn desk_streak_block() -> Vec<String> {
                 // gracefully rather than restarting from zero.
                 let _ = save_streak_state(&path, &next);
                 return desk_streak_lines(current, next.weekly_max_secs, next.alltime_max_secs);
+            } else {
+                // A non-success / malformed body (e.g. the point-cap "bad_data"
+                // error) means rehydration is broken, NOT that the operator was
+                // absent. Warn LOUD so this can't silently regress again, then
+                // fall through to the sidecar rather than blanking the max.
+                eprintln!(
+                    "claude-watch metrics: desk-streak Prometheus rehydration failed \
+                     (non-success/malformed query_range response from {base}); \
+                     falling back to sidecar. Check CW_PROMETHEUS_URL and the \
+                     query_range point cap (lookback={lookback:.0}s step={step:.0}s)."
+                );
             }
         }
     }
@@ -1498,6 +1533,28 @@ mod tests {
         std::env::set_var("CW_DESK_STREAK_MAX_GAP_SECS", "90");
         assert_eq!(desk_streak_max_gap_secs(), 90.0);
         std::env::remove_var("CW_DESK_STREAK_MAX_GAP_SECS");
+    }
+
+    #[test]
+    fn effective_step_stays_under_prom_point_cap() {
+        // The 8-day default lookback at the 60s configured step is 11 520
+        // points -- OVER Prometheus' 11 000-point query_range cap, which made
+        // the rehydration query error and silently fall back to the sidecar on
+        // every emit. The effective step must be clamped up so the point count
+        // stays at/under PROM_MAX_RANGE_POINTS.
+        let lookback = 691_200.0; // 8 days, the default
+        let eff = effective_step_secs(lookback, 60.0);
+        assert!(eff >= 60.0, "never finer than the configured step");
+        assert!(
+            lookback / eff <= PROM_MAX_RANGE_POINTS,
+            "points {} must be <= cap {}",
+            lookback / eff,
+            PROM_MAX_RANGE_POINTS
+        );
+        // A short lookback leaves the configured step untouched.
+        assert_eq!(effective_step_secs(60_000.0, 60.0), 60.0);
+        // Never below 1s, even for a pathological tiny lookback / zero step.
+        assert!(effective_step_secs(10.0, 0.0) >= 1.0);
     }
 
     #[test]
