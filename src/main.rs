@@ -1075,6 +1075,30 @@ async fn run_daemon() {
 
     let config = load_config();
     let mut state = load_state(&config.general.state_file);
+    // Reconcile the persisted per-watcher health map against the CURRENT
+    // watcher config before anything reads it. `watcher_health` is only ever
+    // grown by the monitor loop (which skips absent/disabled watchers), so a
+    // retired or switched-off watcher would otherwise keep an `enabled: true`
+    // entry with an ever-climbing `consecutive_missing` forever — permanently
+    // inflating `claude_watchers_missing` and the watcher hang signal. Done
+    // here (not only in the monitor) so the map is honest even when the watcher
+    // monitor is disabled; the monitor repeats the pass each cycle so a config
+    // edit is picked up without a restart.
+    {
+        let mut entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
+        if let Some(ref extra) = config.watcher_monitor.watchers_config_extra {
+            entries.extend(status::parse_watchers_config(extra));
+        }
+        let outcome = state::reconcile_watcher_health(&mut state, &entries);
+        if outcome.changed() {
+            info!(
+                removed = ?outcome.removed,
+                disabled = ?outcome.disabled,
+                re_enabled = ?outcome.re_enabled,
+                "reconciled watcher_health against watcher config on load"
+            );
+        }
+    }
     // Anchor for the "time since last clear" metric fallback: record when THIS
     // daemon process started, so the (separate, short-lived) `claude-watch
     // metrics` scraper can render a real duration even before any /clear is

@@ -196,6 +196,14 @@ groups:
             the daemon is not running.
 
       # ClaudeWatchersMissing -- enabled watchers that have gone missing.
+      #
+      # Source note: this reads the daemon's PERSISTED per-watcher health map
+      # (miss streaks, grace windows), NOT the live config probe behind
+      # claude_code_live_watchers / claude_code_enabled_watchers. The two can
+      # legitimately differ for a cycle or two; a LASTING disagreement (this
+      # alert firing while the live pair reports every watcher healthy) means
+      # the persisted map has drifted from the watcher config, not that a
+      # watcher is down.
       - alert: ClaudeWatchersMissing
         expr: claude_watchers_missing > 0
         for: 5m

@@ -5802,6 +5802,21 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         if let Some(ref extra) = config.watcher_monitor.watchers_config_extra {
             entries.extend(status::parse_watchers_config(extra));
         }
+        // Drop health for watchers the config no longer lists, and force
+        // `enabled: false` on the ones it disables. The loop below `continue`s
+        // past both shapes, so without this pass their entries would keep the
+        // `enabled: true` + climbing `consecutive_missing` they had at
+        // retirement forever. Re-run every cycle (not just at load) so editing
+        // the watchers config takes effect without a daemon restart.
+        let reconciled = crate::state::reconcile_watcher_health(state, &entries);
+        if reconciled.changed() {
+            info!(
+                removed = ?reconciled.removed,
+                disabled = ?reconciled.disabled,
+                re_enabled = ?reconciled.re_enabled,
+                "reconciled watcher_health against watcher config"
+            );
+        }
         let mut any_critical_missing = false;
         let mut missing_names: Vec<String> = Vec::new();
         // Longest continuous-down duration (seconds) among the watchers that
