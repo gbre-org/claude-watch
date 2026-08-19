@@ -231,7 +231,32 @@ fn build_metrics(
     let alert_count = num(state, "alert_count");
     let restart_count = num(state, "restart_count");
 
-    // Watcher health
+    // Watcher health.
+    //
+    // NOTE — there are deliberately TWO watcher gauge families, fed by two
+    // different sources, and they answer subtly different questions:
+    //
+    //   * `claude_watchers_missing` / `claude_watchers_total` (here) are
+    //     derived from the DAEMON'S PERSISTED BELIEF (`watcher_health` in the
+    //     state file). They are what the monitor has concluded over successive
+    //     check cycles, including its grace windows and miss streaks — the same
+    //     view the inject/event path acts on. That makes them the right series
+    //     for "is the watcher monitor about to do something about this", but it
+    //     also means they are only as good as the state map.
+    //   * `claude_code_live_watchers` / `claude_code_enabled_watchers` (see
+    //     `collect_live_counts`) are probed FRESH from the watchers config on
+    //     every scrape. They are instantaneous truth, and self-correcting by
+    //     construction, but they know nothing about streaks or grace.
+    //
+    // The two silently disagreed because only the second was self-correcting:
+    // `watcher_health` was append-only, so watchers that had been retired or
+    // disabled kept `enabled: true` entries with unbounded `consecutive_missing`
+    // and pinned `claude_watchers_missing` above zero forever, while the live
+    // pair correctly reported every configured watcher healthy. The state map is
+    // now reconciled against the config (see `state::reconcile_watcher_health`),
+    // which is what keeps the persisted view from drifting away from the live
+    // one. Divergence beyond a short transient is a bug in the state map, not a
+    // reason to change the predicate below.
     let (watchers_missing, watchers_total) = match state.get("watcher_health") {
         Some(Value::Object(map)) => {
             let mut missing = 0u64;
