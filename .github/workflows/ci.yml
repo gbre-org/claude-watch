@@ -18,6 +18,7 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        timeout-minutes: 5
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -46,6 +47,7 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        timeout-minutes: 5
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -60,6 +62,7 @@ jobs:
 
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        timeout-minutes: 5
 
       - name: Run unit + fixture tests
         run: cargo nextest run -E 'not binary(~e2e_)'
@@ -72,9 +75,20 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        timeout-minutes: 5
 
       - name: Install tmux
+        # Bounded because a stuck runner makes an infra step
+        # indistinguishable from a slow one. This `apt-get` and the
+        # inotify-tools one below have each wedged twice in the last 60
+        # runs; with no step bound they ran until the implicit 360-minute
+        # job ceiling, so every later step in the job stayed pending for
+        # six hours over a package install that normally takes seconds.
+        # 5 minutes is ~9x the slowest healthy run of this step (35s) and
+        # >2x the slowest healthy run of any apt step here (134s), so a
+        # genuinely slow mirror still passes while a hang fails fast.
         run: sudo apt-get update && sudo apt-get install -y tmux
+        timeout-minutes: 5
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -89,6 +103,7 @@ jobs:
 
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        timeout-minutes: 5
 
       - name: Start tmux server
         run: tmux start-server
@@ -118,6 +133,7 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        timeout-minutes: 5
 
       - name: Run queue-minisite end-to-end suites
         # These suites were local-only, so minisite PRs could merge on a
@@ -201,6 +217,7 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        timeout-minutes: 5
 
       - name: Run hostjob detached-runner tests
         run: make test-hostjob
@@ -224,7 +241,10 @@ jobs:
         run: make test-ttyd-lock-toggle
 
       - name: Install inotify-tools (for claude-event-watch tests)
+        # Same exposure as the tmux install in the e2e job, and it hung on
+        # the same two days. Slowest healthy run of this step was 134s.
         run: sudo apt-get update && sudo apt-get install -y inotify-tools
+        timeout-minutes: 5
 
       - name: Run watcher tests (self-clear/self-login + claude-event-watch debounce)
         run: make test-watchers
