@@ -196,17 +196,24 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("queue", "queue-stale-ready", None, ACTIONABLE,
         "Queue item ready but stale; needs spawn/abandon decision."),
 
-    # heartbeat-tick -> the main loop MUST touch the heartbeat file named in
-    # the event's `data.path` (surfaced on the EVENT[] one-liner as `path=`).
-    # The file is the daemon's wedge-detector: if the idle loop never
-    # refreshes it, it goes stale at the ~10-min threshold and the daemon
-    # fires a spurious "heartbeat stale" alert. This is a tiny self-service
-    # action (one `touch`), not an agent-spawn — but it IS required, so it's
+    # heartbeat-tick -> the main loop MUST refresh the heartbeat file named
+    # in the event's `data.path` (surfaced on the EVENT[] one-liner as
+    # `path=`). The file is the daemon's wedge-detector: if the idle loop
+    # never refreshes it, it goes stale at the ~10-min threshold and the
+    # daemon fires a spurious "heartbeat stale" alert. This is a tiny
+    # self-service action, not an agent-spawn — but it IS required, so it's
     # actionable rather than ambient. Placed before the claude-watch/* ambient
     # catch-all below.
+    #
+    # The action is `heartbeat-ack` (tools/event-must-act/heartbeat-ack), NOT
+    # a bare `touch`: the touch alone leaves this very entry pending forever,
+    # and an `event-ack ack` alone proves no liveness. The wrapper does both
+    # in one command and is exempt in every gate, so naming it here keeps the
+    # instruction and the tooling in agreement.
     ("claude-watch", "heartbeat-tick", None, ACTIONABLE,
-        "Heartbeat tick; touch the heartbeat file at data.path (path=… on "
-        "the event line) to keep the loop's wedge-detector fresh."),
+        "Heartbeat tick; run `heartbeat-ack` — it touches the heartbeat file "
+        "(data.path / path=… on the event line) AND acks this entry in one "
+        "command, keeping the loop's wedge-detector fresh."),
 
     # memory-reminder -> ambient context-hygiene reminder emitted by the
     # daemon every 30min (carries the memory checklist in the event message).
