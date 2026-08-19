@@ -26,7 +26,8 @@ the `claude-watch` Rust binary (multicall symlinks — see
 ## `claude-event-watch`
 
 ```
-claude-event-watch [--debounce SECONDS] [--quiet SECONDS]
+claude-event-watch [--debounce SECONDS] [--quiet SECONDS] [--min-interval SECONDS]
+                   [--mode exit|monitor] [--liveness-interval SECONDS]
 ```
 
 - Once at least one event is pending (whether already queued at startup or
@@ -64,6 +65,118 @@ Environment:
   (default 10000)
 - `$EVENT_WATCH_DEBOUNCE_SECONDS` — equivalent of `--debounce` (hard cap)
 - `$EVENT_WATCH_QUIET_SECONDS` — equivalent of `--quiet` (quiet period)
+
+### Delivery mode (experimental, opt-in, runtime-toggleable)
+
+```
+claude-event-watch [--mode exit|monitor] [--liveness-interval SECONDS]
+claude-event-watch --print-mode        # one word, for scripts
+claude-event-watch --mode-status       # configured + live instance + pending
+```
+
+The block-print-exit shape above is `--mode exit` and remains **the
+default** — landing this changes nothing until someone flips the switch.
+
+| | `exit` (default) | `monitor` |
+|---|---|---|
+| Launcher | background Bash task (`run_in_background`) | a **line-streaming** launcher that turns each stdout line into a notification |
+| Lifetime | exits after every batch | stays alive across batches |
+| Cost per batch | notification **+ a restart call** | one notification |
+| Restart banner | printed | not printed (nothing exited) |
+
+**Why the exit exists, and what it actually buys.** Under a background-task
+launcher, captured stdout is handed back to the session only when the process
+*terminates*. So in `exit` mode the exit is not a nudge to handle the batch —
+it *is* the delivery mechanism. That is why `monitor` mode is only valid under
+a launcher that streams lines as they are written, and why the script refuses
+to enter it when it can tell it was started by the block-print-exit supervisor
+(see the guard below).
+
+**The mode is resolved from** (first hit wins) the `--mode` flag, then
+`$CLAUDE_EVENT_WATCH_MODE`, then a one-word **mode file** (default
+`$CLAUDE_EVENT_LOG_DIR/mode`, override `$CLAUDE_EVENT_WATCH_MODE_FILE`), then
+`exit`. Flag and env **pin** the mode for that process; only the file is a
+runtime toggle, and it is re-read on **every loop iteration**:
+
+```bash
+echo monitor > ~/.config/claude-events/mode    # on
+echo exit    > ~/.config/claude-events/mode    # off (default)
+```
+
+Neither direction needs a rebuild, a code revert, or a session restart, and
+neither needs anything killed:
+
+- **monitor → exit**: the live monitor notices within one loop iteration (at
+  most `$EVENT_WATCH_INOTIFY_TIMEOUT`, default 30s), writes its clean-exit
+  marker, prints the ordinary `WATCHER EXITED …` banner and exits — handing
+  itself back to the block-print-exit cycle the surrounding loop already drives.
+- **exit → monitor**: `exit` mode terminates after every batch anyway, so the
+  next ordinary restart comes up in monitor mode.
+
+An unreadable or unrecognised mode-file value **fails safe to `exit`** with a
+warning, so a typo cannot silently blackhole event delivery. An explicit bad
+`--mode` flag, being a direct instruction rather than ambient config, is a hard
+error instead.
+
+**Nothing about draining changes between modes.** Both call the same
+`print_pending`, so the no-consume contract is identical: events are surfaced,
+logged to `consumed.jsonl` and routed through `event-ack ingest`, and are never
+acked on the loop's behalf. Batching, the `--min-interval` throttle and the
+flock singleton are likewise untouched.
+
+**Making a monitor's death visible.** A monitor never exits, so silence is
+ambiguous between *idle*, *wedged* and *dead* — three states that look
+identical from outside. Two mechanisms disambiguate them, at different layers:
+
+- **Dead** is caught from **outside**, by the existing supervision layer and
+  with no new machinery. The flock guard writes this process's PID into
+  `<runtime-dir>/claude-event-watch.lock`, and watcher liveness is resolved by
+  checking that a recorded PID is a genuinely-live, cmdline-matching process —
+  a check that inspects a PID, not an exit, and so is mode-independent. A
+  killed monitor leaves a dead PID, no clean-exit marker, and (because the
+  lockfile is written once at startup rather than per batch) no fresh
+  runtime-file mtime to hold it inside the restart grace window: it reads as a
+  genuine outage, which it is. The separate spool-staleness health check —
+  which fires when `.json` events sit unconsumed past its window — is likewise
+  mode-independent.
+- **Wedged** (process alive, loop stuck) is invisible to a PID check, so it is
+  caught from **inside**: after `--liveness-interval` seconds with *no stdout*
+  (default 900, `0` disables) the monitor emits one
+  `EVENT-WATCH ALIVE mode=monitor pid=… uptime=… batches=… since_delivery=… pending=…`
+  line. The timer is reset by real deliveries, so a busy watcher never pays for
+  it and the line only appears during a lull. Reporting `pending` makes an
+  alive-but-not-draining loop visible rather than merely inferable.
+
+A monitor also prints one `EVENT-WATCH MONITOR MODE ACTIVE …` line at startup,
+so a launch that fails immediately is distinguishable from a quiet queue.
+
+**Supervised-monitor guard.** If the watcher can see that an ancestor is a
+`watcher-ctl run claude-event-watch` supervisor (identified by *both* a
+supervisor `/proc` comm *and* the `run <watcher>` argv, so a shell whose
+command line merely contains the phrase is not a false positive), it declines
+monitor mode and stays in `exit` mode with a warning — a monitor there would
+drain events to a stdout nobody reads. Override with
+`$CLAUDE_EVENT_WATCH_ALLOW_SUPERVISED_MONITOR=1`.
+
+**Interaction with the unread-watcher-output gate.** The obligation that blocks
+tool calls until the captured watcher output has been read is armed by a
+PostToolUse sidecar written when a *background Bash task* runs `watcher-ctl run
+<name>`. Monitor mode is not launched that way and produces no captured
+`.output` file, so no sidecar is registered and that predicate is vacuously
+satisfied rather than broken — the batch arrives inline in the conversation
+instead of in a file that has to be read. In `exit` mode the gate is completely
+unaffected. Note that this is a real trade: in monitor mode the *forcing* of a
+read comes from the notification itself, not from a gate, so a deployment that
+wants hard enforcement should seed the `event_must_act` obligation (which both
+modes arm identically, via the unchanged `event-ack ingest` call).
+
+Extra environment:
+
+- `$CLAUDE_EVENT_WATCH_MODE` — pins the mode for one process
+- `$CLAUDE_EVENT_WATCH_MODE_FILE` — mode-file path (default
+  `$CLAUDE_EVENT_LOG_DIR/mode`)
+- `$EVENT_WATCH_LIVENESS_INTERVAL` — equivalent of `--liveness-interval`
+- `$CLAUDE_EVENT_WATCH_ALLOW_SUPERVISED_MONITOR` — bypass the supervisor guard
 
 ## `self-clear`
 
