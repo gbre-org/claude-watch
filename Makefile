@@ -586,6 +586,12 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@ln -sfn $(abspath tools/watchers/claude-event-watch) $(BIN_DIR)/claude-event-watch
 	@ln -sfn $(abspath tools/watchers/self-clear) $(BIN_DIR)/self-clear
 	@ln -sfn $(abspath tools/watchers/self-login) $(BIN_DIR)/self-login
+	@ln -sfn $(abspath tools/obligations/obligations-init) $(BIN_DIR)/obligations-init
+	@ln -sfn $(abspath tools/event-must-act/event-classify) $(BIN_DIR)/event-classify
+	@ln -sfn $(abspath tools/event-must-act/event-ack) $(BIN_DIR)/event-ack
+	@ln -sfn $(abspath tools/event-must-act/eval-event-must-act) $(BIN_DIR)/eval-event-must-act
+	@ln -sfn $(abspath tools/event-must-act/user-prompt-ambient-inject-hook) $(BIN_DIR)/user-prompt-ambient-inject-hook
+	@ln -sfn $(abspath tools/event-must-act/cw-watcher-health-check) $(BIN_DIR)/cw-watcher-health-check
 	@echo "Installed to $(BIN_DIR):"
 	@echo "  - claude-watch              (file copy, build artifact)"
 	@echo "  - session-task              (symlink -> tools/session-task/)"
@@ -605,6 +611,12 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@echo "  - claude-event-watch        (symlink -> tools/watchers/)"
 	@echo "  - self-clear                (symlink -> tools/watchers/)"
 	@echo "  - self-login                (symlink -> tools/watchers/)"
+	@echo "  - obligations-init          (symlink -> tools/obligations/)"
+	@echo "  - event-classify            (symlink -> tools/event-must-act/)"
+	@echo "  - event-ack                 (symlink -> tools/event-must-act/)"
+	@echo "  - eval-event-must-act       (symlink -> tools/event-must-act/)"
+	@echo "  - user-prompt-ambient-inject-hook (symlink -> tools/event-must-act/)"
+	@echo "  - cw-watcher-health-check   (symlink -> tools/event-must-act/)"
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
 # Points core.hooksPath at the tracked scripts/git-hooks/ dir instead of
