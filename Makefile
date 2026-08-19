@@ -185,12 +185,20 @@ test-pr-branches: ## pr-branches classification + merge-assertion unit tests
 # cron-driven dead-watcher recovery injector (cw-watcher-health-check),
 # whose bash test stubs `claude-watch` so nothing is ever injected into a
 # real pane.
+#
+# producer-tier-e2e.test covers what the per-tool self-tests structurally
+# cannot: that a PRODUCER-shipped `data.tier` survives the WHOLE chain
+# (event file -> claude-event-watch -> event-ack ingest -> event-classify ->
+# pending/ambient). A unit test of classify() passes even when the watcher
+# never reads data.tier, so only the e2e proves the path is wired. It
+# sandboxes its own queue/state/lock/PATH and never touches a live watcher.
 test-event-must-act: ## event-must-act toolchain self-tests
 	python3 tools/event-must-act/event-classify --self-test
 	python3 tools/event-must-act/event-ack --self-test
 	python3 tools/event-must-act/eval-event-must-act --self-test
 	python3 tools/event-must-act/heartbeat-ack --self-test
 	tools/event-must-act/tests/cw-watcher-health-check.test
+	tools/event-must-act/tests/producer-tier-e2e.test
 
 # Run the self-clear config-only smoke tests (the full inject flow needs
 # a live Claude Code tmux pane, which can't be reproduced in unit tests).

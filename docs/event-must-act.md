@@ -14,9 +14,72 @@ entrypoint run; the evaluator script and CLIs live in `container/bin/`.
 ## Four-tier event-response model
 
 When `claude-event-watch` delivers events, each event is classified into
-one of four tiers based on its `source` and `tag` (see the mapping in
-`event-classify`'s `CLASSIFICATIONS` table; inspect with
-`event-classify --list-rules`).
+one of four tiers. **The producer is the source of truth**: an event
+source ships its own tier in the event's `data.tier`, and that decision is
+NOT duplicated in `event-classify`'s `CLASSIFICATIONS` table or in local
+config. The table is the FALLBACK for producers that ship nothing, plus a
+place for genuine consumer policy.
+
+### Classification precedence
+
+| # | Rung | Where it lives |
+|---|------|----------------|
+| 0 | EXCLUDED consumer policy — **absolute** | `CLASSIFICATIONS` (`signal/*` only) |
+| 1 | **User-side override** | `~/.config/claude-events/tier-overrides.json` |
+| 2 | **Producer-shipped tier** | the event's own `data.tier` |
+| 3 | `CLASSIFICATIONS` table — fallback | `event-classify` |
+| 4 | fail-LOUD default (`actionable`, marked `UNCLASSIFIED`) | `event-classify` |
+
+Inspect every rung with `event-classify --list-rules`.
+
+**Adding a new event source?** Prefer rung 2 — stamp `data.tier` on the
+event in the producer. Only add a `CLASSIFICATIONS` row when you do not
+control the producer. Duplicating a producer's decision in the table is a
+two-sources-of-truth bug.
+
+#### Producer-shipped tier (rung 2)
+
+A producer sets `data.tier` to `actionable` / `ambient` / `excluded`:
+
+```bash
+claude-event "PR #637: CI still RED" --tag pr-ci-red --source cron \
+    --data tier=actionable
+```
+
+`claude-event-watch` reads `data.tier` off the event and passes it to
+`event-ack ingest --tier`, which hands it to `event-classify`. An invalid
+value (a typo, or a severity word like `high` — that is the separate
+top-level `priority` field) is IGNORED, and the event falls through to the
+table rather than being mis-routed.
+
+#### User-side overrides (rung 1)
+
+The operator can re-tier any event **without editing the producer and
+without editing `event-classify`**. Overrides outrank the producer.
+
+The file is OPTIONAL and never auto-created; absent means no overrides.
+Path: `$EVENT_CLASSIFY_OVERRIDES`, else
+`~/.config/claude-events/tier-overrides.json`.
+
+```json
+{"overrides": [
+  {"source": "cron", "tag": "pr-ci-red", "tier": "ambient",
+   "reason": "I watch PRs myself; the nudge is noise"},
+  {"source": "*", "tag": "pr-status-change", "contains": "merged",
+   "tier": "ambient"}
+]}
+```
+
+- `source` / `tag` — exact, `*`, or `prefix*`. Default `*`.
+- `contains` — OPTIONAL message substring narrowing the rule. Data, not
+  code: operator config never executes a predicate.
+- `tier` — `actionable` | `ambient` | `excluded` (required).
+- First match wins. A malformed file is ignored **wholesale** (default-open
+  — a typo must never break routing or half-apply); `--list-rules` prints
+  the parse error.
+
+An override can move anything **to** `excluded`, but cannot pull a
+`signal/*` event **out** of it: rung 0 stays absolute.
 
 ### Tier 1 — Ambient (info-only, context-inject only)
 
@@ -67,13 +130,45 @@ inbound is acked via `signal-ack`.
 
 ### Tier 4 — Unknown (defaults to ACTIONABLE — fail-LOUD)
 
-Any event whose `(source, tag)` pair doesn't match a rule in the
-`event-classify` table falls through to the default tier, which is now
-**actionable** (flipped from ambient). Fail-LOUD posture — a genuinely
-unknown event must be handled or get a classifier rule, never silently
-swallowed as context. Every deliberately-ambient pair already has an
-explicit rule above the catch-alls, so only TRULY-unmatched pairs hit
-this default.
+An event whose `(source, tag)` pair matches no rule in the
+`event-classify` table **and** whose producer shipped no `data.tier`
+falls through to the default tier, which is **actionable**. Fail-LOUD
+posture — a genuinely unknown event must be handled or get a
+classification, never silently swallowed as context. Every
+deliberately-ambient pair already has an explicit rule above the
+catch-alls, so only TRULY-unmatched pairs hit this default.
+
+#### The "add a rule" signal
+
+A fall-through is a **missing classification**, not a mystery gate, so it
+is surfaced as one. Such an event is marked `unclassified` in
+`pending-actions.json` and the `event-must-act` deny banner renders it
+distinctly:
+
+```
+Pending events:
+  - torrent-completed:Some.Release.mkv
+  - novel-tag:something new  [UNCLASSIFIED]
+
+NOTE: 1 of the above are [UNCLASSIFIED] -- they matched no rule in
+event-classify's CLASSIFICATIONS table AND their producer shipped no
+`data.tier`, so they hit the fail-loud ACTIONABLE default. Acking clears
+the event, NOT the cause -- the next one lands here too. Fix the
+classification (in preference order):
+  1. PREFERRED - have the PRODUCER stamp `data.tier=actionable|ambient`
+     on the event. Classification belongs with the source, not here.
+  2. Add a rule to CLASSIFICATIONS in tools/event-must-act/event-classify.
+  3. Add a user-side override (outranks the producer):
+     ~/.config/claude-events/tier-overrides.json
+
+  Inspect the current rules: event-classify --list-rules
+  Unclassified (source/tag): novel-source/novel-tag
+```
+
+This is **observability only** — the fail-loud ACTIONABLE default is
+deliberate and unchanged. Acking an unclassified event clears that event
+but not the cause; the next one lands in the same place until the
+classification is fixed.
 
 ## Workflow
 

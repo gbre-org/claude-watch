@@ -71,6 +71,13 @@ STATE_DIR = Path(os.environ.get(
 PENDING_FILE = STATE_DIR / "pending-actions.json"
 COUNTER_FILE = STATE_DIR / "tool-call-counter.json"
 
+# User-side tier overrides (rung 1 of event-classify's precedence ladder).
+# Named in the deny banner so an operator hitting an UNCLASSIFIED event is
+# told where to re-tier it. Read by event-classify, never by this file.
+OVERRIDES_PATH = Path(
+    os.environ.get("EVENT_CLASSIFY_OVERRIDES")
+    or os.path.expanduser("~/.config/claude-events/tier-overrides.json"))
+
 DEFAULT_N = 3
 try:
     THRESHOLD = max(1, int(os.environ.get("EVENT_MUST_ACT_N", DEFAULT_N)))
@@ -175,7 +182,11 @@ def _pending_count() -> int:
     return len(pending)
 
 
-def _pending_keys() -> list[str]:
+def _pending_entries() -> list[dict]:
+    """Pending entries with the classifier's verdict attached, so the deny
+    banner can flag UNCLASSIFIED events (matched no rule AND the producer
+    shipped no data.tier). Default-open on every read failure: an
+    unreadable/malformed pending file yields [] (ALLOW), never a deny."""
     if not PENDING_FILE.exists():
         return []
     try:
@@ -187,11 +198,15 @@ def _pending_keys() -> list[str]:
     pending = data.get("pending", [])
     if not isinstance(pending, list):
         return []
-    keys = []
+    out = []
     for it in pending:
         if isinstance(it, dict) and "key" in it:
-            keys.append(str(it["key"]))
-    return keys
+            out.append({
+                "key": str(it["key"]),
+                "unclassified": bool(it.get("unclassified")),
+                "source_event": str(it.get("source_event") or ""),
+            })
+    return out
 
 
 def _bump_counter() -> int:
@@ -220,18 +235,23 @@ def _get_counter() -> int:
 
 # --- Main evaluation ------------------------------------------------------
 
-def _emit_deny(pending: list[str], counter: int) -> None:
+def _emit_deny(pending: list, counter: int) -> None:
     """Write the deny banner to stderr (surfaced by the obligations
-    cascade)."""
+    cascade). Accepts either plain key strings (legacy / tests) or the
+    richer dicts from _pending_entries()."""
+    entries = [e if isinstance(e, dict)
+               else {"key": str(e), "unclassified": False, "source_event": ""}
+               for e in pending]
     lines = [
-        f"EVENT-MUST-ACT: {len(pending)} actionable event(s) un-acked "
+        f"EVENT-MUST-ACT: {len(entries)} actionable event(s) un-acked "
         f"AND {counter} consecutive non-exempt tool call(s) executed "
         f"(threshold N={THRESHOLD}).",
         "",
         "Pending events:",
     ]
-    for k in pending:
-        lines.append(f"  - {k}")
+    for e in entries:
+        mark = "  [UNCLASSIFIED]" if e["unclassified"] else ""
+        lines.append(f"  - {e['key']}{mark}")
     lines.extend([
         "",
         "For each event, either:",
@@ -244,6 +264,38 @@ def _emit_deny(pending: list[str], counter: int) -> None:
         "",
         "Or clear all: event-ack clear",
     ])
+
+    # The "add a rule" signal (botchat #2483). An UNCLASSIFIED event is not
+    # a mystery gate -- it is a MISSING CLASSIFICATION. Acking it clears the
+    # event but not the cause, so say so and name the three fixes. This is
+    # observability only: the fail-loud ACTIONABLE default is deliberate and
+    # unchanged.
+    unc = [e for e in entries if e["unclassified"]]
+    if unc:
+        pairs = sorted({e["source_event"] for e in unc if e["source_event"]})
+        lines.extend([
+            "",
+            f"NOTE: {len(unc)} of the above are [UNCLASSIFIED] -- they matched "
+            "no rule in",
+            "event-classify's CLASSIFICATIONS table AND their producer shipped "
+            "no",
+            "`data.tier`, so they hit the fail-loud ACTIONABLE default. Acking "
+            "clears",
+            "the event, NOT the cause -- the next one lands here too. Fix the",
+            "classification (in preference order):",
+            "  1. PREFERRED - have the PRODUCER stamp `data.tier="
+            "actionable|ambient`",
+            "     on the event. Classification belongs with the source, not "
+            "here.",
+            "  2. Add a rule to CLASSIFICATIONS in "
+            "tools/event-must-act/event-classify.",
+            "  3. Add a user-side override (outranks the producer):",
+            f"     {OVERRIDES_PATH}",
+            "",
+            "  Inspect the current rules: event-classify --list-rules",
+        ])
+        if pairs:
+            lines.append("  Unclassified (source/tag): " + ", ".join(pairs))
     print("\n".join(lines), file=sys.stderr)
 
 
@@ -255,7 +307,7 @@ def evaluate(cmd: str) -> int:
     if _is_exempt(cmd):
         return 0
 
-    pending = _pending_keys()
+    pending = _pending_entries()
     if not pending:
         return 0
 
@@ -286,17 +338,21 @@ def _self_test() -> int:
     import tempfile
     failures: list[str] = []
 
-    def _setup_state(td: Path, pending: list[str] | None = None,
+    def _setup_state(td: Path, pending: list | None = None,
                      counter: int | None = None) -> None:
+        """`pending` items are keys, or (key, extra_dict) pairs."""
         global PENDING_FILE, COUNTER_FILE, STATE_DIR
         STATE_DIR = td
         PENDING_FILE = td / "pending-actions.json"
         COUNTER_FILE = td / "tool-call-counter.json"
         if pending is not None:
-            PENDING_FILE.write_text(json.dumps({
-                "pending": [{"key": k, "added_at": "now"}
-                            for k in pending],
-            }))
+            rows = []
+            for k in pending:
+                extra = {}
+                if isinstance(k, tuple):
+                    k, extra = k
+                rows.append({"key": k, "added_at": "now", **extra})
+            PENDING_FILE.write_text(json.dumps({"pending": rows}))
         if counter is not None:
             COUNTER_FILE.write_text(json.dumps({"count": counter}))
 
@@ -438,12 +494,55 @@ def _self_test() -> int:
             if evaluate(c) != 0:
                 fail(f"botchat command must be exempt: {c!r}")
 
+    # Case 12: the "add a rule" signal (botchat #2483). An UNCLASSIFIED
+    # pending entry still DENIES exactly as before (routing unchanged), but
+    # the banner must MARK it and tell the operator how to classify it --
+    # otherwise a missing rule reads as mysterious gating.
+    import io
+    import contextlib
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), counter=99, pending=[
+            ("classified-key", {}),
+            ("novel-tag:something new",
+             {"unclassified": True, "source_event": "novel-source/novel-tag"}),
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = evaluate("rm -rf /tmp/foo")
+        out = buf.getvalue()
+        if rc != 1:
+            fail("unclassified pending must still DENY (routing unchanged)")
+        # Exactly the unclassified entry is marked in the pending LIST (the
+        # NOTE block below also names the marker, so scope the count).
+        listed = [ln for ln in out.splitlines() if ln.startswith("  - ")]
+        marked = [ln for ln in listed if "[UNCLASSIFIED]" in ln]
+        if len(listed) != 2:
+            fail(f"expected 2 listed entries, got {listed}")
+        if len(marked) != 1 or "novel-tag" not in marked[0]:
+            fail(f"only the unclassified entry may be marked: {marked}")
+        for needle in ("data.tier", "CLASSIFICATIONS", "tier-overrides.json",
+                       "novel-source/novel-tag", "NOT the cause",
+                       "event-classify --list-rules"):
+            if needle not in out:
+                fail(f"banner missing {needle!r}:\n{out}")
+
+    # Case 13: with NO unclassified entries the banner is unchanged -- the
+    # 'add a rule' block must not appear as noise on ordinary events.
+    with _tf.TemporaryDirectory() as td:
+        _setup_state(Path(td), pending=["k1"], counter=99)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            evaluate("rm -rf /tmp/foo")
+        out = buf.getvalue()
+        if "UNCLASSIFIED" in out or "data.tier" in out:
+            fail(f"add-a-rule block leaked onto a classified event:\n{out}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("OK: 11 cases pass.")
+    print("OK: 13 cases pass (incl. the add-a-rule banner signal).")
     return 0
 
 

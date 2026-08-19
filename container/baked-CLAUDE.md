@@ -1250,15 +1250,14 @@ vs. recent corpus activity, flag it to the operator — re-indexing is host-side
 >   Cron ticks below are producer output — cron jobs are **not** watchers.
 
 When `claude-event-watch` delivers events, the container classifies each into
-one of three tiers by its `source` and `tag`. The tiers escalate from "purely
-informational" to "blocking" so the LLM sees the right pressure per event
-class.
+one of three tiers, escalating from "purely informational" to "blocking" so
+the LLM sees the right pressure per event class.
 
 ### Tier 1 — Ambient (info-only, context-inject only)
 
 Routine, non-actionable events: alerts that Andrew already gets push for, cron
 ticks, routine queue transitions (running/done/abandoned), workload-done,
-non-fatal claude-watch alerts, routine PR status (push/pending/mergeable), etc.
+non-fatal claude-watch alerts, routine PR status (push/pending/CI success), etc.
 
   - Routed by `event-ack ingest` into `ambient-context.json`.
   - Surfaced by the `user-prompt-ambient-inject-hook` (UserPromptSubmit) on
@@ -1271,7 +1270,7 @@ non-fatal claude-watch alerts, routine PR status (push/pending/mergeable), etc.
 Events that demand a response within a reasonable window: torrent-completed
 (agent spawn), manual/request-fulfilled (requester DM), queue/queue-api-dead
 (respawn), fatal claude-watch alerts (CONTEXT CRITICALLY LOW, main pane crashed),
-PR CI failure/success, workbot-prompt, queue-stale-ready, slack-unread,
+PR CI failure / merge conflict, workbot-prompt, queue-stale-ready, slack-unread,
 **claude-watch/heartbeat-tick**.
 
 > **`heartbeat-tick` — run `heartbeat-ack`.** Every ~5 min the claude-watch
@@ -1290,29 +1289,23 @@ PR CI failure/success, workbot-prompt, queue-stale-ready, slack-unread,
   - **Each `event-ack` transaction resets the counter to 0**, so the LLM gets
     a fresh N-call grace window after every ack.
   - The gate does NOT fire immediately on every actionable event — only after
-    the LLM has missed N consecutive triage opportunities (only TRULY actionable
-    events go into pending; the gate escalates after N missed calls).
+    the LLM has missed N consecutive triage opportunities.
 
 ### Tier 3 — Unknown (defaults to ACTIONABLE — fail-LOUD)
 
-A source/tag pair matching no `event-classify` rule now defaults to
-**actionable** (flipped from ambient): a brand-new event source must be handled
-or get a rule, never silently swallowed. Routine events are unaffected —
-ambient pairs (`cron/*`, `alertmanager/*`, `claude-watch/*`, queue
-transitions) have explicit rules above the catch-alls; only unmatched pairs hit
-this default.
+A pair matching no rule **and** shipping no tier defaults to **actionable**:
+a brand-new source must be handled or get a classification, never silently
+swallowed. Such an event is **marked `UNCLASSIFIED`** and the deny banner
+names the fixes — acking clears the event, NOT the cause.
 
-### Event classification table
+### Event classification — the PRODUCER is the source of truth
 
-The mapping is DATA, in `event-classify`'s `CLASSIFICATIONS` table. Inspect:
-
-```sh
-event-classify --list-rules
-event-classify --source <src> --tag <tag> [--message <text>] --json
-```
-
-Adding a new event source = appending a row to the table. No gate-logic code
-change.
+A source ships its tier in `data.tier`; that is NOT duplicated here or in
+local config — the `CLASSIFICATIONS` table is only the FALLBACK. Precedence:
+`excluded` (**absolute**, `signal/*`) → **user override**
+(`~/.config/claude-events/tier-overrides.json`) → **producer `data.tier`** →
+table → fail-LOUD `actionable`. Inspect: `event-classify --list-rules`.
+**New source: stamp `data.tier` in the producer**, don't add a row.
 
 ### Workflow
 
