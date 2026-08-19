@@ -186,6 +186,18 @@ VERIFY_SECS = float(_env("CW_THEME_VERIFY_SECS", "10.0"))
 # us re-injecting into the operator's prompt line every poll, forever.
 MAX_VERIFY_FAILURES = 3
 
+# Delay before retry attempt N (seconds). An unbounded retry against a SHARED
+# prompt line is a self-inflicted denial of service: on 2026-08-19 the
+# every-poll retry put three mangled payloads into the live pane in ~90s,
+# which is worse than the silent failure it replaced. Back off hard, then
+# give up -- a wrong-coloured TUI is much cheaper than a corrupted input
+# stream.
+RETRY_BACKOFF_SECS = (30.0, 120.0, 300.0)
+
+# How long the input line must stay empty before we believe the pane is
+# genuinely idle rather than being typed into right now.
+PROMPT_RECHECK_SECS = float(_env("CW_THEME_PROMPT_RECHECK_SECS", "0.8"))
+
 # Set by SIGHUP: forget what we think is applied and re-assert.
 _reassert_requested = False
 
@@ -251,19 +263,56 @@ def resolve_pane():
     return "claude-container:0.0"
 
 
-def is_idle(pane):
-    """True when the pane shows an idle input prompt cursor.
+def _prompt_line(pane_text):
+    """Text currently sitting on the `❯` input line, or None if no prompt
+    is rendered. '' means the input line is empty."""
+    for line in reversed(pane_text.split("\n")):
+        if "❯" in line:
+            return line.split("❯", 1)[1].strip()
+    return None
 
-    Mirrors self-clear's is_idle. We only inject when idle so a theme
-    toggle never interrupts an in-flight turn.
+
+def is_idle(pane):
+    """True only when it is SAFE to type into the pane.
+
+    The original check -- "is the `❯` glyph anywhere in the last 15 lines"
+    -- was far too weak. Claude Code renders that prompt box permanently,
+    including while a turn is generating, so it reported idle for a pane that
+    was mid-composition. On 2026-08-19 that let three theme injects land in an
+    actively-generating pane.
+
+    Four gates now, each closing a distinct way the old one was wrong:
+
+      1. A prompt must actually be rendered (`❯` present).
+      2. No in-flight turn -- Claude Code shows "esc to interrupt" in the
+         status bar for the whole duration of one.
+      3. THE INPUT LINE MUST BE EMPTY. This is the direct guard against the
+         bug: the non-cancelling inject has no `dd` line-clear, so anything
+         already on that line gets our payload glued onto it. If someone (or
+         something) has half-typed input sitting there, typing is exactly the
+         wrong move.
+      4. The input line must still be empty a moment later, so we don't race
+         a human who just started typing.
+
+    Deliberately NOT a full-pane stability check: the pane carries a ticking
+    token counter and agent elapsed-time line, so it is never byte-stable and
+    such a check would report "never idle".
     """
     out, rc = run(["tmux", "capture-pane", "-t", pane, "-p"])
     if rc != 0 or not out:
         return False
-    for line in out.strip().split("\n")[-15:]:
-        if "❯" in line:  # the prompt cursor
-            return True
-    return False
+    if "esc to interrupt" in out.lower():
+        return False                      # a turn is generating
+    first = _prompt_line(out)
+    if first is None or first != "":
+        return False                      # no prompt, or input already there
+    time.sleep(PROMPT_RECHECK_SECS)
+    out2, rc2 = run(["tmux", "capture-pane", "-t", pane, "-p"])
+    if rc2 != 0 or not out2:
+        return False
+    if "esc to interrupt" in out2.lower():
+        return False
+    return _prompt_line(out2) == ""
 
 
 def read_theme():
@@ -497,6 +546,7 @@ def main():
     desired = None          # last theme read from the file (may await idle)
     last_mtime = None
     verify_failures = 0     # consecutive failed verifications of `desired`
+    retry_not_before = 0.0  # monotonic deadline enforcing RETRY_BACKOFF_SECS
 
     while True:
         # SIGHUP asks us to re-assert even though the file value has not
@@ -506,6 +556,7 @@ def main():
             log("SIGHUP: re-asserting current theme (forgetting applied state)")
             applied = None
             verify_failures = 0
+            retry_not_before = 0.0
             last_mtime = None
 
         try:
@@ -519,13 +570,21 @@ def main():
                 log(f"theme reported: {val}")
                 desired = val
                 verify_failures = 0
+                retry_not_before = 0.0
 
         if desired and desired != applied:
+            # Backoff gate: after a failed attempt we wait out
+            # RETRY_BACKOFF_SECS before touching the pane again.
+            if time.monotonic() < retry_not_before:
+                time.sleep(min(IDLE_POLL_SECS, POLL_SECS))
+                continue
+
             pane = resolve_pane()
             if is_idle(pane):
                 if inject_theme(pane, desired):
                     applied = desired
                     verify_failures = 0
+                    retry_not_before = 0.0
                 else:
                     verify_failures += 1
                     if verify_failures >= MAX_VERIFY_FAILURES:
@@ -542,6 +601,17 @@ def main():
                         )
                         applied = desired
                         verify_failures = 0
+                        retry_not_before = 0.0
+                    else:
+                        backoff = RETRY_BACKOFF_SECS[
+                            min(verify_failures - 1, len(RETRY_BACKOFF_SECS) - 1)
+                        ]
+                        retry_not_before = time.monotonic() + backoff
+                        log(
+                            f"backing off {backoff:.0f}s before retry "
+                            f"{verify_failures + 1}/{MAX_VERIFY_FAILURES} of "
+                            f"theme={desired}"
+                        )
                 time.sleep(POLL_SECS)
                 continue
             time.sleep(min(IDLE_POLL_SECS, POLL_SECS))
