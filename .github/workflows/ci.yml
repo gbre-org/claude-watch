@@ -77,23 +77,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         timeout-minutes: 5
 
-      - name: Install tmux
-        # Goes through scripts/ci-apt-install.sh, which bounds each
-        # `apt-get` attempt WELL BELOW the step cap and retries inside it.
-        # This step and the inotify-tools one below wedge intermittently,
-        # always in `apt-get update`, and the failure has no middle ground:
-        # ~21s healthy, or silent until it hits whatever bound it is given
-        # (312s / 21s / 313s on three consecutive runs of one branch).
-        #
-        # `timeout-minutes: 5` STAYS as the outer backstop. Before it
-        # existed these hangs ran to the implicit 360-minute job ceiling, so
-        # a larger bound buys longer failures, not passes — and without it a
-        # restructured step would silently revert to that ceiling. But a cap
-        # alone only converts the hang into a failed job, because the first
-        # wedged attempt consumes the whole budget and nothing retries.
-        # The script's inner bound is what leaves the retry room to succeed.
-        run: scripts/ci-apt-install.sh tmux
-        timeout-minutes: 5
+      # NOTE: there is deliberately no `Install tmux` step here. tmux ships
+      # PREINSTALLED on GitHub's ubuntu-latest image, so the install this job
+      # used to run was a measured no-op — apt reported "tmux is already the
+      # newest version (3.4-1ubuntu0.1). 0 upgraded, 0 newly installed" — and
+      # the only thing it actually did was trigger an ~11 MB `apt-get update`,
+      # which is where the intermittent Ubuntu-mirror wedge lives. Removing
+      # the step removes this job's entire apt exposure. `Start tmux server`
+      # below asserts tmux's presence, so a future image dropping it fails
+      # loudly and instantly rather than mysteriously.
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -111,7 +103,14 @@ jobs:
         timeout-minutes: 5
 
       - name: Start tmux server
-        run: tmux start-server
+        # `tmux -V` first: this job no longer installs tmux (see the note
+        # above), so this is the assertion that the runner image still
+        # provides it. It costs milliseconds and turns a hypothetical future
+        # image change into a one-line failure instead of a confusing e2e
+        # test collapse.
+        run: |
+          tmux -V
+          tmux start-server
 
       - name: Run e2e tests
         run: cargo nextest run -E 'binary(~e2e_)' --retries 2
@@ -254,11 +253,25 @@ jobs:
         run: make test-ttyd-lock-toggle
 
       - name: Install inotify-tools (for claude-event-watch tests)
-        # Same exposure as the tmux install in the e2e job, same fix. This
-        # step is where the wedge was captured in full: apt cycling `Ign:`
-        # on the runner's azure.archive.ubuntu.com mirror, falling back to
-        # archive.ubuntu.com, then going silent for 4.5 minutes mid-transfer
-        # until the step cap killed it. See scripts/ci-apt-install.sh.
+        # The ONLY apt install left in CI — inotify-tools is genuinely absent
+        # from the runner image (unlike tmux, whose step is gone entirely).
+        #
+        # This step is where the wedge was captured in full: apt cycling
+        # `Ign:` on the runner's azure.archive.ubuntu.com mirror, falling
+        # back to archive.ubuntu.com, and timing out part-way through the
+        # index refresh — three attempts in a row, all against the same dead
+        # mirror. So scripts/ci-apt-install.sh now (a) installs straight from
+        # the image's pre-baked package lists and only runs `apt-get update`
+        # if that fails, and (b) drops the stalling mirror from the runner's
+        # mirrorlist before any retry, so a retry actually goes somewhere new.
+        #
+        # `timeout-minutes: 5` STAYS as the outer backstop. Before it existed
+        # these hangs ran to the implicit 360-minute job ceiling, so a larger
+        # bound buys longer failures, not passes — and without it a
+        # restructured step would silently revert to that ceiling. But a cap
+        # alone only converts the hang into a failed job, because the first
+        # wedged attempt consumes the whole budget and nothing retries. The
+        # script's inner bound is what leaves the retry room to succeed.
         run: scripts/ci-apt-install.sh inotify-tools
         timeout-minutes: 5
 
