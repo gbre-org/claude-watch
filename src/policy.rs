@@ -5065,7 +5065,18 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 }),
             );
             tmux::dismiss_feedback_prompt(&effective_pane).await;
-            inject_dispatch::inject_to_agent(&effective_pane, &config.alerts.resume_prompt).await;
+            // NOT the generic `resume_prompt`: that one reports a stuck state
+            // with "no background tasks running" and asks for a watcher
+            // cleanup. This gate exists precisely BECAUSE background shells
+            // survive a /clear — the log line above records how many are live
+            // — so the generic wording states something the daemon has just
+            // measured to be false, and points the recovery at the wrong
+            // thing.
+            inject_dispatch::inject_to_agent(
+                &effective_pane,
+                &config.alerts.post_clear_resume_prompt,
+            )
+            .await;
             state.post_clear_resume_injected_for = state.last_context_clear.clone();
             state.post_clear_idle_checks = 0;
             state.fresh_clear_resume_inject_interrupts_total = state

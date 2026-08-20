@@ -70,6 +70,32 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     parse_status_bar_with_diag(pane_text).0
 }
 
+/// Is this line one of the agent-roster rows Claude Code draws below the
+/// status bar, one per running subagent?
+///
+/// Shape (real capture, 2026-08-20):
+/// ```text
+///   ● main
+///   ◯ general-purpose    Scanning claude-w… 3m 14s · ↓ 102.8k tokens
+/// ```
+/// The trailing count belongs to THAT AGENT, not to the session, so the
+/// token parser must never mistake it for the session context size.
+///
+/// The thinking indicator uses the same bullet glyph in some Claude Code
+/// versions (`● Zigzagging… (37s · ↓ 1.3k tokens · thought for 13s)`) but
+/// always parenthesises its counters, while a roster row never does — so
+/// the `(` test separates them without depending on which glyph is in
+/// fashion.
+pub(crate) fn is_agent_roster_row(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let starts_with_bullet = trimmed.starts_with('\u{25ef}') // ◯ — idle/running agent
+        || trimmed.starts_with('\u{25cf}'); // ● — selected / main row
+    starts_with_bullet
+        && !trimmed.contains('(')
+        && (trimmed.contains('\u{2191}') || trimmed.contains('\u{2193}'))
+        && trimmed.contains("tok")
+}
+
 /// Like `parse_status_bar` but also returns whether a status-bar marker was
 /// detected in the tail. The marker flag lets `is_parse_miss` suppress
 /// warnings for legitimately-idle status bars (which carry neither tokens
@@ -102,6 +128,36 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
     // has been clobbered by an overlay panel or extreme wrap.
     let token_thinking_re =
         Regex::new(r"[\u{2191}\u{2193}]\s*([\d]+(?:\.[\d]+)?)\s*([kKmM]?)\s*tok").unwrap();
+    // ARROW-PREFIXED counters are NOT the session context total.
+    //
+    // Two different UI elements render `<arrow> N tokens`:
+    //   * the thinking indicator — output tokens streamed in the CURRENT turn;
+    //   * the agent-roster rows Claude Code draws BELOW the status bar, one
+    //     per running subagent (`◯ general-purpose  Scanning… 3m 14s · ↓ 102.8k
+    //     tokens`) — that agent's own token count.
+    // Neither is the session's context size, which the status bar prints
+    // bare (`224598 tokens`) with no arrow.
+    //
+    // The generic `token_re` above has no arrow anchor, so it happily matches
+    // those counters too, and the per-line loop below keeps the LAST match in
+    // the bottom-10 window. Roster rows are drawn AFTER the status bar, so a
+    // roster row inside the window overwrites the real total with an agent's
+    // count. It only bites while an agent's count is under 1000: at 1000+ the
+    // roster prints `1.2k tokens`, which `token_re` cannot match (the `.`
+    // breaks `(\d[\d,]*)\s+tok`), so the total silently comes back.
+    //
+    // Observed 2026-08-20: three times in seven minutes the session total
+    // (169233, 178465, …) was replaced by a just-spawned agent's row
+    // (119, 21, 39, 74 tokens). Downstream that reads as "tokens collapsed
+    // from 169k to 119" — i.e. a context clear — and the daemon injected a
+    // post-clear resume prompt into a session that had never been cleared.
+    //
+    // Fix: blank out arrow-prefixed counter segments before running the
+    // generic status-bar match. The dedicated `token_thinking_re` pass below
+    // still recovers a thinking-indicator count when the status bar carries
+    // no total of its own, so no coverage is lost.
+    let arrow_counter_re =
+        Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
     // Claude Code has used multiple names for the concurrent-task counter:
     // `bashes` (old), `background tasks` (mid), and `shells` (2.1.94+). Match
     // all of them — including the singular forms (status bar shows
@@ -157,7 +213,10 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
 
     for line in &lines[start..] {
         if has_status_bar {
-            if let Some(caps) = token_re.captures(line) {
+            // Strip arrow-prefixed counters (thinking indicator, agent-roster
+            // rows) so they cannot overwrite the status bar's bare total.
+            let bare = arrow_counter_re.replace_all(line, " ");
+            if let Some(caps) = token_re.captures(&bare) {
                 if let Some(m) = caps.get(1) {
                     let cleaned = m.as_str().replace(',', "");
                     if let Ok(v) = cleaned.parse::<u64>() {
@@ -246,21 +305,37 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
     // Whole-pane scan for thinking-indicator tokens (always safe because
     // the ↑/↓ + tok anchor never appears in chat prose). Catches cases
     // where a thinking line is more than 10 lines above the bottom.
+    //
+    // Run it in two passes so an agent-roster row is only ever a LAST
+    // resort: a roster row reports one subagent's tokens, which is a much
+    // worse stand-in for the session context size than the main loop's own
+    // thinking indicator. The second pass keeps the pre-existing behaviour
+    // when a roster row is the only arrow line on screen — reporting
+    // nothing would read downstream as `tokens = 0`, which is not an
+    // improvement over reporting something.
     if result.tokens.is_none() {
-        for line in &lines {
-            if let Some(caps) = token_thinking_re.captures(line) {
-                if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
-                    if let Ok(base) = num.as_str().parse::<f64>() {
-                        let mult: f64 = match suffix.as_str() {
-                            "k" | "K" => 1_000.0,
-                            "m" | "M" => 1_000_000.0,
-                            _ => 1.0,
-                        };
-                        let v = (base * mult).round() as u64;
-                        result.tokens = Some(v);
-                        break;
+        for pass_skips_roster in [true, false] {
+            for line in &lines {
+                if pass_skips_roster && is_agent_roster_row(line) {
+                    continue;
+                }
+                if let Some(caps) = token_thinking_re.captures(line) {
+                    if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
+                        if let Ok(base) = num.as_str().parse::<f64>() {
+                            let mult: f64 = match suffix.as_str() {
+                                "k" | "K" => 1_000.0,
+                                "m" | "M" => 1_000_000.0,
+                                _ => 1.0,
+                            };
+                            let v = (base * mult).round() as u64;
+                            result.tokens = Some(v);
+                            break;
+                        }
                     }
                 }
+            }
+            if result.tokens.is_some() {
+                break;
             }
         }
     }
@@ -1724,6 +1799,108 @@ mod tests {
         let input = "-- INSERT -- 5000 tokens";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.tokens, Some(5000));
+    }
+
+    /// Real pane capture, 2026-08-20 — the agent-roster rows Claude Code
+    /// draws BELOW the status bar carry each subagent's own token count.
+    /// A just-spawned agent's count is a plain sub-1000 integer, which the
+    /// generic `N tok` match happily consumed; being the LAST match in the
+    /// bottom-10 window it overwrote the session total.
+    ///
+    /// Downstream that reads as the token count collapsing from 169233 to
+    /// 119 — indistinguishable from a context clear — and the daemon
+    /// injected a post-clear resume prompt into a session that had never
+    /// been cleared. Three fires in seven minutes.
+    #[test]
+    fn test_agent_roster_row_does_not_clobber_session_total_2026_08_20() {
+        let input = "\
+\u{25cf} Read agent output bbow3km6m\n\
+  \u{239d}  Read 7 lines\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} esc to interrupt\n\
+                                                     169233 tokens\n\
+\n\
+  \u{25cf} main\n\
+  \u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens\n\
+  \u{25ef} grafana-dashboard  Listing panels in\u{2026} 1m 28s \u{00b7} \u{2193} 90.6k tokens\n\
+  \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(
+            parsed.tokens,
+            Some(169233),
+            "the status bar's bare total must win over a freshly-spawned \
+             agent's roster row (↓ 119 tokens) — reading 119 as the session \
+             context size is what manufactured a phantom context clear"
+        );
+        assert_eq!(parsed.bashes, Some(5));
+    }
+
+    /// The same shape, but with EVERY roster count already past 1000 so it
+    /// renders with a `k` suffix. This case never broke (the `.` in `1.2k`
+    /// defeats the generic match), and must keep working.
+    #[test]
+    fn test_agent_roster_rows_with_k_suffix_still_yield_session_total() {
+        let input = "\
+  \u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} esc to interrupt\n\
+                                                     224598 tokens\n\
+\n\
+  \u{25cf} main\n\
+  \u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(224598));
+    }
+
+    /// A roster row must not be promoted to "the session's token count" by
+    /// the whole-pane arrow fallback either, as long as a real thinking
+    /// indicator is on screen to supply one.
+    #[test]
+    fn test_thinking_indicator_beats_agent_roster_row_in_fallback() {
+        let input = "\
+\u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt\n\
+  \u{25cf} main\n\
+  \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(
+            parsed.tokens,
+            Some(26000),
+            "with no total on the status bar, the main loop's own thinking \
+             indicator is the fallback — not a subagent's roster row"
+        );
+    }
+
+    /// Last-resort behaviour is preserved: when a roster row is the ONLY
+    /// arrow line on screen the fallback still reports it. Reporting
+    /// nothing collapses to `tokens = 0` downstream, which is no better.
+    #[test]
+    fn test_agent_roster_row_is_last_resort_not_forbidden() {
+        let input = "\
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt\n\
+  \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(119));
+    }
+
+    #[test]
+    fn test_is_agent_roster_row_discriminates_from_thinking_indicator() {
+        assert!(is_agent_roster_row(
+            "  \u{25ef} general-purpose    Scanning\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens"
+        ));
+        // Thinking indicator: same bullet in some versions, but it always
+        // parenthesises its counters.
+        assert!(!is_agent_roster_row(
+            "\u{25cf} Zigzagging\u{2026} (37s \u{00b7} \u{2193} 1.3k tokens \u{00b7} thought for 13s)"
+        ));
+        // A roster row with no token count yet is not a token source.
+        assert!(!is_agent_roster_row("  \u{25cf} main"));
+        // Ordinary tool-call output lines share the bullet.
+        assert!(!is_agent_roster_row(
+            "\u{25cf} Read agent output bbow3km6m"
+        ));
     }
 
     #[test]

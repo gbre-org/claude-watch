@@ -342,6 +342,24 @@ pub struct AlertsConfig {
     /// elsewhere; such text renders as prose and is silently dropped.
     #[serde(default = "default_heartbeat_stale_prompt")]
     pub heartbeat_stale_prompt: String,
+    /// Prompt injected on the POST-CLEAR resume path specifically (as opposed
+    /// to the generic `resume_prompt`).
+    ///
+    /// That gate exists for one situation: a context clear was observed and
+    /// the pane has been sitting idle at an empty prompt ever since, so the
+    /// loop needs a nudge to pick its work back up. It is explicitly designed
+    /// to fire WITH background shells alive — surviving background shells are
+    /// the reason the other resume gates can't cover this case.
+    ///
+    /// The generic `resume_prompt` describes a stuck daemon-detected state
+    /// ("no background tasks running and not thinking") and asks for a watcher
+    /// cleanup. On this path both halves are wrong: the daemon's own log line
+    /// for the inject records the live background-shell count, and a cleanup
+    /// is not the recovery. Injecting it told the loop, in writing, something
+    /// the daemon knew to be false (2026-08-20), so this path gets its own
+    /// wording.
+    #[serde(default = "default_post_clear_resume_prompt")]
+    pub post_clear_resume_prompt: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -415,6 +433,17 @@ fn default_interrupt_enabled() -> bool {
 /// triage so a genuinely-wedged event pipeline still gets surfaced.
 fn default_heartbeat_stale_prompt() -> String {
     "[CLAUDE-WATCH] The host heartbeat file went stale — you are not touching /var/run/claude/claude-heartbeat. Immediately run `heartbeat-ack` (it touches the file AND acks the pending heartbeat-tick entries; fall back to `touch /var/run/claude/claude-heartbeat` if that command is not installed) as a single well-formed Bash tool call to restore liveness, then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details.".to_string()
+}
+
+/// Default post-clear resume prompt. Single-line (the tmux inject pipeline
+/// assumes single-line). Says what the daemon actually observed — a context
+/// clear followed by an idle prompt — and asks the loop to pick its recorded
+/// resume action back up. Deliberately makes NO claim about background tasks
+/// (this gate fires with background shells alive by design) and does NOT ask
+/// for a watcher cleanup, and it tells the loop what to check if the premise
+/// is wrong, so a misfire is reported rather than acted on.
+fn default_post_clear_resume_prompt() -> String {
+    "[CLAUDE-WATCH] A context clear was observed and the pane has been idle at an empty prompt since — nothing has picked the work back up. Resume from your recorded resume action (session-task) and continue; do NOT run a watcher cleanup on account of this message. If your context was NOT cleared (the conversation above is intact), this fired incorrectly: ignore it, finish what you were doing, and DM Andrew with the details.".to_string()
 }
 
 fn default_interrupt_message() -> String {
@@ -2359,6 +2388,47 @@ cooldown = 300
         let config = parse_config(SAMPLE_CONFIG).unwrap();
         let p = &config.alerts.heartbeat_stale_prompt;
         assert!(!p.is_empty(), "heartbeat_stale_prompt should default non-empty");
+    }
+
+    #[test]
+    fn test_post_clear_resume_prompt_defaults_when_absent() {
+        // Same backward-compat contract as heartbeat_stale_prompt: configs
+        // already deployed in the field don't carry the key.
+        let config = parse_config(SAMPLE_CONFIG).unwrap();
+        assert!(
+            !config.alerts.post_clear_resume_prompt.is_empty(),
+            "post_clear_resume_prompt should default non-empty"
+        );
+    }
+
+    #[test]
+    fn test_default_post_clear_resume_prompt_makes_no_background_task_claim() {
+        // 2026-08-20: the post-clear gate injected the generic stuck-state
+        // resume_prompt, which asserts "no background tasks running and not
+        // thinking" and asks for /cleanup. The gate is designed to fire WITH
+        // background shells alive, and the daemon's own log line for the
+        // inject records the live count — so that wording states something
+        // already measured to be false, and points recovery at the wrong
+        // thing. Pin both properties out of the default.
+        let p = default_post_clear_resume_prompt();
+        assert!(
+            !p.contains("no background tasks"),
+            "post-clear prompt must not claim background tasks are idle — the \
+             gate exists for the case where they are still running; got: {p:?}"
+        );
+        assert!(
+            !p.contains("/cleanup"),
+            "post-clear prompt must not direct a watcher cleanup; got: {p:?}"
+        );
+        assert!(
+            !p.contains('\n'),
+            "post-clear prompt must be single-line for the tmux inject \
+             pipeline; got: {p:?}"
+        );
+        assert!(
+            p.contains("[CLAUDE-WATCH]"),
+            "post-clear prompt must be tagged as a daemon interrupt; got: {p:?}"
+        );
     }
 
     #[test]
