@@ -124,6 +124,14 @@ resume_prompt = "[CLAUDE-WATCH] Daemon detected stuck state: no background tasks
 # the prompt as the no-dependency fallback for a host that has not installed
 # the wrapper.
 heartbeat_stale_prompt = "[CLAUDE-WATCH] The host heartbeat file went stale — you are not touching /var/run/claude/heartbeat. Immediately run `heartbeat-ack` (it touches the file AND acks the pending heartbeat-tick entries; fall back to `touch /var/run/claude/heartbeat` if that command is not installed) as a single well-formed Bash tool call to restore liveness, then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details."
+# Prompt injected on the post-clear resume path specifically. That gate fires
+# when a context clear was observed and the pane has been idle at an empty
+# prompt ever since — and it fires WITH background shells alive, by design
+# (surviving shells are why the other resume gates cannot cover this case).
+# The generic resume_prompt above reports a stuck state with "no background
+# tasks running" and asks for a watcher cleanup; on this path both halves are
+# wrong, so it gets its own wording.
+post_clear_resume_prompt = "[CLAUDE-WATCH] A context clear was observed and the pane has been idle at an empty prompt since — nothing has picked the work back up. Resume from your recorded resume action (session-task) and continue; do NOT run a watcher cleanup on account of this message. If your context was NOT cleared (the conversation above is intact), this fired incorrectly: ignore it, finish what you were doing, and DM Andrew with the details."
 
 [foreground_monitor]
 # Enable foreground blocking pattern detection
