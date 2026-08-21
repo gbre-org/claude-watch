@@ -109,6 +109,7 @@ DEFAULT_STATE_DIR = Path(os.environ.get(
 PENDING_FILE = "pending-actions.json"
 COUNTER_FILE = "tool-call-counter.json"
 AMBIENT_FILE = "ambient-context.json"
+LAST_ACK_FILE = "last-ack-timestamp"
 
 DEFAULT_N = int(os.environ.get("EVENT_MUST_ACT_N", "3"))
 
@@ -172,6 +173,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _update_last_ack_timestamp(state_dir: Path) -> None:
+    """Update the last-ack timestamp file to now (Unix epoch seconds).
+
+    This file's mtime serves as the liveness signal for the daemon's
+    ack-driven heartbeat detection. ANY event-ack (not just heartbeat-tick)
+    refreshes liveness, so a busy loop acking many events stays alive even
+    if the heartbeat-tick cadence event never delivers.
+
+    Default-open: write failure is silently swallowed (logged to stderr).
+    The ack itself already succeeded; losing the timestamp update is
+    recoverable -- the daemon will emit a probe heartbeat-tick, and acking
+    that will refresh the timestamp.
+    """
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        path = state_dir / LAST_ACK_FILE
+        # Write the current Unix epoch as a simple float. This is cheaper
+        # than JSON and sufficient for the daemon's mtime + content check.
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        path.write_text(f"{now_epoch}\n")
+    except OSError as e:
+        print(f"event-ack: warning: could not update last-ack timestamp: {e}",
+              file=sys.stderr)
+
+
 # --- Core operations ------------------------------------------------------
 
 def add_pending(state_dir: Path, key: str, source: str = "",
@@ -212,7 +238,12 @@ def add_pending(state_dir: Path, key: str, source: str = "",
 
 
 def ack_pending(state_dir: Path, key: str, action: str) -> dict:
-    """Remove an entry from pending-actions.json. Reset the N-counter."""
+    """Remove an entry from pending-actions.json. Reset the N-counter.
+
+    Also updates the last-ack timestamp, which serves as the liveness signal
+    for the daemon's ack-driven heartbeat detection (any ack refreshes
+    liveness, not just heartbeat-tick acks).
+    """
     removed = False
     remaining = 0
     with _locked(state_dir, PENDING_FILE) as p:
@@ -228,6 +259,10 @@ def ack_pending(state_dir: Path, key: str, action: str) -> dict:
     # Reset counter on any ack (whether the key was present or not -- the
     # idempotent ack should still relax the gate).
     _set_counter(state_dir, 0)
+
+    # Update liveness timestamp: ANY ack proves the loop is alive.
+    _update_last_ack_timestamp(state_dir)
+
     return {"removed": removed, "key": key, "action": action,
             "remaining": remaining}
 

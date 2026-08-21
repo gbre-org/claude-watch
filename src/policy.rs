@@ -778,6 +778,77 @@ pub(crate) fn stuck_suppressed_by_activity(workload_fresh: bool, active_subagent
     workload_fresh || active_subagents > 0
 }
 
+/// Pure predicate: given the heartbeat-stale proof-of-life inputs, return the
+/// reason to SUPPRESS the stuck flag this cycle, or `None` to let it fire.
+///
+/// Extends [`stuck_suppressed_by_activity`] with two INDEPENDENT liveness
+/// signals the daemon already tracks, decoupling host-heartbeat freshness from
+/// event-bus tick DELIVERY. The host heartbeat file is refreshed by the main
+/// loop only when it PROCESSES a `heartbeat-tick` claude-event (runs
+/// `heartbeat-ack`) -- which needs (a) the event bus to deliver the tick AND
+/// (b) the loop to reach a tool-call boundary. Both premises fail while the
+/// loop is ALIVE: a long single turn (prolonged thinking, no tool calls) or a
+/// stalled bus (claude-event-watch itself down) starves the heartbeat even
+/// though nothing is wedged, firing a FALSE "heartbeat stale" alert (incident
+/// 2026-08-21: 25min + 40min false stale while the loop was thinking).
+///
+/// So when the daemon has its OWN evidence the loop is alive -- an active
+/// thinking episode (`loop_thinking`) or a tool call running / run within the
+/// active window (`actively_turning`) -- a stale heartbeat file is NOT a wedge
+/// and the stuck flag is suppressed. A genuinely wedged session shows NEITHER
+/// signal (idle pane, no thinking, no tool activity, no live subagents, no
+/// fresh workload heartbeat), so real wedge detection is preserved. The
+/// "thinking forever" case is independently covered by prolonged-thinking
+/// detection + its own token-progress rearm, so deferring to it here loses no
+/// coverage. Kept pure (no /proc, no Config) so it is unit-testable.
+pub(crate) fn heartbeat_stale_liveness_reason(
+    workload_fresh: bool,
+    active_subagents: u32,
+    loop_thinking: bool,
+    actively_turning: bool,
+) -> Option<&'static str> {
+    if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
+        return Some(if workload_fresh {
+            "workload_heartbeat_fresh"
+        } else {
+            "active_subagents"
+        });
+    }
+    if loop_thinking {
+        return Some("loop_thinking");
+    }
+    if actively_turning {
+        return Some("loop_actively_turning");
+    }
+    None
+}
+
+/// Check the last-ack timestamp file age (ack-driven heartbeat).
+///
+/// Returns the age in seconds if the file exists and is readable, None otherwise.
+/// The file is written by `event-ack` on every ack (any event, not just
+/// heartbeat-tick), so its mtime serves as a liveness signal: ANY ack proves
+/// the loop is alive. The daemon emits a heartbeat-tick probe ONLY when this
+/// timestamp has gone quiet (no acks in a while), replacing the fixed-cadence
+/// heartbeat-tick with an on-demand probe.
+///
+/// Default-open: missing/unreadable file => None (treat as "no ack data yet",
+/// not an error). The daemon falls back to the legacy heartbeat_file check
+/// when this returns None.
+pub(crate) fn last_ack_timestamp_age(state_dir: &str) -> Option<u64> {
+    use std::fs;
+    use std::time::SystemTime;
+
+    let path = std::path::Path::new(state_dir).join("last-ack-timestamp");
+    let meta = fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok()?;
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .ok()?
+        .as_secs();
+    Some(age)
+}
+
 /// Reason a force-inject escalation should fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EscalationReason {
@@ -1054,6 +1125,15 @@ async fn emit_watcher_down_event(
     let watcher_kv = format!("watcher={}", watcher);
     let consec_kv = format!("consecutive_missing={}", consecutive_missing);
     let pid_kv = format!("recorded_pid={}", pid_str);
+    // Producer-stamped routing tier (rung 2 in the classifier precedence): a
+    // down watcher DEMANDS a relaunch, so route it to the ACTIONABLE pending
+    // list + N-call gate rather than ambient context. Without this the event
+    // fell through the classifier's `claude-watch/* -> ambient` catch-all and a
+    // busy main loop never relaunched the watcher (comms watcher down ~4h,
+    // incident 2026-08-21). claude-event-watch forwards data.tier to
+    // `event-ack ingest --tier`, so this producer stamp wins over the
+    // consumer-side table.
+    let tier_kv = "tier=actionable";
     let args: Vec<&str> = vec![
         cli,
         &message,
@@ -1071,6 +1151,8 @@ async fn emit_watcher_down_event(
         &consec_kv,
         "--data",
         &pid_kv,
+        "--data",
+        tier_kv,
     ];
 
     // 5s timeout — claude-event is a tiny Python script that should complete
@@ -5252,22 +5334,49 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.consecutive_fast_detections = 0;
     }
 
-    // --- Heartbeat stale detection ---
+    // --- Heartbeat stale detection (ack-driven) ---
+    // Redesign (2026-08-21): the daemon now checks the last-ack timestamp
+    // (written by event-ack on EVERY ack, not just heartbeat-tick) as the
+    // primary liveness signal. ANY ack proves the loop is alive. The daemon
+    // emits heartbeat-tick ONLY when acks have gone quiet (on-demand probe).
+    // Falls back to the legacy heartbeat_file check when the last-ack
+    // timestamp is unavailable (fresh boot, stripped deployment without
+    // event-must-act infrastructure).
     let mut stuck = false;
     let mut stuck_reason = String::new();
     // Captured for the claude-event sink so the main loop can parse
     // `stale_minutes` as a number rather than re-regex'ing the string.
     let mut stuck_stale_minutes: Option<u64> = None;
 
-    match std::fs::metadata(&config.claude.heartbeat_file) {
-        Ok(meta) => {
-            if let Ok(modified) = meta.modified() {
-                let age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default()
-                    .as_secs();
-                let stale_secs = config.heartbeat.stale_minutes * 60;
-                if age >= stale_secs {
+    // Resolve the event state dir the same way event-ack does: $CLAUDE_EVENT_STATE_DIR,
+    // else ~/.config/claude-events/.
+    let event_state_dir = std::env::var("CLAUDE_EVENT_STATE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{}/.config/claude-events", home)
+        });
+
+    // Check last-ack timestamp first (ack-driven heartbeat).
+    let last_ack_age = last_ack_timestamp_age(&event_state_dir);
+    let heartbeat_age = match std::fs::metadata(&config.claude.heartbeat_file) {
+        Ok(meta) => meta
+            .modified()
+            .ok()
+            .and_then(|m| SystemTime::now().duration_since(m).ok())
+            .map(|d| d.as_secs()),
+        Err(_) => None,
+    };
+
+    // Use last-ack age if available; else fall back to heartbeat_file age.
+    // This preserves wedge detection during the transition (hosts without
+    // event-must-act still have heartbeat_file-based detection).
+    let liveness_age = last_ack_age.or(heartbeat_age);
+
+    if let Some(age) = liveness_age {
+        let stale_secs = config.heartbeat.stale_minutes * 60;
+        if age >= stale_secs {
                     // Workload-heartbeat suppression: a long-running
                     // `workload run` (stv-promote, big rsync, ffmpeg)
                     // can pin the main loop in a fire-and-forget wait
@@ -5298,18 +5407,33 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     let workload_fresh = workload_heartbeat_suppresses_stuck(config);
                     let active_subagents =
                         crate::respawn::count_alive_subagents();
-                    if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
+                    // Independent proof-of-life signals the daemon already
+                    // tracks, so host-heartbeat freshness is decoupled from
+                    // event-bus tick DELIVERY (incident 2026-08-21): a live
+                    // loop in a long turn / with a stalled bus starves the
+                    // heartbeat without being wedged. `thinking_start` is set
+                    // by the foreground thinking detector (cleared when idle),
+                    // so `is_some()` ~= "the model is mid-generation now".
+                    let loop_thinking = state.thinking_start.is_some();
+                    let actively_turning = main_loop_actively_turning(
+                        state,
+                        bashes,
+                        config.watcher_monitor.active_window_secs,
+                    );
+                    if let Some(reason) = heartbeat_stale_liveness_reason(
+                        workload_fresh,
+                        active_subagents,
+                        loop_thinking,
+                        actively_turning,
+                    ) {
                         let age_min = age / 60;
-                        let reason = if workload_fresh {
-                            "workload_heartbeat_fresh"
-                        } else {
-                            "active_subagents"
-                        };
                         debug!(
                             stale_age_min = age_min,
                             threshold_min = config.heartbeat.stale_minutes,
                             workload_fresh,
                             active_subagents,
+                            loop_thinking,
+                            actively_turning,
                             reason,
                             "heartbeat-stale suppressed (proof-of-life)"
                         );
@@ -5322,6 +5446,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                                 "reason": reason,
                                 "workload_fresh": workload_fresh,
                                 "active_subagents": active_subagents,
+                                "loop_thinking": loop_thinking,
+                                "actively_turning": actively_turning,
                                 "dir": &config.stuck_detection.workload_heartbeat_dir,
                                 "max_age_secs": config.stuck_detection.workload_heartbeat_max_age_secs,
                             }),
@@ -5338,12 +5464,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         stuck_stale_minutes = Some(age_min);
                         state.heartbeat_stale_count += 1;
                     }
-                }
-            }
         }
-        Err(_) => {
-            // No heartbeat file -- give it time
-        }
+        // No liveness signal available (neither last-ack nor heartbeat_file) --
+        // give it time. This is the fresh-boot / early-daemon-start case.
     }
 
     // --- AskUserQuestion stale detection (Phase 1: detect + alarm) ---
@@ -10677,6 +10800,94 @@ pane_unchanged_secs = 600
         assert!(
             stuck_suppressed_by_activity(true, 3),
             "both conditions must suppress"
+        );
+    }
+
+    #[test]
+    fn heartbeat_stale_liveness_reason_truth_table() {
+        // No proof-of-life at all -> None (stuck may fire = genuine wedge).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, false, false),
+            None,
+            "idle+not-thinking+no-activity must let the stuck flag fire"
+        );
+        // Pre-existing signals still win, with their original reason strings.
+        assert_eq!(
+            heartbeat_stale_liveness_reason(true, 0, false, false),
+            Some("workload_heartbeat_fresh")
+        );
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 2, false, false),
+            Some("active_subagents")
+        );
+        // NEW: an active thinking episode is independent proof-of-life ->
+        // suppress the false stale (the incident case: loop thinking in a
+        // long turn, heartbeat starved because no tool call processed a tick).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, true, false),
+            Some("loop_thinking")
+        );
+        // NEW: actively turning (tool call running / recent) also suppresses.
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, false, true),
+            Some("loop_actively_turning")
+        );
+        // Precedence: workload/subagents outrank the new signals (stable
+        // reason string for existing log consumers).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(true, 1, true, true),
+            Some("workload_heartbeat_fresh")
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_none_when_missing() {
+        // Missing file -> None (fresh boot / stripped deployment).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().to_str().unwrap();
+        assert_eq!(
+            last_ack_timestamp_age(state_dir),
+            None,
+            "missing last-ack timestamp must return None"
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_age_when_present() {
+        // Fresh file -> Some(age ~0).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path();
+        let ack_file = state_dir.join("last-ack-timestamp");
+        std::fs::write(&ack_file, "1234567890.0\n").expect("write ack file");
+        let age = last_ack_timestamp_age(state_dir.to_str().unwrap());
+        assert!(age.is_some(), "fresh ack file must return Some(age)");
+        // Age should be very small (file just written).
+        assert!(
+            age.unwrap() < 10,
+            "fresh ack file age must be near zero, got {:?}",
+            age
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_age_when_stale() {
+        // Stale file -> Some(age > threshold).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path();
+        let ack_file = state_dir.join("last-ack-timestamp");
+        std::fs::write(&ack_file, "1234567890.0\n").expect("write ack file");
+        // Backdate the file mtime by 700 seconds.
+        let now = std::time::SystemTime::now();
+        let old = now - std::time::Duration::from_secs(700);
+        filetime::set_file_mtime(&ack_file, filetime::FileTime::from_system_time(old))
+            .expect("backdate mtime");
+        let age = last_ack_timestamp_age(state_dir.to_str().unwrap());
+        assert!(age.is_some(), "stale ack file must return Some(age)");
+        let age_val = age.unwrap();
+        assert!(
+            age_val >= 690 && age_val <= 710,
+            "stale ack file age must be ~700s, got {}",
+            age_val
         );
     }
 
