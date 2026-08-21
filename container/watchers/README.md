@@ -19,7 +19,7 @@ This "block-print-exit" contract is fundamental **for a watcher launched as a ba
 
 ### Opt-in alternative: monitor mode (line-streaming launcher)
 
-A watcher can instead be declared `mode=monitor` in its `watchers.conf` entry. Such a watcher is **armed once** by the session through a launcher that turns **each stdout line into its own notification** (Claude Code's `Monitor` tool with `persistent: true`) and stays alive across batches — one notification per batch and no restart call. Everything else is identical: same one-liner format, same file consumption/deletion, same no-ack contract (the watcher never consumes on the loop's behalf; every `EVENT[...]` line must still be read and acted on).
+A watcher can instead be declared `mode=monitor` in its `watchers.conf` entry. Such a watcher is **armed once** by the session through a launcher that turns **each stdout line into its own notification** (Claude Code's `Monitor` tool with `persistent: true`) and stays alive across batches — one notification per batch and no restart call. Everything else is identical: same `EVENT[<source>/<tag>]` prefix (the monitor line additionally carries a per-tag lead plus the full message, since that line is the whole notification — see `tools/watchers/README.md`, *Monitor line format*), same file consumption/deletion, same no-ack contract (the watcher never consumes on the loop's behalf; every `EVENT[...]` line must still be read and acted on).
 
 What changes for the operator:
 

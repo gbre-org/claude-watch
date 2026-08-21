@@ -45,7 +45,8 @@
 #     Events arriving during the hold are BATCHED, never dropped — the throttle
 #     only DELAYS delivery, it never discards.
 #   - Print each event as a single one-liner: EVENT[<source>/<tag>] <msg…>
-#     then delete the queue file. Full event JSON (compact, one line) is
+#     (monitor mode: EVENT[<source>/<tag>] <lead> — <full msg> [k=v …], see
+#     process_event) then delete the queue file. Full event JSON (compact, one line) is
 #     appended to the consumed-event ring buffer log at
 #     $LOG_DIR/consumed.jsonl so `claude-event-tail` can show it after
 #     the fact.
@@ -317,8 +318,16 @@ waits and counts, then drains the queue once at the end. Events arriving
 during the window are batched; events landing after the final drain remain
 on disk for the next run.
 
-Output: one line per event, shape:
-  EVENT[<source>/<tag>] <first-60-chars-of-message>…
+Output: one line per event. In exit mode (the one-shot, unchanged):
+  EVENT[<source>/<tag>] <first-60-chars-of-message>… [k=v …]
+In monitor mode the stdout line is the whole notification, so it carries a
+per-source/tag human lead plus the FULL message (newlines -> ' ⏎ '), capped
+at ~400 chars (data tags are cut first, then the message, never the prefix):
+  EVENT[<source>/<tag>] <lead> — <full message> [k=v …]
+  e.g. EVENT[cron/pr-status-change] PR #652 CI failure — PR owner/repo#652: CI failure (was: pending) [field=ci_status …]
+       EVENT[torrent/torrent-completed] torrent done: <name> [hash=… name=… path=…]
+       EVENT[alertmanager/alert-firing] alert FIRING HDDTempWarn: <summary> [alertname=… severity=…]
+When no lead pattern matches the tag, the lead is the full message itself.
 
 Full event JSON appended to \$CLAUDE_EVENT_LOG_DIR/consumed.jsonl
 (default ~/.config/claude-events/, ring-buffered at
@@ -870,11 +879,34 @@ fi
 # Concurrent appenders are safe because Python opens the log with
 # O_APPEND ('a' mode) — POSIX guarantees atomicity for single write() calls
 # below PIPE_BUF, and a one-line JSON event is well under that limit.
+#
+# LINE FORMAT depends on the delivery mode ($EVENT_LINE_FORMAT, passed from
+# MODE_RESOLVED at call time so a runtime mode flip is honoured per batch):
+#   exit    (default) — the one-shot shape, byte-for-byte unchanged:
+#             EVENT[<source>/<tag>] <message, whitespace-collapsed, cut at 60>… [k=v …]
+#             The main loop reads the captured .output file and can open the
+#             event JSON / consumed.jsonl for the rest, so brevity wins.
+#   monitor — the stdout line IS the notification (the Monitor tool's own
+#             description is static, set at arm time), so it has to carry the
+#             useful part on its own:
+#             EVENT[<source>/<tag>] <lead> — <full message> [k=v …]
+#             * `lead` is a terse per-source/tag human headline derived from
+#               `data` where the producer's shape is stable (see
+#               monitor_lead below); when no pattern matches, the lead IS the
+#               full message and the ` — <message>` part is omitted.
+#             * the message is the FULL text (never the 60-char cut), with
+#               newline runs flattened to ` ⏎ ` so it stays one line; it is
+#               dropped when the lead already says everything it says.
+#             * hard cap ~400 chars per line: the ` [k=v …]` data tags are
+#               truncated first, then the message; the `EVENT[...]` prefix and
+#               the lead are never cut. Routing keys on the prefix, which is
+#               identical in both modes.
 process_event() {
     local f="$1"
     local log="$2"
-    EVENT_ACK_CLI="$EVENT_ACK_CLI" python3 -u - "$f" "$log" <<'PYEOF'
-import json, os, subprocess, sys
+    EVENT_ACK_CLI="$EVENT_ACK_CLI" EVENT_LINE_FORMAT="${MODE_RESOLVED:-exit}" \
+        python3 -u - "$f" "$log" <<'PYEOF'
+import json, os, re, subprocess, sys
 src, log = sys.argv[1], sys.argv[2]
 try:
     with open(src, "r", encoding="utf-8", errors="replace") as fp:
@@ -894,6 +926,191 @@ message = full_message
 message = " ".join(message.split())
 if len(message) > 60:
     message = message[:60] + "…"
+
+# --- monitor-mode line format --------------------------------------------
+MONITOR_LINE_MAX = 400   # hard cap per stdout line in monitor mode
+DATA_VALUE_MAX = 80      # per-value cap inside the ` [k=v …]` data tags
+
+def flat(s):
+    """One line: newline runs -> ' ⏎ ', other whitespace runs -> one space."""
+    parts = [" ".join(p.split()) for p in str(s).splitlines()]
+    return " ⏎ ".join(p for p in parts if p)
+
+def dget(d, key):
+    """Flattened str of data[key], or '' when absent/None/non-scalar."""
+    if not isinstance(d, dict):
+        return ""
+    v = d.get(key)
+    if v is None or isinstance(v, (dict, list)):
+        return ""
+    return flat(v)
+
+def pr_num(pr_id):
+    """'github:owner/repo#310' -> '#310'; anything else passes through."""
+    m = re.search(r"#(\d+)$", pr_id)
+    return f"#{m.group(1)}" if m else pr_id
+
+def monitor_lead(source, tag, msg, d):
+    """Return (lead, covers_message) or None when no stable pattern applies.
+
+    covers_message=True means the producer's message is a fixed template of
+    the same data fields the lead already shows, so appending it would only
+    repeat the lead; False keeps the full message after ` — `.
+    Every branch returns None when the data it needs is missing, so a
+    producer that changes shape degrades to the full-message fallback
+    instead of printing a half-empty headline.
+    """
+    if tag == "heartbeat-tick":
+        return ("heartbeat tick", True)
+    if tag in ("memory-reminder", "memory-remind"):
+        return ("memory reminder", False)
+    if tag == "claude-watch-alert":
+        at = dget(d, "alert_type")
+        if not at:
+            return None
+        sev = dget(d, "severity")
+        return (f"claude-watch alert {at}" + (f" ({sev})" if sev else ""), False)
+    if tag == "watcher-down":
+        w = dget(d, "watcher")
+        return (f"watcher DOWN {w}", False) if w else None
+    if tag == "force-start" or tag.startswith("queue-"):
+        qid = dget(d, "queue_id")
+        if not qid:
+            return None
+        verb = "force-started" if tag == "force-start" else tag[len("queue-"):]
+        summary = dget(d, "summary")
+        lead = f"queue {verb} {qid}" + (f": {summary}" if summary else "")
+        # A populated reason field (blocked/unblocked/quarantined/abandoned/
+        # force-start) is lifted into the lead so the message is covered too.
+        # Without one, done/running/abandoned messages are pure templates of
+        # id+summary (covered); anything else keeps the message — it may be
+        # the only copy of the reason.
+        for key in ("block_reason", "force_started_reason", "prior_reason", "reason"):
+            reason = dget(d, key)
+            if reason:
+                return (f"{lead} — reason: {reason}", True)
+        return (lead, tag in ("queue-done", "queue-running", "queue-abandoned"))
+    if tag in ("alert-firing", "alert-resolved"):
+        name = dget(d, "alertname")
+        if not name:
+            return None
+        status = (dget(d, "status") or tag[len("alert-"):]).upper()
+        summary = dget(d, "summary")
+        return (f"alert {status} {name}" + (f": {summary}" if summary else ""), True)
+    if tag == "torrent-completed":
+        name = dget(d, "name")
+        return (f"torrent done: {name}", True) if name else None
+    if tag in ("workload-done", "hostjob-done"):
+        label = dget(d, "label")
+        if not label:
+            return None
+        kind = tag[:-len("-done")]
+        rc = dget(d, "exit_code")
+        lead = f"{kind} done {label}" + (f" rc={rc}" if rc else "")
+        if dget(d, "killed").lower() == "true":
+            lead += " KILLED"
+        return (lead, True)
+    if tag == "pr-status-change":
+        pid = dget(d, "pr_id")
+        field = dget(d, "field")
+        new = dget(d, "new_value")
+        if not pid or not field:
+            return None
+        desc = {
+            "state": new.lower(),
+            "ci_status": f"CI {new}",
+            "head_sha": f"new push {new[:7]}",
+            "review_status": f"reviews {new}",
+            "mergeable": f"mergeable={new}",
+            "unresolved_comments": f"{new} unresolved comment(s)",
+        }.get(field, f"{field} {new}")
+        return (f"PR {pr_num(pid)} {desc}".rstrip(), False)
+    if tag == "pr-ci-red":
+        pid = dget(d, "pr_id")
+        if not pid:
+            return None
+        lead = f"PR {pr_num(pid)} CI still RED"
+        ci = dget(d, "ci_status")
+        n = dget(d, "renotify_count")
+        if ci:
+            lead += f" ({ci})"
+        if n:
+            lead += f" renotify #{n}"
+        return (lead, False)
+    if tag == "cron-failure":
+        job = flat(ev.get("source_name") or "") or dget(d, "cmd")
+        if not job:
+            return None
+        rc = dget(d, "exit_code")
+        return (f"cron FAILED {job}" + (f" rc={rc}" if rc else ""), False)
+    if tag == "request-fulfilled":
+        title = dget(d, "title")
+        if not title:
+            return None
+        rid = dget(d, "request_id")
+        who = dget(d, "requester_handle")
+        lead = "request fulfilled" + (f" #{rid}" if rid else "") + f": {title}"
+        if who:
+            lead += f" for {who}"
+        return (lead, True)
+    if tag == "promote-candidates":
+        ready = dget(d, "ready_count")
+        if not ready:
+            return None
+        counts = [f"{ready} ready"]
+        for k in ("protected", "blocked", "unmatched"):
+            v = dget(d, f"{k}_count")
+            if v:
+                counts.append(f"{v} {k}")
+        return ("promote candidates: " + ", ".join(counts), False)
+    if tag == "obligations-bypass":
+        oid = dget(d, "override_id")
+        return (f"obligations override {oid}", False) if oid else None
+    return None
+
+def monitor_line(source, tag, full_message, d):
+    prefix = f"EVENT[{source}/{tag}]"
+    msg = flat(full_message)
+    got = monitor_lead(source, tag, msg, d)
+    if got is None:
+        lead, covers = "", True          # fallback: the message IS the lead
+    else:
+        lead, covers = got
+    # Drop the message when the lead already contains it (or covers it).
+    if lead and (covers or (msg and msg.casefold() in lead.casefold())):
+        msg = ""
+    # Data tags, same selection/order rules as the one-shot line.
+    parts = []
+    if isinstance(d, dict):
+        for k in sorted(d):
+            v = d[k]
+            if isinstance(v, bool) or isinstance(v, (int, float, str)):
+                sv = flat(v)
+                if len(sv) > DATA_VALUE_MAX:
+                    sv = sv[:DATA_VALUE_MAX] + "…"
+                parts.append(f"{k}={sv}")
+    suffix = (" [" + " ".join(parts) + "]") if parts else ""
+
+    def assemble(lead, msg, suffix):
+        body = " — ".join(p for p in (lead, msg) if p)
+        return (f"{prefix} {body}" if body else prefix) + suffix
+
+    line = assemble(lead, msg, suffix)
+    if len(line) <= MONITOR_LINE_MAX:
+        return line
+    # Over the cap: cut the data tags first ...
+    head_len = len(assemble(lead, msg, ""))
+    room = MONITOR_LINE_MAX - head_len
+    suffix = (suffix[:room - 2].rstrip() + "…]") if room > 4 else ""
+    line = assemble(lead, msg, suffix)
+    if len(line) <= MONITOR_LINE_MAX:
+        return line
+    # ... then the message. The prefix and a derived lead are never cut; a
+    # fallback lead (lead == "") is the message itself, so it IS cuttable.
+    if msg:
+        room = MONITOR_LINE_MAX - len(assemble(lead, "", "")) - (3 if lead else 1) - 1
+        msg = (msg[:room] + "…") if room > 0 else ""
+    return assemble(lead, msg, "")
 
 # Surface scalar fields from the event's `data` object on the one-liner so
 # the main loop can act WITHOUT re-reading the JSON file. Many events carry
@@ -915,7 +1132,11 @@ if isinstance(data, dict):
             parts.append(f"{k}={sv}")
     if parts:
         suffix = " [" + " ".join(parts) + "]"
-print(f"EVENT[{source}/{tag}] {message}{suffix}")
+if os.environ.get("EVENT_LINE_FORMAT", "exit") == "monitor":
+    print(monitor_line(source, tag, full_message, data))
+else:
+    # exit mode: the one-shot line, byte-identical to before monitor mode.
+    print(f"EVENT[{source}/{tag}] {message}{suffix}")
 
 # Compact one-line JSON for the log; ensure_ascii keeps the line PIPE_BUF-safe
 # even with multibyte chars in the message field.
