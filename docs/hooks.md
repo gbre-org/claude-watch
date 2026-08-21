@@ -94,29 +94,33 @@ Main-loop Monitor calls (watcher captured-output, external-messaging
 threads, etc.) are unaffected -- detection uses the same `agent_id`
 signal as the obligations CLI's `is_main_loop` predicate.
 
-Recovery path (use this instead of `Monitor` to wait for CI):
+Recovery path (use this instead of `Monitor`):
 
-```bash
-for i in $(seq 1 60); do
-    rollup=$(gh pr view <PR#> --json statusCheckRollup \
-        --jq '.statusCheckRollup')
-    # break on all-green, exit 1 on any FAILURE conclusion
-    sleep 30
-done
-pr-branches merge <PR#>
-```
+**Do not arm a background task and return.** A subagent that starts a
+`run_in_background: true` Bash task and then ends its turn is NOT woken
+when the task completes -- the turn end *is* the agent's completion, and
+the work sits idle until a human or the operator loop resumes it. (Three
+agents were orphaned this way on 2026-08-21.)
 
-Use `pr-branches merge` rather than `gh pr merge --squash --delete-branch`
-directly. `gh` performs the remote-branch deletion and the local branch
-cleanup in one step, and the local half fails when the branch is still checked
-out in a worktree -- aborting *before* the remote ref is deleted, so the branch
-survives while the non-zero exit reads like a cosmetic local-cleanup nit.
-`pr-branches merge` re-reads the PR afterwards and deletes the ref explicitly
-if that happened. See `tools/pr-branches/README.md`.
+- **CI-wait:** open the PR, run `pr-watch add <PR-URL>`, and exit. The
+  operator loop receives the `pr-status-change` event and queues the
+  follow-up (merge on green, re-spawn to fix red). Do not wait for CI
+  inside the agent.
+- **Any other wait:** block *in the foreground* with one long Bash call
+  -- the Bash tool's `timeout` parameter goes up to 600000 ms; the
+  15-second cap is an operator-loop convention, not a subagent rule.
+  Poll an **artifact** (a marker file, an output file, a state command),
+  never a process name: `pgrep -f <name>` matches the polling shell
+  itself (use `pgrep -f "[n]ame"` or `pgrep -x` if you must).
 
-Run that loop with `run_in_background: true` so the agent blocks in a
-normal tool-call wait state (not a Monitor-event-driven async state).
-The harness's "agent is done" semantics correctly distinguish the two.
+When the operator loop merges, it should use `pr-branches merge` rather
+than `gh pr merge --squash --delete-branch` directly. `gh` performs the
+remote-branch deletion and the local branch cleanup in one step, and the
+local half fails when the branch is still checked out in a worktree --
+aborting *before* the remote ref is deleted, so the branch survives while
+the non-zero exit reads like a cosmetic local-cleanup nit. `pr-branches
+merge` re-reads the PR afterwards and deletes the ref explicitly if that
+happened. See `tools/pr-branches/README.md`.
 
 ### Heartbeat-liveness `touch` (narrow ALLOW)
 

@@ -120,6 +120,13 @@ big rsyncs, etc. Blocking the foreground prevents message processing.
 (Per-deployment policy may layer a stricter foreground ceiling on top —
 e.g. a 15-second cap. The 30-second rule is the floor.)
 
+This is a **main-loop** rule. A *subagent* must NOT arm a background
+task and return — it is not woken when the task completes, and the work
+orphans. Subagents block in the foreground with one long Bash call
+(`timeout` up to 600000 ms) polling an artifact, or for CI hand off via
+`pr-watch add <PR-URL>` and exit — see the `Monitor` gate in
+[hooks.md](hooks.md#monitor-tool-in-subagent-context).
+
 ## Never use `&` in background commands
 
 `run_in_background: true` already handles backgrounding. Adding `&`
