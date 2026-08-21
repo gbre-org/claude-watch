@@ -823,6 +823,32 @@ pub(crate) fn heartbeat_stale_liveness_reason(
     None
 }
 
+/// Check the last-ack timestamp file age (ack-driven heartbeat).
+///
+/// Returns the age in seconds if the file exists and is readable, None otherwise.
+/// The file is written by `event-ack` on every ack (any event, not just
+/// heartbeat-tick), so its mtime serves as a liveness signal: ANY ack proves
+/// the loop is alive. The daemon emits a heartbeat-tick probe ONLY when this
+/// timestamp has gone quiet (no acks in a while), replacing the fixed-cadence
+/// heartbeat-tick with an on-demand probe.
+///
+/// Default-open: missing/unreadable file => None (treat as "no ack data yet",
+/// not an error). The daemon falls back to the legacy heartbeat_file check
+/// when this returns None.
+pub(crate) fn last_ack_timestamp_age(state_dir: &str) -> Option<u64> {
+    use std::fs;
+    use std::time::SystemTime;
+
+    let path = std::path::Path::new(state_dir).join("last-ack-timestamp");
+    let meta = fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok()?;
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .ok()?
+        .as_secs();
+    Some(age)
+}
+
 /// Reason a force-inject escalation should fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EscalationReason {
@@ -5308,22 +5334,49 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.consecutive_fast_detections = 0;
     }
 
-    // --- Heartbeat stale detection ---
+    // --- Heartbeat stale detection (ack-driven) ---
+    // Redesign (2026-08-21): the daemon now checks the last-ack timestamp
+    // (written by event-ack on EVERY ack, not just heartbeat-tick) as the
+    // primary liveness signal. ANY ack proves the loop is alive. The daemon
+    // emits heartbeat-tick ONLY when acks have gone quiet (on-demand probe).
+    // Falls back to the legacy heartbeat_file check when the last-ack
+    // timestamp is unavailable (fresh boot, stripped deployment without
+    // event-must-act infrastructure).
     let mut stuck = false;
     let mut stuck_reason = String::new();
     // Captured for the claude-event sink so the main loop can parse
     // `stale_minutes` as a number rather than re-regex'ing the string.
     let mut stuck_stale_minutes: Option<u64> = None;
 
-    match std::fs::metadata(&config.claude.heartbeat_file) {
-        Ok(meta) => {
-            if let Ok(modified) = meta.modified() {
-                let age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default()
-                    .as_secs();
-                let stale_secs = config.heartbeat.stale_minutes * 60;
-                if age >= stale_secs {
+    // Resolve the event state dir the same way event-ack does: $CLAUDE_EVENT_STATE_DIR,
+    // else ~/.config/claude-events/.
+    let event_state_dir = std::env::var("CLAUDE_EVENT_STATE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{}/.config/claude-events", home)
+        });
+
+    // Check last-ack timestamp first (ack-driven heartbeat).
+    let last_ack_age = last_ack_timestamp_age(&event_state_dir);
+    let heartbeat_age = match std::fs::metadata(&config.claude.heartbeat_file) {
+        Ok(meta) => meta
+            .modified()
+            .ok()
+            .and_then(|m| SystemTime::now().duration_since(m).ok())
+            .map(|d| d.as_secs()),
+        Err(_) => None,
+    };
+
+    // Use last-ack age if available; else fall back to heartbeat_file age.
+    // This preserves wedge detection during the transition (hosts without
+    // event-must-act still have heartbeat_file-based detection).
+    let liveness_age = last_ack_age.or(heartbeat_age);
+
+    if let Some(age) = liveness_age {
+        let stale_secs = config.heartbeat.stale_minutes * 60;
+        if age >= stale_secs {
                     // Workload-heartbeat suppression: a long-running
                     // `workload run` (stv-promote, big rsync, ffmpeg)
                     // can pin the main loop in a fire-and-forget wait
@@ -5414,9 +5467,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 }
             }
         }
-        Err(_) => {
-            // No heartbeat file -- give it time
-        }
+        // No liveness signal available (neither last-ack nor heartbeat_file) --
+        // give it time. This is the fresh-boot / early-daemon-start case.
     }
 
     // --- AskUserQuestion stale detection (Phase 1: detect + alarm) ---
@@ -10787,6 +10839,57 @@ pane_unchanged_secs = 600
         assert_eq!(
             heartbeat_stale_liveness_reason(true, 1, true, true),
             Some("workload_heartbeat_fresh")
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_none_when_missing() {
+        // Missing file -> None (fresh boot / stripped deployment).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().to_str().unwrap();
+        assert_eq!(
+            last_ack_timestamp_age(state_dir),
+            None,
+            "missing last-ack timestamp must return None"
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_age_when_present() {
+        // Fresh file -> Some(age ~0).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path();
+        let ack_file = state_dir.join("last-ack-timestamp");
+        std::fs::write(&ack_file, "1234567890.0\n").expect("write ack file");
+        let age = last_ack_timestamp_age(state_dir.to_str().unwrap());
+        assert!(age.is_some(), "fresh ack file must return Some(age)");
+        // Age should be very small (file just written).
+        assert!(
+            age.unwrap() < 10,
+            "fresh ack file age must be near zero, got {:?}",
+            age
+        );
+    }
+
+    #[test]
+    fn last_ack_timestamp_age_returns_age_when_stale() {
+        // Stale file -> Some(age > threshold).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path();
+        let ack_file = state_dir.join("last-ack-timestamp");
+        std::fs::write(&ack_file, "1234567890.0\n").expect("write ack file");
+        // Backdate the file mtime by 700 seconds.
+        let now = std::time::SystemTime::now();
+        let old = now - std::time::Duration::from_secs(700);
+        filetime::set_file_mtime(&ack_file, filetime::FileTime::from_system_time(old))
+            .expect("backdate mtime");
+        let age = last_ack_timestamp_age(state_dir.to_str().unwrap());
+        assert!(age.is_some(), "stale ack file must return Some(age)");
+        let age_val = age.unwrap();
+        assert!(
+            age_val >= 690 && age_val <= 710,
+            "stale ack file age must be ~700s, got {}",
+            age_val
         );
     }
 
