@@ -131,6 +131,16 @@
       {{ site_title }}
     </div>
     <div class="meta" id="topbar-meta">
+      {#- STACKED COUNT PILLS (botchat #2983): the count pills sit in TWO
+          stacked half-height rows inside the header — TOP = the status pills
+          (running / blocked / pending / …), BOTTOM = the agent-activity
+          pills — at roughly half their old size. Both rows are nowrap
+          (flex-wrap + white-space + overflow/ellipsis in style.css), so the
+          header never grows a third line at any width: it is ALWAYS exactly
+          these two rows. Mirrored by static/refresh.js buildTopbarMetaDOM()
+          (this subtree is rebuilt every 5s tick). -#}
+      <div class="count-stack" id="count-stack">
+      <div class="count-row count-row-status">
       <span class="count count-running" title="running items">{{ totals.running }} running</span>
       {% if starting_count %}<span class="count count-starting" title="registered but agent not yet emitting events">{{ starting_count }} starting</span>{% endif %}
       {% if totals.wedged %}<span class="count count-wedged" title="in-flight items whose owning agent is stuck — still holding their scope">{{ totals.wedged }} wedged</span>{% endif %}
@@ -139,6 +149,20 @@
       {% if totals.other %}<span class="count count-other" title="items whose status this UI does not recognise — rendered in the fallback section rather than hidden">{{ totals.other }} unrecognised</span>{% endif %}
       <span class="count count-pending" title="pending items">{{ totals.pending }} pending</span>
       {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
+      </div>
+      {#- AGENT ACTIVITY PILLS (botchat #2967, stacked #2983): live session
+          totals from the agent-stats snapshot as the BOTTOM half-row — one
+          small pill per part (`N agt` · `C calls` · `K tok` · `main M`,
+          server-formatted in agent_stats.pills). Row absent entirely when
+          the feature is off or the snapshot file is missing; a single dimmed
+          italic "agents n/a" pill when the snapshot is STALE (never a frozen
+          number). Also rendered by static/refresh.js buildTopbarMetaDOM() —
+          this subtree is rebuilt every 5s tick, so a server-only row would
+          vanish on the first tick. -#}
+      {% if agent_stats %}<div class="count-row count-row-agents{% if agent_stats.stale %} stale{% endif %}" title="{{ agent_stats.title }}">
+        {%- for p in agent_stats.pills %}<span class="count count-agent-stats agent-stats-{{ p.key }}{% if agent_stats.stale %} stale{% endif %}" title="{{ agent_stats.title }}">{{ p.text }}</span>{% endfor -%}
+      </div>{% endif %}
+      </div>
       {#- DENSITY TOGGLE (botchat #1944): a "density" pill that flips the whole
           view between comfortable and a vertically-DENSE (compact) layout,
           condensing each queue row so q-site aligns row-by-row with the
@@ -279,6 +303,18 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
+            {#- AGENT ACTIVITY CELL (botchat #2967): live tool-call + context
+                token counters for the agent bound to this queue id, from the
+                agent-stats snapshot. Lives in the item HEAD (not .age / .scope)
+                so it is visible in compact density too — compact elides scope
+                + description but never the head. Two alternative labels:
+                .agent-stats-full (`11 calls · 82K tok`) for comfortable and
+                .agent-stats-short (`11·82Kt`) for compact; CSS picks one via
+                html.density-compact. Rendered ONLY when a live agent matched
+                (it.agent_stats is None when the feature is off, the snapshot
+                is absent / stale, or no agent carries this id). Mirrored in
+                static/refresh.js renderRunningItem(). #}
+            {% if it.agent_stats %}<span class="agent-stats" title="{{ it.agent_stats.title }}" data-tool-calls="{{ it.agent_stats.tool_calls }}" data-context-tokens="{{ it.agent_stats.context_tokens }}"><span class="agent-stats-full">{{ it.agent_stats.full_label }}</span><span class="agent-stats-short">{{ it.agent_stats.short_label }}</span></span>{% endif %}
             <button
               type="button"
               class="action-btn stop-btn"

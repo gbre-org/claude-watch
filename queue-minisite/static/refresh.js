@@ -453,6 +453,20 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    // Agent activity cell (botchat #2967) — MUST mirror the RUNNING block in
+    // templates/index.html: tool-call + context-token counters for the live
+    // agent bound to this queue id, in the HEAD so compact density keeps it.
+    // Labels come pre-formatted from the server (full_label / short_label /
+    // title) so both renderers print identical strings. Omitted entirely when
+    // it.agent_stats is null (feature off / snapshot absent or stale / no
+    // matching agent) — never a frozen or placeholder number.
+    const agentStats = it.agent_stats;
+    if (agentStats) {
+      head += `<span class="agent-stats" title="${attr(agentStats.title || '')}" data-tool-calls="${attr(agentStats.tool_calls ?? '')}" data-context-tokens="${attr(agentStats.context_tokens ?? '')}">` +
+        `<span class="agent-stats-full">${esc(agentStats.full_label || '')}</span>` +
+        `<span class="agent-stats-short">${esc(agentStats.short_label || '')}</span>` +
+        '</span>';
+    }
     head += `<button type="button" class="action-btn stop-btn" data-action="stop" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Stop this running item">stop</button>`;
 
     const startedIso = it.started_at_iso || '';
@@ -1134,6 +1148,15 @@
     const errorTxt = state.error;
 
     let html = '';
+    // STACKED COUNT PILLS (botchat #2983): two half-height nowrap rows —
+    // TOP = status pills, BOTTOM = agent-activity pills — inside one
+    // .count-stack. MUST mirror templates/index.html (rebuilt every tick).
+    // The stack carries id="count-stack" so morphdom KEYS it (getNodeKey):
+    // unkeyed, a page whose #topbar-meta still has the flat pills pairs this
+    // leading <div> positionally with the only other <div> — .info-wrap,
+    // which onBeforeElUpdated SKIPS — and the stack never appears.
+    html += `<div class="count-stack" id="count-stack">`;
+    html += `<div class="count-row count-row-status">`;
     html += `<span class="count count-running" title="running items">${esc(totals.running ?? 0)} running</span>`;
     if (startingCount) {
       html += `<span class="count count-starting" title="registered but agent not yet emitting events">${esc(startingCount)} starting</span>`;
@@ -1159,6 +1182,31 @@
     if (orphanCount) {
       html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
     }
+    html += `</div>`; // .count-row-status
+    // Agent activity pills (botchat #2967, stacked #2983) — session totals
+    // from the agent-stats snapshot as the BOTTOM half-row: one small pill
+    // per server-formatted part (`N agt` · `C calls` · `K tok` · `main M`).
+    // MUST mirror templates/index.html: this subtree is rebuilt every tick.
+    // state.agent_stats is null when the feature is off / snapshot absent
+    // (no row); {stale:true} renders the single "agents n/a" pill the server
+    // supplies — never a frozen number. Falls back to the long `label` (+
+    // main_label) as one pill if a server ever omits `pills`.
+    const agentStatsPill = state.agent_stats;
+    if (agentStatsPill) {
+      const stale = agentStatsPill.stale ? ' stale' : '';
+      const title = attr(agentStatsPill.title || '');
+      let pills = Array.isArray(agentStatsPill.pills) ? agentStatsPill.pills : null;
+      if (!pills || !pills.length) {
+        pills = [{ key: 'label', text: agentStatsPill.label || '' }];
+        if (agentStatsPill.main_label) pills.push({ key: 'main', text: agentStatsPill.main_label });
+      }
+      html += `<div class="count-row count-row-agents${stale}" title="${title}">`;
+      for (const p of pills) {
+        html += `<span class="count count-agent-stats agent-stats-${attr(p.key || '')}${stale}" title="${title}">${esc(p.text || '')}</span>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div>`; // .count-stack
     // Density toggle pill (botchat #1944). MUST be rendered here too (not just
     // in the Jinja template): mergeTopbarMeta rebuilds #topbar-meta every tick,
     // so omitting it would let morphdom discard the server-rendered control on

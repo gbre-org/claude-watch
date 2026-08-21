@@ -33,6 +33,9 @@ Test cases (PreToolUse):
  28. Exempt: Bash:^pgrep bypasses gate even with unread sidecar
  29. Exempt: Read tool bypasses gate even with unread sidecar
  30. Sidecar-write on Bash + run_in_background + watcher-ctl run -> sidecar appears
+     (project-slug-agnostic glob fallback; regression guard for the
+     HOME-vs-project-slug bug fixed in ah/fix-watcher-sidecar-session-uuid)
+ 30e. resolver is env-var-independent (finds real output despite mismatched CLAUDE_CODE_SESSION_ID)
  30a. exempt_command_patterns absent -> watcher-ctl sidecar still gates (baseline)
  30b. exempt_command_patterns matches watcher-ctl -> sidecar skipped, predicate allows
  30c. exempt_command_patterns doesn't skip non-matching sidecars (regression guard)
@@ -1023,20 +1026,33 @@ def main() -> int:
         # --- Test 30: PostToolUse on Bash + run_in_background + watcher-ctl
         # writes a sidecar. We supply a deterministic backgroundTaskId and
         # pre-create the corresponding session-task output file so the
-        # session UUID resolver finds it.
-        # Layout: /tmp/claude-<uid>/<HOME-slug>/<uuid>/tasks/<id>.output
-        # where <HOME-slug> is HOME with `/` -> `-` and a leading `-`. We
-        # mirror the resolver in the hook (which derives the slug from $HOME
-        # at call time, so this hook is portable across users).
+        # resolver finds it via the fully-wildcarded glob fallback (no
+        # CLAUDE_CODE_SESSION_ID in env).
+        # Layout: /tmp/claude-<uid>/<project-slug>/<uuid>/tasks/<id>.output
+        # -- the resolver globs `/tmp/claude-<uid>/*/*/tasks/<id>.output`
+        # when no session-id env var is set, so the project-slug component
+        # (here a fake one, deliberately NOT matching $HOME) is irrelevant.
+        # This is the regression guard for the bug fixed in
+        # ah/fix-watcher-sidecar-session-uuid: the resolver used to derive
+        # the slug from $HOME, which never matches the REAL slug (the
+        # project cwd) whenever cwd != HOME -- e.g. this container, where
+        # HOME=/home/hndrewaall but sessions run against
+        # /Users/hallandrew/repos. That mismatch made session-uuid
+        # resolution fail 100% of the time in production (40/40 observed
+        # `sidecar-no-session-uuid` log entries, sidecar dir never even
+        # created) -- the gate was permanently inert. Using an
+        # intentionally-wrong-looking fake slug here (instead of the real
+        # $HOME-derived one) proves the fix doesn't depend on the slug at
+        # all.
         fake_uuid = "deadbeef-cafe-1234-5678-abcdef012345"
         uid = os.geteuid()
-        home_slug = env["HOME"].replace("/", "-")
+        fake_slug = "-fake-project-slug-not-home"
         # Use a unique task id so we don't collide with a real Claude
         # session. The file we create here is what makes the resolver
         # succeed (it globs for an existing output file with this task id).
         fake_task_id = f"btestxx30{secrets.token_hex(2)}"
         fake_session_dir = Path(
-            f"/tmp/claude-{uid}/{home_slug}/{fake_uuid}/tasks")
+            f"/tmp/claude-{uid}/{fake_slug}/{fake_uuid}/tasks")
         fake_session_dir.mkdir(parents=True, exist_ok=True)
         fake_output = fake_session_dir / f"{fake_task_id}.output"
         fake_output.write_text("")  # exists, empty (so the predicate would allow)
@@ -1044,6 +1060,14 @@ def main() -> int:
         sidecar_dir2 = tmpdir / "watcher-output-pending-2"
         env_npwo2 = env.copy()
         env_npwo2["WATCHER_PENDING_DIR"] = str(sidecar_dir2)
+        # Strip any ambient session-id env vars (e.g. the REAL
+        # CLAUDE_CODE_SESSION_ID of the session running this test suite,
+        # inherited via env = os.environ.copy() above) so this test
+        # exercises the fully-wildcarded glob fallback deterministically,
+        # regardless of what environment the test suite itself runs under.
+        for _v in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_UUID",
+                   "CLAUDE_SESSION_ID"):
+            env_npwo2.pop(_v, None)
         rc, _stdout, _err = _hook_post(
             {
                 "tool_name": "Bash",
@@ -1087,6 +1111,69 @@ def main() -> int:
             if fake_session_dir.exists():
                 fake_session_dir.rmdir()
             fake_session_dir.parent.rmdir()
+        except OSError:
+            pass
+
+        # --- Test 30e: resolver is env-var-INDEPENDENT -- it must find the
+        # real output file purely by task id even when CLAUDE_CODE_SESSION_ID
+        # is set to a completely unrelated/"wrong" uuid. This is the
+        # regression guard for the second bug found while fixing this: an
+        # earlier iteration of the fix trusted CLAUDE_CODE_SESSION_ID to
+        # narrow the glob, but that env var was empirically observed to NOT
+        # match the session-uuid directory a subagent's background task
+        # output actually lands under (task outputs appear to be rooted at
+        # the TOP-LEVEL session's uuid, not the calling subagent's own id).
+        # Trusting it would have silently resolved to None (or the wrong
+        # file) for exactly that case. ---
+        real_uuid = "11111111-1111-1111-1111-111111111111"
+        wrong_uuid = "22222222-2222-2222-2222-222222222222"
+        fake_task_id_e = f"btestxx30e{secrets.token_hex(2)}"
+        real_dir = Path(f"/tmp/claude-{uid}/-fake-slug-e/{real_uuid}/tasks")
+        real_dir.mkdir(parents=True, exist_ok=True)
+        real_output = real_dir / f"{fake_task_id_e}.output"
+        real_output.write_text("")
+        sidecar_dir_e = tmpdir / "watcher-output-pending-e"
+        env_e = env.copy()
+        env_e["WATCHER_PENDING_DIR"] = str(sidecar_dir_e)
+        # Deliberately set the env var to a uuid that does NOT match the
+        # directory the real output lives under.
+        env_e["CLAUDE_CODE_SESSION_ID"] = wrong_uuid
+        for _v in ("CLAUDE_SESSION_UUID", "CLAUDE_SESSION_ID"):
+            env_e.pop(_v, None)
+        rc, _stdout, _err = _hook_post(
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "watcher-ctl run signal-wait-dm",
+                    "run_in_background": True,
+                },
+                "tool_response": {
+                    "backgroundTaskId": fake_task_id_e,
+                },
+            },
+            env_e,
+        )
+        sidecar_path_e = sidecar_dir_e / f"{fake_task_id_e}.json"
+        sidecar_matches_real = False
+        if sidecar_path_e.exists():
+            try:
+                sc_data_e = json.loads(sidecar_path_e.read_text())
+                sidecar_matches_real = (
+                    sc_data_e.get("output_file_path") == str(real_output))
+            except (OSError, json.JSONDecodeError):
+                pass
+        results.append(_check(
+            "30e. resolver finds real output despite a mismatched "
+            "CLAUDE_CODE_SESSION_ID (env-var-independent by design)",
+            rc == 0 and sidecar_matches_real,
+            f"rc={rc} sidecar={sidecar_path_e} matches_real={sidecar_matches_real}",
+        ))
+        try:
+            if sidecar_path_e.exists():
+                sidecar_path_e.unlink()
+            real_output.unlink()
+            real_dir.rmdir()
+            real_dir.parent.rmdir()
         except OSError:
             pass
 

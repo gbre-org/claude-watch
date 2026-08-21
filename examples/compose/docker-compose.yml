@@ -666,6 +666,16 @@ services:
       # obligations write path) — so no new mount is required; this env var
       # just points the loader at the in-container path explicitly.
       AGENT_QUEUE_BINDINGS_JSON: /queue-home/.config/claude/agent-queue-bindings.json
+      # Live per-agent activity counters (tool calls + tokens) for running
+      # rows + the header totals pill. Points INTO the read-only directory
+      # mount below (CLAUDE_HOST_AGENT_STATS_DIR). A host-side cron writes
+      # the snapshot atomically (tmp + rename) about once a minute, so the
+      # DIRECTORY is mounted, not the single file — a single-file bind mount
+      # pins the original inode and goes stale on the first rewrite (the
+      # SESSION_TASK_BIN lesson). Unset operators get /dev/null mounted at
+      # /agent-stats, the open() fails with ENOTDIR, and the feature hides
+      # itself cleanly (no pill, no cell).
+      QUEUE_MINISITE_AGENT_STATS_FILE: /agent-stats/agent-stats.json
     volumes:
       # session-task queue.json — rw because the Stop button mutates it
       # via session-task (atomic tmp+rename + flock).
@@ -701,6 +711,13 @@ services:
       # writes ~/.cache/hostjob/<label>/log on the host; the live-log modal
       # tails it via <HOSTJOB_LOG_DIR>/<label>/log (HOSTJOB_LOG_DIR above).
       - "${HOME}/.cache/hostjob:/hostjobs:ro"
+      # Agent activity snapshot dir — read-only. Set CLAUDE_HOST_AGENT_STATS_DIR
+      # (in .env / the override) to the host directory that holds
+      # agent-stats.json (the per-agent tool-call / token snapshot a host cron
+      # rewrites every minute). Default /dev/null = graceful no-op: the
+      # minisite hides the counters entirely. See QUEUE_MINISITE_AGENT_STATS_FILE
+      # above for why the DIRECTORY (not the file) is what gets mounted.
+      - "${CLAUDE_HOST_AGENT_STATS_DIR:-/dev/null}:/agent-stats:ro"
     restart: unless-stopped
 
   # ---------------------------------------------------------------------
