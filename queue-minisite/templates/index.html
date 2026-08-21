@@ -139,6 +139,15 @@
       {% if totals.other %}<span class="count count-other" title="items whose status this UI does not recognise — rendered in the fallback section rather than hidden">{{ totals.other }} unrecognised</span>{% endif %}
       <span class="count count-pending" title="pending items">{{ totals.pending }} pending</span>
       {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
+      {#- AGENT ACTIVITY PILL (botchat #2967): live session totals from the
+          agent-stats snapshot — `N agents · C calls · K tok` (+ the main
+          loop's context tokens). Absent entirely when the feature is off or
+          the snapshot file is missing; reads "agents n/a" when the snapshot
+          is STALE (never a frozen number). Also rendered by
+          static/refresh.js buildTopbarMetaDOM() — this subtree is rebuilt
+          every 5s tick, so a server-only pill would vanish on the first
+          tick. -#}
+      {% if agent_stats %}<span class="count count-agent-stats{% if agent_stats.stale %} stale{% endif %}" title="{{ agent_stats.title }}">{{ agent_stats.label }}{% if agent_stats.main_label %} <span class="agent-stats-main">· {{ agent_stats.main_label }}</span>{% endif %}</span>{% endif %}
       {#- DENSITY TOGGLE (botchat #1944): a "density" pill that flips the whole
           view between comfortable and a vertically-DENSE (compact) layout,
           condensing each queue row so q-site aligns row-by-row with the
@@ -279,6 +288,18 @@
             {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
             <span class="id">{{ it.id }}</span>
             <span class="prio" title="priority">p{{ it.priority }}</span>
+            {#- AGENT ACTIVITY CELL (botchat #2967): live tool-call + context
+                token counters for the agent bound to this queue id, from the
+                agent-stats snapshot. Lives in the item HEAD (not .age / .scope)
+                so it is visible in compact density too — compact elides scope
+                + description but never the head. Two alternative labels:
+                .agent-stats-full (`11 calls · 82K tok`) for comfortable and
+                .agent-stats-short (`11·82Kt`) for compact; CSS picks one via
+                html.density-compact. Rendered ONLY when a live agent matched
+                (it.agent_stats is None when the feature is off, the snapshot
+                is absent / stale, or no agent carries this id). Mirrored in
+                static/refresh.js renderRunningItem(). #}
+            {% if it.agent_stats %}<span class="agent-stats" title="{{ it.agent_stats.title }}" data-tool-calls="{{ it.agent_stats.tool_calls }}" data-context-tokens="{{ it.agent_stats.context_tokens }}"><span class="agent-stats-full">{{ it.agent_stats.full_label }}</span><span class="agent-stats-short">{{ it.agent_stats.short_label }}</span></span>{% endif %}
             <button
               type="button"
               class="action-btn stop-btn"
