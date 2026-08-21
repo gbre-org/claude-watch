@@ -232,6 +232,39 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         post-tool-satisfy needed -- the predicate flips as soon as the
         item leaves ready+pending state).
 
+  - force_started_unspawned: {queue_id, grace_secs?, grace_from?,
+                              queue_path?, agents_state_path?,
+                              pending_spawns_path?,
+                              pending_spawn_max_age_secs?}
+        Registered by ``session-task queue force-start`` (and the
+        queue-minisite Force-start button, which shells out to it).
+        Satisfied (=allow) iff ANY of:
+          (a) the queue item is no longer ``running`` (moot), OR
+          (b) the call falls inside the dispatch GRACE WINDOW: fewer
+              than ``grace_secs`` seconds have elapsed since the
+              force-start (anchor = ``grace_from`` param if given, else
+              the queue item's ``force_started_at``). Default
+              ``grace_secs`` is 0 (no grace) at the predicate level;
+              session-task registers 60s (env
+              ``OBLIGATIONS_FORCE_START_GRACE_SECS``), OR
+          (c) claude-watch's active-agents JSON shows a LIVE record whose
+              ``queue_id`` matches, OR
+          (d) a fresh pending-spawn record (written by the
+              pre-agent-queue-gate-hook at PreToolUse:Agent time) exists
+              for the queue id.
+        Failure (=deny) means the item is still running, the grace has
+        elapsed, and no agent has been dispatched -- the operator
+        force-started but never spawned.
+
+        SCOPING: the predicate itself is context-blind. session-task
+        registers it as ``all_of [is_main_loop, force_started_unspawned]``
+        so it gates ONLY the main loop (the party that can dispatch); a
+        concurrently-running subagent's tool calls are never denied by a
+        force-start it did not issue and cannot satisfy (regression
+        2026-08-20: three subagents were denied in the seconds between
+        ``force-start`` and the main loop's ``Agent`` call, and fell back
+        to audited bypasses).
+
   - subagent_queue_item_running: {bindings_path?}
         Continuous queue-discipline enforcement for SUBAGENTS. Satisfied
         (=allow) iff ANY of:
@@ -2246,6 +2279,41 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None,
             return (True,
                     f"queue {qid} status={status!r} (no longer running -- "
                     f"obligation moot)")
+
+        # 1b. Dispatch grace window. The main loop issues `force-start` and
+        # `Agent` back-to-back, but "back-to-back" is still two tool calls
+        # plus model latency, and any bookkeeping call in between (queue
+        # register, a Read of the recovery bundle) would otherwise be
+        # denied the instant the obligation lands. Inside the window the
+        # predicate is satisfied unconditionally; once it elapses the
+        # normal "has an agent been observed" checks below take over, so
+        # a force-started item can never sit `running` with no agent past
+        # the grace. Anchor precedence: explicit `grace_from` param, else
+        # the queue item's own `force_started_at` (epoch secs, written by
+        # session-task at promotion time). No anchor => no grace.
+        # `grace_secs` defaults to 0 so pre-existing rows / callers keep
+        # their exact behavior; session-task opts in explicitly.
+        try:
+            grace_secs = int(params.get("grace_secs", 0) or 0)
+        except (TypeError, ValueError):
+            grace_secs = 0
+        if grace_secs > 0:
+            anchor_raw = params.get("grace_from")
+            if anchor_raw is None:
+                anchor_raw = target.get("force_started_at")
+            anchor = None
+            try:
+                if anchor_raw is not None:
+                    anchor = int(anchor_raw)
+            except (TypeError, ValueError):
+                anchor = None
+            if anchor is not None:
+                age = int(time.time()) - anchor
+                if 0 <= age < grace_secs:
+                    return (True,
+                            f"queue {qid} force-started {age}s ago -- "
+                            f"inside the {grace_secs}s dispatch grace "
+                            f"window (allow)")
 
         # 2. Active-agents check. The state file is written by claude-watch's
         # active-agents poller. It maps each subagent's first user-message

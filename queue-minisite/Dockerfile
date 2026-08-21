@@ -44,10 +44,11 @@ COPY queue-minisite/claude_agents.py /app/claude_agents.py
 #   claude-event — emits queue-abandoned events into
 #       $HOME/claude-events/ for the host's event watcher to pick up.
 #   obligations — registers a hard-gate `force_started_unspawned`
-#       obligation in $HOME/.config/claude/obligations.json (bind-mounted
-#       from the host) so the force-start path blocks the host's main
-#       loop until an Agent has been dispatched for the promoted queue
-#       id.
+#       obligation (wrapped `all_of [is_main_loop, ...]`, 60s dispatch
+#       grace) in $HOME/.config/claude/obligations.json (bind-mounted
+#       from the host) so the force-start path blocks the host's MAIN
+#       loop -- never its already-running subagents -- until an Agent
+#       has been dispatched for the promoted queue id.
 COPY tools/claude-event/claude-event /usr/local/bin/claude-event
 COPY tools/obligations/obligations /usr/local/bin/obligations
 RUN chmod +x /usr/local/bin/claude-event /usr/local/bin/obligations

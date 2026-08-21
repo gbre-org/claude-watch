@@ -31,6 +31,55 @@ from pathlib import Path
 SESSION_TASK = Path(__file__).resolve().parent.parent / "session-task"
 
 
+def _force_start_leaf(ob):
+    """Return the `force_started_unspawned` leaf predicate of an obligation
+    row, or None.
+
+    force-start registers the leaf WRAPPED as
+    ``all_of [is_main_loop, force_started_unspawned]`` (main-loop-only
+    scope); accept both the wrapped and a bare row so the assertions read
+    the same either way.
+    """
+    pred = ob.get("predicate", {}) or {}
+    if pred.get("kind") == "force_started_unspawned":
+        return pred
+    if pred.get("kind") == "all_of":
+        for child in (pred.get("params", {}) or {}).get("predicates", []):
+            if (isinstance(child, dict)
+                    and child.get("kind") == "force_started_unspawned"):
+                return child
+    return None
+
+
+def _force_start_obligations_for(ob_data, qid):
+    return [
+        ob for ob in ob_data.get("obligations", [])
+        if (_force_start_leaf(ob) or {}).get("params", {}).get("queue_id")
+        == qid
+    ]
+
+
+def _run_obligations_gate_hook(hook_path, env, payload):
+    """Run the pre-tool-obligations-gate-hook on ``payload``; return the
+    parsed decision dict (empty dict == allow)."""
+    proc = subprocess.run(
+        [sys.executable, str(hook_path)],
+        input=json.dumps(payload),
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+    try:
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _decision(decision):
+    return (decision.get("hookSpecificOutput", {}) or {}).get(
+        "permissionDecision"
+    )
+
+
 def _env_for_tmp(tmp):
     env = dict(os.environ)
     env["HOME"] = str(tmp)
@@ -384,12 +433,7 @@ def test_force_start_registers_obligation():
             f"expected obligations.json at {ob_path}, but it was not written"
         )
         ob_data = json.loads(ob_path.read_text())
-        matching = [
-            ob for ob in ob_data.get("obligations", [])
-            if ob.get("predicate", {}).get("kind") == "force_started_unspawned"
-            and ob.get("predicate", {}).get("params", {}).get("queue_id")
-                == d2["id"]
-        ]
+        matching = _force_start_obligations_for(ob_data, d2["id"])
         assert matching, (
             f"expected a force_started_unspawned obligation for {d2['id']!r}, "
             f"got {[ob.get('predicate') for ob in ob_data.get('obligations',[])]}"
@@ -398,6 +442,19 @@ def test_force_start_registers_obligation():
         assert ob.get("tool_pattern") == "*"
         assert ob.get("enforcement", "gate") == "gate"
         assert ob.get("created_by", "").startswith("force-start:")
+        # Main-loop-only scoping: the leaf must be wrapped in an all_of whose
+        # FIRST child is the `is_main_loop` scope guard, so the gate is
+        # inert for concurrently-running subagents (regression 2026-08-20:
+        # a bare row denied three unrelated subagents in the seconds
+        # between force-start and the main loop's Agent call).
+        pred = ob["predicate"]
+        assert pred.get("kind") == "all_of", pred
+        children = pred.get("params", {}).get("predicates", [])
+        assert children and children[0].get("kind") == "is_main_loop", pred
+        leaf = _force_start_leaf(ob)
+        assert leaf is not None, pred
+        # Dispatch grace window: default 60s.
+        assert leaf.get("params", {}).get("grace_secs") == 60, leaf
         assert ob.get("ttl_secs", 0) > 0  # has a TTL safety net
 
 
@@ -429,13 +486,7 @@ def test_force_start_obligation_suppressed_by_env():
         # force_started_unspawned row for d2.
         if ob_path.exists():
             ob_data = json.loads(ob_path.read_text())
-            matching = [
-                ob for ob in ob_data.get("obligations", [])
-                if (ob.get("predicate", {}).get("kind")
-                    == "force_started_unspawned")
-                and ob.get("predicate", {}).get("params", {}).get("queue_id")
-                    == d2["id"]
-            ]
+            matching = _force_start_obligations_for(ob_data, d2["id"])
             assert not matching, (
                 f"expected NO obligation registered when "
                 f"OBLIGATIONS_FORCE_START=0, got {matching}"
@@ -690,11 +741,7 @@ def test_force_start_obligation_message_includes_bundle_path():
         ob_path = Path(tmp) / ".config" / "claude" / "obligations.json"
         assert ob_path.exists(), "obligations.json not written"
         ob_data = json.loads(ob_path.read_text())
-        matching = [
-            ob for ob in ob_data.get("obligations", [])
-            if ob.get("predicate", {}).get("kind") == "force_started_unspawned"
-            and ob.get("predicate", {}).get("params", {}).get("queue_id") == d2["id"]
-        ]
+        matching = _force_start_obligations_for(ob_data, d2["id"])
         assert matching, "force_started_unspawned obligation not registered"
         # The obligations CLI stores the deny banner under `deny_message`
         # (writable via `obligations add --deny-msg ...`). Older deploys
@@ -798,6 +845,11 @@ def test_force_start_then_hook_clears_obligation():
 
     This covers the q-X dispatch race that previously required manual
     `obligations override --duration` workarounds.
+
+    The dispatch grace window is DISABLED here
+    (``OBLIGATIONS_FORCE_START_GRACE_SECS=0``) so step 2 asserts the
+    post-grace DENY deterministically; the grace itself is covered by
+    ``test_force_start_obligation_grace_window``.
     """
     repo_root = Path(__file__).resolve().parent.parent.parent.parent
     pre_agent_hook = repo_root / "tools" / "hooks" / "pre-agent-queue-gate-hook"
@@ -811,6 +863,7 @@ def test_force_start_then_hook_clears_obligation():
 
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
+        env["OBLIGATIONS_FORCE_START_GRACE_SECS"] = "0"
         # Direct the pending-spawns sidecar into the temp HOME so the
         # test can both write it (via the agent hook) and read it (via
         # the predicate).
@@ -935,6 +988,169 @@ def test_force_start_then_hook_clears_obligation():
         )
 
 
+def _force_start_for_gate_tests(tmp, env, scope_tag):
+    """Force-start a blocked-pending item in the temp HOME; return its qid
+    plus the paths the obligations gate hook reads."""
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    pre_obligations_hook = (
+        repo_root / "tools" / "hooks" / "pre-tool-obligations-gate-hook"
+    )
+    assert pre_obligations_hook.exists(), pre_obligations_hook
+    # Keep the predicate's agents/pending lookups off the live host files:
+    # the pending-spawns sidecar is env-redirectable, and a test qid can
+    # never appear in the host's active-agents.json anyway.
+    env["CLAUDE_PENDING_SPAWNS_PATH"] = str(
+        Path(tmp) / ".config" / "claude" / "pending-spawns.json"
+    )
+    r1 = _add(env, "blocker", [f"scope:{scope_tag}"])
+    d1 = json.loads(r1.stdout)
+    _register(env, d1["id"], "--json")
+    r2 = _add(env, "blocked", [f"scope:{scope_tag}"], "--force-enqueue")
+    d2 = json.loads(r2.stdout)
+    rs = _run(
+        env, "queue", "force-start", d2["id"],
+        "--reason", f"{scope_tag}-test", "--json",
+    )
+    assert rs.returncode == 0, rs.stderr
+    ob_path = Path(tmp) / ".config" / "claude" / "obligations.json"
+    assert ob_path.exists(), "obligation row must be written"
+    return d2["id"], pre_obligations_hook
+
+
+def test_force_start_obligation_does_not_gate_subagents():
+    """Regression (2026-08-20): the FORCE-START obligation is evaluated on
+    EVERY PreToolUse, including tool calls issued by subagents that were
+    already running. Between the main loop's `force-start` and its `Agent`
+    call, three unrelated subagents were denied with "spawn the agent for
+    q=X" -- a gate they could neither cause nor satisfy -- and fell back
+    to audited bypasses.
+
+    The obligation is now registered as
+    ``all_of [is_main_loop, force_started_unspawned]``: a subagent caller
+    (non-empty ``agent_id``, or a subagent ``agent_type`` slug) must be
+    ALLOWED while the same call from the main loop is DENIED.
+
+    Grace disabled so the main-loop DENY is immediate.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        env["OBLIGATIONS_FORCE_START_GRACE_SECS"] = "0"
+        qid, hook = _force_start_for_gate_tests(tmp, env, "subgate")
+        bash = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+
+        # Main loop (no agent_id / agent_type) -> DENY naming the qid.
+        main = _run_obligations_gate_hook(hook, env, bash)
+        assert _decision(main) == "deny", f"expected main-loop DENY: {main}"
+        assert qid in (
+            main.get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
+            + main.get("systemMessage", "")
+        )
+
+        # Subagent by agent_id -> ALLOW (scope guard inactive).
+        sub = _run_obligations_gate_hook(
+            hook, env, dict(bash, agent_id="agent-other-work"),
+        )
+        assert _decision(sub) != "deny", (
+            f"subagent must not be gated by another item's force-start: {sub}"
+        )
+
+        # Subagent by agent_type slug only (in-process teammate) -> ALLOW.
+        sub2 = _run_obligations_gate_hook(
+            hook, env, dict(bash, agent_type="general-purpose"),
+        )
+        assert _decision(sub2) != "deny", (
+            f"agent_type-slug subagent must not be gated: {sub2}"
+        )
+
+        # Sanity: the main loop is STILL denied after the subagent calls
+        # (the subagent path must not have satisfied/cleared the row).
+        main2 = _run_obligations_gate_hook(hook, env, bash)
+        assert _decision(main2) == "deny", main2
+
+
+def test_force_start_obligation_grace_window():
+    """The main loop gets a dispatch grace window (default 60s) after a
+    force-start: `force-start` -> `queue register` -> `Agent` must not
+    trip over its own gate. Once the window has elapsed with no agent
+    observed, the main loop IS denied (a force-started item must never sit
+    `running` with no agent); a live agent / pending-spawn still clears it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        env.pop("OBLIGATIONS_FORCE_START_GRACE_SECS", None)  # default 60
+        qid, hook = _force_start_for_gate_tests(tmp, env, "grace")
+        bash = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+
+        # Immediately after force-start: inside the grace -> ALLOW.
+        d0 = _run_obligations_gate_hook(hook, env, bash)
+        assert _decision(d0) != "deny", f"expected grace ALLOW: {d0}"
+
+        # Rewind the queue item's force_started_at by 2 min -> grace
+        # elapsed -> DENY.
+        qpath = Path(tmp) / ".config" / "session" / "queue.json"
+        qdata = json.loads(qpath.read_text())
+        for it in qdata.get("items", []):
+            if it.get("id") == qid:
+                assert isinstance(it.get("force_started_at"), int), it
+                it["force_started_at"] -= 120
+        qpath.write_text(json.dumps(qdata))
+        d1 = _run_obligations_gate_hook(hook, env, bash)
+        assert _decision(d1) == "deny", f"expected post-grace DENY: {d1}"
+
+        # A subagent is still unaffected after the grace.
+        d_sub = _run_obligations_gate_hook(
+            hook, env, dict(bash, agent_id="agent-elsewhere"),
+        )
+        assert _decision(d_sub) != "deny", d_sub
+
+        # A fresh pending-spawn record for the qid clears it for the main
+        # loop (same evidence the pre-agent-queue-gate-hook writes).
+        pending_path = Path(env["CLAUDE_PENDING_SPAWNS_PATH"])
+        pending_path.parent.mkdir(parents=True, exist_ok=True)
+        import time as _time
+        pending_path.write_text(json.dumps({"pending": [{
+            "queue_id": qid, "registered_at": int(_time.time()), "pid": 1,
+        }]}))
+        d2 = _run_obligations_gate_hook(hook, env, bash)
+        assert _decision(d2) != "deny", f"expected ALLOW after spawn: {d2}"
+
+
+def test_force_start_grace_env_override():
+    """``OBLIGATIONS_FORCE_START_GRACE_SECS`` sets the leaf's ``grace_secs``;
+    ``0`` omits it (no grace)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        env["OBLIGATIONS_FORCE_START_GRACE_SECS"] = "15"
+        r1 = _add(env, "blocker", ["scope:genv"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "blocked", ["scope:genv"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+        rs = _run(env, "queue", "force-start", d2["id"],
+                  "--reason", "genv", "--json")
+        assert rs.returncode == 0, rs.stderr
+        ob_path = Path(tmp) / ".config" / "claude" / "obligations.json"
+        ob_data = json.loads(ob_path.read_text())
+        leaf = _force_start_leaf(_force_start_obligations_for(ob_data, d2["id"])[0])
+        assert leaf["params"].get("grace_secs") == 15, leaf
+
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        env["OBLIGATIONS_FORCE_START_GRACE_SECS"] = "0"
+        r1 = _add(env, "blocker", ["scope:genv0"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "blocked", ["scope:genv0"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+        rs = _run(env, "queue", "force-start", d2["id"],
+                  "--reason", "genv0", "--json")
+        assert rs.returncode == 0, rs.stderr
+        ob_path = Path(tmp) / ".config" / "claude" / "obligations.json"
+        ob_data = json.loads(ob_path.read_text())
+        leaf = _force_start_leaf(_force_start_obligations_for(ob_data, d2["id"])[0])
+        assert "grace_secs" not in leaf["params"], leaf
+
+
 # ---------------------------------------------------------------------------
 # Entry point for direct invocation
 # ---------------------------------------------------------------------------
@@ -961,6 +1177,9 @@ def _all_tests():
         test_force_start_obligation_message_includes_bundle_path,
         test_force_start_repo_snapshot_captured_in_bundle,
         test_force_start_then_hook_clears_obligation,
+        test_force_start_obligation_does_not_gate_subagents,
+        test_force_start_obligation_grace_window,
+        test_force_start_grace_env_override,
     ]
 
 

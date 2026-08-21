@@ -66,6 +66,15 @@ Bounded set, NOT Turing-complete:
   - `no_pending_watcher_outputs {}` — no captured-but-unread watcher output sidecars
   - `agent_inbox_empty {path}` — agent-msg inbox has no UNREAD messages
   - `is_main_loop {negate?}` — caller is the main session loop (no agent_id)
+  - `force_started_unspawned {queue_id, grace_secs?, grace_from?, ...}` —
+    the `session-task queue force-start` gate: satisfied once the
+    force-started queue item is no longer running, OR a live subagent /
+    fresh pending-spawn record exists for it, OR fewer than `grace_secs`
+    seconds have passed since the force-start (anchor: `grace_from`, else
+    the item's `force_started_at`). session-task registers it wrapped as
+    `all_of [is_main_loop, force_started_unspawned {grace_secs: 60}]` so
+    it gates ONLY the main loop — concurrently-running subagents are never
+    denied by a force-start they cannot satisfy.
   - `evaluator {cmd, timeout_ms?, stdin_field?, decision_mode?,
     allow_on_zero_exit?, allow_pattern?, deny_pattern?, env?}` —
     generic delegation primitive. Runs `cmd` (shell string or argv list)

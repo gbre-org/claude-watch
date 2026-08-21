@@ -2249,17 +2249,60 @@ def _claude_event_notify(tag, message, data, priority="low", silent=False):
     return cmd
 
 
+FORCE_START_GRACE_SECS_DEFAULT = 60
+
+
+def _force_start_grace_secs():
+    """Dispatch grace window (seconds) baked into the force-start obligation.
+
+    Default ``FORCE_START_GRACE_SECS_DEFAULT`` (60s). Override via the env
+    var ``OBLIGATIONS_FORCE_START_GRACE_SECS``; ``0`` disables the grace
+    (the gate denies the main loop immediately -- what tests asserting the
+    pre-dispatch DENY want). Garbage / negative values fall back to the
+    default rather than silently disabling the window.
+    """
+    raw = os.environ.get("OBLIGATIONS_FORCE_START_GRACE_SECS", "").strip()
+    if not raw:
+        return FORCE_START_GRACE_SECS_DEFAULT
+    try:
+        val = int(raw)
+    except ValueError:
+        return FORCE_START_GRACE_SECS_DEFAULT
+    return val if val >= 0 else FORCE_START_GRACE_SECS_DEFAULT
+
+
 def _obligations_register_force_start(queue_id, summary, reason, ttl_secs=900,
                                        bundle_path=None, autostopped_count=0,
                                        co_run=False):
     """Register a `force_started_unspawned` obligation on the queue id.
 
     Wired by `cmd_queue_force_start` after a successful pending->running
-    promotion. The obligation gates `*` (every tool) until the main loop
-    actually spawns an Agent for the queue item -- the predicate clears
-    the moment claude-watch's active-agents JSON shows a live record for
-    the qid. The Agent tool itself is in `UNIVERSAL_RECOVERY_EXEMPT_PATTERNS`
-    so the spawning Agent call is never blocked by the gate it satisfies.
+    promotion. The obligation gates `*` (every tool) FOR THE MAIN LOOP
+    until it actually spawns an Agent for the queue item -- the predicate
+    clears the moment claude-watch's active-agents JSON shows a live
+    record for the qid (or a fresh pending-spawn record is written by the
+    pre-agent-queue-gate-hook). The Agent tool itself is in
+    `UNIVERSAL_RECOVERY_EXEMPT_PATTERNS` so the spawning Agent call is
+    never blocked by the gate it satisfies.
+
+    Scoping + grace (2026-08-20 regression fix):
+      * The predicate is registered WRAPPED as
+        ``all_of [is_main_loop, force_started_unspawned]`` so it gates
+        ONLY the main loop. The obligations gate evaluates every row on
+        every PreToolUse -- including tool calls issued by subagents
+        that are already running -- and a bare ``force_started_unspawned``
+        row denied three concurrently-running subagents in the seconds
+        between the main loop's ``force-start`` and its ``Agent`` call
+        (they fell back to audited bypasses). A subagent can neither
+        cause nor cure an unspawned force-start, so it must never be
+        gated by one.
+      * The leaf carries ``grace_secs`` (default 60, env
+        ``OBLIGATIONS_FORCE_START_GRACE_SECS``; ``0`` disables): the main
+        loop is NOT denied inside that window after the force-start, so
+        `force-start` -> `queue register` -> `Agent` never trips over its
+        own gate. After the grace the main loop IS denied until an agent
+        is observed, so a force-started item can never sit `running`
+        with no agent.
 
     MUST NEVER block or fail the underlying queue op. All errors are
     caught and logged to stderr as a warning. Suppression mirrors
@@ -2308,12 +2351,23 @@ def _obligations_register_force_start(queue_id, summary, reason, ttl_secs=900,
         f"Agent has been spawned for it yet. Dispatch the agent before "
         f"running any other tool. Reason: {reason}.{bundle_hint}"
     )
-    params = json.dumps({"queue_id": queue_id})
+    leaf_params = {"queue_id": queue_id}
+    grace_secs = _force_start_grace_secs()
+    if grace_secs > 0:
+        leaf_params["grace_secs"] = grace_secs
+    # Main-loop-only scope guard: `is_main_loop` as the FIRST all_of child
+    # short-circuits the whole row to "inactive" for subagent callers.
+    params = json.dumps({
+        "predicates": [
+            {"kind": "is_main_loop", "params": {}},
+            {"kind": "force_started_unspawned", "params": leaf_params},
+        ],
+    })
     cmd = [
         cli,
         "add",
         "--tool-pattern", "*",
-        "--predicate", "force_started_unspawned",
+        "--predicate", "all_of",
         "--params", params,
         "--ttl", str(int(ttl_secs)),
         "--deny-msg", deny_msg,
@@ -6147,11 +6201,12 @@ def cmd_queue_force_start(args):
         silent=getattr(args, "silent", False),
     )
 
-    # Obligations gate: hard-deny every non-exempt main-loop tool call
-    # until an Agent has been spawned for this queue id. The Agent tool
-    # is in UNIVERSAL_RECOVERY_EXEMPT_PATTERNS so the spawning call is
-    # never blocked by its own gate. TTL 15min so a wedged main loop
-    # doesn't deadlock forever.
+    # Obligations gate: hard-deny every non-exempt MAIN-LOOP tool call
+    # (subagents are scope-guarded out; 60s dispatch grace first) until
+    # an Agent has been spawned for this queue id. The Agent tool is in
+    # UNIVERSAL_RECOVERY_EXEMPT_PATTERNS so the spawning call is never
+    # blocked by its own gate. TTL 15min so a wedged main loop doesn't
+    # deadlock forever.
     _obligations_register_force_start(
         queue_id=promoted["id"],
         summary=_item_summary(promoted),
