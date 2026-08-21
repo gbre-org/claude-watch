@@ -241,7 +241,17 @@ recorded it says so and exits 0 (idempotent). `watcher-ctl status` judges a
 monitor-mode watcher by the same pidfile model as any other (`<name>.lock`
 written by the watcher itself), tags its row `[monitor]`, and in the DOWN
 footer says to re-arm rather than re-run; `watcher-restart` stops it like any
-other watcher. Flipping back is the same one-line edit (`mode=oneshot`) plus
+other watcher (and removes the `.monitor-intent`, voiding a pending arm).
+Between `watcher-ctl run` printing the command and the Monitor actually
+being live there is no process yet; for that gap the row reads **`ARMING`**
+(healthy-pending — not counted by `--unhealthy-only`, not a daemon miss) for
+up to `[watcher_monitor].monitor_arming_grace_secs` (default 120s, env
+override `CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS`), provided no runtime file
+has been written since the intent (a `.lock` younger than the intent means
+the monitor went live and then died — real DOWN, immediately). The Monitor
+call that arms it (exactly the printed command, trailing ` 2>&1` tolerated)
+is exempt from every obligations gate via the `MonitorArm` token — see
+`tools/obligations/README.md`. Flipping back is the same one-line edit (`mode=oneshot`) plus
 a normal `watcher-ctl run <name>` background task — no rebuild, no revert, no
 session restart in either direction.
 

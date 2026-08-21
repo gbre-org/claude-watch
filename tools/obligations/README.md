@@ -249,8 +249,8 @@ Three flavors (in order of precedence at gate-evaluation time):
      side-effect-free, can never mutate guarded state), `ToolSearch`
      (unconditional — tool-discovery is read-only and a session-start
      recovery prerequisite for loading deferred MCP recovery tools),
-     `self-clear`. See
-     `UNIVERSAL_RECOVERY_EXEMPT_PATTERNS` in the source for the
+     `self-clear`, and `MonitorArm` (the monitor-mode watcher cure, below).
+     See `UNIVERSAL_RECOVERY_EXEMPT_PATTERNS` in the source for the
      authoritative list + rationale.
   2. Per-obligation `exempt_patterns` — list of tool_pattern strings; if
      any match, the obligation auto-allows even when tool_pattern matches.
@@ -302,6 +302,50 @@ gate must allow a tool for it to fire). Two obligations whose exempt
 sets do not overlap form a deadlock. The universal recovery floor is
 the structural guarantee that the recovery surface always overlaps —
 no obligation author can accidentally close it off.
+
+### `MonitorArm` — the monitor-mode watcher cure, and the `ARMING` state
+
+A watcher whose layered `watchers.conf` entry says `mode=monitor` is not
+exec'd by `watcher-ctl run <name>`: the command prints the Monitor-tool
+invocation (`<monitor_cmd> 2>&1`, `persistent: true`) and records
+`<pid_dir>/<name>.monitor-intent`; the main loop must then ARM it. That
+Monitor call is the monitor-mode form of `watcher-ctl run` — the one tool
+call that cures a DOWN monitor-mode watcher. Without special handling the
+`watchers_healthy` gate denied exactly that call ("watchers unhealthy —
+restart them first" on the arm of the watcher it named), leaving
+`obligations override --scope infra` as the only exit — a gate blocking
+its own cure, the same class as the cross-gate deadlock above. Two
+mechanisms close it:
+
+  * **`MonitorArm`** is a tool_pattern token (usable in any `tool_pattern`
+    / `exempt_patterns`) that matches the `Monitor` tool ONLY when its
+    `command` is exactly the `monitor_cmd` of an ENABLED `mode=monitor`
+    watcher in the layered config (read via `watcher-ctl list --json`, the
+    same loader `watcher-ctl run` prints from). Whitespace runs and a
+    trailing ` 2>&1` are normalised away; anything else — a different
+    command, an extra flag, a oneshot watcher's derived `--mode monitor`
+    form, a disabled monitor watcher — does NOT match, so any other
+    Monitor call stays gated. It is FAIL-CLOSED (no `watcher-ctl`, non-zero
+    exit, unparseable output ⇒ no match ⇒ the gate stands). It is listed
+    in the universal recovery floor (so it passes EVERY gate, including an
+    operator-registered `watchers_healthy` row) and, as a sibling of the
+    recovery CLIs, in `obligations-init`'s shared `DEFAULT_EXEMPT_PATTERNS`.
+    The hook's hardcoded subagent-Monitor ban still runs first: a subagent
+    arming a watcher is still denied (watchers belong to the main loop).
+  * **`ARMING`** is a `watcher-ctl status` state for a monitor-mode watcher
+    with no live pid but a fresh, unconsumed arm intent: for
+    `[watcher_monitor].monitor_arming_grace_secs` (default 120s; env
+    override `CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS`) after `watcher-ctl
+    run` wrote `<name>.monitor-intent` — and as long as no runtime file
+    (`.lock`/`.pid`) has been written SINCE it — the watcher is
+    healthy-pending: `watcher-status --unhealthy-only` stays silent (so
+    `watchers_healthy` does not trip) and the daemon's watcher_monitor does
+    not count a miss or fire WATCHER(S) DOWN. A live pidfile flips it to
+    `ok [monitor]`; a runtime file younger than the intent means the monitor
+    went live and died (real DOWN at once); past the grace with no pid it is
+    DOWN again with the re-ARM footer. `watcher-restart` removes intents
+    (a stop voids the pending arm). The predicate itself is unchanged —
+    it still keys on `--unhealthy-only` being empty.
 
 ## `drain_before_dispatch` — force drain before task-dispatch
 

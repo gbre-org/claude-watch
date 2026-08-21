@@ -614,6 +614,32 @@ pub struct WatcherMonitorConfig {
     /// Set to 0 to disable (pure `grace_secs`-only behaviour).
     #[serde(default = "default_watcher_clean_exit_grace_secs")]
     pub clean_exit_grace_secs: u64,
+    /// ARMING grace (seconds) for `mode=monitor` watchers. `watcher-ctl run
+    /// <name>` does not exec a monitor-mode watcher: it prints the Monitor-tool
+    /// command for the main loop to arm and records the request in
+    /// `<pid_dir>/<name>.monitor-intent`. Between that print and the Monitor
+    /// actually going live (its pidfile showing a live pid) the watcher has no
+    /// process, so a naive liveness check reads DOWN -- which trips the
+    /// `watchers_healthy` obligation gate and the daemon's WATCHER(S) DOWN
+    /// path in the very gap where the loop is doing the right thing. For
+    /// this many seconds after a FRESH intent (one not superseded by a
+    /// runtime file written since), `watcher-ctl status` / the daemon's
+    /// watcher_monitor treat the watcher as `ARMING` (healthy-pending): not
+    /// DOWN, not counted as a miss. A live pidfile flips it to `ok`; past
+    /// the window with no live pid it is `DOWN` again (re-ARM footer).
+    ///
+    /// Override per process with `$CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS`
+    /// (the one-shot `watcher-status` CLI honours it; tests use it). Default:
+    /// 120s. 0 disables (an un-armed monitor reads DOWN immediately).
+    #[serde(default = "default_watcher_monitor_arming_grace_secs")]
+    pub monitor_arming_grace_secs: u64,
+}
+
+/// Code default for `[watcher_monitor].monitor_arming_grace_secs`.
+pub const DEFAULT_MONITOR_ARMING_GRACE_SECS: u64 = 120;
+
+fn default_watcher_monitor_arming_grace_secs() -> u64 {
+    DEFAULT_MONITOR_ARMING_GRACE_SECS
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -2257,6 +2283,9 @@ cooldown = 300
         // Health-grace default (no health_grace_secs key in SAMPLE_CONFIG).
         // KNOB #1 (2026-06-24): default raised 30 -> 180.
         assert_eq!(config.watcher_monitor.health_grace_secs, 180);
+        // Monitor-mode ARMING grace default (no key in SAMPLE_CONFIG).
+        assert_eq!(config.watcher_monitor.monitor_arming_grace_secs, 120);
+        assert_eq!(DEFAULT_MONITOR_ARMING_GRACE_SECS, 120);
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
         assert!(config.task_watch.enabled);
