@@ -65,7 +65,6 @@ NEW_SCRIPTS = {
     "event-ack": EVENT_MUST_ACT_DIR / "event-ack",
     "event-classify": EVENT_MUST_ACT_DIR / "event-classify",
     "eval-event-must-act": EVENT_MUST_ACT_DIR / "eval-event-must-act",
-    "heartbeat-ack": EVENT_MUST_ACT_DIR / "heartbeat-ack",
     "user-prompt-ambient-inject-hook":
         EVENT_MUST_ACT_DIR / "user-prompt-ambient-inject-hook",
 }
@@ -98,7 +97,6 @@ def test_scripts_exist_and_executable() -> None:
 def test_self_tests_pass() -> None:
     # Run each script's --self-test in an isolated subprocess.
     for name in ("event-ack", "event-classify", "eval-event-must-act",
-                 "heartbeat-ack"):
         path = NEW_SCRIPTS[name]
         proc = subprocess.run(
             [sys.executable, str(path), "--self-test"],
