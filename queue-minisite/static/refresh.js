@@ -1148,6 +1148,15 @@
     const errorTxt = state.error;
 
     let html = '';
+    // STACKED COUNT PILLS (botchat #2983): two half-height nowrap rows —
+    // TOP = status pills, BOTTOM = agent-activity pills — inside one
+    // .count-stack. MUST mirror templates/index.html (rebuilt every tick).
+    // The stack carries id="count-stack" so morphdom KEYS it (getNodeKey):
+    // unkeyed, a page whose #topbar-meta still has the flat pills pairs this
+    // leading <div> positionally with the only other <div> — .info-wrap,
+    // which onBeforeElUpdated SKIPS — and the stack never appears.
+    html += `<div class="count-stack" id="count-stack">`;
+    html += `<div class="count-row count-row-status">`;
     html += `<span class="count count-running" title="running items">${esc(totals.running ?? 0)} running</span>`;
     if (startingCount) {
       html += `<span class="count count-starting" title="registered but agent not yet emitting events">${esc(startingCount)} starting</span>`;
@@ -1173,19 +1182,31 @@
     if (orphanCount) {
       html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
     }
-    // Agent activity pill (botchat #2967) — session totals from the
-    // agent-stats snapshot (`N agents · C calls · K tok` + main-loop context).
+    html += `</div>`; // .count-row-status
+    // Agent activity pills (botchat #2967, stacked #2983) — session totals
+    // from the agent-stats snapshot as the BOTTOM half-row: one small pill
+    // per server-formatted part (`N agt` · `C calls` · `K tok` · `main M`).
     // MUST mirror templates/index.html: this subtree is rebuilt every tick.
     // state.agent_stats is null when the feature is off / snapshot absent
-    // (no pill); {stale:true} renders the "agents n/a" label the server
-    // supplies — never a frozen number.
+    // (no row); {stale:true} renders the single "agents n/a" pill the server
+    // supplies — never a frozen number. Falls back to the long `label` (+
+    // main_label) as one pill if a server ever omits `pills`.
     const agentStatsPill = state.agent_stats;
     if (agentStatsPill) {
-      const mainLabel = agentStatsPill.main_label
-        ? ` <span class="agent-stats-main">· ${esc(agentStatsPill.main_label)}</span>`
-        : '';
-      html += `<span class="count count-agent-stats${agentStatsPill.stale ? ' stale' : ''}" title="${attr(agentStatsPill.title || '')}">${esc(agentStatsPill.label || '')}${mainLabel}</span>`;
+      const stale = agentStatsPill.stale ? ' stale' : '';
+      const title = attr(agentStatsPill.title || '');
+      let pills = Array.isArray(agentStatsPill.pills) ? agentStatsPill.pills : null;
+      if (!pills || !pills.length) {
+        pills = [{ key: 'label', text: agentStatsPill.label || '' }];
+        if (agentStatsPill.main_label) pills.push({ key: 'main', text: agentStatsPill.main_label });
+      }
+      html += `<div class="count-row count-row-agents${stale}" title="${title}">`;
+      for (const p of pills) {
+        html += `<span class="count count-agent-stats agent-stats-${attr(p.key || '')}${stale}" title="${title}">${esc(p.text || '')}</span>`;
+      }
+      html += `</div>`;
     }
+    html += `</div>`; // .count-stack
     // Density toggle pill (botchat #1944). MUST be rendered here too (not just
     // in the Jinja template): mergeTopbarMeta rebuilds #topbar-meta every tick,
     // so omitting it would let morphdom discard the server-rendered control on

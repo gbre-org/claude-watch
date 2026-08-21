@@ -905,6 +905,17 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
     if main_ctx is not None:
         title_bits.append(f"main loop context {_fmt_count(main_ctx)} tokens")
     title_bits.append(f"snapshot {_humanize_age(age)}")
+    main_label = f"main {_fmt_count(main_ctx)}" if main_ctx is not None else ""
+    # Header pills (botchat #2983): the session totals render as a HALF-ROW
+    # of small pills stacked under the status pills, so each part is its own
+    # short token — `agt` not `agents` — to stay one line at every width.
+    pills = [
+        {"key": "agents", "text": f"{_fmt_count(n_agents)} agt"},
+        {"key": "calls", "text": f"{_fmt_count(calls)} calls"},
+        {"key": "tok", "text": f"{_fmt_count(ctx)} tok"},
+    ]
+    if main_label:
+        pills.append({"key": "main", "text": main_label})
     view["totals"] = {
         "agents": n_agents,
         "tool_calls": calls,
@@ -912,7 +923,8 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
         "output_tokens": out,
         "main_context_tokens": main_ctx,
         "label": label,
-        "main_label": f"main {_fmt_count(main_ctx)}" if main_ctx is not None else "",
+        "main_label": main_label,
+        "pills": pills,
         "title": " · ".join(title_bits),
     }
     view["main"] = {
@@ -924,7 +936,12 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
 
 
 def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
-    """The header-pill payload: None = render no pill (off / absent)."""
+    """The header-pill payload: None = render no pill (off / absent).
+
+    ``pills`` is the list the header's bottom half-row renders (one small
+    pill per entry: ``N agt`` / ``C calls`` / ``K tok`` / ``main M``, or the
+    single ``agents n/a`` pill when stale); ``label`` / ``main_label`` stay
+    for the API (same numbers, the long form)."""
     if not view.get("available"):
         return None
     if view.get("stale"):
@@ -934,6 +951,7 @@ def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
             "stale": True,
             "label": "agents n/a",
             "main_label": "",
+            "pills": [{"key": "na", "text": "agents n/a"}],
             "title": f"agent-stats snapshot is stale (written {age_txt}) — counters withheld rather than frozen",
         }
     t = view.get("totals") or {}
@@ -941,6 +959,7 @@ def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
         "stale": False,
         "label": t.get("label", ""),
         "main_label": t.get("main_label", ""),
+        "pills": list(t.get("pills") or []),
         "title": t.get("title", ""),
     }
 
