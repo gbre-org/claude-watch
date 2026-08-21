@@ -723,23 +723,41 @@ compose-down: ## Tear the compose stack down (volumes survive)
 # systemd variant is `deploy-systemd`). `make redeploy` remains a working
 # DEPRECATED alias of this target.
 #
-# A SINGLE `docker compose up -d --force-recreate claude-container`.
-# This is deliberately one host-daemon operation so the target works
-# when issued FROM INSIDE the container (self-redeploy): the in-
-# container docker CLI hands the recreate request to the HOST docker
-# daemon, which performs the stop-old + start-new host-side and
-# COMPLETES it even after the issuing container (and the shell that ran
-# `make redeploy`) is torn down. The daemon owns the operation — no
-# backgrounding, no nohup, no disown, no second `&& up -d` that would
-# die with the issuing container.
+# TWO ordered compose ops, FIRST of which is the atomic self-redeploy op:
+#   1. `docker compose up -d --force-recreate claude-container`  (atomic)
+#   2. `docker compose up -d`  (no service arg — fill in the rest of the
+#      stack: ttyd, queue-minisite, eichi-search — idempotently, WITHOUT
+#      --force-recreate so the just-recreated claude-container is left
+#      running untouched).
 #
-# Why a single command and NOT a `rm -sf && up -d` split: when run from
-# inside the container, the FIRST command (`rm -sf` / `down`) destroys
-# the very container running the make recipe, so the shell dies and the
-# `&& up -d` never executes — the container goes down and never comes
-# back. `up -d --force-recreate` is atomic from the CLI's perspective:
-# it issues ONE create+start request that the daemon carries to
-# completion independently of the caller's lifetime.
+# Command 1 is deliberately ONE host-daemon operation so the target works
+# when issued FROM INSIDE the container (self-redeploy): the in-container
+# docker CLI hands the recreate request to the HOST docker daemon, which
+# performs the stop-old + start-new host-side and COMPLETES it even after
+# the issuing container (and the shell that ran `make redeploy`) is torn
+# down. The daemon owns that op — no backgrounding, no nohup, no disown.
+#
+# The claude-container recreate is ordered FIRST precisely so it never
+# DEPENDS on a following command. On self-redeploy the recreate tears down
+# the issuing container, the recipe shell dies, and the trailing `&& up -d`
+# (command 2) simply never runs — which is fine: self-redeploy always runs
+# on an already-up system where the siblings are ALREADY running, so the
+# claude-container recreate is the only thing it needs. On a HOST cold
+# start (docker-autostart after a Docker Desktop restart, everything down),
+# the recipe shell runs host-side and SURVIVES the recreate, so command 2
+# executes and brings the whole stack up. This is the coverage fix for the
+# 'siblings missing after Docker Desktop restart' bug (ttyd / minisite /
+# eichi-search never came up because deploy-container only touched
+# claude-container). The trailing `up -d` is idempotent: on a normal
+# already-up host it no-ops.
+#
+# Why command 1 is a single op and NOT a `rm -sf && up -d` split: when run
+# from inside the container, a FIRST `rm -sf` / `down` destroys the very
+# container running the make recipe, so the shell dies and the `&& up -d`
+# never executes — the container goes down and never comes back.
+# `up -d --force-recreate` is atomic from the CLI's perspective: it issues
+# ONE create+start request the daemon carries to completion independently
+# of the caller's lifetime.
 #
 # Why force-recreate no longer wedges (the bug #292 worked around):
 # in-place recreate only ever stuck because a grandchild outlived PID
@@ -821,7 +839,7 @@ sync-main-clone: ## ff-only sync the bind-mount source clone to origin/main
 	@git -C "$(CW_MAIN_CLONE)" merge --ff-only origin/main
 	@echo "Now at: $$(git -C "$(CW_MAIN_CLONE)" log -1 --oneline)"
 
-deploy-container: container-build ## Container deploy: build + force-recreate claude-container
+deploy-container: container-build ## Container deploy: force-recreate claude-container, then up -d the rest of the stack
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
 	  env_flag=""; \
@@ -829,11 +847,9 @@ deploy-container: container-build ## Container deploy: build + force-recreate cl
 	  export CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)"; \
 	  export CW_BUILD_PR="$(CW_BUILD_PR)"; \
 	  export GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"; \
-	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then \
-	    COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)" docker compose $$env_flag up -d --force-recreate claude-container; \
-	  else \
-	    docker compose $$env_flag up -d --force-recreate claude-container; \
-	  fi
+	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then export COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)"; fi; \
+	  docker compose $$env_flag up -d --force-recreate claude-container && \
+	  docker compose $$env_flag up -d
 
 # DEPRECATED alias — kept so the baked image's own scripts/docs (entrypoint,
 # cwsr, container/tests/redeploy-self-recreate.test, baked-CLAUDE.md) and the
