@@ -987,4 +987,171 @@ grep -q -- '--liveness-interval' <<<"$help_out" || { echo "FAIL: --help missing 
 grep -q -- '--print-mode' <<<"$help_out" || { echo "FAIL: --help missing --print-mode" >&2; exit 1; }
 echo "  mode: --help documents --mode / --liveness-interval / --print-mode OK"
 
-echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard + delivery mode)"
+# --- monitor-mode line format tests --------------------------------------
+# In monitor mode the stdout line IS the notification (the Monitor tool's own
+# description is static), so each EVENT[...] line carries a per-source/tag
+# human lead + the FULL message + the data tags, capped at ~400 chars. Exit
+# mode keeps the one-shot shape byte-for-byte — guarded at the end of this
+# section. All fixtures below are hand-written JSON so the expected lines can
+# be asserted EXACTLY (grep -x -F), not just by substring.
+write_json() {  # <queue> <fname> <json-text>
+    printf '%s' "$3" >"$1/$2"
+}
+# Character-length of a line (NOT bytes: '…' / '⏎' are multibyte and CI may
+# run under a C locale where ${#var} counts bytes).
+charlen() { python3 -c 'import sys; print(len(sys.argv[1]))' "$1"; }
+
+M100="$(printf 'M%.0s' $(seq 1 100))"
+B70="$(printf 'B%.0s' $(seq 1 70))"
+C70="$(printf 'C%.0s' $(seq 1 70))"
+D70="$(printf 'D%.0s' $(seq 1 70))"
+E70="$(printf 'E%.0s' $(seq 1 70))"
+X600="$(printf 'X%.0s' $(seq 1 600))"
+
+# Fixture set: written into BOTH a monitor-mode queue and an exit-mode queue so
+# the two formats are compared over identical inputs.
+load_format_fixtures() {  # <queue>
+    local q="$1"
+    write_json "$q" "100_hb.json" '{"source":"claude-watch","tag":"heartbeat-tick","message":"heartbeat tick","data":{"interval_secs":300,"path":"/var/run/claude/heartbeat"}}'
+    write_json "$q" "101_pr_merged.json" '{"source":"cron","tag":"pr-status-change","message":"PR o/r#651: MERGED (was: OPEN)","data":{"pr_id":"github:o/r#651","pr_url":"https://example.invalid/pr/651","field":"state","old_value":"OPEN","new_value":"MERGED"}}'
+    write_json "$q" "102_pr_ci.json" '{"source":"cron","tag":"pr-status-change","message":"PR o/r#652: CI failure (was: pending)","data":{"pr_id":"github:o/r#652","field":"ci_status","old_value":"pending","new_value":"failure"}}'
+    write_json "$q" "103_torrent.json" '{"source":"torrent","tag":"torrent-completed","message":"Torrent completed: The Audacity S01E05 1080p WEB-DL","data":{"name":"The Audacity S01E05 1080p WEB-DL","hash":"abc"}}'
+    write_json "$q" "104_qdone.json" '{"source":"queue","tag":"queue-done","message":"queue done: q-2026-08-21-ad82 (Ship the thing)","data":{"queue_id":"q-2026-08-21-ad82","summary":"Ship the thing","elapsed_sec":"12"}}'
+    write_json "$q" "105_qblocked.json" '{"source":"queue","tag":"queue-blocked","message":"queue BLOCKED: q-1 (S) -- reason: waiting on X","data":{"queue_id":"q-1","summary":"S","block_reason":"waiting on X"}}'
+    write_json "$q" "106_afire.json" '{"source":"alertmanager","tag":"alert-firing","message":"HDDTempWarn firing: sda at 61C","data":{"alertname":"HDDTempWarn","status":"firing","summary":"sda at 61C"}}'
+    write_json "$q" "107_ares.json" '{"source":"alertmanager","tag":"alert-resolved","message":"HDDTempWarn resolved: sda at 61C","data":{"alertname":"HDDTempWarn","status":"resolved","summary":"sda at 61C"}}'
+    write_json "$q" "108_wl.json" '{"source":"workload","tag":"workload-done","message":"workload cw-deploy-x done rc=0 log=/x","data":{"exit_code":0,"killed":false,"label":"cw-deploy-x"}}'
+    write_json "$q" "109_fallback.json" '{"source":"botchat","tag":"brand-new","message":"from alice: hello there","data":{"n":1}}'
+    write_json "$q" "110_multi.json" "$(printf '{"source":"manual","tag":"multi","message":"line one\\n\\nline two\\n   line three  ","data":{}}')"
+    write_json "$q" "111_cap_data.json" "{\"source\":\"manual\",\"tag\":\"cap1\",\"message\":\"$M100\",\"data\":{\"big\":\"$B70\",\"big2\":\"$C70\",\"big3\":\"$D70\",\"big4\":\"$E70\"}}"
+    write_json "$q" "112_cap_msg.json" "{\"source\":\"claude-watch\",\"tag\":\"memory-reminder\",\"message\":\"$X600\",\"data\":{}}"
+    write_json "$q" "113_torrent_noname.json" '{"source":"torrent","tag":"torrent-completed","message":"Torrent completed: weird","data":{}}'
+    write_json "$q" "114_cw_alert.json" '{"source":"claude-watch","tag":"claude-watch-alert","message":"[CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/push in-flight work and save state NOW before compaction.","data":{"alert_type":"context-low","severity":"high"}}'
+    write_json "$q" "115_last.json" '{"source":"manual","tag":"last","message":"LAST FIXTURE","data":{}}'
+}
+
+FMT_Q="$TMP/fmtq"; FMT_LOG="$TMP/fmtlog"; mkdir -p "$FMT_Q" "$FMT_LOG"
+FMT_OUT="$TMP/fmt.out"
+load_format_fixtures "$FMT_Q"
+CLAUDE_EVENT_QUEUE="$FMT_Q" CLAUDE_EVENT_LOG_DIR="$FMT_LOG" \
+    CLAUDE_EVENT_WATCH_LOCK="$TMP/fmt.lock" \
+    EVENT_WATCH_INOTIFY_TIMEOUT=2 \
+    "$WATCHER" --monitor --debounce 0 >"$FMT_OUT" 2>&1 &
+FMT_PID=$!
+BG_PIDS+=("$FMT_PID")
+waited=0
+while ! grep -q 'LAST FIXTURE' "$FMT_OUT" 2>/dev/null; do
+    if (( waited >= 30 )); then
+        echo "FAIL: monitor-format instance never drained the fixture set" >&2
+        cat "$FMT_OUT" >&2; exit 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+done
+kill -TERM "$FMT_PID" 2>/dev/null || true
+reap_within "$FMT_PID" 10 || true
+
+expect_line() {  # <label> <exact-line> <file>
+    if ! grep -qxF -- "$2" "$3"; then
+        echo "FAIL: monitor-format $1 — expected exact line:" >&2
+        echo "    $2" >&2
+        echo "  got:" >&2
+        grep -F "EVENT[" "$3" >&2 || true
+        exit 1
+    fi
+}
+
+# Per-pattern leads.
+expect_line "heartbeat lead" \
+    'EVENT[claude-watch/heartbeat-tick] heartbeat tick [interval_secs=300 path=/var/run/claude/heartbeat]' "$FMT_OUT"
+expect_line "pr-status-change state lead" \
+    'EVENT[cron/pr-status-change] PR #651 merged — PR o/r#651: MERGED (was: OPEN) [field=state new_value=MERGED old_value=OPEN pr_id=github:o/r#651 pr_url=https://example.invalid/pr/651]' "$FMT_OUT"
+expect_line "pr-status-change ci lead" \
+    'EVENT[cron/pr-status-change] PR #652 CI failure — PR o/r#652: CI failure (was: pending) [field=ci_status new_value=failure old_value=pending pr_id=github:o/r#652]' "$FMT_OUT"
+expect_line "torrent-completed lead (message covered)" \
+    'EVENT[torrent/torrent-completed] torrent done: The Audacity S01E05 1080p WEB-DL [hash=abc name=The Audacity S01E05 1080p WEB-DL]' "$FMT_OUT"
+expect_line "queue-done lead (message covered)" \
+    'EVENT[queue/queue-done] queue done q-2026-08-21-ad82: Ship the thing [elapsed_sec=12 queue_id=q-2026-08-21-ad82 summary=Ship the thing]' "$FMT_OUT"
+expect_line "queue-blocked lead lifts the reason" \
+    'EVENT[queue/queue-blocked] queue blocked q-1: S — reason: waiting on X [block_reason=waiting on X queue_id=q-1 summary=S]' "$FMT_OUT"
+expect_line "alert-firing lead" \
+    'EVENT[alertmanager/alert-firing] alert FIRING HDDTempWarn: sda at 61C [alertname=HDDTempWarn status=firing summary=sda at 61C]' "$FMT_OUT"
+expect_line "alert-resolved lead" \
+    'EVENT[alertmanager/alert-resolved] alert RESOLVED HDDTempWarn: sda at 61C [alertname=HDDTempWarn status=resolved summary=sda at 61C]' "$FMT_OUT"
+expect_line "workload-done lead" \
+    'EVENT[workload/workload-done] workload done cw-deploy-x rc=0 [exit_code=0 killed=False label=cw-deploy-x]' "$FMT_OUT"
+expect_line "claude-watch-alert lead + FULL message (no 60-char cut)" \
+    'EVENT[claude-watch/claude-watch-alert] claude-watch alert context-low (high) — [CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/push in-flight work and save state NOW before compaction. [alert_type=context-low severity=high]' "$FMT_OUT"
+echo "  monitor-format: per-tag leads (heartbeat/pr/torrent/queue/alert/workload/claude-watch-alert) OK"
+
+# Fallbacks: unknown tag -> the full message is the lead; a known tag whose
+# data lacks the field the lead needs -> same fallback, no half-empty headline.
+expect_line "unknown-tag fallback" \
+    'EVENT[botchat/brand-new] from alice: hello there [n=1]' "$FMT_OUT"
+expect_line "missing-data fallback" \
+    'EVENT[torrent/torrent-completed] Torrent completed: weird' "$FMT_OUT"
+echo "  monitor-format: fallback to the full message (unknown tag / missing data) OK"
+
+# Multiline message flattens to one line with ' ⏎ ' between lines.
+expect_line "multiline flattening" \
+    'EVENT[manual/multi] line one ⏎ line two ⏎ line three' "$FMT_OUT"
+if (( $(grep -c '^EVENT\[' "$FMT_OUT") != 16 )); then
+    echo "FAIL: monitor-format surfaced $(grep -c '^EVENT\[' "$FMT_OUT") EVENT lines for 16 fixtures (a multiline message split?)" >&2
+    cat "$FMT_OUT" >&2; exit 1
+fi
+echo "  monitor-format: multiline message stays one line OK"
+
+# 400-char cap, data tags cut FIRST: full message intact, suffix truncated to
+# fit exactly, ends in '…]'.
+cap1_line="$(grep -F 'EVENT[manual/cap1] ' "$FMT_OUT")"
+[[ "$cap1_line" == "EVENT[manual/cap1] $M100 [big=$B70 big2="* ]] || {
+    echo "FAIL: cap test lost the full message or the leading data tags: $cap1_line" >&2; exit 1; }
+[[ "$cap1_line" == *"…]" ]] || { echo "FAIL: truncated data tags do not end in '…]': $cap1_line" >&2; exit 1; }
+[[ "$(charlen "$cap1_line")" == "400" ]] || {
+    echo "FAIL: cap test line is $(charlen "$cap1_line") chars, expected exactly 400: $cap1_line" >&2; exit 1; }
+# 400-char cap, message cut SECOND (no data tags to cut): lead intact, message
+# truncated with '…', no data bracket.
+cap2_line="$(grep -F 'EVENT[claude-watch/memory-reminder] ' "$FMT_OUT")"
+[[ "$cap2_line" == "EVENT[claude-watch/memory-reminder] memory reminder — XXXX"* ]] || {
+    echo "FAIL: cap test lost the lead or the message start: $cap2_line" >&2; exit 1; }
+[[ "$cap2_line" == *"X…" ]] || { echo "FAIL: truncated message does not end in '…': $cap2_line" >&2; exit 1; }
+[[ "$cap2_line" != *" ["* ]] || { echo "FAIL: over-cap message line still carries data tags: $cap2_line" >&2; exit 1; }
+[[ "$(charlen "$cap2_line")" == "400" ]] || {
+    echo "FAIL: message-cap line is $(charlen "$cap2_line") chars, expected exactly 400" >&2; exit 1; }
+# Nothing in the batch exceeds the cap.
+while IFS= read -r l; do
+    if (( $(charlen "$l") > 400 )); then
+        echo "FAIL: monitor line over 400 chars: $l" >&2; exit 1
+    fi
+done < <(grep '^EVENT\[' "$FMT_OUT")
+echo "  monitor-format: 400-char cap (data tags first, then message, never prefix/lead) OK"
+
+# Byte-identity guard: the SAME fixtures through exit mode must produce the
+# pre-monitor one-shot lines — 60-char cut + '…', whitespace collapsed to
+# single spaces, no lead, no ' — ', no '⏎'.
+EXIT_Q="$TMP/exitfmtq"; EXIT_LOG="$TMP/exitfmtlog"; mkdir -p "$EXIT_Q" "$EXIT_LOG"
+load_format_fixtures "$EXIT_Q"
+exit_out=$(CLAUDE_EVENT_QUEUE="$EXIT_Q" CLAUDE_EVENT_LOG_DIR="$EXIT_LOG" \
+    CLAUDE_EVENT_WATCH_LOCK="$TMP/exitfmt.lock" "$WATCHER" --debounce 0 2>&1)
+EXIT_OUT="$TMP/exitfmt.out"; printf '%s\n' "$exit_out" >"$EXIT_OUT"
+M60="$(printf 'M%.0s' $(seq 1 60))"
+X60="$(printf 'X%.0s' $(seq 1 60))"
+expect_line "exit-mode heartbeat unchanged" \
+    'EVENT[claude-watch/heartbeat-tick] heartbeat tick [interval_secs=300 path=/var/run/claude/heartbeat]' "$EXIT_OUT"
+expect_line "exit-mode pr-status-change unchanged (no lead)" \
+    'EVENT[cron/pr-status-change] PR o/r#651: MERGED (was: OPEN) [field=state new_value=MERGED old_value=OPEN pr_id=github:o/r#651 pr_url=https://example.invalid/pr/651]' "$EXIT_OUT"
+expect_line "exit-mode torrent unchanged (no lead)" \
+    'EVENT[torrent/torrent-completed] Torrent completed: The Audacity S01E05 1080p WEB-DL [hash=abc name=The Audacity S01E05 1080p WEB-DL]' "$EXIT_OUT"
+expect_line "exit-mode multiline collapses to spaces" \
+    'EVENT[manual/multi] line one line two line three' "$EXIT_OUT"
+expect_line "exit-mode 60-char cut + full data tags" \
+    "EVENT[manual/cap1] $M60… [big=$B70 big2=$C70 big3=$D70 big4=$E70]" "$EXIT_OUT"
+expect_line "exit-mode long message 60-char cut" \
+    "EVENT[claude-watch/memory-reminder] $X60…" "$EXIT_OUT"
+expect_line "exit-mode claude-watch-alert 60-char cut" \
+    'EVENT[claude-watch/claude-watch-alert] [CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/p… [alert_type=context-low severity=high]' "$EXIT_OUT"
+if grep -q '⏎\|^EVENT\[.* — reason: \|^EVENT\[cron/pr-status-change\] PR #' "$EXIT_OUT"; then
+    echo "FAIL: exit-mode output carries monitor-format markers" >&2; cat "$EXIT_OUT" >&2; exit 1
+fi
+echo "  monitor-format: exit-mode one-shot lines are byte-identical (guard) OK"
+
+echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard + delivery mode + monitor line format)"

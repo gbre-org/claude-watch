@@ -49,7 +49,8 @@ claude-event-watch [--debounce SECONDS] [--quiet SECONDS] [--min-interval SECOND
   next run, so no event is lost.
 - `--debounce 0` disables batching (surface immediately — pre-debounce
   behavior).
-- Output shape: `EVENT[<source>/<tag>] <first-60-chars-of-message>…`
+- Output shape (exit mode): `EVENT[<source>/<tag>] <first-60-chars-of-message>… [k=v …]`
+  — monitor mode prints a richer line, see *Monitor line format* below.
 - Restart banner: `WATCHER EXITED. RESTART NOW: watcher-ctl run claude-event-watch`
 
 Per-host configuration goes in the `start_cmd` field of the watcher's
@@ -148,6 +149,50 @@ error instead.
 logged to `consumed.jsonl` and routed through `event-ack ingest`, and are never
 acked on the loop's behalf. Batching, the `--min-interval` throttle and the
 flock singleton are likewise untouched.
+
+**Monitor line format.** The one thing that *does* change per mode is the
+shape of each `EVENT[...]` line. In `exit` mode the main loop reads a captured
+`.output` file and can open the event JSON / `consumed.jsonl` for detail, so
+the one-shot line stays terse and byte-identical to before:
+`EVENT[<source>/<tag>] <message, whitespace-collapsed, cut at 60 chars>… [k=v …]`.
+In `monitor` mode the stdout line **is** the notification — the `Monitor`
+tool's own description is static, set at arm time — so the line has to carry
+the useful part itself:
+
+```
+EVENT[<source>/<tag>] <lead> — <full message> [k=v …]
+```
+
+- `EVENT[<source>/<tag>]` stays first and identical in both modes; routing
+  keys on it.
+- `<lead>` is a terse human headline derived from `data` where the producer's
+  shape is stable — `PR #652 CI failure` / `PR #651 merged`
+  (`pr-status-change`: `pr_id` + `field` + `new_value`), `torrent done: <name>`
+  (`torrent-completed`), `queue done q-…: <summary>` (`queue-*`, with a
+  populated reason field lifted in as ` — reason: …`), `alert FIRING
+  HDDTempWarn: <summary>` / `alert RESOLVED …` (`alert-firing`/`-resolved`),
+  `workload done <label> rc=0` / `hostjob done …`, `heartbeat tick`, `memory
+  reminder`, `claude-watch alert <type> (<severity>)`, `watcher DOWN <name>`,
+  `cron FAILED <job> rc=N`, `request fulfilled #N: <title> for <handle>`,
+  `promote candidates: N ready, …`, `obligations override <id>`. A tag with no
+  pattern (or one whose data lacks the fields the pattern needs) falls back to
+  the full message as the lead.
+- `<full message>` is the whole message, never the 60-char cut, with newline
+  runs flattened to ` ⏎ `. It is omitted when the lead already covers it
+  (the template-message tags above, or a message contained in the lead).
+- `[k=v …]` are the same scalar data tags as the one-shot line.
+- Hard cap ~400 characters per line: the data tags are truncated first, then
+  the message; the prefix and a derived lead are never cut.
+
+Before / after for the same event:
+
+```
+EVENT[cron/pr-status-change] PR hndrewaall/claude-watch#652: CI failure (was: pending) [field=ci_status new_value=failure …]
+EVENT[cron/pr-status-change] PR #652 CI failure — PR hndrewaall/claude-watch#652: CI failure (was: pending) [field=ci_status new_value=failure old_value=pending pr_id=github:hndrewaall/claude-watch#652 pr_url=…]
+
+EVENT[claude-watch/claude-watch-alert] [CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/p… [alert_type=context-low severity=high …]
+EVENT[claude-watch/claude-watch-alert] claude-watch alert context-low (high) — [CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/push in-flight work and save state NOW before compaction. [alert_type=context-low severity=high …]
+```
 
 **Making a monitor's death visible.** A monitor never exits, so silence is
 ambiguous between *idle*, *wedged* and *dead* — three states that look

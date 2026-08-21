@@ -32,11 +32,19 @@ main loop reads stdout, dispatches per-tag, restarts the watcher.
 Each consumed event surfaces as exactly one line:
 
 ```
-EVENT[<source>/<tag>] <first-60-chars-of-message>…
+EVENT[<source>/<tag>] <first-60-chars-of-message>… [k=v …]
 ```
 
 The shape is intentionally narrow — the main loop's bash-task view stays
 small. To see details, use `claude-event-tail` against the ring buffer.
+
+In **monitor mode** (`--mode monitor`, where each stdout line is itself the
+notification) the same prefix is followed by a terse per-source/tag lead, the
+**full** message (newlines flattened to ` ⏎ `) and the data tags, capped at
+~400 chars — e.g. `EVENT[cron/pr-status-change] PR #652 CI failure — PR
+owner/repo#652: CI failure (was: pending) [field=ci_status …]`. The lead
+patterns and cap rules are documented in `tools/watchers/README.md`
+(*Monitor line format*).
 
 ## Debounce / cooloff
 
