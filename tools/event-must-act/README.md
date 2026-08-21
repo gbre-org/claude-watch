@@ -39,53 +39,24 @@ fail-LOUD `actionable` default (marked `UNCLASSIFIED`). Details:
   `event-classify --list-rules`. Adding a new event source: prefer stamping
   `data.tier` in the PRODUCER; append a `CLASSIFICATIONS` row only when you
   do not control the producer. `heartbeat-tick` is classified **actionable**
-  here (refresh the heartbeat file — see `heartbeat-ack` below).
+  here; its clear-path is a plain `event-ack ack` (liveness is ack-driven —
+  see `event-ack` below).
 - **`event-ack`** — CLI managing the response surface:
   - `event-ack ingest --source S --tag T --message M` — classify + route an
     event into `pending-actions.json` (actionable) or `ambient-context.json`
     (ambient); Signal-tagged events are no-op.
   - `event-ack ack "<key>" --action "<text>"` — clear a pending entry; resets
-    the N-tool-call counter.
+    the N-tool-call counter **and** refreshes the liveness timestamp (ANY
+    ack does this, not just heartbeat-tick acks — the ack-driven redesign,
+    #649). `heartbeat-tick`'s clear-path is exactly this: `event-ack list` to
+    find the pending key, then `event-ack ack "<key>" --action "..."`. There
+    is no separate wrapper command — a prior `heartbeat-ack` compat shim was
+    retired 2026-08-21 once it became clear a plain ack already covers it.
   - `event-ack list | clear | drain-ambient | reset-counter`.
 - **`eval-event-must-act`** — obligations `evaluator` predicate. While
   `pending-actions.json` is non-empty, it bumps a counter on each non-exempt
   Bash tool call and DENIES once the counter reaches `N` (default 3, override
   `$EVENT_MUST_ACT_N`). Default-open on missing/corrupt state.
-- **`heartbeat-ack`** — the one-command clear-path for `heartbeat-tick`.
-  Touches the host liveness heartbeat file **and** acks the pending
-  heartbeat-tick entry:
-
-  ```sh
-  heartbeat-ack                 # the shape the main loop runs
-  heartbeat-ack --path /tmp/hb  # explicit file
-  heartbeat-ack --json          # machine-readable result
-  ```
-
-  Without it the loop owes two commands on every tick — the `touch` (which
-  the daemon watches but which leaves the entry pending forever) and an
-  `event-ack ack` (which clears the gate but proves no liveness). Design
-  points that are load-bearing:
-
-  - **Touch first, ack second.** A broken ack path is reported loudly on
-    stderr and via exit 2, but never costs you the liveness signal. A failed
-    *touch* exits 1 and acks nothing, so the entry stays pending.
-  - **The ack key is DERIVED, not hardcoded.** `event-ack ingest` builds keys
-    as `tag:message[:80]`; the wrapper reads `pending-actions.json` and acks
-    every entry whose tag is `heartbeat-tick`, whatever the message text says.
-    A hardcoded key would silently stop clearing anything the day the message
-    changed, while still exiting 0.
-  - **The path is DERIVED too**: `--path`, then `$CLAUDE_HEARTBEAT_FILE`, then
-    `[claude] heartbeat_file` from the claude-watch config (user overlay →
-    `$CLAUDE_WATCH_CONFIG` → `/etc/claude-watch/config.toml`; `./config.toml`
-    is deliberately skipped as cwd-dependent), then
-    `/var/run/claude/heartbeat`.
-  - **Idempotent and quiet when nothing is pending** — including on a host
-    where `event_must_act` was never seeded and the state file never exists.
-  - **Exempt in all three gates** (`eval-event-must-act` `_EXEMPT_PATTERNS`,
-    `pre-tool-dispatch-gate-hook`, and the bare form in
-    `pre-tool-obligations-gate-hook`'s hardcoded ALLOW), so the command that
-    discharges the tick is never the command that gets denied.
-
 - **`user-prompt-ambient-inject-hook`** — `UserPromptSubmit` hook; drains the
   ambient queue into the next prompt's context (no gate).
 

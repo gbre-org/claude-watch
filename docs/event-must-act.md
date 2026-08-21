@@ -303,22 +303,24 @@ typically **before** you seed the row. Check `event-ack list` (and
 or the gate denies on its very first evaluation.
 
 Note that `heartbeat-tick` is classified **actionable**, so on a host that
-emits it the gate is what forces the loop to touch the heartbeat file. The
-`touch` alone does NOT clear the pending entry (only an `event-ack ack`
-does), and an ack alone proves no liveness — so the loop runs
-**`heartbeat-ack`**, the wrapper that does both in one command:
+emits it the gate is what forces the loop to clear the pending entry.
+Liveness is **ack-driven** (#649): `event-ack ack` refreshes the liveness
+timestamp on ANY ack, not just heartbeat-tick acks, so the clear-path is
+just:
 
 ```sh
-heartbeat-ack        # touch the heartbeat file + ack the pending tick
+event-ack list                                   # find the pending key
+event-ack ack "<key>" --action "restored liveness"
 ```
 
-It touches first and acks second (a broken ack can never cost you the
-liveness signal), derives the ack key from what is actually pending rather
-than hardcoding `heartbeat-tick:heartbeat tick`, and exits 0 when nothing is
-pending — including on a host where this obligation was never seeded. It is
-exempt in this evaluator, in `pre-tool-dispatch-gate-hook`, and (in its bare
-form) in `pre-tool-obligations-gate-hook`, so the command that discharges the
-tick can never be the command the gate denies.
+A prior `heartbeat-ack` wrapper collapsed a `touch` + `event-ack ack` into
+one command; it was retired 2026-08-21 once it became clear a plain ack
+already satisfies both the gate and the liveness signal. `event-ack` is
+exempt in this evaluator (and in `pre-tool-dispatch-gate-hook`), so the
+command that discharges the tick can never be the command the gate denies.
+A bare `touch /var/run/claude/heartbeat` remains as a no-dependency
+fallback, hardcoded-ALLOWed in `pre-tool-obligations-gate-hook` for the
+pathological case where a down watcher blocks `event-ack` itself too.
 
 ### Container redeploy
 

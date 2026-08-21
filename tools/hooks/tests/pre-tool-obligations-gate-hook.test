@@ -3141,16 +3141,14 @@ def main() -> int:
             ))
 
             # ---------------------------------------------------------------
-            # 74hb10-74hb14: the same ALLOW covers a BARE `heartbeat-ack`.
-            #
-            # `heartbeat-ack` is the wrapper that does the liveness touch AND
-            # acks the pending heartbeat-tick event in one command; it is what
-            # the loop runs on every tick, so it needs the same catch-22
-            # exemption the bare touch has. Deliberately BARE-only: any
-            # argument (e.g. `--path <file>`) falls through to the normal gate.
+            # 74hb10: `heartbeat-ack` was RETIRED 2026-08-21 (#649 ack-driven
+            # redesign -- a plain `event-ack ack` already refreshes liveness,
+            # so the wrapper and its dedicated hardcoded-ALLOW exemption are
+            # gone). A bare `heartbeat-ack` invocation must now fall through
+            # to the normal obligations dispatch like any other command --
+            # NOT bypass live denying gates the way the bare heartbeat touch
+            # (tested above) still does.
             # ---------------------------------------------------------------
-
-            # 74hb10: bare `heartbeat-ack` -> ALLOW despite live denying gates.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
@@ -3158,61 +3156,8 @@ def main() -> int:
                 env_hb,
             )
             results.append(_check(
-                "74hb10. bare heartbeat-ack -> allow despite unhealthy/unread gates",
-                rc == 0 and _is_allow(out),
-                f"rc={rc} out={out}",
-            ))
-
-            # 74hb11: path-resolved bare form -> ALLOW.
-            _write_hb_sidecar()
-            rc, out, _err = _hook_pre(
-                {"tool_name": "Bash",
-                 "tool_input": {"command": "  /usr/local/bin/heartbeat-ack  "}},
-                env_hb,
-            )
-            results.append(_check(
-                "74hb11. absolute-path bare heartbeat-ack -> allow",
-                rc == 0 and _is_allow(out),
-                f"rc={rc} out={out}",
-            ))
-
-            # 74hb12: bundled with a second action -> NOT exempt -> DENY.
-            _write_hb_sidecar()
-            rc, out, _err = _hook_pre(
-                {"tool_name": "Bash",
-                 "tool_input": {"command": "heartbeat-ack && rm -rf /tmp/x"}},
-                env_hb,
-            )
-            results.append(_check(
-                "74hb12. heartbeat-ack bundled with `&& rm` -> NOT exempt -> deny",
-                rc == 0 and _is_deny(out),
-                f"rc={rc} out={out}",
-            ))
-
-            # 74hb13: any argument -> NOT exempt -> DENY (an arg could name an
-            # arbitrary path to create via --path).
-            _write_hb_sidecar()
-            rc, out, _err = _hook_pre(
-                {"tool_name": "Bash",
-                 "tool_input": {"command": "heartbeat-ack --path /tmp/evil"}},
-                env_hb,
-            )
-            results.append(_check(
-                "74hb13. heartbeat-ack with args -> NOT exempt -> deny",
-                rc == 0 and _is_deny(out),
-                f"rc={rc} out={out}",
-            ))
-
-            # 74hb14: the name inside a quoted arg to another command is not
-            # an invocation -> NOT exempt -> DENY.
-            _write_hb_sidecar()
-            rc, out, _err = _hook_pre(
-                {"tool_name": "Bash",
-                 "tool_input": {"command": "echo 'heartbeat-ack'"}},
-                env_hb,
-            )
-            results.append(_check(
-                "74hb14. heartbeat-ack inside echo arg -> NOT exempt -> deny",
+                "74hb10. bare heartbeat-ack no longer hardcoded-ALLOW "
+                "-> denied like any other command under unhealthy/unread gates",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))

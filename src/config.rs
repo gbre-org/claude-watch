@@ -426,13 +426,15 @@ fn default_interrupt_enabled() -> bool {
 }
 
 /// Default heartbeat-stale recovery prompt. Single-line (the tmux inject
-/// pipeline assumes single-line). Explicitly instructs the loop to touch
-/// the host heartbeat file so liveness recovers — the whole point of the
-/// inject fallback. Marked `[CLAUDE-WATCH]` so the loop recognises it as a
-/// daemon interrupt, and asks for a watcher sanity-check + heartbeat-tick
-/// triage so a genuinely-wedged event pipeline still gets surfaced.
+/// pipeline assumes single-line). Liveness is ack-driven (#649): ANY
+/// `event-ack ack` call refreshes the liveness timestamp, so the prompt's
+/// primary instruction is to ack the pending heartbeat-tick entry; a bare
+/// `touch` of the host heartbeat file remains a no-dependency fallback.
+/// Marked `[CLAUDE-WATCH]` so the loop recognises it as a daemon interrupt,
+/// and asks for a watcher sanity-check + heartbeat-tick triage so a
+/// genuinely-wedged event pipeline still gets surfaced.
 fn default_heartbeat_stale_prompt() -> String {
-    "[CLAUDE-WATCH] The host heartbeat file went stale — you are not touching /var/run/claude/claude-heartbeat. Immediately run `heartbeat-ack` (it touches the file AND acks the pending heartbeat-tick entries; fall back to `touch /var/run/claude/claude-heartbeat` if that command is not installed) as a single well-formed Bash tool call to restore liveness, then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details.".to_string()
+    "[CLAUDE-WATCH] The host heartbeat file went stale. Immediately ack the pending heartbeat-tick entry (`event-ack list` to find its key, then `event-ack ack \"<key>\" --action \"restored liveness\"`) — any event-ack call refreshes the liveness timestamp; fall back to `touch /var/run/claude/claude-heartbeat` if event-ack is unavailable. Then check why the heartbeat-tick events weren't handled (watcher-ctl status; is claude-event-watch up?). If this fired incorrectly, DM Andrew with the details.".to_string()
 }
 
 /// Default post-clear resume prompt. Single-line (the tmux inject pipeline
@@ -2504,6 +2506,23 @@ cooldown = 300
         assert!(
             !p.contains("<invoke") && !p.contains("<parameter"),
             "heartbeat-stale prompt must not embed raw tool-call tags; got: {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_heartbeat_stale_prompt_retired_heartbeat_ack() {
+        // heartbeat-ack was RETIRED 2026-08-21 (#649 ack-driven redesign):
+        // ANY `event-ack ack` refreshes liveness, so there is no distinct
+        // "heartbeat ack" step anymore. The default prompt must point at
+        // `event-ack`, not the retired wrapper.
+        let p = default_heartbeat_stale_prompt();
+        assert!(
+            !p.contains("heartbeat-ack"),
+            "heartbeat-stale prompt must not reference the retired heartbeat-ack wrapper; got: {p:?}"
+        );
+        assert!(
+            p.contains("event-ack"),
+            "heartbeat-stale prompt must point at event-ack (the ack-driven clear-path); got: {p:?}"
         );
     }
 
