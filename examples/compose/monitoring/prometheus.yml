@@ -1,6 +1,6 @@
 # Prometheus scrape config for the claude-watch monitoring stack.
 #
-# Targets the claude-watch metrics surface, which is THREE distinct sources
+# Targets the claude-watch metrics surface, which is FOUR distinct sources
 # (see examples/compose/monitoring/README.md for the full map):
 #
 #   1. work-queue-exporter   — Python HTTP exporter on :9099 /metrics.
@@ -8,7 +8,9 @@
 #        Drives WorkQueueOrphaned / WorkQueueStuck / WorkQueueReadyStuck.
 #   2. claude-events-exporter — Python HTTP exporter on :9103 /metrics.
 #        Reads ~/claude-events/. Emits claude_events_*.
-#   3. claude-watch daemon    — writes a node-exporter *textfile* .prom
+#   3. llm-usage-exporter    — Python HTTP exporter on :9104 /metrics.
+#        Reads ~/.claude/projects/*/*.jsonl. Emits llm_usage_*.
+#   4. claude-watch daemon    — writes a node-exporter *textfile* .prom
 #        (claude_watch_* / claude_code_*). NOT an HTTP endpoint, so it is
 #        scraped indirectly via node-exporter's textfile collector (the
 #        optional `node-exporter` profile below).
@@ -57,6 +59,13 @@ scrape_configs:
       - targets: ["claude-events-exporter:9103"]
         labels:
           source: claude-events-exporter
+
+  # llm-usage-exporter (:9104) — llm_usage_* per-model usage metrics.
+  - job_name: llm-usage-exporter
+    static_configs:
+      - targets: ["llm-usage-exporter:9104"]
+        labels:
+          source: llm-usage-exporter
 
   # node-exporter (:9100) — surfaces the claude-watch daemon's textfile
   # metrics (claude_watch_* / claude_code_*) written by `claude-watch

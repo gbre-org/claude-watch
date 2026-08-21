@@ -12,6 +12,7 @@
 # What it scrapes (full map in README.md):
 #   * work-queue-exporter   (:9099)  worktask_queue_*   (built from repo root)
 #   * claude-events-exporter(:9103)  claude_events_*    (built from repo root)
+#   * llm-usage-exporter    (:9104)  llm_usage_*        (built from repo root)
 #   * node-exporter         (:9100)  claude_watch_* / claude_code_* textfile
 #                                     (OPTIONAL `node-exporter` profile)
 #
@@ -75,7 +76,27 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------
-  # prometheus — scrapes the two exporters (+ node-exporter when enabled)
+  # llm-usage-exporter — reads Claude Code session transcripts, exposes
+  # llm_usage_* per-model usage on :9104/metrics. Built from in-repo exporter.
+  # ---------------------------------------------------------------------
+  llm-usage-exporter:
+    build:
+      context: ../../..
+      dockerfile: exporters/llm-usage-exporter/Dockerfile
+    image: claude-watch-llm-usage-exporter:dev
+    environment:
+      PORT: "9104"
+      CLAUDE_PROJECTS_DIR: /claude-projects
+    volumes:
+      - "${CW_CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}:/claude-projects:ro"
+    expose:
+      - "9104"
+    ports:
+      - "9104:9104"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # prometheus — scrapes the three exporters (+ node-exporter when enabled)
   # and evaluates the starter alert rules.
   # ---------------------------------------------------------------------
   prometheus:
@@ -99,6 +120,7 @@ services:
     depends_on:
       - work-queue-exporter
       - claude-events-exporter
+      - llm-usage-exporter
     restart: unless-stopped
 
   # ---------------------------------------------------------------------
