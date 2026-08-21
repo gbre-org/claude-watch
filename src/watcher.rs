@@ -1138,9 +1138,14 @@ pub fn format_monitor_arm_instructions(
     ));
     out.push_str("    persistent:  true\n");
     out.push_str(
-        "Reminder: every stdout line is a notification — read each EVENT[...] line and ACT on it; \
-         the watcher never acks on your behalf. Lines tagged [monitor-mode] are watcher status \
-         (ACTIVE / ALIVE / STOPPED), not events.\n",
+        "Reminder: every stdout line is a notification — read each item line (EVENT[...] / \
+         BOTCHAT[...] / SIGNAL[...]) and ACT on it; the watcher never acks on your behalf. Lines \
+         tagged [monitor-mode] are watcher status (ACTIVE / ALIVE / STOPPED), not events.\n",
+    );
+    out.push_str(
+        "When you act on a line, your visible reply MUST quote its lead (the text after the \
+         prefix, ~80 chars) plus what you did — never a bare 'Acknowledged' / 'Idle' — so a human \
+         reading the terminal can see what was handled.\n",
     );
     out.push_str(&format!(
         "Stop: TaskStop the monitor, or `watcher-restart` (kills it like any other watcher). \
@@ -2082,7 +2087,17 @@ mod tests {
         );
         assert!(text.contains("persistent:  true"), "{}", text);
         assert!(text.contains("Monitor"), "{}", text);
-        assert!(text.contains("read each EVENT[...] line and ACT"), "{}", text);
+        assert!(
+            text.contains("read each item line (EVENT[...] / BOTCHAT[...] / SIGNAL[...]) and ACT"),
+            "{}",
+            text
+        );
+        // The visible-reply admonition: a human reading the terminal only sees
+        // the operator's one-line reply (the Monitor event collapses to its
+        // static description), so the arm text demands the lead be quoted.
+        assert!(text.contains("your visible reply MUST quote its lead"), "{}", text);
+        assert!(text.contains("never a bare 'Acknowledged' / 'Idle'"), "{}", text);
+        assert!(text.contains("a human reading the terminal can see what was handled"), "{}", text);
         assert!(text.contains("mode set by the override layer"), "{}", text);
         assert!(text.contains("intent recorded: /run/x/claude-event-watch.monitor-intent"), "{}", text);
         // Explicit monitor_cmd wins over the derived `--mode monitor` form,

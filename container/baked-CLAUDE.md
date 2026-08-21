@@ -1273,14 +1273,15 @@ Events that demand a response within a reasonable window: torrent-completed
 PR CI failure / merge conflict, workbot-prompt, queue-stale-ready, slack-unread,
 **claude-watch/heartbeat-tick**.
 
-> **`heartbeat-tick` — run `heartbeat-ack`.** Every ~5 min the claude-watch
-> daemon emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick [path=<FILE>
-> interval_secs=…]`. Run **`heartbeat-ack`**: one command that refreshes the
-> heartbeat file AND acks this entry. A bare `touch <FILE>` moves the mtime
-> but leaves the entry pending forever, so the gate escalates while you think
-> you handled it. The file is the wedge-detector: a stale mtime (~10 min)
-> fires a "heartbeat stale" alert. The refresh MUST come from you acting on
-> the event (it proves the loop is alive); never the daemon.
+> **`heartbeat-tick` — ack it via `event-ack`.** Every ~5 min claude-watch
+> emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick [path=<FILE>
+> interval_secs=…]`. Liveness is **ack-driven** (#649): `event-ack list` to
+> find the pending key, then `event-ack ack "<key>" --action "..."` — ANY
+> ack refreshes the liveness timestamp, so a plain ack is the whole
+> clear-path (`heartbeat-ack` wrapper retired 2026-08-21 as redundant). A
+> bare `touch <FILE>` alone leaves the entry pending forever; ack, not
+> touch. The refresh must come from acting on the event, never the
+> daemon (proves liveness).
 
   - Routed by `event-ack ingest` into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt

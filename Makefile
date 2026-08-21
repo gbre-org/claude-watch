@@ -598,7 +598,6 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@ln -sfn $(abspath tools/event-must-act/event-classify) $(BIN_DIR)/event-classify
 	@ln -sfn $(abspath tools/event-must-act/event-ack) $(BIN_DIR)/event-ack
 	@ln -sfn $(abspath tools/event-must-act/eval-event-must-act) $(BIN_DIR)/eval-event-must-act
-	@ln -sfn $(abspath tools/event-must-act/heartbeat-ack) $(BIN_DIR)/heartbeat-ack
 	@ln -sfn $(abspath tools/event-must-act/user-prompt-ambient-inject-hook) $(BIN_DIR)/user-prompt-ambient-inject-hook
 	@ln -sfn $(abspath tools/event-must-act/cw-watcher-health-check) $(BIN_DIR)/cw-watcher-health-check
 	@echo "Installed to $(BIN_DIR):"
@@ -624,7 +623,6 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@echo "  - event-classify            (symlink -> tools/event-must-act/)"
 	@echo "  - event-ack                 (symlink -> tools/event-must-act/)"
 	@echo "  - eval-event-must-act       (symlink -> tools/event-must-act/)"
-	@echo "  - heartbeat-ack             (symlink -> tools/event-must-act/)"
 	@echo "  - user-prompt-ambient-inject-hook (symlink -> tools/event-must-act/)"
 	@echo "  - cw-watcher-health-check   (symlink -> tools/event-must-act/)"
 

@@ -1385,6 +1385,12 @@ if [[ "$MODE_RESOLVED" == "monitor" ]]; then
     # immediately-failing launch is distinguishable from a quiet queue. The
     # `[monitor-mode]` marker is the banner a reader / a test keys on.
     echo "[monitor-mode] EVENT-WATCH MONITOR MODE ACTIVE pid=$$ queue=$QUEUE_DIR liveness=${LIVENESS_INTERVAL}s mode_file=$MODE_FILE source=$MODE_SOURCE — each EVENT[...] line below is a batch to act on; stderr is merged into this stream"
+    # Second banner line, deliberately addressed to the OPERATOR session: under
+    # a line-streaming launcher the terminal collapses each delivery to the
+    # launcher's static description, so the operator's own one-line reply is
+    # the ONLY human-visible trace of what was read. A bare "Acknowledged" /
+    # "Idle" is indistinguishable from a rubber stamp.
+    echo "[monitor-mode] REPLY RULE: when you act on an EVENT[...] line, your visible reply MUST quote its lead (the text after the prefix, ~80 chars) plus what you did — never a bare 'Acknowledged' / 'Idle' — so a human reading the terminal can see what was handled"
     LAST_OUTPUT_AT="$(date +%s)"
 fi
 

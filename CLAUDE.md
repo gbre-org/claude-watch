@@ -93,6 +93,28 @@ case:
 
 claude-watch provides the surfaces; external alerting wires INTO them.
 
+## Monitor-mode replies must surface the event
+
+A `mode=monitor` watcher delivers each line through the `Monitor` tool, and
+the Claude Code terminal collapses every delivery to the Monitor's **static**
+description (set once at arm time). The operator session's own one-line
+reply is therefore the **only human-visible trace** of what was read — a
+bare "Acknowledged" / "Idle" is indistinguishable from a rubber stamp. So:
+**when you act on an item line (`EVENT[...]` / `BOTCHAT[...]` / `SIGNAL[...]`),
+the visible reply quotes the line's lead (the text after the prefix, ~80
+chars) plus what you did.** The arm text `watcher-ctl run <name>` prints and
+the `[monitor-mode] REPLY RULE:` banner line `claude-event-watch` emits both
+say this; this section is the rule itself.
+
+```
+BAD   Liveness ping — status only. Idle.
+GOOD  EVENT[claude-watch/heartbeat-tick] heartbeat tick — touched /var/run/claude/heartbeat; nothing else pending.
+GOOD  EVENT[cron/pr-status-change] PR #652 CI failure — queued a fix-up agent (q-…).
+```
+
+`[monitor-mode]` status lines (ACTIVE / ALIVE / STOPPED / REPLY RULE) are
+watcher status, not events; a reply to one names it as such.
+
 ## Build & Test
 
 ```bash

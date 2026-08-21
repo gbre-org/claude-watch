@@ -492,50 +492,6 @@ def _is_heartbeat_liveness_touch(cmd: str) -> bool:
     return operands == [HEARTBEAT_PATH]
 
 
-HEARTBEAT_ACK_CMD = "heartbeat-ack"
-
-
-def _is_heartbeat_ack(cmd: str) -> bool:
-    """True iff `cmd` is a BARE `heartbeat-ack` invocation.
-
-    `heartbeat-ack` (tools/event-must-act/heartbeat-ack) is the wrapper that
-    touches the liveness heartbeat file AND acks the pending `heartbeat-tick`
-    event in one command. Once the loop runs it instead of the bare `touch`,
-    it needs the SAME catch-22 exemption the touch has: a stale heartbeat
-    frequently coincides with a momentarily-down watcher, and the liveness
-    command must not be blocked by the predicate that the liveness command
-    exists to help recover from.
-
-    Scoped as tightly as the touch, and deliberately tighter in one respect:
-    the exemption requires the BARE form -- exactly one top-level segment,
-    effective head basename `heartbeat-ack`, and NO further words at all. Any
-    argument (including `--path <file>`, which would let an arbitrary path be
-    created) falls through to the normal gate. Parse failure fails CLOSED.
-    """
-    if not isinstance(cmd, str) or not cmd.strip():
-        return False
-    if _shell_ast is None:
-        return False
-    try:
-        parsed = _shell_ast.parse(cmd)
-    except Exception:  # noqa: BLE001 -- any parse failure => not exempt
-        return False
-
-    if parsed.has_top_level_operator():
-        return False
-    word_segs = [s for s in parsed.segments if s.words]
-    if len(word_segs) != 1:
-        return False
-
-    words = _shell_ast._strip_command_prefix(word_segs[0].words)
-    if len(words) != 1:
-        return False
-    head = words[0]
-    # Accept the bare name and any absolute/relative path ending in it
-    # (`~/bin/heartbeat-ack`, `/usr/local/bin/heartbeat-ack`).
-    return head == HEARTBEAT_ACK_CMD or head.endswith("/" + HEARTBEAT_ACK_CMD)
-
-
 def _monitor_subagent_deny() -> dict:
     banner_lines = [
         "!! BLOCKED: Monitor tool is disabled for subagents",
@@ -869,14 +825,16 @@ def main() -> int:
     # command (`touch ... && rm -rf x`) or a different path is NOT exempt.
     # Runs BEFORE the obligations CLI dispatch so no predicate can block it.
     #
-    # The same ALLOW covers a BARE `heartbeat-ack` -- the wrapper that does
-    # that touch AND acks the pending `heartbeat-tick` event in one command,
-    # and which is now the shape the loop runs on every tick. See
-    # `_is_heartbeat_ack` above.
+    # heartbeat-tick's normal clear-path is now a plain `event-ack ack`
+    # (liveness is ack-driven, #649; the `heartbeat-ack` wrapper that used
+    # to share this hardcoded ALLOW was retired 2026-08-21). `event-ack` is
+    # already exempted from the `event_must_act` evaluator specifically, so
+    # it clears the gate it exists to resolve; the bare touch above remains
+    # the universal catch-22 fallback (bypasses EVERY gate, not just
+    # event_must_act) for the pathological case where a down watcher is
+    # also blocking `event-ack` itself.
     # ---------------------------------------------------------------------
-    if tool_name == "Bash" and (
-        _is_heartbeat_liveness_touch(cmd_str) or _is_heartbeat_ack(cmd_str)
-    ):
+    if tool_name == "Bash" and _is_heartbeat_liveness_touch(cmd_str):
         print(json.dumps(_allow()))
         return 0
 
