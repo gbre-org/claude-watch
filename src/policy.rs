@@ -784,9 +784,10 @@ pub(crate) fn stuck_suppressed_by_activity(workload_fresh: bool, active_subagent
 /// Extends [`stuck_suppressed_by_activity`] with two INDEPENDENT liveness
 /// signals the daemon already tracks, decoupling host-heartbeat freshness from
 /// event-bus tick DELIVERY. The host heartbeat file is refreshed by the main
-/// loop only when it PROCESSES a `heartbeat-tick` claude-event (runs
-/// `heartbeat-ack`) -- which needs (a) the event bus to deliver the tick AND
-/// (b) the loop to reach a tool-call boundary. Both premises fail while the
+/// loop only when it PROCESSES a `heartbeat-tick` claude-event (acks it via
+/// `event-ack ack`, which refreshes the liveness timestamp per #649's
+/// ack-driven redesign) -- which needs (a) the event bus to deliver the tick
+/// AND (b) the loop to reach a tool-call boundary. Both premises fail while the
 /// loop is ALIVE: a long single turn (prolonged thinking, no tool calls) or a
 /// stalled bus (claude-event-watch itself down) starves the heartbeat even
 /// though nothing is wedged, firing a FALSE "heartbeat stale" alert (incident

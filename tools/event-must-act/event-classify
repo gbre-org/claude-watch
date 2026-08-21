@@ -396,15 +396,15 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     # actionable rather than ambient. Placed before the claude-watch/* ambient
     # catch-all below.
     #
-    # The action is `heartbeat-ack` (tools/event-must-act/heartbeat-ack), NOT
-    # a bare `touch`: the touch alone leaves this very entry pending forever,
-    # and an `event-ack ack` alone proves no liveness. The wrapper does both
-    # in one command and is exempt in every gate, so naming it here keeps the
-    # instruction and the tooling in agreement.
+    # The action is a plain `event-ack ack` (RETIRED the `heartbeat-ack`
+    # wrapper, 2026-08-21, #649): liveness is now ack-driven -- ANY
+    # event-ack ack call refreshes the liveness timestamp, so acking this
+    # entry like any other actionable event is sufficient. No separate
+    # "touch the heartbeat file" step is required.
     ("claude-watch", "heartbeat-tick", None, ACTIONABLE,
-        "Heartbeat tick; run `heartbeat-ack` — it touches the heartbeat file "
-        "(data.path / path=… on the event line) AND acks this entry in one "
-        "command, keeping the loop's wedge-detector fresh."),
+        "Heartbeat tick; run `event-ack ack \"<key>\" --action \"...\"` "
+        "for this entry (any event-ack ack refreshes liveness), keeping "
+        "the loop's wedge-detector fresh."),
 
     # memory-reminder -> ambient context-hygiene reminder emitted by the
     # daemon every 30min (carries the memory checklist in the event message).
