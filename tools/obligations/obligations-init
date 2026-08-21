@@ -28,6 +28,17 @@ Currently seeded rows:
     args to a filter tool are DENIED. Plain ``cat`` of the file (no
     pipe) is ALLOWED. Ensures the operator sees ALL events unfiltered.
 
+  - ``no_pending_watcher_outputs`` — blocks tool calls while watcher
+    output remains unread. Uses the NATIVE ``no_pending_watcher_outputs``
+    predicate which checks sidecars in ``/tmp/claude-watcher-output-pending/``.
+    The ``post-tool-obligations-update-hook`` (PostToolUse:*) creates a
+    sidecar for each backgrounded ``watcher-ctl run`` and deletes it when
+    the output is Read. Incident 2026-08-21 (Andrew #5191): the main loop
+    blind-relaunched watchers without reading their stdout, missing operator
+    messages. This gate enforces the documented block-print-exit contract:
+    read output THEN relaunch. Main-loop scoped via
+    ``all_of [is_main_loop, no_pending_watcher_outputs]``.
+
   - ``event_must_act`` — blocks Bash tool calls while actionable events
     remain un-acked. When ``claude-event-watch`` delivers events with
     actionable tags (``pr-status-change`` with CI failure/success,
@@ -63,20 +74,20 @@ Currently seeded rows:
     was absent from the container image (silent no-op). Main-loop scoped
     via ``all_of [is_main_loop, no_backgrounded_watcher]``.
 
-MAIN-LOOP SCOPING: the four evaluator-backed rows above
-(``no_grep_watcher_output``, ``event_must_act``, ``agent_ack_pending``,
+MAIN-LOOP SCOPING: the five gates above (``no_grep_watcher_output``,
+``no_pending_watcher_outputs``, ``event_must_act``, ``agent_ack_pending``,
 ``queue_ready_unspawned``) are all conceptually MAIN-LOOP ONLY -- they gate
 on state that only the main loop owns (watcher output it must read in full,
 event triage, pending agent-ack bookkeeping, ready-queue spawning). They MUST
-NOT fire inside a subagent. The ``evaluator`` predicate alone has no
-main-loop scoping, so each is wrapped in
-``all_of [is_main_loop {}, evaluator]`` via
-``_main_loop_only_evaluator_params()``: in a subagent the ``is_main_loop``
-child fails and short-circuits the all_of to inactive (the gate does not
-fire); in the main loop it passes and the evaluator decides. This mirrors
-``subagent_queue_item_running`` (which uses the INVERSE
+NOT fire inside a subagent. Each is wrapped in ``all_of [is_main_loop {},
+<predicate>]``: in a subagent the ``is_main_loop`` child fails and
+short-circuits the all_of to inactive (the gate does not fire); in the main
+loop it passes and the predicate decides. The four evaluator-backed rows use
+``_main_loop_only_evaluator_params()`` to build this wrapper;
+``no_pending_watcher_outputs`` (a native predicate) constructs it directly.
+This mirrors ``subagent_queue_item_running`` (which uses the INVERSE
 ``is_main_loop {negate: true}`` to fire ONLY in subagents). Without the guard
-a bare evaluator row fired inside subagent contexts, letting a subagent block
+a bare predicate row fired inside subagent contexts, letting a subagent block
 itself over -- and then clobber -- the main loop's pending-ack / event /
 queue state.
 
@@ -119,6 +130,7 @@ import sys
 # (or until an operator runs `obligations satisfy <id>` against them).
 SUBAGENT_QID_RUNNING_TAG = "[default-seed] subagent_queue_item_running"
 NO_GREP_WATCHER_OUTPUT_TAG = "[default-seed] no_grep_watcher_output"
+NO_PENDING_WATCHER_OUTPUTS_TAG = "[default-seed] no_pending_watcher_outputs"
 EVENT_MUST_ACT_TAG = "[default-seed] event_must_act"
 AGENT_ACK_PENDING_TAG = "[default-seed] agent_ack_pending"
 QUEUE_READY_UNSPAWNED_TAG = "[default-seed] queue_ready_unspawned"
@@ -427,6 +439,92 @@ def seed_no_grep_watcher_output(cli: str, *, dry_run: bool = False,
                   f"id={row.get('id', '?')}", file=sys.stderr)
         except (json.JSONDecodeError, ValueError):
             print(f"no_grep_watcher_output: seeded "
+                  f"(rc={proc.returncode})", file=sys.stderr)
+    return 0
+
+
+def seed_no_pending_watcher_outputs(cli: str, *, dry_run: bool = False,
+                                       force: bool = False,
+                                       verbose: bool = False) -> int:
+    """Add the no_pending_watcher_outputs obligation. Uses the native
+    no_pending_watcher_outputs predicate to block tool calls while watcher
+    output remains unread. Returns 0 on success.
+
+    The gate requires the main loop to Read captured watcher output before
+    proceeding. PostToolUse hook creates sidecars in
+    /tmp/claude-watcher-output-pending/ for each backgrounded watcher-ctl run;
+    this predicate fails while any sidecar points to unread output. Main-loop
+    only (subagents don't launch watchers).
+
+    Incident 2026-08-21 (Andrew #5191): the main loop blind-relaunched watchers
+    without reading their stdout, missing operator messages embedded in the
+    output. This gate enforces the documented block-print-exit contract: read
+    THEN relaunch."""
+    if not force and _row_already_present(cli, NO_PENDING_WATCHER_OUTPUTS_TAG):
+        if verbose:
+            print("no_pending_watcher_outputs: already seeded -- skipping",
+                  file=sys.stderr)
+        return 0
+
+    # Main-loop ONLY: wrap the native predicate behind an is_main_loop
+    # scope-guard inside all_of so this gate NEVER fires inside a subagent
+    # context. Subagents don't launch watchers; only the main loop does.
+    predicate_params = {
+        "predicates": [
+            {"kind": "is_main_loop", "params": {}},
+            {"kind": "no_pending_watcher_outputs", "params": {}},
+        ]
+    }
+
+    cmd = [
+        cli, "add",
+        "--tool-pattern", "*",
+        "--predicate", "all_of",
+        "--params", json.dumps(predicate_params),
+        "--ttl", "0",  # non-expiring
+        "--enforcement", "gate",
+        "--deny-msg", NO_PENDING_WATCHER_OUTPUTS_TAG,
+        "--created-by", "obligations-init",
+        "--json",
+    ]
+    for pat in DEFAULT_EXEMPT_PATTERNS:
+        cmd.extend(["--exempt-tool-pattern", pat])
+
+    # Additional exempts specific to watcher workflow: Read of the output,
+    # watcher-ctl commands, and process diagnosis tools.
+    watcher_exempts = [
+        "Read",  # Reading the output is the satisfier
+        r"Bash:^watcher-(ctl|status|restart)\b",  # Watcher management
+        r"Bash:^(pgrep|pkill|ps)\b",  # Process diagnosis
+        r"Bash:^cat\b",  # Alternative read path
+    ]
+    for pat in watcher_exempts:
+        cmd.extend(["--exempt-tool-pattern", pat])
+
+    if dry_run:
+        print("DRY-RUN: " + " ".join(cmd))
+        return 0
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"obligations-init: subprocess failed: {e}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        print("obligations-init: obligations add failed "
+              f"rc={proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr)
+        return 1
+    if verbose:
+        try:
+            row = json.loads(proc.stdout)
+            print(f"no_pending_watcher_outputs: seeded "
+                  f"id={row.get('id', '?')}", file=sys.stderr)
+        except (json.JSONDecodeError, ValueError):
+            print(f"no_pending_watcher_outputs: seeded "
                   f"(rc={proc.returncode})", file=sys.stderr)
     return 0
 
@@ -1202,6 +1300,7 @@ def seed_from_manifest_dir(cli: str, manifest_dir: str, *,
 SEEDERS = {
     "subagent_queue_item_running": seed_subagent_queue_item_running,
     "no_grep_watcher_output": seed_no_grep_watcher_output,
+    "no_pending_watcher_outputs": seed_no_pending_watcher_outputs,
     "event_must_act": seed_event_must_act,
     "agent_ack_pending": seed_agent_ack_pending,
     "queue_ready_unspawned": seed_queue_ready_unspawned,
@@ -1279,6 +1378,10 @@ def main() -> int:
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
 
+    rc2a = seed_no_pending_watcher_outputs(
+        cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
+    )
+
     rc3 = seed_event_must_act(
         cli, dry_run=args.dry_run, force=args.force, verbose=args.verbose,
     )
@@ -1314,7 +1417,7 @@ def main() -> int:
     )
 
     # Return first non-zero exit code (if any)
-    return rc or rc2 or rc3 or rc4 or rc5 or rc6 or rc7 or rc8
+    return rc or rc2 or rc2a or rc3 or rc4 or rc5 or rc6 or rc7 or rc8
 
 
 if __name__ == "__main__":

@@ -98,9 +98,9 @@ def test_default_exempt_patterns_includes_all_recovery_clis():
 
 
 def test_evaluator_gates_all_use_default_exempt_patterns(tmp_path, monkeypatch):
-    """Every evaluator-backed gate seeder (event_must_act, agent_ack_pending,
-    queue_ready_unspawned) must register with DEFAULT_EXEMPT_PATTERNS applied,
-    so every gate exempts every other gate's clearing commands."""
+    """Every main-loop gate seeder (evaluator-backed + no_pending_watcher_outputs)
+    must register with DEFAULT_EXEMPT_PATTERNS applied, so every gate exempts
+    every other gate's clearing commands."""
     mod = _load_init_module()
 
     # We'll intercept `obligations add` calls and capture the --exempt-tool-pattern
@@ -139,16 +139,18 @@ def test_evaluator_gates_all_use_default_exempt_patterns(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "_row_already_present", lambda *a, **kw: False)
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
 
-    # Seed the three evaluator-backed gates that must have DEFAULT_EXEMPT_PATTERNS.
+    # Seed the four main-loop gates that must have DEFAULT_EXEMPT_PATTERNS.
     mod.seed_event_must_act("obligations", dry_run=False, force=False, verbose=False)
     mod.seed_agent_ack_pending("obligations", dry_run=False, force=False, verbose=False)
     mod.seed_queue_ready_unspawned("obligations", dry_run=False, force=False, verbose=False)
+    mod.seed_no_pending_watcher_outputs("obligations", dry_run=False, force=False, verbose=False)
 
     # Verify each gate was registered with exempts.
     gates_under_test = [
         (mod.EVENT_MUST_ACT_TAG, "event_must_act"),
         (mod.AGENT_ACK_PENDING_TAG, "agent_ack_pending"),
         (mod.QUEUE_READY_UNSPAWNED_TAG, "queue_ready_unspawned"),
+        (mod.NO_PENDING_WATCHER_OUTPUTS_TAG, "no_pending_watcher_outputs"),
     ]
 
     for tag, name in gates_under_test:
