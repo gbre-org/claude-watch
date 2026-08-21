@@ -96,7 +96,7 @@ def test_scripts_exist_and_executable() -> None:
 
 def test_self_tests_pass() -> None:
     # Run each script's --self-test in an isolated subprocess.
-    for name in ("event-ack", "event-classify", "eval-event-must-act",
+    for name in ("event-ack", "event-classify", "eval-event-must-act"):
         path = NEW_SCRIPTS[name]
         proc = subprocess.run(
             [sys.executable, str(path), "--self-test"],
