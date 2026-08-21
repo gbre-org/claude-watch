@@ -453,6 +453,20 @@
     if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
     head += `<span class="id">${esc(it.id)}</span>`;
     head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    // Agent activity cell (botchat #2967) — MUST mirror the RUNNING block in
+    // templates/index.html: tool-call + context-token counters for the live
+    // agent bound to this queue id, in the HEAD so compact density keeps it.
+    // Labels come pre-formatted from the server (full_label / short_label /
+    // title) so both renderers print identical strings. Omitted entirely when
+    // it.agent_stats is null (feature off / snapshot absent or stale / no
+    // matching agent) — never a frozen or placeholder number.
+    const agentStats = it.agent_stats;
+    if (agentStats) {
+      head += `<span class="agent-stats" title="${attr(agentStats.title || '')}" data-tool-calls="${attr(agentStats.tool_calls ?? '')}" data-context-tokens="${attr(agentStats.context_tokens ?? '')}">` +
+        `<span class="agent-stats-full">${esc(agentStats.full_label || '')}</span>` +
+        `<span class="agent-stats-short">${esc(agentStats.short_label || '')}</span>` +
+        '</span>';
+    }
     head += `<button type="button" class="action-btn stop-btn" data-action="stop" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Stop this running item">stop</button>`;
 
     const startedIso = it.started_at_iso || '';
@@ -1158,6 +1172,19 @@
     }
     if (orphanCount) {
       html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
+    }
+    // Agent activity pill (botchat #2967) — session totals from the
+    // agent-stats snapshot (`N agents · C calls · K tok` + main-loop context).
+    // MUST mirror templates/index.html: this subtree is rebuilt every tick.
+    // state.agent_stats is null when the feature is off / snapshot absent
+    // (no pill); {stale:true} renders the "agents n/a" label the server
+    // supplies — never a frozen number.
+    const agentStatsPill = state.agent_stats;
+    if (agentStatsPill) {
+      const mainLabel = agentStatsPill.main_label
+        ? ` <span class="agent-stats-main">· ${esc(agentStatsPill.main_label)}</span>`
+        : '';
+      html += `<span class="count count-agent-stats${agentStatsPill.stale ? ' stale' : ''}" title="${attr(agentStatsPill.title || '')}">${esc(agentStatsPill.label || '')}${mainLabel}</span>`;
     }
     // Density toggle pill (botchat #1944). MUST be rendered here too (not just
     // in the Jinja template): mergeTopbarMeta rebuilds #topbar-meta every tick,

@@ -218,6 +218,12 @@ html.header-collapsed .topbar .density-control { display: none; }
 .count-other    { color: var(--other);    border-color: var(--other); }
 .count-pending  { color: var(--pending);  border-color: var(--pending); }
 .count-orphan   { color: var(--orphan);   border-color: var(--orphan); }
+/* Agent activity pill (botchat #2967): live session totals from the
+   agent-stats snapshot. Neutral tone (it is telemetry, not a state); the
+   stale variant dims to make "n/a" read as withheld, not as zero. */
+.count-agent-stats { color: var(--fg-mute); border-color: var(--line); font-variant-numeric: tabular-nums; }
+.count-agent-stats.stale { opacity: 0.6; font-style: italic; }
+.count-agent-stats .agent-stats-main { opacity: 0.75; }
 
 .dot {
   width: 10px;
@@ -2110,6 +2116,22 @@ html.density-compact .summary {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Agent activity cell (botchat #2967): `11 calls · 82K tok` in the item
+   head of a RUNNING row. Sits in the HEAD (not the elided .scope/.description)
+   so compact density keeps it — see the html.density-compact override below
+   which swaps the full label for the short `11·82Kt` form. */
+.agent-stats {
+  font-size: 0.72rem;
+  color: var(--fg-mute);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.agent-stats-short { display: none; }
+/* Compact: shortest form, NEVER hidden. */
+html.density-compact .agent-stats { font-size: 0.68rem; }
+html.density-compact .agent-stats-full { display: none; }
+html.density-compact .agent-stats-short { display: inline; }
 
 /* Age line: keep (it carries the live running/agent signal) but shrink + tighten. */
 html.density-compact .age {

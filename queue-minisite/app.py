@@ -109,6 +109,35 @@ AGENT_QUEUE_BINDINGS_PATH = os.environ.get(
     "AGENT_QUEUE_BINDINGS_JSON",
     "/queue-home/.config/claude/agent-queue-bindings.json",
 )
+# Live per-agent activity counters (tool calls + tokens) for RUNNING queue
+# items + session totals in the header (botchat #2967). Source: an atomic JSON
+# snapshot a host-side cron rewrites every minute (producer: botchat's
+# ``bin/botchat-agent-stats``), shape::
+#
+#     {"version": 1, "generated_at": <epoch>, "live_window_seconds": 900,
+#      "main": {"session_id", "context_tokens", "last_write_at", "age_seconds"},
+#      "agents": [{"agent_id", "queue_id", "tool_calls", "context_tokens",
+#                  "output_tokens", "last_tool", "started_at",
+#                  "last_write_at", "age_seconds", "finished", ...}],
+#      "totals": {"agents", "tool_calls", "context_tokens", "output_tokens"}}
+#
+# We JOIN ``agents[].queue_id`` onto the running rows; we never re-fold
+# transcripts ourselves. Empty env var = feature OFF (no read at all). A
+# missing / unreadable / unparseable file = feature HIDDEN (no pill, no
+# cell). A snapshot older than AGENT_STATS_STALE_SECONDS (by ``generated_at``
+# OR file mtime, whichever is older) is STALE: the header pill reads "n/a"
+# and every per-row cell is BLANK — a frozen number is worse than no number.
+#
+# The producer replaces the file atomically (tmp + rename), so a deployment
+# must bind-mount its DIRECTORY (or mirror the host path), not the single
+# file: a single-file bind mount pins the original inode and goes stale on
+# the first rewrite — the same trap documented for SESSION_TASK_BIN.
+AGENT_STATS_PATH = os.environ.get(
+    "QUEUE_MINISITE_AGENT_STATS_FILE", "/var/apps/botchat/agent-stats.json"
+)
+AGENT_STATS_STALE_SECONDS = float(
+    os.environ.get("QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS", "60")
+)
 # Persistent archive directory for spawning-subagent transcripts. The
 # vendored session-task `_archive_agent_transcript` copies the active
 # JSONL into this directory at queue-done / queue-abandon time and
@@ -463,6 +492,22 @@ class _ArchiveCache:
 
 _archive_cache = _ArchiveCache()
 
+
+@dataclass
+class _AgentStatsCache:
+    # Parsed agent-stats snapshot, keyed on the file's (mtime, size) so the
+    # 5s poll re-reads only when the producer actually rewrote it. Staleness
+    # is NOT cached — it is re-derived from ``generated_at`` / mtime against
+    # the wall clock on every call, so a producer that stops writing flips
+    # the view to "n/a" within the stale window even though nothing on disk
+    # changed.
+    data: dict[str, Any] | None = None
+    mtime: float = -1.0
+    size: int = -1
+
+
+_agent_stats_cache = _AgentStatsCache()
+
 # Strips the `[queue <id>]` / `[queue <id> abandoned]` layer prefix that
 # session-task prepends to the archived task string, so we render the bare
 # task text (matching session-task's own `_entry_display_task`).
@@ -667,6 +712,237 @@ def _load_agent_state() -> dict[str, dict[str, Any]]:
     alongside this module for the implementation.
     """
     return _agents_by_qid(_load_state(AGENT_STATE_PATH))
+
+
+def _fmt_count(n: Any) -> str:
+    """Abbreviate a counter for a narrow cell: 820, 8.2K, 82K, 1.2M.
+
+    Non-numeric / negative input renders as ``?`` so a producer hiccup can
+    never throw the whole card render.
+    """
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    if v < 0:
+        return "?"
+    if v < 1000:
+        return str(int(v))
+    if v < 10_000:
+        return f"{v / 1000:.1f}K".replace(".0K", "K")
+    if v < 1_000_000:
+        return f"{int(v // 1000)}K"
+    if v < 10_000_000:
+        return f"{v / 1_000_000:.1f}M".replace(".0M", "M")
+    return f"{int(v // 1_000_000)}M"
+
+
+def _agent_stats_empty(enabled: bool) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "available": False,
+        "stale": False,
+        "age_seconds": None,
+        "generated_at": None,
+        "by_queue_id": {},
+        "by_agent_id": {},
+        "totals": None,
+        "main": None,
+    }
+
+
+def _read_agent_stats_file() -> dict[str, Any] | None:
+    """Read + parse the snapshot, cached on (mtime, size). None = absent."""
+    if not AGENT_STATS_PATH:
+        return None
+    try:
+        st = os.stat(AGENT_STATS_PATH)
+    except OSError:
+        _agent_stats_cache.data = None
+        _agent_stats_cache.mtime = -1.0
+        _agent_stats_cache.size = -1
+        return None
+    if (
+        _agent_stats_cache.data is not None
+        and _agent_stats_cache.mtime == st.st_mtime
+        and _agent_stats_cache.size == st.st_size
+    ):
+        return _agent_stats_cache.data
+    try:
+        with open(AGENT_STATS_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    parsed = {"raw": raw, "file_mtime": st.st_mtime}
+    _agent_stats_cache.data = parsed
+    _agent_stats_cache.mtime = st.st_mtime
+    _agent_stats_cache.size = st.st_size
+    return parsed
+
+
+def _shape_agent_stat(rec: dict[str, Any]) -> dict[str, Any]:
+    """Per-agent counters + the display strings both renderers print.
+
+    Labels are built HERE (not in JS) so the Jinja first paint and the 5s
+    refresh.js rebuild are byte-identical and the formatting has one home.
+    """
+    calls = rec.get("tool_calls")
+    ctx = rec.get("context_tokens")
+    out = rec.get("output_tokens")
+    age = rec.get("age_seconds")
+    last_tool = rec.get("last_tool") or ""
+    calls_s = _fmt_count(calls)
+    ctx_s = _fmt_count(ctx)
+    title_bits = [f"{calls_s} tool calls", f"{ctx_s} context tokens"]
+    if out is not None:
+        title_bits.append(f"{_fmt_count(out)} output tokens")
+    if last_tool:
+        title_bits.append(f"last tool {last_tool}")
+    if isinstance(age, (int, float)):
+        title_bits.append(f"last write {_humanize_age(float(age))}")
+    if rec.get("finished"):
+        title_bits.append("finished")
+    return {
+        "agent_id": rec.get("agent_id") or "",
+        "tool_calls": calls,
+        "context_tokens": ctx,
+        "output_tokens": out,
+        "last_tool": last_tool,
+        "age_seconds": age,
+        "finished": bool(rec.get("finished")),
+        # Comfortable: ``11 calls · 82K tok``. Compact: ``11·82Kt``.
+        "full_label": f"{calls_s} calls · {ctx_s} tok",
+        "short_label": f"{calls_s}·{ctx_s}t",
+        "title": " · ".join(title_bits),
+    }
+
+
+def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
+    """Normalised agent-stats view for the render pass + /api/agent-stats.
+
+    Returns::
+
+        {"enabled", "available", "stale", "age_seconds", "generated_at",
+         "by_queue_id": {qid: shaped}, "by_agent_id": {aid: shaped},
+         "totals": {"agents", "tool_calls", "context_tokens",
+                    "output_tokens", "main_context_tokens", "label"} | None,
+         "main": {...} | None}
+
+    ``available`` is False when the feature is off or the file is missing /
+    unreadable (render NOTHING). ``stale`` is True when the snapshot is
+    older than AGENT_STATS_STALE_SECONDS — ``by_queue_id`` is then EMPTY and
+    ``totals`` is None so no consumer can paint a frozen number; the header
+    shows an explicit "n/a" instead. Dedup when several agents carry the
+    same queue_id (a retry): unfinished beats finished, then the most
+    recently written (smallest age_seconds) wins.
+    """
+    enabled = bool(AGENT_STATS_PATH)
+    parsed = _read_agent_stats_file() if enabled else None
+    if parsed is None:
+        return _agent_stats_empty(enabled)
+    raw = parsed["raw"]
+    now_ts = time.time() if now_ts is None else now_ts
+    gen = raw.get("generated_at")
+    ages: list[float] = []
+    if isinstance(gen, (int, float)):
+        ages.append(max(0.0, now_ts - float(gen)))
+    ages.append(max(0.0, now_ts - float(parsed["file_mtime"])))
+    age = max(ages)
+    view = _agent_stats_empty(enabled)
+    view["available"] = True
+    view["age_seconds"] = round(age, 1)
+    view["generated_at"] = gen if isinstance(gen, (int, float)) else None
+    if age > AGENT_STATS_STALE_SECONDS:
+        view["stale"] = True
+        return view
+    by_qid: dict[str, dict[str, Any]] = {}
+    by_aid: dict[str, dict[str, Any]] = {}
+    for rec in raw.get("agents") or []:
+        if not isinstance(rec, dict):
+            continue
+        shaped = _shape_agent_stat(rec)
+        aid = shaped["agent_id"]
+        if aid and aid not in by_aid:
+            by_aid[aid] = shaped
+        qid = rec.get("queue_id")
+        if not isinstance(qid, str) or not qid:
+            continue
+        prev = by_qid.get(qid)
+        if prev is None:
+            by_qid[qid] = shaped
+            continue
+        if prev["finished"] and not shaped["finished"]:
+            by_qid[qid] = shaped
+            continue
+        if prev["finished"] == shaped["finished"]:
+            p_age = prev.get("age_seconds")
+            n_age = shaped.get("age_seconds")
+            if isinstance(n_age, (int, float)) and (
+                not isinstance(p_age, (int, float)) or n_age < p_age
+            ):
+                by_qid[qid] = shaped
+    view["by_queue_id"] = by_qid
+    view["by_agent_id"] = by_aid
+    totals_raw = raw.get("totals") if isinstance(raw.get("totals"), dict) else {}
+    main_raw = raw.get("main") if isinstance(raw.get("main"), dict) else {}
+    n_agents = totals_raw.get("agents")
+    if n_agents is None:
+        n_agents = len(by_aid)
+    calls = totals_raw.get("tool_calls")
+    ctx = totals_raw.get("context_tokens")
+    out = totals_raw.get("output_tokens")
+    main_ctx = main_raw.get("context_tokens")
+    label = f"{_fmt_count(n_agents)} agents · {_fmt_count(calls)} calls · {_fmt_count(ctx)} tok"
+    title_bits = [
+        f"{_fmt_count(n_agents)} live agents (last {int(raw.get('live_window_seconds') or 0) // 60}m window)",
+        f"{_fmt_count(calls)} tool calls",
+        f"{_fmt_count(ctx)} context tokens",
+    ]
+    if out is not None:
+        title_bits.append(f"{_fmt_count(out)} output tokens")
+    if main_ctx is not None:
+        title_bits.append(f"main loop context {_fmt_count(main_ctx)} tokens")
+    title_bits.append(f"snapshot {_humanize_age(age)}")
+    view["totals"] = {
+        "agents": n_agents,
+        "tool_calls": calls,
+        "context_tokens": ctx,
+        "output_tokens": out,
+        "main_context_tokens": main_ctx,
+        "label": label,
+        "main_label": f"main {_fmt_count(main_ctx)}" if main_ctx is not None else "",
+        "title": " · ".join(title_bits),
+    }
+    view["main"] = {
+        "session_id": main_raw.get("session_id"),
+        "context_tokens": main_ctx,
+        "age_seconds": main_raw.get("age_seconds"),
+    }
+    return view
+
+
+def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
+    """The header-pill payload: None = render no pill (off / absent)."""
+    if not view.get("available"):
+        return None
+    if view.get("stale"):
+        age = view.get("age_seconds")
+        age_txt = _humanize_age(age) if isinstance(age, (int, float)) else "?"
+        return {
+            "stale": True,
+            "label": "agents n/a",
+            "main_label": "",
+            "title": f"agent-stats snapshot is stale (written {age_txt}) — counters withheld rather than frozen",
+        }
+    t = view.get("totals") or {}
+    return {
+        "stale": False,
+        "label": t.get("label", ""),
+        "main_label": t.get("main_label", ""),
+        "title": t.get("title", ""),
+    }
 
 
 def _load_agent_queue_bindings() -> dict[str, str]:
@@ -1164,6 +1440,7 @@ def _shape(
     bindings: dict[str, str] | None = None,
     owner_bindings: dict[str, str] | None = None,
     locked_scopes: dict[str, Any] | None = None,
+    agent_stats_by_qid: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     status = item.get("status", "unknown")
     # Normalize to a non-empty string. A missing / null / non-string status is
@@ -1396,6 +1673,13 @@ def _shape(
         # totals (queue.json says they're running), but render with
         # a distinct pill + suppress orphan badging during the window.
         shaped["is_starting"] = bool(owner.get("is_starting"))
+        # Live per-agent counters (tool calls / tokens) joined by queue id from
+        # the agent-stats snapshot. None when the feature is off, the file is
+        # absent or STALE, or no live agent carries this queue id — the
+        # template / refresh.js render nothing in all four cases.
+        shaped["agent_stats"] = (agent_stats_by_qid or {}).get(
+            item.get("id", "")
+        )
         # Nested subagent tree -- for running items with a known owner
         # agent, resolve the owner's parent main-loop session, enumerate
         # the session's subagent transcripts, then build the REAL tree via
@@ -1690,6 +1974,10 @@ def _render_payload() -> dict[str, Any]:
     # queue_id -> agent_id (arm-hook), so _classify_owner can attribute an
     # owner to a just-spawned running item before active-agents publishes it.
     owner_bindings = _load_owner_bindings_by_qid()
+    # Live per-agent tool-call / token counters (botchat #2967), loaded ONCE
+    # per render pass (mtime-cached) and joined onto running rows by queue id.
+    agent_stats_view = _load_agent_stats()
+    agent_stats_by_qid = agent_stats_view["by_queue_id"]
 
     # Table-driven bucketing. EVERY shaped item lands in exactly one bucket:
     # a declared status goes to its section, anything else goes to the
@@ -1706,6 +1994,7 @@ def _render_payload() -> dict[str, Any]:
         s = _shape(
             it, now, agent_by_qid, items=items, bindings=bindings,
             owner_bindings=owner_bindings, locked_scopes=locked_scopes,
+            agent_stats_by_qid=agent_stats_by_qid,
         )
         st = s["status"]
         key = STATUS_SECTION.get(st)
@@ -1882,6 +2171,9 @@ def _render_payload() -> dict[str, Any]:
         },
         "orphan_count": orphan_count,
         "starting_count": starting_count,
+        # Header agent-activity pill (botchat #2967). None = render no pill
+        # (feature off / snapshot absent); ``stale`` True = "n/a" pill.
+        "agent_stats": _agent_stats_header(agent_stats_view),
         "fetched_at": datetime.fromtimestamp(_cache.fetched_at, timezone.utc).isoformat()
         if _cache.fetched_at
         else "",
@@ -1913,6 +2205,22 @@ def api_queue() -> Any:
     payload = _render_payload()
     payload.pop("user", None)
     return jsonify(payload)
+
+
+@app.route("/api/agent-stats")
+def api_agent_stats() -> Any:
+    """Normalised agent-stats snapshot (see ``_load_agent_stats``).
+
+    The queue page itself does NOT call this — the per-row cells and the
+    header pill ride along in ``/api/queue`` so the existing 5s poll is the
+    only timer. This endpoint is for debugging / other consumers: it exposes
+    the join maps (``by_queue_id`` / ``by_agent_id``), the staleness verdict
+    and the raw-ish totals.
+    """
+    view = _load_agent_stats()
+    view["path"] = AGENT_STATS_PATH
+    view["stale_after_seconds"] = AGENT_STATS_STALE_SECONDS
+    return jsonify(view)
 
 
 def _ids_by_status(*statuses: str) -> dict[str, str]:
