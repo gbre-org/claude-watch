@@ -5943,10 +5943,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 
     // --- Individual watcher health monitoring ---
     if config.watcher_monitor.enabled {
-        let mut entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
-        if let Some(ref extra) = config.watcher_monitor.watchers_config_extra {
-            entries.extend(status::parse_watchers_config(extra));
-        }
+        // Layered load — base file + the user-dir override layer — through
+        // the SAME loader `watcher-ctl` uses, so the daemon can never
+        // disagree with the CLI about what is enabled or which mode a
+        // watcher is in. `[watcher_monitor].watchers_config_extra` names the
+        // override file; when unset, the CLI's default resolution
+        // (`$WATCHERS_CONFIG_EXTRA`, else
+        // `$XDG_CONFIG_HOME/watchmen/watchers.override.conf`) applies.
+        let override_path = config
+            .watcher_monitor
+            .watchers_config_extra
+            .clone()
+            .or_else(crate::watcher::config_path_extra);
+        let entries = status::load_watchers_config(
+            &config.watcher_monitor.watchers_config,
+            override_path.as_deref(),
+        );
         // Drop health for watchers the config no longer lists, and force
         // `enabled: false` on the ones it disables. The loop below `continue`s
         // past both shapes, so without this pass their entries would keep the

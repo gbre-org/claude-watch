@@ -32,8 +32,54 @@ pub struct VersionInfo {
     pub installed: Option<String>,
 }
 
-/// Watcher config entry parsed from watchers.conf.
-#[derive(Debug, Clone)]
+/// How a watcher is launched and how its output reaches the main loop.
+///
+/// * `Oneshot` (the default, the historical contract): `watcher-ctl run
+///   <name>` is spawned as a background Bash task; the watcher blocks, prints
+///   one batch, EXITS, and the task-completion notification delivers the
+///   captured stdout. Every batch costs a restart.
+/// * `Monitor`: the watcher is armed ONCE, from the main loop, through a
+///   line-streaming launcher (Claude Code's `Monitor` tool) and stays alive
+///   across batches; each stdout line is its own notification. `watcher-ctl
+///   run <name>` then does NOT exec the one-shot — it prints the exact command
+///   to arm and records the intent — while `status`/`list` keep treating a
+///   live pid as healthy via the same pidfile model as any other watcher.
+///
+/// Flipping between them is ONE config edit + re-arm; nothing is rebuilt or
+/// reverted and no session restart is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WatcherMode {
+    #[default]
+    Oneshot,
+    Monitor,
+}
+
+impl WatcherMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WatcherMode::Oneshot => "oneshot",
+            WatcherMode::Monitor => "monitor",
+        }
+    }
+
+    /// Parse a config value. Accepts the canonical `oneshot` / `monitor` plus
+    /// the spellings a human is likely to type (`one-shot`, `exit` — the
+    /// watcher script's own name for the block-print-exit shape). `None` for
+    /// anything else, which callers treat as "unset" (default Oneshot) so a
+    /// typo degrades to today's behaviour rather than to a blackholed watcher.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "oneshot" | "one-shot" | "exit" | "block-print-exit" => Some(WatcherMode::Oneshot),
+            "monitor" => Some(WatcherMode::Monitor),
+            _ => None,
+        }
+    }
+}
+
+/// Watcher config entry parsed from watchers.conf (base layer + optional
+/// override layer; see [`load_watchers_config`]).
+#[derive(Debug, Clone, Default)]
 pub struct WatcherEntry {
     pub name: String,
     pub pattern: String,
@@ -48,7 +94,46 @@ pub struct WatcherEntry {
     /// of message history) without baking integration names into the
     /// daemon.
     pub on_restart_cmd: Option<String>,
+    /// Delivery mode — see [`WatcherMode`]. Field 7 (`mode`) of a conf line.
+    pub mode: WatcherMode,
+    /// Command the main loop arms under the line-streaming launcher when
+    /// `mode=monitor`. Field 8 (`monitor_cmd`). When unset, the effective
+    /// command is `<start_cmd> --mode monitor` — the convention the reference
+    /// watcher (`claude-event-watch`) implements; a watcher with a different
+    /// monitor flag sets this explicitly.
+    pub monitor_cmd: Option<String>,
+    /// Which config layer INTRODUCED this entry: `"base"` or `"override"`.
+    /// Purely informational (shown by `watcher-ctl list`).
+    pub layer: String,
+    /// Field names the override layer CHANGED on a base entry (e.g.
+    /// `["mode", "enabled"]`). Empty when the entry is exactly what the base
+    /// file says. Shown by `watcher-ctl list` so "which layer won" is visible.
+    pub overridden: Vec<String>,
 }
+
+impl WatcherEntry {
+    /// The command to arm under a line-streaming launcher when this watcher
+    /// is in monitor mode: the explicit `monitor_cmd` if set, else
+    /// `<start_cmd> --mode monitor`. `None` when neither is derivable.
+    pub fn effective_monitor_cmd(&self) -> Option<String> {
+        if let Some(m) = self.monitor_cmd.as_deref() {
+            let m = m.trim();
+            if !m.is_empty() {
+                return Some(m.to_string());
+            }
+        }
+        self.start_cmd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("{} --mode monitor", s))
+    }
+}
+
+/// Layer label for entries that come from the primary watchers.conf.
+pub const WATCHER_LAYER_BASE: &str = "base";
+/// Layer label for entries introduced (not merely modified) by the override file.
+pub const WATCHER_LAYER_OVERRIDE: &str = "override";
 
 /// Pure function: parse status bar fields from pane capture text.
 ///
@@ -998,38 +1083,193 @@ pub fn parse_watchers_config(path: &str) -> Vec<WatcherEntry> {
     parse_watchers_config_str(&content)
 }
 
-/// Pure function: parse watchers config from a string.
-pub(crate) fn parse_watchers_config_str(content: &str) -> Vec<WatcherEntry> {
+/// The per-watcher fields a conf line may set, in POSITIONAL order (the
+/// pipe-separated slot after `name`) — and the key each accepts in the
+/// `key=value` form. Index = positional slot.
+pub const WATCHER_FIELD_KEYS: [&str; 7] = [
+    "pattern",
+    "min_count",
+    "enabled",
+    "start_cmd",
+    "on_restart_cmd",
+    "mode",
+    "monitor_cmd",
+];
+
+/// One conf line, parsed but not yet resolved: `fields[i]` is `Some(text)`
+/// when the line SET slot `i` (see [`WATCHER_FIELD_KEYS`]) and `None` when
+/// it left it blank / omitted it. Keeping "unset" distinct from "default" is
+/// what lets the same line grammar serve both layers: in the base file an
+/// unset field takes the documented default, in the override file it means
+/// "inherit from base".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawWatcherLine {
+    pub name: String,
+    pub fields: [Option<String>; 7],
+}
+
+/// Parse one non-comment conf line. Grammar (both forms may mix on a line):
+///
+/// ```text
+/// name|pattern|min_count|enabled|start_cmd|on_restart_cmd|mode|monitor_cmd   (positional)
+/// name|mode=monitor|enabled=false                                          (keyed)
+/// ```
+///
+/// A field whose text is `<known-key>=<value>` is KEYED and sets that key
+/// regardless of its position; any other field is positional by its slot.
+/// Blank positional fields are "unset". Lines with only a name (no `|`) are
+/// rejected, as before.
+pub(crate) fn parse_watcher_line(line: &str) -> Option<RawWatcherLine> {
+    let parts: Vec<&str> = line.split('|').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let name = parts[0].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut fields: [Option<String>; 7] = Default::default();
+    for (slot, part) in parts[1..].iter().enumerate() {
+        let text = part.trim();
+        if let Some((k, v)) = text.split_once('=') {
+            if let Some(idx) = WATCHER_FIELD_KEYS.iter().position(|key| *key == k.trim()) {
+                fields[idx] = Some(v.trim().to_string());
+                continue;
+            }
+        }
+        if slot < WATCHER_FIELD_KEYS.len() && !text.is_empty() {
+            fields[slot] = Some(text.to_string());
+        }
+    }
+    Some(RawWatcherLine { name, fields })
+}
+
+/// Parse every non-comment, non-blank line of a conf file into raw lines.
+pub(crate) fn parse_watcher_lines(content: &str) -> Vec<RawWatcherLine> {
     content
         .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('|').collect();
-            if parts.len() < 2 {
-                return None;
-            }
-            let name = parts[0].to_string();
-            let pattern = parts[1].to_string();
-            let min_count = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-            let enabled = parts.get(3).map(|s| *s == "true").unwrap_or(true);
-            let start_cmd = parts
-                .get(4)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let on_restart_cmd = parts
-                .get(5)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            Some(WatcherEntry {
-                name,
-                pattern,
-                min_count,
-                enabled,
-                start_cmd,
-                on_restart_cmd,
-            })
-        })
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .filter_map(parse_watcher_line)
         .collect()
+}
+
+/// Resolve a raw BASE-layer line into an entry, applying the documented
+/// defaults for every unset field (`min_count` 1, `enabled` true, `mode`
+/// oneshot, everything else empty).
+pub(crate) fn entry_from_raw(raw: &RawWatcherLine, layer: &str) -> WatcherEntry {
+    let f = &raw.fields;
+    let nonempty = |i: usize| {
+        f[i].as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    WatcherEntry {
+        name: raw.name.clone(),
+        pattern: f[0].clone().unwrap_or_default(),
+        min_count: f[1]
+            .as_deref()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(1),
+        enabled: f[2].as_deref().map(|s| s.trim() == "true").unwrap_or(true),
+        start_cmd: nonempty(3),
+        on_restart_cmd: nonempty(4),
+        mode: f[5]
+            .as_deref()
+            .and_then(WatcherMode::parse)
+            .unwrap_or_default(),
+        monitor_cmd: nonempty(6),
+        layer: layer.to_string(),
+        overridden: Vec::new(),
+    }
+}
+
+/// Apply one override line to an existing entry: only the fields the line
+/// SET are changed; each changed field's key is recorded in `overridden`.
+pub(crate) fn apply_override(entry: &mut WatcherEntry, raw: &RawWatcherLine) {
+    fn note(entry: &mut WatcherEntry, key: &str) {
+        if !entry.overridden.iter().any(|k| k == key) {
+            entry.overridden.push(key.to_string());
+        }
+    }
+    if let Some(v) = raw.fields[0].as_deref() {
+        entry.pattern = v.to_string();
+        note(entry, "pattern");
+    }
+    if let Some(v) = raw.fields[1].as_deref() {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            entry.min_count = n;
+            note(entry, "min_count");
+        }
+    }
+    if let Some(v) = raw.fields[2].as_deref() {
+        entry.enabled = v.trim() == "true";
+        note(entry, "enabled");
+    }
+    if let Some(v) = raw.fields[3].as_deref() {
+        entry.start_cmd = Some(v.to_string()).filter(|s| !s.is_empty());
+        note(entry, "start_cmd");
+    }
+    if let Some(v) = raw.fields[4].as_deref() {
+        entry.on_restart_cmd = Some(v.to_string()).filter(|s| !s.is_empty());
+        note(entry, "on_restart_cmd");
+    }
+    if let Some(v) = raw.fields[5].as_deref() {
+        if let Some(m) = WatcherMode::parse(v) {
+            entry.mode = m;
+            note(entry, "mode");
+        }
+    }
+    if let Some(v) = raw.fields[6].as_deref() {
+        entry.monitor_cmd = Some(v.to_string()).filter(|s| !s.is_empty());
+        note(entry, "monitor_cmd");
+    }
+}
+
+/// Pure function: parse a BASE-layer watchers config from a string.
+pub(crate) fn parse_watchers_config_str(content: &str) -> Vec<WatcherEntry> {
+    parse_watcher_lines(content)
+        .iter()
+        .map(|raw| entry_from_raw(raw, WATCHER_LAYER_BASE))
+        .collect()
+}
+
+/// Pure function: merge an OVERRIDE-layer config string onto already-parsed
+/// base entries. A line naming an existing watcher changes only the fields
+/// it sets (blank = inherit); a line naming an unknown watcher is appended
+/// as a new entry (layer `"override"`). Later lines win over earlier ones.
+pub(crate) fn merge_watchers_override_str(
+    mut base: Vec<WatcherEntry>,
+    override_content: &str,
+) -> Vec<WatcherEntry> {
+    for raw in parse_watcher_lines(override_content) {
+        if let Some(existing) = base.iter_mut().find(|e| e.name == raw.name) {
+            apply_override(existing, &raw);
+        } else {
+            base.push(entry_from_raw(&raw, WATCHER_LAYER_OVERRIDE));
+        }
+    }
+    base
+}
+
+/// Load the LAYERED watcher config: the base file plus an optional override
+/// file (a user-dir file, typically a symlink into a dotfiles/config repo).
+/// A missing base yields no entries (as before); a missing / unreadable
+/// override is silently a no-op, so the committed default always loads on
+/// its own. Symlinks are followed (`std::fs::read_to_string`), which is what
+/// lets the override file be a symlink into a repo — with the caveat that
+/// inside a container the symlink's TARGET must also be inside a mounted
+/// tree, or the link dangles and the override is treated as absent.
+///
+/// This is THE loader both the CLI (`watcher-ctl`) and the daemon's
+/// `watcher_monitor` use, so "what is enabled / which mode" can never
+/// disagree between the two.
+pub fn load_watchers_config(base_path: &str, override_path: Option<&str>) -> Vec<WatcherEntry> {
+    let base = parse_watchers_config(base_path);
+    match override_path.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(content) => merge_watchers_override_str(base, &content),
+        None => base,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2775,6 +3015,146 @@ mod tests {
     fn test_parse_watchers_config_missing_file() {
         let entries = parse_watchers_config("/tmp/nonexistent-watchers-test.conf");
         assert_eq!(entries.len(), 0);
+    }
+
+    // --- mode field + layered override ------------------------------------
+
+    #[test]
+    fn test_parse_watchers_mode_defaults_to_oneshot() {
+        let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw --quiet 10");
+        assert_eq!(entries[0].mode, WatcherMode::Oneshot);
+        assert_eq!(entries[0].layer, WATCHER_LAYER_BASE);
+        assert!(entries[0].overridden.is_empty());
+        assert_eq!(
+            entries[0].effective_monitor_cmd().as_deref(),
+            Some("evw --quiet 10 --mode monitor")
+        );
+    }
+
+    #[test]
+    fn test_parse_watchers_mode_positional_seventh_field() {
+        let entries =
+            parse_watchers_config_str("evw|bin/evw|1|true|evw --quiet 10|hist|monitor|evw --stream");
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert_eq!(entries[0].on_restart_cmd.as_deref(), Some("hist"));
+        assert_eq!(entries[0].monitor_cmd.as_deref(), Some("evw --stream"));
+        assert_eq!(entries[0].effective_monitor_cmd().as_deref(), Some("evw --stream"));
+        // Blank on_restart_cmd slot still lets mode land in slot 7.
+        let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw||monitor");
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert!(entries[0].on_restart_cmd.is_none());
+    }
+
+    #[test]
+    fn test_parse_watchers_mode_keyed_form() {
+        let entries = parse_watchers_config_str("evw|bin/evw|mode=monitor|enabled=false");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pattern, "bin/evw");
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert!(!entries[0].enabled);
+        // Keyed fields do not consume positional slots: min_count stays default.
+        assert_eq!(entries[0].min_count, 1);
+        // A start_cmd that happens to contain `=` is NOT mistaken for a key.
+        let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw --debounce=60");
+        assert_eq!(entries[0].start_cmd.as_deref(), Some("evw --debounce=60"));
+    }
+
+    #[test]
+    fn test_parse_watchers_mode_unknown_value_falls_back_to_oneshot() {
+        let entries = parse_watchers_config_str("evw|bin/evw|1|true|evw||streamy");
+        assert_eq!(entries[0].mode, WatcherMode::Oneshot);
+        assert_eq!(WatcherMode::parse("exit"), Some(WatcherMode::Oneshot));
+        assert_eq!(WatcherMode::parse("one-shot"), Some(WatcherMode::Oneshot));
+        assert_eq!(WatcherMode::parse(" Monitor "), Some(WatcherMode::Monitor));
+        assert_eq!(WatcherMode::parse("bogus"), None);
+    }
+
+    #[test]
+    fn test_merge_override_changes_only_set_fields() {
+        let base = parse_watchers_config_str(
+            "evw|bin/evw|1|true|evw --quiet 10\nsig|--tag dm|1|true|signal-wait --dm\n",
+        );
+        let merged = merge_watchers_override_str(base, "# flip evw to monitor\nevw|mode=monitor\n");
+        assert_eq!(merged.len(), 2);
+        let evw = &merged[0];
+        assert_eq!(evw.mode, WatcherMode::Monitor);
+        // Everything the override did not mention is inherited verbatim.
+        assert_eq!(evw.pattern, "bin/evw");
+        assert!(evw.enabled);
+        assert_eq!(evw.start_cmd.as_deref(), Some("evw --quiet 10"));
+        assert_eq!(evw.layer, WATCHER_LAYER_BASE);
+        assert_eq!(evw.overridden, vec!["mode".to_string()]);
+        // Untouched sibling is pristine.
+        assert!(merged[1].overridden.is_empty());
+        assert_eq!(merged[1].mode, WatcherMode::Oneshot);
+    }
+
+    #[test]
+    fn test_merge_override_positional_blank_means_inherit() {
+        let base = parse_watchers_config_str("evw|bin/evw|1|true|evw --quiet 10|hist\n");
+        // Positional override: blank pattern/min_count/start_cmd/on_restart
+        // inherit; only enabled (slot 3) + mode (slot 6) are set.
+        let merged = merge_watchers_override_str(base, "evw||| false|||monitor\n");
+        let evw = &merged[0];
+        assert_eq!(evw.pattern, "bin/evw");
+        assert_eq!(evw.min_count, 1);
+        assert!(!evw.enabled);
+        assert_eq!(evw.start_cmd.as_deref(), Some("evw --quiet 10"));
+        assert_eq!(evw.on_restart_cmd.as_deref(), Some("hist"));
+        assert_eq!(evw.mode, WatcherMode::Monitor);
+        let mut ov = evw.overridden.clone();
+        ov.sort();
+        assert_eq!(ov, vec!["enabled".to_string(), "mode".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_override_appends_unknown_watcher_and_later_lines_win() {
+        let base = parse_watchers_config_str("evw|bin/evw|1|true|evw\n");
+        let merged = merge_watchers_override_str(
+            base,
+            "extra|bin/extra|1|true|extra-watch||monitor\nevw|mode=monitor\nevw|mode=oneshot\n",
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].name, "extra");
+        assert_eq!(merged[1].layer, WATCHER_LAYER_OVERRIDE);
+        assert_eq!(merged[1].mode, WatcherMode::Monitor);
+        // Last line naming evw wins.
+        assert_eq!(merged[0].mode, WatcherMode::Oneshot);
+        assert_eq!(merged[0].overridden, vec!["mode".to_string()]);
+    }
+
+    #[test]
+    fn test_load_watchers_config_layers_and_absent_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("watchers.conf");
+        std::fs::write(&base, "evw|bin/evw|1|true|evw --quiet 10\n").unwrap();
+        let ov = dir.path().join("watchers.override.conf");
+
+        // Override absent: the committed default loads on its own.
+        let entries = load_watchers_config(base.to_str().unwrap(), Some(ov.to_str().unwrap()));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].mode, WatcherMode::Oneshot);
+
+        // Override present: it wins on the fields it sets.
+        std::fs::write(&ov, "evw|mode=monitor|enabled=false\n").unwrap();
+        let entries = load_watchers_config(base.to_str().unwrap(), Some(ov.to_str().unwrap()));
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert!(!entries[0].enabled);
+
+        // Override reached THROUGH A SYMLINK (the "linked in from a repo" shape).
+        let repo_file = dir.path().join("repo-watchers.override.conf");
+        std::fs::write(&repo_file, "evw|mode=monitor\n").unwrap();
+        let link = dir.path().join("linked.override.conf");
+        std::os::unix::fs::symlink(&repo_file, &link).unwrap();
+        let entries = load_watchers_config(base.to_str().unwrap(), Some(link.to_str().unwrap()));
+        assert_eq!(entries[0].mode, WatcherMode::Monitor);
+        assert!(entries[0].enabled, "symlinked override set only mode");
+
+        // Dangling symlink (target outside the mounted tree) == absent.
+        let dangling = dir.path().join("dangling.override.conf");
+        std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
+        let entries = load_watchers_config(base.to_str().unwrap(), Some(dangling.to_str().unwrap()));
+        assert_eq!(entries[0].mode, WatcherMode::Oneshot);
     }
 
     // --- shared watcher-liveness helpers (hoisted from policy.rs) -----------

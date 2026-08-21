@@ -471,10 +471,14 @@ fn default_heartbeat_fresh_secs() -> u64 {
 pub struct WatcherMonitorConfig {
     pub enabled: bool,
     pub watchers_config: String,
-    /// Optional supplementary watchers.conf path. Entries from this file are
-    /// merged with the primary `watchers_config`. Intended for operator-local
-    /// watchers (bind-mounted into the container) that aren't baked into the
-    /// image. Missing file is silently ignored.
+    /// Optional OVERRIDE watchers.conf path (the user-dir layer). Entries
+    /// here override same-named entries in `watchers_config` field-by-field
+    /// (blank = inherit; keyed `name|mode=monitor` form supported) and new
+    /// names are appended. Intended for operator-local config that is not
+    /// baked into the image (bind-mounted into the container; may be a
+    /// symlink into a config repo). Missing file is silently ignored. When
+    /// unset, falls back to the CLI's resolution: `$WATCHERS_CONFIG_EXTRA`,
+    /// else `$XDG_CONFIG_HOME/watchmen/watchers.override.conf`.
     #[serde(default)]
     pub watchers_config_extra: Option<String>,
     pub expected_watchmen: u32,

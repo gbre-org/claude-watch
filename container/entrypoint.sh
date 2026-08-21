@@ -151,6 +151,17 @@ if [ ! -e "$CLAUDE_WATCH_RUNTIME_CONFIG" ]; then
 CWRUNTIMEEOF
 fi
 
+# Watcher-list OVERRIDE layer (user-dir file, may be a symlink into a repo).
+# The baked base list is $WATCHERS_CONFIG (image ENV). The override lives in
+# the same bind-mounted, operator-editable ~/.config/claude-container/ dir as
+# the runtime config above — $HOME-relative, never a host-absolute path — and
+# is the SAME file the baked daemon config names in
+# [watcher_monitor].watchers_config_extra, so `watcher-ctl list/status/run`
+# and the daemon's watcher_monitor resolve one identical layered view. Absent
+# file = base only. A symlinked override works only if its target is inside a
+# mounted tree (otherwise it dangles in here and reads as absent).
+export WATCHERS_CONFIG_EXTRA="${WATCHERS_CONFIG_EXTRA:-${HOME:-/home/hndrewaall}/.config/claude-container/watchers/watchers.conf}"
+
 # Make sure the directories claude-watch wants to write to exist + are
 # writable by uid 1000. State dir is under ~/.cache; logs are in /tmp.
 mkdir -p "${HOME:-/home/hndrewaall}/.cache/claude-watch"
@@ -794,6 +805,8 @@ if [ -n "${CLAUDE_EVENT_QUEUE:-}" ] || [ -n "${CW_PROMETHEUS_URL:-}" ] \
         printf 'PATH=%s\n' "${PATH}"
         printf 'CLAUDE_WATCH_CONFIG=%s\n' "${CLAUDE_WATCH_CONFIG:-/etc/claude-watch/config.toml}"
         [ -n "${CLAUDE_WATCH_RUNTIME_CONFIG:-}" ] && printf 'CLAUDE_WATCH_RUNTIME_CONFIG=%s\n' "${CLAUDE_WATCH_RUNTIME_CONFIG}"
+        [ -n "${WATCHERS_CONFIG:-}" ] && printf 'WATCHERS_CONFIG=%s\n' "${WATCHERS_CONFIG}"
+        [ -n "${WATCHERS_CONFIG_EXTRA:-}" ] && printf 'WATCHERS_CONFIG_EXTRA=%s\n' "${WATCHERS_CONFIG_EXTRA}"
         [ -n "${CW_PROMETHEUS_URL:-}" ] && printf 'CW_PROMETHEUS_URL=%s\n' "${CW_PROMETHEUS_URL}"
         [ -n "${CLAUDE_WATCH_PROM_FILE:-}" ] && printf 'CLAUDE_WATCH_PROM_FILE=%s\n' "${CLAUDE_WATCH_PROM_FILE}"
         [ -n "${CLAUDE_WATCH_STATE:-}" ] && printf 'CLAUDE_WATCH_STATE=%s\n' "${CLAUDE_WATCH_STATE}"

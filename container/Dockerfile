@@ -840,6 +840,9 @@ ENV CLAUDE_WATCH_CONFIG=/etc/claude-watch/config.toml
 # read path; this env var covers the CLI path the main loop invokes when
 # the WATCHER(S) DOWN alert prompt tells it to run `watcher-ctl run
 # claude-event-watch`. src/watcher.rs config_path() honors WATCHERS_CONFIG.
+# The user-dir OVERRIDE layer (WATCHERS_CONFIG_EXTRA) is exported by the
+# entrypoint, $HOME-relative, pointing into the bind-mounted
+# ~/.config/claude-container/ dir — not baked here, since it is per-host.
 ENV WATCHERS_CONFIG=/opt/claude-container/watchmen/watchers.conf
 
 # /etc/profile.d/claude-tools.sh — discoverability for bind-mounted CLIs.
