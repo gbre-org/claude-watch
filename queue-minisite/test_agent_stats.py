@@ -7,7 +7,9 @@ onto the RUNNING rows and renders:
 
 * per running row, in the item HEAD (so compact density keeps it): a cell
   with ``11 calls · 82K tok`` (comfortable) / ``11·82Kt`` (compact);
-* in the header: ``N agents · C calls · K tok`` (+ main-loop context).
+* in the header: a bottom half-row of small pills ``N agt`` · ``C calls`` ·
+  ``K tok`` · ``main M`` stacked under the status pills (botchat #2983; the
+  API still carries the long ``label`` ``N agents · C calls · K tok``).
 
 Rules pinned here:
 
@@ -236,10 +238,90 @@ class AgentStatsTest(unittest.TestCase):
         # The unmatched running row renders NO cell.
         art_b = self._article(html, "q-2026-08-21-bbbb")
         self.assertNotIn("agent-stats", art_b)
-        # Header pill with totals + main context.
-        self.assertIn('class="count count-agent-stats"', html)
-        self.assertIn("1 agents · 11 calls · 82K tok", html)
-        self.assertIn('<span class="agent-stats-main">· main 546K</span>', html)
+        # Header: the agent totals render as the BOTTOM half-row of small
+        # pills (botchat #2983) — one per part, abbreviated, + main context.
+        self.assertIn('class="count-row count-row-agents"', html)
+        for pill in (
+            '<span class="count count-agent-stats agent-stats-agents" title="',
+            '<span class="count count-agent-stats agent-stats-calls" title="',
+            '<span class="count count-agent-stats agent-stats-tok" title="',
+            '<span class="count count-agent-stats agent-stats-main" title="',
+        ):
+            self.assertIn(pill, html, pill)
+        for text in (">1 agt</span>", ">11 calls</span>", ">82K tok</span>", ">main 546K</span>"):
+            self.assertIn(text, html, text)
+        # The long form is NOT in the header any more (it would not fit the
+        # half-row); it stays in the API payload (`label`) only.
+        self.assertNotIn("1 agents · 11 calls · 82K tok", html)
+
+    def test_header_pills_are_two_stacked_nowrap_rows(self):
+        """botchat #2983: the header count pills are TWO stacked half-height
+        rows — status pills on top, agent-activity pills below — inside one
+        .count-stack, and both rows are hard-nowrap (flex-wrap + white-space
+        + overflow/ellipsis) so the header never grows a third line."""
+        self._write_stats(_snapshot([_agent("a1", "q-2026-08-21-aaaa")]))
+        html = self._html()
+        meta_start = html.index('id="topbar-meta"')
+        meta_end = html.index("</header>", meta_start)
+        meta = html[meta_start:meta_end]
+        stack = meta.index('<div class="count-stack" id="count-stack">')
+        status = meta.index('<div class="count-row count-row-status">')
+        agents = meta.index('<div class="count-row count-row-agents"')
+        self.assertLess(stack, status)
+        self.assertLess(status, agents)
+        # Status pills live in the TOP row, agent pills in the BOTTOM row.
+        self.assertLess(status, meta.index("count-running"))
+        self.assertLess(meta.index("count-running"), agents)
+        self.assertLess(meta.index("count-pending"), agents)
+        self.assertLess(agents, meta.index("agent-stats-agents"))
+        # Exactly two rows, one stack; the controls stay OUTSIDE the stack.
+        self.assertEqual(meta.count('class="count-row '), 2)
+        self.assertEqual(meta.count('id="count-stack"'), 1)
+        stack_end = meta.index("density-control")
+        self.assertLess(meta.index("agent-stats-main"), stack_end)
+        # The API hands the renderers the same abbreviated parts.
+        hdr = self._api()["agent_stats"]
+        self.assertEqual(
+            [p["text"] for p in hdr["pills"]],
+            ["1 agt", "11 calls", "82K tok", "main 546K"],
+        )
+        self.assertEqual([p["key"] for p in hdr["pills"]], ["agents", "calls", "tok", "main"])
+        # CSS: reduced size + no-wrap on both rows (one .count-row rule
+        # covers both; the pill rule halves font/padding and ellipsises).
+        css = (HERE / "static" / "style.css").read_text(encoding="utf-8")
+        import re
+
+        def block(selector: str) -> str:
+            m = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", css)
+            self.assertIsNotNone(m, selector)
+            return m.group(1)
+
+        stack_css = block(".count-stack")
+        self.assertIn("flex-direction: column", stack_css)
+        self.assertIn("min-width: 0", stack_css)
+        row_css = block(".count-row")
+        self.assertIn("flex-wrap: nowrap", row_css)
+        self.assertIn("white-space: nowrap", row_css)
+        self.assertIn("overflow: hidden", row_css)
+        pill_css = block(".count-row .count")
+        self.assertIn("white-space: nowrap", pill_css)
+        self.assertIn("text-overflow: ellipsis", pill_css)
+        self.assertIn("overflow: hidden", pill_css)
+        # Reduced size: font well under the base .count 0.85rem, tight padding.
+        m = re.search(r"font-size:\s*([0-9.]+)rem", pill_css)
+        self.assertIsNotNone(m, pill_css)
+        self.assertLess(float(m.group(1)), 0.75)
+        self.assertIn("padding: 1px 7px", pill_css)
+        # Narrow (mobile) + compact density shrink further, still nowrap
+        # (they only override size — the nowrap rule is unconditional).
+        self.assertIn(".count-row .count { font-size: 0.62rem; padding: 1px 5px; }", css)
+        self.assertIn("html.density-compact .count-row .count { font-size: 0.64rem;", css)
+        # Nothing hides the stack or either row in compact / collapsed.
+        hidden = re.findall(
+            r"html\.(?:density-compact|header-collapsed)[^{]*\.count-(?:stack|row)[^{]*\{[^}]*display:\s*none",
+            css,
+        )
+        self.assertEqual(hidden, [], hidden)
 
     def test_compact_css_swaps_full_for_short_never_hides(self):
         """The compact-density rule shows the short label and hides the full
@@ -265,7 +347,9 @@ class AgentStatsTest(unittest.TestCase):
             'class="agent-stats-full"',
             'class="agent-stats-short"',
             "count-agent-stats",
-            'class="agent-stats-main"',
+            'class="count-stack" id="count-stack"',
+            'class="count-row count-row-status"',
+            "count-row count-row-agents",
             "agent_stats",
         ):
             self.assertIn(token, js, token)
@@ -273,7 +357,8 @@ class AgentStatsTest(unittest.TestCase):
         # The JS prints the server-supplied labels verbatim (one formatter).
         self.assertIn("agentStats.full_label", js)
         self.assertIn("agentStats.short_label", js)
-        self.assertIn("agentStatsPill.label", js)
+        self.assertIn("agentStatsPill.pills", js)
+        self.assertIn("agentStatsPill.label", js)  # fallback when pills absent
 
     # -- staleness ----------------------------------------------------------
     def test_stale_snapshot_blanks_cells_and_shows_na_pill(self):
@@ -294,7 +379,11 @@ class AgentStatsTest(unittest.TestCase):
         self.assertNotIn("11 calls", html)
         self.assertNotIn('class="agent-stats"', html)
         self.assertIn("agents n/a", html)
-        self.assertIn("count-agent-stats stale", html)
+        # The bottom half-row collapses to ONE dimmed italic pill; both the
+        # row and the pill carry `stale` (the pill keeps the old selector).
+        self.assertIn('class="count-row count-row-agents stale"', html)
+        self.assertIn('class="count count-agent-stats agent-stats-na stale"', html)
+        self.assertEqual(hdr["pills"], [{"key": "na", "text": "agents n/a"}])
 
     def test_stale_by_generated_at_even_if_mtime_fresh(self):
         """generated_at is authoritative: a fresh mtime on an old snapshot
