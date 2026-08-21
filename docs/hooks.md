@@ -118,7 +118,7 @@ Run that loop with `run_in_background: true` so the agent blocks in a
 normal tool-call wait state (not a Monitor-event-driven async state).
 The harness's "agent is done" semantics correctly distinguish the two.
 
-### Heartbeat-liveness `touch` / `heartbeat-ack` (narrow ALLOW)
+### Heartbeat-liveness `touch` (narrow ALLOW)
 
 When claude-watch detects a stale heartbeat it injects an instruction to
 run `touch /var/run/claude/heartbeat` as a single Bash tool call to
@@ -142,14 +142,16 @@ normal gate. The liveness touch is a pure state-restore with no
 destructive side effect, so allowing it is safe. Parse failure fails
 CLOSED (the command is treated as non-exempt).
 
-The same ALLOW covers a **bare `heartbeat-ack`** — the
-`tools/event-must-act/heartbeat-ack` wrapper that performs that touch *and*
-acks the pending `heartbeat-tick` event in one command, and which is the
-shape the loop runs on every tick. It needs the identical catch-22
-exemption. It is scoped one notch tighter than the touch: exactly one
-top-level segment, effective head `heartbeat-ack` (bare or path-resolved),
-and **no arguments at all** — `heartbeat-ack --path <file>` could name an
-arbitrary file to create, so any argument falls through to the normal gate.
+Liveness is now **ack-driven** (#649): heartbeat-tick's normal clear-path
+is a plain `event-ack ack "<key>" --action "..."`, which refreshes the
+liveness timestamp on ANY ack, not just heartbeat-tick acks. `event-ack` is
+already exempt from the dedicated `event_must_act` evaluator, so it clears
+the gate it exists to resolve without needing a hardcoded ALLOW here. A
+prior `heartbeat-ack` wrapper shared this hardcoded ALLOW (it did the touch
+*and* the ack in one command); it was retired 2026-08-21 once the
+ack-driven redesign made the wrapper redundant. The bare touch above
+remains as the universal catch-22 fallback for the pathological case where
+a down watcher blocks `event-ack` itself too.
 
 ### Bypass
 

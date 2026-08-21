@@ -239,13 +239,10 @@ _BAKED_BASH_EXEMPT_PATTERNS = [
     # obligations gate already enforces the strict bare-touch shape; here
     # we only need to keep the touch from tripping the dispatcher counter.
     r"^touch\s+/var/run/claude/(?:claude-)?heartbeat(?:\s|$)",
-    # ...and `heartbeat-ack`, the wrapper that does that touch AND acks the
-    # pending `heartbeat-tick` event in one command (tools/event-must-act/
-    # heartbeat-ack). It replaces the bare touch as the shape the loop runs
-    # on every tick, so it inherits the same exemption -- otherwise the
-    # single command that discharges the tick would start tripping the
-    # dispatcher counter every ~5 minutes. Bare + PATH-resolved + absolute.
-    r"^(?:\S*/)?heartbeat-ack(?:\s|$)",
+    # heartbeat-tick's clear-path is now a plain `event-ack ack` (liveness
+    # is ack-driven, #649) -- already covered by the `event-ack` exemption
+    # above. The prior `heartbeat-ack` wrapper exemption was retired
+    # 2026-08-21 along with the wrapper itself.
     # In-container baked watcher launchers. /opt/claude-container/ is
     # the current bake root; the /etc/claude-code/ entry is kept for
     # images built before the managed-config-dir cleanup (that dir is

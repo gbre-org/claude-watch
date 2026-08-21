@@ -35,9 +35,10 @@ Default-open posture:
 
 Exempt commands (never count toward the N-counter, never denied):
 
-  - ``event-ack``, ``event-classify``  (the gate-resolution surface)
-  - ``heartbeat-ack``                  (the heartbeat-tick clear-path:
-    touches the liveness file AND acks the pending entry in one command)
+  - ``event-ack``, ``event-classify``  (the gate-resolution surface;
+    covers heartbeat-tick too -- liveness is ack-driven, so a plain
+    ``event-ack ack`` is the heartbeat-tick clear-path, no separate
+    ``heartbeat-ack`` wrapper needed -- RETIRED 2026-08-21, #649)
   - ``session-task queue``             (queue dispatch)
   - ``obligations``                    (inspection / override)
   - ``claude-watch-ack`` / ``claude-watch-dispatch``  (alert surface)
@@ -112,14 +113,9 @@ _EXEMPT_PATTERNS = [
     r"botchat-history(\s|$)",
     r"botchat-show(\s|$)",
     r"botchat-wait(\s|$)",
-    # Heartbeat-liveness wrapper. `heartbeat-ack` touches the host
-    # heartbeat file AND acks the pending `heartbeat-tick` entry in one
-    # command -- it IS this gate's own clear-path for the most frequent
-    # actionable event on the box. Leaving it non-exempt would mean the
-    # command that resolves the gate is itself denied at threshold: a
-    # guard the caller cannot satisfy. Path-tolerant so a $BIN_DIR- or
-    # /usr/local/bin-absolute invocation matches too.
-    r"(?:\S*/)?heartbeat-ack(\s|$)",
+    # Heartbeat-tick liveness is ack-driven: a plain `event-ack ack`
+    # (already exempt above) refreshes the timestamp, so no dedicated
+    # `heartbeat-ack` exemption is needed here (retired 2026-08-21, #649).
     r"/opt/claude-container/watchers/",
 ]
 _EXEMPT_RE = re.compile(
@@ -375,17 +371,9 @@ def _self_test() -> int:
             fail("exempt session-task queue should allow")
         if evaluate("obligations list") != 0:
             fail("exempt obligations should allow")
-        # heartbeat-ack is this gate's own clear-path for the most frequent
-        # actionable event. If it were not exempt, the command that resolves
-        # the gate would itself be denied at threshold -- a guard the caller
-        # cannot satisfy. Test the behaviour, not the regex.
-        for cmd in ("heartbeat-ack",
-                    "heartbeat-ack --quiet",
-                    "/usr/local/bin/heartbeat-ack",
-                    "/home/x/bin/heartbeat-ack --json"):
-            if evaluate(cmd) != 0:
-                fail(f"exempt heartbeat-ack should allow at high counter: "
-                     f"{cmd!r}")
+        # heartbeat-tick's clear-path is a plain `event-ack ack` (the
+        # heartbeat-ack wrapper was retired 2026-08-21, #649); already
+        # covered by the `event-ack` exemption tested above.
         # The counter must not have moved either -- an exempt command that
         # still bumps the counter would starve the grace window.
         if _get_counter() != 99:
