@@ -196,7 +196,6 @@ test-event-must-act: ## event-must-act toolchain self-tests
 	python3 tools/event-must-act/event-classify --self-test
 	python3 tools/event-must-act/event-ack --self-test
 	python3 tools/event-must-act/eval-event-must-act --self-test
-	python3 tools/event-must-act/heartbeat-ack --self-test
 	tools/event-must-act/tests/cw-watcher-health-check.test
 	tools/event-must-act/tests/producer-tier-e2e.test
 

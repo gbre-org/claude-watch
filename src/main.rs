@@ -1286,16 +1286,15 @@ async fn run_daemon() {
 
         // Cadence signals (heartbeat-tick / memory-reminder).
         //
-        // heartbeat-tick: writes a single low-priority claude-event into the
-        // event queue every 5 min. This is the reminder that prompts the main
-        // loop to touch the host heartbeat file (its wedge-detector). Without a
-        // delivered event the main loop has nothing to react to while idle, the
-        // heartbeat goes stale at the 10-min threshold, and the daemon fires a
-        // spurious "heartbeat stale" alert. A lone 5-min single-event cadence is
-        // an acceptable cost: the watcher-restart treadmill is driven by event
-        // *bursts* during active threads, not by one steady periodic event.
-        // The daemon still does NOT touch the host heartbeat file itself — that
-        // remains the main loop's job so a wedged loop is detectable.
+        // heartbeat-tick (ACK-DRIVEN REDESIGN 2026-08-21): the daemon now emits
+        // heartbeat-tick as an ON-DEMAND PROBE, only when the last-ack timestamp
+        // has gone quiet (no event-ack in the ack-quiet window). ANY event-ack
+        // (not just heartbeat-tick acks) proves the loop is alive, so a busy loop
+        // acking many events never sees a probe — the daemon only nudges when acks
+        // are quiet. This replaces the fixed ~900s cadence with a gated probe that
+        // fires ONLY when liveness is uncertain. The daemon still does NOT touch
+        // the heartbeat file itself — that remains the main loop's job (wedge
+        // detection).
         //
         // memory-reminder: tmux-inject the checklist directly into the pane so
         // the main loop sees it as a user-typed prompt. This is the same delivery
@@ -1311,21 +1310,68 @@ async fn run_daemon() {
                 );
             }
             if due.heartbeat_tick {
-                // Body carries the configured host heartbeat-file path so the
-                // main loop knows WHICH file to touch. It is the canonical
-                // `[claude].heartbeat_file` path — the same one the daemon
-                // monitors for staleness — so the reminder and the detector
-                // stay pinned to one user-configurable path.
-                event_bus::emit_cadence(&event_bus::CadenceEvent {
-                    tag: cadence::HEARTBEAT_TICK_TAG,
-                    source: cadence::CADENCE_SOURCE,
-                    message: "heartbeat tick",
-                    priority: "low",
-                    data: event_bus::heartbeat_tick_data(
-                        &current_config.claude.heartbeat_file,
-                        current_config.cadence.heartbeat_tick_interval_secs,
-                    ),
-                });
+                // Ack-driven probe: check the last-ack timestamp age. Only emit
+                // the heartbeat-tick probe if acks have gone quiet (last-ack older
+                // than the ack-quiet threshold). Default threshold: 600s (10 min).
+                // Resolves the event state dir the same way event-ack does.
+                let event_state_dir = std::env::var("CLAUDE_EVENT_STATE_DIR")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                        format!("{}/.config/claude-events", home)
+                    });
+                let last_ack_age = policy::last_ack_timestamp_age(&event_state_dir);
+                let ack_quiet_threshold_secs =
+                    std::env::var("HEARTBEAT_ACK_QUIET_SECS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(600); // 10 min default
+
+                let should_emit = match last_ack_age {
+                    Some(age) if age >= ack_quiet_threshold_secs => {
+                        tracing::debug!(
+                            last_ack_age_secs = age,
+                            threshold_secs = ack_quiet_threshold_secs,
+                            "acks quiet: emitting heartbeat-tick probe"
+                        );
+                        true
+                    }
+                    Some(age) => {
+                        tracing::debug!(
+                            last_ack_age_secs = age,
+                            threshold_secs = ack_quiet_threshold_secs,
+                            "acks still fresh: suppressing heartbeat-tick probe"
+                        );
+                        false
+                    }
+                    None => {
+                        // No last-ack timestamp available (fresh boot / stripped
+                        // deployment). Emit the probe — this is the legacy behavior.
+                        tracing::debug!(
+                            "no last-ack timestamp: emitting heartbeat-tick probe (legacy mode)"
+                        );
+                        true
+                    }
+                };
+
+                if should_emit {
+                    // Body carries the configured host heartbeat-file path so the
+                    // main loop knows WHICH file to touch. It is the canonical
+                    // `[claude].heartbeat_file` path — the same one the daemon
+                    // monitors for staleness — so the reminder and the detector
+                    // stay pinned to one user-configurable path.
+                    event_bus::emit_cadence(&event_bus::CadenceEvent {
+                        tag: cadence::HEARTBEAT_TICK_TAG,
+                        source: cadence::CADENCE_SOURCE,
+                        message: "heartbeat tick",
+                        priority: "low",
+                        data: event_bus::heartbeat_tick_data(
+                            &current_config.claude.heartbeat_file,
+                            current_config.cadence.heartbeat_tick_interval_secs,
+                        ),
+                    });
+                }
             }
             if due.memory_reminder {
                 // Memory-reminder is non-urgent context hygiene, so it is

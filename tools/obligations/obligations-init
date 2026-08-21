@@ -147,6 +147,13 @@ USER_MANIFEST_DEFAULT_CREATED_BY = "user-obligations-manifest"
 # the recovery surface a subagent uses to either re-register a queue
 # item, inspect / ack agent-msg messages, or read claude-watch alerts.
 # Same shape as the agent-msg inbox-gate exempt set.
+#
+# CROSS-GATE DEADLOCK PREVENTION: this list MUST include the clearing
+# commands for EVERY gate-mode obligation (agent-ack, event-ack, etc.),
+# so no gate can block the command that clears another gate. Without this,
+# two simultaneously-armed gates deadlock each other (agent_ack_pending
+# blocks event-ack, event_must_act blocks agent-ack → neither can clear
+# without obligations override). See feedback_wildcard_obligation_must_exempt_recovery_clis.
 DEFAULT_EXEMPT_PATTERNS = [
     # Queue dispatch surface: a subagent that just got denied needs to
     # be able to inspect the queue state to figure out whether to re-
@@ -168,6 +175,15 @@ DEFAULT_EXEMPT_PATTERNS = [
     r"Bash:^agent-msg\s+(ack|inbox|gc|disarm)\b",
     # agent-tail self-inspection (rare, but harmless when allowed).
     r"Bash:^agent-tail\b",
+    # agent-ack: clears agent_ack_pending gate. MUST be exempt from
+    # event_must_act and other gates to prevent deadlock.
+    r"Bash:^agent-ack\s+(register|done|list|status|show|ack|clear)\b",
+    # event-ack: clears event_must_act gate. MUST be exempt from
+    # agent_ack_pending and other gates to prevent deadlock.
+    r"Bash:^event-ack\s+(ingest|add|ack|list|clear|reset-counter|drain-ambient)\b",
+    # event-classify: used during event triage. MUST be exempt to allow
+    # classification before acking events.
+    r"Bash:^event-classify\b",
 ]
 
 
@@ -450,6 +466,8 @@ def seed_event_must_act(cli: str, *, dry_run: bool = False,
         "--created-by", "obligations-init",
         "--json",
     ]
+    for pat in DEFAULT_EXEMPT_PATTERNS:
+        cmd.extend(["--exempt-tool-pattern", pat])
 
     if dry_run:
         print("DRY-RUN: " + " ".join(cmd))
@@ -515,6 +533,11 @@ def seed_agent_ack_pending(cli: str, *, dry_run: bool = False,
         "--created-by", "obligations-init",
         "--json",
     ]
+    # Shared recovery-CLI allowlist: MUST exempt the clearing commands for
+    # EVERY gate (agent-ack, event-ack, etc.) to prevent cross-gate deadlock.
+    # See the DEFAULT_EXEMPT_PATTERNS docstring above.
+    for pat in DEFAULT_EXEMPT_PATTERNS:
+        cmd.extend(["--exempt-tool-pattern", pat])
 
     # Cross-gate deadlock-break: EXEMPT the botchat mark-read gate's OWN
     # clearing commands from this (agent_ack_pending) gate. Without this,
@@ -630,6 +653,8 @@ def seed_queue_ready_unspawned(cli: str, *, dry_run: bool = False,
         "--created-by", "obligations-init",
         "--json",
     ]
+    for pat in DEFAULT_EXEMPT_PATTERNS:
+        cmd.extend(["--exempt-tool-pattern", pat])
 
     if dry_run:
         print("DRY-RUN: " + " ".join(cmd))

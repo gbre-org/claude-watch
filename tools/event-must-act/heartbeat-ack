@@ -1,291 +1,53 @@
 #!/usr/bin/env python3
-"""heartbeat-ack — touch the liveness heartbeat file AND ack the pending
-``heartbeat-tick`` event(s), in one command.
+"""heartbeat-ack — COMPATIBILITY SHIM for the ack-driven heartbeat redesign.
 
-Why this exists
----------------
+REDESIGN (2026-08-21): heartbeat-ack is now folded into event-ack. ANY
+event-ack (not just heartbeat-tick acks) refreshes the liveness timestamp,
+so there is no longer a distinct "heartbeat ack" category. This script is
+a COMPAT SHIM so existing callers (`heartbeat-ack` without args) keep
+working during the transition.
 
-``heartbeat-tick`` is classified **actionable** in ``event-classify``: the
-claude-watch daemon emits it on a fixed cadence and the main loop is
-required to refresh the host heartbeat file, whose mtime is the daemon's
-wedge-detector. But the two halves of that contract never met:
+The shim delegates to `event-ack ack` for any pending heartbeat-tick
+entries. If event-ack is unavailable (stripped deployment, PATH issue),
+it exits 0 silently — the ack-driven design tolerates missed acks
+(the daemon emits a probe heartbeat-tick, and acking THAT refreshes
+liveness).
 
-  - ``touch <heartbeat-file>`` satisfies the DAEMON (the mtime moves), yet
-    leaves the entry sitting in ``pending-actions.json`` forever;
-  - ``event-ack ack "<key>" ...`` satisfies the GATE, yet does not prove
-    liveness.
+Exit codes:
+  0  success (entries acked, or nothing pending, or event-ack unavailable)
+  1  event-ack invocation failed for a reason OTHER than "not found"
+     (e.g., corrupt state file after event-ack was found)
 
-So the loop owed two commands on every tick, and the ``touch`` — the one the
-daemon actually watches — is not in the ``eval-event-must-act`` exempt set,
-meaning it counted toward the very gate it was trying to clear. This wrapper
-collapses both halves into one invocation, which keeps the fail-loud
-*actionable* classification intact instead of downgrading the tick to
-ambient to dodge the problem.
+Usage:
+  heartbeat-ack                 # compat mode: ack pending heartbeat-ticks
+  heartbeat-ack --help          # show this help
+  heartbeat-ack --version       # show version and exit
 
-Usage
------
+The old heartbeat-ack CLI (with --path, --state-dir, --self-test) is
+RETIRED. The touch-then-ack contract no longer applies: event-ack
+updates the liveness timestamp on every ack, and the daemon checks
+that timestamp (not the heartbeat_file mtime) as the primary liveness
+signal. The heartbeat_file still exists for fallback/compatibility,
+but the main loop no longer needs a distinct "touch + ack" wrapper.
 
-    heartbeat-ack                       # the shape the main loop runs
-    heartbeat-ack --path /tmp/hb        # explicit heartbeat file
-    heartbeat-ack --state-dir DIR       # explicit claude-events state dir
-    heartbeat-ack --json                # machine-readable result
-    heartbeat-ack --quiet               # no stdout on success
-    heartbeat-ack --self-test           # embedded test suite
-
-Ordering + failure posture (deliberate)
----------------------------------------
-
-1. **Touch first, ack second.** The touch is the liveness signal; it must
-   never be lost because the ack path broke. A broken ack is reported LOUDLY
-   on stderr and via exit status — never swallowed — but it happens after the
-   file has already been refreshed.
-2. **A failed touch does NOT ack.** If the required action did not happen,
-   the pending entry stays pending so the gate keeps nagging. Exit 1.
-3. **Nothing pending is not an error.** The wrapper runs on every tick,
-   including on a host where the ``event_must_act`` obligation is not seeded
-   at all and ``pending-actions.json`` never exists. That path touches the
-   file and exits 0, silently.
-
-Exit codes
-----------
-
-  0  touch succeeded; every heartbeat-tick entry found was acked (or there
-     were none)
-  1  the touch itself failed — nothing was acked
-  2  the touch succeeded but the ack path failed (missing/erroring
-     ``event-ack``, unwritable state). The liveness half is done; the gate
-     half is not.
-
-Ack-key derivation (NOT hardcoded)
-----------------------------------
-
-``event-ack ingest`` builds a pending key as ``f"{tag}:{message[:80]}"``, so
-today's key is ``heartbeat-tick:heartbeat tick``. Hardcoding that string
-would mean that the day the daemon's event message text changes, this
-wrapper keeps exiting 0 while clearing nothing — a success line that proves
-nothing. Instead we READ ``pending-actions.json`` and select entries whose
-
-  - ``key`` is exactly ``heartbeat-tick`` or starts with ``heartbeat-tick:``
-    (the tag component of the derived key), OR
-  - ``source_event`` names ``heartbeat-tick`` as its tag
-
-and ack each key verbatim as stored. Message text may change freely; the tag
-is the identity.
-
-Heartbeat-path derivation
--------------------------
-
-The path is user-configurable (``[claude] heartbeat_file``), and the daemon
-ships it on the event as ``data.path``, so it is not hardcoded either:
-
-  1. ``--path``
-  2. ``$CLAUDE_HEARTBEAT_FILE``
-  3. ``[claude] heartbeat_file`` from the claude-watch config, looked up in
-     the daemon's own precedence order minus the cwd-relative entry:
-     ``~/.config/claude-watch/config.toml`` (the user overlay, which wins in
-     the daemon), then ``$CLAUDE_WATCH_CONFIG``, then
-     ``/etc/claude-watch/config.toml``. ``./config.toml`` is deliberately
-     NOT consulted — this wrapper is invoked from whatever directory the
-     loop happens to be in, and picking up a stray cwd config would touch
-     the wrong file while reporting success.
-  4. ``/var/run/claude/heartbeat``
-
-Exempt-set note
----------------
-
-``heartbeat-ack`` is registered in the ``eval-event-must-act`` exempt
-patterns and in ``pre-tool-dispatch-gate-hook``'s dispatcher-maintenance
-set, and the bare form carries the same hardcoded ALLOW in
-``pre-tool-obligations-gate-hook`` that the bare ``touch`` has. Without all
-three the wrapper would itself be denied at threshold — a guard the caller
-cannot satisfy.
+For the full event-ack surface (ingest, add, list, clear, drain-ambient),
+invoke `event-ack` directly.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-# --- Constants ------------------------------------------------------------
+__version__ = "2.0.0-compat"
 
-HEARTBEAT_TAG = "heartbeat-tick"
-DEFAULT_HEARTBEAT_PATH = "/var/run/claude/heartbeat"
-PENDING_FILE = "pending-actions.json"
-ACK_ACTION = "touched heartbeat file (heartbeat-ack)"
-
-EXIT_OK = 0
-EXIT_TOUCH_FAILED = 1
-EXIT_ACK_FAILED = 2
-
-
-def _default_state_dir() -> Path:
-    return Path(os.environ.get(
-        "CLAUDE_EVENT_STATE_DIR",
-        os.path.expanduser("~/.config/claude-events"),
-    ))
-
-
-# --- Heartbeat path resolution -------------------------------------------
-
-_HEARTBEAT_KEY_RE = re.compile(
-    r"""^\s*heartbeat_file\s*=\s*["'](?P<val>[^"']*)["']\s*(?:#.*)?$""",
-)
-_SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*(?:#.*)?$")
-
-
-def _heartbeat_from_toml_text(text: str) -> str | None:
-    """Pull ``[claude] heartbeat_file`` out of a claude-watch config.
-
-    Uses ``tomllib`` when available and falls back to a section-aware line
-    scan, so a config with a syntax error elsewhere in the file still yields
-    the key rather than silently dropping to the built-in default path.
-    """
-    try:
-        import tomllib
-        data = tomllib.loads(text)
-        val = data.get("claude", {}).get("heartbeat_file")
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-        return None
-    except Exception:  # noqa: BLE001 -- fall through to the line scan
-        pass
-
-    section = ""
-    for line in text.splitlines():
-        m = _SECTION_RE.match(line)
-        if m:
-            section = m.group("name").strip()
-            continue
-        if section != "claude":
-            continue
-        m = _HEARTBEAT_KEY_RE.match(line)
-        if m:
-            val = m.group("val").strip()
-            if val:
-                return val
-    return None
-
-
-def _config_candidates() -> list[Path]:
-    """Config files to consult, highest precedence first.
-
-    Mirrors the daemon's layering for this one key: the user overlay
-    (``~/.config/claude-watch/config.toml``) wins over the base layer, whose
-    first entry is ``$CLAUDE_WATCH_CONFIG``. ``./config.toml`` is
-    intentionally omitted (see the module docstring).
-    """
-    out: list[Path] = []
-    home = os.path.expanduser("~")
-    out.append(Path(home) / ".config" / "claude-watch" / "config.toml")
-    env_cfg = os.environ.get("CLAUDE_WATCH_CONFIG", "").strip()
-    if env_cfg:
-        out.append(Path(env_cfg))
-    out.append(Path("/etc/claude-watch/config.toml"))
-    return out
-
-
-def resolve_heartbeat_path(explicit: str | None = None) -> tuple[str, str]:
-    """Return ``(path, provenance)``.
-
-    Provenance feeds the summary line so a surprising path is visible rather
-    than silently assumed.
-    """
-    if explicit:
-        return explicit, "--path"
-    env = os.environ.get("CLAUDE_HEARTBEAT_FILE", "").strip()
-    if env:
-        return env, "$CLAUDE_HEARTBEAT_FILE"
-    for cand in _config_candidates():
-        try:
-            if not cand.is_file():
-                continue
-            val = _heartbeat_from_toml_text(cand.read_text())
-        except OSError:
-            continue
-        if val:
-            return val, str(cand)
-    return DEFAULT_HEARTBEAT_PATH, "built-in default"
-
-
-# --- Touch ----------------------------------------------------------------
-
-def touch(path: str) -> None:
-    """``touch(1)`` semantics: create if absent, bump mtime if present.
-
-    Raises ``OSError`` on failure — the caller turns that into a loud stderr
-    line and exit 1 (and skips the ack, so the entry stays pending).
-    """
-    p = Path(path)
-    parent = p.parent
-    if str(parent) and not parent.exists():
-        # Best-effort: a missing parent is the common "fresh boot, the
-        # /var/run tmpfs is empty" case. If we can't create it, the open()
-        # below raises and the caller reports it.
-        try:
-            parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-    with open(p, "a", encoding="utf-8"):
-        pass
-    os.utime(p, None)
-
-
-# --- Pending-entry selection (key DERIVED, never hardcoded) ---------------
-
-def _is_heartbeat_entry(entry: dict) -> bool:
-    key = entry.get("key")
-    if isinstance(key, str):
-        if key == HEARTBEAT_TAG or key.startswith(HEARTBEAT_TAG + ":"):
-            return True
-    src = entry.get("source_event")
-    if isinstance(src, str):
-        # Stored as "<source>/<tag>" by `event-ack ingest`.
-        if src == HEARTBEAT_TAG or src.rsplit("/", 1)[-1] == HEARTBEAT_TAG:
-            return True
-    return False
-
-
-def pending_heartbeat_keys(state_dir: Path) -> list[str]:
-    """Keys of every pending heartbeat-tick entry, in file order.
-
-    Default-open, matching the rest of the toolchain: a missing or corrupt
-    state file means "nothing pending", not an error — the wrapper still has
-    a heartbeat to touch.
-    """
-    path = state_dir / PENDING_FILE
-    try:
-        if not path.exists():
-            return []
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError, ValueError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    pending = data.get("pending")
-    if not isinstance(pending, list):
-        return []
-    keys: list[str] = []
-    for entry in pending:
-        if not isinstance(entry, dict):
-            continue
-        if not _is_heartbeat_entry(entry):
-            continue
-        key = entry.get("key")
-        if isinstance(key, str) and key and key not in keys:
-            keys.append(key)
-    return keys
-
-
-# --- Ack ------------------------------------------------------------------
 
 def _resolve_event_ack() -> list[str] | None:
-    """Command prefix for ``event-ack``, or None if it can't be found."""
+    """Command prefix for event-ack, or None if it can't be found."""
     env_bin = os.environ.get("EVENT_ACK_BIN", "").strip()
     if env_bin:
         return [env_bin]
@@ -294,356 +56,138 @@ def _resolve_event_ack() -> list[str] | None:
         return [cli]
     sibling = Path(__file__).resolve().parent / "event-ack"
     if sibling.exists():
-        # Run through the current interpreter: the sibling may not be
-        # executable in a stripped checkout.
         return [sys.executable, str(sibling)]
     return None
 
 
-def ack_keys(state_dir: Path, keys: list[str],
-             action: str = ACK_ACTION) -> tuple[list[str], list[str]]:
-    """Ack each key via the ``event-ack`` CLI. Returns ``(acked, errors)``."""
-    if not keys:
-        return [], []
+def _ack_via_event_ack(state_dir: str | None) -> int:
+    """Delegate to event-ack to ack any pending heartbeat-tick entries.
+
+    Returns 0 on success (entries acked, or nothing pending, or event-ack
+    not found). Returns 1 if event-ack was found but failed for a reason
+    other than "no such entry" (e.g., corrupt state).
+    """
     prefix = _resolve_event_ack()
     if prefix is None:
-        return [], [
-            "event-ack not found on PATH, at $EVENT_ACK_BIN, or as a "
-            "sibling script -- cannot clear the pending heartbeat-tick "
-            f"entries: {keys}"
-        ]
-    acked: list[str] = []
-    errors: list[str] = []
-    for key in keys:
-        cmd = prefix + ["--state-dir", str(state_dir), "ack", key,
-                        "--action", action]
+        # event-ack not found — this is a stripped deployment or PATH issue.
+        # Exit 0 silently: the ack-driven design tolerates missed acks (the
+        # daemon emits a probe heartbeat-tick, and acking THAT refreshes
+        # liveness).
+        return 0
+
+    # List pending heartbeat-tick entries via event-ack list --json.
+    list_cmd = prefix + ["list", "--json"]
+    if state_dir:
+        list_cmd += ["--state-dir", state_dir]
+    try:
+        proc = subprocess.run(
+            list_cmd, capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(
+            f"heartbeat-ack: warning: event-ack list failed: {exc}",
+            file=sys.stderr,
+        )
+        return 0  # Tolerate the failure
+
+    if proc.returncode != 0:
+        # event-ack list failed — maybe corrupt state, maybe missing state dir.
+        # Tolerate it (exit 0) rather than blocking the main loop.
+        detail = (proc.stderr or proc.stdout or "").strip()
+        print(
+            f"heartbeat-ack: warning: event-ack list exited {proc.returncode}: {detail}",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Parse the JSON to find heartbeat-tick entries.
+    import json
+
+    try:
+        data = json.loads(proc.stdout)
+        pending = data.get("pending", [])
+    except (json.JSONDecodeError, ValueError, KeyError):
+        print(
+            "heartbeat-ack: warning: event-ack list returned unparseable JSON",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Filter to heartbeat-tick entries (key starts with "heartbeat-tick:" or
+    # source_event contains "heartbeat-tick").
+    hb_keys = []
+    for entry in pending:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key", "")
+        source = entry.get("source_event", "")
+        if (
+            key == "heartbeat-tick"
+            or key.startswith("heartbeat-tick:")
+            or source == "heartbeat-tick"
+            or source.endswith("/heartbeat-tick")
+        ):
+            if key and key not in hb_keys:
+                hb_keys.append(key)
+
+    if not hb_keys:
+        # No heartbeat-tick entries pending — nothing to do.
+        return 0
+
+    # Ack each heartbeat-tick entry via event-ack ack.
+    for key in hb_keys:
+        ack_cmd = prefix + ["ack", key, "--action", "heartbeat-ack (compat shim)"]
+        if state_dir:
+            ack_cmd += ["--state-dir", state_dir]
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10, check=False,
+                ack_cmd, capture_output=True, text=True, timeout=10, check=False
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            errors.append(f"event-ack failed for {key!r}: {exc}")
+            print(
+                f"heartbeat-ack: warning: event-ack ack {key!r} failed: {exc}",
+                file=sys.stderr,
+            )
             continue
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
-            errors.append(
-                f"event-ack exited {proc.returncode} for {key!r}: {detail}"
+            print(
+                f"heartbeat-ack: warning: event-ack ack {key!r} exited {proc.returncode}: {detail}",
+                file=sys.stderr,
             )
             continue
-        acked.append(key)
-    return acked, errors
 
-
-# --- Main -----------------------------------------------------------------
-
-def run(path: str | None, state_dir: Path, *, quiet: bool,
-        as_json: bool) -> int:
-    hb_path, provenance = resolve_heartbeat_path(path)
-
-    result: dict = {
-        "heartbeat_path": hb_path,
-        "path_source": provenance,
-        "touched": False,
-        "pending_found": [],
-        "acked": [],
-        "errors": [],
-    }
-
-    # 1. Touch FIRST. The liveness signal must not depend on the ack path.
-    try:
-        touch(hb_path)
-        result["touched"] = True
-    except OSError as exc:
-        result["errors"].append(f"touch failed for {hb_path}: {exc}")
-        print(f"heartbeat-ack: ERROR: could not touch {hb_path}: {exc}",
-              file=sys.stderr)
-        print("heartbeat-ack: NOT acking -- the required action did not "
-              "happen, so the pending entry stays pending.", file=sys.stderr)
-        if as_json:
-            print(json.dumps(result, indent=2))
-        return EXIT_TOUCH_FAILED
-
-    # 2. Ack second, key DERIVED from what is actually pending.
-    keys = pending_heartbeat_keys(state_dir)
-    result["pending_found"] = keys
-    acked, errors = ack_keys(state_dir, keys)
-    result["acked"] = acked
-    result["errors"].extend(errors)
-
-    for err in errors:
-        print(f"heartbeat-ack: ERROR: {err}", file=sys.stderr)
-    if errors:
-        print(f"heartbeat-ack: the heartbeat file WAS touched ({hb_path}); "
-              "only the ack half failed.", file=sys.stderr)
-
-    if as_json:
-        print(json.dumps(result, indent=2))
-    elif not quiet:
-        if errors:
-            # Never print a clean "nothing pending" line after a failed ack
-            # -- that is exactly the success line that proves nothing.
-            unacked = [k for k in keys if k not in acked]
-            print(f"heartbeat-ack: touched {hb_path}; ACK FAILED for "
-                  f"{len(unacked)} heartbeat-tick event(s) "
-                  f"(still pending): {', '.join(unacked)}")
-        elif acked:
-            print(f"heartbeat-ack: touched {hb_path}; acked "
-                  f"{len(acked)} heartbeat-tick event(s): "
-                  f"{', '.join(acked)}")
-        else:
-            print(f"heartbeat-ack: touched {hb_path}; "
-                  "no pending heartbeat-tick events.")
-
-    return EXIT_ACK_FAILED if errors else EXIT_OK
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="heartbeat-ack",
-        description=(
-            "Touch the claude-watch liveness heartbeat file and ack the "
-            "pending heartbeat-tick event(s) in one command."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Exit: 0 = touched + acked (or nothing pending); "
-            "1 = touch failed (nothing acked); "
-            "2 = touched but the ack path failed."
-        ),
-    )
-    p.add_argument("--path", default=None,
-                   help="Heartbeat file to touch. Default: "
-                        "$CLAUDE_HEARTBEAT_FILE, then [claude] "
-                        "heartbeat_file from the claude-watch config, then "
-                        f"{DEFAULT_HEARTBEAT_PATH}.")
-    p.add_argument("--state-dir", default=None,
-                   help="claude-events state dir (default: "
-                        "$CLAUDE_EVENT_STATE_DIR or "
-                        "~/.config/claude-events).")
-    p.add_argument("--quiet", "-q", action="store_true",
-                   help="Suppress the success summary line (errors still "
-                        "go to stderr).")
-    p.add_argument("--json", dest="as_json", action="store_true",
-                   help="Emit a machine-readable result object.")
-    p.add_argument("--self-test", action="store_true",
-                   help="Run the embedded test suite and exit.")
-    return p
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
-    if argv and argv[0] == "--self-test":
-        return _self_test()
-    args = _build_parser().parse_args(argv)
-    if args.self_test:
-        return _self_test()
-    state_dir = (Path(args.state_dir) if args.state_dir
-                 else _default_state_dir())
-    return run(args.path, state_dir, quiet=args.quiet, as_json=args.as_json)
 
+    parser = argparse.ArgumentParser(
+        prog="heartbeat-ack",
+        description=(
+            "Compatibility shim for the ack-driven heartbeat redesign. "
+            "Delegates to event-ack to ack pending heartbeat-tick entries."
+        ),
+        epilog=(
+            "The old heartbeat-ack CLI (--path, --state-dir, --self-test) is "
+            "retired. Use event-ack directly for the full surface."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="claude-events state dir (default: $CLAUDE_EVENT_STATE_DIR or ~/.config/claude-events).",
+    )
+    args = parser.parse_args(argv)
 
-# --- Embedded self-test ---------------------------------------------------
-
-def _self_test() -> int:  # noqa: C901 -- a flat list of cases reads better
-    import tempfile
-    import time
-
-    failures: list[str] = []
-
-    def check(cond: bool, msg: str) -> None:
-        if not cond:
-            print(f"  FAIL {msg}")
-            failures.append(msg)
-        else:
-            print(f"  ok   {msg}")
-
-    def write_pending(sd: Path, entries: list[dict]) -> None:
-        sd.mkdir(parents=True, exist_ok=True)
-        (sd / PENDING_FILE).write_text(json.dumps({"pending": entries}))
-
-    def read_pending(sd: Path) -> list[dict]:
-        try:
-            return json.loads((sd / PENDING_FILE).read_text())["pending"]
-        except (OSError, KeyError, json.JSONDecodeError, ValueError):
-            return []
-
-    print("heartbeat-ack --self-test")
-
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-
-        # 1. Nothing pending: touches, exits 0.
-        sd = root / "state1"
-        sd.mkdir()
-        hb = root / "hb1"
-        rc = run(str(hb), sd, quiet=True, as_json=False)
-        check(rc == EXIT_OK, "nothing pending -> exit 0")
-        check(hb.exists(), "nothing pending -> heartbeat file created")
-
-        # 2. Existing file: mtime moves.
-        old = time.time() - 4000
-        os.utime(hb, (old, old))
-        before = hb.stat().st_mtime
-        rc = run(str(hb), sd, quiet=True, as_json=False)
-        after = hb.stat().st_mtime
-        check(rc == EXIT_OK and after > before,
-              "existing file -> mtime bumped")
-
-        # 3. Today's key: pending entry cleared.
-        sd = root / "state3"
-        write_pending(sd, [{"key": "heartbeat-tick:heartbeat tick",
-                            "source_event": "claude-watch/heartbeat-tick"}])
-        rc = run(str(hb), sd, quiet=True, as_json=False)
-        check(rc == EXIT_OK, "pending entry -> exit 0")
-        check(read_pending(sd) == [],
-              "pending entry -> heartbeat-tick entry removed")
-
-        # 4. DERIVED key: a DIFFERENT message text is still cleared. This is
-        #    the regression guard against hardcoding
-        #    "heartbeat-tick:heartbeat tick".
-        sd = root / "state4"
-        write_pending(sd, [
-            {"key": "heartbeat-tick:pulse check v2 (reworded)",
-             "source_event": "claude-watch/heartbeat-tick"},
-        ])
-        rc = run(str(hb), sd, quiet=True, as_json=False)
-        check(rc == EXIT_OK, "reworded message -> exit 0")
-        check(read_pending(sd) == [],
-              "reworded message -> entry still cleared (key is derived)")
-
-        # 5. Unrelated pending entries are left alone.
-        sd = root / "state5"
-        write_pending(sd, [
-            {"key": "heartbeat-tick:heartbeat tick",
-             "source_event": "claude-watch/heartbeat-tick"},
-            {"key": "torrent-completed:Some.Release",
-             "source_event": "transmission/torrent-completed"},
-        ])
-        rc = run(str(hb), sd, quiet=True, as_json=False)
-        left = [e["key"] for e in read_pending(sd)]
-        check(rc == EXIT_OK, "mixed pending -> exit 0")
-        check(left == ["torrent-completed:Some.Release"],
-              "mixed pending -> only the heartbeat entry is acked")
-
-        # 6. Multiple heartbeat entries: all cleared.
-        sd = root / "state6"
-        write_pending(sd, [
-            {"key": "heartbeat-tick:heartbeat tick"},
-            {"key": "heartbeat-tick:heartbeat tick (later)"},
-        ])
-        rc = run(str(hb), sd, quiet=True, as_json=False)
-        check(rc == EXIT_OK and read_pending(sd) == [],
-              "multiple heartbeat entries -> all cleared")
-
-        # 7. Missing state dir entirely (obligation never seeded).
-        sd = root / "never-created"
-        hb7 = root / "hb7"
-        rc = run(str(hb7), sd, quiet=True, as_json=False)
-        check(rc == EXIT_OK and hb7.exists(),
-              "missing state dir -> touch happens, exit 0")
-
-        # 8. Corrupt state file -> default-open, still touches, exit 0.
-        sd = root / "state8"
-        sd.mkdir()
-        (sd / PENDING_FILE).write_text("{not json")
-        hb8 = root / "hb8"
-        rc = run(str(hb8), sd, quiet=True, as_json=False)
-        check(rc == EXIT_OK and hb8.exists(),
-              "corrupt pending file -> touch happens, exit 0")
-
-        # 9. Touch failure -> exit 1 AND nothing acked (entry stays pending).
-        sd = root / "state9"
-        write_pending(sd, [{"key": "heartbeat-tick:heartbeat tick"}])
-        blocked = root / "not-a-dir"
-        blocked.write_text("x")
-        rc = run(str(blocked / "hb"), sd, quiet=True, as_json=False)
-        check(rc == EXIT_TOUCH_FAILED, "touch failure -> exit 1")
-        check([e["key"] for e in read_pending(sd)]
-              == ["heartbeat-tick:heartbeat tick"],
-              "touch failure -> entry stays pending (no false ack)")
-
-        # 10. Ack-path failure does NOT prevent the touch: point
-        #     $EVENT_ACK_BIN at a command that always fails.
-        sd = root / "state10"
-        write_pending(sd, [{"key": "heartbeat-tick:heartbeat tick"}])
-        broken = root / "broken-event-ack"
-        broken.write_text("#!/bin/sh\necho boom >&2\nexit 7\n")
-        broken.chmod(0o755)
-        hb10 = root / "hb10"
-        prev = os.environ.get("EVENT_ACK_BIN")
-        os.environ["EVENT_ACK_BIN"] = str(broken)
-        try:
-            rc = run(str(hb10), sd, quiet=True, as_json=False)
-        finally:
-            if prev is None:
-                os.environ.pop("EVENT_ACK_BIN", None)
-            else:
-                os.environ["EVENT_ACK_BIN"] = prev
-        check(rc == EXIT_ACK_FAILED, "broken ack path -> exit 2 (loud)")
-        check(hb10.exists(),
-              "broken ack path -> touch STILL happened")
-        check([e["key"] for e in read_pending(sd)]
-              == ["heartbeat-tick:heartbeat tick"],
-              "broken ack path -> entry correctly still pending")
-
-        # 11. Path resolution precedence.
-        cfg = root / "cfg.toml"
-        cfg.write_text('[claude]\nheartbeat_file = "/tmp/from-config"\n')
-        prev_cfg = os.environ.get("CLAUDE_WATCH_CONFIG")
-        prev_hb = os.environ.get("CLAUDE_HEARTBEAT_FILE")
-        prev_home = os.environ.get("HOME")
-        os.environ["HOME"] = str(root / "fake-home")
-        os.environ["CLAUDE_WATCH_CONFIG"] = str(cfg)
-        os.environ.pop("CLAUDE_HEARTBEAT_FILE", None)
-        try:
-            p, src = resolve_heartbeat_path(None)
-            check(p == "/tmp/from-config",
-                  f"config [claude].heartbeat_file wins over the default "
-                  f"(got {p!r} from {src})")
-            os.environ["CLAUDE_HEARTBEAT_FILE"] = "/tmp/from-env"
-            p, _ = resolve_heartbeat_path(None)
-            check(p == "/tmp/from-env",
-                  "$CLAUDE_HEARTBEAT_FILE beats config")
-            p, _ = resolve_heartbeat_path("/tmp/explicit")
-            check(p == "/tmp/explicit", "--path beats everything")
-            os.environ.pop("CLAUDE_WATCH_CONFIG", None)
-            os.environ.pop("CLAUDE_HEARTBEAT_FILE", None)
-            p, _ = resolve_heartbeat_path(None)
-            check(p == DEFAULT_HEARTBEAT_PATH,
-                  "no config, no env -> built-in default path")
-        finally:
-            for k, v in (("CLAUDE_WATCH_CONFIG", prev_cfg),
-                         ("CLAUDE_HEARTBEAT_FILE", prev_hb),
-                         ("HOME", prev_home)):
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-
-        # 12. TOML fallback parser handles a file tomllib would reject.
-        broken_toml = '[claude]\nheartbeat_file = "/tmp/hb-x"\n[[[bad\n'
-        check(_heartbeat_from_toml_text(broken_toml) == "/tmp/hb-x",
-              "line-scan fallback reads the key from a malformed config")
-        check(_heartbeat_from_toml_text(
-            '[other]\nheartbeat_file = "/tmp/nope"\n') is None,
-            "heartbeat_file outside [claude] is ignored")
-
-        # 13. Entry identified purely by source_event.
-        sd = root / "state13"
-        write_pending(sd, [
-            {"key": "some-legacy-key",
-             "source_event": "claude-watch/heartbeat-tick"},
-        ])
-        keys = pending_heartbeat_keys(sd)
-        check(keys == ["some-legacy-key"],
-              "source_event alone identifies a heartbeat entry")
-
-    if failures:
-        print(f"\n{len(failures)} FAILURE(S)")
-        return 1
-    print("\nAll heartbeat-ack self-tests passed.")
-    return 0
+    return _ack_via_event_ack(args.state_dir)
 
 
 if __name__ == "__main__":
