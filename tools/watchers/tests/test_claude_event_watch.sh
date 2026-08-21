@@ -949,6 +949,24 @@ while ! grep -q 'signal first' "$SIG_OUT" 2>/dev/null; do
 done
 grep -q '^\[monitor-mode\] EVENT-WATCH MONITOR MODE ACTIVE' "$SIG_OUT" || {
     echo "FAIL: monitor banner lacks the [monitor-mode] marker" >&2; cat "$SIG_OUT" >&2; exit 1; }
+# The ACTIVE banner is followed by ONE [monitor-mode] REPLY RULE line that
+# tells the operator session to quote the event's lead in its visible reply
+# (the launcher collapses each delivery to its static description, so the
+# reply is the only human-visible trace). It must be a single line, tagged as
+# watcher status (not an EVENT), and come right after ACTIVE.
+active_ln=$(grep -n '^\[monitor-mode\] EVENT-WATCH MONITOR MODE ACTIVE' "$SIG_OUT" | head -1 | cut -d: -f1)
+rule_ln=$(grep -n '^\[monitor-mode\] REPLY RULE: ' "$SIG_OUT" | head -1 | cut -d: -f1)
+[[ -n "$rule_ln" ]] || {
+    echo "FAIL: monitor banner has no [monitor-mode] REPLY RULE line" >&2; cat "$SIG_OUT" >&2; exit 1; }
+if (( rule_ln != active_ln + 1 )); then
+    echo "FAIL: REPLY RULE line is not directly after the ACTIVE banner (active=$active_ln rule=$rule_ln)" >&2; cat "$SIG_OUT" >&2; exit 1
+fi
+if (( $(grep -c '^\[monitor-mode\] REPLY RULE: ' "$SIG_OUT") != 1 )); then
+    echo "FAIL: REPLY RULE line printed more than once" >&2; cat "$SIG_OUT" >&2; exit 1
+fi
+grep -q "^\[monitor-mode\] REPLY RULE: .*MUST quote its lead.*never a bare 'Acknowledged' / 'Idle'.*what was handled\$" "$SIG_OUT" || {
+    echo "FAIL: REPLY RULE line lacks the quote-the-lead / no-bare-ack wording" >&2; cat "$SIG_OUT" >&2; exit 1; }
+echo "  monitor banner: ACTIVE + single REPLY RULE line OK"
 # The watcher is now blocked in inotifywait (30s timeout). SIGTERM must be
 # honoured promptly (background+wait makes the trap run at once), not after
 # the inotify window.
@@ -1151,6 +1169,10 @@ expect_line "exit-mode claude-watch-alert 60-char cut" \
     'EVENT[claude-watch/claude-watch-alert] [CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/p… [alert_type=context-low severity=high]' "$EXIT_OUT"
 if grep -q '⏎\|^EVENT\[.* — reason: \|^EVENT\[cron/pr-status-change\] PR #' "$EXIT_OUT"; then
     echo "FAIL: exit-mode output carries monitor-format markers" >&2; cat "$EXIT_OUT" >&2; exit 1
+fi
+# The monitor-only banner lines (ACTIVE + REPLY RULE) never appear in exit mode.
+if grep -q '^\[monitor-mode\]' "$EXIT_OUT"; then
+    echo "FAIL: exit-mode output carries a [monitor-mode] banner line" >&2; cat "$EXIT_OUT" >&2; exit 1
 fi
 echo "  monitor-format: exit-mode one-shot lines are byte-identical (guard) OK"
 

@@ -218,7 +218,14 @@ identical from outside. Two mechanisms disambiguate them, at different layers:
   alive-but-not-draining loop visible rather than merely inferable.
 
 A monitor also prints one `EVENT-WATCH MONITOR MODE ACTIVE …` line at startup,
-so a launch that fails immediately is distinguishable from a quiet queue.
+so a launch that fails immediately is distinguishable from a quiet queue,
+immediately followed by one `[monitor-mode] REPLY RULE: …` line addressed to
+the operator session: because the terminal collapses each Monitor delivery to
+the tool's static description, the operator's visible reply is the only
+human-readable trace of what was read, so it must quote the event's lead (the
+text after `EVENT[...]`, ~80 chars) plus what was done — never a bare
+"Acknowledged" / "Idle". Both lines are `[monitor-mode]`-tagged status, not
+events, and neither appears in `exit` mode.
 
 **Supervised-monitor guard.** If the watcher can see that an ancestor is a
 `watcher-ctl run claude-event-watch` supervisor (identified by *both* a
