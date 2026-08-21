@@ -968,6 +968,90 @@ def test_mcp_autoapprove_preserves_other_keys() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Corp Bedrock / telemetry env-key stripping (STRIP_ENV_KEYS)
+# ---------------------------------------------------------------------------
+#
+# CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_SKIP_BEDROCK_AUTH /
+# ANTHROPIC_BEDROCK_BASE_URL / DISABLE_TELEMETRY leak in via the bind-
+# mounted host settings.json's `env` block and previously passed through
+# this helper untouched (an earlier fix only sanitized the SEPARATE
+# managed-settings.json path). These four keys must be stripped while
+# every other env key (ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, devbar
+# token, arbitrary operator keys) survives verbatim.
+
+
+def test_strip_env_keys_removed_others_preserved() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {
+            "env": {
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+                "ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example/bedrock",
+                "DISABLE_TELEMETRY": "1",
+                "ANTHROPIC_BASE_URL": "https://gateway.example",
+                "ANTHROPIC_API_KEY": "devbar-token-abc123",
+                "NODE_EXTRA_CA_CERTS": "/path/to/ca-bundle.pem",
+            },
+            "hooks": {},
+        })
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        env = result["env"]
+        for stripped_key in (
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "DISABLE_TELEMETRY",
+        ):
+            expect(
+                stripped_key not in env,
+                f"strip-env: {stripped_key} should be stripped, got {env!r}",
+            )
+        expect(
+            env.get("ANTHROPIC_BASE_URL") == "https://gateway.example",
+            f"strip-env: ANTHROPIC_BASE_URL must survive, got {env.get('ANTHROPIC_BASE_URL')!r}",
+        )
+        expect(
+            env.get("ANTHROPIC_API_KEY") == "devbar-token-abc123",
+            f"strip-env: ANTHROPIC_API_KEY must survive, got {env.get('ANTHROPIC_API_KEY')!r}",
+        )
+        expect(
+            env.get("NODE_EXTRA_CA_CERTS") == "/path/to/ca-bundle.pem",
+            f"strip-env: unrelated env key must survive, got {env.get('NODE_EXTRA_CA_CERTS')!r}",
+        )
+
+
+def test_strip_env_keys_noop_when_none_present() -> None:
+    """An env block with none of the strip keys round-trips unchanged."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"env": {"FOO": "bar"}, "hooks": {}})
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(
+            result["env"] == {"FOO": "bar"},
+            f"strip-env: no-op when none of the strip keys are present, got {result['env']!r}",
+        )
+
+
+def test_strip_env_keys_noop_when_no_env_key() -> None:
+    """No top-level `env` key at all -> no crash, no `env` key added."""
+    with tempfile.TemporaryDirectory() as td:
+        inp = Path(td) / "in.json"
+        out = Path(td) / "out.json"
+        write_json(inp, {"hooks": {}})
+        run_helper(str(inp), str(out))
+        result = load_output(out)
+        expect(
+            "env" not in result,
+            f"strip-env: absent env key should stay absent, got {result.get('env')!r}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -1561,6 +1645,9 @@ TESTS = [
     test_already_wrapped_not_double_wrapped,
     test_multi_event_multi_hook_all_wrapped,
     test_other_top_level_keys_preserved,
+    test_strip_env_keys_removed_others_preserved,
+    test_strip_env_keys_noop_when_none_present,
+    test_strip_env_keys_noop_when_no_env_key,
     test_apikeyhelper_dropped_when_path_missing,
     test_apikeyhelper_dropped_when_macho,
     test_apikeyhelper_kept_when_elf,

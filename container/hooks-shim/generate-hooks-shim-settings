@@ -182,6 +182,25 @@ from pathlib import Path
 
 EXEC_HOOK_PATH = "/usr/local/bin/exec-hook"
 
+# Top-level `env` keys stripped from the rewritten settings.json. These
+# mirror STRIP_ENV_KEYS in host-claude-config/strip-managed-settings.py
+# (the managed-settings.json path) -- but that script only sanitizes the
+# ROOT-owned managed tier. The corp Bedrock env also leaks in via the
+# operator's bind-mounted ~/.claude/settings.json (the USER tier, which
+# THIS script rewrites), and this script previously passed the "env" key
+# through untouched, so the earlier managed-settings-only strip was
+# insufficient: CLAUDE_CODE_USE_BEDROCK + CLAUDE_CODE_SKIP_BEDROCK_AUTH
+# still reached the live process from here, forcing Bedrock mode (which
+# the container has no AWS creds for) and DISABLE_TELEMETRY gated off the
+# Claude Code Monitor tool. Keep this list in sync with the sibling
+# STRIP_ENV_KEYS constant if either changes.
+STRIP_ENV_KEYS = {
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "DISABLE_TELEMETRY",
+}
+
 # Obligations gate hook scripts baked into the container at /usr/local/bin/.
 # When CLAUDE_CONTAINER_OBLIGATIONS=1 (the default), `inject_obligations_hooks`
 # adds these to the rewritten settings so the in-container claude enforces
@@ -387,6 +406,27 @@ def target_runnable_here(path: str) -> bool:
     if magic[:2] == b"#!":
         return True
     return False
+
+
+def strip_env_keys(settings: dict) -> tuple[dict, list[str]]:
+    """Drop the STRIP_ENV_KEYS from settings["env"] (if present).
+
+    Returns (new_settings, dropped_keys). The input is not mutated. All
+    OTHER env keys -- notably ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, and
+    any devbar-gateway-token key -- are preserved verbatim; auth for the
+    container's Anthropic-native path depends on those surviving. When
+    `env` is absent, not a dict, or carries none of the strip keys, the
+    settings are returned unchanged and `dropped_keys` is [].
+    """
+    env = settings.get("env")
+    if not isinstance(env, dict):
+        return settings, []
+    dropped = sorted(k for k in env if k in STRIP_ENV_KEYS)
+    if not dropped:
+        return settings, []
+    out = dict(settings)
+    out["env"] = {k: v for k, v in env.items() if k not in STRIP_ENV_KEYS}
+    return out, dropped
 
 
 def sanitize_api_key_helper(
@@ -767,6 +807,19 @@ def main(argv: list[str]) -> int:
         rewritten = {"hooks": {}}
     else:
         rewritten = rewrite_hooks(settings, patterns)
+        # Drop the corp Bedrock-forcing / telemetry-gating env keys that
+        # leak through from the bind-mounted host settings.json's `env`
+        # block (see STRIP_ENV_KEYS above). Unconditional and
+        # operator-safe: the container has no AWS creds for Bedrock mode,
+        # and DISABLE_TELEMETRY otherwise gates off the Monitor tool.
+        rewritten, dropped_env_keys = strip_env_keys(rewritten)
+        if dropped_env_keys and not args.quiet:
+            print(
+                "generate-hooks-shim-settings: stripped env key(s) "
+                f"{dropped_env_keys} (corp Bedrock-forcing / telemetry-"
+                "gating keys not valid in this container)",
+                file=sys.stderr,
+            )
         # Drop a cross-arch / missing apiKeyHelper that would 127 on every
         # inference inside the container (host-native binary leaked in via
         # the bind-mounted settings.json). Only the rewrite path carries
