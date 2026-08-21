@@ -218,12 +218,57 @@ html.header-collapsed .topbar .density-control { display: none; }
 .count-other    { color: var(--other);    border-color: var(--other); }
 .count-pending  { color: var(--pending);  border-color: var(--pending); }
 .count-orphan   { color: var(--orphan);   border-color: var(--orphan); }
-/* Agent activity pill (botchat #2967): live session totals from the
+/* Agent activity pills (botchat #2967): live session totals from the
    agent-stats snapshot. Neutral tone (it is telemetry, not a state); the
    stale variant dims to make "n/a" read as withheld, not as zero. */
 .count-agent-stats { color: var(--fg-mute); border-color: var(--line); font-variant-numeric: tabular-nums; }
 .count-agent-stats.stale { opacity: 0.6; font-style: italic; }
-.count-agent-stats .agent-stats-main { opacity: 0.75; }
+.count-agent-stats.agent-stats-main { opacity: 0.8; }
+
+/* ------- stacked count pills (botchat #2983) -------
+   The count pills live in TWO stacked half-height rows inside the header:
+   TOP (.count-row-status) = running / blocked / pending / …, BOTTOM
+   (.count-row-agents) = the agent-activity pills (`N agt` · `C calls` ·
+   `K tok` · `main M`). Each pill is roughly HALF its old size (font + padding)
+   so the stack is about as tall as the single old row was, and the header
+   keeps its height. Both rows are hard-nowrap at EVERY width — flex-wrap
+   nowrap + white-space nowrap, the stack can shrink (min-width: 0) and a
+   pill clips with an ellipsis before anything breaks onto a third line. The
+   controls to the right (density, source filter, dot, info) are unchanged. */
+.count-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.count-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.count-row .count {
+  display: block;            /* (not inline-flex) so text-overflow applies */
+  font-size: 0.68rem;
+  line-height: 1.25;
+  padding: 1px 7px;
+  min-height: 0;
+  min-width: 0;
+  flex: 0 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The bottom row is the reduced agent-stats; the stale "agents n/a" pill
+   keeps the dimmed italic look at the small size. */
+.count-row-agents .count { font-weight: 500; }
+.count-row-agents.stale .count { opacity: 0.6; font-style: italic; }
 
 .dot {
   width: 10px;
@@ -757,6 +802,11 @@ html.header-collapsed .topbar .density-control { display: none; }
   .topbar { padding: 10px 12px; }
   .topbar .title { font-size: 0.95rem; }
   .topbar .meta { font-size: 0.78rem; }
+  /* Stacked count pills (botchat #2983): shrink a notch more on phones —
+     still two nowrap rows, abbreviation + ellipsis, never a third line. */
+  .count-stack { gap: 2px; }
+  .count-row { gap: 3px; }
+  .count-row .count { font-size: 0.62rem; padding: 1px 5px; }
   .info-dropdown { min-width: 180px; font-size: 0.78rem; }
 }
 
@@ -2130,6 +2180,10 @@ html.density-compact .summary {
 .agent-stats-short { display: none; }
 /* Compact: shortest form, NEVER hidden. */
 html.density-compact .agent-stats { font-size: 0.68rem; }
+/* Header count pills (botchat #2983) in compact: same two nowrap half-rows,
+   one notch smaller so the stack tracks the denser page. */
+html.density-compact .count-stack { gap: 2px; }
+html.density-compact .count-row .count { font-size: 0.64rem; padding: 1px 6px; }
 html.density-compact .agent-stats-full { display: none; }
 html.density-compact .agent-stats-short { display: inline; }
 

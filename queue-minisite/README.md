@@ -72,8 +72,12 @@ Every RUNNING row carries a live cell in its item head — `11 calls · 82K tok`
 in comfortable density, `11·82Kt` in compact (the head is the one line
 compact never elides, so the counters stay visible there too; hover for
 output tokens / last tool / last-write age) — and the header shows the
-session totals `N agents · C calls · K tok · main 546K` (main = the main
-loop's own context tokens).
+session totals as a bottom half-row of small pills `N agt` · `C calls` ·
+`K tok` · `main 546K` (main = the main loop's own context tokens), stacked
+under the status pills (running / blocked / pending). The two rows are
+half-size and hard-nowrap at every width, so the header is always exactly
+two rows; `/api/queue`'s `agent_stats.pills` carries the parts and
+`agent_stats.label` the long form (`N agents · C calls · K tok`).
 
 The minisite does NOT fold transcripts itself. It reads a small JSON
 snapshot that a host-side cron rewrites atomically about once a minute
