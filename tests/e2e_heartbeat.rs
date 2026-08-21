@@ -20,8 +20,13 @@ fn stale_heartbeat_detected() {
         },
     );
 
-    // Set healthy status (so we get past dead process check)
-    env.set_status(&MockStatus::healthy(&env.tmux_pane));
+    // Set status showing a live process but NO recent bash activity,
+    // so the actively_turning proof-of-life check doesn't suppress
+    // heartbeat-stale detection (the ack-driven redesign suppresses
+    // when bashes > 0 within the active window).
+    env.set_status(&MockStatus {
+        pane: env.tmux_pane.clone(), tokens: 50000, bashes: 0,
+        compact_remaining: None, version: Some("1.0.0".to_string()) });
 
     // Create heartbeat file aged 120 seconds (past the 60s threshold)
     env.age_heartbeat(120);

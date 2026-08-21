@@ -68,12 +68,23 @@
 #   debounce, same drain, same one-liners — it simply does not exit, so the
 #   surrounding loop never has to spend a call restarting it.
 #
-#   The mode is resolved from (first hit wins): --mode flag, then
-#   $CLAUDE_EVENT_WATCH_MODE, then a one-word MODE FILE (default
-#   $CLAUDE_EVENT_LOG_DIR/mode), then "exit". Only the FILE is re-read at
-#   runtime, and it is re-read on every loop iteration — so flipping the mode
-#   needs no rebuild, no revert, and no session restart. See the MODE block
-#   further down for the full contract.
+#   The mode is resolved from (first hit wins): --mode flag (`--monitor` is
+#   shorthand for `--mode monitor`), then $CLAUDE_EVENT_WATCH_MODE, then a
+#   one-word MODE FILE (default $CLAUDE_EVENT_LOG_DIR/mode), then "exit". Only
+#   the FILE is re-read at runtime, and it is re-read on every loop iteration —
+#   so flipping the mode needs no rebuild, no revert, and no session restart.
+#   See the MODE block further down for the full contract.
+#
+#   In monitor mode the process additionally (a) merges stderr into stdout, so
+#   a warning or failure is part of the event stream rather than invisible,
+#   (b) prefixes its own status lines with `[monitor-mode]` so a reader can
+#   tell them from EVENT[...] batches, and (c) exits 0 on SIGTERM/SIGINT/SIGHUP
+#   after printing one `EVENT-WATCH MONITOR STOPPED` line — a deliberate stop
+#   (`watcher-restart`, the launcher's stop control) is a clean exit, not a
+#   crash. The supervision layer's watchers.conf `mode=monitor` field is how a
+#   deployment declares that THIS watcher is armed through a line-streaming
+#   launcher; `watcher-ctl run <name>` then prints the command to arm instead
+#   of exec'ing the block-print-exit form.
 #
 # The one-liner stdout shape is intentional — the main loop's bash-task view
 # stays small. Use `claude-event-tail` to inspect details.
@@ -242,7 +253,7 @@ LIVENESS_INTERVAL="${EVENT_WATCH_LIVENESS_INTERVAL:-900}"
 usage() {
     cat <<EOF
 Usage: claude-event-watch [--debounce SECONDS] [--quiet SECONDS] [--min-interval SECONDS]
-                          [--mode exit|monitor] [--liveness-interval SECONDS]
+                          [--mode exit|monitor | --monitor] [--liveness-interval SECONDS]
                           [--print-mode] [--mode-status] [-h|--help]
 
 Block until a new claude-event arrives in \$CLAUDE_EVENT_QUEUE
@@ -282,6 +293,11 @@ Options:
                       it off and write the word into the mode file instead to
                       keep the runtime toggle live. Also settable (also pinned)
                       via \$CLAUDE_EVENT_WATCH_MODE.
+  --monitor           Shorthand for \`--mode monitor\` (pins monitor mode for
+                      this process). In monitor mode stderr is merged into
+                      stdout, status lines carry a \`[monitor-mode]\` prefix,
+                      and SIGTERM/SIGINT produce a clean exit 0 after one
+                      \`EVENT-WATCH MONITOR STOPPED\` line.
   --liveness-interval SECONDS
                       Monitor mode only (default: 900, 0 disables). After this
                       many seconds with NO stdout, emit one
@@ -376,6 +392,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --mode=*)
             MODE_FLAG="${1#--mode=}"
+            shift
+            ;;
+        --monitor)
+            MODE_FLAG="monitor"
             shift
             ;;
         --liveness-interval)
@@ -786,7 +806,21 @@ throttle_wait() {
         return 0
     fi
     remaining=$(( MIN_INTERVAL_SECONDS - elapsed ))
-    sleep "$remaining" 9>&-
+    do_sleep "$remaining"
+}
+
+# Sleep SECONDS in a way a signal can interrupt promptly. bash defers trap
+# handlers until a FOREGROUND child exits, so a plain `sleep 30` would hold a
+# SIGTERM'd monitor hostage for up to 30s; running the sleep in the background
+# and `wait`ing on it lets the handler run at once (it kills the child). The
+# `9>&-` closes the singleton lock fd in the child — see the lockfile note.
+# Callers ignore the return value (non-zero only when interrupted).
+SLEEP_PID=""
+do_sleep() {
+    sleep "$1" 9>&- &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null || true
+    SLEEP_PID=""
 }
 
 # Rotate consumed.jsonl when it exceeds LOG_MAX_LINES. Keeps last N rotations
@@ -973,9 +1007,9 @@ collect_burst() {
         # Sleep up to QUIET_SECONDS, but never overshoot the hard cap.
         local remaining=$(( DEBOUNCE_SECONDS - waited ))
         local nap=$(( QUIET_SECONDS < remaining ? QUIET_SECONDS : remaining ))
-        # `9>&-`: same reason as the inotifywait call — do not let the
-        # singleton lock leak into a child that can outlive us.
-        sleep "$nap" 9>&-
+        # Interruptible (background + wait) so a SIGTERM'd monitor does not
+        # sit out the whole quiet interval before its handler runs.
+        do_sleep "$nap"
         waited=$(( waited + nap ))
 
         local now_count
@@ -1080,17 +1114,56 @@ maybe_emit_liveness() {
     LAST_OUTPUT_AT="$now"
 }
 
+# Pid of the inotifywait child while one is running (background + wait, so a
+# signal handler can reap it — see monitor_stop_on_signal / the wait loop).
+INOTIFY_PID=""
+
+# Monitor-mode signal handler: a deliberate stop (SIGTERM from `watcher-restart`
+# or the launcher's stop control, SIGINT from an operator, SIGHUP from a closed
+# launcher) is a CLEAN exit, not a crash. Reap the child we are waiting on,
+# say ONE line about it (so the stop is visible in the stream and a reader
+# can tell "stopped" from "died"), stamp the clean-exit marker — the same
+# "this instance exited deliberately, a restart is pending" signal the
+# block-print-exit path writes — and exit 0. Exit mode is untouched: it keeps
+# bash's default signal disposition (and the 128+N exit status the supervisor
+# translates), so the historical behaviour there is byte-for-byte the same.
+monitor_stop_on_signal() {
+    local sig="$1"
+    trap - TERM INT HUP
+    if [[ -n "${INOTIFY_PID:-}" ]]; then
+        kill "$INOTIFY_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${SLEEP_PID:-}" ]]; then
+        kill "$SLEEP_PID" 2>/dev/null || true
+    fi
+    local now
+    now="$(date +%s)"
+    echo "[monitor-mode] EVENT-WATCH MONITOR STOPPED signal=$sig pid=$$ uptime=$(( now - STARTED_AT ))s batches=$BATCHES_DELIVERED pending=$(count_pending) — clean exit 0; re-arm with: watcher-ctl run claude-event-watch"
+    write_clean_exit_marker
+    exit 0
+}
+
 resolve_mode
 stamp_active_mode
 if [[ "$MODE_RESOLVED" == "monitor" ]]; then
+    # Merge stderr into stdout for the rest of this process. Under a
+    # line-streaming launcher only stdout is the event stream, so a warning or
+    # a failure written to stderr would be INVISIBLE — exactly the silent
+    # failure mode a monitor must not have. (The `--mode-status`/`--print-mode`
+    # query paths exited above and keep their streams separate.)
+    exec 2>&1
+    trap 'monitor_stop_on_signal TERM' TERM
+    trap 'monitor_stop_on_signal INT' INT
+    trap 'monitor_stop_on_signal HUP' HUP
     # A stale clean-exit marker from a PREVIOUS block-print-exit run must not
     # be mistaken for this long-lived instance having exited cleanly. Clearing
     # it here means the marker only ever describes a real exit of a real
-    # block-print-exit run.
+    # block-print-exit run (or a deliberate signal stop of this one).
     rm -f "$CLEAN_EXIT_MARKER" 2>/dev/null || true
     # Positive control at startup: one line proving the monitor came up, so an
-    # immediately-failing launch is distinguishable from a quiet queue.
-    echo "EVENT-WATCH MONITOR MODE ACTIVE pid=$$ queue=$QUEUE_DIR liveness=${LIVENESS_INTERVAL}s mode_file=$MODE_FILE source=$MODE_SOURCE"
+    # immediately-failing launch is distinguishable from a quiet queue. The
+    # `[monitor-mode]` marker is the banner a reader / a test keys on.
+    echo "[monitor-mode] EVENT-WATCH MONITOR MODE ACTIVE pid=$$ queue=$QUEUE_DIR liveness=${LIVENESS_INTERVAL}s mode_file=$MODE_FILE source=$MODE_SOURCE — each EVENT[...] line below is a batch to act on; stderr is merged into this stream"
     LAST_OUTPUT_AT="$(date +%s)"
 fi
 
@@ -1166,9 +1239,14 @@ while true; do
     # watcher is killed — so the very next `watcher-ctl run` is refused by a
     # lock whose only holder is an orphan. The parent's own fd 9 is
     # untouched, so our lock is still held for as long as WE live.
+    # Background + `wait` (rather than a foreground child) so a signal handler
+    # runs promptly instead of being deferred until inotifywait's timeout.
     inotifywait -q -t "$INOTIFY_TIMEOUT" -e create -e moved_to \
-        --include '\.json$' "$QUEUE_DIR" >/dev/null 2>&1 9>&-
+        --include '\.json$' "$QUEUE_DIR" >/dev/null 2>&1 9>&- &
+    INOTIFY_PID=$!
+    wait "$INOTIFY_PID"
     rc=$?
+    INOTIFY_PID=""
     # rc=0: event fired → loop re-checks catch-up (drains). rc=2: timeout →
     # loop re-checks catch-up (catches any gap-event). Any other rc is a real
     # inotifywait error → stop looping and surface it.

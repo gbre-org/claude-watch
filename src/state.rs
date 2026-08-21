@@ -1137,6 +1137,7 @@ mod tests {
             enabled,
             start_cmd: None,
             on_restart_cmd: None,
+            ..Default::default()
         }
     }
 

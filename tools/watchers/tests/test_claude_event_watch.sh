@@ -917,8 +917,72 @@ grep -q 'WATCHER EXITED' "$LIVE_OUT" || {
     cat "$LIVE_OUT" >&2; exit 1; }
 echo "  mode: mode-file flip made a LIVE monitor exit cleanly, no restart needed OK"
 
+# (w) `--monitor` is shorthand for `--mode monitor` (the flag name the
+# supervision layer's `watcher-ctl run` prints for a mode=monitor watcher).
+out=$(CLAUDE_EVENT_QUEUE="$LIVE_Q" CLAUDE_EVENT_LOG_DIR="$LIVE_LOG" \
+    "$WATCHER" --monitor --print-mode 2>/dev/null)
+[[ "$out" == "monitor" ]] || { echo "FAIL: --monitor did not resolve to monitor mode (got '$out')" >&2; exit 1; }
+echo "  mode: --monitor shorthand resolves to monitor OK"
+
+# (x) A live `--monitor` instance: prints the [monitor-mode] banner, and a
+# SIGTERM (what `watcher-restart` / the launcher's stop control send) is a
+# CLEAN exit 0 with one STOPPED line — not a 143 crash, and no RESTART NOW
+# banner (the stop was deliberate). The clean-exit marker is written so the
+# supervision layer treats the gap as a pending restart, not an outage.
+SIG_Q="$TMP/sigq"; SIG_LOG="$TMP/siglog"; mkdir -p "$SIG_Q" "$SIG_LOG"
+SIG_OUT="$TMP/sig.out"
+SIG_LOCK="$TMP/sig.lock"
+write_event "$SIG_Q" "100_s1.json" "signal first"
+CLAUDE_EVENT_QUEUE="$SIG_Q" CLAUDE_EVENT_LOG_DIR="$SIG_LOG" \
+    CLAUDE_EVENT_WATCH_LOCK="$SIG_LOCK" \
+    EVENT_WATCH_INOTIFY_TIMEOUT=30 \
+    "$WATCHER" --monitor --debounce 1 --quiet 1 >"$SIG_OUT" 2>/dev/null &
+SIG_PID=$!
+BG_PIDS+=("$SIG_PID")
+waited=0
+while ! grep -q 'signal first' "$SIG_OUT" 2>/dev/null; do
+    if (( waited >= 20 )); then
+        echo "FAIL: --monitor instance never surfaced its first batch" >&2
+        cat "$SIG_OUT" >&2; exit 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+done
+grep -q '^\[monitor-mode\] EVENT-WATCH MONITOR MODE ACTIVE' "$SIG_OUT" || {
+    echo "FAIL: monitor banner lacks the [monitor-mode] marker" >&2; cat "$SIG_OUT" >&2; exit 1; }
+# The watcher is now blocked in inotifywait (30s timeout). SIGTERM must be
+# honoured promptly (background+wait makes the trap run at once), not after
+# the inotify window.
+kill -TERM "$SIG_PID"
+sig_rc=0
+waited=0
+while kill -0 "$SIG_PID" 2>/dev/null; do
+    if (( waited >= 10 )); then
+        echo "FAIL: SIGTERM'd monitor still alive after 10s (signal not honoured promptly)" >&2
+        cat "$SIG_OUT" >&2; kill -9 "$SIG_PID" 2>/dev/null || true; exit 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+done
+wait "$SIG_PID" 2>/dev/null || sig_rc=$?
+if [[ "$sig_rc" != "0" ]]; then
+    echo "FAIL: SIGTERM'd monitor exited $sig_rc (expected a clean 0)" >&2
+    cat "$SIG_OUT" >&2; exit 1
+fi
+grep -q '^\[monitor-mode\] EVENT-WATCH MONITOR STOPPED signal=TERM' "$SIG_OUT" || {
+    echo "FAIL: monitor did not announce its signal stop" >&2; cat "$SIG_OUT" >&2; exit 1; }
+if grep -q 'WATCHER EXITED' "$SIG_OUT"; then
+    echo "FAIL: a deliberate signal stop printed the RESTART NOW banner" >&2
+    cat "$SIG_OUT" >&2; exit 1
+fi
+[[ -f "$TMP/claude-event-watch.exit" ]] || {
+    echo "FAIL: signal stop did not write the clean-exit marker beside the lockfile" >&2; exit 1; }
+# stderr was redirected to /dev/null at launch, yet the STOPPED line (and
+# anything the script says after entering monitor mode) is on stdout — the
+# merged stream is the event stream.
+echo "  mode: --monitor instance exits 0 on SIGTERM with a STOPPED line and no banner OK"
+
 # --help advertises the new surface.
 grep -q -- '--mode' <<<"$help_out" || { echo "FAIL: --help missing --mode" >&2; exit 1; }
+grep -q -- '--monitor' <<<"$help_out" || { echo "FAIL: --help missing --monitor" >&2; exit 1; }
 grep -q -- '--liveness-interval' <<<"$help_out" || { echo "FAIL: --help missing --liveness-interval" >&2; exit 1; }
 grep -q -- '--print-mode' <<<"$help_out" || { echo "FAIL: --help missing --print-mode" >&2; exit 1; }
 echo "  mode: --help documents --mode / --liveness-interval / --print-mode OK"

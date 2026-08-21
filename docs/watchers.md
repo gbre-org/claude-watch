@@ -23,8 +23,24 @@ that fire into the void.
 ## Cardinal rule: watchers belong to the main loop
 
 > **Watchers can ONLY ever be started by Claude Code's main loop**, via the
-> Bash tool's `run_in_background: true`. Never via systemd-run, never via
-> nohup, never by the `claude-watch` daemon, never by a subagent.
+> Bash tool's `run_in_background: true` — or, for a watcher whose
+> `watchers.conf` entry says `mode=monitor`, via the main loop's `Monitor`
+> tool (`persistent: true`), which `watcher-ctl run <name>` prints the exact
+> command for instead of exec'ing. Never via systemd-run, never via nohup,
+> never by the `claude-watch` daemon, never by a subagent.
+
+Two delivery modes coexist, chosen per watcher in the layered
+`watchers.conf` (base file + user-dir override, see
+[`adding-watchers.md`](adding-watchers.md#registering-with-watchersconf)):
+
+| `mode=` | launched as | per batch | stopped by |
+|---|---|---|---|
+| `oneshot` (default) | `watcher-ctl run <name>` as a background Bash task | one notification **+ one restart call** | its own exit / `watcher-restart` |
+| `monitor` | the Monitor tool armed ONCE with the command `watcher-ctl run <name>` prints | one notification, no restart | `TaskStop` / `watcher-restart` |
+
+Flipping is one line in the override file (`<name>|mode=monitor`) plus a
+re-arm; nothing is rebuilt, reverted or restarted. Health is judged the same
+way in both modes (pidfile liveness), so a live monitor is `ok (1/1)`.
 
 The daemon's only emergency action is **tmux-injecting** a
 `watcher-ctl run <name>` line into the main loop's pane, so the main
@@ -188,7 +204,9 @@ alerts, restarts trivially on resume.
 - **On every resume** — boot, `/clear`, restart, compaction — **kill and
   restart ALL watchers**. Background tasks survive the resume, but the
   main loop loses its handles, so the watchers become orphans that
-  cannot deliver results to this session.
+  cannot deliver results to this session. A `mode=monitor` watcher is
+  re-ARMED (Monitor tool, command from `watcher-ctl run <name>`) rather
+  than re-run; it is killed by `watcher-restart` like any other.
 - **Cleanup**: first `TaskStop` every known task id, THEN run
   `watcher-restart` to kill any remaining orphaned processes (reads from
   config, handles all watchers in one shot). Never use bare `pgrep -f` /

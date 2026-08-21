@@ -4,13 +4,22 @@
 //! `watcher-restart` with native Rust implementations.
 
 use crate::cmd::run_cmd_any;
-use crate::status::{parse_watchers_config, WatcherEntry};
+use crate::status::{WatcherEntry, WatcherMode};
 use serde::Serialize;
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
 
-/// Default config path for watchers.
-const DEFAULT_CONFIG: &str = ".config/watchmen/watchers.conf";
+/// Default BASE config path for watchers, relative to `$XDG_CONFIG_HOME`
+/// (which itself defaults to `$HOME/.config`).
+const DEFAULT_CONFIG: &str = "watchmen/watchers.conf";
+
+/// Default OVERRIDE config path (the user-dir layer), relative to
+/// `$XDG_CONFIG_HOME`. Entries here override same-named entries in the base
+/// file field-by-field; see `status::load_watchers_config`. The file may be a
+/// symlink into a dotfiles/config repo. Inside a container the effective path
+/// is whatever `$WATCHERS_CONFIG_EXTRA` names (the entrypoint points it at the
+/// bind-mounted operator config dir) — never a host-absolute path.
+const DEFAULT_OVERRIDE_CONFIG: &str = "watchmen/watchers.override.conf";
 
 /// Default PID file directory for watcher liveness tracking.
 pub const PID_DIR: &str = "/var/run/claude";
@@ -25,21 +34,45 @@ pub fn pid_dir() -> String {
     }
 }
 
-/// Resolve the watchers.conf path (respects $WATCHERS_CONFIG for testing).
+/// `$XDG_CONFIG_HOME`, defaulting to `$HOME/.config`. Both layers of the
+/// watcher config resolve relative to this, so the same binary finds the
+/// right files on a host (`~/.config/...`) and inside a container whose
+/// `$HOME`/`$XDG_CONFIG_HOME` point at a bind-mounted user config tree.
+pub fn xdg_config_home() -> String {
+    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
+        if !p.trim().is_empty() {
+            return p;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+    format!("{}/.config", home)
+}
+
+/// Resolve the BASE watchers.conf path (respects $WATCHERS_CONFIG for tests
+/// and for the container, which bakes the committed default's location).
 pub fn config_path() -> String {
     if let Ok(p) = std::env::var("WATCHERS_CONFIG") {
         return p;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
-    format!("{}/{}", home, DEFAULT_CONFIG)
+    format!("{}/{}", xdg_config_home(), DEFAULT_CONFIG)
 }
 
-/// Resolve the optional extra watchers.conf path (respects $WATCHERS_CONFIG_EXTRA).
-/// Returns None when the env var is unset or empty.
+/// Resolve the OVERRIDE (user-dir) watchers.conf path.
+///
+/// * `$WATCHERS_CONFIG_EXTRA` set and non-empty → that path (the container
+///   entrypoint points it at the bind-mounted operator dir);
+/// * `$WATCHERS_CONFIG_EXTRA` set but EMPTY → `None` (explicitly "no override
+///   layer" — what the test suites use to stay isolated from a real user file);
+/// * unset → `$XDG_CONFIG_HOME/watchmen/watchers.override.conf`.
+///
+/// The file is optional: a missing override is a silent no-op and the base
+/// config loads on its own.
 pub fn config_path_extra() -> Option<String> {
-    std::env::var("WATCHERS_CONFIG_EXTRA")
-        .ok()
-        .filter(|s| !s.is_empty())
+    match std::env::var("WATCHERS_CONFIG_EXTRA") {
+        Ok(p) if p.trim().is_empty() => None,
+        Ok(p) => Some(p),
+        Err(_) => Some(format!("{}/{}", xdg_config_home(), DEFAULT_OVERRIDE_CONFIG)),
+    }
 }
 
 /// Status of a single watcher.
@@ -68,6 +101,11 @@ pub struct WatcherStatus {
     pub required: u32,
     pub pids: String,
     pub enabled: bool,
+    /// Delivery mode from the (layered) config: `"oneshot"` or `"monitor"`.
+    /// Informational — liveness is decided the same way for both — but it
+    /// changes the recovery hint (a monitor-mode watcher is re-ARMED via the
+    /// main loop's Monitor tool; `watcher-ctl run <name>` prints the command).
+    pub mode: String,
     /// PIDs of duplicate `watcher-ctl run <name>` supervisor wrappers.
     /// Empty when only one (canonical) supervisor is alive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -354,15 +392,12 @@ fn read_proc_comm(pid: u32) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Load watcher entries from the primary config and an optional extra config,
-/// concatenating entries from both. Missing extra file is silently ignored
-/// (parse_watchers_config already returns an empty vec for missing files).
+/// Load the LAYERED watcher config: base file + optional override file. The
+/// override changes same-named entries field-by-field (blank = inherit) and
+/// appends unknown names; a missing override is silently a no-op. Shared with
+/// the daemon (`status::load_watchers_config`) so CLI and daemon agree.
 fn load_entries(config_path: &str, extra_config_path: Option<&str>) -> Vec<WatcherEntry> {
-    let mut entries = parse_watchers_config(config_path);
-    if let Some(extra) = extra_config_path {
-        entries.extend(parse_watchers_config(extra));
-    }
-    entries
+    crate::status::load_watchers_config(config_path, extra_config_path)
 }
 
 /// List all watcher entries from config.
@@ -444,6 +479,7 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
                 required: entry.min_count,
                 pids: String::new(),
                 enabled: false,
+                mode: entry.mode.as_str().to_string(),
                 dup_supervisors: Vec::new(),
                 dup_pollers: Vec::new(),
             });
@@ -510,6 +546,7 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
             required: entry.min_count,
             pids: pid_str,
             enabled: true,
+            mode: entry.mode.as_str().to_string(),
             dup_supervisors,
             dup_pollers,
         });
@@ -774,6 +811,16 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
         return Err(format!("watcher '{}' is disabled", name));
     }
 
+    // mode=monitor: this watcher is armed ONCE from the main loop through a
+    // line-streaming launcher (the Monitor tool) and stays alive across
+    // batches. Exec'ing the one-shot here would be wrong on two counts — the
+    // watcher would see a block-print-exit supervisor above it and decline
+    // monitor mode, and its stdout would be captured-until-exit. So print the
+    // exact command to arm, record the intent, and return.
+    if entry.mode == WatcherMode::Monitor {
+        return monitor_arm(entry).await;
+    }
+
     let start_cmd = entry
         .start_cmd
         .as_deref()
@@ -938,6 +985,132 @@ pub async fn watcher_run(config_path: &str, extra_config_path: Option<&str>, nam
     ))
 }
 
+/// `watcher-ctl run <name>` for a `mode=monitor` watcher.
+///
+/// Does NOT spawn anything. If a live instance is already recorded (same
+/// pidfile model `watcher-ctl status` uses) it says so and exits 0 — the
+/// idempotent no-op the main loop's restart cadence expects. Otherwise it
+/// writes `<pid_dir>/<name>.monitor-intent` (epoch + command, so "was arming
+/// ever requested, and with what?" is answerable after the fact) and prints
+/// the Monitor-tool invocation for the MAIN LOOP to arm.
+async fn monitor_arm(entry: &WatcherEntry) -> Result<i32, String> {
+    let cmd = entry.effective_monitor_cmd().ok_or_else(|| {
+        format!(
+            "watcher '{}' is mode=monitor but has neither start_cmd nor monitor_cmd configured",
+            entry.name
+        )
+    })?;
+
+    let pid_dirs = crate::status::watcher_pid_dirs();
+    let (recorded_pid, is_down) = crate::status::watcher_pidfile_liveness_multi(
+        &pid_dirs,
+        &entry.name,
+        entry.start_cmd.as_deref(),
+    );
+    if !is_down {
+        // The pidfile model proves a live instance, not WHICH mode it runs in
+        // (a one-shot started before the flip holds the same `.lock`). Say
+        // exactly that, and how to get from here to an armed monitor.
+        println!(
+            "{} already running (pid {}; a live instance holds its pidfile) — nothing to arm. \
+             If that is the one-shot instance and you want the monitor: `watcher-restart` \
+             (stops it), then `watcher-ctl run {}` again to get the Monitor command.",
+            entry.name,
+            recorded_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+            entry.name
+        );
+        return Ok(0);
+    }
+
+    // Record intent (best-effort: an unwritable pid dir must not block the
+    // instructions from printing).
+    let pid_dir = pid_dir();
+    let _ = std::fs::create_dir_all(&pid_dir);
+    let intent_path = format!("{}/{}.monitor-intent", pid_dir, entry.name);
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let intent_written = std::fs::write(
+        &intent_path,
+        format!("epoch={}\ncommand={}\n", epoch, cmd),
+    )
+    .is_ok();
+
+    print!(
+        "{}",
+        format_monitor_arm_instructions(
+            entry,
+            &cmd,
+            if intent_written {
+                Some(intent_path.as_str())
+            } else {
+                None
+            }
+        )
+    );
+    Ok(0)
+}
+
+/// The shell command string to hand to the line-streaming launcher: the
+/// configured monitor command with stderr merged into stdout (only stdout is
+/// the event stream there; a warning on stderr would be invisible). Idempotent
+/// when the command already merges.
+pub fn monitor_launch_command(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if trimmed.ends_with("2>&1") {
+        trimmed.to_string()
+    } else {
+        format!("{} 2>&1", trimmed)
+    }
+}
+
+/// Pure: the text `watcher-ctl run <name>` prints for a monitor-mode watcher.
+pub fn format_monitor_arm_instructions(
+    entry: &WatcherEntry,
+    cmd: &str,
+    intent_path: Option<&str>,
+) -> String {
+    let layer_note = if entry.overridden.iter().any(|k| k == "mode") {
+        "mode set by the override layer".to_string()
+    } else if entry.layer == crate::status::WATCHER_LAYER_OVERRIDE {
+        "entry defined in the override layer".to_string()
+    } else {
+        "mode set in the base watchers.conf".to_string()
+    };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "[monitor-mode] {} is configured mode=monitor ({}) — NOT exec'ing the one-shot watcher.\n",
+        entry.name, layer_note
+    ));
+    out.push_str(
+        "ARM IT NOW from the main loop with the Monitor tool (not a background Bash task, not `&`):\n",
+    );
+    out.push_str("  Monitor\n");
+    out.push_str(&format!("    command:     {}\n", monitor_launch_command(cmd)));
+    out.push_str(&format!(
+        "    description: {} (monitor-mode watcher)\n",
+        entry.name
+    ));
+    out.push_str("    persistent:  true\n");
+    out.push_str(
+        "Reminder: every stdout line is a notification — read each EVENT[...] line and ACT on it; \
+         the watcher never acks on your behalf. Lines tagged [monitor-mode] are watcher status \
+         (ACTIVE / ALIVE / STOPPED), not events.\n",
+    );
+    out.push_str(&format!(
+        "Stop: TaskStop the monitor, or `watcher-restart` (kills it like any other watcher). \
+         Flip back: set `{}|mode=oneshot` in the override watchers.conf, then \
+         `watcher-ctl run {}` as a background task.\n",
+        entry.name, entry.name
+    ));
+    match intent_path {
+        Some(p) => out.push_str(&format!("intent recorded: {}\n", p)),
+        None => out.push_str("intent NOT recorded (pid dir unwritable)\n"),
+    }
+    out
+}
+
 /// Translate a child `ExitStatus` into a Unix-conventional integer exit code.
 ///
 /// - Normal exit: returns the child's exit code (0..=255).
@@ -978,7 +1151,12 @@ pub fn exit_code_from_status(code: Option<i32>, signal: Option<i32>) -> i32 {
 /// Watchers that must never be disabled (guardrails).
 const PROTECTED_WATCHERS: &[&str] = &["memory-remind"];
 
-pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Result<String, String> {
+pub async fn watcher_toggle(
+    config_path: &str,
+    override_path: Option<&str>,
+    name: &str,
+    enable: bool,
+) -> Result<String, String> {
     if !enable && PROTECTED_WATCHERS.contains(&name) {
         return Err(format!(
             "watcher '{}' is protected and cannot be disabled. \
@@ -987,43 +1165,42 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
         ));
     }
 
+    // The override layer wins over the base file, so flipping `enabled` in
+    // the base while the override pins it would be a silent no-op. Refuse
+    // with a pointer instead of writing a flag that has no effect.
+    if let Some(ov) = override_path {
+        if let Ok(ov_content) = std::fs::read_to_string(ov) {
+            let pins = crate::status::parse_watcher_lines(&ov_content)
+                .iter()
+                .any(|raw| raw.name == name && raw.fields[2].is_some());
+            if pins {
+                return Err(format!(
+                    "watcher '{}': `enabled` is pinned by the override layer ({}) — \
+                     edit it there (e.g. `{}|enabled={}`), not in the base file",
+                    name,
+                    ov,
+                    name,
+                    if enable { "true" } else { "false" }
+                ));
+            }
+        }
+    }
+
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("failed to read config: {}", e))?;
 
-    let new_val = if enable { "true" } else { "false" };
-    let mut found = false;
-    let mut target_pattern = String::new();
-    let mut target_start_cmd = String::new();
-    let mut output_lines = Vec::new();
+    // Resolve pattern/start_cmd from the merged view (so a pattern the
+    // override layer changed is the one we kill on disable).
+    let merged = load_entries(config_path, override_path);
+    let (target_pattern, target_start_cmd) = match merged.iter().find(|e| e.name == name) {
+        Some(e) => (e.pattern.clone(), e.start_cmd.clone().unwrap_or_default()),
+        None => (String::new(), String::new()),
+    };
 
-    for line in content.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
-            output_lines.push(line.to_string());
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() >= 2 && parts[0] == name {
-            found = true;
-            target_pattern = parts[1].to_string();
-            let min_count = parts.get(2).unwrap_or(&"1");
-            let start_cmd = parts.get(4).unwrap_or(&"");
-            target_start_cmd = start_cmd.trim().to_string();
-            output_lines.push(format!(
-                "{}|{}|{}|{}|{}",
-                parts[0], parts[1], min_count, new_val, start_cmd
-            ));
-        } else {
-            output_lines.push(line.to_string());
-        }
-    }
-
-    if !found {
-        return Err(format!("watcher '{}' not found in config", name));
-    }
+    let new_content = rewrite_config_toggle(&content, name, enable)
+        .ok_or_else(|| format!("watcher '{}' not found in config", name))?;
 
     // Write updated config
-    let new_content = output_lines.join("\n") + "\n";
     let mut file =
         std::fs::File::create(config_path).map_err(|e| format!("failed to write config: {}", e))?;
     file.write_all(new_content.as_bytes())
@@ -1227,16 +1404,16 @@ pub fn cmd_list(config_path: &str, extra_config_path: Option<&str>, json: bool) 
                     "min_count": e.min_count,
                     "enabled": e.enabled,
                     "start_cmd": e.start_cmd,
+                    "mode": e.mode.as_str(),
+                    "monitor_cmd": e.effective_monitor_cmd(),
+                    "layer": e.layer,
+                    "overridden": e.overridden,
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&items).unwrap());
     } else {
-        println!("{:<20} {:<8} PATTERN", "NAME", "ENABLED");
-        println!("{:<20} {:<8} -------", "----", "-------");
-        for e in &entries {
-            println!("{:<20} {:<8} {}", e.name, e.enabled, e.pattern);
-        }
+        print!("{}", format_list(&entries, config_path, extra_config_path));
     }
 }
 
@@ -1292,8 +1469,13 @@ pub async fn cmd_run(config_path: &str, extra_config_path: Option<&str>, name: &
 }
 
 /// `claude-watch watcher enable <name>` / `claude-watch watcher disable <name>`
-pub async fn cmd_toggle(config_path: &str, name: &str, enable: bool) -> i32 {
-    match watcher_toggle(config_path, name, enable).await {
+pub async fn cmd_toggle(
+    config_path: &str,
+    extra_config_path: Option<&str>,
+    name: &str,
+    enable: bool,
+) -> i32 {
+    match watcher_toggle(config_path, extra_config_path, name, enable).await {
         Ok(msg) => {
             println!("{}", msg);
             0
@@ -1313,14 +1495,57 @@ pub async fn cmd_restart(config_path: &str, extra_config_path: Option<&str>) {
 
 // --- Pure function tests ---
 
+/// Which config layer decided an entry, for the `SOURCE` column of
+/// `watcher-ctl list`: `base`, `override` (entry introduced there), or
+/// `base+override(<fields>)` naming the fields the override changed.
+pub fn entry_source_label(e: &WatcherEntry) -> String {
+    if e.layer == crate::status::WATCHER_LAYER_OVERRIDE {
+        crate::status::WATCHER_LAYER_OVERRIDE.to_string()
+    } else if e.overridden.is_empty() {
+        crate::status::WATCHER_LAYER_BASE.to_string()
+    } else {
+        format!("base+override({})", e.overridden.join(","))
+    }
+}
+
 /// Pure function: format watcher list output (for testing without I/O).
-#[allow(dead_code)]
-pub fn format_list(entries: &[WatcherEntry]) -> String {
+///
+/// Rows carry the effective values (after the override layer is applied);
+/// the `SOURCE` column says which layer set them, and the trailing `layers:`
+/// block names both files and whether the override is present, so "which
+/// file do I edit to flip this?" is answered by the listing itself.
+pub fn format_list(entries: &[WatcherEntry], base_path: &str, override_path: Option<&str>) -> String {
     let mut out = String::new();
-    out.push_str(&format!("{:<20} {:<8} {}\n", "NAME", "ENABLED", "PATTERN"));
-    out.push_str(&format!("{:<20} {:<8} {}\n", "----", "-------", "-------"));
+    out.push_str(&format!(
+        "{:<20} {:<8} {:<8} {:<24} {}\n",
+        "NAME", "ENABLED", "MODE", "SOURCE", "PATTERN"
+    ));
+    out.push_str(&format!(
+        "{:<20} {:<8} {:<8} {:<24} {}\n",
+        "----", "-------", "----", "------", "-------"
+    ));
     for e in entries {
-        out.push_str(&format!("{:<20} {:<8} {}\n", e.name, e.enabled, e.pattern));
+        out.push_str(&format!(
+            "{:<20} {:<8} {:<8} {:<24} {}\n",
+            e.name,
+            e.enabled,
+            e.mode.as_str(),
+            entry_source_label(e),
+            e.pattern
+        ));
+    }
+    out.push('\n');
+    out.push_str(&format!("layers: base     = {}\n", base_path));
+    match override_path {
+        Some(p) => {
+            let state = if std::path::Path::new(p).is_file() {
+                "active"
+            } else {
+                "absent — base only"
+            };
+            out.push_str(&format!("        override = {} ({})\n", p, state));
+        }
+        None => out.push_str("        override = (disabled: WATCHERS_CONFIG_EXTRA is empty)\n"),
     }
     out
 }
@@ -1365,6 +1590,7 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
     let mut out = String::new();
     let mut all_healthy = true;
     let mut down_names: Vec<String> = Vec::new();
+    let mut down_monitor_names: Vec<String> = Vec::new();
     let mut has_duplicate = false;
     for s in statuses {
         if s.status == "off" {
@@ -1379,13 +1605,20 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
             }
             if s.status == "DOWN" {
                 down_names.push(s.name.clone());
+                if s.mode == "monitor" {
+                    down_monitor_names.push(s.name.clone());
+                }
             }
             if s.status == "DUPLICATE" {
                 has_duplicate = true;
             }
+            // Oneshot rows keep their historical byte-exact shape; a
+            // monitor-mode row carries a trailing ` [monitor]` tag so a
+            // reader knows it is re-ARMED (Monitor tool), not re-run.
+            let mode_tag = if s.mode == "monitor" { "  [monitor]" } else { "" };
             out.push_str(&format!(
-                "{:<20} {:<9} ({}/{})  {}\n",
-                s.name, s.status, s.count, s.required, s.pids
+                "{:<20} {:<9} ({}/{})  {}{}\n",
+                s.name, s.status, s.count, s.required, s.pids, mode_tag
             ));
             // Indented detail lines for duplicates. The 21-space gutter
             // (column 22) lines up under the status column so the output
@@ -1443,12 +1676,26 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
                 names
             ));
         }
+        if !down_monitor_names.is_empty() {
+            out.push_str(&format!(
+                "Monitor-mode watcher(s) DOWN: {} — `watcher-ctl run <name>` does NOT \
+                 exec them; it prints the Monitor-tool command for the main loop to \
+                 re-ARM (persistent: true). Arm it, then read every stdout line.\n",
+                down_monitor_names.join(" ")
+            ));
+        }
     }
     out
 }
 
 /// Pure function: rewrite config content toggling the enabled field for a watcher.
 /// Returns the new config content, or None if the watcher was not found.
+///
+/// Preserves every OTHER field on the line — including the optional trailing
+/// `on_restart_cmd`, `mode` and `monitor_cmd` slots, which the previous
+/// five-field rewrite silently dropped — and handles a keyed `enabled=...`
+/// field in place. A line shorter than four fields is padded so the enabled
+/// slot exists (`name|pat` → `name|pat|1|<val>|`).
 #[allow(dead_code)]
 pub fn rewrite_config_toggle(content: &str, name: &str, enable: bool) -> Option<String> {
     let new_val = if enable { "true" } else { "false" };
@@ -1461,15 +1708,28 @@ pub fn rewrite_config_toggle(content: &str, name: &str, enable: bool) -> Option<
             continue;
         }
 
-        let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() >= 2 && parts[0] == name {
+        let mut parts: Vec<String> = line.split('|').map(|s| s.to_string()).collect();
+        if parts.len() >= 2 && parts[0].trim() == name {
             found = true;
-            let min_count = parts.get(2).unwrap_or(&"1");
-            let start_cmd = parts.get(4).unwrap_or(&"");
-            output_lines.push(format!(
-                "{}|{}|{}|{}|{}",
-                parts[0], parts[1], min_count, new_val, start_cmd
-            ));
+            if let Some(keyed) = parts
+                .iter_mut()
+                .skip(1)
+                .find(|f| f.trim().starts_with("enabled="))
+            {
+                *keyed = format!("enabled={}", new_val);
+            } else {
+                while parts.len() < 3 {
+                    parts.push("1".to_string());
+                }
+                if parts.len() < 4 {
+                    parts.push(new_val.to_string());
+                    // Keep the historical 5-field shape for a minimal line.
+                    parts.push(String::new());
+                } else {
+                    parts[3] = new_val.to_string();
+                }
+            }
+            output_lines.push(parts.join("|"));
         } else {
             output_lines.push(line.to_string());
         }
@@ -1682,6 +1942,8 @@ mod tests {
                 enabled: true,
                 start_cmd: Some("alerts-watcher".to_string()),
                 on_restart_cmd: None,
+                layer: "base".to_string(),
+                ..Default::default()
             },
             WatcherEntry {
                 name: "torrent".to_string(),
@@ -1690,13 +1952,96 @@ mod tests {
                 enabled: false,
                 start_cmd: None,
                 on_restart_cmd: None,
+                mode: WatcherMode::Monitor,
+                layer: "base".to_string(),
+                overridden: vec!["mode".to_string(), "enabled".to_string()],
+                ..Default::default()
             },
         ];
-        let output = format_list(&entries);
+        let output = format_list(&entries, "/etc/x/watchers.conf", Some("/nonexistent/override.conf"));
         assert!(output.contains("alerts"));
         assert!(output.contains("torrent"));
         assert!(output.contains("true"));
         assert!(output.contains("false"));
+        // Mode + which-layer-won are visible per row, and both layer paths
+        // are named in the footer (override reported absent here).
+        assert!(output.contains("MODE"), "header has MODE column: {}", output);
+        assert!(output.contains("SOURCE"), "header has SOURCE column: {}", output);
+        let torrent_row = output.lines().find(|l| l.starts_with("torrent")).unwrap();
+        assert!(torrent_row.contains("monitor"), "row shows mode: {}", torrent_row);
+        assert!(
+            torrent_row.contains("base+override(mode,enabled)"),
+            "row names the overriding layer + fields: {}",
+            torrent_row
+        );
+        let alerts_row = output.lines().find(|l| l.starts_with("alerts")).unwrap();
+        assert!(alerts_row.contains("oneshot"), "{}", alerts_row);
+        assert!(alerts_row.contains(" base "), "{}", alerts_row);
+        assert!(output.contains("base     = /etc/x/watchers.conf"));
+        assert!(output.contains("override = /nonexistent/override.conf (absent"));
+    }
+
+    #[test]
+    fn test_format_list_override_layer_disabled() {
+        let output = format_list(&[], "/etc/x/watchers.conf", None);
+        assert!(output.contains("override = (disabled"), "{}", output);
+    }
+
+    #[test]
+    fn test_monitor_arm_instructions_shape() {
+        let e = WatcherEntry {
+            name: "claude-event-watch".to_string(),
+            pattern: "bin/claude-event-watch".to_string(),
+            min_count: 1,
+            enabled: true,
+            start_cmd: Some("claude-event-watch --debounce 60 --quiet 10".to_string()),
+            mode: WatcherMode::Monitor,
+            layer: "base".to_string(),
+            overridden: vec!["mode".to_string()],
+            ..Default::default()
+        };
+        let cmd = e.effective_monitor_cmd().unwrap();
+        assert_eq!(cmd, "claude-event-watch --debounce 60 --quiet 10 --mode monitor");
+        let text = format_monitor_arm_instructions(&e, &cmd, Some("/run/x/claude-event-watch.monitor-intent"));
+        // The exact command string the main loop must arm, stderr merged.
+        assert!(
+            text.contains("command:     claude-event-watch --debounce 60 --quiet 10 --mode monitor 2>&1"),
+            "{}",
+            text
+        );
+        assert!(text.contains("persistent:  true"), "{}", text);
+        assert!(text.contains("Monitor"), "{}", text);
+        assert!(text.contains("read each EVENT[...] line and ACT"), "{}", text);
+        assert!(text.contains("mode set by the override layer"), "{}", text);
+        assert!(text.contains("intent recorded: /run/x/claude-event-watch.monitor-intent"), "{}", text);
+        // Explicit monitor_cmd wins over the derived `--mode monitor` form,
+        // and an already-merged stderr is not doubled.
+        let e2 = WatcherEntry {
+            monitor_cmd: Some("my-watch --stream 2>&1".to_string()),
+            ..e.clone()
+        };
+        assert_eq!(e2.effective_monitor_cmd().unwrap(), "my-watch --stream 2>&1");
+        assert_eq!(monitor_launch_command("my-watch --stream 2>&1"), "my-watch --stream 2>&1");
+    }
+
+    #[test]
+    fn test_format_status_monitor_row_tag_and_recovery_hint() {
+        let mut up = ok_status("evw", 1, 1, "4242");
+        up.mode = "monitor".to_string();
+        let out = format_status(&[up], false);
+        let row = out.lines().next().unwrap();
+        assert!(row.contains("ok"), "{}", row);
+        assert!(row.ends_with("[monitor]"), "monitor row is tagged: {}", row);
+        assert!(out.contains("All watchers healthy."));
+        // Oneshot rows are byte-for-byte unchanged (no tag).
+        let plain = format_status(&[ok_status("sig", 1, 1, "7")], false);
+        assert!(!plain.contains("[monitor]"));
+
+        let mut down = down_status("evw", 1);
+        down.mode = "monitor".to_string();
+        let out = format_status(&[down], false);
+        assert!(out.contains("Monitor-mode watcher(s) DOWN: evw"), "{}", out);
+        assert!(out.contains("re-ARM"), "{}", out);
     }
 
     /// Test helper: build a healthy `ok` watcher status.
@@ -1708,6 +2053,7 @@ mod tests {
             required,
             pids: pids.to_string(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: Vec::new(),
             dup_pollers: Vec::new(),
         }
@@ -1722,6 +2068,7 @@ mod tests {
             required,
             pids: String::new(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: Vec::new(),
             dup_pollers: Vec::new(),
         }
@@ -1756,6 +2103,7 @@ mod tests {
             required: 1,
             pids: String::new(),
             enabled: false,
+            mode: "oneshot".to_string(),
             dup_supervisors: Vec::new(),
             dup_pollers: Vec::new(),
         }];
@@ -1774,6 +2122,7 @@ mod tests {
             required: 1,
             pids: String::new(),
             enabled: false,
+            mode: "oneshot".to_string(),
             dup_supervisors: Vec::new(),
             dup_pollers: Vec::new(),
         }
@@ -1890,12 +2239,35 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_config_preserves_trailing_fields() {
+        // on_restart_cmd (6th), mode (7th) and monitor_cmd (8th) must survive
+        // a toggle — the old 5-field rewrite silently dropped them.
+        let config = "evw|bin/evw|1|true|evw --quiet 10|hist --since 5m|monitor|evw --stream\n";
+        let result = rewrite_config_toggle(config, "evw", false).unwrap();
+        assert_eq!(
+            result,
+            "evw|bin/evw|1|false|evw --quiet 10|hist --since 5m|monitor|evw --stream\n"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_config_keyed_enabled_field() {
+        let config = "evw|bin/evw|mode=monitor|enabled=true\n";
+        let result = rewrite_config_toggle(config, "evw", false).unwrap();
+        assert_eq!(result, "evw|bin/evw|mode=monitor|enabled=false\n");
+    }
+
+    #[test]
     fn test_format_list_empty() {
         let entries: Vec<WatcherEntry> = vec![];
-        let output = format_list(&entries);
+        let output = format_list(&entries, "/tmp/base.conf", Some("/tmp/nope.conf"));
         assert!(output.contains("NAME"));
-        // Just headers, no entries
-        assert_eq!(output.lines().count(), 2);
+        // Two header lines, a blank separator, then the two `layers:` lines.
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 5, "{:?}", lines);
+        assert!(lines[0].starts_with("NAME"));
+        assert!(lines[1].starts_with("----"));
+        assert!(lines[3].starts_with("layers:"));
     }
 
     // --- DUPLICATE detection tests -------------------------
@@ -1916,6 +2288,7 @@ mod tests {
             required: 1,
             pids: "111 222 333".to_string(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: Vec::new(),
             dup_pollers: vec![111, 222, 333],
         }];
@@ -1945,6 +2318,7 @@ mod tests {
             required: 1,
             pids: "783136".to_string(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: vec![358036, 359170, 705775, 761576],
             dup_pollers: Vec::new(),
         }];
@@ -1970,6 +2344,7 @@ mod tests {
             required: 1,
             pids: "100 200".to_string(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: vec![10, 20],
             dup_pollers: vec![100, 200],
         }];
@@ -1991,6 +2366,7 @@ mod tests {
             required: 1,
             pids: String::new(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: vec![10, 20],
             dup_pollers: Vec::new(),
         }];
@@ -2015,6 +2391,7 @@ mod tests {
             required: 1,
             pids: "1 2".to_string(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: Vec::new(),
             dup_pollers: vec![1, 2],
         }];
@@ -2036,6 +2413,7 @@ mod tests {
             required: 1,
             pids: String::new(),
             enabled: false,
+            mode: "oneshot".to_string(),
             dup_supervisors: Vec::new(),
             dup_pollers: Vec::new(),
         }];
@@ -2054,6 +2432,7 @@ mod tests {
             required: 1,
             pids: "1 2".to_string(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: vec![3, 4],
             dup_pollers: vec![1, 2],
         }];
@@ -2083,6 +2462,7 @@ mod tests {
             required: 1,
             pids: "111 222 333".to_string(),
             enabled: true,
+            mode: "oneshot".to_string(),
             dup_supervisors: Vec::new(),
             dup_pollers: vec![111, 222, 333],
         }];
@@ -2169,6 +2549,7 @@ mod tests {
                 required: 1,
                 pids: "111 222 333".to_string(),
                 enabled: true,
+                mode: "oneshot".to_string(),
                 dup_supervisors: Vec::new(),
                 dup_pollers: vec![111, 222, 333],
             },
@@ -2250,7 +2631,7 @@ mod tests {
         )
         .unwrap();
 
-        let msg = watcher_toggle(cfg.to_str().unwrap(), "toggle-test", true)
+        let msg = watcher_toggle(cfg.to_str().unwrap(), None, "toggle-test", true)
             .await
             .expect("enable should succeed for a known watcher");
         // Config-only flip — no `started, pid` substring, which was the
@@ -2294,7 +2675,7 @@ mod tests {
         )
         .unwrap();
 
-        let _ = watcher_toggle(cfg.to_str().unwrap(), "toggle-test", true)
+        let _ = watcher_toggle(cfg.to_str().unwrap(), None, "toggle-test", true)
             .await
             .expect("enable should succeed");
 
@@ -2655,7 +3036,10 @@ mod tests {
             let prev_cfg_extra = std::env::var("WATCHERS_CONFIG_EXTRA").ok();
             std::env::set_var("CLAUDE_WATCH_PID_DIR", pid_dir);
             std::env::set_var("WATCHERS_CONFIG", cfg);
-            std::env::remove_var("WATCHERS_CONFIG_EXTRA");
+            // Empty = explicitly no override layer (an UNSET var would resolve
+            // to the real `$XDG_CONFIG_HOME/watchmen/watchers.override.conf`
+            // and let a developer's own override leak into the test config).
+            std::env::set_var("WATCHERS_CONFIG_EXTRA", "");
             RunEnv {
                 _lock: lock,
                 prev_pid_dir,
@@ -2714,6 +3098,47 @@ mod tests {
             (u32::MAX - 1).to_string(),
             "stale PID file should have been overwritten by a real start"
         );
+    }
+
+    /// `watcher_run` for a `mode=monitor` watcher must NOT exec the start_cmd:
+    /// it records the arm intent (command included) and returns 0. The
+    /// override layer is what flips the mode here — the base line is a plain
+    /// oneshot entry — so this also pins "one line in the override file is
+    /// the whole flip".
+    #[tokio::test]
+    async fn test_watcher_run_monitor_mode_prints_arm_and_does_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        let ov = dir.path().join("watchers.override.conf");
+        let sentinel = format!("cw-runtest-monitor-{}", unique_token("w"));
+        let script = make_poller_script(dir.path(), &sentinel, "30");
+        std::fs::write(&cfg, format!("runtest|{}|1|true|{} --quiet 10\n", sentinel, script)).unwrap();
+        std::fs::write(&ov, "runtest|mode=monitor\n").unwrap();
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        std::env::set_var("WATCHERS_CONFIG_EXTRA", ov.to_str().unwrap());
+
+        let code = watcher_run(&config_path(), config_path_extra().as_deref(), "runtest")
+            .await
+            .expect("monitor-mode run should succeed");
+        assert_eq!(code, 0);
+
+        // Intent recorded with the exact command to arm.
+        let intent = std::fs::read_to_string(pid_dir.join("runtest.monitor-intent"))
+            .expect("monitor intent file written");
+        assert!(intent.contains("epoch="), "{}", intent);
+        assert!(
+            intent.contains(&format!("command={} --quiet 10 --mode monitor", script)),
+            "{}",
+            intent
+        );
+        // Nothing was spawned: no pid file, no live poller matching the sentinel.
+        assert!(!pid_dir.join("runtest.pid").exists(), "monitor mode must not claim the one-shot pid slot");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let pids = process_pids(&sentinel).await;
+        assert!(pids.is_empty(), "monitor mode must not exec the start_cmd, found {:?}", pids);
     }
 
     /// `watcher_run` for a watcher with no PID file and no poller → starts.
