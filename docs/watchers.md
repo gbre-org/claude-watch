@@ -53,6 +53,17 @@ intent. The Monitor call itself (exactly the printed command) passes every
 obligations gate via the `MonitorArm` exempt — see
 [`tools/obligations/README.md`](../tools/obligations/README.md).
 
+**Monitor-mode replies must surface the event.** Under the Monitor tool the
+terminal collapses every delivery to the Monitor's static description, so
+the main loop's own one-line reply is the only human-visible trace of what
+was read. When acting on an item line (`EVENT[...]` / `BOTCHAT[...]` /
+`SIGNAL[...]`), quote its lead (the text after the prefix, ~80 chars) plus
+what was done — never a bare "Acknowledged" / "Idle". Bad: `Liveness ping —
+status only. Idle.` Good: `EVENT[claude-watch/heartbeat-tick] heartbeat tick
+— touched the heartbeat file; nothing pending.` The arm text and
+`claude-event-watch`'s `[monitor-mode] REPLY RULE:` banner line both restate
+this.
+
 The daemon's only emergency action is **tmux-injecting** a
 `watcher-ctl run <name>` line into the main loop's pane, so the main
 loop re-spawns the watcher itself. If anything else spawns the watcher,
