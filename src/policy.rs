@@ -5464,8 +5464,6 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         stuck_stale_minutes = Some(age_min);
                         state.heartbeat_stale_count += 1;
                     }
-                }
-            }
         }
         // No liveness signal available (neither last-ack nor heartbeat_file) --
         // give it time. This is the fresh-boot / early-daemon-start case.
