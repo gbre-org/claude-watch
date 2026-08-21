@@ -110,7 +110,7 @@ pub fn build_event_json(alert: &ClaudeWatchAlert<'_>) -> serde_json::Value {
     let user = std::env::var("USER").unwrap_or_default();
     let pid = std::process::id();
 
-    serde_json::json!({
+    let mut event = serde_json::json!({
         "timestamp": now,
         "timestamp_iso": now_iso,
         "hostname": hostname,
@@ -128,7 +128,20 @@ pub fn build_event_json(alert: &ClaudeWatchAlert<'_>) -> serde_json::Value {
         },
         "pid": pid,
         "user": user,
-    })
+    });
+    // Producer-stamped routing tier (rung 2 in the classifier precedence).
+    // The alert-path watcher-down emission ships tag="claude-watch-alert" with
+    // data.alert_type="watcher-down"; without an explicit tier it routes
+    // through the claude-watch-alert NON-FATAL ambient row, so a down watcher
+    // surfaces only as passive context and a busy main loop never relaunches
+    // it (comms watcher down ~4h, incident 2026-08-21). claude-event-watch
+    // forwards data.tier to `event-ack ingest --tier`, so stamping it here
+    // routes watcher-down ACTIONABLE. Other alert_types keep their existing
+    // (conditional-fatal / ambient) classification.
+    if alert.alert_type == "watcher-down" {
+        event["data"]["tier"] = serde_json::Value::from("actionable");
+    }
+    event
 }
 
 /// Resolve the queue dir. Honors `CLAUDE_EVENT_QUEUE` (preferred) and
@@ -584,6 +597,10 @@ mod tests {
         assert_eq!(data["severity"], "high");
         assert!(data["affected_watchers"].is_array());
         assert_eq!(data["affected_watchers"].as_array().unwrap().len(), 0);
+        // Only watcher-down is producer-stamped actionable; other alert
+        // types (here heartbeat-stale) carry no data.tier and keep their
+        // existing conditional/ambient classification.
+        assert!(data["tier"].is_null());
     }
 
     #[test]
@@ -606,6 +623,11 @@ mod tests {
         assert_eq!(watchers[0], "alerts-watcher");
         assert_eq!(watchers[1], "torrent-wait");
         assert_eq!(v["priority"], "normal");
+        // Producer-stamped routing tier: watcher-down must ship
+        // data.tier=actionable so it routes to the actionable pending
+        // list, not the claude-watch-alert ambient row (incident
+        // 2026-08-21).
+        assert_eq!(v["data"]["tier"], "actionable");
     }
 
     #[test]

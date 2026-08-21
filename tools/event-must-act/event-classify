@@ -368,6 +368,25 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
     ("queue", "queue-stale-ready", None, ACTIONABLE,
         "Queue item ready but stale; needs spawn/abandon decision."),
 
+    # watcher-down -> the main loop MUST relaunch the named watcher. The daemon
+    # (src/policy.rs watcher_monitor) emits this on the bus when a session
+    # watcher (the botchat / claude-event-watch watchers) has been DOWN past
+    # threshold.
+    # Routing it ambient (the old claude-watch/* catch-all) meant a down comms
+    # watcher surfaced only as passive context and the busy main loop never
+    # relaunched it -- the comms watcher sat DOWN ~4h with Andrew's messages
+    # unsurfaced (incident 2026-08-21). Actionable so it lands on the pending
+    # list + N-call gate and DRIVES a `watcher-ctl run <name>` relaunch. The
+    # daemon ALSO stamps data.tier=actionable (producer rung wins); this row is
+    # the consumer-side fallback and MUST precede the claude-watch/* ambient
+    # catch-all. NOTE: the daemon's OTHER watcher-down emission path
+    # (alert::emit_event) ships tag="claude-watch-alert" with
+    # data.alert_type="watcher-down" and relies on the producer-stamped
+    # data.tier, not this tag rule.
+    ("claude-watch", "watcher-down", None, ACTIONABLE,
+        "Watcher DOWN; relaunch it now with `watcher-ctl run <name>` "
+        "(name in the message / data.watcher)."),
+
     # heartbeat-tick -> the main loop MUST refresh the heartbeat file named
     # in the event's `data.path` (surfaced on the EVENT[] one-liner as
     # `path=`). The file is the daemon's wedge-detector: if the idle loop
@@ -773,6 +792,10 @@ def _self_test() -> int:
         # heartbeat-tick is actionable (touch the file), and must win over
         # the claude-watch/* ambient catch-all below it.
         (("claude-watch", "heartbeat-tick", "heartbeat tick"), ACTIONABLE),
+        # watcher-down is actionable (relaunch the watcher) and MUST win over
+        # the claude-watch/* ambient catch-all (incident 2026-08-21).
+        (("claude-watch", "watcher-down", "Watcher DOWN"),
+            ACTIONABLE),
         # queue-orphaned / queue-stuck are actionable (respawn/resurrect the
         # item) and MUST win over the claude-watch/* ambient catch-all. These
         # are the events `claude-watch queue-check` emits; routing them ambient

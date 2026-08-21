@@ -778,6 +778,51 @@ pub(crate) fn stuck_suppressed_by_activity(workload_fresh: bool, active_subagent
     workload_fresh || active_subagents > 0
 }
 
+/// Pure predicate: given the heartbeat-stale proof-of-life inputs, return the
+/// reason to SUPPRESS the stuck flag this cycle, or `None` to let it fire.
+///
+/// Extends [`stuck_suppressed_by_activity`] with two INDEPENDENT liveness
+/// signals the daemon already tracks, decoupling host-heartbeat freshness from
+/// event-bus tick DELIVERY. The host heartbeat file is refreshed by the main
+/// loop only when it PROCESSES a `heartbeat-tick` claude-event (runs
+/// `heartbeat-ack`) -- which needs (a) the event bus to deliver the tick AND
+/// (b) the loop to reach a tool-call boundary. Both premises fail while the
+/// loop is ALIVE: a long single turn (prolonged thinking, no tool calls) or a
+/// stalled bus (claude-event-watch itself down) starves the heartbeat even
+/// though nothing is wedged, firing a FALSE "heartbeat stale" alert (incident
+/// 2026-08-21: 25min + 40min false stale while the loop was thinking).
+///
+/// So when the daemon has its OWN evidence the loop is alive -- an active
+/// thinking episode (`loop_thinking`) or a tool call running / run within the
+/// active window (`actively_turning`) -- a stale heartbeat file is NOT a wedge
+/// and the stuck flag is suppressed. A genuinely wedged session shows NEITHER
+/// signal (idle pane, no thinking, no tool activity, no live subagents, no
+/// fresh workload heartbeat), so real wedge detection is preserved. The
+/// "thinking forever" case is independently covered by prolonged-thinking
+/// detection + its own token-progress rearm, so deferring to it here loses no
+/// coverage. Kept pure (no /proc, no Config) so it is unit-testable.
+pub(crate) fn heartbeat_stale_liveness_reason(
+    workload_fresh: bool,
+    active_subagents: u32,
+    loop_thinking: bool,
+    actively_turning: bool,
+) -> Option<&'static str> {
+    if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
+        return Some(if workload_fresh {
+            "workload_heartbeat_fresh"
+        } else {
+            "active_subagents"
+        });
+    }
+    if loop_thinking {
+        return Some("loop_thinking");
+    }
+    if actively_turning {
+        return Some("loop_actively_turning");
+    }
+    None
+}
+
 /// Reason a force-inject escalation should fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EscalationReason {
@@ -1054,6 +1099,15 @@ async fn emit_watcher_down_event(
     let watcher_kv = format!("watcher={}", watcher);
     let consec_kv = format!("consecutive_missing={}", consecutive_missing);
     let pid_kv = format!("recorded_pid={}", pid_str);
+    // Producer-stamped routing tier (rung 2 in the classifier precedence): a
+    // down watcher DEMANDS a relaunch, so route it to the ACTIONABLE pending
+    // list + N-call gate rather than ambient context. Without this the event
+    // fell through the classifier's `claude-watch/* -> ambient` catch-all and a
+    // busy main loop never relaunched the watcher (comms watcher down ~4h,
+    // incident 2026-08-21). claude-event-watch forwards data.tier to
+    // `event-ack ingest --tier`, so this producer stamp wins over the
+    // consumer-side table.
+    let tier_kv = "tier=actionable";
     let args: Vec<&str> = vec![
         cli,
         &message,
@@ -1071,6 +1125,8 @@ async fn emit_watcher_down_event(
         &consec_kv,
         "--data",
         &pid_kv,
+        "--data",
+        tier_kv,
     ];
 
     // 5s timeout — claude-event is a tiny Python script that should complete
@@ -5298,18 +5354,33 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     let workload_fresh = workload_heartbeat_suppresses_stuck(config);
                     let active_subagents =
                         crate::respawn::count_alive_subagents();
-                    if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
+                    // Independent proof-of-life signals the daemon already
+                    // tracks, so host-heartbeat freshness is decoupled from
+                    // event-bus tick DELIVERY (incident 2026-08-21): a live
+                    // loop in a long turn / with a stalled bus starves the
+                    // heartbeat without being wedged. `thinking_start` is set
+                    // by the foreground thinking detector (cleared when idle),
+                    // so `is_some()` ~= "the model is mid-generation now".
+                    let loop_thinking = state.thinking_start.is_some();
+                    let actively_turning = main_loop_actively_turning(
+                        state,
+                        bashes,
+                        config.watcher_monitor.active_window_secs,
+                    );
+                    if let Some(reason) = heartbeat_stale_liveness_reason(
+                        workload_fresh,
+                        active_subagents,
+                        loop_thinking,
+                        actively_turning,
+                    ) {
                         let age_min = age / 60;
-                        let reason = if workload_fresh {
-                            "workload_heartbeat_fresh"
-                        } else {
-                            "active_subagents"
-                        };
                         debug!(
                             stale_age_min = age_min,
                             threshold_min = config.heartbeat.stale_minutes,
                             workload_fresh,
                             active_subagents,
+                            loop_thinking,
+                            actively_turning,
                             reason,
                             "heartbeat-stale suppressed (proof-of-life)"
                         );
@@ -5322,6 +5393,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                                 "reason": reason,
                                 "workload_fresh": workload_fresh,
                                 "active_subagents": active_subagents,
+                                "loop_thinking": loop_thinking,
+                                "actively_turning": actively_turning,
                                 "dir": &config.stuck_detection.workload_heartbeat_dir,
                                 "max_age_secs": config.stuck_detection.workload_heartbeat_max_age_secs,
                             }),
@@ -10677,6 +10750,43 @@ pane_unchanged_secs = 600
         assert!(
             stuck_suppressed_by_activity(true, 3),
             "both conditions must suppress"
+        );
+    }
+
+    #[test]
+    fn heartbeat_stale_liveness_reason_truth_table() {
+        // No proof-of-life at all -> None (stuck may fire = genuine wedge).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, false, false),
+            None,
+            "idle+not-thinking+no-activity must let the stuck flag fire"
+        );
+        // Pre-existing signals still win, with their original reason strings.
+        assert_eq!(
+            heartbeat_stale_liveness_reason(true, 0, false, false),
+            Some("workload_heartbeat_fresh")
+        );
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 2, false, false),
+            Some("active_subagents")
+        );
+        // NEW: an active thinking episode is independent proof-of-life ->
+        // suppress the false stale (the incident case: loop thinking in a
+        // long turn, heartbeat starved because no tool call processed a tick).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, true, false),
+            Some("loop_thinking")
+        );
+        // NEW: actively turning (tool call running / recent) also suppresses.
+        assert_eq!(
+            heartbeat_stale_liveness_reason(false, 0, false, true),
+            Some("loop_actively_turning")
+        );
+        // Precedence: workload/subagents outrank the new signals (stable
+        // reason string for existing log consumers).
+        assert_eq!(
+            heartbeat_stale_liveness_reason(true, 1, true, true),
+            Some("workload_heartbeat_fresh")
         );
     }
 
