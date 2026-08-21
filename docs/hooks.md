@@ -181,7 +181,7 @@ surface).
 | `no_output_consumed {commands, redirect_mode?, include_substitution?}` | BAN, fully AST-based — deny when a command whose HEAD matches `commands` (literal names or globs like `botchat-*`) has its stdout piped, redirected (`redirect_mode`: `devnull` default / `any` / `none`), or captured by `$(...)`. A mention as an argument or inside a string never matches. Unparseable command → DENY (fail-closed). |
 | `process_alive {pid_file}` | PID in file is alive |
 | `process_in_pgrep {pattern}` | pattern matches via `pgrep -f` |
-| `watchers_healthy {}` | `watcher-status --unhealthy-only` is empty |
+| `watchers_healthy {}` | `watcher-status --unhealthy-only` is empty (a monitor-mode watcher in its `ARMING` window — fresh `<name>.monitor-intent` from `watcher-ctl run`, Monitor not live yet — is healthy-pending, not unhealthy). The Monitor call that ARMS a configured monitor-mode watcher passes this gate via the `MonitorArm` universal exempt (see the obligations README) |
 | `is_main_loop {negate?}` | main-loop call vs subagent (scope guard) |
 | `agent_inbox_empty {path}` | `agent-msg` inbox has no unread messages |
 | `stale_ready_queue_present {threshold_secs?, queue_path?}` | BAN — true iff NO ready-now queue item has been waiting `>= threshold_secs` (default 300s). Failure carries the offending ids in `why`. |
@@ -309,7 +309,10 @@ env-var pollution.
 If the `obligations` CLI is missing, JSON parse fails, or any internal
 error happens, the hook logs to `~/.config/claude/obligations-hook-errors.log`
 and allows the call. Same semantics for `watchers_healthy` if
-`watcher-status` is missing or hangs.
+`watcher-status` is missing or hangs. The one deliberate exception is the
+`MonitorArm` exempt, which is fail-CLOSED: if `watcher-ctl list --json`
+is missing or unparseable the arm is simply not exempt (the gate stands,
+`obligations override` remains) — an exemption must never widen on error.
 
 ## Tests
 

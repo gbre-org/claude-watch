@@ -1809,6 +1809,91 @@ pub(crate) fn watcher_cleanly_exited_recently(
     }
 }
 
+/// Age (seconds) of the freshest `<name>.monitor-intent` for `name` across
+/// ALL candidate dirs, or `None` if no intent file exists.
+///
+/// `watcher-ctl run <name>` writes this file for a `mode=monitor` watcher
+/// instead of exec'ing it (`epoch=<secs>\ncommand=<monitor_cmd>\n`) and
+/// prints the Monitor-tool command for the main loop to arm. The `epoch=`
+/// line is the authoritative timestamp (it is what the writer meant); the
+/// file mtime is the fallback for a hand-written or truncated file. A
+/// future-dated value (clock skew) clamps to 0 so skew can never
+/// manufacture a stale reading (mirrors `watcher_runtime_file_age_secs`).
+///
+/// Pure-ish: filesystem reads only, no `pgrep` / `/proc`.
+pub(crate) fn watcher_monitor_intent_age_secs_multi(dirs: &[String], name: &str) -> Option<f64> {
+    let now = SystemTime::now();
+    let now_epoch = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    dirs.iter()
+        .filter_map(|d| {
+            let path = format!("{}/{}.monitor-intent", d, name);
+            let meta = std::fs::metadata(&path).ok()?;
+            let from_epoch = std::fs::read_to_string(&path).ok().and_then(|body| {
+                body.lines()
+                    .find_map(|l| l.strip_prefix("epoch="))
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .map(|e| (now_epoch - e).max(0.0))
+            });
+            from_epoch.or_else(|| {
+                meta.modified().ok().map(|mtime| {
+                    now.duration_since(mtime)
+                        .map(|x| x.as_secs_f64())
+                        .unwrap_or(0.0)
+                })
+            })
+        })
+        .fold(None, |acc, age| Some(acc.map_or(age, |cur: f64| cur.min(age))))
+}
+
+/// Pure decision: is a `mode=monitor` watcher that currently has NO live pid
+/// in its ARMING window (healthy-pending, not DOWN)?
+///
+/// ARMING iff an arm intent exists (`intent_age`), it is younger than
+/// `arming_grace_secs`, AND no runtime file (`.lock`/`.pid`/`.runlock`,
+/// `pidfile_age`) has been written SINCE the intent. The last clause is what
+/// keeps a real outage visible: the monitor's flock guard rewrites
+/// `<name>.lock` when it goes live, so a runtime file YOUNGER than the intent
+/// proves the arm was consumed — if the watcher is down after that, it DIED
+/// and must read DOWN at once, not ride out the rest of the window. A runtime
+/// file OLDER than the intent (left over from the one-shot era, or a stale
+/// lock `watcher-restart` did not clean) does not consume it.
+///
+/// `arming_grace_secs <= 0` disables the state entirely (an un-armed monitor
+/// reads DOWN immediately, the pre-ARMING behaviour).
+pub(crate) fn watcher_is_arming(
+    intent_age: Option<f64>,
+    pidfile_age: Option<f64>,
+    arming_grace_secs: f64,
+) -> bool {
+    if arming_grace_secs <= 0.0 {
+        return false;
+    }
+    match intent_age {
+        Some(ia) if ia < arming_grace_secs => pidfile_age.is_none_or(|pf| pf > ia),
+        _ => false,
+    }
+}
+
+/// Resolve the monitor-mode ARMING grace for a ONE-SHOT CLI call
+/// (`watcher-ctl status` / `watcher-status --unhealthy-only`, which do not
+/// carry the daemon's `Config`). Order: `$CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS`
+/// (non-empty, parseable) → `[watcher_monitor].monitor_arming_grace_secs`
+/// from the layered config if one loads → the code default. The daemon
+/// passes its own config value directly and never calls this.
+pub(crate) fn resolve_monitor_arming_grace_secs() -> f64 {
+    if let Ok(v) = std::env::var("CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            return n as f64;
+        }
+    }
+    crate::config::try_load_config()
+        .map(|c| c.watcher_monitor.monitor_arming_grace_secs)
+        .unwrap_or(crate::config::DEFAULT_MONITOR_ARMING_GRACE_SECS) as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1952,6 +2037,95 @@ mod tests {
         assert!(watcher_in_grace(Some(10.0), None, grace));
         // Fresh pidfile alone keeps it in grace (the new anchor).
         assert!(watcher_in_grace(None, Some(10.0), grace));
+    }
+
+    // --- monitor-mode ARMING grace tests ---
+
+    #[test]
+    fn arming_true_for_fresh_unconsumed_intent() {
+        // Intent written 5s ago, no runtime file at all: the main loop just
+        // ran `watcher-ctl run` and has not armed the Monitor yet.
+        assert!(watcher_is_arming(Some(5.0), None, 120.0));
+        // A runtime file OLDER than the intent (stale one-shot lock) does not
+        // consume the intent.
+        assert!(watcher_is_arming(Some(5.0), Some(3600.0), 120.0));
+    }
+
+    #[test]
+    fn arming_false_when_intent_stale_or_missing() {
+        // Past the grace window with nothing live -> DOWN again.
+        assert!(!watcher_is_arming(Some(121.0), None, 120.0));
+        assert!(!watcher_is_arming(Some(120.0), None, 120.0));
+        // No intent was ever recorded -> plain DOWN.
+        assert!(!watcher_is_arming(None, None, 120.0));
+        assert!(!watcher_is_arming(None, Some(1.0), 120.0));
+    }
+
+    #[test]
+    fn arming_false_when_runtime_file_is_younger_than_intent() {
+        // The monitor went live AFTER the intent (its flock guard rewrote
+        // <name>.lock) and is now dead: that is a real outage, not an arm in
+        // progress — must NOT ride out the rest of the window as ARMING.
+        assert!(!watcher_is_arming(Some(60.0), Some(10.0), 120.0));
+        // Equal ages are treated as consumed too (not strictly older).
+        assert!(!watcher_is_arming(Some(10.0), Some(10.0), 120.0));
+    }
+
+    #[test]
+    fn arming_disabled_when_grace_is_zero() {
+        assert!(!watcher_is_arming(Some(1.0), None, 0.0));
+        assert!(!watcher_is_arming(Some(0.0), None, 0.0));
+    }
+
+    #[test]
+    fn monitor_intent_age_prefers_epoch_line_and_takes_freshest_across_dirs() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Dir 1: intent stamped 500s ago (epoch line wins over the fresh mtime).
+        std::fs::write(
+            d1.path().join("evw.monitor-intent"),
+            format!("epoch={}\ncommand=evw --mode monitor\n", now - 500),
+        )
+        .unwrap();
+        // Dir 2: intent stamped 30s ago.
+        std::fs::write(
+            d2.path().join("evw.monitor-intent"),
+            format!("epoch={}\ncommand=evw --mode monitor\n", now - 30),
+        )
+        .unwrap();
+        let dirs = vec![
+            d1.path().to_str().unwrap().to_string(),
+            d2.path().to_str().unwrap().to_string(),
+        ];
+        let age = watcher_monitor_intent_age_secs_multi(&dirs, "evw").expect("intent present");
+        assert!((29.0..35.0).contains(&age), "freshest intent wins: {}", age);
+        // Single stale dir alone reads ~500.
+        let age1 = watcher_monitor_intent_age_secs_multi(&dirs[..1], "evw").unwrap();
+        assert!((499.0..505.0).contains(&age1), "{}", age1);
+        // Unknown watcher / no file -> None.
+        assert!(watcher_monitor_intent_age_secs_multi(&dirs, "nope").is_none());
+    }
+
+    #[test]
+    fn monitor_intent_age_falls_back_to_mtime_without_epoch_line() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("evw.monitor-intent"), "command=evw --mode monitor\n")
+            .unwrap();
+        let dirs = vec![d.path().to_str().unwrap().to_string()];
+        let age = watcher_monitor_intent_age_secs_multi(&dirs, "evw").expect("intent present");
+        assert!(age < 5.0, "just-written file reads fresh via mtime: {}", age);
+        // A future-dated epoch clamps to 0, never negative.
+        let far = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 10_000;
+        std::fs::write(d.path().join("evw.monitor-intent"), format!("epoch={}\n", far)).unwrap();
+        assert_eq!(watcher_monitor_intent_age_secs_multi(&dirs, "evw"), Some(0.0));
     }
 
     // --- clean-exit grace (block-print-exit flap fix) tests ---

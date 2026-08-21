@@ -80,9 +80,13 @@ deployment** is the supervision layer's `watchers.conf`: set
 `claude-event-watch|mode=monitor` in the user-dir override file, then run
 `watcher-ctl run claude-event-watch` — which, for a monitor-mode watcher,
 does not exec the one-shot but prints the exact `Monitor` command to arm
-(`claude-event-watch … --mode monitor 2>&1`, `persistent: true`). The
-mode-file toggle below still works for a hand-launched instance, but a
-conf-pinned `--mode monitor` flag wins over it.
+(`claude-event-watch … --mode monitor 2>&1`, `persistent: true`). Until the
+Monitor is live the watcher reads `ARMING` (healthy-pending, not DOWN) in
+`watcher-ctl status` for the arming grace (default 120s), and that Monitor
+call is exempt from every obligations gate (`MonitorArm`) — see
+`docs/watchers.md`. The mode-file toggle below still works for a
+hand-launched instance, but a conf-pinned `--mode monitor` flag wins over
+it.
 
 In monitor mode the process also **merges stderr into stdout** (only stdout
 is the event stream under a line-streaming launcher, so a warning must not

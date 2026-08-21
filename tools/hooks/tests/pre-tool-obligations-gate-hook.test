@@ -6422,6 +6422,188 @@ def main() -> int:
             ))
             _run([str(CLI), "satisfy", ob_215], env_g)
 
+        # ===================================================================
+        # Tests 216-222: MonitorArm — the monitor-mode cure exemption.
+        #
+        # For a `mode=monitor` watcher `watcher-ctl run <name>` does not exec
+        # anything: it prints the Monitor-tool command and the main loop must
+        # ARM it. 2026-08-21: with claude-event-watch DOWN in monitor mode,
+        # the `watchers_healthy` gate DENIED that very Monitor call ("watchers
+        # unhealthy -- restart them first") -- the gate blocked its own cure
+        # and only `obligations override` got out. `MonitorArm` is the
+        # universal-floor (and DEFAULT_EXEMPT_PATTERNS) entry that lets the
+        # arm through: Monitor tool + command EXACTLY a configured, enabled
+        # monitor-mode watcher's monitor_cmd (per `watcher-ctl list --json`,
+        # trailing ` 2>&1` tolerated). Anything else stays gated; a missing /
+        # failing watcher-ctl is fail-CLOSED (no exemption).
+        # ===================================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-marm-") as td_ma:
+            tmpdir_ma = Path(td_ma)
+            env_ma, _ob_ma = _make_isolated_env(tmpdir_ma)
+            fake_bin_ma = tmpdir_ma / "fake-bin"
+            fake_bin_ma.mkdir()
+            monitor_cmd = "/opt/claude-container/watchers/claude-event-watch.sh --mode monitor"
+            # Fake layered-config reader: exactly the JSON shape
+            # `watcher-ctl list --json` prints. One ENABLED monitor-mode
+            # watcher, one DISABLED monitor-mode watcher, one oneshot (whose
+            # derived monitor_cmd must NOT count -- it is not in monitor mode).
+            (fake_bin_ma / "watcher-ctl").write_text(
+                "#!/bin/sh\n"
+                "[ \"$1\" = list ] || exit 1\n"
+                "cat <<'EOF'\n"
+                + json.dumps([
+                    {"name": "claude-event-watch", "pattern": "x", "min_count": 1,
+                     "enabled": True, "start_cmd": "/opt/claude-container/watchers/claude-event-watch.sh",
+                     "mode": "monitor", "monitor_cmd": monitor_cmd,
+                     "layer": "base", "overridden": ["mode"]},
+                    {"name": "disabled-mon", "pattern": "d", "min_count": 1,
+                     "enabled": False, "start_cmd": "disabled-mon",
+                     "mode": "monitor", "monitor_cmd": "disabled-mon --mode monitor",
+                     "layer": "override", "overridden": []},
+                    {"name": "botchat-wait", "pattern": "b", "min_count": 1,
+                     "enabled": True, "start_cmd": "botchat-wait",
+                     "mode": "oneshot", "monitor_cmd": "botchat-wait --mode monitor",
+                     "layer": "base", "overridden": []},
+                ])
+                + "\nEOF\n"
+            )
+            (fake_bin_ma / "watcher-ctl").chmod(0o755)
+            # Fake watcher-status: the exact unhealthy report the incident
+            # produced (monitor-mode watcher DOWN + the re-ARM footer), so the
+            # real `watchers_healthy` predicate FAILS.
+            (fake_bin_ma / "watcher-status").write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "claude-event-watch   DOWN      (0/1)    [monitor]\n"
+                "\n"
+                "WARNING: Some watchers are down or duplicated!\n"
+                "Recovery for DOWN state: `watcher-ctl run <name>` for each DOWN watcher (e.g. claude-event-watch).\n"
+                "Monitor-mode watcher(s) DOWN: claude-event-watch — `watcher-ctl run <name>` does NOT exec them; it prints the Monitor-tool command for the main loop to re-ARM (persistent: true). Arm it, then read every stdout line.\n"
+                "EOF\n"
+            )
+            (fake_bin_ma / "watcher-status").chmod(0o755)
+            env_ma["PATH"] = f"{fake_bin_ma}{os.pathsep}{env_ma['PATH']}"
+
+            ob_wh_ma = _add_ob(
+                env_ma,
+                tool_pattern="*",
+                predicate="watchers_healthy",
+                params={},
+                ttl=300,
+                deny_msg="watchers unhealthy — restart them first (test 216)",
+            )
+
+            def _monitor_payload(cmd, agent_id=None):
+                p = {"tool_name": "Monitor",
+                     "tool_input": {"command": cmd,
+                                    "description": "claude-event-watch (monitor-mode watcher)",
+                                    "persistent": True}}
+                if agent_id is not None:
+                    p["agent_id"] = agent_id
+                return p
+
+            # Baseline: the gate IS firing for an unrelated tool.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_ma)
+            results.append(_check(
+                "216. MonitorArm: baseline -- watchers_healthy gate fires on Bash",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 216b: the CURE -- the Monitor arm of the DOWN monitor-mode
+            # watcher, exactly as `watcher-ctl run` prints it (with ` 2>&1`)
+            # -> ALLOW even though watchers_healthy fails.
+            rc, out, _err = _hook_pre(_monitor_payload(monitor_cmd + " 2>&1"), env_ma)
+            results.append(_check(
+                "216b. MonitorArm: Monitor arm of the configured monitor_cmd "
+                "(+ ` 2>&1`) passes the firing watchers_healthy gate",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 217: same command without the redirect, and with sloppy
+            # whitespace -> still the same command -> ALLOW.
+            rc, out, _err = _hook_pre(_monitor_payload(monitor_cmd), env_ma)
+            rc2, out2, _err = _hook_pre(
+                _monitor_payload("  " + monitor_cmd.replace(" --mode", "   --mode") + "  2>&1 "),
+                env_ma)
+            results.append(_check(
+                "217. MonitorArm: bare monitor_cmd / whitespace-sloppy form both allowed",
+                rc == 0 and _is_allow(out) and rc2 == 0 and _is_allow(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+
+            # 218: a DIFFERENT Monitor command stays gated (narrowness).
+            rc, out, _err = _hook_pre(_monitor_payload("sleep 3600"), env_ma)
+            rc2, out2, _err = _hook_pre(
+                _monitor_payload(monitor_cmd + " --extra-flag 2>&1"), env_ma)
+            results.append(_check(
+                "218. MonitorArm: unrelated / extended Monitor command still denied",
+                rc == 0 and _is_deny(out) and rc2 == 0 and _is_deny(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+
+            # 219: a monitor_cmd that belongs to a watcher NOT in monitor mode
+            # (oneshot's derived form) or to a DISABLED monitor watcher is not
+            # an arm cure -> denied.
+            rc, out, _err = _hook_pre(
+                _monitor_payload("botchat-wait --mode monitor 2>&1"), env_ma)
+            rc2, out2, _err = _hook_pre(
+                _monitor_payload("disabled-mon --mode monitor 2>&1"), env_ma)
+            results.append(_check(
+                "219. MonitorArm: oneshot watcher's monitor_cmd / disabled "
+                "monitor watcher -> denied (only enabled mode=monitor counts)",
+                rc == 0 and _is_deny(out) and rc2 == 0 and _is_deny(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+
+            # 220: universal floor -- the arm passes an UNRELATED firing gate
+            # too (the cure must never be blocked by whatever else is armed).
+            ob_other_ma = _add_ob(
+                env_ma,
+                tool_pattern="*",
+                predicate="file_exists",
+                params={"path": str(tmpdir_ma / "definitely-missing")},
+                ttl=300,
+                deny_msg="unrelated policy gate (test 220)",
+            )
+            rc, out, _err = _hook_pre(_monitor_payload(monitor_cmd + " 2>&1"), env_ma)
+            rc2, out2, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_ma)
+            results.append(_check(
+                "220. MonitorArm: universal floor -- arm passes an unrelated "
+                "firing gate too, while Bash stays denied",
+                rc == 0 and _is_allow(out) and rc2 == 0 and _is_deny(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+            _run([str(CLI), "satisfy", ob_other_ma], env_ma)
+
+            # 221: FAIL-CLOSED -- watcher-ctl exits non-zero (or is absent):
+            # no exemption, the gate stands.
+            (fake_bin_ma / "watcher-ctl").write_text("#!/bin/sh\nexit 1\n")
+            rc, out, _err = _hook_pre(_monitor_payload(monitor_cmd + " 2>&1"), env_ma)
+            (fake_bin_ma / "watcher-ctl").write_text("#!/bin/sh\necho 'not json'\n")
+            rc2, out2, _err = _hook_pre(_monitor_payload(monitor_cmd + " 2>&1"), env_ma)
+            results.append(_check(
+                "221. MonitorArm: failing / garbage watcher-ctl => fail-closed (denied)",
+                rc == 0 and _is_deny(out) and rc2 == 0 and _is_deny(out2),
+                f"rc={rc} out={out} rc2={rc2} out2={out2}",
+            ))
+
+            # 222: the hardcoded subagent Monitor gate still wins -- MonitorArm
+            # is a main-loop cure, a subagent arming a watcher is still denied
+            # (watchers belong to the main loop).
+            rc, out, _err = _hook_pre(
+                _monitor_payload(monitor_cmd + " 2>&1", agent_id="agent-xyz"), env_ma)
+            results.append(_check(
+                "222. MonitorArm: subagent Monitor arm still denied by the "
+                "subagent Monitor gate",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_wh_ma], env_ma)
+
     total = len(results)
     passed = sum(1 for r in results if r)
     print()
