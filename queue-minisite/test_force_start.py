@@ -235,12 +235,24 @@ class ForceStartEndpointTest(unittest.TestCase):
             )
             with open(ob_path) as f:
                 ob_data = json.load(f)
+            # session-task registers the leaf WRAPPED as
+            # `all_of [is_main_loop, force_started_unspawned]` so the gate
+            # is inert for subagents; accept the wrapped or a bare row.
+            def _leaf(ob):
+                pred = ob.get("predicate", {}) or {}
+                if pred.get("kind") == "force_started_unspawned":
+                    return pred
+                if pred.get("kind") == "all_of":
+                    for child in (pred.get("params", {}) or {}).get(
+                            "predicates", []):
+                        if child.get("kind") == "force_started_unspawned":
+                            return child
+                return {}
+
             matching = [
                 ob for ob in ob_data.get("obligations", [])
-                if (ob.get("predicate", {}).get("kind")
-                    == "force_started_unspawned")
-                and ob.get("predicate", {}).get("params", {}).get("queue_id")
-                    == self.blocked_id
+                if _leaf(ob).get("params", {}).get("queue_id")
+                == self.blocked_id
             ]
             self.assertTrue(
                 matching,

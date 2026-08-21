@@ -162,6 +162,12 @@ Test cases (PreToolUse):
 139. evaluator: OBLIGATIONS_BYPASS=1 forces allow past evaluator deny
 140. evaluator: argv list cmd form works (no shell)
 141. evaluator: env param merged into subprocess environment
+210. force-start gate as registered (all_of [is_main_loop, force_started_unspawned]): subagent -> allow
+211. force-start gate as registered: main loop, no agent, grace elapsed -> deny
+212. force_started_unspawned grace_secs: inside window -> allow (why names the grace)
+213. force_started_unspawned grace_secs: window elapsed -> deny
+214. force_started_unspawned grace elapsed + live agent -> allow
+215. force_started_unspawned grace_from param overrides queue anchor
 
 Each test uses a SEPARATE OBLIGATIONS_FILE path (not the live ~/.config/claude/
 one) by overriding via environment + an isolated state dir, so we never touch
@@ -6206,6 +6212,215 @@ def main() -> int:
                 rc_209 == 0 and _is_allow(out_209),
                 f"rc={rc_209} out={out_209}",
             ))
+
+        # ===================================================================
+        # Tests 210-215: the FORCE-START gate must not block subagents, and
+        # must give the main loop a dispatch grace window.
+        #
+        # Regression 2026-08-20: `session-task queue force-start` registered
+        # a BARE `force_started_unspawned` row on tool_pattern `*`. The gate
+        # evaluates every row for every PreToolUse -- including tool calls
+        # from subagents that were already running -- so in the seconds
+        # between the main loop's `force-start` and its `Agent` call, three
+        # unrelated subagents were denied with "spawn the agent for q=X"
+        # and fell back to audited bypasses. session-task now registers
+        # `all_of [is_main_loop, force_started_unspawned {grace_secs: 60}]`.
+        # These tests pin (a) the wrapped shape is inert for subagents,
+        # (b) it still denies the main loop once the grace has elapsed,
+        # (c) the grace window itself, anchored on the queue item's
+        # `force_started_at` (or an explicit `grace_from`).
+        # ===================================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-fsg-") as td_g:
+            tmpdir_g = Path(td_g)
+            env_g, _ob_g = _make_isolated_env(tmpdir_g)
+
+            def _write_queue_fs(path, qid, status="running",
+                                force_started_at=None):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                item = {
+                    "id": qid,
+                    "status": status,
+                    "group_id": "g-x",
+                    "summary": "grace test",
+                    "scope": ["test"],
+                    "created_at": "2026-08-20T00:00:00+00:00",
+                }
+                if force_started_at is not None:
+                    item["force_started_at"] = int(force_started_at)
+                path.write_text(json.dumps({"items": [item]}) + "\n")
+
+            def _write_agents_fs(path, records):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "subagents": [], "workloads": [], "agents": records,
+                }) + "\n")
+
+            def _wrapped_params(leaf_params):
+                # Exactly the shape `session-task queue force-start` writes.
+                return {"predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {"kind": "force_started_unspawned", "params": leaf_params},
+                ]}
+
+            bash_ls = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+            now_g = int(time.time())
+
+            # 210/211: the registered shape. Queue running, force-started
+            # 120s ago (grace 60s elapsed), no agent, no pending-spawn.
+            qfile_210 = tmpdir_g / "fs210-queue.json"
+            afile_210 = tmpdir_g / "fs210-agents.json"
+            pfile_210 = tmpdir_g / "fs210-pending.json"  # never written
+            _write_queue_fs(qfile_210, "q-fs-210-test",
+                            force_started_at=now_g - 120)
+            _write_agents_fs(afile_210, [])
+            ob_210 = _add_ob(
+                env_g,
+                tool_pattern="*",
+                predicate="all_of",
+                params=_wrapped_params({
+                    "queue_id": "q-fs-210-test",
+                    "grace_secs": 60,
+                    "queue_path": str(qfile_210),
+                    "agents_state_path": str(afile_210),
+                    "pending_spawns_path": str(pfile_210),
+                }),
+                ttl=120,
+                deny_msg="FORCE-START: spawn agent for q-fs-210-test",
+            )
+            # Subagent caller (non-empty agent_id) -> scope-guard inactive.
+            rc, out, _err = _hook_pre(
+                dict(bash_ls, agent_id="agent-sub-210"), env_g,
+            )
+            results.append(_check(
+                "210. force-start gate as registered: subagent -> allow "
+                "(is_main_loop scope-guard inactive)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            # Subagent via agent_type slug only (in-process teammate).
+            rc_t, out_t, _err = _hook_pre(
+                dict(bash_ls, agent_type="general-purpose"), env_g,
+            )
+            results.append(_check(
+                "210b. force-start gate as registered: subagent by "
+                "agent_type slug -> allow",
+                rc_t == 0 and _is_allow(out_t),
+                f"rc={rc_t} out={out_t}",
+            ))
+            # Main loop (no agent_id / agent_type) -> grace elapsed -> DENY.
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            banner = (out or {}).get("systemMessage", "")
+            results.append(_check(
+                "211. force-start gate as registered: main loop, grace "
+                "elapsed, no agent -> deny",
+                (rc == 0 and _is_deny(out)
+                 and "q-fs-210-test" in banner),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_210], env_g)
+
+            # 212: inside the grace window -> allow, why names the grace.
+            qfile_212 = tmpdir_g / "fs212-queue.json"
+            afile_212 = tmpdir_g / "fs212-agents.json"
+            _write_queue_fs(qfile_212, "q-fs-212-test",
+                            force_started_at=now_g)
+            _write_agents_fs(afile_212, [])
+            ob_212 = _add_ob(
+                env_g,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-212-test",
+                    "grace_secs": 60,
+                    "queue_path": str(qfile_212),
+                    "agents_state_path": str(afile_212),
+                    "pending_spawns_path": str(tmpdir_g / "nope.json"),
+                },
+                ttl=120,
+                deny_msg="(should not fire -- inside grace)",
+            )
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            chk = _run([str(CLI), "check", "--tool", "Bash",
+                        "--command-string", "ls", "--json"], env_g)
+            results.append(_check(
+                "212. force_started_unspawned grace_secs: inside window "
+                "-> allow",
+                rc == 0 and _is_allow(out) and chk.returncode == 0,
+                f"rc={rc} out={out} check={chk.stdout[:200]!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_212], env_g)
+
+            # 213: same row but force-started 61s ago -> grace elapsed -> DENY.
+            qfile_213 = tmpdir_g / "fs213-queue.json"
+            afile_213 = tmpdir_g / "fs213-agents.json"
+            _write_queue_fs(qfile_213, "q-fs-213-test",
+                            force_started_at=now_g - 61)
+            _write_agents_fs(afile_213, [])
+            ob_213 = _add_ob(
+                env_g,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-213-test",
+                    "grace_secs": 60,
+                    "queue_path": str(qfile_213),
+                    "agents_state_path": str(afile_213),
+                    "pending_spawns_path": str(tmpdir_g / "nope.json"),
+                },
+                ttl=120,
+                deny_msg="must spawn agent for q-fs-213-test",
+            )
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            results.append(_check(
+                "213. force_started_unspawned grace_secs: window elapsed "
+                "-> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            # 214: grace elapsed but a LIVE agent for the qid -> allow.
+            _write_agents_fs(afile_213, [{
+                "agent_id": "a-fs-213", "queue_id": "q-fs-213-test",
+                "alive": True,
+            }])
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            results.append(_check(
+                "214. force_started_unspawned grace elapsed + live agent "
+                "-> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_213], env_g)
+
+            # 215: explicit grace_from wins over the queue item's anchor.
+            # Queue says force-started long ago; grace_from says "just now".
+            qfile_215 = tmpdir_g / "fs215-queue.json"
+            afile_215 = tmpdir_g / "fs215-agents.json"
+            _write_queue_fs(qfile_215, "q-fs-215-test",
+                            force_started_at=now_g - 3600)
+            _write_agents_fs(afile_215, [])
+            ob_215 = _add_ob(
+                env_g,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-215-test",
+                    "grace_secs": 60,
+                    "grace_from": now_g,
+                    "queue_path": str(qfile_215),
+                    "agents_state_path": str(afile_215),
+                    "pending_spawns_path": str(tmpdir_g / "nope.json"),
+                },
+                ttl=120,
+                deny_msg="(should not fire -- grace_from just now)",
+            )
+            rc, out, _err = _hook_pre(bash_ls, env_g)
+            results.append(_check(
+                "215. force_started_unspawned grace_from param overrides "
+                "queue anchor -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_215], env_g)
 
     total = len(results)
     passed = sum(1 for r in results if r)
