@@ -69,10 +69,31 @@ Environment:
 ### Delivery mode (experimental, opt-in, runtime-toggleable)
 
 ```
-claude-event-watch [--mode exit|monitor] [--liveness-interval SECONDS]
+claude-event-watch [--mode exit|monitor | --monitor] [--liveness-interval SECONDS]
 claude-event-watch --print-mode        # one word, for scripts
 claude-event-watch --mode-status       # configured + live instance + pending
 ```
+
+`--monitor` is shorthand for `--mode monitor`. **The supported way to flip a
+deployment** is the supervision layer's `watchers.conf`: set
+`claude-event-watch|mode=monitor` in the user-dir override file, then run
+`watcher-ctl run claude-event-watch` — which, for a monitor-mode watcher,
+does not exec the one-shot but prints the exact `Monitor` command to arm
+(`claude-event-watch … --mode monitor 2>&1`, `persistent: true`). The
+mode-file toggle below still works for a hand-launched instance, but a
+conf-pinned `--mode monitor` flag wins over it.
+
+In monitor mode the process also **merges stderr into stdout** (only stdout
+is the event stream under a line-streaming launcher, so a warning must not
+be invisible), prefixes its own status lines with **`[monitor-mode]`** so
+they can be told from `EVENT[...]` batches, and treats **SIGTERM / SIGINT /
+SIGHUP as a clean stop**: it reaps its `inotifywait` child at once
+(background + `wait`, so the signal is not deferred until the inotify
+window closes), prints one
+`[monitor-mode] EVENT-WATCH MONITOR STOPPED signal=… pid=… uptime=… batches=… pending=…`
+line, writes the clean-exit marker, and exits 0 — no `RESTART NOW` banner,
+because a signal stop (`watcher-restart`, `TaskStop`) is deliberate.
+`exit` mode keeps bash's default signal disposition, byte-for-byte as before.
 
 The block-print-exit shape above is `--mode exit` and remains **the
 default** — landing this changes nothing until someone flips the switch.

@@ -668,12 +668,18 @@ enum AgentAction {
 
 #[derive(Subcommand)]
 enum WatcherAction {
-    /// Run a watcher by name (exec start_cmd, wait for exit)
+    /// Run a watcher by name (exec start_cmd, wait for exit).
+    ///
+    /// For a `mode=monitor` watcher this does NOT exec anything: it prints
+    /// the exact Monitor-tool invocation the main loop must arm (command,
+    /// `persistent: true`) and records the intent, then exits 0.
     Run {
         /// Watcher name
         name: String,
     },
-    /// List configured watchers
+    /// List configured watchers (effective values after the user-dir
+    /// override layer is applied; the SOURCE column + `layers:` footer say
+    /// which file set what)
     #[command(alias = "ls")]
     List {
         /// Output as JSON
@@ -1519,8 +1525,10 @@ async fn run_watcher(action: WatcherAction) {
             watcher::cmd_status(&cfg, extra_ref, json, unhealthy_only, all).await;
             0
         }
-        WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, &name, true).await,
-        WatcherAction::Disable { name } => watcher::cmd_toggle(&cfg, &name, false).await,
+        WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, extra_ref, &name, true).await,
+        WatcherAction::Disable { name } => {
+            watcher::cmd_toggle(&cfg, extra_ref, &name, false).await
+        }
         WatcherAction::Restart => {
             watcher::cmd_restart(&cfg, extra_ref).await;
             0

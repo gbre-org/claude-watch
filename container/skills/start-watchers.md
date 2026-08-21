@@ -40,6 +40,7 @@ This skill exists so the in-container agent has a single canonical place to:
 
    - **Already running** (e.g. an earlier launch in this same session — `watcher-ctl status` shows `ok`): do NOT double-launch.
    - **Not running** (`watcher-ctl status` shows `DOWN`): launch via `watcher-ctl run <name>`, invoked **only through Claude Code's `run_in_background: true` Bash invocation** — never via shell `&` or `nohup` (matches the host's cardinal watcher rule: watchers can ONLY be started by Claude Code's main loop). `watcher-ctl run` writes the `<name>.pid` / `<name>.runlock` files (so the daemon's pidfile-based liveness check can see the watcher) and is idempotent (it no-ops if a live instance already holds the slot). Capture the resulting `bash_id` so the watcher can be monitored / killed later.
+   - **Monitor-mode watcher** (`watcher-ctl list` shows `MODE monitor` — set per watcher in the layered `watchers.conf`, override layer at `$WATCHERS_CONFIG_EXTRA`): the `watcher-ctl run <name>` background task exits immediately and its output is the exact `Monitor` tool invocation to arm (command, `persistent: true`). Arm it from the main loop, then read every stdout line it emits as an event batch. `watcher-ctl status` shows a live monitor as `ok (1/1)` with a `[monitor]` tag.
 
    > Do NOT launch the raw `bash /opt/claude-container/watchers/<name>.sh` directly: a raw launch skips the pidfile/runlock bookkeeping `watcher_run` performs, so the daemon's watcher_monitor (pidfile-based since PR #339) can't see it and will report a false DOWN.
 
