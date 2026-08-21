@@ -53,8 +53,10 @@ dispatch, so stored-state bugs can't disable them):
   which conflicts with subagent process semantics -- subagents using
   Monitor to wait on long jobs (CI, etc.) reliably return mid-wait
   with thin partial reports. Main-loop Monitor usage is unaffected.
-  Recovery: poll ``gh pr view <PR#> --json statusCheckRollup`` in a
-  Bash loop with ``run_in_background: true``.
+  Recovery: do NOT arm a background Bash task and return (a subagent is
+  not woken when it completes). CI-wait: open the PR, ``pr-watch add
+  <PR-URL>``, exit. Other waits: block in the foreground with one long
+  Bash call (``timeout`` up to 600000 ms), polling an artifact.
 """
 
 from __future__ import annotations
@@ -545,24 +547,21 @@ def _monitor_subagent_deny() -> dict:
         "!! is still in flight -- whoever spawned the agent then has to",
         "!! clean up.",
         "!!",
-        "!! Use this pattern instead for CI-wait:",
+        "!! Do NOT arm a background task and return. A subagent that starts a",
+        "!! `run_in_background: true` Bash and then ends its turn is NOT woken",
+        "!! when the task completes -- the turn end IS the agent's completion,",
+        "!! and the work sits idle until a human or the operator loop resumes it.",
         "!!",
-        "!!     for i in $(seq 1 60); do",
-        "!!         rollup=$(gh pr view <PR#> --json statusCheckRollup \\",
-        "!!             --jq '.statusCheckRollup')",
-        "!!         # break on all-green, exit 1 on any FAILURE",
-        "!!         sleep 30",
-        "!!     done",
-        "!!     gh pr merge <PR#> --squash --delete-branch",
+        "!! CI-wait: open the PR, `pr-watch add <PR-URL>`, and EXIT. The",
+        "!! operator loop receives the status-change event and queues the",
+        "!! follow-up (merge on green / fix on red). Do not wait for CI.",
         "!!",
-        "!! Run that loop with `run_in_background: true` so the agent blocks",
-        "!! in a normal tool-call wait state (NOT a Monitor-event-driven",
-        "!! async state). The harness's \"agent is done\" semantics correctly",
-        "!! distinguish the two.",
-        "!!",
-        "!! For non-CI waits (long-running computation), prefer a workload",
-        "!! runner that survives /clear and lets the spawner pick up the",
-        "!! completion notification.",
+        "!! Any other wait: block IN THE FOREGROUND with ONE long Bash call",
+        "!! (its `timeout` parameter goes up to 600000 ms; the 15-second cap is",
+        "!! an operator-loop convention, not a subagent rule). Poll an ARTIFACT",
+        "!! -- a marker file, an output file, a state command -- never a process",
+        "!! name: `pgrep -f <name>` matches the polling shell itself (use",
+        "!! `pgrep -f \"[n]ame\"` or `pgrep -x` if you must).",
         "!!",
         "!! Main-loop callers: this gate does NOT apply to you -- Monitor",
         "!! is allowed from the main loop (watcher captured-output,",
@@ -576,10 +575,13 @@ def _monitor_subagent_deny() -> dict:
         "Monitor tool is disabled for subagents. The harness treats every "
         "Monitor event as a task-completion signal, so subagents that use "
         "Monitor to wait for CI/long jobs reliably return mid-wait with "
-        "thin partial reports. For CI-wait, poll `gh pr view <PR#> --json "
-        "statusCheckRollup` in a Bash loop with `run_in_background: true` "
-        "and `sleep 30-60` between iterations -- that pattern blocks the "
-        "agent in a normal tool-call wait state."
+        "thin partial reports. Do NOT arm a background task and return "
+        "either -- a subagent is not woken when a background Bash task "
+        "completes. For CI-wait: open the PR, `pr-watch add <PR-URL>`, and "
+        "exit; the operator loop gets the status-change event. For any "
+        "other wait: block in the foreground with one long Bash call "
+        "(timeout up to 600000 ms), polling an artifact (marker/output "
+        "file/state command), never a process name."
     )
     return _deny(banner, reason)
 

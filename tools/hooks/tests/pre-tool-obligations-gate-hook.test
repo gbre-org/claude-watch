@@ -2750,13 +2750,24 @@ def main() -> int:
                 ((out or {}).get("hookSpecificOutput") or {})
                 .get("permissionDecisionReason", "")
             )
+            # The banner must carry the NEW wait guidance (pr-watch + exit
+            # for CI; foreground long Bash polling an artifact otherwise)
+            # and must NOT carry the old "arm a background loop and
+            # return" advice -- a subagent is not woken when a background
+            # Bash task completes, so that advice orphaned agents.
+            _old_bg_phrase = "run_in_background: true` so the agent blocks"
             results.append(_check(
                 "74a. Monitor gate: subagent + Monitor -> deny + banner",
                 (rc == 0 and _is_deny(out)
                  and "Monitor tool is disabled for subagents" in banner
-                 and "gh pr view" in banner
-                 and "run_in_background" in banner
-                 and "gh pr view" in reason),
+                 and "Do NOT arm a background task and return" in banner
+                 and "pr-watch add" in banner
+                 and "IN THE FOREGROUND" in banner
+                 and "600000" in banner
+                 and _old_bg_phrase not in banner
+                 and "so the agent blocks" not in banner
+                 and "pr-watch add" in reason
+                 and "run_in_background" not in reason),
                 f"rc={rc} banner={banner!r} reason={reason!r}",
             ))
 
