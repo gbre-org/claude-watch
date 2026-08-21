@@ -284,6 +284,17 @@ health_grace_secs = 180
 # dead_process catch a dead session independently). 600s aligns with the
 # heartbeat-stale window. 0 disables (pure grace_secs behaviour).
 clean_exit_grace_secs = 600
+# monitor_arming_grace_secs: ARMING window for `mode=monitor` watchers.
+# `watcher-ctl run <name>` does not exec a monitor-mode watcher — it prints the
+# Monitor-tool command for the main loop to arm and writes
+# `<pid_dir>/<name>.monitor-intent`. For this many seconds after a fresh intent
+# (one no runtime file has superseded) the watcher reads ARMING — healthy-
+# pending — in `watcher-ctl status`, `watcher-status --unhealthy-only` (the
+# obligations gate) and the daemon's watcher_monitor, so neither fires in the
+# gap between "printed the command" and "the Monitor is live". A live pidfile
+# flips it to ok; past the window with no pid it is DOWN again. Env override:
+# $CLAUDE_WATCH_MONITOR_ARMING_GRACE_SECS. 0 disables (immediate DOWN).
+monitor_arming_grace_secs = 120
 # max_suppress_secs (per-watcher watcher-down suppression CAP), 2026-08-12.
 # `suppress_inject_when_active` drops the in-pane watcher-down inject while the
 # main loop is actively turning (the out-of-band claude-event still fires). But

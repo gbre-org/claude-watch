@@ -87,6 +87,14 @@ pub fn config_path_extra() -> Option<String> {
 ///     * more than one `watcher-ctl run <name>` supervisor process is alive
 ///   `DOWN` takes precedence over `DUPLICATE` if both apply (because a dead
 ///   poller is the more urgent failure mode).
+/// - `"ARMING"` — monitor mode only: no live pid, but `watcher-ctl run <name>`
+///   recorded a `<name>.monitor-intent` younger than the arming grace
+///   (`[watcher_monitor].monitor_arming_grace_secs`, default 120s) that no
+///   runtime file has superseded. The main loop is between "printed the
+///   Monitor command" and "the Monitor is live". Healthy-pending: NOT
+///   unhealthy for `--unhealthy-only` (so the `watchers_healthy` gate does not
+///   trip) and NOT a miss for the daemon. Flips to `ok` once the pidfile shows
+///   a live pid; past the grace with no pid it is `DOWN` again.
 /// - `"off"` — disabled in watchers.conf
 ///
 /// `dup_supervisors` and `dup_pollers` are populated (non-empty) only when the
@@ -96,7 +104,11 @@ pub fn config_path_extra() -> Option<String> {
 #[derive(Debug, Serialize)]
 pub struct WatcherStatus {
     pub name: String,
-    pub status: String, // "ok", "DOWN", "DUPLICATE", "off"
+    /// "ok", "DOWN", "DUPLICATE", "off", or — monitor mode only — "ARMING"
+    /// (no live pid yet, but a fresh unconsumed `<name>.monitor-intent`
+    /// from `watcher-ctl run` is within the arming grace; healthy-pending,
+    /// NOT counted as unhealthy by `--unhealthy-only`).
+    pub status: String,
     pub count: u32,
     pub required: u32,
     pub pids: String,
@@ -429,6 +441,18 @@ pub fn watcher_list(config_path: &str, extra_config_path: Option<&str>) -> Vec<W
 /// Both fans run as `tokio::spawn` tasks so the wall-clock per status call
 /// stays near one pgrep round-trip even with many watchers configured.
 pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) -> Vec<WatcherStatus> {
+    let arming_grace = crate::status::resolve_monitor_arming_grace_secs();
+    watcher_status_with(config_path, extra_config_path, arming_grace).await
+}
+
+/// [`watcher_status`] with an explicit monitor-mode ARMING grace (seconds)
+/// instead of the env/config-resolved one. The daemon passes its own
+/// `[watcher_monitor].monitor_arming_grace_secs`; tests pin a value.
+pub async fn watcher_status_with(
+    config_path: &str,
+    extra_config_path: Option<&str>,
+    arming_grace_secs: f64,
+) -> Vec<WatcherStatus> {
     let entries = load_entries(config_path, extra_config_path);
 
     // Fan out: for each enabled watcher, spawn BOTH a poller-pid lookup and
@@ -498,6 +522,21 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
         );
         let is_down = entry.min_count != 0 && pidfile_down;
 
+        // ARMING (monitor mode only): `watcher-ctl run <name>` recorded an
+        // arm intent (`<name>.monitor-intent`) that is younger than the
+        // arming grace and has not been consumed by a runtime file written
+        // since. The watcher has no process YET because the main loop is
+        // between "printed the Monitor command" and "the Monitor is live" —
+        // healthy-pending, not DOWN. Same helper + same intent file the
+        // daemon's watcher_monitor consults, so CLI and daemon agree.
+        let is_arming = is_down
+            && entry.mode == WatcherMode::Monitor
+            && crate::status::watcher_is_arming(
+                crate::status::watcher_monitor_intent_age_secs_multi(&pid_dirs, &entry.name),
+                crate::status::watcher_runtime_file_age_secs_multi(&pid_dirs, &entry.name),
+                arming_grace_secs,
+            );
+
         // `count` reflects the single-instance pidfile model: 1 when the
         // pidfile names a live matching watcher, else 0. (The poller pgrep
         // count is unreliable post-exec, so it must NOT drive this.)
@@ -528,10 +567,15 @@ pub async fn watcher_status(config_path: &str, extra_config_path: Option<&str>) 
             Vec::new()
         };
 
-        // Status precedence: DOWN > DUPLICATE > ok. A dead poller is the more
-        // urgent failure; duplicates are a state-cleanliness issue. If both
-        // apply the dup vecs are still populated so the human sees both.
-        let status = if is_down {
+        // Status precedence: ARMING > DOWN > DUPLICATE > ok. A dead poller is
+        // the more urgent failure; duplicates are a state-cleanliness issue.
+        // If both apply the dup vecs are still populated so the human sees
+        // both. ARMING is the monitor-mode "no process yet, arm pending"
+        // state — it outranks DOWN only because it IS the DOWN case with a
+        // fresh, unconsumed arm intent (see `is_arming` above).
+        let status = if is_arming {
+            "ARMING".to_string()
+        } else if is_down {
             "DOWN".to_string()
         } else if !dup_pollers.is_empty() || !dup_supervisors.is_empty() {
             "DUPLICATE".to_string()
@@ -1366,11 +1410,20 @@ pub async fn watcher_restart(config_path: &str, extra_config_path: Option<&str>)
         }
     }
 
-    // Clean PID files
+    // Clean PID files — and monitor-mode arm intents: a restart voids any
+    // pending arm (the monitor it was for is being stopped), so a leftover
+    // `<name>.monitor-intent` must not keep the watcher reading ARMING for
+    // the rest of its grace window with nothing arming it.
     if let Ok(dir) = std::fs::read_dir(pid_dir()) {
         for entry in dir.flatten() {
-            if entry.path().extension().is_some_and(|ext| ext == "pid") {
-                let _ = std::fs::remove_file(entry.path());
+            let path = entry.path();
+            let is_pid = path.extension().is_some_and(|ext| ext == "pid");
+            let is_intent = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".monitor-intent"));
+            if is_pid || is_intent {
+                let _ = std::fs::remove_file(path);
             }
         }
         messages.push("Cleaned PID files".to_string());
@@ -1591,6 +1644,7 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
     let mut all_healthy = true;
     let mut down_names: Vec<String> = Vec::new();
     let mut down_monitor_names: Vec<String> = Vec::new();
+    let mut arming_names: Vec<String> = Vec::new();
     let mut has_duplicate = false;
     for s in statuses {
         if s.status == "off" {
@@ -1608,6 +1662,13 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
                 if s.mode == "monitor" {
                     down_monitor_names.push(s.name.clone());
                 }
+            }
+            // ARMING is healthy-pending: it never flips `all_healthy` (so
+            // `--unhealthy-only` stays silent and the obligations gate does
+            // not trip) but gets its own footer so the reader knows the
+            // Monitor still has to actually be armed.
+            if s.status == "ARMING" {
+                arming_names.push(s.name.clone());
             }
             if s.status == "DUPLICATE" {
                 has_duplicate = true;
@@ -1684,6 +1745,16 @@ pub fn format_status(statuses: &[WatcherStatus], show_all: bool) -> String {
                 down_monitor_names.join(" ")
             ));
         }
+    }
+    if !arming_names.is_empty() {
+        out.push_str(&format!(
+            "Monitor-mode watcher(s) ARMING: {} — `watcher-ctl run <name>` recorded the arm \
+             intent; the row flips to ok once the Monitor is live (pidfile shows a live pid) \
+             and back to DOWN if it is not armed within the arming grace. If you have not \
+             armed it yet, arm it NOW (Monitor tool, persistent: true) — this state is not \
+             a substitute for arming.\n",
+            arming_names.join(" ")
+        ));
     }
     out
 }
@@ -2042,6 +2113,39 @@ mod tests {
         let out = format_status(&[down], false);
         assert!(out.contains("Monitor-mode watcher(s) DOWN: evw"), "{}", out);
         assert!(out.contains("re-ARM"), "{}", out);
+    }
+
+    /// ARMING is healthy-PENDING: the row renders with its own status word +
+    /// the `[monitor]` tag, the footer tells the reader the Monitor still has
+    /// to be armed, but it is NOT a WARNING state — `all_healthy` holds (so
+    /// `--unhealthy-only` stays silent and the obligations gate does not
+    /// trip) and `any_unhealthy` is false. Mixed with a real DOWN the warning
+    /// + both footers appear.
+    #[test]
+    fn test_format_status_arming_is_healthy_pending_not_down() {
+        let mut arming = down_status("evw", 1);
+        arming.status = "ARMING".to_string();
+        arming.mode = "monitor".to_string();
+        let out = format_status(std::slice::from_ref(&arming), false);
+        let row = out.lines().next().unwrap();
+        assert!(row.starts_with("evw"), "{}", row);
+        assert!(row.contains(" ARMING "), "{}", row);
+        assert!(row.ends_with("[monitor]"), "{}", row);
+        assert!(out.contains("All watchers healthy."), "ARMING is not unhealthy: {}", out);
+        assert!(!out.contains("WARNING"), "{}", out);
+        assert!(out.contains("Monitor-mode watcher(s) ARMING: evw"), "{}", out);
+        assert!(out.contains("arm it NOW"), "{}", out);
+        assert!(!any_unhealthy(std::slice::from_ref(&arming)), "ARMING must not count as unhealthy");
+
+        // Mixed: a genuinely DOWN oneshot + an ARMING monitor -> WARNING for
+        // the DOWN one, ARMING footer still present, DOWN recovery names only
+        // the DOWN watcher.
+        let out = format_status(&[down_status("sig", 1), arming], false);
+        assert!(out.contains("WARNING"), "{}", out);
+        assert!(out.contains("Recovery for DOWN state"), "{}", out);
+        assert!(out.contains("(e.g. sig)"), "{}", out);
+        assert!(!out.contains("Monitor-mode watcher(s) DOWN"), "{}", out);
+        assert!(out.contains("Monitor-mode watcher(s) ARMING: evw"), "{}", out);
     }
 
     /// Test helper: build a healthy `ok` watcher status.
@@ -3354,6 +3458,155 @@ mod tests {
             evw
         );
         assert_eq!(evw.count, 0);
+    }
+
+    // --- monitor-mode ARMING (status) tests --------------------------------
+    //
+    // Fixture: a `mode=monitor` watcher (flipped by the override layer, as in
+    // production) with NO live process. What decides ARMING vs DOWN is the
+    // `<name>.monitor-intent` file `watcher-ctl run` writes, its age, and
+    // whether a runtime file (`.lock`) has been written since.
+
+    fn epoch_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Write a monitor-mode fixture (base line + override flip) + pid dir and
+    /// return (pid_dir, cfg, ov).
+    fn monitor_fixture(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let pid_dir = dir.join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.join("watchers.conf");
+        let ov = dir.join("watchers.override.conf");
+        std::fs::write(&cfg, "evw|/opt/x/evw.sh|1|true|/opt/x/evw.sh\n").unwrap();
+        std::fs::write(&ov, "evw|mode=monitor\n").unwrap();
+        (pid_dir, cfg, ov)
+    }
+
+    fn write_intent(pid_dir: &std::path::Path, age_secs: u64) {
+        std::fs::write(
+            pid_dir.join("evw.monitor-intent"),
+            format!("epoch={}\ncommand=/opt/x/evw.sh --mode monitor\n", epoch_now() - age_secs),
+        )
+        .unwrap();
+    }
+
+    async fn evw_status(grace: f64) -> WatcherStatus {
+        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), grace).await;
+        statuses.into_iter().find(|s| s.name == "evw").expect("evw present")
+    }
+
+    /// Fresh intent, no runtime file: the loop just ran `watcher-ctl run` and
+    /// has not armed the Monitor yet -> ARMING, count 0, NOT unhealthy.
+    #[tokio::test]
+    async fn test_watcher_status_monitor_fresh_intent_is_arming() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_dir, cfg, ov) = monitor_fixture(dir.path());
+        write_intent(&pid_dir, 10);
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        std::env::set_var("WATCHERS_CONFIG_EXTRA", ov.to_str().unwrap());
+
+        let evw = evw_status(120.0).await;
+        assert_eq!(evw.status, "ARMING", "{:?}", evw);
+        assert_eq!(evw.count, 0);
+        assert_eq!(evw.mode, "monitor");
+        assert!(!any_unhealthy(std::slice::from_ref(&evw)), "ARMING must not trip --unhealthy-only");
+
+        // A STALE lock (dead pid, older than the intent — e.g. left by the
+        // one-shot era) does not consume the intent: still ARMING.
+        let lock = pid_dir.join("evw.lock");
+        std::fs::write(&lock, (u32::MAX - 1).to_string()).unwrap();
+        filetime::set_file_mtime(
+            &lock,
+            filetime::FileTime::from_unix_time((epoch_now() - 3600) as i64, 0),
+        )
+        .unwrap();
+        let evw = evw_status(120.0).await;
+        assert_eq!(evw.status, "ARMING", "stale lock older than intent: {:?}", evw);
+
+        // Grace 0 disables the state entirely -> plain DOWN.
+        let evw = evw_status(0.0).await;
+        assert_eq!(evw.status, "DOWN", "arming grace 0 => DOWN: {:?}", evw);
+        assert!(any_unhealthy(std::slice::from_ref(&evw)));
+    }
+
+    /// Past the arming grace with nothing live -> DOWN again (the existing
+    /// re-ARM footer path), and no intent at all -> DOWN.
+    #[tokio::test]
+    async fn test_watcher_status_monitor_stale_or_missing_intent_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_dir, cfg, ov) = monitor_fixture(dir.path());
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        std::env::set_var("WATCHERS_CONFIG_EXTRA", ov.to_str().unwrap());
+
+        // No intent ever written.
+        let evw = evw_status(120.0).await;
+        assert_eq!(evw.status, "DOWN", "no intent => DOWN: {:?}", evw);
+
+        // Intent older than the grace.
+        write_intent(&pid_dir, 1000);
+        let evw = evw_status(120.0).await;
+        assert_eq!(evw.status, "DOWN", "stale intent => DOWN: {:?}", evw);
+        let out = format_status(std::slice::from_ref(&evw), false);
+        assert!(out.contains("Monitor-mode watcher(s) DOWN: evw"), "{}", out);
+        assert!(!out.contains("ARMING"), "{}", out);
+    }
+
+    /// The monitor went live AFTER the intent (its flock guard rewrote
+    /// `<name>.lock`, so the lock is YOUNGER than the intent) and is now dead:
+    /// a real outage, reported DOWN at once — it must not ride out the rest of
+    /// the arming window as ARMING.
+    #[tokio::test]
+    async fn test_watcher_status_monitor_lock_newer_than_intent_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_dir, cfg, ov) = monitor_fixture(dir.path());
+        write_intent(&pid_dir, 30);
+        // Lock written "now" (after the 30s-old intent), recording a dead pid.
+        std::fs::write(pid_dir.join("evw.lock"), (u32::MAX - 1).to_string()).unwrap();
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        std::env::set_var("WATCHERS_CONFIG_EXTRA", ov.to_str().unwrap());
+
+        let evw = evw_status(120.0).await;
+        assert_eq!(evw.status, "DOWN", "consumed intent + dead monitor => DOWN: {:?}", evw);
+    }
+
+    /// A ONESHOT watcher never reads ARMING, even with a (stray) intent file:
+    /// the state is monitor-mode only.
+    #[tokio::test]
+    async fn test_watcher_status_oneshot_ignores_intent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        std::fs::write(&cfg, "evw|/opt/x/evw.sh|1|true|/opt/x/evw.sh\n").unwrap();
+        write_intent(&pid_dir, 5);
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+
+        let evw = evw_status(120.0).await;
+        assert_eq!(evw.status, "DOWN", "oneshot + intent => still DOWN: {:?}", evw);
+    }
+
+    /// `watcher-restart` voids a pending arm: it removes `<name>.monitor-intent`
+    /// along with the `.pid` files, so a stopped monitor-mode watcher reads
+    /// DOWN (re-ARM footer) rather than ARMING for the rest of the window.
+    #[tokio::test]
+    async fn test_watcher_restart_clears_monitor_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_dir, cfg, ov) = monitor_fixture(dir.path());
+        write_intent(&pid_dir, 5);
+        std::fs::write(pid_dir.join("other.pid"), "1").unwrap();
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        std::env::set_var("WATCHERS_CONFIG_EXTRA", ov.to_str().unwrap());
+
+        let msg = watcher_restart(&config_path(), config_path_extra().as_deref()).await;
+        assert!(msg.contains("Cleaned PID files"), "{}", msg);
+        assert!(!pid_dir.join("evw.monitor-intent").exists(), "intent removed by restart");
+        assert!(!pid_dir.join("other.pid").exists(), "pid files still cleaned");
+        let evw = evw_status(120.0).await;
+        assert_eq!(evw.status, "DOWN", "after restart, no intent => DOWN: {:?}", evw);
     }
 
     /// Portable (macOS + Linux) PURE coverage of the exec-argv fix decision

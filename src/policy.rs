@@ -6051,6 +6051,36 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // only the CURRENT outage, not a prior one.
                 health.down_since = None;
             } else {
+                // ARMING (monitor mode): `watcher-ctl run <name>` does not
+                // exec a `mode=monitor` watcher — it records
+                // `<name>.monitor-intent` and prints the Monitor-tool command
+                // for the main loop to arm. Between that print and the
+                // Monitor going live there is legitimately NO process, and
+                // this is exactly the window a WATCHER(S) DOWN inject (or the
+                // obligations gate, via `watcher-status --unhealthy-only`,
+                // which shares this helper) must not fire in. A fresh intent
+                // that no runtime file has superseded => healthy-pending, not
+                // a miss. A runtime file YOUNGER than the intent means the
+                // monitor went live and then died => falls through to the
+                // normal DOWN path at once. Same decision as `watcher-ctl
+                // status`, so CLI and daemon never disagree.
+                if entry.mode == status::WatcherMode::Monitor {
+                    let arming_grace = config.watcher_monitor.monitor_arming_grace_secs as f64;
+                    let intent_age =
+                        status::watcher_monitor_intent_age_secs_multi(&pid_dirs, &entry.name);
+                    let runtime_age =
+                        status::watcher_runtime_file_age_secs_multi(&pid_dirs, &entry.name);
+                    if status::watcher_is_arming(intent_age, runtime_age, arming_grace) {
+                        debug!(
+                            watcher = %entry.name,
+                            intent_age = ?intent_age,
+                            runtime_age = ?runtime_age,
+                            arming_grace,
+                            "monitor-mode watcher ARMING (arm intent fresh, Monitor not live yet) — not counting a miss"
+                        );
+                        continue;
+                    }
+                }
                 // Grace period: if the watcher was seen running within the
                 // configured grace_secs, don't count this as a miss. Short-
                 // lived watchers (e.g. an `*-wait` watcher that exits when

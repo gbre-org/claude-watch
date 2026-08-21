@@ -14,7 +14,8 @@ State: ``~/.config/claude/obligations.json`` (0600), schema:
         {
           "id": "ob-YYYY-MM-DD-NNNN",
           "tool_pattern": "Bash" | "Bash:^cat" | "*",
-          "exempt_patterns": ["Bash:^watcher-ctl run", "Read"],  # optional
+          "exempt_patterns": ["Bash:^watcher-ctl run", "Read",
+                              "MonitorArm"],                    # optional
           "predicate": {
             "kind": "file_mtime_within" | "env_present" | "queue_status"
                   | "file_exists" | "no_pipe_pattern" | "no_output_consumed"
@@ -522,6 +523,20 @@ def _watcher_output_is_noise_only(output_path: str) -> bool:
             return False
     return saw_line
 
+# Special tool_pattern token: matches the Claude Code ``Monitor`` tool ONLY
+# when its ``command`` is exactly a configured monitor-mode watcher's
+# monitor_cmd (the command `watcher-ctl run <name>` prints for a
+# `mode=monitor` watcher; trailing ` 2>&1` tolerated). It is the monitor-mode
+# analogue of the `Bash:^watcher-ctl run` recovery exempt -- arming the
+# Monitor IS the cure for a DOWN monitor-mode watcher -- and is listed both in
+# the universal recovery floor below and in obligations-init's shared
+# DEFAULT_EXEMPT_PATTERNS. Resolution lives in `_monitor_arm_matches`.
+MONITOR_ARM_PATTERN = "MonitorArm"
+
+# Hard cap on how long the MonitorArm resolver may spend shelling out to
+# `watcher-ctl list --json`. Only ever paid on a Monitor tool call.
+MONITOR_ARM_LIST_TIMEOUT_SECS = 3
+
 # Tool/command patterns exempt from the no_pending_watcher_outputs gate.
 # Without exemptions the gate would self-deadlock: the gate fires, but every
 # tool needed to clear it (Read the output, restart the watcher, diagnose
@@ -663,6 +678,22 @@ UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
     # no_pending_watcher_outputs fire, the recovery is `watcher-ctl run`
     # / `watcher-restart` / `watcher-status`. Always allow.
     "Bash:^watcher-(ctl|status|restart)\\b",
+    # The MONITOR-MODE cure. For a `mode=monitor` watcher, `watcher-ctl run
+    # <name>` does not exec anything -- it prints the Monitor-tool command
+    # and the main loop must ARM it (Monitor tool, persistent: true). That
+    # Monitor call IS the `watcher-ctl run` of monitor mode: the one tool
+    # call that cures a DOWN monitor-mode watcher. Without this floor entry
+    # `watchers_healthy` denied exactly that call (2026-08-21 incident:
+    # "watchers unhealthy -- restart them first" on the arm of the watcher
+    # it named), leaving `obligations override` as the only way out -- the
+    # same deadlock class the recovery-CLI exemptions exist to prevent.
+    # `MonitorArm` is deliberately NARROW (see `_tool_pattern_matches`): it
+    # matches the Monitor tool ONLY when its `command` is exactly a
+    # configured monitor-mode watcher's monitor_cmd (layered watchers.conf
+    # via `watcher-ctl list --json`; trailing ` 2>&1` tolerated). Any other
+    # Monitor call stays gated. Fail-closed: no watcher-ctl / no config /
+    # any parse error => no match => the gate stands.
+    MONITOR_ARM_PATTERN,
     # Process diagnosis -- needed to figure out which watcher is wedged.
     "Bash:^(pgrep|pkill|ps)\\b",
     # Read is UNCONDITIONALLY exempt. Reading a file is inherently
@@ -2932,9 +2963,124 @@ def _command_is_sole(names, command_string):
         return False
 
 
+def _normalize_monitor_cmd(cmd):
+    """Canonical form of a Monitor-tool / monitor_cmd command string for
+    equality comparison: whitespace runs collapsed, trailing ``2>&1``
+    redirects (the one thing `watcher-ctl run` APPENDS to the configured
+    monitor_cmd when it prints the arm command; idempotent there) stripped.
+    Returns None for a non-string / empty input."""
+    if not isinstance(cmd, str):
+        return None
+    norm = " ".join(cmd.split())
+    while norm.endswith("2>&1"):
+        norm = norm[: -len("2>&1")].rstrip()
+    return norm or None
+
+
+def _monitor_tool_command(tool_name, command_string):
+    """Extract the normalized ``command`` a Monitor tool call carries.
+
+    The gate hook renders a non-Bash tool_input as JSON (``{"command": ...,
+    "description": ..., "persistent": ...}``), so the JSON path is the one the
+    hook exercises; a raw string (``obligations check --tool Monitor
+    --command-string '<cmd>'``) is accepted as the command itself. None when
+    the tool is not Monitor or no command can be found."""
+    if tool_name != "Monitor" or not command_string:
+        return None
+    raw = command_string
+    try:
+        parsed = json.loads(command_string)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        raw = parsed.get("command")
+    elif isinstance(parsed, str):
+        raw = parsed
+    return _normalize_monitor_cmd(raw)
+
+
+def _locate_watcher_ctl():
+    """Path of the `watcher-ctl` CLI (PATH first, then the usual install
+    locations), or None. Mirrors the watchers_healthy predicate's lookup of
+    `watcher-status` so the two agree on which claude-watch they ask."""
+    cli = shutil.which("watcher-ctl")
+    if cli:
+        return cli
+    for cand in (
+        os.path.expanduser("~/bin/watcher-ctl"),
+        "/usr/local/bin/watcher-ctl",
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _configured_monitor_cmds():
+    """{normalized monitor_cmd: watcher name} for every ENABLED `mode=monitor`
+    entry in the LAYERED watchers.conf, read through `watcher-ctl list
+    --json` (the same loader `watcher-ctl run` prints the arm command from,
+    so the comparison can never drift from what the loop was told to arm).
+
+    FAIL-CLOSED: no CLI, non-zero exit, timeout, or unparseable output =>
+    empty dict => `MonitorArm` matches nothing and the gate stands. That is
+    the safe direction for an exemption (the audited `obligations override`
+    remains)."""
+    cli = _locate_watcher_ctl()
+    if not cli:
+        return {}
+    try:
+        proc = subprocess.run(
+            [cli, "list", "--json"],
+            capture_output=True, text=True,
+            timeout=MONITOR_ARM_LIST_TIMEOUT_SECS, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        entries = json.loads(proc.stdout or "")
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(entries, list):
+        return {}
+    out = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if e.get("mode") != "monitor" or not e.get("enabled", False):
+            continue
+        norm = _normalize_monitor_cmd(e.get("monitor_cmd"))
+        if norm:
+            out[norm] = str(e.get("name", ""))
+    return out
+
+
+def _monitor_arm_matches(tool_name, command_string):
+    """The `MonitorArm` tool_pattern: True iff ``tool_name`` is the Monitor
+    tool AND its command (see `_monitor_tool_command`) equals -- after
+    normalization -- the monitor_cmd of a configured, enabled monitor-mode
+    watcher. Deliberately exact-match (no regex, no prefix): arming the
+    watcher is the cure the gate must never block; arming anything ELSE
+    under a firing gate is still gated."""
+    cmd = _monitor_tool_command(tool_name, command_string)
+    if not cmd:
+        return False
+    return cmd in _configured_monitor_cmds()
+
+
 def _tool_pattern_matches(pattern, tool_name, command_string):
     """A tool_pattern is one of:
         '*'                       => matches every tool
+        'MonitorArm'              => matches when tool_name == 'Monitor' AND
+                                     the Monitor command is exactly (modulo
+                                     whitespace / a trailing `2>&1`) the
+                                     monitor_cmd of an enabled `mode=monitor`
+                                     watcher in the layered watchers.conf
+                                     (`watcher-ctl list --json`). The
+                                     monitor-mode "watcher-ctl run" cure.
+                                     FAIL-CLOSED (no CLI / no config / parse
+                                     error => no match).
         'Bash'                    => matches when tool_name == 'Bash'
         'Bash:<regex>'            => matches when tool_name=='Bash' AND
                                      command_string matches <regex>
@@ -2983,6 +3129,8 @@ def _tool_pattern_matches(pattern, tool_name, command_string):
     """
     if not pattern or pattern == "*":
         return True
+    if pattern == MONITOR_ARM_PATTERN:
+        return _monitor_arm_matches(tool_name, command_string)
     if ":" in pattern:
         head, rest = pattern.split(":", 1)
         if head == "Bashcmd":

@@ -184,6 +184,16 @@ DEFAULT_EXEMPT_PATTERNS = [
     # event-classify: used during event triage. MUST be exempt to allow
     # classification before acking events.
     r"Bash:^event-classify\b",
+    # MonitorArm: the Monitor-tool call that ARMS a configured `mode=monitor`
+    # watcher (exactly the command `watcher-ctl run <name>` prints). It is
+    # the monitor-mode form of `watcher-ctl run` -- the cure for a DOWN
+    # monitor-mode watcher -- and must pass every gate for the same reason
+    # the watcher recovery CLIs do (2026-08-21: `watchers_healthy` denied the
+    # arm of the very watcher it reported DOWN). Resolved by the obligations
+    # CLI against the layered watchers.conf; any other Monitor call is NOT
+    # matched. Also in the framework's universal recovery floor; listed here
+    # so the shared allowlist is complete and self-documenting.
+    "MonitorArm",
 ]
 
 

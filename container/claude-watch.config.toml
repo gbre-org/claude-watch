@@ -204,6 +204,13 @@ inject_cooldown = 300
 # pidfile → DOWN fires); a dead session's marker ages past the window and
 # heartbeat-stale / dead_process catch it independently. 0 disables.
 clean_exit_grace_secs = 600
+# monitor_arming_grace_secs: ARMING window for `mode=monitor` watchers. After
+# `watcher-ctl run <name>` prints the Monitor command (and writes
+# `<name>.monitor-intent`) the watcher reads ARMING — healthy-pending, not
+# DOWN — for this long (unless a runtime file supersedes the intent), so the
+# obligations gate / WATCHER(S) DOWN do not fire in the print→arm gap. A live
+# pidfile flips it to ok; past the window with no pid it is DOWN again.
+monitor_arming_grace_secs = 120
 # max_suppress_secs (per-watcher watcher-down suppression CAP), 2026-08-12.
 # active-turn suppression drops the in-pane watcher-down inject while the main
 # loop is busy (the out-of-band claude-event still fires). Bug: during a long

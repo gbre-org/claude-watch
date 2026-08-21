@@ -40,7 +40,18 @@ Two delivery modes coexist, chosen per watcher in the layered
 
 Flipping is one line in the override file (`<name>|mode=monitor`) plus a
 re-arm; nothing is rebuilt, reverted or restarted. Health is judged the same
-way in both modes (pidfile liveness), so a live monitor is `ok (1/1)`.
+way in both modes (pidfile liveness), so a live monitor is `ok (1/1)`. The
+one monitor-only state is **`ARMING`**: `watcher-ctl run <name>` records
+`<pid_dir>/<name>.monitor-intent` when it prints the Monitor command, and
+for `[watcher_monitor].monitor_arming_grace_secs` (default 120s) after that
+— until the Monitor is live, unless a runtime file is written in between —
+the watcher is healthy-pending, not DOWN: neither the obligations
+`watchers_healthy` gate nor the daemon's WATCHER(S) DOWN path fires in the
+gap between "printed the command" and "armed". Past the window with no
+live pid it is DOWN again (re-ARM footer); `watcher-restart` clears the
+intent. The Monitor call itself (exactly the printed command) passes every
+obligations gate via the `MonitorArm` exempt — see
+[`tools/obligations/README.md`](../tools/obligations/README.md).
 
 The daemon's only emergency action is **tmux-injecting** a
 `watcher-ctl run <name>` line into the main loop's pane, so the main
