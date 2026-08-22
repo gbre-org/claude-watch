@@ -173,6 +173,9 @@ def _prom_lines(snap: dict) -> list[str]:
         "# HELP claude_agent_live_count Number of live Claude Code subagents in the current cw-agent-stats snapshot.",
         "# TYPE claude_agent_live_count gauge",
         f"claude_agent_live_count {int(totals.get('agents', 0))}",
+        "# HELP claude_agent_spawned_count Distinct Claude Code subagent transcripts observed in the live/recent window (windowed gauge, not a monotonic lifetime counter).",
+        "# TYPE claude_agent_spawned_count gauge",
+        f"claude_agent_spawned_count {int(totals.get('agents_spawned', 0))}",
         "# HELP claude_agent_calls_total Tool calls made so far by a live Claude Code subagent (per-agent gauge; disappears once the agent falls out of the live window).",
         "# TYPE claude_agent_calls_total gauge",
         "# HELP claude_agent_tokens_total Tokens accounted so far by a live Claude Code subagent, by kind (context|output) (per-agent gauge; disappears once the agent falls out of the live window).",
@@ -212,6 +215,15 @@ def _prom_lines(snap: dict) -> list[str]:
         lines.append("# TYPE claude_model_use_total gauge")
         for model, cnt in sorted(model_totals.items()):
             lines.append(f'claude_model_use_total{{model="{_esc_label(model)}"}} {int(cnt)}')
+
+    model_output_tokens_totals = snap.get("model_output_tokens_totals") or {}
+    if model_output_tokens_totals:
+        lines.append(
+            "# HELP claude_output_tokens_total Fleet-wide OUTPUT tokens, by model id, folded over every transcript in the live/recent window (windowed gauge, not a monotonic counter)."
+        )
+        lines.append("# TYPE claude_output_tokens_total gauge")
+        for model, tok in sorted(model_output_tokens_totals.items()):
+            lines.append(f'claude_output_tokens_total{{model="{_esc_label(model)}"}} {int(tok)}')
     return lines
 
 

@@ -171,7 +171,7 @@ def test_collector_folds_live_agents_and_excludes_finished(projects):
     assert a["session_id"] == "sess-1"
 
     assert snap["totals"] == {
-        "agents": 1, "tool_calls": 2,
+        "agents": 1, "agents_spawned": 2, "tool_calls": 2,
         "context_tokens": 101 + 1224 + 78410, "output_tokens": 230,
     }
     # main loop: the LAST usage in the newest top-level transcript
@@ -307,6 +307,12 @@ def test_main_loop_model_and_tools_are_folded_into_totals(tmp_path, monkeypatch)
         "WebSearch": {"claude-opus-4-8": 1},
         "Bash": {"claude-sonnet-5": 1},
     }
+    # Output tokens, folded by model, must ALSO include the main loop's own
+    # turns (same regression class as model_totals above): main loop emits
+    # 5 + 40 output tokens across two distinct messages on claude-opus-4-8;
+    # the subagent emits 7 output tokens on claude-sonnet-5.
+    assert snap["model_output_tokens_totals"] == {"claude-opus-4-8": 45, "claude-sonnet-5": 7}
+    assert snap["totals"]["agents_spawned"] == 1
 
 
 def test_main_loop_model_fold_is_incremental_not_full_reparse(tmp_path, monkeypatch):
@@ -340,6 +346,43 @@ def test_main_loop_model_fold_is_incremental_not_full_reparse(tmp_path, monkeypa
     assert snap["model_totals"] == {"claude-opus-4-8": 2}
 
 
+def test_model_output_tokens_delta_by_message_id_not_double_counted(tmp_path, monkeypatch):
+    """Per-model output-token folding must use the SAME delta-by-message-id
+    logic as ``output_tokens`` (claude-watch dashboard panels, Andrew #5370:
+    tokens = cumulative OUTPUT, split BY MODEL) — summing every cumulative
+    usage reading for a split message would overcount ~5x, same failure mode
+    the plain ``output_tokens`` delta logic already guards against.
+    """
+    root = tmp_path / "projects"
+    slug = root / "-home-x"
+    sub = slug / "sess-1" / "subagents"
+
+    running = sub / "agent-running.jsonl"
+    _write_jsonl(running, [
+        _user("Queue item: q-2026-08-22-mmmm\n\nDo a thing."),
+        # ONE api message split into two entries; usage.output_tokens cumulative
+        # (7 -> 180) -- only the 173-token DELTA should land in the model bucket.
+        _assistant([{"type": "thinking", "thinking": "…"}], mid="m1", stop=None,
+                   usage=_usage(101, 946, 77464, 7), ts="2026-08-21T20:00:05.000Z",
+                   model="claude-sonnet-5"),
+        _assistant([{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}], mid="m1",
+                   stop="tool_use", usage=_usage(101, 946, 77464, 180), ts="2026-08-21T20:00:06.000Z",
+                   model="claude-sonnet-5"),
+        _tool_result("2026-08-21T20:00:07.000Z"),
+        # A second, distinct message on a DIFFERENT model.
+        _assistant([{"type": "tool_use", "id": "t2", "name": "Read", "input": {}}], mid="m2",
+                   stop="tool_use", usage=_usage(101, 1224, 78410, 50), ts="2026-08-21T20:00:08.000Z",
+                   model="claude-opus-4-8"),
+    ])
+
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(root))
+    snap = agentstats.Collector(projects_dir=root).tick()
+
+    assert snap["model_output_tokens_totals"] == {"claude-sonnet-5": 180, "claude-opus-4-8": 50}
+    # Sanity: matches the plain (model-agnostic) output_tokens total for the agent.
+    assert snap["totals"]["output_tokens"] == 230
+
+
 def test_write_snapshot_is_atomic_and_readable(tmp_path, projects):
     out = tmp_path / "data" / "agent-stats.json"
     snap = agentstats.Collector(projects_dir=projects).tick()
@@ -363,6 +406,7 @@ def test_write_snapshot_is_atomic_and_readable(tmp_path, projects):
 SNAPSHOT_TOP_LEVEL_KEYS = {
     "version", "host", "generated_at", "generated_at_iso", "live_window_seconds",
     "main", "agents", "totals", "tool_totals", "model_totals", "tool_model_totals",
+    "model_output_tokens_totals",
 }
 AGENT_RECORD_KEYS = {
     "agent_id", "session_id", "description", "agent_type", "queue_id",
@@ -370,13 +414,13 @@ AGENT_RECORD_KEYS = {
     "started_at", "last_write_at", "age_seconds", "finished",
 }
 MAIN_KEYS = {"session_id", "context_tokens", "last_write_at", "age_seconds"}
-TOTALS_KEYS = {"agents", "tool_calls", "context_tokens", "output_tokens"}
+TOTALS_KEYS = {"agents", "agents_spawned", "tool_calls", "context_tokens", "output_tokens"}
 
 
 def test_snapshot_schema_is_pinned(projects):
     snap = agentstats.Collector(projects_dir=projects, host="h").tick()
     assert set(snap) == SNAPSHOT_TOP_LEVEL_KEYS
-    assert snap["version"] == 2 == agentstats.SNAPSHOT_VERSION
+    assert snap["version"] == 3 == agentstats.SNAPSHOT_VERSION
     assert set(snap["agents"][0]) == AGENT_RECORD_KEYS
     assert set(snap["main"]) == MAIN_KEYS
     assert set(snap["totals"]) == TOTALS_KEYS
@@ -384,6 +428,9 @@ def test_snapshot_schema_is_pinned(projects):
     assert snap["tool_totals"] == {"Bash": 2, "Read": 1}
     assert snap["tool_model_totals"] == {}           # fixture entries carry no model id
     assert snap["model_totals"] == {}
+    assert snap["model_output_tokens_totals"] == {}  # fixture entries carry no model id
+    # agent-running (live) + agent-done (finished but still in the window)
+    assert snap["totals"]["agents_spawned"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +491,7 @@ def test_prom_lines_render_gauges(cli, projects):
     lines = cli._prom_lines(snap)
     text = "\n".join(lines)
     assert "claude_agent_live_count 1" in lines
+    assert "claude_agent_spawned_count 2" in lines        # running + done, both in-window
     assert 'claude_agent_calls_total{agent_id="running"} 2' in lines
     assert 'claude_agent_tokens_total{agent_id="running",kind="context"} %d' % (101 + 1224 + 78410) in lines
     assert 'claude_agent_tokens_total{agent_id="running",kind="output"} 230' in lines
@@ -451,8 +499,25 @@ def test_prom_lines_render_gauges(cli, projects):
     assert 'claude_tool_use_total{tool="Bash"} 2' in lines
     assert 'claude_tool_use_total{tool="Read"} 1' in lines
     assert "claude_model_use_total" not in text          # no model ids in the fixture
+    assert "claude_output_tokens_total" not in text       # no model ids in the fixture
     # label escaping: backslash, double-quote, newline
     assert cli._esc_label('a"b\\c\n') == 'a\\"b\\\\c\\n'
+
+
+def test_prom_lines_render_output_tokens_by_model(cli, tmp_path, monkeypatch):
+    root = tmp_path / "projects"
+    slug = root / "-home-x"
+    sub = slug / "sess-1" / "subagents"
+    _write_jsonl(sub / "agent-running.jsonl", [
+        _user("Queue item: q-2026-08-22-nnnn\n\nDo a thing."),
+        _assistant([{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}], mid="m1",
+                   stop="tool_use", usage=_usage(101, 946, 77464, 30), ts="2026-08-21T20:00:05.000Z",
+                   model="claude-sonnet-5"),
+    ])
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(root))
+    snap = agentstats.Collector(projects_dir=root, host="h").tick()
+    lines = cli._prom_lines(snap)
+    assert 'claude_output_tokens_total{model="claude-sonnet-5"} 30' in lines
 
 
 def test_cli_once_writes_snapshot_and_prom(projects, tmp_path):
