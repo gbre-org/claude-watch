@@ -207,6 +207,25 @@ pub const DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS: u64 = 900;
 /// can only ever WITHHOLD the grace, never invent it.
 const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
+/// How many bytes of transcript HEAD we read looking for the
+/// `Queue item: q-XXXX` spawn marker.
+///
+/// Unlike the tail read, this one happens for EVERY agent on EVERY poll
+/// pass, and transcripts reach tens of MB — reading them whole was
+/// gigabytes of IO per minute to recover one short string. The marker
+/// is in the spawn prompt (the first user record), so a cap this size
+/// covers even the largest prompts (a full agent definition pasted
+/// inline is tens of KB) with an order of magnitude to spare.
+const TRANSCRIPT_HEAD_BYTES: u64 = 256 * 1024;
+
+/// First-pass probe size for the marker scan. Measured over the
+/// transcripts on a busy host, the marker sits a couple of hundred
+/// bytes in for essentially every agent — so this probe answers almost
+/// every call, and `TRANSCRIPT_HEAD_BYTES` is only paid on the rare
+/// transcript whose spawn prompt is genuinely huge (or which has no
+/// marker at all, e.g. a post-context-reset continuation).
+const TRANSCRIPT_HEAD_PROBE_BYTES: u64 = 8 * 1024;
+
 /// Output shape for `claude-watch active-agents [--json]`.
 ///
 /// `Deserialize` is derived (not just `Serialize`) so consumers inside
@@ -346,21 +365,90 @@ pub fn extract_queue_id(content: &str) -> Option<String> {
 
 /// Read a JSONL file and extract the queue id from its FIRST user message.
 ///
-/// We only read the first line for performance — the spawn prompt is
-/// always the first user message and contains the marker. Falls back
-/// to scanning the whole file if the first line doesn't match (cheap
-/// for the small JSONLs; rare path).
+/// The marker lives in the SPAWN PROMPT — the very first user record —
+/// so only the HEAD of the transcript is worth reading. Transcripts
+/// routinely reach tens of MB and this runs for every agent on every
+/// poll pass, so the read is bounded: a cheap
+/// `TRANSCRIPT_HEAD_PROBE_BYTES` probe first, and only if that comes up
+/// empty a second pass out to `TRANSCRIPT_HEAD_BYTES`. A marker beyond
+/// the outer cap is not looked for.
+///
+/// Two stages rather than one because the distribution is extremely
+/// lopsided: the marker is a few hundred bytes in for virtually every
+/// transcript, so the probe settles almost all of them, while the outer
+/// cap still covers the pathological spawn prompt. The result is the
+/// same either way — a match inside the probe is also the FIRST match
+/// inside the larger window.
+///
+/// A continuation transcript (the parent self-cleared mid-agent) has no
+/// marker anywhere — it starts mid-stream. That stays `None` exactly as
+/// before, and `collect_agent_records_merged` still recovers the id
+/// field-wise from the frozen pre-clear transcript.
 fn extract_queue_id_from_jsonl(jsonl_path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(jsonl_path).ok()?;
-    // Fast path: just check the first line (the spawn prompt).
-    if let Some(first_line) = content.lines().next() {
-        if let Some(qid) = extract_queue_id(first_line) {
-            return Some(qid);
-        }
+    let (qid, truncated) = scan_head_for_queue_id(jsonl_path, TRANSCRIPT_HEAD_PROBE_BYTES);
+    if qid.is_some() {
+        return qid;
     }
-    // Fallback: scan everything (handles edge cases — e.g. agents
-    // continued after a follow-up prompt that re-cites the queue id).
-    extract_queue_id(&content)
+    // Nothing more to read: the probe saw the whole file.
+    if !truncated {
+        return None;
+    }
+    scan_head_for_queue_id(jsonl_path, TRANSCRIPT_HEAD_BYTES).0
+}
+
+/// Read at most `max_bytes` from the head of `path` and scan it for the
+/// marker. Returns `(queue_id, hit_the_cap)`; `hit_the_cap` tells the
+/// caller whether a wider read could still find something.
+fn scan_head_for_queue_id(path: &Path, max_bytes: u64) -> (Option<String>, bool) {
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (None, false),
+    };
+    let (head, truncated) = match read_head(f, max_bytes) {
+        Some(pair) => pair,
+        None => return (None, false),
+    };
+    let qid = match extract_queue_id(&head) {
+        Some(q) => q,
+        None => return (None, truncated),
+    };
+    // The cap can land mid-record. A match that runs to the very end of
+    // a cut line may be a CUT id (`q-2026-08-22-15` for
+    // `q-2026-08-22-15e8`), and a wrong id is worse than none — and
+    // since `extract_queue_id` returns the FIRST match, there is no
+    // earlier candidate to fall back to. Report the miss and let the
+    // caller widen the window (the probe stage) or give up (the cap).
+    if truncated && !head.ends_with('\n') && head.ends_with(&qid) {
+        return (None, truncated);
+    }
+    (Some(qid), truncated)
+}
+
+/// Read at most `max_bytes` from the START of `r`, as lossy UTF-8.
+///
+/// Returns `(content, hit_the_cap)`. `content` may end mid-record when
+/// the cap was hit; callers that care check for a trailing newline.
+///
+/// The cap is applied in BYTES, not lines, so a transcript that is one
+/// enormous line — or has no newlines at all — still cannot pull the
+/// whole file into memory.
+fn read_head<R: std::io::Read>(r: R, max_bytes: u64) -> Option<(String, bool)> {
+    use std::io::Read;
+    let mut buf: Vec<u8> = Vec::new();
+    // `take` sits UNDER the `BufReader` on purpose: the other way round
+    // the buffered reader is free to top its buffer up past the cap
+    // from the underlying file, which is exactly the IO we came to
+    // avoid. The one byte past the cap tells "exactly at EOF" from
+    // "hit the cap" without a second syscall.
+    std::io::BufReader::new(r.take(max_bytes.saturating_add(1)))
+        .read_to_end(&mut buf)
+        .ok()?;
+    let mut truncated = false;
+    if buf.len() as u64 > max_bytes {
+        buf.truncate(max_bytes as usize);
+        truncated = true;
+    }
+    Some((String::from_utf8_lossy(&buf).into_owned(), truncated))
 }
 
 /// Pure: does this transcript tail END on an un-answered `tool_use`?
@@ -1331,6 +1419,196 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].in_flight_tool_use, "tail must win over head");
         assert!(records[0].alive);
+    }
+
+    /// Wraps a reader and records how many bytes were actually pulled.
+    struct CountingReader<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    /// A first line carrying the marker, then `filler_bytes` of the
+    /// tool_result traffic that makes real transcripts huge.
+    fn big_transcript(qid: &str, filler_bytes: usize) -> String {
+        let mut body = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"Queue item: {}\"}}}}\n",
+            qid
+        );
+        let filler = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"content\":\"{}\"}}]}}}}\n",
+            "y".repeat(4096)
+        );
+        while body.len() < filler_bytes {
+            body.push_str(&filler);
+        }
+        body
+    }
+
+    #[test]
+    fn read_head_never_pulls_more_than_the_cap() {
+        // The whole point of the change: a 5 MB transcript must cost a
+        // bounded read, not 5 MB, on every poll pass.
+        let body = big_transcript("q-bounded-1", 5 * 1024 * 1024);
+        assert!(body.len() > 5 * 1024 * 1024);
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let reader = CountingReader {
+            inner: std::io::Cursor::new(body.into_bytes()),
+            read: std::rc::Rc::clone(&counter),
+        };
+
+        let (head, truncated) = read_head(reader, TRANSCRIPT_HEAD_BYTES).expect("head");
+
+        assert!(
+            counter.get() as u64 <= TRANSCRIPT_HEAD_BYTES + 1,
+            "read {} bytes, cap is {}",
+            counter.get(),
+            TRANSCRIPT_HEAD_BYTES,
+        );
+        assert!(head.len() as u64 <= TRANSCRIPT_HEAD_BYTES);
+        assert!(truncated, "5 MB does not fit the cap");
+        assert_eq!(extract_queue_id(&head).as_deref(), Some("q-bounded-1"));
+    }
+
+    #[test]
+    fn the_probe_alone_settles_a_marker_at_the_top() {
+        // The common case must not pay the full cap: the probe finds
+        // the marker, so only probe-sized IO happens.
+        let body = big_transcript("q-probe-only", 5 * 1024 * 1024);
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let reader = CountingReader {
+            inner: std::io::Cursor::new(body.into_bytes()),
+            read: std::rc::Rc::clone(&counter),
+        };
+        let (head, _) = read_head(reader, TRANSCRIPT_HEAD_PROBE_BYTES).expect("head");
+        assert!(counter.get() as u64 <= TRANSCRIPT_HEAD_PROBE_BYTES + 1);
+        assert_eq!(extract_queue_id(&head).as_deref(), Some("q-probe-only"));
+    }
+
+    #[test]
+    fn queue_id_still_found_on_a_multi_megabyte_transcript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-ahugeone01.jsonl");
+        std::fs::write(&path, big_transcript("q-2026-08-22-15e8", 5 * 1024 * 1024)).unwrap();
+
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].queue_id.as_deref(), Some("q-2026-08-22-15e8"));
+    }
+
+    #[test]
+    fn queue_id_scan_stops_at_the_cap() {
+        // Direct proof the read is bounded at the FILE level: a marker
+        // parked past the cap is not seen, which can only happen if we
+        // stopped reading.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-apastcap01.jsonl");
+        let filler = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "z".repeat(4096)
+        );
+        let mut body = String::new();
+        while body.len() < (TRANSCRIPT_HEAD_BYTES as usize) + 8192 {
+            body.push_str(&filler);
+        }
+        body.push_str("{\"message\":{\"content\":\"Queue item: q-too-late\"}}\n");
+        std::fs::write(&path, &body).unwrap();
+
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].queue_id, None, "marker past the cap is not read");
+    }
+
+    #[test]
+    fn a_queue_id_cut_by_the_cap_is_rejected_not_truncated() {
+        // A wrong id is worse than no id: half of `q-2026-08-22-15e8`
+        // matches a different queue item, or none at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-acutident.jsonl");
+        // One enormous line whose marker straddles the cap: the read
+        // ends right after `q-a`.
+        let cut_at = "Queue item: q-a".len();
+        let mut body = "x".repeat(TRANSCRIPT_HEAD_BYTES as usize - cut_at);
+        body.push_str("Queue item: q-abcdef1234\n");
+        std::fs::write(&path, &body).unwrap();
+
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].queue_id, None,
+            "a cut id must be dropped, never reported short",
+        );
+    }
+
+    #[test]
+    fn read_head_returns_a_short_file_whole() {
+        let body = "{\"message\":{\"content\":\"Queue item: q-tiny\"}}\n";
+        let (head, truncated) =
+            read_head(std::io::Cursor::new(body.as_bytes()), TRANSCRIPT_HEAD_BYTES)
+                .expect("head");
+        assert_eq!(head, body);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn read_head_reports_hitting_the_cap() {
+        let body = b"aaaa\nbbbb\n";
+        // Exactly at EOF is not "truncated" — nothing was left behind.
+        let (head, truncated) =
+            read_head(std::io::Cursor::new(&body[..]), body.len() as u64).expect("head");
+        assert_eq!(head, "aaaa\nbbbb\n");
+        assert!(!truncated);
+
+        let (head, truncated) = read_head(std::io::Cursor::new(&body[..]), 7).expect("head");
+        assert_eq!(head, "aaaa\nbb");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn queue_id_found_past_the_probe_but_within_the_cap() {
+        // A spawn prompt big enough to push the marker past the probe
+        // must still be found by the second pass.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-abigprompt.jsonl");
+        let padding = (TRANSCRIPT_HEAD_PROBE_BYTES as usize) * 4;
+        let body = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{} Queue item: q-late-but-ok\"}}}}\n",
+            "p".repeat(padding),
+        );
+        assert!(body.len() > TRANSCRIPT_HEAD_PROBE_BYTES as usize);
+        assert!(body.len() < TRANSCRIPT_HEAD_BYTES as usize);
+        std::fs::write(&path, &body).unwrap();
+
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].queue_id.as_deref(), Some("q-late-but-ok"));
+    }
+
+    #[test]
+    fn a_queue_id_cut_by_the_probe_is_recovered_whole_by_the_second_pass() {
+        // The probe boundary must never leak a half id: it falls
+        // through to the wider read and reports the full one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-acutprobe.jsonl");
+        let cut_at = "Queue item: q-a".len();
+        let mut body = "x".repeat(TRANSCRIPT_HEAD_PROBE_BYTES as usize - cut_at);
+        body.push_str("Queue item: q-abcdef1234\n");
+        std::fs::write(&path, &body).unwrap();
+
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].queue_id.as_deref(),
+            Some("q-abcdef1234"),
+            "a probe-cut id must be re-read whole, never reported short",
+        );
     }
 
     #[test]
