@@ -473,6 +473,14 @@ services:
       # session-task writes go to /home/hndrewaall/.config/session inside
       # the container's own filesystem, which is invisible to the minisite.
       - "${HOME}/.config/session:/home/hndrewaall/.config/session:rw"
+      # Host ~/.config/claude — same reasoning as ~/.config/session above,
+      # for the arm-hook's agent-queue-bindings.json (v133 / #697 owner
+      # attribution). Without this, post-tool-agent-arm-hook running for a
+      # container-spawned Agent writes bindings to /home/hndrewaall/.config/claude
+      # inside the container's own filesystem only — invisible to both
+      # queue-minisite and work-queue-exporter (which read the HOST path,
+      # matching queue-minisite's own ~/.config/claude mount below).
+      - "${HOME}/.config/claude:/home/hndrewaall/.config/claude:rw"
       # Corporate SSL CA bundle — ro. Forwarded NODE_EXTRA_CA_CERTS /
       # SSL_CERT_FILE / etc. env vars carry an ABSOLUTE host path that
       # has to resolve inside the container; we bind-mount the host file
