@@ -1185,10 +1185,11 @@ COPY tools/event-must-act/event-ack /usr/local/bin/event-ack
 # (event-classify --source X --tag Y) when manually triaging events.
 COPY tools/event-must-act/event-classify /usr/local/bin/event-classify
 
-# heartbeat-ack: RETIRED 2026-08-21 (#649 ack-driven redesign). Liveness is
-# now refreshed by ANY `event-ack ack` call, not just heartbeat-tick acks,
-# so the touch+ack wrapper is redundant -- `heartbeat-tick` is cleared the
-# same way as any other actionable event, via `event-ack ack`.
+# heartbeat-ack: RETIRED 2026-08-21 (#649 ack-driven redesign), and the host
+# heartbeat FILE it touched retired with it on 2026-08-22. Liveness is the age
+# of the last ack of ANY event; the main loop's per-batch reflex is
+# `event-ack ack-batch`, which clears every pending entry and stamps the
+# timestamp in one bare command.
 
 # user-prompt-ambient-inject-hook — UserPromptSubmit hook that drains
 # the ambient event queue on every prompt and emits the queued events

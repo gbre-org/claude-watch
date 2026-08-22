@@ -38,9 +38,21 @@ Subcommands:
                                   entry. Equivalent to v1's --add.
 
   event-ack ack "<key>" --action "<text>"
-                                  Mark actionable as handled. Removes
+                                  Mark ONE actionable as handled. Removes
                                   from pending-actions, resets the
                                   N-counter to 0.
+
+  event-ack ack-batch [--action "<text>"]
+                                  THE PER-BATCH REFLEX. Acks every pending
+                                  entry at once and stamps the liveness
+                                  timestamp. Takes no required arguments,
+                                  by design: the main loop runs it dozens of
+                                  times a day after handling an EVENT[...]
+                                  batch, so it must be one bare command with
+                                  nothing to look up. Idempotent — safe on an
+                                  empty queue, where it still stamps liveness
+                                  (an idle loop acking a keepalive is exactly
+                                  that case).
 
   event-ack list                  Show pending + counter state.
 
@@ -56,6 +68,19 @@ Subcommands:
                                   changing pending state.
 
   event-ack --self-test           Run the embedded test suite.
+
+Liveness
+--------
+
+``last-ack-timestamp`` (epoch float) is stamped by EVERY ack — ``ack`` and
+``ack-batch`` alike. Its age is the daemon's ONE liveness signal
+(``[ack] stale_minutes`` in claude-watch's config): ANY ack proves the main
+loop is alive, so a loop busy handling real events never needs a synthetic
+poke. When nothing has been acked for ``[cadence] keepalive_interval_secs``
+the daemon emits a ``keepalive`` event whose only purpose is to give an IDLE
+loop something to ack. The pre-2026-08-22 design instead had the loop
+``touch`` a separate host heartbeat FILE; two signals for one fact, and the
+file could stay fresh while events went unread.
 
 Signal-distinct guarantee
 -------------------------
@@ -267,6 +292,33 @@ def ack_pending(state_dir: Path, key: str, action: str) -> dict:
             "remaining": remaining}
 
 
+def ack_batch(state_dir: Path, action: str = "batch ack") -> dict:
+    """Ack EVERY pending entry in one shot and stamp liveness.
+
+    This is the command the main loop runs after handling an event batch. It
+    deliberately takes no required arguments: a reflex performed dozens of
+    times a day cannot require looking a key up first, and the per-key
+    ``ack`` remains available for the rare case where only part of a batch
+    was handled.
+
+    An EMPTY queue is not an error and still stamps the timestamp. That case
+    is load-bearing, not a degenerate one: an idle loop acking a ``keepalive``
+    (which routes ambient, so it may never land in pending-actions) has
+    nothing to remove but is exactly the loop proving it is alive.
+    """
+    keys: list[str] = []
+    with _locked(state_dir, PENDING_FILE) as p:
+        pending = p["data"].get("pending", [])
+        keys = [str(it.get("key")) for it in pending if it.get("key")]
+        p["data"]["pending"] = []
+        p["write"] = True
+
+    _set_counter(state_dir, 0)
+    _update_last_ack_timestamp(state_dir)
+
+    return {"acked": len(keys), "keys": keys, "action": action}
+
+
 def list_state(state_dir: Path) -> dict:
     """Snapshot pending + counter for inspection."""
     pending = []
@@ -466,6 +518,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("key")
     sp.add_argument("--action", required=True)
 
+    sp = sub.add_parser(
+        "ack-batch",
+        help="Ack ALL pending entries + stamp liveness (the per-batch reflex).")
+    sp.add_argument("--action", default="batch ack",
+                    help="Optional note recorded with the batch ack.")
+
     sub.add_parser("list", help="Show pending + counter state.")
     sub.add_parser("clear", help="Clear all pending entries.")
     sub.add_parser("drain-ambient",
@@ -479,7 +537,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 _SUBCOMMANDS = frozenset({
-    "ack", "add", "ingest", "list", "clear",
+    "ack", "ack-batch", "add", "ingest", "list", "clear",
     "drain-ambient", "reset-counter", "bump-counter",
 })
 
@@ -594,6 +652,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"Warning: \"{args.key}\" was not pending "
                   f"(idempotent no-op)")
+        return 0
+
+    if args.cmd == "ack-batch":
+        res = ack_batch(state_dir, args.action)
+        if res["acked"]:
+            print(f"Acked {res['acked']} pending event(s); liveness stamped. "
+                  f"(action: {res['action']})")
+        else:
+            print("Nothing pending; liveness stamped.")
         return 0
 
     if args.cmd == "list":
@@ -854,13 +921,67 @@ def _self_test() -> int:
         if any(e["key"] == "sub-test-key" for e in snap["pending"]):
             fail(f"sub-test-key still pending after argparse ack: {snap}")
 
+        # 18. ack-batch clears the WHOLE queue in one call. This is the
+        #     per-batch reflex; if it only cleared one entry the loop would
+        #     have to iterate, which is exactly the friction it removes.
+        clear_pending(sd)
+        for k in ("batch-a", "batch-b", "batch-c"):
+            add_pending(sd, k)
+        bump_counter(sd)
+        res = ack_batch(sd)
+        if res["acked"] != 3:
+            fail(f"ack-batch should ack all 3, got: {res}")
+        snap = list_state(sd)
+        if snap["pending"] or snap["counter"] != 0:
+            fail(f"ack-batch should empty pending + reset counter: {snap}")
+
+        # 19. ack-batch stamps liveness — the daemon's ONLY wedge signal.
+        stamp = sd / LAST_ACK_FILE
+        if not stamp.exists():
+            fail("ack-batch must write last-ack-timestamp")
+        else:
+            try:
+                stamped = float(stamp.read_text().strip())
+            except ValueError:
+                stamped = -1.0
+                fail(f"last-ack-timestamp must be a parseable epoch, got "
+                     f"{stamp.read_text()!r}")
+            now = datetime.now(timezone.utc).timestamp()
+            if not (0 < now - stamped < 60):
+                fail(f"last-ack stamp {stamped} should be ~now ({now})")
+
+        # 20. ack-batch on an EMPTY queue is not an error and STILL stamps
+        #     liveness. Load-bearing: an idle loop acking a keepalive (which
+        #     routes ambient, so it may never enter pending-actions) has
+        #     nothing to remove but is precisely the loop proving it is alive.
+        stamp.unlink()
+        res = ack_batch(sd)
+        if res["acked"] != 0:
+            fail(f"empty ack-batch should report 0 acked, got: {res}")
+        if not stamp.exists():
+            fail("ack-batch on an empty queue must still stamp liveness")
+
+        # 21. ack-batch is reachable through main() as a BARE command — no
+        #     required flags. The whole design depends on that.
+        add_pending(sd, "bare-cmd-key")
+        rc = main(["--state-dir", str(sd), "ack-batch"])
+        if rc != 0:
+            fail(f"bare `event-ack ack-batch` returned rc={rc}")
+        snap = list_state(sd)
+        if snap["pending"]:
+            fail(f"bare ack-batch left entries pending: {snap}")
+
+        # 22. Legacy dispatch must not swallow the new subcommand name.
+        if _legacy_dispatch(["ack-batch"]) is not None:
+            fail("_legacy_dispatch intercepted the 'ack-batch' subcommand")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("OK: 22 cases pass (incl. unclassified propagation, "
-          "CI-success ambient).")
+    print("OK: 27 cases pass (incl. unclassified propagation, "
+          "CI-success ambient, ack-batch liveness stamping).")
     return 0
 
 

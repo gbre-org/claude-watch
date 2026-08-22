@@ -365,6 +365,51 @@ run_check >/dev/null 2>&1
     || fail "new default failed, injects=$(inject_count) (want 0)"
 teardown
 
+# ---------------------------------------------------------------- 21
+# REGRESSION (2026-08-22): a stale `.json` in a SUBDIRECTORY of the queue is
+# not an event and must not fire "WATCHER DOWN". #681's consumer-written
+# marker lived at `<queue>/.state/last-heartbeat.json`; the recursive find
+# counted it, and this check injected a false WATCHER DOWN twice in one day —
+# each time exactly 6 minutes after the directory's mtime, which is
+# indistinguishable from a real stale event. The marker is gone, but anything
+# else writing beside the queue would reproduce it, so the guard is pinned.
+setup
+mkdir -p "$QUEUE/.state"
+f="$QUEUE/.state/last-heartbeat.json"; echo '{}' > "$f"
+touch -d '10 minutes ago' "$f"
+run_check >/dev/null 2>&1
+[ "$(inject_count)" = 0 ] \
+    && pass "state file in a queue subdir: not counted as an unconsumed event" \
+    || fail "subdir .json counted as an event, injects=$(inject_count) (want 0)"
+teardown
+
+# ---------------------------------------------------------------- 22
+# A stale DOTFILE at the top level is not an event either: `claude-event`
+# writes to a dot-prefixed temp and renames into place, so an interrupted
+# write must not read as a permanently-unconsumed event.
+setup
+f="$QUEUE/.1750000000_tmp.json"; echo '{}' > "$f"
+touch -d '10 minutes ago' "$f"
+run_check >/dev/null 2>&1
+[ "$(inject_count)" = 0 ] \
+    && pass "stale dotfile temp: not counted as an unconsumed event" \
+    || fail "dotfile counted as an event, injects=$(inject_count) (want 0)"
+teardown
+
+# ---------------------------------------------------------------- 23
+# ...and a REAL stale event alongside that noise still fires exactly once, so
+# the two guards above cannot have been implemented by disabling the check.
+setup
+mkdir -p "$QUEUE/.state"
+f="$QUEUE/.state/marker.json"; echo '{}' > "$f"; touch -d '10 minutes ago' "$f"
+f="$QUEUE/.tmp.json"; echo '{}' > "$f"; touch -d '10 minutes ago' "$f"
+stale_event
+run_check >/dev/null 2>&1
+[ "$(inject_count)" = 1 ] \
+    && pass "real stale event still detected beside ignored non-events" \
+    || fail "real stale event missed, injects=$(inject_count) (want 1)"
+teardown
+
 # ----------------------------------------------------------------
 if [ "$fails" -gt 0 ]; then
     printf 'FAIL: %d case(s)\n' "$fails" >&2

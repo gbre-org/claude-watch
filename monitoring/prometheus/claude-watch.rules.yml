@@ -216,16 +216,21 @@ groups:
             gone missing. The daemon's watcher_down interrupt handles this
             in-tree; this is the external mirror.
 
-      # ClaudeMainLoopHeartbeatStale -- the host main-loop heartbeat FILE
-      # mtime has frozen, the canonical wedge signal. Only emitted when the
-      # heartbeat file exists, so absent != firing.
-      - alert: ClaudeMainLoopHeartbeatStale
-        expr: time() - claude_mainloop_heartbeat_timestamp_seconds > 900
+      # ClaudeMainLoopAckStale -- the main loop has not acked ANY claude-event
+      # in >15m, the canonical wedge signal. The loop runs `event-ack
+      # ack-batch` after every batch it handles, and the daemon emits a
+      # `keepalive` event whenever nothing has been acked for the quiet window,
+      # so even a fully idle loop has something to ack well inside 15m. Only
+      # emitted once the loop has acked at least once, so absent != firing.
+      # (Replaced ClaudeMainLoopHeartbeatStale 2026-08-22, when the host
+      # heartbeat file and its `touch` ritual were retired.)
+      - alert: ClaudeMainLoopAckStale
+        expr: time() - claude_mainloop_last_ack_timestamp_seconds > 900
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "claude main-loop heartbeat is stale"
+          summary: "claude main loop has not acked an event in >15m"
           description: >-
-            The host main-loop heartbeat file hasn't been touched in >15m.
-            The main loop is likely wedged.
+            No claude-event has been acked in >15m, through at least two
+            keepalive windows. The main loop is likely wedged.

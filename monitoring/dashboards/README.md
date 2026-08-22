@@ -107,17 +107,22 @@ Skip both and nothing else breaks: the tile does not render, Grafana flags the
 missing datasource on that one panel, and the two Prometheus tiles beside it
 are unaffected.
 
-**Rate limit is the design constraint here.** The call is unauthenticated, so
-GitHub allows 60 requests/hour/IP, and Grafana has no per-panel refresh
-interval — while the panel is in the viewport it fetches once per *dashboard*
-refresh (panels scrolled out of view are not queried). At this file's `30s`
-refresh that is 120/hour worst case, so a viewport parked on the panel can
-exhaust the budget — GitHub then answers 403 and the tile shows a query error
-until the hour rolls, while the Prometheus tiles beside it keep rendering. The
-panel's `interval: 5m` documents the intended ceiling but does not enforce it,
-because Infinity ignores min interval. A deployment that wants the tile
-always-on should raise the dashboard refresh to `5m`, or give the Infinity
-datasource a GitHub token (5,000/hour) and drop the refresh question entirely.
+**Rate limit is the design constraint here, and it is what sets this
+dashboard's refresh.** The call is unauthenticated, so GitHub allows 60
+requests/hour/IP, and Grafana has no per-panel refresh interval — while the
+panel is in the viewport it fetches once per *dashboard* refresh (panels
+scrolled out of view are not queried). At the `30s` this file used to ship,
+that is ~120/hour worst case: a viewport parked on the panel exhausts the
+budget in half an hour, GitHub answers 403, and the tile shows a query error
+until the hour rolls. The panel's `interval: 5m` documents the intended
+ceiling but does not enforce it, because Infinity ignores min interval.
+
+So `refresh` is `5m` (2026-08-22), which puts the worst case at 12/hour. It
+costs this board nothing: the fastest-moving tiles are second-resolution ages
+a viewer reads as "roughly how long", and every alerting decision is made by
+the Prometheus rules in `monitoring/prometheus/`, never by a rendered panel.
+A deployment that genuinely wants sub-minute refresh should give the Infinity
+datasource a GitHub token (5,000/hour) first, and only then lower `refresh`.
 
 The query ranks by `merged_at`, not by PR number — number order and merge order
 diverge whenever two PRs are open at once — via the JSONata root selector

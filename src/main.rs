@@ -1234,16 +1234,15 @@ async fn run_daemon() {
     );
     let mut last_full_check = std::time::Instant::now() - general_interval; // run immediately
 
-    // Cadence emitter: the daemon sources the `heartbeat-tick` (5min) and
-    // `memory-reminder` (15min) cadence signals, replacing the out-of-tree
-    // self-rescheduling reminder background task. heartbeat-tick is delivered
-    // via the event queue (reminds the main loop to touch the heartbeat file);
-    // memory-reminder is tmux-injected. NOTE: the daemon deliberately does NOT
-    // touch the host heartbeat file itself — that remains the main loop's job
-    // so a wedged loop still goes stale and trips wedge detection. See
+    // Cadence emitter: the daemon sources the `keepalive` and
+    // `memory-reminder` cadence signals, replacing the out-of-tree
+    // self-rescheduling reminder background task. Both ride the event queue.
+    // NOTE: the daemon deliberately does NOT stamp the liveness timestamp
+    // itself — that remains the main loop's job (via `event-ack ack-batch`) so
+    // a wedged loop still goes stale and trips wedge detection. See
     // `crate::cadence`.
     let mut cadence_tracker = cadence::CadenceTracker::with_intervals(
-        Duration::from_secs(current_config.cadence.heartbeat_tick_interval_secs),
+        Duration::from_secs(current_config.cadence.keepalive_interval_secs),
         Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
     );
 
@@ -1287,7 +1286,7 @@ async fn run_daemon() {
             // Re-arm the cadence tracker in case the operator tuned the
             // intervals via config.toml + SIGHUP.
             cadence_tracker = cadence::CadenceTracker::with_intervals(
-                Duration::from_secs(current_config.cadence.heartbeat_tick_interval_secs),
+                Duration::from_secs(current_config.cadence.keepalive_interval_secs),
                 Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
             );
             write_jsonl_log(
@@ -1299,92 +1298,69 @@ async fn run_daemon() {
 
         let now = std::time::Instant::now();
 
-        // Cadence signals (heartbeat-tick / memory-reminder).
+        // Cadence signals (keepalive / memory-reminder).
         //
-        // heartbeat-tick (ACK-DRIVEN REDESIGN 2026-08-21): the daemon now emits
-        // heartbeat-tick as an ON-DEMAND PROBE, only when the last-ack timestamp
-        // has gone quiet (no event-ack in the ack-quiet window). ANY event-ack
-        // (not just heartbeat-tick acks) proves the loop is alive, so a busy loop
-        // acking many events never sees a probe — the daemon only nudges when acks
-        // are quiet. This replaces the fixed ~900s cadence with a gated probe that
-        // fires ONLY when liveness is uncertain. The daemon still does NOT touch
-        // the heartbeat file itself — that remains the main loop's job (wedge
-        // detection).
+        // keepalive: a POKE FOR QUIET PERIODS, not a schedule. The tracker
+        // ticks every `[cadence] keepalive_interval_secs`, but the event is
+        // emitted ONLY when the last ack is at least that old. ANY ack (the
+        // main loop runs `event-ack ack-batch` on every event batch it
+        // handles) proves the loop is alive, so a loop that is busy handling
+        // real events never sees a keepalive at all — which is the entire
+        // point of the 2026-08-22 redesign: ONE liveness signal, poked only
+        // when it has gone quiet. The daemon still never stamps the ack
+        // timestamp itself; that would defeat wedge detection.
         //
-        // memory-reminder: tmux-inject the checklist directly into the pane so
-        // the main loop sees it as a user-typed prompt. This is the same delivery
-        // mechanism used by other daemon interventions (nudge, resume, etc.) and
-        // intentionally bypasses the event queue.
+        // memory-reminder: non-urgent context hygiene, delivered as an AMBIENT
+        // claude-event (surfaced on the next UserPromptSubmit).
         if current_config.cadence.enabled {
             let due = cadence_tracker.due(now);
             if !due.is_empty() {
                 tracing::debug!(
-                    heartbeat_tick = due.heartbeat_tick,
+                    keepalive = due.keepalive,
                     memory_reminder = due.memory_reminder,
                     "cadence signal(s) due"
                 );
             }
-            if due.heartbeat_tick {
-                // Ack-driven probe: check the last-ack timestamp age. Only emit
-                // the heartbeat-tick probe if acks have gone quiet (last-ack older
-                // than the ack-quiet threshold). Default threshold: 600s (10 min).
-                // Resolves the event state dir the same way event-ack does.
-                let event_state_dir = std::env::var("CLAUDE_EVENT_STATE_DIR")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                        format!("{}/.config/claude-events", home)
-                    });
-                let last_ack_age = policy::last_ack_timestamp_age(&event_state_dir);
-                let ack_quiet_threshold_secs =
-                    std::env::var("HEARTBEAT_ACK_QUIET_SECS")
-                        .ok()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(600); // 10 min default
+            if due.keepalive {
+                let quiet_secs = current_config.cadence.keepalive_interval_secs;
+                let last_ack_age =
+                    policy::last_ack_timestamp_age(&current_config.ack.resolve_state_dir());
 
+                // Emit only when the bus has been quiet for the whole window.
+                // `None` (no ack state at all: fresh boot, or a deployment
+                // without event-must-act) emits — that host has no other way
+                // to establish liveness, and the first ack starts the clock.
                 let should_emit = match last_ack_age {
-                    Some(age) if age >= ack_quiet_threshold_secs => {
+                    Some(age) if age >= quiet_secs => {
                         tracing::debug!(
                             last_ack_age_secs = age,
-                            threshold_secs = ack_quiet_threshold_secs,
-                            "acks quiet: emitting heartbeat-tick probe"
+                            quiet_secs,
+                            "acks quiet: emitting keepalive"
                         );
                         true
                     }
                     Some(age) => {
                         tracing::debug!(
                             last_ack_age_secs = age,
-                            threshold_secs = ack_quiet_threshold_secs,
-                            "acks still fresh: suppressing heartbeat-tick probe"
+                            quiet_secs,
+                            "acks flowing: suppressing keepalive"
                         );
                         false
                     }
                     None => {
-                        // No last-ack timestamp available (fresh boot / stripped
-                        // deployment). Emit the probe — this is the legacy behavior.
-                        tracing::debug!(
-                            "no last-ack timestamp: emitting heartbeat-tick probe (legacy mode)"
-                        );
+                        tracing::debug!("no last-ack stamp yet: emitting keepalive");
                         true
                     }
                 };
 
                 if should_emit {
-                    // Body carries the configured host heartbeat-file path so the
-                    // main loop knows WHICH file to touch. It is the canonical
-                    // `[claude].heartbeat_file` path — the same one the daemon
-                    // monitors for staleness — so the reminder and the detector
-                    // stay pinned to one user-configurable path.
                     event_bus::emit_cadence(&event_bus::CadenceEvent {
-                        tag: cadence::HEARTBEAT_TICK_TAG,
+                        tag: cadence::KEEPALIVE_TAG,
                         source: cadence::CADENCE_SOURCE,
-                        message: "heartbeat tick",
+                        message: "keepalive: no event acked recently — \
+                                  run `event-ack ack-batch` to prove liveness",
                         priority: "low",
-                        data: event_bus::heartbeat_tick_data(
-                            &current_config.claude.heartbeat_file,
-                            current_config.cadence.heartbeat_tick_interval_secs,
-                        ),
+                        data: event_bus::keepalive_data(quiet_secs, last_ack_age),
                     });
                 }
             }
@@ -1393,7 +1369,7 @@ async fn run_daemon() {
                 // delivered as an AMBIENT claude-event on the queue (surfaced
                 // on the next UserPromptSubmit) rather than as a
                 // mid-generation tmux-inject interruption. Mirrors the
-                // heartbeat-tick delivery path above; the checklist body
+                // keepalive delivery path above; the checklist body
                 // rides in the event `message`, and event-classify routes
                 // claude-watch/memory-reminder to the ambient tier.
                 event_bus::emit_cadence(&event_bus::CadenceEvent {

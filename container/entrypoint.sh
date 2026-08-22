@@ -140,8 +140,8 @@ if [ ! -e "$CLAUDE_WATCH_RUNTIME_CONFIG" ]; then
 #
 # Example — retune the daemon-emitted cadence claude-events live:
 # [cadence]
-# memory_reminder_interval_secs = 3600   # 1h  (code default 1800 = 30min)
-# heartbeat_tick_interval_secs  = 900    # 15min
+# memory_reminder_interval_secs = 3600   # 1h    (code default 1800 = 30min)
+# keepalive_interval_secs       = 300    # 5min  (code default 300)
 #
 # Example -- retune the event-watcher health-check staleness threshold live
 # (consumed by the cw-watcher-health-check cron, not the daemon):

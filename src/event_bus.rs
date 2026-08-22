@@ -81,12 +81,20 @@ pub struct ClaudeWatchAlert<'a> {
     ///   `heartbeat-stale`, `prolonged-thinking`, `watcher-down`,
     ///   `fresh-clear-stuck`, `claude-crashed`, `auto-update-failed`,
     ///   `auto-update-complete`, `reauth-needed`, `wedged-pane`.
+    ///
+    /// NOTE on `heartbeat-stale`: the CONDITION it names is now "the main loop
+    /// has not acked any event in `[ack] stale_minutes`" — see
+    /// `policy::last_ack_timestamp_age`. The string itself is deliberately NOT
+    /// renamed: it is a wire value that out-of-tree consumers (alert-gate
+    /// hooks, host routing tables) match on, and renaming it would silently
+    /// stop those matching with no error anywhere. Read it as the alert's ID,
+    /// not as a description of the mechanism.
     pub alert_type: &'a str,
-    /// Short human-readable reason. For heartbeat-path alerts this is
-    /// the same `stuck_reason` already threaded through `policy.rs`.
+    /// Short human-readable reason. For the liveness path this is the same
+    /// `stuck_reason` already threaded through `policy.rs`.
     pub stuck_reason: &'a str,
-    /// Heartbeat staleness in minutes (only meaningful for
-    /// `heartbeat-stale`; None elsewhere).
+    /// Liveness staleness in minutes (only meaningful for `heartbeat-stale`;
+    /// None elsewhere).
     pub stale_minutes: Option<u64>,
     /// Names of watchers known to be missing (only meaningful for
     /// `watcher-down`; empty elsewhere).
@@ -214,7 +222,7 @@ pub fn emit(alert: &ClaudeWatchAlert<'_>) {
     );
 }
 
-/// A generic daemon-emitted cadence event (`heartbeat-tick`,
+/// A generic daemon-emitted cadence event (`keepalive`,
 /// `memory-reminder`). Unlike [`ClaudeWatchAlert`], these carry no
 /// alert/stuck semantics — they are plain periodic signals the daemon
 /// produces on its monotonic clock (see [`crate::cadence`]). The body
@@ -222,11 +230,11 @@ pub fn emit(alert: &ClaudeWatchAlert<'_>) {
 /// `claude-event-watch` dispatches purely on `tag`.
 #[derive(Debug, Clone)]
 pub struct CadenceEvent<'a> {
-    /// Event tag (also the dispatch key). E.g. `heartbeat-tick`.
+    /// Event tag (also the dispatch key). E.g. `keepalive`.
     pub tag: &'a str,
     /// `source` / `source_name` fields. `claude-watch` for these.
     pub source: &'a str,
-    /// Human-readable message — for `heartbeat-tick` a short string, for
+    /// Human-readable message — for `keepalive` a short string, for
     /// `memory-reminder` the full action checklist.
     pub message: &'a str,
     /// Priority field (`low|normal|high|urgent`).
@@ -263,20 +271,33 @@ pub fn build_cadence_json(ev: &CadenceEvent<'_>) -> serde_json::Value {
     })
 }
 
-/// Build the `data` body for a `heartbeat-tick` cadence event.
+/// The ONE command the main loop runs after handling an event batch. It acks
+/// every pending actionable entry and stamps the liveness timestamp the
+/// daemon reads, so it is both the gate-clear and the proof-of-life. Kept as
+/// a const because three producers quote it: the keepalive event body, the
+/// ack-stale recovery prompt, and `claude-event-watch`'s per-batch footer.
+pub const ACK_BATCH_COMMAND: &str = "event-ack ack-batch";
+
+/// Build the `data` body for a `keepalive` cadence event.
 ///
-/// Carries the configured host heartbeat-file `path` — the file the main
-/// loop is reminded to touch on each tick — plus the emit `interval_secs`.
-/// The path is sourced from the daemon's existing `[claude].heartbeat_file`
-/// config, which is the SAME path the daemon monitors for staleness, so the
-/// "touch this file" instruction and the "this file went stale" detector can
-/// never drift to different paths. Kept as a named builder so the daemon
-/// call site and the unit tests agree on the body shape.
-pub fn heartbeat_tick_data(heartbeat_path: &str, interval_secs: u64) -> serde_json::Value {
-    serde_json::json!({
-        "path": heartbeat_path,
-        "interval_secs": interval_secs,
-    })
+/// Carries the ONE command the main loop must run to clear it —
+/// [`ACK_BATCH_COMMAND`] — plus the quiet window that triggered the emission
+/// and how old the last ack was. `claude-event-watch` surfaces every scalar
+/// in `data` on the EVENT[...] line, so the loop is TOLD the ritual rather
+/// than having to remember it.
+///
+/// `last_ack_age_secs` is `None` on a host with no ack state yet (fresh boot,
+/// or a deployment without event-must-act) — the field is then omitted rather
+/// than faked with a 0 that would read as "just acked".
+pub fn keepalive_data(interval_secs: u64, last_ack_age_secs: Option<u64>) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "ack_command": ACK_BATCH_COMMAND,
+        "quiet_secs": interval_secs,
+    });
+    if let Some(age) = last_ack_age_secs {
+        data["last_ack_age_secs"] = serde_json::json!(age);
+    }
+    data
 }
 
 /// Emit a cadence event JSON file into the queue dir. Default-open: any
@@ -512,7 +533,7 @@ pub(crate) mod test_support {
     /// the var in test A while test B sits between its own set and emit —
     /// B's emission then falls back to the user's LIVE event queue
     /// (`~/claude-events/`). Not hypothetical: fixture events from this
-    /// suite (a "workload translate-book done", a heartbeat-tick with a
+    /// suite (a "workload translate-book done", a keepalive with a
     /// /custom/run path) were observed landing in the live queue and
     /// churning the real event watcher. (nextest is immune — one process
     /// per test — but plain `cargo test` is a supported runner and must
@@ -818,18 +839,18 @@ mod tests {
     #[test]
     fn build_cadence_json_has_required_fields() {
         let ev = CadenceEvent {
-            tag: "heartbeat-tick",
+            tag: "keepalive",
             source: "claude-watch",
-            message: "heartbeat tick",
+            message: "keepalive tick",
             priority: "low",
             data: serde_json::json!({"interval_secs": 60}),
         };
         let v = build_cadence_json(&ev);
-        assert_eq!(v["tag"], "heartbeat-tick");
+        assert_eq!(v["tag"], "keepalive");
         assert_eq!(v["source"], "claude-watch");
         assert_eq!(v["source_name"], "claude-watch");
         assert_eq!(v["priority"], "low");
-        assert_eq!(v["message"], "heartbeat tick");
+        assert_eq!(v["message"], "keepalive tick");
         assert_eq!(v["data"]["interval_secs"], 60);
         assert!(v["timestamp"].is_number());
         assert!(v["timestamp_iso"].is_string());
@@ -869,71 +890,78 @@ mod tests {
         assert_eq!(parsed["data"]["interval_secs"], 900);
     }
 
-    /// Regression guard: heartbeat-tick must reach the event queue.
+    /// Regression guard: keepalive must reach the event queue.
     ///
-    /// An earlier change made the daemon's heartbeat-tick a no-op (logged
-    /// only, never delivered), so the main loop stopped getting its 5-min
-    /// reminder to touch the host heartbeat file → the heartbeat went stale
-    /// and the daemon fired spurious "heartbeat stale" alerts. This test
-    /// builds the heartbeat-tick cadence event exactly as `run_daemon` does
-    /// (using the `cadence` constants) and asserts an event file lands in the
-    /// queue with the right tag/source/priority.
+    /// An earlier change made the daemon's cadence tick a no-op (logged only,
+    /// never delivered), so the main loop stopped getting its quiet-period
+    /// poke → liveness went stale and the daemon fired spurious stale alerts.
+    /// This test builds the keepalive cadence event exactly as `run_daemon`
+    /// does (using the `cadence` constants) and asserts an event file lands in
+    /// the queue with the right tag/source/priority.
     #[test]
-    fn emit_cadence_heartbeat_tick_writes_event() {
+    fn emit_cadence_keepalive_writes_event() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _env = super::test_support::EventQueueGuard::set(tmp.path());
 
-        // Mirror the production call site in `main::run_daemon`, including a
-        // NON-default configured heartbeat path so we prove the configured
-        // value flows into the event body (not a hardcoded constant).
-        let configured_path = "/custom/run/claude/heartbeat";
+        // Mirror the production call site in `main::run_daemon`.
         let ev = CadenceEvent {
-            tag: crate::cadence::HEARTBEAT_TICK_TAG,
+            tag: crate::cadence::KEEPALIVE_TAG,
             source: crate::cadence::CADENCE_SOURCE,
-            message: "heartbeat tick",
+            message: "keepalive: no event acked recently",
             priority: "low",
-            data: heartbeat_tick_data(configured_path, 300),
+            data: keepalive_data(300, Some(612)),
         };
         emit_cadence(&ev);
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
             .filter_map(Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with("_heartbeat-tick.json")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with("_keepalive.json"))
             .collect();
         assert_eq!(
             entries.len(),
             1,
-            "heartbeat-tick must produce exactly one event-queue file"
+            "keepalive must produce exactly one event-queue file"
         );
 
         let content = std::fs::read_to_string(entries[0].path()).expect("read event");
         let parsed: serde_json::Value =
             serde_json::from_str(&content).expect("event is valid JSON");
-        assert_eq!(parsed["tag"], "heartbeat-tick");
+        assert_eq!(parsed["tag"], "keepalive");
         assert_eq!(parsed["source"], "claude-watch");
         assert_eq!(parsed["priority"], "low");
-        assert_eq!(parsed["data"]["interval_secs"], 300);
-        // The configured heartbeat-file path must be carried in the body and
-        // must reflect the configured (non-default) value.
-        assert_eq!(parsed["data"]["path"], configured_path);
+        assert_eq!(parsed["data"]["quiet_secs"], 300);
+        assert_eq!(parsed["data"]["last_ack_age_secs"], 612);
+        // The body must TELL the loop the ritual, not assume it remembers.
+        // claude-event-watch renders every scalar in `data` on the EVENT line,
+        // so this is what makes the instruction visible.
+        assert_eq!(parsed["data"]["ack_command"], "event-ack ack-batch");
     }
 
     #[test]
-    fn heartbeat_tick_data_carries_configured_path() {
-        // Default-shaped path.
-        let data = heartbeat_tick_data("/var/run/claude/heartbeat", 300);
-        assert_eq!(data["path"], "/var/run/claude/heartbeat");
-        assert_eq!(data["interval_secs"], 300);
+    fn keepalive_data_carries_the_ack_command_and_quiet_window() {
+        let data = keepalive_data(300, Some(900));
+        assert_eq!(data["ack_command"], ACK_BATCH_COMMAND);
+        assert_eq!(data["quiet_secs"], 300);
+        assert_eq!(data["last_ack_age_secs"], 900);
 
-        // A user-configured override must surface verbatim in the body — the
-        // path is NOT hardcoded.
-        let data = heartbeat_tick_data("/tmp/claude-heartbeat", 60);
-        assert_eq!(data["path"], "/tmp/claude-heartbeat");
-        assert_eq!(data["interval_secs"], 60);
+        // A configured override surfaces verbatim — the window is NOT
+        // hardcoded in the body.
+        let data = keepalive_data(60, Some(61));
+        assert_eq!(data["quiet_secs"], 60);
+    }
+
+    #[test]
+    fn keepalive_data_omits_age_when_no_ack_recorded() {
+        // No ack state at all (fresh boot / no event-must-act). Omitting the
+        // field is deliberate: a 0 would render on the EVENT line as
+        // `last_ack_age_secs=0`, i.e. "just acked" — the exact opposite of
+        // what triggered the emission.
+        let data = keepalive_data(300, None);
+        assert!(
+            data.get("last_ack_age_secs").is_none(),
+            "unknown ack age must be omitted, never faked as 0; got: {data}"
+        );
+        assert_eq!(data["ack_command"], ACK_BATCH_COMMAND);
     }
 }
