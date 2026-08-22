@@ -774,6 +774,21 @@ pub struct ReauthConfig {
     #[serde(default = "default_reauth_alert_interval")]
     pub alert_interval_seconds: u64,
 
+    /// Drive `self-login` automatically when Claude Code prints its in-TUI
+    /// "Please run /login · API Error: 401 OAuth access token has expired"
+    /// banner AND the credential store agrees the access token is dead.
+    ///
+    /// A sibling of `expiry_auto_self_login`, kept separate because the two
+    /// interrupt different things. The proactive knob interrupts a WORKING
+    /// session days before anything breaks, which is a judgement call; this
+    /// one acts on a session that has ALREADY stopped being able to make API
+    /// calls, where the only alternative is a human typing `/login`. Default
+    /// on. The same retry / attempt / abandon bounds apply. When off, the
+    /// banner still raises the high-priority reauth alert — it is never
+    /// silent.
+    #[serde(default = "default_auth_error_auto_self_login")]
+    pub auth_error_auto_self_login: bool,
+
     // --- Proactive expiry (the `[reauth]` section's second, forward-looking
     // half). The fields above react to credentials that are ALREADY dead; the
     // ones below act on Claude Code's warning that they are about to be.
@@ -853,6 +868,7 @@ impl Default for ReauthConfig {
         Self {
             enabled: default_reauth_enabled(),
             alert_interval_seconds: default_reauth_alert_interval(),
+            auth_error_auto_self_login: default_auth_error_auto_self_login(),
             expiry_watch_enabled: default_expiry_watch_enabled(),
             expiry_auto_self_login: default_expiry_auto_self_login(),
             expiry_auto_days: default_expiry_auto_days(),
@@ -872,6 +888,10 @@ fn default_reauth_enabled() -> bool {
 
 fn default_reauth_alert_interval() -> u64 {
     10800 // 3 hours
+}
+
+fn default_auth_error_auto_self_login() -> bool {
+    true
 }
 
 fn default_expiry_watch_enabled() -> bool {
@@ -2307,6 +2327,7 @@ cooldown = 300
         let config = parse_config(SAMPLE_CONFIG).unwrap();
         assert!(config.reauth.expiry_watch_enabled);
         assert!(config.reauth.expiry_auto_self_login);
+        assert!(config.reauth.auth_error_auto_self_login);
         assert_eq!(config.reauth.expiry_auto_days, 1);
         assert_eq!(config.reauth.self_login_retry_seconds, 3600);
         assert_eq!(config.reauth.self_login_max_attempts, 3);
@@ -2326,6 +2347,7 @@ cooldown = 300
              enabled = true\n\
              alert_interval_seconds = 10800\n\
              expiry_auto_self_login = false\n\
+             auth_error_auto_self_login = false\n\
              expiry_auto_days = 2\n\
              self_login_abandon_seconds = 0\n\
              self_login_command = \"/usr/local/bin/self-login\"\n",
@@ -2338,6 +2360,7 @@ cooldown = 300
         assert!(config.reauth.enabled);
         assert!(config.reauth.expiry_watch_enabled);
         assert!(!config.reauth.expiry_auto_self_login);
+        assert!(!config.reauth.auth_error_auto_self_login);
         assert_eq!(config.reauth.expiry_auto_days, 2);
         assert_eq!(config.reauth.self_login_abandon_seconds, 0);
         assert_eq!(config.reauth.self_login_command, "/usr/local/bin/self-login");
