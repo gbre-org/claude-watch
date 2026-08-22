@@ -8,7 +8,9 @@ drifts.
 
 - **`claude-watch.json`** (uid `claude-watch`) — the daemon dashboard: status,
   heartbeat, context, watchers, hook reminders/fallbacks, interrupts, and
-  token usage.
+  token usage. One optional tile (Build Info → "latest merged PR") needs the
+  Infinity datasource; see [Infinity](#infinity--optional-one-tile-in-claude-watchjson)
+  below.
 - **`claude-events.json`** (uid `claude-events`) — the event bus: backlog
   depth, oldest-unconsumed age, emission rate split by producer and by tag,
   emitted-vs-consumed, and cumulative totals. Needs
@@ -69,6 +71,61 @@ jq '(.. | objects | select(.type? == "prometheus") | .uid) = "YOUR_UID"' \
   claude-watch.json > /path/to/deployment/dashboards/claude-watch.json
 ```
 
+### Infinity — optional, one tile in `claude-watch.json`
+
+One target is not Prometheus: the third tile of the **Build Info** panel
+("latest merged PR #n") queries GitHub's REST API directly through the
+[Infinity](https://grafana.com/grafana/plugins/yesoreyeram-infinity-datasource/)
+datasource, which is why that panel's own datasource is `-- Mixed --`. It is
+the only Infinity target in this repo, and it is deliberately exporter-free: a
+local exporter scraping GitHub for one number is a service to run, restart and
+forget, and the number is already public.
+
+This repo ships no Grafana service — nothing here provisions one, so there is
+no compose file to add the plugin to. A deployment that wants the tile needs
+two things in **its own** Grafana:
+
+1. The plugin installed. On the official image that is one env var —
+   `GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource` (verified against
+   plugin 4.0.0) — or `grafana-cli plugins install
+   yesoreyeram-infinity-datasource` on a package install.
+2. The datasource provisioned with the stable uid the dashboard binds to,
+   exactly as with `uid: prometheus` above:
+
+```yaml
+# provisioning/datasources/infinity.yml
+apiVersion: 1
+datasources:
+  - name: Infinity
+    type: yesoreyeram-infinity-datasource
+    uid: infinity
+    access: proxy
+    jsonData: {}
+```
+
+Skip both and nothing else breaks: the tile does not render, Grafana flags the
+missing datasource on that one panel, and the two Prometheus tiles beside it
+are unaffected.
+
+**Rate limit is the design constraint here.** The call is unauthenticated, so
+GitHub allows 60 requests/hour/IP, and Grafana has no per-panel refresh
+interval — while the panel is in the viewport it fetches once per *dashboard*
+refresh (panels scrolled out of view are not queried). At this file's `30s`
+refresh that is 120/hour worst case, so a viewport parked on the panel can
+exhaust the budget — GitHub then answers 403 and the tile shows a query error
+until the hour rolls, while the Prometheus tiles beside it keep rendering. The
+panel's `interval: 5m` documents the intended ceiling but does not enforce it,
+because Infinity ignores min interval. A deployment that wants the tile
+always-on should raise the dashboard refresh to `5m`, or give the Infinity
+datasource a GitHub token (5,000/hour) and drop the refresh question entirely.
+
+The query ranks by `merged_at`, not by PR number — number order and merge order
+diverge whenever two PRs are open at once — via the JSONata root selector
+`$[merged_at != null]^(>merged_at)[0]`, evaluated by Infinity's **backend**
+parser. `sort=updated` in the URL only pulls recent PRs into the first page; a
+comment bumps `updated_at` without merging anything, so the ordering that
+decides the answer is redone in the selector.
+
 ## Layout conventions
 
 - **No `row` panels.** Even an expanded row costs a chevron, a title line and
@@ -85,5 +142,7 @@ jq '(.. | objects | select(.type? == "prometheus") | .uid) = "YOUR_UID"' \
   textfile collector (`src/metrics.rs`)
 - `claude_events_*` → `exporters/claude-events-exporter/`
 - `worktask_queue_*` → `exporters/work-queue-exporter/`
+- "latest merged PR #n" (Build Info) → no metric at all: Infinity fetches
+  `api.github.com/repos/hndrewaall/claude-watch/pulls` at render time
 
 Alerting on the same metrics lives in `monitoring/prometheus/`.

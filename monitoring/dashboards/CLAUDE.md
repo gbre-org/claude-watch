@@ -28,7 +28,8 @@ lifetime it controls. Consequences, both directions:
 ## Any sync is uid-aware, never a plain `cp`
 
 Panels here bind their datasource by the portable placeholder
-`uid: prometheus`. A deployment whose Prometheus datasource was created through
+`uid: prometheus` (and, for the one GitHub-reading tile in `claude-watch.json`,
+`uid: infinity`). A deployment whose Prometheus datasource was created through
 the Grafana UI instead has a generated uid (`P1234567890ABCDEF`), so its copy
 will differ from this file by at least that value. Copying verbatim in
 **either** direction can therefore point every panel at a datasource that does

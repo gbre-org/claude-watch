@@ -416,6 +416,7 @@
       "id": 47,
       "title": "Build Info",
       "type": "stat",
+      "description": "What is running and what shipped last. Left two tiles come from the claude_watch_build_info gauge the daemon's textfile collector writes (src/metrics.rs): the commit the RUNNING binary was built from, and the PR that commit came in on. They describe the deployed binary, so they only move on a deploy.\n\nThe third tile is the repo's side of the same question -- the most recently MERGED pull request on GitHub -- and it moves the moment a PR merges, which is what makes the pair useful: a gap between them is un-deployed work. It is read directly from GitHub by the Infinity datasource (uid `infinity`, backend parser), NOT from Prometheus, which is why this panel's datasource is `-- Mixed --`. There is deliberately no exporter behind it: a local exporter scraping GitHub for one number is one more service to run, restart and forget, and the value it holds is already public.\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops the closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first. Number order inverts merged order routinely -- two PRs open at once merge in whichever order goes green first (#680 merged after #681 on 2026-08-22) -- so `max(number)` would show the wrong PR every time that happens. The URL's sort=updated is only a cheap way to get recent PRs into the first page; a comment or a label bumps updated_at without merging anything, so the ordering that matters is redone here.\n\nUNAUTHENTICATED, and that is the constraint on how often it may run. GitHub allows 60 requests/hour/IP without a token, and one dashboard refresh with this panel on screen is one request -- Grafana has no per-panel refresh interval, so the call rate is the DASHBOARD refresh rate whenever this panel is in the viewport (panels scrolled out of view are not queried). At the 30s refresh this file ships, a viewport parked here burns the hour's budget in 30 minutes; GitHub then answers 403 and the tile shows a query error until the window rolls; the panel's 5m min interval does not change that, because Infinity ignores it. If a deployment wants this panel always-on, either raise the dashboard refresh to 5m or give the Infinity datasource a GitHub token (5,000/hour). Rate-limited or offline, the failure is confined to this tile and its error marker -- the two Prometheus tiles keep rendering.\n\nWhere the Infinity datasource is not provisioned this tile simply does not appear (Grafana flags the missing datasource on the panel; the two Prometheus tiles still render). Infinity is not part of a default Grafana install: see monitoring/dashboards/README.md for the plugin install and the uid `infinity` provisioning stanza it needs.",
       "gridPos": {
         "h": 4,
         "w": 24,
@@ -423,21 +424,68 @@
         "y": 25
       },
       "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
+        "type": "datasource",
+        "uid": "-- Mixed --"
       },
+      "interval": "5m",
       "targets": [
         {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "expr": "claude_watch_build_info",
           "legendFormat": "commit {{commit}}",
           "refId": "A",
           "instant": true
         },
         {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "expr": "claude_watch_build_info",
           "legendFormat": "PR #{{pr}}",
           "refId": "B",
           "instant": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "infinity"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "https://api.github.com/repos/hndrewaall/claude-watch/pulls?state=closed&sort=updated&direction=desc&per_page=100",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "$[merged_at != null]^(>merged_at)[0]",
+          "columns": [
+            {
+              "selector": "merged_at",
+              "text": "merged_at",
+              "type": "timestamp"
+            },
+            {
+              "selector": "number",
+              "text": "pr",
+              "type": "string"
+            },
+            {
+              "selector": "title",
+              "text": "title",
+              "type": "string"
+            },
+            {
+              "selector": "number",
+              "text": "value",
+              "type": "number"
+            }
+          ]
         }
       ],
       "fieldConfig": {
@@ -456,7 +504,30 @@
             ]
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "latest merged PR #${__field.labels.pr}"
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "${__field.labels.title}",
+                    "url": "https://github.com/hndrewaall/claude-watch/pull/${__field.labels.pr}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "reduceOptions": {
