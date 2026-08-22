@@ -9,6 +9,8 @@
 #
 #     scripts/install-host-cron.sh              # render + install to /etc/cron.d
 #     scripts/install-host-cron.sh -n           # dry run: print the rendered file
+#     scripts/install-host-cron.sh --enable X   # also enable optional job X
+#     scripts/install-host-cron.sh --list-optional  # list optional job names
 #     scripts/install-host-cron.sh --help       # all flags
 #
 # The installer resolves every placeholder from the local checkout (and lets
@@ -93,16 +95,31 @@ PATH=/usr/local/bin:/usr/bin:/bin:@CW_HOME@/bin
 # Optional jobs (commented out — enable per deployment)
 # ---------------------------------------------------------------------------
 #
-# The container bakes these two as well. They are left commented here because a
-# host deployment may already run an equivalent out-of-tree watchdog, and
-# installing this fragment must not silently add event emitters to a host that
-# did not ask for them. Uncomment whichever the deployment wants; the installer
-# substitutes placeholders in commented rows too, so they are ready to enable
-# in place.
+# The container bakes some of these as well. They are left commented here
+# because a host deployment may already run an equivalent out-of-tree
+# watchdog, or may not run the thing the job feeds (e.g. queue-minisite), and
+# installing this fragment must not silently add event emitters to a host
+# that did not ask for them.
+#
+# Enable one at install time — no template edit required — with:
+#
+#     scripts/install-host-cron.sh --enable <job>[,<job>...]   # repeatable
+#     CW_HOST_CRON_ENABLE=<job>,<job> scripts/install-host-cron.sh
+#     scripts/install-host-cron.sh --list-optional              # names
+#
+# Each optional row is preceded by a `# optional: <job>` marker on the line
+# directly above it; that is what `--enable <job>` matches against — NOT the
+# command text — so the marker line must stay immediately above its row if
+# either is ever reordered. An unknown job name is a hard error listing the
+# known ones. The installer still substitutes placeholders in every
+# commented row regardless of whether it gets enabled, so a manually
+# uncommented row is also ready to use in place (that path still works; it
+# is just no longer the only one).
 #
 # Stale-ready queue-item watchdog: every 5 minutes, scan for pending queue
 # items that have been ready past the threshold and emit ONE aggregated
 # `queue-stale-ready` event per qualifying tick (single-emit per queue id).
+# optional: stale-ready-check
 #*/5 * * * *  @CW_USER@ @CW_BIN@ stale-ready-check > /dev/null 2>&1
 #
 # Stuck / orphaned queue-item watchdog: every 5 minutes, emit `queue-orphaned`
@@ -110,6 +127,7 @@ PATH=/usr/local/bin:/usr/bin:/bin:@CW_HOME@/bin
 # heartbeat has gone stale. Emission is gated behind `[queue_check]
 # emit_events` in config.toml (default false), so this runs the detector but
 # stays silent until that toggle is flipped on.
+# optional: queue-check
 #*/5 * * * *  @CW_USER@ @CW_BIN@ queue-check > /dev/null 2>&1
 #
 # Session-store rotation: once a day, bound the two unbounded growers under
@@ -120,6 +138,7 @@ PATH=/usr/local/bin:/usr/bin:/bin:@CW_HOME@/bin
 # PATH via @CW_HOME@/bin after `make install`), NOT @CW_BIN@ (the Rust daemon),
 # so it is a bare command name resolved off the PATH set above. Thresholds are
 # overridable via ROTATE_* env vars (see `session-task queue rotate --help`).
+# optional: session-rotate
 #17 4 * * *  @CW_USER@ session-task queue rotate > /dev/null 2>&1
 #
 # Agent activity snapshot producer: every-minute run of `cw-agent-stats
@@ -134,4 +153,5 @@ PATH=/usr/local/bin:/usr/bin:/bin:@CW_HOME@/bin
 # Bare `cw-agent-stats` resolves off the PATH set above (@CW_HOME@/bin after
 # `make install`), same as the session-task row -- NOT @CW_BIN@, which is
 # the Rust daemon, not this Python script.
+# optional: cw-agent-stats
 #* * * * *  @CW_USER@ /usr/bin/flock -n /tmp/cw-agent-stats.lock cw-agent-stats --loop --duration 58 --interval 4 2>&1 | logger -t cw-agent-stats

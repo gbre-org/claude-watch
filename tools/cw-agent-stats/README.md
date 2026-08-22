@@ -126,9 +126,12 @@ hard error (exit 1), same as always — explicit means opted in.
 cw-agent-stats --once --print --no-write --no-prom
 
 # the cron shape: ~4s freshness, no daemon to babysit (Linux). The canonical
-# in-repo form is the commented-out row in cron.d/cw-host (rendered by
-# scripts/install-host-cron.sh — uncomment it there to enable); the
-# equivalent by hand:
+# in-repo form is the commented-out `cw-agent-stats` row in cron.d/cw-host,
+# tagged `# optional: cw-agent-stats`; enable it at install time (no template
+# edit needed) with:
+scripts/install-host-cron.sh --enable cw-agent-stats
+# or: CW_HOST_CRON_ENABLE=cw-agent-stats scripts/install-host-cron.sh
+# the equivalent by hand:
 * * * * *  USER  /usr/bin/flock -n /tmp/cw-agent-stats.lock ~/bin/cw-agent-stats --loop --duration 58 --interval 4 2>&1 | logger -t cw-agent-stats
 
 # macOS: the LaunchAgent

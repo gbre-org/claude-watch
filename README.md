@@ -400,11 +400,24 @@ on its next minute tick, so there is nothing to restart. Entries in
 non-root files with `WRONG FILE OWNER` — so the installer copies rather than
 links.
 
-Two optional rows (the stale-ready and stuck/orphaned queue watchdogs, both of
-which the container bakes) ship commented out, so installing the fragment
-can't silently add event emitters to a host that already runs an equivalent
-out-of-tree watchdog. Placeholders are substituted in commented rows too, so
-they're ready to enable in place.
+Several rows ship commented out — the stale-ready and stuck/orphaned queue
+watchdogs (both of which the container bakes), session-store rotation, and the
+`cw-agent-stats` snapshot producer — so that installing the fragment can't
+silently add event emitters or cron load to a host that didn't ask for them.
+Each is tagged with a `# optional: <job>` marker on the line above its row;
+enable one at install time, no template edit required:
+
+```sh
+scripts/install-host-cron.sh --enable cw-agent-stats        # one job
+scripts/install-host-cron.sh --enable stale-ready-check,queue-check  # several
+CW_HOST_CRON_ENABLE=session-rotate scripts/install-host-cron.sh      # via env
+scripts/install-host-cron.sh --list-optional                # list job names
+```
+
+An unknown job name is a hard error listing the known ones. Placeholders are
+still substituted in every commented row regardless of whether it gets
+enabled, so hand-uncommenting a row in a local checkout also still works —
+`--enable` is just no longer the only way in.
 
 For cron-driven `claude-event` emissions that are specific to *your*
 deployment rather than to claude-watch itself, see

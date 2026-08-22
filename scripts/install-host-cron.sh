@@ -34,7 +34,22 @@
 #   - leave any @PLACEHOLDER@ unsubstituted in the output;
 #   - symlink the fragment into /etc/cron.d. Cron rejects entries in
 #     /etc/cron.d that are symlinks or not root-owned with "WRONG FILE OWNER"
-#     and skips them silently, so the file is COPIED in as root:root 0644.
+#     and skips them silently, so the file is COPIED in as root:root 0644;
+#   - enable an optional job whose name doesn't match a marker in the
+#     template (hard error listing the known optional jobs).
+#
+# OPTIONAL JOBS
+#   cron.d/cw-host ships some rows commented out (a stale-ready-check /
+#   queue-check watchdog pair, session-store rotation, the cw-agent-stats
+#   producer) so that installing the fragment can't silently add event
+#   emitters or cron load to a host that didn't ask for them. Each such row
+#   is tagged with a `# optional: <job>` marker on the line directly above
+#   it in the template. Enable one or more at render time — no template edit
+#   needed — with `--enable <job>[,<job>...]` (repeatable; unions with any
+#   earlier --enable and with $CW_HOST_CRON_ENABLE) or the env var
+#   CW_HOST_CRON_ENABLE=<job>[,<job>...]. Use --list-optional to print the
+#   job names the template currently defines. Default: nothing is enabled,
+#   same as before this flag existed.
 #
 # Usage:
 #   scripts/install-host-cron.sh [options]
@@ -48,6 +63,12 @@
 #       --source FILE   template to render (default: <repo>/cron.d/cw-host)
 #       --dest PATH     destination (default: /etc/cron.d/cw-host)
 #       --force         install even if @CW_BIN@ does not exist
+#       --enable JOB[,JOB...]
+#                       uncomment the optional row(s) tagged with
+#                       `# optional: JOB` (repeatable; also via
+#                       $CW_HOST_CRON_ENABLE)
+#       --list-optional print the optional job names in the template, one
+#                       per line, and exit (no install, no --force needed)
 #   -h, --help          this help
 #
 # Idempotent: re-running re-renders and overwrites the destination with the
@@ -63,12 +84,14 @@ set -euo pipefail
 
 DRY_RUN=0
 FORCE=0
+LIST_OPTIONAL=0
 DEST="/etc/cron.d/cw-host"
 SOURCE=""
 CW_USER=""
 CW_HOME=""
 CW_BIN=""
 CW_STATE_DIR="/var/lib/claude-watch"
+ENABLE_JOBS="${CW_HOST_CRON_ENABLE:-}"
 
 usage() {
     sed -n '2,/^set -euo/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^set -euo/d'
@@ -105,6 +128,15 @@ while [ $# -gt 0 ]; do
         --state-dir) [ $# -ge 2 ] || die "--state-dir needs a value"; CW_STATE_DIR="$2"; shift 2 ;;
         --source) [ $# -ge 2 ] || die "--source needs a value"; SOURCE="$2"; shift 2 ;;
         --dest) [ $# -ge 2 ] || die "--dest needs a value"; DEST="$2"; shift 2 ;;
+        --enable)
+            [ $# -ge 2 ] || die "--enable needs a value"
+            if [ -n "$ENABLE_JOBS" ]; then
+                ENABLE_JOBS="$ENABLE_JOBS,$2"
+            else
+                ENABLE_JOBS="$2"
+            fi
+            shift 2 ;;
+        --list-optional) LIST_OPTIONAL=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
@@ -119,6 +151,33 @@ done
 [ -n "$CW_BIN" ] || CW_BIN="$repo_root/target/release/claude-watch"
 
 [ -f "$SOURCE" ] || die "template not found: $SOURCE"
+
+# -----------------------------------------------------------------------------
+# Optional jobs: rows tagged `# optional: <job>` in the template, commented
+# out by default. --enable / $CW_HOST_CRON_ENABLE name jobs to uncomment at
+# render time; matching is against this marker, never against command text.
+# -----------------------------------------------------------------------------
+known_optional="$(sed -n 's/^# optional: //p' "$SOURCE")"
+
+if [ "$LIST_OPTIONAL" -eq 1 ]; then
+    [ -z "$known_optional" ] || printf '%s\n' "$known_optional"
+    exit 0
+fi
+
+if [ -n "$ENABLE_JOBS" ]; then
+    old_ifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2086
+    set -- $ENABLE_JOBS
+    IFS="$old_ifs"
+    for job in "$@"; do
+        [ -n "$job" ] || continue
+        if ! printf '%s\n' "$known_optional" | grep -Fxq "$job"; then
+            die "unknown optional job: $job
+  Known optional jobs: $(printf '%s' "$known_optional" | tr '\n' ' ')"
+        fi
+    done
+fi
 
 # Cron ignores files in /etc/cron.d whose name contains a dot.
 dest_base="$(basename "$DEST")"
@@ -156,13 +215,38 @@ fi
 # a trailing backslash would continue the replacement.
 sed_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 
+# Uncomment the row(s) immediately below a `# optional: <job>` marker when
+# <job> is in the enabled set. The marker line is left in place unmodified
+# (it is documentation once rendered, and a second `--enable` re-run must
+# still find it). Matching is line-exact against the marker text, never a
+# regex over the command — so a job whose command text changes still enables
+# correctly as long as its marker line does.
+enable_uncomment() {
+    awk -v enabled=" $1 " '
+        /^# optional: / {
+            job = $0
+            sub(/^# optional: /, "", job)
+            print
+            pending = job
+            next
+        }
+        {
+            if (pending != "" && index(enabled, " " pending " ") > 0 && substr($0, 1, 1) == "#") {
+                print substr($0, 2)
+            } else {
+                print
+            }
+            pending = ""
+        }
+    '
+}
+
 rendered="$(
-    sed \
+    enable_uncomment "$(printf '%s' "$ENABLE_JOBS" | tr ',' ' ')" < "$SOURCE" | sed \
         -e "s|@CW_USER@|$(sed_escape "$CW_USER")|g" \
         -e "s|@CW_HOME@|$(sed_escape "$CW_HOME")|g" \
         -e "s|@CW_BIN@|$(sed_escape "$CW_BIN")|g" \
-        -e "s|@CW_STATE_DIR@|$(sed_escape "$CW_STATE_DIR")|g" \
-        "$SOURCE"
+        -e "s|@CW_STATE_DIR@|$(sed_escape "$CW_STATE_DIR")|g"
 )"
 
 # Nothing may survive substitution — an unfilled placeholder is a cron row that
@@ -180,6 +264,7 @@ install-host-cron.sh (dry run)
   @CW_HOME@      = $CW_HOME
   @CW_BIN@       = $CW_BIN
   @CW_STATE_DIR@ = $CW_STATE_DIR
+  enabled optional jobs = ${ENABLE_JOBS:-(none)}
 EOF
     printf '%s\n' "$rendered"
     exit 0
@@ -227,6 +312,7 @@ echo "Installed $DEST (from $SOURCE)"
 echo "  user      : $CW_USER"
 echo "  binary    : $CW_BIN"
 echo "  state dir : $CW_STATE_DIR"
+echo "  enabled optional jobs : ${ENABLE_JOBS:-(none)}"
 
 if [ ! -d "$CW_STATE_DIR" ]; then
     cat >&2 <<EOF
