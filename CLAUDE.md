@@ -118,19 +118,41 @@ watcher status, not events; a reply to one names it as such.
 ## Build & Test
 
 ```bash
-make help              # index of every target, grouped by build / deploy surface
+make help              # index of every target, grouped by section — start here
 make test              # all tests in parallel (nextest if available, else cargo test)
 make test-unit         # unit + fixture tests only (~0.1s)
 make test-e2e          # e2e tmux tests only (~10s)
 make test-live         # live e2e tests (spawn real Claude Code, ~1-2 min each)
 make test-verbose      # all tests with stdout/stderr visible
 make build             # release build
-make deploy-systemd    # build + install + install-skills + systemctl restart (host/systemd; `make deploy` is a deprecated alias)
+make install-hooks     # install git pre-commit hook
+```
+
+There are TWO deployment shapes and the Makefile is sectioned accordingly;
+`make help` shows which targets belong to which. Do not reach for a target
+from the wrong shape.
+
+Linux host + systemd:
+
+```bash
+make deploy-systemd    # build + install + install-skills + systemctl restart (`make deploy` is a deprecated alias)
 make install           # daemon COPY + tool symlinks into $BIN_DIR (dep of deploy-systemd, so the on-PATH CLI can't go stale)
 make install-skills    # install skills/ as /cw-<name> commands (dep of deploy-systemd; container/skills/ stays container-only)
 make install-cron      # render cron.d/cw-host into /etc/cron.d (needs root; NOT a dep of deploy-systemd)
-make install-hooks     # install git pre-commit hook
 ```
+
+Container ("workbot" — claude-container under `examples/compose/`, macOS host):
+
+```bash
+make deploy-container  # force-recreate claude-container, then up -d the rest of the stack (`make redeploy` is an alias the baked image still calls)
+make container-build   # build just claude-container:dev
+make compose-build     # build every image in the stack
+make sync-main-clone   # ff-only sync the BIND-MOUNTED source clone — needed before a bind-mounted Python-CLI fix goes live
+```
+
+The macOS host-side helpers for that shape (`install-mcp-host-bash-server`,
+`install-cw-agent-stats-launchd`) are macOS-only by construction; they are
+not dead code just because they no-op on Linux.
 
 Or directly:
 ```bash
