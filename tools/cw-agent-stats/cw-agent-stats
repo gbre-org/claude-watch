@@ -116,6 +116,18 @@ def _default_prom_file() -> Path:
     return Path("/var/lib/node-exporter/textfile/claude_agent_stats.prom")
 
 
+def _esc_label(value: str) -> str:
+    """Escape a string for use as a Prometheus text-format label value.
+
+    Per the exposition format, only backslash, double-quote, and newline
+    need escaping inside a quoted label value. Tool/model ids are
+    attacker-free (they come from Claude Code's own transcript schema) but
+    ``<synthetic>`` and similar bracketed/punctuated ids are real observed
+    values, so escape properly rather than stripping characters.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 def _prom_lines(snap: dict) -> list[str]:
     """Render the agent-stats snapshot as Prometheus textfile-collector lines.
 
@@ -127,10 +139,15 @@ def _prom_lines(snap: dict) -> list[str]:
     sets from agents that exited the window are dropped automatically — no
     separate expiry/TTL bookkeeping needed.
 
-    Deliberately does NOT add ``model``/``tool`` labels: the underlying
-    survey (``AgentState.to_record``) doesn't fold those dimensions, and
-    this producer must not grow new, heavier transcript surveying just to
-    populate metric labels.
+    ``model``/``tool`` breakdowns (claude-watch #663, the devbar-equivalent
+    telemetry) ride on the ``tool_totals``/``model_totals`` fields the
+    Collector already folds in the SAME ``feed_entry`` pass as everything
+    else above (``AgentState.tool_counts``/``model_counts``, summed
+    fleet-wide in ``Collector.tick``) — no second, heavier transcript
+    survey. Like the per-agent gauges, these are windowed gauges (bounded
+    by ``live_window_secs``), not monotonic counters: a tool/model that
+    falls out of every live-or-recent transcript disappears from the file
+    on the next tick, same "whole file rewritten" staleness handling.
     """
     totals = snap.get("totals") or {}
     lines = [
@@ -143,7 +160,7 @@ def _prom_lines(snap: dict) -> list[str]:
         "# TYPE claude_agent_tokens_total gauge",
     ]
     for rec in snap.get("agents") or []:
-        agent_id = str(rec.get("agent_id", "")).replace('"', "")
+        agent_id = _esc_label(str(rec.get("agent_id", "")))
         lines.append(f'claude_agent_calls_total{{agent_id="{agent_id}"}} {int(rec.get("tool_calls", 0))}')
         lines.append(
             f'claude_agent_tokens_total{{agent_id="{agent_id}",kind="context"}} {int(rec.get("context_tokens", 0))}'
@@ -158,6 +175,24 @@ def _prom_lines(snap: dict) -> list[str]:
         )
         lines.append("# TYPE claude_agent_main_context_tokens gauge")
         lines.append(f'claude_agent_main_context_tokens {int(main.get("context_tokens", 0))}')
+
+    tool_totals = snap.get("tool_totals") or {}
+    if tool_totals:
+        lines.append(
+            "# HELP claude_tool_use_total Fleet-wide tool calls, by tool name, folded over every transcript in the live/recent window (windowed gauge, not a monotonic counter)."
+        )
+        lines.append("# TYPE claude_tool_use_total gauge")
+        for tool, cnt in sorted(tool_totals.items()):
+            lines.append(f'claude_tool_use_total{{tool="{_esc_label(tool)}"}} {int(cnt)}')
+
+    model_totals = snap.get("model_totals") or {}
+    if model_totals:
+        lines.append(
+            "# HELP claude_model_use_total Fleet-wide assistant turns, by model id, folded over every transcript in the live/recent window (windowed gauge, not a monotonic counter)."
+        )
+        lines.append("# TYPE claude_model_use_total gauge")
+        for model, cnt in sorted(model_totals.items()):
+            lines.append(f'claude_model_use_total{{model="{_esc_label(model)}"}} {int(cnt)}')
     return lines
 
 
