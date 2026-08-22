@@ -433,6 +433,20 @@ enabled = true
 # Interval between repeated alerts (seconds); 10800 = 3 hours
 alert_interval_seconds = 10800
 
+# Drive `self-login` automatically when Claude Code prints its in-TUI
+#   Please run /login · API Error: 401 OAuth access token has expired.
+# banner AND the credential store agrees the access token is dead (expiresAt
+# in the past, or no token at all). The session can no longer make an API
+# call at that point; the only alternative is a human typing /login.
+#
+# A sibling of expiry_auto_self_login below, kept separate because they
+# interrupt different things: that one interrupts a WORKING session days
+# early, this one acts on a session that has already stopped. Same retry /
+# attempt / abandon bounds, same one-dialog-at-a-time latch. Banner text with
+# a VALID token on disk is conversation and is ignored outright. When this is
+# off the banner still raises the high-priority reauth alert — never silent.
+auth_error_auto_self_login = true
+
 # --- Proactive half -------------------------------------------------------
 # Everything above reacts to credentials that are ALREADY dead, which means
 # the recovery always lands at the worst possible moment. Everything below

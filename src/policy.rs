@@ -2724,19 +2724,88 @@ pub(crate) fn check_context_threshold_with_margin(
     None
 }
 
-/// Check if an auto-update should be triggered, and if so, spawn the update task.
-/// This is called from check_cycle() on each iteration.
-/// Check if Claude Code needs API reauth and send high-priority alert.
+/// Where the OAuth credential store lives for this deployment.
+fn credentials_path(config: &Config) -> std::path::PathBuf {
+    if config.reauth.credentials_file.is_empty() {
+        crate::credentials::default_path()
+    } else {
+        std::path::PathBuf::from(&config.reauth.credentials_file)
+    }
+}
+
+/// Check whether Claude Code needs API reauth, and drive the recovery.
 ///
-/// Two-phase flow:
-/// 1. **401 detected** (TUI visible, error JSON in pane) — inject `/login`, no alert yet.
-/// 2. **Login screen visible** (OAuth URL present) — send high-priority alert with URL.
+/// This is the REACTIVE half of `[reauth]` (the proactive half, which acts on
+/// the "login expires in N days" warning before anything breaks, is
+/// `check_login_expiry`). Two phases, keyed on what the pane shows:
+///
+/// 1. **401 banner, TUI still up.** When the OAuth access token lapses and the
+///    silent refresh does not happen, Claude Code keeps the TUI and prints one
+///    inline line: `Please run /login · API Error: 401 OAuth access token has
+///    expired. Re-authenticate to continue.` The session can no longer make an
+///    API call, but nothing about the screen says "dead" to the other
+///    detectors. Text alone is never acted on — any session reading this file
+///    has that sentence on its pane — so the sighting is corroborated against
+///    the credential store's ACCESS token (`expiresAt` in the past, or no token
+///    at all). Corroborated + `auth_error_auto_self_login` → `fire_self_login`,
+///    the SAME path the proactive check uses, under the same retry / attempt /
+///    abandon bounds and the same one-dialog-at-a-time latch. Auto off or
+///    bounds exhausted → the high-priority reauth alert, so it is never silent.
+///    Credential store says the token is VALID → the banner is conversation
+///    text, ignore it. Store unreadable → alert only, and say it stands alone.
+/// 2. **Login screen, TUI gone.** Inject `/login` once per reauth cycle so the
+///    OAuth URL appears (unless a self-login dialog already owns the pane),
+///    then, once the URL is on the pane, send the high-priority alert with it.
 ///
 /// Alerts are rate-limited to once per `alert_interval_seconds` (default 3 hours).
 async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
-    let reauth_result = tmux::needs_reauth(pane).await;
+    let signal = tmux::reauth_signal(pane).await;
 
-    if let Some(login_url) = reauth_result {
+    // Hand the pane back if an auto-fired login (either path) has been sitting
+    // unconsumed. `check_login_expiry` runs this too, but that check can be
+    // configured off while this one stays on, and the banner path opens
+    // dialogs that then need the same watchdog.
+    run_self_login_abandon_watchdog(config, state, pane).await;
+
+    if matches!(signal, tmux::ReauthSignal::Banner401) {
+        // Phase 1. Falls through to the phase-2 bookkeeping below on purpose:
+        // a banner on a live TUI also means any login screen is GONE (the
+        // dialog was answered, cancelled or abandoned), and that state must
+        // not leak into the next cycle.
+        check_reauth_banner(config, state, pane).await;
+    } else if state.reauth_banner_detected && matches!(signal, tmux::ReauthSignal::None) {
+        // The banner is gone from the pane and nothing replaced it: the
+        // session is back to normal. (A login screen replacing it is phase 2
+        // below, and the banner latch stays held through it so the dialog
+        // latch is not released underneath the dialog.)
+        let access = crate::credentials::read_access_token(&credentials_path(config));
+        info!(access_token = access.as_str(), "401 banner resolved");
+        write_jsonl_log(
+            &config.general.log_file,
+            "reauth_401_banner_resolved",
+            serde_json::json!({ "pane": pane, "access_token": access.as_str() }),
+        );
+        write_legacy_log(
+            &config.general.legacy_log_file,
+            &format!("Reauth: 401 banner resolved (access token {})", access.as_str()),
+        );
+        state.reauth_banner_detected = false;
+        if access == crate::credentials::AccessTokenState::Valid {
+            // A 401 that resolved into a valid access token is a login that
+            // went through (or a refresh that finally happened). Either way
+            // the window is over: give the next one a full attempt budget,
+            // and release the dialog latch so the reactive inject is not
+            // suppressed by a dialog that no longer exists. The proactive
+            // path does the same thing on credential renewal, but it can be
+            // configured off while this path stays on.
+            state.self_login_attempts_this_window = 0;
+            state.last_self_login_attempt = None;
+            state.self_login_dialog_opened_at = None;
+        }
+        crate::state::save_state(&config.general.state_file, state);
+    }
+
+    if let tmux::ReauthSignal::LoginScreen { url: login_url } = signal {
         if !state.reauth_detected {
             info!("reauth needed: first detection");
             state.reauth_detected = true;
@@ -2821,18 +2890,241 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
             debug!("reauth detected (401) but no URL yet — waiting for login screen");
         }
     } else if state.reauth_detected {
-        // Reauth resolved
-        info!("reauth resolved");
+        // Login screen gone. With the 401 banner still up this is "the dialog
+        // went away", not "the session is healthy" — the banner path is still
+        // running and says so in its own events.
+        info!(
+            banner_still_up = state.reauth_banner_detected,
+            "reauth resolved (login screen gone)"
+        );
         write_jsonl_log(
             &config.general.log_file,
             "reauth_resolved",
-            serde_json::json!({}),
+            serde_json::json!({ "banner_still_up": state.reauth_banner_detected }),
         );
         write_legacy_log(&config.general.legacy_log_file, "Reauth resolved");
         state.reauth_detected = false;
         state.last_reauth_alert = None;
         state.login_injected = false;
         crate::state::save_state(&config.general.state_file, state);
+    }
+}
+
+/// What the reactive 401-banner path decided to do this cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BannerAction {
+    /// The credential store contradicts the banner: the access token is
+    /// valid, so the text is conversation. Stay silent.
+    Ignore,
+    /// Say so, but do not touch the session. `reason` names which brake held.
+    AlertOnly {
+        corroborated: bool,
+        reason: &'static str,
+    },
+    /// Drive `self-login`.
+    AutoLogin,
+}
+
+/// Evidence available to the 401-banner decision on one cycle. The banner
+/// itself is a precondition (this is only evaluated when it is on the pane).
+pub(crate) struct BannerEvidence {
+    /// What the credential store says about the ACCESS token.
+    pub access_token: crate::credentials::AccessTokenState,
+    /// `auth_error_auto_self_login`.
+    pub auto_enabled: bool,
+    /// Seconds since the last auto-fire (either path), if there was one.
+    pub since_last_attempt: Option<f64>,
+    /// Minimum spacing between auto-fires.
+    pub retry_seconds: u64,
+    /// Attempts already spent in this window (shared with the proactive path).
+    pub attempts: u32,
+    /// Attempt ceiling for one window.
+    pub max_attempts: u32,
+    /// An auto-fired login is already up and waiting for a code.
+    pub login_pending: bool,
+}
+
+/// Decide what the reactive 401-banner path should do, given this cycle's
+/// evidence. Pure, for the same reason `decide_expiry_action` is.
+///
+/// The corroboration rule is the whole point. The banner is ONE LINE OF TEXT
+/// on a live TUI, and the reason the login-screen detector refuses to look at
+/// anything while the TUI is up is that a session reading this file, its
+/// tests, or the diff that introduced them has `API Error: 401` on its pane
+/// while being perfectly well authenticated. So:
+///
+///   * banner + access token VALID on disk  -> IGNORE. Conversation text.
+///   * banner + access token EXPIRED/MISSING -> act. This is the incident:
+///     Claude Code's silent refresh did not happen, `expiresAt` is in the past,
+///     and every request 401s until somebody runs `/login`.
+///   * banner + store UNREADABLE             -> alert, uncorroborated. Not
+///     enough to open a modal on, but an unreadable store is UNKNOWN, never
+///     a negative, and a deployment whose store lives elsewhere should hear
+///     about it rather than sit on a dead session.
+///
+/// The brakes below the corroboration are the proactive path's brakes, shared
+/// deliberately: one dialog at a time, one attempt budget, one retry spacing.
+pub(crate) fn decide_banner_action(ev: &BannerEvidence) -> BannerAction {
+    use crate::credentials::AccessTokenState;
+
+    if ev.access_token == AccessTokenState::Valid {
+        return BannerAction::Ignore;
+    }
+    if !ev.access_token.corroborates_401() {
+        // Unknown: the store could not be read. Not a negative, not evidence.
+        return BannerAction::AlertOnly {
+            corroborated: false,
+            reason: "credential store unreadable",
+        };
+    }
+    let held = |reason: &'static str| BannerAction::AlertOnly {
+        corroborated: true,
+        reason,
+    };
+    if !ev.auto_enabled {
+        return held("auto-login disabled");
+    }
+    // A login dialog we already opened is still waiting for its code. Firing
+    // a second one types `/login` into the first one's text field.
+    if ev.login_pending {
+        return held("login dialog already open");
+    }
+    if ev.attempts >= ev.max_attempts {
+        return held("attempt budget exhausted");
+    }
+    if let Some(elapsed) = ev.since_last_attempt {
+        if elapsed < ev.retry_seconds as f64 {
+            return held("retry spacing");
+        }
+    }
+    BannerAction::AutoLogin
+}
+
+/// Phase 1 of `check_reauth`: the 401 banner is on a live pane. Corroborate,
+/// decide, act.
+async fn check_reauth_banner(config: &Config, state: &mut State, pane: &str) {
+    let access = crate::credentials::read_access_token(&credentials_path(config));
+    let action = decide_banner_action(&BannerEvidence {
+        access_token: access,
+        auto_enabled: config.reauth.auth_error_auto_self_login,
+        since_last_attempt: state
+            .last_self_login_attempt
+            .as_deref()
+            .and_then(elapsed_since),
+        retry_seconds: config.reauth.self_login_retry_seconds,
+        attempts: state.self_login_attempts_this_window,
+        max_attempts: config.reauth.self_login_max_attempts,
+        login_pending: state.self_login_dialog_opened_at.is_some(),
+    });
+
+    if !state.reauth_banner_detected {
+        // First sighting of this banner: log it ONCE with everything the
+        // next incident's diagnosis will need — what the store said and
+        // what was decided. The decision is re-made every cycle (a brake can
+        // release, the store can change), so later cycles log only when they
+        // actually do something.
+        info!(
+            access_token = access.as_str(),
+            decision = ?action,
+            "401 banner on pane: first detection"
+        );
+        write_jsonl_log(
+            &config.general.log_file,
+            "reauth_401_banner",
+            serde_json::json!({
+                "pane": pane,
+                "access_token": access.as_str(),
+                "action": match &action {
+                    BannerAction::Ignore => "ignore",
+                    BannerAction::AlertOnly { .. } => "alert_only",
+                    BannerAction::AutoLogin => "auto_login",
+                },
+                "reason": match &action {
+                    BannerAction::AlertOnly { reason, .. } => *reason,
+                    BannerAction::Ignore => "access token valid on disk",
+                    BannerAction::AutoLogin => "access token expired on disk",
+                },
+            }),
+        );
+        write_legacy_log(
+            &config.general.legacy_log_file,
+            &format!(
+                "Reauth: 401 banner on pane (access token {}): {}",
+                access.as_str(),
+                match &action {
+                    BannerAction::Ignore => "ignored, credentials healthy".to_string(),
+                    BannerAction::AlertOnly { reason, .. } => format!("alert only ({reason})"),
+                    BannerAction::AutoLogin => "auto-firing self-login".to_string(),
+                }
+            ),
+        );
+        state.reauth_banner_detected = true;
+        crate::state::save_state(&config.general.state_file, state);
+    }
+
+    match action {
+        BannerAction::Ignore => {
+            debug!("401 banner on pane but the access token is valid on disk; conversation text");
+        }
+        BannerAction::AutoLogin => {
+            fire_self_login(config, state, pane, SelfLoginTrigger::Banner401).await;
+        }
+        BannerAction::AlertOnly {
+            corroborated,
+            reason,
+        } => {
+            // Same cooldown and same alert channel as phase 2, so a banner the
+            // daemon cannot or may not act on still reaches a human.
+            let should_alert = match &state.last_reauth_alert {
+                Some(last) => elapsed_since(last)
+                    .map(|e| e >= config.reauth.alert_interval_seconds as f64)
+                    .unwrap_or(true),
+                None => true,
+            };
+            if !should_alert {
+                debug!(reason, "401 banner still on pane, alert cooldown active");
+                return;
+            }
+            let qualifier = if corroborated {
+                ""
+            } else {
+                " (seen on the pane only — the credential store was not readable)"
+            };
+            let tail = if config.reauth.auth_error_auto_self_login {
+                format!(" Auto-login did not fire: {reason}.")
+            } else {
+                " Auto-login is disabled; run `self-login start` or `/login`.".to_string()
+            };
+            warn!(reason, "Claude Code hit a 401 (access token expired); alerting");
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "reauth-needed",
+                stuck_reason: "claude code 401, access token expired, login needed",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: &format!(
+                    "Claude Code login needed: API Error 401, OAuth access token expired{qualifier}.{tail}"
+                ),
+            })
+            .await;
+            write_jsonl_log(
+                &config.general.log_file,
+                "reauth_alert",
+                serde_json::json!({
+                    "pane": pane,
+                    "url": "",
+                    "trigger": "401_banner",
+                    "corroborated": corroborated,
+                    "reason": reason,
+                }),
+            );
+            write_legacy_log(
+                &config.general.legacy_log_file,
+                &format!("Reauth needed (401 banner): sent high-priority alert ({reason})"),
+            );
+            state.last_reauth_alert = Some(Local::now().to_rfc3339());
+            crate::state::save_state(&config.general.state_file, state);
+        }
     }
 }
 
@@ -2957,11 +3249,7 @@ pub(crate) fn decide_expiry_action(ev: &ExpiryEvidence) -> ExpiryAction {
 async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
     let pane_days_left = tmux::login_expiry_warning(pane).await;
 
-    let creds_path = if config.reauth.credentials_file.is_empty() {
-        crate::credentials::default_path()
-    } else {
-        std::path::PathBuf::from(&config.reauth.credentials_file)
-    };
+    let creds_path = credentials_path(config);
     let credentials = crate::credentials::read(&creds_path);
 
     // Renewal is the ONLY unambiguous "this is resolved" signal, and it is
@@ -3011,6 +3299,16 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
     run_self_login_abandon_watchdog(config, state, pane).await;
 
     if matches!(action, ExpiryAction::Idle) {
+        // A login screen or the 401 banner is on the pane: the reactive path
+        // owns the session right now. The pane warning this check keys on is
+        // NOT visible while a login dialog covers the TUI, so an Idle here
+        // says nothing about the expiry — it must neither "resolve" the
+        // window (resetting the attempt budget mid-flow) nor release the
+        // dialog latch, because that latch is what stops the reactive path
+        // from injecting `/login` into the dialog the daemon itself opened.
+        if state.reauth_detected || state.reauth_banner_detected {
+            return;
+        }
         if state.login_expiry_detected {
             info!("login expiry resolved");
             write_jsonl_log(
@@ -3071,7 +3369,13 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
     state.login_expiry_days_left = Some(days_left);
 
     if auto {
-        fire_self_login(config, state, pane, days_left).await;
+        fire_self_login(
+            config,
+            state,
+            pane,
+            SelfLoginTrigger::ExpiryWarning { days_left },
+        )
+        .await;
     }
 
     // Alert on the same cooldown the reactive path uses. The warning stands
@@ -3113,13 +3417,57 @@ async fn check_login_expiry(config: &Config, state: &mut State, pane: &str) {
     crate::state::save_state(&config.general.state_file, state);
 }
 
+/// Why `self-login` is being auto-fired. Both paths go through ONE
+/// `fire_self_login` — the same booking, the same latch, the same budget —
+/// and the trigger exists only so the logs and alerts say which one it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfLoginTrigger {
+    /// Proactive: Claude Code warned the login expires in `days_left` days.
+    ExpiryWarning { days_left: u32 },
+    /// Reactive: the in-TUI "API Error: 401 OAuth access token has expired"
+    /// banner, corroborated by the credential store.
+    Banner401,
+}
+
+impl SelfLoginTrigger {
+    /// Stable label for JSONL events and metrics.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SelfLoginTrigger::ExpiryWarning { .. } => "expiry_warning",
+            SelfLoginTrigger::Banner401 => "401_banner",
+        }
+    }
+
+    fn days_left(self) -> Option<u32> {
+        match self {
+            SelfLoginTrigger::ExpiryWarning { days_left } => Some(days_left),
+            SelfLoginTrigger::Banner401 => None,
+        }
+    }
+
+    /// The situation, phrased for a human alert.
+    fn situation(self) -> &'static str {
+        match self {
+            SelfLoginTrigger::ExpiryWarning { .. } => "Claude Code login is expiring",
+            SelfLoginTrigger::Banner401 => {
+                "Claude Code hit API Error 401 (OAuth access token expired)"
+            }
+        }
+    }
+}
+
 /// Drive `self-login start` out of process and publish whatever it produced.
 ///
 /// Spawned rather than awaited: `start` interrupts the pane, injects `/login`,
 /// drives the method picker and then waits for the dialog to paint, which is
 /// far longer than a check cycle. Blocking the cycle on it would stall every
 /// other monitor the daemon runs.
-async fn fire_self_login(config: &Config, state: &mut State, pane: &str, days_left: u32) {
+async fn fire_self_login(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    trigger: SelfLoginTrigger,
+) {
     // Book the attempt BEFORE spawning. If the process crashes mid-run the
     // budget is still spent, which is the safe direction: an unbooked attempt
     // re-fires on the next cycle and every cycle after it.
@@ -3130,21 +3478,38 @@ async fn fire_self_login(config: &Config, state: &mut State, pane: &str, days_le
     state.self_login_dialog_opened_at = Some(Local::now().to_rfc3339());
     crate::state::save_state(&config.general.state_file, state);
 
-    info!(days_left, attempt, "auto-firing self-login");
+    info!(trigger = trigger.as_str(), days_left = ?trigger.days_left(), attempt, "auto-firing self-login");
     write_jsonl_log(
         &config.general.log_file,
         "self_login_autofire",
-        serde_json::json!({ "pane": pane, "days_left": days_left, "attempt": attempt }),
+        serde_json::json!({
+            "pane": pane,
+            "trigger": trigger.as_str(),
+            "days_left": trigger.days_left(),
+            "attempt": attempt,
+        }),
     );
     write_legacy_log(
         &config.general.legacy_log_file,
-        &format!("Login expiring in {days_left}d: auto-firing self-login (attempt {attempt})"),
+        &match trigger {
+            SelfLoginTrigger::ExpiryWarning { days_left } => format!(
+                "Login expiring in {days_left}d: auto-firing self-login (attempt {attempt})"
+            ),
+            SelfLoginTrigger::Banner401 => format!(
+                "401 banner, access token expired: auto-firing self-login (attempt {attempt})"
+            ),
+        },
     );
 
     let cmd = config.reauth.self_login_command.clone();
     let pane = pane.to_string();
     let log_file = config.general.log_file.clone();
     let legacy_log_file = config.general.legacy_log_file.clone();
+    let situation = trigger.situation();
+    let stuck_reason: &'static str = match trigger {
+        SelfLoginTrigger::ExpiryWarning { .. } => "claude code login expiring, auto-login started",
+        SelfLoginTrigger::Banner401 => "claude code 401, auto-login started",
+    };
     tokio::spawn(async move {
         // `--foreground --json` is self-login's programmatic entry point: it
         // blocks and emits exactly one JSON object.
@@ -3167,16 +3532,16 @@ async fn fire_self_login(config: &Config, state: &mut State, pane: &str, days_le
             write_jsonl_log(
                 &log_file,
                 "self_login_url",
-                serde_json::json!({ "pane": pane, "url": url }),
+                serde_json::json!({ "pane": pane, "url": url, "trigger": trigger.as_str() }),
             );
             alert::notify(crate::event_bus::ClaudeWatchAlert {
                 alert_type: "reauth-needed",
-                stuck_reason: "claude code login expiring, auto-login started",
+                stuck_reason,
                 stale_minutes: None,
                 affected_watchers: vec![],
                 severity: crate::event_bus::Severity::High,
                 message: &format!(
-                    "Claude Code login is expiring and auto-login has opened the dialog. \
+                    "{situation} and auto-login has opened the dialog. \
                      Authorize at {url} then run: self-login code <CODE>"
                 ),
             })
@@ -3193,22 +3558,27 @@ async fn fire_self_login(config: &Config, state: &mut State, pane: &str, days_le
             write_jsonl_log(
                 &log_file,
                 "self_login_autofire_failed",
-                serde_json::json!({ "pane": pane, "reason": reason }),
+                serde_json::json!({ "pane": pane, "reason": reason, "trigger": trigger.as_str() }),
             );
             write_legacy_log(
                 &legacy_log_file,
                 &format!("self-login auto-fire FAILED: {reason}"),
             );
+            let advice = match trigger {
+                SelfLoginTrigger::ExpiryWarning { .. } => {
+                    "Log in by hand before the credentials lapse."
+                }
+                SelfLoginTrigger::Banner401 => {
+                    "The session cannot make API calls until somebody runs /login."
+                }
+            };
             alert::notify(crate::event_bus::ClaudeWatchAlert {
                 alert_type: "reauth-needed",
                 stuck_reason: "self-login auto-fire failed",
                 stale_minutes: None,
                 affected_watchers: vec![],
                 severity: crate::event_bus::Severity::High,
-                message: &format!(
-                    "Claude Code login is expiring and auto-login FAILED: {reason}. \
-                     Log in by hand before the credentials lapse."
-                ),
+                message: &format!("{situation} and auto-login FAILED: {reason}. {advice}"),
             })
             .await;
         }
@@ -6975,7 +7345,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::CredentialExpiry;
+    use crate::credentials::{AccessTokenState, CredentialExpiry};
 
     // ---- Proactive login-expiry decision ----
 
@@ -7201,6 +7571,214 @@ mod tests {
                 corroborated: true,
             }
         );
+    }
+
+    // ---- Reactive 401-banner decision ----
+
+    fn banner_evidence() -> BannerEvidence {
+        BannerEvidence {
+            access_token: AccessTokenState::Expired,
+            auto_enabled: true,
+            since_last_attempt: None,
+            retry_seconds: 3600,
+            attempts: 0,
+            max_attempts: 3,
+            login_pending: false,
+        }
+    }
+
+    /// THE incident: the banner is on a live pane and the credential store
+    /// agrees the access token is dead. Fire.
+    #[test]
+    fn banner_with_expired_access_token_fires_self_login() {
+        assert_eq!(decide_banner_action(&banner_evidence()), BannerAction::AutoLogin);
+        let missing = BannerEvidence {
+            access_token: AccessTokenState::Missing,
+            ..banner_evidence()
+        };
+        assert_eq!(decide_banner_action(&missing), BannerAction::AutoLogin);
+    }
+
+    /// THE false-positive guard, and the reason the detector alone is not
+    /// trusted. The banner text on a pane whose credential store says the
+    /// access token is valid is conversation — a session reading this file,
+    /// its tests, or the diff that introduced them. Silence, not an alert.
+    #[test]
+    fn banner_with_a_valid_access_token_is_ignored_outright() {
+        let ev = BannerEvidence {
+            access_token: AccessTokenState::Valid,
+            ..banner_evidence()
+        };
+        assert_eq!(decide_banner_action(&ev), BannerAction::Ignore);
+        // ...even with every brake released and auto on.
+        let ev = BannerEvidence {
+            access_token: AccessTokenState::Valid,
+            since_last_attempt: Some(99999.0),
+            attempts: 0,
+            ..banner_evidence()
+        };
+        assert_eq!(decide_banner_action(&ev), BannerAction::Ignore);
+    }
+
+    /// An unreadable store is UNKNOWN, never a negative — but it is also not
+    /// enough evidence to open a modal on. Alert, and say it stands alone.
+    #[test]
+    fn banner_with_an_unreadable_store_alerts_uncorroborated_and_never_fires() {
+        let ev = BannerEvidence {
+            access_token: AccessTokenState::Unknown,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: false,
+                reason: "credential store unreadable",
+            }
+        );
+    }
+
+    /// Auto off degrades to the high-priority alert, never to silence.
+    #[test]
+    fn banner_auto_disabled_degrades_to_alert_only() {
+        let ev = BannerEvidence {
+            auto_enabled: false,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "auto-login disabled",
+            }
+        );
+    }
+
+    /// The fire is bounded by the SAME knobs as the proactive path: one
+    /// dialog at a time, retry spacing, and the per-window attempt budget.
+    /// Walk a window the way `fire_self_login` books it and check each brake
+    /// engages in turn — and that every held cycle still alerts.
+    #[test]
+    fn banner_fire_is_bounded_by_the_shared_self_login_knobs() {
+        let max_attempts = 3;
+        let retry_seconds = 3600;
+        let mut attempts = 0;
+
+        // Cycle 1: nothing booked yet -> fire. `fire_self_login` books the
+        // attempt and sets the dialog latch before the command runs.
+        let ev = BannerEvidence {
+            attempts,
+            max_attempts,
+            retry_seconds,
+            ..banner_evidence()
+        };
+        assert_eq!(decide_banner_action(&ev), BannerAction::AutoLogin);
+        attempts += 1;
+
+        // Cycle 2: the dialog is up and waiting for its code -> held, alert.
+        let ev = BannerEvidence {
+            attempts,
+            since_last_attempt: Some(10.0),
+            login_pending: true,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "login dialog already open",
+            }
+        );
+
+        // The watchdog abandoned the dialog (latch cleared) but the retry
+        // spacing has not elapsed -> held, alert.
+        let ev = BannerEvidence {
+            attempts,
+            since_last_attempt: Some(retry_seconds as f64 - 1.0),
+            login_pending: false,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "retry spacing",
+            }
+        );
+
+        // Spacing elapsed -> fire again, up to the budget.
+        while attempts < max_attempts {
+            let ev = BannerEvidence {
+                attempts,
+                since_last_attempt: Some(retry_seconds as f64),
+                ..banner_evidence()
+            };
+            assert_eq!(decide_banner_action(&ev), BannerAction::AutoLogin, "attempt {attempts}");
+            attempts += 1;
+        }
+
+        // Budget spent -> held forever (until the window resets), still alerting.
+        let ev = BannerEvidence {
+            attempts,
+            since_last_attempt: Some(99999.0),
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&ev),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "attempt budget exhausted",
+            }
+        );
+    }
+
+    /// The proactive path's brakes and the banner path's brakes are the same
+    /// state: an attempt the proactive path booked counts against the banner
+    /// path's budget and spacing, because it is the same dialog on the same
+    /// pane.
+    #[test]
+    fn banner_and_expiry_paths_share_one_budget_and_one_latch() {
+        // Proactive fired a moment ago (latch set).
+        let proactive_pending = ExpiryEvidence {
+            pane_days_left: Some(1),
+            credentials: CredentialExpiry::Expiring { days_left: 1 },
+            since_last_attempt: Some(5.0),
+            attempts: 1,
+            login_pending: true,
+            ..evidence()
+        };
+        assert!(matches!(
+            decide_expiry_action(&proactive_pending),
+            ExpiryAction::AlertOnly { .. }
+        ));
+        let banner_same_state = BannerEvidence {
+            since_last_attempt: Some(5.0),
+            attempts: 1,
+            login_pending: true,
+            ..banner_evidence()
+        };
+        assert_eq!(
+            decide_banner_action(&banner_same_state),
+            BannerAction::AlertOnly {
+                corroborated: true,
+                reason: "login dialog already open",
+            }
+        );
+    }
+
+    /// `SelfLoginTrigger` labels are what the JSONL events and alerts key on;
+    /// pin them so a log grep written today still works tomorrow.
+    #[test]
+    fn self_login_trigger_labels_are_stable() {
+        assert_eq!(
+            SelfLoginTrigger::ExpiryWarning { days_left: 2 }.as_str(),
+            "expiry_warning"
+        );
+        assert_eq!(SelfLoginTrigger::Banner401.as_str(), "401_banner");
+        assert_eq!(
+            SelfLoginTrigger::ExpiryWarning { days_left: 2 }.days_left(),
+            Some(2)
+        );
+        assert_eq!(SelfLoginTrigger::Banner401.days_left(), None);
     }
 
     #[test]

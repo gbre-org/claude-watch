@@ -293,6 +293,12 @@ pub struct State {
     pub last_reauth_alert: Option<String>,
     #[serde(default)]
     pub login_injected: bool,
+    /// Latched while Claude Code's in-TUI "Please run /login · API Error: 401
+    /// OAuth access token has expired" banner is standing on the pane. Used
+    /// only to log the first sighting and the resolution once each; the
+    /// decision to act is re-made against the credential store every cycle.
+    #[serde(default)]
+    pub reauth_banner_detected: bool,
 
     // Proactive login-expiry tracking (the forward-looking half of reauth).
     /// Latched while Claude Code's "your login expires in N days" warning is

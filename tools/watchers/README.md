@@ -9,7 +9,7 @@ background tasks. These are the **canonical implementations**.
 |--------|------|---------|
 | `claude-event-watch` | bash watcher | Block on `$CLAUDE_EVENT_QUEUE` (default `~/claude-events/`); print one-liner per pending event; append full JSON to `$CLAUDE_EVENT_LOG_DIR/consumed.jsonl`; exit. The main loop re-invokes it after each delivery. |
 | `self-clear` | one-shot | Inject `/clear` + a configurable resume-prompt into the Claude Code tmux pane. Final step of a compact-prep procedure; eliminates the wait for the daemon's resume-injection path to fire on its own. |
-| `self-login` | one-shot | Inject `/login`, scrape the OAuth URL back out of the pane, and take the authorization code back in. Re-authenticates a session from outside it, so nobody has to be at the terminal. The daemon drives it automatically when Claude Code warns the login is about to expire — see `docs/watchers.md`. |
+| `self-login` | one-shot | Inject `/login`, scrape the OAuth URL back out of the pane, and take the authorization code back in. Re-authenticates a session from outside it, so nobody has to be at the terminal. The daemon drives it automatically when Claude Code warns the login is about to expire, and when a live session hits the `API Error: 401 OAuth access token has expired` banner — see `docs/watchers.md`. |
 
 ## Watcher lifecycle (cardinal rule)
 

@@ -2218,21 +2218,17 @@ pub async fn wait_for_idle_prompt(pane: &str, timeout_secs: u64) -> bool {
 /// ("Browser didn't open?", OAuth URL, "Paste code here"), so the absence of
 /// TUI indicators is the reliable signal. This is a single-phase check: if the
 /// TUI is gone AND login-screen patterns are present, reauth is needed.
+///
+/// The 401 banner Claude Code prints INSIDE a live TUI ("Please run /login ·
+/// API Error: 401 OAuth access token has expired") is deliberately NOT this
+/// function's business — it is text, and text on a live pane is conversation
+/// until something off-screen says otherwise. `check_lines_for_401_banner`
+/// detects that banner and the caller corroborates it against the credential
+/// store before acting.
 pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
     let lower = pane_output.to_lowercase();
 
-    // Unified TUI guard: any TUI indicator means we're looking at live conversation,
-    // not a login screen. Conversation content can legitimately contain any
-    // auth-error text without triggering reauth.
-    let tui_visible = lower.contains("tokens")
-        || lower.contains("bashes")
-        || lower.contains(" shells")
-        || lower.contains(" agents")
-        || lower.contains(" background tasks")
-        || lower.contains("\u{276f}")
-        || lower.contains("bypass permissi");
-
-    if tui_visible {
+    if tui_visible(&lower) {
         return false;
     }
 
@@ -2251,6 +2247,61 @@ pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
         || lower.contains("authentication required")
         || lower.contains("auth required")
         || lower.contains("api key expired")
+}
+
+/// Unified TUI guard: any TUI indicator (tokens counter, background-task
+/// counters, the idle prompt glyph, the permission-mode banner) means we are
+/// looking at a live Claude Code session with conversation content. Takes the
+/// already-lowercased capture.
+fn tui_visible(lower: &str) -> bool {
+    lower.contains("tokens")
+        || lower.contains("bashes")
+        || lower.contains(" shells")
+        || lower.contains(" agents")
+        || lower.contains(" background tasks")
+        || lower.contains("\u{276f}")
+        || lower.contains("bypass permissi")
+}
+
+/// Pure function: is Claude Code's "access token has expired" banner on a
+/// LIVE pane?
+///
+/// This is the hole between the other two detectors. When the OAuth access
+/// token lapses and the silent refresh does not happen, Claude Code does not
+/// replace the TUI with a login screen — it keeps the TUI up (tokens footer,
+/// permission-mode banner, `❯` prompt all intact) and prints one inline line:
+///
+/// ```text
+/// ● Please run /login · API Error: 401 OAuth access token has expired. Re-authenticate to continue.
+/// ```
+///
+/// `check_lines_for_reauth` refuses to look at anything while the TUI is up
+/// (correctly — that is the conversation-text false positive), and the
+/// proactive expiry detector keys on a different warning about the REFRESH
+/// token, which can be weeks from lapsing while the access token is already
+/// dead. So nothing reacted, and the session sat on the banner until a human
+/// typed `/login`.
+///
+/// This detector requires the TUI to be VISIBLE (the banner is an in-TUI
+/// render; with the TUI gone the login-screen detector owns the pane) and
+/// requires the COMBINATION of the `/login` instruction and the 401 / expired
+/// phrasing, not any one phrase alone. It is still only text. The caller MUST
+/// corroborate against the credential store (`credentials::read_access_token`)
+/// before acting — a session reading this file, its tests, or the diff that
+/// added them has this exact sentence on the pane while perfectly well
+/// authenticated, and that case has to stay silent.
+///
+/// Matching is whitespace-insensitive for the same reason
+/// `detect_login_expiry_warning` is: a tmux pane hard-wraps a line this long
+/// at any column with no separator.
+pub(crate) fn check_lines_for_401_banner(pane_output: &str) -> bool {
+    let lower = pane_output.to_lowercase();
+    if !tui_visible(&lower) {
+        return false;
+    }
+    let squashed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    squashed.contains("pleaserun/login")
+        && (squashed.contains("apierror:401") || squashed.contains("oauthaccesstokenhasexpired"))
 }
 
 /// Every OAuth authorize-URL prefix a Claude Code login screen can print.
@@ -2382,7 +2433,7 @@ pub(crate) fn detect_login_expiry_warning(pane_output: &str) -> Option<u32> {
 
 /// Capture the pane and report Claude Code's proactive login-expiry warning.
 ///
-/// Companion to `needs_reauth`, deliberately a separate capture: the two
+/// Companion to `reauth_signal`, deliberately a separate capture: the two
 /// signals are mutually exclusive (one needs the TUI gone, the other needs it
 /// present) so neither can mask the other.
 pub async fn login_expiry_warning(pane: &str) -> Option<u32> {
@@ -2390,15 +2441,45 @@ pub async fn login_expiry_warning(pane: &str) -> Option<u32> {
     detect_login_expiry_warning(&out)
 }
 
-/// Check if the pane is showing a reauth/login prompt.
-/// Returns the login URL if reauth is needed (or empty string if needed but URL not found).
-pub async fn needs_reauth(pane: &str) -> Option<String> {
-    if let Some(out) = capture_pane(pane).await {
-        if check_lines_for_reauth(&out) {
-            return Some(extract_login_url(&out).unwrap_or_default());
-        }
+/// What the reactive reauth path can see on the pane this cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReauthSignal {
+    /// Nothing auth-related on the pane.
+    None,
+    /// The TUI is gone and a login screen is up. Carries the OAuth URL if one
+    /// is on the pane, or an empty string if the screen is up but the URL has
+    /// not been reassembled yet.
+    LoginScreen { url: String },
+    /// The TUI is UP and Claude Code's "Please run /login · API Error: 401
+    /// OAuth access token has expired" banner is on it. Text only — the
+    /// caller corroborates against the credential store before acting.
+    Banner401,
+}
+
+/// Pure function: classify ONE pane frame for the reactive reauth path.
+///
+/// One frame rather than two captures so the two detectors can never disagree
+/// about what they are looking at: the login-screen check runs first because
+/// it is the stronger claim (the TUI is gone), and the banner check only runs
+/// on a frame the TUI was still on.
+pub(crate) fn classify_reauth_frame(pane_output: &str) -> ReauthSignal {
+    if check_lines_for_reauth(pane_output) {
+        return ReauthSignal::LoginScreen {
+            url: extract_login_url(pane_output).unwrap_or_default(),
+        };
     }
-    None
+    if check_lines_for_401_banner(pane_output) {
+        return ReauthSignal::Banner401;
+    }
+    ReauthSignal::None
+}
+
+/// Capture the pane and classify it for the reactive reauth path.
+pub async fn reauth_signal(pane: &str) -> ReauthSignal {
+    match capture_pane(pane).await {
+        Some(out) => classify_reauth_frame(&out),
+        None => ReauthSignal::None,
+    }
 }
 
 /// Reason a Claude Code session is considered wedged (unable to recover on its own).
@@ -4270,6 +4351,146 @@ mod tests {
             "-- INSERT --  871864 tokens"
         );
         assert!(!check_lines_for_reauth(output));
+    }
+
+    // --- check_lines_for_401_banner: the in-TUI access-token-expired banner ---
+    //
+    // The real thing, as observed: the TUI fully intact (tokens footer,
+    // "bypass permissions on", ❯ prompt) with ONE inline line from Claude
+    // Code. `check_lines_for_reauth` must keep saying no to this frame (the
+    // TUI guard above is load-bearing), and this detector must say yes — the
+    // decision to ACT is then the caller's, made against the credential store.
+    const BANNER_401_WITH_TUI: &str = concat!(
+        "● Please run /login · API Error: 401 OAuth access token has expired. ",
+        "Re-authenticate to continue.\n",
+        "\n",
+        "❯ \n",
+        "  bypass permissions on · 871,864 tokens\n"
+    );
+
+    #[test]
+    fn test_401_banner_detected_with_tui_up() {
+        assert!(check_lines_for_401_banner(BANNER_401_WITH_TUI));
+        // ...and the login-screen detector still leaves this frame alone.
+        assert!(!check_lines_for_reauth(BANNER_401_WITH_TUI));
+    }
+
+    #[test]
+    fn test_401_banner_detected_on_the_older_json_form() {
+        // The older render: banner line plus the raw error JSON underneath.
+        // Same frame `test_reauth_not_detected_401_text_with_tui` holds for.
+        let output = concat!(
+            "Please run /login · API Error: 401\n",
+            "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",",
+            "\"message\":\"Invalid authentication credentials\"}}\n",
+            "❯ \n",
+            "-- INSERT --  871864 tokens"
+        );
+        assert!(check_lines_for_401_banner(output));
+    }
+
+    #[test]
+    fn test_401_banner_survives_tmux_hard_wrap() {
+        // A narrow pane wraps the banner mid-phrase with no separator.
+        let output = concat!(
+            "● Please run /login · API Err\n",
+            "or: 401 OAuth access token has exp\n",
+            "ired. Re-authenticate to continue.\n",
+            "❯ \n",
+            "  12,345 tokens\n"
+        );
+        assert!(check_lines_for_401_banner(output));
+    }
+
+    #[test]
+    fn test_401_banner_not_detected_when_tui_gone() {
+        // With the TUI gone this is a login-screen frame, not a banner frame —
+        // the other detector owns it and this one must not double-claim.
+        let output = "Please run /login · API Error: 401 OAuth access token has expired.\n";
+        assert!(!check_lines_for_401_banner(output));
+        // (and the other detector does pick it up via "re-authenticate")
+        let output = "API Error: 401 OAuth access token has expired. Re-authenticate to continue.";
+        assert!(check_lines_for_reauth(output));
+    }
+
+    #[test]
+    fn test_401_banner_requires_the_combination_not_one_phrase() {
+        // "/login" alone (the proactive expiry warning, say) is not a 401.
+        assert!(!check_lines_for_401_banner(
+            "Your login expires in 2 days · run /login to renew\n❯ \n 1,234 tokens"
+        ));
+        assert!(!check_lines_for_401_banner("Please run /login\n❯ \n 1,234 tokens"));
+        // A 401 alone (a curl in the conversation) is not the banner.
+        assert!(!check_lines_for_401_banner(
+            "curl: HTTP/1.1 401 Unauthorized\nAPI Error: 401\n❯ \n 1,234 tokens"
+        ));
+        assert!(!check_lines_for_401_banner(
+            "the OAuth access token has expired on the other host\n❯ \n 1,234 tokens"
+        ));
+        assert!(!check_lines_for_401_banner(""));
+    }
+
+    // --- classify_reauth_frame: one frame, one verdict ---
+
+    #[test]
+    fn test_reauth_frame_login_screen_wins_and_carries_the_url() {
+        // TUI gone, login screen up with the authorize URL: phase 2, with URL.
+        let frame = concat!(
+            "Browser didn't open? Use the url below to sign in:\n",
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=abc\n",
+            "Paste code here if prompted >\n"
+        );
+        match classify_reauth_frame(frame) {
+            ReauthSignal::LoginScreen { url } => {
+                assert!(url.starts_with("https://claude.com/cai/oauth/authorize"), "{url}")
+            }
+            other => panic!("expected LoginScreen, got {other:?}"),
+        }
+        // TUI gone, login-ish text but no URL yet: phase 2 with an empty URL,
+        // which is what tells the caller to inject `/login` and wait.
+        assert_eq!(
+            classify_reauth_frame("Session expired. Login required.\n"),
+            ReauthSignal::LoginScreen { url: String::new() }
+        );
+    }
+
+    #[test]
+    fn test_reauth_frame_banner_with_tui_is_banner401() {
+        assert_eq!(
+            classify_reauth_frame(BANNER_401_WITH_TUI),
+            ReauthSignal::Banner401
+        );
+    }
+
+    #[test]
+    fn test_reauth_frame_normal_tui_is_none() {
+        assert_eq!(
+            classify_reauth_frame("● Done.\n\n❯ \n  bypass permissions on · 57,129 tokens\n"),
+            ReauthSignal::None
+        );
+        assert_eq!(classify_reauth_frame(""), ReauthSignal::None);
+        // The proactive warning is NOT this path's business.
+        assert_eq!(
+            classify_reauth_frame(
+                "Your login expires in 2 days · run /login to renew\n❯ \n 1,234 tokens"
+            ),
+            ReauthSignal::None
+        );
+    }
+
+    #[test]
+    fn test_401_banner_text_in_conversation_is_still_detected_as_text() {
+        // Somebody reading THIS file has the banner on the pane. The detector
+        // says "banner present" — it is text, and it cannot know better. The
+        // false-positive guard lives one layer up, in the credential
+        // corroboration (policy::decide_banner_action), and that is where the
+        // healthy-credentials case is asserted silent.
+        let output = concat!(
+            "    /// ● Please run /login · API Error: 401 OAuth access token has expired.\n",
+            "❯ \n",
+            "  bypass permissions on · 55,000 tokens\n"
+        );
+        assert!(check_lines_for_401_banner(output));
     }
 
     #[test]

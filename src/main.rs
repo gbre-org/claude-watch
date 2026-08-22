@@ -1938,6 +1938,11 @@ async fn run_login_expiry(
         None => credentials::default_path(),
     };
     let creds = credentials::read(&path);
+    // The OTHER half of the store: the short-lived access token, which is
+    // what the reactive 401 banner is corroborated against. Reported
+    // alongside so "why did / didn't the banner path fire" is answerable
+    // from this one command.
+    let access = credentials::read_access_token(&path);
 
     let (state_str, days, code) = match creds {
         CredentialExpiry::Expiring { days_left } => ("expiring", Some(days_left), 3),
@@ -1951,7 +1956,7 @@ async fn run_login_expiry(
 
     if json {
         println!(
-            "{{\"pane\":{},\"pane_warning_days\":{},\"credentials\":{},\"credentials_file\":{},\"days_left\":{}}}",
+            "{{\"pane\":{},\"pane_warning_days\":{},\"credentials\":{},\"credentials_file\":{},\"days_left\":{},\"access_token\":{}}}",
             serde_json::to_string(&pane).unwrap_or_else(|_| "\"\"".to_string()),
             pane_days
                 .map(|d| d.to_string())
@@ -1961,6 +1966,7 @@ async fn run_login_expiry(
                 .unwrap_or_else(|_| "\"\"".to_string()),
             days.map(|d| d.to_string())
                 .unwrap_or_else(|| "null".to_string()),
+            serde_json::to_string(access.as_str()).unwrap_or_else(|_| "\"\"".to_string()),
         );
         return code;
     }
@@ -1971,6 +1977,10 @@ async fn run_login_expiry(
         None => println!("on-screen:       no expiry warning on the pane"),
     }
     println!("credentials:     {state_str} ({})", path.display());
+    println!(
+        "access token:    {} (the reactive 401 banner fires only on expired/missing)",
+        access.as_str()
+    );
     match (state_str, days) {
         ("expiring", Some(d)) if pane_days.is_none() => {
             println!("=> the credential store says {d} day(s), with no warning on the pane.");
