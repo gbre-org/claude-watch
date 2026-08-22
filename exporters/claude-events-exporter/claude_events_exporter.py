@@ -25,6 +25,15 @@ Metrics:
   - claude_events_processed_total{outcome}       counter (consumed = total_seen - depth)
   - claude_events_dir_last_modified              gauge  (mtime of queue dir)
   - claude_events_scrape_errors_total            counter
+  - claude_events_last_heartbeat_timestamp_seconds gauge (epoch of the most
+    recent claude-watch heartbeat-tick event this process has observed on
+    the bus -- backs the dashboard's "Last Ack Age" stat via
+    time() - (this value > 0). Monotonic within a process lifetime: a
+    file's timestamp updates the gauge even after claude-event-watch
+    consumes (deletes) the file, so the signal survives fast consumption.
+    Stays 0 (cold start -- no heartbeat-tick observed yet by this process)
+    until the first one is seen; the dashboard query filters that 0 out
+    with "> 0" so a fresh exporter doesn't render a bogus multi-decade age.)
 """
 
 import json
@@ -109,6 +118,17 @@ c_scrape_errors = Counter(
     "Number of failed reads of the events queue directory",
     registry=REG,
 )
+g_last_heartbeat_ts = Gauge(
+    "claude_events_last_heartbeat_timestamp_seconds",
+    "Epoch timestamp of the most recent claude-watch heartbeat-tick event "
+    "this exporter process has observed on the bus. Updated from the "
+    "filename-encoded ns-timestamp, so it reflects the event's true emit "
+    "time even if it is scraped just before claude-event-watch consumes "
+    "(deletes) it. Monotonic (never decreases) for the life of this "
+    "process; stays 0 until the first heartbeat-tick is observed (query "
+    "with `> 0` to exclude the cold-start zero).",
+    registry=REG,
+)
 
 # Filename pattern: <ns_timestamp>_<safe_tag>.json (per claude-event emitter)
 FILENAME_RE = re.compile(r"^(?P<ns>\d+)_(?P<tag>[A-Za-z0-9_-]+)\.json$")
@@ -118,6 +138,7 @@ FILENAME_RE = re.compile(r"^(?P<ns>\d+)_(?P<tag>[A-Za-z0-9_-]+)\.json$")
 # the watcher removes files quickly, so this set stays small.
 _seen_filenames: set[str] = set()
 _total_seen = 0  # cumulative count of distinct events ever seen by this exporter
+_last_heartbeat_ts: float | None = None  # epoch of newest heartbeat-tick ever observed
 
 
 def _normalize_source(s: str | None) -> str:
@@ -134,7 +155,7 @@ def _normalize_tag(t: str | None) -> str:
 
 def collect():
     """Re-scan the events dir and refresh metrics. Called on every /metrics scrape."""
-    global _total_seen
+    global _total_seen, _last_heartbeat_ts
     try:
         st = os.stat(EVENTS_DIR)
         g_dir_mtime.set(st.st_mtime)
@@ -179,6 +200,15 @@ def collect():
         if age > oldest_age:
             oldest_age = age
 
+        # Track the newest heartbeat-tick regardless of dedup/consumption
+        # state below -- this is the liveness signal, so it must keep
+        # advancing even for a file we've already counted once, and it
+        # must survive the file being deleted by claude-event-watch on a
+        # later scrape (hence the module-level global, not a local).
+        if m and m.group("tag") == "heartbeat-tick":
+            if _last_heartbeat_ts is None or ev_time > _last_heartbeat_ts:
+                _last_heartbeat_ts = ev_time
+
         # First-time-seen counter increment + JSON parse for source/tag labels.
         if name not in _seen_filenames:
             _seen_filenames.add(name)
@@ -199,6 +229,9 @@ def collect():
             c_events_total.labels(source=source, tag=tag).inc()
 
     g_oldest_age.set(oldest_age)
+
+    if _last_heartbeat_ts is not None:
+        g_last_heartbeat_ts.set(_last_heartbeat_ts)
 
     # Derive processed count: every event the exporter has ever seen but that
     # is no longer in the queue dir was consumed by claude-event-watch (or
