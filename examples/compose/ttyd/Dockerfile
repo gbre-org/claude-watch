@@ -76,10 +76,21 @@ FROM debian:bookworm-slim AS html-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
     && rm -rf /var/lib/apt/lists/*
+# Idle window (seconds) after which the injected lock toggle engages
+# itself. 300 = 5 minutes; 0 disables auto-lock and leaves the manual
+# padlock as the only path. Baked into the served index.html because the
+# image ships ONE static HTML file (ttyd serves it with `-I`) — there is
+# no server-side render at request time to read a runtime env var from.
+# Operators who want a different window per deployment override the build
+# arg (docker-compose.yml wires it to $TTYD_AUTOLOCK_SECONDS); a per-tab
+# `?autolock=<seconds>` URL param overrides it without a rebuild.
+ARG TTYD_AUTOLOCK_SECONDS=300
 COPY inject-autodark.py /tmp/inject-autodark.py
 COPY --from=frontend-builder /build/ttyd/html/dist/inline.html /tmp/index.upstream.html
 RUN set -eux; \
-    python3 /tmp/inject-autodark.py /tmp/index.upstream.html /tmp/index.patched.html; \
+    TTYD_AUTOLOCK_SECONDS="${TTYD_AUTOLOCK_SECONDS}" \
+        python3 /tmp/inject-autodark.py /tmp/index.upstream.html /tmp/index.patched.html; \
+    grep -q "var AUTO_LOCK_SECONDS = ${TTYD_AUTOLOCK_SECONDS};" /tmp/index.patched.html; \
     grep -q 'prefers-color-scheme' /tmp/index.patched.html; \
     grep -q 'autodark-injected' /tmp/index.patched.html; \
     grep -q 'paste-intercept-injected' /tmp/index.patched.html; \
