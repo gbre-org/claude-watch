@@ -410,8 +410,8 @@
     },
     {
       "id": 109,
-      "title": "Model Breakdown",
-      "type": "bargauge",
+      "title": "Model Breakdown (assistant messages)",
+      "type": "piechart",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -434,21 +434,42 @@
           "color": {
             "mode": "palette-classic"
           },
-          "unit": "short",
-          "decimals": 0
+          "custom": {
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "mappings": [],
+          "unit": "short"
         },
         "overrides": []
       },
       "options": {
+        "pieType": "pie",
+        "tooltip": {
+          "mode": "single"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "displayLabels": [
+          "name",
+          "value"
+        ],
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
           ],
+          "fields": "",
           "values": false
-        },
-        "orientation": "horizontal",
-        "displayMode": "gradient",
-        "showUnfilled": true
+        }
       }
     },
     {
