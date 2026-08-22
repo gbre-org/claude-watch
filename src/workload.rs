@@ -49,6 +49,16 @@
 //! `kill_one_workload` -> `kill_workload_tree`. `cmd_kill` is the
 //! single-label entry point to the same routine, so the two cannot
 //! drift.
+//!
+//! `workload run` on a label whose previous run is STILL LIVE had the
+//! same blind spot for the same reason (a bare `tmux kill-pane`), with
+//! an extra hazard: the orphaned payload keeps appending to the very
+//! `<label>.output` the new run is about to publish, and overwrites the
+//! `<label>.pgid` the next kill will aim at. It now runs the same
+//! teardown — see `cmd_run` and [`Teardown`] for the replace semantics
+//! (the old run's completion is marked `reason="replaced"`, the new
+//! run's queue binding happens only after the teardown returns, and a
+//! survivor REFUSES the new run rather than doubling up on the label).
 
 use crate::event_bus::{emit_workload_done, WorkloadDoneEvent};
 use serde::{Deserialize, Serialize};
@@ -1708,6 +1718,44 @@ fn build_wrapper_script(
 /// skipped. Suppression knob: `WORKLOAD_QUEUE_AUTO_CREATE=0` (env)
 /// disables auto-create globally without touching CLI args. Used by
 /// tests + by environments without `session-task` installed.
+///
+/// # Replacing a live run of the same label
+///
+/// Re-running a label whose previous run is still going REPLACES it, as
+/// it always has. What changed (2026-08-22) is that the previous run is
+/// now actually torn down — the same TREE-WIDE teardown `workload kill`
+/// and `task init --recreate --force` use, not a bare `tmux kill-pane`
+/// that hung up the pane shell and left the payload running as an
+/// orphan, appending to the `.output` file the new run was about to
+/// publish under and clobbering the `.pgid` sidecar the next kill would
+/// aim at.
+///
+/// Three ordering rules keep the replaced run from masquerading as the
+/// run that replaced it:
+///
+///   1. **The old run's completion is marked.** It gets its usual
+///      exactly-once `workload-done` with `killed=true`, plus
+///      `data.reason="replaced"` and `data.replaced_by=<the new run's
+///      `started_at`>` — byte-identical to the `started_at` the new
+///      registry entry gets, so the two correlate exactly. Without the
+///      marker it is a `killed=true` event on the same label with the
+///      same log path arriving moments before the new run starts, i.e.
+///      indistinguishable from the new run dying instantly.
+///   2. **The new run's queue binding happens AFTER the teardown
+///      returns.** Auto-create + `register` used to run first, which
+///      left a window where the item being abandoned by the teardown
+///      was the item the new run had just claimed. When the caller
+///      supplies the SAME `--queue-id` the dying run was bound to, that
+///      item is CARRIED OVER instead: left `running` for the new run
+///      and reported as `data.carried_over_queue_id`, never abandoned.
+///   3. **Survivors refuse the new run.** If anything outlived the
+///      SIGKILL sweep, `cmd_run` returns [`KILL_SURVIVORS_EXIT`] with
+///      the pids named rather than starting a second payload on a label
+///      the first one is still writing to.
+///
+/// The teardown uses the standard kill grace ([`KILL_GRACE_SECS_DEFAULT`],
+/// env [`KILL_GRACE_ENV`]); `workload run` has no `--grace` flag of its
+/// own.
 pub fn cmd_run(
     label: &str,
     cmd_args: &[String],
@@ -1728,6 +1776,117 @@ pub fn cmd_run(
         eprintln!("No '{SESSION}' tmux session. Run: claude-watch task init");
         return 1;
     }
+
+    if let Err(e) = fs::create_dir_all(WORKLOAD_DIR) {
+        eprintln!("Failed to create {WORKLOAD_DIR}: {e}");
+        return 1;
+    }
+    // Best-effort: maintain the legacy `/tmp/claude-workloads` path as
+    // a symlink so out-of-tree consumers (docker bind-mount,
+    // cron-workload-stale-check) keep working without a coordinated
+    // multi-repo deploy. Lazy + idempotent — see helper docs.
+    ensure_legacy_compat_symlink();
+
+    let out_path = output_file(label);
+    let exit_path = exit_file(label);
+    let heartbeat_path = heartbeat_file(label);
+    let runtime_heartbeat_path = runtime_heartbeat_file(label);
+    let pgid_path = pgid_file(label);
+    let script_path = script_file(label);
+    let script_capture_path = script_capture_file(label);
+
+    // The new run's identity, minted BEFORE the teardown so the
+    // replaced run's completion event can name the run that displaced
+    // it (`data.replaced_by`) with the exact string the new registry
+    // entry gets.
+    let started_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+
+    // --- Replace a live run of the same label -------------------------
+    //
+    // TREE-WIDE, like `workload kill` and the recreate teardown. This
+    // used to be a bare `tmux kill-pane`, which hangs up the pane shell
+    // and leaves the payload — which lives two sessions below it
+    // (`setsid --wait`, then `script(1)`) — reparented to pid 1 and
+    // still running, now racing the NEW run for the same `.output` and
+    // `.pgid` sidecars, with no completion event ever emitted for it and
+    // its queue item stranded in `running`.
+    let mut state = load_state();
+    if let Some(entry) = state.get(label).cloned() {
+        if pane_alive(&entry.pane_id) {
+            // Carry the queue item over instead of abandoning it when
+            // the replacing run was handed the SAME qid: that item is
+            // about to be the NEW run's, and abandoning it here would
+            // abandon live work.
+            let carry_over = match (queue_id, entry.queue_id.as_deref()) {
+                (Some(new), Some(old)) => new == old,
+                _ => false,
+            };
+            println!(
+                "Replacing running workload '{label}' — tearing down the \
+                 previous run's process tree first"
+            );
+            let outcome = kill_one_workload(
+                label,
+                &entry,
+                resolve_kill_grace(None),
+                &Teardown::replaced(started_at.clone(), carry_over),
+            );
+            let survivors = report_kill_outcome(&outcome);
+            // Drop the label either way: its pane is gone, and the
+            // registry tracks panes.
+            state.remove(label);
+            let _ = save_state(&state);
+            if survivors {
+                // Starting now would put two payloads on one label:
+                // both appending to `<label>.output`, both overwriting
+                // `<label>.pgid`, so the NEXT kill would target the
+                // wrong process group. Refuse instead — the survivor
+                // pids are named above.
+                eprintln!(
+                    "Refusing to start a new run of '{label}': the previous run's \
+                     process tree survived SIGKILL. Reap the pids above, then re-run."
+                );
+                rebalance();
+                return KILL_SURVIVORS_EXIT;
+            }
+        } else {
+            state.remove(label);
+            let _ = save_state(&state);
+        }
+    }
+
+    // Clean up previous run's exit marker + output + heartbeats. The
+    // heartbeats MUST be removed up-front so neither the cron-stale
+    // detector nor the daemon's stuck-suppression check can get a
+    // false-positive on a stale leftover from a prior run that pet the
+    // watchdog and then crashed.
+    // Also remove any prior script-capture sidecar so a re-run that no
+    // longer matches the interpreter pattern doesn't surface a stale
+    // capture from the previous invocation.
+    let _ = fs::remove_file(&exit_path);
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&heartbeat_path);
+    let _ = fs::remove_file(&runtime_heartbeat_path);
+    // Stale process-group sidecar from a previous run would point a
+    // later `workload kill` at a recycled pid.
+    let _ = fs::remove_file(&pgid_path);
+    // Stale kill-emitted sentinel from a previous run that was killed
+    // would swallow THIS run's completion event.
+    let _ = fs::remove_file(kill_emitted_file(label));
+    let _ = fs::remove_file(&script_capture_path);
+
+    // Try to capture the script content NOW (before the workload
+    // starts) so a later modify/delete of the script doesn't affect
+    // what the modal shows. Fail-soft: no capture means the modal
+    // omits the "Script contents" section.
+    if let Some(cap) = try_capture_script(cmd_args) {
+        write_script_capture(label, &cap);
+    }
+    // Also clear the cron-workload-stale-check single-emit sentinel so
+    // a freshly-started workload that legitimately stalls again will
+    // re-fire workload-stale instead of being silently swallowed.
+    let alerted_path = PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat.alerted"));
+    let _ = fs::remove_file(&alerted_path);
 
     // Resolve effective queue id. Precedence:
     //   1. Caller-supplied --queue-id wins (existing behaviour).
@@ -1784,69 +1943,6 @@ pub fn cmd_run(
         if let Some(ref qid) = effective_queue_id {
             inject_workload_scope_token(label, qid);
         }
-    }
-
-    if let Err(e) = fs::create_dir_all(WORKLOAD_DIR) {
-        eprintln!("Failed to create {WORKLOAD_DIR}: {e}");
-        return 1;
-    }
-    // Best-effort: maintain the legacy `/tmp/claude-workloads` path as
-    // a symlink so out-of-tree consumers (docker bind-mount,
-    // cron-workload-stale-check) keep working without a coordinated
-    // multi-repo deploy. Lazy + idempotent — see helper docs.
-    ensure_legacy_compat_symlink();
-
-    let out_path = output_file(label);
-    let exit_path = exit_file(label);
-    let heartbeat_path = heartbeat_file(label);
-    let runtime_heartbeat_path = runtime_heartbeat_file(label);
-    let pgid_path = pgid_file(label);
-    let script_path = script_file(label);
-    let script_capture_path = script_capture_file(label);
-
-    // Clean up previous run's exit marker + output + heartbeats. The
-    // heartbeats MUST be removed up-front so neither the cron-stale
-    // detector nor the daemon's stuck-suppression check can get a
-    // false-positive on a stale leftover from a prior run that pet the
-    // watchdog and then crashed.
-    // Also remove any prior script-capture sidecar so a re-run that no
-    // longer matches the interpreter pattern doesn't surface a stale
-    // capture from the previous invocation.
-    let _ = fs::remove_file(&exit_path);
-    let _ = fs::remove_file(&out_path);
-    let _ = fs::remove_file(&heartbeat_path);
-    let _ = fs::remove_file(&runtime_heartbeat_path);
-    // Stale process-group sidecar from a previous run would point a
-    // later `workload kill` at a recycled pid.
-    let _ = fs::remove_file(&pgid_path);
-    // Stale kill-emitted sentinel from a previous run that was killed
-    // would swallow THIS run's completion event.
-    let _ = fs::remove_file(kill_emitted_file(label));
-    let _ = fs::remove_file(&script_capture_path);
-
-    // Try to capture the script content NOW (before the workload
-    // starts) so a later modify/delete of the script doesn't affect
-    // what the modal shows. Fail-soft: no capture means the modal
-    // omits the "Script contents" section.
-    if let Some(cap) = try_capture_script(cmd_args) {
-        write_script_capture(label, &cap);
-    }
-    // Also clear the cron-workload-stale-check single-emit sentinel so
-    // a freshly-started workload that legitimately stalls again will
-    // re-fire workload-stale instead of being silently swallowed.
-    let alerted_path = PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat.alerted"));
-    let _ = fs::remove_file(&alerted_path);
-
-    // Kill existing workload with same label
-    let mut state = load_state();
-    if let Some(entry) = state.get(label) {
-        if pane_alive(&entry.pane_id) {
-            let _ = Command::new("tmux")
-                .args(["kill-pane", "-t", &entry.pane_id])
-                .output();
-        }
-        state.remove(label);
-        let _ = save_state(&state);
     }
 
     // Wrapper script — identical layout to Python version, plus a
@@ -1921,7 +2017,6 @@ pub fn cmd_run(
 
     rebalance();
 
-    let started_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     state.insert(
         label.to_string(),
         WorkloadEntry {
@@ -2401,7 +2496,12 @@ pub fn cmd_kill(label: &str, grace_secs: Option<f64>) -> i32 {
         }
     };
 
-    let outcome = kill_one_workload(label, &info, resolve_kill_grace(grace_secs));
+    let outcome = kill_one_workload(
+        label,
+        &info,
+        resolve_kill_grace(grace_secs),
+        &Teardown::plain(),
+    );
     let rc = if report_kill_outcome(&outcome) {
         KILL_SURVIVORS_EXIT
     } else {
@@ -2437,6 +2537,62 @@ impl WorkloadKillOutcome {
     }
 }
 
+/// Why a run is being torn down, and what that means for the queue item
+/// it was bound to.
+///
+/// Two teardown reasons exist, and they must not produce the same event:
+///
+///   * [`Teardown::plain`] — `workload kill`, or the teardown
+///     `task init --recreate --force` runs before it destroys the
+///     session. The run is over and nothing takes its place: the
+///     completion is a plain `killed=true` and the queue item goes
+///     terminal (`abandoned`).
+///   * [`Teardown::replaced`] — `workload run` was invoked on a label
+///     whose previous run is still live. That run also dies, but a NEW
+///     run of the same label is about to start with the same log path
+///     and the same registry key. Its completion therefore carries
+///     `reason="replaced"` + `replaced_by=<the new run's started_at>`
+///     so the main loop can never read it as the new run's completion.
+///
+/// `carry_over_queue_item` covers the one case where the queue item
+/// must NOT be transitioned: `workload run --queue-id q-X` on a label
+/// whose dying run was already bound to `q-X`. Abandoning it there
+/// would abandon the item the replacing run is about to work under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Teardown {
+    /// `None` = a plain kill. `Some(started_at)` = replaced by a new run
+    /// of the same label starting at `started_at` (byte-identical to the
+    /// `started_at` the new registry entry gets, so the two correlate).
+    pub replaced_by: Option<String>,
+    /// The replacing run re-binds the SAME queue item, so this teardown
+    /// must leave it `running` and report it as
+    /// `data.carried_over_queue_id` rather than `data.queue_id`.
+    pub carry_over_queue_item: bool,
+}
+
+impl Teardown {
+    /// `workload kill` / recreate: the run is over, its queue item is
+    /// terminal.
+    pub fn plain() -> Self {
+        Teardown::default()
+    }
+
+    /// `workload run` reusing a live label. `carry_over_queue_item` is
+    /// true iff the new run was handed the qid the dying run owns.
+    pub fn replaced(started_at: impl Into<String>, carry_over_queue_item: bool) -> Self {
+        Teardown {
+            replaced_by: Some(started_at.into()),
+            carry_over_queue_item,
+        }
+    }
+
+    /// `"replaced"` for a replace, `None` otherwise — the `data.reason`
+    /// wire value.
+    fn reason(&self) -> Option<&'static str> {
+        self.replaced_by.as_ref().map(|_| "replaced")
+    }
+}
+
 /// Emit this run's `workload-done` with `killed=true` — exactly once.
 ///
 /// Two guards, because the wrapper is a live racer, not a passive file:
@@ -2457,6 +2613,11 @@ impl WorkloadKillOutcome {
 /// (Andrew DM 2026-05-13: rc=-15 event arrived but the queue UI still
 /// showed `running`).
 ///
+/// `teardown` says whether this is a plain kill or a same-label
+/// REPLACE; on a replace the emitted event carries the replace markers
+/// and, when the queue item is being carried over to the replacing run,
+/// the queue transition is skipped.
+///
 /// Paths are parameters so a test can drive the real routine against a
 /// tempdir instead of the production workload-state dir.
 fn ensure_kill_done_event(
@@ -2465,13 +2626,14 @@ fn ensure_kill_done_event(
     sentinel_path: &Path,
     log_path: &str,
     queue_id: Option<&str>,
+    teardown: &Teardown,
 ) -> bool {
     if exit_path.exists() {
         return false;
     }
     let _ = fs::write(exit_path, "-15\n");
     mark_kill_emitted_at(sentinel_path);
-    cmd_emit_done_with_sentinel(label, -15, log_path, true, queue_id, sentinel_path);
+    emit_done_with_sentinel(label, -15, log_path, true, queue_id, sentinel_path, teardown);
     true
 }
 
@@ -2483,7 +2645,12 @@ fn ensure_kill_done_event(
 /// never drift — same ordering, same grace, same verification, same
 /// sidecar cleanup. Deliberately does NOT touch `state.json` and does
 /// not re-layout the session: the callers do that once, at the end.
-fn kill_one_workload(label: &str, info: &WorkloadEntry, grace: Duration) -> WorkloadKillOutcome {
+fn kill_one_workload(
+    label: &str,
+    info: &WorkloadEntry,
+    grace: Duration,
+    teardown: &Teardown,
+) -> WorkloadKillOutcome {
     let mut outcome = WorkloadKillOutcome {
         label: label.to_string(),
         pane_id: info.pane_id.clone(),
@@ -2498,6 +2665,7 @@ fn kill_one_workload(label: &str, info: &WorkloadEntry, grace: Duration) -> Work
             &kill_emitted_file(label),
             &info.output,
             info.queue_id.as_deref(),
+            teardown,
         );
         outcome.report = kill_workload_tree(label, &info.pane_id, grace);
         let _ = Command::new("tmux")
@@ -2599,7 +2767,7 @@ pub fn kill_workloads(labels: &[String], grace: Duration) -> Vec<WorkloadKillOut
                 continue;
             }
         };
-        outcomes.push(kill_one_workload(label, &info, grace));
+        outcomes.push(kill_one_workload(label, &info, grace, &Teardown::plain()));
         state.remove(label);
         touched = true;
     }
@@ -2637,26 +2805,31 @@ pub fn cmd_emit_done(
     killed: bool,
     queue_id: Option<&str>,
 ) -> i32 {
-    cmd_emit_done_with_sentinel(
+    emit_done_with_sentinel(
         label,
         exit_code,
         log_path,
         killed,
         queue_id,
         &kill_emitted_file(label),
+        // The wrapper's own emit is never a replace: only a teardown
+        // knows it is making room for another run.
+        &Teardown::plain(),
     )
 }
 
-/// [`cmd_emit_done`] with the kill-emitted sentinel path passed in, so a
-/// test can exercise the suppression against a tempdir instead of the
-/// production workload-state dir.
-fn cmd_emit_done_with_sentinel(
+/// [`cmd_emit_done`] with the kill-emitted sentinel path and the
+/// [`Teardown`] passed in, so a test can exercise the suppression (and
+/// the replace markers) against a tempdir instead of the production
+/// workload-state dir.
+fn emit_done_with_sentinel(
     label: &str,
     exit_code: i32,
     log_path: &str,
     killed: bool,
     queue_id: Option<&str>,
     sentinel_path: &Path,
+    teardown: &Teardown,
 ) -> i32 {
     // Exactly-once guard for the KILL race. The killer emits this run's
     // completion (with `killed=true`) before it tears the pane down; the
@@ -2673,15 +2846,33 @@ fn cmd_emit_done_with_sentinel(
         );
         return 0;
     }
+    // A carried-over queue item belongs to the run that is REPLACING
+    // this one. It must not be named as this run's item (a consumer
+    // correlating on `data.queue_id` would read a live item as dead) and
+    // it must not be transitioned.
+    let carried = teardown.carry_over_queue_item.then_some(queue_id).flatten();
     emit_workload_done(&WorkloadDoneEvent {
         label,
         exit_code,
         killed,
         log_path,
-        queue_id,
+        queue_id: if carried.is_some() { None } else { queue_id },
+        reason: teardown.reason(),
+        replaced_by: teardown.replaced_by.as_deref(),
+        carried_over_queue_id: carried,
     });
-    if let Some(qid) = queue_id {
-        transition_queue_item_for_workload(qid, label, exit_code, killed, log_path);
+    match (queue_id, carried) {
+        (Some(qid), None) => {
+            transition_queue_item_for_workload(qid, label, exit_code, killed, log_path, teardown);
+        }
+        (Some(qid), Some(_)) => {
+            tracing::info!(
+                label,
+                queue_id = %qid,
+                "queue item carried over to the replacing run; leaving it running"
+            );
+        }
+        _ => {}
     }
     0
 }
@@ -2716,6 +2907,7 @@ fn transition_queue_item_for_workload(
     exit_code: i32,
     killed: bool,
     log_path: &str,
+    teardown: &Teardown,
 ) {
     if std::env::var("WORKLOAD_QUEUE_TRANSITION")
         .ok()
@@ -2744,7 +2936,14 @@ fn transition_queue_item_for_workload(
             "--silent".to_string(),
         ]
     } else {
-        let reason = if killed {
+        let reason = if let Some(replaced_by) = teardown.replaced_by.as_deref() {
+            // Say WHY it died: a bare "killed" on a label that is
+            // running again reads like the live run is the dead one.
+            format!(
+                "workload {label} replaced by a new run started {replaced_by} \
+                 (previous run killed, rc={exit_code}, log={log_path})"
+            )
+        } else if killed {
             format!("workload {label} killed (rc={exit_code}, log={log_path})")
         } else {
             format!(
@@ -6328,7 +6527,8 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &sentinel,
             "/tmp/kt.output",
-            None
+            None,
+            &Teardown::plain()
         ));
 
         assert_eq!(
@@ -6360,7 +6560,8 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &sentinel,
             "/tmp/kt.output",
-            None
+            None,
+            &Teardown::plain()
         ));
 
         assert!(!sentinel.exists(), "no sentinel when we did not emit");
@@ -6387,14 +6588,16 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &sentinel,
             "/tmp/kt.output",
-            None
+            None,
+            &Teardown::plain()
         ));
         assert!(!ensure_kill_done_event(
             "kt",
             &exit_path,
             &sentinel,
             "/tmp/kt.output",
-            None
+            None,
+            &Teardown::plain()
         ));
         assert_eq!(done_events(&events).len(), 1);
     }
@@ -6411,9 +6614,24 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let sentinel = tmp.path().join("kt.kill-emitted");
         let _guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
 
-        ensure_kill_done_event("kt", &exit_path, &sentinel, "/tmp/kt.output", None);
+        ensure_kill_done_event(
+            "kt",
+            &exit_path,
+            &sentinel,
+            "/tmp/kt.output",
+            None,
+            &Teardown::plain(),
+        );
         // The wrapper's own emit, with the payload's real signal rc.
-        cmd_emit_done_with_sentinel("kt", 143, "/tmp/kt.output", false, None, &sentinel);
+        emit_done_with_sentinel(
+            "kt",
+            143,
+            "/tmp/kt.output",
+            false,
+            None,
+            &sentinel,
+            &Teardown::plain(),
+        );
 
         let ev = one_done_event(&events);
         assert_eq!(
@@ -6437,12 +6655,20 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let _guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
 
         // No sentinel: a natural completion emits as always.
-        cmd_emit_done_with_sentinel("kt", 0, "/tmp/kt.output", false, None, &sentinel);
+        emit_done_with_sentinel("kt", 0, "/tmp/kt.output", false, None, &sentinel, &Teardown::plain());
         assert_eq!(done_events(&events).len(), 1);
 
         // Sentinel present but this IS a kill emit: not suppressed.
         mark_kill_emitted_at(&sentinel);
-        cmd_emit_done_with_sentinel("kt", -15, "/tmp/kt.output", true, None, &sentinel);
+        emit_done_with_sentinel(
+            "kt",
+            -15,
+            "/tmp/kt.output",
+            true,
+            None,
+            &sentinel,
+            &Teardown::plain(),
+        );
         assert_eq!(done_events(&events).len(), 2);
         assert!(
             sentinel.exists(),
@@ -6646,6 +6872,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &sentinel_path,
             &out_path.to_string_lossy(),
             None,
+            &Teardown::plain(),
         );
         // `wrapper_pid` stands in for the tmux pane shell: it is a
         // protected ROOT (tmux owns the pane teardown) whose descendants
@@ -6699,6 +6926,412 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let ev = one_done_event(&events);
         assert_eq!(ev["data"]["killed"], true);
         assert_eq!(ev["data"]["label"], "rt");
+        drop(guard);
+    }
+
+
+    // ----- `workload run` replacing a live same-label run --------------------
+
+    /// The plain teardowns (`workload kill`, recreate) must stay exactly
+    /// what they were: no reason, no `replaced_by`, no carry-over.
+    #[test]
+    fn plain_teardown_carries_no_replace_marker() {
+        let t = Teardown::plain();
+        assert_eq!(t.reason(), None);
+        assert_eq!(t.replaced_by, None);
+        assert!(!t.carry_over_queue_item);
+
+        let r = Teardown::replaced("2026-08-22T11:04:07", false);
+        assert_eq!(r.reason(), Some("replaced"));
+        assert_eq!(r.replaced_by.as_deref(), Some("2026-08-22T11:04:07"));
+        assert!(!r.carry_over_queue_item);
+    }
+
+    /// A replaced run's completion must be TELLABLE from the completion
+    /// of the run that replaced it: same label, same log path,
+    /// `killed=true`, emitted moments before the new run starts. The
+    /// markers (`reason=replaced`, `replaced_by=<the new run's
+    /// started_at>`) are what stop the main loop from reading it as the
+    /// new run finishing instantly.
+    ///
+    /// The dying run's own queue item still goes terminal here — it is
+    /// a different item from whatever the new run binds to — and the
+    /// abandon reason must say REPLACED, not just "killed", because the
+    /// label is running again by the time anyone reads it.
+    #[test]
+    fn replace_teardown_marks_the_event_and_abandons_the_old_runs_item() {
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(&events);
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
+        }
+
+        let exit_path = tmp.path().join("rep.exit");
+        let sentinel_path = tmp.path().join("rep.kill-emitted");
+        let emitted = ensure_kill_done_event(
+            "rep",
+            &exit_path,
+            &sentinel_path,
+            "/tmp/claude-workloads/rep.output",
+            Some("q-2026-08-22-old0"),
+            &Teardown::replaced("2026-08-22T11:04:07", false),
+        );
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        assert!(emitted, "the replaced run's completion must be synthesised");
+        let ev = one_done_event(&events);
+        assert_eq!(ev["data"]["killed"], true);
+        assert_eq!(ev["data"]["exit_code"], -15);
+        assert_eq!(ev["data"]["reason"], "replaced");
+        assert_eq!(ev["data"]["replaced_by"], "2026-08-22T11:04:07");
+        assert_eq!(ev["data"]["queue_id"], "q-2026-08-22-old0");
+
+        let recorded = std::fs::read_to_string(&recording).expect("stub was invoked");
+        assert!(
+            recorded.contains("queue\nabandon\nq-2026-08-22-old0"),
+            "the dying run's own item must go terminal: {recorded}"
+        );
+        assert!(
+            recorded.contains("replaced by a new run started 2026-08-22T11:04:07"),
+            "the abandon reason must say it was replaced, not just killed: {recorded}"
+        );
+    }
+
+    /// `workload run --queue-id q-X` on a label whose live run is
+    /// ALREADY bound to `q-X`: the item belongs to the replacing run, so
+    /// the teardown must leave it `running` and must not present it as
+    /// the dead run's item. Abandoning it here would abandon the work
+    /// that is about to start.
+    #[test]
+    fn replace_teardown_carries_a_shared_queue_item_over_untouched() {
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let _env = crate::event_bus::test_support::EventQueueGuard::set(&events);
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755));
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
+        }
+
+        let exit_path = tmp.path().join("carry.exit");
+        let sentinel_path = tmp.path().join("carry.kill-emitted");
+        let emitted = ensure_kill_done_event(
+            "carry",
+            &exit_path,
+            &sentinel_path,
+            "/tmp/claude-workloads/carry.output",
+            Some("q-2026-08-22-same"),
+            &Teardown::replaced("2026-08-22T11:04:07", true),
+        );
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        assert!(emitted);
+        assert!(
+            !recording.exists(),
+            "a carried-over item must NOT be transitioned: {}",
+            std::fs::read_to_string(&recording).unwrap_or_default()
+        );
+        let ev = one_done_event(&events);
+        assert_eq!(ev["data"]["reason"], "replaced");
+        assert_eq!(ev["data"]["carried_over_queue_id"], "q-2026-08-22-same");
+        assert!(
+            ev["data"].get("queue_id").is_none(),
+            "the item is the NEW run's; naming it as this run's invites \
+             a consumer to read live work as dead: {ev}"
+        );
+    }
+
+    /// THE regression test for the `workload run` replace blind spot,
+    /// mirroring `kill_tree_reaps_grandchildren_and_double_forked_orphans`
+    /// and `recreate_teardown_reaps_the_whole_tree_and_emits_one_kill_event`.
+    ///
+    /// `workload run <label>` on a label whose previous run was still
+    /// live used to be a bare `tmux kill-pane`: the pane shell was hung
+    /// up and the payload — two sessions below it (`setsid --wait`, then
+    /// `script(1)`) — was reparented to pid 1 and kept running, racing
+    /// the NEW run for the same `.output` and `.pgid` sidecars, with no
+    /// `workload-done` ever emitted for it.
+    ///
+    /// Drives the REAL routines `cmd_run` now calls, in its order,
+    /// against a real generated wrapper: teardown, then the sidecar
+    /// reset, then the new run. Tempdir-only: no production
+    /// workload-state dir, no tmux, no live `workload run`.
+    #[test]
+    fn replace_teardown_reaps_the_whole_tree_and_lets_the_new_run_start_clean() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events = tmp.path().join("events");
+        let out_path = tmp.path().join("rp.output");
+        let exit_path = tmp.path().join("rp.exit");
+        let hb_path = tmp.path().join("rp.heartbeat");
+        let rt_hb_path = tmp.path().join("rp.runtime.heartbeat");
+        let pgid_path = tmp.path().join("rp.pgid");
+        let sentinel_path = tmp.path().join("rp.kill-emitted");
+        let script_path = tmp.path().join("rp.sh");
+
+        let drv_pid_f = tmp.path().join("drv.pid");
+        let child_pid_f = tmp.path().join("child.pid");
+        let orphan_pid_f = tmp.path().join("orphan.pid");
+
+        let command = format!(
+            "echo $$ > {drv}; sleep 600 & echo $! > {child}; \
+             ( sleep 600 & echo $! > {orphan} ) ; sleep 600",
+            drv = drv_pid_f.display(),
+            child = child_pid_f.display(),
+            orphan = orphan_pid_f.display(),
+        );
+
+        let script = build_wrapper_script(
+            "rp",
+            &command,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            &pgid_path,
+            "/bin/true",
+            None,
+        );
+        std::fs::write(&script_path, &script).expect("write script");
+
+        let mut wrapper = Command::new("bash")
+            .arg(&script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn wrapper");
+        let wrapper_pid = wrapper.id() as i32;
+
+        let ready = wait_until(Duration::from_secs(20), || {
+            read_pid_file(&pgid_path).is_some()
+                && read_pid_file(&drv_pid_f).is_some()
+                && read_pid_file(&child_pid_f).is_some()
+                && read_pid_file(&orphan_pid_f).is_some()
+        });
+        let recorded = read_pid_file(&pgid_path);
+        let drv = read_pid_file(&drv_pid_f);
+        let child = read_pid_file(&child_pid_f);
+        let orphan = read_pid_file(&orphan_pid_f);
+
+        if !ready {
+            // Never leave the tree running if the setup failed.
+            let _ = kill_tree(
+                &[wrapper_pid],
+                recorded,
+                &self_protected(),
+                Duration::from_millis(200),
+            );
+            let _ = wrapper.wait();
+            panic!(
+                "workload tree never fully started: pgid={recorded:?} drv={drv:?} \
+                 child={child:?} orphan={orphan:?}\noutput:\n{}",
+                std::fs::read_to_string(&out_path).unwrap_or_default()
+            );
+        }
+
+        let recorded = recorded.expect("pgid recorded");
+        let drv = drv.expect("driver pid");
+        let child = child.expect("child pid");
+        let orphan = orphan.expect("orphan pid");
+
+        // --- exactly what the replace path does, in order ---------------
+        let guard = crate::event_bus::test_support::EventQueueGuard::set(&events);
+        let replaced_by = "2026-08-22T11:04:07";
+        let emitted = ensure_kill_done_event(
+            "rp",
+            &exit_path,
+            &sentinel_path,
+            &out_path.to_string_lossy(),
+            None,
+            &Teardown::replaced(replaced_by, false),
+        );
+        // `wrapper_pid` stands in for the tmux pane shell: a protected
+        // ROOT (tmux owns the pane teardown) whose descendants are the
+        // target set.
+        let report = kill_workload_tree_with(
+            "rp",
+            Some(wrapper_pid),
+            Some(recorded),
+            Duration::from_millis(500),
+        );
+        // ...and then `tmux kill-pane` takes the pane shell itself,
+        // which is not available here — signal the stand-in directly.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(wrapper_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = wrapper.wait();
+
+        assert!(emitted, "the replace must synthesise the old run's completion");
+        for (name, pid) in [
+            ("payload leader", recorded),
+            ("driver", drv),
+            ("grandchild sleep", child),
+            ("double-forked sleep", orphan),
+            ("wrapper", wrapper_pid),
+        ] {
+            let gone = wait_until(Duration::from_secs(5), || !proc_alive(pid));
+            assert!(
+                gone,
+                "{name} (pid {pid}) survived the replace teardown; report: {report:?}"
+            );
+        }
+        assert!(
+            report.survived.is_empty(),
+            "replace teardown reported survivors: {report:?}"
+        );
+        assert!(
+            report.pgids.contains(&recorded),
+            "the payload process group must have been signalled: {report:?}"
+        );
+        assert!(
+            report.killed.contains(&drv)
+                && report.killed.contains(&child)
+                && report.killed.contains(&orphan),
+            "every member of the old tree must be accounted for as killed: {report:?}"
+        );
+
+        // Exactly ONE completion for the replaced run, and it says
+        // REPLACED — the new run is about to publish under the same
+        // label and log path, so a bare killed=true would be
+        // indistinguishable from the new run dying on the spot.
+        let ev = one_done_event(&events);
+        assert_eq!(ev["data"]["killed"], true);
+        assert_eq!(ev["data"]["label"], "rp");
+        assert_eq!(ev["data"]["reason"], "replaced");
+        assert_eq!(ev["data"]["replaced_by"], replaced_by);
+
+        // --- the new run: same label, clean sidecars, healthy ----------
+        for p in [&exit_path, &out_path, &pgid_path, &sentinel_path] {
+            let _ = std::fs::remove_file(p);
+        }
+        let new_script_path = tmp.path().join("rp-new.sh");
+        let new_script = build_wrapper_script(
+            "rp",
+            "echo replaced-run-ok",
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            &pgid_path,
+            "/bin/true",
+            None,
+        );
+        std::fs::write(&new_script_path, &new_script).expect("write new script");
+        let mut new_wrapper = Command::new("bash")
+            .arg(&new_script_path)
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn the replacing wrapper");
+        let new_wrapper_pid = new_wrapper.id() as i32;
+        // The wrapper lingers on a `sleep 30` after its payload so the
+        // pane stays readable; wait on the ARTIFACTS, not on the
+        // process, then reap it.
+        let finished = wait_until(Duration::from_secs(30), || {
+            std::fs::read_to_string(&exit_path)
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false)
+        });
+        let exit_marker = std::fs::read_to_string(&exit_path).unwrap_or_default();
+        let new_out = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let _ = kill_tree(
+            &[new_wrapper_pid],
+            read_pid_file(&pgid_path),
+            &self_protected(),
+            Duration::from_millis(200),
+        );
+        let _ = new_wrapper.wait();
+
+        assert!(
+            finished,
+            "the new run never wrote an exit marker; output:\n{new_out}"
+        );
+        assert_eq!(
+            exit_marker.trim(),
+            "0",
+            "the new run must write its OWN exit marker, not inherit the -15"
+        );
+        assert!(
+            new_out.contains("replaced-run-ok"),
+            "the new run's output must be its own: {new_out}"
+        );
+
+        // The replaced run's kill-emitted sentinel must not swallow the
+        // NEW run's completion — that would be the replace masquerading
+        // as the new run in the other direction: no event at all.
+        assert!(
+            !sentinel_path.exists(),
+            "the replace reset must clear the kill-emitted sentinel"
+        );
+        emit_done_with_sentinel(
+            "rp",
+            0,
+            &out_path.to_string_lossy(),
+            false,
+            None,
+            &sentinel_path,
+            &Teardown::plain(),
+        );
+        let evs = done_events(&events);
+        assert_eq!(
+            evs.len(),
+            2,
+            "the new run's completion must be emitted, not suppressed: {evs:?}"
+        );
+        // readdir order is not time order — find the new run's event.
+        let fresh = evs
+            .iter()
+            .find(|e| e["data"]["killed"] == false)
+            .unwrap_or_else(|| panic!("no killed=false completion among {evs:?}"));
+        assert!(
+            fresh["data"].get("reason").is_none(),
+            "the new run's completion is not a replace: {fresh}"
+        );
         drop(guard);
     }
 
