@@ -131,7 +131,7 @@
               },
               {
                 "id": "noValue",
-                "value": "n/a \u2014 no clear recorded"
+                "value": "n/a — no clear recorded"
               }
             ]
           }
@@ -240,7 +240,7 @@
           "titleSize": 16
         }
       },
-      "description": "Tokens per minute, averaged over 1m / 5m / 15m. claude_code_tokens_total is a cumulative COUNTER, so each tile is rate(...[window]) * 60 \u2014 never the raw counter. type=\"cache_read\" is excluded: cache reads re-count the whole cached prefix on every request and dominate the sum by ~300x, which would make the tiles read in the millions rather than the actual burn rate."
+      "description": "Tokens per minute, averaged over 1m / 5m / 15m. claude_code_tokens_total is a cumulative COUNTER, so each tile is rate(...[window]) * 60 — never the raw counter. type=\"cache_read\" is excluded: cache reads re-count the whole cached prefix on every request and dominate the sum by ~300x, which would make the tiles read in the millions rather than the actual burn rate."
     },
     {
       "id": 3,
@@ -1323,7 +1323,7 @@
     },
     {
       "id": 24,
-      "title": "Reminder\u2192Action Latency (avg)",
+      "title": "Reminder→Action Latency (avg)",
       "type": "timeseries",
       "description": "Average time from reminder fire to Claude action (self-/clear or /restart), split by type. Computed as sum/count since the exporter ships counter pairs rather than a true histogram -- this is an AVERAGE, not a real quantile. Samples only when Claude acted within 1h (context) / 6h (version).",
       "gridPos": {
@@ -2194,6 +2194,187 @@
         },
         "tooltip": {
           "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 110,
+      "title": "Tool Calls (by tool)",
+      "type": "piechart",
+      "description": "Fleet-wide tool calls, by tool name (claude_tool_use_total) — a windowed gauge folded over every live/recent transcript, not a monotonic counter.",
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 146
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (tool) (claude_tool_use_total)",
+          "legendFormat": "{{tool}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "pie",
+        "tooltip": {
+          "mode": "single"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "displayLabels": [
+          "name",
+          "value"
+        ],
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 111,
+      "title": "Agents Spawned",
+      "type": "stat",
+      "description": "Distinct Claude Code subagent transcripts observed in the live/recent window (claude_agent_spawned_count) — a windowed gauge, not a lifetime total.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 146
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "claude_agent_spawned_count",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#268bd2",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 112,
+      "title": "Output Tokens (by model, period)",
+      "type": "piechart",
+      "description": "Cumulative OUTPUT tokens by model over the dashboard's time range (increase() of the windowed claude_output_tokens_total gauge; Andrew #5370 — tokens = cumulative OUTPUT, split by model).",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 154
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (model) (increase(claude_output_tokens_total[$__range]))",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "pie",
+        "tooltip": {
+          "mode": "single"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "displayLabels": [
+          "name",
+          "value"
+        ],
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       }
     }
