@@ -435,6 +435,64 @@ expiry. The wording is verbatim and the parsing is covered by tests against
 wrapped, truncated and near-miss panes, but nothing here has yet met a live
 credential lapse in production.
 
+## Automatic re-login when the access token has already lapsed
+
+The proactive path above watches the *refresh* token, which is what Claude
+Code's "login expires in N days" warning is about. There is a second, more
+common way to lose the session, and it looks nothing like either of the
+screens the daemon used to react to. When the short-lived OAuth *access* token
+lapses and Claude Code's silent refresh does not happen, the TUI stays fully
+intact — tokens footer, permission-mode banner, `❯` prompt — and one inline
+line appears:
+
+```
+● Please run /login · API Error: 401 OAuth access token has expired. Re-authenticate to continue.
+```
+
+Nothing is "dead" about that screen to a detector that looks for the TUI to be
+gone, and the refresh token can be weeks from lapsing, so the proactive path
+has nothing to corroborate either. The session just sits there, unable to make
+an API call, until a human types `/login`.
+
+The daemon now treats that banner as phase 1 of the reactive path
+(`auth_error_auto_self_login`, default on). **It is still only text**, and text
+on a live pane is conversation until something off-screen says otherwise — the
+same false positive the TUI guard exists for, since a session reading this
+paragraph has the banner on its pane while perfectly well authenticated. So the
+sighting is corroborated against the credential store's *access* token:
+
+| On the pane | `expiresAt` on disk | Result |
+| --- | --- | --- |
+| banner | in the past, or no `accessToken` | **fire `self-login`** — the incident shape |
+| banner | in the future | ignore outright; it is conversation text |
+| banner | store unreadable | alert only, qualified as uncorroborated; never fire on UNKNOWN |
+
+A corroborated banner goes through the **same** `fire_self_login` as the
+proactive path — the same `self-login start --foreground --json`, the same
+one-dialog-at-a-time latch, the same `self_login_retry_seconds` /
+`self_login_max_attempts` spacing and budget, the same
+`self_login_abandon_seconds` watchdog — so the two can never open a dialog on
+top of each other or cancel each other's. A banner the daemon may not or can
+not act on (auto off, budget spent, dialog pending, store unreadable) raises
+the high-priority `reauth-needed` alert on the usual `alert_interval_seconds`
+cooldown. It is never silent.
+
+Diagnosing it from the log: the first sighting of a banner writes one
+`reauth_401_banner` JSONL event carrying what the store said (`access_token`:
+`expired` / `missing` / `valid` / `unknown`) and what was decided (`action`,
+`reason`); a fire writes `self_login_autofire` with `trigger: "401_banner"`;
+the banner leaving the pane writes `reauth_401_banner_resolved`. A banner that
+resolves into a valid access token is a login that went through, and resets
+the attempt budget for the next window. `claude-watch login-expiry` now prints
+the access-token state next to the refresh-token one.
+
+**Known limit:** the pane capture is the visible screen, so a banner still on
+screen from an *earlier* 401 on an otherwise idle session, combined with an
+access token that has since passed its `expiresAt` without Claude Code yet
+being asked to refresh it, reads the same as a live failure and would fire.
+The attempt budget and the abandon watchdog bound the cost; a session that is
+doing anything at all scrolls the old banner off long before that.
+
 ## Tests
 
 ```

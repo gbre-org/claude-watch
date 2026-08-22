@@ -33,6 +33,12 @@
 //!     understands and nothing is reported;
 //!   * an already-expired token reports nothing — that is the REACTIVE
 //!     reauth path's job, not this one's.
+//!
+//! The same file also corroborates the REACTIVE path's 401 banner
+//! (`AccessTokenState` / `read_access_token`). That one keys on the OTHER
+//! field — the short-lived `expiresAt` access token — because "OAuth access
+//! token has expired" is precisely the failure Claude Code reports when the
+//! silent refresh did not happen and the access token on disk is now stale.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -42,18 +48,25 @@ pub const WARNING_WINDOW_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
-#[derive(Debug, Deserialize)]
+// No `Debug` on either struct: `OauthBlock` carries a bearer token and must
+// never be formattable into a log line, even by accident.
+#[derive(Deserialize)]
 struct CredentialsFile {
     #[serde(rename = "claudeAiOauth")]
     claude_ai_oauth: Option<OauthBlock>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OauthBlock {
     #[serde(rename = "refreshTokenExpiresAt")]
     refresh_token_expires_at: Option<i64>,
     #[serde(rename = "expiresAt")]
     expires_at: Option<i64>,
+    /// Only its PRESENCE is ever looked at. The value is a bearer token and
+    /// must never reach a log line, which is also why this struct does not
+    /// derive `Debug`.
+    #[serde(rename = "accessToken")]
+    access_token: Option<String>,
 }
 
 /// Default location of the credential store.
@@ -137,6 +150,81 @@ pub fn read(path: &Path) -> CredentialExpiry {
 /// can, because that is renewal happening.
 pub fn read_refresh_expiry_ms(path: &Path) -> Option<i64> {
     read_oauth(path)?.refresh_token_expires_at
+}
+
+/// What the credential store says about the short-lived ACCESS token.
+///
+/// This is the reactive 401 banner's corroboration, and it is deliberately a
+/// different question from `CredentialExpiry`. That one asks "is the LOGIN
+/// about to lapse?" and reads `refreshTokenExpiresAt`. This one asks "is the
+/// token Claude Code is sending RIGHT NOW dead?" and reads `expiresAt`. Claude
+/// Code refreshes the access token silently, so on a healthy session the
+/// on-disk `expiresAt` is always in the future; an `expiresAt` in the past
+/// means the refresh did not happen, which is exactly the state that makes
+/// Claude Code print "OAuth access token has expired".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessTokenState {
+    /// The file could not be read or held no OAuth block at all. UNKNOWN,
+    /// never a negative.
+    Unknown,
+    /// There is an access token and its `expiresAt` is in the future.
+    Valid,
+    /// There is an access token but its `expiresAt` is in the past — or the
+    /// file carries no `expiresAt` for it at all, which no healthy Claude
+    /// Code write produces.
+    Expired,
+    /// The OAuth block exists but has no access token in it. Nothing to send
+    /// means every request 401s.
+    Missing,
+}
+
+impl AccessTokenState {
+    /// Does this state CORROBORATE an on-screen "access token has expired"?
+    /// Only the two states that positively say "there is no usable token".
+    /// `Unknown` is not evidence either way and `Valid` is a contradiction.
+    pub fn corroborates_401(self) -> bool {
+        matches!(self, AccessTokenState::Expired | AccessTokenState::Missing)
+    }
+
+    /// Stable lowercase label for logs and JSONL events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessTokenState::Unknown => "unknown",
+            AccessTokenState::Valid => "valid",
+            AccessTokenState::Expired => "expired",
+            AccessTokenState::Missing => "missing",
+        }
+    }
+}
+
+/// Classify an access token's presence and `expiresAt` against `now`.
+///
+/// Split out from the file read so the decision is testable without a
+/// filesystem or a clock. `has_access_token` is the PRESENCE of the field,
+/// never its value.
+pub fn classify_access(
+    has_access_token: bool,
+    expires_at: Option<i64>,
+    now_ms: i64,
+) -> AccessTokenState {
+    if !has_access_token {
+        return AccessTokenState::Missing;
+    }
+    match expires_at {
+        Some(exp) if exp > now_ms => AccessTokenState::Valid,
+        // A token with no expiry stamped next to it is not a shape Claude
+        // Code writes; treat it as unusable rather than inventing a lifetime.
+        _ => AccessTokenState::Expired,
+    }
+}
+
+/// Read the credential store and classify its ACCESS token against the clock.
+pub fn read_access_token(path: &Path) -> AccessTokenState {
+    let Some(oauth) = read_oauth(path) else {
+        return AccessTokenState::Unknown;
+    };
+    let now_ms = chrono::Local::now().timestamp_millis();
+    classify_access(oauth.access_token.is_some(), oauth.expires_at, now_ms)
 }
 
 fn read_oauth(path: &Path) -> Option<OauthBlock> {
@@ -282,5 +370,96 @@ mod tests {
         );
         std::fs::write(&path, body).unwrap();
         assert_eq!(read(&path), CredentialExpiry::Expiring { days_left: 1 });
+    }
+
+    // ---- Access-token state (the reactive 401 banner's corroboration) ----
+
+    #[test]
+    fn a_future_expires_at_is_a_valid_access_token() {
+        assert_eq!(
+            classify_access(true, Some(NOW + 60_000), NOW),
+            AccessTokenState::Valid
+        );
+        assert!(!AccessTokenState::Valid.corroborates_401());
+    }
+
+    #[test]
+    fn a_past_expires_at_is_an_expired_access_token() {
+        assert_eq!(
+            classify_access(true, Some(NOW - 1), NOW),
+            AccessTokenState::Expired
+        );
+        // Exactly now is already gone: Claude Code would be sending a token
+        // the server no longer honours.
+        assert_eq!(
+            classify_access(true, Some(NOW), NOW),
+            AccessTokenState::Expired
+        );
+        assert!(AccessTokenState::Expired.corroborates_401());
+    }
+
+    #[test]
+    fn a_token_with_no_expiry_stamp_is_treated_as_expired() {
+        assert_eq!(classify_access(true, None, NOW), AccessTokenState::Expired);
+    }
+
+    #[test]
+    fn a_missing_access_token_corroborates_a_401() {
+        assert_eq!(
+            classify_access(false, Some(NOW + DAY_MS), NOW),
+            AccessTokenState::Missing
+        );
+        assert!(AccessTokenState::Missing.corroborates_401());
+    }
+
+    #[test]
+    fn an_unreadable_store_is_an_unknown_access_token() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_access_token(&dir.path().join("nope.json")),
+            AccessTokenState::Unknown
+        );
+        let path = dir.path().join("creds.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(read_access_token(&path), AccessTokenState::Unknown);
+        assert!(!AccessTokenState::Unknown.corroborates_401());
+    }
+
+    /// The two shapes that matter, written the way Claude Code writes them:
+    /// a healthy session (access token hours out, refresh token weeks out) and
+    /// the incident shape (refresh token still weeks out, access token STALE
+    /// on disk because the silent refresh did not happen). The refresh-token
+    /// classification must not move between them — that is the proactive
+    /// path's signal, and it was "healthy" throughout the incident.
+    #[test]
+    fn read_access_token_reads_the_real_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        let now = chrono::Local::now().timestamp_millis();
+        let refresh = now + 30 * DAY_MS;
+        let write = |expires_at: i64| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"claudeAiOauth":{{"accessToken":"sk-ant-oat01-x","refreshToken":"sk-ant-ort01-x","expiresAt":{expires_at},"refreshTokenExpiresAt":{refresh},"subscriptionType":"max"}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write(now + 8 * 60 * 60 * 1000);
+        assert_eq!(read_access_token(&path), AccessTokenState::Valid);
+        assert_eq!(read(&path), CredentialExpiry::Healthy);
+
+        write(now - 60_000);
+        assert_eq!(read_access_token(&path), AccessTokenState::Expired);
+        assert_eq!(read(&path), CredentialExpiry::Healthy);
+
+        // No access token at all.
+        std::fs::write(
+            &path,
+            format!(r#"{{"claudeAiOauth":{{"refreshTokenExpiresAt":{refresh}}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_access_token(&path), AccessTokenState::Missing);
     }
 }
