@@ -143,6 +143,28 @@ impl WatcherStatus {
     pub fn is_live(&self) -> bool {
         self.enabled && matches!(self.status.as_str(), "ok" | "ARMING" | "DUPLICATE")
     }
+
+    /// Is this a monitor-mode watcher whose Monitor task is LIVE — enabled,
+    /// `mode=monitor`, and a live recorded pid (`ok` or `DUPLICATE`)?
+    ///
+    /// Narrower than [`is_live`](Self::is_live) on purpose: `ARMING` means
+    /// the main loop has been handed the Monitor command but no process is
+    /// up yet, so there is no Monitor task to count. This is the predicate
+    /// behind "Live monitors" in `claude-watch status` and the
+    /// `claude_code_live_monitors` gauge.
+    ///
+    /// Why watcher status and not Claude Code's own task list: Claude Code
+    /// exposes no generic enumeration of Monitor-tool tasks — its tasks dir
+    /// stores Monitor output under the same `b<id>.output` naming as
+    /// background Bash tasks and its status bar carries no monitor count —
+    /// so the monitor-mode watchers (whose process IS the Monitor task's
+    /// command) are the honest observable. A monitor process orphaned by a
+    /// session restart still counts here; that matches `watcher-ctl status`.
+    pub fn is_monitor_live(&self) -> bool {
+        self.enabled
+            && self.mode == "monitor"
+            && matches!(self.status.as_str(), "ok" | "DUPLICATE")
+    }
 }
 
 /// `(live, enabled)` watcher counts over a [`watcher_status`] result — the
@@ -153,6 +175,13 @@ pub fn count_live_and_enabled(statuses: &[WatcherStatus]) -> (u32, u32) {
     let live = statuses.iter().filter(|w| w.is_live()).count() as u32;
     let enabled = statuses.iter().filter(|w| w.enabled).count() as u32;
     (live, enabled)
+}
+
+/// Number of monitor-mode watchers whose Monitor task is live
+/// ([`WatcherStatus::is_monitor_live`]) — the ONE shared reduction for
+/// "Live monitors: N" and the `claude_code_live_monitors` gauge.
+pub fn count_live_monitors(statuses: &[WatcherStatus]) -> u32 {
+    statuses.iter().filter(|w| w.is_monitor_live()).count() as u32
 }
 
 /// Get process count for a pattern via `pgrep -fc`.
@@ -4116,6 +4145,54 @@ mod tests {
         ];
         assert_eq!(count_live_and_enabled(&rows), (3, 4));
         assert_eq!(count_live_and_enabled(&[]), (0, 0));
+    }
+
+    /// Pure predicate table for `is_monitor_live` / `count_live_monitors`:
+    /// only enabled `mode=monitor` rows with a live pid (`ok` / `DUPLICATE`)
+    /// count. ARMING is excluded (no Monitor task exists yet), oneshot rows
+    /// are excluded whatever their status, disabled rows never count.
+    #[test]
+    fn test_is_monitor_live_predicate_table() {
+        let mk = |status: &str, mode: &str, enabled: bool| WatcherStatus {
+            name: "w".into(),
+            status: status.into(),
+            count: 0,
+            required: 1,
+            pids: String::new(),
+            enabled,
+            mode: mode.into(),
+            dup_supervisors: Vec::new(),
+            dup_pollers: Vec::new(),
+        };
+        assert!(mk("ok", "monitor", true).is_monitor_live());
+        assert!(mk("DUPLICATE", "monitor", true).is_monitor_live());
+        assert!(
+            !mk("ARMING", "monitor", true).is_monitor_live(),
+            "ARMING has no Monitor task yet"
+        );
+        assert!(!mk("DOWN", "monitor", true).is_monitor_live());
+        assert!(!mk("off", "monitor", false).is_monitor_live());
+        assert!(
+            !mk("ok", "monitor", false).is_monitor_live(),
+            "disabled never counts"
+        );
+        assert!(
+            !mk("ok", "oneshot", true).is_monitor_live(),
+            "oneshot is not a Monitor task"
+        );
+
+        let rows = vec![
+            mk("ok", "monitor", true),
+            mk("DUPLICATE", "monitor", true),
+            mk("ARMING", "monitor", true),
+            mk("DOWN", "monitor", true),
+            mk("ok", "oneshot", true),
+            mk("off", "monitor", false),
+        ];
+        assert_eq!(count_live_monitors(&rows), 2);
+        assert_eq!(count_live_monitors(&[]), 0);
+        // Sanity: the broader is_live reduction still sees the ARMING row.
+        assert_eq!(count_live_and_enabled(&rows), (4, 5));
     }
 
     /// `watcher-restart` voids a pending arm: it removes `<name>.monitor-intent`

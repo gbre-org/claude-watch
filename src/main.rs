@@ -763,6 +763,9 @@ struct StatusReport {
     /// Number of enabled watchers (`status != "off"`). Equal to total minus
     /// disabled rows.
     enabled_watchers: u32,
+    /// Number of monitor-mode watchers whose Monitor task is live
+    /// (`WatcherStatus::is_monitor_live`: live pid, ARMING excluded).
+    live_monitors: u32,
     /// claude-watch's own crate version (compile-time CARGO_PKG_VERSION).
     claude_watch_version: &'static str,
     /// `Some(true)` if `claude-watch.service` reports `active`, `Some(false)`
@@ -783,6 +786,7 @@ struct StatusReport {
 ///   Active agents:  1
 ///   Running tasks:  0
 ///   Live watchers:  4/4
+///   Live monitors:  4
 ///   Open bashes:    2
 ///
 /// claude-watch:
@@ -823,6 +827,7 @@ fn format_status_human(r: &StatusReport) -> String {
         "  Live watchers:  {}/{}\n",
         r.healthy_watchers, r.enabled_watchers
     ));
+    out.push_str(&format!("  Live monitors:  {}\n", r.live_monitors));
     out.push_str(&format!("  Open bashes:    {}\n", r.bashes));
 
     out.push_str("\nclaude-watch:\n");
@@ -864,6 +869,7 @@ fn format_status_human(r: &StatusReport) -> String {
 ///   * `active_agents` — count of live subagent PIDs
 ///   * `running_workloads` — count of running workload labels
 ///   * `live_watchers`, `enabled_watchers` — healthy / total counts
+///   * `live_monitors` — monitor-mode watchers with a live Monitor task
 ///
 /// A consumer that grepped for the old keys keeps working.
 fn status_json_value(r: &StatusReport) -> serde_json::Value {
@@ -923,6 +929,10 @@ fn status_json_value(r: &StatusReport) -> serde_json::Value {
     map.insert(
         "enabled_watchers".to_string(),
         serde_json::Value::Number(r.enabled_watchers.into()),
+    );
+    map.insert(
+        "live_monitors".to_string(),
+        serde_json::Value::Number(r.live_monitors.into()),
     );
     serde_json::Value::Object(map)
 }
@@ -1017,6 +1027,8 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
     // Same reduction the `claude_code_live_watchers` gauge uses
     // (`collect_live_counts` in metrics.rs) — monitor-aware, one predicate.
     let (healthy_watchers, enabled_watchers) = watcher::count_live_and_enabled(&watchers);
+    // Same reduction as the `claude_code_live_monitors` gauge.
+    let live_monitors = watcher::count_live_monitors(&watchers);
 
     let report = StatusReport {
         pane: cs.pane.clone(),
@@ -1030,6 +1042,7 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
         running_workloads: agents.workloads.len(),
         healthy_watchers,
         enabled_watchers,
+        live_monitors,
         claude_watch_version: env!("CARGO_PKG_VERSION"),
         daemon_active,
     };
@@ -2190,6 +2203,7 @@ mod tests {
             running_workloads: 0,
             healthy_watchers: 4,
             enabled_watchers: 4,
+            live_monitors: 4,
             claude_watch_version: "0.1.0",
             daemon_active: Some(true),
         }
@@ -2262,6 +2276,7 @@ mod tests {
         assert!(out.contains("Active agents:  1"), "out:\n{}", out);
         assert!(out.contains("Running tasks:  0"), "out:\n{}", out);
         assert!(out.contains("Live watchers:  4/4"), "out:\n{}", out);
+        assert!(out.contains("Live monitors:  4"), "out:\n{}", out);
         assert!(out.contains("Open bashes:    2"), "out:\n{}", out);
     }
 
@@ -2368,6 +2383,7 @@ mod tests {
         assert_eq!(v["running_workloads"], serde_json::json!(0));
         assert_eq!(v["live_watchers"], serde_json::json!(4));
         assert_eq!(v["enabled_watchers"], serde_json::json!(4));
+        assert_eq!(v["live_monitors"], serde_json::json!(4));
     }
 
     #[test]
