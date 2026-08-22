@@ -1,21 +1,29 @@
 #!/usr/bin/env node
-// Tests for the live AGENT ACTIVITY counters (botchat #2967) in refresh.js.
+// Tests for the live AGENT ACTIVITY counters (botchat #2967 / #3066) in
+// refresh.js + agent-bar.js.
 //
 // The server joins the per-agent tool-call / token snapshot onto running rows
-// (it.agent_stats, pre-formatted labels) and supplies the header pill
-// (state.agent_stats). refresh.js rebuilds #queue-root and #topbar-meta every
-// tick, so BOTH must be re-rendered here or morphdom drops them on the first
-// tick. Pins:
+// (it.agent_stats, pre-formatted labels) and supplies the header agent-bar
+// payload (state.agent_stats: numerals, popover rows, main loop, freshness).
+// refresh.js rebuilds #queue-root and #topbar-meta every tick, so BOTH must be
+// re-rendered here or morphdom drops them on the first tick. Pins:
 //   A. renderRunningItem emits the .agent-stats cell (full + short labels) in
 //      the item HEAD when it.agent_stats is set, and NOTHING when null.
-//   B. buildTopbarMetaDOM emits the .count-agent-stats pills (one per
-//      server-formatted part, with the stale variant) when state.agent_stats
-//      is set, and NOTHING when null.
+//   B. buildTopbarMetaDOM emits ONE outlined pill — button#agent-bar, "● N
+//      agents · C calls · K tok", botchat's agent-bar look — in the bottom
+//      row: .active (≥1 agent) / .idle (0) / .stale ("n/a" numerals), and
+//      NOTHING when state.agent_stats is null. The old per-part pills are gone.
 //   C. (botchat #2983) the count pills are TWO stacked rows inside one
-//      .count-stack — status pills on top, agent pills below — with the
-//      header controls outside the stack.
-//   D. style.css pins: both rows half-size + hard-nowrap (flex-wrap /
-//      white-space / overflow + ellipsis), nothing hides them in compact.
+//      .count-stack — status pills on top, the agent-bar below — with the
+//      header controls outside the stack; the merge keeps the info dropdown.
+//   D. style.css pins: rows half-size + hard-nowrap; the pill has botchat's
+//      chip geometry/colours; units collapse to a/c/t under 480px; nothing
+//      hides them in compact / collapsed.
+//   E. agent-bar.js: the popover paints from the JSON seed / update(), pins on
+//      click, closes on click-again / Esc / outside click, repaints live on a
+//      merge while open (the rebuilt pill keeps `open` + aria-expanded), and
+//      closes when the payload goes away. textContent only.
+//   F. the liveness `.dot` is a `live` / `error` pill.
 //
 // Usage:   node agent-stats.test.js
 // Exit 0 on success, 1 on first failure.
@@ -31,6 +39,7 @@ const { JSDOM } = require(path.join(NODE_MODULES, 'jsdom'));
 
 const STATIC_DIR = path.dirname(path.resolve(__filename));
 const refreshSrc = fs.readFileSync(path.join(STATIC_DIR, 'refresh.js'), 'utf8');
+const agentBarSrc = fs.readFileSync(path.join(STATIC_DIR, 'agent-bar.js'), 'utf8');
 const morphdomSrc = fs.readFileSync(
   path.join(STATIC_DIR, 'vendor', 'morphdom-2.7.4.min.js'), 'utf8');
 
@@ -43,18 +52,27 @@ function assert(label, cond, detail) {
   }
 }
 
-function boot() {
+// Boot a page with the header shell the template renders: #topbar-meta (the
+// morph target), the popover shell + JSON seed OUTSIDE it, then morphdom,
+// refresh.js and agent-bar.js (same order as the template).
+function boot(seed) {
+  const seedJson = seed === undefined ? 'null' : JSON.stringify(seed);
   const html = `<!doctype html><html><head></head><body>
-    <div class="meta" id="topbar-meta"></div>
+    <header class="topbar">
+      <div class="meta" id="topbar-meta"></div>
+      <div id="agent-bar-pop" class="agent-bar-pop" role="dialog" aria-label="Live agent activity" hidden></div>
+      <script type="application/json" id="agent-bar-data">${seedJson}</script>
+    </header>
     <main id="queue-root"></main>
     <div id="action-modal" data-no-morph hidden></div>
     <div id="log-modal" data-no-morph hidden></div>
   </body></html>`;
   const dom = new JSDOM(html, { runScripts: 'dangerously' });
-  const s1 = dom.window.document.createElement('script');
-  s1.textContent = morphdomSrc; dom.window.document.head.appendChild(s1);
-  const s2 = dom.window.document.createElement('script');
-  s2.textContent = refreshSrc; dom.window.document.head.appendChild(s2);
+  for (const src of [morphdomSrc, refreshSrc, agentBarSrc]) {
+    const s = dom.window.document.createElement('script');
+    s.textContent = src;
+    dom.window.document.head.appendChild(s);
+  }
   return dom;
 }
 
@@ -75,11 +93,52 @@ const STATS = {
   title: '11 tool calls · 82K context tokens · 3.2K output tokens · last tool Bash',
 };
 
+function row(over) {
+  return Object.assign({
+    agent_id: 'aa64be2138dbef3d8', queue_id: 'q-2026-08-22-5fc7',
+    description: 'q-site: port botchat agent-bar styling', agent_type: 'general-purpose',
+    last_tool: 'Bash', tool_calls: 11, context_tokens: 102300, output_tokens: 8100,
+    running_seconds: 413, finished: false,
+    calls_text: '11', ctx_text: '102K', out_text: '8.1K', age_text: '6m53s', last_write_text: '6s',
+  }, over || {});
+}
+
+// The server's header payload (app.py _agent_stats_header), fresh.
+const FRESH = {
+  stale: false, agents: 3, tool_calls: 48, context_tokens: 272000, output_tokens: 14600,
+  agents_text: '3', calls_text: '48', tok_text: '272K', out_text: '14K',
+  main: { context_tokens: 195432, text: '195K', age_seconds: 2, age_text: '2s' },
+  rows: [
+    row(),
+    row({ agent_id: 'bb11', queue_id: 'q-2026-08-22-aaaa', description: 'torrent-process: flac batch', agent_type: 'torrent-process', last_tool: 'Read', calls_text: '25', ctx_text: '88K', out_text: '4K', age_text: '1h5m', last_write_text: '40s' }),
+    row({ agent_id: 'cc22', queue_id: '', description: '', agent_type: '', last_tool: '', calls_text: '12', ctx_text: '81K', out_text: '2.5K', age_text: '1m16s', last_write_text: '' }),
+  ],
+  host: 'gomorrah', age_seconds: 2.1, age_text: '2s',
+  label: '3 agents · 48 calls · 272K tok', main_label: 'main 195K',
+  title: '3 live agents (last 15m window) · 48 tool calls · 272K context tokens',
+};
+const IDLE = Object.assign({}, FRESH, {
+  agents: 0, tool_calls: 0, context_tokens: 0, output_tokens: 0,
+  agents_text: '0', calls_text: '0', tok_text: '0', out_text: '0', rows: [],
+  label: '0 agents · 0 calls · 0 tok', title: '0 live agents',
+});
+const STALE = {
+  stale: true, agents: null, tool_calls: null, context_tokens: null, output_tokens: null,
+  agents_text: 'n/a', calls_text: 'n/a', tok_text: 'n/a', out_text: 'n/a',
+  main: null, rows: [], host: '', age_seconds: 300.4, age_text: '5m0s',
+  label: 'agents n/a', main_label: '',
+  title: 'agent-stats snapshot is stale (written 5m ago) — counters withheld rather than frozen',
+};
+
 function emptyState(extra) {
   return Object.assign({
     running: [], wedged: [], quarantined: [], pending: [], blocked: [], other: [],
     done_recent: [], abandoned_recent: [], totals: {}, sources: [],
   }, extra || {});
+}
+
+function click(dom, el) {
+  el.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
 }
 
 // --- A. renderRunningItem cell ---
@@ -116,34 +175,58 @@ console.log('refresh.js: running row with agent_stats renders the cell in the he
   assert('no cell when agent_stats is null', b && !b.querySelector('.agent-stats'));
 }
 
-// --- B. buildTopbarMetaDOM pill ---
+// --- B. buildTopbarMetaDOM: the agent-bar pill ---
 
-console.log('refresh.js: buildTopbarMetaDOM renders the agent-stats pills (fresh / stale / absent)');
+console.log('refresh.js: buildTopbarMetaDOM renders the agent-bar pill (active / idle / stale / absent)');
 {
   const dom = boot();
   const R = dom.window.__queueRefresh;
-  const FRESH_PILLS = [
-    { key: 'agents', text: '1 agt' }, { key: 'calls', text: '11 calls' },
-    { key: 'tok', text: '82K tok' }, { key: 'main', text: 'main 546K' },
-  ];
   const fresh = R.buildTopbarMetaDOM(emptyState({
-    totals: { running: 2, blocked: 82, pending: 0 },
-    agent_stats: {
-      stale: false, label: '1 agents · 11 calls · 82K tok', main_label: 'main 546K',
-      pills: FRESH_PILLS, title: '1 live agents · 11 tool calls',
-    },
+    totals: { running: 3, blocked: 84, pending: 0 },
+    agent_stats: FRESH,
   }));
-  const pills = Array.from(fresh.querySelectorAll('.count-agent-stats'));
-  assert('four fresh pills rendered (one per part)', pills.length === 4, String(pills.length));
-  assert('fresh pills not stale', pills.every((p) => !p.classList.contains('stale')));
-  assert('fresh pill texts are the abbreviated parts',
-    JSON.stringify(pills.map((p) => p.textContent)) === JSON.stringify(['1 agt', '11 calls', '82K tok', 'main 546K']),
-    JSON.stringify(pills.map((p) => p.textContent)));
-  assert('per-part classes', pills.map((p) => p.className).join('|') ===
-    'count count-agent-stats agent-stats-agents|count count-agent-stats agent-stats-calls|count count-agent-stats agent-stats-tok|count count-agent-stats agent-stats-main',
-    pills.map((p) => p.className).join('|'));
-  assert('every pill carries the hover title', pills.every((p) => p.getAttribute('title') === '1 live agents · 11 tool calls'));
-  assert('long label is NOT rendered (would not fit the half-row)', !/1 agents · 11 calls/.test(fresh.textContent));
+  const bars = fresh.querySelectorAll('#agent-bar');
+  assert('exactly one agent-bar pill', bars.length === 1, String(bars.length));
+  const bar = bars[0];
+  assert('pill is a <button>', bar && bar.tagName === 'BUTTON' && bar.getAttribute('type') === 'button');
+  assert('pill classes: agent-bar active (≥1 live agent)', bar && bar.className === 'agent-bar active', bar && bar.className);
+  assert('pill aria: haspopup=dialog, expanded=false, controls the popover',
+    bar && bar.getAttribute('aria-haspopup') === 'dialog' && bar.getAttribute('aria-expanded') === 'false' &&
+    bar.getAttribute('aria-controls') === 'agent-bar-pop');
+  assert('pill title = server title + click hint', bar && bar.getAttribute('title') === FRESH.title + ' — click for the per-agent breakdown', bar && bar.getAttribute('title'));
+  assert('live dot first', bar && bar.firstElementChild && bar.firstElementChild.className === 'agent-bar-dot');
+  const nums = bar ? Array.from(bar.querySelectorAll('.agent-bar-num')).map((e) => e.textContent) : [];
+  assert('numerals 3 / 48 / 272K (server-formatted)', JSON.stringify(nums) === JSON.stringify(['3', '48', '272K']), JSON.stringify(nums));
+  assert('numeral part classes', bar && !!bar.querySelector('.agent-bar-num.agent-bar-agents') && !!bar.querySelector('.agent-bar-num.agent-bar-calls') && !!bar.querySelector('.agent-bar-num.agent-bar-tok'));
+  const longs = bar ? Array.from(bar.querySelectorAll('.agent-bar-unit-long')).map((e) => e.textContent) : [];
+  const shorts = bar ? Array.from(bar.querySelectorAll('.agent-bar-unit-short')).map((e) => e.textContent) : [];
+  assert('long units " agents" / " calls" / " tok"', JSON.stringify(longs) === JSON.stringify([' agents', ' calls', ' tok']), JSON.stringify(longs));
+  assert('short units a / c / t (phone collapse)', JSON.stringify(shorts) === JSON.stringify(['a', 'c', 't']), JSON.stringify(shorts));
+  assert('two · separators', bar && bar.querySelectorAll('.agent-bar-sep').length === 2);
+  assert('pill reads "3 agents · 48 calls · 272K tok" (+ the hidden short units)',
+    bar && bar.textContent.replace(/\s+/g, '') === '3agentsa·48callsc·272Ktokt', bar && bar.textContent.replace(/\s+/g, ''));
+  assert('bottom row wraps the pill', bar && bar.parentElement.className === 'count-row count-row-agents');
+  assert('old per-part pills are NOT rendered', !fresh.querySelector('.count-agent-stats') && !/ agt\b/.test(fresh.textContent) && !/main 195K/.test(fresh.textContent));
+  assert('long label is NOT rendered', !/3 agents · 48 calls/.test(fresh.textContent));
+
+  const idle = R.buildTopbarMetaDOM(emptyState({ agent_stats: IDLE }));
+  const ibar = idle.querySelector('#agent-bar');
+  assert('idle (0 agents): class agent-bar idle', ibar && ibar.className === 'agent-bar idle', ibar && ibar.className);
+  assert('idle numerals 0 / 0 / 0', ibar && JSON.stringify(Array.from(ibar.querySelectorAll('.agent-bar-num')).map((e) => e.textContent)) === JSON.stringify(['0', '0', '0']));
+
+  const stale = R.buildTopbarMetaDOM(emptyState({ agent_stats: STALE }));
+  const sbar = stale.querySelector('#agent-bar');
+  assert('stale: class agent-bar stale', sbar && sbar.className === 'agent-bar stale', sbar && sbar.className);
+  assert('stale: numerals n/a ×3 (withheld, never frozen)', sbar && JSON.stringify(Array.from(sbar.querySelectorAll('.agent-bar-num')).map((e) => e.textContent)) === JSON.stringify(['n/a', 'n/a', 'n/a']));
+  assert('stale: row carries stale', !!stale.querySelector('.count-row-agents.stale'));
+  assert('stale: still two rows', stale.querySelectorAll('.count-stack > .count-row').length === 2);
+
+  const absent = R.buildTopbarMetaDOM(emptyState({ agent_stats: null }));
+  assert('no pill when agent_stats is null', !absent.querySelector('#agent-bar'));
+  assert('no agents row when agent_stats is null', !absent.querySelector('.count-row-agents'));
+  assert('status row still rendered when agent_stats is null', !!absent.querySelector('.count-stack > .count-row-status .count-running'));
+  const missing = R.buildTopbarMetaDOM(emptyState());
+  assert('no pill when agent_stats key is missing', !missing.querySelector('#agent-bar'));
 
   // --- C. stacked two-row structure (botchat #2983) ---
   const stack = fresh.querySelector('.count-stack');
@@ -154,15 +237,16 @@ console.log('refresh.js: buildTopbarMetaDOM renders the agent-stats pills (fresh
   assert('bottom row is the agents row', rows[1] && rows[1].className === 'count-row count-row-agents', rows[1] && rows[1].className);
   const topTexts = rows[0] ? Array.from(rows[0].children).map((e) => e.textContent) : [];
   assert('top row holds running / blocked / pending in order',
-    JSON.stringify(topTexts) === JSON.stringify(['2 running', '82 blocked', '0 pending']), JSON.stringify(topTexts));
+    JSON.stringify(topTexts) === JSON.stringify(['3 running', '84 blocked', '0 pending']), JSON.stringify(topTexts));
   assert('top row children are all .count pills', rows[0] && Array.from(rows[0].children).every((e) => e.classList.contains('count')));
-  assert('bottom row holds exactly the four agent pills', rows[1] && rows[1].children.length === 4 &&
-    Array.from(rows[1].children).every((e) => e.classList.contains('count-agent-stats')));
-  assert('bottom row carries the hover title', rows[1] && rows[1].getAttribute('title') === '1 live agents · 11 tool calls');
-  // The controls (density / source filter / dot / info) stay OUTSIDE the stack,
-  // after it, so the stack is the one leading flex item of #topbar-meta.
+  assert('bottom row holds exactly the agent-bar', rows[1] && rows[1].children.length === 1 && rows[1].firstElementChild.id === 'agent-bar');
   assert('stack is the first child of #topbar-meta', fresh.firstElementChild === stack);
   assert('stack is keyed by id (morphdom getNodeKey)', stack && stack.id === 'count-stack');
+  assert('density control is outside the stack', !stack.querySelector('.density-control') && !!fresh.querySelector('.density-control'));
+  assert('source filter is outside the stack', !stack.querySelector('#source-filter') && !!fresh.querySelector('#source-filter'));
+  assert('no status pill outside the stack',
+    fresh.querySelectorAll('.count-running, .count-blocked, .count-pending').length ===
+    stack.querySelectorAll('.count-running, .count-blocked, .count-pending').length);
 
   // Morph onto a page whose #topbar-meta still holds the FLAT pills (the
   // pre-stack layout): the keyed stack must appear with live numbers, the
@@ -174,10 +258,7 @@ console.log('refresh.js: buildTopbarMetaDOM renders the agent-stats pills (fresh
       '<span class="count count-pending">2 pending</span><span class="dot dot-ok"></span>' +
       '<div class="info-wrap"><button id="info-toggle" class="info-btn">i</button>' +
       '<div id="info-dropdown" class="info-dropdown"></div></div>';
-    R.mergeTopbarMeta(emptyState({
-      totals: { running: 2, pending: 1 },
-      agent_stats: { stale: false, label: '', main_label: '', pills: FRESH_PILLS, title: 't' },
-    }));
+    R.mergeTopbarMeta(emptyState({ totals: { running: 2, pending: 1 }, agent_stats: FRESH }));
     const live = d.getElementById('topbar-meta');
     const ls = live.querySelector('#count-stack');
     assert('merge onto flat pills: stack present', !!ls);
@@ -187,56 +268,26 @@ console.log('refresh.js: buildTopbarMetaDOM renders the agent-stats pills (fresh
       Array.from(live.children).map((e) => e.className).join('|'));
     assert('merge onto flat pills: counts updated',
       ls && ls.querySelector('.count-running').textContent === '2 running' && ls.querySelector('.count-pending').textContent === '1 pending');
-    assert('merge onto flat pills: four agent pills', ls && ls.querySelectorAll('.count-agent-stats').length === 4);
+    assert('merge onto flat pills: agent-bar present + active', ls && ls.querySelector('#agent-bar') && ls.querySelector('#agent-bar').className === 'agent-bar active');
     assert('merge onto flat pills: exactly one info-wrap', live.querySelectorAll('.info-wrap').length === 1);
     assert('merge onto flat pills: info dropdown open state preserved',
       d.getElementById('info-dropdown') && d.getElementById('info-dropdown').hidden === false);
     // Second merge (steady state): still one stack, still two rows.
-    R.mergeTopbarMeta(emptyState({
-      totals: { running: 3, pending: 0 },
-      agent_stats: { stale: false, label: '', main_label: '', pills: FRESH_PILLS, title: 't' },
-    }));
-    assert('second merge: one stack, two rows, updated count',
+    R.mergeTopbarMeta(emptyState({ totals: { running: 3, pending: 0 }, agent_stats: IDLE }));
+    assert('second merge: one stack, two rows, updated count, pill flipped to idle',
       live.querySelectorAll('#count-stack').length === 1 &&
       live.querySelectorAll('#count-stack > .count-row').length === 2 &&
-      live.querySelector('.count-running').textContent === '3 running');
+      live.querySelector('.count-running').textContent === '3 running' &&
+      live.querySelector('#agent-bar').className === 'agent-bar idle');
+    // Third merge: payload gone -> row gone.
+    R.mergeTopbarMeta(emptyState({ totals: { running: 3, pending: 0 }, agent_stats: null }));
+    assert('merge with null payload removes the agent row', !live.querySelector('#agent-bar') && !live.querySelector('.count-row-agents'));
   }
-  assert('density control is outside the stack', !stack.querySelector('.density-control') && !!fresh.querySelector('.density-control'));
-  assert('source filter is outside the stack', !stack.querySelector('#source-filter') && !!fresh.querySelector('#source-filter'));
-  assert('no status pill outside the stack',
-    fresh.querySelectorAll('.count-running, .count-blocked, .count-pending').length ===
-    stack.querySelectorAll('.count-running, .count-blocked, .count-pending').length);
-
-  const stale = R.buildTopbarMetaDOM(emptyState({
-    agent_stats: { stale: true, label: 'agents n/a', main_label: '', pills: [{ key: 'na', text: 'agents n/a' }], title: 'stale' },
-  }));
-  const spills = Array.from(stale.querySelectorAll('.count-agent-stats'));
-  assert('stale renders exactly one pill', spills.length === 1, String(spills.length));
-  const spill = spills[0];
-  assert('stale pill has stale class', spill && spill.classList.contains('stale'));
-  assert('stale row has stale class', stale.querySelector('.count-row-agents.stale') !== null);
-  assert('stale pill says n/a', spill && spill.textContent.trim() === 'agents n/a', spill && spill.textContent);
-  assert('stale pill has no main pill', !stale.querySelector('.agent-stats-main'));
-  assert('stale still renders two rows', stale.querySelectorAll('.count-stack > .count-row').length === 2);
-
-  // Fallback: a payload without `pills` still renders (long label + main).
-  const legacy = R.buildTopbarMetaDOM(emptyState({
-    agent_stats: { stale: false, label: '1 agents · 11 calls · 82K tok', main_label: 'main 546K', title: 't' },
-  }));
-  const lp = Array.from(legacy.querySelectorAll('.count-agent-stats')).map((p) => p.textContent);
-  assert('no-pills payload falls back to label + main', JSON.stringify(lp) === JSON.stringify(['1 agents · 11 calls · 82K tok', 'main 546K']), JSON.stringify(lp));
-
-  const absent = R.buildTopbarMetaDOM(emptyState({ agent_stats: null }));
-  assert('no pill when agent_stats is null', !absent.querySelector('.count-agent-stats'));
-  assert('no agents row when agent_stats is null', !absent.querySelector('.count-row-agents'));
-  assert('status row still rendered when agent_stats is null', !!absent.querySelector('.count-stack > .count-row-status .count-running'));
-  const missing = R.buildTopbarMetaDOM(emptyState());
-  assert('no pill when agent_stats key is missing', !missing.querySelector('.count-agent-stats'));
 }
 
-// --- D. CSS pins: reduced size + nowrap on both rows (botchat #2983) ---
+// --- D. CSS pins ---
 
-console.log('style.css: stacked count rows are half-size and hard-nowrap');
+console.log('style.css: stacked rows half-size + nowrap; agent-bar pill has the botchat chip look');
 {
   const css = fs.readFileSync(path.join(STATIC_DIR, 'style.css'), 'utf8');
   const block = (sel) => {
@@ -256,8 +307,168 @@ console.log('style.css: stacked count rows are half-size and hard-nowrap');
   assert('.count-row .count nowrap + ellipsis', /white-space:\s*nowrap/.test(pillCss) && /text-overflow:\s*ellipsis/.test(pillCss) && /overflow:\s*hidden/.test(pillCss), pillCss);
   assert('mobile override keeps it small (no wrap rule added)', /\.count-row \.count \{ font-size: 0\.62rem; padding: 1px 5px; \}/.test(css));
   assert('compact density override present', /html\.density-compact \.count-row \.count \{ font-size: 0\.64rem;/.test(css));
-  assert('nothing hides the stack/rows in compact or collapsed',
-    !/html\.(?:density-compact|header-collapsed)[^{]*\.count-(?:stack|row)[^{]*\{[^}]*display:\s*none/.test(css));
+  // The agent-bar pill (botchat chip look, half-row sized).
+  const barCss = block('.agent-bar');
+  assert('.agent-bar is a 999px-radius outlined inline-flex pill',
+    /border-radius:\s*999px/.test(barCss) && /border:\s*1px solid var\(--line\)/.test(barCss) && /display:\s*inline-flex/.test(barCss), barCss);
+  assert('.agent-bar tabular numerals + nowrap + pointer',
+    /font-variant-numeric:\s*tabular-nums/.test(barCss) && /white-space:\s*nowrap/.test(barCss) && /cursor:\s*pointer/.test(barCss), barCss);
+  const bfs = barCss.match(/font-size:\s*([0-9.]+)rem/);
+  assert('.agent-bar sized to the half-row (< 0.75rem)', bfs && parseFloat(bfs[1]) < 0.75, barCss);
+  assert('--info token defined for light + dark', (css.match(/--info:\s*#268bd2/g) || []).length === 2);
+  assert('.agent-bar.active is info-blue (text + border)', /\.agent-bar\.active \{ color: var\(--info\); border-color: var\(--info\); \}/.test(css));
+  assert('.agent-bar.active dot is blue and pulses', /\.agent-bar\.active \.agent-bar-dot \{ background: var\(--info\); animation: agent-bar-pulse/.test(css));
+  assert('@keyframes agent-bar-pulse present', /@keyframes agent-bar-pulse/.test(css));
+  assert('reduced motion stops the pulse', /\.agent-bar\.active \.agent-bar-dot \{ animation: none; \}/.test(css));
+  assert('.agent-bar.stale is dashed with an amber dot', /\.agent-bar\.stale \{ border-style: dashed;/.test(css) && /\.agent-bar\.stale \.agent-bar-dot \{ background: var\(--pending\); \}/.test(css));
+  assert('.agent-bar.open / hover tint', /\.agent-bar:hover, \.agent-bar\.open \{ background: var\(--bg-alt\); \}/.test(css));
+  assert('short units hidden by default', /\.agent-bar \.agent-bar-unit-short \{ display: none; \}/.test(css));
+  assert('≤480px: long units collapse to a/c/t', /  \.agent-bar \.agent-bar-unit-long \{ display: none; \}\n  \.agent-bar \.agent-bar-unit-short \{ display: inline;/.test(css));
+  assert('compact density shrinks the pill a notch', /html\.density-compact \.agent-bar \{ font-size: 0\.64rem;/.test(css));
+  // Popover.
+  const popCss = block('.agent-bar-pop');
+  assert('.agent-bar-pop is absolute under the topbar, right-anchored', /position:\s*absolute/.test(popCss) && /top:\s*100%/.test(popCss) && /right:\s*12px/.test(popCss), popCss);
+  assert('.agent-bar-pop[hidden] hides', /\.agent-bar-pop\[hidden\] \{ display: none; \}/.test(css));
+  assert('≤480px: popover edge-to-edge', /  \.agent-bar-pop \{ right: 6px; left: 6px; min-width: 0; max-width: none; \}/.test(css));
+  assert('popover table: numeric columns right-aligned, description column left + wrapping',
+    /\.agent-bar-pop th, \.agent-bar-pop td \{[^}]*text-align: right/.test(css) && /\.agent-bar-pop th:first-child, \.agent-bar-pop td:first-child \{[^}]*text-align: left/.test(css));
+  assert('nothing hides the stack/rows/pill in compact or collapsed',
+    !/html\.(?:density-compact|header-collapsed)[^{]*\.(?:count-(?:stack|row)|agent-bar)[^{]*\{[^}]*display:\s*none/.test(css));
+}
+
+// --- E. agent-bar.js: the popover ---
+
+console.log('agent-bar.js: popover paints from the seed, pins on click, repaints on merge, closes on Esc / outside / payload gone');
+{
+  const dom = boot(FRESH);
+  const d = dom.window.document;
+  const R = dom.window.__queueRefresh;
+  const AB = dom.window.__qsiteAgentBar;
+  assert('__qsiteAgentBar exposed', !!AB && typeof AB.update === 'function' && typeof AB.open === 'function');
+  assert('seed parsed on boot', AB && AB.last && AB.last.agents === 3);
+  const pop = d.getElementById('agent-bar-pop');
+  assert('popover hidden on boot', pop && pop.hidden === true);
+
+  // Paint the header (first tick) then click the pill.
+  R.mergeTopbarMeta(emptyState({ totals: { running: 3 }, agent_stats: FRESH }));
+  let bar = d.getElementById('agent-bar');
+  assert('pill rendered by the merge', !!bar);
+  click(dom, bar.querySelector('.agent-bar-num'));   // click lands on a child span
+  assert('click opens the popover', pop.hidden === false);
+  bar = d.getElementById('agent-bar');
+  assert('pill gets class open + aria-expanded=true', bar.classList.contains('open') && bar.getAttribute('aria-expanded') === 'true', bar.className);
+  const head = pop.querySelector('.abp-head');
+  assert('head: "3 live agents" — "48 calls · 272K ctx · 14K out"',
+    head && head.children[0].textContent === '3 live agents' && head.children[1].textContent === '48 calls · 272K ctx · 14K out',
+    head && head.textContent);
+  const ths = Array.from(pop.querySelectorAll('thead th')).map((e) => e.textContent);
+  assert('table columns agent / calls / ctx / out / age', JSON.stringify(ths) === JSON.stringify(['agent', 'calls', 'ctx', 'out', 'age']), JSON.stringify(ths));
+  const trs = Array.from(pop.querySelectorAll('tbody tr'));
+  assert('one row per agent (3)', trs.length === 3, String(trs.length));
+  const r0 = trs[0];
+  assert('row 0: description + "type · qid · last: tool" subtitle',
+    r0 && r0.querySelector('td.abp-desc > div').textContent === 'q-site: port botchat agent-bar styling' &&
+    r0.querySelector('td.abp-desc .abp-type').textContent === 'general-purpose · q-2026-08-22-5fc7 · last: Bash',
+    r0 && r0.querySelector('td.abp-desc').textContent);
+  assert('row 0: calls / ctx / out / age cells', r0 && JSON.stringify(Array.from(r0.children).slice(1).map((e) => e.textContent)) === JSON.stringify(['11', '102K', '8.1K', '6m53s']),
+    r0 && JSON.stringify(Array.from(r0.children).slice(1).map((e) => e.textContent)));
+  assert('row 0: age cell titled with the last-write age', r0 && r0.children[4].getAttribute('title') === 'last transcript write 6s ago');
+  assert('row 0: data-queue-id / data-agent-id stamped', r0 && r0.getAttribute('data-queue-id') === 'q-2026-08-22-5fc7' && r0.getAttribute('data-agent-id') === 'aa64be2138dbef3d8');
+  const r2 = trs[2];
+  assert('row 2 (no description / type / qid / tool): agent id as the label, no subtitle, no age title',
+    r2 && r2.querySelector('td.abp-desc > div').textContent === 'cc22' && !r2.querySelector('.abp-type') && !r2.children[4].getAttribute('title'),
+    r2 && r2.querySelector('td.abp-desc').textContent);
+  const foot = pop.querySelector('.abp-foot');
+  assert('foot: main loop ctx + updated · host',
+    foot && foot.children[0].textContent === 'main loop ctx 195K (2s ago)' && foot.children[1].textContent === 'updated 2s ago · gomorrah',
+    foot && foot.textContent);
+  assert('no stale marker when fresh', !pop.querySelector('.abp-stale'));
+
+  // A tick while open: the rebuilt pill keeps the open state and the popover repaints.
+  const FRESH2 = Object.assign({}, FRESH, { agents: 4, agents_text: '4', calls_text: '60', rows: FRESH.rows.concat([row({ agent_id: 'dd33', description: 'fourth' })]), age_text: '0s' });
+  R.mergeTopbarMeta(emptyState({ totals: { running: 4 }, agent_stats: FRESH2 }));
+  bar = d.getElementById('agent-bar');
+  assert('after merge while open: popover still open', pop.hidden === false);
+  assert('after merge while open: rebuilt pill keeps open + aria-expanded', bar.classList.contains('open') && bar.getAttribute('aria-expanded') === 'true', bar.className);
+  assert('after merge while open: pill numerals updated', bar.querySelector('.agent-bar-agents').textContent === '4' && bar.querySelector('.agent-bar-calls').textContent === '60');
+  assert('after merge while open: popover repainted (4 rows, head 4 live agents)',
+    pop.querySelectorAll('tbody tr').length === 4 && pop.querySelector('.abp-head').children[0].textContent === '4 live agents');
+
+  // Click again: unpins + closes; pill loses open.
+  click(dom, d.getElementById('agent-bar'));
+  assert('second click closes', pop.hidden === true);
+  assert('pill loses open + aria-expanded=false', !d.getElementById('agent-bar').classList.contains('open') && d.getElementById('agent-bar').getAttribute('aria-expanded') === 'false');
+
+  // Esc closes.
+  click(dom, d.getElementById('agent-bar'));
+  assert('re-open by click', pop.hidden === false);
+  d.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert('Escape closes', pop.hidden === true);
+
+  // Outside click closes; a click inside the popover does not.
+  click(dom, d.getElementById('agent-bar'));
+  click(dom, pop.querySelector('.abp-head'));
+  assert('click inside the popover keeps it open', pop.hidden === false);
+  click(dom, d.getElementById('queue-root'));
+  assert('outside click closes', pop.hidden === true);
+
+  // A merge that brings the pill to a "stale" payload, opened: n/a head + STALE foot, no table.
+  R.mergeTopbarMeta(emptyState({ totals: { running: 0 }, agent_stats: STALE }));
+  click(dom, d.getElementById('agent-bar'));
+  assert('stale popover: head reads n/a + stale', pop.querySelector('.abp-head').textContent.indexOf('agent activity: n/a') === 0 && !!pop.querySelector('.abp-head .abp-stale'));
+  assert('stale popover: no table, withheld note', !pop.querySelector('table') && /withheld/.test(pop.querySelector('.abp-empty').textContent));
+  assert('stale popover: STALE footer with the silence age', /STALE — producer silent 5m0s/.test(pop.querySelector('.abp-foot .abp-stale').textContent));
+  assert('stale popover: no main loop line (main is null)', !/main loop ctx/.test(pop.querySelector('.abp-foot').textContent));
+
+  // A merge whose payload went away closes the popover and drops the pill.
+  R.mergeTopbarMeta(emptyState({ totals: { running: 0 }, agent_stats: null }));
+  assert('payload gone: popover closed', pop.hidden === true);
+  assert('payload gone: pill removed', !d.getElementById('agent-bar'));
+  assert('payload gone: open() is a no-op without a pill', (AB.open(), pop.hidden === true));
+
+  // Idle payload: "0 live agents" + "no live agents" body, main loop still in the footer.
+  R.mergeTopbarMeta(emptyState({ totals: { running: 0 }, agent_stats: IDLE }));
+  click(dom, d.getElementById('agent-bar'));
+  assert('idle popover: 0 live agents / no live agents / main loop footer',
+    pop.querySelector('.abp-head').children[0].textContent === '0 live agents' &&
+    pop.querySelector('.abp-empty').textContent === 'no live agents' &&
+    /main loop ctx 195K/.test(pop.querySelector('.abp-foot').textContent));
+  click(dom, d.getElementById('agent-bar'));
+
+  // Descriptions are prompt text: rendered as text, never as markup.
+  const EVIL = Object.assign({}, FRESH, { rows: [row({ description: '<img src=x onerror="window.__pwned=1"><b>bold</b>' })] });
+  R.mergeTopbarMeta(emptyState({ totals: { running: 1 }, agent_stats: EVIL }));
+  click(dom, d.getElementById('agent-bar'));
+  assert('description rendered as text (no elements injected)',
+    !pop.querySelector('img') && !pop.querySelector('b') && pop.querySelector('td.abp-desc > div').textContent === '<img src=x onerror="window.__pwned=1"><b>bold</b>' && !dom.window.__pwned);
+  click(dom, d.getElementById('agent-bar'));
+}
+
+console.log('agent-bar.js: a null seed (feature off on first paint) boots quietly and lights up on a later tick');
+{
+  const dom = boot();   // seed = null
+  const d = dom.window.document;
+  const R = dom.window.__queueRefresh;
+  const AB = dom.window.__qsiteAgentBar;
+  assert('null seed -> last is null', AB && AB.last === null);
+  assert('open() without data is a no-op', (AB.open(), d.getElementById('agent-bar-pop').hidden === true));
+  R.mergeTopbarMeta(emptyState({ totals: { running: 1 }, agent_stats: FRESH }));
+  click(dom, d.getElementById('agent-bar'));
+  assert('later tick: pill appears and the popover opens with rows', d.getElementById('agent-bar-pop').hidden === false && d.querySelectorAll('#agent-bar-pop tbody tr').length === 3);
+}
+
+// --- F. liveness badge ---
+
+console.log('refresh.js: the liveness .dot is a `live` / `error` pill');
+{
+  const dom = boot();
+  const R = dom.window.__queueRefresh;
+  const ok = R.buildTopbarMetaDOM(emptyState({ totals: { running: 0 } }));
+  const dot = ok.querySelector('.dot');
+  assert('healthy: .dot.dot-ok reads "live"', dot && dot.classList.contains('dot-ok') && dot.textContent === 'live' && /live/.test(dot.getAttribute('title')), dot && dot.outerHTML);
+  const err = R.buildTopbarMetaDOM(emptyState({ totals: { running: 0 }, error: 'boom' }));
+  const edot = err.querySelector('.dot');
+  assert('error: .dot.dot-err reads "error"', edot && edot.classList.contains('dot-err') && edot.textContent === 'error' && /error/.test(edot.getAttribute('title')), edot && edot.outerHTML);
 }
 
 if (failures) {

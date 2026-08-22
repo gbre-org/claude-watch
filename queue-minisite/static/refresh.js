@@ -1183,27 +1183,33 @@
       html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
     }
     html += `</div>`; // .count-row-status
-    // Agent activity pills (botchat #2967, stacked #2983) — session totals
-    // from the agent-stats snapshot as the BOTTOM half-row: one small pill
-    // per server-formatted part (`N agt` · `C calls` · `K tok` · `main M`).
-    // MUST mirror templates/index.html: this subtree is rebuilt every tick.
-    // state.agent_stats is null when the feature is off / snapshot absent
-    // (no row); {stale:true} renders the single "agents n/a" pill the server
-    // supplies — never a frozen number. Falls back to the long `label` (+
-    // main_label) as one pill if a server ever omits `pills`.
+    // Agent activity bar (botchat #2967, stacked #2983, botchat-look #3066) —
+    // session totals from the agent-stats snapshot as the BOTTOM half-row:
+    // ONE outlined pill `● N agents · C calls · K tok` (live dot; .active
+    // info-blue when ≥1 agent, .idle muted, .stale dashed + "n/a" numerals —
+    // never a frozen number). The server formats the numerals
+    // (agents_text / calls_text / tok_text). MUST mirror
+    // templates/index.html: this subtree is rebuilt every tick. state.agent_stats
+    // is null when the feature is off / snapshot absent (no row). The pill is
+    // the popover's toggle (agent-bar.js, delegated): its `open` class +
+    // aria-expanded mirror the LIVE popover so the rebuild never flaps it.
     const agentStatsPill = state.agent_stats;
     if (agentStatsPill) {
-      const stale = agentStatsPill.stale ? ' stale' : '';
-      const title = attr(agentStatsPill.title || '');
-      let pills = Array.isArray(agentStatsPill.pills) ? agentStatsPill.pills : null;
-      if (!pills || !pills.length) {
-        pills = [{ key: 'label', text: agentStatsPill.label || '' }];
-        if (agentStatsPill.main_label) pills.push({ key: 'main', text: agentStatsPill.main_label });
-      }
-      html += `<div class="count-row count-row-agents${stale}" title="${title}">`;
-      for (const p of pills) {
-        html += `<span class="count count-agent-stats agent-stats-${attr(p.key || '')}${stale}" title="${title}">${esc(p.text || '')}</span>`;
-      }
+      const stale = !!agentStatsPill.stale;
+      const nAgents = Number(agentStatsPill.agents) || 0;
+      const stateCls = stale ? 'stale' : (nAgents > 0 ? 'active' : 'idle');
+      const popEl = document.getElementById('agent-bar-pop');
+      const popOpen = !!(popEl && !popEl.hidden);
+      const title = attr((agentStatsPill.title || '') + ' — click for the per-agent breakdown');
+      html += `<div class="count-row count-row-agents${stale ? ' stale' : ''}">`;
+      html += `<button type="button" id="agent-bar" class="agent-bar ${stateCls}${popOpen ? ' open' : ''}" aria-haspopup="dialog" aria-expanded="${popOpen ? 'true' : 'false'}" aria-controls="agent-bar-pop" title="${title}">` +
+        `<span class="agent-bar-dot" aria-hidden="true"></span>` +
+        `<span class="agent-bar-num agent-bar-agents">${esc(agentStatsPill.agents_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> agents</span><span class="agent-bar-unit agent-bar-unit-short">a</span>` +
+        `<span class="agent-bar-sep" aria-hidden="true">·</span>` +
+        `<span class="agent-bar-num agent-bar-calls">${esc(agentStatsPill.calls_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> calls</span><span class="agent-bar-unit agent-bar-unit-short">c</span>` +
+        `<span class="agent-bar-sep" aria-hidden="true">·</span>` +
+        `<span class="agent-bar-num agent-bar-tok">${esc(agentStatsPill.tok_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>` +
+        `</button>`;
       html += `</div>`;
     }
     html += `</div>`; // .count-stack
@@ -1235,7 +1241,9 @@
     // preserved across the merge by onBeforeElUpdated. Options are
     // rebuilt from state.sources (the global distinct created_by set).
     html += buildSourceFilterHTML(state.sources || []);
-    html += `<span class="dot ${errorTxt ? 'dot-err' : 'dot-ok'}" title="${errorTxt ? 'fetch error' : 'live'}"></span>`;
+    // Liveness badge: a small outlined `live` / `error` pill (botchat's
+    // connection-chip look, #3066). MUST mirror templates/index.html.
+    html += `<span class="dot ${errorTxt ? 'dot-err' : 'dot-ok'}" title="${errorTxt ? 'queue fetch error — showing the last-good snapshot' : 'live — refreshes every 5s'}">${errorTxt ? 'error' : 'live'}</span>`;
     // NOTE: the last-fetch clock (.ts) used to live inline here. It now
     // lives inside the info-dropdown ("last fetch" row) so the topbar row
     // is shorter and less likely to wrap on narrow viewports. Because
@@ -1442,6 +1450,14 @@
       getNodeKey: getNodeKey,
       childrenOnly: false,
     });
+    // Hand the agent-bar popover (agent-bar.js) the fresh header payload so
+    // an OPEN breakdown repaints live with the tick, and a payload that went
+    // away (feature off / snapshot gone) closes it. The popover lives OUTSIDE
+    // #topbar-meta, so the morph above never touches it — this hook is the
+    // only way it learns about new data.
+    if (window.__qsiteAgentBar && typeof window.__qsiteAgentBar.update === 'function') {
+      window.__qsiteAgentBar.update(state.agent_stats || null);
+    }
     return true;
   }
 

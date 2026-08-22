@@ -150,17 +150,30 @@
       <span class="count count-pending" title="pending items">{{ totals.pending }} pending</span>
       {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
       </div>
-      {#- AGENT ACTIVITY PILLS (botchat #2967, stacked #2983): live session
-          totals from the agent-stats snapshot as the BOTTOM half-row — one
-          small pill per part (`N agt` · `C calls` · `K tok` · `main M`,
-          server-formatted in agent_stats.pills). Row absent entirely when
-          the feature is off or the snapshot file is missing; a single dimmed
-          italic "agents n/a" pill when the snapshot is STALE (never a frozen
-          number). Also rendered by static/refresh.js buildTopbarMetaDOM() —
-          this subtree is rebuilt every 5s tick, so a server-only row would
-          vanish on the first tick. -#}
-      {% if agent_stats %}<div class="count-row count-row-agents{% if agent_stats.stale %} stale{% endif %}" title="{{ agent_stats.title }}">
-        {%- for p in agent_stats.pills %}<span class="count count-agent-stats agent-stats-{{ p.key }}{% if agent_stats.stale %} stale{% endif %}" title="{{ agent_stats.title }}">{{ p.text }}</span>{% endfor -%}
+      {#- AGENT ACTIVITY BAR (botchat #2967, stacked #2983, botchat-look
+          #3066): live session totals from the agent-stats snapshot as the
+          BOTTOM half-row — ONE outlined rounded pill, `● N agents · C calls
+          · K tok`, ported from botchat's topbar badge: a live dot (pulsing
+          info-blue while ≥1 agent is live = .active, muted when none =
+          .idle, amber + dashed border + "n/a" numerals when the snapshot is
+          STALE = .stale, never a frozen number). The long units collapse to
+          a/c/t under 480px (CSS). It is a <button>: click/tap pins the
+          per-agent popover (#agent-bar-pop, below the .meta block), hover
+          peeks — static/agent-bar.js. Row absent entirely when the feature is
+          off or the snapshot file is missing. Also rendered by
+          static/refresh.js buildTopbarMetaDOM() — this subtree is rebuilt
+          every 5s tick, so a server-only row would vanish on the first tick
+          (the `open` class / aria-expanded there mirror the LIVE popover so
+          the merge never flaps it). -#}
+      {% if agent_stats %}<div class="count-row count-row-agents{% if agent_stats.stale %} stale{% endif %}">
+        <button type="button" id="agent-bar" class="agent-bar {% if agent_stats.stale %}stale{% elif agent_stats.agents %}active{% else %}idle{% endif %}" aria-haspopup="dialog" aria-expanded="false" aria-controls="agent-bar-pop" title="{{ agent_stats.title }} — click for the per-agent breakdown">
+          <span class="agent-bar-dot" aria-hidden="true"></span>
+          <span class="agent-bar-num agent-bar-agents">{{ agent_stats.agents_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> agents</span><span class="agent-bar-unit agent-bar-unit-short">a</span>
+          <span class="agent-bar-sep" aria-hidden="true">·</span>
+          <span class="agent-bar-num agent-bar-calls">{{ agent_stats.calls_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> calls</span><span class="agent-bar-unit agent-bar-unit-short">c</span>
+          <span class="agent-bar-sep" aria-hidden="true">·</span>
+          <span class="agent-bar-num agent-bar-tok">{{ agent_stats.tok_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>
+        </button>
       </div>{% endif %}
       </div>
       {#- DENSITY TOGGLE (botchat #1944): a "density" pill that flips the whole
@@ -188,7 +201,11 @@
           {% endfor %}
         </select>
       </label>
-      <span class="dot {% if error %}dot-err{% else %}dot-ok{% endif %}" title="{{ 'fetch error' if error else 'live' }}"></span>
+      {#- LIVENESS BADGE: a small outlined `live` / `error` pill (the look of
+          botchat's connection-state chip, #3066) — green while the 5s poll is
+          healthy, red on a fetch error. Same .dot element/classes as before
+          (refresh.js rebuilds it every tick; header-collapse hides it). -#}
+      <span class="dot {% if error %}dot-err{% else %}dot-ok{% endif %}" title="{{ 'queue fetch error — showing the last-good snapshot' if error else 'live — refreshes every 5s' }}">{{ 'error' if error else 'live' }}</span>
       <div class="info-wrap">
         <button
           type="button"
@@ -226,6 +243,19 @@
         </div>
       </div>
     </div>
+    {#- AGENT-BAR POPOVER (botchat #3066): the per-agent breakdown behind the
+        header pill — head "N live agents — C calls · K ctx · O out", one row
+        per live agent (description; type · queue id · last tool; calls / ctx /
+        out / age since spawn) and a footer with the main loop's context size
+        + snapshot freshness + host. Anchored to the sticky topbar (absolute
+        inside it), OUTSIDE #topbar-meta so the 5s morphdom rebuild never
+        touches it. Painted by static/agent-bar.js ONLY (textContent, never
+        innerHTML — descriptions come from agent prompts) from the JSON seed
+        below on first paint and from each /api/queue tick afterwards
+        (refresh.js hands it state.agent_stats). Always present (hidden) so a
+        snapshot that appears after load has somewhere to render. -#}
+    <div id="agent-bar-pop" class="agent-bar-pop" role="dialog" aria-label="Live agent activity" hidden></div>
+    <script type="application/json" id="agent-bar-data">{{ agent_stats|tojson }}</script>
   </header>
 
   {% if error %}
@@ -1154,6 +1184,7 @@
   <script src="{{ url_for('static', filename='action.js') }}" defer></script>
   <script src="{{ url_for('static', filename='depend.js') }}" defer></script>
   <script src="{{ url_for('static', filename='info.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='agent-bar.js') }}" defer></script>
   <script src="{{ url_for('static', filename='live-log.js') }}" defer></script>
   <script src="{{ url_for('static', filename='keyboard.js') }}" defer></script>
   <script src="{{ url_for('static', filename='copy-cmd.js') }}" defer></script>

@@ -25,6 +25,7 @@
   --wedged:    #cb4b16; /* orange — in-flight but stuck; still holds scope */
   --quarantined: #dc322f; /* red — scope held, liveness unknown, needs a human */
   --other:     #268bd2; /* blue — status this UI has no section for */
+  --info:      #268bd2; /* blue — the agent-activity pill while agents are live */
   --done:      #859900; /* green */
   --abandoned: #93a1a1; /* base1 */
   --orphan:    #dc322f; /* red */
@@ -51,6 +52,7 @@
     --wedged:    #cb4b16;
     --quarantined: #dc322f;
     --other:     #268bd2;
+    --info:      #268bd2;
     --done:      #859900;
     --abandoned: #586e75;
     --orphan:    #dc322f;
@@ -218,12 +220,6 @@ html.header-collapsed .topbar .density-control { display: none; }
 .count-other    { color: var(--other);    border-color: var(--other); }
 .count-pending  { color: var(--pending);  border-color: var(--pending); }
 .count-orphan   { color: var(--orphan);   border-color: var(--orphan); }
-/* Agent activity pills (botchat #2967): live session totals from the
-   agent-stats snapshot. Neutral tone (it is telemetry, not a state); the
-   stale variant dims to make "n/a" read as withheld, not as zero. */
-.count-agent-stats { color: var(--fg-mute); border-color: var(--line); font-variant-numeric: tabular-nums; }
-.count-agent-stats.stale { opacity: 0.6; font-style: italic; }
-.count-agent-stats.agent-stats-main { opacity: 0.8; }
 
 /* ------- stacked count pills (botchat #2983) -------
    The count pills live in TWO stacked half-height rows inside the header:
@@ -265,19 +261,145 @@ html.header-collapsed .topbar .density-control { display: none; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* The bottom row is the reduced agent-stats; the stale "agents n/a" pill
-   keeps the dimmed italic look at the small size. */
-.count-row-agents .count { font-weight: 500; }
-.count-row-agents.stale .count { opacity: 0.6; font-style: italic; }
 
-.dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  display: inline-block;
+/* ------- agent-activity bar (botchat #2967 / #2983, botchat-look #3066) -------
+   The bottom half-row is ONE outlined rounded pill — "● N agents · C calls ·
+   K tok" — ported from botchat's topbar badge: a live dot + tabular numerals
+   on a 999px-radius outline. States: .active (≥1 live agent: info-blue text,
+   border, dot; the dot pulses), .idle (0 agents: muted), .stale (snapshot
+   past the fresh window: dashed border, amber dot, "n/a" numerals — withheld,
+   never frozen), .open (popover pinned: tinted). It is a <button> (the
+   popover toggle) but sized to the half-row, NOT botchat's 28px chip, so the
+   header keeps its two-row height. Under 480px the long units (" agents" /
+   " calls" / " tok") collapse to a / c / t so the pill still fits one line —
+   the same degradation botchat's chip had on its phone topbar. */
+.agent-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 8px;
+  min-height: 0;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--fg-mute);
+  font: inherit;
+  font-size: 0.68rem;
+  line-height: 1.25;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
 }
-.dot-ok  { background: var(--ok); }
-.dot-err { background: var(--critical); }
+.agent-bar:focus-visible { outline: 2px solid var(--info); outline-offset: 1px; }
+.agent-bar .agent-bar-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-mute);
+  flex: 0 0 auto;
+  margin-right: 1px;
+}
+.agent-bar .agent-bar-num { color: var(--fg-emph); }
+.agent-bar .agent-bar-sep { opacity: 0.6; margin: 0 1px; }
+.agent-bar .agent-bar-unit-short { display: none; }
+.agent-bar.active { color: var(--info); border-color: var(--info); }
+.agent-bar.active .agent-bar-dot { background: var(--info); animation: agent-bar-pulse 2.4s ease-in-out infinite; }
+.agent-bar.active .agent-bar-num { color: var(--info); }
+.agent-bar.stale { border-style: dashed; color: var(--fg-mute); }
+.agent-bar.stale .agent-bar-num { color: var(--fg-mute); }
+.agent-bar.stale .agent-bar-dot { background: var(--pending); }
+.agent-bar:hover, .agent-bar.open { background: var(--bg-alt); }
+@keyframes agent-bar-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-bar.active .agent-bar-dot { animation: none; }
+}
+
+/* The per-agent breakdown popover behind the pill (agent-bar.js). Anchored
+   to the sticky topbar (absolute inside it, top-right), OUTSIDE #topbar-meta
+   so the 5s morph never touches it. Layout/typography as botchat's: bold
+   head (count — totals), a right-aligned numeric table with the description
+   column left-aligned + wrapping, a muted footer (main loop ctx · updated ·
+   host). Phones: pinned edge-to-edge. */
+.agent-bar-pop {
+  position: absolute;
+  top: 100%;
+  right: 12px;
+  margin-top: 4px;
+  z-index: 20;
+  min-width: 300px;
+  max-width: min(560px, calc(100vw - 24px));
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  padding: 10px 12px;
+  font-size: 0.82rem;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+.agent-bar-pop[hidden] { display: none; }
+.agent-bar-pop .abp-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 600;
+  color: var(--fg-emph);
+  margin-bottom: 6px;
+}
+.agent-bar-pop table { border-collapse: collapse; width: 100%; }
+.agent-bar-pop th, .agent-bar-pop td {
+  text-align: right;
+  padding: 3px 6px;
+  white-space: nowrap;
+  vertical-align: top;
+}
+.agent-bar-pop th { color: var(--fg-mute); font-weight: 500; border-bottom: 1px solid var(--line); }
+.agent-bar-pop th:first-child, .agent-bar-pop td:first-child {
+  text-align: left;
+  white-space: normal;
+  max-width: 260px;
+  overflow-wrap: anywhere;
+}
+.agent-bar-pop td.abp-desc .abp-type { color: var(--fg-mute); font-size: 0.75rem; }
+.agent-bar-pop .abp-empty { color: var(--fg-mute); padding: 4px 0; }
+.agent-bar-pop .abp-foot {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  color: var(--fg-mute);
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.agent-bar-pop .abp-stale { color: var(--pending); font-weight: 600; }
+
+/* Liveness badge: was a 10px dot; now a small outlined `live` / `error`
+   pill — the look of botchat's connection-state chip (#3066). Same element
+   + classes (refresh.js rebuilds it every tick; header-collapse hides it). */
+.dot {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  font-size: 0.68rem;
+  line-height: 1.25;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.dot-ok  { color: var(--ok); border-color: var(--ok); }
+.dot-err { color: var(--critical); border-color: var(--critical); }
 
 /* ------- source filter dropdown (topbar) ------- */
 .source-filter-label {
@@ -807,6 +929,11 @@ html.header-collapsed .topbar .density-control { display: none; }
   .count-stack { gap: 2px; }
   .count-row { gap: 3px; }
   .count-row .count { font-size: 0.62rem; padding: 1px 5px; }
+  .agent-bar { font-size: 0.62rem; padding: 1px 6px; gap: 2px; }
+  .agent-bar .agent-bar-unit-long { display: none; }
+  .agent-bar .agent-bar-unit-short { display: inline; opacity: 0.75; }
+  .agent-bar-pop { right: 6px; left: 6px; min-width: 0; max-width: none; }
+  .dot { font-size: 0.62rem; padding: 1px 5px; }
   .info-dropdown { min-width: 180px; font-size: 0.78rem; }
 }
 
@@ -2184,6 +2311,7 @@ html.density-compact .agent-stats { font-size: 0.68rem; }
    one notch smaller so the stack tracks the denser page. */
 html.density-compact .count-stack { gap: 2px; }
 html.density-compact .count-row .count { font-size: 0.64rem; padding: 1px 6px; }
+html.density-compact .agent-bar { font-size: 0.64rem; padding: 1px 7px; }
 html.density-compact .agent-stats-full { display: none; }
 html.density-compact .agent-stats-short { display: inline; }
 
