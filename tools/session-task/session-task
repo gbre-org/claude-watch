@@ -6709,6 +6709,16 @@ def cmd_queue_block(args):
     # Claude-event emit: queue-blocked. Dashboards / status banner can
     # surface the block; the main loop can route the event to the
     # appropriate "ping the operator" handler.
+    #
+    # data.tier=ambient: a `block` is the SYSTEM correctly parking work on
+    # an external blocker (see the block-vs-wedge distinction in this
+    # module's docstring) -- routine, not "system broken, fix me now". It
+    # was previously unclassified (no CLASSIFICATIONS row) and so fell
+    # through to the fail-LOUD actionable default, firing the
+    # event_must_act gate on every recurring re-nudge for a DO-NOT-MERGE /
+    # awaiting-blocker item. Stamping the tier here (rung 2 in
+    # event-classify's precedence) is the producer-side fix; a local
+    # operator override in tier-overrides.json already did this by hand.
     _claude_event_notify(
         tag="queue-blocked",
         message=(
@@ -6722,6 +6732,7 @@ def cmd_queue_block(args):
             "summary": _item_summary(target),
             "block_reason": raw_reason,
             "blocked_at": target["blocked_at"],
+            "tier": "ambient",
         },
         priority="normal",
         silent=getattr(args, "silent", False),
@@ -6843,6 +6854,8 @@ def cmd_queue_unblock(args):
         silent=getattr(args, "silent", False),
     )
 
+    # data.tier=ambient: recovery notice for a routine block clearing --
+    # same rationale as queue-blocked above (sibling transition).
     _claude_event_notify(
         tag="queue-unblocked",
         message=f"queue unblocked: {target['id']} ({_item_summary(target)})",
@@ -6853,6 +6866,7 @@ def cmd_queue_unblock(args):
             "summary": _item_summary(target),
             "prior_reason": prior_reason,
             "unblocked_at": now,
+            "tier": "ambient",
         },
         priority="low",
         silent=getattr(args, "silent", False),
