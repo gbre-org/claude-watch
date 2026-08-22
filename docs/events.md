@@ -137,16 +137,16 @@ ring-buffer log (compact JSON).
 - **Consumed log**: `$CLAUDE_EVENT_LOG_DIR/consumed.jsonl` (default
   `~/.config/claude-events/`), rotated to `.1`/`.2`/`.3`.
 - **Ring buffer max lines**: `$CLAUDE_EVENT_LOG_MAX_LINES` (default 10000).
-- **Heartbeat marker**: `$CLAUDE_EVENT_HEARTBEAT_MARKER` (default
-  `$CLAUDE_EVENT_QUEUE/.state/last-heartbeat.json`). `claude-event-watch`
-  rewrites it — atomically, and never backwards — every time it surfaces a
-  `heartbeat-tick`. `claude-events-exporter` reads it to publish
-  `claude_events_last_heartbeat_timestamp_seconds`, because a tick sits on
-  the queue for only seconds and a 30s scrape essentially never catches one
-  there. It is deliberately written by the CONSUMER: if `claude-event-watch`
-  dies or wedges, the marker (and so the metric) goes stale, which is the
-  signal. Note this is **not** `$CLAUDE_EVENT_STATE_DIR` — that belongs to
-  `event-must-act` and defaults outside the queue dir.
+- **Liveness stamp**: `$CLAUDE_EVENT_STATE_DIR/last-ack-timestamp` (default
+  `~/.config/claude-events/`). `event-ack` writes it on EVERY ack; the main
+  loop's per-batch reflex is `event-ack ack-batch`. Its age is claude-watch's
+  liveness signal (`[ack] stale_minutes`), exported by `claude-watch metrics`
+  as `claude_mainloop_last_ack_timestamp_seconds`. Note where it does NOT
+  live: **nothing writes state under the queue dir**. A `.state/` subdir
+  there (#681's drain-time marker, removed 2026-08-22) is counted as an
+  unconsumed event by `cw-watcher-health-check`'s scan, and fired two false
+  "WATCHER DOWN: 1 event(s) unconsumed >6min" alerts in one day before it was
+  removed.
 
 ## Schema
 

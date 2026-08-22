@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
-"""Tests for claude-events-exporter's claude_events_last_heartbeat_timestamp_seconds
-gauge (backs the dashboard's "Last Ack Age" stat) and the
-claude_events_heartbeat_marker_present gauge beside it.
+"""Tests for claude-events-exporter's QUEUE metrics.
 
-In-dir-scan scenarios (the legacy fallback path, kept working):
+The exporter answers one question: what is sitting in the event queue right
+now, and how old is it. It deliberately does NOT answer "is the main loop
+alive" — that is the age of the main loop's last ack, exported by
+`claude-watch metrics` as `claude_mainloop_last_ack_timestamp_seconds`.
 
-  (1) Fresh exporter, no heartbeat-tick ever seen -> gauge stays 0. The
-      dashboard maps the resulting implausible age to "n/a".
-  (2) A heartbeat-tick file lands in the queue dir -> gauge picks up its
-      filename-encoded ns-timestamp.
-  (3) claude-event-watch consumes (deletes) that file before the next
-      scrape -> gauge PERSISTS the last-seen value.
-  (4) A newer heartbeat-tick arrives -> gauge advances to it.
-  (5) A late-arriving OLDER heartbeat-tick does not regress the gauge.
-  (6) An unrelated bus event (any other source/tag) does not move it.
+Scenarios:
 
-Marker scenarios (the durable consumer-written signal, the reason this
-metric is observable at all -- a tick lives on the queue for seconds, far
-too briefly for a 30s scrape to reliably catch):
-
-  (7)  Marker present, queue empty -> gauge reads the marker's
-       event_timestamp, marker_present = 1.
-  (8)  No marker -> marker_present = 0, in-dir scan still drives the gauge.
-  (9)  Malformed marker (not JSON) -> treated as absent: marker_present = 0,
-       fallback value retained, no exception.
-  (10) Structurally-wrong markers (not an object / missing field /
-       non-numeric / non-positive) -> same as (9).
-  (11) WEDGED CONSUMER: a stale marker plus FRESH unconsumed heartbeat-tick
-       files piling up in the queue -> the gauge stays stale. This is the
-       whole point of not using max(marker, in-dir scan): a dead consumer
-       must make "Last Ack Age" grow, not be masked by the emitter still
-       emitting.
-  (12) Marker monotonicity -> a marker rewritten with an older timestamp
-       does not rewind the gauge.
-  (13) Marker takes over from the scan fallback once it appears.
+  (1) Cold start on an empty dir -> depth 0, oldest age 0, no scrape errors.
+  (2) Events present -> depth counts them and the oldest age is derived from
+      the filename ns-timestamp (not file mtime, which a copy would reset).
+  (3) Events consumed between scrapes -> depth falls back to 0 and the
+      processed counter advances by exactly the number consumed.
+  (4) Per source/tag counting is one-shot: rescraping the same file must not
+      double-count it.
+  (5) An unknown tag/source collapses to "other" so cardinality stays bounded.
+  (6) `keepalive` gets its own label, and so does the legacy `heartbeat-tick`
+      spelling for one release.
+  (7) A dot-prefixed temp file (claude-event's atomic-write staging) is NOT
+      counted as a queued event.
+  (8) A SUBDIRECTORY in the queue dir is not counted either. This is the #681
+      regression in exporter form: state under the queue dir got counted as
+      events elsewhere in the stack and fired false WATCHER DOWN alerts.
+  (9) RETIRED GAUGES: the heartbeat marker gauges must not come back. A
+      dashboard or alert rule keying on a silently-dead series is worse than
+      one keying on a missing one.
+ (10) A missing events dir increments the scrape-error counter instead of
+      raising.
 
 Run:  python3 test_claude_events_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
@@ -41,6 +35,7 @@ Exits 0 on success, 1 on first failure with a diagnostic.
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -51,8 +46,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def load_exporter(events_dir):
     """Reload the exporter module under a fresh CLAUDE_EVENTS_DIR so its
-    module-level EVENTS_DIR constant (and all _seen_filenames /
-    _last_heartbeat_ts state) starts clean for each scenario."""
+    module-level EVENTS_DIR constant (and all _seen_filenames state) starts
+    clean for each scenario."""
     saved = os.environ.get("CLAUDE_EVENTS_DIR")
     os.environ["CLAUDE_EVENTS_DIR"] = events_dir
     try:
@@ -70,54 +65,37 @@ def load_exporter(events_dir):
             os.environ["CLAUDE_EVENTS_DIR"] = saved
 
 
-def write_event(events_dir, tag, *, source="claude-watch", ns_ago=0):
+def write_event(events_dir, tag, *, source="claude-watch", ns_ago=0, name=None):
     """Drop a bus event file named like the real emitter:
     <ns_timestamp>_<safe_tag>.json"""
     ts_ns = int(time.time() * 1e9) - int(ns_ago * 1e9)
-    path = os.path.join(events_dir, f"{ts_ns}_{tag}.json")
+    path = os.path.join(events_dir, name or f"{ts_ns}_{tag}.json")
     with open(path, "w") as f:
         json.dump({"source": source, "tag": tag}, f)
     return path
 
 
-def marker_path(events_dir):
-    return os.path.join(events_dir, ".state", "last-heartbeat.json")
-
-
-def write_marker(events_dir, *, ts=None, ago=0.0, raw=None, payload=None):
-    """Write the marker claude-event-watch produces.
-
-    `raw` writes arbitrary bytes (malformed-marker cases); `payload` writes an
-    arbitrary JSON value; otherwise a well-formed marker `ago` seconds old (or
-    at the absolute `ts` given) is written.
-    """
-    path = marker_path(events_dir)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if raw is not None:
-        with open(path, "w") as f:
-            f.write(raw)
-        return path
-    if payload is None:
-        ev_ts = ts if ts is not None else time.time() - ago
-        payload = {
-            "tag": "heartbeat-tick",
-            "event_timestamp": ev_ts,
-            "processed_at": ev_ts + 0.2,
-            "event_file": f"{int(ev_ts * 1e9)}_heartbeat-tick.json",
-        }
-    with open(path, "w") as f:
-        json.dump(payload, f)
-    return path
-
-
-def find_sample(mod, metric_name):
+def find_sample(mod, metric_name, **labels):
+    # Match on the SAMPLE name, not the family name: prometheus_client strips
+    # the _total suffix from a Counter family, so matching families would
+    # silently miss every counter here and report None as if the metric were
+    # absent.
     for fam in mod.REG.collect():
-        if fam.name != metric_name:
-            continue
         for sample in fam.samples:
-            if sample.name == metric_name:
-                return sample.value
+            if sample.name != metric_name:
+                continue
+            if labels and any(sample.labels.get(k) != v for k, v in labels.items()):
+                continue
+            return sample.value
     return None
+
+
+def all_metric_names(mod):
+    names = set()
+    for fam in mod.REG.collect():
+        names.add(fam.name)
+        names.update(s.name for s in fam.samples)
+    return names
 
 
 def run_scenarios():
@@ -130,166 +108,123 @@ def run_scenarios():
             print(f"  FAIL: {name} -- {msg}")
             failures.append((name, msg))
 
-    METRIC = "claude_events_last_heartbeat_timestamp_seconds"
+    DEPTH = "claude_events_queue_depth"
+    AGE = "claude_events_age_seconds"
+    TOTAL = "claude_events_total"
+    PROCESSED = "claude_events_processed_total"
+    ERRORS = "claude_events_scrape_errors_total"
 
-    # ---- Scenario 1: cold start, no events at all.
-    print("\nScenario 1: fresh exporter, no heartbeat-tick seen -> gauge stays 0")
+    # ---- Scenario 1: cold start on an empty dir.
+    print("\nScenario 1: empty queue -> depth 0, age 0, no errors")
     tmpdir = tempfile.mkdtemp(prefix="cee-test-")
     mod = load_exporter(tmpdir)
     mod.collect()
-    v = find_sample(mod, METRIC)
-    check("S1 gauge is 0 (cold start)", v == 0.0, f"got {v!r}")
+    check("S1 depth 0", find_sample(mod, DEPTH) == 0.0, f"got {find_sample(mod, DEPTH)!r}")
+    check("S1 age 0", find_sample(mod, AGE) == 0.0, f"got {find_sample(mod, AGE)!r}")
+    check("S1 no scrape errors", find_sample(mod, ERRORS) == 0.0,
+          f"got {find_sample(mod, ERRORS)!r}")
 
-    # ---- Scenario 2: a heartbeat-tick lands in the queue.
-    print("\nScenario 2: heartbeat-tick file present -> gauge picks up its timestamp")
+    # ---- Scenario 2: events present -> depth + oldest age.
+    print("\nScenario 2: queued events -> depth counts them, age is the OLDEST")
     tmpdir = tempfile.mkdtemp(prefix="cee-test-")
     mod = load_exporter(tmpdir)
-    write_event(tmpdir, "heartbeat-tick", ns_ago=30)
+    write_event(tmpdir, "keepalive", ns_ago=300)
+    write_event(tmpdir, "queue-added", source="queue", ns_ago=10)
     mod.collect()
-    v = find_sample(mod, METRIC)
-    check("S2 gauge set", v is not None and v > 0, f"got {v!r}")
-    check("S2 age ~30s", v is not None and abs(time.time() - v - 30) < 5,
-          f"age computed as {time.time() - (v or 0)!r}")
+    check("S2 depth 2", find_sample(mod, DEPTH) == 2.0, f"got {find_sample(mod, DEPTH)!r}")
+    age = find_sample(mod, AGE)
+    # From the filename ns-prefix, so it survives a copy that resets mtime.
+    check("S2 age ~300s (the oldest)", age is not None and 295 <= age <= 320,
+          f"got {age!r}")
 
-    # ---- Scenario 3: watcher consumes (deletes) the file -- value persists.
-    print("\nScenario 3: file consumed before next scrape -> gauge PERSISTS")
+    # ---- Scenario 3: consumption between scrapes.
+    print("\nScenario 3: consumed events -> depth drops, processed advances")
     for name in os.listdir(tmpdir):
-        os.remove(os.path.join(tmpdir, name))
+        os.unlink(os.path.join(tmpdir, name))
     mod.collect()
-    v2 = find_sample(mod, METRIC)
-    check("S3 gauge unchanged after file removed", v2 == v, f"got {v2!r}, expected {v!r}")
+    check("S3 depth back to 0", find_sample(mod, DEPTH) == 0.0,
+          f"got {find_sample(mod, DEPTH)!r}")
+    check("S3 age back to 0", find_sample(mod, AGE) == 0.0,
+          f"got {find_sample(mod, AGE)!r}")
+    check("S3 processed == 2", find_sample(mod, PROCESSED, outcome="consumed") == 2.0,
+          f"got {find_sample(mod, PROCESSED, outcome='consumed')!r}")
 
-    # ---- Scenario 4: a newer heartbeat-tick advances the gauge.
-    print("\nScenario 4: newer heartbeat-tick -> gauge advances")
-    write_event(tmpdir, "heartbeat-tick", ns_ago=0)
-    mod.collect()
-    v3 = find_sample(mod, METRIC)
-    check("S4 gauge advanced", v3 is not None and v3 > v2, f"got {v3!r} vs prior {v2!r}")
-
-    # ---- Scenario 5: an older heartbeat-tick never regresses the gauge.
-    print("\nScenario 5: older heartbeat-tick arriving late -> gauge does not regress")
-    write_event(tmpdir, "heartbeat-tick", ns_ago=600)
-    mod.collect()
-    v4 = find_sample(mod, METRIC)
-    check("S5 gauge did not regress", v4 == v3, f"got {v4!r}, expected {v3!r}")
-
-    # ---- Scenario 6: unrelated bus events don't move the gauge.
-    print("\nScenario 6: unrelated event (queue-added) -> gauge untouched")
-    for name in os.listdir(tmpdir):
-        os.remove(os.path.join(tmpdir, name))
-    write_event(tmpdir, "queue-added", source="queue")
-    mod.collect()
-    v5 = find_sample(mod, METRIC)
-    check("S6 gauge unaffected by unrelated event", v5 == v3, f"got {v5!r}, expected {v3!r}")
-
-    MARKER = "claude_events_heartbeat_marker_present"
-
-    # ---- Scenario 7: marker present, queue empty -> marker drives the gauge.
-    print("\nScenario 7: marker present, queue empty -> gauge reads the marker")
-    tmpdir = tempfile.mkdtemp(prefix="cee-test-")
-    marker_ts = time.time() - 45
-    write_marker(tmpdir, ts=marker_ts)
-    mod = load_exporter(tmpdir)
-    mod.collect()
-    v = find_sample(mod, METRIC)
-    check("S7 gauge == marker event_timestamp",
-          v is not None and abs(v - marker_ts) < 0.01, f"got {v!r}, want {marker_ts!r}")
-    check("S7 marker_present == 1", find_sample(mod, MARKER) == 1.0,
-          f"got {find_sample(mod, MARKER)!r}")
-    check("S7 marker file is not counted as a bus event",
-          find_sample(mod, "claude_events_queue_depth") == 0.0,
-          f"depth {find_sample(mod, 'claude_events_queue_depth')!r}")
-
-    # ---- Scenario 8: no marker -> fallback path, marker_present == 0.
-    print("\nScenario 8: no marker -> marker_present 0, in-dir scan still works")
+    # ---- Scenario 4: one-shot counting across rescrapes.
+    print("\nScenario 4: rescraping the same file does not double-count it")
     tmpdir = tempfile.mkdtemp(prefix="cee-test-")
     mod = load_exporter(tmpdir)
+    write_event(tmpdir, "keepalive")
     mod.collect()
-    check("S8 marker_present == 0 (no marker)", find_sample(mod, MARKER) == 0.0,
-          f"got {find_sample(mod, MARKER)!r}")
-    write_event(tmpdir, "heartbeat-tick", ns_ago=10)
     mod.collect()
-    scan_v = find_sample(mod, METRIC)
-    check("S8 scan fallback still sets the gauge", scan_v is not None and scan_v > 0,
-          f"got {scan_v!r}")
+    mod.collect()
+    v = find_sample(mod, TOTAL, source="claude-watch", tag="keepalive")
+    check("S4 counted exactly once", v == 1.0, f"got {v!r}")
 
-    # ---- Scenario 9: malformed marker (not JSON) -> treated as absent.
-    print("\nScenario 9: malformed marker -> ignored, fallback retained")
-    write_marker(tmpdir, raw="{not json at all")
+    # ---- Scenario 5: unknown labels collapse to "other".
+    print("\nScenario 5: unknown source/tag collapse to 'other' (bounded cardinality)")
+    tmpdir = tempfile.mkdtemp(prefix="cee-test-")
+    mod = load_exporter(tmpdir)
+    write_event(tmpdir, "some-brand-new-tag", source="some-brand-new-source")
     mod.collect()
-    check("S9 marker_present == 0 (malformed)", find_sample(mod, MARKER) == 0.0,
-          f"got {find_sample(mod, MARKER)!r}")
-    check("S9 gauge keeps the fallback value", find_sample(mod, METRIC) == scan_v,
-          f"got {find_sample(mod, METRIC)!r}, want {scan_v!r}")
+    check("S5 collapsed to other/other",
+          find_sample(mod, TOTAL, source="other", tag="other") == 1.0,
+          f"got {find_sample(mod, TOTAL, source='other', tag='other')!r}")
 
-    # ---- Scenario 10: structurally-wrong markers.
-    print("\nScenario 10: wrong-shaped markers -> ignored, no exception")
-    for label, kwargs in (
-        ("array instead of object", {"payload": [1, 2, 3]}),
-        ("missing event_timestamp", {"payload": {"tag": "heartbeat-tick"}}),
-        ("non-numeric event_timestamp", {"payload": {"event_timestamp": "soon"}}),
-        ("null event_timestamp", {"payload": {"event_timestamp": None}}),
-        ("zero event_timestamp", {"payload": {"event_timestamp": 0}}),
-        ("negative event_timestamp", {"payload": {"event_timestamp": -5}}),
-        ("empty file", {"raw": ""}),
+    # ---- Scenario 6: keepalive + its legacy spelling both get real labels.
+    print("\nScenario 6: keepalive and legacy heartbeat-tick keep their own labels")
+    tmpdir = tempfile.mkdtemp(prefix="cee-test-")
+    mod = load_exporter(tmpdir)
+    write_event(tmpdir, "keepalive")
+    write_event(tmpdir, "heartbeat-tick")
+    mod.collect()
+    check("S6 keepalive labelled",
+          find_sample(mod, TOTAL, source="claude-watch", tag="keepalive") == 1.0,
+          f"got {find_sample(mod, TOTAL, source='claude-watch', tag='keepalive')!r}")
+    check("S6 legacy heartbeat-tick labelled",
+          find_sample(mod, TOTAL, source="claude-watch", tag="heartbeat-tick") == 1.0,
+          f"got {find_sample(mod, TOTAL, source='claude-watch', tag='heartbeat-tick')!r}")
+
+    # ---- Scenario 7: dot-prefixed temp files are not events.
+    print("\nScenario 7: atomic-write temp file is not counted as a queued event")
+    tmpdir = tempfile.mkdtemp(prefix="cee-test-")
+    mod = load_exporter(tmpdir)
+    write_event(tmpdir, "tmp", name=".1750000000_tmp.json")
+    mod.collect()
+    check("S7 depth 0", find_sample(mod, DEPTH) == 0.0, f"got {find_sample(mod, DEPTH)!r}")
+
+    # ---- Scenario 8: a subdirectory is not an event (#681 regression).
+    print("\nScenario 8: a subdir in the queue dir is not counted as an event")
+    tmpdir = tempfile.mkdtemp(prefix="cee-test-")
+    mod = load_exporter(tmpdir)
+    os.makedirs(os.path.join(tmpdir, ".state"))
+    with open(os.path.join(tmpdir, ".state", "some-state.json"), "w") as f:
+        json.dump({"not": "an event"}, f)
+    mod.collect()
+    check("S8 depth 0", find_sample(mod, DEPTH) == 0.0, f"got {find_sample(mod, DEPTH)!r}")
+    check("S8 age 0", find_sample(mod, AGE) == 0.0, f"got {find_sample(mod, AGE)!r}")
+
+    # ---- Scenario 9: retired gauges stay retired.
+    print("\nScenario 9: the retired heartbeat-marker gauges are gone")
+    names = all_metric_names(mod)
+    for retired in (
+        "claude_events_last_heartbeat_timestamp",
+        "claude_events_last_heartbeat_timestamp_seconds",
+        "claude_events_heartbeat_marker_present",
     ):
-        write_marker(tmpdir, **kwargs)
-        try:
-            mod.collect()
-            ok = find_sample(mod, MARKER) == 0.0 and find_sample(mod, METRIC) == scan_v
-            detail = f"present={find_sample(mod, MARKER)!r} gauge={find_sample(mod, METRIC)!r}"
-        except Exception as e:  # noqa: BLE001 - the point is that it cannot raise
-            ok, detail = False, f"raised {e!r}"
-        check(f"S10 {label} ignored", ok, detail)
+        check(f"S9 {retired} absent", retired not in names,
+              f"still exported: {sorted(names)}")
+    check("S9 no marker reader left on the module",
+          not hasattr(mod, "read_heartbeat_marker"),
+          "read_heartbeat_marker still defined")
 
-    # ---- Scenario 11: wedged consumer -> gauge must go STALE, not be masked.
-    print("\nScenario 11: stale marker + fresh unconsumed ticks -> gauge stays stale")
-    tmpdir = tempfile.mkdtemp(prefix="cee-test-")
-    stale_ts = time.time() - 3600
-    write_marker(tmpdir, ts=stale_ts)
-    mod = load_exporter(tmpdir)
-    mod.collect()
-    # Consumer dies; the emitter keeps emitting and ticks pile up unconsumed.
-    write_event(tmpdir, "heartbeat-tick", ns_ago=60)
-    write_event(tmpdir, "heartbeat-tick", ns_ago=1)
-    mod.collect()
-    v = find_sample(mod, METRIC)
-    check("S11 gauge still the STALE marker value (not the fresh queue file)",
-          v is not None and abs(v - stale_ts) < 0.01, f"got {v!r}, want {stale_ts!r}")
-    check("S11 backlog is visible on queue_depth instead",
-          find_sample(mod, "claude_events_queue_depth") == 2.0,
-          f"depth {find_sample(mod, 'claude_events_queue_depth')!r}")
-
-    # ---- Scenario 12: marker monotonicity.
-    print("\nScenario 12: marker rewritten older -> gauge does not regress")
-    tmpdir = tempfile.mkdtemp(prefix="cee-test-")
-    newer_ts = time.time() - 10
-    write_marker(tmpdir, ts=newer_ts)
-    mod = load_exporter(tmpdir)
-    mod.collect()
-    write_marker(tmpdir, ts=newer_ts - 500)
-    mod.collect()
-    v = find_sample(mod, METRIC)
-    check("S12 gauge held at the newer marker value",
-          v is not None and abs(v - newer_ts) < 0.01, f"got {v!r}, want {newer_ts!r}")
-
-    # ---- Scenario 13: marker takes over from the scan fallback.
-    print("\nScenario 13: marker appearing later takes over from the scan fallback")
+    # ---- Scenario 10: a missing dir is an error counter, not a crash.
+    print("\nScenario 10: missing events dir -> scrape error, no exception")
     tmpdir = tempfile.mkdtemp(prefix="cee-test-")
     mod = load_exporter(tmpdir)
-    write_event(tmpdir, "heartbeat-tick", ns_ago=90)
+    shutil.rmtree(tmpdir)
     mod.collect()
-    before = find_sample(mod, METRIC)
-    check("S13 scan value in effect first", before is not None and before > 0,
-          f"got {before!r}")
-    take_over_ts = time.time() - 5
-    write_marker(tmpdir, ts=take_over_ts)
-    mod.collect()
-    v = find_sample(mod, METRIC)
-    check("S13 marker now drives the gauge",
-          v is not None and abs(v - take_over_ts) < 0.01, f"got {v!r}, want {take_over_ts!r}")
-    check("S13 marker_present == 1", find_sample(mod, MARKER) == 1.0,
-          f"got {find_sample(mod, MARKER)!r}")
+    check("S10 scrape error counted", find_sample(mod, ERRORS) == 1.0,
+          f"got {find_sample(mod, ERRORS)!r}")
 
     print()
     if failures:

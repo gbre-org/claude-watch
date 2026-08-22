@@ -11,7 +11,7 @@
     "from": "now-24h",
     "to": "now"
   },
-  "refresh": "30s",
+  "refresh": "5m",
   "panels": [
     {
       "id": 2,
@@ -29,8 +29,8 @@
       },
       "targets": [
         {
-          "expr": "time() - claude_mainloop_heartbeat_timestamp_seconds",
-          "legendFormat": "Heartbeat",
+          "expr": "time() - claude_mainloop_last_ack_timestamp_seconds",
+          "legendFormat": "Last Ack",
           "refId": "A",
           "range": true,
           "instant": false
@@ -46,13 +46,6 @@
           "expr": "time() - (claude_last_context_clear_timestamp_seconds > 0)",
           "legendFormat": "Since Clear",
           "refId": "C",
-          "range": true,
-          "instant": false
-        },
-        {
-          "expr": "time() - claude_events_last_heartbeat_timestamp_seconds",
-          "legendFormat": "Last Ack Age",
-          "refId": "D",
           "range": true,
           "instant": false
         }
@@ -77,7 +70,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Heartbeat"
+              "options": "Last Ack"
             },
             "properties": [
               {
@@ -105,6 +98,10 @@
                     }
                   ]
                 }
+              },
+              {
+                "id": "noValue",
+                "value": "n/a"
               }
             ]
           },
@@ -138,62 +135,7 @@
               },
               {
                 "id": "noValue",
-                "value": "n/a — no clear recorded"
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Last Ack Age"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "thresholds"
-                }
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "#859900",
-                      "value": null
-                    },
-                    {
-                      "color": "#b58900",
-                      "value": 360
-                    },
-                    {
-                      "color": "#dc322f",
-                      "value": 600
-                    }
-                  ]
-                }
-              },
-              {
-                "id": "noValue",
-                "value": "n/a — no heartbeat-tick observed yet"
-              },
-              {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "range",
-                    "options": {
-                      "from": 1000000000,
-                      "to": null,
-                      "result": {
-                        "text": "n/a — no heartbeat-tick observed yet",
-                        "color": "#93a1a1",
-                        "index": 0
-                      }
-                    }
-                  }
-                ]
+                "value": "n/a \u2014 no clear recorded"
               }
             ]
           }
@@ -217,7 +159,7 @@
           "titleSize": 16
         }
       },
-      "description": "Session lifetime timers, ONE stat panel with four tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded). LAST ACK AGE = seconds since claude-event-watch last SURFACED a claude-watch heartbeat-tick to the main loop (time() - claude_events_last_heartbeat_timestamp_seconds; same green<360/amber>=360/red>=600 thresholds as HEARTBEAT). The exporter reads that timestamp from the durable marker the watcher writes on drain (claude-events dir, .state/last-heartbeat.json) -- scanning the queue dir for a tick cannot work, since the watcher consumes one within seconds and ticks are ~15min apart, so the gauge previously sat at its cold-start 0 forever. It is deliberately consumer-written: a dead or wedged claude-event-watch makes this tile go RED rather than being masked by the still-emitting producer. The query no longer filters the cold-start 0 with \"> 0\" -- that produced an EMPTY vector and the tile vanished entirely instead of rendering its n/a text; the 0 now yields an implausible (>1e9 s) age that a value mapping renders as \"n/a -- no heartbeat-tick observed yet\"."
+      "description": "Session lifetime timers, ONE stat panel with three tiles SIDE-BY-SIDE (orientation=vertical => columns). LAST ACK = seconds since the main loop last acked ANY claude-event (time() - claude_mainloop_last_ack_timestamp_seconds; green<360, amber>=360, red>=600). That is the whole liveness story: the loop runs `event-ack ack-batch` after every event batch it handles, which stamps last-ack-timestamp, and `claude-watch metrics` exports it. A wedged loop stops acking and this climbs. CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container). SINCE CLEAR = seconds since the last context clear (n/a if none recorded). There used to be a fourth tile, LAST ACK AGE, fed by the age of a marker claude-event-watch wrote each time it surfaced a heartbeat-tick. It and the HEARTBEAT tile (the heartbeat FILE's mtime) were two approximations of the same question, and the marker lived inside the event queue dir where a health-check counted it as an unconsumed event and fired false WATCHER DOWN alerts. Both are retired (2026-08-22); this single tile measures the quantity directly. No value => the loop has never acked, rendered as \"n/a\" (kept short: the old tile's explanatory n/a string overflowed at every width)."
     },
     {
       "id": 104,
@@ -302,7 +244,7 @@
           "titleSize": 16
         }
       },
-      "description": "Tokens per minute, averaged over 1m / 5m / 15m. claude_code_tokens_total is a cumulative COUNTER, so each tile is rate(...[window]) * 60 — never the raw counter. type=\"cache_read\" is excluded: cache reads re-count the whole cached prefix on every request and dominate the sum by ~300x, which would make the tiles read in the millions rather than the actual burn rate."
+      "description": "Tokens per minute, averaged over 1m / 5m / 15m. claude_code_tokens_total is a cumulative COUNTER, so each tile is rate(...[window]) * 60 \u2014 never the raw counter. type=\"cache_read\" is excluded: cache reads re-count the whole cached prefix on every request and dominate the sum by ~300x, which would make the tiles read in the millions rather than the actual burn rate."
     },
     {
       "id": 3,
@@ -416,7 +358,7 @@
       "id": 47,
       "title": "Build Info",
       "type": "stat",
-      "description": "What is running and what shipped last. Left two tiles come from the claude_watch_build_info gauge the daemon's textfile collector writes (src/metrics.rs): the commit the RUNNING binary was built from, and the PR that commit came in on. They describe the deployed binary, so they only move on a deploy.\n\nThe third tile is the repo's side of the same question -- the most recently MERGED pull request on GitHub -- and it moves the moment a PR merges, which is what makes the pair useful: a gap between them is un-deployed work. It is read directly from GitHub by the Infinity datasource (uid `infinity`, backend parser), NOT from Prometheus, which is why this panel's datasource is `-- Mixed --`. There is deliberately no exporter behind it: a local exporter scraping GitHub for one number is one more service to run, restart and forget, and the value it holds is already public.\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops the closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first. Number order inverts merged order routinely -- two PRs open at once merge in whichever order goes green first (#680 merged after #681 on 2026-08-22) -- so `max(number)` would show the wrong PR every time that happens. The URL's sort=updated is only a cheap way to get recent PRs into the first page; a comment or a label bumps updated_at without merging anything, so the ordering that matters is redone here.\n\nUNAUTHENTICATED, and that is the constraint on how often it may run. GitHub allows 60 requests/hour/IP without a token, and one dashboard refresh with this panel on screen is one request -- Grafana has no per-panel refresh interval, so the call rate is the DASHBOARD refresh rate whenever this panel is in the viewport (panels scrolled out of view are not queried). At the 30s refresh this file ships, a viewport parked here burns the hour's budget in 30 minutes; GitHub then answers 403 and the tile shows a query error until the window rolls; the panel's 5m min interval does not change that, because Infinity ignores it. If a deployment wants this panel always-on, either raise the dashboard refresh to 5m or give the Infinity datasource a GitHub token (5,000/hour). Rate-limited or offline, the failure is confined to this tile and its error marker -- the two Prometheus tiles keep rendering.\n\nWhere the Infinity datasource is not provisioned this tile simply does not appear (Grafana flags the missing datasource on the panel; the two Prometheus tiles still render). Infinity is not part of a default Grafana install: see monitoring/dashboards/README.md for the plugin install and the uid `infinity` provisioning stanza it needs.",
+      "description": "What is running and what shipped last. Left two tiles come from the claude_watch_build_info gauge the daemon's textfile collector writes (src/metrics.rs): the commit the RUNNING binary was built from, and the PR that commit came in on. They describe the deployed binary, so they only move on a deploy.\n\nThe third tile is the repo's side of the same question -- the most recently MERGED pull request on GitHub -- and it moves the moment a PR merges, which is what makes the pair useful: a gap between them is un-deployed work. It is read directly from GitHub by the Infinity datasource (uid `infinity`, backend parser), NOT from Prometheus, which is why this panel's datasource is `-- Mixed --`. There is deliberately no exporter behind it: a local exporter scraping GitHub for one number is one more service to run, restart and forget, and the value it holds is already public.\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops the closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first. Number order inverts merged order routinely -- two PRs open at once merge in whichever order goes green first (#680 merged after #681 on 2026-08-22) -- so `max(number)` would show the wrong PR every time that happens. The URL's sort=updated is only a cheap way to get recent PRs into the first page; a comment or a label bumps updated_at without merging anything, so the ordering that matters is redone here.\n\nUNAUTHENTICATED, and that is the constraint on how often it may run. GitHub allows 60 requests/hour/IP without a token, and one dashboard refresh with this panel on screen is one request -- Grafana has no per-panel refresh interval, so the call rate is the DASHBOARD refresh rate whenever this panel is in the viewport (panels scrolled out of view are not queried). That is why this dashboard's refresh is 5m (2026-08-22): at the 30s it previously shipped, a viewport parked here burned the hour's budget in 30 minutes, GitHub answered 403, and the tile showed a query error until the window rolled \u2014 and the panel's 5m min interval does not change that, because Infinity ignores it. 5m puts the worst case at 12/hour and costs this board nothing, since nothing here needs sub-minute freshness and every alerting decision is made by Prometheus rules rather than by a rendered panel. A deployment that wants sub-minute refresh back should give the Infinity datasource a GitHub token (5,000/hour) first. Rate-limited or offline, the failure is confined to this tile and its error marker -- the two Prometheus tiles keep rendering.\n\nWhere the Infinity datasource is not provisioned this tile simply does not appear (Grafana flags the missing datasource on the panel; the two Prometheus tiles still render). Infinity is not part of a default Grafana install: see monitoring/dashboards/README.md for the plugin install and the uid `infinity` provisioning stanza it needs.",
       "gridPos": {
         "h": 4,
         "w": 24,
@@ -609,7 +551,7 @@
       "id": 112,
       "title": "Output Tokens (by model, period)",
       "type": "piechart",
-      "description": "Cumulative OUTPUT tokens by model over the dashboard's time range (increase() of the windowed claude_output_tokens_total gauge; Andrew #5370 — tokens = cumulative OUTPUT, split by model).",
+      "description": "Cumulative OUTPUT tokens by model over the dashboard's time range (increase() of the windowed claude_output_tokens_total gauge; Andrew #5370 \u2014 tokens = cumulative OUTPUT, split by model).",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -1170,7 +1112,7 @@
     },
     {
       "id": 12,
-      "title": "Heartbeat Staleness",
+      "title": "Ack Staleness",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -1184,8 +1126,8 @@
       },
       "targets": [
         {
-          "expr": "time() - claude_mainloop_heartbeat_timestamp_seconds",
-          "legendFormat": "Heartbeat Staleness",
+          "expr": "time() - claude_mainloop_last_ack_timestamp_seconds",
+          "legendFormat": "Ack Staleness",
           "refId": "A"
         }
       ],
@@ -1263,7 +1205,8 @@
         "tooltip": {
           "mode": "multi"
         }
-      }
+      },
+      "description": "Seconds since the main loop last acked ANY claude-event, over time. The stat tile above shows the current value; this shows whether it is a spike or a trend. Renamed from \"Heartbeat Staleness\" 2026-08-22 when the host heartbeat file was retired in favour of the ack timestamp."
     },
     {
       "id": 10,
@@ -1521,7 +1464,7 @@
     },
     {
       "id": 24,
-      "title": "Reminder→Action Latency (avg)",
+      "title": "Reminder\u2192Action Latency (avg)",
       "type": "timeseries",
       "description": "Average time from reminder fire to Claude action (self-/clear or /restart), split by type. Computed as sum/count since the exporter ships counter pairs rather than a true histogram -- this is an AVERAGE, not a real quantile. Samples only when Claude acted within 1h (context) / 6h (version).",
       "gridPos": {
@@ -2399,7 +2342,7 @@
       "id": 110,
       "title": "Tool Calls (by tool)",
       "type": "piechart",
-      "description": "Fleet-wide tool calls, by tool name (claude_tool_use_total) — a windowed gauge folded over every live/recent transcript, not a monotonic counter.",
+      "description": "Fleet-wide tool calls, by tool name (claude_tool_use_total) \u2014 a windowed gauge folded over every live/recent transcript, not a monotonic counter.",
       "gridPos": {
         "h": 8,
         "w": 16,
@@ -2464,7 +2407,7 @@
       "id": 111,
       "title": "Agents Spawned",
       "type": "stat",
-      "description": "Distinct Claude Code subagent transcripts observed in the live/recent window (claude_agent_spawned_count) — a windowed gauge, not a lifetime total.",
+      "description": "Distinct Claude Code subagent transcripts observed in the live/recent window (claude_agent_spawned_count) \u2014 a windowed gauge, not a lifetime total.",
       "gridPos": {
         "h": 8,
         "w": 8,

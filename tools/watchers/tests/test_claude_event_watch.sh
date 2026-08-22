@@ -1030,7 +1030,10 @@ X600="$(printf 'X%.0s' $(seq 1 600))"
 # the two formats are compared over identical inputs.
 load_format_fixtures() {  # <queue>
     local q="$1"
-    write_json "$q" "100_hb.json" '{"source":"claude-watch","tag":"heartbeat-tick","message":"heartbeat tick","data":{"interval_secs":300,"path":"/var/run/claude/heartbeat"}}'
+    write_json "$q" "100_ka.json" '{"source":"claude-watch","tag":"keepalive","message":"keepalive: no event acked recently - run `event-ack ack-batch` to prove liveness","data":{"ack_command":"event-ack ack-batch","quiet_secs":300}}'
+    # The pre-2026-08-22 tag. Kept as a fixture so the compat lead is proven,
+    # not just asserted in a comment.
+    write_json "$q" "100b_hb.json" '{"source":"claude-watch","tag":"heartbeat-tick","message":"heartbeat tick","data":{"interval_secs":300}}'
     write_json "$q" "101_pr_merged.json" '{"source":"cron","tag":"pr-status-change","message":"PR o/r#651: MERGED (was: OPEN)","data":{"pr_id":"github:o/r#651","pr_url":"https://example.invalid/pr/651","field":"state","old_value":"OPEN","new_value":"MERGED"}}'
     write_json "$q" "102_pr_ci.json" '{"source":"cron","tag":"pr-status-change","message":"PR o/r#652: CI failure (was: pending)","data":{"pr_id":"github:o/r#652","field":"ci_status","old_value":"pending","new_value":"failure"}}'
     write_json "$q" "103_torrent.json" '{"source":"torrent","tag":"torrent-completed","message":"Torrent completed: The Audacity S01E05 1080p WEB-DL","data":{"name":"The Audacity S01E05 1080p WEB-DL","hash":"abc"}}'
@@ -1079,8 +1082,10 @@ expect_line() {  # <label> <exact-line> <file>
 }
 
 # Per-pattern leads.
-expect_line "heartbeat lead" \
-    'EVENT[claude-watch/heartbeat-tick] heartbeat tick [interval_secs=300 path=/var/run/claude/heartbeat]' "$FMT_OUT"
+expect_line "keepalive lead keeps the message (it names the required command)" \
+    'EVENT[claude-watch/keepalive] keepalive — nothing acked recently — keepalive: no event acked recently - run `event-ack ack-batch` to prove liveness [ack_command=event-ack ack-batch quiet_secs=300]' "$FMT_OUT"
+expect_line "legacy heartbeat-tick tag still gets the keepalive lead" \
+    'EVENT[claude-watch/heartbeat-tick] keepalive — nothing acked recently — heartbeat tick [interval_secs=300]' "$FMT_OUT"
 expect_line "pr-status-change state lead" \
     'EVENT[cron/pr-status-change] PR #651 merged — PR o/r#651: MERGED (was: OPEN) [field=state new_value=MERGED old_value=OPEN pr_id=github:o/r#651 pr_url=https://example.invalid/pr/651]' "$FMT_OUT"
 expect_line "pr-status-change ci lead" \
@@ -1099,7 +1104,7 @@ expect_line "workload-done lead" \
     'EVENT[workload/workload-done] workload done cw-deploy-x rc=0 [exit_code=0 killed=False label=cw-deploy-x]' "$FMT_OUT"
 expect_line "claude-watch-alert lead + FULL message (no 60-char cut)" \
     'EVENT[claude-watch/claude-watch-alert] claude-watch alert context-low (high) — [CLAUDE-WATCH] Context at 90% — auto-clear pending. Commit/push in-flight work and save state NOW before compaction. [alert_type=context-low severity=high]' "$FMT_OUT"
-echo "  monitor-format: per-tag leads (heartbeat/pr/torrent/queue/alert/workload/claude-watch-alert) OK"
+echo "  monitor-format: per-tag leads (keepalive/pr/torrent/queue/alert/workload/claude-watch-alert) OK"
 
 # Fallbacks: unknown tag -> the full message is the lead; a known tag whose
 # data lacks the field the lead needs -> same fallback, no half-empty headline.
@@ -1112,8 +1117,8 @@ echo "  monitor-format: fallback to the full message (unknown tag / missing data
 # Multiline message flattens to one line with ' ⏎ ' between lines.
 expect_line "multiline flattening" \
     'EVENT[manual/multi] line one ⏎ line two ⏎ line three' "$FMT_OUT"
-if (( $(grep -c '^EVENT\[' "$FMT_OUT") != 16 )); then
-    echo "FAIL: monitor-format surfaced $(grep -c '^EVENT\[' "$FMT_OUT") EVENT lines for 16 fixtures (a multiline message split?)" >&2
+if (( $(grep -c '^EVENT\[' "$FMT_OUT") != 17 )); then
+    echo "FAIL: monitor-format surfaced $(grep -c '^EVENT\[' "$FMT_OUT") EVENT lines for 17 fixtures (a multiline message split?)" >&2
     cat "$FMT_OUT" >&2; exit 1
 fi
 echo "  monitor-format: multiline message stays one line OK"
@@ -1153,8 +1158,8 @@ exit_out=$(CLAUDE_EVENT_QUEUE="$EXIT_Q" CLAUDE_EVENT_LOG_DIR="$EXIT_LOG" \
 EXIT_OUT="$TMP/exitfmt.out"; printf '%s\n' "$exit_out" >"$EXIT_OUT"
 M60="$(printf 'M%.0s' $(seq 1 60))"
 X60="$(printf 'X%.0s' $(seq 1 60))"
-expect_line "exit-mode heartbeat unchanged" \
-    'EVENT[claude-watch/heartbeat-tick] heartbeat tick [interval_secs=300 path=/var/run/claude/heartbeat]' "$EXIT_OUT"
+expect_line "exit-mode keepalive unchanged (60-char cut, no lead)" \
+    'EVENT[claude-watch/keepalive] keepalive: no event acked recently - run `event-ack ack-batc… [ack_command=event-ack ack-batch quiet_secs=300]' "$EXIT_OUT"
 expect_line "exit-mode pr-status-change unchanged (no lead)" \
     'EVENT[cron/pr-status-change] PR o/r#651: MERGED (was: OPEN) [field=state new_value=MERGED old_value=OPEN pr_id=github:o/r#651 pr_url=https://example.invalid/pr/651]' "$EXIT_OUT"
 expect_line "exit-mode torrent unchanged (no lead)" \
@@ -1176,137 +1181,82 @@ if grep -q '^\[monitor-mode\]' "$EXIT_OUT"; then
 fi
 echo "  monitor-format: exit-mode one-shot lines are byte-identical (guard) OK"
 
-# --- Heartbeat marker (backs claude_events_last_heartbeat_timestamp_seconds)
-# The exporter cannot see a heartbeat-tick by scanning the queue dir: this
-# watcher drains one within seconds of it landing, ticks are ~15min apart and
-# the scrape interval is 30s. So the CONSUMER records the observation to
-# $CLAUDE_EVENT_HEARTBEAT_MARKER (default <queue>/.state/last-heartbeat.json),
-# which the exporter reads. Consumer-written on purpose — a dead watcher must
-# let the metric go stale rather than have it derived off the still-emitting
-# producer.
-#
-# Note that $CLAUDE_EVENT_STATE_DIR (exported near the top of this file) is
-# event-must-act's, NOT this marker's: it defaults to ~/.config/claude-events,
-# which the exporter does not mount. Reusing it here would have silently put
-# the marker somewhere the exporter can never see.
-HBQ="$TMP/hbq"; HBLOG="$TMP/hblog"; mkdir -p "$HBQ" "$HBLOG"
-HB_MARKER="$HBQ/.state/last-heartbeat.json"
+# --- Per-batch ack footer + "no state in the queue dir" ------------------
+# The main loop is TOLD what to run, the way the SIGNAL watchers have always
+# named `signal-ack`: every delivered batch in monitor mode ends with one
+# EVENT-ACK REQUIRED line naming `event-ack ack-batch`. Per BATCH, not per
+# event — one command clears the whole drain, and that ack is what stamps the
+# liveness timestamp claude-watch's ack-stale detector reads.
+AFQ="$TMP/afq"; AFLOG="$TMP/aflog"; mkdir -p "$AFQ" "$AFLOG"
+AF_OUT="$TMP/af.out"
+echo '{"source":"manual","tag":"one","message":"first of batch","data":{}}' \
+    >"$AFQ/1750000000000000000_one.json"
+echo '{"source":"manual","tag":"two","message":"second of batch","data":{}}' \
+    >"$AFQ/1750000000000000001_two.json"
+CLAUDE_EVENT_QUEUE="$AFQ" CLAUDE_EVENT_LOG_DIR="$AFLOG" \
+    CLAUDE_EVENT_WATCH_LOCK="$TMP/af.lock" \
+    CLAUDE_EVENT_WATCH_AUTO_INGEST=0 \
+    EVENT_WATCH_INOTIFY_TIMEOUT=2 \
+    "$WATCHER" --monitor --debounce 0 >"$AF_OUT" 2>&1 &
+AF_PID=$!
+BG_PIDS+=("$AF_PID")
+waited=0
+while ! grep -q '^EVENT-ACK REQUIRED' "$AF_OUT" 2>/dev/null; do
+    if (( waited >= 30 )); then
+        echo "FAIL: monitor mode never printed the EVENT-ACK REQUIRED footer" >&2
+        cat "$AF_OUT" >&2; exit 1
+    fi
+    sleep 1; waited=$(( waited + 1 ))
+done
+kill -TERM "$AF_PID" 2>/dev/null || true
+reap_within "$AF_PID" 10 || true
 
-write_tick() {  # <queue> <ns_timestamp>
-    python3 - "$1" "$2" <<'PYEOF'
-import json, sys, time
-queue, ns = sys.argv[1], sys.argv[2]
-ev = {
-    "timestamp": int(ns) / 1e9,
-    "source": "claude-watch",
-    "tag": "heartbeat-tick",
-    "message": "heartbeat tick",
-    "data": {"interval_secs": 300, "path": "/var/run/claude/heartbeat"},
-}
-with open(f"{queue}/{ns}_heartbeat-tick.json", "w") as f:
-    json.dump(ev, f)
-PYEOF
-}
+if ! grep -q '^EVENT-ACK REQUIRED.*event-ack ack-batch' "$AF_OUT"; then
+    echo "FAIL: ack footer does not name \`event-ack ack-batch\`" >&2
+    cat "$AF_OUT" >&2; exit 1
+fi
+# ONE footer for a TWO-event batch. A per-event footer would make the reflex
+# ambiguous ("do I run it twice?") and is exactly what the batch design avoids.
+# Anchored: the [monitor-mode] ACK RULE banner also contains the phrase,
+# and counting it would make a per-event regression invisible here.
+af_footers=$(grep -c '^EVENT-ACK REQUIRED' "$AF_OUT")
+if [[ "$af_footers" != "1" ]]; then
+    echo "FAIL: expected exactly 1 ack footer for a 2-event batch, got $af_footers" >&2
+    cat "$AF_OUT" >&2; exit 1
+fi
+echo "  ack footer: one EVENT-ACK REQUIRED line per BATCH, naming event-ack ack-batch OK"
 
-run_hb_watcher() {  # <queue> <logdir> [extra env assignments handled by caller]
-    CLAUDE_EVENT_QUEUE="$1" CLAUDE_EVENT_LOG_DIR="$2" \
-        CLAUDE_EVENT_WATCH_LOCK="$TMP/hb.lock" \
-        CLAUDE_EVENT_WATCH_AUTO_INGEST=0 \
-        "$WATCHER" --debounce 0 2>&1
-}
+# The footer is monitor-only: in exit mode the main loop reads the captured
+# .output file and the ack reflex is driven by its own runbook, and the
+# byte-identity guard above pins the one-shot format.
+AFEQ="$TMP/afeq"; AFELOG="$TMP/afelog"; mkdir -p "$AFEQ" "$AFELOG"
+echo '{"source":"manual","tag":"one","message":"exit mode batch","data":{}}' \
+    >"$AFEQ/1750000000000000000_one.json"
+afe_out=$(CLAUDE_EVENT_QUEUE="$AFEQ" CLAUDE_EVENT_LOG_DIR="$AFELOG" \
+    CLAUDE_EVENT_WATCH_LOCK="$TMP/afe.lock" \
+    CLAUDE_EVENT_WATCH_AUTO_INGEST=0 "$WATCHER" --debounce 0 2>&1)
+if grep -q '^EVENT-ACK REQUIRED' <<<"$afe_out"; then
+    echo "FAIL: exit mode printed the monitor-only ack footer" >&2
+    echo "$afe_out" >&2; exit 1
+fi
+echo "  ack footer: absent in exit mode OK"
 
-# (a) A drained heartbeat-tick writes the marker with the emit timestamp.
-write_tick "$HBQ" 1750000000123456789
-hb_out=$(run_hb_watcher "$HBQ" "$HBLOG")
-if ! grep -q '^EVENT\[claude-watch/heartbeat-tick\]' <<<"$hb_out"; then
-    echo "FAIL: heartbeat-tick not delivered" >&2; echo "$hb_out" >&2; exit 1
-fi
-if [[ ! -f "$HB_MARKER" ]]; then
-    echo "FAIL: heartbeat marker not written to $HB_MARKER" >&2; exit 1
-fi
-if ! python3 -c "
-import json, sys
-m = json.load(open('$HB_MARKER'))
-assert m['tag'] == 'heartbeat-tick', m
-assert abs(m['event_timestamp'] - 1750000000.1234567) < 0.01, m
-assert m['processed_at'] >= m['event_timestamp'], m
-assert m['event_file'] == '1750000000123456789_heartbeat-tick.json', m
-"; then
-    echo "FAIL: heartbeat marker content wrong" >&2; cat "$HB_MARKER" >&2; exit 1
-fi
-# Atomic write: the temp file must have been renamed away, never left behind.
-if compgen -G "$HBQ/.state/.last-heartbeat.*.tmp" >/dev/null; then
-    echo "FAIL: heartbeat marker left a temp file behind (non-atomic write)" >&2
-    ls -la "$HBQ/.state" >&2; exit 1
-fi
-# The .state subdir must stay invisible to the drain (find is -maxdepth 1
-# -type f), so the marker is never surfaced or deleted as if it were an event.
-if grep -q 'last-heartbeat' <<<"$hb_out"; then
-    echo "FAIL: marker surfaced as an event" >&2; echo "$hb_out" >&2; exit 1
-fi
-echo "  heartbeat marker: written on drain, atomic, .state invisible to the drain OK"
-
-# (b) Monotonic — a late-arriving OLDER tick must not rewind the marker.
-write_tick "$HBQ" 1740000000000000000
-run_hb_watcher "$HBQ" "$HBLOG" >/dev/null
-if ! python3 -c "
-import json
-m = json.load(open('$HB_MARKER'))
-assert abs(m['event_timestamp'] - 1750000000.1234567) < 0.01, m
-"; then
-    echo "FAIL: older heartbeat-tick rewound the marker" >&2; cat "$HB_MARKER" >&2; exit 1
-fi
-# ...but a NEWER one does advance it.
-write_tick "$HBQ" 1760000000000000000
-run_hb_watcher "$HBQ" "$HBLOG" >/dev/null
-if ! python3 -c "
-import json
-m = json.load(open('$HB_MARKER'))
-assert abs(m['event_timestamp'] - 1760000000.0) < 0.01, m
-"; then
-    echo "FAIL: newer heartbeat-tick did not advance the marker" >&2; cat "$HB_MARKER" >&2; exit 1
-fi
-echo "  heartbeat marker: monotonic (older tick ignored, newer tick advances) OK"
-
-# (c) A non-heartbeat event must not touch the marker.
-NHQ="$TMP/nhq"; NHLOG="$TMP/nhlog"; mkdir -p "$NHQ" "$NHLOG"
-echo '{"source":"manual","tag":"smoke","message":"not a heartbeat","data":{}}' \
-    >"$NHQ/1750000000000000000_smoke.json"
-run_hb_watcher "$NHQ" "$NHLOG" >/dev/null
-if [[ -e "$NHQ/.state" ]]; then
-    echo "FAIL: non-heartbeat event created heartbeat marker state" >&2; exit 1
-fi
-echo "  heartbeat marker: untouched by non-heartbeat events OK"
-
-# (d) $CLAUDE_EVENT_HEARTBEAT_MARKER relocates the marker (used by hosts whose
-#     exporter mounts something other than the queue dir).
-CUSTQ="$TMP/custq"; CUSTLOG="$TMP/custlog"; mkdir -p "$CUSTQ" "$CUSTLOG"
-CUSTOM_MARKER="$TMP/custom-state/hb.json"
-write_tick "$CUSTQ" 1750000001000000000
-CLAUDE_EVENT_HEARTBEAT_MARKER="$CUSTOM_MARKER" CLAUDE_EVENT_QUEUE="$CUSTQ" \
-    CLAUDE_EVENT_LOG_DIR="$CUSTLOG" CLAUDE_EVENT_WATCH_LOCK="$TMP/hb.lock" \
+# NO STATE UNDER THE QUEUE DIR. This is the #681 regression: a `.state/`
+# subdir here was counted by cw-watcher-health-check's `find ... -name '*.json'`
+# as an unconsumed event, firing "WATCHER DOWN: 1 event(s) unconsumed >6min"
+# twice in one day off a directory that was never an event. The watcher must
+# leave the queue dir containing nothing but events.
+NSQ="$TMP/nsq"; NSLOG="$TMP/nslog"; mkdir -p "$NSQ" "$NSLOG"
+echo '{"source":"claude-watch","tag":"keepalive","message":"keepalive","data":{"ack_command":"event-ack ack-batch","quiet_secs":300}}' \
+    >"$NSQ/1750000000000000000_keepalive.json"
+CLAUDE_EVENT_QUEUE="$NSQ" CLAUDE_EVENT_LOG_DIR="$NSLOG" \
+    CLAUDE_EVENT_WATCH_LOCK="$TMP/ns.lock" \
     CLAUDE_EVENT_WATCH_AUTO_INGEST=0 "$WATCHER" --debounce 0 >/dev/null 2>&1
-if [[ ! -f "$CUSTOM_MARKER" ]]; then
-    echo "FAIL: CLAUDE_EVENT_HEARTBEAT_MARKER override ignored" >&2; exit 1
+leftovers=$(find "$NSQ" -mindepth 1 2>/dev/null)
+if [[ -n "$leftovers" ]]; then
+    echo "FAIL: watcher left state behind in the queue dir:" >&2
+    echo "$leftovers" >&2; exit 1
 fi
-if [[ -e "$CUSTQ/.state" ]]; then
-    echo "FAIL: override still wrote the default marker path" >&2; exit 1
-fi
-echo "  heartbeat marker: CLAUDE_EVENT_HEARTBEAT_MARKER override honored OK"
+echo "  queue dir: drained clean, no .state/ or any other residue OK"
 
-# (e) Best-effort: an unwritable marker path must NOT break event delivery.
-#     A regular file where the state dir belongs makes makedirs() fail.
-BEQ="$TMP/beq"; BELOG="$TMP/belog"; mkdir -p "$BEQ" "$BELOG"
-: >"$BEQ/.state"   # a FILE, not a directory
-write_tick "$BEQ" 1750000002000000000
-be_out=$(run_hb_watcher "$BEQ" "$BELOG")
-if ! grep -q '^EVENT\[claude-watch/heartbeat-tick\]' <<<"$be_out"; then
-    echo "FAIL: a failing marker write broke event delivery (must be best-effort)" >&2
-    echo "$be_out" >&2; exit 1
-fi
-if compgen -G "$BEQ/*.json" >/dev/null; then
-    echo "FAIL: queue file not drained after a failing marker write" >&2; exit 1
-fi
-echo "  heartbeat marker: best-effort — delivery survives an unwritable marker OK"
-
-echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard + delivery mode + monitor line format + heartbeat marker)"
+echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard + delivery mode + monitor line format + per-batch ack footer + clean queue dir)"

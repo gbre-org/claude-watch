@@ -237,7 +237,7 @@ test-watchers: test-self-clear test-self-login ## claude-event-watch fast-path +
 # prometheus_client so no checked-in venv is needed. The suite rewrites
 # CLAUDE_EVENTS_DIR and re-execs the module per scenario, so it never reads a
 # real ~/claude-events.
-test-claude-events-exporter: ## claude-events-exporter heartbeat/marker gauge tests
+test-claude-events-exporter: ## claude-events-exporter queue-metric tests
 	uv run --python 3.11 --with prometheus_client \
 		python3 exporters/claude-events-exporter/test_claude_events_exporter.py
 

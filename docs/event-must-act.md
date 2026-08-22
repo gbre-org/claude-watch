@@ -302,25 +302,26 @@ typically **before** you seed the row. Check `event-ack list` (and
 `event-ack clear` if a backlog accumulated) immediately before seeding,
 or the gate denies on its very first evaluation.
 
-Note that `heartbeat-tick` is classified **actionable**, so on a host that
-emits it the gate is what forces the loop to clear the pending entry.
-Liveness is **ack-driven** (#649): `event-ack ack` refreshes the liveness
-timestamp on ANY ack, not just heartbeat-tick acks, so the clear-path is
-just:
+Note that `keepalive` is classified **actionable**, so on a host that emits
+it the gate is what forces the loop to clear the pending entry. The
+clear-path is the same one used for every batch:
 
 ```sh
-event-ack list                                   # find the pending key
-event-ack ack "<key>" --action "restored liveness"
+event-ack ack-batch
 ```
 
-A prior `heartbeat-ack` wrapper collapsed a `touch` + `event-ack ack` into
-one command; it was retired 2026-08-21 once it became clear a plain ack
-already satisfies both the gate and the liveness signal. `event-ack` is
-exempt in this evaluator (and in `pre-tool-dispatch-gate-hook`), so the
-command that discharges the tick can never be the command the gate denies.
-A bare `touch /var/run/claude/heartbeat` remains as a no-dependency
-fallback, hardcoded-ALLOWed in `pre-tool-obligations-gate-hook` for the
-pathological case where a down watcher blocks `event-ack` itself too.
+One bare command: it acks every pending entry, resets the N-counter, and
+stamps `last-ack-timestamp` -- whose age is claude-watch's liveness signal
+(`[ack] stale_minutes`). `event-ack` is exempt in this evaluator (and in
+`pre-tool-dispatch-gate-hook`), and `event-ack ack-batch` specifically is
+hardcoded-ALLOWed in `pre-tool-obligations-gate-hook`, so the command that
+discharges the event can never be the command a gate denies.
+
+Two things this replaced, both retired: a `heartbeat-ack` wrapper (gone
+2026-08-21, once a plain ack was enough) and a `touch
+/var/run/claude/heartbeat` fallback (gone 2026-08-22 with the file itself).
+The per-key `event-ack ack "<key>" --action "..."` still exists for the case
+where you handled part of a batch and want the rest left pending.
 
 ### Container redeploy
 

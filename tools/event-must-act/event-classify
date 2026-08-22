@@ -387,24 +387,25 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "Watcher DOWN; relaunch it now with `watcher-ctl run <name>` "
         "(name in the message / data.watcher)."),
 
-    # heartbeat-tick -> the main loop MUST refresh the heartbeat file named
-    # in the event's `data.path` (surfaced on the EVENT[] one-liner as
-    # `path=`). The file is the daemon's wedge-detector: if the idle loop
-    # never refreshes it, it goes stale at the ~10-min threshold and the
-    # daemon fires a spurious "heartbeat stale" alert. This is a tiny
-    # self-service action, not an agent-spawn — but it IS required, so it's
+    # keepalive -> the daemon emits this ONLY when nothing has been acked for
+    # the whole quiet window, so by construction the loop is idle and the one
+    # required action is to ack. Acking stamps `last-ack-timestamp`, whose age
+    # IS the daemon's wedge-detector: leave it and the ack-stale alert fires.
+    # A tiny self-service action, not an agent-spawn — but required, so
     # actionable rather than ambient. Placed before the claude-watch/* ambient
     # catch-all below.
-    #
-    # The action is a plain `event-ack ack` (RETIRED the `heartbeat-ack`
-    # wrapper, 2026-08-21, #649): liveness is now ack-driven -- ANY
-    # event-ack ack call refreshes the liveness timestamp, so acking this
-    # entry like any other actionable event is sufficient. No separate
-    # "touch the heartbeat file" step is required.
+    ("claude-watch", "keepalive", None, ACTIONABLE,
+        "Keepalive: nothing acked recently. Run `event-ack ack-batch` (one "
+        "bare command) to clear this and stamp liveness."),
+
+    # heartbeat-tick: the pre-2026-08-22 name for keepalive. Kept for one
+    # release so an event emitted by an older daemon — or one still sitting on
+    # the queue across the upgrade — classifies the same way instead of
+    # falling through to the claude-watch/* ambient catch-all and silently
+    # losing its required action.
     ("claude-watch", "heartbeat-tick", None, ACTIONABLE,
-        "Heartbeat tick; run `event-ack ack \"<key>\" --action \"...\"` "
-        "for this entry (any event-ack ack refreshes liveness), keeping "
-        "the loop's wedge-detector fresh."),
+        "Keepalive (legacy `heartbeat-tick` tag): run `event-ack ack-batch` "
+        "to clear this and stamp liveness."),
 
     # memory-reminder -> ambient context-hygiene reminder emitted by the
     # daemon every 30min (carries the memory checklist in the event message).
@@ -600,7 +601,7 @@ def classify(source: str, tag: str, message: str = "",
     UNKNOWN (source, tag) pair that matches no rule above is surfaced
     in the actionable tier so the loop is pressed to handle it or add
     a classifier rule, rather than silently absorbed as ambient
-    context. Every intentionally-ambient pair (heartbeat-tick is
+    context. Every intentionally-ambient pair (keepalive is
     actionable; routine cron / queue-running|done|abandoned /
     memory-reminder / alertmanager / etc.) already has an EXPLICIT
     rule above the catch-alls, so this fallback only changes the fate
@@ -789,8 +790,11 @@ def _self_test() -> int:
         # actionable, and MUST win over cron/* ambient.
         (("cron", "comment-triage-STUCK", ""), ACTIONABLE),
         (("manual", "comment-triage-STUCK", ""), ACTIONABLE),
-        # heartbeat-tick is actionable (touch the file), and must win over
-        # the claude-watch/* ambient catch-all below it.
+        # keepalive is actionable (ack it), and must win over the
+        # claude-watch/* ambient catch-all below it.
+        (("claude-watch", "keepalive", "keepalive: no event acked recently"),
+            ACTIONABLE),
+        # ... and so must its legacy tag, for one release.
         (("claude-watch", "heartbeat-tick", "heartbeat tick"), ACTIONABLE),
         # watcher-down is actionable (relaunch the watcher) and MUST win over
         # the claude-watch/* ambient catch-all (incident 2026-08-21).
@@ -868,7 +872,7 @@ def _self_test() -> int:
         (("hostjob", "hostjob-done", ""), AMBIENT),
         (("claude-watch", "memory-reminder", ""), AMBIENT),
         (("manual", "watcher-cleanup", ""), AMBIENT),
-        # claude-watch/* catch-all stays ambient for non-heartbeat tags.
+        # claude-watch/* catch-all stays ambient for non-keepalive tags.
         (("claude-watch", "some-other-tag", ""), AMBIENT),
 
         # Unknown -> default. The fallback default is now ACTIONABLE

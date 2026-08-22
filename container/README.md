@@ -133,7 +133,7 @@ restores the previous 2-pane layout:
   interactively.
 - **Pane 1 (`claude-container:0.1`, right, ~25%)** — the in-container
   `claude-watch` daemon (bare `claude-watch` invocation). Reads pane 0 via
-  in-container `tmux capture-pane`, enforces token-stall / heartbeat /
+  in-container `tmux capture-pane`, enforces token-stall / ack-stale /
   context-warning checks against the in-container claude.
 
 The daemon is still available outside sidebar mode — exec into the

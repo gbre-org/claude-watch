@@ -1,6 +1,6 @@
 # claude-watch
 
-Rust daemon that monitors Claude Code health via tmux pane capture. Detects activity states (Thinking, ToolRunning, Writing, Idle), heartbeat stalls, token stalls, zombie sessions, and foreground blocks. Runs as a systemd service (`claude-watch.service`).
+Rust daemon that monitors Claude Code health via tmux pane capture. Detects activity states (Thinking, ToolRunning, Writing, Idle), ack stalls (the main loop has stopped acking events), token stalls, zombie sessions, and foreground blocks. Runs as a systemd service (`claude-watch.service`).
 
 ## Alerting hierarchy
 
@@ -108,7 +108,7 @@ say this; this section is the rule itself.
 
 ```
 BAD   Liveness ping — status only. Idle.
-GOOD  EVENT[claude-watch/heartbeat-tick] heartbeat tick — touched /var/run/claude/heartbeat; nothing else pending.
+GOOD  EVENT[claude-watch/keepalive] keepalive — ran event-ack ack-batch; nothing else pending.
 GOOD  EVENT[cron/pr-status-change] PR #652 CI failure — queued a fix-up agent (q-…).
 ```
 
@@ -168,7 +168,7 @@ Full test suite (including e2e): `cargo nextest run` (~49s, 292 tests in paralle
 ## Key Files
 
 - `src/tmux.rs` — tmux pane capture, `detect_activity()`, activity state detection
-- `src/daemon.rs` — main monitoring loop, heartbeat/token tracking
+- `src/daemon.rs` — main monitoring loop, ack-age/token tracking
 - `src/config.rs` — configuration loading
 - `src/actions.rs` — recovery actions (inject resume, etc.)
 - `tests/fixtures/` — saved tmux captures for fixture tests

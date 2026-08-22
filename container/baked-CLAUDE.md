@@ -39,8 +39,8 @@ Examples that are OK inline (single tool call):
 
 **Agents MUST be backgrounded — never foreground.** A foreground Agent call
 blocks this loop until the subagent finishes, freezing everything the
-dispatcher must keep doing (babysit the queue, answer agent-chat, refresh the
-heartbeat, field claude-watch alerts) and making a long subagent look wedged
+dispatcher must keep doing (babysit the queue, answer agent-chat, ack event
+batches, field claude-watch alerts) and making a long subagent look wedged
 to the daemon. If your Agent schema has `run_in_background`, pass `true`;
 newer builds dropped it and background natively, so just spawn. Enforced:
 `pre-agent-background-required-hook` DENIES an explicitly-falsy
@@ -1259,7 +1259,7 @@ Routine, non-actionable events: alerts that Andrew already gets push for, cron
 ticks, routine queue transitions (running/done/abandoned), workload-done,
 non-fatal claude-watch alerts, routine PR status (push/pending/CI success), etc.
 
-  - Routed by `event-ack ingest` into `ambient-context.json`.
+  - Routed into `ambient-context.json`.
   - Surfaced by the `user-prompt-ambient-inject-hook` (UserPromptSubmit) on
     the NEXT user prompt as additional context.
   - **Non-blocking**. No gate. The LLM sees them, acts if something stands
@@ -1271,26 +1271,22 @@ Events that demand a response within a reasonable window: torrent-completed
 (agent spawn), manual/request-fulfilled (requester DM), queue/queue-api-dead
 (respawn), fatal claude-watch alerts (CONTEXT CRITICALLY LOW, main pane crashed),
 PR CI failure / merge conflict, workbot-prompt, queue-stale-ready, slack-unread,
-**claude-watch/heartbeat-tick**.
+**claude-watch/keepalive**.
 
-> **`heartbeat-tick` — ack it via `event-ack`.** Every ~5 min claude-watch
-> emits `EVENT[claude-watch/heartbeat-tick] heartbeat tick [path=<FILE>
-> interval_secs=…]`. Liveness is **ack-driven** (#649): `event-ack list` to
-> find the pending key, then `event-ack ack "<key>" --action "..."` — ANY
-> ack refreshes the liveness timestamp, so a plain ack is the whole
-> clear-path (`heartbeat-ack` wrapper retired 2026-08-21 as redundant). A
-> bare `touch <FILE>` alone leaves the entry pending forever; ack, not
-> touch. The refresh must come from acting on the event, never the
-> daemon (proves liveness).
+> **`keepalive` = the daemon asking whether you are alive.** Emitted only
+> when nothing has been acked for the quiet window (5 min), so if you ack
+> your batches you never see one. Clear it like any batch:
+> **`event-ack ack-batch`**. The stamp must come from YOU, never the daemon:
+> that is the wedge detector. Miss it past `[ack] stale_minutes` (20) and
+> claude-watch nudges + alerts. (Was `heartbeat-tick`; the file it told you
+> to `touch` is gone.)
 
-  - Routed by `event-ack ingest` into `pending-actions.json`.
+  - Routed into `pending-actions.json`.
   - The `event_must_act` obligation evaluator counts CONSECUTIVE non-exempt
     Bash tool calls while pending. **Default N=3**: under threshold = ALLOW +
     bump counter; threshold reached = DENY. Override via `$EVENT_MUST_ACT_N`.
-  - **Each `event-ack` transaction resets the counter to 0**, so the LLM gets
-    a fresh N-call grace window after every ack.
-  - The gate does NOT fire immediately on every actionable event — only after
-    the LLM has missed N consecutive triage opportunities.
+  - Any `event-ack` transaction resets the counter, so the gate fires only
+    after N missed triage opportunities.
 
 ### Tier 3 — Unknown (defaults to ACTIONABLE — fail-LOUD)
 
@@ -1310,25 +1306,29 @@ table → fail-LOUD `actionable`. Inspect: `event-classify --list-rules`.
 
 ### Workflow
 
-1. **Watcher fires** — `claude-event-watch` prints `EVENT[source/tag]
-   message` lines and exits.
-2. **Restart watcher immediately** (before processing).
-3. **For each event line**, call `event-ack ingest --source <src> --tag <tag>
-   --message "<msg>"`. The classifier routes it to the right queue.
-4. **For actionable events**, queue an agent / act directly / dismiss, then
-   `event-ack ack "<key>" --action "<what you did>"` (resets the N-counter).
-5. **Ambient events** need no action — they surface in the next prompt's
-   context via the UserPromptSubmit hook.
+1. **Watcher fires**: `claude-event-watch` prints `EVENT[source/tag]` lines
+   (monitor mode keeps streaming; exit mode prints one batch and exits).
+2. **Restart the watcher immediately** if it exited (before processing).
+3. Ingest is automatic (the watcher does it as it drains).
+4. **Handle the batch**: queue an agent / act directly / dismiss, per event.
+5. **Ack the batch, every batch: `event-ack ack-batch`.** One bare command:
+   clears all pending, resets the N-counter, stamps `last-ack-timestamp`
+   (its age is claude-watch's ONLY liveness signal). Monitor mode prints an
+   `EVENT-ACK REQUIRED:` line per batch as the reminder. Per-key `event-ack
+   ack "<key>"` only to leave part of a batch pending.
+6. **Ambient events** need no action: they surface in the next prompt's
+   context via the UserPromptSubmit hook. Ack the batch anyway.
 
 ### CLI reference
 
 ```sh
-# Route an event through the classifier + into the correct queue.
+# Replay one event by hand (the watcher ingests as it drains).
 event-ack ingest --source <src> --tag <tag> --message "<msg>"
 
 # Pending-actions surface (actionable tier).
+event-ack ack-batch                        # THE per-batch reflex: ack all + stamp
 event-ack add "<key>" [--source "<src>"]   # Manual add (rare)
-event-ack ack "<key>" --action "<text>"    # Ack -> resets N-counter
+event-ack ack "<key>" --action "<text>"    # Ack ONE key (partial batch only)
 event-ack list                             # Show pending + counter
 event-ack clear                            # Clear all (escape hatch)
 
