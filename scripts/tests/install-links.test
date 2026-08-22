@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Tests for the Makefile `install` target's TOOL_LINKS / MULTICALL_NAMES.
+
+Background: `make install` puts the daemon binary + every tool script this
+repo ships onto $BIN_DIR (default ~/bin). Historically the recipe was 26
+hand-written `ln -sfn` lines with a matching hand-written `echo` block — easy
+to add a tool to `tools/` and forget the two lines that actually wire it onto
+$PATH. That drift is exactly what happened: a 2026-08-22 deploy-worktree
+migration found 10 host symlinks (`agent-ctl`, `session-event`,
+`watcher-restart`, `watcher-status`, `task-watch`, `claude-watch-metrics`,
+`dashboard`, `dashboard-refit`, `queue-notify`, plus the intentionally-retired
+`heartbeat-ack`) that `make install` did not create and had to be relinked by
+hand.
+
+The fix replaces the hand-written lines with two Make variables the install
+recipe (and this test) both walk:
+
+  - `TOOL_LINKS`      — `name=path` pairs for every script-based tool,
+                         installed as an absolute-path symlink back to the
+                         source under `tools/` (or the repo root, for
+                         `dashboard`/`dashboard-refit`).
+  - `MULTICALL_NAMES` — argv[0] aliases the daemon binary ITSELF dispatches
+                         on (busybox-style, see `multicall_rewrite_args` in
+                         src/main.rs), symlinked to the installed
+                         `$(BIN_DIR)/claude-watch` copy instead of a script.
+
+`heartbeat-ack` is deliberately excluded: it was retired in commit e09afdc
+("Retire heartbeat-ack: fold heartbeat-tick clear-path into plain
+event-ack") and the dangling host symlink is host-side residue to be cleaned
+up separately, not something this repo should re-ship.
+
+What's covered:
+
+  1. `make -n install` (a dry run — no cargo build, no real filesystem
+     writes) lists every one of the 10 previously-missing names, and does
+     NOT list `heartbeat-ack`.
+  2. Every `TOOL_LINKS` source path exists in the repo and is executable —
+     catches a typo'd path before it ships as a dangling symlink.
+  3. A real (non-dry-run) run of just the symlinking logic — reimplemented
+     here from the parsed Make variables, so this test exercises the actual
+     values `make -n install` resolved rather than a hand-copied list —
+     against a tmp BIN_DIR creates a working symlink for every TOOL_LINKS
+     and MULTICALL_NAMES entry, with none dangling.
+  4. That symlinking is idempotent: a second pass leaves every link pointing
+     at the same real target.
+  5. `install`'s TOOL_LINKS values carry no private-path sentinel (this repo
+     is public).
+
+Run:  ./scripts/tests/install-links.test
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MAKEFILE = REPO_ROOT / "Makefile"
+
+# The 10 names a 2026-08-22 deploy-worktree migration found missing from
+# `make install` and had to relink by hand on the host.
+PREVIOUSLY_MISSING = [
+    "agent-ctl",
+    "session-event",
+    "watcher-restart",
+    "watcher-status",
+    "task-watch",
+    "claude-watch-metrics",
+    "dashboard",
+    "dashboard-refit",
+    "heartbeat-ack",  # deliberately NOT re-added — see module docstring
+    "queue-notify",
+]
+
+# Substrings that must never appear in a file shipped from this PUBLIC repo.
+PRIVATE_SENTINELS = [
+    "/mnt/Raiden",
+    "/mnt/Scorpion",
+    "ADHPrivate",
+    "~/repos/claude-config",
+    "~/repos/server-config",
+    "~/repos/pr-watch",
+]
+
+failures: list[str] = []
+
+
+def check(cond: bool, msg: str) -> None:
+    if cond:
+        print(f"  ok: {msg}")
+    else:
+        print(f"  FAIL: {msg}")
+        failures.append(msg)
+
+
+def run(args: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args, capture_output=True, text=True, cwd=str(REPO_ROOT), **kw
+    )
+
+
+# -----------------------------------------------------------------------------
+print("1. `make -n install` lists every previously-missing name (except heartbeat-ack)")
+# -----------------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as tmp:
+    dry = run(["make", "-n", "install", f"BIN_DIR={tmp}"])
+    check(dry.returncode == 0, f"make -n install exits 0 (stderr: {dry.stderr!r})")
+    dry_out = dry.stdout
+    for name in PREVIOUSLY_MISSING:
+        if name == "heartbeat-ack":
+            check(
+                "heartbeat-ack" not in dry_out,
+                "heartbeat-ack is NOT listed (intentionally retired, not re-added)",
+            )
+        else:
+            check(
+                re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", dry_out) is not None,
+                f"make -n install lists {name!r}",
+            )
+
+# -----------------------------------------------------------------------------
+print("2. Parse TOOL_LINKS / MULTICALL_NAMES straight from `make -p`")
+# -----------------------------------------------------------------------------
+# `make -p` (database dump) is the robust way to read a variable's fully
+# expanded value without hand-parsing Makefile continuation syntax. `-n`
+# alongside it keeps this a dry run — no cargo build, no filesystem writes.
+dump = run(["make", "-p", "-n", "-f", str(MAKEFILE), "install"])
+check(dump.returncode == 0, f"make -p -n install exits 0 (stderr: {dump.stderr!r})")
+
+
+def make_var(name: str, text: str) -> str:
+    m = re.search(rf"^{re.escape(name)} := (.*)$", text, re.MULTILINE)
+    check(m is not None, f"make -p database defines {name}")
+    return m.group(1) if m else ""
+
+
+tool_links_raw = make_var("TOOL_LINKS", dump.stdout)
+multicall_raw = make_var("MULTICALL_NAMES", dump.stdout)
+
+tool_links: dict[str, str] = {}
+for pair in tool_links_raw.split():
+    if "=" in pair:
+        name, src = pair.split("=", 1)
+        tool_links[name] = src
+
+multicall_names = multicall_raw.split()
+
+check(len(tool_links) >= 24, f"TOOL_LINKS has the expected breadth (got {len(tool_links)})")
+check(len(multicall_names) >= 6, f"MULTICALL_NAMES has the expected breadth (got {len(multicall_names)})")
+
+for name in PREVIOUSLY_MISSING:
+    if name == "heartbeat-ack":
+        check(
+            name not in tool_links and name not in multicall_names,
+            "heartbeat-ack is not present in either variable",
+        )
+    else:
+        check(
+            name in tool_links or name in multicall_names,
+            f"{name!r} is covered by TOOL_LINKS or MULTICALL_NAMES",
+        )
+
+# -----------------------------------------------------------------------------
+print("3. Every TOOL_LINKS source path exists and is executable")
+# -----------------------------------------------------------------------------
+for name, src in tool_links.items():
+    p = REPO_ROOT / src
+    check(p.is_file(), f"{name}: source {src} exists as a file")
+    check(os.access(p, os.X_OK), f"{name}: source {src} is executable")
+
+# -----------------------------------------------------------------------------
+print("4. Public-repo hygiene: no private-path sentinel in the linked paths")
+# -----------------------------------------------------------------------------
+for sentinel in PRIVATE_SENTINELS:
+    check(
+        sentinel not in tool_links_raw and sentinel not in multicall_raw,
+        f"TOOL_LINKS/MULTICALL_NAMES free of private sentinel {sentinel!r}",
+    )
+
+# -----------------------------------------------------------------------------
+print("5. Real (non-dry-run) symlinking against a tmp BIN_DIR: nothing dangles")
+# -----------------------------------------------------------------------------
+
+
+def make_links(bin_dir: Path) -> None:
+    for name, src in tool_links.items():
+        target = REPO_ROOT / src
+        link = bin_dir / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(target)
+    claude_watch_stub = bin_dir / "claude-watch"
+    if not claude_watch_stub.exists():
+        claude_watch_stub.write_text("#!/bin/sh\n")
+        claude_watch_stub.chmod(0o755)
+    for name in multicall_names:
+        link = bin_dir / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(claude_watch_stub)
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    bin_dir = Path(tmp)
+    make_links(bin_dir)
+
+    dangling = [p.name for p in bin_dir.iterdir() if p.is_symlink() and not p.exists()]
+    check(not dangling, f"no dangling symlinks after install (found {dangling})")
+
+    for name in tool_links:
+        link = bin_dir / name
+        check(link.is_symlink(), f"{name}: is a symlink")
+        check(link.resolve() == (REPO_ROOT / tool_links[name]).resolve(), f"{name}: resolves to its source")
+
+    for name in multicall_names:
+        link = bin_dir / name
+        check(link.is_symlink(), f"{name}: is a symlink")
+        check(link.resolve() == (bin_dir / "claude-watch").resolve(), f"{name}: resolves to claude-watch")
+
+    # -------------------------------------------------------------------
+    print("6. Idempotent: a second pass leaves every link pointing the same place")
+    # -------------------------------------------------------------------
+    before = {p.name: p.resolve() for p in bin_dir.iterdir() if p.is_symlink()}
+    make_links(bin_dir)
+    after = {p.name: p.resolve() for p in bin_dir.iterdir() if p.is_symlink()}
+    check(before == after, "re-running the install logic changes no symlink target")
+
+print()
+if failures:
+    print(f"{len(failures)} FAILURE(S):")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+print("All install-links tests passed.")

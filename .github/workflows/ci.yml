@@ -201,6 +201,14 @@ jobs:
       - name: Run host-cron installer tests
         run: make test-install-host-cron
 
+      # `install` target's TOOL_LINKS / MULTICALL_NAMES coverage: every
+      # source path resolves, `make -n install` lists every tool this repo
+      # ships (including the 10 names a 2026-08-22 host migration found
+      # missing), and the symlinking is idempotent. Tmpdirs + `make -n`
+      # only — no cargo build.
+      - name: Run install-links tests
+        run: make test-install-links
+
       - name: Run claude-tmux env passthrough + fail-loud warning tests
         run: make test-claude-tmux-env
 
