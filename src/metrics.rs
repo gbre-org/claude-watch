@@ -46,7 +46,8 @@ pub struct LiveCounts {
     pub active_agents: u32,
     /// Currently-running workload labels (tmux pane alive in `tasks` session).
     pub running_tasks: u32,
-    /// Number of enabled watchers that are healthy (`status == "ok"`).
+    /// Number of enabled watchers that are live (UP in either delivery mode,
+    /// or monitor-mode ARMING) — `watcher::WatcherStatus::is_live`.
     pub live_watchers: u32,
     /// Number of enabled watchers (config rows with `enabled=true`).
     pub enabled_watchers: u32,
@@ -582,7 +583,7 @@ fn build_metrics(
         "# TYPE claude_code_running_tasks gauge".to_string(),
         format!("claude_code_running_tasks {}", live.running_tasks),
         "".to_string(),
-        "# HELP claude_code_live_watchers Number of enabled watchers currently healthy".to_string(),
+        "# HELP claude_code_live_watchers Number of enabled watchers currently live (UP or ARMING)".to_string(),
         "# TYPE claude_code_live_watchers gauge".to_string(),
         format!("claude_code_live_watchers {}", live.live_watchers),
         "".to_string(),
@@ -733,8 +734,10 @@ async fn collect_live_counts() -> LiveCounts {
         agents: Vec::new(),
     });
 
-    let live_watchers = watchers.iter().filter(|w| w.status == "ok").count() as u32;
-    let enabled_watchers = watchers.iter().filter(|w| w.enabled).count() as u32;
+    // ONE shared reduction with `claude-watch status` ("Live watchers: N/M")
+    // — monitor-aware (ARMING counts as live, a lock-only monitor-mode
+    // watcher counts as live) so the gauge cannot drift from the CLI.
+    let (live_watchers, enabled_watchers) = watcher::count_live_and_enabled(&watchers);
 
     // open_bashes: prefer a fresh status-bar parse. If that fails (no pane
     // visible, parser miss, etc.), fall back to 0 — the existing

@@ -757,7 +757,8 @@ struct StatusReport {
     active_agents: usize,
     /// Currently-running workload labels (tmux pane alive in `tasks` session).
     running_workloads: usize,
-    /// Number of enabled watchers that are healthy (`status == "ok"`).
+    /// Number of enabled watchers that are live (`WatcherStatus::is_live`:
+    /// UP in either delivery mode, or monitor-mode ARMING).
     healthy_watchers: u32,
     /// Number of enabled watchers (`status != "off"`). Equal to total minus
     /// disabled rows.
@@ -1013,8 +1014,9 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
         agents: Vec::new(),
     });
 
-    let healthy_watchers = watchers.iter().filter(|w| w.status == "ok").count() as u32;
-    let enabled_watchers = watchers.iter().filter(|w| w.enabled).count() as u32;
+    // Same reduction the `claude_code_live_watchers` gauge uses
+    // (`collect_live_counts` in metrics.rs) — monitor-aware, one predicate.
+    let (healthy_watchers, enabled_watchers) = watcher::count_live_and_enabled(&watchers);
 
     let report = StatusReport {
         pane: cs.pane.clone(),
