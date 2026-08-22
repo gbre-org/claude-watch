@@ -515,6 +515,50 @@ If you don't want the autodark behavior, drop the `-I /usr/local/share/ttyd/inde
 line from `ttyd.command` in `docker-compose.yml`. ttyd will then serve
 its upstream bundled HTML unchanged.
 
+### Terminal input lock (padlock toggle + idle auto-lock)
+
+The same patched `index.html` adds a subtle padlock button in the
+top-right corner. Click it and every keystroke — and every paste — is
+dropped before it reaches the PTY, so a browser tab left open on a live
+Claude Code / tmux session can't take stray input from a passing cat,
+child, or colleague. Click again to unlock. Keys are vetoed at the
+terminal layer (xterm.js's `attachCustomKeyEventHandler`), so
+browser-native shortcuts — reload, devtools, tab switching, copying a
+selection — keep working while the lock is on. The state is persisted in
+`localStorage`, so a reload or a sleep-driven reconnect comes back locked
+instead of silently reverting.
+
+**Auto-lock.** The padlock engages itself after a period of operator
+inactivity — the case the manual button can't help with, because nobody
+is there to press it. Activity means *deliberate input to the page*:
+`keydown`, `mousedown`, `pointerdown`, `touchstart`, `wheel`, `paste`.
+Terminal **output** deliberately does not count — a chatty session (a
+build log, `tail -f`, streaming tokens) would otherwise hold an
+unattended terminal open indefinitely. An explicit unlock restarts the
+countdown from zero, and an auto-lock persists through exactly the same
+`localStorage` path as a manual one.
+
+| Knob | Where | Default |
+| --- | --- | --- |
+| `TTYD_AUTOLOCK_SECONDS` | build arg on the `ttyd` service (`.env` → `docker-compose.yml` → `ttyd/Dockerfile`) | `300` (5 min) |
+| `?autolock=<seconds>` | URL query param, per browser tab | falls back to the built-in value |
+
+Both accept `0` to disable auto-lock entirely and leave the manual
+padlock as the only path. The idle window is baked in at **build** time
+because the image ships a single static `index.html` (ttyd serves it via
+`-I`), so there is no request-time render to read a runtime env var
+from — change `TTYD_AUTOLOCK_SECONDS` and rebuild:
+
+```bash
+TTYD_AUTOLOCK_SECONDS=900 docker compose build ttyd && docker compose up -d ttyd
+```
+
+The URL param exists for the one-off case (`http://localhost:7681/?autolock=0`
+to keep a long-running demo unlocked) and needs no rebuild. The
+build-time value is asserted in the image (the Dockerfile greps the
+emitted `var AUTO_LOCK_SECONDS = <n>;`), so a typo'd value fails the
+build instead of silently shipping the default.
+
 ### Dynamic Claude Code TUI theme (follows the browser)
 
 The autodark block above recolours the **terminal** (xterm.js background +

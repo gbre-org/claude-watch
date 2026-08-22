@@ -24,7 +24,7 @@
 .PHONY: test-agent-msg test-agent-tail test-claude-event test-event-must-act
 .PHONY: test-pr-branches
 .PHONY: test-self-clear test-self-login test-self-login-tmux test-watchers
-.PHONY: test-dashboard test-trust-workspace
+.PHONY: test-dashboard test-trust-workspace test-claude-events-exporter
 .PHONY: test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links
 .PHONY: test-claude-md-size test-install-hooks test-install-host-skills
 .PHONY: test-install-host-cron test-ci-apt-install
@@ -231,6 +231,15 @@ test-self-login-tmux: ## self-login end-to-end against a real tmux pane
 # Run the claude-event-watch fast-path smoke test.
 test-watchers: test-self-clear test-self-login ## claude-event-watch fast-path + self-clear/self-login
 	tools/watchers/tests/test_claude_event_watch.sh
+
+# Run the claude-events-exporter suite: the heartbeat gauge that backs the
+# dashboard's "Last Ack Age" tile. Standalone script (not pytest); uv supplies
+# prometheus_client so no checked-in venv is needed. The suite rewrites
+# CLAUDE_EVENTS_DIR and re-execs the module per scenario, so it never reads a
+# real ~/claude-events.
+test-claude-events-exporter: ## claude-events-exporter heartbeat/marker gauge tests
+	uv run --python 3.11 --with prometheus_client \
+		python3 exporters/claude-events-exporter/test_claude_events_exporter.py
 
 # Run the dashboard parser tests (sources dashboard-lib.sh in a bash
 # subshell and exercises conf_get / conf_windows / has_split / expected_panes
@@ -478,6 +487,15 @@ test-ttyd-paste-handler: ## ttyd browser paste-handler JS tests
 # Runs the JS body inside Node with DOM / window.term stubs and asserts the
 # button state (glyph, aria-pressed, cw-locked class) + key-veto return
 # value across the unlocked → locked → unlocked toggle cycle.
+#
+# Also covers the idle AUTO-LOCK: a fake wall clock drives the injected
+# poll to prove activity before the deadline resets the countdown, idling
+# past it engages the lock through the same setLocked() path (including
+# the localStorage write), and a window of 0 registers no listeners and
+# never locks. The TTYD_AUTOLOCK_SECONDS env var → baked-in
+# `var AUTO_LOCK_SECONDS = <n>;` resolution (default 300, 0 = off,
+# non-integer = build failure) is exercised by running inject-autodark.py
+# end-to-end against a minimal HTML document.
 test-ttyd-lock-toggle: ## ttyd browser lock-toggle JS tests
 	python3 examples/compose/ttyd/tests/test_lock_toggle.py
 

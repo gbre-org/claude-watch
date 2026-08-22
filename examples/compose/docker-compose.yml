@@ -810,6 +810,15 @@ services:
     build:
       context: ./ttyd
       dockerfile: Dockerfile
+      args:
+        # Idle window (seconds) after which the browser terminal's lock
+        # toggle engages itself, so an unattended tab can't take stray
+        # keystrokes into the live tmux session. 300 = 5 min (default);
+        # 0 disables auto-lock and leaves the manual padlock as the only
+        # path. Build-time because the image bakes one static index.html
+        # — change it and rebuild (`docker compose build ttyd`), or use
+        # the per-tab `?autolock=<seconds>` URL override for a one-off.
+        TTYD_AUTOLOCK_SECONDS: ${TTYD_AUTOLOCK_SECONDS:-300}
     image: claude-ttyd:dev
     ports:
       - "7681:7681"
