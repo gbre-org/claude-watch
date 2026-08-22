@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""cw-agent-stats — host-side producer for the live agent-activity badge.
+
+Originally shipped as ``botchat/bin/botchat-agent-stats`` (botchat
+#2955/#2956, Andrew, 2026-08-21: *"live updating counter of agent tool calls
+(on all views, including compact)"* + *"token count too if possible"*).
+Moved into claude-watch so the launchd job / install target that owns this
+producer is claude-watch's own responsibility, not botchat's — claude-watch
+should not need botchat's repo checked out just to run its own dashboard
+producers.
+
+Scans the live Claude Code subagent transcripts (``~/.claude/projects/<slug>/
+<session>/subagents/agent-*.jsonl``) plus the main-loop transcript, folds them
+into per-agent {tool calls, context tokens, output tokens, age} and writes ONE
+JSON snapshot ATOMICALLY to the given ``--out`` path (default: botchat's data
+dir, for backward compatibility with manual/local invocations)::
+
+    <BOTCHAT_DATA_DIR>/agent-stats.json        (default /var/apps/botchat)
+
+That directory is bind-mounted into the botchat container as ``/data``, so
+the web app picks the snapshot up with no new mount: ``GET /api/agent-stats``
+serves it, and the SSE stream pushes it as an ``agent_stats`` event on every
+change. The actual fold/survey logic still lives in botchat's own
+``src/botchat/agentstats.py`` (imported below by pointing ``sys.path`` at
+botchat's checkout) — that module is the source-of-truth for the transcript
+survey + exact counter definitions; see botchat's DESIGN.md §3f for the
+consumer-side badge. Only the *scheduling* (the launchd job) moved; the
+survey library is still a documented dependency on the botchat checkout.
+
+Modes
+-----
+* ``--once``  (default): one tick, write the snapshot, exit.
+* ``--loop``: tick every ``--interval`` seconds for ``--duration`` seconds, then
+  exit — the CRON shape. ``* * * * *`` + ``--loop --duration 58 --interval 4``
+  gives ~4s freshness with no daemon to babysit, and the per-file byte offsets
+  live in-process so only the appended tail is parsed between ticks (one full
+  parse of the live files per minute at process start, ~10ms).
+* ``--print``: also dump the snapshot to stdout (``--no-write`` to only print).
+
+Idempotent + single-instance friendly: wrap with ``flock -n`` in cron so an
+overlapping minute can't double-write (harmless anyway — atomic replace).
+
+Exit codes: 0 ok; 2 bad args; 1 the snapshot could not be written at all.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+# The survey/fold library still lives in botchat's checkout (it's the
+# source-of-truth module, shared with botchat's own consumer-side code). This
+# is a deliberate LIBRARY dependency, distinct from the OPERATIONAL ownership
+# (launchd job + install target) that this move relocates into claude-watch.
+_BOTCHAT_SRC = Path(os.environ.get("CW_AGENT_STATS_BOTCHAT_SRC", os.path.expanduser("~/repos/botchat/src")))
+sys.path.insert(0, str(_BOTCHAT_SRC))
+
+from botchat import agentstats  # noqa: E402
+
+
+def _default_out() -> Path:
+    """``<data dir>/agent-stats.json`` — data dir via env > host config > /data.
+
+    Deliberately does NOT import ``botchat.store`` for the resolution (that
+    module pulls psycopg); this producer must run on a host with only the
+    stdlib, so the ``~/.config/botchat/config`` fallback is re-read here
+    (same precedence as ``store._default_data_dir``). Callers wiring the
+    launchd job should pass ``--out`` explicitly instead of relying on this
+    fallback.
+    """
+    env = os.environ.get("BOTCHAT_DATA_DIR", "").strip()
+    if env:
+        return Path(env) / agentstats.SNAPSHOT_FILENAME
+    cfg = Path(os.path.expanduser("~/.config/botchat/config"))
+    try:
+        for line in cfg.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("BOTCHAT_DATA_DIR="):
+                v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if v:
+                    return Path(v) / agentstats.SNAPSHOT_FILENAME
+    except OSError:
+        pass
+    return Path("/data") / agentstats.SNAPSHOT_FILENAME
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="cw-agent-stats",
+        description="Write the live agent tool-call/token snapshot for the botchat header badge.",
+    )
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="one tick then exit (default)")
+    mode.add_argument("--loop", action="store_true", help="tick every --interval for --duration seconds")
+    ap.add_argument("--interval", type=float, default=4.0, help="seconds between ticks in --loop (default 4)")
+    ap.add_argument("--duration", type=float, default=58.0, help="total seconds to run in --loop (default 58)")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="snapshot path (default <BOTCHAT_DATA_DIR>/agent-stats.json)")
+    ap.add_argument("--projects-dir", type=Path, default=None,
+                    help="Claude projects dir (default ~/.claude/projects or $CLAUDE_PROJECTS_DIR)")
+    ap.add_argument("--live-window", type=float, default=agentstats.DEFAULT_LIVE_WINDOW_SECS,
+                    help="seconds since last transcript write within which an agent counts as live")
+    ap.add_argument("--print", dest="do_print", action="store_true", help="print the snapshot JSON to stdout")
+    ap.add_argument("--no-write", action="store_true", help="do not write the snapshot file")
+    ap.add_argument("-v", "--verbose", action="store_true", help="one status line per tick on stderr")
+    args = ap.parse_args(argv)
+
+    out = args.out or _default_out()
+    collector = agentstats.Collector(projects_dir=args.projects_dir, live_window_secs=args.live_window)
+
+    deadline = time.monotonic() + args.duration if args.loop else None
+    rc = 0
+    while True:
+        t0 = time.monotonic()
+        snap = collector.tick()
+        if not args.no_write:
+            try:
+                agentstats.write_snapshot(snap, out)
+            except OSError as e:
+                print(f"cw-agent-stats: cannot write {out}: {e}", file=sys.stderr)
+                rc = 1
+        if args.do_print:
+            print(json.dumps(snap, indent=1))
+        if args.verbose:
+            t = snap["totals"]
+            print(
+                f"cw-agent-stats: agents={t['agents']} calls={t['tool_calls']} "
+                f"ctx={t['context_tokens']} out={t['output_tokens']} "
+                f"main={(snap.get('main') or {}).get('context_tokens')} "
+                f"({(time.monotonic() - t0) * 1000:.0f}ms)",
+                file=sys.stderr,
+            )
+        if deadline is None or time.monotonic() + args.interval > deadline:
+            return rc
+        time.sleep(max(0.0, args.interval - (time.monotonic() - t0)))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
