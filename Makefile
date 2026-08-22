@@ -358,7 +358,7 @@ test-hooks-shim: ## container hooks-shim / settings-rewrite suites
 # CLIs installed, volumes/pid1/cron shape). All run on plain Linux against
 # the checked-in sources — no docker daemon, no built image.
 #
-# Two of them are worth calling out because they encode past regressions:
+# Three of them are worth calling out because they encode past regressions:
 #
 #   - entrypoint-claude-cmd.test extracts the CLAUDE_CMD-building shell
 #     block from container/entrypoint.sh by regex and exercises it in a
@@ -373,6 +373,13 @@ test-hooks-shim: ## container hooks-shim / settings-rewrite suites
 #     warning (`Native installation exists but ~/.local/bin is not in your
 #     PATH`) prints on every launch as soon as a self-update materialises
 #     ~/.local/bin/claude.
+#   - task-init-keeps-session.test asserts the baked config keeps
+#     `[task_watch] enabled = true` AND that daemon_pane_command() falls back
+#     to the keepalive stub when the legacy `task-watch` CLI is missing. With
+#     it disabled, `task init` ran a binary the image doesn't ship, pane 0
+#     exited instantly, and tmux destroyed the `tasks` session right after
+#     "Session 'tasks' created" printed — `workload run` / `workload kill`
+#     were unusable in the container.
 test-entrypoint: ## Container entrypoint + baked-image assertion suites
 	container/tests/entrypoint-claude-cmd.test
 	container/tests/entrypoint-tmux-truecolor.test
@@ -395,6 +402,7 @@ test-entrypoint: ## Container entrypoint + baked-image assertion suites
 	container/tests/process-compose-pid1.test
 	container/tests/cron-default-baked.test
 	container/tests/in-container-daemon.test
+	container/tests/task-init-keeps-session.test
 	container/tests/iproute2-installed.test
 	container/tests/code-cli-installed.test
 	container/tests/claude-event-tail-baked.test

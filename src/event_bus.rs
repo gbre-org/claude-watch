@@ -366,7 +366,11 @@ pub fn emit_cadence(ev: &CadenceEvent<'_>) {
 /// transitions the queue item to done/abandoned in the same step.
 /// Workload completion IS queue completion; no separate respawn-
 /// obligation handshake.
-#[derive(Debug, Clone)]
+///
+/// `Default` is derived so a caller (or a test) can construct the
+/// common shape and `..Default::default()` the optional replace
+/// markers, which only the `workload run` same-label replace path sets.
+#[derive(Debug, Clone, Default)]
 pub struct WorkloadDoneEvent<'a> {
     pub label: &'a str,
     /// Exit code as reported by the wrapper script. Negative values
@@ -383,7 +387,30 @@ pub struct WorkloadDoneEvent<'a> {
     /// --queue-id q-X`). When present, included in the event's
     /// ``data.queue_id`` field so consumers can correlate without
     /// round-tripping through the workload state file.
+    ///
+    /// Deliberately EMPTY when [`Self::carried_over_queue_id`] is set:
+    /// the item is not this run's any more, so presenting it here would
+    /// invite a consumer to read a live item as dead.
     pub queue_id: Option<&'a str>,
+    /// Why this completion exists, when it is not a plain natural exit
+    /// or a plain `workload kill`. Currently only `"replaced"` —
+    /// `workload run` was invoked on a label whose previous run was
+    /// still live, so that run was torn down to make room.
+    ///
+    /// The marker is what keeps a replaced run from masquerading as the
+    /// completion of the run that replaced it: same label, same log
+    /// path, `killed=true`, arriving moments before the new run starts.
+    pub reason: Option<&'a str>,
+    /// For `reason="replaced"`: the `started_at` of the run that took
+    /// this label over (identical to the string in the workload
+    /// registry entry the new run writes), so a consumer can line the
+    /// two up exactly.
+    pub replaced_by: Option<&'a str>,
+    /// For `reason="replaced"`: the queue item the dying run was bound
+    /// to that the REPLACING run re-binds (it was handed the same
+    /// `--queue-id`). It was deliberately NOT transitioned — the item
+    /// is still `running`, now owned by the new run.
+    pub carried_over_queue_id: Option<&'a str>,
 }
 
 /// Build the JSON event body for a workload-done event. Public for
@@ -400,7 +427,14 @@ pub fn build_workload_done_json(ev: &WorkloadDoneEvent<'_>) -> serde_json::Value
 
     // Human-readable message — same string the main loop sees in the
     // `EVENT[workload/workload-done] <preview>` one-liner.
-    let message = if ev.killed {
+    let message = if let Some(replaced_by) = ev.replaced_by {
+        // Say REPLACED, not just "killed": the reader is about to see a
+        // new run of the same label, and the two must not blur.
+        format!(
+            "workload {} replaced (previous run killed rc={}, new run started {}, log={})",
+            ev.label, ev.exit_code, replaced_by, ev.log_path
+        )
+    } else if ev.killed {
         format!(
             "workload {} killed (rc={}, log={})",
             ev.label, ev.exit_code, ev.log_path
@@ -425,6 +459,15 @@ pub fn build_workload_done_json(ev: &WorkloadDoneEvent<'_>) -> serde_json::Value
     });
     if let Some(qid) = ev.queue_id {
         data["queue_id"] = serde_json::Value::String(qid.to_string());
+    }
+    if let Some(reason) = ev.reason {
+        data["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    if let Some(replaced_by) = ev.replaced_by {
+        data["replaced_by"] = serde_json::Value::String(replaced_by.to_string());
+    }
+    if let Some(qid) = ev.carried_over_queue_id {
+        data["carried_over_queue_id"] = serde_json::Value::String(qid.to_string());
     }
 
     serde_json::json!({
@@ -720,6 +763,7 @@ mod tests {
             killed: false,
             log_path: "/tmp/claude-workloads/ebook-twilight.output",
             queue_id: None,
+            ..Default::default()
         };
         let v = build_workload_done_json(&ev);
 
@@ -752,6 +796,7 @@ mod tests {
             killed: false,
             log_path: "/tmp/claude-workloads/broken-task.output",
             queue_id: None,
+            ..Default::default()
         };
         let v = build_workload_done_json(&ev);
         assert_eq!(v["priority"], "normal"); // non-zero exit → normal
@@ -767,6 +812,7 @@ mod tests {
             killed: true,
             log_path: "/tmp/claude-workloads/dead-task.output",
             queue_id: None,
+            ..Default::default()
         };
         let v = build_workload_done_json(&ev);
         assert_eq!(v["priority"], "normal");
@@ -790,10 +836,90 @@ mod tests {
             killed: false,
             log_path: "/tmp/claude-workloads/stv-promote-Akudama.output",
             queue_id: Some("q-2026-05-03-test"),
+            ..Default::default()
         };
         let v = build_workload_done_json(&ev);
         assert_eq!(v["tag"], "workload-done");
         assert_eq!(v["data"]["queue_id"], "q-2026-05-03-test");
+    }
+
+    /// A run torn down because `workload run` re-used its label must be
+    /// distinguishable from the run that replaced it. Same label, same
+    /// log path, `killed=true`, arriving a moment before the new run
+    /// starts — without the markers the main loop would have no way to
+    /// tell it is not the NEW run's completion.
+    #[test]
+    fn build_workload_done_replaced_carries_the_replace_markers() {
+        let ev = WorkloadDoneEvent {
+            label: "media-promote",
+            exit_code: -15,
+            killed: true,
+            log_path: "/tmp/claude-workloads/media-promote.output",
+            queue_id: Some("q-2026-08-22-old0"),
+            reason: Some("replaced"),
+            replaced_by: Some("2026-08-22T11:04:07"),
+            carried_over_queue_id: None,
+        };
+        let v = build_workload_done_json(&ev);
+
+        assert_eq!(v["data"]["killed"], true);
+        assert_eq!(v["data"]["reason"], "replaced");
+        assert_eq!(v["data"]["replaced_by"], "2026-08-22T11:04:07");
+        // The dying run's own item IS terminal here, so it is named.
+        assert_eq!(v["data"]["queue_id"], "q-2026-08-22-old0");
+        assert!(v["data"].get("carried_over_queue_id").is_none());
+        let msg = v["message"].as_str().unwrap();
+        assert!(
+            msg.contains("replaced") && msg.contains("2026-08-22T11:04:07"),
+            "the one-liner must say REPLACED and name the new run: {msg}"
+        );
+    }
+
+    /// When the replacing run was handed the SAME `--queue-id`, the item
+    /// belongs to the new run: it must NOT be presented as this (dead)
+    /// run's queue item, or a consumer correlating on `data.queue_id`
+    /// would read a live item as abandoned.
+    #[test]
+    fn build_workload_done_replaced_moves_a_carried_over_qid_out_of_queue_id() {
+        let ev = WorkloadDoneEvent {
+            label: "media-promote",
+            exit_code: -15,
+            killed: true,
+            log_path: "/tmp/claude-workloads/media-promote.output",
+            queue_id: None,
+            reason: Some("replaced"),
+            replaced_by: Some("2026-08-22T11:04:07"),
+            carried_over_queue_id: Some("q-2026-08-22-same"),
+        };
+        let v = build_workload_done_json(&ev);
+
+        assert!(
+            v["data"].get("queue_id").is_none(),
+            "a carried-over item must never appear as the dead run's queue_id"
+        );
+        assert_eq!(v["data"]["carried_over_queue_id"], "q-2026-08-22-same");
+    }
+
+    /// Nothing changes for the paths that are not a replace: no stray
+    /// keys in `data`, no reworded message.
+    #[test]
+    fn build_workload_done_plain_paths_carry_no_replace_keys() {
+        for (killed, rc) in [(false, 0), (true, -15)] {
+            let ev = WorkloadDoneEvent {
+                label: "plain",
+                exit_code: rc,
+                killed,
+                log_path: "/tmp/claude-workloads/plain.output",
+                ..Default::default()
+            };
+            let v = build_workload_done_json(&ev);
+            for key in ["reason", "replaced_by", "carried_over_queue_id"] {
+                assert!(
+                    v["data"].get(key).is_none(),
+                    "{key} must be absent on a non-replace completion"
+                );
+            }
+        }
     }
 
     #[test]
@@ -807,6 +933,7 @@ mod tests {
             killed: false,
             log_path: "/tmp/claude-workloads/translate-book.output",
             queue_id: None,
+            ..Default::default()
         };
         emit_workload_done(&ev);
 

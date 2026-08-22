@@ -16,7 +16,6 @@
 #     pre-created uid-1000-owned by the Dockerfile so the in-container
 #     daemon (uid 1000) writes them without root or runtime mkdir.
 #   - auto_update / reauth / hybrid hooks disabled (host integrations).
-#   - task_watch disabled (no in-container `tasks` session yet).
 # Phase 1e (q-2026-05-11-8a96).
 
 [general]
@@ -271,8 +270,30 @@ relaunch_command = ["cwsr", "--no-upgrade"]
 enabled = false
 
 [task_watch]
-# Disabled — no in-container `tasks` session yet.
-enabled = false
+# ENABLED. The original "no in-container `tasks` session yet" note went stale:
+# the image pre-creates /var/run/claude/workload-state uid-1000-owned so
+# `workload run` works, and `workload run` / `claude-watch task init` create
+# the `tasks` session in the container's own tmux server.
+#
+# `enabled` also decides what pane 0 of that session RUNS. With `false`,
+# `task init` put the LEGACY `task-watch daemon` there — a Python CLI that is
+# not in this image. The pane command exited instantly, tmux destroyed the
+# only pane, and the session was gone microseconds after `task init` printed
+# "Session 'tasks' created, daemon running in pane 0" — so `workload run` /
+# `workload kill` were unusable in the container (operator report,
+# 2026-08-22). With `true`, pane 0 gets claude-watch's keepalive stub
+# (`echo ...; sleep infinity`) and the in-process task-watch loop manages the
+# task panes.
+#
+# `task init` now ALSO falls back to the stub whenever `task-watch` is absent
+# from PATH (src/task_watch.rs::daemon_pane_command), so a missing binary can
+# never silently kill the session again. This flag is the intent; that is the
+# safety net.
+#
+# The loop's TASKS_BASE (/tmp/claude-1000/-home-hndrewaall) matches this
+# image's uid-1000 `hndrewaall` home, so it finds the in-container Claude Code
+# task outputs; with no tasks directory present it just idles.
+enabled = true
 
 [suppression]
 max_consecutive_suppressions = 3
