@@ -1163,7 +1163,10 @@
     // ONE outlined pill `● N agents · C calls · K tok` (live dot; .active
     // info-blue when ≥1 agent, .idle muted, .stale dashed + "n/a" numerals —
     // never a frozen number). The server formats the numerals
-    // (agents_text / calls_text / tok_text). MUST mirror
+    // (agents_text / pill_calls_text / pill_tok_text, plus pill_tok_pre — a
+    // "main" qualifier: with no agent live the pill falls back to the last
+    // window's calls and the MAIN loop's context, since the live sums are
+    // structurally 0 then and 0/0/0 reads as a broken sensor). MUST mirror
     // templates/index.html: this subtree is rebuilt every tick. state.agent_stats
     // is null when the feature is off / snapshot absent (no row). The pill is
     // the popover's toggle (agent-bar.js, delegated): its `open` class +
@@ -1181,9 +1184,10 @@
         `<span class="agent-bar-dot" aria-hidden="true"></span>` +
         `<span class="agent-bar-num agent-bar-agents">${esc(agentStatsPill.agents_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> agents</span><span class="agent-bar-unit agent-bar-unit-short">a</span>` +
         `<span class="agent-bar-sep" aria-hidden="true">·</span>` +
-        `<span class="agent-bar-num agent-bar-calls">${esc(agentStatsPill.calls_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> calls</span><span class="agent-bar-unit agent-bar-unit-short">c</span>` +
+        `<span class="agent-bar-num agent-bar-calls">${esc(agentStatsPill.pill_calls_text ?? agentStatsPill.calls_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> calls</span><span class="agent-bar-unit agent-bar-unit-short">c</span>` +
         `<span class="agent-bar-sep" aria-hidden="true">·</span>` +
-        `<span class="agent-bar-num agent-bar-tok">${esc(agentStatsPill.tok_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>` +
+        (agentStatsPill.pill_tok_pre ? `<span class="agent-bar-pre">${esc(agentStatsPill.pill_tok_pre)} </span>` : '') +
+        `<span class="agent-bar-num agent-bar-tok">${esc(agentStatsPill.pill_tok_text ?? agentStatsPill.tok_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>` +
         `</button>`;
       html += `</div>`; // .count-row-agents
     }

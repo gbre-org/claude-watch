@@ -74,6 +74,13 @@ DEFINITIONS (keep these in sync with queue-minisite/README.md "Agent activity co
   claude-watch's own liveness is mtime-only with a 120s window; ours is wider
   because a single build/test tool call routinely takes minutes and a counter
   that drops an agent mid-build reads as a bug.
+* **window** — every agent whose transcript was written inside
+  ``live_window_secs``, FINISHED ONES INCLUDED, deduped by agent id (one agent
+  can own two paths after a session rollover — see ``Collector.tick``). The
+  ``totals.window_*`` figures and the ``tool_totals`` / ``model_totals``
+  breakdowns are summed over this set; ``totals.agents`` /
+  ``totals.tool_calls`` / … cover only the still-running subset, so they read
+  0 whenever nothing is running.
 * **main loop context tokens** — the latest ``usage`` in the newest top-level
   session transcript (``~/.claude/projects/<slug>/<session>.jsonl``), same sum
   as above. Tail-read only (last 256KB), cached on (mtime, size).
@@ -110,7 +117,16 @@ SNAPSHOT_FILENAME = "agent-stats.json"
 # ``totals.agents_spawned`` (distinct subagent transcripts seen in the live
 # window) so cw-agent-stats can expose ``claude_output_tokens_total{model=}``
 # and ``claude_agent_spawned_count``.
-SNAPSHOT_VERSION = 3
+# v4 (2026-08-22, claude-watch #676): transcripts are DEDUPED BY AGENT ID
+# before anything is counted (a session rollover — e.g. a self-clear — copies a
+# still-running subagent's transcript into the new session dir, so the same
+# agent used to be counted twice, the truncated pre-rollover copy even reading
+# as a second, still-running "ghost" agent for a whole live window), and
+# ``totals`` gained the ``window_*`` figures (tool calls / context / output
+# tokens over every agent seen in the live window, FINISHED ONES INCLUDED) so a
+# consumer can show what the fleet did in the last N minutes instead of only
+# what is running this instant.
+SNAPSHOT_VERSION = 4
 
 # Producer: a transcript not written within this window is not live.
 DEFAULT_LIVE_WINDOW_SECS = 900.0
@@ -540,7 +556,6 @@ class Collector:
     def tick(self, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         cutoff = now - self.live_window_secs
-        live: list[AgentState] = []
         seen_paths: set[str] = set()
 
         for path, st in iter_subagent_transcripts(self.projects_dir):
@@ -554,14 +569,32 @@ class Collector:
                 self.agents[path] = state
             state.refresh(st)
             state.load_meta()
-            if state.finished:
-                continue
-            live.append(state)
 
         # Forget state for transcripts that fell out of the window (bounded memory).
         for path in list(self.agents):
             if path not in seen_paths:
                 del self.agents[path]
+
+        # DEDUPE BY AGENT ID (claude-watch #676). One agent can own SEVERAL
+        # transcript paths: a session rollover (a self-clear, say) starts a new
+        # ``<session>/`` dir and a still-running subagent's transcript
+        # continues there, leaving the pre-rollover copy frozen on disk under
+        # the OLD session id. Both sit inside the live window, so counting by
+        # PATH counted that agent twice — and worse, the frozen copy was cut
+        # mid-flight, so it carries no terminal ``end_turn`` entry and read as
+        # a SECOND, still-running agent (a "ghost" holding the agent's older,
+        # smaller counters) for the rest of the window, while the real,
+        # complete copy was the one dropped as finished. Keep exactly ONE
+        # state per agent id: the most recently written path, tie-broken on
+        # bytes read (the continuation is both newer and longer).
+        by_id: dict[str, AgentState] = {}
+        for path in seen_paths:
+            state = self.agents[path]
+            prev = by_id.get(state.agent_id)
+            if prev is None or (state.mtime, state.offset) > (prev.mtime, prev.offset):
+                by_id[state.agent_id] = state
+        window = list(by_id.values())
+        live = [s for s in window if not s.finished]
 
         live.sort(key=lambda s: s.started_at or "", reverse=False)
         records = [s.to_record(now) for s in live]
@@ -570,19 +603,31 @@ class Collector:
 
         totals = {
             "agents": len(records),
-            # Distinct subagent transcripts observed in the live/recent window
-            # (``seen_paths``: live AND recently-finished) -- a windowed proxy
-            # for "agents spawned", same semantics as tool_totals/model_totals
-            # below (recomputed each tick, not a monotonic lifetime counter).
-            "agents_spawned": len(seen_paths),
+            # Distinct subagents observed in the live/recent window
+            # (``window``: live AND recently-finished, deduped by agent id) --
+            # a windowed proxy for "agents spawned", same semantics as
+            # tool_totals/model_totals below (recomputed each tick, not a
+            # monotonic lifetime counter).
+            "agents_spawned": len(window),
             "tool_calls": sum(r["tool_calls"] for r in records),
             "context_tokens": sum(r["context_tokens"] for r in records),
             "output_tokens": sum(r["output_tokens"] for r in records),
+            # The same three figures over the WHOLE live window -- every agent
+            # in ``window``, finished ones included (claude-watch #676). The
+            # live-only sums above collapse to 0/0/0 the instant the last
+            # agent returns, which is what made the queue-minisite header pill
+            # read "0 agents - 0 calls - 0 tok" through any quiet quarter-hour
+            # and look broken. These stay meaningful for a full live window
+            # and are what a consumer should show once nothing is running.
+            "window_tool_calls": sum(s.tool_calls for s in window),
+            "window_context_tokens": sum(s.context_tokens for s in window),
+            "window_output_tokens": sum(s.output_tokens for s in window),
         }
 
         # Fleet-wide tool/model breakdowns (claude-watch #663) — summed over
-        # every transcript still IN the live window (``seen_paths``: live AND
-        # recently-finished), not just the still-running ``live`` list, so a
+        # every agent still IN the live window (``window``: live AND
+        # recently-finished, deduped by agent id), not just the still-running
+        # ``live`` list, so a
         # tool call doesn't vanish from the totals the instant its agent
         # returns. Same "bounded by the live window" semantics as everything
         # else in this snapshot: these are gauges recomputed each tick, not
@@ -592,8 +637,7 @@ class Collector:
         model_totals: dict[str, int] = {}
         tool_model_totals: dict[str, dict[str, int]] = {}
         model_output_tokens_totals: dict[str, int] = {}
-        for path in seen_paths:
-            state = self.agents[path]
+        for state in window:
             for name, cnt in state.tool_counts.items():
                 tool_totals[name] = tool_totals.get(name, 0) + cnt
             for model, cnt in state.model_counts.items():

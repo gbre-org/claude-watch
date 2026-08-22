@@ -3,10 +3,12 @@
 // The header's TOP half-row (right-aligned, botchat #3090) is one outlined
 // pill — `● N agents · C calls · K tok` (#agent-bar, a <button>) — and THIS
 // file owns the per-agent breakdown behind it (#agent-bar-pop): head "N live agents — C calls · K ctx
-// · O out", a table with one row per live agent (description; type · queue id
-// · last tool; calls / ctx / out / age since spawn) and a footer with the main
-// loop's context size, the snapshot freshness and the host. Same layout as the
-// botchat popover this look is ported from.
+// · O out", a "last 15m" line covering every agent seen in the live window
+// (finished ones included — the head is live-only, so this is what survives an
+// agent returning), a table with one row per live agent (description; type ·
+// queue id · last tool; calls / ctx / out / age since spawn) and a footer with
+// the main loop's context size, the snapshot freshness and the host. Same
+// layout as the botchat popover this look is ported from.
 //
 // Data: the server's `agent_stats` header payload (see app.py
 // _agent_stats_header) — every string pre-formatted server-side (one
@@ -77,6 +79,19 @@
         (data.tok_text || '?') + ' ctx · ' + (data.out_text || '–') + ' out'));
     }
     pop.appendChild(head);
+
+    // Recent-window line: what every agent seen in the live window did,
+    // FINISHED ONES INCLUDED. The head above is live-only, so without this
+    // an idle moment loses every trace of the agents that just returned —
+    // the thing that made the pill's zeros look like a dead feature.
+    const win = data.stale ? null : data.window;
+    if (win) {
+      const sub = el('div', 'abp-window');
+      sub.appendChild(el('span', null, 'last ' + (win.minutes || 15) + 'm'));
+      sub.appendChild(el('span', null, (win.agents_text || '?') + ' agents · ' +
+        (win.calls_text || '?') + ' calls · ' + (win.out_text || '–') + ' out'));
+      pop.appendChild(sub);
+    }
 
     if (rows.length) {
       const table = document.createElement('table');
