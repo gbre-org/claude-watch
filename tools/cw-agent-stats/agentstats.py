@@ -506,6 +506,14 @@ class Collector:
         self.host = host or socket.gethostname()
         self.agents: dict[str, AgentState] = {}
         self._main_cache: tuple[tuple[str, float, int] | None, dict | None] = (None, None)
+        # Bounded-tail AgentState for the main-loop transcript itself (see
+        # ``_main`` below) -- folds the main loop's OWN tool/model usage into
+        # ``tool_totals``/``model_totals`` the same way subagent transcripts
+        # already do. Kept separate from ``self.agents`` (which is keyed by
+        # subagent path and forgotten once a path falls out of the live
+        # window) because the main transcript is a single, open-ended file
+        # that never "falls out of window" the way a finished subagent does.
+        self._main_state: AgentState | None = None
 
     def tick(self, now: float | None = None) -> dict:
         now = time.time() if now is None else now
@@ -567,6 +575,27 @@ class Collector:
                 for model, cnt in per_model.items():
                     dest[model] = dest.get(model, 0) + cnt
 
+        # The main loop's OWN turns (claude-watch #663 follow-up, 2026-08-22):
+        # the loop above only ever walks subagent transcripts, so a solo
+        # operator running the main loop on one model (e.g. Opus) and
+        # subagents on another (e.g. Sonnet, per the "always Sonnet for
+        # subagents" convention) got a ``claude_model_use_total`` that showed
+        # ONLY the subagent model -- the main loop's turns were silently
+        # excluded, not merely undercounted. ``_main`` (below) keeps
+        # ``self._main_state`` fed off the SAME bounded tail window used for
+        # ``main.context_tokens``, through the identical per-entry
+        # tool/model-folding path subagents use, so fold it in here too.
+        main_state = self._main_state
+        if main_state is not None:
+            for name, cnt in main_state.tool_counts.items():
+                tool_totals[name] = tool_totals.get(name, 0) + cnt
+            for model, cnt in main_state.model_counts.items():
+                model_totals[model] = model_totals.get(model, 0) + cnt
+            for name, per_model in main_state.tool_model_counts.items():
+                dest = tool_model_totals.setdefault(name, {})
+                for model, cnt in per_model.items():
+                    dest[model] = dest.get(model, 0) + cnt
+
         return {
             "version": SNAPSHOT_VERSION,
             "host": self.host,
@@ -585,6 +614,7 @@ class Collector:
         found = find_main_transcript(self.projects_dir)
         if found is None:
             self._main_cache = (None, None)
+            self._main_state = None
             return None
         path, st = found
         key = (path, st.st_mtime, st.st_size)
@@ -594,6 +624,23 @@ class Collector:
         else:
             parsed = parse_main_tail(path)
             self._main_cache = (key, parsed)
+
+        # Fold the same bounded tail window through the per-entry tool/model
+        # counters (see the ``_main_state`` comment in ``__init__`` and the
+        # fold-in at the end of ``tick``). Seed a fresh ``AgentState``'s
+        # offset to the tail window the FIRST time this path is seen (or when
+        # the active session rolls over to a new file) so this never re-parses
+        # more than ``MAIN_TAIL_BYTES`` of what can be a many-MB, open-ended
+        # transcript; every tick after that is ``AgentState.refresh``'s normal
+        # incremental read of just the newly appended bytes -- no extra cost
+        # over the read ``parse_main_tail`` above was already doing.
+        main_state = self._main_state
+        if main_state is None or main_state.path != path:
+            main_state = AgentState(path=path, agent_id="main")
+            main_state.offset = max(0, st.st_size - MAIN_TAIL_BYTES)
+            self._main_state = main_state
+        main_state.refresh(st)
+
         if parsed is None:
             return None
         session_id = os.path.splitext(os.path.basename(path))[0]

@@ -191,6 +191,25 @@ const INTERPRETER_COMMS: &[&str] = &[
     "bash", "sh", "dash", "zsh", "ksh", "python", "python3", "perl", "ruby", "env", "stdbuf",
 ];
 
+/// Process-table PROBERS: programs whose argv carries a search pattern
+/// precisely because they are LOOKING for it. A `pgrep -f -- <pattern>`
+/// spawned by a concurrent `watcher-status` (the obligations hook, the
+/// metrics exporter and the cron health check all run one, often at the same
+/// instant) matches our own `pgrep -f -- <pattern>` for the same watcher —
+/// `pgrep` excludes only ITSELF, not a sibling prober. These are never
+/// pollers, whatever the watcher config looks like.
+const PROBER_COMMS: &[&str] = &["pgrep", "pkill", "pidof"];
+
+/// A raw `pgrep -f` hit younger than this (seconds) is NOT counted towards
+/// the DUPLICATE verdict. Every transient prober child (a concurrent
+/// `watcher-status`'s `pgrep`, a `ps | grep`, a shell between fork and exec)
+/// lives for milliseconds; a genuine second poller for one watcher is a
+/// long-lived process, so a 2 s floor loses nothing real. Scoped to the
+/// DUPLICATE decision only — `watcher_run`'s start guard and the restart /
+/// toggle kill paths still see young pollers (a just-started real poller must
+/// still block a second start).
+pub(crate) const DUPLICATE_MIN_AGE_SECS: f64 = 2.0;
+
 /// Get PIDs of `watcher-ctl run <name>` supervisor processes.
 ///
 /// `pgrep -f "watcher-ctl run <name>"` would also pick up the shell wrappers
@@ -369,6 +388,15 @@ pub(crate) fn is_poller_candidate(
     pattern: &str,
     expected: &[String],
 ) -> bool {
+    // A process-table prober (`pgrep -f -- <pattern>` from a concurrent
+    // status run) is never a poller, regardless of what the config lets us
+    // derive. Checked FIRST so the "nothing derivable" fail-open below cannot
+    // let one through.
+    if let Some(c) = comm {
+        if PROBER_COMMS.contains(&c.trim()) {
+            return false;
+        }
+    }
     // Nothing derivable from the config -> no filtering (preserve old
     // behaviour rather than risk a false DOWN).
     if expected.is_empty() {
@@ -376,7 +404,10 @@ pub(crate) fn is_poller_candidate(
     }
     let comm = match comm {
         Some(c) if !c.trim().is_empty() => c.trim(),
-        // Unreadable comm: keep the candidate.
+        // Unreadable comm: keep the candidate. (`poller_pids` has already
+        // dropped candidates that are GONE — see the liveness check there —
+        // so this fail-open covers only a live process whose /proc is
+        // unreadable, e.g. a non-Linux host.)
         _ => return true,
     };
     if comm_matches_expected(comm, expected) {
@@ -405,23 +436,144 @@ pub(crate) fn is_poller_candidate(
 ///     so a phantom match blocks a legitimate start;
 ///   * `watcher_restart` and `watcher_toggle` SIGTERM everything on this list,
 ///     so a phantom match means killing an unrelated process.
+///
+/// Two further exclusions, both about the PROBER rather than the pollers:
+///   * a candidate that is already GONE by the time we look at it (the raw
+///     `pgrep` listed it, but `kill(pid, 0)` now says ESRCH) is dropped. This
+///     is the transient-sibling case: a concurrent `watcher-status`'s own
+///     `pgrep -f -- <pattern>` child carries the pattern in its argv, is
+///     listed by OUR pgrep, and has exited by the time we read its
+///     `/proc/PID/comm` — the old "unreadable comm = keep" fail-open then
+///     counted it as a live poller and reported a phantom DUPLICATE;
+///   * our own process and its ancestors (the shell that ran `watcher-ctl`,
+///     a hook runner, ...) are never pollers of anything.
 pub async fn poller_pids(pattern: &str, start_cmd: Option<&str>) -> Vec<u32> {
     let candidates = process_pids(pattern).await;
     if candidates.is_empty() {
         return candidates;
     }
+    let own_tree = own_process_tree();
     let expected = expected_poller_comms(pattern, start_cmd);
-    if expected.is_empty() {
-        return candidates;
-    }
     candidates
         .into_iter()
         .filter(|pid| {
+            if own_tree.contains(pid) || !pid_is_alive(*pid) {
+                return false;
+            }
             let comm = read_proc_comm(*pid);
             let argv = pid_argv(*pid);
             is_poller_candidate(comm.as_deref(), argv.as_deref(), pattern, &expected)
         })
         .collect()
+}
+
+/// This process's PID plus every ancestor up to (not including) pid 1,
+/// read from `/proc/PID/stat`. Empty chain beyond self when /proc is absent.
+/// Bounded so a corrupt ppid chain can never loop.
+fn own_process_tree() -> Vec<u32> {
+    let mut chain = vec![std::process::id()];
+    let mut cur = std::process::id();
+    for _ in 0..64 {
+        match proc_stat_after_comm(cur).and_then(|f| f.ppid) {
+            Some(ppid) if ppid > 1 && !chain.contains(&ppid) => {
+                chain.push(ppid);
+                cur = ppid;
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// The `/proc/PID/stat` fields we care about, parsed from after the LAST `)`
+/// (comm may contain spaces and parentheses).
+struct ProcStatFields {
+    ppid: Option<u32>,
+    /// Process start time in clock ticks since boot (field 22).
+    starttime_ticks: Option<u64>,
+}
+
+fn proc_stat_after_comm(pid: u32) -> Option<ProcStatFields> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // After `)`: state(0) ppid(1) ... starttime(19).
+    Some(ProcStatFields {
+        ppid: fields.get(1).and_then(|p| p.parse().ok()),
+        starttime_ticks: fields.get(19).and_then(|p| p.parse().ok()),
+    })
+}
+
+/// Seconds since `pid` started, from `/proc/PID/stat` starttime vs
+/// `/proc/uptime`. `None` when either is unreadable (process gone, or no
+/// /proc) — callers treat unknown as "cannot filter".
+fn pid_age_secs(pid: u32) -> Option<f64> {
+    let start_ticks = proc_stat_after_comm(pid)?.starttime_ticks? as f64;
+    let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf is a plain libc query with no memory arguments.
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if clk_tck <= 0 {
+        return None;
+    }
+    let age = uptime - start_ticks / clk_tck as f64;
+    Some(if age < 0.0 { 0.0 } else { age })
+}
+
+/// What the DUPLICATE filter needs to know about one raw pid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PidFacts {
+    /// `kill(pid, 0)` says the process exists right now.
+    pub alive: bool,
+    /// Seconds since the process started; `None` = unknown (cannot filter).
+    pub age_secs: Option<f64>,
+}
+
+/// Pure decision: which of `pids` are STABLE enough to count towards a
+/// DUPLICATE verdict?
+///
+/// Drops (a) anything in `own_tree` (the prober itself and its ancestors),
+/// (b) anything no longer alive, and (c) anything younger than
+/// `min_age_secs` — a transient prober child (a concurrent status run's
+/// `pgrep`, a shell mid-fork) is gone within milliseconds, whereas a real
+/// second poller for one watcher has been running for seconds to days. An
+/// unknown age is kept (we can only ever remove what we can positively
+/// identify as transient). Order is preserved.
+pub(crate) fn stable_duplicate_pids(
+    pids: &[u32],
+    own_tree: &[u32],
+    min_age_secs: f64,
+    facts: impl Fn(u32) -> PidFacts,
+) -> Vec<u32> {
+    pids.iter()
+        .copied()
+        .filter(|pid| {
+            if own_tree.contains(pid) {
+                return false;
+            }
+            let f = facts(*pid);
+            if !f.alive {
+                return false;
+            }
+            match f.age_secs {
+                Some(age) => age >= min_age_secs,
+                None => true,
+            }
+        })
+        .collect()
+}
+
+/// [`stable_duplicate_pids`] against the live process table.
+fn stable_duplicate_pids_live(pids: &[u32]) -> Vec<u32> {
+    let own_tree = own_process_tree();
+    stable_duplicate_pids(pids, &own_tree, DUPLICATE_MIN_AGE_SECS, |pid| PidFacts {
+        alive: pid_is_alive(pid),
+        age_secs: pid_age_secs(pid),
+    })
 }
 
 /// Read `/proc/PID/comm`, trimmed. `None` on any I/O error.
@@ -583,13 +735,22 @@ pub async fn watcher_status_with(
         // Duplicate detection is orthogonal to UP/DOWN and still uses pgrep.
         // Multiple live pollers matching the pattern, or multiple supervisor
         // wrappers, indicate a state-cleanliness problem the human should fix.
-        let dup_pollers = if pollers.len() > 1 {
-            pollers.clone()
+        //
+        // Only STABLE pids count: alive, not our own process tree, and older
+        // than `DUPLICATE_MIN_AGE_SECS`. A raw pgrep hit that is a concurrent
+        // status run's own `pgrep` child (argv carries the same pattern) or
+        // any other fork-and-exit transient would otherwise read as a second
+        // poller — a phantom DUPLICATE that the obligations gate turned into
+        // a refused tool call. Two long-lived pollers still trip it.
+        let stable_pollers = stable_duplicate_pids_live(&pollers);
+        let dup_pollers = if stable_pollers.len() > 1 {
+            stable_pollers
         } else {
             Vec::new()
         };
-        let dup_supervisors = if supervisors.len() > 1 {
-            supervisors
+        let stable_supervisors = stable_duplicate_pids_live(&supervisors);
+        let dup_supervisors = if stable_supervisors.len() > 1 {
+            stable_supervisors
         } else {
             Vec::new()
         };
@@ -1998,6 +2159,97 @@ mod tests {
         assert!(is_poller_candidate(Some("anything"), None, "--tag dm", &[]));
         // Interpreter comm with an unreadable argv is also kept.
         assert!(is_poller_candidate(Some("bash"), None, "bin/claude-event-watch", &e));
+    }
+
+    #[test]
+    fn test_is_poller_candidate_rejects_process_table_probers() {
+        // A concurrent `watcher-status`'s `pgrep -f -- <pattern>` carries the
+        // pattern in its argv and is listed by OUR pgrep (pgrep excludes only
+        // itself). It is never a poller — even when the config yields nothing
+        // derivable and the filter would otherwise fail open.
+        let e = comms("--tag group", Some("signal-wait --tag group --quiet 12"));
+        for prober in ["pgrep", "pkill", "pidof"] {
+            assert!(
+                !is_poller_candidate(
+                    Some(prober),
+                    Some(&argv(&[prober, "-f", "--", "--tag group"])),
+                    "--tag group",
+                    &e
+                ),
+                "{} must never count as a poller",
+                prober
+            );
+            assert!(
+                !is_poller_candidate(Some(prober), None, "--tag group", &[]),
+                "{} must be rejected even with nothing derivable from config",
+                prober
+            );
+        }
+    }
+
+    // --- DUPLICATE transient filter ----------------------------------------
+    //
+    // 2026-08-22: the `watchers_healthy` gate refused tool calls with three
+    // watchers at once reading DUPLICATE, each listing the real poller plus a
+    // fresh consecutive pid that was gone a second later. Those pids were a
+    // concurrent status run's own `pgrep` children (argv carries the same
+    // pattern), kept by the unreadable-comm fail-open because they had
+    // already exited. Only STABLE pids may count towards DUPLICATE.
+
+    fn facts_table(table: &[(u32, bool, Option<f64>)]) -> impl Fn(u32) -> PidFacts + '_ {
+        move |pid| {
+            table
+                .iter()
+                .find(|(p, _, _)| *p == pid)
+                .map(|(_, alive, age)| PidFacts { alive: *alive, age_secs: *age })
+                .unwrap_or(PidFacts { alive: false, age_secs: None })
+        }
+    }
+
+    #[test]
+    fn test_stable_duplicate_pids_drops_own_tree_dead_and_young() {
+        let table = [
+            (100, true, Some(86400.0)),  // the real, long-lived poller
+            (200, true, Some(0.01)),     // concurrent prober's pgrep, still alive
+            (300, false, None),          // transient, already gone
+            (400, true, Some(3600.0)),   // OUR ancestor shell (in own_tree)
+            (500, true, Some(1.99)),     // just under the floor
+        ];
+        let own_tree = [std::process::id(), 400];
+        let kept = stable_duplicate_pids(
+            &[100, 200, 300, 400, 500],
+            &own_tree,
+            DUPLICATE_MIN_AGE_SECS,
+            facts_table(&table),
+        );
+        assert_eq!(
+            kept,
+            vec![100],
+            "only the long-lived live poller may count; transients, dead pids \
+             and our own process tree must be filtered"
+        );
+        // One stable poller -> no DUPLICATE (caller requires len > 1).
+        assert!(kept.len() <= 1);
+    }
+
+    #[test]
+    fn test_stable_duplicate_pids_keeps_two_real_pollers() {
+        // Two long-lived pollers for one watcher is the genuine DUPLICATE
+        // case and MUST survive the filter.
+        let table = [(100, true, Some(86400.0)), (101, true, Some(2.0))];
+        let kept =
+            stable_duplicate_pids(&[100, 101], &[std::process::id()], DUPLICATE_MIN_AGE_SECS, facts_table(&table));
+        assert_eq!(kept, vec![100, 101]);
+        assert!(kept.len() > 1, "two stable pollers must still read as DUPLICATE");
+    }
+
+    #[test]
+    fn test_stable_duplicate_pids_unknown_age_is_kept() {
+        // Unknown age (no /proc) must not hide a live duplicate — we can only
+        // remove what we can positively identify as transient.
+        let table = [(100, true, None), (101, true, None)];
+        let kept = stable_duplicate_pids(&[100, 101], &[], DUPLICATE_MIN_AGE_SECS, facts_table(&table));
+        assert_eq!(kept, vec![100, 101]);
     }
 
     // --- restart descendant reaping ---------------------------------------
@@ -3469,6 +3721,119 @@ mod tests {
         // Cleanup.
         let _ = child.start_kill();
         let _ = child.wait().await;
+    }
+
+    /// REGRESSION (phantom DUPLICATE from concurrent status runs, 2026-08-22):
+    /// several `watcher_status` calls running at the same instant — as the
+    /// obligations gate, the metrics exporter and the cron health check do on
+    /// a real host — each spawn `pgrep -f -- <pattern>` children whose argv
+    /// carries the pattern. Run A's pgrep lists run B's pgrep; by the time A
+    /// reads its `/proc/PID/comm` it has exited, and the unreadable-comm
+    /// fail-open counted it as a second live poller. ONE real poller under
+    /// concurrent probing must read `ok` on every call, never DUPLICATE.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_watcher_status_concurrent_probes_are_not_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+
+        // A real poller whose argv[0] IS the pattern (matchable by pgrep) and
+        // whose PID is recorded in <name>.lock (so UP/DOWN reads UP).
+        let sentinel = unique_token("dupstat");
+        let script = make_poller_script(dir.path(), &sentinel, "30");
+        std::fs::write(&cfg, format!("dups|{}|1|true|{}\n", sentinel, script)).unwrap();
+        let mut child = tokio::process::Command::new(&script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn live poller");
+        let live_pid = child.id().expect("child pid");
+        std::fs::write(pid_dir.join("dups.lock"), live_pid.to_string()).unwrap();
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+        let cfg_s = config_path();
+        let extra = config_path_extra();
+
+        // Many rounds of several concurrent status calls. Each call's pgrep
+        // fan is what the other calls' pgrep fans see in the process table.
+        for _round in 0..6 {
+            let mut joins = Vec::new();
+            for _ in 0..4 {
+                let c = cfg_s.clone();
+                let e = extra.clone();
+                joins.push(tokio::spawn(async move {
+                    watcher_status_with(&c, e.as_deref(), 120.0).await
+                }));
+            }
+            for j in joins {
+                let statuses = j.await.expect("status task");
+                let s = statuses.iter().find(|s| s.name == "dups").expect("dups row");
+                assert_eq!(
+                    s.status, "ok",
+                    "one real poller under concurrent probing must never read \
+                     DUPLICATE (a sibling probe's pgrep is not a poller) — got {:?}",
+                    s
+                );
+                assert!(s.dup_pollers.is_empty(), "no duplicate pollers: {:?}", s);
+            }
+        }
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    /// Positive companion: two GENUINE long-lived pollers for one watcher
+    /// must still read DUPLICATE once they are older than the transient floor
+    /// — the filter removes probes, not real duplicates.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_watcher_status_two_real_pollers_are_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.path().join("watchers.conf");
+
+        let sentinel = unique_token("dupreal");
+        let script = make_poller_script(dir.path(), &sentinel, "30");
+        std::fs::write(&cfg, format!("dupr|{}|1|true|{}\n", sentinel, script)).unwrap();
+        let spawn = || {
+            tokio::process::Command::new(&script)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn poller")
+        };
+        let mut a = spawn();
+        let mut b = spawn();
+        let pid_a = a.id().unwrap();
+        let pid_b = b.id().unwrap();
+        std::fs::write(pid_dir.join("dupr.lock"), pid_a.to_string()).unwrap();
+
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), cfg.to_str().unwrap());
+
+        // Fresh pollers are under the transient floor: the status must NOT
+        // flag them yet (this is exactly the window a probe child lives in).
+        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let s = statuses.iter().find(|s| s.name == "dupr").unwrap();
+        assert_eq!(s.status, "ok", "pollers younger than the floor are not yet DUPLICATE: {:?}", s);
+
+        // Let them age past the floor; a real duplicate is long-lived.
+        tokio::time::sleep(std::time::Duration::from_secs_f64(DUPLICATE_MIN_AGE_SECS + 0.5)).await;
+        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let s = statuses.iter().find(|s| s.name == "dupr").unwrap();
+        assert_eq!(s.status, "DUPLICATE", "two long-lived pollers must read DUPLICATE: {:?}", s);
+        let mut dups = s.dup_pollers.clone();
+        dups.sort_unstable();
+        let mut want = vec![pid_a, pid_b];
+        want.sort_unstable();
+        assert_eq!(dups, want, "both real pollers listed");
+
+        let _ = a.start_kill();
+        let _ = b.start_kill();
+        let _ = a.wait().await;
+        let _ = b.wait().await;
     }
 
     /// Negative companion: a STALE `<name>.lock` (recorded PID dead) with no
