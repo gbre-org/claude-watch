@@ -1912,9 +1912,9 @@ def _shape(
         # the session's subagent transcripts, then build the REAL tree via
         # the authoritative agent_id -> queue_id bindings. See
         # ``_build_subagent_tree`` for the attribution rules (drop the
-        # self-nested owner, collapse retry-attempts, surface genuine
-        # children). The dir walk is cheap (running items are few) and
-        # fail-soft.
+        # self-nested owner, nest genuine spawn descendants, render NOTHING
+        # for agents we cannot attribute rather than guessing). The dir walk
+        # is cheap (running items are few) and fail-soft.
         session_subagents: list[dict[str, Any]] = []
         parent_map: dict[str, str] = {}
         owner_agent_id = owner.get("agent_id") or ""
@@ -3226,6 +3226,68 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
     return best[1] if best else None
 
 
+def _agent_transcripts(agent_id: str) -> list[Path]:
+    """Every on-disk transcript for ``agent_id``, oldest-modified FIRST.
+
+    ``_find_agent_jsonl`` returns only the most-recently-modified match,
+    which is the right answer for "tail this agent's live log". It is the
+    WRONG answer for "what was this agent asked to do", because ONE agent
+    can own SEVERAL ``agent-<id>.jsonl`` files: when the parent main-loop
+    session is cleared/restarted while a subagent is still running, the
+    agent keeps writing under the NEW session id, so its transcript
+    CONTINUES as a fresh file that starts MID-STREAM — no ``role: user``
+    first message, and therefore no ``Queue item: q-XXXX`` spawn marker.
+    The marker (and the spawn records that reconstruct the parent->child
+    graph) live in the PRE-clear file.
+
+    So this returns ALL matches across every session dir of the mount,
+    sorted oldest-first, and callers that need the spawn prompt walk them
+    in that order (the original spawn is in the oldest file).
+
+    Same one-level vs two-level shape tolerance as ``_find_agent_jsonl``
+    — see that docstring; shape (2) is only walked when shape (1) matched
+    nothing, so the gomorrah fast path stays fast. Returns ``[]`` on a
+    bad id (path-traversal guard) or when nothing matches.
+    """
+    if not re.match(r"^[a-z0-9-]{4,64}$", agent_id):
+        return []
+    root = Path(AGENTS_JSONL_ROOT)
+    if not root.is_dir():
+        return []
+    needle = f"agent-{agent_id}.jsonl"
+    found: list[tuple[float, Path]] = []
+
+    def _consider(candidate: Path) -> None:
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            return
+        found.append((mtime, candidate))
+
+    try:
+        top_dirs = list(root.iterdir())
+    except OSError:
+        return []
+
+    # Shape (1): <root>/<session-uuid>/subagents/agent-<id>.jsonl.
+    for entry in top_dirs:
+        _consider(entry / "subagents" / needle)
+    if not found:
+        # Shape (2): <root>/<project-slug>/<session-uuid>/subagents/...
+        for project in top_dirs:
+            if not project.is_dir():
+                continue
+            try:
+                session_dirs = list(project.iterdir())
+            except OSError:
+                continue
+            for session in session_dirs:
+                _consider(session / "subagents" / needle)
+
+    found.sort(key=lambda t: t[0])  # oldest first — the spawn prompt is there
+    return [path for _mtime, path in found]
+
+
 def _find_parent_session_jsonl(session_id: str) -> Path | None:
     """Locate the parent session JSONL under AGENTS_JSONL_ROOT.
 
@@ -3385,6 +3447,51 @@ def _first_user_text(path: Path) -> str:
     return ""
 
 
+def _agent_first_user_text(agent_id: str, primary: Path) -> str:
+    """First-user text for ``agent_id``, looking ACROSS its transcripts.
+
+    ``primary`` is the transcript found in the session dir being rendered.
+    Usually that file starts with the agent's spawn prompt and this is just
+    ``_first_user_text(primary)``.
+
+    It is NOT when the main-loop session was cleared/restarted while the
+    agent was still running: the agent's transcript then CONTINUES as a new
+    ``agent-<id>.jsonl`` under the NEW session id, beginning mid-stream with
+    tool records — no ``role: user`` message, so no ``Queue item: q-XXXX``
+    marker. Reading only that file loses the agent's attribution, which is
+    exactly how three unrelated running items each rendered the other two
+    items' owner agents as their children (2026-08-22).
+
+    So when ``primary`` yields no marker we walk the agent's OTHER
+    transcripts oldest-first (``_agent_transcripts``) and take the first one
+    that DOES carry a marker. Falling back, in order: ``primary``'s own text
+    (a label without a marker is still a good label), then the oldest
+    non-empty text we saw. Returns "" when no transcript has a user message.
+    """
+    text = _first_user_text(primary)
+    if _QUEUE_MARKER_RE.search(text):
+        return text
+    try:
+        primary_key = primary.resolve()
+    except OSError:
+        primary_key = primary
+    fallback = text
+    for path in _agent_transcripts(agent_id):
+        try:
+            if path.resolve() == primary_key:
+                continue
+        except OSError:
+            continue
+        other = _first_user_text(path)
+        if not other:
+            continue
+        if _QUEUE_MARKER_RE.search(other):
+            return other
+        if not fallback:
+            fallback = other
+    return fallback
+
+
 def _session_subagent_dirs(session_id: str) -> list[Path]:
     """Resolve a session's ``subagents/`` dir(s) across both mount shapes.
 
@@ -3449,10 +3556,17 @@ def _session_subagent_parent_map(session_id: str) -> dict[str, str]:
             if not m:
                 continue
             parent_id = m.group(1)
-            for child_id in _launched_children(entry):
-                if child_id == parent_id:
-                    continue  # never self-parent
-                out.setdefault(child_id, parent_id)
+            # Scan EVERY transcript this agent owns, not just the one in
+            # this session dir: a spawn that happened before a main-loop
+            # clear/restart is recorded in the PRE-clear file, so reading
+            # only the post-clear continuation would lose the edge (and with
+            # it the nesting) for every agent that outlived a clear.
+            paths = _agent_transcripts(parent_id) or [entry]
+            for path in paths:
+                for child_id in _launched_children(path):
+                    if child_id == parent_id:
+                        continue  # never self-parent
+                    out.setdefault(child_id, parent_id)
     return out
 
 
@@ -3558,13 +3672,19 @@ def _list_session_subagents(session_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for sid, (mtime, path) in best.items():
         age_seconds = max(0.0, now - mtime)
-        first_user = _first_user_text(path)
+        # Resolve the spawn prompt ACROSS the agent's transcripts, not just
+        # the one in this session dir: after a main-loop clear/restart a
+        # still-running agent continues into a NEW session file that starts
+        # mid-stream (no user message, no marker), and its attribution lives
+        # in the pre-clear file. See ``_agent_first_user_text``.
+        first_user = _agent_first_user_text(sid, path)
         label = first_user or sid
         # Attribute the subagent to its owning queue item by parsing the
         # ``Queue item: q-XXXX`` marker the main loop seeds into every
         # spawn prompt (the same first-user text used for the label).
-        # Empty string when the transcript predates / omits the marker;
-        # ``_shape`` only filters when at least one sibling carries one.
+        # Empty string when the transcript predates / omits the marker, in
+        # which case ``_build_subagent_tree`` renders NO node for it rather
+        # than guessing (an unattributed agent is not evidence of kinship).
         m = _QUEUE_MARKER_RE.search(first_user)
         out.append(
             {
@@ -3661,10 +3781,13 @@ def _build_subagent_tree(
         the recursive template has a uniform shape to walk. Peers are flat
         (always ``[]``); only genuine spawn-children nest.
 
-    Fail-soft fallback: when NO subagent has either a binding or a parsed
-    marker (pre-arm-hook transcripts), keep the prior unfiltered behaviour
-    rather than render a silently-empty tree — but STILL drop the owner so
-    the self-nesting bug can't resurface even in fallback mode.
+    NO-ATTRIBUTION CASE: when neither bindings nor transcript markers
+    resolve for any sibling, the result is the owner's spawn descendants
+    only — and an EMPTY list when there are none. We do NOT fall back to
+    "every sibling in the session": those siblings are simply the other
+    agents of the same main-loop session, and rendering them as this item's
+    children invents a relationship the data never recorded (see the inline
+    note at the top of the body for the incident this replaced).
     """
     pmap = parent_map or {}
 
@@ -3675,24 +3798,20 @@ def _build_subagent_tree(
             return b
         return sa.get("queue_id", "") or ""
 
-    # Did ANY sibling carry an attributable owning-item signal?
-    have_attribution = any(_auth_qid(sa) for sa in session_subagents)
-
-    if not have_attribution:
-        # Pre-arm-hook fallback: no bindings + no markers anywhere. Keep the
-        # session list but still drop the owner (it's the item, not a child)
-        # so we never re-introduce the self-nest. Annotate children=[] for
-        # the recursive renderer.
-        nodes: list[dict[str, Any]] = []
-        for sa in session_subagents:
-            if sa.get("subagent_id") == owner_agent_id:
-                continue
-            node = dict(sa)
-            node.setdefault("queue_id", "")
-            node["kind"] = node.get("kind", "child")
-            node["children"] = []
-            nodes.append(node)
-        return nodes
+    # NOTE: there is deliberately NO "no attribution anywhere" fallback. The
+    # code here used to fall back to "every sibling in the session, minus the
+    # owner" when neither bindings nor markers resolved, on the theory that a
+    # rough tree beat an empty one. It does not: a session's subagents/ dir
+    # holds EVERY agent of that main-loop session, so the fallback rendered
+    # unrelated items' agents as this item's children. Three concurrently
+    # running items each showed "Subagents (2)" listing the OTHER two items'
+    # owner agents (2026-08-22) after the bindings file turned out to be
+    # absent on that host AND a mid-flight session clear left every
+    # transcript starting mid-stream with no spawn marker. The paths below
+    # degrade honestly instead: with no attribution the peer filter matches
+    # nothing, and only REAL spawn edges (``parent_map``, which is evidence,
+    # not inference) still nest. An empty tree is the correct rendering of
+    # "we cannot tell".
 
     # Authoritative path. The subagent tree is the REAL spawn graph rooted at
     # the owner agent, walked to ARBITRARY DEPTH. ``parent_map`` (pmap) is the
