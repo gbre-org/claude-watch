@@ -1211,8 +1211,12 @@ fn setup_notify_watcher(
 /// each entry containing a `pane_id`. Tests can override the path via the
 /// `CLAUDE_WATCH_WORKLOAD_STATE` env var (default:
 /// `/var/run/claude/workload-state/state.json`). The default must stay
-/// in sync with `workload::WORKLOAD_DIR` — the two are read-only mirrors
-/// of the same on-disk file.
+/// in sync with `workload::WORKLOAD_DIR` — the two are mirrors of the
+/// same on-disk file, and `workload::state_file` honours the SAME
+/// override for exactly that reason: `--recreate --force` decides what
+/// to kill through this mirror and then tears it down through the
+/// `workload` side, so a divergence would kill a different set of
+/// workloads than the one it warned about.
 fn workload_state_path() -> PathBuf {
     if let Ok(p) = std::env::var("CLAUDE_WATCH_WORKLOAD_STATE") {
         if !p.is_empty() {
@@ -1267,33 +1271,27 @@ fn load_workload_pane_ids() -> std::collections::HashSet<String> {
 
 /// Get the list of running workloads by reading workload state and intersecting
 /// with the currently alive panes in the tasks session.
+///
+/// The intersection itself is `workload::select_running_labels` — the same
+/// pure selector the teardown iterates, so the labels this warns about are
+/// exactly the labels that get killed. Default-open: a missing or malformed
+/// registry yields an empty list rather than blocking the recreate.
 async fn get_running_workloads(session: &str) -> Vec<String> {
     let path = workload_state_path();
     let content = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let state: serde_json::Value = match serde_json::from_str(&content) {
+    let state: crate::workload::WorkloadState = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let obj = match state.as_object() {
-        Some(o) => o,
-        None => return Vec::new(),
-    };
-    let alive = get_alive_panes(session).await;
-    let mut running = Vec::new();
-    for (label, info) in obj {
-        let pane_id = info
-            .get("pane_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !pane_id.is_empty() && alive.contains(&pane_id) {
-            running.push(label.clone());
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "workload state malformed; treating as empty");
+            return Vec::new();
         }
-    }
-    running
+    };
+    let alive: std::collections::BTreeSet<String> =
+        get_alive_panes(session).await.into_iter().collect();
+    crate::workload::select_running_labels(&state, &alive)
 }
 
 /// Check if claude-watch's task_watch loop is handling the daemon.
@@ -1311,13 +1309,35 @@ fn claude_watch_handles_daemon() -> bool {
 ///   are running workloads.
 /// - When claude-watch handles the daemon loop, pane 0 gets a stub command
 ///   (`echo ...; sleep infinity`) instead of `task-watch daemon`.
+///
+/// **`--recreate --force` is TREE-WIDE.** Destroying the session with a
+/// bare `tmux kill-session` only hangs up the pane SHELLS: every running
+/// workload runs its payload under `setsid --wait` (and, on the PTY
+/// path, under `script(1)`, which opens a session again), so the real
+/// command sits two sessions below its pane and used to survive the
+/// recreate as an orphan — still burning CPU, still writing to a
+/// `.output` file nothing was tailing any more, and with no
+/// `workload-done` event ever emitted, so its queue item stayed
+/// `running` forever. Each doomed workload now goes through the same
+/// teardown `workload kill` uses (`workload::kill_workloads`) BEFORE the
+/// session is destroyed: exactly-one `workload-done` with
+/// `killed=true`, snapshot -> SIGTERM pids+pgids -> `grace` ->
+/// re-snapshot -> SIGKILL -> verify.
+///
+/// Returns the process exit code: `1` when `--recreate` is refused for
+/// want of `--force`, [`crate::workload::KILL_SURVIVORS_EXIT`] when the
+/// teardown could not be fully accounted for — something outlived the
+/// SIGKILL sweep, or a workload named by the gate had vanished from the
+/// registry before we could tear it down. The session is recreated
+/// either way; what is refused is calling that outcome clean. Else `0`.
 pub async fn cmd_task_init(
     session: &str,
     show_all: bool,
     detach: bool,
     recreate: bool,
     force: bool,
-) {
+    kill_grace_secs: Option<f64>,
+) -> i32 {
     let all_flag = if show_all { " --all" } else { "" };
 
     // Clean orphaned grouped sessions (tasks-N from previous inits)
@@ -1338,6 +1358,7 @@ pub async fn cmd_task_init(
         format!("task-watch daemon{}", all_flag)
     };
 
+    let mut rc = 0;
     if session_exists(session).await {
         if recreate {
             // --recreate: destroy and rebuild; --force required if workloads are running
@@ -1358,6 +1379,30 @@ pub async fn cmd_task_init(
                     running.len(),
                     running.join(", ")
                 );
+                // TREE-WIDE teardown BEFORE the session goes away. See
+                // this function's doc comment: `tmux kill-session` alone
+                // leaves every payload tree orphaned and emits nothing.
+                // Blocking work (a SIGTERM grace window, /proc walks) so
+                // it runs off the async runtime's worker thread.
+                let grace = crate::workload::resolve_kill_grace(kill_grace_secs);
+                let labels = running.clone();
+                let outcomes =
+                    tokio::task::spawn_blocking(move || crate::workload::kill_workloads(&labels, grace))
+                        .await
+                        .unwrap_or_else(|e| {
+                            // A panic in the teardown must not silently
+                            // become "recreated cleanly" — say so, and
+                            // fail the command.
+                            warn!(error = %e, "workload teardown task failed before recreate");
+                            Vec::new()
+                        });
+                let mut survivors = false;
+                for outcome in &outcomes {
+                    survivors |= crate::workload::report_kill_outcome(outcome);
+                }
+                if outcomes.len() != running.len() || survivors {
+                    rc = crate::workload::KILL_SURVIVORS_EXIT;
+                }
             }
             let _ = run_cmd(&["tmux", "kill-session", "-t", session], 5).await;
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1444,6 +1489,7 @@ pub async fn cmd_task_init(
             println!("Attach with: tmux attach -t {}", session);
         }
     }
+    rc
 }
 
 // ---- Standalone (state-file-backed) CLI subcommands ----

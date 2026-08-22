@@ -221,6 +221,51 @@ survived SIGKILL** (it names the pids; inspect with
 > driver script kept going under the reparented session, and eleven render
 > processes had to be `pkill`ed by hand.
 
+#### Destroying the whole session: `task init --recreate --force`
+
+```
+claude-watch task init --recreate --force [--grace SECS]
+```
+
+`--recreate` tears the `tasks` tmux session down and rebuilds it, so it
+destroys every workload pane at once. `--force` is required while any
+workload is running, and the labels it is about to kill are named on stdout
+first.
+
+**It runs the same tree-wide teardown, once per running workload, before it
+destroys the session.** A bare `tmux kill-session` only hangs up the pane
+*shells* — it has exactly the blind spot `workload kill` used to have, and at
+N-workloads scale: every payload sits two sessions below its pane (`setsid`,
+then `script`), so each one was reparented to pid 1 and kept running after the
+session was gone, still burning CPU, still appending to a `.output` file
+nothing was tailing, with no `workload-done` event ever emitted and its queue
+item stuck in `running` forever.
+
+So a recreate now, for each workload whose pane is still alive:
+
+1. emits its `workload-done` with `killed=true` — **exactly once** — and
+   transitions its queue item to `abandoned`, before touching any process;
+2. runs the identical snapshot -> SIGTERM (pids + pgids) -> grace ->
+   re-snapshot -> SIGKILL -> verify sequence described above;
+3. closes the pane and drops the label from the registry.
+
+`--grace SECS` is the same budget as `workload kill --grace` and honours the
+same `WORKLOAD_KILL_GRACE_SECS` env override; it applies to each workload's
+teardown. Survivors are named on stderr and **`task init` exits `3`** — as
+does a workload that vanished from the registry mid-teardown, i.e. anything
+the recreate cannot account for. The session is recreated either way; what
+exit `3` refuses is calling that outcome clean, because "recreated" must not
+be allowed to mean "and something is still running". Exit `1` is the
+pre-existing refusal when workloads are running and `--force` was not passed.
+
+> Exactly-once, concretely: the killer drops a `<label>.kill-emitted`
+> sentinel next to the other workload artifacts when it emits. The wrapper
+> returns from `setsid --wait` the instant its payload dies and can reach its
+> own `workload emit-done` before the pane is destroyed; that call consumes
+> the sentinel and declines to emit, so one killed run produces one
+> completion rather than a `killed=true` event followed by a `killed=false`
+> one. `workload run` clears the sentinel when the label starts again.
+
 ## Schema (v2)
 
 ```json

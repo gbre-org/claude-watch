@@ -586,6 +586,12 @@ enum TaskAction {
         /// Allow --recreate even with running workloads
         #[arg(long)]
         force: bool,
+        /// SIGTERM -> SIGKILL grace, in seconds, for the workload
+        /// teardown `--recreate --force` runs before destroying the
+        /// session. Same budget (and same env override,
+        /// WORKLOAD_KILL_GRACE_SECS) as `workload kill --grace`.
+        #[arg(long)]
+        grace: Option<f64>,
     },
     /// List tracked tasks
     #[command(alias = "ls")]
@@ -1529,10 +1535,8 @@ async fn run_task(action: TaskAction) -> i32 {
             detach,
             recreate,
             force,
-        } => {
-            task_watch::cmd_task_init(session, all, detach, recreate, force).await;
-            0
-        }
+            grace,
+        } => task_watch::cmd_task_init(session, all, detach, recreate, force, grace).await,
         TaskAction::List { json } => {
             task_watch::cmd_task_list(session, json).await;
             0
