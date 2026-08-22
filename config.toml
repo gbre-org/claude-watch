@@ -724,6 +724,19 @@ enabled = true
 # operator-editable file (~/.config/claude-container/claude-watch.override.toml)
 # so cadence can be retuned live, with no image rebuild. See src/config.rs
 # `config_layer_paths` / `config_layers_mtime`.
+#
+# RELOAD SEMANTICS -- a reload does NOT re-arm the cadence timers. Only a
+# genuine daemon START fires the immediate startup keepalive + memory-reminder;
+# a reload (SIGHUP or an auto-detected file edit) carries the last-fired
+# instants across the config swap and applies only the changed intervals. So:
+#   * saving the file N times inside an interval emits NOTHING;
+#   * SHORTENING an interval measures the next fire from the real last
+#     emission, so it can be due immediately -- but only once, and because the
+#     interval changed, not because of the save;
+#   * LENGTHENING one pushes the next fire out from that same last emission.
+# Before this was fixed (2026-08-22), a reload rebuilt the tracker from a
+# cold-start state and every save emitted a full set of events: seven
+# memory-reminders landed in 52 seconds against a 30-minute interval.
 
 # --- Event-watcher health check (cw-watcher-health-check cron) --------------
 # CONSUMED BY THE cw-watcher-health-check CRON SCRIPT, not the claude-watch
