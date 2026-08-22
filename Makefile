@@ -32,7 +32,7 @@
 .PHONY: test-personal-mcp-install test-ttyd-paste-handler test-ttyd-lock-toggle
 # Build / install / host-deploy targets
 .PHONY: build install install-hooks install-skills install-cron deploy deploy-systemd
-.PHONY: install-mcp-host-bash-server
+.PHONY: install-mcp-host-bash-server install-cw-agent-stats-launchd
 # Container / compose targets
 .PHONY: bootstrap compose-build compose-up compose-down
 .PHONY: container-build deploy-container redeploy sync-main-clone
@@ -648,6 +648,24 @@ install-hooks: ## Point core.hooksPath at scripts/git-hooks (pre-commit gate)
 # cli-mcp-server + mcp-proxy-auth-shim chain. See that crate's Makefile.
 install-mcp-host-bash-server: ## Build + install the host-bash MCP server to ~/bin
 	$(MAKE) -C crates/mcp-host-bash-server install
+
+# Install + (re)start the cw-agent-stats macOS LaunchAgent: the host producer
+# that folds live Claude Code subagent transcripts into the agent tool-call /
+# token snapshot the botchat header badge + queue-minisite dashboard read.
+# Moved here from claude-config/botchat (was org.gbre.claude-watch.botchat-
+# agent-stats, installed by hand) so claude-watch owns its own producer's
+# install lifecycle. ProgramArguments[0] in the plist points directly at the
+# shebang'd tools/cw-agent-stats/cw-agent-stats script (never a bare python
+# interpreter -- see the plist's own header comment). Idempotent: bootout is
+# best-effort (no-op if not yet loaded), then bootstrap + kickstart -k always
+# leaves exactly one fresh instance running.
+install-cw-agent-stats-launchd: ## Install + kickstart the cw-agent-stats LaunchAgent (host producer)
+	@mkdir -p $(HOME)/Library/LaunchAgents
+	@cp tools/cw-agent-stats/org.gbre.claude-watch.cw-agent-stats.plist $(HOME)/Library/LaunchAgents/
+	@launchctl bootout gui/$$(id -u)/org.gbre.claude-watch.cw-agent-stats 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/org.gbre.claude-watch.cw-agent-stats.plist
+	@launchctl kickstart -k gui/$$(id -u)/org.gbre.claude-watch.cw-agent-stats
+	@echo "Installed + started org.gbre.claude-watch.cw-agent-stats (tools/cw-agent-stats/cw-agent-stats)"
 
 ##@ Container image + compose stack
 

@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  org.gbre.claude-watch.cw-agent-stats — host producer for the queue-minisite
+  / botchat live agent tool-call + token counters (claude-watch #655, botchat
+  #2955/#2956). Writes the agent-stats.json snapshot atomically every ~4s
+  (--loop --duration 58 --interval 4, fired once a minute) by folding the
+  appended tail of ~/.claude/projects/*/*/subagents/agent-*.jsonl transcripts.
+
+  Formerly org.gbre.claude-watch.botchat-agent-stats, installed from
+  claude-config and running botchat/bin/botchat-agent-stats. Moved so the
+  producer's install/ownership lives in claude-watch (which now owns this
+  plist + the `install-cw-agent-stats-launchd` Makefile target) instead of
+  botchat -- claude-watch's own dashboard tooling shouldn't need botchat
+  checked out just to install its producers. The --out path below is
+  UNCHANGED from the prior plist so the queue-minisite needs no redeploy.
+
+  Must run on the HOST (not in-container): needs direct read access to
+  ~/.claude/projects and RW access to the botchat data dir, neither of which
+  the container has writable (~/repos is RO in claude-container).
+
+  Namespace: org.gbre.claude-watch.* is the namespace for claude-watch's own
+  plists (see claude-config launchagents/README.md rule 4 and memory
+  feedback_claude_watch_plist_namespace).
+
+  ProgramArguments[0] points DIRECTLY at the shebang'd
+  (`#!/usr/bin/env python3`), descriptively-named, extension-less
+  cw-agent-stats script -- NEVER a bare `python`/`python3` interpreter
+  fronting it -- so macOS Background Task Management attributes the "can run
+  in the background" notification to the friendly name "cw-agent-stats"
+  instead of the anonymous, unqualified "python" (see launchagents/README.md
+  rule 3 in claude-config for the anti-pattern this avoids).
+
+  Install (or `make install-cw-agent-stats-launchd` from the repo root):
+    cp tools/cw-agent-stats/org.gbre.claude-watch.cw-agent-stats.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/org.gbre.claude-watch.cw-agent-stats.plist
+
+  Run now (test):
+    launchctl kickstart -k gui/$(id -u)/org.gbre.claude-watch.cw-agent-stats
+
+  Dismantle:
+    launchctl bootout gui/$(id -u)/org.gbre.claude-watch.cw-agent-stats 2>/dev/null || true
+    rm ~/Library/LaunchAgents/org.gbre.claude-watch.cw-agent-stats.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.gbre.claude-watch.cw-agent-stats</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/hallandrew/repos/claude-watch/tools/cw-agent-stats/cw-agent-stats</string>
+        <string>--loop</string>
+        <string>--duration</string>
+        <string>58</string>
+        <string>--interval</string>
+        <string>4</string>
+        <string>--out</string>
+        <string>/Users/hallandrew/repos/botchat-data/agent-stats.json</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/hallandrew/bin:/usr/sbin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/hallandrew</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/hallandrew/Library/Logs/cw-agent-stats.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hallandrew/Library/Logs/cw-agent-stats.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
