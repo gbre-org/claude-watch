@@ -36,10 +36,11 @@ fn prom_file_path() -> PathBuf {
 
 /// Live-process snapshot collected at metrics-emission time.
 ///
-/// Mirrors the four counts in `claude-watch status`'s "Claude Code" section:
+/// Mirrors the counts in `claude-watch status`'s "Claude Code" section:
 /// active agents, running tasks (workloads), live + enabled watcher counts,
-/// and open bashes. Singletons — there's only one Claude Code on this host.
-/// Kept as a plain struct so `build_metrics` stays a pure function (no I/O).
+/// live monitors, and open bashes. Singletons — there's only one Claude Code
+/// on this host. Kept as a plain struct so `build_metrics` stays a pure
+/// function (no I/O).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LiveCounts {
     /// Live subagent PIDs (children of the Claude PID, watchers/own-cmds excluded).
@@ -51,6 +52,12 @@ pub struct LiveCounts {
     pub live_watchers: u32,
     /// Number of enabled watchers (config rows with `enabled=true`).
     pub enabled_watchers: u32,
+    /// Number of monitor-mode watchers whose Monitor task is live (a live
+    /// pid; ARMING excluded) — `watcher::WatcherStatus::is_monitor_live`.
+    /// Stands in for "live Claude Code Monitor tasks": Claude Code exposes
+    /// no generic Monitor-task list, and these watchers' processes ARE the
+    /// Monitor tasks' commands.
+    pub live_monitors: u32,
     /// Open-bash count parsed from Claude Code's status bar.
     pub open_bashes: u32,
 }
@@ -570,7 +577,7 @@ fn build_metrics(
             reminder_to_update_count
         ),
         "".to_string(),
-        // Claude Code live-process counts — the four numbers exposed by
+        // Claude Code live-process counts — the numbers exposed by
         // `claude-watch status`'s top section. Singleton gauges (no
         // session_id label) because there's only one Claude Code on this
         // host. Names use the `claude_code_*` prefix to make ownership
@@ -590,6 +597,10 @@ fn build_metrics(
         "# HELP claude_code_enabled_watchers Number of watchers enabled in watchers.conf".to_string(),
         "# TYPE claude_code_enabled_watchers gauge".to_string(),
         format!("claude_code_enabled_watchers {}", live.enabled_watchers),
+        "".to_string(),
+        "# HELP claude_code_live_monitors Number of live Claude Code Monitor tasks (monitor-mode watchers with a live pid; ARMING excluded)".to_string(),
+        "# TYPE claude_code_live_monitors gauge".to_string(),
+        format!("claude_code_live_monitors {}", live.live_monitors),
         "".to_string(),
         "# HELP claude_code_open_bashes Number of open background-bash slots in Claude Code".to_string(),
         "# TYPE claude_code_open_bashes gauge".to_string(),
@@ -738,6 +749,10 @@ async fn collect_live_counts() -> LiveCounts {
     // — monitor-aware (ARMING counts as live, a lock-only monitor-mode
     // watcher counts as live) so the gauge cannot drift from the CLI.
     let (live_watchers, enabled_watchers) = watcher::count_live_and_enabled(&watchers);
+    // Live Monitor tasks: monitor-mode watchers with a live pid. Same
+    // reduction as `claude-watch status` "Live monitors"; ARMING (command
+    // handed to the main loop, no process yet) is deliberately NOT counted.
+    let live_monitors = watcher::count_live_monitors(&watchers);
 
     // open_bashes: prefer a fresh status-bar parse. If that fails (no pane
     // visible, parser miss, etc.), fall back to 0 — the existing
@@ -758,6 +773,7 @@ async fn collect_live_counts() -> LiveCounts {
         running_tasks: agents.workloads.len() as u32,
         live_watchers,
         enabled_watchers,
+        live_monitors,
         open_bashes,
     }
 }
@@ -2545,7 +2561,7 @@ mod tests {
 
     #[test]
     fn build_metrics_live_counts_zero_default() {
-        // LiveCounts::default() means all five gauges emit 0.
+        // LiveCounts::default() means all six gauges emit 0.
         let state = json!({});
         let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
         let joined = lines.join("\n");
@@ -2554,6 +2570,7 @@ mod tests {
             "claude_code_running_tasks",
             "claude_code_live_watchers",
             "claude_code_enabled_watchers",
+            "claude_code_live_monitors",
             "claude_code_open_bashes",
         ] {
             let needle = format!("{} 0", name);
@@ -2575,6 +2592,7 @@ mod tests {
             running_tasks: 1,
             live_watchers: 3,
             enabled_watchers: 3,
+            live_monitors: 5,
             open_bashes: 4,
         };
         let lines = build_metrics(&state, "x", "y", &live, None, None);
@@ -2583,7 +2601,12 @@ mod tests {
         assert!(joined.contains("claude_code_running_tasks 1"), "{joined}");
         assert!(joined.contains("claude_code_live_watchers 3"), "{joined}");
         assert!(joined.contains("claude_code_enabled_watchers 3"), "{joined}");
+        assert!(joined.contains("claude_code_live_monitors 5"), "{joined}");
         assert!(joined.contains("claude_code_open_bashes 4"), "{joined}");
+        assert!(
+            joined.lines().any(|l| l == "# TYPE claude_code_live_monitors gauge"),
+            "{joined}"
+        );
     }
 
     #[test]
