@@ -106,14 +106,30 @@ node-exporter `--collector.textfile.directory`); else
 disables it. All values are windowed gauges (the whole file is rewritten each
 tick), not monotonic counters.
 
+**Missing textfile-collector directory (fresh host):** the Prometheus output
+is optional — the JSON snapshot is the thing the queue-minisite actually
+needs. If `--prom-file` / `$CW_AGENT_STATS_PROM_FILE` /
+`$CLAUDE_WATCH_PROM_FILE` were never set and the resulting HARDCODED default
+directory (`/var/lib/node-exporter/textfile/`) doesn't exist — e.g. a fresh
+host that hasn't installed node-exporter's textfile collector yet — the tool
+does NOT try to create that system directory. It prints one warning to
+stderr per run and skips just the prom write; the JSON snapshot (`--out`)
+is still written every tick and the exit code stays 0. Once you point
+`--prom-file` (or either env var) at a path explicitly, that path's
+directory IS auto-created (`mkdir -p`) and a real write failure there is a
+hard error (exit 1), same as always — explicit means opted in.
+
 ## Running it
 
 ```sh
 # one tick, inspect
 cw-agent-stats --once --print --no-write --no-prom
 
-# the cron shape: ~4s freshness, no daemon to babysit (Linux)
-* * * * *  USER  flock -n /tmp/cw-agent-stats.lock ~/bin/cw-agent-stats --loop --duration 58 --interval 4 2>&1 | logger -t cw-agent-stats
+# the cron shape: ~4s freshness, no daemon to babysit (Linux). The canonical
+# in-repo form is the commented-out row in cron.d/cw-host (rendered by
+# scripts/install-host-cron.sh — uncomment it there to enable); the
+# equivalent by hand:
+* * * * *  USER  /usr/bin/flock -n /tmp/cw-agent-stats.lock ~/bin/cw-agent-stats --loop --duration 58 --interval 4 2>&1 | logger -t cw-agent-stats
 
 # macOS: the LaunchAgent
 make install-cw-agent-stats-launchd
@@ -121,7 +137,9 @@ make install-cw-agent-stats-launchd
 
 `make install` symlinks `~/bin/cw-agent-stats` at this script. Pass `--out`
 explicitly in the cron/plist if the consumer reads from anywhere other than
-the state dir. Exit codes: 0 ok; 2 bad args; 1 a file could not be written.
+the state dir. Exit codes: 0 ok (including the prom-dir-missing degrade
+above); 2 bad args; 1 a file could not be written (snapshot, or an
+explicitly-configured prom path).
 
 ## Tests
 

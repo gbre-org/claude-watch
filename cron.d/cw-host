@@ -121,3 +121,17 @@ PATH=/usr/local/bin:/usr/bin:/bin:@CW_HOME@/bin
 # so it is a bare command name resolved off the PATH set above. Thresholds are
 # overridable via ROTATE_* env vars (see `session-task queue rotate --help`).
 #17 4 * * *  @CW_USER@ session-task queue rotate > /dev/null 2>&1
+#
+# Agent activity snapshot producer: every-minute run of `cw-agent-stats
+# --loop`, the live per-agent tool-call / token counters the queue-minisite
+# header pills and Prometheus gauges read (tools/cw-agent-stats/README.md).
+# Commented like the two watchdogs above -- not every deployment runs
+# queue-minisite, so this must not appear on a host that didn't ask for it.
+# `--loop --duration 58 --interval 4` gives ~4s freshness inside the one
+# minute tick with no separate daemon to babysit; `flock -n` guards against
+# an overlapping minute if one tick ever runs long (harmless anyway, since
+# the snapshot write is an atomic replace, but pointless double work).
+# Bare `cw-agent-stats` resolves off the PATH set above (@CW_HOME@/bin after
+# `make install`), same as the session-task row -- NOT @CW_BIN@, which is
+# the Rust daemon, not this Python script.
+#* * * * *  @CW_USER@ /usr/bin/flock -n /tmp/cw-agent-stats.lock cw-agent-stats --loop --duration 58 --interval 4 2>&1 | logger -t cw-agent-stats

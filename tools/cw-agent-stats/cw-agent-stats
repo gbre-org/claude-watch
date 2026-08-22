@@ -283,10 +283,22 @@ def main(argv=None) -> int:
 
     out = args.out or _default_out()
     prom_file = args.prom_file or _default_prom_file()
+    # Only the HARDCODED fallback (no --prom-file, no CW_AGENT_STATS_PROM_FILE,
+    # no CLAUDE_WATCH_PROM_FILE) degrades sanely when its directory is missing
+    # -- see the "prom dir missing" handling below. An operator who explicitly
+    # named a path (flag or env) is opting in, so a missing parent there still
+    # gets auto-created (mkdir(parents=True) in _write_prom) and any failure
+    # is a real error, same as always.
+    prom_file_is_hardcoded_default = (
+        args.prom_file is None
+        and not os.environ.get("CW_AGENT_STATS_PROM_FILE", "").strip()
+        and not os.environ.get("CLAUDE_WATCH_PROM_FILE", "").strip()
+    )
     collector = agentstats.Collector(projects_dir=args.projects_dir, live_window_secs=args.live_window)
 
     deadline = time.monotonic() + args.duration if args.loop else None
     rc = 0
+    prom_dir_missing_warned = False
     while True:
         t0 = time.monotonic()
         snap = collector.tick()
@@ -296,7 +308,24 @@ def main(argv=None) -> int:
             except OSError as e:
                 print(f"cw-agent-stats: cannot write {out}: {e}", file=sys.stderr)
                 rc = 1
-        if not args.no_prom:
+        if not args.no_prom and prom_file_is_hardcoded_default and not prom_file.parent.is_dir():
+            # Fresh host, no node-exporter textfile collector configured (or
+            # not installed at all yet): the DEFAULT prom path's directory
+            # doesn't exist. Don't force it into existence (this is a system
+            # dir owned by the node-exporter package, not ours to create) and
+            # don't fail the whole tick over an optional output -- warn once
+            # per run and keep writing the snapshot JSON every tick.
+            if not prom_dir_missing_warned:
+                print(
+                    f"cw-agent-stats: {prom_file.parent} does not exist -- skipping "
+                    "Prometheus textfile output (still writing the JSON snapshot). "
+                    "Install node-exporter's textfile collector, or set "
+                    "CW_AGENT_STATS_PROM_FILE / CLAUDE_WATCH_PROM_FILE / --prom-file "
+                    "to enable it.",
+                    file=sys.stderr,
+                )
+                prom_dir_missing_warned = True
+        elif not args.no_prom:
             try:
                 _write_prom(_prom_lines(snap), prom_file)
             except OSError as e:

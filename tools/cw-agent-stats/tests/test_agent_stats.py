@@ -552,6 +552,58 @@ def test_default_prom_file_precedence(cli, monkeypatch):
     assert cli._default_prom_file() == Path("/x/y.prom")
 
 
+def test_prom_write_skips_missing_hardcoded_default_dir(cli, monkeypatch, projects, tmp_path, capsys):
+    """Fresh host: no --prom-file / CW_AGENT_STATS_PROM_FILE / CLAUDE_WATCH_PROM_FILE,
+    and the hardcoded default's directory (normally
+    /var/lib/node-exporter/textfile/) doesn't exist yet. The tool must NOT
+    try to create that system directory, must still write the JSON snapshot,
+    must warn exactly once, and must exit 0 -- this is a sane degrade, not a
+    failure."""
+    out = tmp_path / "state" / "agent-stats.json"
+    missing_prom = tmp_path / "no-such-textfile-dir" / "claude_agent_stats.prom"
+    monkeypatch.setattr(cli, "_default_prom_file", lambda: missing_prom)
+
+    rc = cli.main(["--once", "--out", str(out), "--projects-dir", str(projects)])
+
+    assert rc == 0
+    assert out.is_file()
+    assert not missing_prom.parent.exists()   # never auto-created
+    err = capsys.readouterr().err
+    assert str(missing_prom.parent) in err
+    assert "skip" in err.lower()
+
+
+def test_prom_write_warns_once_per_run_not_per_tick(cli, monkeypatch, projects, tmp_path, capsys):
+    """The missing-dir warning must not spam once per --loop tick."""
+    out = tmp_path / "state" / "agent-stats.json"
+    missing_prom = tmp_path / "no-such-textfile-dir" / "claude_agent_stats.prom"
+    monkeypatch.setattr(cli, "_default_prom_file", lambda: missing_prom)
+
+    rc = cli.main([
+        "--loop", "--duration", "0.5", "--interval", "0.15",
+        "--out", str(out), "--projects-dir", str(projects),
+    ])
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert err.count(str(missing_prom.parent)) == 1
+
+
+def test_prom_write_still_auto_creates_dir_when_explicit(cli, monkeypatch, projects, tmp_path):
+    """An explicitly-configured prom path (flag or env) is opt-in: its
+    directory IS auto-created, unlike the hardcoded default above."""
+    out = tmp_path / "state" / "agent-stats.json"
+    explicit_prom = tmp_path / "explicit-dir" / "claude_agent_stats.prom"
+
+    rc = cli.main([
+        "--once", "--out", str(out), "--prom-file", str(explicit_prom),
+        "--projects-dir", str(projects),
+    ])
+
+    assert rc == 0
+    assert explicit_prom.is_file()
+
+
 def test_prom_lines_render_gauges(cli, projects):
     snap = agentstats.Collector(projects_dir=projects, host="h").tick()
     lines = cli._prom_lines(snap)
