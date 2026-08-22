@@ -44,11 +44,23 @@
 #     than `no_binding_grace_secs` so the event always leads.
 #
 # Owner attribution note: the exporter + queue-minisite resolve a running
-# item's owner from claude-watch active-agents.json AND the arm-hook
-# agent-queue-bindings.json (queue_id -> agent_id, written synchronously at
-# spawn). A bound item is treated as OWNED even during active-agents poll
-# lag, so has_live_owner=0 fires only for GENUINELY owner-less items -- the
+# item's owner through the SAME three-step ladder -- (1) an active-agents
+# record keyed on this queue id, (2) the item's register-time `agent_id`
+# stamp from `session-task queue register`, (3) the arm-hook
+# agent-queue-bindings.json binding (queue_id -> agent_id, written
+# synchronously at spawn). Steps 2 and 3 name an owner that was definitively
+# spawned, so such an item is treated as OWNED even during active-agents poll
+# lag, and has_live_owner=0 fires only for GENUINELY owner-less items -- the
 # never-spawned / died-after-spawn cases WorkQueueOrphaned is meant to catch.
+# Liveness is ALWAYS active-agents' `alive` flag, never a pid: subagents share
+# the parent Claude Code PID and container-spawned agents have no resolvable
+# pid at all.
+#
+# When the exporter cannot READ its owner inputs (a container missing a bind
+# mount) every running item looks ownerless. Rather than page the whole queue,
+# the exporter goes SILENT on has_live_owner and publishes
+# worktask_queue_owner_input_available=0 -- which WorkQueueOwnerInputMissing
+# below is the alert for. Do not read the orphan metric's silence as health.
 #
 # Metric provenance:
 #   worktask_queue_*  -> exporters/work-queue-exporter/work_queue_exporter.py
@@ -178,6 +190,31 @@ groups:
             claude-watch is not publishing active-agents.json, so owner
             liveness (WorkQueueOrphaned) is blind. Check the active-agents
             cron / daemon.
+
+      # WorkQueueOwnerInputMissing -- the exporter cannot READ one of the two
+      # files it attributes owners from (active-agents.json, or the arm-hook
+      # agent-queue-bindings.json). In a container that is almost always a
+      # missing bind mount. This is the alert that has to carry the alarm,
+      # because when BOTH inputs are unreadable the exporter deliberately goes
+      # SILENT on worktask_queue_item_has_live_owner: an unmounted path makes
+      # every running item look ownerless, and paging the whole queue as
+      # orphaned would be a deployment fault wearing an incident's clothes.
+      # `for: 10m` rides out a state-file rewrite / a restart.
+      - alert: WorkQueueOwnerInputMissing
+        expr: worktask_queue_owner_input_available == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "work-queue-exporter cannot read owner input {{ $labels.input }}"
+          description: >-
+            worktask_queue_owner_input_available{input="{{ $labels.input }}"}
+            has been 0 for >10m -- the work-queue-exporter cannot read that
+            owner-attribution file (missing, unreadable, or malformed). Owner
+            attribution is degraded; if BOTH inputs read 0 the exporter
+            suppresses has_live_owner entirely and WorkQueueOrphaned is blind.
+            Check the exporter's bind mounts / AGENT_STATE_JSON /
+            AGENT_QUEUE_BINDINGS_JSON, and its log for the path it named.
 
   - name: claude-watch-events
     rules:

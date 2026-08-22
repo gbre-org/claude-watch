@@ -21,12 +21,27 @@ Scenarios covered:
       jsonl_age_seconds).
   (7) ready_age + status counts still emit normally regardless of
       agent state.
+  (23) container-spawned agent: no pid, owner named only by the
+      register-time `agent_id` stamp, active-agents record keyed under
+      a DIFFERENT qid -> has_live_owner=1 with agent_id populated;
+      stale stamped owner -> 0; unresolved stamp -> presumed alive;
+      the stamp outranks a disagreeing arm-hook binding.
+  (24) in-flight tool call (alive=true with a 443s transcript, the
+      post-#690 shape) -> has_live_owner=1; liveness is read from
+      `alive`, never re-derived from the transcript age and never
+      from a pid.
+  (25) BOTH owner inputs unreadable (a container missing its bind
+      mounts) -> loud warning naming each path + env var,
+      worktask_queue_owner_input_available=0 for each, and
+      has_live_owner ABSENT rather than 0 for every running item.
+      One readable input is enough to keep the orphan fallback live.
 
 Run:  python3 test_work_queue_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
 """
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -952,6 +967,234 @@ def run_scenarios():
     )
     check("S22 no false empty-agent orphan series", v_empty is None,
           "expected None, got " + repr(v_empty))
+
+    # ---- Scenario 23: container-spawned agent -- register-time agent_id
+    # stamp, NO pid on the item, active-agents record keyed under a
+    # DIFFERENT qid. This is the shape that produced the reported bug:
+    # has_live_owner=0 with agent_id="" for an agent the minisite showed
+    # alive. The stamp is the minisite's step-2 owner signal and the
+    # exporter now honours it too.
+    print("\nScenario 23: register-time agent_id stamp -> owned (container agent)")
+
+    # 23a: stamped owner, live record under another qid -> 1 with agent_id.
+    stale_iso = (datetime.now(timezone.utc) - timedelta(seconds=1200)).isoformat()
+    item = make_running_item("q-stamp23", "container agent, stamped owner")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    item["pid"] = None  # container-spawned: no resolvable pid, by design
+    item["agent_id"] = "agent-c23"
+    item["agent_id_source"] = "register"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-c23", "queue_id": "q-orig23",
+        "alive": True, "jsonl_age_seconds": 12,
+    }])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23", "agent_id": "agent-c23"},
+    )
+    check("S23a stamped live owner has_live_owner == 1", v == 1.0, "got " + repr(v))
+    age = find_sample(
+        mod, "worktask_queue_item_agent_jsonl_age_seconds",
+        {"id": "q-stamp23", "agent_id": "agent-c23"},
+    )
+    check("S23a stamped owner jsonl_age emitted", age == 12.0, "got " + repr(age))
+    v_empty = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23", "agent_id": ""},
+    )
+    check("S23a no false empty-agent orphan series", v_empty is None,
+          "expected None, got " + repr(v_empty))
+
+    # 23b: stamped owner whose record went stale -> genuine orphan, WITH id.
+    item = make_running_item("q-stamp23b", "stamped owner died")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    item["agent_id"] = "agent-c23b"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-c23b", "queue_id": "q-orig23b",
+        "alive": False, "jsonl_age_seconds": 1500,
+    }])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23b", "agent_id": "agent-c23b"},
+    )
+    check("S23b stale stamped owner has_live_owner == 0", v == 0.0,
+          "got " + repr(v))
+
+    # 23c: stamped owner absent from active-agents -> presume alive (1).
+    item = make_running_item("q-stamp23c", "stamped owner unresolved")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    item["agent_id"] = "agent-c23c"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23c", "agent_id": "agent-c23c"},
+    )
+    check("S23c unresolved stamped owner presumed alive == 1", v == 1.0,
+          "got " + repr(v))
+
+    # 23d: stamp BEATS a disagreeing binding (minisite precedence order).
+    bpath = os.path.join(tmpdir, "bindings-s23d.json")
+    item = make_running_item("q-stamp23d", "stamp beats binding")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    item["agent_id"] = "agent-stamped23d"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [
+        {"agent_id": "agent-stamped23d", "queue_id": "q-o1",
+         "alive": True, "jsonl_age_seconds": 5},
+        {"agent_id": "agent-bound23d", "queue_id": "q-o2",
+         "alive": False, "jsonl_age_seconds": 1500},
+    ])
+    write_bindings(bpath, {"q-stamp23d": "agent-bound23d"})
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": bpath})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23d", "agent_id": "agent-stamped23d"},
+    )
+    check("S23d stamp wins over binding (== 1)", v == 1.0, "got " + repr(v))
+    v_bound = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-stamp23d", "agent_id": "agent-bound23d"},
+    )
+    check("S23d binding-derived series not emitted", v_bound is None,
+          "expected None, got " + repr(v_bound))
+
+    # ---- Scenario 24: liveness comes from `alive`, NOT transcript age.
+    # Post-#690 an agent inside one long foreground tool call publishes
+    # alive=true with a many-minute-old transcript (in_flight_tool_use).
+    # The exporter must mirror `alive` and never re-derive it from the age.
+    print("\nScenario 24: in-flight tool call (old transcript, alive=true) -> owned")
+    item = make_running_item("q-inflight24", "agent inside a long tool call")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "agent-i24", "queue_id": "q-inflight24",
+        "alive": True, "jsonl_age_seconds": 443, "in_flight_tool_use": True,
+    }])
+    mod = load_exporter(env)
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-inflight24", "agent_id": "agent-i24"},
+    )
+    check("S24 in-flight agent has_live_owner == 1", v == 1.0, "got " + repr(v))
+    age = find_sample(
+        mod, "worktask_queue_item_agent_jsonl_age_seconds",
+        {"id": "q-inflight24", "agent_id": "agent-i24"},
+    )
+    check("S24 stale transcript age still exported", age == 443.0,
+          "got " + repr(age))
+
+    # ---- Scenario 25: owner inputs ABSENT -> warning + metric absent, not 0.
+    # A container that never got its bind mounts sees neither input. Every
+    # running item then looks ownerless, and the old code flagged the whole
+    # queue orphaned. Now: has_live_owner is ABSENT, both
+    # owner_input_available series read 0, and a WARNING names each path.
+    print("\nScenario 25: both owner inputs missing -> warn + suppress orphan gauge")
+    missing_bindings = os.path.join(tmpdir, "no-such-bindings.json")
+    item = make_running_item("q-noinput25", "stale item, no owner inputs")
+    item["registered_at"] = stale_iso
+    item["started_at"] = stale_iso
+    item["last_heartbeat_at"] = stale_iso
+    write_queue(qjson, [item])
+    if os.path.exists(astate):
+        os.remove(astate)
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": missing_bindings})
+    warnings = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                warnings.append(record.getMessage())
+
+    mod.log.addHandler(_Capture())
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-noinput25")
+    check(
+        "S25 has_live_owner ABSENT (not 0) with no owner inputs",
+        v is None,
+        "expected None, got " + repr(v),
+    )
+    st = find_sample(
+        mod, "worktask_queue_owner_input_available", {"input": "agent_state"},
+    )
+    check("S25 owner_input_available{agent_state} == 0", st == 0.0,
+          "got " + repr(st))
+    bd = find_sample(
+        mod, "worktask_queue_owner_input_available",
+        {"input": "agent_queue_bindings"},
+    )
+    check("S25 owner_input_available{agent_queue_bindings} == 0", bd == 0.0,
+          "got " + repr(bd))
+    check(
+        "S25 loud warning names both inputs",
+        sum("OWNER-ATTRIBUTION INPUT" in w for w in warnings) == 2,
+        "warnings=" + repr(warnings),
+    )
+    check(
+        "S25 warning names the state path",
+        any(astate in w for w in warnings),
+        "warnings=" + repr(warnings),
+    )
+    # Repeat scrape: state unchanged -> no NEW warnings (loud once, not spam).
+    before = len(warnings)
+    mod.collect()
+    check("S25 repeat scrape does not re-warn", len(warnings) == before,
+          "warnings grew to " + repr(warnings))
+
+    # 25b: ONE input readable is enough -- the orphan fallback still works.
+    print("\nScenario 25b: agent-state readable, bindings missing -> orphan still fires")
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": missing_bindings})
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-noinput25", "agent_id": ""},
+    )
+    check("S25b orphan still detected with one readable input", v == 0.0,
+          "got " + repr(v))
+    st = find_sample(
+        mod, "worktask_queue_owner_input_available", {"input": "agent_state"},
+    )
+    check("S25b owner_input_available{agent_state} == 1", st == 1.0,
+          "got " + repr(st))
+
+    # 25c: MALFORMED agent state + missing bindings -> same suppression.
+    print("\nScenario 25c: malformed agent state -> treated as no signal")
+    with open(astate, "w") as f:
+        f.write("{not json at all")
+    write_queue(qjson, [item])
+    mod = load_exporter({**env, "AGENT_QUEUE_BINDINGS_JSON": missing_bindings})
+    mod.collect()
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-noinput25")
+    check("S25c malformed state -> has_live_owner absent", v is None,
+          "expected None, got " + repr(v))
+    st = find_sample(
+        mod, "worktask_queue_owner_input_available", {"input": "agent_state"},
+    )
+    check("S25c owner_input_available{agent_state} == 0 on malformed", st == 0.0,
+          "got " + repr(st))
+    # Restore a good state file for anything appended after this point.
+    write_agent_state(astate, [])
 
     print()
     if failures:
