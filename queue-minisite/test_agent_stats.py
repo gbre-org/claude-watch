@@ -7,7 +7,7 @@ onto the RUNNING rows and renders:
 
 * per running row, in the item HEAD (so compact density keeps it): a cell
   with ``11 calls · 82K tok`` (comfortable) / ``11·82Kt`` (compact);
-* in the header: the bottom half-row is ONE outlined rounded pill —
+* in the header: the TOP half-row (right-aligned, #3090) is ONE outlined rounded pill —
   ``● N agents · C calls · K tok`` — botchat's topbar agent-bar look
   (botchat #3066): live dot, info-blue while ≥1 agent is live (``.active``),
   muted when none (``.idle``), dashed + ``n/a`` numerals when stale
@@ -318,7 +318,7 @@ class AgentStatsTest(unittest.TestCase):
         # The unmatched running row renders NO cell.
         art_b = self._article(html, "q-2026-08-21-bbbb")
         self.assertNotIn("agent-stats", art_b)
-        # Header: the bottom half-row is ONE outlined pill — a <button> with
+        # Header: the top half-row (right-aligned) is ONE outlined pill — a <button> with
         # the live dot, three numerals + long/short units, in the ACTIVE
         # state (≥1 live agent) — botchat's agent-bar look (#3066).
         meta = self._meta(html)
@@ -404,10 +404,12 @@ class AgentStatsTest(unittest.TestCase):
         self.assertIn(".dot-ok  { color: var(--ok); border-color: var(--ok); }", self.css)
         self.assertIn(".dot-err { color: var(--critical); border-color: var(--critical); }", self.css)
 
-    def test_header_is_two_stacked_rows_status_over_agent_bar(self):
-        """botchat #2983 + #3066: the header count pills are TWO stacked
-        half-height rows inside one .count-stack — status pills on top, the
-        agent-bar pill below — and both rows are hard-nowrap (flex-wrap +
+    def test_header_is_two_stacked_rows_agent_bar_over_status(self):
+        """botchat #2983 + #3066 + #3090: the header count pills are TWO
+        stacked half-height rows inside one .count-stack — the agent-bar pill
+        on TOP, right-aligned within the stack (#3090: "make the agent line
+        the top one, and make it right aligned"), the status pills below,
+        left-aligned as before — and both rows are hard-nowrap (flex-wrap +
         white-space + overflow/ellipsis) so the header never grows a third
         line. The pill is styled like botchat's topbar badge."""
         self._write_stats(_snapshot([_agent("a1", "q-2026-08-21-aaaa")]))
@@ -416,23 +418,30 @@ class AgentStatsTest(unittest.TestCase):
         stack = meta.index('<div class="count-stack" id="count-stack">')
         status = meta.index('<div class="count-row count-row-status">')
         agents = meta.index('<div class="count-row count-row-agents">')
-        self.assertLess(stack, status)
-        self.assertLess(status, agents)
-        # Status pills live in the TOP row, the agent-bar in the BOTTOM row.
-        self.assertLess(status, meta.index("count-running"))
-        self.assertLess(meta.index("count-running"), agents)
-        self.assertLess(meta.index("count-pending"), agents)
+        self.assertLess(stack, agents)
+        self.assertLess(agents, status)
+        # The agent-bar lives in the TOP row, the status pills in the BOTTOM row.
         self.assertLess(agents, meta.index('id="agent-bar"'))
+        self.assertLess(meta.index('id="agent-bar"'), status)
+        self.assertLess(status, meta.index("count-running"))
+        self.assertLess(status, meta.index("count-pending"))
         # Exactly two rows, one stack; the controls stay OUTSIDE the stack.
         self.assertEqual(meta.count('class="count-row '), 2)
         self.assertEqual(meta.count('id="count-stack"'), 1)
         stack_end = meta.index("density-control")
-        self.assertLess(meta.index('id="agent-bar"'), stack_end)
+        self.assertLess(meta.index("count-pending"), stack_end)
         # CSS: reduced size + no-wrap on both rows (one .count-row rule
         # covers both; the pill rule halves font/padding and ellipsises).
         stack_css = self._css_block(".count-stack")
         self.assertIn("flex-direction: column", stack_css)
         self.assertIn("min-width: 0", stack_css)
+        # The stack stays flex-start (status row keeps its left edge); ONLY
+        # the agent row is pushed to the stack's right edge.
+        self.assertIn("align-items: flex-start", stack_css)
+        agents_row_css = self._css_block(".count-row-agents")
+        self.assertIn("align-self: flex-end", agents_row_css)
+        self.assertIn("justify-content: flex-end", agents_row_css)
+        self.assertNotIn("align-self", self._css_block(".count-row"))
         row_css = self._css_block(".count-row")
         self.assertIn("flex-wrap: nowrap", row_css)
         self.assertIn("white-space: nowrap", row_css)
@@ -468,12 +477,27 @@ class AgentStatsTest(unittest.TestCase):
         # Phone: the long units collapse to a/c/t (same as botchat's chip).
         self.assertIn("  .agent-bar .agent-bar-unit-long { display: none; }", self.css)
         self.assertIn("  .agent-bar .agent-bar-unit-short { display: inline;", self.css)
-        # Popover: absolute in the sticky topbar; edge-to-edge on phones.
+        # Popover: absolute in the sticky topbar, its right edge anchored to
+        # the pill's via the --abp-right custom property that agent-bar.js
+        # measures (12px fallback = the old fixed top-right inset); still
+        # edge-to-edge on phones (that rule sets right/left outright, so the
+        # measured anchor is ignored there).
         pop_css = self._css_block(".agent-bar-pop")
         self.assertIn("position: absolute", pop_css)
         self.assertIn("top: 100%", pop_css)
+        self.assertIn("right: var(--abp-right, 12px)", pop_css)
+        self.assertNotIn("left:", pop_css)
         self.assertIn(".agent-bar-pop[hidden] { display: none; }", self.css)
         self.assertIn("  .agent-bar-pop { right: 6px; left: 6px; min-width: 0; max-width: none; }", self.css)
+        bar = self.bar_js
+        self.assertIn("function position()", bar)
+        self.assertIn("setProperty('--abp-right'", bar)
+        self.assertIn("removeProperty('--abp-right')", bar)
+        self.assertIn("addEventListener('resize'", bar)
+        # Positioned on open, on a repaint while open, and exposed for tests.
+        self.assertRegex(bar, r"pop\.hidden = false;\s*syncBar\(\);\s*position\(\);")
+        self.assertIn("if (!pop.hidden) { paint(); position(); }", bar)
+        self.assertIn("window.__qsiteAgentBar = { update, open, close, paint, position, isOpen", bar)
         # Reduced motion stops the pulse.
         self.assertIn(".agent-bar.active .agent-bar-dot { animation: none; }", self.css)
         # Nothing hides the stack / rows / pill in compact or collapsed.

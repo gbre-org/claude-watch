@@ -221,16 +221,18 @@ html.header-collapsed .topbar .density-control { display: none; }
 .count-pending  { color: var(--pending);  border-color: var(--pending); }
 .count-orphan   { color: var(--orphan);   border-color: var(--orphan); }
 
-/* ------- stacked count pills (botchat #2983) -------
+/* ------- stacked count pills (botchat #2983, reordered #3090) -------
    The count pills live in TWO stacked half-height rows inside the header:
-   TOP (.count-row-status) = running / blocked / pending / …, BOTTOM
-   (.count-row-agents) = the agent-activity pills (`N agt` · `C calls` ·
-   `K tok` · `main M`). Each pill is roughly HALF its old size (font + padding)
-   so the stack is about as tall as the single old row was, and the header
-   keeps its height. Both rows are hard-nowrap at EVERY width — flex-wrap
-   nowrap + white-space nowrap, the stack can shrink (min-width: 0) and a
-   pill clips with an ellipsis before anything breaks onto a third line. The
-   controls to the right (density, source filter, dot, info) are unchanged. */
+   TOP (.count-row-agents) = the agent-activity pill (`● N agents · C calls
+   · K tok`), RIGHT-aligned within the stack (align-self: flex-end — the
+   stack itself stays flex-start so the status row keeps its left edge);
+   BOTTOM (.count-row-status) = running / blocked / pending / …. Each pill is
+   roughly HALF its old size (font + padding) so the stack is about as tall
+   as the single old row was, and the header keeps its height. Both rows are
+   hard-nowrap at EVERY width — flex-wrap nowrap + white-space nowrap, the
+   stack can shrink (min-width: 0) and a pill clips with an ellipsis before
+   anything breaks onto a third line. The controls to the right (density,
+   source filter, dot, info) are unchanged. */
 .count-stack {
   display: flex;
   flex-direction: column;
@@ -249,6 +251,14 @@ html.header-collapsed .topbar .density-control { display: none; }
   max-width: 100%;
   overflow: hidden;
 }
+/* The agent pill's row hugs the RIGHT edge of the stack (botchat #3090:
+   "make the agent line the top one, and make it right aligned") — the stack
+   is as wide as its widest row (normally the status row), so the pill's
+   right edge lines up with the last status pill's. */
+.count-row-agents {
+  align-self: flex-end;
+  justify-content: flex-end;
+}
 .count-row .count {
   display: block;            /* (not inline-flex) so text-overflow applies */
   font-size: 0.68rem;
@@ -262,9 +272,9 @@ html.header-collapsed .topbar .density-control { display: none; }
   text-overflow: ellipsis;
 }
 
-/* ------- agent-activity bar (botchat #2967 / #2983, botchat-look #3066) -------
-   The bottom half-row is ONE outlined rounded pill — "● N agents · C calls ·
-   K tok" — ported from botchat's topbar badge: a live dot + tabular numerals
+/* ------- agent-activity bar (botchat #2967 / #2983, botchat-look #3066, top-right #3090) -------
+   The TOP half-row (right-aligned) is ONE outlined rounded pill — "● N
+   agents · C calls · K tok" — ported from botchat's topbar badge: a live dot + tabular numerals
    on a 999px-radius outline. States: .active (≥1 live agent: info-blue text,
    border, dot; the dot pulses), .idle (0 agents: muted), .stale (snapshot
    past the fresh window: dashed border, amber dot, "n/a" numerals — withheld,
@@ -321,16 +331,21 @@ html.header-collapsed .topbar .density-control { display: none; }
   .agent-bar.active .agent-bar-dot { animation: none; }
 }
 
-/* The per-agent breakdown popover behind the pill (agent-bar.js). Anchored
-   to the sticky topbar (absolute inside it, top-right), OUTSIDE #topbar-meta
-   so the 5s morph never touches it. Layout/typography as botchat's: bold
-   head (count — totals), a right-aligned numeric table with the description
-   column left-aligned + wrapping, a muted footer (main loop ctx · updated ·
-   host). Phones: pinned edge-to-edge. */
+/* The per-agent breakdown popover behind the pill (agent-bar.js). Absolute
+   inside the sticky topbar, OUTSIDE #topbar-meta so the 5s morph never
+   touches it. Its RIGHT edge is anchored to the pill's right edge
+   (`--abp-right`, set by agent-bar.js from the pill's box each time it
+   opens / repaints / the window resizes, clamped so the popover never
+   leaves the viewport on either side; the 12px fallback = the old fixed
+   top-right anchor, used until the script measures). Layout/typography as
+   botchat's: bold head (count — totals), a right-aligned numeric table with
+   the description column left-aligned + wrapping, a muted footer (main loop
+   ctx · updated · host). Phones: pinned edge-to-edge (the ≤480px rule below
+   overrides right/left, so the measured anchor is ignored there). */
 .agent-bar-pop {
   position: absolute;
   top: 100%;
-  right: 12px;
+  right: var(--abp-right, 12px);
   margin-top: 4px;
   z-index: 20;
   min-width: 300px;

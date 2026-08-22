@@ -10,20 +10,26 @@
 //   A. renderRunningItem emits the .agent-stats cell (full + short labels) in
 //      the item HEAD when it.agent_stats is set, and NOTHING when null.
 //   B. buildTopbarMetaDOM emits ONE outlined pill — button#agent-bar, "● N
-//      agents · C calls · K tok", botchat's agent-bar look — in the bottom
+//      agents · C calls · K tok", botchat's agent-bar look — in the TOP
 //      row: .active (≥1 agent) / .idle (0) / .stale ("n/a" numerals), and
 //      NOTHING when state.agent_stats is null. The old per-part pills are gone.
-//   C. (botchat #2983) the count pills are TWO stacked rows inside one
-//      .count-stack — status pills on top, the agent-bar below — with the
-//      header controls outside the stack; the merge keeps the info dropdown.
-//   D. style.css pins: rows half-size + hard-nowrap; the pill has botchat's
-//      chip geometry/colours; units collapse to a/c/t under 480px; nothing
-//      hides them in compact / collapsed.
+//   C. (botchat #2983, reordered #3090) the count pills are TWO stacked rows
+//      inside one .count-stack — the agent-bar on TOP (right-aligned via
+//      CSS), the status pills below — with the header controls outside the
+//      stack; the merge keeps the info dropdown.
+//   D. style.css pins: rows half-size + hard-nowrap; the agent row is pushed
+//      to the stack's right edge (align-self: flex-end) while the stack stays
+//      flex-start; the pill has botchat's chip geometry/colours; units
+//      collapse to a/c/t under 480px; nothing hides them in compact /
+//      collapsed; the popover's right inset is the --abp-right custom property.
 //   E. agent-bar.js: the popover paints from the JSON seed / update(), pins on
 //      click, closes on click-again / Esc / outside click, repaints live on a
 //      merge while open (the rebuilt pill keeps `open` + aria-expanded), and
 //      closes when the payload goes away. textContent only.
 //   F. the liveness `.dot` is a `live` / `error` pill.
+//   G. agent-bar.js position(): the popover's right edge is anchored to the
+//      pill's right edge (--abp-right), clamped inside the topbar on both
+//      sides; cleared when nothing has layout (jsdom default).
 //
 // Usage:   node agent-stats.test.js
 // Exit 0 on success, 1 on first failure.
@@ -205,7 +211,7 @@ console.log('refresh.js: buildTopbarMetaDOM renders the agent-bar pill (active /
   assert('two · separators', bar && bar.querySelectorAll('.agent-bar-sep').length === 2);
   assert('pill reads "3 agents · 48 calls · 272K tok" (+ the hidden short units)',
     bar && bar.textContent.replace(/\s+/g, '') === '3agentsa·48callsc·272Ktokt', bar && bar.textContent.replace(/\s+/g, ''));
-  assert('bottom row wraps the pill', bar && bar.parentElement.className === 'count-row count-row-agents');
+  assert('agents row wraps the pill', bar && bar.parentElement.className === 'count-row count-row-agents');
   assert('old per-part pills are NOT rendered', !fresh.querySelector('.count-agent-stats') && !/ agt\b/.test(fresh.textContent) && !/main 195K/.test(fresh.textContent));
   assert('long label is NOT rendered', !/3 agents · 48 calls/.test(fresh.textContent));
 
@@ -220,26 +226,28 @@ console.log('refresh.js: buildTopbarMetaDOM renders the agent-bar pill (active /
   assert('stale: numerals n/a ×3 (withheld, never frozen)', sbar && JSON.stringify(Array.from(sbar.querySelectorAll('.agent-bar-num')).map((e) => e.textContent)) === JSON.stringify(['n/a', 'n/a', 'n/a']));
   assert('stale: row carries stale', !!stale.querySelector('.count-row-agents.stale'));
   assert('stale: still two rows', stale.querySelectorAll('.count-stack > .count-row').length === 2);
+  assert('stale: agents row still first', stale.querySelector('.count-stack').firstElementChild.classList.contains('count-row-agents'));
 
   const absent = R.buildTopbarMetaDOM(emptyState({ agent_stats: null }));
   assert('no pill when agent_stats is null', !absent.querySelector('#agent-bar'));
   assert('no agents row when agent_stats is null', !absent.querySelector('.count-row-agents'));
   assert('status row still rendered when agent_stats is null', !!absent.querySelector('.count-stack > .count-row-status .count-running'));
+  assert('status row is the only row when agent_stats is null', absent.querySelectorAll('.count-stack > .count-row').length === 1);
   const missing = R.buildTopbarMetaDOM(emptyState());
   assert('no pill when agent_stats key is missing', !missing.querySelector('#agent-bar'));
 
-  // --- C. stacked two-row structure (botchat #2983) ---
+  // --- C. stacked two-row structure (botchat #2983, agent row on top #3090) ---
   const stack = fresh.querySelector('.count-stack');
   assert('one .count-stack wraps the pills', !!stack && fresh.querySelectorAll('.count-stack').length === 1);
   const rows = stack ? Array.from(stack.children) : [];
   assert('stack has exactly two rows', rows.length === 2, String(rows.length));
-  assert('top row is the status row', rows[0] && rows[0].className === 'count-row count-row-status', rows[0] && rows[0].className);
-  assert('bottom row is the agents row', rows[1] && rows[1].className === 'count-row count-row-agents', rows[1] && rows[1].className);
-  const topTexts = rows[0] ? Array.from(rows[0].children).map((e) => e.textContent) : [];
-  assert('top row holds running / blocked / pending in order',
-    JSON.stringify(topTexts) === JSON.stringify(['3 running', '84 blocked', '0 pending']), JSON.stringify(topTexts));
-  assert('top row children are all .count pills', rows[0] && Array.from(rows[0].children).every((e) => e.classList.contains('count')));
-  assert('bottom row holds exactly the agent-bar', rows[1] && rows[1].children.length === 1 && rows[1].firstElementChild.id === 'agent-bar');
+  assert('top row is the agents row', rows[0] && rows[0].className === 'count-row count-row-agents', rows[0] && rows[0].className);
+  assert('bottom row is the status row', rows[1] && rows[1].className === 'count-row count-row-status', rows[1] && rows[1].className);
+  assert('top row holds exactly the agent-bar', rows[0] && rows[0].children.length === 1 && rows[0].firstElementChild.id === 'agent-bar');
+  const statusTexts = rows[1] ? Array.from(rows[1].children).map((e) => e.textContent) : [];
+  assert('bottom row holds running / blocked / pending in order',
+    JSON.stringify(statusTexts) === JSON.stringify(['3 running', '84 blocked', '0 pending']), JSON.stringify(statusTexts));
+  assert('bottom row children are all .count pills', rows[1] && Array.from(rows[1].children).every((e) => e.classList.contains('count')));
   assert('stack is the first child of #topbar-meta', fresh.firstElementChild === stack);
   assert('stack is keyed by id (morphdom getNodeKey)', stack && stack.id === 'count-stack');
   assert('density control is outside the stack', !stack.querySelector('.density-control') && !!fresh.querySelector('.density-control'));
@@ -297,6 +305,11 @@ console.log('style.css: stacked rows half-size + nowrap; agent-bar pill has the 
   const stackCss = block('.count-stack');
   assert('.count-stack is a column flex', /flex-direction:\s*column/.test(stackCss), stackCss);
   assert('.count-stack can shrink (min-width: 0)', /min-width:\s*0/.test(stackCss), stackCss);
+  assert('.count-stack stays flex-start (status row keeps its left edge)', /align-items:\s*flex-start/.test(stackCss), stackCss);
+  const agentsRowCss = block('.count-row-agents');
+  assert('.count-row-agents hugs the stack\'s right edge (align-self: flex-end)', /align-self:\s*flex-end/.test(agentsRowCss), agentsRowCss);
+  assert('.count-row-agents content right-aligned (justify-content: flex-end)', /justify-content:\s*flex-end/.test(agentsRowCss), agentsRowCss);
+  assert('no align-self on the shared .count-row rule', !/align-self/.test(block('.count-row')));
   const rowCss = block('.count-row');
   assert('.count-row flex-wrap: nowrap', /flex-wrap:\s*nowrap/.test(rowCss), rowCss);
   assert('.count-row white-space: nowrap', /white-space:\s*nowrap/.test(rowCss), rowCss);
@@ -327,7 +340,8 @@ console.log('style.css: stacked rows half-size + nowrap; agent-bar pill has the 
   assert('compact density shrinks the pill a notch', /html\.density-compact \.agent-bar \{ font-size: 0\.64rem;/.test(css));
   // Popover.
   const popCss = block('.agent-bar-pop');
-  assert('.agent-bar-pop is absolute under the topbar, right-anchored', /position:\s*absolute/.test(popCss) && /top:\s*100%/.test(popCss) && /right:\s*12px/.test(popCss), popCss);
+  assert('.agent-bar-pop is absolute under the topbar, right inset = --abp-right (12px fallback)',
+    /position:\s*absolute/.test(popCss) && /top:\s*100%/.test(popCss) && /right:\s*var\(--abp-right, 12px\)/.test(popCss) && !/left:/.test(popCss), popCss);
   assert('.agent-bar-pop[hidden] hides', /\.agent-bar-pop\[hidden\] \{ display: none; \}/.test(css));
   assert('≤480px: popover edge-to-edge', /  \.agent-bar-pop \{ right: 6px; left: 6px; min-width: 0; max-width: none; \}/.test(css));
   assert('popover table: numeric columns right-aligned, description column left + wrapping',
@@ -458,6 +472,76 @@ console.log('agent-bar.js: a null seed (feature off on first paint) boots quietl
 }
 
 // --- F. liveness badge ---
+
+console.log('agent-bar.js: position() anchors the popover right edge to the pill, clamped inside the topbar');
+{
+  const dom = boot(FRESH);
+  const d = dom.window.document;
+  const R = dom.window.__queueRefresh;
+  const AB = dom.window.__qsiteAgentBar;
+  const pop = d.getElementById('agent-bar-pop');
+  const host = d.querySelector('header.topbar');
+  assert('position exposed', AB && typeof AB.position === 'function');
+  R.mergeTopbarMeta(emptyState({ totals: { running: 3 }, agent_stats: FRESH }));
+
+  // jsdom has no layout: every box is 0×0 → no override, CSS fallback applies.
+  AB.open();
+  assert('no layout: --abp-right not set (CSS 12px fallback)', pop.hidden === false && pop.style.getPropertyValue('--abp-right') === '', pop.style.cssText);
+  AB.close();
+
+  // Fake the boxes: a 1440px-wide header, the pill ending 340px from its
+  // right edge (left of the density / source / live / info controls), a
+  // 320px-wide popover.
+  function rect(left, right, top, bottom) {
+    return { left, right, top, bottom, width: right - left, height: bottom - top, x: left, y: top };
+  }
+  let hostRect = rect(0, 1440, 0, 60);
+  let barRect = rect(900, 1100, 10, 26);
+  host.getBoundingClientRect = () => hostRect;
+  Object.defineProperty(pop, 'offsetWidth', { configurable: true, get: () => 320 });
+  function stubBar() { const b = d.getElementById('agent-bar'); b.getBoundingClientRect = () => barRect; return b; }
+  stubBar();
+  AB.open();
+  assert('anchored: right = host.right - pill.right (1440 - 1100 = 340px)', pop.style.getPropertyValue('--abp-right') === '340px', pop.style.getPropertyValue('--abp-right'));
+
+  // The pill is rebuilt by every merge; a resize re-measures the new node
+  // (moved 100px right here).
+  barRect = rect(1000, 1200, 10, 26);
+  R.mergeTopbarMeta(emptyState({ totals: { running: 3 }, agent_stats: FRESH }));
+  stubBar();
+  dom.window.dispatchEvent(new dom.window.Event('resize'));
+  assert('resize re-measures: 1440 - 1200 = 240px', pop.style.getPropertyValue('--abp-right') === '240px', pop.style.getPropertyValue('--abp-right'));
+
+  // Right clamp: a pill flush with the header edge never pulls the popover
+  // closer than 12px to it.
+  barRect = rect(1300, 1436, 10, 26);
+  stubBar();
+  AB.position();
+  assert('right clamp: min 12px inset', pop.style.getPropertyValue('--abp-right') === '12px', pop.style.getPropertyValue('--abp-right'));
+
+  // Left clamp: a narrow header (400px) with the pill far left — the popover
+  // (320px) may not leave the header on the left: right ≤ 400 - 320 - 12 = 68.
+  hostRect = rect(0, 400, 0, 60);
+  barRect = rect(20, 120, 10, 26);
+  stubBar();
+  AB.position();
+  assert('left clamp: right ≤ host.width - pop.width - 12 (68px)', pop.style.getPropertyValue('--abp-right') === '68px', pop.style.getPropertyValue('--abp-right'));
+
+  // Hidden popover: position() is a no-op (keeps whatever was last set).
+  AB.close();
+  barRect = rect(900, 1100, 10, 26); hostRect = rect(0, 1440, 0, 60);
+  stubBar();
+  AB.position();
+  assert('hidden: position() no-op', pop.hidden === true && pop.style.getPropertyValue('--abp-right') === '68px', pop.style.getPropertyValue('--abp-right'));
+  // …and re-opening measures afresh.
+  AB.open();
+  assert('re-open measures afresh (340px)', pop.style.getPropertyValue('--abp-right') === '340px', pop.style.getPropertyValue('--abp-right'));
+
+  // Boxes collapse (e.g. header display:none): override cleared.
+  hostRect = rect(0, 0, 0, 0);
+  AB.position();
+  assert('no layout while open: override cleared', pop.style.getPropertyValue('--abp-right') === '', pop.style.cssText);
+}
 
 console.log('refresh.js: the liveness .dot is a `live` / `error` pill');
 {

@@ -131,29 +131,22 @@
       {{ site_title }}
     </div>
     <div class="meta" id="topbar-meta">
-      {#- STACKED COUNT PILLS (botchat #2983): the count pills sit in TWO
-          stacked half-height rows inside the header — TOP = the status pills
-          (running / blocked / pending / …), BOTTOM = the agent-activity
-          pills — at roughly half their old size. Both rows are nowrap
-          (flex-wrap + white-space + overflow/ellipsis in style.css), so the
-          header never grows a third line at any width: it is ALWAYS exactly
-          these two rows. Mirrored by static/refresh.js buildTopbarMetaDOM()
-          (this subtree is rebuilt every 5s tick). -#}
+      {#- STACKED COUNT PILLS (botchat #2983, reordered #3090): the count
+          pills sit in TWO stacked half-height rows inside the header — TOP =
+          the agent-activity pill, RIGHT-aligned within the stack (align-self
+          in style.css), BOTTOM = the status pills (running / blocked /
+          pending / …), left-aligned as before — at roughly half their old
+          size. Both rows are nowrap (flex-wrap + white-space +
+          overflow/ellipsis in style.css), so the header never grows a third
+          line at any width: it is ALWAYS exactly these two rows. Mirrored by
+          static/refresh.js buildTopbarMetaDOM() (this subtree is rebuilt
+          every 5s tick). -#}
       <div class="count-stack" id="count-stack">
-      <div class="count-row count-row-status">
-      <span class="count count-running" title="running items">{{ totals.running }} running</span>
-      {% if starting_count %}<span class="count count-starting" title="registered but agent not yet emitting events">{{ starting_count }} starting</span>{% endif %}
-      {% if totals.wedged %}<span class="count count-wedged" title="in-flight items whose owning agent is stuck — still holding their scope">{{ totals.wedged }} wedged</span>{% endif %}
-      {% if totals.quarantined %}<span class="count count-quarantined" title="abandoned without evidence the agent is gone — STILL HOLDING their scope, waiting on an operator decision">{{ totals.quarantined }} quarantined</span>{% endif %}
-      {% if totals.blocked %}<span class="count count-blocked" title="items parked on an external blocker (human greenlight, third-party API, etc.) — NOT alert candidates">{{ totals.blocked }} blocked</span>{% endif %}
-      {% if totals.other %}<span class="count count-other" title="items whose status this UI does not recognise — rendered in the fallback section rather than hidden">{{ totals.other }} unrecognised</span>{% endif %}
-      <span class="count count-pending" title="pending items">{{ totals.pending }} pending</span>
-      {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
-      </div>
       {#- AGENT ACTIVITY BAR (botchat #2967, stacked #2983, botchat-look
-          #3066): live session totals from the agent-stats snapshot as the
-          BOTTOM half-row — ONE outlined rounded pill, `● N agents · C calls
-          · K tok`, ported from botchat's topbar badge: a live dot (pulsing
+          #3066, top-right #3090): live session totals from the agent-stats
+          snapshot as the TOP half-row, right-aligned within the stack — ONE
+          outlined rounded pill, `● N agents · C calls · K tok`, ported from
+          botchat's topbar badge: a live dot (pulsing
           info-blue while ≥1 agent is live = .active, muted when none =
           .idle, amber + dashed border + "n/a" numerals when the snapshot is
           STALE = .stale, never a frozen number). The long units collapse to
@@ -175,6 +168,16 @@
           <span class="agent-bar-num agent-bar-tok">{{ agent_stats.tok_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>
         </button>
       </div>{% endif %}
+      <div class="count-row count-row-status">
+      <span class="count count-running" title="running items">{{ totals.running }} running</span>
+      {% if starting_count %}<span class="count count-starting" title="registered but agent not yet emitting events">{{ starting_count }} starting</span>{% endif %}
+      {% if totals.wedged %}<span class="count count-wedged" title="in-flight items whose owning agent is stuck — still holding their scope">{{ totals.wedged }} wedged</span>{% endif %}
+      {% if totals.quarantined %}<span class="count count-quarantined" title="abandoned without evidence the agent is gone — STILL HOLDING their scope, waiting on an operator decision">{{ totals.quarantined }} quarantined</span>{% endif %}
+      {% if totals.blocked %}<span class="count count-blocked" title="items parked on an external blocker (human greenlight, third-party API, etc.) — NOT alert candidates">{{ totals.blocked }} blocked</span>{% endif %}
+      {% if totals.other %}<span class="count count-other" title="items whose status this UI does not recognise — rendered in the fallback section rather than hidden">{{ totals.other }} unrecognised</span>{% endif %}
+      <span class="count count-pending" title="pending items">{{ totals.pending }} pending</span>
+      {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
+      </div>
       </div>
       {#- DENSITY TOGGLE (botchat #1944): a "density" pill that flips the whole
           view between comfortable and a vertically-DENSE (compact) layout,
