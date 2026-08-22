@@ -327,6 +327,11 @@ jobs:
         run: make test-claude-events-exporter
         timeout-minutes: 5
 
+      # Same uv-provided prometheus_client as the suite above.
+      - name: Run work-queue-exporter tests
+        run: make test-work-queue-exporter
+        timeout-minutes: 5
+
       - name: Install session-task companion CLIs onto PATH
         # `make install` would build claude-watch via cargo (heavy), so
         # we mirror just the script-symlink portion here. The

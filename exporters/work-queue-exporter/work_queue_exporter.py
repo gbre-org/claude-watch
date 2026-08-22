@@ -16,9 +16,30 @@ Owner-liveness model (rev 2026-05-01-v3 — claude-watch agent-state):
   with its parsed `Queue item: q-XXXX` marker and an mtime-based
   alive flag.
 
-  For each running queue.json item, we look up its agent record by
-  `queue_id`. If found, has_live_owner reflects that record's `alive`
-  field. If NOT found we normally stay silent (silence beats either
+  For each running queue.json item we attribute an owner through three
+  steps, in the SAME order queue-minisite's `_classify_owner` uses so the
+  dashboard and the alert can never disagree:
+
+    1. an active-agents record keyed on THIS item's `queue_id`
+    2. the item's register-time `agent_id` stamp (`session-task queue
+       register` #3615/#3617) — the only owner signal for an agent
+       RESUMED onto a rotated queue id, whose transcript still carries the
+       ORIGINAL `Queue item:` marker
+    3. the arm-hook binding (`queue_id -> agent_id`), written
+       synchronously at spawn, which beats the 60s active-agents poll
+
+  Step 1 reports that record's `alive` flag directly. Steps 2 and 3 name
+  an owner that was definitively spawned; their liveness is recovered from
+  any active-agents record carrying that agent_id, and when none resolves
+  we emit 1 (owner known, liveness ambiguous) rather than page on a
+  live agent. Liveness is ALWAYS active-agents' `alive` — never a pid.
+  Subagents share the parent Claude Code PID and a container-spawned agent
+  has no pid this exporter could resolve at all, so any pid-shaped check
+  fails exactly the agents it most needs to see. `alive` already folds in
+  the post-#690 in-flight-tool-use grace, so an agent sitting inside one
+  long foreground call reads alive with a ten-minute-old transcript.
+
+  With no owner attributed we normally stay silent (silence beats either
   false-alert or false-healthy when we genuinely have no signal) —
   EXCEPT for `running` items whose `last_heartbeat_at` (falling back to
   `registered_at` / `started_at`) is older than
@@ -29,6 +50,20 @@ Owner-liveness model (rev 2026-05-01-v3 — claude-watch agent-state):
   orphan from a died-after-spawn one). `blocked` items are exempt — they
   have no live agent by design. A fresh / unparseable heartbeat stays
   silent so a just-registered item is not false-flagged before its beat.
+
+Fail-loud on missing inputs (rev 2026-08-22):
+
+  Both owner inputs are files the exporter must be able to SEE — in a
+  container that means bind mounts. An unmounted path yields an empty map
+  that is indistinguishable from "nothing is running", so the old code
+  turned a deployment fault into a queue-wide orphan storm, silently. Now
+  each input's readability is published as
+  `worktask_queue_owner_input_available{input=...}` and logged loudly on
+  every state change (naming the path AND the env var), and while NEITHER
+  input is readable the never-spawned-orphan fallback is suppressed
+  entirely: `worktask_queue_item_has_live_owner` goes ABSENT rather than 0.
+  Alert on the input gauge; never read the orphan metric's silence as
+  health.
 
 Lock-awareness (rev 2026-05-09 — queue lock feature):
 
@@ -109,6 +144,11 @@ Metrics:
   - worktask_queue_agent_state_last_modified gauge  (mtime of active-agents.json,
         OR 0 if file missing — useful for alerting when claude-watch
         stops publishing the state file)
+  - worktask_queue_owner_input_available{input} gauge (1 when the named
+        owner-attribution input — `agent_state` or `agent_queue_bindings`
+        — is readable and well-formed, 0 otherwise. Both 0 means the
+        exporter has no owner signal at all and is deliberately silent on
+        has_live_owner.)
   - worktask_queue_scrape_errors_total       counter (reads that failed)
 """
 
@@ -131,10 +171,11 @@ from prometheus_client import (
 # Shared loader / dedup logic — lives in claude_agents.py alongside this
 # exporter in claude-watch/exporters/work-queue-exporter/.
 from claude_agents import (
+    INPUT_OK,
     agents_by_agent_id,
     agents_by_queue_id,
-    load_agent_queue_bindings,
-    load_agent_state,
+    load_agent_queue_bindings_status,
+    load_agent_state_status,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -315,6 +356,22 @@ g_agent_state_mtime = Gauge(
     registry=REG,
 )
 
+g_owner_input_available = Gauge(
+    "worktask_queue_owner_input_available",
+    (
+        "1 when the named owner-attribution input is readable and "
+        "well-formed, 0 when it is missing / unreadable / malformed. "
+        "`input` is `agent_state` (claude-watch active-agents.json) or "
+        "`agent_queue_bindings` (the arm-hook queue_id -> agent_id file). "
+        "When BOTH read 0 the exporter has NO owner signal at all and "
+        "SUPPRESSES worktask_queue_item_has_live_owner entirely rather "
+        "than reporting every running item as orphaned -- so alert on "
+        "this gauge, not on the silence of the orphan metric."
+    ),
+    ["input"],
+    registry=REG,
+)
+
 c_scope_conflicts = Counter(
     "worktask_queue_scope_conflicts",
     "Items added with forced_enqueue=true (scope-conflict bypasses)",
@@ -398,22 +455,166 @@ def _parse_ts(s):
 
 
 def _load_agent_state_with_mtime():
-    """Read active-agents JSON: return ({qid: rec}, {agent_id: rec}, mtime).
+    """Read active-agents JSON: ({qid: rec}, {agent_id: rec}, mtime, status).
 
     Wraps the shared `claude_agents` helpers (`agents_by_queue_id` +
     `agents_by_agent_id`) so the file mtime can be exposed as its own gauge
     (used to alert when claude-watch stops publishing the state file). The
     by-agent_id map lets us resolve the liveness of an owner discovered via
-    the arm-hook bindings, whose agent may be keyed under a different queue
-    id in active-agents.
+    the arm-hook bindings or the item's register-time stamp, whose agent may
+    be keyed under a different queue id in active-agents.
+
+    `status` is the `read_json_input` classification (`ok` / `missing` /
+    `unreadable` / `malformed`) so the caller can tell "claude-watch says
+    no agents are running" from "I cannot see claude-watch's state file at
+    all" — the two produce an identical empty map, and only the first one
+    licenses calling anything orphaned.
     """
     try:
         st = os.stat(AGENT_STATE_PATH)
         mtime = st.st_mtime
     except OSError:
         mtime = 0.0
-    state = load_agent_state(AGENT_STATE_PATH)
-    return agents_by_queue_id(state), agents_by_agent_id(state), mtime
+    state, status = load_agent_state_status(AGENT_STATE_PATH)
+    return (
+        agents_by_queue_id(state),
+        agents_by_agent_id(state),
+        mtime,
+        status,
+    )
+
+
+# Last-reported status per owner-attribution input, so the warning below
+# is LOUD ONCE per transition instead of once per scrape (a 15s scrape
+# interval would otherwise bury the log). Keyed by the short input name.
+_owner_input_last_status = {}
+
+# (short name, env var, path) for each owner-attribution input, used by
+# `_report_owner_inputs` for both the gauge and the warning text.
+_OWNER_INPUTS = (
+    ("agent_state", "AGENT_STATE_JSON", lambda: AGENT_STATE_PATH),
+    (
+        "agent_queue_bindings",
+        "AGENT_QUEUE_BINDINGS_JSON",
+        lambda: AGENT_QUEUE_BINDINGS_PATH,
+    ),
+)
+
+
+def _report_owner_inputs(agent_state_status, bindings_status):
+    """Publish + log the readability of each owner-attribution input.
+
+    Returns True when AT LEAST ONE input is `ok` — i.e. the exporter has
+    some trustworthy owner signal and may legitimately conclude that a
+    running item has no owner. When BOTH are unusable the caller must stay
+    SILENT on has_live_owner: with no inputs, "no record for this item" is
+    not evidence of an orphan, it is evidence of a broken deployment, and
+    emitting 0 would page on every running item at once.
+
+    A container deployment that never got the bind mounts produces exactly
+    that state and produces it silently, which is why this logs a loud
+    warning naming the path AND the env var to fix.
+    """
+    statuses = {
+        "agent_state": agent_state_status,
+        "agent_queue_bindings": bindings_status,
+    }
+    for name, env_var, path_fn in _OWNER_INPUTS:
+        status = statuses[name]
+        g_owner_input_available.labels(input=name).set(
+            1 if status == INPUT_OK else 0
+        )
+        if _owner_input_last_status.get(name) == status:
+            continue
+        previous = _owner_input_last_status.get(name)
+        _owner_input_last_status[name] = status
+        if status == INPUT_OK:
+            if previous is not None:
+                log.info(
+                    "owner-attribution input %s recovered (%s)",
+                    name, path_fn(),
+                )
+            continue
+        log.warning(
+            "OWNER-ATTRIBUTION INPUT %s IS %s at %s (set %s to fix). "
+            "Owner attribution for running queue items is DEGRADED; "
+            "queue items owned by agents this exporter cannot see will "
+            "read agent_id=\"\". Container deployments must bind-mount "
+            "this path from the host.",
+            name, status.upper(), path_fn(), env_var,
+        )
+    return any(st == INPUT_OK for st in statuses.values())
+
+
+def _stamped_owner_agent_id(item):
+    """Return the item's register-time `agent_id` stamp, or None.
+
+    `session-task queue register` stamps the invoking subagent's agent_id
+    onto the item (`agent_id_source: "register"`). That stamp is the ONLY
+    owner signal for an agent RESUMED onto a rotated queue id: its
+    transcript still carries the ORIGINAL `Queue item:` marker, so
+    active-agents keys it under the old qid and the arm-hook binding names
+    the old qid too. queue-minisite's `_classify_owner` has honoured this
+    stamp since #3615/#3617; the exporter did not, which is how a
+    demonstrably-live agent surfaced as `has_live_owner=0, agent_id=""`.
+    """
+    aid = item.get("agent_id")
+    if isinstance(aid, str) and aid:
+        return aid
+    return None
+
+
+def _resolve_owner(iid, item, agent_by_qid, agent_by_aid, owner_bindings):
+    """Attribute an owner to a queue item. Returns a dict or None.
+
+    Precedence mirrors queue-minisite's `_classify_owner` exactly, so the
+    dashboard and the alert can never disagree about who owns an item:
+
+      1. an active-agents record keyed on THIS queue id
+      2. the item's register-time `agent_id` stamp  (#3615/#3617)
+      3. the arm-hook binding (queue_id -> agent_id)
+
+    Steps 2 and 3 name an owner that was DEFINITIVELY spawned; their
+    liveness is recovered from any active-agents record carrying that
+    agent_id. When no such record resolves, `alive` is None — owner known,
+    liveness ambiguous — which the caller renders as 1, not 0. Presuming a
+    known owner alive is the only safe default: if it really died,
+    active-agents publishes alive=false for that agent_id on its next poll
+    and the gauge flips honestly.
+
+    NOTE: liveness comes exclusively from active-agents' `alive` field,
+    which already folds in the post-#690 in-flight-tool-use grace (an agent
+    inside one long foreground call writes nothing for minutes and is still
+    alive). There is deliberately NO pid probe anywhere on this path:
+    subagents share the parent Claude Code PID, and a container-spawned
+    agent has no pid this exporter could resolve even in principle.
+
+    Returns None when no owner can be attributed at all.
+    """
+    agent = agent_by_qid.get(iid)
+    if agent is not None:
+        return {
+            "agent_id": agent.get("agent_id", ""),
+            "alive": bool(agent.get("alive")),
+            "age": agent.get("jsonl_age_seconds"),
+        }
+
+    for candidate in (
+        _stamped_owner_agent_id(item),
+        owner_bindings.get(iid),
+    ):
+        if not candidate:
+            continue
+        rec = agent_by_aid.get(candidate)
+        if rec is not None:
+            return {
+                "agent_id": candidate,
+                "alive": bool(rec.get("alive")),
+                "age": rec.get("jsonl_age_seconds"),
+            }
+        return {"agent_id": candidate, "alive": None, "age": None}
+
+    return None
 
 
 def collect():
@@ -428,11 +629,23 @@ def collect():
         c_scrape_errors.inc()
         return
 
-    agent_by_qid, agent_by_aid, agent_mtime = _load_agent_state_with_mtime()
+    (
+        agent_by_qid,
+        agent_by_aid,
+        agent_mtime,
+        agent_state_status,
+    ) = _load_agent_state_with_mtime()
     g_agent_state_mtime.set(agent_mtime)
     # Arm-hook owner bindings (queue_id -> agent_id). The earliest +
     # authoritative "this item is owned" signal; see AGENT_QUEUE_BINDINGS_PATH.
-    owner_bindings = load_agent_queue_bindings(AGENT_QUEUE_BINDINGS_PATH)
+    owner_bindings, bindings_status = load_agent_queue_bindings_status(
+        AGENT_QUEUE_BINDINGS_PATH
+    )
+    # True when at least one owner-attribution input is readable. With NO
+    # readable input the never-spawned-orphan fallback is suppressed: an
+    # absent input makes every running item look ownerless, and reporting
+    # them all orphaned is worse than reporting nothing.
+    have_owner_signal = _report_owner_inputs(agent_state_status, bindings_status)
 
     items = data.get("items", [])
     # Top-level locked_scopes dict: {scope_token: {reason, locked_at, ...}}
@@ -552,84 +765,63 @@ def collect():
                         # emitted. Fail-soft (same posture as workload).
                         pass
 
-            # Look up agent by queue_id. Emit has_live_owner ONLY when we
-            # have an agent record -- silent on no-signal items.
-            agent = agent_by_qid.get(iid)
-            if agent is not None:
-                aid = agent.get("agent_id", "")
-                alive = 1 if agent.get("alive") else 0
+            # Attribute an owner: active-agents record keyed on this qid,
+            # then the register-time `agent_id` stamp, then the arm-hook
+            # binding -- the same precedence queue-minisite's
+            # `_classify_owner` uses, so the dashboard and the alert can
+            # never disagree. Liveness always comes from active-agents'
+            # `alive` flag (post-#690: already tolerant of an agent sitting
+            # inside one long foreground tool call); never from a pid,
+            # which subagents and container-spawned agents do not have.
+            owner = _resolve_owner(
+                iid, it, agent_by_qid, agent_by_aid, owner_bindings,
+            )
+            if owner is not None:
+                aid = owner["agent_id"]
+                # alive is None for a KNOWN owner whose liveness could not
+                # be resolved (state lag / between transcript writes).
+                # Presume alive: a named owner was definitively spawned, and
+                # active-agents will publish alive=false honestly if it died.
                 g_has_live_owner.labels(
                     id=iid, summary=summary, agent_id=aid, status=status,
-                ).set(alive)
-                age = agent.get("jsonl_age_seconds")
-                if age is not None:
+                ).set(0 if owner["alive"] is False else 1)
+                if owner["age"] is not None:
                     g_agent_jsonl_age.labels(
                         id=iid, summary=summary, agent_id=aid, status=status,
-                    ).set(age)
-            elif status == "running":
-                # No active-agents record keyed on this queue id. Before the
-                # never-spawned orphan fallback, honor an arm-hook binding: a
-                # bound queue id was DEFINITIVELY spawned (the PostToolUse
-                # arm-hook fired synchronously at spawn), so it is OWNED even
-                # while active-agents (60s poll) has not yet -- or no longer --
-                # keys it under this qid (spawn-to-poll lag, or a
-                # SendMessage-rotated qid whose transcript marker still points
-                # at the ORIGINAL id). Resolve the bound agent's liveness by
-                # agent_id so a live owner never trips WorkQueueOrphaned.
-                bound_aid = owner_bindings.get(iid)
-                if bound_aid:
-                    brec = agent_by_aid.get(bound_aid)
-                    if brec is not None:
-                        alive = 1 if brec.get("alive") else 0
+                    ).set(owner["age"])
+            elif status == "running" and have_owner_signal:
+                # Never-spawned / abandoned-without-binding orphan -- a
+                # `running` item whose Agent was never fired has NO agent
+                # record AND no binding (vs died-after-spawn, which has a
+                # record with alive=0 handled above). Without this branch
+                # such an item emits no has_live_owner series, so the
+                # WorkQueueOrphaned {status=running} == 0 alert matches
+                # nothing and never fires. Fall back to heartbeat
+                # staleness -- if the item has not heartbeat in
+                # ORPHAN_HEARTBEAT_STALE_SECONDS, flag it orphaned with
+                # agent_id empty (the empty agent_id distinguishes a
+                # no-binding orphan from a died-after-spawn one). ONLY
+                # `running` -- `blocked` items legitimately have no live
+                # agent by design. A fresh or unparseable heartbeat stays
+                # SILENT to preserve no-false-alert on a just-spawned item.
+                # Gated on `have_owner_signal`: with BOTH owner inputs
+                # unreadable (a container missing its bind mounts) EVERY
+                # running item lands here, and flagging the whole queue
+                # orphaned at once is a deployment fault masquerading as an
+                # incident. In that state we stay silent and let
+                # `worktask_queue_owner_input_available` carry the alarm.
+                hb_ts = _parse_ts(
+                    it.get("last_heartbeat_at")
+                    or it.get("registered_at")
+                    or it.get("started_at")
+                )
+                if hb_ts is not None:
+                    hb_age = (now - hb_ts).total_seconds()
+                    if hb_age >= ORPHAN_HEARTBEAT_STALE_SECONDS:
                         g_has_live_owner.labels(
-                            id=iid, summary=summary, agent_id=bound_aid,
+                            id=iid, summary=summary, agent_id="",
                             status="running",
-                        ).set(alive)
-                        age = brec.get("jsonl_age_seconds")
-                        if age is not None:
-                            g_agent_jsonl_age.labels(
-                                id=iid, summary=summary, agent_id=bound_aid,
-                                status="running",
-                            ).set(age)
-                    else:
-                        # Owner known (bound) but not resolvable in
-                        # active-agents (poll lag / between transcript writes).
-                        # A binding PROVES an agent was spawned; presume alive
-                        # (emit 1) rather than false-alert on an ambiguous
-                        # liveness signal. If it genuinely died, active-agents
-                        # publishes alive=0 for this agent_id and the branch
-                        # above flips it to 0.
-                        g_has_live_owner.labels(
-                            id=iid, summary=summary, agent_id=bound_aid,
-                            status="running",
-                        ).set(1)
-                else:
-                    # Never-spawned / abandoned-without-binding orphan -- a
-                    # `running` item whose Agent was never fired has NO agent
-                    # record AND no binding (vs died-after-spawn, which has a
-                    # record with alive=0 handled above). Without this branch
-                    # such an item emits no has_live_owner series, so the
-                    # WorkQueueOrphaned {status=running} == 0 alert matches
-                    # nothing and never fires. Fall back to heartbeat
-                    # staleness -- if the item has not heartbeat in
-                    # ORPHAN_HEARTBEAT_STALE_SECONDS, flag it orphaned with
-                    # agent_id empty (the empty agent_id distinguishes a
-                    # no-binding orphan from a died-after-spawn one). ONLY
-                    # `running` -- `blocked` items legitimately have no live
-                    # agent by design. A fresh or unparseable heartbeat stays
-                    # SILENT to preserve no-false-alert on a just-spawned item.
-                    hb_ts = _parse_ts(
-                        it.get("last_heartbeat_at")
-                        or it.get("registered_at")
-                        or it.get("started_at")
-                    )
-                    if hb_ts is not None:
-                        hb_age = (now - hb_ts).total_seconds()
-                        if hb_age >= ORPHAN_HEARTBEAT_STALE_SECONDS:
-                            g_has_live_owner.labels(
-                                id=iid, summary=summary, agent_id="",
-                                status="running",
-                            ).set(0)
+                        ).set(0)
 
         # Ready-stuck / locked-age gauges.
         # A pending group-head may be intentionally held by a scope lock

@@ -66,7 +66,7 @@
 .PHONY: test-queue-minisite test-hooks test-agent-msg test-agent-tail
 .PHONY: test-claude-event test-pr-branches test-event-must-act
 .PHONY: test-self-clear test-self-login test-self-login-tmux test-watchers
-.PHONY: test-claude-events-exporter test-dashboard
+.PHONY: test-claude-events-exporter test-work-queue-exporter test-dashboard
 # Tests — container image
 .PHONY: test-trust-workspace test-claude-tmux-env test-cron-toggle
 .PHONY: test-hooks-shim test-entrypoint
@@ -290,6 +290,16 @@ test-watchers: test-self-clear test-self-login ## claude-event-watch fast-path +
 test-claude-events-exporter: ## claude-events-exporter queue-metric tests
 	uv run --python 3.11 --with prometheus_client \
 		python3 exporters/claude-events-exporter/test_claude_events_exporter.py
+
+# Same shape as the claude-events-exporter suite above: self-contained, one
+# scenario per owner-attribution / liveness case, re-execs the exporter module
+# per scenario against a tmpdir so it never reads a real queue.json or
+# active-agents.json. Covers the owner precedence ladder (active-agents qid ->
+# register-time agent_id stamp -> arm-hook binding) and the fail-loud posture
+# when the exporter cannot see its inputs at all.
+test-work-queue-exporter: ## work-queue-exporter owner-liveness tests
+	uv run --python 3.11 --with prometheus_client \
+		python3 exporters/work-queue-exporter/test_work_queue_exporter.py
 
 # Run the dashboard parser tests (sources dashboard-lib.sh in a bash
 # subshell and exercises conf_get / conf_windows / has_split / expected_panes

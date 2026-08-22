@@ -41,15 +41,68 @@ A `running` queue item that loses its owner is surfaced fast-then-slow:
 
 ## Owner attribution
 
-The exporter and queue-minisite resolve a running item's owner from
-claude-watch's `active-agents.json` AND the arm-hook
-`agent-queue-bindings.json` (`queue_id -> agent_id`, written synchronously
-at spawn by `post-tool-agent-arm-hook`). A **bound** item is treated as
-OWNED even during active-agents poll lag, so `has_live_owner=0` fires only
-for GENUINELY owner-less items — the never-spawned (`agent_id=""`) or
-died-after-spawn (`agent_id` set) cases `WorkQueueOrphaned` is meant to
-catch. This is what keeps a live-but-not-yet-polled agent from being
-mis-reported as "owner unknown" / falsely paged.
+The exporter and queue-minisite resolve a running item's owner through the
+**same three-step ladder**, in the same order, so the dashboard and the
+alert can never disagree about who owns an item:
+
+1. an `active-agents.json` record keyed on **this item's `queue_id`**
+   (parsed from the agent transcript's `Queue item: q-XXXX` marker);
+2. the item's **register-time `agent_id` stamp**, written by
+   `session-task queue register`. This is the only owner signal for an
+   agent RESUMED onto a rotated queue id: its transcript still carries the
+   ORIGINAL marker, so active-agents keys it under the OLD qid and the
+   arm-hook binding names the OLD qid too;
+3. the arm-hook **`agent-queue-bindings.json`** binding
+   (`queue_id -> agent_id`, written synchronously at spawn by
+   `post-tool-agent-arm-hook`), which beats the 60s active-agents poll.
+
+Steps 2 and 3 name an owner that was definitively spawned; their liveness
+is recovered from any active-agents record carrying that `agent_id`, and
+when none resolves the exporter emits `has_live_owner=1` (owner known,
+liveness ambiguous) rather than page on a live agent. So `has_live_owner=0`
+fires only for GENUINELY owner-less items — the never-spawned
+(`agent_id=""`) or died-after-spawn (`agent_id` set) cases
+`WorkQueueOrphaned` is meant to catch.
+
+**Liveness is never a pid.** Subagents share the parent Claude Code PID,
+and a container-spawned agent has no pid the exporter could resolve at all,
+so any pid-shaped check fails exactly the agents it most needs to see. The
+only liveness input is active-agents' `alive` flag, which already folds in
+the in-flight-tool-use grace described below.
+
+The exporter carried steps 1 and 3 but **not** step 2 until 2026-08-22.
+A container-spawned agent whose only owner signal was the register-time
+stamp therefore fell all the way through to the never-spawned-orphan
+fallback and published
+`worktask_queue_item_has_live_owner{agent_id="",status="running"} = 0`
+while the minisite — which had honoured the stamp since #3615/#3617 —
+showed the same agent alive.
+
+### Missing inputs are a deployment fault, not an orphan storm
+
+Both owner inputs are files the exporter must be able to SEE; in a
+container that means bind mounts:
+
+| Env var | Container default | Host source |
+| --- | --- | --- |
+| `AGENT_STATE_JSON` | `/agents-state/active-agents.json` | the dir claude-watch writes `active-agents.json` into, mounted `:ro` |
+| `AGENT_QUEUE_BINDINGS_JSON` | `/queue-home/.config/claude/agent-queue-bindings.json` | the user's `.config/claude` dir, where the arm-hook writes bindings |
+
+An unmounted path yields an empty map that is **indistinguishable from
+"nothing is running"**, so a deployment fault used to surface as every
+running item going orphaned at once, silently. Now:
+
+- each input's readability is published as
+  `worktask_queue_owner_input_available{input="agent_state"|"agent_queue_bindings"}`
+  (1 = readable and well-formed, 0 = missing / unreadable / malformed);
+- a **WARNING is logged on every state change**, naming the path AND the
+  env var to fix (once per transition, not once per scrape);
+- while NEITHER input is readable the never-spawned-orphan fallback is
+  **suppressed**: `worktask_queue_item_has_live_owner` goes ABSENT rather
+  than 0. One readable input is enough to keep the fallback live.
+
+Alert on `worktask_queue_owner_input_available == 0`. Never read the orphan
+metric's silence as health.
 
 ## Agent liveness: silence is not death
 
@@ -97,8 +150,9 @@ Recording (`claude-watch-work-queue.recording`):
 - `worktask:queue_items_orphaned_never_spawned:count`
 
 Alerts: `WorkQueueOrphaned`, `WorkQueueStuckSoft`, `WorkQueueReadyStuck`,
-`AgentStateFileMissing`, `ClaudeEventsBacklogStale`, `ClaudeWatchDown`,
-`ClaudeWatchersMissing`, `ClaudeMainLoopHeartbeatStale`.
+`AgentStateFileMissing`, `WorkQueueOwnerInputMissing`,
+`ClaudeEventsBacklogStale`, `ClaudeWatchDown`, `ClaudeWatchersMissing`,
+`ClaudeMainLoopHeartbeatStale`.
 
 Metric provenance:
 - `worktask_queue_*` → `exporters/work-queue-exporter/work_queue_exporter.py`

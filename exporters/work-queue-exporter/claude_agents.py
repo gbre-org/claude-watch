@@ -25,10 +25,21 @@ The same identifier is used by:
 
 Functions:
 
-  load_agent_state(path)
+  read_json_input(path)
+      Read + parse a JSON input file, classifying WHY it yielded nothing
+      (`ok` / `missing` / `unreadable` / `malformed`). Callers that must
+      distinguish "the file says there are no agents" from "I cannot see
+      the file at all" use this instead of the fail-soft loaders below —
+      a container that never got the bind mount looks IDENTICAL to an
+      idle fleet otherwise, and reporting every running item as orphaned
+      on a missing mount is the failure mode that costs the most trust.
+
+  load_agent_state(path) / load_agent_state_status(path)
       Read the JSON written by `claude-watch active-agents --write-state`.
       Returns the parsed dict (always has `subagents`/`workloads`/`agents`
-      keys, even on failure — empty arrays).
+      keys, even on failure — empty arrays). The `_status` variant also
+      returns the `read_json_input` status so a caller can tell an empty
+      fleet from an unreadable file.
 
   agents_by_queue_id(state)
       Build a queue_id -> agent record map. Dedup rule when multiple
@@ -51,6 +62,63 @@ from typing import Any, Optional
 
 DEFAULT_AGENT_STATE_PATH = "/var/lib/claude-watch/active-agents.json"
 
+# `read_json_input` status values. `INPUT_OK` is the ONLY one that means
+# "this input is a trustworthy source of truth right now"; every other
+# value means the caller is flying blind on that input and must NOT
+# convert its emptiness into a negative assertion.
+INPUT_OK = "ok"
+INPUT_MISSING = "missing"
+INPUT_UNREADABLE = "unreadable"
+INPUT_MALFORMED = "malformed"
+
+
+def read_json_input(path: str) -> tuple[Any, str]:
+    """Read + parse a JSON file, returning ``(data, status)``.
+
+    ``status`` is one of ``INPUT_OK`` / ``INPUT_MISSING`` /
+    ``INPUT_UNREADABLE`` / ``INPUT_MALFORMED``; ``data`` is ``None``
+    unless the status is ``INPUT_OK``.
+
+    The fail-soft loaders below collapse every failure into an empty
+    result, which is right for rendering but WRONG for alerting: an
+    unmounted path and a genuinely idle fleet produce the identical
+    empty dict. Anything that turns "no record" into "orphaned" needs
+    this distinction.
+    """
+    try:
+        with open(path, "r") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None, INPUT_MISSING
+    except OSError:
+        return None, INPUT_UNREADABLE
+    try:
+        return json.loads(raw), INPUT_OK
+    except (ValueError, TypeError):
+        return None, INPUT_MALFORMED
+
+
+def load_agent_state_status(
+    path: str = DEFAULT_AGENT_STATE_PATH,
+) -> tuple[dict[str, Any], str]:
+    """``load_agent_state`` + the `read_json_input` status of the file.
+
+    A file that parses but is not a JSON object reports
+    ``INPUT_MALFORMED`` — the shape is as unusable as a parse error.
+    """
+    empty = {"subagents": [], "workloads": [], "agents": []}
+    data, status = read_json_input(path)
+    if status != INPUT_OK:
+        return empty, status
+    if not isinstance(data, dict):
+        return empty, INPUT_MALFORMED
+    # Normalize missing keys.
+    return {
+        "subagents": list(data.get("subagents") or []),
+        "workloads": list(data.get("workloads") or []),
+        "agents": list(data.get("agents") or []),
+    }, INPUT_OK
+
 
 def load_agent_state(path: str = DEFAULT_AGENT_STATE_PATH) -> dict[str, Any]:
     """Read claude-watch's active-agents JSON state file.
@@ -58,22 +126,10 @@ def load_agent_state(path: str = DEFAULT_AGENT_STATE_PATH) -> dict[str, Any]:
     Returns a dict with keys `subagents`, `workloads`, `agents` (always
     present, defaulting to empty lists). Failures (missing file, parse
     error) yield the empty-shape dict so callers can treat the file as
-    "no signal" without try/except.
+    "no signal" without try/except. Use `load_agent_state_status` when
+    "no signal" and "no agents" must be told apart.
     """
-    empty = {"subagents": [], "workloads": [], "agents": []}
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return empty
-    if not isinstance(data, dict):
-        return empty
-    # Normalize missing keys.
-    return {
-        "subagents": list(data.get("subagents") or []),
-        "workloads": list(data.get("workloads") or []),
-        "agents": list(data.get("agents") or []),
-    }
+    return load_agent_state_status(path)[0]
 
 
 def agents_by_queue_id(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -181,17 +237,29 @@ def load_agent_queue_bindings(path: str) -> dict[str, str]:
     binding (largest ``registered_at``) wins -- that is the current owner.
     Fail-soft: missing file, unreadable, bad JSON, or an unexpected shape
     all yield ``{}`` so a missing mount degrades to the legacy behaviour.
+    Use ``load_agent_queue_bindings_status`` when a caller must tell a
+    missing mount apart from a genuinely empty bindings file.
     """
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return load_agent_queue_bindings_status(path)[0]
+
+
+def load_agent_queue_bindings_status(path: str) -> tuple[dict[str, str], str]:
+    """``load_agent_queue_bindings`` + the file's `read_json_input` status.
+
+    A parsed file whose top level is not an object, or whose ``bindings``
+    key is not an object, reports ``INPUT_MALFORMED``: the file exists but
+    carries no usable owner relation, which is a deployment fault, not an
+    empty fleet. A well-formed file with zero bindings is ``INPUT_OK`` —
+    "nothing is currently bound" is real, trustworthy signal.
+    """
+    data, status = read_json_input(path)
+    if status != INPUT_OK:
+        return {}, status
     if not isinstance(data, dict):
-        return {}
+        return {}, INPUT_MALFORMED
     bindings = data.get("bindings")
     if not isinstance(bindings, dict):
-        return {}
+        return {}, INPUT_MALFORMED
     best: dict[str, tuple[float, str]] = {}
     for aid, rec in bindings.items():
         if not isinstance(aid, str) or not aid:
@@ -212,4 +280,4 @@ def load_agent_queue_bindings(path: str) -> dict[str, str]:
         prev = best.get(qid)
         if prev is None or reg_f >= prev[0]:
             best[qid] = (reg_f, aid)
-    return {qid: aid for qid, (_reg, aid) in best.items()}
+    return {qid: aid for qid, (_reg, aid) in best.items()}, INPUT_OK
