@@ -83,6 +83,7 @@
 .PHONY: build install install-skills install-cron deploy-systemd deploy
 # Container image + compose stack (workbot)
 .PHONY: bootstrap container-build compose-build compose-up compose-down
+.PHONY: work-queue-exporter-build
 .PHONY: sync-main-clone deploy-container redeploy
 # macOS host helpers
 .PHONY: install-mcp-host-bash-server install-cw-agent-stats-launchd
@@ -801,6 +802,12 @@ bootstrap: ## Check compose prereqs + seed examples/compose/.env
 CW_BUILD_COMMIT = $(shell git rev-parse --short HEAD 2>/dev/null)
 CW_BUILD_PR = $(shell git log -1 --format=%s 2>/dev/null | grep -oE '\#[0-9]+' | tail -1 | tr -d '\#')
 
+# Semver for the same build identity, read from Cargo.toml so the daemon and
+# the Python exporters can never disagree about which release they belong to.
+# Recursive for the same reason as the two above: only forked when a build
+# target actually expands it.
+CW_BUILD_VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
 # Build just the claude-container image directly (no compose). Same
 # GIT_SHA plumbing as compose-build. Context is the repo root because the
 # Dockerfile COPYs from sibling tools/ + container/ trees, and the
@@ -813,6 +820,26 @@ container-build: ## Build just the claude-container:dev image
 	  --build-arg CW_BUILD_PR="$(CW_BUILD_PR)" \
 	  -t claude-container:dev \
 	  -f container/Dockerfile \
+	  .
+
+# Build the work-queue-exporter image with its build identity stamped in.
+#
+# The exporter's serving image is normally built by the OUT-OF-TREE monitoring
+# compose stack, which is why this target exists at all: it is the in-repo,
+# executable statement of the build-arg contract that stack has to satisfy
+# (`build.args: {CW_BUILD_COMMIT, CW_BUILD_VERSION}`), and it lets an operator
+# rebuild + verify locally without that stack. The args land in the image as
+# ENV and surface as `worktask_exporter_build_info{commit,version,source}` --
+# `curl -s localhost:9099/metrics | grep build_info` after a deploy.
+#
+# Context is the REPO ROOT, matching the compose stack's `build.context`,
+# because the Dockerfile COPYs the exporter sources by full in-repo path.
+work-queue-exporter-build: ## Build the work-queue-exporter image (build identity stamped)
+	DOCKER_BUILDKIT=1 docker build \
+	  --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
+	  --build-arg CW_BUILD_VERSION="$(CW_BUILD_VERSION)" \
+	  -t work-queue-exporter:dev \
+	  -f exporters/work-queue-exporter/Dockerfile \
 	  .
 
 # Build the compose stack images (skip the sibling eichi build context

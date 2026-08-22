@@ -142,6 +142,36 @@ with a fresh progress heartbeat is. Without it every agent-owned item
 alerted purely for running longer than 30 minutes, since agents have no
 heartbeat file to match the workload clause.
 
+## Verifying which exporter build is deployed
+
+`curl -s localhost:9099/metrics | grep build_info` — the work-queue-exporter
+publishes `worktask_exporter_build_info{commit,version,source} 1`, so a
+deploy can be confirmed against a revision instead of against a container
+create time or a file mtime (which name no revision at all, and were the
+only evidence available before this metric existed). `source` is `image` for
+a container that baked its identity at build time and `host` for a
+directly-run process.
+
+The commit has to be handed IN rather than discovered: `.dockerignore`
+prunes `.git/` from the build context and the exporter's slim base image has
+no `git`, so the image cannot resolve HEAD itself — the same constraint the
+Rust daemon's `claude_watch_build_info` lives under, and the same fix.
+`exporters/work-queue-exporter/Dockerfile` takes `--build-arg
+CW_BUILD_COMMIT` / `CW_BUILD_VERSION`; `make work-queue-exporter-build`
+resolves both on the host and passes them, and the out-of-tree monitoring
+compose stack should pass the same two under `build.args`. A host-run or
+otherwise un-baked instance can set `WORKTASK_EXPORTER_COMMIT` /
+`WORKTASK_EXPORTER_VERSION` / `WORKTASK_EXPORTER_SOURCE` in the process
+environment instead; a runtime value overrides the image's baked default.
+
+The series is emitted **unconditionally**, reading `commit="unknown"` when
+nothing stamped the build. That is deliberate: had it been dropped instead,
+its absence would be ambiguous between "exporter predates this metric" and
+"current exporter that failed to get stamped", and resolving exactly that
+ambiguity is the metric's job. So `commit="unknown"` means the build args
+did not reach the image; an ABSENT series means the exporter is older than
+this metric.
+
 ## Rules summary
 
 Recording (`claude-watch-work-queue.recording`):
@@ -156,5 +186,8 @@ Alerts: `WorkQueueOrphaned`, `WorkQueueStuckSoft`, `WorkQueueReadyStuck`,
 
 Metric provenance:
 - `worktask_queue_*` → `exporters/work-queue-exporter/work_queue_exporter.py`
+- `worktask_exporter_build_info` → same exporter (see "Verifying which
+  exporter build is deployed" above). Unalerted by design: it is a deploy
+  *identity*, not a health signal.
 - `claude_events_*` → `exporters/claude-events-exporter/claude_events_exporter.py`
 - `claude_watch_*` / `claude_code_*` → `claude-watch metrics` textfile (`src/metrics.rs`)

@@ -35,6 +35,11 @@ Scenarios covered:
       worktask_queue_owner_input_available=0 for each, and
       has_live_owner ABSENT rather than 0 for every running item.
       One readable input is enough to keep the orphan fallback live.
+  (26) build identity: worktask_exporter_build_info carries the
+      env-provided commit/version/source, falls back to
+      commit="unknown"/version="0.0.0"/source="host" when nothing
+      stamps the build, is stamped at IMPORT (present before any
+      collect()), and never emits more than one series.
 
 Run:  python3 test_work_queue_exporter.py
 Exits 0 on success, 1 on first failure with a diagnostic.
@@ -53,12 +58,32 @@ from importlib.util import spec_from_file_location, module_from_spec
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+# Build-identity vars are handled differently from the path vars below: a
+# scenario that omits them is ASSERTING they are unset (the "unknown"
+# fallback case is exactly that), so they must be actively removed rather
+# than inherited from whatever the developer's shell or the CI runner
+# happens to export. The path vars keep their existing set-only behaviour.
+BUILD_ENV_KEYS = (
+    "WORKTASK_EXPORTER_COMMIT",
+    "WORKTASK_EXPORTER_VERSION",
+    "WORKTASK_EXPORTER_SOURCE",
+)
+
+
 def load_exporter(env):
     """Reload the exporter module under a fresh env so module-level
     config constants pick up our overrides."""
     saved = {}
-    for k in ("PORT", "QUEUE_JSON", "AGENT_STATE_JSON", "AGENT_QUEUE_BINDINGS_JSON"):
+    for k in (
+        "PORT",
+        "QUEUE_JSON",
+        "AGENT_STATE_JSON",
+        "AGENT_QUEUE_BINDINGS_JSON",
+    ) + BUILD_ENV_KEYS:
         saved[k] = os.environ.get(k)
+    for k in BUILD_ENV_KEYS:
+        if k not in env:
+            os.environ.pop(k, None)
     for k, v in env.items():
         os.environ[k] = v
     try:
@@ -1195,6 +1220,78 @@ def run_scenarios():
           "got " + repr(st))
     # Restore a good state file for anything appended after this point.
     write_agent_state(astate, [])
+
+    # ---- Scenario 26: exporter build identity.
+    #
+    # The metric answers "is the exporter I am scraping the commit I think it
+    # is", so the two cases that matter are (a) a stamped build reports
+    # exactly what it was stamped with, and (b) an UNstamped build still
+    # publishes a series -- absence has to keep meaning "exporter too old to
+    # have this metric" and nothing else.
+    print("\nScenario 26: build identity gauge")
+    write_queue(qjson, [])
+    write_agent_state(astate, [])
+
+    mod = load_exporter({
+        **env,
+        "WORKTASK_EXPORTER_COMMIT": "deadbee",
+        "WORKTASK_EXPORTER_VERSION": "1.2.3",
+        "WORKTASK_EXPORTER_SOURCE": "image",
+    })
+    # Deliberately BEFORE collect(): build identity is stamped at import, so
+    # the deploy question stays answerable on a scrape whose collect() bails.
+    v = find_sample(
+        mod, "worktask_exporter_build_info",
+        {"commit": "deadbee", "version": "1.2.3", "source": "image"},
+    )
+    check("S26 build_info == 1 with env-provided labels (pre-collect)",
+          v == 1.0, "got " + repr(v))
+    mod.collect()
+    v = find_sample(
+        mod, "worktask_exporter_build_info",
+        {"commit": "deadbee", "version": "1.2.3", "source": "image"},
+    )
+    check("S26 build_info survives a collect()", v == 1.0, "got " + repr(v))
+    n = sum(
+        1
+        for fam in mod.REG.collect()
+        if fam.name == "worktask_exporter_build_info"
+        for sample in fam.samples
+        if sample.name == "worktask_exporter_build_info"
+    )
+    check("S26 exactly one build_info series", n == 1, "got " + repr(n))
+
+    # 26b: nothing stamped -> the series is STILL emitted, carrying the
+    # unambiguous sentinel rather than being dropped.
+    print("\nScenario 26b: unstamped build -> commit=unknown, series present")
+    mod = load_exporter(env)
+    v = find_sample(
+        mod, "worktask_exporter_build_info",
+        {"commit": "unknown", "version": "0.0.0", "source": "host"},
+    )
+    check("S26b build_info == 1 with unknown/0.0.0/host fallback",
+          v == 1.0, "got " + repr(v))
+    got = (mod.EXPORTER_COMMIT, mod.EXPORTER_VERSION, mod.EXPORTER_SOURCE)
+    check("S26b module constants match the fallback",
+          got == ("unknown", "0.0.0", "host"), "got " + repr(got))
+
+    # 26c: an EMPTY build arg reaches the container as an empty ENV, not an
+    # absent one. It must fall through to the sentinel exactly like an unset
+    # var -- otherwise a host-side commit lookup that came back empty would
+    # ship an image advertising commit="" as though that were an identity.
+    print("\nScenario 26c: empty build args -> same sentinel fallback")
+    mod = load_exporter({
+        **env,
+        "WORKTASK_EXPORTER_COMMIT": "",
+        "WORKTASK_EXPORTER_VERSION": "   ",
+        "WORKTASK_EXPORTER_SOURCE": "",
+    })
+    v = find_sample(
+        mod, "worktask_exporter_build_info",
+        {"commit": "unknown", "version": "0.0.0", "source": "host"},
+    )
+    check("S26c empty/whitespace env falls back to the sentinel",
+          v == 1.0, "got " + repr(v))
 
     print()
     if failures:
