@@ -695,8 +695,12 @@ RUN case "$(uname -m)" in \
 # Container-tailored claude-watch config — pins the daemon to the in-container
 # tmux session `claude-container:0.0` (the claude pane created by
 # entrypoint.sh), points all writes at uid-1000-writable paths (/tmp/, ~/.cache),
-# and disables host-only features (auto_update, reauth, hybrid, task_watch)
-# that have no in-container backing yet (Phase 2 work). The host's
+# and disables host-only features (auto_update, reauth, hybrid)
+# that have no in-container backing yet (Phase 2 work). task_watch stays
+# ENABLED: it is what puts claude-watch's keepalive stub in pane 0 of the
+# `tasks` session instead of the legacy `task-watch daemon` CLI, which this
+# image does not ship — see the section comment in claude-watch.config.toml.
+# The host's
 # ~/.config/claude-watch/config.toml is NOT bind-mounted by the wrapper, so
 # without this file the daemon would FATAL on "no config file found". Phase 1e.
 COPY container/claude-watch.config.toml /etc/claude-watch/config.toml
