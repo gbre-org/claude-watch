@@ -1148,14 +1148,45 @@
     const errorTxt = state.error;
 
     let html = '';
-    // STACKED COUNT PILLS (botchat #2983): two half-height nowrap rows —
-    // TOP = status pills, BOTTOM = agent-activity pills — inside one
-    // .count-stack. MUST mirror templates/index.html (rebuilt every tick).
+    // STACKED COUNT PILLS (botchat #2983, reordered #3090): two half-height
+    // nowrap rows — TOP = the agent-activity pill (right-aligned within the
+    // stack via CSS), BOTTOM = the status pills — inside one .count-stack.
+    // MUST mirror templates/index.html (rebuilt every tick).
     // The stack carries id="count-stack" so morphdom KEYS it (getNodeKey):
     // unkeyed, a page whose #topbar-meta still has the flat pills pairs this
     // leading <div> positionally with the only other <div> — .info-wrap,
     // which onBeforeElUpdated SKIPS — and the stack never appears.
     html += `<div class="count-stack" id="count-stack">`;
+    // Agent activity bar (botchat #2967, stacked #2983, botchat-look #3066,
+    // top-right #3090) — session totals from the agent-stats snapshot as the
+    // TOP half-row (right-aligned within the stack by CSS):
+    // ONE outlined pill `● N agents · C calls · K tok` (live dot; .active
+    // info-blue when ≥1 agent, .idle muted, .stale dashed + "n/a" numerals —
+    // never a frozen number). The server formats the numerals
+    // (agents_text / calls_text / tok_text). MUST mirror
+    // templates/index.html: this subtree is rebuilt every tick. state.agent_stats
+    // is null when the feature is off / snapshot absent (no row). The pill is
+    // the popover's toggle (agent-bar.js, delegated): its `open` class +
+    // aria-expanded mirror the LIVE popover so the rebuild never flaps it.
+    const agentStatsPill = state.agent_stats;
+    if (agentStatsPill) {
+      const stale = !!agentStatsPill.stale;
+      const nAgents = Number(agentStatsPill.agents) || 0;
+      const stateCls = stale ? 'stale' : (nAgents > 0 ? 'active' : 'idle');
+      const popEl = document.getElementById('agent-bar-pop');
+      const popOpen = !!(popEl && !popEl.hidden);
+      const title = attr((agentStatsPill.title || '') + ' — click for the per-agent breakdown');
+      html += `<div class="count-row count-row-agents${stale ? ' stale' : ''}">`;
+      html += `<button type="button" id="agent-bar" class="agent-bar ${stateCls}${popOpen ? ' open' : ''}" aria-haspopup="dialog" aria-expanded="${popOpen ? 'true' : 'false'}" aria-controls="agent-bar-pop" title="${title}">` +
+        `<span class="agent-bar-dot" aria-hidden="true"></span>` +
+        `<span class="agent-bar-num agent-bar-agents">${esc(agentStatsPill.agents_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> agents</span><span class="agent-bar-unit agent-bar-unit-short">a</span>` +
+        `<span class="agent-bar-sep" aria-hidden="true">·</span>` +
+        `<span class="agent-bar-num agent-bar-calls">${esc(agentStatsPill.calls_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> calls</span><span class="agent-bar-unit agent-bar-unit-short">c</span>` +
+        `<span class="agent-bar-sep" aria-hidden="true">·</span>` +
+        `<span class="agent-bar-num agent-bar-tok">${esc(agentStatsPill.tok_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>` +
+        `</button>`;
+      html += `</div>`; // .count-row-agents
+    }
     html += `<div class="count-row count-row-status">`;
     html += `<span class="count count-running" title="running items">${esc(totals.running ?? 0)} running</span>`;
     if (startingCount) {
@@ -1183,35 +1214,6 @@
       html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
     }
     html += `</div>`; // .count-row-status
-    // Agent activity bar (botchat #2967, stacked #2983, botchat-look #3066) —
-    // session totals from the agent-stats snapshot as the BOTTOM half-row:
-    // ONE outlined pill `● N agents · C calls · K tok` (live dot; .active
-    // info-blue when ≥1 agent, .idle muted, .stale dashed + "n/a" numerals —
-    // never a frozen number). The server formats the numerals
-    // (agents_text / calls_text / tok_text). MUST mirror
-    // templates/index.html: this subtree is rebuilt every tick. state.agent_stats
-    // is null when the feature is off / snapshot absent (no row). The pill is
-    // the popover's toggle (agent-bar.js, delegated): its `open` class +
-    // aria-expanded mirror the LIVE popover so the rebuild never flaps it.
-    const agentStatsPill = state.agent_stats;
-    if (agentStatsPill) {
-      const stale = !!agentStatsPill.stale;
-      const nAgents = Number(agentStatsPill.agents) || 0;
-      const stateCls = stale ? 'stale' : (nAgents > 0 ? 'active' : 'idle');
-      const popEl = document.getElementById('agent-bar-pop');
-      const popOpen = !!(popEl && !popEl.hidden);
-      const title = attr((agentStatsPill.title || '') + ' — click for the per-agent breakdown');
-      html += `<div class="count-row count-row-agents${stale ? ' stale' : ''}">`;
-      html += `<button type="button" id="agent-bar" class="agent-bar ${stateCls}${popOpen ? ' open' : ''}" aria-haspopup="dialog" aria-expanded="${popOpen ? 'true' : 'false'}" aria-controls="agent-bar-pop" title="${title}">` +
-        `<span class="agent-bar-dot" aria-hidden="true"></span>` +
-        `<span class="agent-bar-num agent-bar-agents">${esc(agentStatsPill.agents_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> agents</span><span class="agent-bar-unit agent-bar-unit-short">a</span>` +
-        `<span class="agent-bar-sep" aria-hidden="true">·</span>` +
-        `<span class="agent-bar-num agent-bar-calls">${esc(agentStatsPill.calls_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> calls</span><span class="agent-bar-unit agent-bar-unit-short">c</span>` +
-        `<span class="agent-bar-sep" aria-hidden="true">·</span>` +
-        `<span class="agent-bar-num agent-bar-tok">${esc(agentStatsPill.tok_text ?? '?')}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>` +
-        `</button>`;
-      html += `</div>`;
-    }
     html += `</div>`; // .count-stack
     // Density toggle pill (botchat #1944). MUST be rendered here too (not just
     // in the Jinja template): mergeTopbarMeta rebuilds #topbar-meta every tick,
