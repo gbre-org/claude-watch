@@ -2541,10 +2541,96 @@ pub(crate) const CONTEXT_FRESH_TOKEN_THRESHOLD: u64 = 30000;
 /// is just starting up (no prior high reading).
 const PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG: u64 = 30000;
 
-/// Reset `state.context_clear_triggered` when tokens drop below the fresh
-/// threshold, regardless of whether the inner trigger gate (`tokens > 0`)
-/// runs this cycle. Also handles the external-clear bookkeeping path so the
-/// "Since Last Clear" dashboard metric stays accurate.
+/// Fraction of the PREVIOUS token sample the counter must FALL BY for the new
+/// sample to read as a context reset, even when the new sample is still above
+/// `CONTEXT_FRESH_TOKEN_THRESHOLD`.
+///
+/// Why a ratio and not just the fresh threshold: within one context the token
+/// counter only ever climbs. A halving is not something a live context does —
+/// it means the context was thrown away and rebuilt (a `/clear`, a `self-clear`,
+/// or an auto-compaction). The fresh threshold alone MISSES that event whenever
+/// the replacement context boots above 30K, which is the normal case for any
+/// session with a large always-loaded preamble.
+pub(crate) const CONTEXT_RESET_DROP_RATIO: f64 = 0.5;
+
+/// How a check sample was recognised as "the context was just reset".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextResetSignal {
+    /// The sample itself is below `CONTEXT_FRESH_TOKEN_THRESHOLD` — the pane
+    /// is showing a near-empty context (classically `0 tokens` in the seconds
+    /// between `/clear` landing and the first turn of the new context).
+    FreshSample,
+    /// The sample is still above the fresh threshold, but the counter FELL by
+    /// at least `CONTEXT_RESET_DROP_RATIO` of the previous sample — a context
+    /// that was replaced, observed only after the replacement had already
+    /// loaded its preamble.
+    TokenDrop,
+}
+
+/// Pure predicate: does this token sample mean the context was reset since the
+/// previous sample?
+///
+/// THE BUG THIS EXISTS FOR (observed 2026-08-22): the daemon recognised a
+/// context reset ONLY by sampling a token count below
+/// `CONTEXT_FRESH_TOKEN_THRESHOLD` (30K). That works only if the daemon happens
+/// to land a poll inside the few seconds a cleared pane reads near-zero. On a
+/// session whose fresh context boots at ~77K tokens (large always-loaded
+/// preamble) the window is not just narrow — the pane may NEVER read below 30K
+/// at all. The real samples across that day's auto-clear were:
+///
+///   21:08:13  tokens=907979
+///   21:08:46  tokens=77185      <- the clear happened in this 33s gap
+///
+/// Neither sample is under 30K, so nothing stamped `last_context_clear`, the
+/// dashboard's "Since Clear" tile kept counting from the PREVIOUS day's clear
+/// (1.07 days at 17:57 ET, 50 minutes after the clear it should have shown),
+/// and `context_clear_triggered` was left at the mercy of a later low sample.
+///
+/// Keying on the DROP instead makes detection independent of how big a fresh
+/// context is, and covers every path that resets a context: the daemon's own
+/// deferred auto-clear, a wedged-pane recovery self-clear, an agent- or
+/// operator-run `self-clear`, a hand-typed `/clear`, and an auto-compaction.
+/// All of them manifest the same way — the counter collapses between two polls.
+///
+/// Returns `None` for a live context (growth, or the ordinary small jitter of a
+/// re-rendered status bar), so a normal turn never reads as a clear.
+pub(crate) fn context_reset_signal(
+    prev_tokens: Option<u64>,
+    tokens: u64,
+) -> Option<ContextResetSignal> {
+    if tokens < CONTEXT_FRESH_TOKEN_THRESHOLD {
+        return Some(ContextResetSignal::FreshSample);
+    }
+    // A drop is only meaningful against a previous sample that was itself high
+    // enough to be a real context (the same "previously high" notion the
+    // external-clear log uses) — during boot there is nothing to compare to.
+    let prev = prev_tokens?;
+    if prev < PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG {
+        return None;
+    }
+    let dropped = prev.saturating_sub(tokens);
+    if (dropped as f64) >= (prev as f64) * CONTEXT_RESET_DROP_RATIO {
+        return Some(ContextResetSignal::TokenDrop);
+    }
+    None
+}
+
+/// Reset `state.context_clear_triggered` when a check sample shows the context
+/// was reset (see `context_reset_signal`), regardless of whether the inner
+/// trigger gate (`tokens > 0`) runs this cycle. Also handles the external-clear
+/// bookkeeping path so the "Since Clear" dashboard metric stays accurate.
+///
+/// STAMP SEMANTICS: `last_context_clear` is stamped with `now` — the check
+/// cycle on which the reset was OBSERVED, not the instant the context was
+/// actually thrown away, which the daemon cannot see. The two differ by at most
+/// one `check_interval` plus the status read (order of seconds; ~33s in the
+/// 2026-08-22 incident, where the clear fell inside a poll gap). The dashboard
+/// tile renders this in minutes/hours/days, so the observation lag is not
+/// material — and it is far closer than the alternative anchors: the deferred
+/// auto-clear's TRIGGER stamp runs up to a full `grace_period` (300s) EARLY,
+/// and `self-clear`'s handoff marker is touched only after the resume prompt
+/// has been delivered, LATER. Whichever of those fired, this landing
+/// observation re-stamps with the closest available reading.
 ///
 /// Why this lives outside the `tokens > 0` guard in `check_cycle`:
 /// when `self-clear` succeeds, the pane briefly shows tokens=0. The inner
@@ -2561,14 +2647,21 @@ pub(crate) fn maybe_reset_context_clear(
     tokens: u64,
     now: &str,
 ) {
-    if tokens >= CONTEXT_FRESH_TOKEN_THRESHOLD {
+    // The previous sample, captured BEFORE `check_cycle` slides
+    // `last_seen_tokens` forward — a reset is a relation between two samples.
+    let prev_tokens = state.last_seen_tokens;
+    let Some(signal) = context_reset_signal(prev_tokens, tokens) else {
         return;
-    }
+    };
+    let detected_by = match signal {
+        ContextResetSignal::FreshSample => "fresh_sample",
+        ContextResetSignal::TokenDrop => "token_drop",
+    };
 
-    // Context-low condition has cleared (tokens below the fresh threshold) —
-    // disarm the two-phase obligation so the next crossing re-arms, and end
-    // the threshold episode so the hook-deferral ceiling restarts from the
-    // NEXT crossing rather than staying permanently expired.
+    // Context-low condition has cleared (the context was reset) — disarm the
+    // two-phase obligation so the next crossing re-arms, and end the threshold
+    // episode so the hook-deferral ceiling restarts from the NEXT crossing
+    // rather than staying permanently expired.
     state.context_obligation_armed_at = None;
     state.context_threshold_first_seen_at = None;
 
@@ -2576,12 +2669,17 @@ pub(crate) fn maybe_reset_context_clear(
     // the in-flight flag + child-pid bookkeeping so the next threshold
     // crossing can fire.
     if state.context_clear_triggered {
-        info!(tokens, "context clear detected — resetting trigger");
+        info!(
+            tokens,
+            prev_tokens, detected_by, "context clear detected — resetting trigger"
+        );
         write_jsonl_log(
             &config.general.log_file,
             "context_clear_reset",
             serde_json::json!({
                 "tokens": tokens,
+                "prev_tokens": prev_tokens,
+                "detected_by": detected_by,
             }),
         );
         record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
@@ -2599,17 +2697,21 @@ pub(crate) fn maybe_reset_context_clear(
     // Path 2: external clear (user `/clear`, fresh-clear path, or any other
     // off-path reset). Only emit the log when we previously saw a high
     // sample, to avoid logging on every check during boot.
-    if state.last_seen_tokens.unwrap_or(0) >= PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG {
+    // (A `TokenDrop` signal implies this — it is measured against a
+    // previously-high sample. The check is what suppresses the boot case,
+    // where a `FreshSample` is just an empty pane and not a clear at all.)
+    if prev_tokens.unwrap_or(0) >= PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG {
         info!(
             tokens,
-            prev_tokens = state.last_seen_tokens,
-            "external context clear detected"
+            prev_tokens, detected_by, "external context clear detected"
         );
         write_jsonl_log(
             &config.general.log_file,
             "context_clear_reset",
             serde_json::json!({
                 "tokens": tokens,
+                "prev_tokens": prev_tokens,
+                "detected_by": detected_by,
                 "external": true,
             }),
         );
@@ -5839,6 +5941,14 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // Calling maybe_reset_context_clear() ahead of the trigger gate also means a
     // fresh fire can happen in the same cycle the reset lands, if tokens jump
     // straight from <30K to >threshold (boundary case, but cheap to handle).
+    //
+    // A reset is recognised from EITHER a below-threshold sample or a large
+    // drop against the previous sample (`context_reset_signal`). The drop arm
+    // is what covers a clear whose replacement context boots above 30K — on a
+    // session with a big always-loaded preamble the pane may never read low at
+    // all, so the below-threshold arm alone silently misses the clear (real
+    // incident 2026-08-22: 907979 -> 77185 across one poll gap, nothing
+    // stamped, "Since Clear" kept counting from the previous day).
     if config.context_monitor.enabled {
         // Reset path runs first so it can observe the pre-update last_seen_tokens.
         maybe_reset_context_clear(config, state, tokens, &now);
@@ -6060,7 +6170,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         }
 
-        // Reset paths (tokens < 30K) and last_seen_tokens bookkeeping run
+        // Reset paths (below-threshold sample or a halved token counter) and
+        // last_seen_tokens bookkeeping run
         // unconditionally above this block via maybe_reset_context_clear() —
         // keeping them outside the `tokens > 0` guard so a clean tokens=0
         // sample successfully resets `context_clear_triggered`.
@@ -8481,6 +8592,164 @@ cooldown = 300
         maybe_reset_context_clear(&config, &mut state, 5_300, &now);
         assert!(!state.context_clear_triggered);
         assert_eq!(state.last_context_clear, before);
+    }
+
+    // --- Context-reset DETECTION tests (regression guard for 2026-08-22) ---
+    //
+    // 2026-08-22 incident: the daemon recognised a context reset only from a
+    // token sample below 30K. The session's fresh context boots at ~77K
+    // (large always-loaded preamble), and the clear fell inside a poll gap:
+    //
+    //     21:08:13  tokens=907979
+    //     21:08:46  tokens=77185     <- the auto-clear landed in here
+    //
+    // Neither sample is under 30K, so `last_context_clear` was never stamped
+    // and the dashboard's "Since Clear" tile read 1.07 DAYS (the previous
+    // day's clear) 50 minutes after the clear it should have shown. These
+    // tests pin drop-based detection, one per path that resets a context.
+
+    #[test]
+    fn test_context_reset_signal_fresh_sample() {
+        // The classic case still holds: a near-empty sample is a reset even
+        // with no previous sample to compare against (daemon just started).
+        assert_eq!(
+            context_reset_signal(None, 0),
+            Some(ContextResetSignal::FreshSample)
+        );
+        assert_eq!(
+            context_reset_signal(Some(900_000), 5_300),
+            Some(ContextResetSignal::FreshSample)
+        );
+    }
+
+    #[test]
+    fn test_context_reset_signal_token_drop() {
+        // The incident's exact samples.
+        assert_eq!(
+            context_reset_signal(Some(907_979), 77_185),
+            Some(ContextResetSignal::TokenDrop)
+        );
+    }
+
+    #[test]
+    fn test_context_reset_signal_ignores_growth_and_jitter() {
+        // A live context only climbs; a re-rendered status bar can jitter a
+        // little. Neither may read as a clear, or every turn would stamp one.
+        assert_eq!(context_reset_signal(Some(905_000), 950_000), None);
+        assert_eq!(context_reset_signal(Some(900_000), 880_000), None);
+        // Just short of the halving boundary.
+        assert_eq!(context_reset_signal(Some(900_000), 450_001), None);
+        // Exactly halved counts (>= ratio).
+        assert_eq!(
+            context_reset_signal(Some(900_000), 450_000),
+            Some(ContextResetSignal::TokenDrop)
+        );
+    }
+
+    #[test]
+    fn test_context_reset_signal_needs_previously_high_sample() {
+        // No previous sample, or a previous sample that was itself boot-level:
+        // there is no context to have been reset.
+        assert_eq!(context_reset_signal(None, 100_000), None);
+        assert_eq!(context_reset_signal(Some(29_000), 100_000), None);
+    }
+
+    #[test]
+    fn test_daemon_auto_clear_landing_above_fresh_threshold_stamps() {
+        // PATH: daemon-triggered deferred auto-clear (context-low ->
+        // self-clear). The clear lands, the replacement context boots at 77K,
+        // and the daemon's first post-clear sample is already above the fresh
+        // threshold. Must reset the in-flight flag AND stamp the clear.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = true;
+        state.context_clear_child_pid = Some(12345);
+        state.last_seen_tokens = Some(907_979);
+        state.last_context_clear = Some("2026-08-21T16:21:11-04:00".to_string());
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 77_185, &now);
+        assert!(
+            !state.context_clear_triggered,
+            "a clear landing above the fresh threshold must still reset the flag"
+        );
+        assert!(state.context_clear_child_pid.is_none());
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(now.as_str()),
+            "the auto-clear path must stamp last_context_clear at the observing cycle"
+        );
+        assert_eq!(
+            state.post_clear_resume_injected_for.as_deref(),
+            Some(now.as_str()),
+            "a daemon-driven clear injects its own resume — latch the gate"
+        );
+    }
+
+    #[test]
+    fn test_agent_self_clear_landing_above_fresh_threshold_stamps() {
+        // PATH: `self-clear` run by the agent / an operator / a skill. The
+        // daemon never triggered, so only the external-clear path can stamp.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = false;
+        state.last_seen_tokens = Some(903_905);
+        state.last_context_clear = Some("2026-08-21T16:21:11-04:00".to_string());
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 84_000, &now);
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(now.as_str()),
+            "an externally-driven self-clear must stamp last_context_clear"
+        );
+    }
+
+    #[test]
+    fn test_manual_clear_then_restart_stamps() {
+        // PATH: hand-typed /clear (or a `session-resume restart`, which brings
+        // up a brand-new process whose context starts from the preamble). Both
+        // present to the daemon as a collapsed token counter.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.last_seen_tokens = Some(640_000);
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 61_000, &now);
+        assert_eq!(state.last_context_clear.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_compaction_stamps() {
+        // PATH: auto-compaction. The context is rebuilt from a summary, so the
+        // counter collapses the same way a clear's does — and it IS a context
+        // reset, which is what the panel measures.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.last_seen_tokens = Some(950_000);
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 180_000, &now);
+        assert_eq!(state.last_context_clear.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_reset_stamps_exactly_once_per_clear() {
+        // The stamp must land on the observing cycle and NOT be refreshed by
+        // the subsequent cycles of the new (small, growing) context — the tile
+        // would otherwise sit pinned near zero forever.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.last_seen_tokens = Some(907_979);
+        let landing = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 77_185, &landing);
+        assert_eq!(state.last_context_clear.as_deref(), Some(landing.as_str()));
+
+        // check_cycle slides the sample forward after the reset path runs.
+        state.last_seen_tokens = Some(77_185);
+        let later = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 85_993, &later);
+        assert_eq!(
+            state.last_context_clear.as_deref(),
+            Some(landing.as_str()),
+            "the growing new context must not re-stamp the clear"
+        );
     }
 
     // --- Thinking backoff threshold tests ---

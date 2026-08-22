@@ -2270,6 +2270,49 @@ mod tests {
     }
 
     #[test]
+    fn last_context_clear_gauge_follows_the_newest_stamp() {
+        // End of the chain the 2026-08-22 bug broke: whatever the daemon
+        // stamps must be what the panel reads. A clear observed AFTER an
+        // earlier one has to move the gauge forward -- the incident's symptom
+        // was a gauge frozen on the previous day's stamp (rendered as "Since
+        // Clear = 1.07 days" 50 minutes after a clear), because nothing
+        // re-stamped state. Also pins that a stamp NEWER than the fallbacks
+        // still wins over them.
+        let old = json!({
+            "last_context_clear": "2026-08-21T20:21:11Z",
+            "daemon_start_epoch": 1_787_000_000.0
+        });
+        let old_line = build_metrics(&old, "x", "y", &LiveCounts::default(), None, Some(1000.0))
+            .into_iter()
+            .find(|l| l.starts_with("claude_last_context_clear_timestamp_seconds "))
+            .expect("gauge should be present");
+
+        let new = json!({
+            "last_context_clear": "2026-08-22T21:08:46Z",
+            "daemon_start_epoch": 1_787_000_000.0
+        });
+        let new_line = build_metrics(&new, "x", "y", &LiveCounts::default(), None, Some(1000.0))
+            .into_iter()
+            .find(|l| l.starts_with("claude_last_context_clear_timestamp_seconds "))
+            .expect("gauge should be present");
+
+        let val = |l: &str| -> f64 {
+            l.rsplit(' ')
+                .next()
+                .expect("value")
+                .parse()
+                .expect("numeric gauge value")
+        };
+        // 2026-08-21T20:21:11Z == 1787343671, 2026-08-22T21:08:46Z == 1787432926.
+        assert_eq!(val(&old_line), 1_787_343_671.0);
+        assert_eq!(val(&new_line), 1_787_432_926.0);
+        assert!(
+            val(&new_line) > val(&old_line),
+            "a newer observed clear must move the gauge forward: {old_line} -> {new_line}"
+        );
+    }
+
+    #[test]
     fn build_metrics_watcher_health() {
         let state = json!({
             "watcher_health": {
