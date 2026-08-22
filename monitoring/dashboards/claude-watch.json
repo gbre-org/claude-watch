@@ -48,6 +48,13 @@
           "refId": "C",
           "range": true,
           "instant": false
+        },
+        {
+          "expr": "time() - (claude_events_last_heartbeat_timestamp_seconds > 0)",
+          "legendFormat": "Last Ack Age",
+          "refId": "D",
+          "range": true,
+          "instant": false
         }
       ],
       "fieldConfig": {
@@ -134,6 +141,44 @@
                 "value": "n/a — no clear recorded"
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last Ack Age"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#859900",
+                      "value": null
+                    },
+                    {
+                      "color": "#b58900",
+                      "value": 360
+                    },
+                    {
+                      "color": "#dc322f",
+                      "value": 600
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "noValue",
+                "value": "n/a — no heartbeat-tick observed yet"
+              }
+            ]
           }
         ]
       },
@@ -155,7 +200,7 @@
           "titleSize": 16
         }
       },
-      "description": "Session lifetime timers, ONE stat panel with three tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded)."
+      "description": "Session lifetime timers, ONE stat panel with four tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded). LAST ACK AGE = seconds since claude-events-exporter last observed a claude-watch heartbeat-tick event on the bus (claude_events_last_heartbeat_timestamp_seconds, tracked across scrapes even after claude-event-watch consumes the file -- same green<360/amber>=360/red>=600 thresholds as HEARTBEAT; n/a on a freshly-restarted exporter that hasn't seen a tick yet)."
     },
     {
       "id": 104,
@@ -473,6 +518,71 @@
       }
     },
     {
+      "id": 112,
+      "title": "Output Tokens (by model, period)",
+      "type": "piechart",
+      "description": "Cumulative OUTPUT tokens by model over the dashboard's time range (increase() of the windowed claude_output_tokens_total gauge; Andrew #5370 — tokens = cumulative OUTPUT, split by model).",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (model) (increase(claude_output_tokens_total[$__range]))",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "pie",
+        "tooltip": {
+          "mode": "single"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "displayLabels": [
+          "name",
+          "value"
+        ],
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
       "id": 46,
       "title": "Restarts / Alerts",
       "type": "stat",
@@ -480,7 +590,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 37
+        "y": 45
       },
       "datasource": {
         "type": "prometheus",
@@ -569,7 +679,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 49
       },
       "datasource": {
         "type": "prometheus",
@@ -635,7 +745,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 53
       },
       "datasource": {
         "type": "prometheus",
@@ -696,7 +806,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 49
+        "y": 57
       },
       "datasource": {
         "type": "prometheus",
@@ -768,7 +878,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 53
+        "y": 61
       },
       "datasource": {
         "type": "prometheus",
@@ -893,7 +1003,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 53
+        "y": 61
       },
       "datasource": {
         "type": "prometheus",
@@ -978,7 +1088,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 61
+        "y": 69
       },
       "datasource": {
         "type": "prometheus",
@@ -1075,7 +1185,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 61
+        "y": 69
       },
       "datasource": {
         "type": "prometheus",
@@ -1161,7 +1271,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 69
+        "y": 77
       },
       "datasource": {
         "type": "prometheus",
@@ -1215,7 +1325,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 69
+        "y": 77
       },
       "datasource": {
         "type": "prometheus",
@@ -1269,7 +1379,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 77
+        "y": 85
       },
       "datasource": {
         "type": "prometheus",
@@ -1330,7 +1440,7 @@
         "h": 8,
         "w": 12,
         "x": 6,
-        "y": 77
+        "y": 85
       },
       "datasource": {
         "type": "prometheus",
@@ -1380,7 +1490,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 77
+        "y": 85
       },
       "datasource": {
         "type": "prometheus",
@@ -1452,7 +1562,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 85
+        "y": 93
       },
       "datasource": {
         "type": "prometheus",
@@ -1511,7 +1621,7 @@
         "h": 8,
         "w": 18,
         "x": 6,
-        "y": 85
+        "y": 93
       },
       "datasource": {
         "type": "prometheus",
@@ -1571,7 +1681,7 @@
         "h": 8,
         "w": 18,
         "x": 0,
-        "y": 93
+        "y": 101
       },
       "datasource": {
         "type": "prometheus",
@@ -1625,7 +1735,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 93
+        "y": 101
       },
       "datasource": {
         "type": "prometheus",
@@ -1683,7 +1793,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 101
+        "y": 109
       },
       "datasource": {
         "type": "prometheus",
@@ -1732,7 +1842,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 105
+        "y": 113
       },
       "datasource": {
         "type": "prometheus",
@@ -1795,7 +1905,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 105
+        "y": 113
       },
       "datasource": {
         "type": "prometheus",
@@ -1849,7 +1959,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 113
+        "y": 121
       },
       "datasource": {
         "type": "prometheus",
@@ -1894,7 +2004,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 121
+        "y": 129
       },
       "datasource": {
         "type": "prometheus",
@@ -2013,7 +2123,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 130
+        "y": 138
       },
       "datasource": {
         "type": "prometheus",
@@ -2061,7 +2171,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 130
+        "y": 138
       },
       "datasource": {
         "type": "prometheus",
@@ -2109,7 +2219,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 138
+        "y": 146
       },
       "datasource": {
         "type": "prometheus",
@@ -2157,7 +2267,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 138
+        "y": 146
       },
       "datasource": {
         "type": "prometheus",
@@ -2206,7 +2316,7 @@
         "h": 8,
         "w": 16,
         "x": 0,
-        "y": 146
+        "y": 154
       },
       "datasource": {
         "type": "prometheus",
@@ -2271,7 +2381,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 146
+        "y": 154
       },
       "datasource": {
         "type": "prometheus",
@@ -2311,71 +2421,6 @@
         "colorMode": "background",
         "graphMode": "area",
         "textMode": "value"
-      }
-    },
-    {
-      "id": 112,
-      "title": "Output Tokens (by model, period)",
-      "type": "piechart",
-      "description": "Cumulative OUTPUT tokens by model over the dashboard's time range (increase() of the windowed claude_output_tokens_total gauge; Andrew #5370 — tokens = cumulative OUTPUT, split by model).",
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 154
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "expr": "sum by (model) (increase(claude_output_tokens_total[$__range]))",
-          "legendFormat": "{{model}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            }
-          },
-          "mappings": [],
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "pieType": "pie",
-        "tooltip": {
-          "mode": "single"
-        },
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "values": [
-            "value",
-            "percent"
-          ]
-        },
-        "displayLabels": [
-          "name",
-          "value"
-        ],
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
       }
     }
   ]

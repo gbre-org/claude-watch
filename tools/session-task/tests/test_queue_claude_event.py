@@ -525,6 +525,69 @@ def test_abandon_is_idempotent_after_done():
 
 
 # ---------------------------------------------------------------------------
+# 8. queue block / unblock ship data.tier=ambient (producer-side fix)
+#
+# `queue-blocked` / `queue-unblocked` have no CLASSIFICATIONS row in
+# event-classify, so before this fix they fell through to the fail-LOUD
+# `actionable` default -- firing the event_must_act gate on every recurring
+# re-nudge for a routine, correctly-parked block (e.g. a DO-NOT-MERGE item
+# awaiting an external blocker). A `block` is the system correctly parking
+# work, not "system broken" (contrast `wedge`, which stays genuinely
+# actionable and is NOT touched here). Stamping data.tier=ambient at
+# emission is rung 2 in event-classify's precedence, honored ahead of the
+# consumer-side fallback table. Andrew q-2026-08-22-6650.
+# ---------------------------------------------------------------------------
+
+
+def test_block_emits_queue_blocked_event_with_ambient_tier():
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_dir = Path(tmp) / "bin"
+        ev_log = Path(tmp) / "claude-event.log"
+        _install_fake_claude_event(bin_dir, ev_log)
+        _install_fake_pingme(bin_dir)
+        env = _env_for_tmp(tmp, bin_dir=bin_dir)
+
+        r1 = _add(env, "block-test", ["repo:ce-block"], "--summary",
+                  "block test summary")
+        d1 = json.loads(r1.stdout)
+        _run(env, "queue", "register", d1["id"], "--json", check=True)
+        _run(env, "queue", "block", d1["id"], "--reason",
+             "awaiting external blocker", check=True)
+
+        calls = _read_shim_log(ev_log)
+        assert len(calls) == 1, calls
+        parsed = _parse_claude_event_argv(calls[0])
+        assert parsed["tag"] == "queue-blocked"
+        assert parsed["data"]["queue_id"] == d1["id"]
+        assert parsed["data"]["tier"] == "ambient"
+
+
+def test_unblock_emits_queue_unblocked_event_with_ambient_tier():
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_dir = Path(tmp) / "bin"
+        ev_log = Path(tmp) / "claude-event.log"
+        _install_fake_claude_event(bin_dir, ev_log)
+        _install_fake_pingme(bin_dir)
+        env = _env_for_tmp(tmp, bin_dir=bin_dir)
+
+        r1 = _add(env, "unblock-test", ["repo:ce-unblock"], "--summary",
+                  "unblock test summary")
+        d1 = json.loads(r1.stdout)
+        _run(env, "queue", "register", d1["id"], "--json", check=True)
+        _run(env, "queue", "block", d1["id"], "--reason",
+             "awaiting external blocker", check=True)
+        _run(env, "queue", "unblock", d1["id"], check=True)
+
+        calls = _read_shim_log(ev_log)
+        # block, then unblock.
+        assert len(calls) == 2, calls
+        parsed = _parse_claude_event_argv(calls[1])
+        assert parsed["tag"] == "queue-unblocked"
+        assert parsed["data"]["queue_id"] == d1["id"]
+        assert parsed["data"]["tier"] == "ambient"
+
+
+# ---------------------------------------------------------------------------
 # Entry point for direct invocation
 # ---------------------------------------------------------------------------
 
@@ -540,6 +603,8 @@ def _all_tests():
         test_env_var_suppresses_claude_event,
         test_abandon_is_idempotent_on_already_abandoned,
         test_abandon_is_idempotent_after_done,
+        test_block_emits_queue_blocked_event_with_ambient_tier,
+        test_unblock_emits_queue_unblocked_event_with_ambient_tier,
     ]
 
 
