@@ -1,8 +1,8 @@
 // Agent-activity bar popover (botchat #3066: "port botchat's agent bar").
 //
-// The header's bottom half-row is one outlined pill — `● N agents · C calls ·
-// K tok` (#agent-bar, a <button>) — and THIS file owns the per-agent
-// breakdown behind it (#agent-bar-pop): head "N live agents — C calls · K ctx
+// The header's TOP half-row (right-aligned, botchat #3090) is one outlined
+// pill — `● N agents · C calls · K tok` (#agent-bar, a <button>) — and THIS
+// file owns the per-agent breakdown behind it (#agent-bar-pop): head "N live agents — C calls · K ctx
 // · O out", a table with one row per live agent (description; type · queue id
 // · last tool; calls / ctx / out / age since spawn) and a footer with the main
 // loop's context size, the snapshot freshness and the host. Same layout as the
@@ -24,6 +24,18 @@
 // refresh.js — the same survival pattern as the density toggle. The popover
 // itself sits OUTSIDE #topbar-meta, so the morph never touches it; the
 // rebuilt pill mirrors the live open state (class `open` + aria-expanded).
+//
+// Anchoring (#3090): the popover's RIGHT edge follows the pill's right edge.
+// The pill sits at the top-right of the count stack, LEFT of the header
+// controls (density / source filter / live / info), so a fixed top-right
+// anchor would open the popover a few hundred px away from it on a desktop
+// header. position() measures the live boxes and writes the offset as the
+// CSS custom property `--abp-right` (style.css: `right: var(--abp-right,
+// 12px)`), clamped so the popover is never clipped at the right (≥ 12px from
+// the topbar edge) nor at the left (its left edge stays inside the topbar —
+// a wide popover under a narrow header degrades to the old top-right
+// anchor). The ≤480px rule pins the popover edge-to-edge by setting
+// right/left outright, so the measured anchor is ignored on phones.
 (function () {
   'use strict';
 
@@ -121,11 +133,32 @@
     b.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
 
+  const ANCHOR_MARGIN = 12;   // px — the popover's fallback top-right inset
+
+  // Anchor the popover's right edge to the pill's right edge (see the header
+  // comment). Measured from the LIVE boxes, so call it after every paint /
+  // unhide and on resize. No-op while hidden; clears the override when either
+  // box has no layout (display:none, jsdom) so the CSS fallback applies.
+  function position() {
+    const b = bar();
+    const host = pop.offsetParent || pop.parentElement;
+    if (!b || !host || pop.hidden) return;
+    const hb = host.getBoundingClientRect();
+    const bb = b.getBoundingClientRect();
+    if (!hb.width || !bb.width) { pop.style.removeProperty('--abp-right'); return; }
+    const popW = pop.offsetWidth || 0;
+    let right = hb.right - bb.right;                       // pill's right edge
+    right = Math.min(right, hb.width - popW - ANCHOR_MARGIN); // no left clip
+    right = Math.max(right, ANCHOR_MARGIN);                // no right clip
+    pop.style.setProperty('--abp-right', Math.round(right) + 'px');
+  }
+
   function open() {
     if (!bar() || !last) return;
     paint();
     pop.hidden = false;
     syncBar();
+    position();
   }
 
   function close() {
@@ -143,7 +176,7 @@
   function update(data) {
     last = data || null;
     if (!last) { close(); return; }
-    if (!pop.hidden) paint();
+    if (!pop.hidden) { paint(); position(); }
     syncBar();
   }
 
@@ -190,6 +223,8 @@
     }
   });
 
+  window.addEventListener('resize', () => { if (!pop.hidden) position(); });
+
   syncBar();
-  window.__qsiteAgentBar = { update, open, close, paint, isOpen, get last() { return last; } };
+  window.__qsiteAgentBar = { update, open, close, paint, position, isOpen, get last() { return last; } };
 })();

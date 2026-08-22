@@ -72,9 +72,10 @@ Every RUNNING row carries a live cell in its item head — `11 calls · 82K tok`
 in comfortable density, `11·82Kt` in compact (the head is the one line
 compact never elides, so the counters stay visible there too; hover for
 output tokens / last tool / last-write age) — and the header shows the
-session totals as ONE outlined rounded pill in a bottom half-row, `● N agents
-· C calls · K tok`, stacked under the status pills (running / blocked /
-pending). The pill is the botchat topbar agent-bar look: a live dot,
+session totals as ONE outlined rounded pill in the TOP half-row, `● N agents
+· C calls · K tok`, right-aligned within the stack so its right edge lines up
+with the last status pill's; the status pills (running / blocked / pending)
+sit in the row below, left-aligned. The pill is the botchat topbar agent-bar look: a live dot,
 info-blue while at least one agent is live (`.active`), muted when none
 (`.idle`), dashed with an amber dot and `n/a` numerals when the snapshot is
 stale (`.stale`); under 480px the units collapse to `a` / `c` / `t`. Click
@@ -83,7 +84,10 @@ calls · K ctx · O out`, one row per live agent (description; type · queue id
 · last tool; calls / ctx / out / age since spawn) and a footer with the main
 loop's own context tokens, the snapshot age and the host (`static/agent-bar.js`,
 painted from the same `/api/queue` payload: `agent_stats.rows` /
-`agent_stats.main`; the template embeds the first paint as a JSON seed).
+`agent_stats.main`; the template embeds the first paint as a JSON seed). The
+popover's right edge is anchored to the pill's (measured into the `--abp-right`
+CSS property on open / repaint / resize, clamped inside the header on both
+sides); under 480px it pins edge-to-edge instead.
 The two rows are half-size and hard-nowrap at every width, so the header is
 always exactly two rows; `agent_stats.label` still carries the long form
 (`N agents · C calls · K tok`) for API consumers. The liveness dot next to
