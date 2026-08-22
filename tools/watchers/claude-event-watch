@@ -6,6 +6,15 @@
 #
 # Queue: ~/claude-events/ (override with $CLAUDE_EVENT_QUEUE, legacy
 #        $CRON_EVENT_QUEUE also honored for backward compat)
+# Marker: ~/claude-events/.state/last-heartbeat.json
+#        ($CLAUDE_EVENT_HEARTBEAT_MARKER) — durable consumer-side record that
+#        outlives the queue file it describes. It is the liveness signal
+#        claude-events-exporter turns into
+#        claude_events_last_heartbeat_timestamp_seconds, and it lives UNDER
+#        the queue dir so the exporter's existing bind-mount already covers
+#        it. (NOT $CLAUDE_EVENT_STATE_DIR — that one belongs to
+#        event-must-act and defaults to ~/.config/claude-events, which the
+#        exporter does not mount.)
 #
 # Behavior:
 #   - Block on inotifywait for create/moved_to (or, if events are already
@@ -138,6 +147,21 @@ fi
 
 QUEUE_DIR="${CLAUDE_EVENT_QUEUE:-${CRON_EVENT_QUEUE:-$HOME/claude-events}}"
 LOG_DIR="${CLAUDE_EVENT_LOG_DIR:-$HOME/.config/claude-events}"
+
+# Durable consumer-side state, kept as a DOT-SUBDIRECTORY OF THE QUEUE DIR on
+# purpose: claude-events-exporter already bind-mounts the queue dir (as
+# /events), so a marker written here needs no new mount, no new env var and no
+# deploy change to become visible to it. Nothing else walks it — the drain's
+# find is `-maxdepth 1 -type f -name '*.json'`, and the exporter's scandir
+# skips non-files — so a subdir here is invisible to both.
+#
+# NOTE the variable name: $CLAUDE_EVENT_STATE_DIR is ALREADY event-must-act's
+# (it defaults to ~/.config/claude-events, which the exporter does not mount),
+# so this marker gets its own full-path override instead of reusing it.
+#
+# "The consumer surfaced a heartbeat-tick to the main loop at T" marker. See
+# record_heartbeat_marker() for why the exporter cannot derive this itself.
+HEARTBEAT_MARKER="${CLAUDE_EVENT_HEARTBEAT_MARKER:-$QUEUE_DIR/.state/last-heartbeat.json}"
 LOG_FILE="$LOG_DIR/consumed.jsonl"
 LOG_MAX_LINES="${CLAUDE_EVENT_LOG_MAX_LINES:-10000}"
 LOG_KEEP_ROTATIONS=3
@@ -332,6 +356,15 @@ When no lead pattern matches the tag, the lead is the full message itself.
 Full event JSON appended to \$CLAUDE_EVENT_LOG_DIR/consumed.jsonl
 (default ~/.config/claude-events/, ring-buffered at
 \$CLAUDE_EVENT_LOG_MAX_LINES lines, default 10000).
+
+HEARTBEAT MARKER — every drained \`heartbeat-tick\` also refreshes
+\$CLAUDE_EVENT_HEARTBEAT_MARKER (default
+\$CLAUDE_EVENT_QUEUE/.state/last-heartbeat.json). Written atomically (temp + rename),
+never regressed by a late older tick. claude-events-exporter reads it
+for claude_events_last_heartbeat_timestamp_seconds — a tick lives on
+the queue for seconds, far too briefly for a 30s scrape to catch, so
+this durable marker is what makes the metric observable at all. It is
+consumer-written on purpose: if this watcher dies, it goes stale.
 
 MODE FILE (the runtime toggle) — default \$CLAUDE_EVENT_LOG_DIR/mode,
 override \$CLAUDE_EVENT_WATCH_MODE_FILE. One word, \`exit\` or \`monitor\`;
@@ -1248,6 +1281,94 @@ collect_burst() {
     done
 }
 
+# Persist "a heartbeat-tick was consumed here" to $HEARTBEAT_MARKER.
+#
+# WHY THIS EXISTS: claude-events-exporter used to derive its
+# claude_events_last_heartbeat_timestamp_seconds gauge purely by scanning the
+# queue dir for `*_heartbeat-tick.json` at scrape time. That can essentially
+# never fire: this watcher consumes a tick within SECONDS of it landing, the
+# scrape interval is 30s and ticks are ~15min apart, so the odds of a scrape
+# catching one on disk are negligible — the gauge sat at its cold-start 0
+# indefinitely. The observation has to be recorded by the side that observes it.
+#
+# It also has to be recorded by the CONSUMER, not the emitter: the gauge means
+# "seconds since the main loop was last shown a heartbeat-tick", so a wedged or
+# dead claude-event-watch must let it go stale. A marker written here does; one
+# derived from the emit side would not.
+#
+# Best-effort by construction — failing to write the marker must never break or
+# delay event delivery, so the caller ignores the return code.
+record_heartbeat_marker() {
+    local f="$1"
+    local base="${f##*/}"
+    # Filename shape is <ns_timestamp>_<safe_tag>.json (see claude-event).
+    [[ "$base" == *_heartbeat-tick.json ]] || return 0
+    HEARTBEAT_MARKER="$HEARTBEAT_MARKER" python3 - "$f" <<'HBEOF' || true
+import json, os, sys, tempfile, time
+
+src = sys.argv[1]
+marker = os.environ["HEARTBEAT_MARKER"]
+base = os.path.basename(src)
+
+# Emit time comes from the filename's ns prefix (the emitter's own clock), so
+# the exported age stays "time since the tick was EMITTED" — the same quantity
+# the old in-dir scan reported. Fall back to mtime, then now, if unparseable.
+ev_ts = None
+ns = base.split("_", 1)[0]
+if ns.isdigit():
+    try:
+        ev_ts = int(ns) / 1e9
+    except (ValueError, OverflowError):
+        ev_ts = None
+if ev_ts is None:
+    try:
+        ev_ts = os.stat(src).st_mtime
+    except OSError:
+        ev_ts = time.time()
+
+# Never regress: a late-arriving older tick must not rewind the marker.
+try:
+    with open(marker, "r", encoding="utf-8") as fp:
+        prev = float(json.load(fp).get("event_timestamp") or 0)
+    if prev > ev_ts:
+        sys.exit(0)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    pass  # absent or malformed -> just overwrite it
+
+payload = {
+    "tag": "heartbeat-tick",
+    "event_timestamp": ev_ts,        # when the tick was emitted
+    "processed_at": time.time(),     # when this watcher surfaced it
+    "event_file": base,
+}
+
+d = os.path.dirname(marker) or "."
+os.makedirs(d, exist_ok=True)
+# The reader is a separate process (the exporter, often in a container with
+# a different uid), so don't let a restrictive umask make the dir unreadable
+# to it. Best-effort: a pre-existing dir we don't own is left alone.
+try:
+    os.chmod(d, 0o755)
+except OSError:
+    pass
+# Atomic: write a temp file in the SAME directory, then rename over the
+# marker, so a concurrent reader (the exporter) never sees a partial file.
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".last-heartbeat.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp)
+        fp.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, marker)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+HBEOF
+}
+
 print_pending() {
     local any=0
     maybe_rotate_log
@@ -1255,6 +1376,9 @@ print_pending() {
     while IFS= read -r -d '' f; do
         any=1
         process_event "$f" "$LOG_FILE"
+        # Marker AFTER process_event: it records that the event was actually
+        # surfaced, not merely that a file was found on disk.
+        record_heartbeat_marker "$f" || true
         rm -f "$f"
     done < <(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | sort -z)
     # Expose whether anything was actually delivered so the throttle stamps the

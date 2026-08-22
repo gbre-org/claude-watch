@@ -1176,4 +1176,137 @@ if grep -q '^\[monitor-mode\]' "$EXIT_OUT"; then
 fi
 echo "  monitor-format: exit-mode one-shot lines are byte-identical (guard) OK"
 
-echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard + delivery mode + monitor line format)"
+# --- Heartbeat marker (backs claude_events_last_heartbeat_timestamp_seconds)
+# The exporter cannot see a heartbeat-tick by scanning the queue dir: this
+# watcher drains one within seconds of it landing, ticks are ~15min apart and
+# the scrape interval is 30s. So the CONSUMER records the observation to
+# $CLAUDE_EVENT_HEARTBEAT_MARKER (default <queue>/.state/last-heartbeat.json),
+# which the exporter reads. Consumer-written on purpose — a dead watcher must
+# let the metric go stale rather than have it derived off the still-emitting
+# producer.
+#
+# Note that $CLAUDE_EVENT_STATE_DIR (exported near the top of this file) is
+# event-must-act's, NOT this marker's: it defaults to ~/.config/claude-events,
+# which the exporter does not mount. Reusing it here would have silently put
+# the marker somewhere the exporter can never see.
+HBQ="$TMP/hbq"; HBLOG="$TMP/hblog"; mkdir -p "$HBQ" "$HBLOG"
+HB_MARKER="$HBQ/.state/last-heartbeat.json"
+
+write_tick() {  # <queue> <ns_timestamp>
+    python3 - "$1" "$2" <<'PYEOF'
+import json, sys, time
+queue, ns = sys.argv[1], sys.argv[2]
+ev = {
+    "timestamp": int(ns) / 1e9,
+    "source": "claude-watch",
+    "tag": "heartbeat-tick",
+    "message": "heartbeat tick",
+    "data": {"interval_secs": 300, "path": "/var/run/claude/heartbeat"},
+}
+with open(f"{queue}/{ns}_heartbeat-tick.json", "w") as f:
+    json.dump(ev, f)
+PYEOF
+}
+
+run_hb_watcher() {  # <queue> <logdir> [extra env assignments handled by caller]
+    CLAUDE_EVENT_QUEUE="$1" CLAUDE_EVENT_LOG_DIR="$2" \
+        CLAUDE_EVENT_WATCH_LOCK="$TMP/hb.lock" \
+        CLAUDE_EVENT_WATCH_AUTO_INGEST=0 \
+        "$WATCHER" --debounce 0 2>&1
+}
+
+# (a) A drained heartbeat-tick writes the marker with the emit timestamp.
+write_tick "$HBQ" 1750000000123456789
+hb_out=$(run_hb_watcher "$HBQ" "$HBLOG")
+if ! grep -q '^EVENT\[claude-watch/heartbeat-tick\]' <<<"$hb_out"; then
+    echo "FAIL: heartbeat-tick not delivered" >&2; echo "$hb_out" >&2; exit 1
+fi
+if [[ ! -f "$HB_MARKER" ]]; then
+    echo "FAIL: heartbeat marker not written to $HB_MARKER" >&2; exit 1
+fi
+if ! python3 -c "
+import json, sys
+m = json.load(open('$HB_MARKER'))
+assert m['tag'] == 'heartbeat-tick', m
+assert abs(m['event_timestamp'] - 1750000000.1234567) < 0.01, m
+assert m['processed_at'] >= m['event_timestamp'], m
+assert m['event_file'] == '1750000000123456789_heartbeat-tick.json', m
+"; then
+    echo "FAIL: heartbeat marker content wrong" >&2; cat "$HB_MARKER" >&2; exit 1
+fi
+# Atomic write: the temp file must have been renamed away, never left behind.
+if compgen -G "$HBQ/.state/.last-heartbeat.*.tmp" >/dev/null; then
+    echo "FAIL: heartbeat marker left a temp file behind (non-atomic write)" >&2
+    ls -la "$HBQ/.state" >&2; exit 1
+fi
+# The .state subdir must stay invisible to the drain (find is -maxdepth 1
+# -type f), so the marker is never surfaced or deleted as if it were an event.
+if grep -q 'last-heartbeat' <<<"$hb_out"; then
+    echo "FAIL: marker surfaced as an event" >&2; echo "$hb_out" >&2; exit 1
+fi
+echo "  heartbeat marker: written on drain, atomic, .state invisible to the drain OK"
+
+# (b) Monotonic — a late-arriving OLDER tick must not rewind the marker.
+write_tick "$HBQ" 1740000000000000000
+run_hb_watcher "$HBQ" "$HBLOG" >/dev/null
+if ! python3 -c "
+import json
+m = json.load(open('$HB_MARKER'))
+assert abs(m['event_timestamp'] - 1750000000.1234567) < 0.01, m
+"; then
+    echo "FAIL: older heartbeat-tick rewound the marker" >&2; cat "$HB_MARKER" >&2; exit 1
+fi
+# ...but a NEWER one does advance it.
+write_tick "$HBQ" 1760000000000000000
+run_hb_watcher "$HBQ" "$HBLOG" >/dev/null
+if ! python3 -c "
+import json
+m = json.load(open('$HB_MARKER'))
+assert abs(m['event_timestamp'] - 1760000000.0) < 0.01, m
+"; then
+    echo "FAIL: newer heartbeat-tick did not advance the marker" >&2; cat "$HB_MARKER" >&2; exit 1
+fi
+echo "  heartbeat marker: monotonic (older tick ignored, newer tick advances) OK"
+
+# (c) A non-heartbeat event must not touch the marker.
+NHQ="$TMP/nhq"; NHLOG="$TMP/nhlog"; mkdir -p "$NHQ" "$NHLOG"
+echo '{"source":"manual","tag":"smoke","message":"not a heartbeat","data":{}}' \
+    >"$NHQ/1750000000000000000_smoke.json"
+run_hb_watcher "$NHQ" "$NHLOG" >/dev/null
+if [[ -e "$NHQ/.state" ]]; then
+    echo "FAIL: non-heartbeat event created heartbeat marker state" >&2; exit 1
+fi
+echo "  heartbeat marker: untouched by non-heartbeat events OK"
+
+# (d) $CLAUDE_EVENT_HEARTBEAT_MARKER relocates the marker (used by hosts whose
+#     exporter mounts something other than the queue dir).
+CUSTQ="$TMP/custq"; CUSTLOG="$TMP/custlog"; mkdir -p "$CUSTQ" "$CUSTLOG"
+CUSTOM_MARKER="$TMP/custom-state/hb.json"
+write_tick "$CUSTQ" 1750000001000000000
+CLAUDE_EVENT_HEARTBEAT_MARKER="$CUSTOM_MARKER" CLAUDE_EVENT_QUEUE="$CUSTQ" \
+    CLAUDE_EVENT_LOG_DIR="$CUSTLOG" CLAUDE_EVENT_WATCH_LOCK="$TMP/hb.lock" \
+    CLAUDE_EVENT_WATCH_AUTO_INGEST=0 "$WATCHER" --debounce 0 >/dev/null 2>&1
+if [[ ! -f "$CUSTOM_MARKER" ]]; then
+    echo "FAIL: CLAUDE_EVENT_HEARTBEAT_MARKER override ignored" >&2; exit 1
+fi
+if [[ -e "$CUSTQ/.state" ]]; then
+    echo "FAIL: override still wrote the default marker path" >&2; exit 1
+fi
+echo "  heartbeat marker: CLAUDE_EVENT_HEARTBEAT_MARKER override honored OK"
+
+# (e) Best-effort: an unwritable marker path must NOT break event delivery.
+#     A regular file where the state dir belongs makes makedirs() fail.
+BEQ="$TMP/beq"; BELOG="$TMP/belog"; mkdir -p "$BEQ" "$BELOG"
+: >"$BEQ/.state"   # a FILE, not a directory
+write_tick "$BEQ" 1750000002000000000
+be_out=$(run_hb_watcher "$BEQ" "$BELOG")
+if ! grep -q '^EVENT\[claude-watch/heartbeat-tick\]' <<<"$be_out"; then
+    echo "FAIL: a failing marker write broke event delivery (must be best-effort)" >&2
+    echo "$be_out" >&2; exit 1
+fi
+if compgen -G "$BEQ/*.json" >/dev/null; then
+    echo "FAIL: queue file not drained after a failing marker write" >&2; exit 1
+fi
+echo "  heartbeat marker: best-effort — delivery survives an unwritable marker OK"
+
+echo "PASS: all claude-event-watch checks (fast-path + adaptive debounce + throttle + singleton + tty guard + delivery mode + monitor line format + heartbeat marker)"

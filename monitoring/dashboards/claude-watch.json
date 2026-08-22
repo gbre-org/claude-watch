@@ -50,7 +50,7 @@
           "instant": false
         },
         {
-          "expr": "time() - (claude_events_last_heartbeat_timestamp_seconds > 0)",
+          "expr": "time() - claude_events_last_heartbeat_timestamp_seconds",
           "legendFormat": "Last Ack Age",
           "refId": "D",
           "range": true,
@@ -177,6 +177,23 @@
               {
                 "id": "noValue",
                 "value": "n/a — no heartbeat-tick observed yet"
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "range",
+                    "options": {
+                      "from": 1000000000,
+                      "to": null,
+                      "result": {
+                        "text": "n/a — no heartbeat-tick observed yet",
+                        "color": "#93a1a1",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
               }
             ]
           }
@@ -200,7 +217,7 @@
           "titleSize": 16
         }
       },
-      "description": "Session lifetime timers, ONE stat panel with four tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded). LAST ACK AGE = seconds since claude-events-exporter last observed a claude-watch heartbeat-tick event on the bus (claude_events_last_heartbeat_timestamp_seconds, tracked across scrapes even after claude-event-watch consumes the file -- same green<360/amber>=360/red>=600 thresholds as HEARTBEAT; n/a on a freshly-restarted exporter that hasn't seen a tick yet)."
+      "description": "Session lifetime timers, ONE stat panel with four tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded). LAST ACK AGE = seconds since claude-event-watch last SURFACED a claude-watch heartbeat-tick to the main loop (time() - claude_events_last_heartbeat_timestamp_seconds; same green<360/amber>=360/red>=600 thresholds as HEARTBEAT). The exporter reads that timestamp from the durable marker the watcher writes on drain (claude-events dir, .state/last-heartbeat.json) -- scanning the queue dir for a tick cannot work, since the watcher consumes one within seconds and ticks are ~15min apart, so the gauge previously sat at its cold-start 0 forever. It is deliberately consumer-written: a dead or wedged claude-event-watch makes this tile go RED rather than being masked by the still-emitting producer. The query no longer filters the cold-start 0 with \"> 0\" -- that produced an EMPTY vector and the tile vanished entirely instead of rendering its n/a text; the 0 now yields an implausible (>1e9 s) age that a value mapping renders as \"n/a -- no heartbeat-tick observed yet\"."
     },
     {
       "id": 104,

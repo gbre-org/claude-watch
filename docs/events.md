@@ -137,6 +137,16 @@ ring-buffer log (compact JSON).
 - **Consumed log**: `$CLAUDE_EVENT_LOG_DIR/consumed.jsonl` (default
   `~/.config/claude-events/`), rotated to `.1`/`.2`/`.3`.
 - **Ring buffer max lines**: `$CLAUDE_EVENT_LOG_MAX_LINES` (default 10000).
+- **Heartbeat marker**: `$CLAUDE_EVENT_HEARTBEAT_MARKER` (default
+  `$CLAUDE_EVENT_QUEUE/.state/last-heartbeat.json`). `claude-event-watch`
+  rewrites it — atomically, and never backwards — every time it surfaces a
+  `heartbeat-tick`. `claude-events-exporter` reads it to publish
+  `claude_events_last_heartbeat_timestamp_seconds`, because a tick sits on
+  the queue for only seconds and a 30s scrape essentially never catches one
+  there. It is deliberately written by the CONSUMER: if `claude-event-watch`
+  dies or wedges, the marker (and so the metric) goes stale, which is the
+  signal. Note this is **not** `$CLAUDE_EVENT_STATE_DIR` — that belongs to
+  `event-must-act` and defaults outside the queue dir.
 
 ## Schema
 
