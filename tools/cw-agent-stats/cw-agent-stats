@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
-"""cw-agent-stats — host-side producer for the live agent-activity badge.
+"""cw-agent-stats — host-side producer of the live agent-activity snapshot.
 
-Originally shipped as ``botchat/bin/botchat-agent-stats`` (botchat
-#2955/#2956, Andrew, 2026-08-21: *"live updating counter of agent tool calls
-(on all views, including compact)"* + *"token count too if possible"*).
-Moved into claude-watch so the launchd job / install target that owns this
-producer is claude-watch's own responsibility, not botchat's — claude-watch
-should not need botchat's repo checked out just to run its own dashboard
-producers.
+Originally ``botchat/bin/botchat-agent-stats`` (botchat #2955/#2956, Andrew,
+2026-08-21: *"live updating counter of agent tool calls (on all views,
+including compact)"* + *"token count too if possible"*). The feature was then
+removed from botchat altogether (2026-08-22, Andrew: "move what you have to
+into cw"), so this script AND the survey library under it (``agentstats.py``,
+vendored next to this file) are now claude-watch's own — no botchat checkout,
+``sys.path`` hack, or botchat env is needed to run it.
 
 Scans the live Claude Code subagent transcripts (``~/.claude/projects/<slug>/
 <session>/subagents/agent-*.jsonl``) plus the main-loop transcript, folds them
 into per-agent {tool calls, context tokens, output tokens, age} and writes ONE
-JSON snapshot ATOMICALLY to the given ``--out`` path (default: botchat's data
-dir, for backward compatibility with manual/local invocations)::
+JSON snapshot ATOMICALLY to ``--out``. Default ``--out`` (first match wins)::
 
-    <BOTCHAT_DATA_DIR>/agent-stats.json        (default /var/apps/botchat)
+    $CW_AGENT_STATS_OUT                               explicit file path
+    $CLAUDE_WATCH_STATE_DIR/agent-stats.json          claude-watch state dir
+    $BOTCHAT_DATA_DIR/agent-stats.json                DEPRECATED fallback (warns)
+    /var/lib/claude-watch/agent-stats.json            the daemon's default state dir
 
-That directory is bind-mounted into the botchat container as ``/data``, so
-the web app picks the snapshot up with no new mount: ``GET /api/agent-stats``
-serves it, and the SSE stream pushes it as an ``agent_stats`` event on every
-change. The actual fold/survey logic still lives in botchat's own
-``src/botchat/agentstats.py`` (imported below by pointing ``sys.path`` at
-botchat's checkout) — that module is the source-of-truth for the transcript
-survey + exact counter definitions; see botchat's DESIGN.md §3f for the
-consumer-side badge. Only the *scheduling* (the launchd job) moved; the
-survey library is still a documented dependency on the botchat checkout.
+i.e. the snapshot lands next to the daemon's ``active-agents.json`` — the
+directory the compose stack already bind-mounts into the queue-minisite at
+``/agents-state`` (``CW_STATE_PATH``), where ``queue-minisite/app.py`` reads
+it by default (``QUEUE_MINISITE_AGENT_STATS_FILE``). The ``BOTCHAT_DATA_DIR``
+fallback is kept for ONE release so an operator whose environment still
+exports it does not silently lose the snapshot; it prints a deprecation line
+on stderr and will be removed. The old ``~/.config/botchat/config`` file read
+is GONE (that was botchat-specific plumbing, and it is exactly what kept this
+producer writing into botchat's data dir after the botchat consumer was
+removed).
 
 Modes
 -----
@@ -53,47 +56,63 @@ import tempfile
 import time
 from pathlib import Path
 
-# The survey/fold library still lives in botchat's checkout (it's the
-# source-of-truth module, shared with botchat's own consumer-side code). This
-# is a deliberate LIBRARY dependency, distinct from the OPERATIONAL ownership
-# (launchd job + install target) that this move relocates into claude-watch.
-_BOTCHAT_SRC = Path(os.environ.get("CW_AGENT_STATS_BOTCHAT_SRC", os.path.expanduser("~/repos/botchat/src")))
-sys.path.insert(0, str(_BOTCHAT_SRC))
+# The survey/fold library is vendored NEXT TO this script (agentstats.py).
+# Resolve it relative to this file's real location so the ~/bin symlink
+# (``make install``) and the cron / launchd absolute-path invocations all
+# find it without any PYTHONPATH or botchat checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from botchat import agentstats  # noqa: E402
+import agentstats  # noqa: E402
+
+
+DEFAULT_STATE_DIR = Path("/var/lib/claude-watch")
 
 
 def _default_out() -> Path:
-    """``<data dir>/agent-stats.json`` — data dir via env > host config > /data.
+    """Resolve the snapshot path when ``--out`` is not given.
 
-    Deliberately does NOT import ``botchat.store`` for the resolution (that
-    module pulls psycopg); this producer must run on a host with only the
-    stdlib, so the ``~/.config/botchat/config`` fallback is re-read here
-    (same precedence as ``store._default_data_dir``). Callers wiring the
-    launchd job should pass ``--out`` explicitly instead of relying on this
-    fallback.
+    Mirrors the Rust daemon's state-dir resolution (``CLAUDE_WATCH_STATE_DIR``
+    env, else ``/var/lib/claude-watch`` — see ``src/stale_ready.rs`` /
+    ``src/queue_check.rs``) so the snapshot lands beside ``active-agents.json``
+    and rides the SAME bind-mount into the queue-minisite. Precedence:
+
+    1. ``CW_AGENT_STATS_OUT`` — an explicit file path (this producer's own knob).
+    2. ``CLAUDE_WATCH_STATE_DIR`` — ``<dir>/agent-stats.json``.
+    3. ``BOTCHAT_DATA_DIR`` — ``<dir>/agent-stats.json``. DEPRECATED: the
+       pre-vendoring default; honoured for one release with a stderr warning
+       so an operator whose env still exports it keeps a working snapshot
+       while they move the consumer off botchat's data dir. Will be removed.
+    4. ``/var/lib/claude-watch/agent-stats.json``.
+
+    Note the old ``~/.config/botchat/config`` file lookup is deliberately NOT
+    carried over — that file is botchat's, and reading it is what kept the
+    snapshot landing in botchat's data dir after the botchat consumer was
+    removed. Operators wanting a non-default location pass ``--out`` or set
+    ``CW_AGENT_STATS_OUT``.
     """
-    env = os.environ.get("BOTCHAT_DATA_DIR", "").strip()
-    if env:
-        return Path(env) / agentstats.SNAPSHOT_FILENAME
-    cfg = Path(os.path.expanduser("~/.config/botchat/config"))
-    try:
-        for line in cfg.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("BOTCHAT_DATA_DIR="):
-                v = line.split("=", 1)[1].strip().strip('"').strip("'")
-                if v:
-                    return Path(v) / agentstats.SNAPSHOT_FILENAME
-    except OSError:
-        pass
-    return Path("/data") / agentstats.SNAPSHOT_FILENAME
+    explicit = os.environ.get("CW_AGENT_STATS_OUT", "").strip()
+    if explicit:
+        return Path(explicit)
+    state_dir = os.environ.get("CLAUDE_WATCH_STATE_DIR", "").strip()
+    if state_dir:
+        return Path(state_dir) / agentstats.SNAPSHOT_FILENAME
+    legacy = os.environ.get("BOTCHAT_DATA_DIR", "").strip()
+    if legacy:
+        print(
+            "cw-agent-stats: BOTCHAT_DATA_DIR is deprecated as the snapshot location "
+            f"(writing {legacy}/{agentstats.SNAPSHOT_FILENAME}); set CW_AGENT_STATS_OUT "
+            "or CLAUDE_WATCH_STATE_DIR, or pass --out. This fallback will be removed.",
+            file=sys.stderr,
+        )
+        return Path(legacy) / agentstats.SNAPSHOT_FILENAME
+    return DEFAULT_STATE_DIR / agentstats.SNAPSHOT_FILENAME
 
 
 def _default_prom_file() -> Path:
     """Resolve the node-exporter textfile-collector output path for the agent gauges.
 
     Design (2026-08-22, Andrew's call): this daemon is the ONE producer for
-    both outputs — the botchat snapshot JSON above AND these Prometheus
+    both outputs — the agent-stats snapshot JSON above AND these Prometheus
     gauges — rather than a second hook-based capture pipeline. Mirrors
     claude-watch's own ``CLAUDE_WATCH_PROM_FILE`` convention
     (``src/metrics.rs::prom_file_path``):
@@ -133,7 +152,7 @@ def _prom_lines(snap: dict) -> list[str]:
 
     These are GAUGES, not monotonic counters: each value is the tool-call /
     token count accumulated so far by a still-live agent (per
-    ``botchat.agentstats.AgentState``), which can only ever grow while the
+    ``agentstats.AgentState``), which can only ever grow while the
     agent is live and then disappears from the file once it falls out of the
     live window. Because the whole file is rewritten every tick, stale label
     sets from agents that exited the window are dropped automatically — no
@@ -199,7 +218,7 @@ def _prom_lines(snap: dict) -> list[str]:
 def _write_prom(lines: list[str], path: Path) -> None:
     """Atomic textfile-collector write: temp file in the same dir + rename.
 
-    Same shape as ``botchat.agentstats.write_snapshot`` (tmp + ``os.replace``)
+    Same shape as ``agentstats.write_snapshot`` (tmp + ``os.replace``)
     and Rust ``metrics.rs::write_prom`` — node-exporter polls this directory
     on its own schedule, so a half-written file would get scraped as a
     truncated/corrupt exposition and dropped for that scrape.
@@ -225,7 +244,7 @@ def _write_prom(lines: list[str], path: Path) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="cw-agent-stats",
-        description="Write the live agent tool-call/token snapshot for the botchat header badge.",
+        description="Write the live agent tool-call/token snapshot the queue-minisite reads.",
     )
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="one tick then exit (default)")
@@ -233,7 +252,9 @@ def main(argv=None) -> int:
     ap.add_argument("--interval", type=float, default=4.0, help="seconds between ticks in --loop (default 4)")
     ap.add_argument("--duration", type=float, default=58.0, help="total seconds to run in --loop (default 58)")
     ap.add_argument("--out", type=Path, default=None,
-                    help="snapshot path (default <BOTCHAT_DATA_DIR>/agent-stats.json)")
+                    help="snapshot path (default $CW_AGENT_STATS_OUT, else "
+                         "$CLAUDE_WATCH_STATE_DIR/agent-stats.json, else "
+                         "/var/lib/claude-watch/agent-stats.json)")
     ap.add_argument("--prom-file", type=Path, default=None,
                     help="node-exporter textfile-collector path for the Prometheus gauges "
                          "(default $CW_AGENT_STATS_PROM_FILE, else a sibling of "

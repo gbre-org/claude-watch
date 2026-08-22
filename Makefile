@@ -20,6 +20,7 @@
 .PHONY: test test-verbose test-unit test-e2e test-live
 # Python / shell tool test targets
 .PHONY: test-session-task test-obligations-init test-queue-minisite test-hooks
+.PHONY: test-cw-agent-stats
 .PHONY: test-agent-msg test-agent-tail test-claude-event test-event-must-act
 .PHONY: test-pr-branches
 .PHONY: test-self-clear test-self-login test-self-login-tmux test-watchers
@@ -103,6 +104,17 @@ test-session-task: ## session-task queue CLI pytest suite
 # a tempdir HOME so the live ~/.config/claude/obligations.json is untouched.
 test-obligations-init: ## obligations-init user-manifest idempotency pytest suite
 	uv run --python 3.11 --with pytest pytest tools/obligations/tests/ -v
+
+# Run the cw-agent-stats pytest suite: the vendored transcript survey/fold
+# library (tools/cw-agent-stats/agentstats.py -- formerly botchat's
+# src/botchat/agentstats.py) + the cw-agent-stats CLI (--out default
+# resolution, Prometheus textfile rendering, an end-to-end --once run).
+# Pins the agent-stats.json snapshot schema the queue-minisite joins on;
+# run together with test-queue-minisite when touching either side.
+# Self-contained: synthetic ~/.claude/projects tree under tmp_path, never
+# the live one or the live state dir.
+test-cw-agent-stats: ## cw-agent-stats producer (agentstats library + CLI) pytest suite
+	uv run --python 3.11 --with pytest pytest tools/cw-agent-stats/tests/ -v
 
 # Run the queue-minisite end-to-end suites (queue-minisite/test_*.py).
 # Each file is a standalone unittest script that boots the Flask app
@@ -600,6 +612,7 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@ln -sfn $(abspath tools/event-must-act/eval-event-must-act) $(BIN_DIR)/eval-event-must-act
 	@ln -sfn $(abspath tools/event-must-act/user-prompt-ambient-inject-hook) $(BIN_DIR)/user-prompt-ambient-inject-hook
 	@ln -sfn $(abspath tools/event-must-act/cw-watcher-health-check) $(BIN_DIR)/cw-watcher-health-check
+	@ln -sfn $(abspath tools/cw-agent-stats/cw-agent-stats) $(BIN_DIR)/cw-agent-stats
 	@echo "Installed to $(BIN_DIR):"
 	@echo "  - claude-watch              (file copy, build artifact)"
 	@echo "  - session-task              (symlink -> tools/session-task/)"
@@ -625,6 +638,7 @@ install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@echo "  - eval-event-must-act       (symlink -> tools/event-must-act/)"
 	@echo "  - user-prompt-ambient-inject-hook (symlink -> tools/event-must-act/)"
 	@echo "  - cw-watcher-health-check   (symlink -> tools/event-must-act/)"
+	@echo "  - cw-agent-stats            (symlink -> tools/cw-agent-stats/)"
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
 # Points core.hooksPath at the tracked scripts/git-hooks/ dir instead of
@@ -651,10 +665,13 @@ install-mcp-host-bash-server: ## Build + install the host-bash MCP server to ~/b
 
 # Install + (re)start the cw-agent-stats macOS LaunchAgent: the host producer
 # that folds live Claude Code subagent transcripts into the agent tool-call /
-# token snapshot the botchat header badge + queue-minisite dashboard read.
-# Moved here from claude-config/botchat (was org.gbre.claude-watch.botchat-
-# agent-stats, installed by hand) so claude-watch owns its own producer's
-# install lifecycle. ProgramArguments[0] in the plist points directly at the
+# token snapshot the queue-minisite dashboard reads (library + CLI both live
+# in tools/cw-agent-stats/ now -- no botchat checkout involved; see that
+# dir's README). Moved here from claude-config/botchat (was
+# org.gbre.claude-watch.botchat-agent-stats, installed by hand) so
+# claude-watch owns its own producer's install lifecycle. On Linux hosts the
+# equivalent is a cron line (README), and `make install` symlinks the CLI
+# into ~/bin. ProgramArguments[0] in the plist points directly at the
 # shebang'd tools/cw-agent-stats/cw-agent-stats script (never a bare python
 # interpreter -- see the plist's own header comment). Idempotent: bootout is
 # best-effort (no-op if not yet loaded), then bootstrap + kickstart -k always

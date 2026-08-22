@@ -148,6 +148,15 @@ jobs:
         run: make test-queue-minisite
         timeout-minutes: 10
 
+      - name: Run cw-agent-stats producer tests (agentstats library + CLI)
+        # The host-side producer of the agent-stats.json snapshot the
+        # minisite suites above consume. Lives in the same job on purpose:
+        # one side pins the snapshot schema from the producer, the other
+        # from the consumer, so a shape change that forgets either fails
+        # here. pytest supplied by uv (installed above).
+        run: make test-cw-agent-stats
+        timeout-minutes: 5
+
   container-shell-tests:
     name: Container shell + shim tests
     runs-on: ubuntu-latest

@@ -90,7 +90,10 @@ always exactly two rows; `agent_stats.label` still carries the long form
 the controls is a matching small `live` / `error` pill.
 
 The minisite does NOT fold transcripts itself. It reads a small JSON
-snapshot that a host-side cron rewrites atomically about once a minute
+snapshot that the host-side producer in this repo —
+[`tools/cw-agent-stats/cw-agent-stats`](../tools/cw-agent-stats/README.md),
+run from cron (Linux) or the launchd plist beside it (macOS) — rewrites
+atomically every few seconds
 (`QUEUE_MINISITE_AGENT_STATS_FILE`; shape: `{generated_at, main:{context_tokens,…},
 agents:[{agent_id, queue_id, tool_calls, context_tokens, output_tokens,
 last_tool, age_seconds, finished,…}], totals:{agents, tool_calls,
@@ -114,9 +117,15 @@ Degradation rules, in order:
 **Mount the snapshot's DIRECTORY, not the file.** The producer replaces the
 file atomically (tmp + rename); a single-file bind mount pins the original
 inode and goes stale on the first rewrite — the same trap the
-`session-task` mount documents. Either mirror the host path
-(`/var/apps/botchat:/var/apps/botchat:ro`, default env works) or mount the
-dir elsewhere and point the env var at the file inside it.
+`session-task` mount documents. The producer's default `--out` is
+`<claude-watch state dir>/agent-stats.json` (`$CLAUDE_WATCH_STATE_DIR`, else
+`/var/lib/claude-watch` — beside the daemon's `active-agents.json`), and the
+minisite's default path is the SIBLING of `AGENT_STATE_JSON`, so when the
+compose stack bind-mounts that state dir at `/agents-state` (`CW_STATE_PATH`)
+both sides already agree (`/agents-state/agent-stats.json`) with no env var.
+Otherwise mount the producer's output dir elsewhere and point the env var at
+the file inside it (the `CLAUDE_HOST_AGENT_STATS_DIR` pattern in
+`examples/compose/docker-compose.yml`).
 
 ## Layout
 
@@ -183,7 +192,7 @@ brand identity lives outside the public image.
 | `SSE_TAIL_MAX_IDLE_SECONDS` | `30` | Idle cap on SSE live-log streams. |
 | `SSE_TAIL_MAX_LIFETIME_SECONDS` | `3600` | Lifetime cap on SSE live-log streams. |
 | `SSE_TAIL_BACKFILL_LINES` | `200` | Historical-context backfill cap when a client first connects. |
-| `QUEUE_MINISITE_AGENT_STATS_FILE` | `/var/apps/botchat/agent-stats.json` | Per-agent activity snapshot (tool calls + tokens) joined onto running rows + summed in the header — see "Agent activity counters" below. Empty = feature off. |
+| `QUEUE_MINISITE_AGENT_STATS_FILE` | sibling of `AGENT_STATE_JSON` (`/agents-state/agent-stats.json`) | Per-agent activity snapshot (tool calls + tokens) written by `tools/cw-agent-stats/cw-agent-stats`, joined onto running rows + summed in the header — see "Agent activity counters" below. Empty = feature off. |
 | `QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS` | `60` | Snapshot older than this (by `generated_at` or file mtime) renders as stale: blank cells + `n/a` numerals on the header pill, never a frozen number. |
 | `PINGME_SESSION_TASK` | `0` | Set to `1` to suppress pingme chatter from `session-task` lifecycle. |
 | `CLAUDE_EVENT_SESSION_TASK` | `0` | Set to `1` to suppress claude-event chatter from `session-task` lifecycle. |
