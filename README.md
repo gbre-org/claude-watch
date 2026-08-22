@@ -30,6 +30,9 @@ make install                # daemon copied + tool scripts symlinked into $BIN_D
 make install-hooks          # opt-in: warning-free build + unit-tests pre-commit gate
 ```
 
+`make help` indexes every target, grouped by which deployment shape it
+belongs to (Linux host + systemd, or the container/compose stack).
+
 Prerequisites: `cargo` + `rustc` (1.74+), `tmux`, Python 3.11+ for the
 `tools/` scripts.
 
@@ -280,6 +283,11 @@ or ops repo and call into these tools as primitives.
 
 ## Build & run
 
+`make help` prints the full index, grouped into sections — the test suites
+(split by where the code under test lives), the Linux host build/install and
+systemd deploy, the container/compose deploy, and the macOS host helpers.
+The commonly used ones:
+
 ```bash
 make test                # all Rust tests in parallel
 make test-session-task   # session-task pytest suite
@@ -296,6 +304,9 @@ make install-skills      # install skills/ as /cw-<name> slash commands (dep of 
 make install-hooks       # install the git pre-commit hook (warnings + tests)
 make test-install-host-skills  # tests for the skills installer + its Makefile wiring
 ```
+
+Deploying the container ("workbot") shape instead is `make deploy-container`
+— see [`examples/compose/README.md`](examples/compose/README.md).
 
 ### Skills
 
