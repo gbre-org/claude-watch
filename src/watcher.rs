@@ -128,6 +128,33 @@ pub struct WatcherStatus {
     pub dup_pollers: Vec<u32>,
 }
 
+impl WatcherStatus {
+    /// Is this watcher LIVE — enabled and either UP (a live recorded pid, in
+    /// either delivery mode) or ARMING (monitor mode, arm intent within the
+    /// grace: healthy-pending)? This is THE predicate behind every "N live
+    /// of M" figure (`claude-watch status` "Live watchers", the
+    /// `claude_code_live_watchers` gauge), so the CLI, the textfile collector
+    /// and the daemon's `watcher_monitor` UP/DOWN model agree on what counts.
+    ///
+    /// Mirrors the daemon's liveness model (UP/DOWN only): `DUPLICATE` is a
+    /// live watcher with a state-cleanliness problem (count is 1, extra pgrep
+    /// matches) and still counts as live, exactly as it is NOT a miss for
+    /// `claude_watchers_missing`. `DOWN` and `off` are not live.
+    pub fn is_live(&self) -> bool {
+        self.enabled && matches!(self.status.as_str(), "ok" | "ARMING" | "DUPLICATE")
+    }
+}
+
+/// `(live, enabled)` watcher counts over a [`watcher_status`] result — the
+/// ONE shared reduction for "Live watchers: N/M" and the
+/// `claude_code_live_watchers` / `claude_code_enabled_watchers` gauges.
+/// `live` uses [`WatcherStatus::is_live`]; `enabled` is the config view.
+pub fn count_live_and_enabled(statuses: &[WatcherStatus]) -> (u32, u32) {
+    let live = statuses.iter().filter(|w| w.is_live()).count() as u32;
+    let enabled = statuses.iter().filter(|w| w.enabled).count() as u32;
+    (live, enabled)
+}
+
 /// Get process count for a pattern via `pgrep -fc`.
 ///
 /// Currently unused inside this module (`watcher_status` derives the count
@@ -3602,6 +3629,128 @@ mod tests {
 
         let evw = evw_status(120.0).await;
         assert_eq!(evw.status, "DOWN", "oneshot + intent => still DOWN: {:?}", evw);
+    }
+
+    /// Fixture for the live-count tests: ONE enabled watcher named `evw` with
+    /// NO start_cmd (so a live recorded pid is itself evidence of UP — the
+    /// test process's own pid stands in for the watcher) and a pgrep pattern
+    /// nothing on the host matches. `monitor` layers `mode=monitor` over it.
+    fn live_count_fixture(dir: &std::path::Path, monitor: bool) -> (std::path::PathBuf, String, String) {
+        let pid_dir = dir.join("pids");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        let cfg = dir.join("watchers.conf");
+        let ov = dir.join("watchers.override.conf");
+        // Per-process-unique pgrep pattern: a FIXED literal is matched by the
+        // sibling tests' own concurrent `pgrep -f <literal>` invocations
+        // (pgrep excludes itself, not other pgreps) and reads as DUPLICATE.
+        let pattern = unique_token("cw-live-count-no-such-process");
+        std::fs::write(&cfg, format!("evw|{}|1|true|\n", pattern)).unwrap();
+        std::fs::write(&ov, if monitor { "evw|mode=monitor\n" } else { "" }).unwrap();
+        (
+            pid_dir,
+            cfg.to_str().unwrap().to_string(),
+            ov.to_str().unwrap().to_string(),
+        )
+    }
+
+    /// The Grafana "Live 1 / Enabled 4" regression, monitor-mode half: a
+    /// `mode=monitor` watcher writes ONLY `<name>.lock` (its flock guard) —
+    /// never `<name>.pid` — and with a live pid in it the watcher is `ok`,
+    /// `[monitor]`, and counted LIVE by the shared reduction both
+    /// `claude-watch status` and the `claude_code_live_watchers` gauge use.
+    #[tokio::test]
+    async fn test_live_count_monitor_mode_lock_only_counts_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_dir, cfg, ov) = live_count_fixture(dir.path(), true);
+        // Live pid in the .lock, NO .pid anywhere.
+        std::fs::write(pid_dir.join("evw.lock"), std::process::id().to_string()).unwrap();
+        assert!(!pid_dir.join("evw.pid").exists());
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), &cfg);
+        std::env::set_var("WATCHERS_CONFIG_EXTRA", &ov);
+
+        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let evw = statuses.iter().find(|s| s.name == "evw").expect("evw present");
+        assert_eq!(evw.status, "ok", "{:?}", evw);
+        assert_eq!(evw.mode, "monitor");
+        assert_eq!(evw.count, 1);
+        assert!(evw.is_live());
+        assert_eq!(count_live_and_enabled(&statuses), (1, 1));
+
+        // ARMING (fresh intent, no live pid) is healthy-pending: still LIVE.
+        std::fs::remove_file(pid_dir.join("evw.lock")).unwrap();
+        write_intent(&pid_dir, 10);
+        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let evw = statuses.iter().find(|s| s.name == "evw").unwrap();
+        assert_eq!(evw.status, "ARMING", "{:?}", evw);
+        assert!(evw.is_live(), "ARMING must count as live");
+        assert_eq!(count_live_and_enabled(&statuses), (1, 1));
+
+        // Past the grace with nothing live → DOWN → not live, still enabled.
+        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 0.0).await;
+        let evw = statuses.iter().find(|s| s.name == "evw").unwrap();
+        assert_eq!(evw.status, "DOWN", "{:?}", evw);
+        assert!(!evw.is_live());
+        assert_eq!(count_live_and_enabled(&statuses), (0, 1));
+    }
+
+    /// One-shot half of the same regression: the `watcher_run` path writes
+    /// `<name>.pid` (no `.lock`); a live pid there still counts as LIVE.
+    #[tokio::test]
+    async fn test_live_count_oneshot_pid_only_counts_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pid_dir, cfg, ov) = live_count_fixture(dir.path(), false);
+        std::fs::write(pid_dir.join("evw.pid"), std::process::id().to_string()).unwrap();
+        assert!(!pid_dir.join("evw.lock").exists());
+        let _env = RunEnv::new(pid_dir.to_str().unwrap(), &cfg);
+        std::env::set_var("WATCHERS_CONFIG_EXTRA", &ov);
+
+        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let evw = statuses.iter().find(|s| s.name == "evw").expect("evw present");
+        assert_eq!(evw.status, "ok", "{:?}", evw);
+        assert_eq!(evw.mode, "oneshot");
+        assert!(evw.is_live());
+        assert_eq!(count_live_and_enabled(&statuses), (1, 1));
+
+        // Dead recorded pid → DOWN → not live.
+        std::fs::write(pid_dir.join("evw.pid"), (u32::MAX - 1).to_string()).unwrap();
+        let statuses = watcher_status_with(&config_path(), config_path_extra().as_deref(), 120.0).await;
+        let evw = statuses.iter().find(|s| s.name == "evw").unwrap();
+        assert_eq!(evw.status, "DOWN", "{:?}", evw);
+        assert_eq!(count_live_and_enabled(&statuses), (0, 1));
+    }
+
+    /// Pure predicate table for `is_live` / `count_live_and_enabled`: DUPLICATE
+    /// is live-but-unclean (the daemon's UP/DOWN model), `off` and `DOWN` are
+    /// not, and a disabled row never counts as live whatever its status says.
+    #[test]
+    fn test_is_live_predicate_table() {
+        let mk = |status: &str, enabled: bool| WatcherStatus {
+            name: "w".into(),
+            status: status.into(),
+            count: 0,
+            required: 1,
+            pids: String::new(),
+            enabled,
+            mode: "oneshot".into(),
+            dup_supervisors: Vec::new(),
+            dup_pollers: Vec::new(),
+        };
+        assert!(mk("ok", true).is_live());
+        assert!(mk("ARMING", true).is_live());
+        assert!(mk("DUPLICATE", true).is_live());
+        assert!(!mk("DOWN", true).is_live());
+        assert!(!mk("off", false).is_live());
+        assert!(!mk("ok", false).is_live(), "disabled never counts as live");
+
+        let rows = vec![
+            mk("ok", true),
+            mk("ARMING", true),
+            mk("DUPLICATE", true),
+            mk("DOWN", true),
+            mk("off", false),
+        ];
+        assert_eq!(count_live_and_enabled(&rows), (3, 4));
+        assert_eq!(count_live_and_enabled(&[]), (0, 0));
     }
 
     /// `watcher-restart` voids a pending arm: it removes `<name>.monitor-intent`
