@@ -150,6 +150,14 @@ Metrics:
         exporter has no owner signal at all and is deliberately silent on
         has_live_owner.)
   - worktask_queue_scrape_errors_total       counter (reads that failed)
+  - worktask_exporter_build_info{commit,version,source} gauge, always 1.
+        Build identity of the exporter ITSELF, so "is the deployed
+        exporter the commit I think it is" has an answer that is not a
+        container create time. Stamped at image build via
+        `--build-arg CW_BUILD_COMMIT` / `CW_BUILD_VERSION`, or at
+        runtime via $WORKTASK_EXPORTER_COMMIT / _VERSION / _SOURCE.
+        ALWAYS emitted — commit="unknown" when nothing stamped it, so
+        an ABSENT series means only "exporter older than this metric".
 """
 
 import json
@@ -233,6 +241,40 @@ AGENT_QUEUE_BINDINGS_PATH = os.environ.get(
     "AGENT_QUEUE_BINDINGS_JSON",
     "/queue-home/.config/claude/agent-queue-bindings.json",
 )
+
+# --- build identity ------------------------------------------------------
+#
+# `worktask_exporter_build_info` exists to answer one question an operator
+# could not previously answer at all: is the exporter I am scraping built
+# from the commit I think it is? Every other `worktask_*` series describes
+# the QUEUE; none described the exporter, so a deploy could only be
+# confirmed from container create times and file mtimes, neither of which
+# names a revision.
+#
+# The values come from the environment, and the environment gets them from
+# one of two places:
+#
+#   1. Image build. `Dockerfile` accepts `--build-arg CW_BUILD_COMMIT` /
+#      `CW_BUILD_VERSION` and freezes them into ENV alongside
+#      `WORKTASK_EXPORTER_SOURCE=image`. That mirrors how the Rust daemon's
+#      `claude_watch_build_info` is stamped (the Makefile resolves the
+#      commit on the HOST and feeds it in as a build arg) and for the same
+#      reason: `.dockerignore` prunes `.git/` from the build context and
+#      the slim base image has no `git`, so nothing INSIDE the build can
+#      run `git rev-parse` — the identity has to be handed in from outside.
+#   2. Runtime. A host-run exporter, or a container whose out-of-tree
+#      builder cannot pass build args, sets `WORKTASK_EXPORTER_COMMIT` /
+#      `WORKTASK_EXPORTER_VERSION` / `WORKTASK_EXPORTER_SOURCE` in the
+#      process environment. A runtime value naturally wins over the image's
+#      baked ENV default, which is what makes the same variable serve both.
+#
+# When NOTHING stamps it we still emit the series, with `commit="unknown"`.
+# Omitting it would make its absence ambiguous between "exporter too old to
+# have this metric" and "current exporter that failed to get stamped" — and
+# removing exactly that ambiguity is the whole point of the metric.
+EXPORTER_COMMIT = os.environ.get("WORKTASK_EXPORTER_COMMIT", "").strip() or "unknown"
+EXPORTER_VERSION = os.environ.get("WORKTASK_EXPORTER_VERSION", "").strip() or "0.0.0"
+EXPORTER_SOURCE = os.environ.get("WORKTASK_EXPORTER_SOURCE", "").strip() or "host"
 
 REG = CollectorRegistry()
 
@@ -371,6 +413,31 @@ g_owner_input_available = Gauge(
     ["input"],
     registry=REG,
 )
+
+g_build_info = Gauge(
+    "worktask_exporter_build_info",
+    (
+        "Build identity of the RUNNING work-queue-exporter process; always "
+        "1, the labels carry the payload. `commit` is the short git SHA, "
+        "`version` a semver, `source` is `image` for a container that baked "
+        "them at build time and `host` for a directly-run process. "
+        "commit=\"unknown\" means nothing stamped this build -- the series "
+        "is emitted anyway so that its ABSENCE means only one thing: an "
+        "exporter predating this metric. Verify a deploy with "
+        "`curl -s localhost:9099/metrics | grep build_info`."
+    ),
+    ["commit", "version", "source"],
+    registry=REG,
+)
+# Set once at import rather than per-scrape in collect(): build identity
+# cannot change while the process runs, and stamping it here means the
+# series is present even on a scrape whose collect() bails on a bad
+# queue.json -- the deploy question stays answerable when the queue is not.
+g_build_info.labels(
+    commit=EXPORTER_COMMIT,
+    version=EXPORTER_VERSION,
+    source=EXPORTER_SOURCE,
+).set(1)
 
 c_scope_conflicts = Counter(
     "worktask_queue_scope_conflicts",
@@ -916,6 +983,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
 def main():
     log.info("Starting work-queue exporter on :%d (queue=%s, agent_state=%s)",
              PORT, QUEUE_PATH, AGENT_STATE_PATH)
+    log.info("Build: commit=%s version=%s source=%s",
+             EXPORTER_COMMIT, EXPORTER_VERSION, EXPORTER_SOURCE)
     collect()
     HTTPServer(("0.0.0.0", PORT), MetricsHandler).serve_forever()
 

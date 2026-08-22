@@ -147,6 +147,10 @@ decides the answer is redone in the selector.
   textfile collector (`src/metrics.rs`)
 - `claude_events_*` → `exporters/claude-events-exporter/`
 - `worktask_queue_*` → `exporters/work-queue-exporter/`
+- `worktask_exporter_build_info` (Build Info, "exporter <commit>") → the same
+  exporter, stamped at image build; `commit=unknown` means the build args
+  never reached the image, an absent series means an exporter predating the
+  metric. See `monitoring/prometheus/README.md`.
 - "latest merged PR #n" (Build Info) → no metric at all: Infinity fetches
   `api.github.com/repos/hndrewaall/claude-watch/pulls` at render time
 
