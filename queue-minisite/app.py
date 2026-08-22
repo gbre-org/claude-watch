@@ -111,10 +111,11 @@ AGENT_QUEUE_BINDINGS_PATH = os.environ.get(
 )
 # Live per-agent activity counters (tool calls + tokens) for RUNNING queue
 # items + session totals in the header (botchat #2967). Source: an atomic JSON
-# snapshot a host-side cron rewrites every minute (producer: botchat's
-# ``bin/botchat-agent-stats``), shape::
+# snapshot a host-side cron rewrites every minute (producer: this repo's
+# ``tools/cw-agent-stats/cw-agent-stats``, library ``agentstats.py`` beside
+# it — the whole feature left botchat 2026-08-22), shape::
 #
-#     {"version": 1, "generated_at": <epoch>, "live_window_seconds": 900,
+#     {"version": 2, "generated_at": <epoch>, "live_window_seconds": 900,
 #      "main": {"session_id", "context_tokens", "last_write_at", "age_seconds"},
 #      "agents": [{"agent_id", "queue_id", "tool_calls", "context_tokens",
 #                  "output_tokens", "last_tool", "started_at",
@@ -132,8 +133,22 @@ AGENT_QUEUE_BINDINGS_PATH = os.environ.get(
 # must bind-mount its DIRECTORY (or mirror the host path), not the single
 # file: a single-file bind mount pins the original inode and goes stale on
 # the first rewrite — the same trap documented for SESSION_TASK_BIN.
+#
+# DEFAULT PATH = a SIBLING of ``AGENT_STATE_PATH`` (active-agents.json). The
+# producer's own default is ``<claude-watch state dir>/agent-stats.json``
+# (``$CLAUDE_WATCH_STATE_DIR``, else ``/var/lib/claude-watch`` — the same dir
+# the daemon writes ``active-agents.json`` into), and that dir is what the
+# compose stack already bind-mounts here as ``/agents-state`` (CW_STATE_PATH).
+# Deriving the default from AGENT_STATE_JSON keeps producer and consumer in
+# agreement with ZERO extra config wherever the state dir is shared: in the
+# container it resolves to ``/agents-state/agent-stats.json``; run bare on the
+# host it resolves to ``/var/lib/claude-watch/agent-stats.json`` if
+# AGENT_STATE_JSON points there. Set the env var to override (e.g. a
+# named-volume state dir the host cron cannot write into: mount the
+# producer's output dir separately and point this at it).
 AGENT_STATS_PATH = os.environ.get(
-    "QUEUE_MINISITE_AGENT_STATS_FILE", "/var/apps/botchat/agent-stats.json"
+    "QUEUE_MINISITE_AGENT_STATS_FILE",
+    os.path.join(os.path.dirname(AGENT_STATE_PATH), "agent-stats.json"),
 )
 AGENT_STATS_STALE_SECONDS = float(
     os.environ.get("QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS", "60")

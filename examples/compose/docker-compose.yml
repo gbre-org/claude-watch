@@ -668,13 +668,23 @@ services:
       AGENT_QUEUE_BINDINGS_JSON: /queue-home/.config/claude/agent-queue-bindings.json
       # Live per-agent activity counters (tool calls + tokens) for running
       # rows + the header totals pill. Points INTO the read-only directory
-      # mount below (CLAUDE_HOST_AGENT_STATS_DIR). A host-side cron writes
-      # the snapshot atomically (tmp + rename) about once a minute, so the
-      # DIRECTORY is mounted, not the single file — a single-file bind mount
-      # pins the original inode and goes stale on the first rewrite (the
-      # SESSION_TASK_BIN lesson). Unset operators get /dev/null mounted at
-      # /agent-stats, the open() fails with ENOTDIR, and the feature hides
-      # itself cleanly (no pill, no cell).
+      # mount below (CLAUDE_HOST_AGENT_STATS_DIR). The host-side producer
+      # (tools/cw-agent-stats/cw-agent-stats, via cron or the launchd plist
+      # beside it) writes the snapshot atomically (tmp + rename) every few
+      # seconds, so the DIRECTORY is mounted, not the single file — a
+      # single-file bind mount pins the original inode and goes stale on
+      # the first rewrite (the SESSION_TASK_BIN lesson). Unset operators get
+      # /dev/null mounted at /agent-stats, the open() fails with ENOTDIR,
+      # and the feature hides itself cleanly (no pill, no cell).
+      #
+      # The producer's DEFAULT --out is <claude-watch state dir>/agent-stats.json
+      # ($CLAUDE_WATCH_STATE_DIR, else /var/lib/claude-watch) — i.e. beside
+      # active-agents.json in the dir mounted at /agents-state above — and
+      # the minisite's own default is the sibling of AGENT_STATE_JSON, so
+      # when CW_STATE_PATH is a host bind-mount of that same dir you can
+      # DROP this env var + the CLAUDE_HOST_AGENT_STATS_DIR mount entirely
+      # and both sides agree with zero config. Keep this pair when the
+      # state dir is the named volume (a host cron can't write into it).
       QUEUE_MINISITE_AGENT_STATS_FILE: /agent-stats/agent-stats.json
     volumes:
       # session-task queue.json — rw because the Stop button mutates it
@@ -713,10 +723,13 @@ services:
       - "${HOME}/.cache/hostjob:/hostjobs:ro"
       # Agent activity snapshot dir — read-only. Set CLAUDE_HOST_AGENT_STATS_DIR
       # (in .env / the override) to the host directory that holds
-      # agent-stats.json (the per-agent tool-call / token snapshot a host cron
-      # rewrites every minute). Default /dev/null = graceful no-op: the
-      # minisite hides the counters entirely. See QUEUE_MINISITE_AGENT_STATS_FILE
-      # above for why the DIRECTORY (not the file) is what gets mounted.
+      # agent-stats.json — wherever the host cw-agent-stats producer's --out /
+      # CW_AGENT_STATS_OUT points (default: the claude-watch state dir,
+      # /var/lib/claude-watch, which is also what CW_STATE_PATH mounts at
+      # /agents-state — in that case this mount is redundant, see above).
+      # Default /dev/null = graceful no-op: the minisite hides the counters
+      # entirely. See QUEUE_MINISITE_AGENT_STATS_FILE above for why the
+      # DIRECTORY (not the file) is what gets mounted.
       - "${CLAUDE_HOST_AGENT_STATS_DIR:-/dev/null}:/agent-stats:ro"
     restart: unless-stopped
 

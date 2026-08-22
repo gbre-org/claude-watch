@@ -703,5 +703,37 @@ class AgentStatsTest(unittest.TestCase):
         self.assertEqual(j["stale_after_seconds"], 60.0)
 
 
+class AgentStatsDefaultPathTest(unittest.TestCase):
+    """With no QUEUE_MINISITE_AGENT_STATS_FILE the path is the SIBLING of
+    AGENT_STATE_JSON (active-agents.json) — the producer's own default lands
+    the snapshot in the claude-watch state dir, so sharing that one mount is
+    enough. Runs in its own class so it can import ``app`` under a different
+    env; AgentStatsTest re-imports with its explicit path afterwards."""
+
+    def test_default_is_sibling_of_agent_state_json(self):
+        saved = {k: os.environ.get(k) for k in ("QUEUE_MINISITE_AGENT_STATS_FILE", "AGENT_STATE_JSON")}
+        tmp = tempfile.mkdtemp(prefix="qmin-agent-stats-default-")
+        try:
+            os.environ.pop("QUEUE_MINISITE_AGENT_STATS_FILE", None)
+            os.environ["AGENT_STATE_JSON"] = str(Path(tmp) / "state" / "active-agents.json")
+            os.environ.setdefault("QUEUE_JSON", str(Path(tmp) / "queue.json"))
+            sys.path.insert(0, str(HERE))
+            for mod in list(sys.modules):
+                if mod in ("app", "claude_agents"):
+                    del sys.modules[mod]
+            import app as appmod  # noqa: E402
+
+            self.assertEqual(appmod.AGENT_STATS_PATH, str(Path(tmp) / "state" / "agent-stats.json"))
+            for mod in ("app", "claude_agents"):
+                sys.modules.pop(mod, None)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   org.gbre.claude-watch.cw-agent-stats — host producer for the queue-minisite
-  / botchat live agent tool-call + token counters (claude-watch #655, botchat
+  live agent tool-call + token counters (claude-watch #655; originally botchat
   #2955/#2956). Writes the agent-stats.json snapshot atomically every ~4s
   (--loop --duration 58 --interval 4, fired once a minute) by folding the
   appended tail of ~/.claude/projects/*/*/subagents/agent-*.jsonl transcripts.
@@ -11,13 +11,21 @@
   claude-config and running botchat/bin/botchat-agent-stats. Moved so the
   producer's install/ownership lives in claude-watch (which now owns this
   plist + the `install-cw-agent-stats-launchd` Makefile target) instead of
-  botchat -- claude-watch's own dashboard tooling shouldn't need botchat
-  checked out just to install its producers. The --out path below is
-  UNCHANGED from the prior plist so the queue-minisite needs no redeploy.
+  botchat. The survey library is vendored beside the script too
+  (tools/cw-agent-stats/agentstats.py), so NO botchat checkout is needed.
+
+  --out: the script's own DEFAULT is now <claude-watch state dir>/agent-stats.json
+  ($CLAUDE_WATCH_STATE_DIR, else /var/lib/claude-watch — beside the daemon's
+  active-agents.json, which the compose stack mounts into the minisite as
+  /agents-state). The explicit --out below is kept UNCHANGED from the prior
+  plist because this Mac's compose stack reads the snapshot through the
+  separate CLAUDE_HOST_AGENT_STATS_DIR mount of that dir; repoint both
+  together (or drop both in favour of the default + CW_STATE_PATH) when
+  convenient.
 
   Must run on the HOST (not in-container): needs direct read access to
-  ~/.claude/projects and RW access to the botchat data dir, neither of which
-  the container has writable (~/repos is RO in claude-container).
+  ~/.claude/projects and RW access to the --out dir, neither of which the
+  container has writable (~/repos is RO in claude-container).
 
   CW_AGENT_STATS_PROM_FILE points the Prometheus textfile-collector output
   (claude_agent_live_count / claude_agent_calls_total / claude_agent_tokens_total)
