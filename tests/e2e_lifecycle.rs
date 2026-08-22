@@ -73,7 +73,7 @@ fn state_persisted_after_checks() {
     );
 
     env.set_status(&MockStatus::healthy(&env.tmux_pane));
-    env.touch_heartbeat();
+    env.record_ack();
 
     let _run = env.run_daemon_cycles(3, 1500);
 

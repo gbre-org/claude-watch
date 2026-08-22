@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Gate: `make help` stays a truthful index of the Makefile.
+
+The Makefile groups every public target under a `##@ <section>` banner and
+annotates it with a trailing `## <one-line description>`; `make help` is a
+small awk pass over those two conventions. Nothing enforced them, so the
+usual drift was silent: a target added without a `##` annotation simply
+never appeared in the index, and nobody noticed until they went looking for
+it.
+
+Asserts:
+  1. `make help` exits 0 and prints something.
+  2. Every `##`-annotated target in the Makefile shows up in the output,
+     with its description intact.
+  3. Every declared .PHONY target is either annotated (so it is indexed) or
+     on the DEPRECATED_ALIASES allowlist below. That is the direction that
+     actually catches drift -- (2) alone passes vacuously for a target that
+     was never annotated in the first place.
+  4. Every `##@` section banner shows up as a heading.
+
+Read-only: shells out to `make help` and parses the Makefile text. Touches
+no state and builds nothing.
+"""
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MAKEFILE = REPO_ROOT / "Makefile"
+
+# Targets deliberately kept OUT of `make help`: deprecated aliases retained
+# for muscle memory and for the baked image's self-redeploy contract. The
+# index should only advertise the current names. Each must still exist.
+DEPRECATED_ALIASES = {"deploy", "redeploy"}
+
+failures = []
+
+
+def check(cond, msg):
+    print(("  ok   " if cond else "  FAIL ") + msg)
+    if not cond:
+        failures.append(msg)
+
+
+text = MAKEFILE.read_text(encoding="utf-8")
+
+# --- 1. `make help` runs -----------------------------------------------------
+print("1. `make help` runs")
+proc = subprocess.run(
+    ["make", "--no-print-directory", "help"],
+    cwd=REPO_ROOT,
+    capture_output=True,
+    text=True,
+)
+check(proc.returncode == 0, f"`make help` exits 0 (got {proc.returncode})")
+out = proc.stdout
+check(out.strip() != "", "`make help` prints a non-empty index")
+if proc.returncode != 0:
+    print(proc.stderr)
+    sys.exit(1)
+
+# --- 2. every annotated target is indexed ------------------------------------
+print("2. every `## `-annotated target appears in the index")
+annotated = dict(
+    re.findall(r"^([a-zA-Z0-9_-]+):.*?## (.+)$", text, re.MULTILINE)
+)
+check(len(annotated) > 20, f"Makefile annotates a plausible number of targets ({len(annotated)})")
+for name, desc in sorted(annotated.items()):
+    check(
+        re.search(rf"^  {re.escape(name)}\s+{re.escape(desc.strip())}$", out, re.MULTILINE)
+        is not None,
+        f"`{name}` is listed with its description",
+    )
+
+# --- 3. every phony target is annotated (or a known deprecated alias) --------
+print("3. every .PHONY target is annotated or an allowlisted alias")
+phony = set()
+for line in text.splitlines():
+    if line.startswith(".PHONY:"):
+        phony.update(line.split(":", 1)[1].split())
+check(len(phony) > 20, f"Makefile declares a plausible number of phony targets ({len(phony)})")
+for name in sorted(phony):
+    check(
+        name in annotated or name in DEPRECATED_ALIASES,
+        f"`{name}` carries a `## ` description (or is an allowlisted alias)",
+    )
+
+# Allowlisted aliases must still be real targets -- an allowlist entry for a
+# target that no longer exists is dead weight that hides the next removal.
+for name in sorted(DEPRECATED_ALIASES):
+    check(
+        re.search(rf"^{re.escape(name)}:", text, re.MULTILINE) is not None,
+        f"allowlisted alias `{name}` still exists as a target",
+    )
+
+# --- 4. every section banner is rendered -------------------------------------
+print("4. every `##@ ` section banner appears as a heading")
+sections = re.findall(r"^##@ (.+)$", text, re.MULTILINE)
+check(len(sections) > 5, f"Makefile declares a plausible number of sections ({len(sections)})")
+for sec in sections:
+    check(
+        re.search(rf"^{re.escape(sec.strip())}$", out, re.MULTILINE) is not None,
+        f"section heading `{sec.strip()}` is rendered",
+    )
+
+print()
+if failures:
+    print(f"FAILED: {len(failures)} check(s)")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+print("PASS make-help (all checks passed)")

@@ -111,19 +111,31 @@ fn num(v: &Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Epoch seconds (float, with sub-second precision) of the mtime of the host
-/// main-loop heartbeat file. Returns `None` if the file is missing or its
-/// mtime can't be read — the caller then omits the gauge entirely (matching
+/// Epoch seconds (float, with sub-second precision) of the main loop's last
+/// ack of ANY claude-event — read from `<ack state dir>/last-ack-timestamp`,
+/// which `event-ack` stamps on every ack. Returns `None` if the file is
+/// missing or unreadable; the caller then omits the gauge entirely (matching
 /// how an absent optional series is handled: no stale value is exported).
 ///
-/// This is the file the main loop `touch`es on each `heartbeat-tick`. It is
-/// the canonical liveness signal: if the main loop wedges and stops touching
-/// the file, its mtime freezes and the gauge's age climbs without bound —
-/// unlike `claude_heartbeat_timestamp_seconds`, which tracks the *daemon's*
-/// own ~60s check cycle (`state.last_check`) and stays fresh even when the
-/// main loop is dead.
-fn heartbeat_file_mtime_secs(path: &Path) -> Option<f64> {
-    let meta = fs::metadata(path).ok()?;
+/// This is THE liveness signal: if the main loop wedges and stops acking, the
+/// stamp freezes and the gauge's age climbs without bound — unlike
+/// `claude_heartbeat_timestamp_seconds`, which tracks the *daemon's* own ~60s
+/// check cycle (`state.last_check`) and stays fresh even when the main loop is
+/// dead.
+///
+/// The file's CONTENT is the authority (an epoch float written by `event-ack`)
+/// with mtime as the fallback: content survives a copy/restore that would
+/// otherwise reset an mtime to "now" and fake a fresh ack.
+fn last_ack_epoch_secs(state_dir: &Path) -> Option<f64> {
+    let path = state_dir.join(crate::config::LAST_ACK_FILE);
+    let meta = fs::metadata(&path).ok()?;
+    if let Ok(text) = fs::read_to_string(&path) {
+        if let Ok(v) = text.trim().parse::<f64>() {
+            if v.is_finite() && v > 0.0 {
+                return Some(v);
+            }
+        }
+    }
     let modified = meta.modified().ok()?;
     let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(dur.as_secs_f64())
@@ -267,7 +279,7 @@ fn build_metrics(
     current_version: &str,
     latest_version: &str,
     live: &LiveCounts,
-    mainloop_heartbeat_mtime: Option<f64>,
+    mainloop_last_ack: Option<f64>,
     session_start_fallback: Option<f64>,
 ) -> Vec<String> {
     let last_check = state
@@ -607,24 +619,23 @@ fn build_metrics(
         format!("claude_code_open_bashes {}", live.open_bashes),
     ];
 
-    // Main-loop heartbeat FILE mtime — the true liveness signal. The main
-    // loop touches the host heartbeat file on each `heartbeat-tick`; this
-    // gauge exports that file's mtime so a wedged main loop (which stops
-    // touching the file) shows a climbing age. Distinct from
+    // Main-loop LAST ACK — the true liveness signal. The main loop acks every
+    // event batch it handles (`event-ack ack-batch`), which stamps
+    // `last-ack-timestamp`; this gauge exports that stamp so a wedged main
+    // loop (which stops acking) shows a climbing age. Distinct from
     // `claude_heartbeat_timestamp_seconds`, which tracks the daemon's own
     // check cycle and stays fresh regardless of main-loop liveness. Omitted
-    // entirely when the file is absent so no stale value is exported.
-    if let Some(mtime) = mainloop_heartbeat_mtime {
+    // entirely when no ack has ever been recorded so no stale value is
+    // exported. (Replaced `claude_mainloop_heartbeat_timestamp_seconds`
+    // 2026-08-22 when the host heartbeat file was retired.)
+    if let Some(ts) = mainloop_last_ack {
         lines.push("".to_string());
         lines.push(
-            "# HELP claude_mainloop_heartbeat_timestamp_seconds Epoch (mtime) of the host main-loop heartbeat file, touched by the main loop on each heartbeat-tick"
+            "# HELP claude_mainloop_last_ack_timestamp_seconds Epoch of the main loop's last ack of any claude-event (event-ack stamps it; the age of this is THE liveness signal)"
                 .to_string(),
         );
-        lines.push("# TYPE claude_mainloop_heartbeat_timestamp_seconds gauge".to_string());
-        lines.push(format!(
-            "claude_mainloop_heartbeat_timestamp_seconds {:.3}",
-            mtime
-        ));
+        lines.push("# TYPE claude_mainloop_last_ack_timestamp_seconds gauge".to_string());
+        lines.push(format!("claude_mainloop_last_ack_timestamp_seconds {:.3}", ts));
     }
 
     // Last context-clear timestamp (with session-start fallback -- see the
@@ -1494,14 +1505,15 @@ pub async fn cmd_metrics() -> i32 {
     let (cur, latest) = fetch_version_info();
     let live = collect_live_counts().await;
 
-    // Resolve the host main-loop heartbeat file path from config (the
-    // canonical `[claude].heartbeat_file` field). If config can't be loaded,
-    // fall back to the documented default path so the gauge still works on a
-    // normally-provisioned host. The gauge is omitted if the file is absent.
-    let heartbeat_path = crate::config::try_load_config()
-        .map(|c| c.claude.heartbeat_file)
-        .unwrap_or_else(|_| "/run/claude/heartbeat".to_string());
-    let mainloop_heartbeat_mtime = heartbeat_file_mtime_secs(Path::new(&heartbeat_path));
+    // Resolve the ack state dir from config (`[ack] state_dir`, else
+    // $CLAUDE_EVENT_STATE_DIR, else ~/.config/claude-events) — the same ladder
+    // `event-ack` walks, so this reader can't drift from the writer. If config
+    // can't be loaded, fall back to the default AckConfig, which resolves the
+    // env/home ladder on its own. The gauge is omitted if no ack is recorded.
+    let ack_state_dir = crate::config::try_load_config()
+        .map(|c| c.ack.resolve_state_dir())
+        .unwrap_or_else(|_| crate::config::AckConfig::default().resolve_state_dir());
+    let mainloop_last_ack = last_ack_epoch_secs(Path::new(&ack_state_dir));
 
     // Session-start fallback for the "since last clear" gauge: the container's
     // start epoch (Some only in-container). build_metrics falls back further to
@@ -1513,7 +1525,7 @@ pub async fn cmd_metrics() -> i32 {
         &cur,
         &latest,
         &live,
-        mainloop_heartbeat_mtime,
+        mainloop_last_ack,
         session_start_fallback,
     );
 
@@ -2282,27 +2294,83 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_file_mtime_present_for_fresh_file() {
+    fn last_ack_epoch_reads_the_stamped_content() {
+        // event-ack writes the epoch as text. Content is authoritative over
+        // mtime so a restore/copy (which resets mtime to "now") cannot fake a
+        // fresh ack.
         let dir = tempfile::tempdir().unwrap();
-        let hb = dir.path().join("heartbeat");
-        std::fs::write(&hb, b"").unwrap();
-        let mtime = heartbeat_file_mtime_secs(&hb).expect("fresh file should yield an mtime");
-        // Within a generous window of "now" — file was just written.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        std::fs::write(
+            dir.path().join(crate::config::LAST_ACK_FILE),
+            b"1767225600.5\n",
+        )
+        .unwrap();
+        let ts = last_ack_epoch_secs(dir.path()).expect("stamped file should yield an epoch");
         assert!(
-            (now - mtime).abs() < 60.0,
-            "mtime {mtime} should be near now {now}"
+            (ts - 1767225600.5).abs() < 0.001,
+            "content must win over mtime; got {ts}"
         );
     }
 
     #[test]
-    fn heartbeat_file_mtime_none_when_missing() {
+    fn last_ack_epoch_falls_back_to_mtime_when_content_unusable() {
+        // Truncated/garbled write (or a pre-content-format stamp): the file
+        // still proves an ack HAPPENED, so mtime is the fallback rather than
+        // discarding the signal entirely.
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist");
-        assert!(heartbeat_file_mtime_secs(&missing).is_none());
+        std::fs::write(dir.path().join(crate::config::LAST_ACK_FILE), b"not-a-number").unwrap();
+        let ts = last_ack_epoch_secs(dir.path()).expect("garbled file should fall back to mtime");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!((now - ts).abs() < 60.0, "mtime {ts} should be near now {now}");
+    }
+
+    #[test]
+    fn last_ack_epoch_none_when_never_acked() {
+        // No stamp at all => the gauge is OMITTED, not exported as 0. A 0
+        // would render on the dashboard as a ~56-year age.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(last_ack_epoch_secs(dir.path()).is_none());
+    }
+
+    #[test]
+    fn last_ack_gauge_emitted_when_present_and_omitted_when_absent() {
+        // The gauge that backs the dashboard's LAST ACK tile.
+        let state = serde_json::json!({});
+        let live = LiveCounts::default();
+        let with_ack = build_metrics(
+            &state,
+            "1.0.0",
+            "1.0.0",
+            &live,
+            Some(1767225600.0),
+            None,
+        );
+        assert!(with_ack
+            .iter()
+            .any(|l| l == "claude_mainloop_last_ack_timestamp_seconds 1767225600.000"));
+        assert!(with_ack
+            .iter()
+            .any(|l| l == "# TYPE claude_mainloop_last_ack_timestamp_seconds gauge"));
+
+        let without = build_metrics(&state, "1.0.0", "1.0.0", &live, None, None);
+        assert!(
+            !without
+                .iter()
+                .any(|l| l.contains("claude_mainloop_last_ack_timestamp_seconds")),
+            "no ack recorded => the series must be absent, not zero"
+        );
+        // The retired heartbeat-file gauge must not come back under either
+        // branch: dashboards keying on it would silently read a dead series.
+        for lines in [&with_ack, &without] {
+            assert!(
+                !lines
+                    .iter()
+                    .any(|l| l.contains("claude_mainloop_heartbeat_timestamp_seconds")),
+                "the retired heartbeat-file gauge must not be emitted"
+            );
+        }
     }
 
     #[test]
@@ -2390,11 +2458,15 @@ mod tests {
     }
 
     #[test]
-    fn build_metrics_includes_mainloop_heartbeat_when_present() {
-        let state = json!({});
-        // A fixed, recognizable epoch (2026-01-01T00:00:00Z = 1767225600).
+    fn build_metrics_keeps_the_daemon_check_gauge_beside_the_ack_gauge() {
+        // Two gauges with confusable names live side by side and mean
+        // different things: `claude_heartbeat_timestamp_seconds` is the
+        // DAEMON's own ~60s check cycle (fresh even when the main loop is
+        // dead), `claude_mainloop_last_ack_timestamp_seconds` is the MAIN
+        // LOOP's liveness. Retiring the heartbeat FILE must not have taken the
+        // daemon-check gauge with it.
         let lines = build_metrics(
-            &state,
+            &json!({}),
             "x",
             "y",
             &LiveCounts::default(),
@@ -2403,27 +2475,10 @@ mod tests {
         );
         assert!(lines
             .iter()
-            .any(|l| l == "claude_mainloop_heartbeat_timestamp_seconds 1767225600.000"));
-        assert!(lines
-            .iter()
-            .any(|l| l == "# TYPE claude_mainloop_heartbeat_timestamp_seconds gauge"));
-        // The daemon-check gauge must remain present and untouched.
-        assert!(lines
-            .iter()
             .any(|l| l.starts_with("claude_heartbeat_timestamp_seconds ")));
-    }
-
-    #[test]
-    fn build_metrics_omits_mainloop_heartbeat_when_absent() {
-        let state = json!({});
-        let lines = build_metrics(&state, "x", "y", &LiveCounts::default(), None, None);
-        assert!(!lines
-            .iter()
-            .any(|l| l.contains("claude_mainloop_heartbeat_timestamp_seconds")));
-        // Daemon-check gauge still present.
         assert!(lines
             .iter()
-            .any(|l| l.starts_with("claude_heartbeat_timestamp_seconds ")));
+            .any(|l| l.starts_with("claude_mainloop_last_ack_timestamp_seconds ")));
     }
 
     #[test]

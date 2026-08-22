@@ -6,15 +6,15 @@
 #
 # Queue: ~/claude-events/ (override with $CLAUDE_EVENT_QUEUE, legacy
 #        $CRON_EVENT_QUEUE also honored for backward compat)
-# Marker: ~/claude-events/.state/last-heartbeat.json
-#        ($CLAUDE_EVENT_HEARTBEAT_MARKER) — durable consumer-side record that
-#        outlives the queue file it describes. It is the liveness signal
-#        claude-events-exporter turns into
-#        claude_events_last_heartbeat_timestamp_seconds, and it lives UNDER
-#        the queue dir so the exporter's existing bind-mount already covers
-#        it. (NOT $CLAUDE_EVENT_STATE_DIR — that one belongs to
-#        event-must-act and defaults to ~/.config/claude-events, which the
-#        exporter does not mount.)
+#
+# NO STATE IS WRITTEN UNDER THE QUEUE DIR. That is a rule, not an
+# implementation detail: the queue dir is scanned by other tools that count
+# what is in it as UNCONSUMED EVENTS. A `.state/` subdir here (the #681
+# drain-time marker, removed 2026-08-22) made the cron health-check fire
+# "WATCHER DOWN: 1 event(s) unconsumed >6min" twice in one day off a directory
+# that was never an event. Liveness is now the age of the main loop's last ack
+# (`event-ack ack-batch` stamps $CLAUDE_EVENT_STATE_DIR/last-ack-timestamp),
+# which is state the ACKER owns, outside the queue entirely.
 #
 # Behavior:
 #   - Block on inotifywait for create/moved_to (or, if events are already
@@ -148,20 +148,6 @@ fi
 QUEUE_DIR="${CLAUDE_EVENT_QUEUE:-${CRON_EVENT_QUEUE:-$HOME/claude-events}}"
 LOG_DIR="${CLAUDE_EVENT_LOG_DIR:-$HOME/.config/claude-events}"
 
-# Durable consumer-side state, kept as a DOT-SUBDIRECTORY OF THE QUEUE DIR on
-# purpose: claude-events-exporter already bind-mounts the queue dir (as
-# /events), so a marker written here needs no new mount, no new env var and no
-# deploy change to become visible to it. Nothing else walks it — the drain's
-# find is `-maxdepth 1 -type f -name '*.json'`, and the exporter's scandir
-# skips non-files — so a subdir here is invisible to both.
-#
-# NOTE the variable name: $CLAUDE_EVENT_STATE_DIR is ALREADY event-must-act's
-# (it defaults to ~/.config/claude-events, which the exporter does not mount),
-# so this marker gets its own full-path override instead of reusing it.
-#
-# "The consumer surfaced a heartbeat-tick to the main loop at T" marker. See
-# record_heartbeat_marker() for why the exporter cannot derive this itself.
-HEARTBEAT_MARKER="${CLAUDE_EVENT_HEARTBEAT_MARKER:-$QUEUE_DIR/.state/last-heartbeat.json}"
 LOG_FILE="$LOG_DIR/consumed.jsonl"
 LOG_MAX_LINES="${CLAUDE_EVENT_LOG_MAX_LINES:-10000}"
 LOG_KEEP_ROTATIONS=3
@@ -357,14 +343,12 @@ Full event JSON appended to \$CLAUDE_EVENT_LOG_DIR/consumed.jsonl
 (default ~/.config/claude-events/, ring-buffered at
 \$CLAUDE_EVENT_LOG_MAX_LINES lines, default 10000).
 
-HEARTBEAT MARKER — every drained \`heartbeat-tick\` also refreshes
-\$CLAUDE_EVENT_HEARTBEAT_MARKER (default
-\$CLAUDE_EVENT_QUEUE/.state/last-heartbeat.json). Written atomically (temp + rename),
-never regressed by a late older tick. claude-events-exporter reads it
-for claude_events_last_heartbeat_timestamp_seconds — a tick lives on
-the queue for seconds, far too briefly for a 30s scrape to catch, so
-this durable marker is what makes the metric observable at all. It is
-consumer-written on purpose: if this watcher dies, it goes stale.
+ACK FOOTER (monitor mode) — after each delivered batch the watcher prints
+one \`EVENT-ACK REQUIRED: ... event-ack ack-batch\` line. The main loop acks
+EVERY batch it handles; that ack stamps the liveness timestamp claude-watch
+reads, so the footer is both the gate-clear instruction and the thing that
+keeps the daemon from declaring the loop wedged. It is printed per BATCH, not
+per event: one command clears the whole drain.
 
 MODE FILE (the runtime toggle) — default \$CLAUDE_EVENT_LOG_DIR/mode,
 override \$CLAUDE_EVENT_WATCH_MODE_FILE. One word, \`exit\` or \`monitor\`;
@@ -993,8 +977,15 @@ def monitor_lead(source, tag, msg, d):
     producer that changes shape degrades to the full-message fallback
     instead of printing a half-empty headline.
     """
-    if tag == "heartbeat-tick":
-        return ("heartbeat tick", True)
+    if tag in ("keepalive", "heartbeat-tick"):
+        # `heartbeat-tick` is the pre-2026-08-22 name, kept for one release so
+        # an event from an older daemon still renders with its lead instead of
+        # falling through to the raw-message fallback.
+        #
+        # covers_message=False: the message names the required action
+        # (`event-ack ack-batch`), which the lead does not, and this is the one
+        # event whose ENTIRE purpose is getting that action performed.
+        return ("keepalive — nothing acked recently", False)
     if tag in ("memory-reminder", "memory-remind"):
         return ("memory reminder", False)
     if tag == "claude-watch-alert":
@@ -1147,9 +1138,9 @@ def monitor_line(source, tag, full_message, d):
 
 # Surface scalar fields from the event's `data` object on the one-liner so
 # the main loop can act WITHOUT re-reading the JSON file. Many events carry
-# the actionable payload there (e.g. heartbeat-tick's `path` = the heartbeat
-# file to touch); without this the loop sees only an opaque message and can't
-# tell what to do. Only flat string/number/bool values are appended (nested
+# the actionable payload there (e.g. keepalive's `ack_command` = the command
+# to run); without this the loop sees only an opaque message and can't tell
+# what to do. Only flat string/number/bool values are appended (nested
 # objects/arrays stay in the logged JSON); rendered as ` key=value` pairs in
 # sorted order for determinism.
 data = ev.get("data")
@@ -1229,6 +1220,25 @@ if cli:
 PYEOF
 }
 
+# The one command the main loop runs after handling a batch. It acks every
+# pending entry AND stamps the liveness timestamp claude-watch's ack-stale
+# detector reads. Overridable for a deployment that wraps it.
+ACK_BATCH_COMMAND="${CLAUDE_EVENT_ACK_COMMAND:-event-ack ack-batch}"
+
+# Print the per-batch ack instruction (monitor mode only).
+#
+# Under a line-streaming launcher the terminal collapses each delivery to the
+# launcher's static description, so an EVENT[...] line is the ONLY thing the
+# loop is told — including what to do afterwards. The SIGNAL watchers have
+# always named their `signal-ack` command this way; events had no equivalent,
+# which is why acking every event was a rule the loop had to REMEMBER rather
+# than one it was told. One line per BATCH, not per event: a single
+# `ack-batch` clears the whole drain.
+print_ack_footer() {
+    [[ "$MODE_RESOLVED" == "monitor" ]] || return 0
+    echo "EVENT-ACK REQUIRED: after handling the batch above, run \`$ACK_BATCH_COMMAND\` (one bare command — acks every pending entry and stamps liveness)"
+}
+
 # Count the number of pending event files currently in the queue. Used by the
 # adaptive collect loop to decide when the burst has settled. Cheap: a single
 # find piped to a count. Does NOT consume or modify anything.
@@ -1281,94 +1291,6 @@ collect_burst() {
     done
 }
 
-# Persist "a heartbeat-tick was consumed here" to $HEARTBEAT_MARKER.
-#
-# WHY THIS EXISTS: claude-events-exporter used to derive its
-# claude_events_last_heartbeat_timestamp_seconds gauge purely by scanning the
-# queue dir for `*_heartbeat-tick.json` at scrape time. That can essentially
-# never fire: this watcher consumes a tick within SECONDS of it landing, the
-# scrape interval is 30s and ticks are ~15min apart, so the odds of a scrape
-# catching one on disk are negligible — the gauge sat at its cold-start 0
-# indefinitely. The observation has to be recorded by the side that observes it.
-#
-# It also has to be recorded by the CONSUMER, not the emitter: the gauge means
-# "seconds since the main loop was last shown a heartbeat-tick", so a wedged or
-# dead claude-event-watch must let it go stale. A marker written here does; one
-# derived from the emit side would not.
-#
-# Best-effort by construction — failing to write the marker must never break or
-# delay event delivery, so the caller ignores the return code.
-record_heartbeat_marker() {
-    local f="$1"
-    local base="${f##*/}"
-    # Filename shape is <ns_timestamp>_<safe_tag>.json (see claude-event).
-    [[ "$base" == *_heartbeat-tick.json ]] || return 0
-    HEARTBEAT_MARKER="$HEARTBEAT_MARKER" python3 - "$f" <<'HBEOF' || true
-import json, os, sys, tempfile, time
-
-src = sys.argv[1]
-marker = os.environ["HEARTBEAT_MARKER"]
-base = os.path.basename(src)
-
-# Emit time comes from the filename's ns prefix (the emitter's own clock), so
-# the exported age stays "time since the tick was EMITTED" — the same quantity
-# the old in-dir scan reported. Fall back to mtime, then now, if unparseable.
-ev_ts = None
-ns = base.split("_", 1)[0]
-if ns.isdigit():
-    try:
-        ev_ts = int(ns) / 1e9
-    except (ValueError, OverflowError):
-        ev_ts = None
-if ev_ts is None:
-    try:
-        ev_ts = os.stat(src).st_mtime
-    except OSError:
-        ev_ts = time.time()
-
-# Never regress: a late-arriving older tick must not rewind the marker.
-try:
-    with open(marker, "r", encoding="utf-8") as fp:
-        prev = float(json.load(fp).get("event_timestamp") or 0)
-    if prev > ev_ts:
-        sys.exit(0)
-except (OSError, ValueError, TypeError, json.JSONDecodeError):
-    pass  # absent or malformed -> just overwrite it
-
-payload = {
-    "tag": "heartbeat-tick",
-    "event_timestamp": ev_ts,        # when the tick was emitted
-    "processed_at": time.time(),     # when this watcher surfaced it
-    "event_file": base,
-}
-
-d = os.path.dirname(marker) or "."
-os.makedirs(d, exist_ok=True)
-# The reader is a separate process (the exporter, often in a container with
-# a different uid), so don't let a restrictive umask make the dir unreadable
-# to it. Best-effort: a pre-existing dir we don't own is left alone.
-try:
-    os.chmod(d, 0o755)
-except OSError:
-    pass
-# Atomic: write a temp file in the SAME directory, then rename over the
-# marker, so a concurrent reader (the exporter) never sees a partial file.
-fd, tmp = tempfile.mkstemp(dir=d, prefix=".last-heartbeat.", suffix=".tmp")
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as fp:
-        json.dump(payload, fp)
-        fp.write("\n")
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, marker)
-except BaseException:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    raise
-HBEOF
-}
-
 print_pending() {
     local any=0
     maybe_rotate_log
@@ -1376,9 +1298,6 @@ print_pending() {
     while IFS= read -r -d '' f; do
         any=1
         process_event "$f" "$LOG_FILE"
-        # Marker AFTER process_event: it records that the event was actually
-        # surfaced, not merely that a file was found on disk.
-        record_heartbeat_marker "$f" || true
         rm -f "$f"
     done < <(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | sort -z)
     # Expose whether anything was actually delivered so the throttle stamps the
@@ -1515,6 +1434,7 @@ if [[ "$MODE_RESOLVED" == "monitor" ]]; then
     # the ONLY human-visible trace of what was read. A bare "Acknowledged" /
     # "Idle" is indistinguishable from a rubber stamp.
     echo "[monitor-mode] REPLY RULE: when you act on an EVENT[...] line, your visible reply MUST quote its lead (the text after the prefix, ~80 chars) plus what you did — never a bare 'Acknowledged' / 'Idle' — so a human reading the terminal can see what was handled"
+    echo "[monitor-mode] ACK RULE: every batch ends with an EVENT-ACK REQUIRED line — run \`$ACK_BATCH_COMMAND\` once per batch. That ack is the daemon's ONLY liveness signal; skip it and claude-watch eventually declares the loop wedged"
     LAST_OUTPUT_AT="$(date +%s)"
 fi
 
@@ -1558,6 +1478,7 @@ while true; do
         # Stamp the leading edge ONLY if we actually delivered >=1 event, so the
         # throttle window is measured from a real wake (not an empty drain).
         if (( DELIVERED_ANY )); then
+            print_ack_footer
             record_delivery
             BATCHES_DELIVERED=$(( BATCHES_DELIVERED + 1 ))
             LAST_DELIVERY_AT="$(date +%s)"
