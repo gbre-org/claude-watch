@@ -782,11 +782,54 @@ def _read_agent_stats_file() -> dict[str, Any] | None:
     return parsed
 
 
-def _shape_agent_stat(rec: dict[str, Any]) -> dict[str, Any]:
+def _fmt_dur(secs: Any) -> str:
+    """Compact duration for the agent popover: ``48s``, ``5m12s``, ``12m``,
+    ``1h5m``. Mirrors the botchat badge's fmtSecs (the look being ported).
+    ``?`` for non-numeric / negative input."""
+    try:
+        s = float(secs)
+    except (TypeError, ValueError):
+        return "?"
+    if s < 0:
+        return "?"
+    if s < 60:
+        return f"{int(round(s))}s"
+    if s < 3600:
+        m = int(s // 60)
+        return f"{m}m{int(round(s % 60))}s" if s < 600 else f"{m}m"
+    h, rem = divmod(int(s), 3600)
+    return f"{h}h{rem // 60}m"
+
+
+def _iso_to_epoch(ts: Any) -> float | None:
+    """Parse the producer's ISO-8601 stamps (``2026-08-22T04:48:35.946Z``)
+    to an epoch; None when absent / unparseable."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+# The subset of a shaped agent record the header popover prints (one row per
+# live agent) — projected so /api/queue does not ship every per-row label
+# twice (the running-row cell already carries the full shape).
+_POPOVER_ROW_KEYS = (
+    "agent_id", "queue_id", "description", "agent_type", "last_tool",
+    "tool_calls", "context_tokens", "output_tokens", "running_seconds", "finished",
+    "calls_text", "ctx_text", "out_text", "age_text", "last_write_text",
+)
+
+
+def _shape_agent_stat(rec: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
     """Per-agent counters + the display strings both renderers print.
 
     Labels are built HERE (not in JS) so the Jinja first paint and the 5s
     refresh.js rebuild are byte-identical and the formatting has one home.
+    The same record feeds the running-row cell AND one row of the header
+    pill's per-agent popover (description / type / queue id / last tool /
+    calls / ctx / out / age since spawn).
     """
     calls = rec.get("tool_calls")
     ctx = rec.get("context_tokens")
@@ -804,12 +847,30 @@ def _shape_agent_stat(rec: dict[str, Any]) -> dict[str, Any]:
         title_bits.append(f"last write {_humanize_age(float(age))}")
     if rec.get("finished"):
         title_bits.append("finished")
+    # Age since the agent's FIRST transcript entry (its spawn), not its last
+    # write — that is what the popover's "age" column shows.
+    started_epoch = _iso_to_epoch(rec.get("started_at"))
+    since_start = None
+    if started_epoch is not None:
+        now_ts = time.time() if now_ts is None else now_ts
+        since_start = max(0.0, now_ts - started_epoch)
     return {
         "agent_id": rec.get("agent_id") or "",
+        "queue_id": rec.get("queue_id") if isinstance(rec.get("queue_id"), str) else "",
+        "description": rec.get("description") if isinstance(rec.get("description"), str) else "",
+        "agent_type": rec.get("agent_type") if isinstance(rec.get("agent_type"), str) else "",
         "tool_calls": calls,
         "context_tokens": ctx,
         "output_tokens": out,
         "last_tool": last_tool,
+        "started_at": rec.get("started_at") if isinstance(rec.get("started_at"), str) else "",
+        "running_seconds": round(since_start, 1) if since_start is not None else None,
+        # Popover cell strings (one formatter: here).
+        "calls_text": calls_s,
+        "ctx_text": ctx_s,
+        "out_text": _fmt_count(out) if out is not None else "–",
+        "age_text": _fmt_dur(since_start) if since_start is not None else "?",
+        "last_write_text": _fmt_dur(age) if isinstance(age, (int, float)) else "",
         "age_seconds": age,
         "finished": bool(rec.get("finished")),
         # Comfortable: ``11 calls · 82K tok``. Compact: ``11·82Kt``.
@@ -859,13 +920,17 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
         return view
     by_qid: dict[str, dict[str, Any]] = {}
     by_aid: dict[str, dict[str, Any]] = {}
+    # Popover rows: one per distinct agent, in the producer's order (the
+    # producer already restricts the list to the live window).
+    rows: list[dict[str, Any]] = []
     for rec in raw.get("agents") or []:
         if not isinstance(rec, dict):
             continue
-        shaped = _shape_agent_stat(rec)
+        shaped = _shape_agent_stat(rec, now_ts)
         aid = shaped["agent_id"]
         if aid and aid not in by_aid:
             by_aid[aid] = shaped
+            rows.append({k: shaped.get(k) for k in _POPOVER_ROW_KEYS})
         qid = rec.get("queue_id")
         if not isinstance(qid, str) or not qid:
             continue
@@ -906,16 +971,8 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
         title_bits.append(f"main loop context {_fmt_count(main_ctx)} tokens")
     title_bits.append(f"snapshot {_humanize_age(age)}")
     main_label = f"main {_fmt_count(main_ctx)}" if main_ctx is not None else ""
-    # Header pills (botchat #2983): the session totals render as a HALF-ROW
-    # of small pills stacked under the status pills, so each part is its own
-    # short token — `agt` not `agents` — to stay one line at every width.
-    pills = [
-        {"key": "agents", "text": f"{_fmt_count(n_agents)} agt"},
-        {"key": "calls", "text": f"{_fmt_count(calls)} calls"},
-        {"key": "tok", "text": f"{_fmt_count(ctx)} tok"},
-    ]
-    if main_label:
-        pills.append({"key": "main", "text": main_label})
+    main_age = main_raw.get("age_seconds")
+    host = raw.get("host") if isinstance(raw.get("host"), str) else ""
     view["totals"] = {
         "agents": n_agents,
         "tool_calls": calls,
@@ -924,24 +981,38 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
         "main_context_tokens": main_ctx,
         "label": label,
         "main_label": main_label,
-        "pills": pills,
         "title": " · ".join(title_bits),
+        # Header pill numerals + popover strings (one formatter: here). The
+        # pill prints agents_text / calls_text / tok_text; the popover head
+        # adds out_text and the footer main_text / main_age_text / age_text.
+        "agents_text": _fmt_count(n_agents),
+        "calls_text": _fmt_count(calls),
+        "tok_text": _fmt_count(ctx),
+        "out_text": _fmt_count(out) if out is not None else "–",
+        "main_text": _fmt_count(main_ctx) if main_ctx is not None else "",
+        "main_age_text": _fmt_dur(main_age) if isinstance(main_age, (int, float)) else "",
+        "age_text": _fmt_dur(age),
+        "host": host,
+        "rows": rows,
     }
     view["main"] = {
         "session_id": main_raw.get("session_id"),
         "context_tokens": main_ctx,
-        "age_seconds": main_raw.get("age_seconds"),
+        "age_seconds": main_age,
     }
     return view
 
 
 def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
-    """The header-pill payload: None = render no pill (off / absent).
+    """The header agent-bar payload: None = render no pill (off / absent).
 
-    ``pills`` is the list the header's bottom half-row renders (one small
-    pill per entry: ``N agt`` / ``C calls`` / ``K tok`` / ``main M``, or the
-    single ``agents n/a`` pill when stale); ``label`` / ``main_label`` stay
-    for the API (same numbers, the long form)."""
+    One outlined pill — ``● N agents · C calls · K tok`` (botchat's topbar
+    badge look, botchat #3066) — plus everything its click-to-open popover
+    prints: per-agent ``rows`` (description / type / queue id / last tool /
+    calls / ctx / out / age), the main loop's context size and the snapshot
+    freshness footer. ``label`` / ``main_label`` stay for API consumers
+    (same numbers, the long form). Stale: every numeral reads ``n/a``,
+    ``rows`` is empty and ``main`` is None — never a frozen number."""
     if not view.get("available"):
         return None
     if view.get("stale"):
@@ -949,17 +1020,50 @@ def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
         age_txt = _humanize_age(age) if isinstance(age, (int, float)) else "?"
         return {
             "stale": True,
+            "agents": None,
+            "tool_calls": None,
+            "context_tokens": None,
+            "output_tokens": None,
+            "agents_text": "n/a",
+            "calls_text": "n/a",
+            "tok_text": "n/a",
+            "out_text": "n/a",
+            "main": None,
+            "rows": [],
+            "host": "",
+            "age_seconds": age,
+            "age_text": _fmt_dur(age) if isinstance(age, (int, float)) else "?",
             "label": "agents n/a",
             "main_label": "",
-            "pills": [{"key": "na", "text": "agents n/a"}],
             "title": f"agent-stats snapshot is stale (written {age_txt}) — counters withheld rather than frozen",
         }
     t = view.get("totals") or {}
+    m = view.get("main") or {}
+    main = None
+    if m.get("context_tokens") is not None:
+        main = {
+            "context_tokens": m.get("context_tokens"),
+            "text": t.get("main_text", ""),
+            "age_seconds": m.get("age_seconds"),
+            "age_text": t.get("main_age_text", ""),
+        }
     return {
         "stale": False,
+        "agents": t.get("agents"),
+        "tool_calls": t.get("tool_calls"),
+        "context_tokens": t.get("context_tokens"),
+        "output_tokens": t.get("output_tokens"),
+        "agents_text": t.get("agents_text", "?"),
+        "calls_text": t.get("calls_text", "?"),
+        "tok_text": t.get("tok_text", "?"),
+        "out_text": t.get("out_text", "–"),
+        "main": main,
+        "rows": list(t.get("rows") or []),
+        "host": t.get("host", ""),
+        "age_seconds": view.get("age_seconds"),
+        "age_text": t.get("age_text", "?"),
         "label": t.get("label", ""),
         "main_label": t.get("main_label", ""),
-        "pills": list(t.get("pills") or []),
         "title": t.get("title", ""),
     }
 

@@ -72,12 +72,22 @@ Every RUNNING row carries a live cell in its item head — `11 calls · 82K tok`
 in comfortable density, `11·82Kt` in compact (the head is the one line
 compact never elides, so the counters stay visible there too; hover for
 output tokens / last tool / last-write age) — and the header shows the
-session totals as a bottom half-row of small pills `N agt` · `C calls` ·
-`K tok` · `main 546K` (main = the main loop's own context tokens), stacked
-under the status pills (running / blocked / pending). The two rows are
-half-size and hard-nowrap at every width, so the header is always exactly
-two rows; `/api/queue`'s `agent_stats.pills` carries the parts and
-`agent_stats.label` the long form (`N agents · C calls · K tok`).
+session totals as ONE outlined rounded pill in a bottom half-row, `● N agents
+· C calls · K tok`, stacked under the status pills (running / blocked /
+pending). The pill is the botchat topbar agent-bar look: a live dot,
+info-blue while at least one agent is live (`.active`), muted when none
+(`.idle`), dashed with an amber dot and `n/a` numerals when the snapshot is
+stale (`.stale`); under 480px the units collapse to `a` / `c` / `t`. Click
+(pin) or hover (peek) it for the per-agent popover — `N live agents — C
+calls · K ctx · O out`, one row per live agent (description; type · queue id
+· last tool; calls / ctx / out / age since spawn) and a footer with the main
+loop's own context tokens, the snapshot age and the host (`static/agent-bar.js`,
+painted from the same `/api/queue` payload: `agent_stats.rows` /
+`agent_stats.main`; the template embeds the first paint as a JSON seed).
+The two rows are half-size and hard-nowrap at every width, so the header is
+always exactly two rows; `agent_stats.label` still carries the long form
+(`N agents · C calls · K tok`) for API consumers. The liveness dot next to
+the controls is a matching small `live` / `error` pill.
 
 The minisite does NOT fold transcripts itself. It reads a small JSON
 snapshot that a host-side cron rewrites atomically about once a minute
@@ -95,9 +105,10 @@ Degradation rules, in order:
 * empty env var → feature off (no read, no pill, no cell);
 * file missing / unreadable / not JSON → hidden (same as off);
 * snapshot older than `QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS` (60s) →
-  **stale**: every cell is blank and the pill reads `agents n/a` — a frozen
-  number is worse than none, so staleness is re-derived on every request
-  even when the file has not changed;
+  **stale**: every cell is blank and the pill's numerals read `n/a` (dashed
+  `.stale` pill, popover shows no rows) — a frozen number is worse than
+  none, so staleness is re-derived on every request even when the file has
+  not changed;
 * a running row with no live agent for its queue id → no cell.
 
 **Mount the snapshot's DIRECTORY, not the file.** The producer replaces the
@@ -173,7 +184,7 @@ brand identity lives outside the public image.
 | `SSE_TAIL_MAX_LIFETIME_SECONDS` | `3600` | Lifetime cap on SSE live-log streams. |
 | `SSE_TAIL_BACKFILL_LINES` | `200` | Historical-context backfill cap when a client first connects. |
 | `QUEUE_MINISITE_AGENT_STATS_FILE` | `/var/apps/botchat/agent-stats.json` | Per-agent activity snapshot (tool calls + tokens) joined onto running rows + summed in the header — see "Agent activity counters" below. Empty = feature off. |
-| `QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS` | `60` | Snapshot older than this (by `generated_at` or file mtime) renders as stale: blank cells + an `agents n/a` pill, never a frozen number. |
+| `QUEUE_MINISITE_AGENT_STATS_STALE_SECONDS` | `60` | Snapshot older than this (by `generated_at` or file mtime) renders as stale: blank cells + `n/a` numerals on the header pill, never a frozen number. |
 | `PINGME_SESSION_TASK` | `0` | Set to `1` to suppress pingme chatter from `session-task` lifecycle. |
 | `CLAUDE_EVENT_SESSION_TASK` | `0` | Set to `1` to suppress claude-event chatter from `session-task` lifecycle. |
 
