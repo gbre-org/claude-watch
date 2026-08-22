@@ -178,7 +178,7 @@ forms may mix on one line. Field semantics:
 | Field | Required | Default | Meaning |
 |-------|----------|---------|---------|
 | `name` | yes | — | Identifier for `watcher-ctl run/enable/disable <name>` |
-| `pgrep_pattern` | yes | — | `pgrep -f` pattern that matches the live watcher process. `watcher-status` uses this to detect DUPLICATE (liveness itself is pidfile-based) |
+| `pgrep_pattern` | yes | — | `pgrep -f` pattern that matches the live watcher process. `watcher-status` uses this to detect DUPLICATE (liveness itself is pidfile-based). Only stable hits count: a match that is already gone, is the prober's own process tree, is a `pgrep`/`pkill` itself, or is younger than 2 s (a concurrent status run's own `pgrep` child) is never a duplicate |
 | `min_count` | no | `1` | How many concurrent pollers should be alive. Almost always `1` |
 | `enabled` | no | `true` | `true` / `false`. `watcher-ctl enable/disable` flips this |
 | `start_cmd` | no | empty | Command line `watcher-ctl run <name>` execs. Whitespace-split (no shell expansion) |
