@@ -3,7 +3,8 @@
 //!
 //! Straight Rust port of the Python `workload` script. State lives under
 //! `/var/run/claude/workload-state/` (state.json, <label>.output,
-//! <label>.exit, <label>.sh, <label>.heartbeat, <label>.script.json).
+//! <label>.exit, <label>.sh, <label>.heartbeat, <label>.script.json,
+//! <label>.pgid).
 //! `/var/run` is a tmpfs (Debian symlink to `/run`) and
 //! `/var/run/claude/` is provisioned at boot by
 //! `/etc/tmpfiles.d/claude.conf` (`d /var/run/claude 0755 hndrewaall
@@ -32,11 +33,19 @@
 //! task. Idempotency: the wrapper script writes an exit-code marker file
 //! BEFORE invoking the emitter; `cmd_kill` consults that marker and
 //! skips its own emit if the wrapper already finished naturally.
+//!
+//! `workload kill` is TREE-WIDE: it snapshots the pane's descendants
+//! from `/proc` first, then SIGTERMs (and after a grace period SIGKILLs)
+//! both those pids AND the payload's process group — recorded in
+//! `<label>.pgid` by the wrapper, since `setsid --wait` forks and the
+//! wrapper is the only thing that can observe the resulting sid. It then
+//! verifies nothing survived. Killing just the tmux pane left the
+//! payload running: see `cmd_kill`.
 
 use crate::event_bus::{emit_workload_done, WorkloadDoneEvent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -148,6 +157,74 @@ fn heartbeat_file(label: &str) -> PathBuf {
 /// real stuck state surfaces.
 fn runtime_heartbeat_file(label: &str) -> PathBuf {
     PathBuf::from(RUNTIME_HEARTBEAT_DIR).join(format!("{label}.heartbeat"))
+}
+
+/// Per-workload process-group sidecar: `<label>.pgid` holds the pgid
+/// (== sid == pid) of the `setsid` payload leader the wrapper script
+/// launched.
+///
+/// **Why a sidecar and not a `WorkloadEntry` field.** The pgid only
+/// becomes knowable INSIDE the pane, after `setsid` has forked — the
+/// `workload run` process that writes `state.json` has already returned
+/// by then, and `setsid --wait`'s own pid is useless (its child lives in
+/// a different session). So the wrapper writes this file itself, atomically
+/// (tmp + `mv -f`), and removes it on exit.
+///
+/// `workload kill` reads it to signal the whole process GROUP rather than
+/// chasing a ppid chain that the first kill has already broken.
+fn pgid_file(label: &str) -> PathBuf {
+    PathBuf::from(WORKLOAD_DIR).join(format!("{label}.pgid"))
+}
+
+/// Parse a `.pgid` sidecar body. Pure. Rejects empty / non-numeric /
+/// nonsensical values (`<= 1` would mean "signal pid 1 or every process
+/// we may signal" — never a legitimate workload pgid).
+pub fn parse_pgid(raw: &str) -> Option<i32> {
+    match raw.trim().parse::<i32>() {
+        Ok(v) if v > 1 => Some(v),
+        _ => None,
+    }
+}
+
+/// Read + parse the `.pgid` sidecar for `label`. `None` when the file is
+/// absent (wrapper too old, wrapper already exited, or the workload never
+/// got far enough to write it) — callers then fall back to the pane
+/// descendant walk alone.
+fn read_recorded_pgid(label: &str) -> Option<i32> {
+    parse_pgid(&fs::read_to_string(pgid_file(label)).ok()?)
+}
+
+/// Default SIGTERM -> SIGKILL grace period for `workload kill`, in
+/// seconds. Long enough for a driver script's own trap handler to stop
+/// its children (ffmpeg flushing a muxer, rsync finishing a file), short
+/// enough that an interactive `workload kill` still feels instant.
+const KILL_GRACE_SECS_DEFAULT: f64 = 5.0;
+
+/// Env override for the grace period (the `--grace` flag wins over it).
+const KILL_GRACE_ENV: &str = "WORKLOAD_KILL_GRACE_SECS";
+
+/// Upper bound on the grace period. A typo'd `--grace 100000` must not
+/// wedge the caller for a day.
+const KILL_GRACE_SECS_MAX: f64 = 600.0;
+
+/// Resolve the grace period from (flag, env). Pure — the env read is the
+/// caller's job so this stays unit-testable without mutating process
+/// state from parallel tests.
+fn resolve_kill_grace_from(explicit: Option<f64>, env_value: Option<&str>) -> Duration {
+    let raw = explicit.or_else(|| env_value.and_then(|v| v.trim().parse::<f64>().ok()));
+    let secs = match raw {
+        Some(v) if v.is_finite() && v >= 0.0 => v.min(KILL_GRACE_SECS_MAX),
+        // Negative / NaN / unparseable env garbage falls back to the
+        // default rather than failing the kill — the kill is the
+        // important part.
+        _ => KILL_GRACE_SECS_DEFAULT,
+    };
+    Duration::from_secs_f64(secs)
+}
+
+/// `resolve_kill_grace_from` bound to the live environment.
+fn resolve_kill_grace(explicit: Option<f64>) -> Duration {
+    resolve_kill_grace_from(explicit, std::env::var(KILL_GRACE_ENV).ok().as_deref())
 }
 
 /// Per-workload captured-script sidecar. Written by `cmd_run` at
@@ -760,90 +837,389 @@ fn print_tail(path: &Path, n: usize) {
     }
 }
 
-/// Kill only the setsid child process group of a pane — never the wrapper
-/// shell's PGID (which may be shared with the tmux session). Mirrors the
-/// Python `_kill_pane_tree`.
-fn kill_pane_tree(pane_id: &str) {
-    // Pane shell PID
-    let out = Command::new("tmux")
-        .args(["list-panes", "-t", pane_id, "-F", "#{pane_pid}"])
-        .output();
-    let shell_pid = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => return,
-    };
-    if shell_pid.is_empty() {
-        return;
+/// One row of a `/proc` snapshot: the process-hierarchy facts
+/// `workload kill` reasons over.
+///
+/// `sid` is carried alongside `pgid` because the wrapper's payload is
+/// launched under `setsid`, so the payload's process-group leader is
+/// also a SESSION leader (`pid == pgid == sid`). That triple-equality is
+/// the cheap sanity check that a recorded `.pgid` sidecar still refers
+/// to *our* process group and not to a recycled pid (see
+/// `recorded_pgid_is_plausible`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcRow {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    pub sid: i32,
+}
+
+/// Parse one `/proc/<pid>/stat` line into a `ProcRow`. Pure (no I/O) so
+/// the field-offset arithmetic is unit-testable.
+///
+/// Layout is `pid (comm) state ppid pgrp session ...`. `comm` is
+/// process-controlled and may contain spaces AND parentheses
+/// (`sleep (evil) x`), so the split point is the LAST `)` in the line,
+/// never the first — a naive `split_whitespace()` mis-indexes every
+/// field for any process whose name has a space in it.
+pub fn parse_proc_stat(content: &str) -> Option<ProcRow> {
+    let open = content.find('(')?;
+    let close = content.rfind(')')?;
+    if close < open {
+        return None;
     }
+    let pid: i32 = content[..open].trim().parse().ok()?;
+    let rest: Vec<&str> = content[close + 1..].split_whitespace().collect();
+    // rest[0] = state, rest[1] = ppid, rest[2] = pgrp, rest[3] = session
+    let ppid: i32 = rest.get(1)?.parse().ok()?;
+    let pgid: i32 = rest.get(2)?.parse().ok()?;
+    let sid: i32 = rest.get(3)?.parse().ok()?;
+    Some(ProcRow {
+        pid,
+        ppid,
+        pgid,
+        sid,
+    })
+}
 
-    // Shell's own PGID — skip this one
-    let shell_pgid = Command::new("ps")
-        .args(["-o", "pgid=", "-p", &shell_pid])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    // Direct children
-    let children: Vec<String> = Command::new("pgrep")
-        .args(["-P", &shell_pid])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut killed_pgids = std::collections::HashSet::new();
-    for pid in &children {
-        let pgid = Command::new("ps")
-            .args(["-o", "pgid=", "-p", pid])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        if pgid.is_empty() || pgid == "1" || pgid == shell_pgid {
-            // Kill the PID directly (not the pgroup)
-            let _ = Command::new("kill").args(["-9", pid]).output();
+/// Snapshot every process visible in `/proc`.
+///
+/// Taken ONCE, up front, before any signal is sent: as soon as the first
+/// process in the tree dies its children are reparented to pid 1, so a
+/// ppid walk performed *after* the kill loses exactly the grandchildren
+/// we are trying to reap. Snapshot first, then kill, then sweep the
+/// snapshot — the ordering is the whole point.
+pub fn snapshot_procs() -> Vec<ProcRow> {
+    let dir = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        if killed_pgids.insert(pgid.clone()) {
-            // setsid group — safe to kill entirely
-            let _ = Command::new("kill")
-                .args(["-9", "--", &format!("-{pgid}")])
-                .output();
+        // Racy by nature: a process can exit between readdir and read.
+        // A missing file just means it is already gone.
+        if let Ok(content) = fs::read_to_string(format!("/proc/{name}/stat")) {
+            if let Some(row) = parse_proc_stat(&content) {
+                rows.push(row);
+            }
         }
     }
+    rows
+}
 
-    // Kill any remaining descendants by PID
-    let remaining = get_descendants(&shell_pid);
-    if !remaining.is_empty() {
-        let mut args = vec!["-9".to_string()];
-        args.extend(remaining);
-        let _ = Command::new("kill").args(&args).output();
+/// Transitive children of `roots` (the roots themselves are NOT
+/// included). Pure + cycle-safe. Order is breadth-first, which is also
+/// parent-before-child — callers that want to signal bottom-up can
+/// reverse it.
+pub fn descendants_of(procs: &[ProcRow], roots: &[i32]) -> Vec<i32> {
+    let mut by_parent: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    for row in procs {
+        by_parent.entry(row.ppid).or_default().push(row.pid);
+    }
+    let mut seen: BTreeSet<i32> = roots.iter().copied().collect();
+    let mut queue: VecDeque<i32> = roots.iter().copied().collect();
+    let mut out = Vec::new();
+    while let Some(pid) = queue.pop_front() {
+        if let Some(children) = by_parent.get(&pid) {
+            for child in children {
+                if seen.insert(*child) {
+                    out.push(*child);
+                    queue.push_back(*child);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every pid in the snapshot belonging to one of `pgids`. Pure.
+///
+/// This is what catches a **double fork**: a process that detached from
+/// the ppid chain but stayed in the process group is invisible to
+/// `descendants_of` and visible here.
+pub fn members_of_pgids(procs: &[ProcRow], pgids: &[i32]) -> Vec<i32> {
+    let wanted: BTreeSet<i32> = pgids.iter().copied().collect();
+    procs
+        .iter()
+        .filter(|r| wanted.contains(&r.pgid))
+        .map(|r| r.pid)
+        .collect()
+}
+
+/// Distinct process groups spanned by `pids`, minus `protected`. Pure.
+///
+/// Signalling the GROUP rather than the pids is what makes the teardown
+/// race-free: anything the doomed tree forks between the snapshot and
+/// the signal inherits its parent's pgid and dies with the group.
+pub fn pgids_of(procs: &[ProcRow], pids: &[i32], protected: &BTreeSet<i32>) -> Vec<i32> {
+    let wanted: BTreeSet<i32> = pids.iter().copied().collect();
+    let mut out: BTreeSet<i32> = BTreeSet::new();
+    for row in procs {
+        if wanted.contains(&row.pid) && row.pgid > 1 && !protected.contains(&row.pgid) {
+            out.insert(row.pgid);
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Is a recorded `.pgid` sidecar still trustworthy?
+///
+/// The sidecar is written by the wrapper and removed on wrapper exit,
+/// but a crashed wrapper can leave one behind and pids DO get recycled —
+/// signalling a stale group would kill an innocent bystander's tree. The
+/// wrapper's payload leader is created under `setsid`, so it satisfies
+/// `pid == pgid == sid`; a recycled pid almost never does. Pure.
+pub fn recorded_pgid_is_plausible(procs: &[ProcRow], pgid: i32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    procs
+        .iter()
+        .any(|r| r.pid == pgid && r.pgid == pgid && r.sid == pgid)
+}
+
+/// What `kill_tree` did, so the caller can report it and set an exit code.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct KillTreeReport {
+    /// Process groups that were signalled.
+    pub pgids: Vec<i32>,
+    /// Individual pids that were signalled (a superset of the group
+    /// members known at snapshot time).
+    pub pids: Vec<i32>,
+    /// Targets confirmed gone after the SIGKILL sweep.
+    pub killed: Vec<i32>,
+    /// Targets STILL ALIVE after the SIGKILL sweep (unkillable D-state,
+    /// or something we lacked permission to signal). Non-empty means
+    /// `workload kill` reports failure.
+    pub survived: Vec<i32>,
+}
+
+/// State character (field 3) of a `/proc/<pid>/stat` line. Pure.
+pub fn parse_proc_state(content: &str) -> Option<char> {
+    let close = content.rfind(')')?;
+    content[close + 1..].split_whitespace().next()?.chars().next()
+}
+
+/// Is this pid still RUNNING?
+///
+/// A zombie counts as dead: it holds no CPU, no files and no locks, it
+/// is just a exit-status slot its parent has not read yet. Treating `Z`
+/// as alive would make every killed direct child of the caller look like
+/// a survivor and turn `workload kill` permanently red.
+fn proc_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Unparseable but present: assume alive (fail safe — we would
+        // rather re-signal than under-report a survivor).
+        Ok(s) => parse_proc_state(&s).map(|st| st != 'Z').unwrap_or(true),
+        Err(_) => false,
     }
 }
 
-fn get_descendants(pid: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let children: Vec<String> = Command::new("pgrep")
-        .args(["-P", pid])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    for c in children {
-        let sub = get_descendants(&c);
-        out.push(c);
-        out.extend(sub);
+/// TERM -> grace -> KILL a whole process tree, then VERIFY.
+///
+/// Contract (the thing the 2026-08-22 incident needed and the old
+/// `kill_pane_tree` did not provide):
+///
+///   1. **Snapshot first.** `descendants_of` is computed BEFORE any
+///      signal, because the first kill reparents everything below it.
+///   2. **Signal the process GROUP**, not just the pids — that sweeps up
+///      double-forked children and anything spawned mid-teardown.
+///   3. **Grace, then SIGKILL.** A driver script gets a chance to shut
+///      its own children down cleanly before we escalate.
+///   4. **Re-snapshot before escalating**, so children spawned during
+///      the grace window (a respawning driver loop — exactly the
+///      incident's failure mode) land in the SIGKILL set.
+///   5. **Verify and report.** Survivors are returned, not swallowed.
+///
+/// `protected` is a hard denylist of pids/pgids that must never be
+/// signalled (this process, its group and session, the tmux pane shell
+/// and its group, pid 1).
+pub fn kill_tree(
+    roots: &[i32],
+    recorded_pgid: Option<i32>,
+    protected: &BTreeSet<i32>,
+    grace: Duration,
+) -> KillTreeReport {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let procs = snapshot_procs();
+
+    // --- Target set: ppid-chain descendants + process-group members ---
+    let mut targets: BTreeSet<i32> = descendants_of(&procs, roots).into_iter().collect();
+    if let Some(pg) = recorded_pgid {
+        targets.extend(members_of_pgids(&procs, &[pg]));
     }
-    out
+    // Roots that are themselves part of the workload (the payload's
+    // session leader) must die too; the pane shell is passed as a root
+    // for the descendant walk but is listed in `protected` because tmux
+    // `kill-pane` owns its teardown.
+    for root in roots {
+        targets.insert(*root);
+    }
+    targets.retain(|p| *p > 1 && !protected.contains(p));
+
+    let target_vec: Vec<i32> = targets.iter().copied().collect();
+    let mut pgids: BTreeSet<i32> = pgids_of(&procs, &target_vec, protected).into_iter().collect();
+    if let Some(pg) = recorded_pgid {
+        if pg > 1 && !protected.contains(&pg) {
+            pgids.insert(pg);
+        }
+    }
+
+    // Everything else already sharing a doomed group is a target too —
+    // that is how a double-forked child (ppid reparented to 1, group
+    // kept) gets both signalled AND reported instead of silently
+    // outliving the kill.
+    let pgid_vec_pre: Vec<i32> = pgids.iter().copied().collect();
+    for pid in members_of_pgids(&procs, &pgid_vec_pre) {
+        if pid > 1 && !protected.contains(&pid) {
+            targets.insert(pid);
+        }
+    }
+
+    let signal_all = |pgids: &BTreeSet<i32>, pids: &BTreeSet<i32>, sig: Signal| {
+        for pg in pgids {
+            let _ = killpg(Pid::from_raw(*pg), sig);
+        }
+        // Bottom-up for the individual pids so a parent doesn't get a
+        // chance to notice a child died and respawn it.
+        for pid in pids.iter().rev() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(*pid), sig);
+        }
+    };
+
+    signal_all(&pgids, &targets, Signal::SIGTERM);
+
+    // --- Grace window: poll instead of sleeping the whole budget ---
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !targets.iter().any(|p| proc_alive(*p)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // --- Re-snapshot: a respawning driver may have forked new children
+    // during the grace window. They inherit the doomed pgid (or hang off
+    // a doomed pid), so pick them up before escalating.
+    let procs2 = snapshot_procs();
+    let pgid_vec: Vec<i32> = pgids.iter().copied().collect();
+    for pid in members_of_pgids(&procs2, &pgid_vec) {
+        if pid > 1 && !protected.contains(&pid) {
+            targets.insert(pid);
+        }
+    }
+    for pid in descendants_of(&procs2, &target_vec) {
+        if pid > 1 && !protected.contains(&pid) {
+            targets.insert(pid);
+        }
+    }
+
+    signal_all(&pgids, &targets, Signal::SIGKILL);
+
+    // SIGKILL delivery is immediate but reaping is not; give the kernel
+    // a moment before declaring anything a survivor.
+    for _ in 0..20 {
+        if !targets.iter().any(|p| proc_alive(*p)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (survived, killed): (Vec<i32>, Vec<i32>) =
+        targets.iter().copied().partition(|p| proc_alive(*p));
+
+    KillTreeReport {
+        pgids: pgids.into_iter().collect(),
+        pids: targets.into_iter().collect(),
+        killed,
+        survived,
+    }
+}
+
+/// Tear down everything the workload `label` (running in tmux pane
+/// `pane_id`) spawned: the wrapper's sidecars, the `setsid` payload
+/// group recorded in the `.pgid` sidecar, and every descendant of both.
+///
+/// Replaces the old `kill_pane_tree`, which walked only the pane shell's
+/// DIRECT children and computed the remaining descendants AFTER killing
+/// them — so the payload (launched via `setsid --wait`, hence in its own
+/// session, and under `script(1)`, which puts the real command in a
+/// SECOND session again) was reparented to pid 1 and survived. On
+/// 2026-08-22 a killed render workload's driver script kept running and
+/// eleven of its children had to be reaped by hand.
+fn kill_workload_tree(label: &str, pane_id: &str, grace: Duration) -> KillTreeReport {
+    let procs = snapshot_procs();
+
+    let shell_pid: Option<i32> = Command::new("tmux")
+        .args(["list-panes", "-t", pane_id, "-F", "#{pane_pid}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<i32>()
+                .ok()
+        });
+
+    let self_pid = std::process::id() as i32;
+    let self_row = procs.iter().find(|r| r.pid == self_pid).copied();
+
+    let mut protected: BTreeSet<i32> = BTreeSet::new();
+    protected.insert(0);
+    protected.insert(1);
+    protected.insert(self_pid);
+    if let Some(row) = self_row {
+        // Never signal our own group/session — that would kill the
+        // caller (and, when invoked from the daemon, the daemon).
+        protected.insert(row.pgid);
+        protected.insert(row.sid);
+        protected.insert(row.ppid);
+    }
+    if let Some(pid) = shell_pid {
+        // The pane shell is a descendant ROOT (we want its children) but
+        // tmux `kill-pane` owns its own teardown, and its pgid may be
+        // shared with the tmux session — signalling that group would
+        // take out unrelated panes.
+        protected.insert(pid);
+        if let Some(row) = procs.iter().find(|r| r.pid == pid) {
+            protected.insert(row.pgid);
+        }
+    }
+
+    let recorded = read_recorded_pgid(label).filter(|pg| {
+        let ok = recorded_pgid_is_plausible(&procs, *pg);
+        if !ok {
+            eprintln!(
+                "warning: recorded pgid {pg} for workload '{label}' is stale or not a \
+                 session leader — falling back to the pane descendant walk"
+            );
+        }
+        ok
+    });
+
+    let mut roots: Vec<i32> = Vec::new();
+    if let Some(pid) = shell_pid {
+        roots.push(pid);
+    }
+    if let Some(pg) = recorded {
+        roots.push(pg);
+    }
+    if roots.is_empty() {
+        return KillTreeReport::default();
+    }
+
+    kill_tree(&roots, recorded, &protected, grace)
 }
 
 /// Build the wrapper bash script that runs the workload command in the
@@ -873,9 +1249,22 @@ fn get_descendants(pid: &str) -> Vec<String> {
 ///     that genuinely needs a non-tty stdout (CI scripts that test
 ///     tty-aware branches).
 ///   * Echoes a header (`=== workload: <label> ===` etc.), runs the
-///     command via `setsid --wait script ...`, captures the exit code,
-///     writes `<label>.exit`, and emits the `workload-done` claude-event
-///     via the embedded `claude-watch workload emit-done` subcommand.
+///     command via `setsid --wait bash -c '<record pgid>; exec script ...'`,
+///     captures the exit code, writes `<label>.exit`, and emits the
+///     `workload-done` claude-event via the embedded `claude-watch
+///     workload emit-done` subcommand.
+///   * Records the payload's process-group id in `<label>.pgid` (written
+///     by the setsid'd bash itself, since `setsid --wait` forks and the
+///     wrapper therefore cannot see the new sid) and removes it again on
+///     exit. `workload kill` needs it to signal the whole GROUP.
+///
+/// **Editing hazard — the EXIT trap.** Its body is one single-quoted
+/// bash word and the interpolated paths inside it are themselves
+/// single-quoted, so the quoting is only balanced as long as nothing
+/// else in that body contains an apostrophe or a backtick. A comment
+/// with a possessive in it turns the trap into a syntax error and every
+/// workload exits 2. `wrapper_script_runtime_pets_and_cleans_runtime_heartbeat`
+/// (which actually RUNS the generated wrapper) is the test that catches it.
 fn build_wrapper_script(
     label: &str,
     command: &str,
@@ -883,12 +1272,14 @@ fn build_wrapper_script(
     exit_path: &Path,
     heartbeat_path: &Path,
     runtime_heartbeat_path: &Path,
+    pgid_path: &Path,
     exe_path: &str,
     queue_id: Option<&str>,
 ) -> String {
     let out_q = shell_quote(&out_path.to_string_lossy());
     let exit_q = shell_quote(&exit_path.to_string_lossy());
     let hb_q = shell_quote(&heartbeat_path.to_string_lossy());
+    let pgid_q = shell_quote(&pgid_path.to_string_lossy());
     let rt_hb_q = shell_quote(&runtime_heartbeat_path.to_string_lossy());
     let rt_hb_dir_q = shell_quote(
         &runtime_heartbeat_path
@@ -1078,6 +1469,7 @@ fn build_wrapper_script(
            if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            if [ -n \"$RUNTIME_HEARTBEAT_PID\" ]; then kill -TERM -\"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || kill \"$RUNTIME_HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
            rm -f {rt_hb_q} {rt_hb_q}.tmp 2>/dev/null || true\n\
+           rm -f {pgid_q} {pgid_q}.tmp 2>/dev/null || true\n\
          ' EXIT\n\
          # Force line-buffered stdio for the workload command's stdout+stderr.\n\
          # Without this, programs whose stdout is a pipe (everything here, since\n\
@@ -1132,10 +1524,35 @@ fn build_wrapper_script(
          else\n\
              INNER_CMD={inner_cmd_raw_q}\n\
          fi\n\
+         # Record the payload's process-group id so `workload kill` can\n\
+         # tear down the WHOLE tree instead of just this pane.\n\
+         #\n\
+         # `setsid --wait` FORKS, so the new session/pgid it creates is\n\
+         # not knowable from this shell — `$!` would be setsid's own pid,\n\
+         # whose child lives in a different session entirely. So we hand\n\
+         # the inner bash the job: after setsid() it IS the session\n\
+         # leader, so its own `$$` is simultaneously its pid, its pgid\n\
+         # and its sid. It writes that id (tmp + atomic mv, same as the\n\
+         # heartbeats, so a concurrent reader never sees a half-written\n\
+         # file) and then `exec`s the real payload — exec preserves the\n\
+         # pid, so the recorded id stays correct for the whole run.\n\
+         #\n\
+         # Note `script(1)` puts the wrapped command in a SECOND session\n\
+         # of its own (it needs a controlling tty for the pty). The\n\
+         # recorded pgid is `script`'s; the killer walks descendants from\n\
+         # it to reach the inner session, which is why it records the\n\
+         # leader pid rather than only the group.\n\
+         #\n\
+         # Paths go through the environment so the single-quoted inner\n\
+         # body needs no nested shell-escaping (same trick as the\n\
+         # heartbeat sidecars above).\n\
+         export WORKLOAD_PGID_FILE={pgid_q}\n\
+         export WORKLOAD_INNER_CMD=\"$INNER_CMD\"\n\
+         WORKLOAD_RECORD_PGID='echo $$ > \"$WORKLOAD_PGID_FILE.tmp\" 2>/dev/null && mv -f \"$WORKLOAD_PGID_FILE.tmp\" \"$WORKLOAD_PGID_FILE\" 2>/dev/null || true'\n\
          if [ \"${{WORKLOAD_PTY:-1}}\" != \"0\" ] && command -v script >/dev/null 2>&1; then\n\
-             setsid --wait script -q -f -e -c \"$INNER_CMD\" /dev/null\n\
+             setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec script -q -f -e -c \"$WORKLOAD_INNER_CMD\" /dev/null'\n\
          else\n\
-             setsid --wait bash -c \"$INNER_CMD\"\n\
+             setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec bash -c \"$WORKLOAD_INNER_CMD\"'\n\
          fi\n\
          EC=$?\n\
          echo ''\n\
@@ -1279,6 +1696,7 @@ pub fn cmd_run(
     let exit_path = exit_file(label);
     let heartbeat_path = heartbeat_file(label);
     let runtime_heartbeat_path = runtime_heartbeat_file(label);
+    let pgid_path = pgid_file(label);
     let script_path = script_file(label);
     let script_capture_path = script_capture_file(label);
 
@@ -1294,6 +1712,9 @@ pub fn cmd_run(
     let _ = fs::remove_file(&out_path);
     let _ = fs::remove_file(&heartbeat_path);
     let _ = fs::remove_file(&runtime_heartbeat_path);
+    // Stale process-group sidecar from a previous run would point a
+    // later `workload kill` at a recycled pid.
+    let _ = fs::remove_file(&pgid_path);
     let _ = fs::remove_file(&script_capture_path);
 
     // Try to capture the script content NOW (before the workload
@@ -1341,6 +1762,7 @@ pub fn cmd_run(
         &exit_path,
         &heartbeat_path,
         &runtime_heartbeat_path,
+        &pgid_path,
         &exe_path,
         effective_queue_id.as_deref(),
     );
@@ -1833,8 +2255,33 @@ pub fn cmd_log(label: &str, lines: usize, follow: bool) -> i32 {
     }
 }
 
-/// CLI: `workload kill <label>`
-pub fn cmd_kill(label: &str) -> i32 {
+/// Exit code for "the pane is gone but something it spawned is still
+/// alive". Distinct from 1 (`no such workload`) so a caller can tell
+/// "nothing to kill" from "the kill did not fully take".
+pub const KILL_SURVIVORS_EXIT: i32 = 3;
+
+/// CLI: `workload kill <label> [--grace SECS]`
+///
+/// **Kill is TREE-WIDE.** It is not `tmux kill-pane`: the pane's wrapper
+/// script, the `setsid` payload group recorded in `<label>.pgid`, and
+/// every descendant of both get SIGTERM, then SIGKILL after `--grace`
+/// seconds (default [`KILL_GRACE_SECS_DEFAULT`], env override
+/// [`KILL_GRACE_ENV`]). Survivors are then VERIFIED and reported.
+///
+/// Killing only the pane was the 2026-08-22 incident: a render workload
+/// was killed during a CPU-temperature alert, its driver script kept
+/// running under the reparented payload session, and eleven render
+/// drivers had to be `pkill`ed by hand.
+///
+/// Unchanged from before: the pane still closes, and the `workload-done`
+/// event with `killed=true` is still emitted EXACTLY ONCE (skipped here
+/// when the wrapper already wrote its `.exit` marker, because it emits
+/// its own).
+///
+/// Exit codes: 0 = killed (or already dead), 1 = no such workload,
+/// [`KILL_SURVIVORS_EXIT`] = something survived SIGKILL.
+pub fn cmd_kill(label: &str, grace_secs: Option<f64>) -> i32 {
+    let mut rc = 0;
     let mut state = load_state();
     let info = match state.get(label) {
         Some(i) => i.clone(),
@@ -1874,18 +2321,54 @@ pub fn cmd_kill(label: &str) -> i32 {
                 info.queue_id.as_deref(),
             );
         }
-        kill_pane_tree(&info.pane_id);
+        let report = kill_workload_tree(label, &info.pane_id, resolve_kill_grace(grace_secs));
         let _ = Command::new("tmux")
             .args(["kill-pane", "-t", &info.pane_id])
             .output();
-        println!("Killed workload '{label}' (pane {})", info.pane_id);
+        println!(
+            "Killed workload '{label}' (pane {}) — {} process(es) in {} process group(s)",
+            info.pane_id,
+            report.killed.len(),
+            report.pgids.len()
+        );
+        if !report.pgids.is_empty() {
+            println!(
+                "  process groups: {}",
+                report
+                    .pgids
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !report.survived.is_empty() {
+            // Silence here would be the old bug all over again: the
+            // pane closes, the status flips to KILLED, and something is
+            // still burning CPU. Name the survivors and fail loudly.
+            eprintln!(
+                "WARNING: {} process(es) SURVIVED the kill: {}",
+                report.survived.len(),
+                report
+                    .survived
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            eprintln!("  inspect with: ps -o pid,ppid,pgid,stat,args -p <pid>");
+            rc = KILL_SURVIVORS_EXIT;
+        }
     } else {
         println!("Workload '{label}' already dead");
     }
     state.remove(label);
     let _ = save_state(&state);
+    // The wrapper's EXIT trap removes this itself on a natural exit, but
+    // a SIGKILLed wrapper never runs its trap.
+    let _ = fs::remove_file(pgid_file(label));
     rebalance();
-    0
+    rc
 }
 
 /// CLI (hidden): `workload emit-done --label X --exit-code N --log-path P [--killed] [--queue-id q-X]`.
@@ -3297,6 +3780,7 @@ mod tests {
             Path::new("/tmp/claude-workloads/demo.exit"),
             Path::new("/tmp/claude-workloads/demo.heartbeat"),
             Path::new("/tmp/claude-wl-rt/demo.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -3330,13 +3814,21 @@ mod tests {
             Path::new("/tmp/pty.exit"),
             Path::new("/tmp/pty.heartbeat"),
             Path::new("/tmp/claude-wl-rt/pty.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
             None,
         );
         assert!(
-            script.contains("setsid --wait script -q -f -e -c"),
+            script.contains(r#"exec script -q -f -e -c "$WORKLOAD_INNER_CMD" /dev/null"#),
             "wrapper must wrap user command in `script -q -f -e -c` for PTY allocation \
              with exit-code propagation:\n{script}"
+        );
+        // The `script` invocation is `exec`ed from the setsid'd bash
+        // that records the pgid — exec preserves the pid, so the
+        // recorded id stays valid for the whole run.
+        assert!(
+            script.contains("setsid --wait bash -c \"$WORKLOAD_RECORD_PGID\"'; exec script"),
+            "PTY path must go through the pgid-recording setsid bash:\n{script}"
         );
         assert!(
             script.contains("WORKLOAD_PTY"),
@@ -3365,6 +3857,7 @@ mod tests {
             Path::new("/tmp/g.exit"),
             Path::new("/tmp/g.heartbeat"),
             Path::new("/tmp/claude-wl-rt/guard.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/bin/claude-watch",
             None,
         );
@@ -3394,6 +3887,7 @@ mod tests {
             Path::new("/tmp/wp.exit"),
             Path::new("/tmp/wp.heartbeat"),
             Path::new("/tmp/claude-wl-rt/wp.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
             Some("q-2026-05-05-test"),
         );
@@ -3422,6 +3916,7 @@ mod tests {
             Path::new("/tmp/lb.exit"),
             Path::new("/tmp/lb.heartbeat"),
             Path::new("/tmp/claude-wl-rt/lb.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
             None,
         );
@@ -3456,6 +3951,7 @@ mod tests {
             Path::new("/tmp/wnq.exit"),
             Path::new("/tmp/wnq.heartbeat"),
             Path::new("/tmp/claude-wl-rt/wnq.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/bin/claude-watch",
             None,
         );
@@ -3497,6 +3993,7 @@ mod tests {
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -3619,6 +4116,7 @@ mod tests {
                 &exit_path,
                 &hb_path,
                 &rt_hb_path,
+                &out_path.with_extension("pgid"),
                 "/bin/true",
                 None,
             );
@@ -3736,6 +4234,7 @@ mod tests {
                 &exit_path,
                 &hb_path,
                 &rt_hb_path,
+                &out_path.with_extension("pgid"),
                 "/bin/true",
                 None,
             );
@@ -3849,6 +4348,7 @@ mod tests {
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -3956,6 +4456,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4027,6 +4528,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             Path::new("/tmp/claude-workloads/hb.exit"),
             Path::new("/tmp/claude-workloads/hb.heartbeat"),
             Path::new("/run/claude/workloads/hb.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -4091,6 +4593,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             Path::new("/tmp/hbo.exit"),
             Path::new("/tmp/hbo.heartbeat"),
             Path::new("/run/claude/workloads/hbo.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/bin/claude-watch",
             None,
         );
@@ -4133,6 +4636,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             Path::new("/tmp/rt.exit"),
             Path::new("/tmp/rt.heartbeat"),
             Path::new("/run/claude/workloads/rt.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -4248,6 +4752,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             Path::new("/tmp/rt2.exit"),
             Path::new("/tmp/rt2.heartbeat"),
             Path::new("/run/claude/workloads/rt2.heartbeat"),
+            Path::new("/tmp/claude-workloads/demo.pgid"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -4304,6 +4809,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4401,6 +4907,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4491,6 +4998,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4550,6 +5058,7 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             &exit_path,
             &hb_path,
             &rt_hb_path,
+            &out_path.with_extension("pgid"),
             "/bin/true",
             None,
         );
@@ -4915,5 +5424,487 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         );
         assert!(meta.is_dir(), "legacy must still be a directory");
         assert!(canary.exists(), "canary inside legacy must survive");
+    }
+
+    // ----- kill: pgid bookkeeping -------------------------------------------
+
+    #[test]
+    fn pgid_file_lives_beside_the_other_workload_artifacts() {
+        let p = pgid_file("furiosity-render");
+        assert_eq!(
+            p,
+            PathBuf::from(WORKLOAD_DIR).join("furiosity-render.pgid")
+        );
+    }
+
+    #[test]
+    fn parse_pgid_accepts_a_plain_id_with_trailing_newline() {
+        assert_eq!(parse_pgid("12345\n"), Some(12345));
+        assert_eq!(parse_pgid("  12345  "), Some(12345));
+    }
+
+    #[test]
+    fn parse_pgid_rejects_empty_garbage_and_degenerate_ids() {
+        // Empty / partial write / non-numeric: no pgid, fall back to the
+        // descendant walk rather than signalling something arbitrary.
+        assert_eq!(parse_pgid(""), None);
+        assert_eq!(parse_pgid("\n"), None);
+        assert_eq!(parse_pgid("not-a-pid"), None);
+        assert_eq!(parse_pgid("12 34"), None);
+        // 0 = "every process in MY group", -1 = "every process we may
+        // signal", 1 = init. Each of these would be catastrophic.
+        assert_eq!(parse_pgid("0"), None);
+        assert_eq!(parse_pgid("1"), None);
+        assert_eq!(parse_pgid("-1"), None);
+    }
+
+    #[test]
+    fn parse_proc_stat_reads_ppid_pgid_and_sid() {
+        let row = parse_proc_stat("4242 (bash) S 4000 4242 4242 34816 4242 4194304 ...")
+            .expect("parse");
+        assert_eq!(
+            row,
+            ProcRow {
+                pid: 4242,
+                ppid: 4000,
+                pgid: 4242,
+                sid: 4242
+            }
+        );
+    }
+
+    #[test]
+    fn parse_proc_stat_survives_a_comm_containing_spaces_and_parens() {
+        // `comm` is process-controlled. Splitting on the FIRST `)` (or
+        // on whitespace) mis-indexes every field after it, which would
+        // hand the killer someone else's pgid.
+        let row = parse_proc_stat("77 (my (weird) proc) S 5 66 9 0 -1 0")
+            .expect("parse");
+        assert_eq!(
+            row,
+            ProcRow {
+                pid: 77,
+                ppid: 5,
+                pgid: 66,
+                sid: 9
+            }
+        );
+    }
+
+    #[test]
+    fn parse_proc_state_reads_the_state_char() {
+        assert_eq!(
+            parse_proc_state("4242 (bash) S 4000 4242 4242 0"),
+            Some('S')
+        );
+        // A killed child of the caller sits in Z until it is waited on —
+        // it must not read as a survivor.
+        assert_eq!(
+            parse_proc_state("4242 (my (weird) proc) Z 1 1 1 0"),
+            Some('Z')
+        );
+        assert_eq!(parse_proc_state("garbage"), None);
+    }
+
+    #[test]
+    fn parse_proc_stat_rejects_truncated_lines() {
+        assert!(parse_proc_stat("").is_none());
+        assert!(parse_proc_stat("4242 (bash)").is_none());
+        assert!(parse_proc_stat("4242 (bash) S 4000").is_none());
+        assert!(parse_proc_stat("not-a-pid (bash) S 1 1 1").is_none());
+    }
+
+    /// Snapshot fixture:
+    ///
+    /// ```text
+    /// 100 pane shell   (pgid 100)
+    ///  └─ 200 setsid   (pgid 100)
+    ///      └─ 300 payload leader (pgid 300, sid 300)   <- recorded
+    ///          └─ 400 driver (pgid 300)
+    ///              └─ 500 ffmpeg (pgid 300)
+    /// 600 double-forked ffmpeg, ppid 1 but STILL pgid 300
+    /// 900 innocent bystander (pgid 900)
+    /// ```
+    fn fixture_procs() -> Vec<ProcRow> {
+        vec![
+            ProcRow { pid: 1, ppid: 0, pgid: 1, sid: 1 },
+            ProcRow { pid: 100, ppid: 50, pgid: 100, sid: 50 },
+            ProcRow { pid: 200, ppid: 100, pgid: 100, sid: 50 },
+            ProcRow { pid: 300, ppid: 200, pgid: 300, sid: 300 },
+            ProcRow { pid: 400, ppid: 300, pgid: 300, sid: 300 },
+            ProcRow { pid: 500, ppid: 400, pgid: 300, sid: 300 },
+            ProcRow { pid: 600, ppid: 1, pgid: 300, sid: 300 },
+            ProcRow { pid: 900, ppid: 1, pgid: 900, sid: 900 },
+        ]
+    }
+
+    #[test]
+    fn descendants_of_walks_the_whole_chain_not_just_direct_children() {
+        let procs = fixture_procs();
+        let mut d = descendants_of(&procs, &[100]);
+        d.sort_unstable();
+        // 600 double-forked out of the ppid chain, so it is NOT here —
+        // that is what `members_of_pgids` is for.
+        assert_eq!(d, vec![200, 300, 400, 500]);
+        // Roots are not included in their own descendant list.
+        assert!(!d.contains(&100));
+    }
+
+    #[test]
+    fn descendants_of_is_cycle_safe_and_handles_missing_roots() {
+        // A ppid loop cannot happen on a sane kernel, but a snapshot is
+        // racy and this must terminate regardless.
+        let procs = vec![
+            ProcRow { pid: 10, ppid: 11, pgid: 10, sid: 10 },
+            ProcRow { pid: 11, ppid: 10, pgid: 10, sid: 10 },
+        ];
+        let d = descendants_of(&procs, &[10]);
+        assert_eq!(d, vec![11]);
+        assert!(descendants_of(&procs, &[9999]).is_empty());
+        assert!(descendants_of(&[], &[10]).is_empty());
+    }
+
+    #[test]
+    fn members_of_pgids_catches_the_double_forked_orphan() {
+        let procs = fixture_procs();
+        let mut m = members_of_pgids(&procs, &[300]);
+        m.sort_unstable();
+        // 600 reparented to init but kept the group — invisible to a
+        // ppid walk, visible here. This is the process that outlived
+        // the old `workload kill`.
+        assert_eq!(m, vec![300, 400, 500, 600]);
+        assert!(members_of_pgids(&procs, &[]).is_empty());
+    }
+
+    #[test]
+    fn pgids_of_collects_groups_and_honours_the_protected_denylist() {
+        let procs = fixture_procs();
+        let protected: BTreeSet<i32> = [100].into_iter().collect();
+        // 200 is in the pane shell's group (protected — it may be shared
+        // with the tmux session); 400 is in the payload group.
+        let pgids = pgids_of(&procs, &[200, 400], &protected);
+        assert_eq!(pgids, vec![300]);
+        // Nothing protected ever comes back, even when asked directly.
+        assert!(pgids_of(&procs, &[100], &protected).is_empty());
+        // pgid 1 is never a target.
+        assert!(pgids_of(&procs, &[1], &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn recorded_pgid_is_plausible_only_for_a_live_session_leader() {
+        let procs = fixture_procs();
+        // The payload leader: pid == pgid == sid (created under setsid).
+        assert!(recorded_pgid_is_plausible(&procs, 300));
+        // A recycled pid that happens to exist but leads nothing.
+        assert!(!recorded_pgid_is_plausible(&procs, 400));
+        // Not in the snapshot at all (wrapper died, pid gone).
+        assert!(!recorded_pgid_is_plausible(&procs, 12345));
+        // Degenerate ids.
+        assert!(!recorded_pgid_is_plausible(&procs, 1));
+        assert!(!recorded_pgid_is_plausible(&procs, 0));
+        assert!(!recorded_pgid_is_plausible(&procs, -300));
+    }
+
+    #[test]
+    fn resolve_kill_grace_prefers_flag_then_env_then_default() {
+        assert_eq!(
+            resolve_kill_grace_from(None, None),
+            Duration::from_secs_f64(KILL_GRACE_SECS_DEFAULT)
+        );
+        assert_eq!(
+            resolve_kill_grace_from(None, Some("2.5")),
+            Duration::from_secs_f64(2.5)
+        );
+        // The flag wins over the env.
+        assert_eq!(
+            resolve_kill_grace_from(Some(1.0), Some("30")),
+            Duration::from_secs_f64(1.0)
+        );
+        // 0 is legitimate: "escalate to SIGKILL immediately".
+        assert_eq!(resolve_kill_grace_from(Some(0.0), None), Duration::ZERO);
+    }
+
+    #[test]
+    fn resolve_kill_grace_clamps_and_falls_back_on_garbage() {
+        // A typo must not wedge the caller for a day.
+        assert_eq!(
+            resolve_kill_grace_from(Some(100_000.0), None),
+            Duration::from_secs_f64(KILL_GRACE_SECS_MAX)
+        );
+        for bad in ["", "abc", "-1", "NaN"] {
+            assert_eq!(
+                resolve_kill_grace_from(None, Some(bad)),
+                Duration::from_secs_f64(KILL_GRACE_SECS_DEFAULT),
+                "env value {bad:?} should fall back to the default"
+            );
+        }
+        assert_eq!(
+            resolve_kill_grace_from(Some(-5.0), None),
+            Duration::from_secs_f64(KILL_GRACE_SECS_DEFAULT)
+        );
+    }
+
+    #[test]
+    fn wrapper_script_records_and_cleans_the_pgid_sidecar() {
+        let script = build_wrapper_script(
+            "pg",
+            "echo hi",
+            Path::new("/tmp/claude-workloads/pg.output"),
+            Path::new("/tmp/claude-workloads/pg.exit"),
+            Path::new("/tmp/claude-workloads/pg.heartbeat"),
+            Path::new("/tmp/claude-wl-rt/pg.heartbeat"),
+            Path::new("/tmp/claude-workloads/pg.pgid"),
+            "/usr/bin/claude-watch",
+            None,
+        );
+        assert!(
+            script.contains("export WORKLOAD_PGID_FILE='/tmp/claude-workloads/pg.pgid'"),
+            "wrapper must export the pgid sidecar path:\n{script}"
+        );
+        assert!(
+            script.contains(r#"echo $$ > "$WORKLOAD_PGID_FILE.tmp""#)
+                && script.contains(r#"mv -f "$WORKLOAD_PGID_FILE.tmp" "$WORKLOAD_PGID_FILE""#),
+            "pgid must be written atomically (tmp + mv) so a racing \
+             `workload kill` never reads a half-written file:\n{script}"
+        );
+        assert!(
+            script.contains("rm -f '/tmp/claude-workloads/pg.pgid' '/tmp/claude-workloads/pg.pgid'.tmp"),
+            "the EXIT trap must remove the sidecar — a stale one names a \
+             pid the kernel may have recycled:\n{script}"
+        );
+    }
+
+    // ----- kill: behavioural ------------------------------------------------
+
+    /// Read this process's own `/proc/self/stat`-derived row, for the
+    /// protected denylist in the behavioural tests below. Without it a
+    /// test would happily SIGKILL its own runner.
+    fn self_protected() -> BTreeSet<i32> {
+        let self_pid = std::process::id() as i32;
+        let procs = snapshot_procs();
+        let mut protected: BTreeSet<i32> = [0, 1, self_pid].into_iter().collect();
+        if let Some(row) = procs.iter().find(|r| r.pid == self_pid) {
+            protected.insert(row.pgid);
+            protected.insert(row.sid);
+            protected.insert(row.ppid);
+        }
+        protected
+    }
+
+    /// Poll until `f` is true or `budget` elapses. Returns whether it
+    /// became true — never `sleep`s a fixed budget, so the tests stay
+    /// fast on a healthy box and still tolerate a loaded CI runner.
+    fn wait_until(budget: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if f() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn read_pid_file(p: &Path) -> Option<i32> {
+        parse_pgid(&std::fs::read_to_string(p).ok()?)
+    }
+
+    /// THE regression test for the 2026-08-22 incident.
+    ///
+    /// Launches a real wrapper whose payload is a shell that spawns a
+    /// `sleep` grandchild AND a double-forked (ppid 1) great-grandchild,
+    /// then tears the workload down the way `workload kill` does and
+    /// asserts NOTHING is left running.
+    ///
+    /// Under the old `kill_pane_tree` the payload lived in a session of
+    /// its own (`setsid --wait`, then `script(1)`'s own session), the
+    /// descendant walk ran AFTER the first kill had already reparented
+    /// everything, and both sleepers survived — the shape of the real
+    /// failure, where a killed render workload's driver kept spawning
+    /// work until eleven processes were reaped by hand.
+    #[test]
+    fn kill_tree_reaps_grandchildren_and_double_forked_orphans() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("kt.output");
+        let exit_path = tmp.path().join("kt.exit");
+        let hb_path = tmp.path().join("kt.heartbeat");
+        let rt_hb_path = tmp.path().join("kt.runtime.heartbeat");
+        let pgid_path = tmp.path().join("kt.pgid");
+        let script_path = tmp.path().join("kt.sh");
+
+        let drv_pid_f = tmp.path().join("drv.pid");
+        let child_pid_f = tmp.path().join("child.pid");
+        let orphan_pid_f = tmp.path().join("orphan.pid");
+
+        // The payload: a driver shell (grandchild of the wrapper), a
+        // plain background sleep under it, and a sleep double-forked out
+        // of the ppid chain (subshell exits immediately, so it is
+        // reparented to pid 1 while KEEPING the process group).
+        let command = format!(
+            "echo $$ > {drv}; sleep 600 & echo $! > {child}; \
+             ( sleep 600 & echo $! > {orphan} ) ; sleep 600",
+            drv = drv_pid_f.display(),
+            child = child_pid_f.display(),
+            orphan = orphan_pid_f.display(),
+        );
+
+        let script = build_wrapper_script(
+            "kt",
+            &command,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            &rt_hb_path,
+            &pgid_path,
+            "/bin/true",
+            None,
+        );
+        std::fs::write(&script_path, &script).expect("write script");
+
+        let mut wrapper = Command::new("bash")
+            .arg(&script_path)
+            // Heartbeat sidecars are orthogonal here and would only add
+            // noise to the survivor report.
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .env("WORKLOAD_RUNTIME_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn wrapper");
+        let wrapper_pid = wrapper.id() as i32;
+
+        // Wait for the whole tree to exist before killing anything —
+        // otherwise the test could pass by killing a process that had
+        // not spawned its children yet.
+        let ready = wait_until(Duration::from_secs(20), || {
+            read_pid_file(&pgid_path).is_some()
+                && read_pid_file(&drv_pid_f).is_some()
+                && read_pid_file(&child_pid_f).is_some()
+                && read_pid_file(&orphan_pid_f).is_some()
+        });
+        let recorded = read_pid_file(&pgid_path);
+        let drv = read_pid_file(&drv_pid_f);
+        let child = read_pid_file(&child_pid_f);
+        let orphan = read_pid_file(&orphan_pid_f);
+
+        if !ready {
+            // Never leave the tree running if the setup failed.
+            let _ = kill_tree(
+                &[wrapper_pid],
+                recorded,
+                &self_protected(),
+                Duration::from_millis(200),
+            );
+            let _ = wrapper.wait();
+            panic!(
+                "workload tree never fully started: pgid={recorded:?} drv={drv:?} \
+                 child={child:?} orphan={orphan:?}\noutput:\n{}",
+                std::fs::read_to_string(&out_path).unwrap_or_default()
+            );
+        }
+
+        let recorded = recorded.expect("pgid recorded");
+        let child = child.expect("child pid");
+        let orphan = orphan.expect("orphan pid");
+        let drv = drv.expect("driver pid");
+
+        // The recorded id must be the payload's SESSION LEADER, which is
+        // what makes the `killpg` safe (and what the staleness check in
+        // `kill_workload_tree` relies on).
+        let procs = snapshot_procs();
+        assert!(
+            recorded_pgid_is_plausible(&procs, recorded),
+            "recorded pgid {recorded} is not a live session leader"
+        );
+        // Sanity: the double-forked sleeper really did leave the ppid
+        // chain but stayed in the group, so the test is exercising the
+        // pgid sweep and not just the descendant walk.
+        let orphan_row = procs.iter().find(|r| r.pid == orphan).copied();
+        assert!(
+            orphan_row.is_some(),
+            "double-forked sleeper {orphan} vanished before the kill"
+        );
+
+        let report = kill_tree(
+            &[wrapper_pid, recorded],
+            Some(recorded),
+            &self_protected(),
+            Duration::from_millis(500),
+        );
+        let _ = wrapper.wait();
+
+        for (name, pid) in [
+            ("wrapper", wrapper_pid),
+            ("payload leader", recorded),
+            ("driver", drv),
+            ("grandchild sleep", child),
+            ("double-forked sleep", orphan),
+        ] {
+            let gone = wait_until(Duration::from_secs(5), || !proc_alive(pid));
+            assert!(
+                gone,
+                "{name} (pid {pid}) survived the kill; report: {report:?}"
+            );
+        }
+        assert!(
+            report.survived.is_empty(),
+            "kill_tree reported survivors: {report:?}"
+        );
+        assert!(
+            report.pgids.contains(&recorded),
+            "the payload process group must have been signalled: {report:?}"
+        );
+        // The report must NAME what it reaped — "silence is not success"
+        // is exactly how the incident stayed invisible.
+        assert!(
+            report.killed.contains(&child)
+                && report.killed.contains(&orphan)
+                && report.killed.contains(&drv),
+            "every member of the tree must be accounted for as killed: {report:?}"
+        );
+    }
+
+    /// `kill_tree` must never signal the caller: a protected pgid stays
+    /// untouched even when a target sits inside it.
+    #[test]
+    fn kill_tree_never_signals_a_protected_group() {
+        // A bystander in OUR OWN process group. If the protection
+        // failed, this (and the test runner) would die.
+        let mut bystander = Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn bystander");
+        let bystander_pid = bystander.id() as i32;
+
+        let protected = self_protected();
+        let procs = snapshot_procs();
+        let row = procs
+            .iter()
+            .find(|r| r.pid == bystander_pid)
+            .copied()
+            .expect("bystander in snapshot");
+        assert!(
+            protected.contains(&row.pgid),
+            "test precondition: the bystander should share our protected group"
+        );
+
+        // Roots empty of anything real: nothing to kill, and crucially
+        // the protected group must not be signalled.
+        let report = kill_tree(&[], None, &protected, Duration::from_millis(50));
+        assert!(
+            !report.pgids.contains(&row.pgid),
+            "protected group {} was targeted: {report:?}",
+            row.pgid
+        );
+        assert!(
+            proc_alive(bystander_pid),
+            "bystander in a protected group was killed"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(bystander_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = bystander.wait();
     }
 }

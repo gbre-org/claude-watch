@@ -491,10 +491,20 @@ enum WorkloadAction {
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
     },
-    /// Kill a running workload
+    /// Kill a running workload AND everything it spawned
+    ///
+    /// Not just the tmux pane: the pane's wrapper, the workload's
+    /// `setsid` process group, and every descendant of both get
+    /// SIGTERM, then SIGKILL after the grace period. Survivors are
+    /// verified afterwards and reported; exit 3 means something
+    /// outlived SIGKILL.
     Kill {
         /// Workload label
         label: String,
+        /// Seconds to wait between SIGTERM and SIGKILL (default 5;
+        /// env: WORKLOAD_KILL_GRACE_SECS)
+        #[arg(long, value_name = "SECS")]
+        grace: Option<f64>,
     },
     /// Internal: emit a workload-done claude-event. Called by the
     /// wrapper script after the workload exits. Hidden from `--help`.
@@ -1632,7 +1642,7 @@ fn run_workload(action: WorkloadAction) -> i32 {
             follow,
             lines,
         } => workload::cmd_log(&label, lines, follow),
-        WorkloadAction::Kill { label } => workload::cmd_kill(&label),
+        WorkloadAction::Kill { label, grace } => workload::cmd_kill(&label, grace),
         WorkloadAction::EmitDone {
             label,
             exit_code,

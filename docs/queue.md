@@ -186,6 +186,41 @@ to keep waiting. Each re-invocation is the only LLM-turn cost of the whole
 wait (≈ once per `--max-block`), versus a fresh turn per poll. Exit 1 = no
 such label; exit 2 = malformed `--qid` (must look like `q-XXXX`).
 
+### Killing a workload — `workload kill` is TREE-WIDE
+
+```
+workload kill <label> [--grace SECS]
+```
+
+`workload kill` is **not** `tmux kill-pane`. It terminates the whole process
+tree the workload created:
+
+1. **Snapshot first.** Every descendant is read out of `/proc` *before* any
+   signal is sent — the first kill reparents the rest to pid 1, so a walk
+   done afterwards loses exactly the grandchildren you are trying to reap.
+2. **Signal the process GROUP**, not just the pids. `workload run` launches
+   its payload under `setsid` and records the resulting process-group id in
+   `<label>.pgid` alongside the other workload artifacts; the killer signals
+   that group, which also sweeps up anything the tree forked mid-teardown and
+   anything that **double-forked** out of the ppid chain but kept the group.
+3. **SIGTERM, then SIGKILL** after the grace period — `--grace SECS`,
+   env `WORKLOAD_KILL_GRACE_SECS`, default 5 s, capped at 600 s. A driver
+   script gets a chance to stop its own children cleanly first.
+4. **Verify and report.** Survivors are re-checked after the SIGKILL sweep
+   and printed by pid; a zombie counts as dead.
+
+The pane still closes and shows the KILLED status, and the `workload-done`
+event still carries `killed=true` exactly once — unchanged.
+
+Exit codes: `0` killed (or already dead), `1` no such label, **`3` something
+survived SIGKILL** (it names the pids; inspect with
+`ps -o pid,ppid,pgid,stat,args -p <pid>`).
+
+> Why it works this way: killing only the pane used to leave the payload
+> running. During a CPU-temperature alert a render workload was killed, its
+> driver script kept going under the reparented session, and eleven render
+> processes had to be `pkill`ed by hand.
+
 ## Schema (v2)
 
 ```json
