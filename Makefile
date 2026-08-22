@@ -27,7 +27,7 @@
 .PHONY: test-dashboard test-trust-workspace test-claude-events-exporter
 .PHONY: test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links
 .PHONY: test-claude-md-size test-install-hooks test-install-host-skills
-.PHONY: test-install-host-cron test-ci-apt-install
+.PHONY: test-install-host-cron test-install-links test-ci-apt-install
 .PHONY: test-entrypoint test-cw test-hostjob test-launchd-plist
 .PHONY: test-personal-mcp-host test-personal-mcp-host-plist
 .PHONY: test-personal-mcp-install test-ttyd-paste-handler test-ttyd-lock-toggle
@@ -337,6 +337,16 @@ test-install-host-skills: ## Tests for the host-skills installer + its wiring
 test-install-host-cron: ## Tests for the host-cron fragment + its installer
 	scripts/tests/install-host-cron.test
 
+# The `install` target's TOOL_LINKS / MULTICALL_NAMES variables: every source
+# path resolves and is executable, `make -n install` lists every previously
+# host-missing name (agent-ctl, session-event, watcher-restart,
+# watcher-status, task-watch, claude-watch-metrics, dashboard,
+# dashboard-refit, queue-notify — NOT the deliberately-retired
+# heartbeat-ack), and the symlinking is idempotent. Tmpdirs only; no cargo
+# build (make -n).
+test-install-links: ## Tests for the install target's TOOL_LINKS / MULTICALL_NAMES coverage
+	scripts/tests/install-links.test
+
 # The bounded/retrying apt wrapper CI's two package-install steps run through.
 # Drives the real script against a fake apt-get that hangs on demand and
 # asserts on WALL-CLOCK behavior: a wedged attempt is aborted early, the retry
@@ -597,66 +607,76 @@ deploy: deploy-systemd
 #     depend on this target. It now does, so a host deploy refreshes this
 #     copy and restarts the service from the same build.
 #   - Every other tool is a script (Python / shell). Those install as
-#     ABSOLUTE-PATH symlinks back to the source under tools/, so editing
-#     a script in-tree is immediately reflected in $(BIN_DIR) without
-#     another `make install` round-trip. `ln -sfn` makes the operation
-#     idempotent (overwrites existing files / stale symlinks; -n
-#     prevents following a directory at the link path).
+#     ABSOLUTE-PATH symlinks back to the source under tools/ (or the repo
+#     root, for dashboard/dashboard-refit), so editing a script in-tree is
+#     immediately reflected in $(BIN_DIR) without another `make install`
+#     round-trip. `ln -sfn` makes the operation idempotent (overwrites
+#     existing files / stale symlinks; -n prevents following a directory
+#     at the link path).
+#   - A third class, MULTICALL_NAMES, are argv[0] aliases the daemon binary
+#     ITSELF dispatches on (busybox-style — see `multicall_rewrite_args` in
+#     src/main.rs, e.g. `agent-ctl list` becomes `claude-watch agent list`).
+#     Those install as symlinks to the installed $(BIN_DIR)/claude-watch
+#     copy, not to a separate script. Keep this list in sync with the match
+#     arms in `multicall_rewrite_args()`.
 BIN_DIR ?= $(HOME)/bin
+
+# name=path pairs (path relative to the repo root). This is the single
+# source of truth for install's script symlinks — `make -n install` and
+# `make test-install-links` both walk it, so a tool added here is proven
+# wired without hand-maintaining a second list.
+TOOL_LINKS := \
+	session-task=tools/session-task/session-task \
+	queue-notify=tools/session-task/queue-notify \
+	obligations=tools/obligations/obligations \
+	obligations-init=tools/obligations/obligations-init \
+	pre-agent-queue-gate-hook=tools/hooks/pre-agent-queue-gate-hook \
+	pre-tool-obligations-gate-hook=tools/hooks/pre-tool-obligations-gate-hook \
+	post-tool-obligations-update-hook=tools/hooks/post-tool-obligations-update-hook \
+	post-tool-mark-attachment-read-hook=tools/hooks/post-tool-mark-attachment-read-hook \
+	pre-agent-background-required-hook=tools/hooks/pre-agent-background-required-hook \
+	pre-agent-worktree-isolation-hook=tools/hooks/pre-agent-worktree-isolation-hook \
+	worktree-create-hook=tools/hooks/worktree-create-hook \
+	agent-msg=tools/agent-msg/agent-msg \
+	agent-tail=tools/agent-tail/agent-tail \
+	pr-branches=tools/pr-branches/pr-branches \
+	claude-event=tools/claude-event/claude-event \
+	claude-event-tail=tools/claude-event/claude-event-tail \
+	claude-event-watch=tools/watchers/claude-event-watch \
+	self-clear=tools/watchers/self-clear \
+	self-login=tools/watchers/self-login \
+	event-classify=tools/event-must-act/event-classify \
+	event-ack=tools/event-must-act/event-ack \
+	eval-event-must-act=tools/event-must-act/eval-event-must-act \
+	user-prompt-ambient-inject-hook=tools/event-must-act/user-prompt-ambient-inject-hook \
+	cw-watcher-health-check=tools/event-must-act/cw-watcher-health-check \
+	cw-agent-stats=tools/cw-agent-stats/cw-agent-stats \
+	dashboard=dashboard \
+	dashboard-refit=dashboard-refit
+
+# argv[0] multicall aliases of the daemon binary (see multicall_rewrite_args
+# in src/main.rs). Symlinked to $(BIN_DIR)/claude-watch, not to a script.
+MULTICALL_NAMES := agent-ctl task-watch watcher-ctl watcher-status workload claude-watch-metrics watcher-restart session-event
 
 install: build ## Install daemon (copy) + tool scripts (symlinks) into $BIN_DIR
 	@mkdir -p $(BIN_DIR)
 	@install -m 0755 target/release/claude-watch $(BIN_DIR)/claude-watch
-	@ln -sfn $(abspath tools/session-task/session-task) $(BIN_DIR)/session-task
-	@ln -sfn $(abspath tools/obligations/obligations) $(BIN_DIR)/obligations
-	@ln -sfn $(abspath tools/hooks/pre-agent-queue-gate-hook) $(BIN_DIR)/pre-agent-queue-gate-hook
-	@ln -sfn $(abspath tools/hooks/pre-tool-obligations-gate-hook) $(BIN_DIR)/pre-tool-obligations-gate-hook
-	@ln -sfn $(abspath tools/hooks/post-tool-obligations-update-hook) $(BIN_DIR)/post-tool-obligations-update-hook
-	@ln -sfn $(abspath tools/hooks/post-tool-mark-attachment-read-hook) $(BIN_DIR)/post-tool-mark-attachment-read-hook
-	@ln -sfn $(abspath tools/hooks/pre-agent-background-required-hook) $(BIN_DIR)/pre-agent-background-required-hook
-	@ln -sfn $(abspath tools/hooks/pre-agent-worktree-isolation-hook) $(BIN_DIR)/pre-agent-worktree-isolation-hook
-	@ln -sfn $(abspath tools/hooks/worktree-create-hook) $(BIN_DIR)/worktree-create-hook
-	@ln -sfn $(abspath tools/agent-msg/agent-msg) $(BIN_DIR)/agent-msg
-	@ln -sfn $(abspath tools/agent-tail/agent-tail) $(BIN_DIR)/agent-tail
-	@ln -sfn $(abspath tools/pr-branches/pr-branches) $(BIN_DIR)/pr-branches
-	@ln -sfn $(abspath tools/claude-event/claude-event) $(BIN_DIR)/claude-event
-	@ln -sfn $(abspath tools/claude-event/claude-event-tail) $(BIN_DIR)/claude-event-tail
-	@ln -sfn $(abspath tools/watchers/claude-event-watch) $(BIN_DIR)/claude-event-watch
-	@ln -sfn $(abspath tools/watchers/self-clear) $(BIN_DIR)/self-clear
-	@ln -sfn $(abspath tools/watchers/self-login) $(BIN_DIR)/self-login
-	@ln -sfn $(abspath tools/obligations/obligations-init) $(BIN_DIR)/obligations-init
-	@ln -sfn $(abspath tools/event-must-act/event-classify) $(BIN_DIR)/event-classify
-	@ln -sfn $(abspath tools/event-must-act/event-ack) $(BIN_DIR)/event-ack
-	@ln -sfn $(abspath tools/event-must-act/eval-event-must-act) $(BIN_DIR)/eval-event-must-act
-	@ln -sfn $(abspath tools/event-must-act/user-prompt-ambient-inject-hook) $(BIN_DIR)/user-prompt-ambient-inject-hook
-	@ln -sfn $(abspath tools/event-must-act/cw-watcher-health-check) $(BIN_DIR)/cw-watcher-health-check
-	@ln -sfn $(abspath tools/cw-agent-stats/cw-agent-stats) $(BIN_DIR)/cw-agent-stats
+	@for pair in $(TOOL_LINKS); do \
+		name=$${pair%%=*}; src=$${pair#*=}; \
+		ln -sfn "$(CURDIR)/$$src" "$(BIN_DIR)/$$name"; \
+	done
+	@for name in $(MULTICALL_NAMES); do \
+		ln -sfn "$(BIN_DIR)/claude-watch" "$(BIN_DIR)/$$name"; \
+	done
 	@echo "Installed to $(BIN_DIR):"
-	@echo "  - claude-watch              (file copy, build artifact)"
-	@echo "  - session-task              (symlink -> tools/session-task/)"
-	@echo "  - obligations               (symlink -> tools/obligations/)"
-	@echo "  - pre-agent-queue-gate-hook (symlink -> tools/hooks/)"
-	@echo "  - pre-tool-obligations-gate-hook (symlink -> tools/hooks/)"
-	@echo "  - post-tool-obligations-update-hook (symlink -> tools/hooks/)"
-	@echo "  - post-tool-mark-attachment-read-hook (symlink -> tools/hooks/)"
-	@echo "  - pre-agent-background-required-hook (symlink -> tools/hooks/)"
-	@echo "  - pre-agent-worktree-isolation-hook (symlink -> tools/hooks/)"
-	@echo "  - worktree-create-hook      (symlink -> tools/hooks/)"
-	@echo "  - agent-msg                 (symlink -> tools/agent-msg/)"
-	@echo "  - agent-tail                (symlink -> tools/agent-tail/)"
-	@echo "  - pr-branches               (symlink -> tools/pr-branches/)"
-	@echo "  - claude-event              (symlink -> tools/claude-event/)"
-	@echo "  - claude-event-tail         (symlink -> tools/claude-event/)"
-	@echo "  - claude-event-watch        (symlink -> tools/watchers/)"
-	@echo "  - self-clear                (symlink -> tools/watchers/)"
-	@echo "  - self-login                (symlink -> tools/watchers/)"
-	@echo "  - obligations-init          (symlink -> tools/obligations/)"
-	@echo "  - event-classify            (symlink -> tools/event-must-act/)"
-	@echo "  - event-ack                 (symlink -> tools/event-must-act/)"
-	@echo "  - eval-event-must-act       (symlink -> tools/event-must-act/)"
-	@echo "  - user-prompt-ambient-inject-hook (symlink -> tools/event-must-act/)"
-	@echo "  - cw-watcher-health-check   (symlink -> tools/event-must-act/)"
-	@echo "  - cw-agent-stats            (symlink -> tools/cw-agent-stats/)"
+	@echo "  - claude-watch (file copy, build artifact)"
+	@for pair in $(TOOL_LINKS); do \
+		name=$${pair%%=*}; src=$${pair#*=}; \
+		echo "  - $$name (symlink -> $$src)"; \
+	done
+	@for name in $(MULTICALL_NAMES); do \
+		echo "  - $$name (multicall symlink -> claude-watch)"; \
+	done
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
 # Points core.hooksPath at the tracked scripts/git-hooks/ dir instead of
