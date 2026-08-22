@@ -563,7 +563,7 @@
     },
     {
       "id": 44,
-      "title": "Agents / Tasks / Shells",
+      "title": "Agents / Tasks / Shells / Monitors",
       "type": "stat",
       "gridPos": {
         "h": 4,
@@ -590,6 +590,11 @@
           "expr": "claude_code_open_bashes",
           "refId": "C",
           "legendFormat": "Shells"
+        },
+        {
+          "expr": "claude_code_live_monitors",
+          "refId": "D",
+          "legendFormat": "Monitors"
         }
       ],
       "fieldConfig": {
@@ -1721,7 +1726,7 @@
     },
     {
       "id": 41,
-      "title": "Agents / Tasks / Shells",
+      "title": "Agents / Tasks / Shells / Monitors",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -1748,6 +1753,11 @@
           "expr": "claude_code_open_bashes",
           "refId": "C",
           "legendFormat": "open shells"
+        },
+        {
+          "expr": "claude_code_live_monitors",
+          "refId": "D",
+          "legendFormat": "live monitors"
         }
       ],
       "fieldConfig": {
