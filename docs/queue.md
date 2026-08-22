@@ -266,6 +266,69 @@ pre-existing refusal when workloads are running and `--force` was not passed.
 > completion rather than a `killed=true` event followed by a `killed=false`
 > one. `workload run` clears the sentinel when the label starts again.
 
+#### Re-running a live label: `workload run` REPLACES, tree-wide
+
+```
+workload run <label> -- <cmd>      # while <label> is already running
+```
+
+`workload run` on a label whose previous run is still going **replaces**
+it — that has always been the behaviour, and it still is. What changed is
+that the previous run is now actually torn down: **the same tree-wide
+teardown described above**, not a bare `tmux kill-pane`. Killing only the
+pane left the payload (two sessions down, `setsid` then `script`)
+reparented to pid 1 and *still running* — appending to the very
+`<label>.output` the new run was about to publish under, and clobbering
+the `<label>.pgid` sidecar the next `workload kill` would aim at. Two
+payloads, one label, and the older one invisible.
+
+A replace must not masquerade as the run that replaced it: it is a
+`killed=true` completion on the same label with the same log path,
+arriving moments before the new run starts. Three rules keep them apart:
+
+1. **The replaced run's completion is marked.** It gets its usual
+   exactly-once `workload-done` (`killed=true`, `exit_code=-15`) plus:
+
+   | field | meaning |
+   |-------|---------|
+   | `data.reason` | `"replaced"` — this run was displaced, not killed by an operator |
+   | `data.replaced_by` | the `started_at` of the run that took the label over, byte-identical to the new registry entry's, so the two line up exactly |
+   | `data.carried_over_queue_id` | present only in case 2 below |
+
+   The message reads `workload <label> replaced (previous run killed
+   rc=-15, new run started <ts>, log=...)`. `tag` and `source` are
+   unchanged, so every existing consumer keeps working.
+
+2. **The new run's queue binding happens only after the teardown
+   returns.** Auto-create + `register` used to run *first*, which left a
+   window where the item the teardown was about to abandon was the item
+   the new run had just claimed. Now:
+   - **auto-created / different qid** → the replaced run's own item is
+     abandoned (`--confirmed-dead`, reason *"workload X replaced by a new
+     run started ..."*), and the new run's item is created afterwards;
+   - **same `--queue-id` as the dying run** → the item is **carried
+     over**: left `running` for the new run, reported as
+     `data.carried_over_queue_id`, and deliberately NOT named in
+     `data.queue_id` so nothing correlating on that field reads live work
+     as dead.
+
+3. **Survivors refuse the new run.** If anything outlives the SIGKILL
+   sweep, `workload run` names the pids and exits **`3`** without
+   starting — running anyway would put two payloads on one label. Reap
+   them (`ps -o pid,ppid,pgid,stat,args -p <pid>`) and re-run.
+
+The teardown uses the standard grace (`WORKLOAD_KILL_GRACE_SECS`, default
+5 s); `workload run` has no `--grace` flag of its own. The sidecar reset
+(`.exit`, `.output`, heartbeats, `.pgid`, `.kill-emitted`) also happens
+*after* the teardown, so the kill can still read the `.pgid` it needs and
+the new run still starts on a clean slate — including a cleared
+`kill-emitted` sentinel, so the replaced run's exactly-once guard cannot
+swallow the NEW run's completion.
+
+> To kill a label without starting anything in its place, use `workload
+> kill <label>` — the replace path exists for *re-running*, and it always
+> ends with either a new run or exit `3`.
+
 ## Schema (v2)
 
 ```json
