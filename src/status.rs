@@ -1379,14 +1379,25 @@ pub(crate) fn watcher_pid_dir() -> String {
 }
 
 /// Pure candidate-directory resolver: given the (optional) values of
-/// `$CLAUDE_WATCH_PID_DIR` and `$XDG_RUNTIME_DIR`, return the ORDERED,
-/// de-duplicated list of directories that may hold a watcher's liveness files,
-/// always ending with the `/var/run/claude` fallback.
+/// `$CLAUDE_WATCH_PID_DIR` and `$XDG_RUNTIME_DIR` plus the uid-derived
+/// per-user runtime dir (`/run/user/<uid>`, see [`uid_runtime_dir`]), return
+/// the ORDERED, de-duplicated list of directories that may hold a watcher's
+/// liveness files, always ending with the `/var/run/claude` fallback.
+///
+/// The uid-derived dir is the ENV-INDEPENDENT spelling of the per-user
+/// runtime dir. It exists because the READER'S environment must not decide
+/// what it can see: `claude-watch metrics` runs from cron, which does not set
+/// `$XDG_RUNTIME_DIR`, while the monitor-mode watchers it is counting write
+/// their `<name>.lock` to `/run/user/<uid>` (THEIR `$XDG_RUNTIME_DIR`). With
+/// only the env value, the cron reader scanned `/var/run/claude` alone and
+/// reported 1 live watcher of 4 while `claude-watch status` (interactive,
+/// env set) and the daemon (unit sets the var) both said 4/4.
 ///
 /// Kept pure (params, not `std::env`) so it is hermetically testable.
 pub(crate) fn pid_dir_candidates(
     claude_watch_pid_dir: Option<&str>,
     xdg_runtime_dir: Option<&str>,
+    uid_runtime_dir: Option<&str>,
 ) -> Vec<String> {
     let mut dirs: Vec<String> = Vec::new();
     let mut push = |d: &str| {
@@ -1401,8 +1412,21 @@ pub(crate) fn pid_dir_candidates(
     if let Some(p) = xdg_runtime_dir {
         push(p);
     }
+    if let Some(p) = uid_runtime_dir {
+        push(p);
+    }
     push("/var/run/claude");
     dirs
+}
+
+/// The per-user runtime directory derived from the REAL uid
+/// (`/run/user/<uid>`), independent of whether the caller's environment
+/// carries `$XDG_RUNTIME_DIR`. Linux-only convention (systemd-logind); on
+/// other platforms the dir simply does not exist and scanning it is a no-op.
+pub(crate) fn uid_runtime_dir() -> String {
+    // SAFETY: getuid(2) has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    format!("/run/user/{}", uid)
 }
 
 /// Every candidate directory that may hold a watcher's liveness files.
@@ -1423,11 +1447,17 @@ pub(crate) fn pid_dir_candidates(
 /// misses the `botchat-wait`/`claude-event-watch` `.lock` in
 /// `/run/user/<uid>`). Scanning ALL candidates makes liveness detection
 /// independent of which dir a given watcher wrote to and of the reader's own
-/// environment.
+/// environment. The per-user runtime dir is therefore ALSO derived from the
+/// uid (`/run/user/<uid>`, [`uid_runtime_dir`]) rather than trusted to
+/// `$XDG_RUNTIME_DIR` alone: the cron-run `claude-watch metrics` has no such
+/// var and previously saw only `/var/run/claude`, under-counting
+/// `claude_code_live_watchers` (1 of 4 live) while every env-carrying reader
+/// agreed on 4/4.
 pub(crate) fn watcher_pid_dirs() -> Vec<String> {
     pid_dir_candidates(
         std::env::var("CLAUDE_WATCH_PID_DIR").ok().as_deref(),
         std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        Some(&uid_runtime_dir()),
     )
 }
 
@@ -3421,34 +3451,70 @@ mod tests {
     fn pid_dir_candidates_orders_and_dedups() {
         // Both env vars distinct → both, then the fallback.
         assert_eq!(
-            pid_dir_candidates(Some("/a"), Some("/b")),
+            pid_dir_candidates(Some("/a"), Some("/b"), None),
             vec!["/a".to_string(), "/b".to_string(), "/var/run/claude".to_string()]
         );
         // XDG only → XDG then fallback.
         assert_eq!(
-            pid_dir_candidates(None, Some("/run/user/1000")),
+            pid_dir_candidates(None, Some("/run/user/1000"), None),
             vec!["/run/user/1000".to_string(), "/var/run/claude".to_string()]
         );
         // A value equal to the fallback is de-duplicated, not repeated.
         assert_eq!(
-            pid_dir_candidates(Some("/var/run/claude"), None),
+            pid_dir_candidates(Some("/var/run/claude"), None, None),
             vec!["/var/run/claude".to_string()]
         );
         // Identical env values collapse to one entry.
         assert_eq!(
-            pid_dir_candidates(Some("/x"), Some("/x")),
+            pid_dir_candidates(Some("/x"), Some("/x"), None),
             vec!["/x".to_string(), "/var/run/claude".to_string()]
         );
         // Empty / whitespace values are skipped.
         assert_eq!(
-            pid_dir_candidates(Some(""), Some("   ")),
+            pid_dir_candidates(Some(""), Some("   "), None),
             vec!["/var/run/claude".to_string()]
         );
         // Neither set → just the fallback.
         assert_eq!(
-            pid_dir_candidates(None, None),
+            pid_dir_candidates(None, None, None),
             vec!["/var/run/claude".to_string()]
         );
+    }
+
+    /// The cron regression: `claude-watch metrics` runs with NO
+    /// `$XDG_RUNTIME_DIR`, but the monitor-mode watchers' `.lock` files live in
+    /// `/run/user/<uid>`. The uid-derived dir must be scanned regardless of the
+    /// reader's env — and must de-dup against an equal `$XDG_RUNTIME_DIR`.
+    #[test]
+    fn pid_dir_candidates_includes_uid_runtime_dir_without_xdg_env() {
+        // No env at all → uid dir, then the fallback.
+        assert_eq!(
+            pid_dir_candidates(None, None, Some("/run/user/1000")),
+            vec!["/run/user/1000".to_string(), "/var/run/claude".to_string()]
+        );
+        // XDG set to the same dir → one entry, not two.
+        assert_eq!(
+            pid_dir_candidates(None, Some("/run/user/1000"), Some("/run/user/1000")),
+            vec!["/run/user/1000".to_string(), "/var/run/claude".to_string()]
+        );
+        // XDG pointing elsewhere (a test harness, a container) → env dir
+        // first, uid dir still scanned, fallback last.
+        assert_eq!(
+            pid_dir_candidates(Some("/pids"), Some("/xdg"), Some("/run/user/1000")),
+            vec![
+                "/pids".to_string(),
+                "/xdg".to_string(),
+                "/run/user/1000".to_string(),
+                "/var/run/claude".to_string()
+            ]
+        );
+        // The live resolver itself always carries the uid dir.
+        assert!(
+            watcher_pid_dirs().iter().any(|d| d == &uid_runtime_dir()),
+            "watcher_pid_dirs() must include {}",
+            uid_runtime_dir()
+        );
+        assert!(uid_runtime_dir().starts_with("/run/user/"));
     }
 
     #[test]
