@@ -45,6 +45,18 @@
 //! stay fresh even while the loop is dead, defeating wedge detection. This
 //! module never writes any liveness state.
 //!
+//! ## Config reload does not re-arm the timers
+//!
+//! Both timers fire on the daemon's FIRST loop pass — that startup keepalive
+//! + reminder is deliberate (see [`CadenceTracker`]). A config RELOAD is not
+//! a start: the daemon calls [`CadenceTracker::apply_intervals`], which swaps
+//! the intervals but preserves the last-fired instants, so N reloads inside
+//! an interval emit nothing and a shortened interval is measured from the
+//! real last emission. Rebuilding the tracker instead would reset both timers
+//! to "never fired" and emit a full set of events per reload — the 2026-08-22
+//! regression, where seven config saves in 52 seconds produced seven
+//! `memory-reminder` events against a 30-minute interval.
+//!
 //! ## Cadence decision is pure
 //!
 //! [`CadenceTracker`] holds the monotonic instant of the last emission for
@@ -153,6 +165,28 @@ impl CadenceTracker {
             last_keepalive: None,
             last_memory: None,
         }
+    }
+
+    /// Adopt new intervals WITHOUT resetting the timers.
+    ///
+    /// Called on a config reload. The distinction matters: rebuilding the
+    /// tracker with [`CadenceTracker::with_intervals`] would reset
+    /// `last_keepalive` / `last_memory` to `None`, and a `None` timer is
+    /// armed to fire on the very next `due()` call. A config file that is
+    /// saved several times in a minute would then emit one cadence event
+    /// per save — which is exactly what happened on 2026-08-22, when seven
+    /// `memory-reminder` events landed in 52 seconds against a 30-minute
+    /// interval.
+    ///
+    /// Preserving the last-fired instants means the next fire is measured
+    /// from the real last emission, against the NEW interval. Shortening
+    /// the interval therefore takes effect immediately (a timer whose
+    /// elapsed time already exceeds the new interval is due on the next
+    /// pass) without replaying a startup burst; lengthening it pushes the
+    /// next fire out. Only a genuine process start fires on construction.
+    pub fn apply_intervals(&mut self, keepalive_interval: Duration, memory_interval: Duration) {
+        self.keepalive_interval = keepalive_interval;
+        self.memory_interval = memory_interval;
     }
 
     /// Decide which cadence events are due as of `now`, and record the
@@ -300,6 +334,92 @@ mod tests {
         // Immediately again — nothing replays.
         let due = t.due(start + Duration::from_secs(600));
         assert!(due.is_empty());
+    }
+
+    #[test]
+    fn reloads_inside_the_interval_emit_nothing() {
+        // REGRESSION (2026-08-22): a config save triggers a reload, and the
+        // reload used to REBUILD the tracker. Seven saves in 52 seconds
+        // produced seven `memory-reminder` events against a 30-minute
+        // interval. Applying the intervals in place must emit nothing.
+        let keepalive = Duration::from_secs(300);
+        let memory = Duration::from_secs(1800);
+        let mut t = CadenceTracker::with_intervals(keepalive, memory);
+        let start = Instant::now();
+        let due = t.due(start);
+        assert!(!due.is_empty(), "startup fires both (documented behaviour)");
+
+        // Seven reloads spread over the next ~50 seconds, unchanged intervals.
+        for n in 1..=7 {
+            t.apply_intervals(keepalive, memory);
+            let due = t.due(start + Duration::from_secs(n * 7));
+            assert!(
+                due.is_empty(),
+                "reload at +{}s must not re-arm the timers",
+                n * 7
+            );
+        }
+
+        // And the real schedule still holds afterwards: the reminder fires
+        // once its own interval has elapsed since the ORIGINAL emission, not
+        // since the last reload.
+        let due = t.due(start + memory);
+        assert!(due.memory_reminder, "reminder still due at its interval");
+    }
+
+    #[test]
+    fn shortened_interval_measures_from_the_preserved_last_fire() {
+        let mut t =
+            CadenceTracker::with_intervals(Duration::from_secs(300), Duration::from_secs(1800));
+        let start = Instant::now();
+        let _ = t.due(start); // arm both
+
+        // 600s in, the operator shortens the reminder to 5min. The new
+        // interval has ALREADY elapsed relative to the preserved last-fire,
+        // so the reminder is due on the next pass — but only once, and it is
+        // the interval change (not the reload) that made it due.
+        t.apply_intervals(Duration::from_secs(300), Duration::from_secs(300));
+        let due = t.due(start + Duration::from_secs(600));
+        assert!(due.memory_reminder, "shortened interval already elapsed");
+
+        // Immediately after, nothing replays.
+        let due = t.due(start + Duration::from_secs(600));
+        assert!(due.is_empty());
+
+        // Next fire is one NEW interval after that emission.
+        let due = t.due(start + Duration::from_secs(600 + 299));
+        assert!(!due.memory_reminder);
+        let due = t.due(start + Duration::from_secs(600 + 300));
+        assert!(due.memory_reminder);
+    }
+
+    #[test]
+    fn lengthened_interval_pushes_the_next_fire_out() {
+        let mut t =
+            CadenceTracker::with_intervals(Duration::from_secs(300), Duration::from_secs(900));
+        let start = Instant::now();
+        let _ = t.due(start);
+
+        // Operator lengthens the reminder to 30min.
+        t.apply_intervals(Duration::from_secs(300), Duration::from_secs(1800));
+
+        // The OLD interval boundary passes with no emission...
+        let due = t.due(start + Duration::from_secs(900));
+        assert!(!due.memory_reminder, "old 15min boundary must not fire");
+        // ...and the new one fires, measured from the preserved last-fire.
+        let due = t.due(start + Duration::from_secs(1800));
+        assert!(due.memory_reminder);
+    }
+
+    #[test]
+    fn apply_intervals_before_first_due_keeps_the_startup_fire() {
+        // A reload that lands before the daemon's first loop pass must not
+        // swallow the documented startup emission (cold start is unchanged).
+        let mut t = CadenceTracker::new();
+        t.apply_intervals(Duration::from_secs(60), Duration::from_secs(900));
+        let due = t.due(Instant::now());
+        assert!(due.keepalive);
+        assert!(due.memory_reminder);
     }
 
     #[test]

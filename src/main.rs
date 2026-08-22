@@ -1283,9 +1283,17 @@ async fn run_daemon() {
             // tuned them via config.toml + SIGHUP (e.g. after confirming the
             // correct key against a live FleetView).
             tmux::set_focus_main_keys(current_config.tmux.focus_main_keys.clone());
-            // Re-arm the cadence tracker in case the operator tuned the
-            // intervals via config.toml + SIGHUP.
-            cadence_tracker = cadence::CadenceTracker::with_intervals(
+            // Adopt any retuned cadence intervals WITHOUT resetting the
+            // timers. This MUST NOT rebuild the tracker: a fresh tracker has
+            // no last-fired instants, and a never-fired timer is armed to
+            // fire on the next loop pass, so every config save would emit a
+            // full set of cadence events. That is what produced seven
+            // `memory-reminder` events in 52 seconds on 2026-08-22 (an agent
+            // saved the config file ~7 times) against a 30-minute interval.
+            // Preserving last-fired also makes a SHORTENED interval take
+            // effect against the real last emission rather than against the
+            // reload. Only a genuine process start fires on construction.
+            cadence_tracker.apply_intervals(
                 Duration::from_secs(current_config.cadence.keepalive_interval_secs),
                 Duration::from_secs(current_config.cadence.memory_reminder_interval_secs),
             );
