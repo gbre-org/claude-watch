@@ -478,6 +478,15 @@ test-ttyd-paste-handler: ## ttyd browser paste-handler JS tests
 # Runs the JS body inside Node with DOM / window.term stubs and asserts the
 # button state (glyph, aria-pressed, cw-locked class) + key-veto return
 # value across the unlocked → locked → unlocked toggle cycle.
+#
+# Also covers the idle AUTO-LOCK: a fake wall clock drives the injected
+# poll to prove activity before the deadline resets the countdown, idling
+# past it engages the lock through the same setLocked() path (including
+# the localStorage write), and a window of 0 registers no listeners and
+# never locks. The TTYD_AUTOLOCK_SECONDS env var → baked-in
+# `var AUTO_LOCK_SECONDS = <n>;` resolution (default 300, 0 = off,
+# non-integer = build failure) is exercised by running inject-autodark.py
+# end-to-end against a minimal HTML document.
 test-ttyd-lock-toggle: ## ttyd browser lock-toggle JS tests
 	python3 examples/compose/ttyd/tests/test_lock_toggle.py
 
