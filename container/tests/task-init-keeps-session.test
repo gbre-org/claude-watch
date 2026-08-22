@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""`claude-watch task init` must leave a LIVE `tasks` session in the container.
+
+Background — operator report, 2026-08-22 (image built from main @ d108149):
+
+    $ claude-watch task init
+    Session 'tasks' created, daemon running in pane 0
+    $ tmux ls
+    no server running on /tmp/tmux-1000/default
+
+Reproduced three times. Root cause is a two-part interaction:
+
+  1. The baked /etc/claude-watch/config.toml had `[task_watch] enabled =
+     false` (comment: "no in-container `tasks` session yet").
+  2. `cmd_task_init` (src/task_watch.rs) reads that flag to decide what pane
+     0 of the session runs. With `false` it selects the LEGACY Python CLI,
+     `task-watch daemon`.
+
+`task-watch` is not installed in this image. The pane command exited
+instantly; tmux destroys a window when its last pane's command exits; the
+`tasks` session starts with exactly one pane — so the session was gone
+microseconds after `task init` printed its success line. Consequence:
+`workload run` / `workload kill` / `task init` were all unusable in the
+container, so nothing that depends on the workload tmux tree could be
+exercised there.
+
+The fix has two halves and this test guards both:
+
+  - the baked config sets `[task_watch] enabled = true`, so pane 0 gets
+    claude-watch's keepalive stub (`echo ...; sleep infinity`);
+  - `daemon_pane_command()` falls back to that same stub whenever the legacy
+    `task-watch` binary is absent from PATH, whatever the config says — a
+    missing binary must degrade to a live-but-idle pane, never to a vanished
+    session.
+
+Like the rest of container/tests/, this is a static-assertion suite: it
+checks the checked-in sources on plain Linux, no docker daemon and no built
+image required. The runtime equivalent (`task init` then `tmux has-session
+-t tasks`) is what the operator ran; the assertions below are what keep it
+from regressing in CI.
+
+Run:  ./task-init-keeps-session.test
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONTAINER_DIR = HERE.parent
+REPO_ROOT = CONTAINER_DIR.parent
+
+CONFIG_TOML = CONTAINER_DIR / "claude-watch.config.toml"
+DOCKERFILE = CONTAINER_DIR / "Dockerfile"
+TASK_WATCH_RS = REPO_ROOT / "src" / "task_watch.rs"
+
+failures: list[str] = []
+
+
+def expect(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def section(text: str, name: str) -> str | None:
+    """Return the body of TOML section `[name]` (up to the next header)."""
+    m = re.search(
+        rf"(?ms)^\[{re.escape(name)}\]\s*$(.*?)(?=^\[|\Z)",
+        text,
+    )
+    return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# 1. The baked config enables task_watch.
+# ---------------------------------------------------------------------------
+expect(CONFIG_TOML.exists(), f"claude-watch.config.toml missing at {CONFIG_TOML}")
+if CONFIG_TOML.exists():
+    cfg = CONFIG_TOML.read_text(encoding="utf-8")
+
+    body = section(cfg, "task_watch")
+    expect(body is not None, "claude-watch.config.toml missing the `[task_watch]` section header")
+    if body is not None:
+        enabled = re.search(r"^\s*enabled\s*=\s*(true|false)\s*$", body, re.MULTILINE)
+        expect(
+            enabled is not None,
+            "claude-watch.config.toml [task_watch] must set `enabled` explicitly",
+        )
+        if enabled:
+            expect(
+                enabled.group(1) == "true",
+                "claude-watch.config.toml [task_watch] must be `enabled = true`. "
+                "With `false`, `claude-watch task init` runs the legacy "
+                "`task-watch daemon` CLI in pane 0 — a binary this image does "
+                "not ship. The pane exits immediately, tmux destroys the only "
+                "pane, and the `tasks` session vanishes right after `task init` "
+                "reports success, making `workload run` / `workload kill` "
+                "unusable in the container.",
+            )
+
+# ---------------------------------------------------------------------------
+# 2. The premise still holds: the image does NOT install a `task-watch` CLI.
+#
+#    If a future change ships one, the fallback below stops being the thing
+#    that keeps the session alive and this test's reasoning needs revisiting
+#    — so assert the premise rather than assume it.
+# ---------------------------------------------------------------------------
+expect(DOCKERFILE.exists(), f"Dockerfile missing at {DOCKERFILE}")
+if DOCKERFILE.exists():
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    installs_legacy = re.search(
+        r"^\s*(?:COPY|RUN)\b[^\n]*?/(?:usr/local/bin|usr/bin)/task-watch\b",
+        df,
+        re.MULTILINE,
+    )
+    expect(
+        installs_legacy is None,
+        "Dockerfile appears to install a `task-watch` binary. This test (and "
+        "the [task_watch] enabled = true rationale) assumes the legacy Python "
+        "task-watch CLI is NOT in the image — if that changed, revisit both.",
+    )
+
+# ---------------------------------------------------------------------------
+# 3. The daemon never picks a pane-0 command that can exit instantly:
+#    `daemon_pane_command` falls back to the keepalive stub when the legacy
+#    binary is missing, and the stub blocks forever.
+# ---------------------------------------------------------------------------
+expect(TASK_WATCH_RS.exists(), f"src/task_watch.rs missing at {TASK_WATCH_RS}")
+if TASK_WATCH_RS.exists():
+    rs = TASK_WATCH_RS.read_text(encoding="utf-8")
+
+    stub = re.search(
+        r'pub const DAEMON_STUB_CMD:\s*&str\s*=\s*\n?\s*"([^"]*)"',
+        rs,
+    )
+    expect(
+        stub is not None,
+        "src/task_watch.rs must define `pub const DAEMON_STUB_CMD` — the "
+        "keepalive command pane 0 runs when claude-watch owns the daemon loop.",
+    )
+    if stub:
+        expect(
+            "sleep infinity" in stub.group(1),
+            "DAEMON_STUB_CMD must block forever (`sleep infinity`). tmux "
+            "destroys a window once its last pane's command exits, so a stub "
+            "that returns takes the whole `tasks` session with it.",
+        )
+
+    fn = re.search(
+        r"(?ms)^pub fn daemon_pane_command\([^)]*\)\s*->\s*String\s*\{(.*?)^\}",
+        rs,
+    )
+    expect(
+        fn is not None,
+        "src/task_watch.rs must define `pub fn daemon_pane_command(...)` — the "
+        "single place that decides what pane 0 of the `tasks` session runs.",
+    )
+    if fn:
+        expect(
+            re.search(r"if\s+cw_handling\s*\|\|\s*!legacy_available", fn.group(1))
+            is not None,
+            "daemon_pane_command must select the stub when EITHER claude-watch "
+            "handles the daemon OR the legacy `task-watch` binary is absent "
+            "(`cw_handling || !legacy_available`). Spawning a command that is "
+            "not on PATH kills pane 0 and therefore the whole session.",
+        )
+
+    expect(
+        "fn legacy_task_watch_available()" in rs,
+        "src/task_watch.rs must probe for the legacy `task-watch` CLI "
+        "(`legacy_task_watch_available()`) before selecting it as the pane-0 "
+        "command.",
+    )
+
+    expect(
+        "let legacy_available = legacy_task_watch_available();" in rs,
+        "cmd_task_init must consult `legacy_task_watch_available()` — the "
+        "fallback only helps if the init path actually calls it.",
+    )
+
+if failures:
+    print("FAIL task-init-keeps-session.test")
+    for f in failures:
+        print(f"  - {f}")
+    sys.exit(1)
+
+print("PASS task-init-keeps-session.test")
+sys.exit(0)

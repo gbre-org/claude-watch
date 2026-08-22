@@ -148,8 +148,17 @@ Container-specific deltas from a typical host config:
   "claude-container"` — pinned to the in-container tmux session, not a host
   `dashboard` session.
 - Logs land at `/var/log/claude-watch/claude-watch.jsonl` (uid 1000 writable, ephemeral).
-- `watcher_monitor`, `auto_update`, `reauth`, `task_watch`, `hybrid`
-  disabled — those depend on host integrations.
+- `watcher_monitor`, `auto_update`, `reauth`, `hybrid` disabled — those
+  depend on host integrations.
+- `[task_watch] enabled = true` — required, not cosmetic. It selects what
+  `claude-watch task init` puts in pane 0 of the `tasks` session: the
+  claude-watch keepalive stub (`echo ...; sleep infinity`) rather than the
+  legacy `task-watch daemon` CLI, which is not installed in this image. With
+  it disabled, pane 0 exited immediately, tmux destroyed the session's only
+  pane, and the session vanished right after `task init` reported success —
+  leaving `workload run` / `workload kill` unusable. `task init` also falls
+  back to the stub on its own when `task-watch` is missing from PATH, so a
+  missing binary can no longer take the session down.
 
 To inspect pane 1 from another shell on the host (only meaningful when
 `CLAUDE_CONTAINER_SIDEBAR=1` was set at container start):
