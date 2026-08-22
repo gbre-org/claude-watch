@@ -221,4 +221,7 @@ fall back to defaults) as well as per-invocation CLI flag.
 watcher-vs-producer guidance) — job-name `session-rotate` in
 `container/cron.d/cw-default` (04:17 daily), toggle via
 `cw-cron-toggle disable|enable session-rotate`. A commented equivalent row
-ships in `cron.d/cw-host` for host/systemd deploys.
+ships in `cron.d/cw-host` for host/systemd deploys, tagged
+`# optional: session-rotate`; enable it at install time with
+`scripts/install-host-cron.sh --enable session-rotate` (or
+`CW_HOST_CRON_ENABLE=session-rotate`) — no template edit needed.

@@ -439,6 +439,131 @@ if copy and cron_rel:
         )
 
 # -----------------------------------------------------------------------------
+print("12. Optional job enabling (--enable / CW_HOST_CRON_ENABLE / --list-optional)")
+# -----------------------------------------------------------------------------
+# Optional rows in cron.d/cw-host (a watchdog pair, session-store rotation,
+# the cw-agent-stats producer) ship commented out. Before --enable existed,
+# turning one on meant hand-editing the tracked template -- impossible on a
+# host that deploys from a read-only checkout of this repo (botchat
+# #3176-#3179). Each optional row is tagged with a `# optional: <job>` marker
+# on the line directly above it; --enable / $CW_HOST_CRON_ENABLE match against
+# that marker, not the command text, so they keep working even if a row's
+# command changes.
+
+MARKER_RE = re.compile(r"^# optional: (\S+)\s*$")
+markers = [m.group(1) for ln in text.splitlines() if (m := MARKER_RE.match(ln))]
+check(len(markers) >= 2, f"cron.d/cw-host has at least 2 `# optional:` markers (got {markers})")
+check(len(markers) == len(set(markers)), f"optional job names are unique (got {markers})")
+
+# Every marker must sit directly above a commented cron row -- that's the only
+# line the installer's uncomment step looks at.
+frag_lines = text.splitlines()
+for i, ln in enumerate(frag_lines):
+    m = MARKER_RE.match(ln)
+    if m and i + 1 < len(frag_lines):
+        nxt = frag_lines[i + 1].lstrip()
+        check(
+            nxt.startswith("#") and CRON_ROW_RE.match(nxt[1:].lstrip()) is not None,
+            f"marker {m.group(1)!r} is immediately followed by a commented cron row",
+        )
+
+
+def optional_row_commented(rendered: str, job: str) -> bool | None:
+    """True/False if `job`'s row is commented/uncommented in `rendered`;
+    None if the marker isn't present at all (a real test failure elsewhere)."""
+    lns = rendered.splitlines()
+    for i, ln in enumerate(lns):
+        if ln.strip() == f"# optional: {job}" and i + 1 < len(lns):
+            return lns[i + 1].lstrip().startswith("#")
+    return None
+
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    fake_bin = tmp / "claude-watch"
+    fake_bin.write_text("#!/bin/sh\n")
+    fake_bin.chmod(0o755)
+    dest = tmp / "cron.d" / "cw-host"
+    common = [
+        "--user", "alice",
+        "--home", "/home/alice",
+        "--bin", str(fake_bin),
+        "--state-dir", str(tmp / "state"),
+        "--dest", str(dest),
+    ]
+
+    # --list-optional: prints exactly the template's marker names, no install.
+    r = run([str(INSTALLER), "--list-optional"])
+    check(r.returncode == 0, f"--list-optional exits 0 (got {r.returncode})")
+    listed = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    check(
+        set(listed) == set(markers),
+        f"--list-optional lists exactly the template's markers (got {listed}, want {markers})",
+    )
+    check(not dest.exists(), "--list-optional installs nothing")
+
+    # Default: nothing enabled, every optional row stays commented.
+    r = run([str(INSTALLER), "-n", *common])
+    check(r.returncode == 0, "default dry-run exits 0")
+    for job in markers:
+        check(
+            optional_row_commented(r.stdout, job) is True,
+            f"default leaves {job!r} commented",
+        )
+
+    job_a = markers[0]
+    job_b = markers[1]
+
+    # Enable one job: its row uncomments, every other stays commented.
+    r = run([str(INSTALLER), "-n", *common, "--enable", job_a])
+    check(r.returncode == 0, f"--enable {job_a} exits 0")
+    check(optional_row_commented(r.stdout, job_a) is False, f"--enable {job_a} uncomments its row")
+    for job in markers:
+        if job != job_a:
+            check(optional_row_commented(r.stdout, job) is True, f"--enable {job_a} leaves {job!r} commented")
+
+    # Enable two jobs: repeated --enable and one comma-joined --enable agree.
+    r_repeat = run([str(INSTALLER), "-n", *common, "--enable", job_a, "--enable", job_b])
+    check(r_repeat.returncode == 0, "enabling two jobs via repeated --enable exits 0")
+    check(optional_row_commented(r_repeat.stdout, job_a) is False, f"repeated --enable uncomments {job_a!r}")
+    check(optional_row_commented(r_repeat.stdout, job_b) is False, f"repeated --enable uncomments {job_b!r}")
+
+    r_comma = run([str(INSTALLER), "-n", *common, "--enable", f"{job_a},{job_b}"])
+    check(r_comma.returncode == 0, "enabling two jobs via one comma-joined --enable exits 0")
+    check(r_comma.stdout == r_repeat.stdout, "comma-joined --enable matches repeated --enable")
+
+    # CW_HOST_CRON_ENABLE env var does the same as --enable.
+    env = dict(os.environ)
+    env["CW_HOST_CRON_ENABLE"] = job_a
+    r = run([str(INSTALLER), "-n", *common], env=env)
+    check(r.returncode == 0, "CW_HOST_CRON_ENABLE exits 0")
+    check(optional_row_commented(r.stdout, job_a) is False, "CW_HOST_CRON_ENABLE uncomments its job")
+
+    # Unknown job name: hard error listing the known optional jobs.
+    r = run([str(INSTALLER), "-n", *common, "--enable", "not-a-real-job"])
+    check(r.returncode == 2, f"unknown --enable job exits 2 (got {r.returncode})")
+    check("not-a-real-job" in r.stderr, "unknown job error names the bad job")
+    for job in markers:
+        check(job in r.stderr, f"unknown job error lists known job {job!r}")
+    check(not dest.exists(), "unknown --enable job installs nothing")
+
+    # A real (non-dry-run) install with --enable writes the uncommented row.
+    r = run([str(INSTALLER), *common, "--enable", job_a])
+    check(r.returncode == 0, f"real install with --enable {job_a} exits 0")
+    check(dest.is_file(), "real install with --enable still writes the destination")
+    if dest.is_file():
+        check(
+            optional_row_commented(dest.read_text(), job_a) is False,
+            "installed file has the enabled job's row uncommented",
+        )
+        for job in markers:
+            if job != job_a:
+                check(
+                    optional_row_commented(dest.read_text(), job) is True,
+                    f"installed file leaves {job!r} commented",
+                )
+
+# -----------------------------------------------------------------------------
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S):")
