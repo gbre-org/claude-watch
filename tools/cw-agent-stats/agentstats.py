@@ -103,7 +103,14 @@ SNAPSHOT_FILENAME = "agent-stats.json"
 # can expose ``claude_tool_use_total`` / ``claude_model_use_total`` — the
 # devbar-equivalent model + tool-use telemetry — without a second transcript
 # survey pass.
-SNAPSHOT_VERSION = 2
+#
+# v3 (2026-08-22, cw dashboard panels, Andrew #5370): added the fleet-wide
+# ``model_output_tokens_totals`` breakdown (OUTPUT tokens by model id, same
+# windowed-gauge semantics as ``tool_totals``/``model_totals``) and
+# ``totals.agents_spawned`` (distinct subagent transcripts seen in the live
+# window) so cw-agent-stats can expose ``claude_output_tokens_total{model=}``
+# and ``claude_agent_spawned_count``.
+SNAPSHOT_VERSION = 3
 
 # Producer: a transcript not written within this window is not live.
 DEFAULT_LIVE_WINDOW_SECS = 900.0
@@ -160,6 +167,11 @@ class AgentState:
     tool_counts: dict[str, int] = field(default_factory=dict)
     tool_model_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     model_counts: dict[str, int] = field(default_factory=dict)
+    # Per-model OUTPUT-token attribution (claude-watch dashboard panels,
+    # 2026-08-22, Andrew #5370: tokens = cumulative OUTPUT, split BY MODEL).
+    # Same delta-by-message-id logic as ``output_tokens`` below, just also
+    # bucketed by the model that produced the message.
+    model_output_tokens: dict[str, int] = field(default_factory=dict)
     queue_id: str | None = None
     first_user_text: str | None = None
     description: str | None = None
@@ -235,12 +247,21 @@ class AgentState:
             out = _int(usage.get("output_tokens"))
             if isinstance(mid, str) and mid == self.last_usage_msg_id:
                 if out > self._last_msg_out:
-                    self.output_tokens += out - self._last_msg_out
+                    delta = out - self._last_msg_out
+                    self.output_tokens += delta
+                    if model:
+                        self.model_output_tokens[model] = (
+                            self.model_output_tokens.get(model, 0) + delta
+                        )
                     self._last_msg_out = out
             else:
                 self.output_tokens += out
                 self.last_usage_msg_id = mid if isinstance(mid, str) else None
                 self._last_msg_out = out
+                if model:
+                    self.model_output_tokens[model] = (
+                        self.model_output_tokens.get(model, 0) + out
+                    )
                 # Count once per distinct message id (i.e. once per assistant
                 # turn, same granularity as the output_tokens delta above) —
                 # NOT once per split JSONL entry, which would inflate the
@@ -306,6 +327,7 @@ class AgentState:
         self.tool_counts = {}
         self.tool_model_counts = {}
         self.model_counts = {}
+        self.model_output_tokens = {}
 
     def load_meta(self) -> None:
         """Read the sibling ``<agent-id>.meta.json`` (description, agentType) once."""
@@ -548,6 +570,11 @@ class Collector:
 
         totals = {
             "agents": len(records),
+            # Distinct subagent transcripts observed in the live/recent window
+            # (``seen_paths``: live AND recently-finished) -- a windowed proxy
+            # for "agents spawned", same semantics as tool_totals/model_totals
+            # below (recomputed each tick, not a monotonic lifetime counter).
+            "agents_spawned": len(seen_paths),
             "tool_calls": sum(r["tool_calls"] for r in records),
             "context_tokens": sum(r["context_tokens"] for r in records),
             "output_tokens": sum(r["output_tokens"] for r in records),
@@ -564,6 +591,7 @@ class Collector:
         tool_totals: dict[str, int] = {}
         model_totals: dict[str, int] = {}
         tool_model_totals: dict[str, dict[str, int]] = {}
+        model_output_tokens_totals: dict[str, int] = {}
         for path in seen_paths:
             state = self.agents[path]
             for name, cnt in state.tool_counts.items():
@@ -574,6 +602,8 @@ class Collector:
                 dest = tool_model_totals.setdefault(name, {})
                 for model, cnt in per_model.items():
                     dest[model] = dest.get(model, 0) + cnt
+            for model, tok in state.model_output_tokens.items():
+                model_output_tokens_totals[model] = model_output_tokens_totals.get(model, 0) + tok
 
         # The main loop's OWN turns (claude-watch #663 follow-up, 2026-08-22):
         # the loop above only ever walks subagent transcripts, so a solo
@@ -595,6 +625,8 @@ class Collector:
                 dest = tool_model_totals.setdefault(name, {})
                 for model, cnt in per_model.items():
                     dest[model] = dest.get(model, 0) + cnt
+            for model, tok in main_state.model_output_tokens.items():
+                model_output_tokens_totals[model] = model_output_tokens_totals.get(model, 0) + tok
 
         return {
             "version": SNAPSHOT_VERSION,
@@ -608,6 +640,7 @@ class Collector:
             "tool_totals": tool_totals,
             "model_totals": model_totals,
             "tool_model_totals": tool_model_totals,
+            "model_output_tokens_totals": model_output_tokens_totals,
         }
 
     def _main(self, now: float) -> dict | None:
