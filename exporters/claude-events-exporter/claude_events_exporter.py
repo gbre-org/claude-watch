@@ -26,14 +26,47 @@ Metrics:
   - claude_events_dir_last_modified              gauge  (mtime of queue dir)
   - claude_events_scrape_errors_total            counter
   - claude_events_last_heartbeat_timestamp_seconds gauge (epoch of the most
-    recent claude-watch heartbeat-tick event this process has observed on
-    the bus -- backs the dashboard's "Last Ack Age" stat via
-    time() - (this value > 0). Monotonic within a process lifetime: a
-    file's timestamp updates the gauge even after claude-event-watch
-    consumes (deletes) the file, so the signal survives fast consumption.
-    Stays 0 (cold start -- no heartbeat-tick observed yet by this process)
-    until the first one is seen; the dashboard query filters that 0 out
-    with "> 0" so a fresh exporter doesn't render a bogus multi-decade age.)
+    recent heartbeat-tick the CONSUMER observed -- backs the dashboard's
+    "Last Ack Age" stat. See "Heartbeat observation" below.)
+  - claude_events_heartbeat_marker_present       gauge  (1 when the durable
+    consumer-written marker was readable + parseable on this scrape)
+
+Heartbeat observation
+---------------------
+`claude_events_last_heartbeat_timestamp_seconds` means "epoch of the most
+recent claude-watch heartbeat-tick that the MAIN LOOP's consumer actually
+observed on the bus". The dashboard turns it into an age.
+
+It cannot be derived by scanning the queue dir. claude-event-watch drains a
+tick within SECONDS of it landing, ticks are ~15 minutes apart and the scrape
+interval is 30s, so a scrape essentially never catches one on disk -- the
+gauge sat at its cold-start 0 forever and the dashboard tile rendered nothing.
+
+So claude-event-watch writes a durable marker when it surfaces a tick:
+
+    $CLAUDE_EVENT_QUEUE/.state/last-heartbeat.json
+      {"tag": "heartbeat-tick", "event_timestamp": <epoch of emit>,
+       "processed_at": <epoch of consumption>, "event_file": "<name>"}
+
+written atomically (temp file + rename in the same dir) so a scrape landing
+mid-write reads the old file, never a partial one. It lives UNDER the queue
+dir, which this exporter already bind-mounts, so no deploy change is needed.
+
+Precedence, deliberately NOT a max():
+
+  - Marker readable  -> the marker's event_timestamp IS the gauge.
+  - Marker absent or unparseable -> fall back to the legacy in-dir scan
+    (the pre-marker behavior), which stays 0 on a host whose consumer does
+    not write markers yet.
+
+Taking max(marker, in-dir scan) would defeat the metric's purpose: if
+claude-event-watch is dead or wedged, ticks PILE UP in the queue dir, and a
+max() would keep advancing the gauge off those unconsumed files -- reporting
+a healthy ack age precisely when nothing is being acked. Queue backlog is
+already covered by claude_events_queue_depth / claude_events_age_seconds.
+
+Both sources are monotonic within a process lifetime (a late-arriving older
+tick never rewinds the gauge).
 """
 
 import json
@@ -56,6 +89,14 @@ log = logging.getLogger("claude-events-exporter")
 
 PORT = int(os.environ.get("PORT", "9103"))
 EVENTS_DIR = os.environ.get("CLAUDE_EVENTS_DIR", "/events")
+
+# Durable consumer-written heartbeat marker (see "Heartbeat observation" in
+# the module docstring). Default sits inside EVENTS_DIR, so the bind-mount
+# this exporter already has covers it -- no new mount, no new env var needed
+# in the compose stack. Overridable for tests / unusual layouts.
+HEARTBEAT_MARKER = os.environ.get(
+    "CLAUDE_EVENTS_HEARTBEAT_MARKER", os.path.join(EVENTS_DIR, ".state", "last-heartbeat.json")
+)
 
 # Known-good label values; anything outside these collapses to "other" to
 # keep cardinality bounded (no per-event-id labels, no unbounded user input).
@@ -120,13 +161,21 @@ c_scrape_errors = Counter(
 )
 g_last_heartbeat_ts = Gauge(
     "claude_events_last_heartbeat_timestamp_seconds",
-    "Epoch timestamp of the most recent claude-watch heartbeat-tick event "
-    "this exporter process has observed on the bus. Updated from the "
-    "filename-encoded ns-timestamp, so it reflects the event's true emit "
-    "time even if it is scraped just before claude-event-watch consumes "
-    "(deletes) it. Monotonic (never decreases) for the life of this "
-    "process; stays 0 until the first heartbeat-tick is observed (query "
-    "with `> 0` to exclude the cold-start zero).",
+    "Epoch (emit time) of the most recent claude-watch heartbeat-tick that "
+    "the bus CONSUMER observed. Read from the durable marker "
+    "claude-event-watch writes when it surfaces a tick; falls back to the "
+    "legacy in-dir scan when no marker exists. Monotonic for the life of "
+    "this process. Stays 0 until the first heartbeat-tick is observed, so a "
+    "cold-start exporter reports an implausibly large age rather than a "
+    "fake-fresh one -- the dashboard maps that band to 'n/a'.",
+    registry=REG,
+)
+g_heartbeat_marker_present = Gauge(
+    "claude_events_heartbeat_marker_present",
+    "1 when the consumer-written heartbeat marker was found and parsed on "
+    "this scrape, 0 otherwise (absent, unreadable, or malformed). 0 with a "
+    "nonzero last_heartbeat timestamp means the gauge is running on the "
+    "legacy in-dir-scan fallback.",
     registry=REG,
 )
 
@@ -138,7 +187,31 @@ FILENAME_RE = re.compile(r"^(?P<ns>\d+)_(?P<tag>[A-Za-z0-9_-]+)\.json$")
 # the watcher removes files quickly, so this set stays small.
 _seen_filenames: set[str] = set()
 _total_seen = 0  # cumulative count of distinct events ever seen by this exporter
-_last_heartbeat_ts: float | None = None  # epoch of newest heartbeat-tick ever observed
+# Newest heartbeat-tick emit time from each source, monotonic per process.
+_marker_heartbeat_ts: float | None = None  # from the consumer-written marker
+_scan_heartbeat_ts: float | None = None  # legacy fallback: file seen in the queue dir
+
+
+def read_heartbeat_marker(path: str | None = None) -> float | None:
+    """Return the marker's heartbeat emit timestamp, or None.
+
+    None covers every failure mode identically -- absent, unreadable, not
+    JSON, not an object, missing/non-numeric/non-positive event_timestamp --
+    because the caller's response to all of them is the same: keep the last
+    known value and fall back to the in-dir scan. Never raises.
+    """
+    try:
+        with open(path if path is not None else HEARTBEAT_MARKER, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        ts = float(data["event_timestamp"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+    # NaN/inf would poison the gauge; a non-positive stamp is a placeholder.
+    if not (ts > 0) or ts == float("inf"):
+        return None
+    return ts
 
 
 def _normalize_source(s: str | None) -> str:
@@ -155,7 +228,7 @@ def _normalize_tag(t: str | None) -> str:
 
 def collect():
     """Re-scan the events dir and refresh metrics. Called on every /metrics scrape."""
-    global _total_seen, _last_heartbeat_ts
+    global _total_seen, _marker_heartbeat_ts, _scan_heartbeat_ts
     try:
         st = os.stat(EVENTS_DIR)
         g_dir_mtime.set(st.st_mtime)
@@ -200,14 +273,15 @@ def collect():
         if age > oldest_age:
             oldest_age = age
 
-        # Track the newest heartbeat-tick regardless of dedup/consumption
-        # state below -- this is the liveness signal, so it must keep
-        # advancing even for a file we've already counted once, and it
-        # must survive the file being deleted by claude-event-watch on a
-        # later scrape (hence the module-level global, not a local).
+        # LEGACY FALLBACK ONLY. Catching a heartbeat-tick still on disk is a
+        # near-impossibility (the consumer drains within seconds), which is
+        # exactly why the marker exists; this branch survives so a host whose
+        # claude-event-watch predates the marker still gets a value, and so a
+        # tick that IS caught mid-flight is not thrown away. It never
+        # overrides the marker -- see the precedence note in the docstring.
         if m and m.group("tag") == "heartbeat-tick":
-            if _last_heartbeat_ts is None or ev_time > _last_heartbeat_ts:
-                _last_heartbeat_ts = ev_time
+            if _scan_heartbeat_ts is None or ev_time > _scan_heartbeat_ts:
+                _scan_heartbeat_ts = ev_time
 
         # First-time-seen counter increment + JSON parse for source/tag labels.
         if name not in _seen_filenames:
@@ -230,8 +304,21 @@ def collect():
 
     g_oldest_age.set(oldest_age)
 
-    if _last_heartbeat_ts is not None:
-        g_last_heartbeat_ts.set(_last_heartbeat_ts)
+    # Heartbeat: marker first (authoritative -- it is the consumer's own
+    # observation, so it goes stale when the consumer does), in-dir scan only
+    # as the pre-marker fallback. Deliberately not a max(); see the docstring.
+    marker_ts = read_heartbeat_marker()
+    g_heartbeat_marker_present.set(1 if marker_ts is not None else 0)
+    if marker_ts is not None and (
+        _marker_heartbeat_ts is None or marker_ts > _marker_heartbeat_ts
+    ):
+        _marker_heartbeat_ts = marker_ts
+
+    heartbeat_ts = (
+        _marker_heartbeat_ts if _marker_heartbeat_ts is not None else _scan_heartbeat_ts
+    )
+    if heartbeat_ts is not None:
+        g_last_heartbeat_ts.set(heartbeat_ts)
 
     # Derive processed count: every event the exporter has ever seen but that
     # is no longer in the queue dir was consumed by claude-event-watch (or
