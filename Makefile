@@ -78,7 +78,7 @@
 # Tests — repo-wide gates + installers
 .PHONY: test-doc-links test-claude-md-size test-install-hooks
 .PHONY: test-install-host-skills test-install-host-cron test-install-links
-.PHONY: test-ci-apt-install
+.PHONY: test-ci-apt-install test-make-help
 # Build + install / deploy — Linux host
 .PHONY: build install install-skills install-cron deploy-systemd deploy
 # Container image + compose stack (workbot)
@@ -566,6 +566,16 @@ test-install-links: ## Tests for the install target's TOOL_LINKS / MULTICALL_NAM
 # handled. Fakes only; never touches the real package manager.
 test-ci-apt-install: ## Tests for the bounded/retrying CI apt installer
 	scripts/tests/ci-apt-install.test
+
+# Gate: `make help` stays a truthful index. The help target is an awk pass
+# over two conventions -- `##@ ` section banners and trailing `## ` target
+# descriptions -- and nothing enforced either, so a target added without an
+# annotation silently never appeared in the index. Asserts help runs, that
+# every annotated target + section is rendered, and (the direction that
+# actually catches drift) that every .PHONY target IS annotated, except the
+# two deprecated aliases on an explicit allowlist. Read-only; builds nothing.
+test-make-help: ## Gate: `make help` indexes every public target
+	scripts/tests/make-help.test
 
 ##@ Build + install — Linux host
 
