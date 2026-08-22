@@ -86,12 +86,27 @@ def _agent(aid: str, qid: str, **over) -> dict:
     return rec
 
 
-def _snapshot(agents: list[dict], generated_at: float | None = None) -> dict:
+def _snapshot(
+    agents: list[dict],
+    generated_at: float | None = None,
+    window: dict | None = None,
+) -> dict:
+    """A producer snapshot. ``window`` overrides the v4 ``totals.window_*``
+    block (every agent seen in the live window, finished ones included);
+    by default it mirrors the live sums, as if nothing had returned yet.
+    Pass ``window={}`` for a pre-v4 producer (no window keys at all)."""
     tot_calls = sum(a.get("tool_calls") or 0 for a in agents)
     tot_ctx = sum(a.get("context_tokens") or 0 for a in agents)
     tot_out = sum(a.get("output_tokens") or 0 for a in agents)
+    if window is None:
+        window = {
+            "agents_spawned": len(agents),
+            "window_tool_calls": tot_calls,
+            "window_context_tokens": tot_ctx,
+            "window_output_tokens": tot_out,
+        }
     return {
-        "version": 1,
+        "version": 4,
         "host": "testhost",
         "generated_at": time.time() if generated_at is None else generated_at,
         "live_window_seconds": 900.0,
@@ -107,6 +122,7 @@ def _snapshot(agents: list[dict], generated_at: float | None = None) -> dict:
             "tool_calls": tot_calls,
             "context_tokens": tot_ctx,
             "output_tokens": tot_out,
+            **window,
         },
     }
 
@@ -376,8 +392,9 @@ class AgentStatsTest(unittest.TestCase):
         self.assertEqual(json.loads(seed_json)["rows"][0]["description"], "x</script><b>y</b>&'z")
 
     def test_idle_snapshot_renders_idle_pill_with_zero_numerals(self):
-        """0 live agents is a real state (not stale): muted `.idle` pill,
-        numerals 0 / 0 / 0, no rows, main loop still reported."""
+        """0 live agents is a real state (not stale): muted `.idle` pill, no
+        rows, main loop still reported. The LIVE sums are all 0 — but the pill
+        does not print three zeros (see the fallback test below)."""
         self._write_stats(_snapshot([]))
         j = self._api()
         hdr = j["agent_stats"]
@@ -389,6 +406,73 @@ class AgentStatsTest(unittest.TestCase):
         meta = self._meta(self._html())
         self.assertIn('class="agent-bar idle"', meta)
         self.assertIn('<span class="agent-bar-num agent-bar-agents">0</span>', meta)
+
+    def test_idle_pill_falls_back_to_window_calls_and_main_context(self):
+        """With nothing running the live sums are structurally 0, so the pill
+        would read "0 agents · 0 calls · 0 tok" and look like a dead sensor
+        (Andrew, 2026-08-22). It instead prints the last window's calls and
+        the MAIN loop's context, tagged `main`."""
+        self._write_stats(_snapshot([], window={
+            "agents_spawned": 3,
+            "window_tool_calls": 37,
+            "window_context_tokens": 190_000,
+            "window_output_tokens": 12_000,
+        }))
+        hdr = self._api()["agent_stats"]
+        self.assertEqual(hdr["agents_text"], "0")
+        self.assertEqual(hdr["pill_calls_text"], "37")
+        self.assertEqual(hdr["pill_tok_text"], "546K")
+        self.assertEqual(hdr["pill_tok_pre"], "main")
+        # the popover's recent-window line
+        self.assertEqual(hdr["window"]["agents_text"], "3")
+        self.assertEqual(hdr["window"]["calls_text"], "37")
+        self.assertEqual(hdr["window"]["out_text"], "12K")
+        self.assertEqual(hdr["window"]["minutes"], 15)
+        meta = self._meta(self._html())
+        self.assertIn('<span class="agent-bar-num agent-bar-calls">37</span>', meta)
+        self.assertIn('<span class="agent-bar-pre">main </span>', meta)
+        self.assertIn('<span class="agent-bar-num agent-bar-tok">546K</span>', meta)
+
+    def test_live_pill_keeps_the_live_sums(self):
+        """With an agent live the pill is unchanged: live agents / live calls /
+        live context, no `main` qualifier."""
+        self._write_stats(_snapshot([_agent("a1", "q-2026-08-21-aaaa")], window={
+            "agents_spawned": 4,
+            "window_tool_calls": 99,
+            "window_context_tokens": 500_000,
+            "window_output_tokens": 40_000,
+        }))
+        hdr = self._api()["agent_stats"]
+        self.assertEqual(
+            (hdr["agents_text"], hdr["pill_calls_text"], hdr["pill_tok_text"]),
+            ("1", "11", "82K"),
+        )
+        self.assertEqual(hdr["pill_tok_pre"], "")
+        self.assertEqual(hdr["window"]["calls_text"], "99")
+        meta = self._meta(self._html())
+        self.assertNotIn("agent-bar-pre", meta)
+
+    def test_pre_v4_producer_has_no_window_block(self):
+        """A producer older than snapshot v4 publishes no `window_*` totals:
+        the window block is None and the pill degrades to the live calls."""
+        self._write_stats(_snapshot([], window={}))
+        hdr = self._api()["agent_stats"]
+        self.assertIsNone(hdr["window"])
+        self.assertEqual(hdr["pill_calls_text"], "0")
+        self.assertEqual(hdr["pill_tok_text"], "546K")   # main loop still known
+        self.assertEqual(hdr["pill_tok_pre"], "main")
+
+    def test_stale_pill_numerals_include_the_pill_fields(self):
+        """Stale withholds the pill numerals too — no frozen fallback."""
+        self._write_stats(_snapshot([_agent("a1", "q-2026-08-21-aaaa")],
+                                    generated_at=time.time() - 3600))
+        hdr = self._api()["agent_stats"]
+        self.assertTrue(hdr["stale"])
+        self.assertEqual(
+            (hdr["pill_calls_text"], hdr["pill_tok_text"], hdr["pill_tok_pre"]),
+            ("n/a", "n/a", ""),
+        )
+        self.assertIsNone(hdr["window"])
 
     def test_liveness_badge_is_a_live_pill(self):
         """The old 10px liveness dot is now a small outlined `live` pill

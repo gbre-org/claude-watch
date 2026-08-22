@@ -314,6 +314,10 @@ html.header-collapsed .topbar .density-control { display: none; }
   margin-right: 1px;
 }
 .agent-bar .agent-bar-num { color: var(--fg-emph); }
+/* Qualifier in front of the token numeral ("main") when the pill is showing
+   the main loop's context because no agent is live. Muted so the numeral
+   still reads first. */
+.agent-bar .agent-bar-pre { color: var(--fg-mute); }
 .agent-bar .agent-bar-sep { opacity: 0.6; margin: 0 1px; }
 .agent-bar .agent-bar-unit-short { display: none; }
 .agent-bar.active { color: var(--info); border-color: var(--info); }
@@ -386,6 +390,16 @@ html.header-collapsed .topbar .density-control { display: none; }
 }
 .agent-bar-pop td.abp-desc .abp-type { color: var(--fg-mute); font-size: 0.75rem; }
 .agent-bar-pop .abp-empty { color: var(--fg-mute); padding: 4px 0; }
+/* "last 15m" line: the window totals (finished agents included) under the
+   live-only head. */
+.agent-bar-pop .abp-window {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--fg-mute);
+  margin-bottom: 6px;
+}
 .agent-bar-pop .abp-foot {
   margin-top: 8px;
   padding-top: 6px;

@@ -36,24 +36,36 @@ Every tick it scans `~/.claude/projects/<slug>/<session>/subagents/agent-*.jsonl
   per-message delta);
 * **live** — written within `--live-window` (900s) and the last entry is not a
   terminal `end_turn` without a tool call;
+* **window** — every agent written within `--live-window`, FINISHED ONES
+  INCLUDED, deduped by agent id (a session rollover leaves the same agent a
+  frozen transcript under the old session dir and a live one under the new);
 
 and writes ONE JSON snapshot atomically (tmp + `os.replace`). Per-file byte
 offsets live in-process, so `--loop` only parses the appended tail between
 ticks. Full definitions + the "why transcripts, not claude-watch/agent-ctl"
 survey are in `agentstats.py`'s module docstring.
 
-## Snapshot (schema v2)
+## Snapshot (schema v4)
 
 ```json
-{"version": 2, "host": "…", "generated_at": 1755830000.1, "generated_at_iso": "…Z",
+{"version": 4, "host": "…", "generated_at": 1755830000.1, "generated_at_iso": "…Z",
  "live_window_seconds": 900.0,
  "main":   {"session_id", "context_tokens", "last_write_at", "age_seconds"},
  "agents": [{"agent_id", "session_id", "description", "agent_type", "queue_id",
              "tool_calls", "context_tokens", "output_tokens", "last_tool",
              "started_at", "last_write_at", "age_seconds", "finished"}],
- "totals": {"agents", "tool_calls", "context_tokens", "output_tokens"},
- "tool_totals": {"Bash": 12}, "model_totals": {"…": 3}, "tool_model_totals": {"Bash": {"…": 12}}}
+ "totals": {"agents", "agents_spawned", "tool_calls", "context_tokens", "output_tokens",
+            "window_tool_calls", "window_context_tokens", "window_output_tokens"},
+ "tool_totals": {"Bash": 12}, "model_totals": {"…": 3}, "tool_model_totals": {"Bash": {"…": 12}},
+ "model_output_tokens_totals": {"…": 4731}}
 ```
+
+`agents` and the bare `totals.agents` / `tool_calls` / `context_tokens` /
+`output_tokens` cover only what is RUNNING right now — they are all 0 in any
+minute when no subagent happens to be live. `agents_spawned` and the
+`window_*` figures (and every `*_totals` breakdown) cover the whole live
+window, finished agents included, so a consumer can show what just happened
+instead of a row of zeros.
 
 The consumer (`queue-minisite/app.py` `_load_agent_stats`) joins
 `agents[].queue_id` onto running queue rows and treats a snapshot older than

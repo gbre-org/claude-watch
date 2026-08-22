@@ -173,6 +173,10 @@ def test_collector_folds_live_agents_and_excludes_finished(projects):
     assert snap["totals"] == {
         "agents": 1, "agents_spawned": 2, "tool_calls": 2,
         "context_tokens": 101 + 1224 + 78410, "output_tokens": 230,
+        # window_* covers agent-done too (finished, still inside the window)
+        "window_tool_calls": 3,
+        "window_context_tokens": (101 + 1224 + 78410) + 60,
+        "window_output_tokens": 230 + 50,
     }
     # main loop: the LAST usage in the newest top-level transcript
     assert snap["main"]["session_id"] == "sess-1"
@@ -249,6 +253,65 @@ def test_live_window_excludes_old_transcripts(projects):
     assert snap["agents"] == []
     assert snap["totals"]["agents"] == 0
     assert str(path) not in c.agents               # state dropped, bounded memory
+
+
+def test_window_totals_survive_the_agent_returning(projects):
+    """Once every agent has RETURNED the live sums go to 0 — the window_*
+    figures must not (claude-watch #676: that is what made the queue-minisite
+    pill read "0 agents · 0 calls · 0 tok" and look broken)."""
+    running = projects / "-home-x" / "sess-1" / "subagents" / "agent-running.jsonl"
+    _write_jsonl(running, [
+        _assistant([{"type": "text", "text": "returned"}], mid="m9", stop="end_turn",
+                   usage=_usage(1, 0, 0, 3), ts="2026-08-21T20:00:20.000Z"),
+    ], append=True)
+    snap = agentstats.Collector(projects_dir=projects).tick()
+    t = snap["totals"]
+    assert snap["agents"] == []
+    assert (t["agents"], t["tool_calls"], t["output_tokens"]) == (0, 0, 0)
+    assert t["agents_spawned"] == 2
+    assert t["window_tool_calls"] == 3
+    assert t["window_output_tokens"] == 230 + 3 + 50
+    assert snap["tool_totals"] == {"Bash": 2, "Read": 1}
+
+
+def test_same_agent_under_two_session_dirs_is_counted_once(projects):
+    """A session rollover (self-clear) leaves the SAME agent's transcript in
+    the old session dir, frozen mid-flight, and continues it in the new one.
+    Counting by path made that a second, still-"running" ghost agent whose
+    counters were the older, smaller ones. Dedupe on agent id: newest path
+    wins (claude-watch #676)."""
+    old_sub = projects / "-home-x" / "sess-1" / "subagents"
+    new_sub = projects / "-home-x" / "sess-2" / "subagents"
+    # The pre-rollover copy: cut off mid-flight, so no terminal end_turn.
+    stale = old_sub / "agent-rolled.jsonl"
+    _write_jsonl(stale, [
+        _user("Queue item: q-2026-08-21-cccc\nRolled over."),
+        _assistant([{"type": "tool_use", "id": "r1", "name": "Bash", "input": {}}], mid="r1",
+                   stop="tool_use", usage=_usage(10, 0, 0, 5), ts="2026-08-21T20:00:05.000Z"),
+    ])
+    # The continuation under the NEW session dir: same agent id, more calls.
+    live = new_sub / "agent-rolled.jsonl"
+    _write_jsonl(live, [
+        _user("Queue item: q-2026-08-21-cccc\nRolled over."),
+        _assistant([{"type": "tool_use", "id": "r1", "name": "Bash", "input": {}}], mid="r1",
+                   stop="tool_use", usage=_usage(10, 0, 0, 5), ts="2026-08-21T20:00:05.000Z"),
+        _tool_result("2026-08-21T20:00:06.000Z"),
+        _assistant([{"type": "tool_use", "id": "r2", "name": "Grep", "input": {}}], mid="r2",
+                   stop="tool_use", usage=_usage(20, 0, 0, 7), ts="2026-08-21T20:00:07.000Z"),
+    ])
+    now = time.time()
+    os.utime(stale, (now - 120, now - 120))
+    os.utime(live, (now, now))
+
+    snap = agentstats.Collector(projects_dir=projects).tick()
+    rolled = [a for a in snap["agents"] if a["agent_id"] == "rolled"]
+    assert len(rolled) == 1                        # one agent, not two
+    assert rolled[0]["tool_calls"] == 2            # the CONTINUATION's counters
+    assert rolled[0]["last_tool"] == "Grep"
+    assert snap["totals"]["agents"] == 2           # agent-running + rolled
+    assert snap["totals"]["agents_spawned"] == 3   # + agent-done, no double count
+    # the ghost's calls are not folded into the fleet breakdown twice either
+    assert snap["tool_totals"] == {"Bash": 3, "Read": 1, "Grep": 1}
 
 
 def test_parse_main_tail_handles_large_prefix(tmp_path):
@@ -414,13 +477,16 @@ AGENT_RECORD_KEYS = {
     "started_at", "last_write_at", "age_seconds", "finished",
 }
 MAIN_KEYS = {"session_id", "context_tokens", "last_write_at", "age_seconds"}
-TOTALS_KEYS = {"agents", "agents_spawned", "tool_calls", "context_tokens", "output_tokens"}
+TOTALS_KEYS = {
+    "agents", "agents_spawned", "tool_calls", "context_tokens", "output_tokens",
+    "window_tool_calls", "window_context_tokens", "window_output_tokens",
+}
 
 
 def test_snapshot_schema_is_pinned(projects):
     snap = agentstats.Collector(projects_dir=projects, host="h").tick()
     assert set(snap) == SNAPSHOT_TOP_LEVEL_KEYS
-    assert snap["version"] == 3 == agentstats.SNAPSHOT_VERSION
+    assert snap["version"] == 4 == agentstats.SNAPSHOT_VERSION
     assert set(snap["agents"][0]) == AGENT_RECORD_KEYS
     assert set(snap["main"]) == MAIN_KEYS
     assert set(snap["totals"]) == TOTALS_KEYS

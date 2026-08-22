@@ -895,6 +895,42 @@ def _shape_agent_stat(rec: dict[str, Any], now_ts: float | None = None) -> dict[
     }
 
 
+def _agent_stats_window(totals_raw: dict[str, Any], window_mins: int) -> dict[str, Any] | None:
+    """The snapshot's ``totals.window_*`` block (producer v4+), or None.
+
+    ``totals.agents`` / ``tool_calls`` / ``context_tokens`` / ``output_tokens``
+    are LIVE-only sums: they are 0 whenever no subagent happens to be running
+    this instant, however busy the last quarter-hour was. The producer also
+    publishes the same figures over the whole live window — finished agents
+    included (``agents_spawned`` + ``window_tool_calls`` /
+    ``window_context_tokens`` / ``window_output_tokens``) — and that is what
+    the header pill falls back to when nothing is live, so an idle moment
+    reads "no agents running, here is what just happened" instead of a row of
+    zeros that looks like a dead sensor.
+
+    None when every window key is missing (a producer older than snapshot v4);
+    callers then keep the live-only numbers.
+    """
+    keys = ("window_tool_calls", "window_context_tokens", "window_output_tokens")
+    if not any(k in totals_raw for k in keys):
+        return None
+    n = totals_raw.get("agents_spawned")
+    calls = totals_raw.get("window_tool_calls")
+    ctx = totals_raw.get("window_context_tokens")
+    out = totals_raw.get("window_output_tokens")
+    return {
+        "minutes": window_mins,
+        "agents": n,
+        "tool_calls": calls,
+        "context_tokens": ctx,
+        "output_tokens": out,
+        "agents_text": _fmt_count(n),
+        "calls_text": _fmt_count(calls),
+        "ctx_text": _fmt_count(ctx),
+        "out_text": _fmt_count(out) if out is not None else "–",
+    }
+
+
 def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
     """Normalised agent-stats view for the render pass + /api/agent-stats.
 
@@ -974,14 +1010,27 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
     ctx = totals_raw.get("context_tokens")
     out = totals_raw.get("output_tokens")
     main_ctx = main_raw.get("context_tokens")
+    window_mins = int(raw.get("live_window_seconds") or 0) // 60
+    # The WINDOW figures (producer v4+): every agent seen in the live window,
+    # FINISHED ONES INCLUDED. ``calls``/``ctx``/``out`` above cover only the
+    # still-running agents, so they collapse to 0 the instant the last one
+    # returns — which is exactly what made the pill read "0 agents · 0 calls ·
+    # 0 tok" through a quiet quarter-hour and look broken. ``None`` when the
+    # producer predates v4; every consumer below degrades to the live sums.
+    window = _agent_stats_window(totals_raw, window_mins)
     label = f"{_fmt_count(n_agents)} agents · {_fmt_count(calls)} calls · {_fmt_count(ctx)} tok"
     title_bits = [
-        f"{_fmt_count(n_agents)} live agents (last {int(raw.get('live_window_seconds') or 0) // 60}m window)",
+        f"{_fmt_count(n_agents)} live agents (last {window_mins}m window)",
         f"{_fmt_count(calls)} tool calls",
         f"{_fmt_count(ctx)} context tokens",
     ]
     if out is not None:
         title_bits.append(f"{_fmt_count(out)} output tokens")
+    if window is not None:
+        title_bits.append(
+            f"last {window_mins}m: {window['agents_text']} agents · "
+            f"{window['calls_text']} calls · {window['out_text']} out"
+        )
     if main_ctx is not None:
         title_bits.append(f"main loop context {_fmt_count(main_ctx)} tokens")
     title_bits.append(f"snapshot {_humanize_age(age)}")
@@ -997,9 +1046,12 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
         "label": label,
         "main_label": main_label,
         "title": " · ".join(title_bits),
-        # Header pill numerals + popover strings (one formatter: here). The
-        # pill prints agents_text / calls_text / tok_text; the popover head
-        # adds out_text and the footer main_text / main_age_text / age_text.
+        # Header pill numerals + popover strings (one formatter: here).
+        # calls_text / tok_text / out_text are the LIVE-agent sums the popover
+        # head prints; the pill's own two numerals are chosen in
+        # ``_agent_stats_header`` (pill_calls_text / pill_tok_text) because
+        # they fall back to the window / main loop when nothing is live. The
+        # footer prints main_text / main_age_text / age_text.
         "agents_text": _fmt_count(n_agents),
         "calls_text": _fmt_count(calls),
         "tok_text": _fmt_count(ctx),
@@ -1009,6 +1061,8 @@ def _load_agent_stats(now_ts: float | None = None) -> dict[str, Any]:
         "age_text": _fmt_dur(age),
         "host": host,
         "rows": rows,
+        "window": window,
+        "window_minutes": window_mins,
     }
     view["main"] = {
         "session_id": main_raw.get("session_id"),
@@ -1027,7 +1081,17 @@ def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
     calls / ctx / out / age), the main loop's context size and the snapshot
     freshness footer. ``label`` / ``main_label`` stay for API consumers
     (same numbers, the long form). Stale: every numeral reads ``n/a``,
-    ``rows`` is empty and ``main`` is None — never a frozen number."""
+    ``rows`` is empty and ``main`` is None — never a frozen number.
+
+    The three numerals the PILL prints are ``agents_text`` /
+    ``pill_calls_text`` / ``pill_tok_text`` (+ ``pill_tok_pre``, a "main"
+    qualifier), NOT the plain ``calls_text`` / ``tok_text`` — those stay the
+    live-agent sums the popover head and API consumers read. With at least one
+    live agent the pill is the live sums, unchanged. With none it falls back
+    to the last-window figures (``window``) for calls and to the MAIN LOOP's
+    context for tokens, because the live sums are structurally 0 then and a
+    header reading "0 agents · 0 calls · 0 tok" reads as a broken sensor
+    rather than as an idle minute (claude-watch #676)."""
     if not view.get("available"):
         return None
     if view.get("stale"):
@@ -1043,7 +1107,11 @@ def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
             "calls_text": "n/a",
             "tok_text": "n/a",
             "out_text": "n/a",
+            "pill_calls_text": "n/a",
+            "pill_tok_text": "n/a",
+            "pill_tok_pre": "",
             "main": None,
+            "window": None,
             "rows": [],
             "host": "",
             "age_seconds": age,
@@ -1062,6 +1130,23 @@ def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
             "age_seconds": m.get("age_seconds"),
             "age_text": t.get("main_age_text", ""),
         }
+    window = t.get("window")
+    # Pill numerals. Live agents => the live sums (unchanged). None live =>
+    # what the window did (calls) + the main loop's context (tokens), so the
+    # pill still carries information instead of three zeros.
+    live_now = bool(t.get("agents"))
+    if live_now:
+        pill_calls = t.get("calls_text", "?")
+        pill_tok = t.get("tok_text", "?")
+        pill_tok_pre = ""
+    else:
+        pill_calls = (window or {}).get("calls_text") or t.get("calls_text", "?")
+        if main is not None:
+            pill_tok = main["text"] or "?"
+            pill_tok_pre = "main"
+        else:
+            pill_tok = (window or {}).get("ctx_text") or t.get("tok_text", "?")
+            pill_tok_pre = ""
     return {
         "stale": False,
         "agents": t.get("agents"),
@@ -1072,7 +1157,11 @@ def _agent_stats_header(view: dict[str, Any]) -> dict[str, Any] | None:
         "calls_text": t.get("calls_text", "?"),
         "tok_text": t.get("tok_text", "?"),
         "out_text": t.get("out_text", "–"),
+        "pill_calls_text": pill_calls,
+        "pill_tok_text": pill_tok,
+        "pill_tok_pre": pill_tok_pre,
         "main": main,
+        "window": window,
         "rows": list(t.get("rows") or []),
         "host": t.get("host", ""),
         "age_seconds": view.get("age_seconds"),

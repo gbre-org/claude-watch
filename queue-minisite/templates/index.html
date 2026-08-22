@@ -150,7 +150,12 @@
           info-blue while ≥1 agent is live = .active, muted when none =
           .idle, amber + dashed border + "n/a" numerals when the snapshot is
           STALE = .stale, never a frozen number). The long units collapse to
-          a/c/t under 480px (CSS). It is a <button>: click/tap pins the
+          a/c/t under 480px (CSS). The calls/tok numerals come from
+          pill_calls_text / pill_tok_text (+ pill_tok_pre): with agents live
+          they are the live sums; with none they are the last-window calls and
+          the MAIN loop's context (prefixed "main"), because the live sums are
+          structurally 0 then and "0 agents · 0 calls · 0 tok" reads as a
+          broken sensor. It is a <button>: click/tap pins the
           per-agent popover (#agent-bar-pop, below the .meta block), hover
           peeks — static/agent-bar.js. Row absent entirely when the feature is
           off or the snapshot file is missing. Also rendered by
@@ -163,9 +168,9 @@
           <span class="agent-bar-dot" aria-hidden="true"></span>
           <span class="agent-bar-num agent-bar-agents">{{ agent_stats.agents_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> agents</span><span class="agent-bar-unit agent-bar-unit-short">a</span>
           <span class="agent-bar-sep" aria-hidden="true">·</span>
-          <span class="agent-bar-num agent-bar-calls">{{ agent_stats.calls_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> calls</span><span class="agent-bar-unit agent-bar-unit-short">c</span>
+          <span class="agent-bar-num agent-bar-calls">{{ agent_stats.pill_calls_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> calls</span><span class="agent-bar-unit agent-bar-unit-short">c</span>
           <span class="agent-bar-sep" aria-hidden="true">·</span>
-          <span class="agent-bar-num agent-bar-tok">{{ agent_stats.tok_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>
+          {% if agent_stats.pill_tok_pre %}<span class="agent-bar-pre">{{ agent_stats.pill_tok_pre }} </span>{% endif %}<span class="agent-bar-num agent-bar-tok">{{ agent_stats.pill_tok_text }}</span><span class="agent-bar-unit agent-bar-unit-long"> tok</span><span class="agent-bar-unit agent-bar-unit-short">t</span>
         </button>
       </div>{% endif %}
       <div class="count-row count-row-status">

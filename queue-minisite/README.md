@@ -78,9 +78,21 @@ with the last status pill's; the status pills (running / blocked / pending)
 sit in the row below, left-aligned. The pill is the botchat topbar agent-bar look: a live dot,
 info-blue while at least one agent is live (`.active`), muted when none
 (`.idle`), dashed with an amber dot and `n/a` numerals when the snapshot is
-stale (`.stale`); under 480px the units collapse to `a` / `c` / `t`. Click
-(pin) or hover (peek) it for the per-agent popover — `N live agents — C
-calls · K ctx · O out`, one row per live agent (description; type · queue id
+stale (`.stale`); under 480px the units collapse to `a` / `c` / `t`.
+
+The agent COUNT is always "live right now". The other two numerals are the
+live sums only while something IS running: with no live agent those sums are
+structurally 0, so instead of `0 agents · 0 calls · 0 tok` — which reads as a
+broken sensor rather than an idle minute — the pill shows the last window's
+tool calls and the MAIN loop's context, tagged `main`
+(`0 agents · 37 calls · main 157K tok`). The server picks that
+(`pill_calls_text` / `pill_tok_text` / `pill_tok_pre`); `calls_text` /
+`tok_text` stay the live sums for the popover and API consumers.
+
+Click (pin) or hover (peek) the pill for the per-agent popover — `N live
+agents — C calls · K ctx · O out`, a `last 15m` line covering every agent seen
+in the live window (finished ones included, so a returned agent's work does not
+vanish), one row per live agent (description; type · queue id
 · last tool; calls / ctx / out / age since spawn) and a footer with the main
 loop's own context tokens, the snapshot age and the host (`static/agent-bar.js`,
 painted from the same `/api/queue` payload: `agent_stats.rows` /
@@ -100,8 +112,11 @@ run from cron (Linux) or the launchd plist beside it (macOS) — rewrites
 atomically every few seconds
 (`QUEUE_MINISITE_AGENT_STATS_FILE`; shape: `{generated_at, main:{context_tokens,…},
 agents:[{agent_id, queue_id, tool_calls, context_tokens, output_tokens,
-last_tool, age_seconds, finished,…}], totals:{agents, tool_calls,
-context_tokens, output_tokens}}`) and JOINS `agents[].queue_id` onto the
+last_tool, age_seconds, finished,…}], totals:{agents, agents_spawned,
+tool_calls, context_tokens, output_tokens, window_tool_calls,
+window_context_tokens, window_output_tokens}}` — the bare totals are
+live-only, the `window_*` ones cover the whole live window including agents
+that already returned) and JOINS `agents[].queue_id` onto the
 running rows. The parse is cached on the file's mtime/size and rides along
 in the existing `/api/queue` 5s poll (no second timer); `/api/agent-stats`
 exposes the normalised view (join maps, staleness verdict, totals) for

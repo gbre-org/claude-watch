@@ -113,6 +113,8 @@ function row(over) {
 const FRESH = {
   stale: false, agents: 3, tool_calls: 48, context_tokens: 272000, output_tokens: 14600,
   agents_text: '3', calls_text: '48', tok_text: '272K', out_text: '14K',
+  pill_calls_text: '48', pill_tok_text: '272K', pill_tok_pre: '',
+  window: { minutes: 15, agents: 5, agents_text: '5', calls_text: '96', ctx_text: '410K', out_text: '31K' },
   main: { context_tokens: 195432, text: '195K', age_seconds: 2, age_text: '2s' },
   rows: [
     row(),
@@ -123,14 +125,18 @@ const FRESH = {
   label: '3 agents · 48 calls · 272K tok', main_label: 'main 195K',
   title: '3 live agents (last 15m window) · 48 tool calls · 272K context tokens',
 };
+// Nothing running: the LIVE sums are all 0, so the server hands the pill the
+// window's calls and the MAIN loop's context instead (claude-watch #676).
 const IDLE = Object.assign({}, FRESH, {
   agents: 0, tool_calls: 0, context_tokens: 0, output_tokens: 0,
   agents_text: '0', calls_text: '0', tok_text: '0', out_text: '0', rows: [],
+  pill_calls_text: '96', pill_tok_text: '195K', pill_tok_pre: 'main',
   label: '0 agents · 0 calls · 0 tok', title: '0 live agents',
 });
 const STALE = {
   stale: true, agents: null, tool_calls: null, context_tokens: null, output_tokens: null,
   agents_text: 'n/a', calls_text: 'n/a', tok_text: 'n/a', out_text: 'n/a',
+  pill_calls_text: 'n/a', pill_tok_text: 'n/a', pill_tok_pre: '', window: null,
   main: null, rows: [], host: '', age_seconds: 300.4, age_text: '5m0s',
   label: 'agents n/a', main_label: '',
   title: 'agent-stats snapshot is stale (written 5m ago) — counters withheld rather than frozen',
@@ -218,12 +224,20 @@ console.log('refresh.js: buildTopbarMetaDOM renders the agent-bar pill (active /
   const idle = R.buildTopbarMetaDOM(emptyState({ agent_stats: IDLE }));
   const ibar = idle.querySelector('#agent-bar');
   assert('idle (0 agents): class agent-bar idle', ibar && ibar.className === 'agent-bar idle', ibar && ibar.className);
-  assert('idle numerals 0 / 0 / 0', ibar && JSON.stringify(Array.from(ibar.querySelectorAll('.agent-bar-num')).map((e) => e.textContent)) === JSON.stringify(['0', '0', '0']));
+  // #676: never "0 agents · 0 calls · 0 tok" — the live sums are structurally
+  // 0 with nothing running, so the pill shows the window's calls + main ctx.
+  assert('idle numerals 0 / window calls / main ctx', ibar && JSON.stringify(Array.from(ibar.querySelectorAll('.agent-bar-num')).map((e) => e.textContent)) === JSON.stringify(['0', '96', '195K']),
+    ibar && JSON.stringify(Array.from(ibar.querySelectorAll('.agent-bar-num')).map((e) => e.textContent)));
+  assert('idle: token numeral is tagged "main"', ibar && ibar.querySelector('.agent-bar-pre') && ibar.querySelector('.agent-bar-pre').textContent === 'main ');
+  assert('idle pill reads "0 agents · 96 calls · main 195K tok"',
+    ibar && ibar.textContent.replace(/\s+/g, ' ').trim() === '0 agentsa·96 callsc·main 195K tokt',
+    ibar && ibar.textContent.replace(/\s+/g, ' ').trim());
 
   const stale = R.buildTopbarMetaDOM(emptyState({ agent_stats: STALE }));
   const sbar = stale.querySelector('#agent-bar');
   assert('stale: class agent-bar stale', sbar && sbar.className === 'agent-bar stale', sbar && sbar.className);
   assert('stale: numerals n/a ×3 (withheld, never frozen)', sbar && JSON.stringify(Array.from(sbar.querySelectorAll('.agent-bar-num')).map((e) => e.textContent)) === JSON.stringify(['n/a', 'n/a', 'n/a']));
+  assert('stale: no "main" fallback qualifier', sbar && !sbar.querySelector('.agent-bar-pre'));
   assert('stale: row carries stale', !!stale.querySelector('.count-row-agents.stale'));
   assert('stale: still two rows', stale.querySelectorAll('.count-stack > .count-row').length === 2);
   assert('stale: agents row still first', stale.querySelector('.count-stack').firstElementChild.classList.contains('count-row-agents'));
@@ -375,6 +389,11 @@ console.log('agent-bar.js: popover paints from the seed, pins on click, repaints
   assert('head: "3 live agents" — "48 calls · 272K ctx · 14K out"',
     head && head.children[0].textContent === '3 live agents' && head.children[1].textContent === '48 calls · 272K ctx · 14K out',
     head && head.textContent);
+  const winLine = pop.querySelector('.abp-window');
+  assert('window line: "last 15m" — "5 agents · 96 calls · 31K out" (finished agents included)',
+    winLine && winLine.children[0].textContent === 'last 15m' &&
+    winLine.children[1].textContent === '5 agents · 96 calls · 31K out',
+    winLine && winLine.textContent);
   const ths = Array.from(pop.querySelectorAll('thead th')).map((e) => e.textContent);
   assert('table columns agent / calls / ctx / out / age', JSON.stringify(ths) === JSON.stringify(['agent', 'calls', 'ctx', 'out', 'age']), JSON.stringify(ths));
   const trs = Array.from(pop.querySelectorAll('tbody tr'));
@@ -399,7 +418,7 @@ console.log('agent-bar.js: popover paints from the seed, pins on click, repaints
   assert('no stale marker when fresh', !pop.querySelector('.abp-stale'));
 
   // A tick while open: the rebuilt pill keeps the open state and the popover repaints.
-  const FRESH2 = Object.assign({}, FRESH, { agents: 4, agents_text: '4', calls_text: '60', rows: FRESH.rows.concat([row({ agent_id: 'dd33', description: 'fourth' })]), age_text: '0s' });
+  const FRESH2 = Object.assign({}, FRESH, { agents: 4, agents_text: '4', calls_text: '60', pill_calls_text: '60', rows: FRESH.rows.concat([row({ agent_id: 'dd33', description: 'fourth' })]), age_text: '0s' });
   R.mergeTopbarMeta(emptyState({ totals: { running: 4 }, agent_stats: FRESH2 }));
   bar = d.getElementById('agent-bar');
   assert('after merge while open: popover still open', pop.hidden === false);
@@ -431,6 +450,7 @@ console.log('agent-bar.js: popover paints from the seed, pins on click, repaints
   click(dom, d.getElementById('agent-bar'));
   assert('stale popover: head reads n/a + stale', pop.querySelector('.abp-head').textContent.indexOf('agent activity: n/a') === 0 && !!pop.querySelector('.abp-head .abp-stale'));
   assert('stale popover: no table, withheld note', !pop.querySelector('table') && /withheld/.test(pop.querySelector('.abp-empty').textContent));
+  assert('stale popover: no window line either (nothing frozen)', !pop.querySelector('.abp-window'));
   assert('stale popover: STALE footer with the silence age', /STALE — producer silent 5m0s/.test(pop.querySelector('.abp-foot .abp-stale').textContent));
   assert('stale popover: no main loop line (main is null)', !/main loop ctx/.test(pop.querySelector('.abp-foot').textContent));
 
@@ -447,6 +467,9 @@ console.log('agent-bar.js: popover paints from the seed, pins on click, repaints
     pop.querySelector('.abp-head').children[0].textContent === '0 live agents' &&
     pop.querySelector('.abp-empty').textContent === 'no live agents' &&
     /main loop ctx 195K/.test(pop.querySelector('.abp-foot').textContent));
+  assert('idle popover: the recent-window line survives the agents returning',
+    /last 15m/.test(pop.querySelector('.abp-window').textContent) &&
+    /96 calls/.test(pop.querySelector('.abp-window').textContent));
   click(dom, d.getElementById('agent-bar'));
 
   // Descriptions are prompt text: rendered as text, never as markup.
