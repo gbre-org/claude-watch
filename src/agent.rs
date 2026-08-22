@@ -1726,12 +1726,14 @@ mod tests {
                 queue_id: Some("q-2026-07-11-abcd".to_string()),
                 alive: true,
                 jsonl_age_seconds: Some(15),
+                in_flight_tool_use: false,
             },
             AgentRecord {
                 agent_id: "a0000000000000000".to_string(),
                 queue_id: None,
                 alive: true,
                 jsonl_age_seconds: None,
+                in_flight_tool_use: false,
             },
         ];
         let w = format_in_process_warning(&live, 600).expect("warning");
