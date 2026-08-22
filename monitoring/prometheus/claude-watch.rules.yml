@@ -111,15 +111,28 @@ groups:
             main loop. Re-register + re-spawn the work, or abandon the item.
 
       # WorkQueueStuckSoft -- a running item with long runtime AND stale (or
-      # absent) progress. WorkQueueStuck joins running_elapsed against
-      # progress_age and fires on items WITHOUT a progress series (agents)
-      # OR WITH stale progress (workloads); the `unless on(id)` half excludes
-      # healthy long-running workloads still emitting a fresh heartbeat.
+      # absent) progress. The base series is running_elapsed; each `unless
+      # on(id)` clause subtracts a class of item that is demonstrably still
+      # progressing:
+      #
+      #   1. progress_age < 900 -- a workload/hostjob still touching its
+      #      heartbeat file (the sidecar only re-touches it when the wrapped
+      #      command's output grows, so a fresh mtime is REAL progress).
+      #   2. agent_jsonl_age < 900 -- an AGENT still writing its transcript.
+      #      Without this, every agent-owned item alerted purely for running
+      #      >30m (15m expr + 15m `for`), because agents have no heartbeat
+      #      file and so never matched clause 1. Transcript freshness is the
+      #      agent-side equivalent of the workload heartbeat, and the 900s
+      #      threshold matches DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS in
+      #      src/active_agents.rs -- an agent parked in one long tool call
+      #      is covered by the same window on both sides.
+      #
       # 15m mirrors config.toml [queue_check] stale_heartbeat_min = 15.
       - alert: WorkQueueStuckSoft
         expr: >-
           (worktask_queue_items_running_elapsed_seconds > 900)
           unless on(id) (worktask_queue_item_progress_age_seconds < 900)
+          unless on(id) (worktask_queue_item_agent_jsonl_age_seconds < 900)
         for: 15m
         labels:
           severity: warning
@@ -127,9 +140,10 @@ groups:
           summary: "Work-queue item {{ $labels.id }} appears stuck"
           description: >-
             Running queue item {{ $labels.id }} ({{ $labels.summary }}) has
-            been running >15m with no fresh progress heartbeat. Healthy
-            long-running workloads that keep touching their progress
-            heartbeat are excluded via the `unless on(id)` join.
+            been running >15m with no fresh progress signal. Healthy
+            long-running workloads (fresh progress heartbeat) and healthy
+            long-running agents (fresh JSONL transcript) are excluded via
+            the `unless on(id)` joins.
 
       # WorkQueueReadyStuck -- a ready-to-spawn pending item unclaimed too
       # long. The exporter only emits ready_age for pending group-heads that

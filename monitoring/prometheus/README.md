@@ -51,6 +51,44 @@ died-after-spawn (`agent_id` set) cases `WorkQueueOrphaned` is meant to
 catch. This is what keeps a live-but-not-yet-polled agent from being
 mis-reported as "owner unknown" / falsely paged.
 
+## Agent liveness: silence is not death
+
+Subagents run in-process and share the parent Claude Code PID, so there is
+no per-agent PID to probe. `claude-watch active-agents` infers liveness
+from the agent's JSONL transcript mtime, and an agent normally touches
+that transcript every tool call — hence the 120s default window.
+
+That assumption breaks in exactly one place, and it is a place agents are
+*told* to go: a long job is supposed to run as ONE long foreground call.
+For the whole of that call the agent writes nothing, so a maximally busy
+agent looks maximally dead. Measured 2026-08-22: an agent driving a
+150-minute render sat in a single ~10-minute wait loop, its transcript
+aged to 443s, `has_live_owner` went to 0 and `WorkQueueOrphaned` fired —
+then resolved when the call returned, then fired again on the next one.
+
+The fix reads the END of the transcript when (and only when) the mtime
+check already said "stale". If the last record is an assistant frame
+carrying a `tool_use` block, no `tool_result` has come back yet: the agent
+is INSIDE that call. Those agents get the longer
+`DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS` (900s) window and publish
+`in_flight_tool_use: true` in `active-agents.json`, which is why a record
+can read `alive: true` with a ten-minute-old transcript.
+
+Two properties this deliberately keeps:
+
+- **The grace is bounded.** Past 900s the normal verdict stands, so an
+  agent killed mid-call still surfaces as dead — just later.
+- **The other death mode is untouched.** When the MODEL turn dies (API
+  5xx, dropped stream) the last record is a `tool_result`, not a
+  `tool_use`, so that agent trips the 120s window on schedule.
+
+`WorkQueueStuckSoft` carries the matching exclusion on the alert side:
+an item whose owning agent's transcript is younger than 900s is
+progressing, and is subtracted from the alert the same way a workload
+with a fresh progress heartbeat is. Without it every agent-owned item
+alerted purely for running longer than 30 minutes, since agents have no
+heartbeat file to match the workload clause.
+
 ## Rules summary
 
 Recording (`claude-watch-work-queue.recording`):

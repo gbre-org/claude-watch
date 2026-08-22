@@ -22,7 +22,11 @@
 //!     Claude Code PID, so per-subagent /proc liveness is impossible —
 //!     we infer "still working" from the transcript being actively
 //!     appended). The default max-age is 120s, matching the typical
-//!     time between agent tool calls.
+//!     time between agent tool calls — EXCEPT while the agent is
+//!     parked inside a single long tool call, which is silent on the
+//!     transcript for as long as the call runs. See
+//!     `DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS` and
+//!     `tail_ends_on_pending_tool_use`.
 //!
 //! Design intent: claude-watch emits FACTS about live processes + agents.
 //! Whoever consumes this output (e.g. work-queue-exporter) decides what is
@@ -164,6 +168,45 @@ pub fn dir_newest_mtime(dir: &Path) -> Option<SystemTime> {
 /// without false-positive death.
 pub const DEFAULT_AGENT_ALIVE_MAX_AGE_SECS: u64 = 120;
 
+/// Extended "alive" window for an agent whose transcript ENDS on an
+/// un-answered `tool_use` — i.e. it is parked INSIDE a tool call right
+/// now and cannot write anything until the call returns.
+///
+/// `DEFAULT_AGENT_ALIVE_MAX_AGE_SECS` assumes an agent touches its
+/// transcript every couple of minutes, which holds only between tool
+/// calls. An agent doing the thing agents are explicitly told to do for
+/// a long job — ONE long foreground call (a build, an encode, a
+/// `until <condition>; do sleep; done` wait) — writes NOTHING for the
+/// whole call. It is maximally alive and looks maximally dead.
+///
+/// Measured failure this exists to stop (2026-08-22): an agent driving
+/// a 150-minute supercut sat in a single 10-minute Bash wait loop; its
+/// transcript aged past 120s, `alive` flipped to false, and
+/// `WorkQueueOrphaned` fired (then resolved, then fired again on the
+/// next long call) against a demonstrably working agent. The last
+/// transcript record was an `assistant` frame whose only content block
+/// was a `tool_use` — direct evidence of "waiting on a tool", not
+/// "died".
+///
+/// 900s = the Bash tool's 600s ceiling plus headroom for a large result
+/// to be written back. Past that, even a pending tool call is suspect
+/// and we let the normal staleness verdict stand, so a genuinely dead
+/// agent is still reported dead — just later. The OTHER death mode (the
+/// model turn itself dying: API 5xx / dropped stream) leaves a
+/// `tool_result` as the last record, so it is NOT covered by this grace
+/// and still trips the 120s window on schedule.
+pub const DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS: u64 = 900;
+
+/// How many bytes of transcript tail we read to decide whether the last
+/// record is a pending `tool_use`. Only read when the plain mtime check
+/// already said "stale", so the healthy path costs zero extra IO.
+///
+/// A single JSONL record can exceed this (a huge tool result); when no
+/// complete line fits the window we simply find no verdict and fall
+/// back to the mtime answer. That direction is deliberate: the window
+/// can only ever WITHHOLD the grace, never invent it.
+const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
 /// Output shape for `claude-watch active-agents [--json]`.
 ///
 /// `Deserialize` is derived (not just `Serialize`) so consumers inside
@@ -206,7 +249,10 @@ pub struct AgentRecord {
     /// True iff ANY of the agent's transcripts (an agent that outlived
     /// a parent context reset has one per session — see
     /// `collect_agent_records_merged`) was modified within the
-    /// configured max-age window. Subagents lack stable PIDs (they run
+    /// applicable max-age window — the usual 120s, or
+    /// `DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS` when the transcript ends
+    /// on a pending tool call (`in_flight_tool_use`). Subagents lack
+    /// stable PIDs (they run
     /// in-process, sharing the parent Claude PID), so transcript-mtime
     /// is the canonical liveness signal.
     pub alive: bool,
@@ -214,6 +260,17 @@ pub struct AgentRecord {
     /// modified. None if metadata was unreadable (treated as
     /// `alive=false`).
     pub jsonl_age_seconds: Option<u64>,
+    /// True iff the agent's freshest transcript ENDS on an un-answered
+    /// `tool_use` — the agent is parked inside a tool call and cannot
+    /// write until it returns. When set, `alive` was decided against
+    /// `DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS` instead of the usual
+    /// 120s window; publishing it makes an "old transcript, still
+    /// alive" record self-explanatory instead of looking like a bug.
+    ///
+    /// `#[serde(default)]` so a state file written by an older binary
+    /// still deserializes (absent = false = prior behaviour).
+    #[serde(default)]
+    pub in_flight_tool_use: bool,
 }
 
 /// Pure: filter `children` down to subagent PIDs and sort.
@@ -306,6 +363,85 @@ fn extract_queue_id_from_jsonl(jsonl_path: &Path) -> Option<String> {
     extract_queue_id(&content)
 }
 
+/// Pure: does this transcript tail END on an un-answered `tool_use`?
+///
+/// The transcript is append-only and strictly ordered, so "the last
+/// record is an assistant frame carrying a `tool_use` block" means no
+/// `tool_result` has come back yet — the agent is INSIDE that tool call
+/// right now. Any other tail shape (a `user` / `tool_result` frame, a
+/// text-only assistant turn) means the agent was between calls when it
+/// went quiet, which is the shape a dead agent leaves behind.
+///
+/// `tail` may begin mid-line (we seek into the file), so we scan lines
+/// BACKWARD and take the verdict from the newest line that parses as a
+/// JSON object with a `type`. Returns false when nothing parses.
+pub fn tail_ends_on_pending_tool_use(tail: &str) -> bool {
+    for line in tail.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            // A truncated first/last line (mid-write, or the seek
+            // landing inside a record) — keep walking backward.
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            return false;
+        }
+        let content = match value.pointer("/message/content") {
+            Some(c) => c,
+            None => return false,
+        };
+        return match content.as_array() {
+            Some(blocks) => blocks.iter().any(|b| {
+                b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+            }),
+            // A plain-string assistant content block is a text turn.
+            None => false,
+        };
+    }
+    false
+}
+
+/// Read the last `max_bytes` of `path` as lossy UTF-8. `None` when the
+/// file cannot be opened or read. Short files are returned whole.
+fn read_transcript_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > max_bytes {
+        f.seek(SeekFrom::Start(len - max_bytes)).ok()?;
+    }
+    let mut buf = Vec::with_capacity(max_bytes.min(len) as usize);
+    f.take(max_bytes).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Pure: final liveness verdict, given the plain-mtime verdict and
+/// whether the transcript is parked on a pending tool call.
+///
+/// An in-flight tool call extends the window to `tool_call_max_age_secs`
+/// (see `DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS`); it never SHORTENS it,
+/// so an agent already fresh by mtime stays alive regardless.
+pub fn agent_alive_with_in_flight(
+    mtime_alive: bool,
+    age_seconds: Option<u64>,
+    in_flight_tool_use: bool,
+    tool_call_max_age_secs: u64,
+) -> bool {
+    if mtime_alive {
+        return true;
+    }
+    if !in_flight_tool_use {
+        return false;
+    }
+    // An unreadable mtime is not evidence of an in-flight call being
+    // recent, so it stays dead (matches `agent_alive_from_mtime`).
+    matches!(age_seconds, Some(age) if age <= tool_call_max_age_secs)
+}
+
 /// Compute alive flag + age from a JSONL mtime and `now`.
 pub fn agent_alive_from_mtime(
     jsonl_mtime: Option<SystemTime>,
@@ -350,13 +486,27 @@ pub fn collect_agent_records(
         };
         let path = entry.path();
         let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        let (alive, age) = agent_alive_from_mtime(mtime, now, max_age_secs);
+        let (mtime_alive, age) = agent_alive_from_mtime(mtime, now, max_age_secs);
+        // Only inspect the tail when the plain mtime verdict was
+        // "stale" — a fresh agent is already alive, so the healthy
+        // path (the overwhelming majority of records) does no extra IO.
+        let in_flight_tool_use = !mtime_alive
+            && read_transcript_tail(&path, TRANSCRIPT_TAIL_BYTES)
+                .map(|tail| tail_ends_on_pending_tool_use(&tail))
+                .unwrap_or(false);
+        let alive = agent_alive_with_in_flight(
+            mtime_alive,
+            age,
+            in_flight_tool_use,
+            DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS,
+        );
         let queue_id = extract_queue_id_from_jsonl(&path);
         out.push(AgentRecord {
             agent_id,
             queue_id,
             alive,
             jsonl_age_seconds: age,
+            in_flight_tool_use,
         });
     }
     out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -379,8 +529,11 @@ pub fn collect_agent_records(
 /// working agent (tokens advancing) was reported `alive=false` with a
 /// 30-minute JSONL age. Field-wise merging fixes that class of bug:
 ///
-///  * `alive` — true if ANY transcript for the agent is fresh.
+///  * `alive` — true if ANY transcript for the agent is fresh (or is
+///    parked on a pending tool call inside the longer tool window).
 ///  * `jsonl_age_seconds` — the freshest (smallest) known age.
+///  * `in_flight_tool_use` — taken from the FRESHEST transcript; a
+///    frozen pre-clear file's tail describes the past, not now.
 ///  * `queue_id` — any `Some` beats `None`; if two records disagree on
 ///    a non-null queue id (rare), the livelier/fresher record's id wins.
 ///
@@ -439,11 +592,22 @@ fn merge_records(a: &AgentRecord, b: &AgentRecord) -> AgentRecord {
             }
         }
     };
+    // In-flight state describes the FRESHEST transcript — the one the
+    // agent is actually writing to. A frozen pre-clear transcript that
+    // happens to end on a tool_use says nothing about right now.
+    let in_flight_tool_use = match (a.jsonl_age_seconds, b.jsonl_age_seconds) {
+        (Some(x), Some(y)) if y < x => b.in_flight_tool_use,
+        (Some(_), Some(_)) => a.in_flight_tool_use,
+        (Some(_), None) => a.in_flight_tool_use,
+        (None, Some(_)) => b.in_flight_tool_use,
+        (None, None) => a.in_flight_tool_use || b.in_flight_tool_use,
+    };
     AgentRecord {
         agent_id: a.agent_id.clone(),
         queue_id,
         alive,
         jsonl_age_seconds,
+        in_flight_tool_use,
     }
 }
 
@@ -634,9 +798,17 @@ pub fn cmd_active_agents(json: bool, max_age_secs: u64, write_state: Option<&str
                     .map(|s| format!("{}s", s))
                     .unwrap_or_else(|| "?".to_string());
                 let alive = if a.alive { "alive" } else { "stale" };
+                // Name the reason an old transcript still counts as
+                // alive, so the terminal answers "why isn't this
+                // orphaned?" without a source dive.
+                let why = if a.in_flight_tool_use {
+                    "  in-flight-tool-call"
+                } else {
+                    ""
+                };
                 println!(
-                    "  {}  queue={}  {}  age={}",
-                    a.agent_id, qid, alive, age
+                    "  {}  queue={}  {}  age={}{}",
+                    a.agent_id, qid, alive, age, why
                 );
             }
         }
@@ -785,6 +957,7 @@ mod tests {
                 queue_id: Some("q-2026-05-01-6087".to_string()),
                 alive: true,
                 jsonl_age_seconds: Some(15),
+                in_flight_tool_use: false,
             }],
         };
         let json = serde_json::to_value(&agents).expect("serialize");
@@ -800,6 +973,7 @@ mod tests {
                 "queue_id": "q-2026-05-01-6087",
                 "alive": true,
                 "jsonl_age_seconds": 15,
+                "in_flight_tool_use": false,
             }])
         );
         // No extra keys leak through.
@@ -992,6 +1166,250 @@ mod tests {
             120,
         );
         assert!(records.is_empty());
+    }
+
+    // --- in-flight tool call liveness ---
+
+    /// A transcript whose LAST record is an assistant frame with a
+    /// `tool_use` block: the agent is parked inside that call. Shape
+    /// copied from a real transcript (2026-08-22 supercut agent).
+    const PENDING_TOOL_USE_TAIL: &str = concat!(
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"long wait"},{"type":"tool_use","name":"Bash","id":"toolu_1","input":{"command":"until grep -q DONE out; do sleep 20; done"}}]}}"#,
+        "\n",
+    );
+
+    /// A transcript whose LAST record is a `tool_result` — the agent
+    /// was BETWEEN calls when it went quiet. This is the shape a dead
+    /// agent (API 5xx on the following model turn) leaves behind.
+    const SETTLED_TAIL: &str = concat!(
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"toolu_1","input":{"command":"ls"}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn tail_pending_tool_use_detected() {
+        assert!(tail_ends_on_pending_tool_use(PENDING_TOOL_USE_TAIL));
+    }
+
+    #[test]
+    fn tail_tool_result_is_not_pending() {
+        assert!(!tail_ends_on_pending_tool_use(SETTLED_TAIL));
+    }
+
+    #[test]
+    fn tail_text_only_assistant_turn_is_not_pending() {
+        let tail = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+            "\n",
+        );
+        assert!(!tail_ends_on_pending_tool_use(tail));
+    }
+
+    #[test]
+    fn tail_string_content_assistant_turn_is_not_pending() {
+        let tail = "{\"type\":\"assistant\",\"message\":{\"content\":\"plain text\"}}\n";
+        assert!(!tail_ends_on_pending_tool_use(tail));
+    }
+
+    #[test]
+    fn tail_empty_or_unparseable_is_not_pending() {
+        assert!(!tail_ends_on_pending_tool_use(""));
+        assert!(!tail_ends_on_pending_tool_use("\n\n"));
+        assert!(!tail_ends_on_pending_tool_use("{not json at all"));
+    }
+
+    #[test]
+    fn tail_skips_truncated_trailing_line_and_uses_the_last_complete_one() {
+        // A record being written right now leaves a partial final line.
+        // The verdict must come from the newest COMPLETE record.
+        let tail = format!("{}{}", PENDING_TOOL_USE_TAIL, r#"{"type":"user","mess"#);
+        assert!(tail_ends_on_pending_tool_use(&tail));
+    }
+
+    #[test]
+    fn tail_ignores_a_partial_leading_line_from_the_seek() {
+        // We seek into the middle of the file, so the FIRST line is
+        // routinely garbage — it must not change the verdict.
+        let tail = format!("ontent\":\"...\"}}]}}}}\n{}", SETTLED_TAIL);
+        assert!(!tail_ends_on_pending_tool_use(&tail));
+    }
+
+    #[test]
+    fn alive_with_in_flight_short_circuits_on_fresh_mtime() {
+        // Fresh by mtime -> alive regardless of the tail shape.
+        assert!(agent_alive_with_in_flight(true, Some(3), false, 900));
+        assert!(agent_alive_with_in_flight(true, Some(3), true, 900));
+    }
+
+    #[test]
+    fn alive_with_in_flight_extends_window_for_pending_call() {
+        // Stale by the 120s window but inside a tool call -> alive.
+        assert!(agent_alive_with_in_flight(false, Some(443), true, 900));
+        // Same age, no pending call -> still dead.
+        assert!(!agent_alive_with_in_flight(false, Some(443), false, 900));
+    }
+
+    #[test]
+    fn alive_with_in_flight_gives_up_past_the_tool_window() {
+        assert!(agent_alive_with_in_flight(false, Some(900), true, 900));
+        assert!(!agent_alive_with_in_flight(false, Some(901), true, 900));
+        // Unreadable mtime is never evidence of a recent call.
+        assert!(!agent_alive_with_in_flight(false, None, true, 900));
+    }
+
+    #[test]
+    fn collect_agent_records_keeps_agent_in_a_long_tool_call_alive() {
+        // The 2026-08-22 false positive: an agent doing ONE long
+        // foreground Bash call (the documented way to run a long job)
+        // writes nothing for the whole call, ages past 120s, and was
+        // reported orphaned while demonstrably working.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let waiting = dir.path().join("agent-awaiting1.jsonl");
+        std::fs::write(&waiting, PENDING_TOOL_USE_TAIL).unwrap();
+        backdate(&waiting, 443); // the measured age when the alert fired
+
+        // Control: same age, but the transcript is settled between
+        // calls — that one IS stale and must stay stale.
+        let settled = dir.path().join("agent-bsettled1.jsonl");
+        std::fs::write(&settled, SETTLED_TAIL).unwrap();
+        backdate(&settled, 443);
+
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert_eq!(records.len(), 2, "{:?}", records);
+
+        let a = &records[0];
+        assert_eq!(a.agent_id, "awaiting1");
+        assert!(a.in_flight_tool_use, "pending tool_use must be detected");
+        assert!(a.alive, "agent inside a long tool call is NOT orphaned");
+        assert!(a.jsonl_age_seconds.unwrap_or(0) >= 443, "age is still reported honestly");
+
+        let b = &records[1];
+        assert_eq!(b.agent_id, "bsettled1");
+        assert!(!b.in_flight_tool_use);
+        assert!(!b.alive, "a settled, stale transcript stays stale");
+    }
+
+    #[test]
+    fn collect_agent_records_gives_up_on_a_tool_call_past_the_window() {
+        // The grace is bounded: a dangling tool_use forever (agent
+        // killed mid-call) must still surface as dead, just later.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-awedged11.jsonl");
+        std::fs::write(&path, PENDING_TOOL_USE_TAIL).unwrap();
+        backdate(&path, DEFAULT_AGENT_TOOL_CALL_MAX_AGE_SECS + 60);
+
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].in_flight_tool_use);
+        assert!(!records[0].alive, "the tool-call grace is bounded");
+    }
+
+    #[test]
+    fn collect_agent_records_reads_the_tail_of_a_large_transcript() {
+        // Real transcripts run to tens of MB; the verdict must come
+        // from the END of the file, not the first bytes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-abigfile01.jsonl");
+        let filler = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(4096)
+        );
+        let mut body = String::new();
+        while body.len() < (TRANSCRIPT_TAIL_BYTES as usize) * 2 {
+            body.push_str(&filler);
+        }
+        body.push_str(PENDING_TOOL_USE_TAIL);
+        std::fs::write(&path, &body).unwrap();
+        backdate(&path, 300);
+
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].in_flight_tool_use, "tail must win over head");
+        assert!(records[0].alive);
+    }
+
+    #[test]
+    fn merge_takes_in_flight_state_from_the_freshest_transcript() {
+        // A frozen pre-clear transcript can END on a tool_use whose
+        // result landed in the POST-clear file. That stale tail
+        // describes the past; the live continuation decides.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+        let id = "acrossclear1";
+
+        let older_jsonl = older.join(format!("agent-{}.jsonl", id));
+        std::fs::write(
+            &older_jsonl,
+            format!(
+                "{{\"message\":{{\"content\":\"Queue item: q-test-777\"}}}}\n{}",
+                PENDING_TOOL_USE_TAIL
+            ),
+        )
+        .unwrap();
+        backdate(&older_jsonl, 30 * 60);
+
+        let newer_jsonl = newer.join(format!("agent-{}.jsonl", id));
+        std::fs::write(&newer_jsonl, SETTLED_TAIL).unwrap();
+        backdate(&newer_jsonl, 400);
+
+        for dirs in [
+            vec![older.clone(), newer.clone()],
+            vec![newer.clone(), older.clone()],
+        ] {
+            let records = collect_agent_records_merged(&dirs, SystemTime::now(), 120);
+            assert_eq!(records.len(), 1, "{:?}", records);
+            let r = &records[0];
+            assert_eq!(r.queue_id.as_deref(), Some("q-test-777"));
+            assert!(
+                !r.in_flight_tool_use,
+                "in-flight state comes from the FRESHEST transcript, got {:?}",
+                r,
+            );
+            assert!(!r.alive, "settled + 400s stale -> not alive");
+        }
+    }
+
+    #[test]
+    fn merge_keeps_alive_when_the_continuation_is_mid_tool_call() {
+        // The full post-clear shape: marker in the old dir, and the
+        // live continuation parked in a long tool call. Owner must
+        // resolve AND report alive.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (older, newer) = build_two_session_dirs(tmp.path());
+        let id = "aliveintool1";
+
+        let older_jsonl = older.join(format!("agent-{}.jsonl", id));
+        write_marker_jsonl(&older_jsonl, "q-test-888");
+        backdate(&older_jsonl, 45 * 60);
+
+        let newer_jsonl = newer.join(format!("agent-{}.jsonl", id));
+        std::fs::write(&newer_jsonl, PENDING_TOOL_USE_TAIL).unwrap();
+        backdate(&newer_jsonl, 443);
+
+        let records =
+            collect_agent_records_merged(&[older, newer], SystemTime::now(), 120);
+        assert_eq!(records.len(), 1, "{:?}", records);
+        let r = &records[0];
+        assert_eq!(r.queue_id.as_deref(), Some("q-test-888"));
+        assert!(r.in_flight_tool_use);
+        assert!(r.alive, "live agent mid-tool-call must not read as orphaned");
+        assert!(r.jsonl_age_seconds.unwrap_or(0) < 45 * 60, "age from the newer file");
+    }
+
+    #[test]
+    fn agent_record_deserializes_without_the_in_flight_field() {
+        // A state file written by an older binary must still load.
+        let raw = r#"{"subagents":[],"workloads":[],
+          "agents":[{"agent_id":"a1","queue_id":"q-1","alive":true,
+                     "jsonl_age_seconds":5}]}"#;
+        let state: ActiveAgents = serde_json::from_str(raw).expect("parse");
+        assert_eq!(state.agents.len(), 1);
+        assert!(!state.agents[0].in_flight_tool_use);
     }
 
     // --- atomic_write ---
@@ -1331,6 +1749,7 @@ mod tests {
             queue_id: qid.map(|s| s.to_string()),
             alive,
             jsonl_age_seconds: age,
+            in_flight_tool_use: false,
         }
     }
 
