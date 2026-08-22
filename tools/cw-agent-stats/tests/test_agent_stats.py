@@ -76,10 +76,12 @@ def _tool_result(ts):
             "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}}
 
 
-def _assistant(blocks, *, mid, stop, usage, ts):
-    return {"type": "assistant", "timestamp": ts,
-            "message": {"id": mid, "role": "assistant", "content": blocks,
-                        "stop_reason": stop, "usage": usage}}
+def _assistant(blocks, *, mid, stop, usage, ts, model=None):
+    msg = {"id": mid, "role": "assistant", "content": blocks,
+           "stop_reason": stop, "usage": usage}
+    if model is not None:
+        msg["model"] = model
+    return {"type": "assistant", "timestamp": ts, "message": msg}
 
 
 def _write_jsonl(path: Path, entries, *, append=False):
@@ -259,6 +261,83 @@ def test_parse_main_tail_handles_large_prefix(tmp_path):
     assert path.stat().st_size > agentstats.MAIN_TAIL_BYTES
     got = agentstats.parse_main_tail(str(path))
     assert got == {"context_tokens": 100, "last_write_at": "2026-08-21T20:30:00.000Z"}
+
+
+def test_main_loop_model_and_tools_are_folded_into_totals(tmp_path, monkeypatch):
+    """The main loop's OWN turns must land in tool_totals/model_totals too.
+
+    Regression for the bug where ``claude_model_use_total`` only ever showed
+    the SUBAGENT model (e.g. Sonnet, per the "always Sonnet for subagents"
+    convention): the fleet-wide fold walked ``iter_subagent_transcripts``
+    only, and the main-loop transcript was scanned solely via
+    ``parse_main_tail`` for its latest context-token reading -- never through
+    the per-entry tool/model-folding path subagents get. A solo operator
+    running the main loop on a different model than their subagents (Opus vs
+    Sonnet) saw the main loop's model silently excluded, not merely
+    undercounted.
+    """
+    root = tmp_path / "projects"
+    slug = root / "-home-x"
+    sub = slug / "sess-1" / "subagents"
+
+    _write_jsonl(slug / "sess-1.jsonl", [
+        _user("hello"),
+        _assistant([{"type": "tool_use", "id": "t1", "name": "WebSearch", "input": {}}],
+                   mid="m-main-1", stop="tool_use", usage=_usage(10, 20, 1000, 5),
+                   ts="2026-08-21T20:00:01.000Z", model="claude-opus-4-8"),
+        _assistant([{"type": "text", "text": "done"}], mid="m-main-2", stop="end_turn",
+                   usage=_usage(2, 469, 488286, 40), ts="2026-08-21T20:00:02.000Z",
+                   model="claude-opus-4-8"),
+    ])
+
+    running = sub / "agent-running.jsonl"
+    _write_jsonl(running, [
+        _user("Queue item: q-2026-08-21-abcd\n\nYou are a coding agent."),
+        _assistant([{"type": "tool_use", "id": "t2", "name": "Bash", "input": {}}], mid="m1",
+                   stop="tool_use", usage=_usage(101, 946, 77464, 7),
+                   ts="2026-08-21T20:00:05.000Z", model="claude-sonnet-5"),
+    ])
+
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(root))
+    snap = agentstats.Collector(projects_dir=root).tick()
+
+    assert snap["model_totals"] == {"claude-opus-4-8": 2, "claude-sonnet-5": 1}
+    assert snap["tool_totals"] == {"WebSearch": 1, "Bash": 1}
+    assert snap["tool_model_totals"] == {
+        "WebSearch": {"claude-opus-4-8": 1},
+        "Bash": {"claude-sonnet-5": 1},
+    }
+
+
+def test_main_loop_model_fold_is_incremental_not_full_reparse(tmp_path, monkeypatch):
+    """Cold start seeds the main AgentState offset to the MAIN_TAIL_BYTES tail
+    (never a full re-parse of a potentially many-MB, open-ended main
+    transcript); later ticks only cost the newly appended bytes."""
+    root = tmp_path / "projects"
+    slug = root / "-home-x"
+    path = slug / "sess-1.jsonl"
+
+    filler = [_user("x" * 5000, ts=f"2026-08-21T19:00:{i % 60:02d}.000Z") for i in range(200)]
+    _write_jsonl(path, filler + [
+        _assistant([{"type": "text", "text": "t"}], mid="z1", stop="end_turn",
+                   usage=_usage(5, 5, 90, 1), ts="2026-08-21T20:30:00.000Z",
+                   model="claude-opus-4-8"),
+    ])
+    assert path.stat().st_size > agentstats.MAIN_TAIL_BYTES
+
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(root))
+    c = agentstats.Collector(projects_dir=root)
+    snap = c.tick()
+    assert snap["model_totals"] == {"claude-opus-4-8": 1}
+    assert c._main_state.offset >= path.stat().st_size - agentstats.MAIN_TAIL_BYTES
+
+    _write_jsonl(path, [
+        _assistant([{"type": "text", "text": "t2"}], mid="z2", stop="end_turn",
+                   usage=_usage(5, 5, 90, 2), ts="2026-08-21T20:31:00.000Z",
+                   model="claude-opus-4-8"),
+    ], append=True)
+    snap = c.tick()
+    assert snap["model_totals"] == {"claude-opus-4-8": 2}
 
 
 def test_write_snapshot_is_atomic_and_readable(tmp_path, projects):
