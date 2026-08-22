@@ -161,60 +161,57 @@ pub(crate) fn apply_thinking_token_progress(
     }
 }
 
-/// Age in whole seconds of the host heartbeat file's mtime relative to
-/// `now` (pure). Returns `None` when the mtime is unavailable (file
-/// missing/unreadable) or in the FUTURE relative to `now`
-/// (`duration_since` fails on clock skew / corrupt stamp). The
-/// heartbeat-freshness gate FAILS OPEN on `None` — the fire is allowed —
-/// deliberately unlike the workload-heartbeat suppressor (which treats a
-/// future mtime as fresh): a corrupt or skewed host heartbeat must never
-/// mask a real wedge.
-pub(crate) fn heartbeat_age_secs(mtime: Option<SystemTime>, now: SystemTime) -> Option<u64> {
+/// Age in whole seconds of a liveness stamp relative to `now` (pure).
+/// Returns `None` when the stamp is unavailable (file missing/unreadable) or
+/// in the FUTURE relative to `now` (`duration_since` fails on clock skew /
+/// corrupt stamp). The ack-freshness gate FAILS OPEN on `None` — the fire is
+/// allowed — deliberately unlike the workload-heartbeat suppressor (which
+/// treats a future mtime as fresh): a corrupt or skewed stamp must never mask
+/// a real wedge.
+pub(crate) fn ack_age_secs(mtime: Option<SystemTime>, now: SystemTime) -> Option<u64> {
     now.duration_since(mtime?).ok().map(|d| d.as_secs())
 }
 
-/// Heartbeat-freshness gate for the prolonged-thinking fire path (v3,
-/// 2026-06-11). In deployments where the supervised session touches the
-/// host heartbeat file (`[claude].heartbeat_file`) on a periodic cadence
-/// event, a FRESH mtime at fire time is proof the session is alive and
-/// merely parked in an open turn — the residual v2 false positive, where
-/// an ultra-quiet stretch drips fewer context tokens than
-/// `min_tokens_delta` per backoff window so the token-progress guard
-/// never re-arms. A STALE mtime means a possible real wedge (a wedged
-/// session stops touching the file by design), so the fire proceeds —
-/// and the daemon's separate heartbeat-stale detection escalates that
-/// case independently.
+/// Ack-freshness gate for the prolonged-thinking fire path (v3, 2026-06-11;
+/// re-sourced from the last-ack timestamp 2026-08-22). A RECENT ack at fire
+/// time is proof the session is alive and merely parked in an open turn — the
+/// residual v2 false positive, where an ultra-quiet stretch drips fewer
+/// context tokens than `min_tokens_delta` per backoff window so the
+/// token-progress guard never re-arms. A STALE ack means a possible real
+/// wedge (a wedged session stops acking by design), so the fire proceeds —
+/// and the daemon's separate ack-stale detection escalates that case
+/// independently.
 ///
 /// Returns `true` (suppress the fire) iff the gate is enabled
-/// (`heartbeat_fresh_secs > 0`) AND the heartbeat age is known AND
-/// `age < heartbeat_fresh_secs` — in which case it RE-ARMS the thinking
+/// (`ack_fresh_secs > 0`) AND the ack age is known AND
+/// `age < ack_fresh_secs` — in which case it RE-ARMS the thinking
 /// timer exactly like the v2 token-progress re-arm: `thinking_start` and
 /// the token baseline slide forward to `now`, so the timer only resumes
 /// accumulating from this check. Returns `false` (allow the fire,
-/// touch nothing) when the gate is disabled, the heartbeat file is
+/// touch nothing) when the gate is disabled, the ack stamp is
 /// missing/unreadable, its mtime is in the future (both surface here as
-/// `heartbeat_age_secs == None` — fail-open), or the age is at/over the
+/// `ack_age_secs == None` — fail-open), or the age is at/over the
 /// threshold. Split out from `check_foreground_inner` so the behavior is
 /// unit-testable without tmux (same pattern as
 /// `apply_thinking_token_progress`).
-pub(crate) fn apply_heartbeat_fresh_rearm(
+pub(crate) fn apply_ack_fresh_rearm(
     thinking_start: &mut Option<String>,
     episode_start_tokens: &mut Option<u64>,
-    heartbeat_age_secs: Option<u64>,
-    heartbeat_fresh_secs: u64,
+    ack_age_secs: Option<u64>,
+    ack_fresh_secs: u64,
     current_tokens: u64,
     now: &str,
 ) -> bool {
-    if heartbeat_fresh_secs == 0 {
+    if ack_fresh_secs == 0 {
         // Gate disabled.
         return false;
     }
-    let Some(age) = heartbeat_age_secs else {
-        // Missing/unreadable file or future mtime — fail open.
+    let Some(age) = ack_age_secs else {
+        // Missing/unreadable stamp or future mtime — fail open.
         return false;
     };
-    if age >= heartbeat_fresh_secs {
-        // Stale heartbeat — possible real wedge, allow the fire.
+    if age >= ack_fresh_secs {
+        // Stale ack — possible real wedge, allow the fire.
         return false;
     }
     *thinking_start = Some(now.to_string());
@@ -824,30 +821,27 @@ pub(crate) fn heartbeat_stale_liveness_reason(
     None
 }
 
-/// Check the last-ack timestamp file age (ack-driven heartbeat).
+/// Age in seconds of the last ack of ANY claude-event — THE liveness signal.
 ///
-/// Returns the age in seconds if the file exists and is readable, None otherwise.
-/// The file is written by `event-ack` on every ack (any event, not just
-/// heartbeat-tick), so its mtime serves as a liveness signal: ANY ack proves
-/// the loop is alive. The daemon emits a heartbeat-tick probe ONLY when this
-/// timestamp has gone quiet (no acks in a while), replacing the fixed-cadence
-/// heartbeat-tick with an on-demand probe.
+/// `event-ack` stamps `<state-dir>/last-ack-timestamp` on every ack, and the
+/// main loop's per-batch reflex is `event-ack ack-batch`, so this timestamp
+/// answers exactly one question: how long since the loop last handled
+/// anything. It is the only liveness input the daemon has (the host heartbeat
+/// FILE and its `touch` ritual were retired 2026-08-22 — two signals for one
+/// fact was the complexity Andrew asked to remove).
 ///
-/// Default-open: missing/unreadable file => None (treat as "no ack data yet",
-/// not an error). The daemon falls back to the legacy heartbeat_file check
-/// when this returns None.
+/// Default-open: missing/unreadable file => `None` (treat as "no ack data
+/// yet", not an error). A `None` NEVER reads as stale — a fresh host with no
+/// ack state must not alert; the first ack starts the clock.
 pub(crate) fn last_ack_timestamp_age(state_dir: &str) -> Option<u64> {
     use std::fs;
     use std::time::SystemTime;
 
-    let path = std::path::Path::new(state_dir).join("last-ack-timestamp");
+    let path = std::path::Path::new(state_dir).join(crate::config::LAST_ACK_FILE);
     let meta = fs::metadata(&path).ok()?;
-    let modified = meta.modified().ok()?;
-    let age = SystemTime::now()
-        .duration_since(modified)
-        .ok()?
-        .as_secs();
-    Some(age)
+    // Age via the pure helper so the fail-open rule for a future/skewed stamp
+    // is defined in exactly one place (and stays unit-testable without I/O).
+    ack_age_secs(meta.modified().ok(), SystemTime::now())
 }
 
 /// Reason a force-inject escalation should fire.
@@ -1632,31 +1626,25 @@ async fn check_foreground_inner(
                         );
                         return;
                     }
-                    // Host-heartbeat freshness gate (v3, 2026-06-11): if the
-                    // supervised session touched the host heartbeat file
-                    // (`[claude].heartbeat_file` — the same path the
-                    // heartbeat-stale detector watches) within
-                    // `heartbeat_fresh_secs`, the session is demonstrably
-                    // alive and this is an idle parked-open turn, not a
-                    // wedge — suppress and RE-ARM (slide thinking_start +
+                    // Ack-freshness gate (v3, 2026-06-11; re-sourced from the
+                    // last-ack timestamp 2026-08-22): if the supervised
+                    // session acked an event — the SAME signal the ack-stale
+                    // detector watches — within `ack_fresh_secs`, it is
+                    // demonstrably alive and this is an idle parked-open turn,
+                    // not a wedge: suppress and RE-ARM (slide thinking_start +
                     // token baseline, same as the v2 token-progress re-arm).
-                    // Stale/missing/unreadable/future-mtime heartbeat allows
-                    // the fire (fail-open); 0 disables the gate. Checked
-                    // BEFORE the global-gate claim so a suppressed cycle
-                    // does not consume a claim. The age is also reused in
-                    // the fire-time observability fields below.
-                    let hb_age_secs = heartbeat_age_secs(
-                        std::fs::metadata(&config.claude.heartbeat_file)
-                            .ok()
-                            .and_then(|m| m.modified().ok()),
-                        SystemTime::now(),
-                    );
+                    // A stale/missing/unreadable/future stamp allows the fire
+                    // (fail-open); 0 disables the gate. Checked BEFORE the
+                    // global-gate claim so a suppressed cycle does not consume
+                    // a claim. The age is also reused in the fire-time
+                    // observability fields below.
+                    let hb_age_secs = last_ack_timestamp_age(&config.ack.resolve_state_dir());
                     let pre_rearm_baseline = state.thinking_episode_start_tokens;
-                    if apply_heartbeat_fresh_rearm(
+                    if apply_ack_fresh_rearm(
                         &mut state.thinking_start,
                         &mut state.thinking_episode_start_tokens,
                         hb_age_secs,
-                        config.foreground_monitor.heartbeat_fresh_secs,
+                        config.foreground_monitor.ack_fresh_secs,
                         tokens,
                         &now,
                     ) {
@@ -1664,12 +1652,12 @@ async fn check_foreground_inner(
                         info!(
                             elapsed_secs = elapsed,
                             threshold = next_threshold,
-                            heartbeat_age_secs = hb_age_secs,
-                            heartbeat_fresh_secs = config.foreground_monitor.heartbeat_fresh_secs,
+                            ack_age_secs = hb_age_secs,
+                            ack_fresh_secs = config.foreground_monitor.ack_fresh_secs,
                             start_tokens,
                             tokens,
                             tokens_delta = tokens.saturating_sub(start_tokens),
-                            "prolonged thinking suppressed: host heartbeat fresh — \
+                            "prolonged thinking suppressed: recent event ack — \
                              session alive, idle parked-open turn; re-arming"
                         );
                         write_jsonl_log(
@@ -1678,10 +1666,10 @@ async fn check_foreground_inner(
                             serde_json::json!({
                                 "elapsed_secs": elapsed,
                                 "threshold_secs": next_threshold,
-                                "reason": "heartbeat_fresh",
-                                "heartbeat_age_secs": hb_age_secs,
-                                "heartbeat_fresh_secs": config.foreground_monitor.heartbeat_fresh_secs,
-                                "heartbeat_file": &config.claude.heartbeat_file,
+                                "reason": "ack_fresh",
+                                "ack_age_secs": hb_age_secs,
+                                "ack_fresh_secs": config.foreground_monitor.ack_fresh_secs,
+                                "ack_state_dir": config.ack.resolve_state_dir(),
                                 "start_tokens": start_tokens,
                                 "tokens": tokens,
                                 "tokens_delta": tokens.saturating_sub(start_tokens),
@@ -1793,7 +1781,7 @@ async fn check_foreground_inner(
                         tokens_delta = tokens.saturating_sub(start_tokens.unwrap_or(0)),
                         baseline_recorded = start_tokens.is_some(),
                         min_tokens_delta = config.foreground_monitor.min_tokens_delta,
-                        heartbeat_age_secs = hb_age_secs,
+                        ack_age_secs = hb_age_secs,
                         "prolonged thinking detected — interrupting (backoff)"
                     );
                     write_jsonl_log(
@@ -1807,8 +1795,8 @@ async fn check_foreground_inner(
                             "tokens_delta": tokens.saturating_sub(start_tokens.unwrap_or(0)),
                             "baseline_recorded": start_tokens.is_some(),
                             "min_tokens_delta": config.foreground_monitor.min_tokens_delta,
-                            "heartbeat_age_secs": hb_age_secs,
-                            "heartbeat_fresh_secs": config.foreground_monitor.heartbeat_fresh_secs,
+                            "ack_age_secs": hb_age_secs,
+                            "ack_fresh_secs": config.foreground_monitor.ack_fresh_secs,
                             "interrupt_count": state.thinking_interrupt_count,
                             "next_threshold_secs": next_threshold,
                             "action": if config.foreground_monitor.interrupt_enabled { "interrupt" } else { "log-only" },
@@ -5705,48 +5693,29 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.consecutive_fast_detections = 0;
     }
 
-    // --- Heartbeat stale detection (ack-driven) ---
-    // Redesign (2026-08-21): the daemon now checks the last-ack timestamp
-    // (written by event-ack on EVERY ack, not just heartbeat-tick) as the
-    // primary liveness signal. ANY ack proves the loop is alive. The daemon
-    // emits heartbeat-tick ONLY when acks have gone quiet (on-demand probe).
-    // Falls back to the legacy heartbeat_file check when the last-ack
-    // timestamp is unavailable (fresh boot, stripped deployment without
-    // event-must-act infrastructure).
+    // --- Ack-stale detection (THE liveness check) ---
+    // Redesign (2026-08-22, botchat #3155-#3167): there is exactly ONE
+    // liveness signal — the age of the last ack of ANY claude-event. The main
+    // loop acks every batch it handles (`event-ack ack-batch`), which stamps
+    // `<state-dir>/last-ack-timestamp`; the daemon reads that stamp here. The
+    // host heartbeat FILE and its `touch` ritual are GONE: two signals for one
+    // fact was the complexity Andrew asked to remove, and the file had its own
+    // failure mode (the loop touching it while ignoring the events that told
+    // it to). The `keepalive` event exists only to give an IDLE loop something
+    // to ack before this threshold elapses.
     let mut stuck = false;
     let mut stuck_reason = String::new();
     // Captured for the claude-event sink so the main loop can parse
     // `stale_minutes` as a number rather than re-regex'ing the string.
     let mut stuck_stale_minutes: Option<u64> = None;
 
-    // Resolve the event state dir the same way event-ack does: $CLAUDE_EVENT_STATE_DIR,
-    // else ~/.config/claude-events/.
-    let event_state_dir = std::env::var("CLAUDE_EVENT_STATE_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{}/.config/claude-events", home)
-        });
-
-    // Check last-ack timestamp first (ack-driven heartbeat).
-    let last_ack_age = last_ack_timestamp_age(&event_state_dir);
-    let heartbeat_age = match std::fs::metadata(&config.claude.heartbeat_file) {
-        Ok(meta) => meta
-            .modified()
-            .ok()
-            .and_then(|m| SystemTime::now().duration_since(m).ok())
-            .map(|d| d.as_secs()),
-        Err(_) => None,
-    };
-
-    // Use last-ack age if available; else fall back to heartbeat_file age.
-    // This preserves wedge detection during the transition (hosts without
-    // event-must-act still have heartbeat_file-based detection).
-    let liveness_age = last_ack_age.or(heartbeat_age);
+    // `[ack] state_dir`, else $CLAUDE_EVENT_STATE_DIR, else
+    // ~/.config/claude-events/ — the same ladder `event-ack` walks, so the
+    // writer and this reader cannot drift apart.
+    let liveness_age = last_ack_timestamp_age(&config.ack.resolve_state_dir());
 
     if let Some(age) = liveness_age {
-        let stale_secs = config.heartbeat.stale_minutes * 60;
+        let stale_secs = config.ack.stale_minutes * 60;
         if age >= stale_secs {
                     // Workload-heartbeat suppression: a long-running
                     // `workload run` (stv-promote, big rsync, ffmpeg)
@@ -5800,7 +5769,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         let age_min = age / 60;
                         debug!(
                             stale_age_min = age_min,
-                            threshold_min = config.heartbeat.stale_minutes,
+                            threshold_min = config.ack.stale_minutes,
                             workload_fresh,
                             active_subagents,
                             loop_thinking,
@@ -5813,7 +5782,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             "heartbeat_stale_suppressed",
                             serde_json::json!({
                                 "stale_age_min": age_min,
-                                "threshold_min": config.heartbeat.stale_minutes,
+                                "threshold_min": config.ack.stale_minutes,
                                 "reason": reason,
                                 "workload_fresh": workload_fresh,
                                 "active_subagents": active_subagents,
@@ -5827,17 +5796,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         stuck = true;
                         let age_min = age / 60;
                         stuck_reason = format!(
-                            "heartbeat stale ({}min, threshold={}min, watchmen={})",
-                            age_min,
-                            config.heartbeat.stale_minutes,
-                            watchmen_count
+                            "no event ack for {}min (threshold={}min, watchmen={})",
+                            age_min, config.ack.stale_minutes, watchmen_count
                         );
                         stuck_stale_minutes = Some(age_min);
                         state.heartbeat_stale_count += 1;
                     }
         }
-        // No liveness signal available (neither last-ack nor heartbeat_file) --
-        // give it time. This is the fresh-boot / early-daemon-start case.
+        // No ack stamp at all -- give it time. Fresh boot / early daemon start
+        // / a host without event-must-act. Absence is NOT staleness: the clock
+        // starts at the first ack.
     }
 
     // --- AskUserQuestion stale detection (Phase 1: detect + alarm) ---
@@ -7291,28 +7259,27 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             stuck_reason = %stuck_reason,
                             dwell_secs = config.general.obligation_dwell_secs,
                             active_subagents = hb_active_subagents,
-                            "heartbeat-stale: obligation armed/held — deferring interrupt"
+                            "ack-stale: obligation armed/held — deferring interrupt"
                         );
                     }
                     ObligationDecision::Escalate => {
-                        // Inject the heartbeat-SPECIFIC recovery prompt, not the
-                        // generic `resume_prompt`. This is the heartbeat-stale
-                        // path (the only site that sets `stuck = true`), and the
-                        // recovery action is to touch the host heartbeat file to
-                        // restore liveness. The generic resume_prompt (a
-                        // "/cleanup" directive) never mentions the heartbeat
-                        // file, so prior to this the inject landed but the loop
-                        // never touched the file and it stayed stale even while
-                        // the loop was actively working (2026-06-19 incident:
-                        // ~85 min stale with a live loop).
+                        // Inject the ack-SPECIFIC recovery prompt, not the
+                        // generic `resume_prompt`. This is the ack-stale path
+                        // (the only site that sets `stuck = true`), and the
+                        // recovery action is to run the per-batch ack. The
+                        // generic resume_prompt (a "/cleanup" directive) never
+                        // mentions acking, so prior to this the inject landed
+                        // but liveness stayed stale even while the loop was
+                        // actively working (2026-06-19 incident: ~85 min stale
+                        // with a live loop).
                         alert::alert(
                             &msg,
                             &alert_pane,
-                            &config.alerts.heartbeat_stale_prompt,
+                            &config.alerts.ack_stale_prompt,
                             use_pingme,
                             event_alert,
-                            // KNOB #4 (2026-06-24): heartbeat-stale is a ROUTINE
-                            // tier — recovery is a `touch` of the heartbeat file,
+                            // KNOB #4 (2026-06-24): ack-stale is a ROUTINE tier
+                            // — recovery is one bare `event-ack ack-batch`,
                             // which can wait for the next turn boundary. Do NOT
                             // seize the turn / kill subagents: queue the nudge.
                             false,
@@ -8744,7 +8711,7 @@ cooldown = 300
         // identical state effect to the v2 token-progress re-arm.
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        let suppressed = apply_heartbeat_fresh_rearm(
+        let suppressed = apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(120),
@@ -8764,7 +8731,7 @@ cooldown = 300
         // baseline-refresh semantics.
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(apply_heartbeat_fresh_rearm(
+        assert!(apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(0),
@@ -8782,7 +8749,7 @@ cooldown = 300
         // the fire, touch nothing. Boundary (age == threshold) is stale.
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(900),
@@ -8790,7 +8757,7 @@ cooldown = 300
             290_000,
             "now"
         ));
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(600),
@@ -8803,13 +8770,13 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_missing_file_fails_open() {
-        // Missing/unreadable heartbeat file surfaces as age None: the gate
-        // must FAIL OPEN (allow the fire) and touch nothing.
-        assert_eq!(heartbeat_age_secs(None, SystemTime::now()), None);
+    fn test_ack_missing_stamp_fails_open() {
+        // Missing/unreadable ack stamp surfaces as age None: the gate must
+        // FAIL OPEN (allow the fire) and touch nothing.
+        assert_eq!(ack_age_secs(None, SystemTime::now()), None);
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             None,
@@ -8822,20 +8789,20 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_future_mtime_fails_open() {
+    fn test_ack_future_mtime_fails_open() {
         // mtime in the future relative to now: duration_since fails, age
         // is None, gate fails open. (Deliberately NOT treated as fresh,
         // unlike the workload-heartbeat suppressor — a corrupt or skewed
-        // host heartbeat must never mask a real wedge.)
+        // stamp must never mask a real wedge.)
         let now = SystemTime::now();
         let future = now + std::time::Duration::from_secs(60);
-        assert_eq!(heartbeat_age_secs(Some(future), now), None);
+        assert_eq!(ack_age_secs(Some(future), now), None);
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
-            heartbeat_age_secs(Some(future), now),
+            ack_age_secs(Some(future), now),
             600,
             290_000,
             "now"
@@ -8844,12 +8811,12 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_gate_zero_disables() {
-        // heartbeat_fresh_secs = 0 disables the gate entirely: even a
-        // just-touched heartbeat (age 0) never suppresses.
+    fn test_ack_gate_zero_disables() {
+        // ack_fresh_secs = 0 disables the gate entirely: even a just-stamped
+        // ack (age 0) never suppresses.
         let mut start = Some("episode-start".to_string());
         let mut baseline = Some(283_000u64);
-        assert!(!apply_heartbeat_fresh_rearm(
+        assert!(!apply_ack_fresh_rearm(
             &mut start,
             &mut baseline,
             Some(0),
@@ -8862,11 +8829,11 @@ cooldown = 300
     }
 
     #[test]
-    fn test_heartbeat_age_secs_past_mtime() {
+    fn test_ack_age_secs_past_mtime() {
         // Plain past mtime: age computes in whole seconds.
         let now = SystemTime::now();
         let past = now - std::time::Duration::from_secs(123);
-        assert_eq!(heartbeat_age_secs(Some(past), now), Some(123));
+        assert_eq!(ack_age_secs(Some(past), now), Some(123));
     }
 
     #[test]

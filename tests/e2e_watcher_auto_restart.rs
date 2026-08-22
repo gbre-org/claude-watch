@@ -169,7 +169,7 @@ fn watcher_down_triggers_inject_and_main_loop_restarts_it() {
         "watcher-restart",
         TestEnvOptions {
             check_interval: 1,
-            heartbeat_stale_minutes: 9999, // disable heartbeat alerts
+            ack_stale_minutes: 9999, // disable ack-stale alerts
             foreground_threshold: 9999,    // disable foreground monitor
             // Watcher monitor: fast firing path.
             //   threshold=2 -> two consecutive missing checks -> ~2s

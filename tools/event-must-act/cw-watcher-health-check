@@ -15,9 +15,9 @@
 # are accumulating, the event consumption path is broken).
 #
 # This is the CRON-DRIVEN RECOVERY injector. It is distinct from, and
-# complementary to, the claude-watch DAEMON's own heartbeat-stale inject:
-#   - The daemon fires when the *host heartbeat file* mtime goes stale (the
-#     main loop stopped touching it). PREVENTION/liveness path.
+# complementary to, the claude-watch DAEMON's own ack-stale inject:
+#   - The daemon fires when the *last-ack timestamp* goes stale (the main loop
+#     stopped acking events). PREVENTION/liveness path.
 #   - This script fires when *event files* go unconsumed (the event WATCHER
 #     is dead, even if the loop is otherwise alive). RECOVERY path for the
 #     watcher itself.
@@ -172,8 +172,28 @@ if [ ! -d "$QUEUE" ]; then
     exit 0
 fi
 
-# Count .json files older than the threshold.
-STALE=$(find "$QUEUE" -name '*.json' -mmin +"$STALE_MIN" 2>/dev/null | wc -l)
+# Count unconsumed EVENTS older than the threshold.
+#
+# The three predicates below are each load-bearing, and the first two were
+# missing until 2026-08-22:
+#
+#   -maxdepth 1   The queue dir's TOP LEVEL is the queue. A recursive find
+#                 descends into any subdirectory and counts what it finds as
+#                 unconsumed events. #681 put a `.state/last-heartbeat.json`
+#                 marker one level down, and this check fired
+#                 "WATCHER DOWN: 1 event(s) unconsumed >6min" twice in one day
+#                 off it — exactly 6 minutes after the directory's mtime,
+#                 which is what a real stale event looks like. The marker is
+#                 gone now, but the guard stays: a scan that counts state as
+#                 events will make that mistake again the next time anything
+#                 writes beside the queue.
+#   ! -name '.*'  Dotfiles are never events. `claude-event` writes each event
+#                 to a dot-prefixed temp file and renames it into place, so a
+#                 leftover temp from an interrupted write would otherwise
+#                 register as an unconsumed event forever.
+#   -type f       A directory named `*.json` is not an event either.
+STALE=$(find "$QUEUE" -maxdepth 1 -type f -name '*.json' ! -name '.*' \
+    -mmin +"$STALE_MIN" 2>/dev/null | wc -l)
 
 if [ "$STALE" -le 0 ]; then
     # Bus is healthy (nothing stale) — clear the escalation counter so a

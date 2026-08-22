@@ -51,7 +51,7 @@ In `~/.claude/settings.json` (after `make install` puts the binaries in
 | Script | Hook event | Matcher | Purpose |
 |--------|------------|---------|---------|
 | `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses `Agent` spawns missing a `Queue item: q-XXXX` marker, or whose marker isn't `running` in the queue. |
-| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces built-in architectural gates: (a) bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`); (b) `Monitor` tool denied inside subagent context; (c) narrow ALLOW for the heartbeat-liveness `touch` (see "Hardcoded gates" below). |
+| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces built-in architectural gates: (a) bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`); (b) `Monitor` tool denied inside subagent context; (c) narrow ALLOW for the liveness ack `event-ack ack-batch` (see "Hardcoded gates" below). |
 | `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories) and manages a sidecar registry for `no_pending_watcher_outputs`. |
 | `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks external-messaging attachments as read via a host-specific `*-mark-read` shim when Claude opens a file under a configured attachment dir. Host-specific integration; safe no-op when neither the shim nor the dir is present. |
 
@@ -64,7 +64,7 @@ the loop.
 script-local code, BEFORE the obligations CLI dispatch. These run even
 with an empty obligations store -- they encode invariants that must hold
 regardless of stored-state health. Two are DENY gates (`watcher-ctl run`,
-`Monitor`); one is a narrow ALLOW (the heartbeat-liveness `touch`).
+`Monitor`); one is a narrow ALLOW (the liveness ack).
 
 ### Bare `watcher-ctl run`
 
@@ -122,40 +122,38 @@ the non-zero exit reads like a cosmetic local-cleanup nit. `pr-branches
 merge` re-reads the PR afterwards and deletes the ref explicitly if that
 happened. See `tools/pr-branches/README.md`.
 
-### Heartbeat-liveness `touch` (narrow ALLOW)
+### Liveness ack (narrow ALLOW)
 
-When claude-watch detects a stale heartbeat it injects an instruction to
-run `touch /var/run/claude/heartbeat` as a single Bash tool call to
-restore liveness. But a stale heartbeat frequently coincides with a
-watcher being momentarily down -- so the `watchers_healthy` (and often
-`no_pending_watcher_outputs`) predicate would DENY that very touch. That
-is a catch-22: the liveness-recovery touch the daemon is begging for
+When claude-watch detects that nothing has been acked for `[ack]
+stale_minutes` it injects an instruction to run `event-ack ack-batch` as a
+single Bash tool call to restore liveness. But a stale ack frequently
+coincides with a watcher being momentarily down -- so the `watchers_healthy`
+(and often `no_pending_watcher_outputs`) predicate would DENY that very ack.
+That is a catch-22: the liveness-recovery command the daemon is begging for
 can't run until watchers are restarted first.
 
-The fix is a narrow ALLOW evaluated BEFORE the obligations CLI dispatch:
-a Bash command whose SOLE effective action is `touch
-/var/run/claude/heartbeat` passes the gate regardless of obligation
-state. It is tightly scoped via the AST matcher -- the command must be a
-single top-level segment (no `&&` / `||` / `;` / `|` / `&` / newline),
-its effective head (after stripping env-assignments / `sudo` / wrappers)
-must be `touch`, and its only non-flag operand must be exactly
-`/var/run/claude/heartbeat`. A bundled command (`touch
-/var/run/claude/heartbeat && rm -rf x`), a different path, a second
-operand, or a value-taking flag (`-r`/`-t`/`-d`) all fall through to the
-normal gate. The liveness touch is a pure state-restore with no
-destructive side effect, so allowing it is safe. Parse failure fails
-CLOSED (the command is treated as non-exempt).
+The fix is a narrow ALLOW evaluated BEFORE the obligations CLI dispatch: a
+Bash command whose SOLE effective action is `event-ack ack-batch` passes the
+gate regardless of obligation state. It is tightly scoped via the AST matcher
+-- the command must be a single top-level segment (no `&&` / `||` / `;` / `|`
+/ `&` / newline), its effective head (after stripping env-assignments /
+`sudo` / wrappers) must be `event-ack` (bare or an absolute path), and its
+only non-flag operand must be exactly `ack-batch`. A bundled command
+(`event-ack ack-batch && rm -rf x`), a different subcommand, a second
+operand, or `ack-batch` appearing as a flag VALUE (`event-ack clear --action
+ack-batch`) all fall through to the normal gate. Parse failure fails CLOSED
+(the command is treated as non-exempt).
 
-Liveness is now **ack-driven** (#649): heartbeat-tick's normal clear-path
-is a plain `event-ack ack "<key>" --action "..."`, which refreshes the
-liveness timestamp on ANY ack, not just heartbeat-tick acks. `event-ack` is
-already exempt from the dedicated `event_must_act` evaluator, so it clears
-the gate it exists to resolve without needing a hardcoded ALLOW here. A
-prior `heartbeat-ack` wrapper shared this hardcoded ALLOW (it did the touch
-*and* the ack in one command); it was retired 2026-08-21 once the
-ack-driven redesign made the wrapper redundant. The bare touch above
-remains as the universal catch-22 fallback for the pathological case where
-a down watcher blocks `event-ack` itself too.
+`event-ack` is separately exempt from the dedicated `event_must_act`
+evaluator; this ALLOW is broader on purpose (it bypasses EVERY gate) for the
+pathological case where a down watcher blocks `event-ack` itself too.
+
+Until 2026-08-22 this ALLOW covered `touch /var/run/claude/heartbeat`
+instead. That file WAS the liveness signal; it is retired, and the recovery
+action is now the same ack the loop performs after every event batch. Worth
+noting what the old shape permitted: a loop could satisfy the daemon by
+touching a file while never reading a single event. Acking cannot be faked
+that way.
 
 ### Bypass
 

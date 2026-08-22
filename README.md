@@ -46,7 +46,7 @@ repo and it will know the build + test loop without further setup.
 claude-watch captures the Claude Code tmux pane every few seconds and parses it to determine what Claude is doing:
 
 - **Activity detection**: Thinking, Writing, ToolRunning, Idle, ForegroundBash, ShellPrompt
-- **Health monitoring**: Detects zombie sessions (no heartbeat), token stalls (context exhaustion), prolonged thinking, and foreground blocks
+- **Health monitoring**: Detects zombie sessions (no event acked in the stale window), token stalls (context exhaustion), prolonged thinking, and foreground blocks
 - **Recovery actions**: Injects prompts to resume stalled sessions, triggers context clears, sends push-notification alerts (via a pluggable `pingme` shim — wire it to whatever notification service you prefer)
 - **Fresh session detection**: Detects when Claude Code starts fresh (via `dashboard --recreate --fresh`) and injects a resume prompt
 - **Task monitoring**: Watches Claude Code's background task output files, tracks agent lifecycle, cleans up orphaned tmux panes

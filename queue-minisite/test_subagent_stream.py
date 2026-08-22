@@ -237,11 +237,10 @@ class SubagentTreeTest(unittest.TestCase):
 
     def test_meta_surfaces_subagents_for_running_owner(self):
         """A running item whose owner agent resolves to a session dir with
-        multiple ``agent-*.jsonl`` siblings surfaces the siblings in the
-        ``subagents`` list on /meta. The OWNER agent itself is DROPPED (it IS
-        the item, not a child of it — the self-nesting fix). With no bindings
-        and no markers this exercises the fallback path, which still drops
-        the owner.
+        multiple ``agent-*.jsonl`` siblings surfaces the siblings ATTRIBUTED
+        TO IT in the ``subagents`` list on /meta. The OWNER agent itself is
+        DROPPED (it IS the item, not a child of it — the self-nesting fix).
+        Marker-only attribution here (no bindings file).
         """
         item = _add(self.env, "nested subagent tree", ["repo:subagent-test"])
         qid = item["id"]
@@ -251,9 +250,11 @@ class SubagentTreeTest(unittest.TestCase):
         owner_id = "a11e41aad23c6fcac"
         sibling_id = "b22f52bbe34d7adbd"
         _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=5)
-        # Two subagent transcripts in the SAME session subagents/ dir.
-        _seed_subagent_jsonl(self.jsonl_root, session_uuid, owner_id)
-        _seed_subagent_jsonl(self.jsonl_root, session_uuid, sibling_id)
+        # Two subagent transcripts in the SAME session subagents/ dir, both
+        # carrying THIS item's spawn marker.
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, owner_id, qid)
+        self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, sibling_id, qid)
         self.appmod._cache.fetched_at = 0.0
 
         r = self.client.get(f"/api/queue/{qid}/meta")
@@ -275,7 +276,8 @@ class SubagentTreeTest(unittest.TestCase):
             self.assertIn("age", s)
         # The sibling record's label is derived from the first user message.
         sib_rec = next(s for s in subs if s["subagent_id"] == sibling_id)
-        self.assertEqual(sib_rec["label"], "do the thing")
+        self.assertTrue(sib_rec["label"].startswith(f"Queue item: {qid}"),
+                        f"label comes from the first user message: {sib_rec}")
 
     def test_meta_subagents_empty_when_no_owner_agent(self):
         """A running item with NO agent record (owner unknown) -> empty
@@ -306,10 +308,24 @@ class SubagentTreeTest(unittest.TestCase):
         sibling_id = "d44a74dda56f9b1ce"
         project_slug = "-home-hndrewaall-workspace"
         _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
-        _seed_subagent_jsonl(self.jsonl_root, session_uuid, owner_id,
-                             project_slug=project_slug)
-        _seed_subagent_jsonl(self.jsonl_root, session_uuid, sibling_id,
-                             project_slug=project_slug)
+        # Both carry this item's spawn marker, so the sibling is attributable
+        # and the test isolates the LAYOUT question (does the two-level mount
+        # resolve at all) from the attribution question.
+        for aid in (owner_id, sibling_id):
+            _seed_subagent_jsonl(
+                self.jsonl_root, session_uuid, aid,
+                project_slug=project_slug,
+                lines=[{
+                    "type": "user",
+                    "sessionId": session_uuid,
+                    "agentId": aid,
+                    "isSidechain": True,
+                    "uuid": "u1",
+                    "message": {
+                        "role": "user",
+                        "content": f"Queue item: {qid}\nDo the scoped task.",
+                    },
+                }])
         self.appmod._cache.fetched_at = 0.0
 
         r = self.client.get(f"/api/queue/{qid}/meta")
@@ -377,12 +393,16 @@ class SubagentTreeTest(unittest.TestCase):
         self.assertEqual(ids, set(),
                          f"expected empty tree for A, got {subs}")
 
-    def test_meta_subagents_unfiltered_when_no_markers(self):
-        """Back-compat fallback: when NO sibling carries a ``Queue item:``
-        marker AND there is no bindings file (pre-arm-hook transcripts), keep
-        the session siblings rather than render a silently-empty tree -- but
-        STILL drop the owner so the self-nesting bug can't resurface even in
-        fallback mode.
+    def test_meta_subagents_empty_when_no_attribution_anywhere(self):
+        """No bindings, no markers, no spawn edges -> EMPTY tree.
+
+        The old behaviour here was to fall back to "every sibling in the
+        session minus the owner". That is not a degraded tree, it is a WRONG
+        one: a session's ``subagents/`` dir holds every agent of that
+        main-loop session, so unrelated items' agents rendered as this item's
+        children (three running items each showing the other two as their
+        subagents, 2026-08-22). With nothing to attribute on, the honest
+        rendering is no children at all.
         """
         item = _add(self.env, "no-marker fallback", ["repo:subagent-nomarker"])
         qid = item["id"]
@@ -400,9 +420,216 @@ class SubagentTreeTest(unittest.TestCase):
         r = self.client.get(f"/api/queue/{qid}/meta")
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         ids = {s["subagent_id"] for s in r.get_json().get("subagents", [])}
-        # No attribution -> fallback keeps siblings, but the owner is dropped.
-        self.assertEqual(ids, {sibling_id},
-                         f"fallback keeps siblings minus owner, got {ids}")
+        self.assertEqual(ids, set(),
+                         f"unattributable siblings must NOT render: {ids}")
+
+    # ---------- attribution across a main-loop session CLEAR ----------
+    #
+    # When the main loop clears/restarts while a subagent is still running,
+    # the agent keeps writing under the NEW session id: its transcript
+    # CONTINUES as a fresh ``agent-<id>.jsonl`` that starts MID-STREAM, with
+    # no ``role: user`` record and therefore no ``Queue item: q-XXXX`` marker.
+    # The marker (and any spawn records) stay in the PRE-clear file. Reading
+    # only the current session's file loses every agent's attribution at once
+    # — which, with no bindings file on the host, is exactly how three running
+    # items each rendered the other two items' owner agents as their children
+    # (2026-08-22).
+
+    def _seed_continuation_subagent(self, jsonl_root, session_uuid, agent_id):
+        """Seed a POST-clear continuation transcript: starts MID-STREAM.
+
+        First record is an ``assistant`` tool_use (no user message anywhere),
+        followed by a tool_result-carrying ``user`` record whose content holds
+        NO text block — so ``_first_user_text`` finds nothing to parse and the
+        spawn marker is genuinely unavailable from this file.
+        """
+        lines = [
+            {
+                "type": "assistant",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+                "isSidechain": True,
+                "uuid": "c1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_cont1",
+                            "name": "Bash",
+                            "input": {"command": "true"},
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": session_uuid,
+                "agentId": agent_id,
+                "uuid": "c2",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_cont1",
+                            "content": [],
+                        }
+                    ],
+                },
+            },
+        ]
+        return _seed_subagent_jsonl(
+            jsonl_root, session_uuid, agent_id, lines=lines)
+
+    @staticmethod
+    def _backdate(path, seconds=600):
+        """Make ``path`` clearly older, so the continuation file is the most
+        recently modified one (what the resolver picks for the live session).
+        """
+        t = path.stat().st_mtime - seconds
+        os.utime(path, (t, t))
+
+    def test_marker_recovered_from_pre_clear_session_transcript(self):
+        """A continuation transcript with no marker still attributes: the
+        spawn prompt is read from the SAME agent's pre-clear transcript in the
+        other session dir. Owner + a co-bound peer both survive the clear; the
+        peer must still surface under this item.
+        """
+        item = _add(self.env, "post-clear peer", ["repo:subagent-clear-peer"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        old_session = "11a72b67-894a-4c87-8084-2ec693a14b69"
+        new_session = "dd2c04ec-7a69-493a-9648-41c92c30fdfa"
+        owner_id = "a1111111111111111"
+        peer_id = "b2222222222222222"
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
+        # Pre-clear transcripts carry the spawn markers...
+        for aid in (owner_id, peer_id):
+            self._backdate(
+                self._seed_marked_subagent(
+                    self.jsonl_root, old_session, aid, qid))
+        # ...the post-clear continuations carry nothing attributable.
+        for aid in (owner_id, peer_id):
+            self._seed_continuation_subagent(
+                self.jsonl_root, new_session, aid)
+        self.appmod._cache.fetched_at = 0.0
+
+        # Sanity: the current session's file really is marker-less.
+        cont = (self.jsonl_root / new_session / "subagents"
+                / f"agent-{peer_id}.jsonl")
+        self.assertEqual(self.appmod._first_user_text(cont), "",
+                         "continuation transcript must have no user text")
+        # ...and the cross-session resolver recovers the marker anyway.
+        recovered = self.appmod._agent_first_user_text(peer_id, cont)
+        self.assertIn(f"Queue item: {qid}", recovered)
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        ids = {s["subagent_id"] for s in subs}
+        self.assertNotIn(owner_id, ids, "owner is the item, never a child")
+        self.assertEqual(ids, {peer_id},
+                         f"co-bound peer must survive the clear: {subs}")
+        self.assertEqual(subs[0].get("queue_id"), qid)
+
+    def test_no_cross_item_leak_after_session_clear(self):
+        """REGRESSION (2026-08-22): three unrelated running items whose agents
+        all continued into ONE post-clear session dir must NOT adopt each
+        other's owner agents as children. Each item's tree is empty; nothing
+        leaks sideways.
+        """
+        items = [
+            _add(self.env, f"clear-leak {n}", [f"repo:subagent-leak-{n}"])["id"]
+            for n in ("a", "b", "c")
+        ]
+        for qid in items:
+            _register(self.env, qid)
+
+        old_session = "22b83c78-905b-5d98-9195-3fd7a4b25c70"
+        new_session = "33c94d89-a16c-6ea9-a2a6-40e8b5c36d81"
+        agents = ["a6fb8574d98bca6b6", "aabba9943ed2e7c10", "ad348c2bfad54f4d9"]
+        for aid, qid in zip(agents, items):
+            self._backdate(
+                self._seed_marked_subagent(
+                    self.jsonl_root, old_session, aid, qid))
+            self._seed_continuation_subagent(self.jsonl_root, new_session, aid)
+
+        for aid, qid in zip(agents, items):
+            # One item at a time is the live dispatch, per its own owner.
+            _seed_agent_state(self.agent_state, aid, qid, alive=True, age=2)
+            self.appmod._cache.fetched_at = 0.0
+            r = self.client.get(f"/api/queue/{qid}/meta")
+            self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+            subs = r.get_json().get("subagents")
+            self.assertEqual(subs, [],
+                             f"{qid} must claim no sibling agents: {subs}")
+
+    def test_spawn_edge_recovered_from_pre_clear_transcript(self):
+        """The parent->child spawn record also lives in the PRE-clear file.
+        A child spawned before the clear must still nest as ``kind='child'``
+        (not degrade to a flat co-bound peer) after both transcripts continue
+        into the new session.
+        """
+        item = _add(self.env, "post-clear child", ["repo:subagent-clear-child"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        old_session = "44da5e9a-b27d-7fba-b3b7-51f9c6d47e92"
+        new_session = "55eb6fab-c38e-80cb-c4c8-620ad7e58fa3"
+        owner_id = "c3333333333333333"
+        child_id = "d4444444444444444"
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=2)
+        # Pre-clear: the owner's transcript records the Agent spawn of child.
+        self._backdate(self._seed_parent_with_spawn(
+            self.jsonl_root, old_session, owner_id, qid, child_id))
+        self._backdate(self._seed_marked_subagent(
+            self.jsonl_root, old_session, child_id, qid))
+        # Post-clear: both continue, mid-stream, with no marker + no spawn.
+        for aid in (owner_id, child_id):
+            self._seed_continuation_subagent(self.jsonl_root, new_session, aid)
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        ids = {s["subagent_id"] for s in subs}
+        self.assertEqual(ids, {child_id}, f"child must surface: {subs}")
+        self.assertEqual(subs[0].get("kind"), "child",
+                         f"recovered spawn edge -> kind=child: {subs}")
+
+    def test_bindings_win_over_recovered_marker(self):
+        """Precedence is unchanged by the cross-session lookup: bindings first,
+        recovered marker second. A sibling whose pre-clear marker claims THIS
+        item but whose binding says another item stays out of this tree.
+        """
+        item_a = _add(self.env, "prec item A", ["repo:subagent-prec-a"])
+        qid_a = item_a["id"]
+        _register(self.env, qid_a)
+        item_b = _add(self.env, "prec item B", ["repo:subagent-prec-b"])
+        qid_b = item_b["id"]
+        _register(self.env, qid_b)
+
+        old_session = "66fc70bc-d49f-91dc-d5d9-731be8f69ab4"
+        new_session = "770d81cd-e5a0-a2ed-e6ea-842cf907abc5"
+        owner_a = "e5555555555555555"
+        sibling = "f6666666666666666"
+        _seed_agent_state(self.agent_state, owner_a, qid_a, alive=True, age=2)
+        for aid in (owner_a, sibling):
+            # Both pre-clear markers claim item A...
+            self._backdate(self._seed_marked_subagent(
+                self.jsonl_root, old_session, aid, qid_a))
+            self._seed_continuation_subagent(self.jsonl_root, new_session, aid)
+        # ...but the authoritative binding puts the sibling on item B.
+        self._seed_bindings({owner_a: qid_a, sibling: qid_b})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid_a}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        ids = {s["subagent_id"] for s in r.get_json().get("subagents", [])}
+        self.assertEqual(ids, set(),
+                         f"binding beats the recovered marker: {ids}")
 
     # ---------- authoritative-bindings tree (the FULL fix) ----------
 

@@ -2961,25 +2961,28 @@ def main() -> int:
             ))
 
         # ===================================================================
-        # Tests 74hb1-74hb9: heartbeat-liveness `touch` exemption.
+        # Tests 74hb1-74hb11: liveness-ack exemption.
         #
-        # claude-watch's stale-heartbeat fallback injects exactly
-        # `touch /var/run/claude/heartbeat`. That touch must execute even
-        # when the obligations gate would otherwise DENY (a stale heartbeat
-        # frequently coincides with a momentarily-down watcher tripping
+        # claude-watch's ack-stale recovery prompt injects exactly
+        # `event-ack ack-batch`. That command must execute even when the
+        # obligations gate would otherwise DENY (a stale ack frequently
+        # coincides with a momentarily-down watcher tripping
         # watchers_healthy / no_pending_watcher_outputs). The exemption is a
         # hardcoded ALLOW in the hook, evaluated before the obligations CLI
         # dispatch, tightly scoped via the AST: ONLY a single-segment bare
-        # `touch /var/run/claude/heartbeat` is exempt; a bundled command or a
-        # different path is NOT.
+        # `event-ack ack-batch` is exempt; a bundled command or a different
+        # subcommand is NOT.
+        #
+        # Until 2026-08-22 this ALLOW covered `touch /var/run/claude/heartbeat`
+        # instead; that file and its ritual are retired (74hb11 pins it).
         # ===================================================================
-        with tempfile.TemporaryDirectory(prefix="obligations-heartbeat-") as td_hb:
+        with tempfile.TemporaryDirectory(prefix="obligations-liveness-") as td_hb:
             tmpdir_hb = Path(td_hb)
             env_hb, _ = _make_isolated_env(tmpdir_hb)
 
             # Register a no_pending_watcher_outputs gate that ACTUALLY denies:
             # an unread sidecar with written output (same recipe as test 23).
-            # This proves the heartbeat touch passes even with a live deny.
+            # This proves the liveness ack passes even with a live deny.
             hb_sidecar_dir = tmpdir_hb / "watcher-output-pending"
             env_hb["WATCHER_PENDING_DIR"] = str(hb_sidecar_dir)
             _add_ob(
@@ -3030,16 +3033,16 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb2: bare `touch /var/run/claude/heartbeat` -> ALLOW despite
-            # the live denying gates (the whole point of the fix).
+            # 74hb2: bare `event-ack ack-batch` -> ALLOW despite the live
+            # denying gates (the whole point of the fix).
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {"command": "touch /var/run/claude/heartbeat"}},
+                 "tool_input": {"command": "event-ack ack-batch"}},
                 env_hb,
             )
             results.append(_check(
-                "74hb2. bare heartbeat touch -> allow despite unhealthy/unread gates",
+                "74hb2. bare `event-ack ack-batch` -> allow despite unhealthy/unread gates",
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
@@ -3048,117 +3051,137 @@ def main() -> int:
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {"command": "  touch /var/run/claude/heartbeat  "}},
+                 "tool_input": {"command": "  event-ack ack-batch  "}},
                 env_hb,
             )
             results.append(_check(
-                "74hb3. whitespace-padded heartbeat touch -> allow",
+                "74hb3. whitespace-padded liveness ack -> allow",
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb4: bundled `touch ... && rm -rf x` -> NOT exempt -> DENY.
-            # The exemption must never let a second action ride along.
+            # 74hb3b: an absolute path to the CLI is the same command. An
+            # operator recovering by hand types the installed path as often as
+            # the bare name, and the catch-22 is identical either way.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "/usr/local/bin/event-ack ack-batch"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb3b. absolute-path liveness ack -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb3c: the optional --action note does not disqualify it.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
                  "tool_input": {
-                     "command": "touch /var/run/claude/heartbeat && rm -rf /tmp/x",
+                     "command": "event-ack ack-batch --action 'restored liveness'",
                  }},
                 env_hb,
             )
             results.append(_check(
-                "74hb4. heartbeat touch bundled with `&& rm` -> NOT exempt -> deny",
-                rc == 0 and _is_deny(out),
+                "74hb3c. liveness ack with --action note -> allow",
+                rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb5: heartbeat touch piped -> NOT exempt -> DENY.
+            # 74hb4: bundled `event-ack ack-batch && rm -rf x` -> NOT exempt
+            # -> DENY. The exemption must never let a second action ride along.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
                  "tool_input": {
-                     "command": "touch /var/run/claude/heartbeat | cat",
+                     "command": "event-ack ack-batch && rm -rf /tmp/x",
                  }},
                 env_hb,
             )
             results.append(_check(
-                "74hb5. heartbeat touch piped -> NOT exempt -> deny",
+                "74hb4. liveness ack bundled with `&& rm` -> NOT exempt -> deny",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb6: `touch` of a DIFFERENT path -> NOT exempt -> DENY.
+            # 74hb5: liveness ack piped -> NOT exempt -> DENY.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {"command": "touch /var/run/claude/other"}},
+                 "tool_input": {"command": "event-ack ack-batch | cat"}},
                 env_hb,
             )
             results.append(_check(
-                "74hb6. touch of a different path -> NOT exempt -> deny",
+                "74hb5. liveness ack piped -> NOT exempt -> deny",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb7: `touch` of the heartbeat path PLUS a second path ->
-            # NOT exempt -> DENY (a second operand smuggles work in).
+            # 74hb6: a DIFFERENT event-ack subcommand -> NOT exempt -> DENY.
+            # Only the recovery command the daemon actually asks for gets to
+            # bypass every gate; `clear` (which discards pending events
+            # wholesale) must not inherit that.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {
-                     "command": "touch /var/run/claude/heartbeat /tmp/evil",
-                 }},
+                 "tool_input": {"command": "event-ack clear"}},
                 env_hb,
             )
             results.append(_check(
-                "74hb7. heartbeat touch + second operand -> NOT exempt -> deny",
+                "74hb6. a different event-ack subcommand -> NOT exempt -> deny",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb8: the heartbeat path mentioned only inside a quoted arg to
-            # another command (echo) is NOT a touch of it -> NOT exempt ->
-            # DENY (proves the exemption keys on the real command head, not
-            # substring presence of the path).
+            # 74hb7: `ack-batch` PLUS a second operand -> NOT exempt -> DENY.
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {
-                     "command": "echo 'touch /var/run/claude/heartbeat'",
-                 }},
+                 "tool_input": {"command": "event-ack ack-batch extra-operand"}},
                 env_hb,
             )
             results.append(_check(
-                "74hb8. heartbeat path inside echo arg -> NOT exempt -> deny",
+                "74hb7. liveness ack + second operand -> NOT exempt -> deny",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
 
-            # 74hb9: a value-taking touch flag (-r reffile) that smuggles a
-            # second path -> NOT exempt -> DENY.
+            # 74hb8: the command mentioned only inside a quoted arg to another
+            # command (echo) is NOT an ack -> NOT exempt -> DENY (proves the
+            # exemption keys on the real command head, not substring presence).
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash",
-                 "tool_input": {
-                     "command": "touch -r /etc/passwd /var/run/claude/heartbeat",
-                 }},
+                 "tool_input": {"command": "echo 'event-ack ack-batch'"}},
                 env_hb,
             )
             results.append(_check(
-                "74hb9. heartbeat touch with -r reffile -> NOT exempt -> deny",
+                "74hb8. ack command inside echo arg -> NOT exempt -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74hb9: `--action ack-batch` is a VALUE, not the subcommand. A
+            # matcher that scanned for the token anywhere would let
+            # `event-ack clear --action ack-batch` bypass every gate.
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "event-ack clear --action ack-batch"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb9. `ack-batch` as a flag VALUE -> NOT exempt -> deny",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
 
             # ---------------------------------------------------------------
             # 74hb10: `heartbeat-ack` was RETIRED 2026-08-21 (#649 ack-driven
-            # redesign -- a plain `event-ack ack` already refreshes liveness,
-            # so the wrapper and its dedicated hardcoded-ALLOW exemption are
-            # gone). A bare `heartbeat-ack` invocation must now fall through
-            # to the normal obligations dispatch like any other command --
-            # NOT bypass live denying gates the way the bare heartbeat touch
-            # (tested above) still does.
+            # redesign). A bare `heartbeat-ack` invocation falls through to the
+            # normal obligations dispatch like any other command.
             # ---------------------------------------------------------------
             _write_hb_sidecar()
             rc, out, _err = _hook_pre(
@@ -3169,6 +3192,26 @@ def main() -> int:
             results.append(_check(
                 "74hb10. bare heartbeat-ack no longer hardcoded-ALLOW "
                 "-> denied like any other command under unhealthy/unread gates",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # ---------------------------------------------------------------
+            # 74hb11: the host heartbeat FILE was retired 2026-08-22. `touch
+            # /var/run/claude/heartbeat` used to hold THIS hardcoded ALLOW; it
+            # must no longer bypass anything. Pinned because a stale exemption
+            # is invisible: the command would keep succeeding, and the loop
+            # would keep "restoring liveness" by writing a file nothing reads.
+            # ---------------------------------------------------------------
+            _write_hb_sidecar()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "touch /var/run/claude/heartbeat"}},
+                env_hb,
+            )
+            results.append(_check(
+                "74hb11. retired heartbeat touch no longer hardcoded-ALLOW "
+                "-> denied like any other command",
                 rc == 0 and _is_deny(out),
                 f"rc={rc} out={out}",
             ))
