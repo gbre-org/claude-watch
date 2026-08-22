@@ -19,6 +19,15 @@
   ~/.claude/projects and RW access to the botchat data dir, neither of which
   the container has writable (~/repos is RO in claude-container).
 
+  CW_AGENT_STATS_PROM_FILE points the Prometheus textfile-collector output
+  (claude_agent_live_count / claude_agent_calls_total / claude_agent_tokens_total)
+  at ~/repos/.claude-watch-textfile/claude_agent_stats.prom -- the SAME host
+  dir the monitoring-node-exporter-1 container bind-mounts read-only at
+  /textfile (--collector.textfile.directory=/textfile). Without this env var
+  cw-agent-stats falls back to /var/lib/node-exporter/textfile/, which is
+  NOT the dir node-exporter actually scrapes on this host -- the metrics
+  would be written but silently never picked up.
+
   Namespace: org.gbre.claude-watch.* is the namespace for claude-watch's own
   plists (see claude-config launchagents/README.md rule 4 and memory
   feedback_claude_watch_plist_namespace).
@@ -67,6 +76,8 @@
         <string>/Users/hallandrew/bin:/usr/sbin:/usr/bin:/bin:/opt/homebrew/bin</string>
         <key>HOME</key>
         <string>/Users/hallandrew</string>
+        <key>CW_AGENT_STATS_PROM_FILE</key>
+        <string>/Users/hallandrew/repos/.claude-watch-textfile/claude_agent_stats.prom</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/Users/hallandrew/Library/Logs/cw-agent-stats.log</string>

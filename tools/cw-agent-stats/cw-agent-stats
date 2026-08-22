@@ -49,6 +49,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -88,6 +89,104 @@ def _default_out() -> Path:
     return Path("/data") / agentstats.SNAPSHOT_FILENAME
 
 
+def _default_prom_file() -> Path:
+    """Resolve the node-exporter textfile-collector output path for the agent gauges.
+
+    Design (2026-08-22, Andrew's call): this daemon is the ONE producer for
+    both outputs — the botchat snapshot JSON above AND these Prometheus
+    gauges — rather than a second hook-based capture pipeline. Mirrors
+    claude-watch's own ``CLAUDE_WATCH_PROM_FILE`` convention
+    (``src/metrics.rs::prom_file_path``):
+
+    * ``CW_AGENT_STATS_PROM_FILE`` wins outright if set.
+    * Else, if ``CLAUDE_WATCH_PROM_FILE`` is set (the Rust `claude-watch
+      metrics` cron's own output path), write a SIBLING file in that same
+      directory — so both producers land in the one node-exporter
+      ``--collector.textfile.directory`` an operator already wired up,
+      with no second env var to configure in the common case.
+    * Else fall back to the hardcoded node-exporter default dir (matches
+      ``metrics.rs``'s own fallback).
+    """
+    env = os.environ.get("CW_AGENT_STATS_PROM_FILE", "").strip()
+    if env:
+        return Path(env)
+    sibling_of = os.environ.get("CLAUDE_WATCH_PROM_FILE", "").strip()
+    if sibling_of:
+        return Path(sibling_of).with_name("claude_agent_stats.prom")
+    return Path("/var/lib/node-exporter/textfile/claude_agent_stats.prom")
+
+
+def _prom_lines(snap: dict) -> list[str]:
+    """Render the agent-stats snapshot as Prometheus textfile-collector lines.
+
+    These are GAUGES, not monotonic counters: each value is the tool-call /
+    token count accumulated so far by a still-live agent (per
+    ``botchat.agentstats.AgentState``), which can only ever grow while the
+    agent is live and then disappears from the file once it falls out of the
+    live window. Because the whole file is rewritten every tick, stale label
+    sets from agents that exited the window are dropped automatically — no
+    separate expiry/TTL bookkeeping needed.
+
+    Deliberately does NOT add ``model``/``tool`` labels: the underlying
+    survey (``AgentState.to_record``) doesn't fold those dimensions, and
+    this producer must not grow new, heavier transcript surveying just to
+    populate metric labels.
+    """
+    totals = snap.get("totals") or {}
+    lines = [
+        "# HELP claude_agent_live_count Number of live Claude Code subagents in the current cw-agent-stats snapshot.",
+        "# TYPE claude_agent_live_count gauge",
+        f"claude_agent_live_count {int(totals.get('agents', 0))}",
+        "# HELP claude_agent_calls_total Tool calls made so far by a live Claude Code subagent (per-agent gauge; disappears once the agent falls out of the live window).",
+        "# TYPE claude_agent_calls_total gauge",
+        "# HELP claude_agent_tokens_total Tokens accounted so far by a live Claude Code subagent, by kind (context|output) (per-agent gauge; disappears once the agent falls out of the live window).",
+        "# TYPE claude_agent_tokens_total gauge",
+    ]
+    for rec in snap.get("agents") or []:
+        agent_id = str(rec.get("agent_id", "")).replace('"', "")
+        lines.append(f'claude_agent_calls_total{{agent_id="{agent_id}"}} {int(rec.get("tool_calls", 0))}')
+        lines.append(
+            f'claude_agent_tokens_total{{agent_id="{agent_id}",kind="context"}} {int(rec.get("context_tokens", 0))}'
+        )
+        lines.append(
+            f'claude_agent_tokens_total{{agent_id="{agent_id}",kind="output"}} {int(rec.get("output_tokens", 0))}'
+        )
+    main = snap.get("main")
+    if main:
+        lines.append(
+            "# HELP claude_agent_main_context_tokens Context tokens in the current main-loop transcript."
+        )
+        lines.append("# TYPE claude_agent_main_context_tokens gauge")
+        lines.append(f'claude_agent_main_context_tokens {int(main.get("context_tokens", 0))}')
+    return lines
+
+
+def _write_prom(lines: list[str], path: Path) -> None:
+    """Atomic textfile-collector write: temp file in the same dir + rename.
+
+    Same shape as ``botchat.agentstats.write_snapshot`` (tmp + ``os.replace``)
+    and Rust ``metrics.rs::write_prom`` — node-exporter polls this directory
+    on its own schedule, so a half-written file would get scraped as a
+    truncated/corrupt exposition and dropped for that scrape.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(lines) + "\n"
+    fd, tmp = tempfile.mkstemp(prefix=".claude_agent_stats.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="cw-agent-stats",
@@ -100,6 +199,11 @@ def main(argv=None) -> int:
     ap.add_argument("--duration", type=float, default=58.0, help="total seconds to run in --loop (default 58)")
     ap.add_argument("--out", type=Path, default=None,
                     help="snapshot path (default <BOTCHAT_DATA_DIR>/agent-stats.json)")
+    ap.add_argument("--prom-file", type=Path, default=None,
+                    help="node-exporter textfile-collector path for the Prometheus gauges "
+                         "(default $CW_AGENT_STATS_PROM_FILE, else a sibling of "
+                         "$CLAUDE_WATCH_PROM_FILE, else /var/lib/node-exporter/textfile/claude_agent_stats.prom)")
+    ap.add_argument("--no-prom", action="store_true", help="do not write the Prometheus textfile-collector output")
     ap.add_argument("--projects-dir", type=Path, default=None,
                     help="Claude projects dir (default ~/.claude/projects or $CLAUDE_PROJECTS_DIR)")
     ap.add_argument("--live-window", type=float, default=agentstats.DEFAULT_LIVE_WINDOW_SECS,
@@ -110,6 +214,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     out = args.out or _default_out()
+    prom_file = args.prom_file or _default_prom_file()
     collector = agentstats.Collector(projects_dir=args.projects_dir, live_window_secs=args.live_window)
 
     deadline = time.monotonic() + args.duration if args.loop else None
@@ -122,6 +227,12 @@ def main(argv=None) -> int:
                 agentstats.write_snapshot(snap, out)
             except OSError as e:
                 print(f"cw-agent-stats: cannot write {out}: {e}", file=sys.stderr)
+                rc = 1
+        if not args.no_prom:
+            try:
+                _write_prom(_prom_lines(snap), prom_file)
+            except OSError as e:
+                print(f"cw-agent-stats: cannot write {prom_file}: {e}", file=sys.stderr)
                 rc = 1
         if args.do_print:
             print(json.dumps(snap, indent=1))
