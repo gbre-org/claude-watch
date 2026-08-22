@@ -48,6 +48,13 @@
           "refId": "C",
           "range": true,
           "instant": false
+        },
+        {
+          "expr": "time() - (claude_events_last_heartbeat_timestamp_seconds > 0)",
+          "legendFormat": "Last Ack Age",
+          "refId": "D",
+          "range": true,
+          "instant": false
         }
       ],
       "fieldConfig": {
@@ -134,6 +141,44 @@
                 "value": "n/a — no clear recorded"
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last Ack Age"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#859900",
+                      "value": null
+                    },
+                    {
+                      "color": "#b58900",
+                      "value": 360
+                    },
+                    {
+                      "color": "#dc322f",
+                      "value": 600
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "noValue",
+                "value": "n/a — no heartbeat-tick observed yet"
+              }
+            ]
           }
         ]
       },
@@ -155,7 +200,7 @@
           "titleSize": 16
         }
       },
-      "description": "Session lifetime timers, ONE stat panel with three tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded)."
+      "description": "Session lifetime timers, ONE stat panel with four tiles SIDE-BY-SIDE (orientation=vertical => columns): HEARTBEAT = seconds since the main-loop heartbeat (green<360, amber>=360, red>=600); CLAUDE UPTIME = seconds since the Claude Code process started (claude_process_start_timestamp_seconds, derived from /proc so it renders on a bare host AND in a container -- the old CONTAINER tile read claude_container_start_timestamp_seconds, which has no series at all on a non-containerized host and so rendered blank there); SINCE CLEAR = seconds since the last context clear (n/a if none recorded). LAST ACK AGE = seconds since claude-events-exporter last observed a claude-watch heartbeat-tick event on the bus (claude_events_last_heartbeat_timestamp_seconds, tracked across scrapes even after claude-event-watch consumes the file -- same green<360/amber>=360/red>=600 thresholds as HEARTBEAT; n/a on a freshly-restarted exporter that hasn't seen a tick yet)."
     },
     {
       "id": 104,
