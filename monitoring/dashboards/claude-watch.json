@@ -135,7 +135,7 @@
               },
               {
                 "id": "noValue",
-                "value": "n/a \u2014 no clear recorded"
+                "value": "n/a — no clear recorded"
               }
             ]
           }
@@ -244,7 +244,7 @@
           "titleSize": 16
         }
       },
-      "description": "Tokens per minute, averaged over 1m / 5m / 15m. claude_code_tokens_total is a cumulative COUNTER, so each tile is rate(...[window]) * 60 \u2014 never the raw counter. type=\"cache_read\" is excluded: cache reads re-count the whole cached prefix on every request and dominate the sum by ~300x, which would make the tiles read in the millions rather than the actual burn rate."
+      "description": "Tokens per minute, averaged over 1m / 5m / 15m. claude_code_tokens_total is a cumulative COUNTER, so each tile is rate(...[window]) * 60 — never the raw counter. type=\"cache_read\" is excluded: cache reads re-count the whole cached prefix on every request and dominate the sum by ~300x, which would make the tiles read in the millions rather than the actual burn rate."
     },
     {
       "id": 3,
@@ -358,7 +358,7 @@
       "id": 47,
       "title": "Build Info",
       "type": "stat",
-      "description": "What is running and what shipped last. Left two tiles come from the claude_watch_build_info gauge the daemon's textfile collector writes (src/metrics.rs): the commit the RUNNING binary was built from, and the PR that commit came in on. They describe the deployed binary, so they only move on a deploy.\n\nThe third tile does that same job for the work-queue-exporter, which ships as its own container image on its own schedule and so can be a different revision from the daemon: worktask_exporter_build_info carries the commit baked in at image build (--build-arg CW_BUILD_COMMIT, the same host-resolves-it-and-passes-it-in mechanism the daemon's gauge uses, because .dockerignore prunes .git from the build context) or supplied at runtime via $WORKTASK_EXPORTER_COMMIT. commit=unknown there means the build args never reached the image; an EMPTY tile means the deployed exporter predates the metric. See monitoring/prometheus/README.md.\n\nThe fourth tile is the repo's side of the same question -- the most recently MERGED pull request on GitHub -- and it moves the moment a PR merges, which is what makes the pair useful: a gap between them is un-deployed work. It is read directly from GitHub by the Infinity datasource (uid `infinity`, backend parser), NOT from Prometheus, which is why this panel's datasource is `-- Mixed --`. There is deliberately no exporter behind it: a local exporter scraping GitHub for one number is one more service to run, restart and forget, and the value it holds is already public.\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops the closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first. Number order inverts merged order routinely -- two PRs open at once merge in whichever order goes green first (#680 merged after #681 on 2026-08-22) -- so `max(number)` would show the wrong PR every time that happens. The URL's sort=updated is only a cheap way to get recent PRs into the first page; a comment or a label bumps updated_at without merging anything, so the ordering that matters is redone here.\n\nUNAUTHENTICATED, and that is the constraint on how often it may run. GitHub allows 60 requests/hour/IP without a token, and one dashboard refresh with this panel on screen is one request -- Grafana has no per-panel refresh interval, so the call rate is the DASHBOARD refresh rate whenever this panel is in the viewport (panels scrolled out of view are not queried). That is why this dashboard's refresh is 5m (2026-08-22): at the 30s it previously shipped, a viewport parked here burned the hour's budget in 30 minutes, GitHub answered 403, and the tile showed a query error until the window rolled \u2014 and the panel's 5m min interval does not change that, because Infinity ignores it. 5m puts the worst case at 12/hour and costs this board nothing, since nothing here needs sub-minute freshness and every alerting decision is made by Prometheus rules rather than by a rendered panel. A deployment that wants sub-minute refresh back should give the Infinity datasource a GitHub token (5,000/hour) first. Rate-limited or offline, the failure is confined to this tile and its error marker -- the three Prometheus tiles keep rendering.\n\nWhere the Infinity datasource is not provisioned this tile simply does not appear (Grafana flags the missing datasource on the panel; the three Prometheus tiles still render). Infinity is not part of a default Grafana install: see monitoring/dashboards/README.md for the plugin install and the uid `infinity` provisioning stanza it needs.",
+      "description": "What is running and what shipped last. Left two tiles come from the claude_watch_build_info gauge the daemon's textfile collector writes (src/metrics.rs): the commit the RUNNING binary was built from, and the PR that commit came in on. They describe the deployed binary, so they only move on a deploy.\n\nThe third tile does that same job for the work-queue-exporter, which ships as its own container image on its own schedule and so can be a different revision from the daemon: worktask_exporter_build_info carries the commit baked in at image build (--build-arg CW_BUILD_COMMIT, the same host-resolves-it-and-passes-it-in mechanism the daemon's gauge uses, because .dockerignore prunes .git from the build context) or supplied at runtime via $WORKTASK_EXPORTER_COMMIT. commit=unknown there means the build args never reached the image; an EMPTY tile means the deployed exporter predates the metric. See monitoring/prometheus/README.md.\n\nThe fourth tile is the repo's side of the same question -- the most recently MERGED pull request on GitHub -- and it moves the moment a PR merges, which is what makes the pair useful: a gap between them is un-deployed work. It is read directly from GitHub by the Infinity datasource (uid `infinity`, backend parser), NOT from Prometheus, which is why this panel's datasource is `-- Mixed --`. There is deliberately no exporter behind it: a local exporter scraping GitHub for one number is one more service to run, restart and forget, and the value it holds is already public.\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops the closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first. Number order inverts merged order routinely -- two PRs open at once merge in whichever order goes green first (#680 merged after #681 on 2026-08-22) -- so `max(number)` would show the wrong PR every time that happens. The URL's sort=updated is only a cheap way to get recent PRs into the first page; a comment or a label bumps updated_at without merging anything, so the ordering that matters is redone here.\n\nUNAUTHENTICATED, and that is the constraint on how often it may run. GitHub allows 60 requests/hour/IP without a token, and one dashboard refresh with this panel on screen is one request -- Grafana has no per-panel refresh interval, so the call rate is the DASHBOARD refresh rate whenever this panel is in the viewport (panels scrolled out of view are not queried). That is why this dashboard's refresh is 5m (2026-08-22): at the 30s it previously shipped, a viewport parked here burned the hour's budget in 30 minutes, GitHub answered 403, and the tile showed a query error until the window rolled — and the panel's 5m min interval does not change that, because Infinity ignores it. 5m puts the worst case at 12/hour and costs this board nothing, since nothing here needs sub-minute freshness and every alerting decision is made by Prometheus rules rather than by a rendered panel. A deployment that wants sub-minute refresh back should give the Infinity datasource a GitHub token (5,000/hour) first. Rate-limited or offline, the failure is confined to this tile and its error marker -- the three Prometheus tiles keep rendering.\n\nWhere the Infinity datasource is not provisioned this tile simply does not appear (Grafana flags the missing datasource on the panel; the three Prometheus tiles still render). Infinity is not part of a default Grafana install: see monitoring/dashboards/README.md for the plugin install and the uid `infinity` provisioning stanza it needs.",
       "gridPos": {
         "h": 4,
         "w": 24,
@@ -465,7 +465,7 @@
             "properties": [
               {
                 "id": "displayName",
-                "value": "latest merged PR #${__field.labels.pr}"
+                "value": "latest PR #${__field.labels.pr}"
               },
               {
                 "id": "links",
@@ -561,7 +561,7 @@
       "id": 112,
       "title": "Output Tokens (by model, period)",
       "type": "piechart",
-      "description": "Cumulative OUTPUT tokens by model over the dashboard's time range (increase() of the windowed claude_output_tokens_total gauge; Andrew #5370 \u2014 tokens = cumulative OUTPUT, split by model).",
+      "description": "Cumulative OUTPUT tokens by model over the dashboard's time range (increase() of the windowed claude_output_tokens_total gauge; Andrew #5370 — tokens = cumulative OUTPUT, split by model).",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -1474,7 +1474,7 @@
     },
     {
       "id": 24,
-      "title": "Reminder\u2192Action Latency (avg)",
+      "title": "Reminder→Action Latency (avg)",
       "type": "timeseries",
       "description": "Average time from reminder fire to Claude action (self-/clear or /restart), split by type. Computed as sum/count since the exporter ships counter pairs rather than a true histogram -- this is an AVERAGE, not a real quantile. Samples only when Claude acted within 1h (context) / 6h (version).",
       "gridPos": {
@@ -2352,7 +2352,7 @@
       "id": 110,
       "title": "Tool Calls (by tool)",
       "type": "piechart",
-      "description": "Fleet-wide tool calls, by tool name (claude_tool_use_total) \u2014 a windowed gauge folded over every live/recent transcript, not a monotonic counter.",
+      "description": "Fleet-wide tool calls, by tool name (claude_tool_use_total) — a windowed gauge folded over every live/recent transcript, not a monotonic counter.",
       "gridPos": {
         "h": 8,
         "w": 16,
@@ -2417,7 +2417,7 @@
       "id": 111,
       "title": "Agents Spawned",
       "type": "stat",
-      "description": "Distinct Claude Code subagent transcripts observed in the live/recent window (claude_agent_spawned_count) \u2014 a windowed gauge, not a lifetime total.",
+      "description": "Distinct Claude Code subagent transcripts observed in the live/recent window (claude_agent_spawned_count) — a windowed gauge, not a lifetime total.",
       "gridPos": {
         "h": 8,
         "w": 8,
