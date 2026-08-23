@@ -8,7 +8,7 @@ drifts.
 
 - **`claude-watch.json`** (uid `claude-watch`) — the daemon dashboard: status,
   heartbeat, context, watchers, hook reminders/fallbacks, interrupts, and
-  token usage. One optional tile (Build Info → "latest merged PR") needs the
+  token usage. One optional tile (Build Info → "latest merged") needs the
   Infinity datasource; see [Infinity](#infinity--optional-one-tile-in-claude-watchjson)
   below.
 - **`claude-events.json`** (uid `claude-events`) — the event bus: backlog
@@ -74,7 +74,7 @@ jq '(.. | objects | select(.type? == "prometheus") | .uid) = "YOUR_UID"' \
 ### Infinity — optional, one tile in `claude-watch.json`
 
 One target is not Prometheus: the third tile of the **Build Info** panel
-("latest merged PR #n") queries GitHub's REST API directly through the
+("latest merged") queries GitHub's REST API directly through the
 [Infinity](https://grafana.com/grafana/plugins/yesoreyeram-infinity-datasource/)
 datasource, which is why that panel's own datasource is `-- Mixed --`. It is
 the only Infinity target in this repo, and it is deliberately exporter-free: a
@@ -147,11 +147,11 @@ decides the answer is redone in the selector.
   textfile collector (`src/metrics.rs`)
 - `claude_events_*` → `exporters/claude-events-exporter/`
 - `worktask_queue_*` → `exporters/work-queue-exporter/`
-- `worktask_exporter_build_info` (Build Info, "exporter <commit>") → the same
-  exporter, stamped at image build; `commit=unknown` means the build args
-  never reached the image, an absent series means an exporter predating the
-  metric. See `monitoring/prometheus/README.md`.
-- "latest merged PR #n" (Build Info) → no metric at all: Infinity fetches
+- `worktask_exporter_build_info` → the work-queue-exporter, stamped at image
+  build. No dashboard tile since 2026-08-23 (the Build Info panel is about
+  the daemon, not the exporter); read it with `curl -s localhost:9099/metrics
+  | grep build_info`. See `monitoring/prometheus/README.md`.
+- "latest merged" (Build Info) → no metric at all: Infinity fetches
   `api.github.com/repos/hndrewaall/claude-watch/pulls` at render time
 
 Alerting on the same metrics lives in `monitoring/prometheus/`.
