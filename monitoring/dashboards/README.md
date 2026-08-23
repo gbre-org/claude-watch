@@ -138,6 +138,13 @@ decides the answer is redone in the selector.
   expensive on a phone, where Grafana stacks panels full width anyway. Convey
   grouping with panel titles and ordering instead.
 - Each band of panels starts at `x: 0` and its widths sum to 24.
+- **`options.text.valueSize` is chosen at 390px, never at desktop width.** A
+  phone stacks every panel to full width, so a three-tile stat gets ~93px of
+  text per tile — and Grafana does not shrink to fit. A value with no break in
+  it (a commit sha, `#699`) overflows sideways THROUGH its neighbour; a value
+  with a space (`57.7 mins`) wraps its unit onto a second line and grows
+  downward until it clips the panel. 24 is where every three-tile stat here
+  landed; anything larger has to be re-measured at 390px before it ships.
 - Check both viewports before calling a change done. Valid JSON is not
   evidence that the layout renders.
 
