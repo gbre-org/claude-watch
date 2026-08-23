@@ -358,10 +358,10 @@
       "id": 47,
       "title": "Build Info",
       "type": "stat",
-      "description": "What is running and what shipped last. Left two tiles come from the claude_watch_build_info gauge the daemon's textfile collector writes (src/metrics.rs): the commit the RUNNING binary was built from, and the PR that commit came in on. They describe the deployed binary, so they only move on a deploy.\n\nThe third tile does that same job for the work-queue-exporter, which ships as its own container image on its own schedule and so can be a different revision from the daemon: worktask_exporter_build_info carries the commit baked in at image build (--build-arg CW_BUILD_COMMIT, the same host-resolves-it-and-passes-it-in mechanism the daemon's gauge uses, because .dockerignore prunes .git from the build context) or supplied at runtime via $WORKTASK_EXPORTER_COMMIT. commit=unknown there means the build args never reached the image; an EMPTY tile means the deployed exporter predates the metric. See monitoring/prometheus/README.md.\n\nThe fourth tile is the repo's side of the same question -- the most recently MERGED pull request on GitHub -- and it moves the moment a PR merges, which is what makes the pair useful: a gap between them is un-deployed work. It is read directly from GitHub by the Infinity datasource (uid `infinity`, backend parser), NOT from Prometheus, which is why this panel's datasource is `-- Mixed --`. There is deliberately no exporter behind it: a local exporter scraping GitHub for one number is one more service to run, restart and forget, and the value it holds is already public.\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops the closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first. Number order inverts merged order routinely -- two PRs open at once merge in whichever order goes green first (#680 merged after #681 on 2026-08-22) -- so `max(number)` would show the wrong PR every time that happens. The URL's sort=updated is only a cheap way to get recent PRs into the first page; a comment or a label bumps updated_at without merging anything, so the ordering that matters is redone here.\n\nUNAUTHENTICATED, and that is the constraint on how often it may run. GitHub allows 60 requests/hour/IP without a token, and one dashboard refresh with this panel on screen is one request -- Grafana has no per-panel refresh interval, so the call rate is the DASHBOARD refresh rate whenever this panel is in the viewport (panels scrolled out of view are not queried). That is why this dashboard's refresh is 5m (2026-08-22): at the 30s it previously shipped, a viewport parked here burned the hour's budget in 30 minutes, GitHub answered 403, and the tile showed a query error until the window rolled — and the panel's 5m min interval does not change that, because Infinity ignores it. 5m puts the worst case at 12/hour and costs this board nothing, since nothing here needs sub-minute freshness and every alerting decision is made by Prometheus rules rather than by a rendered panel. A deployment that wants sub-minute refresh back should give the Infinity datasource a GitHub token (5,000/hour) first. Rate-limited or offline, the failure is confined to this tile and its error marker -- the three Prometheus tiles keep rendering.\n\nWhere the Infinity datasource is not provisioned this tile simply does not appear (Grafana flags the missing datasource on the panel; the three Prometheus tiles still render). Infinity is not part of a default Grafana install: see monitoring/dashboards/README.md for the plugin install and the uid `infinity` provisioning stanza it needs.",
+      "description": "What is running and what shipped last, as three tiles: the commit the RUNNING daemon binary was built from, the PR that commit came in on, and the most recently MERGED pull request on GitHub.\n\nThe first two come from the claude_watch_build_info gauge the daemon's textfile collector writes (src/metrics.rs). That gauge's VALUE is a constant 1 and everything interesting is in its labels, so a labelsToFields transformation -- scoped to refId A, so it cannot touch the GitHub frame -- turns the commit and pr labels into fields, and the stat panel renders those as the tile VALUES under their names. They describe the deployed binary, so they only move on a deploy.\n\nThe third tile is the repo's side of the same question, and it moves the moment a PR merges, which is what makes the pair useful: a gap between them is un-deployed work. It is read directly from GitHub by the Infinity datasource (uid `infinity`, backend parser), NOT from Prometheus, which is why this panel's datasource is `-- Mixed --`. There is deliberately no exporter behind it: a local exporter scraping GitHub for one number is one more service to run, restart and forget, and the value it holds is already public. The tile links to the PR, titled with the PR title.\n\nRANKING IS BY merged_at, NOT BY PR NUMBER. The JSONata root selector `$[merged_at != null]^(>merged_at)[0]` drops the closed-but-never-merged PRs, sorts what is left by merge time descending and takes the first. Number order inverts merged order routinely -- two PRs open at once merge in whichever order goes green first (#680 merged after #681 on 2026-08-22) -- so `max(number)` would show the wrong PR every time that happens. The URL's sort=updated is only a cheap way to get recent PRs into the first page; a comment or a label bumps updated_at without merging anything, so the ordering that matters is redone here.\n\nUNAUTHENTICATED, and that is the constraint on how often it may run. GitHub allows 60 requests/hour/IP without a token, and one dashboard refresh with this panel on screen is one request -- Grafana has no per-panel refresh interval, so the call rate is the DASHBOARD refresh rate whenever this panel is in the viewport (panels scrolled out of view are not queried). That is why this dashboard's refresh is 5m (2026-08-22): at the 30s it previously shipped, a viewport parked here burned the hour's budget in 30 minutes, GitHub answered 403, and the tile showed a query error until the window rolled — and the panel's 5m min interval does not change that, because Infinity ignores it. 5m puts the worst case at 12/hour and costs this board nothing, since nothing here needs sub-minute freshness and every alerting decision is made by Prometheus rules rather than by a rendered panel. A deployment that wants sub-minute refresh back should give the Infinity datasource a GitHub token (5,000/hour) first. Rate-limited or offline, the failure is confined to this tile and its error marker -- the two Prometheus tiles keep rendering.\n\nWhere the Infinity datasource is not provisioned this tile simply does not appear (Grafana flags the missing datasource on the panel; the two Prometheus tiles still render). Infinity is not part of a default Grafana install: see monitoring/dashboards/README.md for the plugin install and the uid `infinity` provisioning stanza it needs.\n\nThere used to be a fourth tile carrying the work-queue-exporter's own build (worktask_exporter_build_info). It was dropped 2026-08-23: the exporter's revision is not the question this panel answers, and four tiles on one row left no room for a value under each name. The metric is still exported and still documented in monitoring/prometheus/README.md.\n\nGEOMETRY IS LOAD-BEARING. A stat tile only stacks its name above its value while the tile is at most ~2.5x wider than it is tall; past that ratio Grafana switches to the wide layout and puts the name to the LEFT of the value, which is the cramped single line this panel used to render (2026-08-23). Three tiles in a full-width 24-column panel are ~620px wide on a 1900px window, so full width would need h=9 to stack -- most of it empty. Half width (w=12) with h=5 puts each tile at roughly 310x155 and stacks, the same shape as the Session Timers tiles at the top of the board. That is why this panel is no longer full width, and why its band is the one place here whose widths do not sum to 24 -- the right half is free for a future half-width panel. Widening it or shortening it flips the tiles back onto one line, so move w and h together.\n\nTILE PLUMBING. The Prometheus gauge's value is a constant 1, so a labelsToFields transformation -- scoped to refId A so it cannot touch the GitHub frame -- promotes the commit and pr labels to fields, and those become the first two tile VALUES; pr is converted to a number so the `prefix:#` unit can render it as #699. The GitHub frame keeps its merged_at TIME field, because Infinity only hangs the pr and title columns on the value field as LABELS (which the data link needs) when the frame has a time field. That time field would otherwise render as a fourth tile, so an override renames it to \"merged at\" and the panel's field selector (/^(commit|PR|latest merged)$/) leaves it out. Filtering it away with a transformation does NOT work: field-name transformations match on the computed DISPLAY name, which for a labelled value field is not its column name, so the filter silently drops the whole frame.",
       "gridPos": {
-        "h": 4,
-        "w": 24,
+        "h": 5,
+        "w": 12,
         "x": 0,
         "y": 25
       },
@@ -377,28 +377,7 @@
             "uid": "prometheus"
           },
           "expr": "claude_watch_build_info",
-          "legendFormat": "commit {{commit}}",
           "refId": "A",
-          "instant": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "claude_watch_build_info",
-          "legendFormat": "PR #{{pr}}",
-          "refId": "B",
-          "instant": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "worktask_exporter_build_info",
-          "legendFormat": "exporter {{commit}}",
-          "refId": "D",
           "instant": true
         },
         {
@@ -459,13 +438,74 @@
         "overrides": [
           {
             "matcher": {
+              "id": "byName",
+              "options": "commit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#859900"
+                }
+              },
+              {
+                "id": "noValue",
+                "value": "n/a"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "PR"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#268bd2"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "prefix:#"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "noValue",
+                "value": "n/a"
+              }
+            ]
+          },
+          {
+            "matcher": {
               "id": "byFrameRefID",
               "options": "C"
             },
             "properties": [
               {
                 "id": "displayName",
-                "value": "latest PR #${__field.labels.pr}"
+                "value": "latest merged"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#b58900"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "prefix:#"
+              },
+              {
+                "id": "decimals",
+                "value": 0
               },
               {
                 "id": "links",
@@ -478,23 +518,92 @@
                 ]
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "time"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "merged at"
+              }
+            ]
           }
         ]
       },
       "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "vertical",
+        "textMode": "value_and_name",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
+          ],
+          "fields": "/^(commit|PR|latest merged)$/",
+          "values": false
         },
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "name",
-        "orientation": "auto",
         "text": {
-          "valueSize": 20
+          "valueSize": 32,
+          "titleSize": 16
         }
-      }
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "filter": {
+            "id": "byRefId",
+            "options": "A"
+          },
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "filter": {
+            "id": "byRefId",
+            "options": "A"
+          },
+          "options": {
+            "include": {
+              "pattern": "^(commit|pr)$"
+            }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "filter": {
+            "id": "byRefId",
+            "options": "A"
+          },
+          "options": {
+            "conversions": [
+              {
+                "targetField": "pr",
+                "destinationType": "number"
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "filter": {
+            "id": "byRefId",
+            "options": "A"
+          },
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "pr": "PR"
+            }
+          }
+        }
+      ]
     },
     {
       "id": 109,
