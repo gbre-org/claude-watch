@@ -490,7 +490,10 @@
         "colorMode": "none",
         "graphMode": "none",
         "textMode": "name",
-        "orientation": "auto"
+        "orientation": "auto",
+        "text": {
+          "valueSize": 20
+        }
       }
     },
     {
