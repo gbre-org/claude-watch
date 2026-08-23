@@ -312,7 +312,19 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
         }
         // Thinking-indicator tokens (with k/M suffix) — match regardless of
         // status_bar flag. The arrow prefix is itself a strong anchor.
-        if result.tokens.is_none() {
+        //
+        // Skip agent-roster rows here, same discipline as the whole-pane
+        // fallback below (PR #646): a roster row's `<n> tokens` belongs to
+        // ONE SUBAGENT, not the session. Unlike the bare-total pass above
+        // (which strips arrow-prefixed counters before matching), this
+        // regex supports k/M suffixes, so an over-1000-token roster row
+        // (`102.8k tokens`) matches it just as easily as a real thinking
+        // indicator — without this guard a subagent's count can win here
+        // purely because its roster row is drawn earlier in the bottom-10
+        // window than the real indicator. If nothing else matches, the
+        // roster-aware whole-pane fallback below still recovers a roster
+        // row as a last resort.
+        if result.tokens.is_none() && !is_agent_roster_row(line) {
             if let Some(caps) = token_thinking_re.captures(line) {
                 if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
                     if let Ok(base) = num.as_str().parse::<f64>() {
@@ -2345,6 +2357,26 @@ mod tests {
         assert!(!is_agent_roster_row(
             "\u{25cf} Read agent output bbow3km6m"
         ));
+    }
+
+    /// The PRIMARY per-line pass (not just the whole-pane fallback) must
+    /// also treat a roster row as a last resort: `token_thinking_re`
+    /// supports k/M suffixes, so an over-1000-token roster row matches this
+    /// pass just as easily as a real thinking indicator, and without a
+    /// guard here a subagent's count can win purely because its roster row
+    /// is drawn earlier in the bottom-10-line window than the real one.
+    #[test]
+    fn test_thinking_indicator_beats_agent_roster_row_in_primary_pass() {
+        let input = "\
+  \u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens\n\
+\u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)";
+        let parsed = parse_status_bar(input);
+        assert_eq!(
+            parsed.tokens,
+            Some(26000),
+            "the roster row (drawn first) must not win over the real \
+             thinking indicator that follows it in the same window"
+        );
     }
 
     #[test]
