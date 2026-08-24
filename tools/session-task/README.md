@@ -44,6 +44,36 @@ session-task queue done q-2026-05-01-XXXX
 `session-task queue spawn-check <id>` is a read-only re-check (exit 0 = clear, exit 2 = blocked
 or not found).
 
+### Owner attribution (`queue assign`)
+
+A running item should name the agent that owns it (`agent_id`), so the
+dashboard and the owner-unknown alert can tell "actively worked" from
+"registered and forgotten". Two paths stamp it automatically: the
+spawn-time arm hook (original spawn) and `queue register --agent-id`
+(the first register of an item).
+
+Neither covers an agent **resumed onto a rotated queue id** — no fresh
+spawn hook fires, and `register` cannot retrofit the stamp:
+
+* `register --agent-id --if-absent` short-circuits at `already running`
+  and stamps nothing.
+* `register` without `--if-absent` refuses a running item on purpose —
+  a register against a running item is the double-spawn signal, and
+  relaxing it to permit an owner edit would blunt that guard.
+
+So owner attribution has its own verb:
+
+```bash
+session-task queue assign q-2026-05-01-XXXX --agent <agent_id>
+```
+
+It writes ONLY `agent_id`, `agent_id_source: "assign"` and
+`agent_id_stamped_at` — no status change, no scope re-acquisition, and
+deliberately no `last_heartbeat_at` bump (an owner stamp is not evidence
+of liveness). Accepted on `running` / `wedged` / `blocked`; refused on
+`pending` (nothing was spawned, so an owner would be invented) and on
+`done` / `abandoned` / `quarantined` (the item is over).
+
 **Note on `--force-enqueue`**: dual purpose as of 2026-05-19 (rev 2):
 
   * **Bypass for the workload-scope hard-fail**. `queue add` REFUSES (exit 3,
@@ -122,7 +152,8 @@ scope, defaulting open on any ambiguity.
 The schema is **stable**: `{"schema_version": 2, "items": [...]}`. Items have:
 `id, description, summary, scope, group_id, group_head, status, priority, created_at,
 created_by`, plus optional `started_at, registered_at, completed_at, abandoned_at,
-abandon_reason, pid, last_heartbeat_at, context`.
+abandon_reason, pid, last_heartbeat_at, context, agent_id, agent_id_source,
+agent_id_stamped_at`.
 
 ## Implementation note
 

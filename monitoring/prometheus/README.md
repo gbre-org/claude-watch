@@ -64,6 +64,46 @@ fires only for GENUINELY owner-less items — the never-spawned
 (`agent_id=""`) or died-after-spawn (`agent_id` set) cases
 `WorkQueueOrphaned` is meant to catch.
 
+### Owner UNKNOWN vs owner ORPHANED
+
+`WorkQueueOrphaned` is about an owner that **went away**. A running item
+can also have **never had an attributable owner at all** — no
+active-agents record on the qid, no register-time `agent_id` stamp, no
+arm-hook binding. That is a queue entry meant for an agent that was never
+assigned one, or an agent resumed onto a rotated queue id whose stamp was
+never retrofitted.
+
+`worktask_queue_item_owner_unknown_age_seconds` (per item, age measured
+from registration) and `worktask_queue_owner_unknown_items` (count) carry
+that case, and `WorkQueueOwnerUnknown` alerts on it at
+`> 600` `for: 10m`.
+
+The gauge deliberately has **no heartbeat-staleness precondition**. The
+never-spawned branch of `has_live_owner` requires a heartbeat older than
+`ORPHAN_HEARTBEAT_STALE_SECONDS`, which is exactly why a live-but-ownerless
+item is invisible today: an item heartbeating happily while belonging to
+nobody never trips it. Age is measured from registration for the same
+reason — a heartbeat says the work is alive, never who owns it, so
+resetting the clock on each beat would re-hide the case the gauge exists
+to expose.
+
+Exempt (matching the queue-check cron's own exemptions):
+
+- items whose scope carries a `workload:` or `hostjob:` token — system
+  jobs owned by a **process** in the tasks session, not by an agent;
+- items with an explicit `pid` stamp, which names the owning process
+  directly;
+- `blocked` items, which have no live agent by design;
+- everything, while no owner-attribution input is readable —
+  `WorkQueueOwnerInputMissing` carries that case instead.
+
+Remedy: stamp the real owner with
+`session-task queue assign <id> --agent <agent_id>`, spawn the missing
+agent, or abandon the item. `queue register` cannot do the retrofit —
+`--if-absent` short-circuits at `already running` and stamps nothing, and a
+bare register on a running item is (correctly) refused as a double-spawn
+signal.
+
 **Liveness is never a pid.** Subagents share the parent Claude Code PID,
 and a container-spawned agent has no pid the exporter could resolve at all,
 so any pid-shaped check fails exactly the agents it most needs to see. The
@@ -179,7 +219,8 @@ Recording (`claude-watch-work-queue.recording`):
 - `worktask:queue_items_owned:count`
 - `worktask:queue_items_orphaned_never_spawned:count`
 
-Alerts: `WorkQueueOrphaned`, `WorkQueueStuckSoft`, `WorkQueueReadyStuck`,
+Alerts: `WorkQueueOrphaned`, `WorkQueueOwnerUnknown`, `WorkQueueStuckSoft`,
+`WorkQueueReadyStuck`,
 `AgentStateFileMissing`, `WorkQueueOwnerInputMissing`,
 `ClaudeEventsBacklogStale`, `ClaudeWatchDown`, `ClaudeWatchersMissing`,
 `ClaudeMainLoopHeartbeatStale`.
