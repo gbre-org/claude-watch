@@ -140,6 +140,22 @@ Metrics:
         genuinely-stuck workloads from healthy long-running ones.
         Absent if the heartbeat file is missing — the alert join
         accounts for that case. )
+  - worktask_queue_item_owner_unknown_age_seconds{id,summary} gauge
+        (seconds since registration for a RUNNING item that no owner can
+        be attributed to -- no active-agents record on the qid, no
+        register-time `agent_id` stamp, no arm-hook binding. OWNER-UNKNOWN
+        is not ORPHANED: orphaned = a known owner is gone; owner-unknown =
+        nobody can be named at all, the "queue entry meant for an agent
+        that never got one assigned" case. Unlike the never-spawned-orphan
+        branch of has_live_owner, this carries NO
+        ORPHAN_HEARTBEAT_STALE_SECONDS precondition -- that staleness gate
+        is exactly why a live-but-ownerless item is invisible today.
+        Suppressed when no owner input is readable; `workload:`/`hostjob:`
+        scoped items and items with an explicit `pid` are exempt (system
+        jobs owned by a process, not an agent). Drives
+        WorkQueueOwnerUnknown; remedy is `session-task queue assign`.)
+  - worktask_queue_owner_unknown_items       gauge  (count of the above;
+        always emitted, 0 when every running item is attributable)
   - worktask_queue_file_last_modified        gauge  (mtime of queue.json)
   - worktask_queue_agent_state_last_modified gauge  (mtime of active-agents.json,
         OR 0 if file missing — useful for alerting when claude-watch
@@ -381,6 +397,43 @@ g_progress_age = Gauge(
         "Absent if the heartbeat file is missing."
     ),
     ["id", "summary", "workload_label"],
+    registry=REG,
+)
+g_owner_unknown_age = Gauge(
+    "worktask_queue_item_owner_unknown_age_seconds",
+    (
+        "Seconds since a RUNNING queue item was registered while NO owner "
+        "can be attributed to it -- no active-agents record keyed on the "
+        "qid, no register-time `agent_id` stamp, and no arm-hook binding. "
+        "This is the `owner unknown` case, and it is NOT the same as "
+        "orphaned: orphaned means a KNOWN owner is gone (has_live_owner=0), "
+        "while owner-unknown means the item is not attributable to anyone "
+        "at all -- classically a queue entry meant for an agent that never "
+        "got one assigned, or an agent RESUMED onto a rotated qid whose "
+        "owner stamp was never retrofitted. Deliberately NOT gated on "
+        "ORPHAN_HEARTBEAT_STALE_SECONDS: the never-spawned-orphan branch "
+        "requires a STALE heartbeat, which is exactly why a live-but-"
+        "ownerless item is invisible today. Emitted only when at least one "
+        "owner-attribution input is readable (see "
+        "worktask_queue_owner_input_available) -- with no inputs every item "
+        "looks ownerless and that is a deployment fault, not a queue fact. "
+        "Items carrying a `workload:` / `hostjob:` scope token or an "
+        "explicit `pid` stamp are EXEMPT: those are system jobs owned by a "
+        "process, not by an agent, so they have no agent owner to be "
+        "missing. Remedy: `session-task queue assign <id> --agent <id>`."
+    ),
+    ["id", "summary"],
+    registry=REG,
+)
+g_owner_unknown_count = Gauge(
+    "worktask_queue_owner_unknown_items",
+    (
+        "Count of running queue items with no attributable owner (the "
+        "series count of worktask_queue_item_owner_unknown_age_seconds). "
+        "0 when every running item is attributable -- the series is always "
+        "emitted, so its ABSENCE means an exporter predating this metric "
+        "rather than a healthy queue."
+    ),
     registry=REG,
 )
 g_file_mtime = Gauge(
@@ -728,6 +781,8 @@ def collect():
     g_ready_age.clear()
     g_locked_age.clear()
     g_progress_age.clear()
+    g_owner_unknown_age.clear()
+    g_owner_unknown_count.set(0)
 
     # Seeded so every known status reports a 0 series rather than
     # disappearing. `quarantined` = abandoned on a guess that the agent
@@ -739,6 +794,11 @@ def collect():
     }
     priority_counts = {}
     group_counts = {}
+    # Running items we could not attribute an owner to at all (see
+    # g_owner_unknown_age). Summed across the loop and published as a
+    # single count so an operator can alert on "any at all" without
+    # per-series aggregation.
+    owner_unknown_count = 0
     now = datetime.now(timezone.utc)
 
     for it in items:
@@ -857,6 +917,44 @@ def collect():
                         id=iid, summary=summary, agent_id=aid, status=status,
                     ).set(owner["age"])
             elif status == "running" and have_owner_signal:
+                # OWNER UNKNOWN -- the item is running and nothing can say
+                # who owns it. Distinct from ORPHANED, which means a KNOWN
+                # owner is gone; here there is no owner to have lost. The
+                # canonical producer is a queue entry meant for an agent
+                # that never got one assigned, and the second is an agent
+                # RESUMED onto a rotated qid whose owner stamp was never
+                # retrofitted (`session-task queue assign` is the fix for
+                # that one).
+                #
+                # Emitted with NO staleness precondition, deliberately. The
+                # never-spawned-orphan branch just below requires a
+                # heartbeat older than ORPHAN_HEARTBEAT_STALE_SECONDS, and
+                # that gate is precisely why a live-but-ownerless item is
+                # invisible today: an item heartbeating happily while
+                # belonging to nobody never trips it, so nothing ever says
+                # the owner is missing. Age here is measured from
+                # registration, not from the last heartbeat, for the same
+                # reason -- heartbeats say the work is alive, never who
+                # owns it, and resetting the clock on each beat would
+                # re-hide exactly the live-but-ownerless case.
+                #
+                # Exemptions mirror the queue-check cron's: an item whose
+                # scope carries a `workload:` or `hostjob:` token is a
+                # system job owned by a PROCESS in the tasks session, and
+                # an item with an explicit `pid` stamp names its owning
+                # process directly. Neither has an agent owner that could
+                # be missing, so flagging them would be noise, not signal.
+                exempt = (
+                    _workload_label_from_scope(it.get("scope")) is not None
+                    or _hostjob_label_from_scope(it.get("scope")) is not None
+                    or it.get("pid") is not None
+                )
+                if not exempt and reg_ts is not None:
+                    owner_unknown_count += 1
+                    g_owner_unknown_age.labels(id=iid, summary=summary).set(
+                        max(0.0, (now - reg_ts).total_seconds())
+                    )
+
                 # Never-spawned / abandoned-without-binding orphan -- a
                 # `running` item whose Agent was never fired has NO agent
                 # record AND no binding (vs died-after-spawn, which has a
@@ -951,6 +1049,8 @@ def collect():
                     h_duration.labels(phase="total").observe(
                         max(0.0, (completed - created).total_seconds())
                     )
+
+    g_owner_unknown_count.set(owner_unknown_count)
 
     for s, n in status_counts.items():
         g_items_total.labels(status=s).set(n)

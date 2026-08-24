@@ -35,6 +35,14 @@ Scenarios covered:
       worktask_queue_owner_input_available=0 for each, and
       has_live_owner ABSENT rather than 0 for every running item.
       One readable input is enough to keep the orphan fallback live.
+  (27) owner-unknown: a running item nobody can be attributed to
+      emits worktask_queue_item_owner_unknown_age_seconds even with a
+      FRESH heartbeat (the case has_live_owner's staleness gate
+      misses); an active-agents record, a register/assign `agent_id`
+      stamp, a `workload:`/`hostjob:` scope token, an explicit pid,
+      and blocked status all exempt it; suppressed with no readable
+      owner input; the count series is always emitted and resets
+      between scrapes.
   (26) build identity: worktask_exporter_build_info carries the
       env-provided commit/version/source, falls back to
       commit="unknown"/version="0.0.0"/source="host" when nothing
@@ -1292,6 +1300,201 @@ def run_scenarios():
     )
     check("S26c empty/whitespace env falls back to the sentinel",
           v == 1.0, "got " + repr(v))
+
+    # ---- Scenario 27: owner-unknown gauges.
+    #
+    # OWNER-UNKNOWN is a different failure from ORPHANED and needs its own
+    # signal. Orphaned = a KNOWN owner is gone (has_live_owner=0 on a named
+    # or once-named agent). Owner-unknown = the item is running and NOBODY
+    # can be named for it -- the "queue entry meant for an agent that never
+    # got one assigned" case, and the resumed-agent case where the owner
+    # stamp was never retrofitted.
+    #
+    # The load-bearing difference from the never-spawned-orphan branch
+    # (Scenario 19) is the ABSENCE of a staleness precondition: that branch
+    # requires a heartbeat older than ORPHAN_HEARTBEAT_STALE_SECONDS, so an
+    # item heartbeating happily while belonging to nobody never trips it.
+    # 27a is exactly that item.
+    print("\nScenario 27: owner-unknown gauges")
+
+    ou_stale_iso = (
+        datetime.now(timezone.utc) - timedelta(seconds=1200)
+    ).isoformat()
+    ou_fresh_iso = datetime.now(timezone.utc).isoformat()
+
+    # 27a: running, no owner, registered long ago, heartbeat FRESH.
+    # has_live_owner stays silent (correctly -- the heartbeat is fresh);
+    # owner_unknown_age fires anyway, which is the whole point.
+    item = make_running_item("q-s27a", "live but ownerless")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    item["last_heartbeat_at"] = ou_fresh_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27a",
+    )
+    check(
+        "S27a owner_unknown_age emitted despite a FRESH heartbeat",
+        age is not None and age > 1100,
+        "got " + repr(age),
+    )
+    v = find_any_sample(mod, "worktask_queue_item_has_live_owner", "q-s27a")
+    check(
+        "S27a has_live_owner still absent (fresh heartbeat) -- the gap this closes",
+        v is None,
+        "expected None, got " + repr(v),
+    )
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27a owner_unknown_items == 1", n == 1.0, "got " + repr(n))
+
+    # 27b: an item with an active-agents record has an owner -> silent.
+    item = make_running_item("q-s27b", "owned by a live agent")
+    write_queue(qjson, [item])
+    write_agent_state(astate, [{
+        "agent_id": "aowner0000000000",
+        "queue_id": "q-s27b",
+        "alive": True,
+        "jsonl_age_seconds": 3,
+    }])
+    mod = load_exporter(env)
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27b",
+    )
+    check("S27b owned item emits no owner_unknown_age", age is None,
+          "expected None, got " + repr(age))
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27b owner_unknown_items == 0", n == 0.0, "got " + repr(n))
+
+    # 27c: the register-time / assign-time `agent_id` stamp names an owner
+    # even with NO active-agents record -- so `session-task queue assign`
+    # is what clears this alert for a resumed agent.
+    item = make_running_item("q-s27c", "owner retrofitted by assign")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    item["agent_id"] = "aassigned0000000"
+    item["agent_id_source"] = "assign"
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27c",
+    )
+    check("S27c an assigned agent_id clears owner-unknown", age is None,
+          "expected None, got " + repr(age))
+
+    # 27d: system jobs are exempt -- a `workload:` / `hostjob:` scoped item
+    # is owned by a PROCESS in the tasks session, and an explicit `pid`
+    # names its owning process directly. Neither has an agent owner that
+    # could be missing.
+    ou_workload = make_running_item("q-s27d-workload", "exempt workload")
+    ou_workload["scope"] = ["workload:stv-promote"]
+    ou_hostjob = make_running_item("q-s27d-hostjob", "exempt hostjob")
+    ou_hostjob["scope"] = ["hostjob:nightly-sync"]
+    ou_pid = make_running_item("q-s27d-pid", "exempt pid-stamped")
+    ou_pid["pid"] = 4242
+    exempt_items = [ou_workload, ou_hostjob, ou_pid]
+    for it_ in exempt_items:
+        it_["registered_at"] = ou_stale_iso
+        it_["started_at"] = ou_stale_iso
+    write_queue(qjson, exempt_items)
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    for iid in ("q-s27d-workload", "q-s27d-hostjob", "q-s27d-pid"):
+        age = find_any_sample(
+            mod, "worktask_queue_item_owner_unknown_age_seconds", iid,
+        )
+        check("S27d " + iid + " exempt from owner-unknown", age is None,
+              "expected None, got " + repr(age))
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27d owner_unknown_items == 0 (all exempt)", n == 0.0,
+          "got " + repr(n))
+
+    # 27e: blocked items are exempt -- parked on an external blocker, no
+    # live agent expected by design (same posture as has_live_owner).
+    item = make_blocked_item("q-s27e", "blocked, ownerless by design")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27e",
+    )
+    check("S27e blocked item emits no owner_unknown_age", age is None,
+          "expected None, got " + repr(age))
+
+    # 27f: with NO readable owner input every running item looks ownerless.
+    # That is a deployment fault, not a queue fact -- stay silent and let
+    # worktask_queue_owner_input_available carry the alarm (same gate the
+    # never-spawned-orphan branch uses).
+    ou_missing_bindings = os.path.join(tmpdir, "no-such-bindings-27.json")
+    item = make_running_item("q-s27f", "no owner inputs at all")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    write_queue(qjson, [item])
+    if os.path.exists(astate):
+        os.remove(astate)
+    mod = load_exporter(
+        {**env, "AGENT_QUEUE_BINDINGS_JSON": ou_missing_bindings}
+    )
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27f",
+    )
+    check(
+        "S27f owner_unknown_age suppressed when no owner input is readable",
+        age is None,
+        "expected None, got " + repr(age),
+    )
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27f owner_unknown_items == 0 while suppressed", n == 0.0,
+          "got " + repr(n))
+    write_agent_state(astate, [])
+
+    # 27g: the count series is ALWAYS emitted, so its absence can only mean
+    # "exporter predating this metric" -- never a healthy queue.
+    write_queue(qjson, [])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27g owner_unknown_items present (0) on an empty queue",
+          n == 0.0, "got " + repr(n))
+
+    # 27h: the gauge is reset between scrapes -- an item that gains an owner
+    # must not leave a stale series behind.
+    item = make_running_item("q-s27h", "gains an owner")
+    item["registered_at"] = ou_stale_iso
+    item["started_at"] = ou_stale_iso
+    write_queue(qjson, [item])
+    write_agent_state(astate, [])
+    mod = load_exporter(env)
+    mod.collect()
+    check(
+        "S27h owner_unknown_age present before assignment",
+        find_any_sample(
+            mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27h",
+        ) is not None,
+        "expected a value",
+    )
+    item["agent_id"] = "alater0000000000"
+    item["agent_id_source"] = "assign"
+    write_queue(qjson, [item])
+    mod.collect()
+    age = find_any_sample(
+        mod, "worktask_queue_item_owner_unknown_age_seconds", "q-s27h",
+    )
+    check("S27h series cleared once an owner is assigned", age is None,
+          "expected None, got " + repr(age))
+    n = find_sample(mod, "worktask_queue_owner_unknown_items", {})
+    check("S27h owner_unknown_items back to 0", n == 0.0, "got " + repr(n))
 
     print()
     if failures:

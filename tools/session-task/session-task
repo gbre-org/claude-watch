@@ -5891,6 +5891,102 @@ def cmd_queue_register(args):
         print("  next  : spawn the agent. call `queue done` when it finishes.")
 
 
+def cmd_queue_assign(args):
+    """Stamp the owning agent_id on an IN-FLIGHT item (owner retrofit).
+
+    Motivation: an item can be legitimately in flight and yet carry no
+    owner. The spawn-time arm-hook binds `agent_id -> queue_id` only for
+    the ORIGINAL spawn marker, so an agent RESUMED onto a rotated queue id
+    leaves the new item ownerless -- "owner unknown" on the dashboard and
+    invisible to the orphan alert, though the work is actively running.
+
+    `register` cannot be the retrofit path for that case:
+
+      * `register --agent-id --if-absent` SHORT-CIRCUITS at the
+        `already running` branch and stamps nothing (verified live), so
+        the flag silently does nothing on exactly the items that need it.
+      * `register` WITHOUT `--if-absent` on a running item is refused by
+        design -- a register against a running item is the double-spawn
+        signal, and weakening it to allow an owner edit would blunt the
+        one guard that catches a real double spawn.
+
+    So owner attribution gets its own verb. `assign` touches ONLY the
+    three owner fields; it does not change status, does not re-acquire a
+    scope lock, does not bump `last_heartbeat_at` (an owner stamp is not
+    evidence of liveness), and fires no lifecycle notification.
+
+    Accepted statuses: running / wedged / blocked -- the in-flight states
+    where an agent genuinely exists to be named. Everything else is
+    refused with a message naming the status:
+
+      * pending      -- nothing has been spawned; stamping an owner would
+                        invent one.
+      * done / abandoned / quarantined -- the item is over (or was
+                        declared over on an inference the agent died);
+                        stamping an owner rewrites history rather than
+                        fixing attribution on live work.
+    """
+    new_aid = (getattr(args, "agent", None) or "").strip()
+    if not new_aid:
+        print("ERROR: --agent must be a non-empty agent id", file=sys.stderr)
+        sys.exit(1)
+
+    ASSIGNABLE = ("running", "wedged", "blocked")
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        status = target.get("status")
+        if status not in ASSIGNABLE:
+            print(
+                f"assign refused: {args.id} status={status!r} "
+                f"(must be one of {', '.join(ASSIGNABLE)})",
+                file=sys.stderr,
+            )
+            if status in ("done", "abandoned", "quarantined"):
+                print(
+                    "  the item is terminal -- owner attribution only applies "
+                    "to work still in flight.",
+                    file=sys.stderr,
+                )
+            elif status == "pending":
+                print(
+                    "  the item has not been spawned yet -- register it "
+                    "(`session-task queue register <id> --agent-id <id>`) "
+                    "instead of assigning an owner to a pending item.",
+                    file=sys.stderr,
+                )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        old_aid = target.get("agent_id")
+        old_source = target.get("agent_id_source")
+        target["agent_id"] = new_aid
+        target["agent_id_source"] = "assign"
+        target["agent_id_stamped_at"] = _fmt_ts()
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    if args.json:
+        print(json.dumps(updated, indent=2))
+    else:
+        print(f"assigned: {args.id} (status={updated.get('status')})")
+        print(f"  old owner : {old_aid or '(none)'}"
+              f"{f' [{old_source}]' if old_source else ''}")
+        print(f"  new owner : {new_aid} [assign]")
+        print(f"  stamped   : {updated.get('agent_id_stamped_at')}")
+
+
 def cmd_queue_force_start(args):
     """Atomically promote a pending item to running, bypassing scope blockers.
 
@@ -8953,6 +9049,31 @@ def build_parser():
         help="Suppress the pingme lifecycle notification for this operation.",
     )
 
+    q_assign = qsub.add_parser(
+        "assign",
+        help=(
+            "Stamp the owning agent_id on an IN-FLIGHT item (running / "
+            "wedged / blocked). Owner retrofit for an agent RESUMED onto a "
+            "rotated queue id, which `register` cannot do: --if-absent "
+            "short-circuits at `already running` and stamps nothing, and a "
+            "bare register on a running item is the double-spawn guard."
+        ),
+    )
+    q_assign.add_argument("id")
+    q_assign.add_argument(
+        "--agent", "--agent-id",
+        dest="agent",
+        required=True,
+        metavar="AGENT_ID",
+        help=(
+            "The owning subagent's agent_id. Stamped as `agent_id` with "
+            "`agent_id_source: \"assign\"` and `agent_id_stamped_at`. "
+            "(`--agent-id` is accepted as an alias for symmetry with "
+            "`queue register --agent-id`.)"
+        ),
+    )
+    q_assign.add_argument("--json", action="store_true")
+
     q_heartbeat = qsub.add_parser(
         "heartbeat",
         help=(
@@ -9455,6 +9576,7 @@ def main():
             "pop": cmd_queue_pop,
             "register": cmd_queue_register,
             "heartbeat": cmd_queue_heartbeat,
+            "assign": cmd_queue_assign,
             "wedge": cmd_queue_wedge,
             "unwedge": cmd_queue_unwedge,
             "block": cmd_queue_block,

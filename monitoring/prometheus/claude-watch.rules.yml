@@ -56,6 +56,20 @@
 # the parent Claude Code PID and container-spawned agents have no resolvable
 # pid at all.
 #
+# ## Owner-UNKNOWN is not owner-ORPHANED
+#
+# The ladder above is about an owner that WENT AWAY. A separate failure is an
+# item that never had an attributable owner in the first place: no
+# active-agents record on the qid, no register-time `agent_id` stamp, no
+# arm-hook binding. That is a queue entry meant for an agent that was never
+# assigned one -- or an agent RESUMED onto a rotated queue id, whose stamp was
+# never retrofitted. `worktask_queue_item_owner_unknown_age_seconds` /
+# WorkQueueOwnerUnknown cover that case, and they carry NO heartbeat-staleness
+# precondition on purpose: the never-spawned branch of has_live_owner requires
+# a STALE heartbeat, so an item heartbeating happily while belonging to nobody
+# is invisible to it. Remedy is `session-task queue assign <id> --agent <id>`
+# (owner retrofit), spawning the missing agent, or abandoning the item.
+#
 # When the exporter cannot READ its owner inputs (a container missing a bind
 # mount) every running item looks ownerless. Rather than page the whole queue,
 # the exporter goes SILENT on has_live_owner and publishes
@@ -121,6 +135,48 @@ groups:
             never-spawned, set = died-after-spawn) and remained so long after
             the Stage-1 queue-orphaned claude-event should have prompted the
             main loop. Re-register + re-spawn the work, or abandon the item.
+
+      # WorkQueueOwnerUnknown -- a RUNNING item that NOBODY can be
+      # attributed to. Distinct from WorkQueueOrphaned above, and the two
+      # are deliberately not merged: orphaned means a KNOWN owner is gone
+      # (has_live_owner=0 on a named or once-named agent); owner-unknown
+      # means the item is not attributable to anyone at all -- no
+      # active-agents record on the qid, no register-time agent_id stamp,
+      # no arm-hook binding. That is what a queue entry meant for an agent
+      # that never got one assigned looks like, and what an agent RESUMED
+      # onto a rotated queue id looks like until its owner stamp is
+      # retrofitted.
+      #
+      # The exporter emits this gauge with NO heartbeat-staleness
+      # precondition, unlike the never-spawned branch of has_live_owner.
+      # That staleness gate is exactly why a live-but-ownerless item is
+      # invisible: an item heartbeating happily while belonging to nobody
+      # never trips it. `workload:`/`hostjob:` scoped items and items with
+      # an explicit `pid` are exempt at the exporter (system jobs owned by
+      # a process, not an agent), and the gauge is suppressed entirely when
+      # no owner-attribution input is readable -- WorkQueueOwnerInputMissing
+      # carries that case.
+      #
+      # 10m expr + 10m `for` = ~20 min after registration, well past any
+      # spawn-time attribution lag.
+      - alert: WorkQueueOwnerUnknown
+        expr: worktask_queue_item_owner_unknown_age_seconds > 600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Work-queue item {{ $labels.id }} has no assigned agent"
+          description: >-
+            Running queue item {{ $labels.id }} ({{ $labels.summary }}) has
+            been running for {{ $value | humanizeDuration }} with NO
+            attributable owner -- no active-agents record, no register-time
+            agent_id stamp, no arm-hook binding. This is "owner unknown", not
+            "orphaned": nobody can be named for the work, rather than a known
+            owner having died. Either an agent was never spawned for it, or an
+            agent resumed onto this (rotated) id and its owner stamp was never
+            retrofitted. Remedy: stamp the real owner with
+            `session-task queue assign {{ $labels.id }} --agent <agent_id>`,
+            spawn the missing agent, or abandon the item.
 
       # WorkQueueStuckSoft -- a running item with long runtime AND stale (or
       # absent) progress. The base series is running_elapsed; each `unless

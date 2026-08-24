@@ -454,6 +454,26 @@ CLASSIFICATIONS: list[tuple[str, str, Callable[[str], bool] | None, str, str]] =
         "PR comment-triage is STUCK (no progress); force a resolution or ping "
         "the operator (triage escalation, botchat #3610)."),
 
+    # A RUNNING queue item that no owner can be attributed to -- no agent
+    # record on the qid, no register-time `agent_id` stamp, no arm-hook
+    # binding. NOT the same failure as queue-orphaned: orphaned means a
+    # KNOWN owner is gone, owner-unknown means the item is not attributable
+    # to anyone at all, which is what a queue entry meant for an agent that
+    # never got one assigned looks like. Actionable because there is a
+    # concrete remedy the loop can perform: spawn the missing agent, or
+    # stamp the owner of a resumed one (`session-task queue assign <id>
+    # --agent <agent_id>`), or abandon the item.
+    #
+    # The producer emits source="cron", so this row MUST precede the
+    # ("cron", "*") ambient catch-all below. It is written out here rather
+    # than left to the producer-shipped tier on purpose: a producer that
+    # forgets to ship `data.tier` would otherwise land this in ambient and
+    # the ownerless item would go on being ownerless, quietly.
+    ("cron", "queue-owner-unknown", None, ACTIONABLE,
+        "Running queue item has NO attributable owner (never assigned an "
+        "agent, or a resumed agent whose owner stamp was never retrofitted); "
+        "spawn the agent, `queue assign` the owner, or abandon the item."),
+
     # --- AMBIENT ----------------------------------------------------------
     #
     # Info-only: surface in next UserPromptSubmit context, no gate.
@@ -790,6 +810,10 @@ def _self_test() -> int:
         # actionable, and MUST win over cron/* ambient.
         (("cron", "comment-triage-STUCK", ""), ACTIONABLE),
         (("manual", "comment-triage-STUCK", ""), ACTIONABLE),
+        # queue-owner-unknown: emitted under source="cron"; MUST win
+        # over the cron/* ambient catch-all so an ownerless running item
+        # actually presses the loop.
+        (("cron", "queue-owner-unknown", ""), ACTIONABLE),
         # keepalive is actionable (ack it), and must win over the
         # claude-watch/* ambient catch-all below it.
         (("claude-watch", "keepalive", "keepalive: no event acked recently"),
