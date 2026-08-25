@@ -47,6 +47,12 @@ Coverage:
   - Default status gate, GREEN: a listener on MCP_LOCAL_PORT → detects
     the service is up, proceeds to start the reverse tunnel (fake ssh
     stand-in), then SIGTERM actively tears the tunnel down.
+  - SIGTERM teardown is not racy: the TERM/INT handler is a bare
+    function name (bash re-parses a handler string on every signal, so
+    a multi-statement or interpolated one can fail to parse and swallow
+    the signal), nothing between the ssh spawn and the steady-state wait
+    uses a command substitution, and a repeated randomized-offset
+    SIGTERM tears the tunnel down cleanly every time.
   - --enable --print-cmd emits the MCP_HOST_BASH_BIN: launch block.
 
 Run:  ./personal-mcp-host.test
@@ -55,6 +61,9 @@ Run:  ./personal-mcp-host.test
 from __future__ import annotations
 
 import os
+import random
+import re
+import signal
 import socket
 import subprocess
 import sys
@@ -719,6 +728,172 @@ def test_default_green_path_detects_service_up() -> None:
                 proc.kill()
                 proc.wait(timeout=5)
             # Reap any orphaned fake-ssh sleep children.
+            subprocess.run(["pkill", "-f", "sleep 600"], check=False)
+
+
+
+def test_sigterm_handler_is_a_bare_function_call() -> None:
+    """The TERM/INT handler string must be a single bare function name.
+
+    bash re-parses a handler string at signal-delivery time, in whatever
+    parser state the shell happens to be in. A handler built out of
+    several statements — or worse, one with a value interpolated into it
+    — is parser work done at the least predictable moment there is, and
+    when that parse fails bash prints
+
+        ...personal-mcp-host.sh: trap: line 2: unexpected EOF while
+        looking for matching `)\'
+
+    and KEEPS GOING: the signal is swallowed, the teardown never runs and
+    the reverse tunnel stays open. Keep the string to one word and read
+    every value from variables inside the function."""
+    body = SCRIPT.read_text()
+    handlers = re.findall(r"^\s*trap\s+(.+?)\s+TERM\s+INT\s*$", body, re.M)
+    expect(
+        len(handlers) == 1,
+        f"expected exactly one `trap ... TERM INT` registration, got {handlers}",
+    )
+    if not handlers:
+        return
+    handler = handlers[0].strip().strip("'\"")
+    expect(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", handler) is not None,
+        f"the TERM/INT handler must be a bare function name, not a command "
+        f"string bash has to parse at signal time; got: {handlers[0]}",
+    )
+    for bad in ("$(", "${", "`", ";"):
+        expect(
+            bad not in handlers[0],
+            f"the TERM/INT handler string must not contain {bad!r} — it is "
+            f"re-parsed on every signal; got: {handlers[0]}",
+        )
+    expect(
+        re.search(rf"^{re.escape(handler)}\(\)\s*{{", body, re.M) is not None,
+        f"the TERM/INT handler `{handler}` should be defined as a function",
+    )
+
+
+def test_no_command_substitution_between_tunnel_spawn_and_wait() -> None:
+    """Nothing between spawning ssh and entering the steady-state wait may
+    use a command substitution.
+
+    That stretch is the window in which a SIGTERM has real teardown work
+    to do, and a `$( )` there makes the shell re-enter its own parser
+    mid-expansion. A signal landing inside that re-entry gets its handler
+    parsed with the substitution's still-open `(` on the parser's
+    delimiter stack, bash aborts the handler with `unexpected EOF while
+    looking for matching `)\'`, and the teardown silently never runs.
+    Log-file/dir preparation belongs BEFORE the spawn; parameter
+    expansion (`${path%/*}`) replaces `$(dirname ...)`."""
+    body = SCRIPT.read_text()
+    fn = re.search(
+        r"^run_tunnel_and_tail\(\)\s*{(.*?)^}", body, re.M | re.S
+    )
+    expect(fn is not None, "could not locate run_tunnel_and_tail() in the script")
+    if fn is None:
+        return
+    inner = fn.group(1)
+    spawn = inner.find('"${ssh_argv[@]}" &')
+    wait = inner.find("while kill -0")
+    expect(spawn != -1, "run_tunnel_and_tail should spawn the ssh argv")
+    expect(wait != -1, "run_tunnel_and_tail should hold in a `while kill -0` wait")
+    if spawn == -1 or wait == -1:
+        return
+    window = inner[spawn:wait]
+    code = "\n".join(
+        line for line in window.splitlines() if not line.lstrip().startswith("#")
+    )
+    for bad in ("$(", "`"):
+        expect(
+            bad not in code,
+            f"no command substitution ({bad!r}) is allowed between the ssh "
+            f"spawn and the steady-state wait — it can swallow a SIGTERM. "
+            f"Window:\n{code}",
+        )
+
+
+def test_green_path_sigterm_teardown_is_race_free() -> None:
+    """Repeat the GREEN-path SIGTERM several times, signalling at a
+    randomized sub-millisecond offset after the tunnel-started line, and
+    require a clean teardown every time.
+
+    This is the regression guard for the intermittent flake where the
+    SIGTERM landed while the shell was expanding
+    `mkdir -p "$(dirname "$MCP_HOST_BASH_LOG")"` — bash failed to parse
+    the handler string, printed `trap: line 2: unexpected EOF while
+    looking for matching `)\'` and carried on running with the tunnel
+    still up."""
+    rounds = 5
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        env_path = tdp / ".env"
+        key_path = tdp / "fake-key"
+        key_path.write_text("")
+        port = _free_port()
+        write_env(env_path, mcp_local_port=str(port), ssh_key_path=str(key_path))
+        bindir = _make_fake_ssh(tdp)
+
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen(64)
+        env = {
+            "PATH": str(bindir) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/tmp"),
+            "PERSONAL_MCP_ENV_FILE": str(env_path),
+            "MCP_HOST_BASH_LOG": str(tdp / "mcp.log"),
+        }
+        try:
+            for i in range(rounds):
+                proc = subprocess.Popen(
+                    [str(SCRIPT)],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                )
+                seen = ""
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    seen += line
+                    if "reverse SSH tunnel started" in line:
+                        break
+                # Signal somewhere inside the spawn -> steady-state window.
+                time.sleep(random.uniform(0, 0.003))
+                proc.terminate()
+                # Give the handler a bounded window, then take the whole
+                # process group down before draining. A child the wrapper
+                # failed to tear down still holds the stdout pipe, and
+                # reading it would block forever instead of failing.
+                exit_by = time.time() + 10
+                while time.time() < exit_by and proc.poll() is None:
+                    time.sleep(0.02)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    seen += proc.communicate(timeout=10)[0] or ""
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    seen += proc.communicate(timeout=10)[0] or ""
+                expect(
+                    ": trap:" not in seen,
+                    f"round {i}: bash failed to parse the signal handler — the "
+                    f"SIGTERM was swallowed; got:\n{seen}",
+                )
+                expect(
+                    "tearing down reverse SSH tunnel" in seen
+                    and "reverse SSH tunnel torn down" in seen,
+                    f"round {i}: SIGTERM should always tear the tunnel down and "
+                    f"confirm it is gone; got:\n{seen}",
+                )
+        finally:
+            listener.close()
             subprocess.run(["pkill", "-f", "sleep 600"], check=False)
 
 
@@ -1603,6 +1778,9 @@ tests = [
     test_enable_flag_in_help,
     test_default_red_path_service_down_exits_three,
     test_default_green_path_detects_service_up,
+    test_sigterm_handler_is_a_bare_function_call,
+    test_no_command_substitution_between_tunnel_spawn_and_wait,
+    test_green_path_sigterm_teardown_is_race_free,
     test_enable_print_cmd_emits_mcp_block,
     test_enable_ctrlc_leaves_host_service_running,
     test_env_example_exists_and_has_required_keys,
