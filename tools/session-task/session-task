@@ -2161,6 +2161,15 @@ def _pingme_notify(title, message, priority="normal", silent=False):
         * ``PINGME_SESSION_TASK=0`` env var skips all session-task queue
           notifications (useful for batch scripts / noisy flows).
         * ``queue-notify`` not on PATH -> silent no-op (not an error).
+        * ``queue-notify`` itself applies a TRANSITION PUSH POLICY and
+          drops non-push-worthy transitions (by default ``started`` and
+          ``done``, which are bookkeeping and burned ~31% of the Pushover
+          account's monthly message allowance in Aug 2026). This function
+          still invokes it for EVERY transition -- the per-event
+          invocation contract is unchanged -- and the matching
+          ``_claude_event_notify`` emit is likewise unchanged, so only the
+          phone push is dropped. Re-enable via
+          ``QUEUE_NOTIFY_PUSH_TRANSITIONS`` (see ``queue-notify``).
 
     The function name is retained (rather than renamed to ``_queue_notify``)
     to avoid churning the ~dozen lifecycle call sites; the keyword/signature

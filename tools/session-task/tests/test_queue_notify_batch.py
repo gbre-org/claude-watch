@@ -14,6 +14,10 @@ These tests exercise the real ``queue-notify`` via subprocess, using:
   * ``QUEUE_NOTIFY_SPOOL`` — a per-test tmp spool file.
   * ``QUEUE_NOTIFY_DEBOUNCE`` / ``QUEUE_NOTIFY_MAX_WINDOW`` — tiny windows
     so the debounce flush happens within test time.
+  * ``QUEUE_NOTIFY_PUSH_TRANSITIONS=all`` — the transition push policy sits
+    UPSTREAM of this layer and drops `started` / `done` by default, which
+    would filter out most of these fixtures before they ever spool. The
+    policy itself is covered by test_queue_notify_policy.py.
 
 Run:
     uv run --python 3.11 --with pytest pytest tests/test_queue_notify_batch.py -v
@@ -58,6 +62,12 @@ def _env(tmp, **overrides):
     # Fast windows by default; individual tests override.
     env.setdefault("QUEUE_NOTIFY_DEBOUNCE", "3")
     env.setdefault("QUEUE_NOTIFY_MAX_WINDOW", "10")
+    # These tests exercise the DEBOUNCE/BATCH layer, which sits downstream of
+    # the transition push policy. `started` / `done` are not push-worthy by
+    # default (see test_queue_notify_policy.py), so opt this file's fixtures
+    # into pushing every transition — otherwise the burst fixtures would be
+    # filtered out before they ever reach the spool.
+    env.setdefault("QUEUE_NOTIFY_PUSH_TRANSITIONS", "all")
     for k, v in overrides.items():
         env[k] = v
     return env
