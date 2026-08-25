@@ -161,6 +161,68 @@ pub(crate) fn apply_thinking_token_progress(
     }
 }
 
+/// Bound on `carry_forward_token_misparse`: how many CONSECUTIVE zero-token
+/// polls a large, same-pane context reading may be carried forward before the
+/// zero is finally trusted. Small so a genuine `/clear` or crashed process
+/// still registers within a couple of extra cycles; large enough to bridge the
+/// 1-2-poll transient misparse (an overlay panel or a mid-redraw scrolls the
+/// bare context total out of the capture window) that the 2026-08 status-parser
+/// hardening now surfaces as a bare 0 instead of a small bogus count.
+pub(crate) const MISPARSE_CARRY_MAX: u32 = 3;
+
+/// Smooth a transient status-bar token MISPARSE so a live session is not
+/// misread as dead/cleared.
+///
+/// Context: the status parser was hardened (2026-08) to NEVER adopt the
+/// thinking-indicator (`\u{2193} N tokens`, the current turn's own output) or
+/// an agent-roster row's per-subagent count as the session context total --
+/// those numbers fooled the fresh-/clear and dead-process detectors into
+/// phantom "context clear" injects. The hardened parser instead returns `None`
+/// (-> `0`) when only those lines are on screen and the bare context total has
+/// momentarily scrolled out of the capture window. But a bare `0` itself feeds
+/// two liveness paths that the old small-bogus count did not: the
+/// `tokens == 0 && bashes == 0` dead-check accumulator and the
+/// fresh-external-session gate. A long, intact session that is merely thinking
+/// mid-turn -- or quiet-holding while subagent roster rows are on screen --
+/// would then be misread as a fresh/dead session and get a bogus resume prompt.
+///
+/// This carries the last known reading forward across a BOUNDED run of
+/// consecutive zero polls, but ONLY when the prior reading was clearly LARGE
+/// (`last_known >= carry_floor`, set by the caller to the fresh-/clear window's
+/// upper bound):
+///
+///   * A genuinely fresh/low session (`last_known < carry_floor`) is never
+///     carried, so fresh-/clear detection in the low-token window is untouched.
+///   * A large context that momentarily reads 0 is held at its last value, so a
+///     transient misparse cannot manufacture a phantom clear.
+///   * The carry is bounded (`max_carry`), so a REAL `/clear` or crashed
+///     process -- which holds 0 for many consecutive polls -- still registers
+///     once the bound is exhausted.
+///
+/// The caller additionally gates this on pane continuity (only smooth within
+/// the SAME pane), so a genuine new session (pane change) is never carried.
+///
+/// Returns `(effective_tokens, new_carry_count)`.
+pub(crate) fn carry_forward_token_misparse(
+    current: u64,
+    last_known: u64,
+    carry_count: u32,
+    carry_floor: u64,
+    max_carry: u32,
+) -> (u64, u32) {
+    if current > 0 {
+        // Real reading this poll -- trust it and reset the carry run.
+        return (current, 0);
+    }
+    if last_known >= carry_floor && carry_count < max_carry {
+        // Transient misparse of a large same-pane context -- hold the last
+        // value and advance the bounded run.
+        return (last_known, carry_count + 1);
+    }
+    // Nothing large to carry, or the carry bound is exhausted: trust the 0.
+    (0, carry_count)
+}
+
 /// Age in whole seconds of a liveness stamp relative to `now` (pure).
 /// Returns `None` when the stamp is unavailable (file missing/unreadable) or
 /// in the FUTURE relative to `now` (`duration_since` fails on clock skew /
@@ -5180,6 +5242,28 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         crate::state::save_state(&config.general.state_file, state);
         return;
     }
+
+    // Carry-forward guard against a transient status-bar token misparse (see
+    // `carry_forward_token_misparse`): if this poll reads 0 tokens for the SAME
+    // pane whose last known reading was a large, intact context, hold the prior
+    // value for a bounded run of polls rather than let the 0 trip the dead-check
+    // accumulator or the fresh-/clear detection below. A pane change (new
+    // session) or an exhausted carry run lets the 0 through. Applied only to the
+    // liveness/detection logic that follows -- the post-restart resume block
+    // above deliberately keeps the raw reading.
+    let same_pane = !cs.pane.is_empty() && cs.pane == state.last_known_pane;
+    let (tokens, token_carry_count) = if same_pane {
+        carry_forward_token_misparse(
+            tokens,
+            state.last_known_tokens,
+            state.token_carry_count,
+            config.fresh_clear.max_tokens,
+            MISPARSE_CARRY_MAX,
+        )
+    } else {
+        (tokens, 0)
+    };
+    state.token_carry_count = token_carry_count;
 
     // --- Find pane when claude-status can't (process crashed) ---
     let effective_pane: String = if pane.is_empty() && tokens == 0 && bashes == 0 {
@@ -10222,6 +10306,107 @@ cooldown = 300
         // No ack data at all (fresh boot / host without event-ack): we cannot
         // prove liveness, so DON'T suppress — preserve fast-path behaviour.
         assert!(!ack_liveness_fresh(None, 20 * 60));
+    }
+
+    #[test]
+    fn test_carry_forward_real_reading_resets_run() {
+        // A non-zero reading this poll is trusted verbatim and resets the
+        // carry run to 0, regardless of any prior carry.
+        assert_eq!(
+            carry_forward_token_misparse(180_000, 200_000, 2, 50_000, 3),
+            (180_000, 0)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_large_context_zero_is_carried() {
+        // A large same-pane context momentarily reads 0 -> hold the last value
+        // and advance the bounded run.
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 0, 50_000, 3),
+            (200_000, 1)
+        );
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 1, 50_000, 3),
+            (200_000, 2)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_bound_exhausted_lets_zero_through() {
+        // Once the run reaches max_carry the 0 is finally trusted, so a real
+        // /clear or crashed process still registers.
+        assert_eq!(
+            carry_forward_token_misparse(0, 200_000, 3, 50_000, 3),
+            (0, 3)
+        );
+    }
+
+    #[test]
+    fn test_carry_forward_below_floor_not_carried() {
+        // A genuinely small prior reading (below the fresh-/clear window's
+        // upper bound) is never carried: fresh-/clear detection in the
+        // low-token window must be untouched.
+        assert_eq!(
+            carry_forward_token_misparse(0, 4_000, 0, 50_000, 3),
+            (0, 0)
+        );
+    }
+
+    /// End-to-end MISPARSE PATTERN over consecutive polls (the real bug):
+    /// a large, intact context (408_000) momentarily reads 0 for a couple of
+    /// polls -- the 2026-08 status-parser hardening now yields a bare 0 for a
+    /// thinking/roster-only pane instead of the old tiny (~2600) count -- then
+    /// the real total returns. Every transient 0 must be carried forward (never
+    /// surfaced as the session total, so no phantom context-clear fires), and
+    /// the real reading resumes cleanly and resets the carry run.
+    #[test]
+    fn test_carry_forward_transient_misparse_sequence_is_smoothed() {
+        let floor = 50_000u64;
+        let max = MISPARSE_CARRY_MAX;
+        let mut last_known = 408_000u64;
+        let mut carry = 0u32;
+        // Two consecutive misparse polls must both be held at the last large
+        // value rather than collapsing the reported context to 0/tiny.
+        for _ in 0..2 {
+            let (eff, c) = carry_forward_token_misparse(0, last_known, carry, floor, max);
+            assert_eq!(eff, 408_000, "a transient 0 must be carried, not surfaced");
+            carry = c;
+            last_known = eff; // caller writes the effective value back (check_cycle)
+        }
+        // Real total returns -> trusted verbatim, carry run resets to 0.
+        let (eff, c) = carry_forward_token_misparse(410_000, last_known, carry, floor, max);
+        assert_eq!(eff, 410_000, "a real reading is always trusted");
+        assert_eq!(c, 0, "a real reading resets the carry run");
+    }
+
+    /// A GENUINE /clear (or crashed process) holds 0 for many consecutive
+    /// polls. The carry is BOUNDED, so after `MISPARSE_CARRY_MAX` held polls
+    /// the 0 is finally trusted and the clear registers: the guard DELAYS a
+    /// real clear by a couple of cycles, it never SUPPRESSES one.
+    #[test]
+    fn test_carry_forward_sustained_zero_eventually_registers_clear() {
+        let floor = 50_000u64;
+        let max = MISPARSE_CARRY_MAX;
+        let mut last_known = 408_000u64;
+        let mut carry = 0u32;
+        let mut effective = Vec::new();
+        for _ in 0..(max + 2) {
+            let (eff, c) = carry_forward_token_misparse(0, last_known, carry, floor, max);
+            effective.push(eff);
+            carry = c;
+            last_known = eff; // mirror check_cycle writing the effective value back
+        }
+        // The first `max` polls are held at the large value...
+        for e in effective.iter().take(max as usize) {
+            assert_eq!(*e, 408_000, "within the bound the large context is held");
+        }
+        // ...then the bound is exhausted and the 0 is trusted, so a real
+        // /clear finally registers downstream.
+        assert_eq!(
+            effective[max as usize], 0,
+            "past the carry bound a sustained 0 (real clear) must register"
+        );
     }
 
     #[test]
