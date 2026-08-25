@@ -87,6 +87,14 @@ pub struct State {
     pub last_known_pane: String,
     #[serde(default)]
     pub last_known_tokens: u64,
+    /// Consecutive polls a transient status-bar token misparse (a large,
+    /// same-pane context momentarily reading 0) has been smoothed over by
+    /// carrying `last_known_tokens` forward. Bounded by
+    /// `policy::MISPARSE_CARRY_MAX` so a genuine sustained collapse (real
+    /// `/clear`, crashed process) still registers. See
+    /// `policy::carry_forward_token_misparse`.
+    #[serde(default)]
+    pub token_carry_count: u32,
     #[serde(default)]
     pub last_known_bashes: u64,
     // Context monitoring

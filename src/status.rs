@@ -187,6 +187,12 @@ pub(crate) fn is_agent_roster_row(line: &str) -> bool {
 /// nor a shell count).
 pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, bool) {
     let mut result = ParsedStatusBar::default();
+    // Seen-but-not-trusted markers: a thinking-indicator or agent-roster
+    // line proves *some* Claude Code status UI was on screen (so
+    // `is_parse_miss` shouldn't complain), but per the fix below neither
+    // one's number is ever allowed into `result.tokens`.
+    let mut saw_thinking_indicator = false;
+    let mut saw_agent_roster = false;
 
     let lines: Vec<&str> = pane_text.lines().collect();
     let start = if lines.len() > 10 {
@@ -310,34 +316,37 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
                 }
             }
         }
-        // Thinking-indicator tokens (with k/M suffix) — match regardless of
-        // status_bar flag. The arrow prefix is itself a strong anchor.
+        // Thinking-indicator lines (`↑/↓ N tokens`) and agent-roster rows
+        // both carry a "N tokens" number, but NEITHER is the session
+        // context total:
+        //   * the thinking indicator's number is the CURRENT TURN's own
+        //     streamed/output token count — it starts near zero and climbs
+        //     for as long as that turn is generating;
+        //   * a roster row's number belongs to ONE SUBAGENT.
         //
-        // Skip agent-roster rows here, same discipline as the whole-pane
-        // fallback below (PR #646): a roster row's `<n> tokens` belongs to
-        // ONE SUBAGENT, not the session. Unlike the bare-total pass above
-        // (which strips arrow-prefixed counters before matching), this
-        // regex supports k/M suffixes, so an over-1000-token roster row
-        // (`102.8k tokens`) matches it just as easily as a real thinking
-        // indicator — without this guard a subagent's count can win here
-        // purely because its roster row is drawn earlier in the bottom-10
-        // window than the real indicator. If nothing else matches, the
-        // roster-aware whole-pane fallback below still recovers a roster
-        // row as a last resort.
-        if result.tokens.is_none() && !is_agent_roster_row(line) {
-            if let Some(caps) = token_thinking_re.captures(line) {
-                if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
-                    if let Ok(base) = num.as_str().parse::<f64>() {
-                        let mult: f64 = match suffix.as_str() {
-                            "k" | "K" => 1_000.0,
-                            "m" | "M" => 1_000_000.0,
-                            _ => 1.0,
-                        };
-                        let v = (base * mult).round() as u64;
-                        result.tokens = Some(v);
-                    }
-                }
-            }
+        // ROOT CAUSE (2026-08 recurring false "fresh session" fires): this
+        // function used to fall back to whichever of those two numbers it
+        // could find whenever the bare total wasn't on screen — reasoning
+        // that a wrong-but-plausible number was "better than nothing" for
+        // the rare case where an overlay panel had pushed the real total
+        // off screen (PR #646, 2026-04-27). But the bare total is ALSO
+        // absent every time the main loop is simply mid-turn — which is
+        // routine, not rare — so on every such poll the fallback handed a
+        // tiny, climbing "current turn" count to callers as if it were the
+        // session's context size. Downstream consumers that watch for a
+        // huge-to-tiny drop (context-clear / fresh-session detection) read
+        // that as the context collapsing and injected a bogus "fresh
+        // session, run the resume checklist" prompt every few minutes,
+        // even though the real context was untouched.
+        //
+        // Fix: never let either number populate `result.tokens`. Still
+        // record that we *saw* one, purely so `is_parse_miss` (below)
+        // continues to treat a thinking/roster-only pane as a recognized
+        // UI state rather than a suspicious miss.
+        if is_agent_roster_row(line) {
+            saw_agent_roster = true;
+        } else if token_thinking_re.is_match(line) {
+            saw_thinking_indicator = true;
         }
         if let Some(caps) = bash_re.captures(line) {
             if let Some(m) = caps.get(1) {
@@ -399,48 +408,26 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
         }
     }
 
-    // Whole-pane scan for thinking-indicator tokens (always safe because
-    // the ↑/↓ + tok anchor never appears in chat prose). Catches cases
-    // where a thinking line is more than 10 lines above the bottom.
-    //
-    // Run it in two passes so an agent-roster row is only ever a LAST
-    // resort: a roster row reports one subagent's tokens, which is a much
-    // worse stand-in for the session context size than the main loop's own
-    // thinking indicator. The second pass keeps the pre-existing behaviour
-    // when a roster row is the only arrow line on screen — reporting
-    // nothing would read downstream as `tokens = 0`, which is not an
-    // improvement over reporting something.
-    if result.tokens.is_none() {
-        for pass_skips_roster in [true, false] {
-            for line in &lines {
-                if pass_skips_roster && is_agent_roster_row(line) {
-                    continue;
-                }
-                if let Some(caps) = token_thinking_re.captures(line) {
-                    if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
-                        if let Ok(base) = num.as_str().parse::<f64>() {
-                            let mult: f64 = match suffix.as_str() {
-                                "k" | "K" => 1_000.0,
-                                "m" | "M" => 1_000_000.0,
-                                _ => 1.0,
-                            };
-                            let v = (base * mult).round() as u64;
-                            result.tokens = Some(v);
-                            break;
-                        }
-                    }
-                }
-            }
-            if result.tokens.is_some() {
-                break;
+    // Whole-pane scan: a thinking-indicator or roster line can sit more
+    // than 10 lines above the bottom (overlay panels push the tail up).
+    // Same rule as the bottom-10 pass above: this only ever updates the
+    // "did we see one" markers, never `result.tokens` — see the fix note
+    // on the bottom-10 pass for why.
+    if !saw_thinking_indicator || !saw_agent_roster {
+        for line in &lines {
+            if is_agent_roster_row(line) {
+                saw_agent_roster = true;
+            } else if token_thinking_re.is_match(line) {
+                saw_thinking_indicator = true;
             }
         }
     }
 
-    // Treat the overlay as a status-bar marker: even though it visually
-    // replaces the bar, it's a known UI state with a count present, and
-    // we don't want is_parse_miss to flag it.
-    let saw_status_bar = has_status_bar || overlay_visible;
+    // Treat the overlay, and a thinking-indicator/roster sighting, as a
+    // status-bar marker: even though none of them carries a trustworthy
+    // token total, they're all known UI states, and we don't want
+    // `is_parse_miss` to flag a pane that's simply mid-turn.
+    let saw_status_bar = has_status_bar || overlay_visible || saw_thinking_indicator || saw_agent_roster;
 
     (result, saw_status_bar)
 }
@@ -2309,36 +2296,44 @@ mod tests {
         assert_eq!(parsed.tokens, Some(224598));
     }
 
-    /// A roster row must not be promoted to "the session's token count" by
-    /// the whole-pane arrow fallback either, as long as a real thinking
-    /// indicator is on screen to supply one.
+    /// With no bare context total on the status bar, NEITHER a thinking
+    /// indicator (`↓ 26000 tokens`, current-turn output) NOR a subagent's
+    /// roster row (`↓ 119 tokens`) is trusted as the session total: both are
+    /// refused and `tokens` stays None (2026-08 hardening). The pane is still a
+    /// recognized UI state, so it is not a parse miss.
     #[test]
-    fn test_thinking_indicator_beats_agent_roster_row_in_fallback() {
+    fn test_thinking_indicator_and_roster_both_refused_in_fallback() {
         let input = "\
 \u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)\n\
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt\n\
   \u{25cf} main\n\
   \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
-        let parsed = parse_status_bar(input);
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
         assert_eq!(
-            parsed.tokens,
-            Some(26000),
-            "with no total on the status bar, the main loop's own thinking \
-             indicator is the fallback — not a subagent's roster row"
+            parsed.tokens, None,
+            "neither a thinking indicator nor a roster row may stand in for the \
+             session context total — reading either manufactured phantom \
+             context clears"
         );
+        assert!(saw_bar);
     }
 
-    /// Last-resort behaviour is preserved: when a roster row is the ONLY
-    /// arrow line on screen the fallback still reports it. Reporting
-    /// nothing collapses to `tokens = 0` downstream, which is no better.
+    /// A roster row alone yields NO session total. Its `↓ 119 tokens` is one
+    /// subagent's count; adopting it as the session context size is exactly the
+    /// misparse that manufactured phantom context clears (it collapses a
+    /// six-figure context to 119). `tokens` must be None -- the downstream
+    /// carry-forward guard (`policy::carry_forward_token_misparse`) holds the
+    /// prior real value rather than trusting this 0, so "no better than 0" no
+    /// longer applies.
     #[test]
-    fn test_agent_roster_row_is_last_resort_not_forbidden() {
+    fn test_agent_roster_row_alone_yields_no_session_total() {
         let input = "\
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt\n\
   \u{25ef} general-purpose    Inspecting subtor\u{2026}     7s \u{00b7} \u{2193} 119 tokens";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(119));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
@@ -2359,24 +2354,23 @@ mod tests {
         ));
     }
 
-    /// The PRIMARY per-line pass (not just the whole-pane fallback) must
-    /// also treat a roster row as a last resort: `token_thinking_re`
-    /// supports k/M suffixes, so an over-1000-token roster row matches this
-    /// pass just as easily as a real thinking indicator, and without a
-    /// guard here a subagent's count can win purely because its roster row
-    /// is drawn earlier in the bottom-10-line window than the real one.
+    /// The PRIMARY per-line (bottom-10) pass must refuse both kinds of
+    /// arrow-token line just as the whole-pane fallback does: neither a roster
+    /// row (`↓ 102.8k tokens`) nor a real thinking indicator (`↓ 26000
+    /// tokens`) is the session total, so `tokens` stays None even though both
+    /// match `token_thinking_re`.
     #[test]
-    fn test_thinking_indicator_beats_agent_roster_row_in_primary_pass() {
+    fn test_thinking_indicator_and_roster_both_refused_in_primary_pass() {
         let input = "\
   \u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{00b7} \u{2193} 102.8k tokens\n\
 \u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)";
-        let parsed = parse_status_bar(input);
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
         assert_eq!(
-            parsed.tokens,
-            Some(26000),
-            "the roster row (drawn first) must not win over the real \
-             thinking indicator that follows it in the same window"
+            parsed.tokens, None,
+            "no arrow-prefixed token count in the bottom-10 window may become \
+             the session total"
         );
+        assert!(saw_bar);
     }
 
     #[test]
@@ -2626,10 +2620,13 @@ mod tests {
                          watcher-ctl run memory-remind (running)\n\
                        \u{276f} watcher-ctl run events-watcher (running)\n\
                        \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
-        let parsed = parse_status_bar(input);
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
         assert_eq!(parsed.bashes, Some(4));
-        // Thinking-indicator token recovery: "↑ 286 tokens".
-        assert_eq!(parsed.tokens, Some(286));
+        // 2026-08 hardening: the "↑ 286 tokens" thinking count is NOT the
+        // session total, so `tokens` stays None; the overlay + thinking
+        // indicator still register as a status bar (no parse miss).
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
@@ -2706,15 +2703,17 @@ mod tests {
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
         let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // 2026-08 hardening: the whole-pane fallback still RECOGNIZES a
+        // thinking indicator above the 10-line window (so it is not a parse
+        // miss), but no longer TRUSTS its count as the session total.
         assert_eq!(
-            parsed.tokens,
-            Some(1300),
-            "thinking-indicator above the 10-line window must be recovered \
-             by the whole-pane fallback scan"
+            parsed.tokens, None,
+            "a thinking indicator above the window is a recognized UI state, \
+             but its count is the current turn's, not the session total"
         );
         assert!(
             saw_bar,
-            "⏵⏵ icon at bottom must register as status bar"
+            "thinking indicator / ⏵⏵ icon must register as status bar"
         );
     }
 
@@ -2774,32 +2773,71 @@ mod tests {
         // status bar is partly obscured but a thinking line is visible, we
         // can still extract a token count from "↑ 2.3k tokens".
         let input = "\u{25cf} Honking\u{2026} (1m 9s \u{00b7} \u{2191} 2.3k tokens)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(2300));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // 2026-08 hardening: a thinking indicator's token count is the CURRENT
+        // TURN's own output, never the session context total, so it must NOT
+        // populate `tokens` (a `2.3k` reading here is exactly the tiny misparse
+        // that manufactured phantom context clears). It IS a recognized UI
+        // state, so it still suppresses `is_parse_miss`.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_down_arrow() {
         // Some thinking lines use ↓ instead of ↑.
         let input = "\u{25cf} Zigzagging\u{2026} (37s \u{00b7} \u{2193} 1.3k tokens \u{00b7} thought for 13s)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(1300));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // Down-arrow thinking indicator: still the current turn's count, not
+        // the session total -- refused (see k-suffix test).
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_no_suffix() {
         // ↑ N tokens (no suffix) — N is a literal integer.
         let input = "\u{25cf} Newspapering\u{2026} (21s \u{00b7} \u{2191} 286 tokens \u{00b7} thought for 1s)";
-        let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(286));
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // A bare-integer (`286`) thinking count is the classic sub-1000 tiny
+        // misparse; it must not become the session total.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
     }
 
     #[test]
     fn test_parse_status_bar_thinking_indicator_m_suffix() {
         // Defensive: M-suffix support for huge contexts (1.4M tokens).
         let input = "\u{25cf} Cooking\u{2026} (5m \u{00b7} \u{2191} 1.4M tokens)";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        // Even a huge M-suffixed thinking count is the current turn's, not the
+        // session context total -- refused all the same.
+        assert_eq!(parsed.tokens, None);
+        assert!(saw_bar);
+    }
+
+    /// A genuine low-token fresh session (a real BARE context total, no arrow
+    /// prefix) MUST still be detected -- the hardening only refuses
+    /// thinking-indicator / roster numbers, never a real bare total, so
+    /// fresh-/clear detection in the low-token window is preserved.
+    #[test]
+    fn test_genuine_low_token_fresh_session_still_detected() {
+        let input = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 0 shells \u{00b7} 1,200 tokens";
         let parsed = parse_status_bar(input);
-        assert_eq!(parsed.tokens, Some(1_400_000));
+        assert_eq!(parsed.tokens, Some(1200));
+    }
+
+    /// Companion to the "both refused" tests: when a real bare context total
+    /// AND a thinking indicator are both on screen, the bare total wins and the
+    /// thinking count is ignored.
+    #[test]
+    fn test_bare_total_wins_over_thinking_indicator() {
+        let input = "\
+\u{2733} Boogieing\u{2026} (4s \u{00b7} \u{2193} 26000 tokens)\n\
+\u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} 224598 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(224598));
+        assert_eq!(parsed.bashes, Some(5));
     }
 
     #[test]
