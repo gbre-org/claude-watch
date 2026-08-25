@@ -563,6 +563,12 @@ cleanup_exit_code=0
 shutting_down=0
 cleanup_ran=0
 
+# Set immediately BEFORE the matching `cmd &`, so the teardown can tell
+# "this child was never started" from "this child is running but its pid
+# never made it into the variable" — see adopt_unrecorded_child.
+ssh_started=0
+tail_started=0
+
 # Has this pid stopped doing anything?
 #
 # `kill -0` alone is the wrong question: a process that has exited but
@@ -613,6 +619,31 @@ teardown_pid() {
     return 0
 }
 
+# Recover a child that was started but whose pid never got recorded.
+#
+# `cmd &` and the `pid=$!` that records it are two statements, and bash
+# runs a pending signal handler at the statement boundary between them.
+# A SIGTERM that arrives while the `&` is still forking therefore reaches
+# the teardown with the pid variable EMPTY even though the child is
+# running — and a teardown that trusted that variable would walk away
+# from a live reverse SSH tunnel, or leave the log follower writing to
+# the operator's terminal after the wrapper exited.
+#
+# `$!` is set by the `&` itself, not by the assignment, so it still names
+# that child. The `*_started` markers say which child it is, so an
+# unrelated background job (notably the DETACHED --enable MCP service,
+# which we deliberately leave running) is never adopted by mistake.
+adopt_unrecorded_child() {
+    local last_bg=${!:-}
+    [ -n "$last_bg" ] || return 0
+    if [ "$tail_started" = "1" ] && [ -z "$tail_pid" ]; then
+        tail_pid=$last_bg
+    elif [ "$ssh_started" = "1" ] && [ -z "$ssh_pid" ]; then
+        ssh_pid=$last_bg
+    fi
+    return 0
+}
+
 cleanup() {
     # Re-entrancy guard: a SIGTERM during the SIGINT-triggered teardown
     # must not restart the sequence.
@@ -620,6 +651,8 @@ cleanup() {
         return
     fi
     cleanup_ran=1
+
+    adopt_unrecorded_child
 
     # Stop the log tail first so its output doesn't race the teardown
     # banner. It's a local follower, not part of the bridge.
@@ -657,7 +690,48 @@ cleanup() {
 
     exit "$cleanup_exit_code"
 }
-trap 'shutting_down=1; cleanup' TERM INT
+
+# The SIGTERM / SIGINT handler.
+#
+# Deliberately a plain function call, and the handler string registered
+# below is deliberately nothing but this function's name. bash re-parses
+# a handler string at signal-delivery time, so everything in it is
+# parser work done at the least predictable moment in the script's life.
+# Keeping it to a single word means there is no state baked into the
+# string (the flag is set here, from a variable, where the rest of the
+# teardown can see it) and the least possible parsing between the signal
+# and the teardown actually running.
+on_terminate() {
+    shutting_down=1
+    cleanup
+}
+trap 'on_terminate' TERM INT
+
+# `mkdir -p "$(dirname "$path")"` without the command substitution.
+#
+# This is NOT stylistic. A command substitution makes the shell re-enter
+# its own parser mid-expansion, and a SIGTERM that lands inside that
+# re-entry can get its handler string parsed while the substitution's
+# still-open `(` is on the parser's delimiter stack. bash then kills the
+# handler with
+#
+#   personal-mcp-host.sh: trap: line 2: unexpected EOF while looking for matching `)'
+#
+# and — this is the damaging part — carries on running. The signal is
+# swallowed: no teardown, no exit, a reverse tunnel left wide open by a
+# SIGTERM that looked like it was delivered. Parameter expansion needs no
+# parser re-entry, so it cannot lose a signal that way. Anything on the
+# path between "tunnel is up" and the steady-state wait must stay free of
+# command substitutions for the same reason.
+ensure_parent_dir() {
+    local path=$1 dir=${1%/*}
+    if [ "$dir" = "$path" ]; then
+        dir=.
+    elif [ -z "$dir" ]; then
+        dir=/
+    fi
+    mkdir -p "$dir" 2>/dev/null || true
+}
 
 # -----------------------------------------------------------------------------
 # Listener probe — poll until the MCP server's loopback port enters
@@ -736,19 +810,28 @@ except OSError:
 # -----------------------------------------------------------------------------
 
 run_tunnel_and_tail() {
+    # Make sure there's a file to follow even on first run — tail -F
+    # tolerates a missing file but emits a noisy warning; pre-create the
+    # directory + file so the follow is clean from the start.
+    #
+    # This happens BEFORE the tunnel is spawned, on purpose. Once ssh is
+    # running, a SIGTERM has real work to do (kill the tunnel, verify it
+    # is gone), so the window between the spawn and the steady-state wait
+    # has to be as short as possible and free of command substitutions —
+    # see ensure_parent_dir for what a substitution does to a signal that
+    # arrives inside it.
+    ensure_parent_dir "$MCP_HOST_BASH_LOG"
+    [ -f "$MCP_HOST_BASH_LOG" ] || : >"$MCP_HOST_BASH_LOG" 2>/dev/null || true
+
+    ssh_started=1
     "${ssh_argv[@]}" &
     ssh_pid=$!
     echo "personal-mcp-host: reverse SSH tunnel started (pid $ssh_pid)" >&2
 
-    # Make sure there's a file to follow even on first run — tail -F
-    # tolerates a missing file but emits a noisy warning; pre-create the
-    # directory + file so the follow is clean from the start.
-    mkdir -p "$(dirname "$MCP_HOST_BASH_LOG")" 2>/dev/null || true
-    [ -f "$MCP_HOST_BASH_LOG" ] || : >"$MCP_HOST_BASH_LOG" 2>/dev/null || true
-
     echo "personal-mcp-host: following $MCP_HOST_BASH_LOG (Ctrl-C to stop)" >&2
     # -F (follow + retry on rotate/recreate) so log rotation doesn't
     # silently end the follow.
+    tail_started=1
     tail -n 50 -F "$MCP_HOST_BASH_LOG" &
     tail_pid=$!
 
@@ -1033,7 +1116,7 @@ EOF
     if [ -z "${MCP_HOST_BASH_BEARER:-}" ]; then
         echo "personal-mcp-host: NOTE: launching the MCP host directly with no MCP_HOST_BASH_BEARER in scope. If your bearer normally comes from the login Keychain via a LaunchAgent wrapper, this instance will NOT have it and remote clients sending Authorization headers may not match." >&2
     fi
-    mkdir -p "$(dirname "$MCP_HOST_BASH_LOG")" 2>/dev/null || true
+    ensure_parent_dir "$MCP_HOST_BASH_LOG"
     start_detached "$MCP_HOST_BASH_BIN" --port "$MCP_LOCAL_PORT" \
         </dev/null >>"$MCP_HOST_BASH_LOG" 2>&1 &
     RESTART_HOST_STARTED_DIRECTLY=1
@@ -1046,7 +1129,7 @@ EOF
 start_tunnel_directly() {
     local log
     log="${PERSONAL_MCP_TUNNEL_LOG:-$(dirname "$MCP_HOST_BASH_LOG")/personal-mcp-tunnel.log}"
-    mkdir -p "$(dirname "$log")" 2>/dev/null || true
+    ensure_parent_dir "$log"
     start_detached "${ssh_argv[@]}" </dev/null >>"$log" 2>&1 &
     echo "personal-mcp-host: launched reverse SSH tunnel directly (pid $!, detached); stderr -> $log" >&2
     return 0
