@@ -3154,7 +3154,7 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
 
     Supports BOTH deployment shapes of ``AGENTS_JSONL_ROOT``:
 
-      1. One-level (gomorrah-style) — mount lands inside a project slug::
+      1. One-level (the-host-style) — mount lands inside a project slug::
 
             <root>/<session-uuid>/subagents/agent-<agent_id>.jsonl
 
@@ -3170,9 +3170,9 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
     The container's queue-minisite has no way to know which shape the
     operator wired up — both are legitimate bind-mount conventions and
     the public example compose uses (2). We try (1) first (matching the
-    historical gomorrah resolver behavior), then fall back to (2). The
+    historical the-host resolver behavior), then fall back to (2). The
     one-level probe is just an ``is_file`` stat per session-dir so the
-    fast path stays fast on gomorrah, and (2) only kicks in when (1)
+    fast path stays fast on the-host, and (2) only kicks in when (1)
     misses entirely.
 
     Returns the most-recently-modified match (handles agent_id reuse
@@ -3212,7 +3212,7 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
 
     # Shape (2): <root>/<project-slug>/<session-uuid>/subagents/agent-<id>.jsonl.
     # Only walked when shape (1) found nothing — keeps the fast path
-    # fast on the gomorrah deployment while still letting workbot's
+    # fast on the-host deployment while still letting workbot's
     # ${HOME}/.claude/projects mount resolve.
     for project in top_dirs:
         if not project.is_dir():
@@ -3246,7 +3246,7 @@ def _agent_transcripts(agent_id: str) -> list[Path]:
 
     Same one-level vs two-level shape tolerance as ``_find_agent_jsonl``
     — see that docstring; shape (2) is only walked when shape (1) matched
-    nothing, so the gomorrah fast path stays fast. Returns ``[]`` on a
+    nothing, so the-host fast path stays fast. Returns ``[]`` on a
     bad id (path-traversal guard) or when nothing matches.
     """
     if not re.match(r"^[a-z0-9-]{4,64}$", agent_id):

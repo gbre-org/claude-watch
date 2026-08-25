@@ -9,19 +9,19 @@ with `launchctl bootout` when they're done.
 
 | Template | Mode | What it starts |
 |---|---|---|
-| `org.gbre.personal-mcp.tunnel.plist` | tunnel-only (`--tunnel-only`) | ONLY the reverse SSH tunnel. Assumes `mcp-host-bash` is already running locally. **Recommended.** |
-| `org.gbre.personal-mcp.host.plist` | bundled (`--enable`) | `mcp-host-bash` AND the tunnel together. Simpler alternative. |
+| `org.claude-watch.personal-mcp.tunnel.plist` | tunnel-only (`--tunnel-only`) | ONLY the reverse SSH tunnel. Assumes `mcp-host-bash` is already running locally. **Recommended.** |
+| `org.claude-watch.personal-mcp.host.plist` | bundled (`--enable`) | `mcp-host-bash` AND the tunnel together. Simpler alternative. |
 
 **Recommended split — MCP always-on locally, remote access on-demand.**
 Run `mcp-host-bash` full-time via the
 [compose-stack LaunchAgent](../../compose/launchd/)
-(`org.gbre.claude-watch.mcp-host-bash.plist`, `RunAtLoad=true`) so the
+(`org.claude-watch.mcp-host-bash.plist`, `RunAtLoad=true`) so the
 MCP server is up at every login, then use the **tunnel-only** unit here
 to grant/revoke remote access on demand without touching the server's
 lifecycle. The tunnel — the only network-facing piece — stays down
 until you explicitly bring it up.
 
-The **bundled** unit (`org.gbre.personal-mcp.host.plist`) is the
+The **bundled** unit (`org.claude-watch.personal-mcp.host.plist`) is the
 simpler alternative when you'd rather have one unit own both pieces and
 don't want the MCP server resident full-time.
 
@@ -29,7 +29,7 @@ Steps 1–8 below walk the **bundled** unit end to end; the
 [tunnel-only unit](#tunnel-only-unit) section calls out the (small)
 differences. Everything else — bootstrap / kickstart / bootout /
 logs / troubleshooting — is identical between the two; substitute the
-Label `org.gbre.personal-mcp.tunnel` for `org.gbre.personal-mcp.host`.
+Label `org.claude-watch.personal-mcp.tunnel` for `org.claude-watch.personal-mcp.host`.
 
 ## LaunchAgent vs LaunchDaemon
 
@@ -92,7 +92,7 @@ run next (step 2). Pass `--bootstrap` to also bootstrap immediately:
 
 Other flags:
 
-- `--tunnel-only` — install `org.gbre.personal-mcp.tunnel.plist` instead
+- `--tunnel-only` — install `org.claude-watch.personal-mcp.tunnel.plist` instead
   of the bundled wrapper unit (only if that template exists in this
   checkout).
 - `--print-cmd` — dry run: print the resolved paths + the rendered plist
@@ -126,13 +126,13 @@ If you'd rather do it by hand, the installer is equivalent to:
 ```sh
 # 1. Copy. launchd only loads files directly under
 #    ~/Library/LaunchAgents/ — no symlinks. The filename must match the
-#    plist's Label (org.gbre.personal-mcp.host); launchd keys bootstrap /
+#    plist's Label (org.claude-watch.personal-mcp.host); launchd keys bootstrap /
 #    bootout / print / kickstart off it.
-cp launchd/org.gbre.personal-mcp.host.plist ~/Library/LaunchAgents/
+cp launchd/org.claude-watch.personal-mcp.host.plist ~/Library/LaunchAgents/
 
 # 2. Edit absolute paths. launchd does NOT expand ~ or ${HOME} in plist
 #    values — literal paths only.
-$EDITOR ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+$EDITOR ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
 #    Search/replace:
 #      /PATH/TO/REPO → absolute path to your claude-watch checkout
 #                      (e.g. /Users/yourname/code/claude-watch)
@@ -156,7 +156,7 @@ sources on every start. To change one, edit
 
 ```sh
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+    ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
 ```
 
 `gui/$(id -u)` is the per-user GUI domain — the right scope for a
@@ -167,7 +167,7 @@ Because `RunAtLoad=false`, this **registers** the unit without firing
 it. Verify:
 
 ```sh
-launchctl print gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl print gui/$(id -u)/org.claude-watch.personal-mcp.host
 ```
 
 Look for `state = not running` and `last exit code = (never exited)`.
@@ -177,7 +177,7 @@ Look for `state = not running` and `last exit code = (never exited)`.
 When you want to grant your remote Claude access to this Mac:
 
 ```sh
-launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.host
 ```
 
 That fires `personal-mcp-host.sh --enable` (the flag is baked into the
@@ -227,7 +227,7 @@ ssh $REMOTE_USER@$REMOTE_HOST "lsof -i :$REMOTE_PORT -sTCP:LISTEN"
 Confirm the in-process side from the Mac:
 
 ```sh
-launchctl print gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl print gui/$(id -u)/org.claude-watch.personal-mcp.host
 # state = running; last exit code = (never exited)
 ```
 
@@ -244,7 +244,7 @@ Two options.
 **A. Soft stop (preferred for "I'll start it again later"):**
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.host
 ```
 
 `bootout` unregisters the unit. The plist file stays in
@@ -299,9 +299,9 @@ which a hand-launch could not reproduce:
 
 | Label | Piece |
 |---|---|
-| `org.gbre.claude-watch.mcp-host-bash` | always-on MCP server (compose stack) |
-| `org.gbre.personal-mcp.tunnel` | tunnel-only unit |
-| `org.gbre.personal-mcp.host` | bundled unit (both pieces) |
+| `org.claude-watch.mcp-host-bash` | always-on MCP server (compose stack) |
+| `org.claude-watch.personal-mcp.tunnel` | tunnel-only unit |
+| `org.claude-watch.personal-mcp.host` | bundled unit (both pieces) |
 
 Labels that aren't bootstrapped are skipped, and anything no unit owns
 is started directly, detached. Override
@@ -332,9 +332,9 @@ the plist — or re-running `install.sh` over it — does NOT take effect
 until you re-bootstrap:
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.host
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+    ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
 ```
 
 Run exactly this after updating a checkout in which the bundled unit
@@ -342,7 +342,7 @@ gained its `--enable` argument (re-run `./install.sh --bundled` first so
 the file on disk is current). Confirm the registered unit picked it up:
 
 ```sh
-launchctl print gui/$(id -u)/org.gbre.personal-mcp.host | grep -A3 arguments
+launchctl print gui/$(id -u)/org.claude-watch.personal-mcp.host | grep -A3 arguments
 # should list personal-mcp-host.sh followed by --enable
 ```
 
@@ -366,8 +366,8 @@ The wrapper writes to two places by default:
 ## 7. Permanently uninstall
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
-rm ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.host
+rm ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
 ```
 
 Optionally remove the logs:
@@ -388,10 +388,10 @@ ssh $REMOTE_USER@$REMOTE_HOST   # then edit ~/.ssh/authorized_keys
 
 ## Tunnel-only unit
 
-The `org.gbre.personal-mcp.tunnel.plist` template is the recommended
+The `org.claude-watch.personal-mcp.tunnel.plist` template is the recommended
 shape: the MCP server (`mcp-host-bash`) runs always-on locally under
 the [compose-stack LaunchAgent](../../compose/launchd/)
-(`org.gbre.claude-watch.mcp-host-bash.plist`, `RunAtLoad=true`), and
+(`org.claude-watch.mcp-host-bash.plist`, `RunAtLoad=true`), and
 this unit opens ONLY the reverse SSH tunnel on demand. It invokes the
 wrapper with `--tunnel-only`, so it does NOT launch `mcp-host-bash` and
 does NOT run the listener probe.
@@ -403,8 +403,8 @@ with these substitutions:
   `127.0.0.1:$MCP_LOCAL_PORT` — bring up the compose-stack LaunchAgent
   first (see [`../../compose/launchd/README.md`](../../compose/launchd/README.md)).
   Confirm with `lsof -nP -iTCP:$MCP_LOCAL_PORT -sTCP:LISTEN`.
-- **Plist + Label:** copy `org.gbre.personal-mcp.tunnel.plist`; its
-  Label is `org.gbre.personal-mcp.tunnel`. Use that Label in every
+- **Plist + Label:** copy `org.claude-watch.personal-mcp.tunnel.plist`; its
+  Label is `org.claude-watch.personal-mcp.tunnel`. Use that Label in every
   `launchctl` command below.
 - **Logs:** distinct paths so the two units can run side by side —
   `~/Library/Logs/personal-mcp-tunnel.out.log` and
@@ -418,20 +418,20 @@ cd examples/personal-mac-mcp-host
 ./install.sh --tunnel-only
 
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
+    ~/Library/LaunchAgents/org.claude-watch.personal-mcp.tunnel.plist
 # Registers the unit. Doesn't fire it (RunAtLoad=false).
 
 # Grant remote access: start the tunnel (MCP server already up).
-launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.tunnel
+launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.tunnel
 
 # Revoke remote access: stop the tunnel. MCP server keeps running.
-launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.tunnel
+launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.tunnel
 ```
 
 (Prefer to do it by hand? Same manual `cp` + editor + `mkdir -p
 ~/Library/Logs` steps as the bundled unit's
 [under-the-hood fallback](#what-it-does-under-the-hood-manual-fallback),
-substituting `org.gbre.personal-mcp.tunnel.plist`.)
+substituting `org.claude-watch.personal-mcp.tunnel.plist`.)
 
 Because the wrapper skips the `mcp-host-bash` launch + listener probe
 in this mode, the only failure surface is the SSH tunnel itself —
@@ -480,9 +480,9 @@ installed copy predates that, refresh it and re-bootstrap:
 ```sh
 cd examples/personal-mac-mcp-host
 ./install.sh --bundled
-launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.host
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+    ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
 ```
 
 (Re-installing alone is not enough — `launchd` runs the snapshot it

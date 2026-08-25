@@ -22,7 +22,7 @@
 #   └──────────────────────────────────┬─────────────────────────────┘
 #                                      │  SSH
 #   ┌──────────────────────────────────▼─────────────────────────────┐
-#   │ remote host (gomorrah)                                          │
+#   │ remote host (the-host)                                          │
 #   │                                                                │
 #   │   ~/.cache/claude-clipboard-bridge/  ← rsync target            │
 #   │      ↑                                                          │
@@ -49,18 +49,18 @@
 # Usage:
 #
 #   # Foreground (debugging):
-#   clipboard-bridge-daemon --remote-host hndrewaall@gomorrah
+#   clipboard-bridge-daemon --remote-host user@the-host
 #
 #   # Background (launchd-managed):
 #   # install the .plist from examples/compose/launchd/
-#   launchctl load ~/Library/LaunchAgents/org.gbre.claude-watch.clipboard-bridge.plist
+#   launchctl load ~/Library/LaunchAgents/org.claude-watch.clipboard-bridge.plist
 #
 #   # Override poll interval / remote path:
-#   clipboard-bridge-daemon --interval 0.5 --remote-host gomorrah \
+#   clipboard-bridge-daemon --interval 0.5 --remote-host the-host \
 #                           --remote-dir '~/.cache/claude-clipboard-bridge/'
 #
 # Env var override (matches what launchd typically passes):
-#   CLIPBOARD_BRIDGE_REMOTE_HOST   (e.g. hndrewaall@gomorrah)
+#   CLIPBOARD_BRIDGE_REMOTE_HOST   (e.g. user@the-host)
 #   CLIPBOARD_BRIDGE_REMOTE_DIR    (default: ~/.cache/claude-clipboard-bridge/)
 #   CLIPBOARD_BRIDGE_INTERVAL      (default: 1.0 seconds)
 #   CLIPBOARD_BRIDGE_LOCAL_DIR     (default: ~/.cache/claude-clipboard-bridge/)

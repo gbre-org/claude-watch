@@ -1,0 +1,57 @@
+# deploy-container.local.mk.example — machine-local deploy-container override
+#
+# TRACKED SOURCE lives in the operator's claude-config repo, NOT here:
+#     claude-config/claude-container/deploy-container.local.mk
+#         -> sets DEPLOY_DASHBOARDS_CMD to invoke the deploy-grafana-dashboards
+#            target in an external, machine-local monitoring/Grafana stack,
+#            which re-provisions the dashboards into the live Grafana.
+#
+# claude-watch's repo-root Makefile picks the override up via a conditional
+# `-include` of the config-dir path:
+#     ~/.config/claude-container/deploy-container.local.mk
+# which is a SYMLINK to the tracked claude-config copy (same pattern as
+# ~/.config/claude-container/mcp-host-bash.env). This keeps the override
+# version-controlled + synced across hosts instead of a hand-made untracked file.
+#
+# ── Setup (idempotent) ────────────────────────────────────────────────────────
+#   mkdir -p ~/.config/claude-container
+#   ln -sfn ~/repos/claude-config/claude-container/deploy-container.local.mk \
+#           ~/.config/claude-container/deploy-container.local.mk
+#
+# (This .example remains for a host WITHOUT claude-config: copy it to the config
+#  dir as a plain file and uncomment a line below instead of symlinking.)
+#
+# ── What this configures ──────────────────────────────────────────────────────
+# `make deploy-container` folds FOUR things into one idempotent command:
+#   1. force-recreate the claude-container service (the agent container);
+#   2. redeploy the q-site / queue-minisite service (in this repo's compose);
+#   3. deploy the Grafana dashboards LINKED IN from this repo
+#      (monitoring/dashboards/{claude-watch,claude-events,work-queue}.json);
+#   4. THIS override — the hook that lets #3 target an EXTERNAL, machine-specific
+#      makefile/stack (kept OUT of this repo) without editing the tracked Makefile.
+#
+# The canonical dashboard files live HERE in claude-watch, but the live Grafana
+# that serves them (`monitoring-grafana-1`) is an EXTERNAL stack that bind-mounts
+# those files and must be RESTARTED to re-provision (a provisioning-reload POST
+# does NOT overwrite an already-provisioned dashboard).
+#
+# DEPLOY_DASHBOARDS_CMD must be:
+#   * idempotent   — safe to re-run on every deploy;
+#   * synchronous  — NO trailing `&` / nohup / disown (the deploy waits on it);
+#   * self-contained — a single shell command line (use `$(MAKE) -f <file> <tgt>`
+#                      to invoke an external makefile target).
+#
+# ── Examples (uncomment ONE) ──────────────────────────────────────────────────
+#
+# (a) PREFERRED: invoke the deploy-grafana-dashboards target in the monitoring
+#     stack (kept OUT of this repo), which restarts the local Grafana
+#     container so it re-provisions from the linked-in dashboards (auto-discovers
+#     the container by name; override GRAFANA_CONTAINER if the Grafana container
+#     isn't named *grafana*):
+#
+# DEPLOY_DASHBOARDS_CMD = $(MAKE) -C /path/to/your/monitoring-stack deploy-grafana-dashboards
+#
+# (b) Minimal: just restart the live Grafana so it re-provisions from the
+#     bind-mounted canonical dashboard files:
+#
+# DEPLOY_DASHBOARDS_CMD = docker restart monitoring-grafana-1

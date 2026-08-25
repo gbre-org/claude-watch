@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch the gomorrah dashboard tmux session
+# Launch the dashboard tmux session
 # Recreates the monitoring layout in one shot
 #
 # Usage:
@@ -78,8 +78,8 @@ if [ "$1" = "--detach" ]; then
     else
         APPEND='--append-system-prompt "You were just restarted via systemd boot (fresh session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
     fi
-    # --dangerously-skip-permissions: Andrew's main-loop hndrewaall@gomorrah
-    # session runs in permanent permission-bypass mode. The harness has its
+    # --dangerously-skip-permissions: the operator's main-loop session runs
+    # in permanent permission-bypass mode. The harness has its
     # own permission gates (obligations, queue gate, signal ack gate, etc.)
     # which provide finer-grained safety than the per-tool prompts; the
     # built-in permission UI just adds friction.
@@ -126,7 +126,7 @@ if [ "$1" = "--attach" ] || [ "$1" = "--read-only" ]; then
     if [ "$SHARED" = 1 ]; then
         # Shared: attach directly to the canonical session. All clients on it
         # share window/pane selection — switching windows in one client
-        # switches them in all. Required so the local gomorrah client, the
+        # switches them in all. Required so the local host client, the
         # ttyd browser client, and the iTerm2 -CC laptop client all drive
         # the SAME view of the dashboard pane.
         if [ "$CC" = 1 ]; then

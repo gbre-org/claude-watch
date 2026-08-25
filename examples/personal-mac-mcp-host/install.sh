@@ -22,11 +22,11 @@
 #
 # Which plist
 #
-#   --bundled       install org.gbre.personal-mcp.host.plist — the
+#   --bundled       install org.claude-watch.personal-mcp.host.plist — the
 #                   bundled wrapper unit (runs personal-mcp-host.sh,
 #                   which spawns mcp-host-bash AND the reverse SSH
 #                   tunnel together).
-#   --tunnel-only   install org.gbre.personal-mcp.tunnel.plist — the
+#   --tunnel-only   install org.claude-watch.personal-mcp.tunnel.plist — the
 #                   tunnel-only unit (the SSH reverse tunnel alone,
 #                   for operators who run their MCP host server out of
 #                   band). Only available if that plist exists in
@@ -46,8 +46,8 @@
 #
 # Flags
 #
-#   --bundled            select org.gbre.personal-mcp.host.plist
-#   --tunnel-only        select org.gbre.personal-mcp.tunnel.plist
+#   --bundled            select org.claude-watch.personal-mcp.host.plist
+#   --tunnel-only        select org.claude-watch.personal-mcp.tunnel.plist
 #   --bootstrap          also `launchctl bootstrap gui/$(id -u) <plist>`
 #                        after install (default: install only + print the
 #                        bootstrap command).
@@ -191,10 +191,10 @@ LOG_DIR="$HOME_DIR/Library/Logs"
 
 case "$UNIT" in
     bundled)
-        PLIST_NAME="org.gbre.personal-mcp.host.plist"
+        PLIST_NAME="org.claude-watch.personal-mcp.host.plist"
         ;;
     tunnel-only)
-        PLIST_NAME="org.gbre.personal-mcp.tunnel.plist"
+        PLIST_NAME="org.claude-watch.personal-mcp.tunnel.plist"
         ;;
 esac
 
@@ -209,7 +209,7 @@ install.sh: tunnel-only plist not found: $SRC_PLIST
 
 The tunnel-only LaunchAgent template is not present in this checkout.
 Use --bundled to install the bundled wrapper unit
-(org.gbre.personal-mcp.host.plist) instead, which runs the MCP host
+(org.claude-watch.personal-mcp.host.plist) instead, which runs the MCP host
 server AND the reverse SSH tunnel together.
 EOF
     else

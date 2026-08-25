@@ -5,10 +5,10 @@ on-demand reverse-tunnelled MCP host bridge.
 
 Two templates are validated with the SAME structural checks:
 
-  - org.gbre.personal-mcp.host.plist    — bundled: launches both
+  - org.claude-watch.personal-mcp.host.plist    — bundled: launches both
     mcp-host-bash AND the reverse SSH tunnel. Invokes the wrapper
     with `--enable`.
-  - org.gbre.personal-mcp.tunnel.plist  — tunnel-only: launches ONLY
+  - org.claude-watch.personal-mcp.tunnel.plist  — tunnel-only: launches ONLY
     the reverse SSH tunnel (mcp-host-bash assumed already running
     locally, e.g. the always-on compose-stack LaunchAgent). Invokes
     the wrapper with `--tunnel-only`.
@@ -49,8 +49,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LAUNCHD_DIR = HERE.parent / "launchd"
-PLIST = LAUNCHD_DIR / "org.gbre.personal-mcp.host.plist"
-TUNNEL_PLIST = LAUNCHD_DIR / "org.gbre.personal-mcp.tunnel.plist"
+PLIST = LAUNCHD_DIR / "org.claude-watch.personal-mcp.host.plist"
+TUNNEL_PLIST = LAUNCHD_DIR / "org.claude-watch.personal-mcp.tunnel.plist"
 LAUNCHD_README = LAUNCHD_DIR / "README.md"
 MAIN_README = HERE.parent / "README.md"
 WRAPPER = HERE.parent / "personal-mcp-host.sh"
@@ -120,7 +120,7 @@ def test_label_matches_filename() -> None:
     filename minus `.plist`. The plist's `Label` MUST match."""
     for p in ALL_PLISTS:
         parsed = load(p)
-        expected_label = p.stem  # e.g. "org.gbre.personal-mcp.host"
+        expected_label = p.stem  # e.g. "org.claude-watch.personal-mcp.host"
         actual = parsed.get("Label")
         expect(
             actual == expected_label,
@@ -129,16 +129,16 @@ def test_label_matches_filename() -> None:
         )
 
 
-def test_label_uses_org_gbre_namespace() -> None:
+def test_label_uses_org_claude_watch_namespace() -> None:
     """Per the claude-watch naming convention, operator-owned launchd
-    Labels live under the `org.gbre.*` namespace (NOT `com.anthropic.*`,
+    Labels live under the `org.claude-watch.*` namespace (NOT `com.anthropic.*`,
     which implies vendor ownership). Guards against a regression that
     renames the unit under the wrong namespace."""
     for p in ALL_PLISTS:
         label = load(p).get("Label", "")
         expect(
-            isinstance(label, str) and label.startswith("org.gbre."),
-            f"{p.name}: Label must use the org.gbre.* reverse-DNS namespace "
+            isinstance(label, str) and label.startswith("org.claude-watch."),
+            f"{p.name}: Label must use the org.claude-watch.* reverse-DNS namespace "
             f"(operator-owned); got {label!r}",
         )
 
@@ -504,7 +504,7 @@ tests = [
     test_plistlib_parses,
     test_plutil_lint_when_available,
     test_label_matches_filename,
-    test_label_uses_org_gbre_namespace,
+    test_label_uses_org_claude_watch_namespace,
     test_keep_alive_true,
     test_run_at_load_false,
     test_program_arguments_present,

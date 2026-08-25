@@ -474,7 +474,7 @@ test-ttyd-lock-toggle: ## ttyd browser lock-toggle JS tests
 
 ##@ Tests — macOS LaunchAgents + personal MCP host
 
-# Tests for examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist
+# Tests for examples/compose/launchd/org.claude-watch.mcp-host-bash.plist
 # — the macOS LaunchAgent template that persistently auto-starts
 # mcp-host-bash on operator-login. File-level structural validation
 # only (parses via stdlib plistlib + plutil-lint when available);
@@ -496,7 +496,7 @@ test-launchd-plist: ## mcp-host-bash LaunchAgent plist structure tests
 test-personal-mcp-host: ## personal-mcp-host.sh wrapper tests
 	examples/personal-mac-mcp-host/tests/personal-mcp-host.test
 
-# Tests for examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.host.plist
+# Tests for examples/personal-mac-mcp-host/launchd/org.claude-watch.personal-mcp.host.plist
 # — the macOS LaunchAgent template for on-demand bring-up of
 # personal-mcp-host.sh. Structural validation only (plistlib + plutil
 # when available); does NOT invoke launchctl. Covers
@@ -984,7 +984,55 @@ COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 # `.env` if present, else the in-file defaults).
 DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 
-deploy-container: container-build ## Container deploy: force-recreate claude-container, then up -d the rest of the stack
+# ── deploy-container local-override hook (q-2026-08-25-8065) ──────────────────
+# A machine-local makefile fragment in the config dir can inject an
+# EXTRA idempotent deploy step into `deploy-container` WITHOUT editing this
+# tracked, branch-protected Makefile. The motivating case is #3/#4 of the
+# "one-command deploy": deploying the Grafana dashboards LINKED IN from this
+# repo (monitoring/dashboards/*.json — claude-watch / claude-events /
+# work-queue) is performed by an EXTERNAL, machine-specific stack — the
+# external, machine-local monitoring/Grafana stack (kept OUT of this repo), which serves the local
+# `monitoring-grafana-1` Grafana container. That live
+# Grafana must be RESTARTED to re-provision from the bind-mounted dashboard
+# file (a POST /api/admin/provisioning reload does NOT overwrite an already-
+# provisioned dashboard), and the external makefile/stack path differs per
+# machine — so it MUST NOT be hardcoded in this shared repo.
+#
+# Mechanism: conditionally `-include` a local .mk (silently skipped when
+# absent, so a fresh host — or an in-container self-redeploy where the config
+# dir is not mounted — still deploys cleanly). That local .mk sets
+# DEPLOY_DASHBOARDS_CMD to the external, idempotent, SYNCHRONOUS (no `&`)
+# invocation. See examples/compose/deploy-container.local.mk.example. E.g.:
+#
+#   DEPLOY_DASHBOARDS_CMD = $(MAKE) -C /path/to/your/monitoring-stack deploy-grafana-dashboards
+# or simply:
+#   DEPLOY_DASHBOARDS_CMD = docker restart monitoring-grafana-1
+#
+# Empty default => a clean no-op on any host without the override.
+#
+# The config-dir path below is a SYMLINK to a TRACKED copy in the operator's
+# claude-config repo (claude-container/deploy-container.local.mk), which in turn
+# invokes the deploy-grafana-dashboards target in that external stack — so
+# the override is version-controlled + synced across hosts rather than hand-made and
+# untracked. See examples/compose/deploy-container.local.mk.example for setup.
+DEPLOY_LOCAL_MK := $(HOME)/.config/claude-container/deploy-container.local.mk
+-include $(DEPLOY_LOCAL_MK)
+DEPLOY_DASHBOARDS_CMD ?=
+
+# Deploy the linked-in Grafana dashboards via the machine-local
+# override. Best-effort + idempotent: a failure never blocks the container
+# recreate. No-op (just an explanatory echo) unless the local .mk configured it.
+.PHONY: deploy-dashboards
+deploy-dashboards: ## Deploy linked-in Grafana dashboards via the machine-local override (no-op unless configured)
+ifneq ($(strip $(DEPLOY_DASHBOARDS_CMD)),)
+	@echo "[deploy-container] deploying linked-in Grafana dashboards via local override: $(DEPLOY_DASHBOARDS_CMD)"
+	@$(DEPLOY_DASHBOARDS_CMD) || echo "[deploy-container] WARN: dashboard deploy failed (non-fatal); continuing"
+else
+	@echo "[deploy-container] no DEPLOY_DASHBOARDS_CMD configured; skipping Grafana dashboard deploy (see examples/compose/deploy-container.local.mk.example)"
+endif
+
+deploy-container: container-build ## One-command deploy: dashboards + q-site + force-recreate claude-container, then up -d the stack
+	@$(MAKE) --no-print-directory deploy-dashboards
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
 	  env_flag=""; \
@@ -993,6 +1041,8 @@ deploy-container: container-build ## Container deploy: force-recreate claude-con
 	  export CW_BUILD_PR="$(CW_BUILD_PR)"; \
 	  export GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"; \
 	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then export COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)"; fi; \
+	  echo "[deploy-container] redeploying queue-minisite (q-site)..."; \
+	  docker compose $$env_flag up -d --build --force-recreate queue-minisite || echo "[deploy-container] WARN: queue-minisite redeploy failed (non-fatal); continuing"; \
 	  docker compose $$env_flag up -d --force-recreate claude-container && \
 	  docker compose $$env_flag up -d
 
@@ -1022,7 +1072,7 @@ install-mcp-host-bash-server: ## Build + install the host-bash MCP server to ~/b
 # token snapshot the queue-minisite dashboard reads (library + CLI both live
 # in tools/cw-agent-stats/ now -- no botchat checkout involved; see that
 # dir's README). Moved here from claude-config/botchat (was
-# org.gbre.claude-watch.botchat-agent-stats, installed by hand) so
+# org.claude-watch.botchat-agent-stats, installed by hand) so
 # claude-watch owns its own producer's install lifecycle. On Linux hosts the
 # equivalent is a cron line (README), and `make install` symlinks the CLI
 # into ~/bin. ProgramArguments[0] in the plist points directly at the
@@ -1032,11 +1082,11 @@ install-mcp-host-bash-server: ## Build + install the host-bash MCP server to ~/b
 # leaves exactly one fresh instance running.
 install-cw-agent-stats-launchd: ## Install + kickstart the cw-agent-stats LaunchAgent (host producer)
 	@mkdir -p $(HOME)/Library/LaunchAgents
-	@cp tools/cw-agent-stats/org.gbre.claude-watch.cw-agent-stats.plist $(HOME)/Library/LaunchAgents/
-	@launchctl bootout gui/$$(id -u)/org.gbre.claude-watch.cw-agent-stats 2>/dev/null || true
-	@launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/org.gbre.claude-watch.cw-agent-stats.plist
-	@launchctl kickstart -k gui/$$(id -u)/org.gbre.claude-watch.cw-agent-stats
-	@echo "Installed + started org.gbre.claude-watch.cw-agent-stats (tools/cw-agent-stats/cw-agent-stats)"
+	@cp tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist $(HOME)/Library/LaunchAgents/
+	@launchctl bootout gui/$$(id -u)/org.claude-watch.cw-agent-stats 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
+	@launchctl kickstart -k gui/$$(id -u)/org.claude-watch.cw-agent-stats
+	@echo "Installed + started org.claude-watch.cw-agent-stats (tools/cw-agent-stats/cw-agent-stats)"
 
 ##@ Developer setup
 

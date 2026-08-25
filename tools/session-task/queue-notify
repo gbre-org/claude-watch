@@ -60,7 +60,53 @@ Batching is skipped (immediate synchronous send, legacy behaviour) when:
   * priority is ``emergency`` — a priority-2 alert with retry/expire must
     never sit in a debounce window.
 
+Transition push policy (which transitions are worth a phone push)
+-----------------------------------------------------------------
+Not every queue lifecycle transition deserves to buzz a phone. ``started``
+and ``done`` are pure BOOKKEEPING: they fire on every register and every
+completion, they carry no decision for the operator, and the same
+information is already on the queue minisite and in the claude-event
+stream. In Aug 2026 those two transitions alone accounted for ~3,000
+Pushover messages in three weeks — about 31% of the account's monthly
+message allowance — spent entirely on "a thing started" / "a thing
+finished" notices nobody acts on.
+
+So this tool applies a POLICY before the debounce/batch layer: only
+transitions in the push set produce a Pushover. The default set is every
+known lifecycle transition EXCEPT ``started`` and ``done`` — i.e. the ones
+that actually ask something of the operator or report a failure:
+
+    abandoned, blocked, force-started, quarantined, unblocked, unwedged,
+    wedged
+
+Two properties matter:
+
+  * The claude-event emission is UNAFFECTED. session-task emits
+    ``queue-started`` / ``queue-done`` claude-events exactly as before, so
+    the main loop, the minisite and the exporter see no change at all.
+    Only the phone push is dropped.
+  * The filter FAILS OPEN on anything it does not recognise as a known
+    lifecycle transition (a hand-written title, or a transition kind added
+    to session-task later). A new transition pushes until someone
+    deliberately adds it to the suppressed set — silence is never the
+    default for something unknown.
+
+Override with ``QUEUE_NOTIFY_PUSH_TRANSITIONS`` (comma/space separated,
+case-insensitive; a leading ``queue `` on each entry is tolerated):
+
+    QUEUE_NOTIFY_PUSH_TRANSITIONS=all          # push everything (pre-2026-08)
+    QUEUE_NOTIFY_PUSH_TRANSITIONS=none         # push nothing known
+    QUEUE_NOTIFY_PUSH_TRANSITIONS=wedged,blocked
+    QUEUE_NOTIFY_PUSH_TRANSITIONS=default,done # the default set plus `done`
+
+``default`` expands to the built-in set, so re-enabling ONE transition
+does not mean re-listing all of them. A suppressed transition exits 0 —
+it is a policy decision, not a delivery failure.
+
 Env knobs (all optional):
+  * ``QUEUE_NOTIFY_PUSH_TRANSITIONS`` — transitions that earn a push
+    (default: all known lifecycle transitions except ``started`` /
+    ``done``). ``all`` / ``none`` / ``default`` are accepted tokens.
   * ``QUEUE_NOTIFY_BATCH``       — ``0`` disables batching (default on).
   * ``QUEUE_NOTIFY_DEBOUNCE``    — quiet-gap seconds (default 10).
   * ``QUEUE_NOTIFY_MAX_WINDOW``  — hard coalesce ceiling seconds (default 60).
@@ -114,6 +160,93 @@ _DEFAULT_MAX_WINDOW = 60.0
 _BATCH_DETAIL_CAP = 12
 # Keep the composed body under Pushover's 1024-char message limit.
 _MESSAGE_LIMIT = 1000
+
+# --- transition push policy ------------------------------------------------
+#
+# Every queue lifecycle transition session-task can emit, as the lower-cased
+# `kind` half of a "queue <kind>: q-..." title. Anything NOT in this set is
+# treated as an unknown/ad-hoc title and always pushes (fail open).
+KNOWN_TRANSITIONS = frozenset({
+    "started",
+    "done",
+    "abandoned",
+    "quarantined",
+    "force-started",
+    "wedged",
+    "unwedged",
+    "blocked",
+    "unblocked",
+})
+
+# Transitions that earn a phone push by DEFAULT.
+#
+# `started` and `done` are deliberately excluded: they are bookkeeping -- one
+# per register, one per completion -- with nothing for the operator to act
+# on, and between them they burned ~31% of the Pushover account's monthly
+# message allowance in Aug 2026. Their claude-events still fire unchanged;
+# only the push is dropped. What remains is either an operator ask or a
+# failure report.
+DEFAULT_PUSH_TRANSITIONS = frozenset(KNOWN_TRANSITIONS - {"started", "done"})
+
+# Tokens accepted in QUEUE_NOTIFY_PUSH_TRANSITIONS besides bare kinds.
+_PUSH_TOKEN_ALL = "all"
+_PUSH_TOKEN_NONE = "none"
+_PUSH_TOKEN_DEFAULT = "default"
+
+
+def _normalize_transition(raw: str) -> str:
+    """Normalise one transition token: lower-cased, no ``queue `` prefix."""
+    tok = (raw or "").strip().lower()
+    if tok.startswith("queue "):
+        tok = tok[len("queue "):].strip()
+    return tok
+
+
+def _push_transitions() -> frozenset:
+    """Resolve the set of transitions that earn a push.
+
+    Reads ``QUEUE_NOTIFY_PUSH_TRANSITIONS`` (comma and/or whitespace
+    separated, case-insensitive). Unset or empty -> the built-in default.
+    Special tokens: ``all`` (every known transition), ``none`` (no known
+    transition), ``default`` (expands to the built-in set, so re-enabling a
+    single transition does not mean re-listing the rest).
+    """
+    raw = os.environ.get("QUEUE_NOTIFY_PUSH_TRANSITIONS")
+    if raw is None or not raw.strip():
+        return DEFAULT_PUSH_TRANSITIONS
+    out: set = set()
+    for chunk in raw.replace(",", " ").split():
+        tok = _normalize_transition(chunk)
+        if not tok:
+            continue
+        if tok == "queue":
+            # A bare `queue` word, left over from a space-separated
+            # "queue done queue wedged" spelling. Never a transition.
+            continue
+        if tok == _PUSH_TOKEN_ALL:
+            out |= set(KNOWN_TRANSITIONS)
+        elif tok == _PUSH_TOKEN_NONE:
+            continue
+        elif tok == _PUSH_TOKEN_DEFAULT:
+            out |= set(DEFAULT_PUSH_TRANSITIONS)
+        else:
+            out.add(tok)
+    return frozenset(out)
+
+
+def _should_push(title: str) -> bool:
+    """True if this title's transition is push-worthy under current policy.
+
+    FAILS OPEN: a title whose kind is not a KNOWN lifecycle transition (an
+    ad-hoc/hand-written title, or a transition added to session-task after
+    this list was written) always pushes. Suppression is only ever applied
+    to kinds this file explicitly knows about.
+    """
+    kind = _event_kind(title)
+    if kind not in KNOWN_TRANSITIONS:
+        return True
+    return kind in _push_transitions()
+
 
 
 def _config_home() -> Path:
@@ -483,6 +616,15 @@ def main(argv=None) -> int:
 
     title = args.title if args.title is not None else socket.gethostname().split(".")[0]
     priority = _PRIORITY_MAP[args.priority]
+
+    # Transition push policy. Applied BEFORE the batch/immediate split so a
+    # suppressed transition never reaches the spool and can never inflate a
+    # batch's event count. Exit 0: "not push-worthy" is a policy decision,
+    # not a delivery failure, and the caller (session-task) must not treat
+    # it as one. The matching claude-event is emitted by session-task
+    # independently and is unaffected by this.
+    if not _should_push(title):
+        return 0
 
     batch_enabled = os.environ.get("QUEUE_NOTIFY_BATCH", "1") != "0"
     # Emergency (priority 2) must never wait in a debounce window; send now.

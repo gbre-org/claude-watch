@@ -5,7 +5,7 @@ config dir and pointing claude at it via CLAUDE_CONFIG_DIR.
 
 WHY THIS EXISTS
 ---------------
-On a macOS Docker host, the operator's Salesforce "devbar" app frequently
+On a macOS Docker host, the operator's "devbar" auth-helper app frequently
 REWRITES the host Claude config files that the container bind-mounts in
 (``~/.claude.json`` and ``~/.claude/settings.json``). devbar writes them
 atomically (write-temp + rename). On macOS Docker's VirtioFS / gRPC-FUSE

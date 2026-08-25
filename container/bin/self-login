@@ -642,7 +642,7 @@ def do_code(pane: str, code: str, args) -> dict:
     #      ambiguous, inject fails open, and the `i` stays -- the code arrives
     #      as `i<code>`.
     #   2. inject first sends the configured FleetView focus-to-main keys. On a
-    #      deployment that sets any (gomorrah sends ten Up presses) those arrive
+    #      deployment that sets any (the-host sends ten Up presses) those arrive
     #      in the modal's text field as raw escape sequences, ahead of the code.
     #   3. inject's success check is "the payload cleared from the prompt
     #      line". A modal has no prompt line, so the check is vacuous and inject

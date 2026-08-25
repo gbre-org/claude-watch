@@ -242,12 +242,12 @@
 #                              MCP_HOST_BASH_LOG.
 #   PERSONAL_MCP_HOST_LABEL    launchd label of the BUNDLED unit (server +
 #                              tunnel in one). Default
-#                              org.gbre.personal-mcp.host
+#                              org.claude-watch.personal-mcp.host
 #   PERSONAL_MCP_TUNNEL_LABEL  launchd label of the TUNNEL-ONLY unit.
-#                              Default org.gbre.personal-mcp.tunnel
+#                              Default org.claude-watch.personal-mcp.tunnel
 #   PERSONAL_MCP_SERVER_LABEL  launchd label of the always-on MCP server
 #                              unit from the compose stack. Default
-#                              org.gbre.claude-watch.mcp-host-bash
+#                              org.claude-watch.mcp-host-bash
 #                              Override any of the three if you renamed a
 #                              unit; a label that is not bootstrapped is
 #                              simply skipped.
@@ -388,9 +388,9 @@ MCP_HOST_BASH_BIN="${MCP_HOST_BASH_BIN:-$(command -v mcp-host-bash-server 2>/dev
 # own their piece's lifecycle and get kickstarted rather than hand-
 # launched. Not bootstrapped (or no launchctl at all — Linux) => restart
 # owns the launch itself. Overridable for operators who renamed a unit.
-PERSONAL_MCP_HOST_LABEL="${PERSONAL_MCP_HOST_LABEL:-org.gbre.personal-mcp.host}"
-PERSONAL_MCP_TUNNEL_LABEL="${PERSONAL_MCP_TUNNEL_LABEL:-org.gbre.personal-mcp.tunnel}"
-PERSONAL_MCP_SERVER_LABEL="${PERSONAL_MCP_SERVER_LABEL:-org.gbre.claude-watch.mcp-host-bash}"
+PERSONAL_MCP_HOST_LABEL="${PERSONAL_MCP_HOST_LABEL:-org.claude-watch.personal-mcp.host}"
+PERSONAL_MCP_TUNNEL_LABEL="${PERSONAL_MCP_TUNNEL_LABEL:-org.claude-watch.personal-mcp.tunnel}"
+PERSONAL_MCP_SERVER_LABEL="${PERSONAL_MCP_SERVER_LABEL:-org.claude-watch.mcp-host-bash}"
 
 # The reverse-forward spec is the fingerprint `restart` uses to find OUR
 # tunnel among any other ssh processes on the box: it is exactly the -R

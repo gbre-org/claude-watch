@@ -9,13 +9,13 @@ truth instead of forking a drifting copy.
 
 ## Why the rules live here (not only in the local stack)
 
-The local Grafana/Prometheus **compose stack** lives out-of-tree (in
-`andrew-sf-tools/monitoring/`), and the daemon itself does not run
+The local Grafana/Prometheus **compose stack** lives out-of-tree (in an
+external monitoring stack), and the daemon itself does not run
 Prometheus. But the rules encode claude-watch's OWN semantics against the
 metric names its two Python exporters emit
 (`exporters/work-queue-exporter/`, `exporters/claude-events-exporter/`) — so
 they belong next to those exporters. Any consumer (the local stack,
-gomorrah/`gb`, a future hosted Prometheus) should **symlink or copy** this
+an external host, a future hosted Prometheus) should **symlink or copy** this
 file rather than maintain its own. Load it via `rule_files:` in
 `prometheus.yml`.
 

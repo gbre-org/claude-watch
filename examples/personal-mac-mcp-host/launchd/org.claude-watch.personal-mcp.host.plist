@@ -27,15 +27,15 @@
   Why RunAtLoad=false: this is the on-demand "open remote access for a
   bit" pattern. The plist registers the unit but does NOT fire it at
   login. The operator triggers a session with
-    launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
+    launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.host
   and tears it down with
-    launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
+    launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.host
   See launchd/README.md for the lifecycle.
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>org.gbre.personal-mcp.host</string>
+    <string>org.claude-watch.personal-mcp.host</string>
 
     <!--
       ProgramArguments: absolute path to personal-mcp-host.sh, invoked
@@ -52,7 +52,7 @@
       another respawn, so a bare-argv unit degrades into a
       ThrottleInterval-paced restart loop that never starts anything. If
       you want the status-gated shape, you want the tunnel-only unit
-      (org.gbre.personal-mcp.tunnel.plist) plus an always-on MCP server,
+      (org.claude-watch.personal-mcp.tunnel.plist) plus an always-on MCP server,
       not this one.
 
       Note on respawns: this mode starts mcp-host-bash DETACHED, so it
