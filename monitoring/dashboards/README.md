@@ -8,9 +8,10 @@ drifts.
 
 - **`claude-watch.json`** (uid `claude-watch`) — the daemon dashboard: status,
   heartbeat, context, watchers, hook reminders/fallbacks, interrupts, and
-  token usage. One optional tile (Build Info → "latest merged") needs the
-  Infinity datasource; see [Infinity](#infinity--optional-one-tile-in-claude-watchjson)
-  below.
+  token usage. Build Info (version/commit/PR of the running binary) is pure
+  Prometheus — no token, no GitHub call. One separate, optional panel
+  ("Latest Merged PR") needs the Infinity datasource; see
+  [Infinity](#infinity--optional-one-panel-in-claude-watchjson) below.
 - **`claude-events.json`** (uid `claude-events`) — the event bus: backlog
   depth, oldest-unconsumed age, emission rate split by producer and by tag,
   emitted-vs-consumed, and cumulative totals. Needs
@@ -71,18 +72,29 @@ jq '(.. | objects | select(.type? == "prometheus") | .uid) = "YOUR_UID"' \
   claude-watch.json > /path/to/deployment/dashboards/claude-watch.json
 ```
 
-### Infinity — optional, one tile in `claude-watch.json`
+### Infinity — optional, one panel in `claude-watch.json`
 
-One target is not Prometheus: the third tile of the **Build Info** panel
-("latest merged") queries GitHub's REST API directly through the
+One panel is not Prometheus: **Latest Merged PR** queries GitHub's REST API
+directly through the
 [Infinity](https://grafana.com/grafana/plugins/yesoreyeram-infinity-datasource/)
-datasource, which is why that panel's own datasource is `-- Mixed --`. It is
-the only Infinity target in this repo, and it is deliberately exporter-free: a
-local exporter scraping GitHub for one number is a service to run, restart and
-forget, and the number is already public.
+datasource. It is the only Infinity target in this repo, and it is
+deliberately exporter-free: a local exporter scraping GitHub for one number is
+a service to run, restart and forget, and the number is already public.
+
+This panel used to be a third tile inside **Build Info**, sharing that panel's
+`-- Mixed --` datasource with the two Prometheus tiles (version/commit/PR).
+That was the recurring failure mode Andrew hit as #5482/#5548: Grafana's
+`/api/ds/query` batches every target of a Mixed-datasource panel into one
+request and fails the WHOLE response the instant any one target errors, so a
+GitHub rate-limit (below) or a missing Infinity plugin/datasource blanked the
+two otherwise-healthy Prometheus tiles too, not just the GitHub one — a
+"skip it and only that tile fails to render" assumption that does not hold in
+practice (verified against Grafana 13.1.3). As of 2026-08-25 this is its own
+panel on its own single datasource, so a GitHub outage is confined to this one
+panel and can never again take the build-identity tiles down with it.
 
 This repo ships no Grafana service — nothing here provisions one, so there is
-no compose file to add the plugin to. A deployment that wants the tile needs
+no compose file to add the plugin to. A deployment that wants the panel needs
 two things in **its own** Grafana:
 
 1. The plugin installed. On the official image that is one env var —
@@ -103,9 +115,9 @@ datasources:
     jsonData: {}
 ```
 
-Skip both and nothing else breaks: the tile does not render, Grafana flags the
-missing datasource on that one panel, and the two Prometheus tiles beside it
-are unaffected.
+Skip both and nothing else breaks: this one panel does not render (Grafana
+flags the missing datasource on it), and Build Info's Prometheus tiles are
+unaffected — they are on a different panel now, not just a different tile.
 
 **Rate limit is the design constraint here, and it is what sets this
 dashboard's refresh.** The call is unauthenticated, so GitHub allows 60
@@ -158,7 +170,7 @@ decides the answer is redone in the selector.
   build. No dashboard tile since 2026-08-23 (the Build Info panel is about
   the daemon, not the exporter); read it with `curl -s localhost:9099/metrics
   | grep build_info`. See `monitoring/prometheus/README.md`.
-- "latest merged" (Build Info) → no metric at all: Infinity fetches
-  `api.github.com/repos/hndrewaall/claude-watch/pulls` at render time
+- "latest merged" (Latest Merged PR panel) → no metric at all: Infinity
+  fetches `api.github.com/repos/hndrewaall/claude-watch/pulls` at render time
 
 Alerting on the same metrics lives in `monitoring/prometheus/`.
