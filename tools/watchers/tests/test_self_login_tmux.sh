@@ -170,7 +170,7 @@ INJECT_HOME="$WORK/inject-probe-home"
 mkdir -p "$INJECT_HOME"
 # A config with a NON-EMPTY FleetView focus-to-main key sequence. Copied from
 # the repo config so every other field keeps its real default (a partial TOML
-# is rejected outright). gomorrah ships ten Up presses; one is enough to show
+# is rejected outright). the-host ships ten Up presses; one is enough to show
 # the class. HOME is redirected too, so the user-config overlay cannot make
 # this probe depend on whoever is running it.
 sed 's/^focus_main_keys = \[\]/focus_main_keys = ["Up"]/' "$REPO/config.toml" \

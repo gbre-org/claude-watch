@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  org.gbre.claude-watch.cw-agent-stats — host producer for the queue-minisite
+  org.claude-watch.cw-agent-stats — host producer for the queue-minisite
   live agent tool-call + token counters (claude-watch #655; originally botchat
   #2955/#2956). Writes the agent-stats.json snapshot atomically every ~4s
   (--loop --duration 58 --interval 4, fired once a minute) by folding the
   appended tail of ~/.claude/projects/*/*/subagents/agent-*.jsonl transcripts.
 
-  Formerly org.gbre.claude-watch.botchat-agent-stats, installed from
+  Formerly org.claude-watch.botchat-agent-stats, installed from
   claude-config and running botchat/bin/botchat-agent-stats. Moved so the
   producer's install/ownership lives in claude-watch (which now owns this
   plist + the `install-cw-agent-stats-launchd` Makefile target) instead of
@@ -36,7 +36,7 @@
   NOT the dir node-exporter actually scrapes on this host -- the metrics
   would be written but silently never picked up.
 
-  Namespace: org.gbre.claude-watch.* is the namespace for claude-watch's own
+  Namespace: org.claude-watch.* is the namespace for claude-watch's own
   plists (see claude-config launchagents/README.md rule 4 and memory
   feedback_claude_watch_plist_namespace).
 
@@ -49,22 +49,22 @@
   rule 3 in claude-config for the anti-pattern this avoids).
 
   Install (or `make install-cw-agent-stats-launchd` from the repo root):
-    cp tools/cw-agent-stats/org.gbre.claude-watch.cw-agent-stats.plist \
+    cp tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist \
        ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) \
-       ~/Library/LaunchAgents/org.gbre.claude-watch.cw-agent-stats.plist
+       ~/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
 
   Run now (test):
-    launchctl kickstart -k gui/$(id -u)/org.gbre.claude-watch.cw-agent-stats
+    launchctl kickstart -k gui/$(id -u)/org.claude-watch.cw-agent-stats
 
   Dismantle:
-    launchctl bootout gui/$(id -u)/org.gbre.claude-watch.cw-agent-stats 2>/dev/null || true
-    rm ~/Library/LaunchAgents/org.gbre.claude-watch.cw-agent-stats.plist
+    launchctl bootout gui/$(id -u)/org.claude-watch.cw-agent-stats 2>/dev/null || true
+    rm ~/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>org.gbre.claude-watch.cw-agent-stats</string>
+    <string>org.claude-watch.cw-agent-stats</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Users/hallandrew/repos/claude-watch/tools/cw-agent-stats/cw-agent-stats</string>

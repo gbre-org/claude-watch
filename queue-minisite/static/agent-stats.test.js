@@ -121,7 +121,7 @@ const FRESH = {
     row({ agent_id: 'bb11', queue_id: 'q-2026-08-22-aaaa', description: 'torrent-process: flac batch', agent_type: 'torrent-process', last_tool: 'Read', calls_text: '25', ctx_text: '88K', out_text: '4K', age_text: '1h5m', last_write_text: '40s' }),
     row({ agent_id: 'cc22', queue_id: '', description: '', agent_type: '', last_tool: '', calls_text: '12', ctx_text: '81K', out_text: '2.5K', age_text: '1m16s', last_write_text: '' }),
   ],
-  host: 'gomorrah', age_seconds: 2.1, age_text: '2s',
+  host: 'the-host', age_seconds: 2.1, age_text: '2s',
   label: '3 agents · 48 calls · 272K tok', main_label: 'main 195K',
   title: '3 live agents (last 15m window) · 48 tool calls · 272K context tokens',
 };
@@ -413,7 +413,7 @@ console.log('agent-bar.js: popover paints from the seed, pins on click, repaints
     r2 && r2.querySelector('td.abp-desc').textContent);
   const foot = pop.querySelector('.abp-foot');
   assert('foot: main loop ctx + updated · host',
-    foot && foot.children[0].textContent === 'main loop ctx 195K (2s ago)' && foot.children[1].textContent === 'updated 2s ago · gomorrah',
+    foot && foot.children[0].textContent === 'main loop ctx 195K (2s ago)' && foot.children[1].textContent === 'updated 2s ago · the-host',
     foot && foot.textContent);
   assert('no stale marker when fresh', !pop.querySelector('.abp-stale'));
 

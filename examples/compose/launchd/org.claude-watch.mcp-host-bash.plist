@@ -38,7 +38,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>org.gbre.claude-watch.mcp-host-bash</string>
+    <string>org.claude-watch.mcp-host-bash</string>
 
     <!--
       ProgramArguments: full argv launchd will exec. Points at the

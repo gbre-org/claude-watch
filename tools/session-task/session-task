@@ -1210,8 +1210,8 @@ def _new_group_id():
 
 _TYPED_TOKEN_RE = re.compile(r"^(repo|resource|book|agent-proto):")
 # `path:<repo>/<subdir>` scope tokens (added 2026-05-11 to fix
-# over-serialization within large repos -- e.g. docker-gomorrah's
-# monitoring/ vs queue-minisite/ subtrees both tagging `repo:docker-gomorrah`
+# over-serialization within large repos -- e.g. an example-monorepo's
+# monitoring/ vs queue-minisite/ subtrees both tagging `repo:example-monorepo`
 # even though their files are disjoint). Semantics: a `path:` token is a
 # finer-grained claim WITHIN a repo. The first segment is the repo name;
 # everything after is a path within that repo.
@@ -2599,7 +2599,7 @@ def _find_agent_jsonl(agent_id):
     needle = f"agent-{agent_id}.jsonl"
     best = None  # (mtime, path)
     # Two-level walk: <root>/<host-token>/<session>/subagents/<file>, OR
-    # <root>/<session>/subagents/<file> (the gomorrah deploy mounts the
+    # <root>/<session>/subagents/<file> (the-host deploy mounts the
     # host-token level directly so the session is one level down). Try
     # both shapes — first hit wins per session-uuid, then we rank by mtime.
     candidates_dirs = [root]
@@ -2656,7 +2656,7 @@ def _find_transcripts_for_queue_marker(queue_id, *, freshness_secs=24 * 60 * 60)
     ``DEFAULT_SUBAGENTS_DIR_FRESHNESS_SECS`` in src/active_agents.rs).
     A file is included iff its mtime is within the window OR the queue id
     is rare enough that operator override should still surface it; in
-    practice we apply the window because stale transcripts on the gomorrah
+    practice we apply the window because stale transcripts on the-host
     deploy easily exceed 100MB+ and grepping all history is wasteful.
     """
     if not isinstance(queue_id, str) or not queue_id:
@@ -2819,7 +2819,7 @@ def _registering_subagent_agent_id(queue_id, *, freshness_secs=600):
     # register tool_use frame, plus any recent inbox/agent-msg read that
     # cited the rotated id) is always among the most-recent writes, so a
     # bounded tail suffices AND keeps this off the critical path even when a
-    # transcript is huge (gomorrah transcripts routinely exceed 100MB, per
+    # transcript is huge (the-host transcripts routinely exceed 100MB, per
     # _find_transcripts_for_queue_marker). needle is ASCII, so a mid-char
     # seek can't corrupt a match within the window.
     tail_bytes = 512 * 1024
@@ -8375,8 +8375,8 @@ def _infer_scope_from_text(text):
             scope.append(tok)
 
     # repo: mentions
-    if "~/repos/docker-gomorrah" in t or "docker-gomorrah" in t or "monitoring/docker-compose" in t:
-        scope.append("repo:docker-gomorrah")
+    if "~/repos/example-monorepo" in t or "example-monorepo" in t or "monitoring/docker-compose" in t:
+        scope.append("repo:example-monorepo")
     if "~/repos/media-tools" in t or "media-tools" in t or "ebook-convert-pdf" in t:
         scope.append("repo:media-tools")
     if ".claude/agents" in t or "agents/security-" in t:

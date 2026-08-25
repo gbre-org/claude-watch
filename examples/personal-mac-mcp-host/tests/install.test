@@ -22,7 +22,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 INSTALL="$HERE/../install.sh"
-SRC_PLIST="$HERE/../launchd/org.gbre.personal-mcp.host.plist"
+SRC_PLIST="$HERE/../launchd/org.claude-watch.personal-mcp.host.plist"
 
 failures=0
 pass() { printf 'PASS  %s\n' "$1"; }
@@ -65,12 +65,12 @@ expect_eq "conflicting --bundled --tunnel-only exits 2" 2 "$rc"
 # When the tunnel plist exists (current checkout), a --tunnel-only install
 # must substitute placeholders into THAT plist. When absent (forward-compat
 # / tarball without it), the installer must exit 2 with a helpful message.
-if [ -f "$HERE/../launchd/org.gbre.personal-mcp.tunnel.plist" ]; then
+if [ -f "$HERE/../launchd/org.claude-watch.personal-mcp.tunnel.plist" ]; then
     TUNHOME="$(mktemp -d)"
     rc=0
     "$INSTALL" --tunnel-only --home "$TUNHOME" --repo "/tmp/fake-repo-tun" >/dev/null 2>&1 || rc=$?
     expect_eq "real --tunnel-only install exits 0" 0 "$rc"
-    TUNDEST="$TUNHOME/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist"
+    TUNDEST="$TUNHOME/Library/LaunchAgents/org.claude-watch.personal-mcp.tunnel.plist"
     if [ -f "$TUNDEST" ]; then pass "installed tunnel plist exists"; else fail "installed tunnel plist exists"; fi
     if [ -f "$TUNDEST" ]; then
         if grep -q '/PATH/TO/' "$TUNDEST"; then
@@ -124,7 +124,7 @@ case "$plist_body" in
 esac
 
 # --print-cmd must NOT have written anything.
-if [ -e "$TMPHOME/Library/LaunchAgents/org.gbre.personal-mcp.host.plist" ]; then
+if [ -e "$TMPHOME/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist" ]; then
     fail "--print-cmd wrote nothing"
 else
     pass "--print-cmd wrote nothing"
@@ -135,7 +135,7 @@ rc=0
 "$INSTALL" --bundled --home "$TMPHOME" --repo "/tmp/fake-repo-xyz" >/dev/null 2>&1 || rc=$?
 expect_eq "real --bundled install exits 0" 0 "$rc"
 
-DEST="$TMPHOME/Library/LaunchAgents/org.gbre.personal-mcp.host.plist"
+DEST="$TMPHOME/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist"
 if [ -f "$DEST" ]; then pass "installed plist exists"; else fail "installed plist exists"; fi
 
 if [ -f "$DEST" ]; then
@@ -170,7 +170,7 @@ else
     fail "re-run overwrites with fresh repo path"
 fi
 # No temp residue (atomic mv via mktemp .XXXXXX).
-residue="$(find "$TMPHOME/Library/LaunchAgents" -name 'org.gbre.personal-mcp.host.plist.*' 2>/dev/null | wc -l | tr -d ' ')"
+residue="$(find "$TMPHOME/Library/LaunchAgents" -name 'org.claude-watch.personal-mcp.host.plist.*' 2>/dev/null | wc -l | tr -d ' ')"
 expect_eq "no temp-file residue after re-run" "0" "$residue"
 
 # --- summary --------------------------------------------------------------
