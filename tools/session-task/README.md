@@ -155,6 +155,71 @@ created_by`, plus optional `started_at, registered_at, completed_at, abandoned_a
 abandon_reason, pid, last_heartbeat_at, context, agent_id, agent_id_source,
 agent_id_stamped_at`.
 
+## Push notifications (`queue-notify`)
+
+Every queue lifecycle transition does two independent things:
+
+1. Emits a **claude-event** (`queue-started`, `queue-done`, `queue-abandoned`,
+   `queue-blocked`, …) into `~/claude-events/`, which is how the main loop, the
+   queue minisite and the exporter learn about the transition.
+2. Shells out to **`queue-notify`** (`tools/session-task/queue-notify`), the
+   dedicated Pushover path, for a phone push.
+
+Those two are **decoupled**, and only the second one is filtered.
+
+### Transition push policy
+
+`queue-notify` pushes a transition only if it is in the *push set*. The default
+set is every known lifecycle transition **except `started` and `done`**:
+
+```
+abandoned  blocked  force-started  quarantined  unblocked  unwedged  wedged
+```
+
+**Why:** `started` and `done` are pure bookkeeping — one fires on every
+`queue register`, one on every `queue done` — and neither asks the operator for
+anything or reports a failure. In Aug 2026 those two transitions alone produced
+roughly 3,000 Pushover messages in three weeks, about 31% of the account's
+monthly message allowance, spent entirely on "a thing started" / "a thing
+finished" notices nobody acts on. The remaining transitions all either need a
+human decision (blocked, wedged, quarantined, force-started) or report an
+outcome that isn't the happy path (abandoned), so they keep their push.
+
+Two properties are deliberate:
+
+- **claude-events are untouched.** `queue-started` / `queue-done` still fire
+  exactly as before, with the same tag, data and timing. Nothing downstream of
+  the event stream changes; only the phone push is dropped. If you want to see
+  starts and completions, the queue minisite and `claude-event-tail` still have
+  every one of them.
+- **The filter fails open.** Only transition kinds `queue-notify` explicitly
+  knows about can be suppressed. A hand-written title, or a transition kind
+  added to `session-task` later, always pushes — silence is never the default
+  for something unrecognised.
+
+`--silent` and `PINGME_SESSION_TASK=0` are unchanged and still suppress both
+the push and the claude-event at the `session-task` end.
+
+### Re-enabling without a code change
+
+`QUEUE_NOTIFY_PUSH_TRANSITIONS` overrides the push set. Comma and/or whitespace
+separated, case-insensitive, and a leading `queue ` on an entry is tolerated:
+
+```bash
+QUEUE_NOTIFY_PUSH_TRANSITIONS=all             # push every transition (pre-policy behaviour)
+QUEUE_NOTIFY_PUSH_TRANSITIONS=none            # push no known transition
+QUEUE_NOTIFY_PUSH_TRANSITIONS=wedged,blocked  # exactly these two
+QUEUE_NOTIFY_PUSH_TRANSITIONS=default,done    # the default set, plus `done`
+```
+
+`default` expands to the built-in set, so re-enabling one transition doesn't
+mean re-listing the rest. A suppressed transition exits **0** — not pushing is
+a policy decision, not a delivery failure, and `session-task` must not treat it
+as one.
+
+Other `queue-notify` env knobs (debounce/batch, spool path, dry-run sink) are
+documented in that file's module docstring.
+
 ## Implementation note
 
 This is a Python 3 script (no third-party runtime deps). It was previously vendored in the
@@ -173,7 +238,7 @@ cd tools/session-task
 uv run --python 3.11 --with pytest pytest tests/ -v
 ```
 
-165 cases, ~36s. All tests are self-contained — each runs against a
+382 cases, ~2min. All tests are self-contained — each runs against a
 tempdir `$HOME` so the live `~/.config/session/queue.json` is never
 touched. CI runs the same suite via `make test-session-task`.
 
