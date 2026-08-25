@@ -619,6 +619,40 @@ pub(crate) fn fresh_clear_inject_suppressed(
     suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
 }
 
+/// Pure predicate: is the main loop provably alive per THE liveness signal —
+/// the age of the last event-ack (`last_ack_timestamp_age`)?
+///
+/// The fresh-/clear fast path infers a `/clear` from a low context-token
+/// reading (`[min_tokens, max_tokens)`) plus `bashes == 0` and an idle pane.
+/// That inference is fooled whenever the token reading is a MISPARSE rather
+/// than a real context reset: the status-bar total can drop out of the capture
+/// window and the parser falls back to the thinking-indicator's `↓ N tokens`
+/// (current-turn output, typically a few thousand) or an agent-roster row's
+/// count — both of which land squarely inside `[min_tokens, max_tokens)`
+/// (see `status::parse_status_bar`). A long, intact session that is thinking
+/// mid-turn or quiet-holding while acking keepalives then reads as a "fresh
+/// /clear" and gets a resume prompt injected on top of live, uncleared work
+/// (false-fire incident 2026-08-24: looped for hours at tokens=2100..4900).
+///
+/// The one signal that cannot be spoofed by a token misparse is whether the
+/// loop is still handling events: `event-ack` stamps `last-ack-timestamp` on
+/// every ack, and the main loop's per-batch reflex is `event-ack ack-batch`.
+/// If that stamp is younger than the stale threshold the loop demonstrably
+/// handled something recently, so it CANNOT have been cleared/stranded — any
+/// low-token reading this cycle is noise. Gate the inject on it.
+///
+/// Returns true iff we HAVE an ack stamp AND it is younger than `stale_secs`.
+/// `None` (no ack data yet — fresh boot, host without event-ack) => false:
+/// we never claim a liveness we can't prove, so the genuine fresh-/clear case
+/// keeps its existing behaviour. Symmetrically, a genuinely stranded post-clear
+/// loop stops acking, so its stamp ages past `stale_secs` and the gate opens
+/// again — this defers to, rather than disables, wedge detection (the same
+/// single-liveness-signal principle the 2026-08-22 ack redesign consolidated
+/// on).
+pub(crate) fn ack_liveness_fresh(liveness_age: Option<u64>, stale_secs: u64) -> bool {
+    liveness_age.is_some_and(|age| age < stale_secs)
+}
+
 /// Pure predicate: should the dead-process restart be suppressed because
 /// the main loop is actively turning? Mirrors the decision we make at
 /// the fire site so unit tests don't have to mock tmux pane reads.
@@ -5684,6 +5718,51 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 }
             }
 
+            // Liveness gate (2026-08-24 false-fire fix): THE single liveness
+            // signal is the age of the last event-ack. If the loop acked ANY
+            // event/keepalive within the stale window it is provably alive and
+            // therefore CANNOT have been /clear'd or stranded — the low token
+            // reading that landed us in this block is a misparse (the
+            // thinking-indicator's `↓ N tokens` current-turn count, or an
+            // agent-roster row, leaking through as the context total; see
+            // `status::parse_status_bar`), NOT a fresh /clear. This is a HARD
+            // suppression, deliberately checked BEFORE the escalation backstop:
+            // escalation exists to force through when the `actively_turning`
+            // heuristic might be wrong, but a fresh ack is direct proof of
+            // life, so it must never be overridden (that is exactly the
+            // false-inject the incident produced — hours of resume prompts on
+            // an intact, mid-turn/quiet-holding session at tokens=2100..4900).
+            // A genuinely stranded post-clear loop stops acking, so its stamp
+            // ages past the threshold and this gate opens again — deferring to,
+            // not disabling, wedge detection.
+            let ack_alive = ack_liveness_fresh(
+                last_ack_timestamp_age(&config.ack.resolve_state_dir()),
+                config.ack.stale_minutes * 60,
+            );
+            if ack_alive {
+                info!(
+                    tokens,
+                    bashes,
+                    "fresh /clear inject suppressed: fresh event-ack liveness (loop alive)"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "fresh_clear_inject_suppressed",
+                    serde_json::json!({
+                        "tokens": tokens,
+                        "bashes": bashes,
+                        "reason": "ack_liveness_fresh",
+                        "stale_secs": config.ack.stale_minutes * 60,
+                    }),
+                );
+                // Rebuild detection from scratch once the (misparsed) reading
+                // clears, exactly as the actively-turning suppression does.
+                state.consecutive_fast_detections = 0;
+                state.last_check = Some(now);
+                crate::state::save_state(&config.general.state_file, state);
+                return;
+            }
+
             // Active-turn suppression (2026-04-27 false-positive fix):
             // The token range [min_tokens, max_tokens) AND `bashes == 0`
             // are both point-in-time predicates that the main loop
@@ -10054,6 +10133,44 @@ cooldown = 300
         let mut state = State::default();
         state.last_active_at = Some(iso_secs_ago(1));
         assert!(!fresh_clear_inject_suppressed(&state, 0, true, 0));
+    }
+
+    // --- ack_liveness_fresh: the fresh-/clear liveness gate (2026-08-24) ---
+    // The fresh-/clear fast path was firing on a MISPARSED low token reading
+    // (thinking-indicator / agent-roster count leaking as the context total)
+    // while the session was alive and intact — looping resume injects for
+    // hours at tokens=2100..4900. The gate suppresses the inject whenever the
+    // last event-ack is fresh (the loop is provably alive), and stays out of
+    // the way when there is no proof of life so genuine fresh /clears still
+    // recover.
+
+    #[test]
+    fn test_ack_liveness_fresh_true_when_recent_ack() {
+        // Acked 60s ago, stale threshold 20min: the loop handled an event
+        // well within the window, so it is alive — suppress the inject.
+        assert!(ack_liveness_fresh(Some(60), 20 * 60));
+    }
+
+    #[test]
+    fn test_ack_liveness_fresh_false_when_ack_stale() {
+        // Last ack 25min ago, threshold 20min: no proof of life, so the gate
+        // opens and a genuine fresh /clear can still be resumed.
+        assert!(!ack_liveness_fresh(Some(25 * 60), 20 * 60));
+    }
+
+    #[test]
+    fn test_ack_liveness_fresh_false_when_no_ack_stamp() {
+        // No ack data at all (fresh boot / host without event-ack): we cannot
+        // prove liveness, so DON'T suppress — preserve fast-path behaviour.
+        assert!(!ack_liveness_fresh(None, 20 * 60));
+    }
+
+    #[test]
+    fn test_ack_liveness_fresh_boundary_is_exclusive() {
+        // age == stale_secs is NOT fresh (mirrors the ack-stale detector's
+        // `age >= stale_secs` staleness boundary — the two must agree).
+        assert!(!ack_liveness_fresh(Some(1200), 1200));
+        assert!(ack_liveness_fresh(Some(1199), 1200));
     }
 
     #[test]
