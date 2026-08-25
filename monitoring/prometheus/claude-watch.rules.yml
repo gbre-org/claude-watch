@@ -4,12 +4,12 @@
 # ##########################################################################
 # #4039: THESE RULES ARE VERSION-CONTROLLED IN THE claude-watch REPO.
 # ##########################################################################
-# The local Grafana/Prometheus COMPOSE stack lives out-of-tree (in
-# andrew-sf-tools/monitoring/), but the alert/recording RULES that encode
+# The local Grafana/Prometheus COMPOSE stack lives out-of-tree (in an
+# external monitoring stack), but the alert/recording RULES that encode
 # claude-watch's own semantics belong HERE, next to the two Python exporters
 # that emit the metrics (exporters/work-queue-exporter/,
 # exporters/claude-events-exporter/). This is the single source of truth:
-# any deployment (the local stack, gomorrah/gb, a future hosted Prometheus)
+# any deployment (the local stack, an external host, a future hosted Prometheus)
 # should symlink or copy THIS file rather than fork its own drifting copy.
 #
 # Load it into Prometheus via `rule_files:` in prometheus.yml, e.g.:
@@ -83,14 +83,14 @@
 
 groups:
   # ----------------------------------------------------------------------
-  # Recording rules -- pre-aggregated series for dashboards + for gb to
-  # reuse without re-deriving the joins. Cheap, evaluated every interval.
+  # Recording rules -- pre-aggregated series for dashboards + for external
+  # consumers to reuse without re-deriving the joins. Cheap, evaluated every interval.
   # ----------------------------------------------------------------------
   - name: claude-watch-work-queue.recording
     rules:
       # Count of running queue items currently flagged orphaned (no live
-      # owner). Drives the "orphaned running items" stat tile and lets gb
-      # alert on a COUNT rather than per-series. agent_id="" ones are
+      # owner). Drives the "orphaned running items" stat tile and lets external
+      # consumers alert on a COUNT rather than per-series. agent_id="" ones are
       # never-spawned; agent_id!="" ones died after spawn -- summed here.
       - record: worktask:queue_items_orphaned:count
         expr: count(worktask_queue_item_has_live_owner{status="running"} == 0) or vector(0)

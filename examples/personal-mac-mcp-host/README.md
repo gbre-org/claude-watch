@@ -21,10 +21,10 @@ corresponding LaunchAgent templates:
 - **Recommended split — MCP always-on locally, remote access
   on-demand.** Run the MCP server (`mcp-host-bash`) all the time on the
   Mac via the compose-stack LaunchAgent
-  [`../compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist`](../compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist)
+  [`../compose/launchd/org.claude-watch.mcp-host-bash.plist`](../compose/launchd/org.claude-watch.mcp-host-bash.plist)
   (`RunAtLoad=true`), so the server is up at every login. Then grant
   remote access only when you want it by starting the **tunnel-only**
-  unit (`org.gbre.personal-mcp.tunnel.plist`, `RunAtLoad=false`), which
+  unit (`org.claude-watch.personal-mcp.tunnel.plist`, `RunAtLoad=false`), which
   runs the wrapper in tunnel-only mode (`--tunnel-only` /
   `PERSONAL_MCP_TUNNEL_ONLY=1`): it opens ONLY the reverse SSH tunnel
   and assumes `mcp-host-bash` is already listening locally. "Grant
@@ -33,7 +33,7 @@ corresponding LaunchAgent templates:
 
 - **Bundled (simpler alternative) — one command brings up both.** Run
   `personal-mcp-host.sh --enable` (or the bundled
-  `org.gbre.personal-mcp.host.plist`, `RunAtLoad=false`, whose
+  `org.claude-watch.personal-mcp.host.plist`, `RunAtLoad=false`, whose
   `ProgramArguments` pass that same `--enable`). The wrapper
   brings `mcp-host-bash` up AND opens the tunnel from one invocation.
   The MCP service is started **detached** (its own session) so it
@@ -60,8 +60,8 @@ examples/personal-mac-mcp-host/
 ├── personal-mcp-host.sh                      # wrapper: mcp-host-bash + ssh tunnel (or tunnel-only)
 ├── install.sh                                # one-command LaunchAgent installer (path substitution)
 ├── launchd/
-│   ├── org.gbre.personal-mcp.host.plist      # bundled LaunchAgent (--enable: mcp-host-bash + tunnel, RunAtLoad=false)
-│   ├── org.gbre.personal-mcp.tunnel.plist    # tunnel-only LaunchAgent (tunnel only, RunAtLoad=false)
+│   ├── org.claude-watch.personal-mcp.host.plist      # bundled LaunchAgent (--enable: mcp-host-bash + tunnel, RunAtLoad=false)
+│   ├── org.claude-watch.personal-mcp.tunnel.plist    # tunnel-only LaunchAgent (tunnel only, RunAtLoad=false)
 │   └── README.md                             # launchctl install walkthrough
 └── tests/
     ├── personal-mcp-host.test                # bash wrapper argv tests
@@ -340,7 +340,7 @@ bundled `install.sh` auto-substitutes the `/PATH/TO/REPO` /
 
 ```sh
 # (1) MCP always-on locally — see ../compose/launchd/README.md:
-#     install + bootstrap org.gbre.claude-watch.mcp-host-bash.plist
+#     install + bootstrap org.claude-watch.mcp-host-bash.plist
 #     (RunAtLoad=true). mcp-host-bash now listens at every login.
 
 # (2) Tunnel-only unit, granting remote access on-demand.
@@ -349,14 +349,14 @@ bundled `install.sh` auto-substitutes the `/PATH/TO/REPO` /
 ./install.sh --tunnel-only
 
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.personal-mcp.tunnel.plist
+    ~/Library/LaunchAgents/org.claude-watch.personal-mcp.tunnel.plist
 # Registers the unit. Doesn't fire it (RunAtLoad=false).
 
 # Grant remote access: start the tunnel (MCP server already up).
-launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.tunnel
+launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.tunnel
 
 # Revoke remote access: stop the tunnel. MCP server keeps running.
-launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.tunnel
+launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.tunnel
 ```
 
 See [`launchd/README.md`](launchd/README.md) for the full walkthrough.
@@ -379,20 +379,20 @@ In short:
 # (re-runnable / idempotent; --print-cmd for a dry run; --help for flags)
 
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.personal-mcp.host.plist
+    ~/Library/LaunchAgents/org.claude-watch.personal-mcp.host.plist
 # Registers the unit. Doesn't fire it (RunAtLoad=false).
 
 # Per-session: start (the unit runs the wrapper with --enable, so it
 # brings up mcp-host-bash AND the tunnel)
-launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.host
 
 # Per-session: stop. Tears down the tunnel; the detached mcp-host-bash
 # keeps listening (that's the point — no cold start on the next grant).
-launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.host
 
 # OR: leave registered + soft-disable
 echo 'PERSONAL_MCP_DISABLED="1"' >> .env
-launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.host
+launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.host
 # (wrapper exits 0 immediately; KeepAlive idles)
 ```
 

@@ -95,7 +95,7 @@ def _seed_jsonl(jsonl_root: Path, session_uuid: str, agent_id: str,
     ``project_slug``:
       * ``None`` (default) — one-level layout: writes at
         ``<jsonl_root>/<session_uuid>/subagents/agent-<id>.jsonl``.
-        This mirrors gomorrah's production bind-mount which lands inside
+        This mirrors the-host's production bind-mount which lands inside
         a single project slug.
       * ``str``           — two-level layout: writes at
         ``<jsonl_root>/<project_slug>/<session_uuid>/subagents/agent-<id>.jsonl``.
@@ -272,12 +272,12 @@ class LiveStreamEndpointTest(unittest.TestCase):
         """workbot / container shape: bind-mount lands at
         ``~/.claude/projects`` so the resolver sees
         ``<root>/<project-slug>/<session-uuid>/subagents/agent-<id>.jsonl``
-        (one extra directory level above the gomorrah shape).
+        (one extra directory level above the-host shape).
 
         The public ``examples/compose/docker-compose.yml`` ships with
         ``${HOME}/.claude/projects:/agents-jsonl:ro`` which is exactly
         this layout. Before PR #queue-minisite-container-jsonl-shape the
-        resolver only handled the gomorrah-style mount (one level) and
+        resolver only handled the-host-style mount (one level) and
         silently missed every agent JSONL on workbot — Andrew's "still
         not seeing agent logs in workbots queue site" DM
         (2026-05-15 17:36 ET) was this exact symptom.
@@ -354,7 +354,7 @@ class LiveStreamEndpointTest(unittest.TestCase):
     def test_find_agent_jsonl_prefers_one_level_when_both_present(self):
         """Mixed layout (one-level dir AND two-level slug both contain
         a JSONL for the same agent_id): the one-level resolver runs
-        first to preserve gomorrah's fast path. The two-level fallback
+        first to preserve the-host's fast path. The two-level fallback
         only walks when the one-level probe finds nothing.
 
         We don't promise a stable picker across both shapes — only that

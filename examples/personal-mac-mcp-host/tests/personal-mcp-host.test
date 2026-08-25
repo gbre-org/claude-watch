@@ -1154,8 +1154,8 @@ def test_restart_print_cmd_emits_plan_block() -> None:
             f"RESTART plan should name the reverse-forward spec; got {plan}",
         )
         expect(
-            "org.gbre.personal-mcp.tunnel" in plan
-            and "org.gbre.claude-watch.mcp-host-bash" in plan,
+            "org.claude-watch.personal-mcp.tunnel" in plan
+            and "org.claude-watch.mcp-host-bash" in plan,
             f"RESTART plan should name the launchd labels it consults; got {plan}",
         )
 
@@ -1509,12 +1509,12 @@ def test_restart_kickstarts_bootstrapped_launchd_units() -> None:
             bindir,
             calls,
             registered=[
-                "org.gbre.claude-watch.mcp-host-bash",
-                "org.gbre.personal-mcp.tunnel",
+                "org.claude-watch.mcp-host-bash",
+                "org.claude-watch.personal-mcp.tunnel",
             ],
             starts={
-                "org.gbre.claude-watch.mcp-host-bash": f"{d}{fake_host}",
-                "org.gbre.personal-mcp.tunnel": (
+                "org.claude-watch.mcp-host-bash": f"{d}{fake_host}",
+                "org.claude-watch.personal-mcp.tunnel": (
                     f"{d}{fake_ssh} -N -R {spec} bob@remote"
                 ),
             },
@@ -1547,12 +1547,12 @@ def test_restart_kickstarts_bootstrapped_launchd_units() -> None:
             body = calls.read_text() if calls.exists() else ""
             uid = os.getuid()
             expect(
-                f"kickstart -k gui/{uid}/org.gbre.claude-watch.mcp-host-bash" in body,
+                f"kickstart -k gui/{uid}/org.claude-watch.mcp-host-bash" in body,
                 f"restart should kickstart -k the bootstrapped MCP server "
                 f"unit; calls:\n{body}",
             )
             expect(
-                f"kickstart -k gui/{uid}/org.gbre.personal-mcp.tunnel" in body,
+                f"kickstart -k gui/{uid}/org.claude-watch.personal-mcp.tunnel" in body,
                 f"restart should kickstart -k the bootstrapped tunnel unit; "
                 f"calls:\n{body}",
             )

@@ -9,7 +9,7 @@
   This is the recommended split:
 
     - MCP host always-on locally at boot:
-        examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist
+        examples/compose/launchd/org.claude-watch.mcp-host-bash.plist
         (RunAtLoad=true) keeps mcp-host-bash listening on
         127.0.0.1:$MCP_LOCAL_PORT all the time.
     - Remote access on-demand:
@@ -20,7 +20,7 @@
 
   If you instead want a single unit that owns BOTH the MCP server and
   the tunnel, use the bundled template
-  org.gbre.personal-mcp.host.plist (same directory) — it invokes the
+  org.claude-watch.personal-mcp.host.plist (same directory) — it invokes the
   wrapper with the enable flag, which brings mcp-host-bash up before
   opening the tunnel.
 
@@ -45,15 +45,15 @@
   Why RunAtLoad=false: this is the on-demand "open remote access for a
   bit" pattern. The plist registers the unit but does NOT fire it at
   login. The operator triggers a session with
-    launchctl kickstart gui/$(id -u)/org.gbre.personal-mcp.tunnel
+    launchctl kickstart gui/$(id -u)/org.claude-watch.personal-mcp.tunnel
   and tears it down with
-    launchctl bootout gui/$(id -u)/org.gbre.personal-mcp.tunnel
+    launchctl bootout gui/$(id -u)/org.claude-watch.personal-mcp.tunnel
   See launchd/README.md for the lifecycle.
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>org.gbre.personal-mcp.tunnel</string>
+    <string>org.claude-watch.personal-mcp.tunnel</string>
 
     <!--
       ProgramArguments: absolute path to personal-mcp-host.sh, invoked

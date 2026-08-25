@@ -570,7 +570,7 @@ sequences don't carry clipboard data. The 2026-05-17 follow-up POC
 ships an **xclip shim + file-watch bridge** (see Mitigations below)
 that closes this gap end-to-end for operators willing to install a
 small Mac-side launchd daemon; without that daemon, image paste in
-TUI mode remains a no-op. Empirically verified on gomorrah
+TUI mode remains a no-op. Empirically verified on the-host
 (2026-05-17):
 
 ```
@@ -582,10 +582,10 @@ WAYLAND_DISPLAY=
 ```
 
 Even with `xclip` installed inside the container, there's nothing for it
-to talk to. Confirmation also on the host: `gomorrah` itself has
+to talk to. Confirmation also on the host: `the-host` itself has
 `/usr/bin/xclip` but `DISPLAY=` is empty in shells reached via SSH from
 a remote VSCode integrated terminal. Image paste in a remote-SSH +
-terminal-mode claude on gomorrah doesn't work either, for the same
+terminal-mode claude on the-host doesn't work either, for the same
 reason.
 
 **Why env-var propagation (`CLAUDE_CODE_SSE_PORT`, etc.) does NOT fix
@@ -636,7 +636,7 @@ clipboard daemon. Detail per option:
   `XCLIP_BRIDGE_DIR`). The operator-side daemon at
   `examples/compose/bin/clipboard-bridge-daemon` (Mac launchd agent;
   example plist at
-  `examples/compose/launchd/org.gbre.claude-watch.clipboard-bridge.plist.example`)
+  `examples/compose/launchd/org.claude-watch.clipboard-bridge.plist.example`)
   polls the Mac clipboard via `osascript` (preferred: `pngpaste` if
   installed), sha256-de-dupes, atomic-renames into a local bridge
   dir, and rsync's to the remote host on every clipboard change. The
@@ -669,21 +669,21 @@ clipboard daemon. Detail per option:
   single directory.
 
 - **`xclip` shim backed by SSH-to-Mac (direct callback)** — REJECTED
-  for the Mac→gomorrah→container path. The shim would need to dial
+  for the Mac→the-host→container path. The shim would need to dial
   back to the Mac (the only host with the clipboard); that's a
   reverse direction across the SSH hop the operator initiated, which
   requires either a reverse-port-forward at SSH-time
-  (`ssh -R 0.0.0.0:9999:localhost:22 gomorrah`, plus a Mac sshd, plus
+  (`ssh -R 0.0.0.0:9999:localhost:22 the-host`, plus a Mac sshd, plus
   a pre-shared key) or a persistent control socket the daemon
   maintains. Strictly more moving parts than the file-watch bridge
   above for the same outcome. Re-evaluate if Andrew explicitly asks
   for the no-rsync-poll shape.
 
 - **Native xclip via SSH X11 forwarding** — REJECTED for Andrew's
-  layout. Theoretically: Mac runs XQuartz; `ssh -X hndrewaall@gomorrah`
-  sets `DISPLAY=localhost:10.0` on gomorrah; docker exec passes
+  layout. Theoretically: Mac runs XQuartz; `ssh -X user@the-host`
+  sets `DISPLAY=localhost:10.0` on the-host; docker exec passes
   `-e DISPLAY=$DISPLAY` into the container; in-container xclip dials
-  gomorrah's localhost:6010 listener which sshd tunnels to Mac
+  the-host's localhost:6010 listener which sshd tunnels to Mac
   XQuartz; XQuartz pastes the Mac clipboard. In practice:
     1. **XQuartz is not pre-installed on macOS**; Andrew would need to
        install it. (Probe: `ls /Applications/Utilities/XQuartz.app`.)
@@ -692,17 +692,17 @@ clipboard daemon. Detail per option:
        Forwarding yes` stanza in `~/.ssh/config` for the host AND a
        VSCode setting to pass through.
     3. **Container netns isolates localhost**: the in-container
-       `xclip` can't reach gomorrah's `localhost:6010` listener
+       `xclip` can't reach the-host's `localhost:6010` listener
        without `--network=host` (which the compose stack does NOT
        use, for good reasons — port collisions, security).
        Workaround: `-e DISPLAY=host.docker.internal:10` on Linux only
        works with `--add-host=host.docker.internal:host-gateway` and
-       a gomorrah-side sshd listening on the right interface. More
+       a remote-side sshd listening on the right interface. More
        knobs than the file-watch bridge for the same outcome.
 
   Empirically observed today: `DISPLAY=` is empty in shells reached
   via SSH from a remote VSCode terminal on Andrew's setup (the
-  variable was never set on the gomorrah side), so the prerequisites
+  variable was never set on the-host side), so the prerequisites
   are not in place. If a future operator DOES have XQuartz + VSCode
   X11 forwarding + a host-network container, the real
   `/usr/bin/xclip` (and `XCLIP_SHIM=disabled` to bypass the shim)
@@ -714,7 +714,7 @@ clipboard daemon. Detail per option:
   `/var/folders/.../vscode-ipc-XXX.sock`. VSCode Remote-SSH does NOT
   tunnel that socket back to the remote host; the `code` CLI inside
   a Remote-SSH terminal talks to the *remote* VSCode server (a
-  different IPC endpoint synthesized on gomorrah). Probed via
+  different IPC endpoint synthesized on the-host). Probed via
   `code --help` inside the container — the `code` binary exposes
   `code --status`, `code --diff`, `code --add`, etc.; there is no
   clipboard read or write subcommand. The remote-side
@@ -732,7 +732,7 @@ clipboard daemon. Detail per option:
   reading it.
 
 - **Wayland / X11 socket bind-mount on a headless remote host.** Not
-  applicable: gomorrah has no display server. Local-Linux operators
+  applicable: the-host has no display server. Local-Linux operators
   with a real display could `-v /tmp/.X11-unix:/tmp/.X11-unix
   -e DISPLAY=$DISPLAY` and use the real xclip, but that's a
   different deployment shape than the Mac-VSCode-Remote-SSH path

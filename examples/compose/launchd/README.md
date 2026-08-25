@@ -84,12 +84,12 @@ It refuses to follow symlinks (and refuses files outside that tree).
 So `cp`, not `ln -s`:
 
 ```sh
-cp examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist \
+cp examples/compose/launchd/org.claude-watch.mcp-host-bash.plist \
    ~/Library/LaunchAgents/
 ```
 
 The filename must match the plist's `Label` key
-(`org.gbre.claude-watch.mcp-host-bash`) — `launchd` keys off the
+(`org.claude-watch.mcp-host-bash`) — `launchd` keys off the
 filename for `bootstrap` / `bootout` / `print`.
 
 ## 2. Edit the absolute paths + EnvironmentVariables
@@ -98,7 +98,7 @@ filename for `bootstrap` / `bootout` / `print`.
 literal paths. Open the copy in your editor:
 
 ```sh
-$EDITOR ~/Library/LaunchAgents/org.gbre.claude-watch.mcp-host-bash.plist
+$EDITOR ~/Library/LaunchAgents/org.claude-watch.mcp-host-bash.plist
 ```
 
 Search/replace:
@@ -140,7 +140,7 @@ mkdir -p ~/Library/Logs
 
 ```sh
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.claude-watch.mcp-host-bash.plist
+    ~/Library/LaunchAgents/org.claude-watch.mcp-host-bash.plist
 ```
 
 `gui/$(id -u)` is the per-user GUI domain — the right scope for a
@@ -154,7 +154,7 @@ If `bootstrap` returns nothing, it succeeded. If it errors, see
 ## 4. Verify it's running
 
 ```sh
-launchctl print gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash
+launchctl print gui/$(id -u)/org.claude-watch.mcp-host-bash
 ```
 
 Look for:
@@ -188,9 +188,9 @@ compose README for the wiring).
 the plist after that does NOT take effect until you re-bootstrap:
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash
+launchctl bootout gui/$(id -u)/org.claude-watch.mcp-host-bash
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/org.gbre.claude-watch.mcp-host-bash.plist
+    ~/Library/LaunchAgents/org.claude-watch.mcp-host-bash.plist
 ```
 
 Same dance for changes to `~/.config/claude-container/mcp-host-bash.env`
@@ -200,7 +200,7 @@ allow-list takes effect on the next (re)spawn. Ditto after a fresh
 so launchd exec's the new build.
 
 If you only want to bounce the server WITHOUT touching the plist,
-`launchctl kickstart -k gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash`
+`launchctl kickstart -k gui/$(id -u)/org.claude-watch.mcp-host-bash`
 sends SIGTERM and lets `KeepAlive` respawn it. Faster than the
 bootout / bootstrap pair.
 
@@ -218,7 +218,7 @@ Tail either live with `tail -F <path>`.
 ## 7. Disable temporarily
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash
+launchctl bootout gui/$(id -u)/org.claude-watch.mcp-host-bash
 ```
 
 `bootout` unregisters the LaunchAgent. The plist file under
@@ -228,8 +228,8 @@ it back without re-editing.
 ## 8. Permanently uninstall
 
 ```sh
-launchctl bootout gui/$(id -u)/org.gbre.claude-watch.mcp-host-bash
-rm ~/Library/LaunchAgents/org.gbre.claude-watch.mcp-host-bash.plist
+launchctl bootout gui/$(id -u)/org.claude-watch.mcp-host-bash
+rm ~/Library/LaunchAgents/org.claude-watch.mcp-host-bash.plist
 ```
 
 Optionally remove the log files, operator config, and the binary:

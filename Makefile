@@ -474,7 +474,7 @@ test-ttyd-lock-toggle: ## ttyd browser lock-toggle JS tests
 
 ##@ Tests — macOS LaunchAgents + personal MCP host
 
-# Tests for examples/compose/launchd/org.gbre.claude-watch.mcp-host-bash.plist
+# Tests for examples/compose/launchd/org.claude-watch.mcp-host-bash.plist
 # — the macOS LaunchAgent template that persistently auto-starts
 # mcp-host-bash on operator-login. File-level structural validation
 # only (parses via stdlib plistlib + plutil-lint when available);
@@ -496,7 +496,7 @@ test-launchd-plist: ## mcp-host-bash LaunchAgent plist structure tests
 test-personal-mcp-host: ## personal-mcp-host.sh wrapper tests
 	examples/personal-mac-mcp-host/tests/personal-mcp-host.test
 
-# Tests for examples/personal-mac-mcp-host/launchd/org.gbre.personal-mcp.host.plist
+# Tests for examples/personal-mac-mcp-host/launchd/org.claude-watch.personal-mcp.host.plist
 # — the macOS LaunchAgent template for on-demand bring-up of
 # personal-mcp-host.sh. Structural validation only (plistlib + plutil
 # when available); does NOT invoke launchctl. Covers
@@ -1072,7 +1072,7 @@ install-mcp-host-bash-server: ## Build + install the host-bash MCP server to ~/b
 # token snapshot the queue-minisite dashboard reads (library + CLI both live
 # in tools/cw-agent-stats/ now -- no botchat checkout involved; see that
 # dir's README). Moved here from claude-config/botchat (was
-# org.gbre.claude-watch.botchat-agent-stats, installed by hand) so
+# org.claude-watch.botchat-agent-stats, installed by hand) so
 # claude-watch owns its own producer's install lifecycle. On Linux hosts the
 # equivalent is a cron line (README), and `make install` symlinks the CLI
 # into ~/bin. ProgramArguments[0] in the plist points directly at the
@@ -1082,11 +1082,11 @@ install-mcp-host-bash-server: ## Build + install the host-bash MCP server to ~/b
 # leaves exactly one fresh instance running.
 install-cw-agent-stats-launchd: ## Install + kickstart the cw-agent-stats LaunchAgent (host producer)
 	@mkdir -p $(HOME)/Library/LaunchAgents
-	@cp tools/cw-agent-stats/org.gbre.claude-watch.cw-agent-stats.plist $(HOME)/Library/LaunchAgents/
-	@launchctl bootout gui/$$(id -u)/org.gbre.claude-watch.cw-agent-stats 2>/dev/null || true
-	@launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/org.gbre.claude-watch.cw-agent-stats.plist
-	@launchctl kickstart -k gui/$$(id -u)/org.gbre.claude-watch.cw-agent-stats
-	@echo "Installed + started org.gbre.claude-watch.cw-agent-stats (tools/cw-agent-stats/cw-agent-stats)"
+	@cp tools/cw-agent-stats/org.claude-watch.cw-agent-stats.plist $(HOME)/Library/LaunchAgents/
+	@launchctl bootout gui/$$(id -u)/org.claude-watch.cw-agent-stats 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/org.claude-watch.cw-agent-stats.plist
+	@launchctl kickstart -k gui/$$(id -u)/org.claude-watch.cw-agent-stats
+	@echo "Installed + started org.claude-watch.cw-agent-stats (tools/cw-agent-stats/cw-agent-stats)"
 
 ##@ Developer setup
 
