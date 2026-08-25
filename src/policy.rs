@@ -4240,6 +4240,23 @@ async fn run_auto_update_clean_relaunch(
     info!("auto-update: injecting resume prompt (clean-relaunch)...");
     inject_dispatch::inject_to_agent(pane, &config.auto_update.resume_prompt).await;
 
+    // Latch this clear as already handled (mirrors the daemon-driven-clear
+    // stamp at the Path-1 branch of `maybe_reset_context_clear`): the
+    // concurrent poll loop's own external-clear detection (Path 2 —
+    // `context_reset_signal` observing the respawned pane's near-zero token
+    // reading) typically stamps `last_context_clear` DURING this relaunch,
+    // independent of this function, since check_cycle keeps polling while
+    // this clean-relaunch sequence awaits the new binary/idle prompt. That
+    // stamp is never otherwise matched by `post_clear_resume_injected_for`
+    // (only the daemon-driven-clear path sets that), so the sibling
+    // "Post-clear resume detection" block's
+    // `post_clear_resume_injected_for != last_context_clear` guard reads
+    // true forever after and double-injects a SECOND resume ~40s later on
+    // top of the one just sent above. Sync the two fields to close that gap.
+    let mut st = crate::state::load_state(&config.general.state_file);
+    st.post_clear_resume_injected_for = st.last_context_clear.clone();
+    crate::state::save_state(&config.general.state_file, &st);
+
     write_jsonl_log(
         &config.general.log_file,
         "auto_update_complete",
@@ -5584,6 +5601,48 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         && state.last_context_clear.is_some()
         && state.post_clear_resume_injected_for != state.last_context_clear
     {
+        // Liveness gate (mirrors the 2026-08-24 fresh-/clear fix at the
+        // sibling fast path — #707/ack_liveness_fresh): THE single liveness
+        // signal is the age of the last event-ack. If the loop acked ANY
+        // event/keepalive within the stale window it is provably alive and
+        // therefore CANNOT be a genuinely stranded post-clear loop — the
+        // low-token reading that satisfied this block's guard is almost
+        // certainly the SAME status-bar misparse #707 fixed for the fresh-
+        // /clear fast path (`context_reset_signal` stamping `last_context_clear`
+        // from a sub-30K sample that is actually the thinking-indicator's
+        // current-turn count or an agent-roster row leaking through, not a
+        // real reset; see `status::parse_status_bar`). This is a hard
+        // suppression, checked before any idle-check bookkeeping or the
+        // `post_clear_resume_due` call so a fresh ack is never overridden. A
+        // genuinely stranded post-clear loop stops acking, so its stamp ages
+        // past the threshold and this gate opens again — deferring to, not
+        // disabling, wedge detection.
+        let ack_alive = ack_liveness_fresh(
+            last_ack_timestamp_age(&config.ack.resolve_state_dir()),
+            config.ack.stale_minutes * 60,
+        );
+        if ack_alive {
+            info!(
+                tokens,
+                bashes,
+                "post-clear resume inject suppressed: fresh event-ack liveness (loop alive)"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "post_clear_inject_suppressed",
+                serde_json::json!({
+                    "tokens": tokens,
+                    "bashes": bashes,
+                    "reason": "ack_liveness_fresh",
+                    "stale_secs": config.ack.stale_minutes * 60,
+                }),
+            );
+            state.post_clear_idle_checks = 0;
+            state.last_check = Some(now);
+            crate::state::save_state(&config.general.state_file, state);
+            return;
+        }
+
         // A clear the DAEMON drove is already covered: the `self-clear` child
         // polls until the clear lands and then injects its own resume prompt.
         // Only operator-driven clears need this gate.
