@@ -985,14 +985,14 @@ COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 
 # ── deploy-container local-override hook (q-2026-08-25-8065) ──────────────────
-# A machine-local, UNTRACKED makefile fragment in the config dir can inject an
+# A machine-local makefile fragment in the config dir can inject an
 # EXTRA idempotent deploy step into `deploy-container` WITHOUT editing this
 # tracked, branch-protected Makefile. The motivating case is #3/#4 of the
 # "one-command deploy": deploying the Grafana dashboards LINKED IN from this
 # repo (monitoring/dashboards/*.json — claude-watch / claude-events /
 # work-queue) is performed by an EXTERNAL, machine-specific stack — the
-# "docker-gomorrah" monitoring compose that serves `monitoring-grafana-1`
-# (on this host via andrew-sf-tools/monitoring; on gb via gomorrah). That live
+# monitoring stack repo (andrew-sf-tools/monitoring), which serves the local
+# `monitoring-grafana-1` Grafana container. That live
 # Grafana must be RESTARTED to re-provision from the bind-mounted dashboard
 # file (a POST /api/admin/provisioning reload does NOT overwrite an already-
 # provisioned dashboard), and the external makefile/stack path differs per
@@ -1004,20 +1004,26 @@ DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 # DEPLOY_DASHBOARDS_CMD to the external, idempotent, SYNCHRONOUS (no `&`)
 # invocation. See examples/compose/deploy-container.local.mk.example. E.g.:
 #
-#   DEPLOY_DASHBOARDS_CMD = $(MAKE) -C $(HOME)/repos/andrew-sf-tools/monitoring docker-gomorrah
+#   DEPLOY_DASHBOARDS_CMD = $(MAKE) -C $(HOME)/repos/andrew-sf-tools/monitoring deploy-grafana-dashboards
 # or simply:
 #   DEPLOY_DASHBOARDS_CMD = docker restart monitoring-grafana-1
 #
 # Empty default => a clean no-op on any host without the override.
+#
+# The config-dir path below is a SYMLINK to a TRACKED copy in the operator's
+# claude-config repo (claude-container/deploy-container.local.mk), which in turn
+# invokes the deploy-grafana-dashboards target in andrew-sf-tools/monitoring — so
+# the override is version-controlled + synced across hosts rather than hand-made and
+# untracked. See examples/compose/deploy-container.local.mk.example for setup.
 DEPLOY_LOCAL_MK := $(HOME)/.config/claude-container/deploy-container.local.mk
 -include $(DEPLOY_LOCAL_MK)
 DEPLOY_DASHBOARDS_CMD ?=
 
-# Deploy the linked-in Grafana dashboards via the local docker-gomorrah
+# Deploy the linked-in Grafana dashboards via the machine-local
 # override. Best-effort + idempotent: a failure never blocks the container
 # recreate. No-op (just an explanatory echo) unless the local .mk configured it.
 .PHONY: deploy-dashboards
-deploy-dashboards: ## Deploy linked-in Grafana dashboards via the local docker-gomorrah override (no-op unless configured)
+deploy-dashboards: ## Deploy linked-in Grafana dashboards via the machine-local override (no-op unless configured)
 ifneq ($(strip $(DEPLOY_DASHBOARDS_CMD)),)
 	@echo "[deploy-container] deploying linked-in Grafana dashboards via local override: $(DEPLOY_DASHBOARDS_CMD)"
 	@$(DEPLOY_DASHBOARDS_CMD) || echo "[deploy-container] WARN: dashboard deploy failed (non-fatal); continuing"
