@@ -984,7 +984,49 @@ COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 # `.env` if present, else the in-file defaults).
 DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 
-deploy-container: container-build ## Container deploy: force-recreate claude-container, then up -d the rest of the stack
+# ── deploy-container local-override hook (q-2026-08-25-8065) ──────────────────
+# A machine-local, UNTRACKED makefile fragment in the config dir can inject an
+# EXTRA idempotent deploy step into `deploy-container` WITHOUT editing this
+# tracked, branch-protected Makefile. The motivating case is #3/#4 of the
+# "one-command deploy": deploying the Grafana dashboards LINKED IN from this
+# repo (monitoring/dashboards/*.json — claude-watch / claude-events /
+# work-queue) is performed by an EXTERNAL, machine-specific stack — the
+# "docker-gomorrah" monitoring compose that serves `monitoring-grafana-1`
+# (on this host via andrew-sf-tools/monitoring; on gb via gomorrah). That live
+# Grafana must be RESTARTED to re-provision from the bind-mounted dashboard
+# file (a POST /api/admin/provisioning reload does NOT overwrite an already-
+# provisioned dashboard), and the external makefile/stack path differs per
+# machine — so it MUST NOT be hardcoded in this shared repo.
+#
+# Mechanism: conditionally `-include` a local .mk (silently skipped when
+# absent, so a fresh host — or an in-container self-redeploy where the config
+# dir is not mounted — still deploys cleanly). That local .mk sets
+# DEPLOY_DASHBOARDS_CMD to the external, idempotent, SYNCHRONOUS (no `&`)
+# invocation. See examples/compose/deploy-container.local.mk.example. E.g.:
+#
+#   DEPLOY_DASHBOARDS_CMD = $(MAKE) -C $(HOME)/repos/andrew-sf-tools/monitoring docker-gomorrah
+# or simply:
+#   DEPLOY_DASHBOARDS_CMD = docker restart monitoring-grafana-1
+#
+# Empty default => a clean no-op on any host without the override.
+DEPLOY_LOCAL_MK := $(HOME)/.config/claude-container/deploy-container.local.mk
+-include $(DEPLOY_LOCAL_MK)
+DEPLOY_DASHBOARDS_CMD ?=
+
+# Deploy the linked-in Grafana dashboards via the local docker-gomorrah
+# override. Best-effort + idempotent: a failure never blocks the container
+# recreate. No-op (just an explanatory echo) unless the local .mk configured it.
+.PHONY: deploy-dashboards
+deploy-dashboards: ## Deploy linked-in Grafana dashboards via the local docker-gomorrah override (no-op unless configured)
+ifneq ($(strip $(DEPLOY_DASHBOARDS_CMD)),)
+	@echo "[deploy-container] deploying linked-in Grafana dashboards via local override: $(DEPLOY_DASHBOARDS_CMD)"
+	@$(DEPLOY_DASHBOARDS_CMD) || echo "[deploy-container] WARN: dashboard deploy failed (non-fatal); continuing"
+else
+	@echo "[deploy-container] no DEPLOY_DASHBOARDS_CMD configured; skipping Grafana dashboard deploy (see examples/compose/deploy-container.local.mk.example)"
+endif
+
+deploy-container: container-build ## One-command deploy: dashboards + q-site + force-recreate claude-container, then up -d the stack
+	@$(MAKE) --no-print-directory deploy-dashboards
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
 	  env_flag=""; \
@@ -993,6 +1035,8 @@ deploy-container: container-build ## Container deploy: force-recreate claude-con
 	  export CW_BUILD_PR="$(CW_BUILD_PR)"; \
 	  export GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"; \
 	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then export COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)"; fi; \
+	  echo "[deploy-container] redeploying queue-minisite (q-site)..."; \
+	  docker compose $$env_flag up -d --build --force-recreate queue-minisite || echo "[deploy-container] WARN: queue-minisite redeploy failed (non-fatal); continuing"; \
 	  docker compose $$env_flag up -d --force-recreate claude-container && \
 	  docker compose $$env_flag up -d
 

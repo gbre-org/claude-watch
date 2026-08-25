@@ -1,0 +1,46 @@
+# deploy-container.local.mk.example — machine-local deploy-container override
+#
+# Copy this file to the STABLE CONFIG DIR (NOT the repo), so `make deploy-container`
+# picks it up via the conditional `-include` in the repo-root Makefile:
+#
+#   mkdir -p ~/.config/claude-container
+#   cp deploy-container.local.mk.example \
+#      ~/.config/claude-container/deploy-container.local.mk
+#
+# then uncomment/adjust the line below for your host. Like the compose override
+# and deploy.env, this file lives in the config dir (LOCATION-INDEPENDENT), so it
+# is picked up no matter which clone or worktree the deploy runs from, and it is
+# NEVER tracked in this branch-protected repo.
+#
+# ── What this configures ──────────────────────────────────────────────────────
+# `make deploy-container` folds FOUR things into one idempotent command:
+#   1. force-recreate the claude-container service (the agent container);
+#   2. redeploy the q-site / queue-minisite service (in this repo's compose);
+#   3. deploy the Grafana dashboards LINKED IN from this repo
+#      (monitoring/dashboards/{claude-watch,claude-events,work-queue}.json);
+#   4. THIS override — the hook that lets #3 target an EXTERNAL, machine-specific
+#      makefile/stack ("docker-gomorrah") without editing the tracked Makefile.
+#
+# The canonical dashboard files live HERE in claude-watch, but the live Grafana
+# that serves them (`monitoring-grafana-1`) is an EXTERNAL stack that bind-mounts
+# those files and must be RESTARTED to re-provision (a provisioning-reload POST
+# does NOT overwrite an already-provisioned dashboard). Its path/mechanism
+# differs per machine, so supply the invocation here.
+#
+# DEPLOY_DASHBOARDS_CMD must be:
+#   * idempotent   — safe to re-run on every deploy;
+#   * synchronous  — NO trailing `&` / nohup / disown (the deploy waits on it);
+#   * self-contained — a single shell command line (use `$(MAKE) -C <dir> <tgt>`
+#                      to invoke an external makefile target).
+#
+# ── Examples (uncomment ONE) ──────────────────────────────────────────────────
+#
+# (a) Invoke the external docker-gomorrah makefile target that (re)deploys the
+#     monitoring stack + re-provisions Grafana from the linked-in dashboards:
+#
+# DEPLOY_DASHBOARDS_CMD = $(MAKE) -C $(HOME)/repos/andrew-sf-tools/monitoring docker-gomorrah
+#
+# (b) Minimal: just restart the live Grafana so it re-provisions from the
+#     bind-mounted canonical dashboard files:
+#
+# DEPLOY_DASHBOARDS_CMD = docker restart monitoring-grafana-1
