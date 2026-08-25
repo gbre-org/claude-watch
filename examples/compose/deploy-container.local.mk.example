@@ -3,7 +3,7 @@
 # TRACKED SOURCE lives in the operator's claude-config repo, NOT here:
 #     claude-config/claude-container/deploy-container.local.mk
 #         -> sets DEPLOY_DASHBOARDS_CMD to invoke the deploy-grafana-dashboards
-#            target in the monitoring stack repo (andrew-sf-tools/monitoring),
+#            target in an external, machine-local monitoring/Grafana stack,
 #            which re-provisions the dashboards into the live Grafana.
 #
 # claude-watch's repo-root Makefile picks the override up via a conditional
@@ -28,7 +28,7 @@
 #   3. deploy the Grafana dashboards LINKED IN from this repo
 #      (monitoring/dashboards/{claude-watch,claude-events,work-queue}.json);
 #   4. THIS override — the hook that lets #3 target an EXTERNAL, machine-specific
-#      makefile/stack (andrew-sf-tools/monitoring) without editing the tracked Makefile.
+#      makefile/stack (kept OUT of this repo) without editing the tracked Makefile.
 #
 # The canonical dashboard files live HERE in claude-watch, but the live Grafana
 # that serves them (`monitoring-grafana-1`) is an EXTERNAL stack that bind-mounts
@@ -44,12 +44,12 @@
 # ── Examples (uncomment ONE) ──────────────────────────────────────────────────
 #
 # (a) PREFERRED: invoke the deploy-grafana-dashboards target in the monitoring
-#     stack repo (andrew-sf-tools/monitoring), which restarts the local Grafana
+#     stack (kept OUT of this repo), which restarts the local Grafana
 #     container so it re-provisions from the linked-in dashboards (auto-discovers
 #     the container by name; override GRAFANA_CONTAINER if the Grafana container
 #     isn't named *grafana*):
 #
-# DEPLOY_DASHBOARDS_CMD = $(MAKE) -C $(HOME)/repos/andrew-sf-tools/monitoring deploy-grafana-dashboards
+# DEPLOY_DASHBOARDS_CMD = $(MAKE) -C /path/to/your/monitoring-stack deploy-grafana-dashboards
 #
 # (b) Minimal: just restart the live Grafana so it re-provisions from the
 #     bind-mounted canonical dashboard files:

@@ -991,7 +991,7 @@ DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 # "one-command deploy": deploying the Grafana dashboards LINKED IN from this
 # repo (monitoring/dashboards/*.json — claude-watch / claude-events /
 # work-queue) is performed by an EXTERNAL, machine-specific stack — the
-# monitoring stack repo (andrew-sf-tools/monitoring), which serves the local
+# external, machine-local monitoring/Grafana stack (kept OUT of this repo), which serves the local
 # `monitoring-grafana-1` Grafana container. That live
 # Grafana must be RESTARTED to re-provision from the bind-mounted dashboard
 # file (a POST /api/admin/provisioning reload does NOT overwrite an already-
@@ -1004,7 +1004,7 @@ DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 # DEPLOY_DASHBOARDS_CMD to the external, idempotent, SYNCHRONOUS (no `&`)
 # invocation. See examples/compose/deploy-container.local.mk.example. E.g.:
 #
-#   DEPLOY_DASHBOARDS_CMD = $(MAKE) -C $(HOME)/repos/andrew-sf-tools/monitoring deploy-grafana-dashboards
+#   DEPLOY_DASHBOARDS_CMD = $(MAKE) -C /path/to/your/monitoring-stack deploy-grafana-dashboards
 # or simply:
 #   DEPLOY_DASHBOARDS_CMD = docker restart monitoring-grafana-1
 #
@@ -1012,7 +1012,7 @@ DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
 #
 # The config-dir path below is a SYMLINK to a TRACKED copy in the operator's
 # claude-config repo (claude-container/deploy-container.local.mk), which in turn
-# invokes the deploy-grafana-dashboards target in andrew-sf-tools/monitoring — so
+# invokes the deploy-grafana-dashboards target in that external stack — so
 # the override is version-controlled + synced across hosts rather than hand-made and
 # untracked. See examples/compose/deploy-container.local.mk.example for setup.
 DEPLOY_LOCAL_MK := $(HOME)/.config/claude-container/deploy-container.local.mk
