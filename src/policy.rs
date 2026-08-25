@@ -3852,9 +3852,11 @@ pub async fn check_update_trigger(config: &Config, state: &mut State, pane: &str
     }
 
     // Check version mismatch (or force)
-    let version_info = tokio::task::spawn_blocking(crate::status::get_version_info)
-        .await
-        .unwrap_or_default();
+    // Pane-scoped: resolve the RUNNING version from the main-loop pane's own
+    // PID, NOT the global `pgrep -af claude` first-match — which in a container
+    // can return a SIGKILL-orphaned OLDER versioned claude and manufacture a
+    // false `running != installed`, driving a self-sustaining relaunch loop.
+    let version_info = crate::status::get_version_info_for_pane(pane).await;
 
     let running = match version_info.running {
         Some(v) => v,
@@ -3965,9 +3967,11 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
     }
 
     // Check version mismatch
-    let version_info = tokio::task::spawn_blocking(crate::status::get_version_info)
-        .await
-        .unwrap_or_default();
+    // Pane-scoped: resolve the RUNNING version from the main-loop pane's own
+    // PID, NOT the global `pgrep -af claude` first-match — which in a container
+    // can return a SIGKILL-orphaned OLDER versioned claude and manufacture a
+    // false `running != installed`, driving a self-sustaining relaunch loop.
+    let version_info = crate::status::get_version_info_for_pane(pane).await;
 
     let running = match version_info.running {
         Some(v) => v,

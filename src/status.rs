@@ -735,6 +735,164 @@ pub fn get_version_info() -> VersionInfo {
     info
 }
 
+/// Resolve a tmux pane's foreground PID — the process tmux forked for the pane.
+/// In the main-loop pane that is the claude TUI itself (launched as
+/// `exec claude`), so its `/proc/<pid>/exe` points straight at the running
+/// versioned binary.
+async fn resolve_pane_pid(pane: &str) -> Option<String> {
+    let (out, ok) = run_cmd_any(
+        &["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+        5,
+    )
+    .await;
+    if !ok {
+        return None;
+    }
+    let pid = out.trim();
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(pid.to_string())
+}
+
+/// True iff an exe path looks like a REAL claude TUI binary — the native
+/// versioned layout (under a `/versions/` dir), the `~/.local/bin/claude`
+/// launcher, or an npm-global `@anthropic-ai/claude-code` binary — as opposed
+/// to tmux, `claude-watch`, or a bash watcher that merely matched
+/// `pgrep -af claude` on its command line. Used to filter the fallback
+/// candidate set so a non-claude PID can never contribute a bogus version.
+pub(crate) fn is_claude_tui_exe(exe_path: &str) -> bool {
+    exe_path.contains("/versions/")
+        || exe_path.ends_with("/.local/bin/claude")
+        || exe_path.contains("@anthropic-ai/claude-code")
+}
+
+/// Compare two dotted numeric version strings (`"2.1.245"` vs `"2.1.243"`).
+/// Components parse as integers (non-numeric / missing components sort as 0),
+/// so `2.1.245 > 2.1.99` (numeric, not lexical).
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(s: &str) -> Vec<u64> {
+        s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect()
+    }
+    parts(a).cmp(&parts(b))
+}
+
+/// A resolved running-claude candidate: a PID and the version it loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningCandidate {
+    pub pid: String,
+    pub version: String,
+}
+
+/// Pure selection core for pane-scoped running-version detection.
+///
+/// Given the resolved running-claude candidates and the main-loop pane's PID,
+/// pick the running version: PREFER the candidate whose PID is the pane PID
+/// (the live main-loop TUI); otherwise fall back to the HIGHEST version among
+/// candidates. The highest-wins fallback guarantees that a dying OLDER
+/// versioned process — a native/npm atomic-install overlap, or a
+/// SIGKILL-orphaned old build still executable on disk — can NEVER mask the
+/// live newer one, which is exactly the false `running < installed` mismatch
+/// that drove the self-sustaining auto-update relaunch loop.
+pub(crate) fn select_running_version(
+    candidates: &[RunningCandidate],
+    pane_pid: Option<&str>,
+) -> Option<String> {
+    if let Some(pp) = pane_pid {
+        if let Some(c) = candidates.iter().find(|c| c.pid == pp) {
+            return Some(c.version.clone());
+        }
+    }
+    candidates
+        .iter()
+        .max_by(|a, b| compare_versions(&a.version, &b.version))
+        .map(|c| c.version.clone())
+}
+
+/// Gather resolved running-claude candidates for the fallback path: every
+/// `pgrep -af claude` PID whose `/proc/<pid>/exe` is a real claude TUI binary
+/// (see [`is_claude_tui_exe`]) and that resolves to a version. Non-claude
+/// matches (tmux/`claude-watch`/bash watchers) are filtered out so they cannot
+/// contribute a bogus version.
+async fn scan_running_candidates() -> Vec<RunningCandidate> {
+    let (stdout, _) = run_cmd_any(&["pgrep", "-af", "claude"], 5).await;
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(pid) = line.split_whitespace().next() else {
+            continue;
+        };
+        // Filter to real claude TUI processes by their exe target.
+        let exe_ok = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|t| is_claude_tui_exe(&t.to_string_lossy()))
+            .unwrap_or(false);
+        if !exe_ok {
+            continue;
+        }
+        if let Some(version) = resolve_running_version(pid) {
+            out.push(RunningCandidate {
+                pid: pid.to_string(),
+                version,
+            });
+        }
+    }
+    out
+}
+
+/// Pane-scoped variant of [`get_version_info`]: resolve the RUNNING version
+/// from the main-loop pane's own PID rather than the global `pgrep -af claude`
+/// first-match.
+///
+/// ## Why (the auto-update version-detection loop)
+///
+/// [`get_version_info`] takes the FIRST `pgrep -af claude` match that resolves
+/// to a version. In a container that pattern matches ~10+ PIDs (the tmux
+/// launcher, `tmux attach`, `claude-watch`, bash watchers) and — critically —
+/// any SIGKILL-orphaned OLD versioned claude processes that briefly coexist
+/// with the live one during a respawn-pane `-k` overlap (the versions dir keeps
+/// several builds all executable). When an older PID sorts first, `running`
+/// comes back OLDER than `installed` (the symlink, always newest), so
+/// `check_auto_update` sees a false `running != installed`, fires
+/// `cwsr --no-upgrade` (which swaps nothing on disk), and re-fires next cycle —
+/// self-sustaining. Pane DETECTION already dodges this exact first-match hazard
+/// via [`find_claude_pane_with_config`]; version detection never did.
+///
+/// Resolution:
+///   1. Resolve the pane's `#{pane_pid}` (the live claude TUI) and read the
+///      running version from THAT PID only.
+///   2. If the pane PID can't be resolved or yields no version, fall back to a
+///      FILTERED scan (real claude TUI exes only) and pick the HIGHEST version
+///      (see [`select_running_version`]) so a dying old PID can't win.
+///
+/// `installed` is sourced identically to [`get_version_info`].
+pub async fn get_version_info_for_pane(pane: &str) -> VersionInfo {
+    let mut info = VersionInfo::default();
+
+    // Installed (on-disk) version — identical source to get_version_info.
+    if let Some(bin) = find_claude_launcher() {
+        info.installed = resolve_installed_version(&bin);
+    }
+
+    let pane_pid = resolve_pane_pid(pane).await;
+
+    // Primary: the version loaded by the pane's own PID.
+    if let Some(pid) = pane_pid.as_deref() {
+        info.running = resolve_running_version(pid);
+    }
+
+    // Fallback (pane PID unresolved, or it carried no version): filtered scan,
+    // preferring the pane PID, else the highest version among real claude TUIs.
+    if info.running.is_none() {
+        let candidates = scan_running_candidates().await;
+        info.running = select_running_version(&candidates, pane_pid.as_deref());
+    }
+
+    info
+}
+
 /// Find the MAIN-LOOP Claude Code pane, preferring the explicitly-configured
 /// `[tmux] dashboard_pane` / `dashboard_session` over the unconstrained
 /// auto-detect scan.
@@ -3111,6 +3269,95 @@ mod tests {
         assert!(!is_claude_hooks_shim(std::path::Path::new(
             "/home/u/.local/share/claude/versions/2.1.186/node_modules/.bin/claude"
         )));
+    }
+
+    // --- pane-scoped running-version selection tests ---
+
+    #[test]
+    fn test_compare_versions_numeric_not_lexical() {
+        use std::cmp::Ordering;
+        // Lexical compare would call "2.1.99" > "2.1.245"; numeric must not.
+        assert_eq!(compare_versions("2.1.245", "2.1.99"), Ordering::Greater);
+        assert_eq!(compare_versions("2.1.243", "2.1.245"), Ordering::Less);
+        assert_eq!(compare_versions("2.1.245", "2.1.245"), Ordering::Equal);
+        assert_eq!(compare_versions("2.2.0", "2.1.999"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_is_claude_tui_exe() {
+        // Native versioned layout, launcher symlink, npm-global binary.
+        assert!(is_claude_tui_exe(
+            "/home/u/.local/share/claude/versions/2.1.245/node_modules/.bin/claude"
+        ));
+        assert!(is_claude_tui_exe("/home/u/.local/bin/claude"));
+        assert!(is_claude_tui_exe(
+            "/home/u/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+        ));
+        // A deleted-inode exe target keeps the /versions/ segment.
+        assert!(is_claude_tui_exe(
+            "/home/u/.local/share/claude/versions/2.1.245/cli.js (deleted)"
+        ));
+        // NOT claude TUIs — these merely match `pgrep -af claude`.
+        assert!(!is_claude_tui_exe("/usr/local/bin/claude-watch"));
+        assert!(!is_claude_tui_exe("/usr/bin/tmux"));
+        assert!(!is_claude_tui_exe("/usr/bin/bash"));
+    }
+
+    #[test]
+    fn test_select_running_version_prefers_pane_pid() {
+        // The live main-loop TUI is pid 143 on 2.1.245; an orphaned OLD build
+        // (pid 99 on 2.1.241) is still executable and also resolved. The pane
+        // PID must win regardless of scan order.
+        let candidates = vec![
+            RunningCandidate { pid: "99".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "143".into(), version: "2.1.245".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, Some("143")),
+            Some("2.1.245".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_pane_pid_even_if_lower() {
+        // Truthfulness: if the pane's OWN pid loaded an older build (genuinely
+        // running behind installed), report THAT — a real mismatch the updater
+        // should act on — not some other process's newer version.
+        let candidates = vec![
+            RunningCandidate { pid: "143".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "200".into(), version: "2.1.245".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, Some("143")),
+            Some("2.1.241".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_fallback_highest_when_pane_pid_absent() {
+        // Pane PID unresolved / not among candidates: a dying OLD process
+        // (2.1.241) must NOT mask the live NEW one (2.1.245). Highest wins —
+        // the exact orphan-masks-live failure mode of the global first-match.
+        let candidates = vec![
+            RunningCandidate { pid: "99".into(), version: "2.1.241".into() },
+            RunningCandidate { pid: "143".into(), version: "2.1.245".into() },
+            RunningCandidate { pid: "150".into(), version: "2.1.243".into() },
+        ];
+        assert_eq!(
+            select_running_version(&candidates, None),
+            Some("2.1.245".to_string())
+        );
+        // Pane PID given but not in the candidate set -> same highest-wins path.
+        assert_eq!(
+            select_running_version(&candidates, Some("777")),
+            Some("2.1.245".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_running_version_empty_is_none() {
+        assert_eq!(select_running_version(&[], Some("143")), None);
+        assert_eq!(select_running_version(&[], None), None);
     }
 
     // --- resolve_installed_version tests ---
