@@ -715,6 +715,27 @@ pub(crate) fn ack_liveness_fresh(liveness_age: Option<u64>, stale_secs: u64) -> 
     liveness_age.is_some_and(|age| age < stale_secs)
 }
 
+/// Pure predicate: should `ack_liveness_fresh` suppress a fresh-/clear or
+/// post-clear-resume inject THIS cycle?
+///
+/// `ack_liveness_fresh` exists to catch a status-bar MISPARSE — a live,
+/// intact session whose low-token reading is actually a thinking-indicator
+/// or agent-roster count leaking through, not a real clear. It must defer
+/// to a genuine context-limit/rate-limit wedge (`wedged_now`, from
+/// `tmux::detect_wedged` on the *current* banner text — independent,
+/// stronger evidence than a token-count reading). Without this carve-out, a
+/// session that hit "Context limit reached" moments after its last
+/// event-ack reads as "alive" for the whole `ack.stale_minutes` window,
+/// and the ack gate's early `return` in `check_cycle` never lets control
+/// reach `handle_wedged_pane` — silently swallowing the autoclear-on-
+/// context-limit recovery (2026-08-26 incident: "Context limit reached"
+/// then "Context low (0% remaining)", autoclear never fired).
+///
+/// Returns true iff `ack_alive && !wedged_now`.
+pub(crate) fn ack_liveness_suppresses_clear_inject(ack_alive: bool, wedged_now: bool) -> bool {
+    ack_alive && !wedged_now
+}
+
 /// Pure predicate: should the dead-process restart be suppressed because
 /// the main loop is actively turning? Mirrors the decision we make at
 /// the fire site so unit tests don't have to mock tmux pane reads.
@@ -5332,6 +5353,28 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         debug!("check_cycle: api_retry active — suppressing wedged/watcher/context fires");
     }
 
+    // --- Wedged-pane pre-check (context limit / persistent rate limit) ---
+    //
+    // Computed once, early, so the ack-liveness suppression gates below (the
+    // fresh-/clear and post-clear-resume fixes from #707/#713, 2026-08-24/25)
+    // can tell a genuine context-wall wedge apart from the status-bar
+    // MISPARSE those gates were built to catch. A session that just hit
+    // "Context limit reached" / "Context low (N% remaining)" typically acked
+    // an event/keepalive moments before it wedged, so `ack_liveness_fresh`
+    // keeps reading "alive" for up to the whole stale window
+    // (`config.ack.stale_minutes`) — during which both ack-gated blocks below
+    // `return`ed BEFORE this function ever reached `handle_wedged_pane`,
+    // silently swallowing the autoclear-on-context-limit recovery (incident
+    // 2026-08-26: "Context limit reached" then "Context low (0% remaining)",
+    // autoclear never fired, operator had to `/clear` by hand). The
+    // ack-liveness gate must suppress spurious resume/restart injects on an
+    // intact session — it must never suppress the wedged-pane recovery,
+    // which rests on independent banner-text evidence (not a token-count
+    // misparse) and has its own consecutive-cycle + cooldown gating inside
+    // `handle_wedged_pane`.
+    let wedged_now =
+        !effective_pane.is_empty() && tmux::detect_wedged(&effective_pane).await.is_some();
+
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
         state.consecutive_dead_checks += 1;
@@ -5727,7 +5770,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             last_ack_timestamp_age(&config.ack.resolve_state_dir()),
             config.ack.stale_minutes * 60,
         );
-        if ack_alive {
+        if ack_liveness_suppresses_clear_inject(ack_alive, wedged_now) {
             info!(
                 tokens,
                 bashes,
@@ -5747,6 +5790,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
+        } else if ack_alive {
+            debug!(
+                tokens,
+                bashes,
+                "post-clear resume suppression skipped: pane shows a genuine wedge banner — deferring to wedged-pane recovery"
+            );
         }
 
         // A clear the DAEMON drove is already covered: the `self-clear` child
@@ -5904,7 +5953,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 last_ack_timestamp_age(&config.ack.resolve_state_dir()),
                 config.ack.stale_minutes * 60,
             );
-            if ack_alive {
+            if ack_liveness_suppresses_clear_inject(ack_alive, wedged_now) {
                 info!(
                     tokens,
                     bashes,
@@ -5926,6 +5975,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 state.last_check = Some(now);
                 crate::state::save_state(&config.general.state_file, state);
                 return;
+            } else if ack_alive {
+                debug!(
+                    tokens,
+                    bashes,
+                    "fresh /clear suppression skipped: pane shows a genuine wedge banner — deferring to wedged-pane recovery"
+                );
             }
 
             // Active-turn suppression (2026-04-27 false-positive fix):
@@ -10328,6 +10383,48 @@ cooldown = 300
         // No ack data at all (fresh boot / host without event-ack): we cannot
         // prove liveness, so DON'T suppress — preserve fast-path behaviour.
         assert!(!ack_liveness_fresh(None, 20 * 60));
+    }
+
+    // --- ack_liveness_suppresses_clear_inject: the wedged carve-out
+    // (2026-08-26 autoclear-swallowed-by-ack-gate fix) ---
+    //
+    // Regression coverage for the incident: a session hit "Context limit
+    // reached" / "Context low (0% remaining)" shortly after its last
+    // event-ack, so `ack_liveness_fresh` kept reading "alive" for the whole
+    // stale window and the fresh-/clear + post-clear-resume gates `return`ed
+    // before `check_cycle` ever reached `handle_wedged_pane`. Autoclear
+    // never fired; the operator had to `/clear` by hand.
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_normal_case() {
+        // Fresh ack, no wedge banner on screen: this IS the misparse case the
+        // gate was built for — suppress the spurious resume/fresh-clear inject.
+        assert!(ack_liveness_suppresses_clear_inject(true, false));
+    }
+
+    #[test]
+    fn test_ack_liveness_does_not_suppress_when_genuinely_wedged() {
+        // Fresh ack (acked moments before hitting the wall) BUT the pane is
+        // showing a genuine context-limit/rate-limit banner right now: do NOT
+        // suppress. Autoclear must be allowed to reach `handle_wedged_pane`
+        // regardless of how recently the loop last acked.
+        assert!(!ack_liveness_suppresses_clear_inject(true, true));
+    }
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_no_ack_no_wedge() {
+        // No proof of life and no wedge banner: gate stays out of the way
+        // (unrelated to the wedge carve-out — mirrors ack_liveness_fresh's
+        // own "no data => false" behaviour flowing through unchanged).
+        assert!(!ack_liveness_suppresses_clear_inject(false, false));
+    }
+
+    #[test]
+    fn test_ack_liveness_suppresses_clear_inject_no_ack_but_wedged() {
+        // Stale/absent ack AND wedged: still don't suppress (wedge detection
+        // was already going to run regardless — this just confirms wedged
+        // never flips the result to "suppress").
+        assert!(!ack_liveness_suppresses_clear_inject(false, true));
     }
 
     #[test]
