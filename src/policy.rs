@@ -5192,6 +5192,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     let pane = &cs.pane;
     let tokens = cs.tokens;
     let bashes = cs.bashes;
+    let active_ui = cs.active_ui;
     let watchmen_count = status::check_watchmen_count().await;
 
     // --- Activity detection (Phase 1: logging only) ---
@@ -5425,7 +5426,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     info!("dead state reached after active session — resetting fresh_session_injected");
                     state.fresh_session_injected = false;
                     state.was_alive_since_inject = false;
-                } else if inject_expired {
+                } else if inject_expired
+                    // ONE-SHOT LATCH GUARD (operator #5620): only treat a
+                    // never-active session as "died during fresh startup" (and
+                    // thus re-arm the inject) when this pane was NOT hosting a
+                    // large context. A large last-known total is positive proof
+                    // the pane holds a live, intact session whose bare total is
+                    // merely a persistent parse miss — re-arming there is what
+                    // re-fired the bogus resume prompt every ~5 min.
+                    && state.last_known_tokens < config.fresh_clear.max_tokens
+                {
                     info!("dead state reached — inject expired (>5min, never active) — resetting fresh_session_injected");
                     state.fresh_session_injected = false;
                     state.was_alive_since_inject = false;
@@ -5553,7 +5563,15 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // recent handoff short-circuits without extra tmux work, and
                 // placed at the GATE (not just inside `inject_to_agent`) so the
                 // `fresh_session_injected` latch is not set on a deferred fire.
-                !tmux::self_clear_in_progress()
+                // ACTIVE-UI SUPPRESSION (operator #5620): a long, active
+                // session whose bare context total has scrolled behind the
+                // thinking indicator / agent-roster / background-tasks overlay
+                // reads tokens==0 — a parse MISS, not a fresh session. Those
+                // active-work markers never appear on a genuinely fresh idle
+                // pane, so their presence is positive proof this is NOT a fresh
+                // external session: never fire the resume-checklist inject.
+                !active_ui
+                && !tmux::self_clear_in_progress()
                 && !tmux::self_clear_handoff_recent(
                     config.fresh_clear.self_clear_handoff_grace_secs,
                 )

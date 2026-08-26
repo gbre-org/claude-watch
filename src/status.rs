@@ -12,6 +12,12 @@ pub struct ClaudeStatus {
     pub pane: String,
     pub tokens: u64,
     pub bashes: u64,
+    /// True when the pane showed active-work UI markers (thinking indicator,
+    /// agent-roster rows, or the Background-tasks overlay) at capture time.
+    /// Positive proof the session is alive even when the bare context total
+    /// could not be parsed (`tokens == 0` is then a parse MISS, not a fresh
+    /// session). See `pane_shows_active_ui`. (operator #5620)
+    pub active_ui: bool,
     pub compact_remaining: Option<u32>,
     pub version: Option<String>,
     pub latest: Option<String>,
@@ -179,6 +185,40 @@ pub(crate) fn is_agent_roster_row(line: &str) -> bool {
         && !trimmed.contains('(')
         && (trimmed.contains('\u{2191}') || trimmed.contains('\u{2193}'))
         && trimmed.contains("tok")
+}
+
+/// Pure predicate: does the pane show ACTIVE-WORK UI markers — a thinking
+/// indicator (`↑/↓ N tokens`), one or more agent-roster rows, or the
+/// "Background tasks" overlay?
+///
+/// These markers are drawn ONLY while the session is actively generating or
+/// has live subagents / background tasks; they NEVER appear on a genuinely
+/// fresh, idle session sitting at an empty `❯` prompt. So when the status
+/// parser cannot read the bare context total (it has scrolled out of the
+/// capture window behind these very markers) and returns `tokens == 0`, this
+/// predicate is the positive-liveness signal that separates a live session
+/// with an off-screen total (a parse MISS) from a genuinely fresh/empty one.
+/// The dead-process / fresh-external-session inject path consults it so a
+/// long, active session is never misread as fresh and spuriously handed the
+/// resume-checklist prompt (recurring false-positive, operator #5620).
+///
+/// Scans the WHOLE pane (markers can sit well above the bottom-10 window when
+/// an overlay panel pushes the tail up), mirroring the whole-pane marker scan
+/// in `parse_status_bar_with_diag`.
+pub(crate) fn pane_shows_active_ui(pane_text: &str) -> bool {
+    let thinking_re =
+        Regex::new(r"[\u{2191}\u{2193}]\s*\d[\d,.]*\s*[kKmM]?\s*tok").unwrap();
+    pane_text.lines().any(|line| {
+        is_agent_roster_row(line)
+            || thinking_re.is_match(line)
+            || line.contains("Background tasks")
+            || line.contains("active shells")
+            || line.contains("active shell")
+            || line.contains("active agents")
+            || line.contains("active agent")
+            || line.contains("Local agents")
+            || line.contains(" Shells (")
+    })
 }
 
 /// Like `parse_status_bar` but also returns whether a status-bar marker was
@@ -1146,6 +1186,7 @@ async fn get_claude_status_inner(
                 pane,
                 tokens: parsed.tokens.unwrap_or(0),
                 bashes: parsed.bashes.unwrap_or(0),
+                active_ui: pane_shows_active_ui(&capture),
                 compact_remaining: parsed.compact_remaining,
                 version: version_info.running,
                 latest: version_info.installed,
@@ -1181,6 +1222,7 @@ async fn get_claude_status_fallback() -> Option<ClaudeStatus> {
         pane: data["pane"].as_str().unwrap_or("").to_string(),
         tokens: data["tokens"].as_u64().unwrap_or(0),
         bashes: data["bashes"].as_u64().unwrap_or(0),
+        active_ui: data["active_ui"].as_bool().unwrap_or(false),
         compact_remaining: data["compact_remaining"].as_u64().map(|v| v as u32),
         version: data["version"].as_str().map(|s| s.to_string()),
         latest: data["latest"].as_str().map(|s| s.to_string()),
@@ -2150,6 +2192,39 @@ mod tests {
             ..Default::default()
         };
         assert!(!prefer_configured_pane(&cfg));
+    }
+
+    #[test]
+    fn active_ui_true_for_agent_roster_row() {
+        let pane = "\u{25ef} general-purpose    Scanning claude-w\u{2026} 3m 14s \u{b7} \u{2193} 102.8k tokens\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_thinking_indicator() {
+        let pane = "\u{25cf} Zigzagging\u{2026} (37s \u{b7} \u{2193} 1.3k tokens \u{b7} thought for 13s)\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_true_for_background_tasks_overlay() {
+        let pane = "Background tasks\n  Shells (2)\n\u{276f} ";
+        assert!(pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_false_for_fresh_idle_pane() {
+        // A genuinely fresh/idle session: permission-mode status bar + empty
+        // prompt, no thinking indicator, no roster, no overlay.
+        let pane = "\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt\n\u{276f} ";
+        assert!(!pane_shows_active_ui(pane));
+    }
+
+    #[test]
+    fn active_ui_false_for_bare_status_bar_total() {
+        // Status bar showing the bare context total but no active-work markers.
+        let pane = "224598 tokens\n\u{23f5}\u{23f5} bypass permissions on\n\u{276f} ";
+        assert!(!pane_shows_active_ui(pane));
     }
 
     #[test]

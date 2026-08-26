@@ -998,6 +998,7 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
                 pane: String::new(),
                 tokens: 0,
                 bashes: 0,
+                active_ui: false,
                 compact_remaining: None,
                 version: version_info.running,
                 latest: version_info.installed,
